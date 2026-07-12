@@ -29,7 +29,7 @@ A patch that fixes the reported bug while silently regressing three unrelated ro
 
 ## How it works
 
-Two adversarial LLM agents, three independent non-LLM sources of truth. A patch ships only when it survives all of them.
+Two adversarial LLM agents, multiple independent non-LLM sources of truth. The patch under verification can come from Vanta's own Creator agent, an external coding agent, or a human — Vanta is a verification layer, not just a repair loop. A patch ships only when it passes every **required** verdict source — non-binary verification outcomes (`Inconclusive` / `Unsupported` / `Timeout`) block or pass according to a per-repository verification policy (**required** for critical paths, **best-effort** by default, **disabled** for unsupported languages).
 
 ```
                 Target codebase + bug report
@@ -39,22 +39,24 @@ Two adversarial LLM agents, three independent non-LLM sources of truth. A patch 
         │     RUST ORCHESTRATION PLANE (Rig)    │
         │                                        │
         │   Creator Agent ──── writes patch      │
+        │   (or patch arrives from an external   │
+        │    agent / human developer)            │
         │        │                               │
         │        ▼                               │
-        │   Attacker Agent ─── writes tests      │
-        │        │            that try to        │
-        │        │            break the patch    │
+        │   Attacker Agent ─── writes tests,     │
+        │        │            each with a        │
+        │        │            declared INTENT    │
         │        ▼                               │
         │   PHASE 1 · BATE                       │
-        │   every new test runs against the      │
-        │   UNMODIFIED codebase first            │
+        │   baseline result on UNMODIFIED code   │
+        │   must MATCH each test's intent        │
         │        │                               │
         │   ┌────┴─────────────────┐             │
         │   ▼                      ▼             │
-        │  FORMAL PROOF        SANDBOX           │
-        │  translator → Z3     microVM exec +    │
-        │  (proof or           3-tier failure    │
-        │   counter-example)   triage            │
+        │  VERIFIER BACKENDS   SANDBOX           │
+        │  CrossHair/Kani/Z3   microVM exec +    │
+        │  (verified-in-bounds 4-way failure     │
+        │   or counterexample) triage            │
         │   └────┬─────────────────┘             │
         │        ▼                               │
         │   PHASE 3 · GOVERNOR                   │
@@ -75,8 +77,8 @@ Two adversarial LLM agents, three independent non-LLM sources of truth. A patch 
 |---|---|---|
 | **Creator** | Reads issue + source + history, writes a minimal patch | — (is the LLM) |
 | **Attacker** | Writes new adversarial regression tests targeting the patch's weak points | — (is the LLM) |
-| **Diagnostician** | Triages every failure: infra noise / static error / real logic failure | No — deterministic |
-| **Formal proof track** | Translates the patch to logic; Z3 proves the invariant or returns a counter-example | No — mathematical |
+| **Diagnostician** | Triages every failure: infrastructure / static / logic / unknown | No — deterministic |
+| **Verifier backends** | Language-specific formal/symbolic systems behind one trait; return structured outcomes | No — mathematical |
 | **Governor** | Computes EIR/ECR live; halts when correction turns net-harmful | No — arithmetic |
 | **Gatekeeper** | Opens a PR only when every signal passes | No — deterministic |
 
@@ -84,29 +86,31 @@ Two adversarial LLM agents, three independent non-LLM sources of truth. A patch 
 
 **1 · Adversarial by construction.** A dedicated Attacker agent actively tries to break every patch — evolving new tests each round based on what the patch actually does — instead of passively checking a fixed suite.
 
-**2 · Baseline-validated tests (BATE).** Every Attacker-generated test runs against the *unmodified* codebase first. Tests that fail there are returned for revision (max 3 retries) then scrapped. This filters malformed adversarial tests **and** excludes pre-existing failures from regression counting — a patch is only ever penalised for damage *it* caused.
+**2 · Intent-labelled, baseline-validated tests (BATE).** Every Attacker-generated test declares its intent — `bug_reproduction` (should FAIL on the original code: that failure proves the bug was reproduced), `feature_acceptance`, or `behavior_preservation` (should PASS on the original code). BATE runs each test against the *unmodified* codebase and checks the result **matches the declared intent**; mismatches are returned for revision (max 3 retries) then scrapped. This filters malformed adversarial tests, pins every baseline, and excludes pre-existing failures from regression counting — a patch is only ever penalised for damage *it* caused.
 
-**3 · Three-tier failure triage.** Not every red test means the model failed:
+**3 · Four-way failure triage.** Not every red test means the model failed:
 
-| Tier | Catches | Counted as a model error? |
+| Class | Catches | Counted as a model error? |
 |---|---|---|
-| 1 | Infra noise — timeouts, OOM, deadlocks (trapped via `parking_lot` deadlock detection) | **No** — sandbox reset & retried |
-| 2 | Pre-execution errors — syntax/type/imports, caught by per-language static analysis | Tracked separately |
-| 3 | Genuine logic failures — test ran, assertion failed | **Yes** — the only class that counts |
+| Infrastructure | Sandbox/timeout/OOM/runner failures — caught by process-level signals (timeouts, exit codes, memory limits, health checks) | **No** — sandbox reset & rerun |
+| Static | Pre-execution errors — syntax/type/imports, caught by per-language static analysis | Tracked separately |
+| Logic | Genuine logic failures — test ran, assertion failed | **Yes** — the only class that counts |
+| Unknown | Unclassifiable execution failures | **No** — rerun → capture logs → quarantine (generated tests only; repository/benchmark tests instead become *human review required*) |
 
-Tier-3 diagnostics travel back to the Creator as token-optimised [GCF](https://www.gcformat.com/) payloads rather than JSON.
+Logic-class diagnostics travel back to the patch source as structured JSON payloads (a token-optimised [GCF](https://www.gcformat.com/) variant is a planned V2 ablation experiment).
 
-**4 · Formal proof as a second, independent verdict.** One solver — **Z3** — behind per-language translator front-ends. A patch can pass *every test* and still be rejected on a concrete counter-example (*"if amount=150 and charge=100, this code allows a refund larger than the charge"*).
+**4 · Formal verification as a second, independent verdict.** One Rust `Verifier` trait over language-specific verification backends — full verification systems, not thin translators (several use Z3 internally, and a direct Z3 backend handles pure mathematical properties). Every backend returns a structured outcome: `VerifiedWithinBounds` / `Counterexample` / `Inconclusive` / `Unsupported` / `Timeout` / `ToolFailure` — because on real code, *inconclusive* is a first-class result, and "verified within bounds" is an honest claim where "mathematically proven" would not be. A patch can pass *every test* and still be rejected on a concrete counter-example (*"if amount=150 and charge=100, this code allows a refund larger than the charge"*).
 
-| Target language | Translator | Status |
+| Target language | Backend | Status |
 |---|---|---|
-| Python | CrossHair | ✅ production (Python-only by necessity — it hooks the Python runtime itself) |
+| Python | CrossHair (uses Z3 internally) | ✅ production (Python-only by necessity — it hooks the Python runtime itself) |
 | Rust | Kani | ✅ production (AWS-maintained) |
-| Java | OpenJML | mature |
-| C / C++ | CBMC | very mature |
-| JS / TS | — | no viable translator; formal track skipped, adversarial suite only |
+| Pure properties | Z3 direct | optional backend |
+| Java | OpenJML | future |
+| C / C++ | CBMC | future |
+| JS / TS | — | no viable backend; verification track skipped, adversarial suite only |
 
-**5 · A principled stopping rule, not an iteration cap.** The repair loop halts on a published stability condition (below), not `for i in 0..4`.
+**5 · A path toward principled stopping.** V1 uses a fixed attempt cap while recording the full transition history needed to estimate EIR/ECR; V2 replaces the cap with the live stability governor (below), so the loop halts on a measured condition rather than `for i in 0..4`.
 
 **6 · Language-agnostic.** Vanta itself is 100% Rust. The code it verifies can be anything — per-language test runners, linters, and translators are dispatched as subprocesses, the way a build script calls `git`.
 
@@ -123,8 +127,9 @@ Vanta's stopping rule implements **Liu & Meng, *"Self-Correction as Feedback Con
 
 The original paper validates this on reasoning benchmarks under *intrinsic* self-correction and explicitly names two limitations as future work. Vanta is built to address both:
 
-- **Domain transfer** — first system to measure EIR/ECR on adversarially-verified *code repair*, where correctness is graded across an entire evolving test suite rather than one answer string.
-- **Non-stationarity** — because the Attacker generates harder tests each round, the error rates are non-stationary *by construction*; Vanta applies the paper's per-iteration equilibrium condition live rather than its steady-state results.
+- **Domain transfer** — Vanta investigates how EIR/ECR can be defined and measured on adversarially-verified *code repair*, where correctness is graded across an entire evolving test suite rather than one answer string.
+- **Non-stationarity** — because the Attacker generates harder tests each round, the error rates are non-stationary *by construction*; Vanta applies the paper's per-iteration equilibrium condition live rather than its steady-state results. EIR/ECR transitions are measured on a **fixed shared test set** between patch attempts (newly generated tests are recorded separately, then join the set), so adversarial escalation never contaminates the error definition.
+- **Evidence provenance** — every signal is logged with its source (repository test, benchmark oracle, Attacker-generated, verifier), so "verified within bounds against a generated property" is never conflated with "proven against a human-specified requirement".
 
 The three-phase pipeline is what makes those measurements defensible: only genuine, patch-caused, logic-level failures — on baseline-validated tests, net of pre-existing failures — ever enter the EIR/ECR calculation.
 
@@ -138,7 +143,7 @@ Untrusted AI-generated code executes only inside a hardware-isolated microVM, be
 | Platform | Backend | Tech | Notes |
 |---|---|---|---|
 | macOS | `shuru.rs` | [Shuru](https://github.com/superhq-ai/shuru) / Apple Virtualization.framework | **primary dev backend — built first** |
-| Linux | `zeroboot.rs` | Firecracker (KVM) | sub-ms CoW forking; production target |
+| Linux | `zeroboot.rs` | Firecracker (KVM) | sub-ms CoW forking; production target — **built in V2**, V1 ships macOS-only |
 | Windows | `wsl.rs` | WSL2 (Hyper-V) | weakest isolation; built last |
 
 ## Institutional memory
@@ -155,9 +160,9 @@ The Attacker is far more dangerous when it remembers how this codebase has broke
 | Orchestration | Rust + [Rig](https://github.com/0xPlaygrounds/rig) |
 | Sandboxing | Shuru (macOS) · Firecracker (Linux) · WSL2 (Windows) |
 | Test execution | `cargo-nextest` (Rust targets, structured JSON) · `pytest --json-report` (Python) · per-language equivalents |
-| Failure triage | kernel exit codes · `parking_lot` deadlock detection · `ruff`/`mypy`/`clippy`/`tsc` |
-| Diagnostics wire format | [GCF](https://www.gcformat.com/) (Rust crate) |
-| Formal verification | Z3 (via `z3` crate) + CrossHair / Kani / OpenJML / CBMC |
+| Failure triage | process-level signals (timeouts, exit codes, memory limits, health checks) · `ruff`/`mypy`/`clippy`/`tsc` · `parking_lot` inside Vanta's own orchestrator |
+| Diagnostics wire format | structured JSON (V1) · [GCF](https://www.gcformat.com/) as V2 ablation |
+| Verification | `Verifier` trait: CrossHair / Kani / Z3-direct (OpenJML, CBMC future) |
 | Memory | JSON → [Graphiti](https://github.com/getzep/graphiti) |
 
 ## Roadmap
@@ -173,14 +178,14 @@ The Attacker is far more dangerous when it remembers how this codebase has broke
 ### Milestone 1 — The adversarial core
 - [ ] Orchestration skeleton (Rig)
 - [ ] Creator agent — issue in, candidate patch out
-- [ ] Attacker agent — patch in, adversarial tests out
+- [ ] Attacker agent — patch in, intent-labelled adversarial tests out
 - [ ] Structured Creator ⇄ Attacker loop with attempt logging
 
 ### Milestone 2 — Ground truth
 - [ ] Sandbox trait (`mod.rs`) + `shuru.rs` macOS backend
-- [ ] Phase 1 — BATE baseline validation with 3-retry test repair
-- [ ] Phase 2 — three-tier Diagnostician (`parking_lot`, per-language static analysis)
-- [ ] GCF Tier-3 diagnostic payloads
+- [ ] Phase 1 — intent-aware BATE baseline validation with 3-retry test repair
+- [ ] Phase 2 — four-way Diagnostician (process-level signals, per-language static analysis, Unknown quarantine flow)
+- [ ] Structured JSON diagnostic payloads + session/attempt/iteration/test IDs on every result
 
 ### Milestone 3 — V1 ship 🚢
 - [ ] Fixed-N Governor + deterministic Gatekeeper
@@ -190,8 +195,9 @@ The Attacker is far more dangerous when it remembers how this codebase has broke
 
 ### Milestone 4 — V2: proof & memory
 - [ ] `zeroboot.rs` — Firecracker CoW forking (Linux, via CI)
-- [ ] Formal-proof track: Z3 + CrossHair (Python), Kani (Rust)
-- [ ] EIR/ECR instrumentation over attempt logs
+- [ ] Verifier trait + backends: CrossHair (Python), Kani (Rust), Z3 direct
+- [ ] EIR/ECR instrumentation over attempt logs (fixed-shared-set protocol)
+- [ ] GCF vs JSON payload ablation
 - [ ] Live Governor (stability condition) + Verify-First intervention
 - [ ] JSON → Graphiti memory migration
 
@@ -208,16 +214,16 @@ The Attacker is far more dangerous when it remembers how this codebase has broke
 ## FAQ
 
 **Why Rust for an AI tool?**
-The sandbox layer needs direct, GC-free control over microVM APIs, and one trait serving three platform backends is what systems languages are for. [Rig](https://github.com/0xPlaygrounds/rig) handles the LLM orchestration natively — no Python needed for the agents.
+Rust provides strong type safety, explicit resource ownership, and dependable process control — a natural fit for sandbox orchestration where one trait serves three platform backends — while also giving the project a deliberate systems-engineering focus. [Rig](https://github.com/0xPlaygrounds/rig) handles the LLM orchestration natively — no Python needed for the agents.
 
 **Then why does CrossHair need Python?**
 Because the *artifact being verified* is Python, and CrossHair symbolically executes it inside the Python interpreter itself. It's a system dependency called as a subprocess — not Python code inside Vanta. Verifying a Rust patch uses Kani and involves no Python at all.
 
 **Isn't this just AI code review?**
-Review tools comment on diffs. Vanta *executes* the patch in hardware isolation, *attacks* it with generated regression tests, *proves* invariants about it mathematically, and *decides when to stop trying* on a published stability condition — then opens the PR itself.
+Review tools comment on diffs. Vanta *executes* the patch in hardware isolation, *attacks* it with generated regression tests, *checks* supported properties through formal and symbolic verification backends, and *decides when to stop trying* on a published stability condition — then opens the PR itself.
 
 **Can the Attacker write bad tests?**
-Yes — it's an LLM. That's exactly what Phase 1 exists for: every test must pass against the known-good original codebase before it's allowed to judge anything, with a 3-retry-then-scrap rule and the discard rate logged as an Attacker-reliability metric.
+Yes — it's an LLM. That's what Phase 1 exists for: every test declares its intent, and its result on the original codebase must *match that intent* (a bug-reproduction test is supposed to fail there — that's proof the bug was reproduced) before it's allowed to judge anything, with a 3-retry-then-scrap rule and the discard rate logged as an Attacker-reliability metric. BATE is a filter, not semantic proof — persistent failure patterns are flagged for provenance-aware review (persistence alone may mean the test is wrong, the patches are wrong, or the bug is genuinely hard), and every generated test carries provenance so it's never mistaken for ground truth.
 
 ## Contributing
 

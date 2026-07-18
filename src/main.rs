@@ -1,3 +1,7 @@
+mod bootstrap;
+mod config;
+mod core;
+
 fn main() {
-    println!("Hello, world!");
+    bootstrap::run();
 }

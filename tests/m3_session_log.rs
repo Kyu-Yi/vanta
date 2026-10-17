@@ -4,14 +4,15 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::Duration;
 
 use tempfile::TempDir;
-use vanta::session::{SessionRecord, TransitionRow};
+use vanta::core::{EcrEirSnapshot, FailureClass, TestIntent, TestResult};
+use vanta::session::{PatchAttemptId, SessionId, SessionRecord, TransitionRow, ecr_eir_from_rows};
 
 /// These tests each spawn a `vanta_m3` process that boots sandboxes and runs
 /// real pytest. Run concurrently they saturate the machine, and the short
@@ -30,6 +31,7 @@ fn serial_run() -> std::sync::MutexGuard<'static, ()> {
 struct StubLlmServer {
     base_url: String,
     request_count: Arc<AtomicUsize>,
+    request_kinds: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
@@ -68,9 +70,11 @@ impl StubLlmServer {
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
         let request_count = Arc::new(AtomicUsize::new(0));
+        let request_kinds = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let request_count_clone = Arc::clone(&request_count);
+        let request_kinds_clone = Arc::clone(&request_kinds);
         let stop_clone = Arc::clone(&stop);
         // The Attacker has two call sites with different response shapes: a
         // generation call expects `{"tests":[...]}` (AttackerResponse), while a
@@ -109,9 +113,10 @@ impl StubLlmServer {
                                             let headers =
                                                 String::from_utf8_lossy(&request[..pos + 4]);
                                             for line in headers.lines() {
-                                                if let Some(value) = line
-                                                    .strip_prefix("Content-Length:")
-                                                    .or_else(|| line.strip_prefix("content-length:"))
+                                                if let Some(value) =
+                                                    line.strip_prefix("Content-Length:").or_else(
+                                                        || line.strip_prefix("content-length:"),
+                                                    )
                                                 {
                                                     content_length =
                                                         value.trim().parse::<usize>().unwrap_or(0);
@@ -142,7 +147,20 @@ impl StubLlmServer {
                         // "write adversarial tests"; revision and simplify calls
                         // want a single test object.
                         let body = String::from_utf8_lossy(&request[header_end.unwrap_or(0)..]);
-                        let content = if body.contains("write adversarial tests") {
+                        let request_kind = if body.contains("write adversarial tests") {
+                            "generate"
+                        } else if body.contains("failed BATE") {
+                            "revise"
+                        } else if body.contains("UNKNOWN result") {
+                            "simplify"
+                        } else {
+                            "other"
+                        };
+                        request_kinds_clone
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(request_kind.to_string());
+                        let content = if request_kind == "generate" {
                             attacker_value.clone()
                         } else {
                             attacker_value
@@ -179,6 +197,7 @@ impl StubLlmServer {
         Self {
             base_url,
             request_count,
+            request_kinds,
             stop,
             join: Some(join),
         }
@@ -187,12 +206,25 @@ impl StubLlmServer {
     fn request_count(&self) -> usize {
         self.request_count.load(Ordering::SeqCst)
     }
+
+    fn request_kinds(&self) -> Vec<String> {
+        self.request_kinds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 impl Drop for StubLlmServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = std::net::TcpStream::connect(self.base_url.trim_start_matches("http://").split('/').next().unwrap());
+        let _ = std::net::TcpStream::connect(
+            self.base_url
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap(),
+        );
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -258,11 +290,35 @@ const HANGING_PATCH: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ 
 const HANGING_PROBE: &str = r#"{"tests":[
         {
             "test_name":"test_hangs_on_patched_tree",
-            "test_source":"import time\nfrom calc import add\n\ndef test_hangs_on_patched_tree():\n    if add(2, 3) == 6:\n        while True:\n            time.sleep(0.5)\n    assert add(2, 3) == 5\n",
+            "test_source":"import time\nfrom calc import add\n\ndef test_hangs_on_patched_tree():\n    if add(2, 3) == 6:\n        time.sleep(3600)\n    assert add(2, 3) == 5\n",
             "intent":"BehaviorPreservation",
             "reason":"Passes on the original tree and hangs on the patched one."
         }
     ]}"#;
+
+fn metric_row_from_observed_outcome(
+    to_result: TestResult,
+    to_failure_class: FailureClass,
+) -> TransitionRow {
+    TransitionRow {
+        session_id: SessionId::new("metric-test"),
+        from_patch_attempt_id: Some(PatchAttemptId::new("p0")),
+        to_patch_attempt_id: Some(PatchAttemptId::new("p1")),
+        from_attempt: 0,
+        to_attempt: 1,
+        test_id: "hash-timeout".into(),
+        test_name: "test_hangs_on_patched_tree".into(),
+        shared_set_id: "set-1".into(),
+        from_result: TestResult::Passed,
+        to_result,
+        from_failure_class: None,
+        to_failure_class: Some(to_failure_class),
+        evidence_source: vanta::core::EvidenceSource::AttackerGenerated,
+        test_intent: TestIntent::BehaviorPreservation,
+        censored: false,
+        in_s0: true,
+    }
+}
 
 fn write_test_repo(root: &Path, patch_text: &str) -> (PathBuf, PathBuf, PathBuf) {
     let repo_dir = root.join("repo");
@@ -352,7 +408,10 @@ fn read_json(path: &Path) -> serde_json::Value {
 
 fn host_python() -> String {
     let output = Command::new("which").arg("python3").output().unwrap();
-    assert!(output.status.success(), "python3 must be available for the integration test");
+    assert!(
+        output.status.success(),
+        "python3 must be available for the integration test"
+    );
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
@@ -367,7 +426,11 @@ const TEST_API_KEY: &str = "sk-SENTINELmustNEVERreachtheLOG";
 /// `VANTA_PYTHON` is pinned to the host interpreter so the static-analysis pass
 /// (ruff + mypy) runs against an interpreter that actually has them installed —
 /// the `/usr/bin/python3` on PATH does not.
-fn run_patch_mode(workspace: &Path, patch_path: &Path, server: &StubLlmServer) -> std::process::ExitStatus {
+fn run_patch_mode(
+    workspace: &Path,
+    patch_path: &Path,
+    server: &StubLlmServer,
+) -> std::process::ExitStatus {
     run_patch_mode_with(workspace, patch_path, server, 3, &[])
 }
 
@@ -384,7 +447,10 @@ fn run_patch_mode_with(
     max_attempts: u32,
     extra_env: &[(&str, &str)],
 ) -> std::process::ExitStatus {
-    let (repo_dir, issue_path) = (workspace.join("repo"), workspace.join("repo").join("issue.md"));
+    let (repo_dir, issue_path) = (
+        workspace.join("repo"),
+        workspace.join("repo").join("issue.md"),
+    );
     let python = host_python();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vanta_m3"));
     cmd.current_dir(workspace)
@@ -398,7 +464,10 @@ fn run_patch_mode_with(
         .arg(max_attempts.to_string())
         .arg("--test-cmd")
         .arg(format!("{python} -m pytest"))
-        .env("VANTA_LLM_BASE_URL", format!("{}/v1", server.base_url.trim_end_matches("/v1")))
+        .env(
+            "VANTA_LLM_BASE_URL",
+            format!("{}/v1", server.base_url.trim_end_matches("/v1")),
+        )
         .env("VANTA_LLM_MODEL", "stub-model")
         .env("VANTA_API_KEY", TEST_API_KEY)
         .env("VANTA_LLM_TIMEOUT_SECS", "5")
@@ -421,8 +490,15 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
 
     let status = run_patch_mode(workspace.path(), &patch_path, &server);
 
-    assert!(!status.success(), "the deliberately bad patch should not be approved");
-    assert_eq!(server.request_count(), 3, "expected one attacker call per attempt");
+    assert!(
+        !status.success(),
+        "the deliberately bad patch should not be approved"
+    );
+    assert_eq!(
+        server.request_count(),
+        3,
+        "expected one attacker call per attempt"
+    );
 
     let records = read_session_records(&find_session_log(workspace.path()));
 
@@ -451,6 +527,12 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
     assert!(
         start.summary.contains("vanta_commit=") && start.summary.contains("vanta_dirty="),
         "session.start must record the Vanta revision AND whether the tree was dirty; got {}",
+        start.summary
+    );
+    assert!(
+        start.summary.contains("baseline_test_timeout_secs=")
+            && start.summary.contains("patched_test_timeout_secs="),
+        "session.start must record the effective baseline and patched-side test timeouts; got {}",
         start.summary
     );
     // The key was set for this run (`VANTA_API_KEY`), and the run-identity line
@@ -566,10 +648,7 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
             patched_result_rows
                 .iter()
                 .filter(|row| {
-                    row.testing_iteration_id
-                        .as_ref()
-                        .map(|id| id.as_str())
-                        == Some(iteration_id)
+                    row.testing_iteration_id.as_ref().map(|id| id.as_str()) == Some(iteration_id)
                 })
                 .count()
         })
@@ -585,7 +664,11 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
         .iter()
         .map(|row| row.patch_attempt_id.as_ref().unwrap().as_str())
         .collect();
-    assert_eq!(unique_patch_ids.len(), 1, "same patch should keep one stable patch_attempt_id");
+    assert_eq!(
+        unique_patch_ids.len(),
+        1,
+        "same patch should keep one stable patch_attempt_id"
+    );
 
     // 28 attempt records + the `session.start` run-identity record.
     assert_eq!(records.len(), 29);
@@ -608,7 +691,10 @@ fn syntax_error_patch_is_classified_static_not_infrastructure() {
     let server = StubLlmServer::start(THREE_SIGNAL_TESTS);
 
     let status = run_patch_mode(workspace.path(), &patch_path, &server);
-    assert!(!status.success(), "a patch that breaks syntax must never be approved");
+    assert!(
+        !status.success(),
+        "a patch that breaks syntax must never be approved"
+    );
 
     let records = read_session_records(&find_session_log(workspace.path()));
 
@@ -622,7 +708,9 @@ fn syntax_error_patch_is_classified_static_not_infrastructure() {
         "the patched run must produce per-test result rows"
     );
     assert!(
-        patched_rows.iter().any(|s| s.contains("failure_class=Static")),
+        patched_rows
+            .iter()
+            .any(|s| s.contains("failure_class=Static")),
         "a real syntax error introduced by the patch must stay Static; got {patched_rows:#?}"
     );
     assert!(
@@ -658,8 +746,15 @@ fn review_rounds_record_equal_patch_ids_on_every_row() {
     let server = StubLlmServer::start(THREE_SIGNAL_TESTS);
 
     let status = run_patch_mode(workspace.path(), &patch_path, &server);
-    assert!(!status.success(), "the deliberately bad patch should not be approved");
-    assert_eq!(server.request_count(), 3, "three review rounds must all run");
+    assert!(
+        !status.success(),
+        "the deliberately bad patch should not be approved"
+    );
+    assert_eq!(
+        server.request_count(),
+        3,
+        "three review rounds must all run"
+    );
 
     let rows = read_transition_rows(&find_transitions(workspace.path()));
     assert!(
@@ -671,8 +766,7 @@ fn review_rounds_record_equal_patch_ids_on_every_row() {
     let offenders: Vec<(u32, u32, String, String)> = rows
         .iter()
         .filter(|r| {
-            !(r.from_patch_attempt_id.is_some()
-                && r.from_patch_attempt_id == r.to_patch_attempt_id)
+            !(r.from_patch_attempt_id.is_some() && r.from_patch_attempt_id == r.to_patch_attempt_id)
         })
         .map(|r| {
             (
@@ -791,7 +885,8 @@ fn transitions_survive_an_abort_after_attempt_two() {
     // on disk are complete, not a truncated blob.
     let rows = read_transition_rows(&find_transitions(workspace.path()));
     assert!(
-        rows.iter().any(|r| r.from_attempt == 0 && r.to_attempt == 1),
+        rows.iter()
+            .any(|r| r.from_attempt == 0 && r.to_attempt == 1),
         "the attempt 1->2 rows must survive an abort at attempt 3; got {:?}",
         rows.iter()
             .map(|r| (r.from_attempt, r.to_attempt))
@@ -842,6 +937,13 @@ fn a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped
          Attacker for revision (up to 3 times) before being scrapped; \
          expected 1 generation + 3 revisions = 4 LLM calls"
     );
+    assert_eq!(
+        server.request_kinds(),
+        vec!["generate", "revise", "revise", "revise"],
+        "the regression guard must prove the exact call sequence — one generate, \
+         then three genuine revise calls — so internal parse retries cannot \
+         masquerade as a working revision path"
+    );
 
     let records = read_session_records(&find_session_log(workspace.path()));
     assert!(
@@ -872,18 +974,19 @@ fn a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped
 fn a_timed_out_test_is_infrastructure_and_is_rerun_once_in_a_fresh_sandbox() {
     let _serial = serial_run();
     let workspace = TempDir::new().unwrap();
-    let (_repo_dir, _issue_path, patch_path) =
-        write_test_repo(workspace.path(), HANGING_PATCH);
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo(workspace.path(), HANGING_PATCH);
     let server = StubLlmServer::start(HANGING_PROBE);
 
     // A short cap so the hang is killed promptly instead of after the 120s
-    // default. This is the ONLY way the timeout path gets exercised for real.
+    // default. This cap applies only to the PATCHED-side execution; BATE's
+    // baseline stays on its normal timeout so machine load cannot move the
+    // failure earlier in the workflow.
     let status = run_patch_mode_with(
         workspace.path(),
         &patch_path,
         &server,
         1,
-        &[("VANTA_TEST_TIMEOUT_SECS", "3")],
+        &[("VANTA_PATCHED_TEST_TIMEOUT_SECS", "5")],
     );
     assert!(
         !status.success(),
@@ -906,7 +1009,8 @@ fn a_timed_out_test_is_infrastructure_and_is_rerun_once_in_a_fresh_sandbox() {
         .join("vanta_sessions")
         .join(records[0].session_id.as_str())
         .join("debug");
-    let diagnostic = read_json(&debug_dir.join("attempt_1_diagnostic_test_hangs_on_patched_tree.json"));
+    let diagnostic =
+        read_json(&debug_dir.join("attempt_1_diagnostic_test_hangs_on_patched_tree.json"));
 
     assert!(
         diagnostic["failure_class"]
@@ -921,5 +1025,39 @@ fn a_timed_out_test_is_infrastructure_and_is_rerun_once_in_a_fresh_sandbox() {
         reason.contains("after sandbox reset + rerun"),
         "Infrastructure must run the Phase-2 remediation — reset the sandbox and \
          rerun once — and the diagnostic must record that it did; got {reason:?}"
+    );
+    let payload = diagnostic["structured_payload"]
+        .as_object()
+        .expect("Infrastructure rerun must write a structured payload");
+    assert_eq!(
+        payload.get("fresh_sandbox_spawned"),
+        Some(&serde_json::Value::Bool(true)),
+        "the rerun must happen in a freshly spawned sandbox; got {payload:?}"
+    );
+    assert_ne!(
+        payload
+            .get("initial_sandbox_root")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        payload
+            .get("rerun_sandbox_root")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        "the rerun must use a different sandbox root than the original failing run; got {payload:?}"
+    );
+
+    let snap: EcrEirSnapshot = ecr_eir_from_rows(&[metric_row_from_observed_outcome(
+        TestResult::Error,
+        FailureClass::Infrastructure,
+    )]);
+    assert_eq!(snap.ecr_count, 0);
+    assert_eq!(snap.eir_count, 0);
+    assert_eq!(
+        snap.complete, 0,
+        "an Infrastructure timeout must be excluded from the metric denominator too"
+    );
+    assert_eq!(
+        snap.excluded_non_logic, 1,
+        "the exclusion must be visible so the run reads as evidence-starved, not as a silent zero"
     );
 }

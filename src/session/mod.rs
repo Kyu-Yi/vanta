@@ -843,8 +843,11 @@ mod tests {
             counting_row(TestResult::Failed, TestResult::Passed, Some(FailureClass::Infrastructure), None, Some("p0"), Some("p1")),
             // "introduced" an error the environment caused: not an introduction.
             counting_row(TestResult::Passed, TestResult::Failed, None, Some(FailureClass::Static), Some("p1"), Some("p2")),
+            // Infrastructure timeouts arrive as Error, but they are still
+            // failing sides and must be excluded from the denominator too.
+            counting_row(TestResult::Passed, TestResult::Error, None, Some(FailureClass::Infrastructure), Some("p2"), Some("p3")),
             // A real logic regression still counts.
-            counting_row(TestResult::Passed, TestResult::Failed, None, Some(FailureClass::Logic), Some("p2"), Some("p3")),
+            counting_row(TestResult::Passed, TestResult::Failed, None, Some(FailureClass::Logic), Some("p3"), Some("p4")),
         ];
 
         let snap = ecr_eir_from_rows(&rows);
@@ -852,7 +855,7 @@ mod tests {
         assert_eq!(snap.eir_count, 1);
         assert_eq!(snap.complete, 1);
         assert_eq!(
-            snap.excluded_non_logic, 2,
+            snap.excluded_non_logic, 3,
             "the exclusions must be visible so an evidence-starved run reads as thin"
         );
     }

@@ -39,6 +39,7 @@ pub struct TestExecutionDetails {
     pub stderr: String,
     pub timed_out: bool,
     pub report_path_exists: bool,
+    pub sandbox_root: Option<String>,
 }
 
 impl TestExecutionDetails {
@@ -49,6 +50,7 @@ impl TestExecutionDetails {
             stderr: String::new(),
             timed_out: false,
             report_path_exists: false,
+            sandbox_root: None,
         }
     }
 
@@ -65,6 +67,7 @@ impl TestExecutionDetails {
             stderr: String::new(),
             timed_out: false,
             report_path_exists: true,
+            sandbox_root: None,
         }
     }
 }
@@ -96,9 +99,16 @@ pub async fn run_tests_parallel_detailed(
             let _ = fs::write(sb.root().join("test_run.py"), &test.test_source);
             let cmd = build_test_cmd(&cmd_template, "test_run.py");
             let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-            let exec = sb.execute(&cmd_refs, Path::new(""), test_timeout_secs()).await;
+            let sandbox_root = sb.root().display().to_string();
+            let exec = sb
+                .execute(&cmd_refs, Path::new(""), patched_test_timeout_secs())
+                .await;
             let result = match exec {
-                Ok(e) => parse_pytest_report_detailed(sb.root().join("report.json"), &e),
+                Ok(e) => parse_pytest_report_detailed(
+                    sb.root().join("report.json"),
+                    &e,
+                    Some(sandbox_root),
+                ),
                 Err(_) => TestExecutionDetails::infrastructure_error(),
             };
             sb.destroy();
@@ -141,19 +151,34 @@ pub async fn run_single_test(
     test_source: &str,
     test_cmd: &TestCommand,
 ) -> TestResult {
+    run_single_test_with_timeout(source_concat, test_source, test_cmd, test_timeout_secs())
+        .await
+        .result
+}
+
+/// Run one test and keep the execution details for rerun diagnostics.
+pub async fn run_single_test_with_timeout(
+    source_concat: &str,
+    test_source: &str,
+    test_cmd: &TestCommand,
+    timeout_secs: u64,
+) -> TestExecutionDetails {
     let sb = match Backend::spawn().await {
         Ok(b) => b,
-        Err(_) => return TestResult::Error,
+        Err(_) => return TestExecutionDetails::infrastructure_error(),
     };
     let _ = write_source_files(sb.root(), source_concat);
     let _ = write_conftest(sb.root());
     let _ = fs::write(sb.root().join("test_bate.py"), test_source);
     let cmd = build_test_cmd(test_cmd, "test_bate.py");
     let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-    let exec = sb.execute(&cmd_refs, Path::new(""), test_timeout_secs()).await;
+    let sandbox_root = sb.root().display().to_string();
+    let exec = sb.execute(&cmd_refs, Path::new(""), timeout_secs).await;
     let result = match exec {
-        Ok(e) => parse_pytest_report(sb.root().join("report.json"), &e),
-        Err(_) => TestResult::Error,
+        Ok(e) => {
+            parse_pytest_report_detailed(sb.root().join("report.json"), &e, Some(sandbox_root))
+        }
+        Err(_) => TestExecutionDetails::infrastructure_error(),
     };
     sb.destroy();
     result
@@ -288,12 +313,13 @@ for _p in (os.path.join(_here, 'src'), _here):
 /// body) means the test did NOT pass — equivalent to "failed". `TestResult::Error`
 /// is reserved for INFRASTRUCTURE failures (timeout, missing report, crash).
 pub fn parse_pytest_report(report_path: PathBuf, exec: &ExecutionResult) -> TestResult {
-    parse_pytest_report_detailed(report_path, exec).result
+    parse_pytest_report_detailed(report_path, exec, None).result
 }
 
 pub fn parse_pytest_report_detailed(
     report_path: PathBuf,
     exec: &ExecutionResult,
+    sandbox_root: Option<String>,
 ) -> TestExecutionDetails {
     if exec.timed_out {
         return TestExecutionDetails {
@@ -302,6 +328,7 @@ pub fn parse_pytest_report_detailed(
             stderr: exec.stderr.clone(),
             timed_out: true,
             report_path_exists: report_path.exists(),
+            sandbox_root,
         };
     }
     if report_path.exists() {
@@ -322,6 +349,7 @@ pub fn parse_pytest_report_detailed(
                             stderr: exec.stderr.clone(),
                             timed_out: false,
                             report_path_exists: true,
+                            sandbox_root,
                         };
                     }
                 }
@@ -334,6 +362,7 @@ pub fn parse_pytest_report_detailed(
         stderr: exec.stderr.clone(),
         timed_out: false,
         report_path_exists: false,
+        sandbox_root,
     }
 }
 
@@ -370,7 +399,11 @@ pub async fn run_static_raw(source: &str) -> (usize, String, usize, String) {
 
     let py = python_exe();
     let ruff = sb
-        .execute(&[py.as_str(), "-m", "ruff", "check", "."], Path::new(""), 30)
+        .execute(
+            &[py.as_str(), "-m", "ruff", "check", "."],
+            Path::new(""),
+            30,
+        )
         .await;
     let (ruff_count, ruff_err) = match ruff {
         Ok(r) => (
@@ -433,6 +466,16 @@ pub fn test_timeout_secs() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(120)
+}
+
+/// Timeout for PATCHED-side execution. Tests may lower only this cap so the
+/// real timeout path is exercised without making BATE's baseline load-sensitive.
+pub fn patched_test_timeout_secs() -> u64 {
+    std::env::var("VANTA_PATCHED_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or_else(test_timeout_secs)
 }
 
 /// Detect the Python import path for a repo (Spec §7 "Import paths" row).

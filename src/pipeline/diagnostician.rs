@@ -17,12 +17,13 @@
 // If tests run but assert fails → Logic.
 // ============================================================================
 
-use crate::agents::attacker::{attacker_simplify_test, GeneratedTest};
+use crate::agents::attacker::{GeneratedTest, attacker_simplify_test};
 use crate::config::LlmConfig;
 use crate::core::{FailureClass, TestResult};
 use crate::pipeline::candidate::TestCommand;
 use crate::pipeline::harness::{self, TestExecutionDetails};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tracing::{debug, info, warn};
 
 // ============================================================================
@@ -128,7 +129,9 @@ pub fn diagnose(inputs: &DiagnosticInputs) -> DiagnosticResult {
     }
 
     if inputs.import_or_syntax_error {
-        info!("Diagnostician → Infrastructure (pytest import/collect error without new static diagnostics)");
+        info!(
+            "Diagnostician → Infrastructure (pytest import/collect error without new static diagnostics)"
+        );
         return DiagnosticResult {
             failure_class: Some(FailureClass::Infrastructure),
             reason: "Pytest failed before executing the test, but no new ruff/mypy diagnostics were introduced".into(),
@@ -208,26 +211,66 @@ pub async fn diagnose_failure(
         })
     };
 
+    let enrich_with_sandbox_roots =
+        |mut diag: DiagnosticResult, initial_root: Option<String>, rerun_root: Option<String>| {
+            let mut payload = diag.structured_payload.take().unwrap_or_else(|| json!({}));
+            if let Some(obj) = payload.as_object_mut() {
+                if let Some(root) = initial_root.clone() {
+                    obj.insert(
+                        "initial_sandbox_root".into(),
+                        serde_json::Value::String(root),
+                    );
+                }
+                if let Some(root) = rerun_root.clone() {
+                    obj.insert("rerun_sandbox_root".into(), serde_json::Value::String(root));
+                }
+                obj.insert(
+                    "fresh_sandbox_spawned".into(),
+                    serde_json::Value::Bool(
+                        initial_root.is_some()
+                            && rerun_root.is_some()
+                            && initial_root != rerun_root,
+                    ),
+                );
+            }
+            diag.structured_payload = Some(payload);
+            diag
+        };
+
     let diag = classify(execution);
 
     match diag.failure_class {
         Some(FailureClass::Infrastructure) => {
             // Spec §7 Phase 2: "Infrastructure: reset backend and rerun."
             tracing::info!(test = %test.test_name, "Infrastructure → resetting sandbox and rerunning");
-            let rerun = harness::run_single_test(patched_source, &test.test_source, test_cmd).await;
-            match rerun {
+            let rerun = harness::run_single_test_with_timeout(
+                patched_source,
+                &test.test_source,
+                test_cmd,
+                harness::patched_test_timeout_secs(),
+            )
+            .await;
+            match rerun.result {
                 TestResult::Passed => {
                     // Flaky infra — the test actually passes on rerun.
-                    DiagnosticResult {
-                        failure_class: None,
-                        reason: "Infrastructure failure resolved on rerun".into(),
-                        structured_payload: None,
-                    }
+                    enrich_with_sandbox_roots(
+                        DiagnosticResult {
+                            failure_class: None,
+                            reason: "Infrastructure failure resolved on rerun".into(),
+                            structured_payload: None,
+                        },
+                        execution.sandbox_root.clone(),
+                        rerun.sandbox_root.clone(),
+                    )
                 }
-                r => {
-                    let mut re = classify(&TestExecutionDetails::from_rerun(r));
+                _ => {
+                    let mut re = classify(&rerun);
                     re.reason = format!("{} (after sandbox reset + rerun)", re.reason);
-                    re
+                    enrich_with_sandbox_roots(
+                        re,
+                        execution.sandbox_root.clone(),
+                        rerun.sandbox_root.clone(),
+                    )
                 }
             }
         }
@@ -298,28 +341,40 @@ mod tests {
 
     #[test]
     fn timeout_is_infrastructure() {
-        let inputs = DiagnosticInputs { timed_out: true, ..Default::default() };
+        let inputs = DiagnosticInputs {
+            timed_out: true,
+            ..Default::default()
+        };
         let result = diagnose(&inputs);
         assert_eq!(result.failure_class, Some(FailureClass::Infrastructure));
     }
 
     #[test]
     fn import_or_syntax_error_without_new_static_signals_is_infrastructure() {
-        let inputs = DiagnosticInputs { import_or_syntax_error: true, ..Default::default() };
+        let inputs = DiagnosticInputs {
+            import_or_syntax_error: true,
+            ..Default::default()
+        };
         let result = diagnose(&inputs);
         assert_eq!(result.failure_class, Some(FailureClass::Infrastructure));
     }
 
     #[test]
     fn ruff_new_errors_is_static() {
-        let inputs = DiagnosticInputs { ruff_new_errors: true, ..Default::default() };
+        let inputs = DiagnosticInputs {
+            ruff_new_errors: true,
+            ..Default::default()
+        };
         let result = diagnose(&inputs);
         assert_eq!(result.failure_class, Some(FailureClass::Static));
     }
 
     #[test]
     fn assertion_failed_is_logic() {
-        let inputs = DiagnosticInputs { assertion_failed: true, ..Default::default() };
+        let inputs = DiagnosticInputs {
+            assertion_failed: true,
+            ..Default::default()
+        };
         let result = diagnose(&inputs);
         assert_eq!(result.failure_class, Some(FailureClass::Logic));
     }
@@ -365,9 +420,14 @@ mod tests {
             ..Default::default()
         };
         let result = diagnose(&inputs);
-        let payload = result.structured_payload.expect("payload should be present");
+        let payload = result
+            .structured_payload
+            .expect("payload should be present");
         assert_eq!(payload["signal"], "pytest_import_or_collect_error");
-        assert_eq!(payload["pytest_stderr"], "ImportError while importing test module");
+        assert_eq!(
+            payload["pytest_stderr"],
+            "ImportError while importing test module"
+        );
         assert_eq!(payload["pytest_stdout"], "collected 0 items / 1 error");
     }
 }

@@ -143,8 +143,12 @@ pub fn is_logic_failure(class: &Option<FailureClass>) -> bool {
 ///   (clearing a harness blip is not a correction);
 /// - a pass->fail is an introduction only if the new failure is Logic (an
 ///   environment-induced import error is not an introduction);
-/// - an unchanged result carries no attribution, so it stays COUNTABLE — it
-///   remains in the denominator to keep the rate comparable across runs.
+/// - any non-pass result on either side is countable only if THAT side's
+///   failure class is Logic. An Infrastructure/Static/Unknown `Error` still
+///   counts as a failing side, so it is excluded too;
+/// - an unchanged all-pass result carries no attribution, so it stays
+///   COUNTABLE — it remains in the denominator to keep the rate comparable
+///   across runs.
 ///
 /// The other half of the rule — that the row must be a genuine patch
 /// transition, both ends observed and different — is
@@ -155,11 +159,12 @@ pub fn counts_toward_metrics(
     from_failure_class: &Option<FailureClass>,
     to_failure_class: &Option<FailureClass>,
 ) -> bool {
-    match (from_result, to_result) {
-        (TestResult::Failed, TestResult::Passed) => is_logic_failure(from_failure_class),
-        (TestResult::Passed, TestResult::Failed) => is_logic_failure(to_failure_class),
-        _ => true,
-    }
+    let side_is_logic_or_pass = |result: &TestResult, class: &Option<FailureClass>| {
+        matches!(result, TestResult::Passed) || is_logic_failure(class)
+    };
+
+    side_is_logic_or_pass(from_result, from_failure_class)
+        && side_is_logic_or_pass(to_result, to_failure_class)
 }
 
 /// FNV-1a 64-bit, hex-encoded. Deterministic across runs and platforms.

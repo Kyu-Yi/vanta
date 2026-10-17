@@ -27,9 +27,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agents::attacker::{attacker_generate_tests, AttackerRequest, GeneratedTest};
+use crate::agents::attacker::{AttackerRequest, GeneratedTest, attacker_generate_tests};
 use crate::agents::creator::{
-    creator_generate_patch, split_multi_file_patch, split_patch_into_files, CreatorRequest,
+    CreatorRequest, creator_generate_patch, split_multi_file_patch, split_patch_into_files,
 };
 use crate::config::LlmConfig;
 use crate::core::{
@@ -45,8 +45,8 @@ use crate::pipeline::harness::{self, TestExecutionDetails};
 use crate::pipeline::patch::apply_patch;
 use crate::repo::Repo;
 use crate::session::{
-    ecr_eir_from_rows, fresh_session_id, fresh_test_id, fresh_testing_iteration_id, vanta_revision,
     PatchAttemptId, SessionId, SessionLog, SessionRecord, TransitionRow, TransitionWriter,
+    ecr_eir_from_rows, fresh_session_id, fresh_test_id, fresh_testing_iteration_id, vanta_revision,
 };
 
 // ============================================================================
@@ -116,7 +116,9 @@ where
 // ============================================================================
 // run — drive one full Vanta run and return the Governor's final decision
 // ============================================================================
-pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run(
+    config: RunConfig,
+) -> Result<GovernorDecision, Box<dyn std::error::Error + Send + Sync>> {
     // ---- Config ----
     let mut cfg = LlmConfig::from_env()?;
     if let Some(m) = &config.model_override {
@@ -130,7 +132,10 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
     println!(
         "  Found {} source files ({} bytes), issue text {} bytes",
         repo.source_files.len(),
-        repo.source_files.iter().map(|f| f.contents.len()).sum::<usize>(),
+        repo.source_files
+            .iter()
+            .map(|f| f.contents.len())
+            .sum::<usize>(),
         repo.issue_text.len()
     );
 
@@ -139,12 +144,19 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
         Some(s) => TestCommand::from_shell(s),
         None => TestCommand::default(),
     };
-    println!("▌ Test command: {} {}", test_cmd.program, test_cmd.args.join(" "));
+    println!(
+        "▌ Test command: {} {}",
+        test_cmd.program,
+        test_cmd.args.join(" ")
+    );
 
     // ---- Import path detection (Spec §7: "Give the Attacker the real import
     //      path, or tests fail as Static and burn attempts") ----
     let import_hint = harness::detect_import_path(&repo.source_files, &config.repo_path);
-    println!("▌ Import hint: {}", import_hint.as_deref().unwrap_or("(flat layout)"));
+    println!(
+        "▌ Import hint: {}",
+        import_hint.as_deref().unwrap_or("(flat layout)")
+    );
 
     // ---- Auto-detect repo dependencies and prepare the VM checkpoint ----
     // [VANTA-WHY] The base shuru checkpoint only ships python3 + pytest + ruff +
@@ -183,7 +195,9 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
     let mut session_log = SessionLog::open(Path::new("vanta_sessions"), session_id.clone())?;
     let debug_dir = session_log.ensure_debug_dir(Path::new("vanta_sessions"))?;
     // SAFETY: single-threaded CLI; no other thread reads env concurrently.
-    unsafe { std::env::set_var("VANTA_DEBUG_DIR", &debug_dir); }
+    unsafe {
+        std::env::set_var("VANTA_DEBUG_DIR", &debug_dir);
+    }
     println!("▌ Session: {}", session_id.as_str());
     println!("▌ Forensics → {}", debug_dir.display());
     println!("▌ Max attempts: {}", config.max_attempts);
@@ -192,8 +206,18 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
     // transition rows surviving a crash can always be traced to their run.
     // `prompt_version` is "unversioned": Vanta's prompts are embedded in source
     // with no version tag, and recording that is a fact, not a gap.
-    let backend_label = if crate::sandbox::shuru_available() { "shuru" } else { "subprocess" };
-    let run_mode = if config.patch_path.is_some() { "patch_review" } else { "creator" };
+    let backend_label = if crate::sandbox::shuru_available() {
+        "shuru"
+    } else {
+        "subprocess"
+    };
+    let run_mode = if config.patch_path.is_some() {
+        "patch_review"
+    } else {
+        "creator"
+    };
+    let baseline_test_timeout_secs = crate::pipeline::harness::test_timeout_secs();
+    let patched_test_timeout_secs = crate::pipeline::harness::patched_test_timeout_secs();
     // [VANTA-WHY] `dirty` accompanies the commit so the reproducibility claim is
     // checkable: a run on a dirty tree includes edits that are not in HEAD, so it
     // must never claim that commit reproduces it. The paper's rule is that any
@@ -209,7 +233,8 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
         phase: "session.start".to_string(),
         summary: format!(
             "model={} model_version={} prompt_version={} provider={} api_key={} \
-             vanta_version={} vanta_commit={} vanta_dirty={} backend={} max_attempts={} test_cmd={} mode={} benchmark_instance={}",
+             vanta_version={} vanta_commit={} vanta_dirty={} backend={} max_attempts={} \
+             baseline_test_timeout_secs={} patched_test_timeout_secs={} test_cmd={} mode={} benchmark_instance={}",
             cfg.model_id,
             std::env::var("VANTA_MODEL_VERSION").unwrap_or_else(|_| "unknown".into()),
             "unversioned",
@@ -220,6 +245,8 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
             vanta_dirty,
             backend_label,
             config.max_attempts,
+            baseline_test_timeout_secs,
+            patched_test_timeout_secs,
             format!("{} {}", test_cmd.program, test_cmd.args.join(" ")),
             run_mode,
             "none",
@@ -244,7 +271,10 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
             test_cmd.clone(),
         );
         original_files = pair.original_files();
-        println!("  Loaded {} original files from worktree", original_files.len());
+        println!(
+            "  Loaded {} original files from worktree",
+            original_files.len()
+        );
     } else {
         for sf in &repo.source_files {
             original_files.insert(sf.path.clone(), sf.contents.clone());
@@ -341,7 +371,8 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
             };
             let creator_response = run_with_spinner("Creator generating patch", async {
                 creator_generate_patch(&cfg, &creator_request).await
-            }).await?;
+            })
+            .await?;
             println!(
                 "  ✔ Creator: patch_text={} chars, files_touched={:?}, confidence={}",
                 creator_response.patch_text.len(),
@@ -368,7 +399,11 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
             summary: format!(
                 "attempt={} mode={} patch_files={} patch_bytes={}",
                 attempt + 1,
-                if config.patch_path.is_some() { "patch_review" } else { "creator" },
+                if config.patch_path.is_some() {
+                    "patch_review"
+                } else {
+                    "creator"
+                },
                 patch_files.len(),
                 patch_text.len()
             ),
@@ -384,7 +419,10 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
         let mut all_patch_failed = true;
 
         for (path, patch_content) in &patch_files {
-            print!("  ⏳ {path}: applying ({:.1}KB patch)... ", patch_content.len() as f64 / 1024.0);
+            print!(
+                "  ⏳ {path}: applying ({:.1}KB patch)... ",
+                patch_content.len() as f64 / 1024.0
+            );
             let _ = io::Write::flush(&mut io::stdout());
             if let Some(original) = original_files.get(path) {
                 let (patched, changed) = apply_patch(original, patch_content);
@@ -450,7 +488,10 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
         // path to the issue text so the Attacker writes tests with the correct
         // `from heretic.foo import bar` instead of `from foo import bar`.
         let attacker_issue = match &import_hint {
-            Some(hint) => format!("{}\n\n[IMPORT PATH HINT] This repo uses import path: `{}`. Generated tests MUST import using this path. If the repo has a src/ layout, the package is under src/.", repo.issue_text, hint),
+            Some(hint) => format!(
+                "{}\n\n[IMPORT PATH HINT] This repo uses import path: `{}`. Generated tests MUST import using this path. If the repo has a src/ layout, the package is under src/.",
+                repo.issue_text, hint
+            ),
             None => repo.issue_text.clone(),
         };
         let attacker_request = AttackerRequest {
@@ -460,7 +501,8 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
         };
         let attacker_response = run_with_spinner("Attacker generating tests", async {
             attacker_generate_tests(&cfg, &attacker_request).await
-        }).await?;
+        })
+        .await?;
         let attacker_tests: Vec<GeneratedTest> = attacker_response.tests;
         println!("  ✔ Attacker: {} tests", attacker_tests.len());
         for t in &attacker_tests {
@@ -500,7 +542,8 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
         println!("\n▌ BATE: validating tests against baseline...");
         let bate_run = run_with_spinner("BATE validating tests against baseline", async {
             run_bate(&cfg, &original_concat, &attacker_tests, &test_cmd).await
-        }).await;
+        })
+        .await;
         let bate_report = bate_run.report;
         let valid_tests: Vec<GeneratedTest> = bate_run.valid_tests;
         let discard_rate = if attacker_tests.is_empty() {
@@ -580,8 +623,11 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
         // against the patched code. The shared set is what gets compared
         // attempt-to-attempt; new tests can reject on the spot but only join
         // the shared set for the NEXT comparison.
-        println!("\n▌ PATCHED run: shared set ({} tests) + new tests ({} tests)...",
-            shared_tests.len(), valid_tests.len());
+        println!(
+            "\n▌ PATCHED run: shared set ({} tests) + new tests ({} tests)...",
+            shared_tests.len(),
+            valid_tests.len()
+        );
 
         let patched_concat = patched_files
             .iter()
@@ -593,12 +639,17 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
 
         // Build the combined test list: shared first, then new.
         let mut tests_to_run: Vec<&GeneratedTest> = Vec::new();
-        for t in &shared_tests { tests_to_run.push(t); }
-        for t in &valid_tests { tests_to_run.push(t); }
+        for t in &shared_tests {
+            tests_to_run.push(t);
+        }
+        for t in &valid_tests {
+            tests_to_run.push(t);
+        }
 
         let patched_results = run_with_spinner("Running tests on patched code", async {
             harness::run_tests_parallel_detailed(&patched_concat, &tests_to_run, &test_cmd).await
-        }).await?;
+        })
+        .await?;
 
         // Static analysis diff — keep the raw streams so the Static payload the
         // Creator receives names the exact diagnostics the patch introduced.
@@ -616,10 +667,8 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
         // [VANTA-WHY] Split results into shared (for EIR/ECR) and new (for
         // immediate rejection). On the first attempt shared_tests is empty, so
         // ALL results become the shared set.
-        let shared_names: std::collections::HashSet<String> = shared_tests
-            .iter()
-            .map(|t| t.test_name.clone())
-            .collect();
+        let shared_names: std::collections::HashSet<String> =
+            shared_tests.iter().map(|t| t.test_name.clone()).collect();
 
         let mut shared_observations: Vec<SharedObservation> = Vec::new();
         let mut new_observations: Vec<SharedObservation> = Vec::new();
@@ -653,7 +702,10 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
                     &test_cmd,
                 )
                 .await;
-                println!("    {} → {:?} ({:?})", test.test_name, result, diag.failure_class);
+                println!(
+                    "    {} → {:?} ({:?})",
+                    test.test_name, result, diag.failure_class
+                );
                 let safe_name = test
                     .test_name
                     .replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
@@ -821,8 +873,10 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
             println!(
                 "\n▌ GOVERNOR: decision={:?}, ECR={} ({:.2}%), EIR={} ({:.2}%)",
                 decision,
-                snap.ecr_count, snap.ecr_rate() * 100.0,
-                snap.eir_count, snap.eir_rate() * 100.0
+                snap.ecr_count,
+                snap.ecr_rate() * 100.0,
+                snap.eir_count,
+                snap.eir_rate() * 100.0
             );
         }
 
@@ -914,7 +968,10 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
                 } else {
                     // Build structured feedback for Creator.
                     prior_feedback = Some(build_creator_feedback(&failed, ruff_new, mypy_new));
-                    println!("  → Feeding {} failure(s) back to Creator for retry", failed.len());
+                    println!(
+                        "  → Feeding {} failure(s) back to Creator for retry",
+                        failed.len()
+                    );
                 }
             }
         }
@@ -951,7 +1008,10 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
                     let _ = fs::write(&out_path, content);
                 }
                 println!("  ✔ Patched files written to {}", stage_dir.display());
-                println!("  ✔ Ready for PR. Use: cd {} && git diff", stage_dir.display());
+                println!(
+                    "  ✔ Ready for PR. Use: cd {} && git diff",
+                    stage_dir.display()
+                );
 
                 // ---- Open PR if requested ----
                 if config.open_pr {
@@ -969,7 +1029,9 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
                             if let Some(url) = &pr.pr_url {
                                 println!("  ✔ PR URL: {}", url);
                             } else {
-                                println!("  ⚠ Branch pushed but PR creation failed (check gh auth)");
+                                println!(
+                                    "  ⚠ Branch pushed but PR creation failed (check gh auth)"
+                                );
                             }
                         }
                         Err(e) => {
@@ -1010,7 +1072,8 @@ pub async fn run(config: RunConfig) -> Result<GovernorDecision, Box<dyn std::err
     // exist — a run that aborted at attempt 3 kept every row up to attempt 3.
     let transitions_path = transition_writer.path().to_path_buf();
 
-    let evidence_path = Path::new("vanta_sessions").join(format!("{}_evidence.json", session_id.as_str()));
+    let evidence_path =
+        Path::new("vanta_sessions").join(format!("{}_evidence.json", session_id.as_str()));
     let _ = fs::write(
         &evidence_path,
         serde_json::to_string_pretty(&final_evidence).unwrap(),
@@ -1038,7 +1101,8 @@ fn build_creator_feedback(failed: &[&TestEvidence], ruff_new: bool, mypy_new: bo
     fb.push_str("The previous patch failed verification:\n\n");
 
     for e in failed {
-        let class = e.failure_class
+        let class = e
+            .failure_class
             .as_ref()
             .map(|c| format!("{c:?}"))
             .unwrap_or_else(|| "Unknown".to_string());
@@ -1055,7 +1119,9 @@ fn build_creator_feedback(failed: &[&TestEvidence], ruff_new: bool, mypy_new: bo
         fb.push_str("- New mypy type errors were introduced.\n");
     }
 
-    fb.push_str("\nPlease revise the patch to fix these failures while preserving existing behavior.");
+    fb.push_str(
+        "\nPlease revise the patch to fix these failures while preserving existing behavior.",
+    );
     fb
 }
 
@@ -1098,8 +1164,12 @@ fn stamp_transition_row(
     session_id: &SessionId,
     attempt_patch_ids: &[PatchAttemptId],
 ) -> TransitionRow {
-    let from_id = attempt_patch_ids.get(transition.from_attempt as usize).cloned();
-    let to_id = attempt_patch_ids.get(transition.to_attempt as usize).cloned();
+    let from_id = attempt_patch_ids
+        .get(transition.from_attempt as usize)
+        .cloned();
+    let to_id = attempt_patch_ids
+        .get(transition.to_attempt as usize)
+        .cloned();
     TransitionRow::from_transition(transition, session_id, from_id, to_id)
 }
 
@@ -1202,7 +1272,10 @@ mod tests {
         let second = patch_attempt_id_for_patch(patch);
 
         assert_eq!(first.as_str(), second.as_str());
-        assert_eq!(stable_patch_fingerprint(patch), stable_patch_fingerprint(patch));
+        assert_eq!(
+            stable_patch_fingerprint(patch),
+            stable_patch_fingerprint(patch)
+        );
     }
 
     #[test]

@@ -390,10 +390,17 @@ In session `1429da22` (an earlier run where patch reconstruction produced a subt
 ## 6. Reproduction
 
 ```bash
-# The M1/M2 spike is reproduced from the frozen M2 milestone, not from HEAD:
-# the pipeline has since been refactored into a shared driver, so a later
-# checkout runs the same loop through different code.
-git checkout m2-standalone
+# IMPORTANT: the exact code that produced the original M1/M2 spike numbers was
+# never committed and cannot be recovered from git history.
+#
+# `driver-baseline` is the FIRST committed state of this repository after the
+# shared-driver extraction. It is useful as a stable public baseline, but it
+# will not reproduce the original spike numbers:
+# - the shared driver restored BATE's revise path in M3
+# - timeout/stdout/stderr/report-missing now reach Diagnostician classification
+# - later fixes changed classification/measurement plumbing (for example
+#   body-hash identity and Infrastructure handling around import/collect errors)
+git checkout driver-baseline
 
 # M1 (agents + session log)
 cargo run --bin vanta_m1
@@ -423,7 +430,7 @@ Forensics for each run are in `vanta_sessions/{session_id}/debug/`:
 SPIKE_OWNER: vanta_m1.rs, vanta_m2.rs
 DATE:        2026-10-15
 VERDICT:     GO — M1+M2 EXIT TESTS fully met (6-strategy patch cascade incl. hunk-by-hunk engine)
-REPRO_CMD:   cd /Users/kyu-yi/vanta && git checkout m2-standalone && cargo run --bin vanta_m2
+REPRO_CMD:   The original spike numbers came from pre-commit code that was never committed and is unrecoverable. The first committed public baseline is `driver-baseline`; running it is expected to differ because of the fixes listed in §6.
 
 
 shuru run --from vanta-python --disk-size 8192 -- python3 -m pytest --version

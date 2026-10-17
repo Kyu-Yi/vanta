@@ -172,8 +172,9 @@ pub struct BateRun {
     pub report: BateReport,
     pub valid_tests: Vec<GeneratedTest>,
     pub relabel_events: Vec<IntentRelabel>,
-    /// One record per non-preservation test the reviver produced, so a run's log
-    /// shows the patch-blind intent audit ran on revised tests too.
+    /// One record per revised test the reviver produced, so a run's log shows the
+    /// patch-blind intent audit ran on revised tests too — including a
+    /// preservation revision the audit scrapped for contradicting the issue.
     pub intent_checks: Vec<IntentCheckRecord>,
 }
 
@@ -255,16 +256,44 @@ pub async fn run_bate(
                                 // revision that claims FeatureAcceptance for a
                                 // behaviour the issue never asked for must be
                                 // demoted before it re-enters the baseline check.
-                                let (revised, relabel, record) =
+                                let (audited, relabel, record) =
                                     audit_test_intent(cfg, issue_text, original_source, &revised)
                                         .await;
                                 if let Some(relabel) = relabel {
                                     relabel_events.push(relabel);
                                 }
+                                // [VANTA-WHY] A preservation revision that asserts
+                                // behaviour the ISSUE requires to change
+                                // contradicts the issue. Revising again cannot
+                                // help — the issue is the fixed point — so the
+                                // test is scrapped, with the audit reason as the
+                                // scrap reason.
+                                let contradictory = record
+                                    .as_ref()
+                                    .filter(|r| r.scrapped)
+                                    .map(|r| r.reason.clone());
                                 if let Some(record) = record {
                                     intent_checks.push(record);
                                 }
-                                current_test = revised;
+                                if let Some(reason) = contradictory {
+                                    info!(
+                                        test = %current_test.test_name,
+                                        "BATE: revision contradicts the issue — scrapping"
+                                    );
+                                    final_outcome = Some(BateOutcome::Mismatch(format!(
+                                        "revision contradicts the issue: {reason}"
+                                    )));
+                                    break;
+                                }
+                                match audited {
+                                    Some(revised) => current_test = revised,
+                                    None => {
+                                        final_outcome = Some(BateOutcome::Mismatch(
+                                            "intent audit scrapped the revised test".into(),
+                                        ));
+                                        break;
+                                    }
+                                }
                             }
                             Err(e) => {
                                 warn!("attacker_revise_test failed: {e} — scrapping test");

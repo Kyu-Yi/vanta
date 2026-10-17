@@ -25,13 +25,42 @@ use std::error::Error;
 use tracing::{debug, info, trace, warn};
 
 // ============================================================================
+// ATTACKER_PROMPT_VERSION — the run-identity tag for the Attacker's prompt
+// ============================================================================
+//
+// [VANTA-WHY] The Attacker prompt is embedded in the binary with no other
+// version tag, so two runs on the same commit that differ only in the prompt
+// are indistinguishable in the session log. That matters here: a run BEFORE the
+// boundary-probing rule and a run AFTER it are different experiments, and the
+// boundary rule is exactly what the catch-rate comparison is about. Bump this
+// string whenever the prompt text changes, so `session.start` names which
+// prompt produced the rows.
+pub const ATTACKER_PROMPT_VERSION: &str = "attacker.2.boundary-probe";
+
+// ============================================================================
 // AttackerRequest — input to the Attacker agent
 // ============================================================================
+//
+// [VANTA-WHY] `existing_tests` is the shared set accumulated by PREVIOUS
+// attempts (Spec §8). From round 2 on the Attacker is shown the probes it has
+// already written so it can attack somewhere new: without this, every round
+// re-derives the same boundary test, the fresh batch adds no coverage, and the
+// run burns its attack depth re-running one probe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttackerRequest {
     pub patch_text: String,
     pub original_source: String,
     pub issue_text: String,
+    /// Probes already in the fixed shared set. Empty on round 1.
+    #[serde(default)]
+    pub existing_tests: Vec<SharedProbe>,
+}
+
+/// One probe already in the shared set, as shown to the Attacker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SharedProbe {
+    pub test_name: String,
+    pub test_source: String,
 }
 
 // ============================================================================
@@ -141,13 +170,43 @@ BOUNDARY-PROBING RULE:
 - A patch that widens, narrows or shifts a comparison (e.g. `<` → `<=`, or a changed threshold constant) changes behaviour ONLY at the exact boundary value. A test at a nearby interior value (e.g. 499 when the boundary is 500) returns the SAME result on original and patched code and proves nothing.
 - For every comparison the patch changes, include a BehaviorPreservation test that asserts the ORIGINAL result at the EXACT boundary constant — the value named in the comparison itself, not its neighbour. Do this for every changed comparison the ISSUE does not ask to change.
 - When the issue explicitly asks to change behaviour at a given boundary (e.g. "1000 should be standard"), do NOT write a preservation test for that boundary; cover it with a BugReproduction test instead.
-- Example: a patch changing `if w < 500` to `if w <= 500` must be checked with `assert shipping_band(500) == "light"` (the original result AT 500), never with `shipping_band(499)`.
+- Example: a patch changing `if w < 500` to `if w <= 500` moves the ORIGINAL result at 500 from `"standard"` (because `< 500` is false at 500) to `"light"`. The preservation probe must therefore assert `shipping_band(500) == "standard"` — the original result AT 500 — and never assert `shipping_band(499)`, which returns the same band on both versions and proves nothing.
+- Read the ORIGINAL result at the boundary out of the ORIGINAL SOURCE you were given. Never copy the patched value back as the expectation.
 
 Write exactly 3 tests. Label each one honestly: use BugReproduction or FeatureAcceptance only when the issue asks for that behaviour at the input you assert, otherwise use BehaviorPreservation. Three BehaviorPreservation tests are a correct answer when the issue only describes one boundary."#;
 
+    // [VANTA-WHY] Round >= 2: show the probes already in the shared set, with
+    // the input literals each one pins, and forbid repeating them. A duplicate
+    // probe adds no coverage but does consume a BATE slot and a patched run, so
+    // the driver also drops exact duplicates before BATE; this section is what
+    // makes the Attacker aim somewhere new instead of being silently discarded.
+    let already_probed = if request.existing_tests.is_empty() {
+        String::new()
+    } else {
+        let mut section = String::from(
+            "\n\nALREADY IN THE SHARED TEST SET — DO NOT REPEAT ANY OF THESE:\n",
+        );
+        for probe in &request.existing_tests {
+            let inputs = asserted_input_literals(&probe.test_source);
+            section.push_str(&format!(
+                "- {} (asserted inputs: [{}]):\n```\n{}\n```\n",
+                probe.test_name,
+                inputs.join(", "),
+                probe.test_source
+            ));
+        }
+        section.push_str(
+            "Each test above already runs on every attempt. A new test that asserts the SAME input \
+             with the SAME expected value is a duplicate, is discarded before it runs, and does not \
+             count as an attack. Probe a DIFFERENT boundary, threshold, branch or input the patch \
+             touches.\n",
+        );
+        section
+    };
+
     let user_prompt = format!(
-        "PATCH:\n```diff\n{}\n```\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nISSUE:\n{}\n\nWrite AttackerResponse JSON.",
-        request.patch_text, request.original_source, request.issue_text
+        "PATCH:\n```diff\n{}\n```\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nISSUE:\n{}{}\n\nWrite AttackerResponse JSON.",
+        request.patch_text, request.original_source, request.issue_text, already_probed
     );
 
     debug!(system_len = system_prompt.len(), user_len = user_prompt.len(), "attacker prompts built");
@@ -395,11 +454,19 @@ Do NOT import constants or symbols that only exist in the PATCHED code."#;
 // survives only if this audit says the issue asks for that behaviour at the
 // input the test asserts.
 //
-// [VANTA-WHY] The audit is DEMOTE-ONLY. It can turn a BugReproduction/
-// FeatureAcceptance test into a BehaviorPreservation one; it can never promote a
-// BehaviorPreservation test, and it never turns a failing candidate into a
-// passing one. An auditor that cannot answer demotes rather than letting the
-// label through: an unverified non-preservation label must not stand.
+// [VANTA-WHY] The audit never PROMOTES a label and never turns a failing
+// candidate into a passing one. It has two directions:
+//   - a non-preservation label survives only if the audit says the issue asks
+//     for that behaviour at the asserted input; otherwise it is demoted to
+//     BehaviorPreservation. An auditor that cannot answer demotes rather than
+//     letting the label through, because an unverified non-preservation label
+//     must not stand;
+//   - a BehaviorPreservation test is scrapped when the audit says the issue
+//     REQUIRES the asserted behaviour to change at that input, because the test
+//     then contradicts the issue. This is what makes the "the issue only asks to
+//     change this one boundary" exception a checked fact rather than a sentence
+//     the Attacker may or may not have honoured.
+// EVERY test is audited and gets a record, preservation included.
 
 /// Input to the intent audit.
 ///
@@ -421,6 +488,18 @@ pub struct IntentVerdict {
     /// Does the issue ask for the behaviour this test asserts, at the input the
     /// test asserts?
     pub issue_asks_for_behaviour: bool,
+    /// [VANTA-WHY] The question a preservation test needs. A BehaviorPreservation
+    /// test asserts the ORIGINAL result, so `issue_asks_for_behaviour` is the
+    /// wrong question for it — an issue that asks for a DIFFERENT result there
+    /// answers false, which would wrongly keep a probe that contradicts the
+    /// issue. This field asks the complementary question: does the issue require
+    /// the behaviour at the asserted input to CHANGE from what the original code
+    /// does? `true` means a preservation probe at that input contradicts the
+    /// issue and must be scrapped. Defaulted so an older/short answer still
+    /// parses, and a missing answer is never read as "the issue requires a
+    /// change".
+    #[serde(default)]
+    pub issue_requires_change: bool,
     pub reason: String,
 }
 
@@ -435,13 +514,22 @@ pub struct QuoteEvidence {
     pub asserted_inputs: Vec<String>,
 }
 
-/// One audit result. Emitted for EVERY non-preservation test, kept or demoted,
-/// so a run's log shows the check ran and what it decided.
+/// One audit result. Emitted for EVERY test — kept, demoted or scrapped — so a
+/// run's log shows the check ran and what it decided.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IntentCheckRecord {
     pub test_name: String,
     pub declared_intent: TestIntent,
     pub issue_asks_for_behaviour: bool,
+    /// [VANTA-WHY] The complementary question a preservation probe needs: does
+    /// the issue require the behaviour at the asserted input to CHANGE? Logged
+    /// alongside the verdict so a reader can see why a preservation test was
+    /// kept or scrapped, not just that it was.
+    pub issue_requires_change: bool,
+    /// [VANTA-WHY] True when a BehaviorPreservation test asserts behaviour the
+    /// issue requires to CHANGE. It contradicts the issue, so it is scrapped
+    /// rather than demoted: there is no honest label left for it.
+    pub scrapped: bool,
     pub reason: String,
     pub evidence: QuoteEvidence,
 }
@@ -451,16 +539,19 @@ pub struct IntentCheckRecord {
 /// bodies carry no patch.
 const INTENT_AUDITOR_SYSTEM_PROMPT: &str = r#"You are Vanta Intent Auditor. You are given an ISSUE, the ORIGINAL source of a repository, and ONE test. You are NOT given the patch and must not speculate about it.
 
-Answer exactly one question: does the ISSUE ask for the behaviour this test asserts, AT THE INPUT THE TEST ASSERTS?
+Answer two questions about the input the test asserts:
+1. "issue_asks_for_behaviour": does the ISSUE ask for the result this test asserts, AT THE INPUT THE TEST ASSERTS?
+2. "issue_requires_change": does the ISSUE require the behaviour at that input to CHANGE from what the ORIGINAL source does there — that is, does the issue ask for a DIFFERENT result than the original returns at that input?
 
 Rules:
 - The issue is the only source of requirements. The original source shows what the behaviour WAS; it is evidence of existing behaviour, never of a new requirement.
 - A test asserting `shipping_band(500) == "light"` is authorised only by an issue sentence that asks for that result at that input. A sentence about a DIFFERENT input does not authorise it.
-- A sentence that forbids changing behaviour ("without changing the existing behaviour at the other thresholds") FORBIDS the change; it never authorises it.
-- If the issue does not ask for the asserted behaviour at the asserted input, answer false. Preserving existing behaviour is always a valid answer.
+- A sentence that forbids changing behaviour ("without changing the existing behaviour at the other thresholds") FORBIDS the change; it never authorises it and never requires one.
+- An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THIS test asserts, not for the issue in general.
+- If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
 
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
-{"issue_asks_for_behaviour": true|false, "reason": "one short sentence"}"#;
+{"issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "reason": "one short sentence"}"#;
 
 /// Audit one test's declared intent against the issue.
 ///
@@ -478,7 +569,7 @@ pub async fn attacker_check_intent(
     let client = build_reqwest_client(cfg)?;
 
     let user_prompt = format!(
-        "ISSUE:\n{}\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nTEST UNDER AUDIT ({}):\n```\n{}\n```\n\nDeclared intent: {:?}\n\nDoes the issue ask for this behaviour at the input this test asserts? Answer with JSON.",
+        "ISSUE:\n{}\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nTEST UNDER AUDIT ({}):\n```\n{}\n```\n\nDeclared intent: {:?}\n\nDoes the issue ask for this behaviour at the input this test asserts, and does it require the behaviour at that input to change? Answer with JSON.",
         request.issue_text,
         request.original_source,
         request.test_name,
@@ -496,7 +587,7 @@ pub async fn attacker_check_intent(
         if attempt >= 2 {
             messages.push(json!({
                 "role": "user",
-                "content": "REPROMPT: output ONLY {\"issue_asks_for_behaviour\": true|false, \"reason\": \"...\"}."
+                "content": "REPROMPT: output ONLY {\"issue_asks_for_behaviour\": true|false, \"issue_requires_change\": true|false, \"reason\": \"...\"}."
             }));
         }
         messages
@@ -564,22 +655,32 @@ pub fn observe_quote_evidence(test: &GeneratedTest, issue_text: &str) -> QuoteEv
     }
 }
 
-/// Audit one test, demoting it when the issue does not ask for its behaviour.
+/// Audit one test against the issue.
 ///
-/// Returns the possibly-demoted test, the relabel event if it was demoted, and
-/// the audit record if the test declared a non-preservation intent. An auditor
-/// that cannot answer demotes: an unverified label must not stand.
+/// Returns the surviving test (`None` = scrapped), the relabel event if the test
+/// was demoted, and the audit record. A record is returned for EVERY test,
+/// preservation included, so the session log shows the check ran and what it
+/// decided — the demote-only asymmetry is what made a preservation test the one
+/// label nobody re-checked.
+///
+/// Three outcomes, one per way the declared intent can relate to the issue:
+///   - non-preservation + issue asks for it  → keep.
+///   - non-preservation + issue does NOT ask → demote to BehaviorPreservation.
+///     An auditor that cannot answer takes this path: an unverified
+///     non-preservation label must not stand.
+///   - BehaviorPreservation + the issue REQUIRES the asserted behaviour to
+///     change → SCRAP. The test contradicts the issue, so no honest label
+///     remains for it. Without this, the "the issue only asks to change 1000"
+///     exception lives in prompt wording alone and a probe asserting the old
+///     value at 1000 rides into BATE, fails the patched side and rejects a
+///     correct patch.
 pub async fn audit_test_intent(
     cfg: &LlmConfig,
     issue_text: &str,
     original_source: &str,
     test: &GeneratedTest,
-) -> (GeneratedTest, Option<IntentRelabel>, Option<IntentCheckRecord>) {
+) -> (Option<GeneratedTest>, Option<IntentRelabel>, Option<IntentCheckRecord>) {
     let evidence = observe_quote_evidence(test, issue_text);
-
-    if matches!(test.intent, TestIntent::BehaviorPreservation) {
-        return (test.clone(), None, None);
-    }
 
     let request = IntentCheckRequest {
         issue_text: issue_text.to_string(),
@@ -599,19 +700,57 @@ pub async fn audit_test_intent(
             );
             IntentVerdict {
                 issue_asks_for_behaviour: false,
+                issue_requires_change: false,
                 reason: format!("intent audit unavailable ({e})"),
             }
         }
     };
 
+    if matches!(test.intent, TestIntent::BehaviorPreservation) {
+        if verdict.issue_requires_change {
+            let reason = format!(
+                "the issue requires the asserted behaviour to change at the asserted input: {}",
+                verdict.reason
+            );
+            return (
+                None,
+                None,
+                Some(IntentCheckRecord {
+                    test_name: test.test_name.clone(),
+                    declared_intent: test.intent.clone(),
+                    issue_asks_for_behaviour: verdict.issue_asks_for_behaviour,
+                    issue_requires_change: true,
+                    scrapped: true,
+                    reason,
+                    evidence,
+                }),
+            );
+        }
+        return (
+            Some(test.clone()),
+            None,
+            Some(IntentCheckRecord {
+                test_name: test.test_name.clone(),
+                declared_intent: test.intent.clone(),
+                issue_asks_for_behaviour: verdict.issue_asks_for_behaviour,
+                issue_requires_change: false,
+                scrapped: false,
+                reason: verdict.reason,
+                evidence,
+            }),
+        );
+    }
+
     if verdict.issue_asks_for_behaviour {
         return (
-            test.clone(),
+            Some(test.clone()),
             None,
             Some(IntentCheckRecord {
                 test_name: test.test_name.clone(),
                 declared_intent: test.intent.clone(),
                 issue_asks_for_behaviour: true,
+                issue_requires_change: verdict.issue_requires_change,
+                scrapped: false,
                 reason: verdict.reason,
                 evidence,
             }),
@@ -626,6 +765,8 @@ pub async fn audit_test_intent(
         test_name: test.test_name.clone(),
         declared_intent: test.intent.clone(),
         issue_asks_for_behaviour: false,
+        issue_requires_change: verdict.issue_requires_change,
+        scrapped: false,
         reason: verdict.reason.clone(),
         evidence,
     };
@@ -638,10 +779,11 @@ pub async fn audit_test_intent(
             test.intent, verdict.reason
         ),
     };
-    (demoted, Some(event), Some(record))
+    (Some(demoted), Some(event), Some(record))
 }
 
-/// Audit a whole batch.
+/// Audit a whole batch. Scrapped tests are dropped from the returned list; their
+/// audit records (with `scrapped = true`) are still returned for logging.
 pub async fn audit_tests_intent(
     cfg: &LlmConfig,
     issue_text: &str,
@@ -658,7 +800,9 @@ pub async fn audit_tests_intent(
     for test in tests {
         let (updated, relabel, record) =
             audit_test_intent(cfg, issue_text, original_source, test).await;
-        audited.push(updated);
+        if let Some(updated) = updated {
+            audited.push(updated);
+        }
         if let Some(relabel) = relabel {
             relabels.push(relabel);
         }

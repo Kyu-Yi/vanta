@@ -453,6 +453,21 @@ const SINGLE_BEHAVIOR_TEST: &str = r#"{"tests":[
         }
     ]}"#;
 
+/// A BehaviourPreservation probe asserting the ORIGINAL result at an input the
+/// issue requires to CHANGE. This is exactly the probe the boundary rule tells
+/// the Attacker to write — correct when the issue preserves that boundary, wrong
+/// when the issue moves it. If the intent check did not ask the complementary
+/// question, this probe would be admitted as preservation, fail on a CORRECT
+/// patch, and reject it.
+const PRESERVATION_PROBE_CONTRADICTING_THE_ISSUE: &str = r#"{"tests":[
+        {
+            "test_name":"test_preserve_old_boundary",
+            "test_source":"from calc import add\n\ndef test_preserve_old_boundary():\n    assert add(2, 3) == 5\n",
+            "intent":"BehaviorPreservation",
+            "reason":"Preserves the old value at an input the issue asks to change."
+        }
+    ]}"#;
+
 const CREATOR_SYNTAX_ERROR_RESPONSE: &str = r#"{
     "patch_text":"def add(a, b):\n    return a + b +\n",
     "explanation":"introduce a broken patch for feedback regression coverage",
@@ -756,8 +771,10 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
     );
     assert_eq!(
         server.request_count(),
-        3,
-        "expected one attacker call per review round"
+        4,
+        "one Attacker call per review round (3), plus the round-1 patch-blind intent \
+         audit of the preservation probe; rounds 2 and 3 generate the same probe, so \
+         the dedup drops it before there is anything left to audit"
     );
 
     let records = read_session_records(&find_session_log(workspace.path()));
@@ -898,7 +915,12 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
         .iter()
         .filter(|r| r.phase.starts_with("patched.result["))
         .collect();
-    assert_eq!(patched_result_rows.len(), 5);
+    assert_eq!(
+        patched_result_rows.len(),
+        3,
+        "one shared probe per round: rounds 2 and 3 generate a duplicate and drop it, so \
+         the shared set never grows and each round runs exactly one test"
+    );
 
     let mut per_iteration_counts: Vec<usize> = attempt_start_rows
         .iter()
@@ -915,9 +937,10 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
     per_iteration_counts.sort_unstable();
     assert_eq!(
         per_iteration_counts,
-        vec![1, 2, 2],
-        "the stub repeats the same test name, so from round 2 on the shared probe and the freshly \
-         generated one are the same probe: 1 row on round 1, then 2 rows per round"
+        vec![1, 1, 1],
+        "the stub repeats the same test every round; from round 2 the Attacker's copy is \
+         a duplicate of the shared probe and is dropped, so each round runs exactly the \
+         one shared probe"
     );
 
     let unique_patch_ids: std::collections::HashSet<&str> = attempt_start_rows
@@ -930,12 +953,12 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
         "same patch should keep one stable patch_attempt_id"
     );
 
-    // Per round: attempt.start, attacker.summary, bate.summary,
-    // native_suite.summary, one patched.result per test run, and attempt.summary
-    // — 6 on round 1 (one probe) and 7 on rounds 2 and 3 (the shared probe plus
-    // the freshly generated copy of it). Plus the run-level session.start,
-    // run.summary and M3_repair_loop records.
-    assert_eq!(records.len(), 23);
+    // Per round: attempt.start, attacker.dedup, attacker.summary,
+    // native_suite.summary, one patched.result (the shared probe), and
+    // attempt.summary — 7, plus the round-1 intent.check row for the freshly
+    // generated probe. Plus the run-level session.start, run.summary and
+    // M3_repair_loop records.
+    assert_eq!(records.len(), 25);
 }
 
 /// The mirror of the import bug.
@@ -1021,8 +1044,8 @@ fn review_rounds_record_equal_patch_ids_on_every_row() {
     );
     assert_eq!(
         server.request_count(),
-        3,
-        "three review rounds must all run"
+        4,
+        "three review rounds must all run (plus the round-1 intent audit)"
     );
 
     let rows = read_transition_rows(&find_transitions(workspace.path()));
@@ -1124,9 +1147,11 @@ fn transitions_survive_an_abort_after_attempt_two() {
     let (_repo_dir, _issue_path, patch_path) =
         write_test_repo(workspace.path(), PRESERVING_PATCH);
 
-    // Requests 0 and 1 serve attempts 1 and 2; request 2 is attempt 3's attacker
-    // call. Dropping that connection aborts the run before attempt 3 completes.
-    let server = StubLlmServer::start_aborting(SINGLE_BEHAVIOR_TEST, 2);
+    // [VANTA-WHY] Round 1 now spends TWO requests (generate, then the patch-blind
+    // intent audit of the probe), so attempt 3's generate call is request 3, not
+    // 2. Dropping that one aborts the run after attempt 2 has completed — which
+    // is what leaves the 1->2 rows on disk.
+    let server = StubLlmServer::start_aborting(SINGLE_BEHAVIOR_TEST, 3);
 
     let status = run_patch_mode(workspace.path(), &patch_path, &server);
     assert!(!status.success(), "an aborted run must not report success");
@@ -1290,12 +1315,13 @@ fn patch_written_feature_acceptance_without_valid_issue_quote_is_relabelled_then
         !status.success(),
         "a bad patch must be rejected once its patch-written acceptance test is relabelled honestly"
     );
-    // One generation, one patch-blind audit, one revision. The revised probe is
-    // BehaviourPreservation, so it is not audited (there is nothing to verify).
+    // One generation, one patch-blind audit, one revision, and one audit OF that
+    // revision: the audit runs for EVERY test, BehaviourPreservation included, so
+    // a preservation probe cannot slip past it just by carrying the safe label.
     assert_eq!(
         server.request_kinds(),
-        vec!["generate", "intent_audit", "revise"],
-        "the invalid feature-acceptance test should be audited (and demoted), fail BATE as preservation, and go back once for revision"
+        vec!["generate", "intent_audit", "revise", "intent_audit"],
+        "the invalid feature-acceptance test should be audited (and demoted), fail BATE as preservation, go back once for revision, and have that revision audited too"
     );
 
     let records = read_session_records(&find_session_log(workspace.path()));
@@ -1414,6 +1440,83 @@ fn intent_check_request_never_contains_the_patch() {
     }
 }
 
+/// The "except where the issue requires the change" clause must not live in
+/// prompt wording alone.
+///
+/// [VANTA-WHY] The boundary rule tells the Attacker to write a
+/// BehaviourPreservation probe at the OLD boundary value — except where the issue
+/// requires that behaviour to change. A prompt cannot enforce "except": an
+/// Attacker that reads it too loosely emits a probe asserting the OLD value at an
+/// input the issue moves, and that probe then fails on a CORRECT patch and
+/// rejects it. The intent check closes the hole by asking the complementary
+/// question ("does the issue require this behaviour to change?") and scrapping
+/// the probe. This test pins that path: the probe is dropped, the drop is logged
+/// as a verdict for the probe, and nothing runs against the patched tree.
+#[test]
+fn a_preservation_probe_the_issue_requires_to_change_is_scrapped_by_the_intent_check() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    // The audit answers the SECOND question: the issue requires the behaviour at
+    // this input to change, so a preservation probe there contradicts it.
+    let server = StubLlmServer::start_with_intent_audit(
+        PRESERVATION_PROBE_CONTRADICTING_THE_ISSUE,
+        r#"{"issue_asks_for_behaviour":false,"issue_requires_change":true,"reason":"the issue asks for a different result at this input"}"#,
+    );
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+    assert!(
+        !output.status.success(),
+        "with its only probe scrapped there is nothing left to verify, so the run cannot approve"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let check = records
+        .iter()
+        .find(|r| r.phase == "intent.check[test_preserve_old_boundary]")
+        .unwrap_or_else(|| {
+            panic!(
+                "the session log must carry a verdict for the preservation probe too, not just \
+                 for non-preservation tests; got phases {:?}",
+                records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        check.summary.contains("scrapped=true"),
+        "a preservation probe the issue requires to change must be scrapped, and the scrap \
+         must be logged as a verdict; got {}",
+        check.summary
+    );
+    assert!(
+        check.summary.contains("issue_requires_change=true"),
+        "the log must show WHICH question scrapped it, so a reader can tell a scrap from a \
+         demotion; got {}",
+        check.summary
+    );
+
+    let summary = records
+        .iter()
+        .find(|r| r.phase == "attacker.summary")
+        .expect("the Attacker summary row must exist");
+    assert!(
+        summary.summary.contains("intent_scrapped=1") && summary.summary.contains("valid_tests=0"),
+        "the scrapped probe must be counted and must not reach verification; got {}",
+        summary.summary
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|r| r.phase.starts_with("patched.result[")),
+        "a scrapped probe must never run against the patched tree; got {:?}",
+        records
+            .iter()
+            .filter(|r| r.phase.starts_with("patched.result["))
+            .map(|r| r.phase.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// The repo's OWN test suite is a gate the generated tests cannot substitute for.
 ///
 /// [VANTA-WHY] Generated tests only cover what the Attacker sampled. A patch can
@@ -1518,14 +1621,15 @@ fn a_timed_out_test_is_infrastructure_and_is_rerun_once_in_a_fresh_sandbox() {
         "a run that uses the test-only timeout seam must warn about the mismatch; got {stderr:?}"
     );
 
-    // Exactly one request: the Attacker generation. Classifying the timeout as
-    // Unknown would have called the Attacker again to simplify the probe.
+    // Exactly two requests: the Attacker generation and the patch-blind intent
+    // audit of the probe. Classifying the timeout as Unknown would have called
+    // the Attacker a THIRD time to simplify the probe.
     assert_eq!(
-        server.request_count(),
-        1,
+        server.request_kinds(),
+        vec!["generate", "intent_audit"],
         "a timed-out test must classify as Infrastructure, not fall through to \
          Unknown — the Unknown chain asks the Attacker to simplify the probe, \
-         which would show up as a second LLM call"
+         which would show up as a further LLM call"
     );
 
     let records = read_session_records(&find_session_log(workspace.path()));
@@ -1608,8 +1712,9 @@ fn an_unknown_failure_is_rerun_then_simplified_then_quarantined() {
     );
     assert_eq!(
         server.request_kinds(),
-        vec!["generate", "simplify"],
-        "the Unknown path must rerun locally and ask the Attacker to simplify once"
+        vec!["generate", "intent_audit", "simplify"],
+        "the Unknown path must rerun locally and ask the Attacker to simplify once, \
+         after the patch-blind audit of the generated probe"
     );
 
     let records = read_session_records(&find_session_log(workspace.path()));
@@ -1665,8 +1770,8 @@ fn a_network_failure_is_classified_infrastructure_not_logic() {
         "a network-down run must not approve the patch"
     );
     assert_eq!(
-        server.request_count(),
-        1,
+        server.request_kinds(),
+        vec!["generate", "intent_audit"],
         "network-down classification must not fall through to Unknown/simplify"
     );
 

@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agents::attacker::{
-    AttackerRequest, GeneratedTest, IntentCheckRecord, attacker_generate_tests,
+    AttackerRequest, GeneratedTest, IntentCheckRecord, SharedProbe, attacker_generate_tests,
     audit_tests_intent,
 };
 use crate::agents::creator::{
@@ -213,8 +213,9 @@ pub async fn run(
 
     // The run-identifying facts, written before any attempt exists so that
     // transition rows surviving a crash can always be traced to their run.
-    // `prompt_version` is "unversioned": Vanta's prompts are embedded in source
-    // with no version tag, and recording that is a fact, not a gap.
+    // `prompt_version` is the ATTACKER's prompt tag (attacker.rs): the Attacker
+    // prompt is the one whose wording changes what a run can find, so a run
+    // before the boundary-probing rule and a run after it must be separable.
     let run_mode = if config.patch_path.is_some() {
         "patch_review"
     } else {
@@ -252,7 +253,7 @@ pub async fn run(
              baseline_test_timeout_secs={} patched_test_timeout_secs={} test_cmd={} mode={} benchmark_instance={}",
             cfg.model_id,
             std::env::var("VANTA_MODEL_VERSION").unwrap_or_else(|_| "unknown".into()),
-            "unversioned",
+            crate::agents::attacker::ATTACKER_PROMPT_VERSION,
             cfg.base_url,
             if cfg.api_key.is_some() { "set" } else { "none" },
             env!("CARGO_PKG_VERSION"),
@@ -530,11 +531,54 @@ pub async fn run(
             patch_text: patch_text.clone(),
             original_source: original_concat.clone(),
             issue_text: attacker_issue,
+            // [VANTA-WHY] Round >= 2: the Attacker is shown the probes already in
+            // the shared set so it attacks somewhere new instead of re-deriving
+            // the same boundary test. Empty on round 1.
+            existing_tests: shared_tests
+                .iter()
+                .map(|t| SharedProbe {
+                    test_name: t.test_name.clone(),
+                    test_source: t.test_source.clone(),
+                })
+                .collect(),
         };
         let attacker_response = run_with_spinner("Attacker generating tests", async {
             attacker_generate_tests(&cfg, &attacker_request).await
         })
         .await?;
+        // [VANTA-WHY] A probe whose body is already in the shared set adds no
+        // coverage: it will be BATE-validated and patched-run again, and the
+        // comparison it produces is a self-transition. Identity is the
+        // content-based `normalized_test_body_hash`, so a rename is still a
+        // duplicate. The count of drops is logged per round — silently keeping
+        // them would make a stalled Attacker look like a productive one.
+        let (generated_tests, dropped_duplicates) =
+            drop_shared_duplicates(&attacker_response.tests, &shared_tests);
+        if !dropped_duplicates.is_empty() {
+            println!(
+                "  ⚠ Attacker repeated {} probe(s) already in the shared set: {:?}",
+                dropped_duplicates.len(),
+                dropped_duplicates
+            );
+        }
+        session_log.append(SessionRecord {
+            session_id: session_id.clone(),
+            patch_attempt_id: Some(patch_attempt_id.clone()),
+            testing_iteration_id: Some(testing_iteration_id.clone()),
+            test_id: None,
+            phase: "attacker.dedup".to_string(),
+            summary: format!(
+                "shared_set_size={} generated={} dropped_duplicates={} remaining={} dropped=[{}]",
+                shared_tests.len(),
+                attacker_response.tests.len(),
+                dropped_duplicates.len(),
+                generated_tests.len(),
+                dropped_duplicates.join(",")
+            ),
+            timestamp: now_iso(),
+            benchmark_instance: None,
+            benchmark_label: None,
+        })?;
         // [VANTA-WHY] The patch-blind intent audit runs here, before BATE: only
         // an audit that cannot see the patch can tell whether the ISSUE asks for
         // the behaviour a non-preservation test asserts. An Attacker that read
@@ -545,10 +589,17 @@ pub async fn run(
             &cfg,
             &repo.issue_text,
             &original_concat,
-            &attacker_response.tests,
+            &generated_tests,
         )
         .await;
-        println!("  ✔ Attacker: {} tests", attacker_tests.len());
+        let intent_scrapped = initial_intent_checks.iter().filter(|c| c.scrapped).count();
+        println!(
+            "  ✔ Attacker: {} tests ({} generated, {} duplicate(s) dropped, {} scrapped by the intent check)",
+            attacker_tests.len(),
+            attacker_response.tests.len(),
+            dropped_duplicates.len(),
+            intent_scrapped
+        );
         for t in &attacker_tests {
             println!("    - {} (intent={:?})", t.test_name, t.intent);
         }
@@ -558,7 +609,13 @@ pub async fn run(
             testing_iteration_id: Some(testing_iteration_id.clone()),
             test_id: None,
             phase: "attacker.summary".to_string(),
-            summary: format!("generated_tests={}", attacker_tests.len()),
+            summary: format!(
+                "generated_tests={} dropped_duplicates={} intent_scrapped={} valid_tests={}",
+                attacker_response.tests.len(),
+                dropped_duplicates.len(),
+                intent_scrapped,
+                attacker_tests.len()
+            ),
             timestamp: now_iso(),
             benchmark_instance: None,
             benchmark_label: None,
@@ -1472,10 +1529,10 @@ fn attempt_verdict(
 
 /// Append one `intent.check[…]` record per audited test.
 ///
-/// [VANTA-WHY] The verdict is logged for EVERY non-preservation test — kept or
-/// demoted — so a run's log proves the patch-blind check ran and what it
-/// decided. The quote-substring outcome rides along as evidence a reader can
-/// re-analyse; it is deliberately not what decided the label.
+/// [VANTA-WHY] The verdict is logged for EVERY test — kept, demoted or scrapped,
+/// preservation included — so a run's log proves the patch-blind check ran and
+/// what it decided. The quote-substring outcome rides along as evidence a reader
+/// can re-analyse; it is deliberately not what decided the label.
 fn log_intent_checks(
     session_log: &mut SessionLog,
     session_id: &SessionId,
@@ -1492,9 +1549,11 @@ fn log_intent_checks(
             test_id: Some(fresh_test_id()),
             phase: format!("intent.check[{}]", check.test_name),
             summary: format!(
-                "source={source} declared={:?} issue_asks_for_behaviour={} quote_present={} quote_in_issue={} quote_names_asserted_input={} asserted_inputs=[{}] reason={}",
+                "source={source} declared={:?} issue_asks_for_behaviour={} issue_requires_change={} scrapped={} quote_present={} quote_in_issue={} quote_names_asserted_input={} asserted_inputs=[{}] reason={}",
                 check.declared_intent,
                 check.issue_asks_for_behaviour,
+                check.issue_requires_change,
+                check.scrapped,
                 check.evidence.quote_present,
                 check.evidence.quote_in_issue,
                 check.evidence.quote_names_asserted_input,
@@ -1507,6 +1566,36 @@ fn log_intent_checks(
         })?;
     }
     Ok(())
+}
+
+/// Drop Attacker tests whose body is already in the shared set.
+///
+/// [VANTA-WHY] Identity is the content-based `normalized_test_body_hash`, so a
+/// renamed duplicate is still a duplicate. Keeping them would let the Attacker
+/// spend its attack depth re-running one probe it already wrote: every round
+/// would produce a self-transition, the shared set would never grow, and a
+/// stalled Attacker would look productive. Returns the kept tests plus the names
+/// of the ones dropped so the count is logged per round.
+fn drop_shared_duplicates(
+    generated: &[GeneratedTest],
+    shared_tests: &[GeneratedTest],
+) -> (Vec<GeneratedTest>, Vec<String>) {
+    let mut seen: Vec<String> = shared_tests
+        .iter()
+        .map(|t| crate::core::normalized_test_body_hash(&t.test_source))
+        .collect();
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for test in generated {
+        let hash = crate::core::normalized_test_body_hash(&test.test_source);
+        if seen.iter().any(|h| h == &hash) {
+            dropped.push(test.test_name.clone());
+        } else {
+            seen.push(hash);
+            kept.push(test.clone());
+        }
+    }
+    (kept, dropped)
 }
 
 fn now_iso() -> String {

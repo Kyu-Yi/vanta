@@ -95,6 +95,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         patch_text: creator_response.patch_text.clone(),
         original_source: cart_source,
         issue_text: issue_text.clone(),
+        // M1 is a single-shot demo: no previous rounds, no shared set.
+        existing_tests: Vec::new(),
     };
     let attacker_response: AttackerResponse =
         vanta::agents::attacker::attacker_generate_tests(&cfg, &attacker_request).await?;

@@ -137,6 +137,12 @@ NO-REIMPLEMENTATION RULE:
 INTENT-vs-API RULE:
 - BehaviorPreservation may ONLY exercise APIs that already exist in the ORIGINAL source. If the behaviour you want to check uses a symbol the patch ADDS, it is a FeatureAcceptance test, not BehaviorPreservation.
 
+BOUNDARY-PROBING RULE:
+- A patch that widens, narrows or shifts a comparison (e.g. `<` → `<=`, or a changed threshold constant) changes behaviour ONLY at the exact boundary value. A test at a nearby interior value (e.g. 499 when the boundary is 500) returns the SAME result on original and patched code and proves nothing.
+- For every comparison the patch changes, include a BehaviorPreservation test that asserts the ORIGINAL result at the EXACT boundary constant — the value named in the comparison itself, not its neighbour. Do this for every changed comparison the ISSUE does not ask to change.
+- When the issue explicitly asks to change behaviour at a given boundary (e.g. "1000 should be standard"), do NOT write a preservation test for that boundary; cover it with a BugReproduction test instead.
+- Example: a patch changing `if w < 500` to `if w <= 500` must be checked with `assert shipping_band(500) == "light"` (the original result AT 500), never with `shipping_band(499)`.
+
 Write exactly 3 tests. Label each one honestly: use BugReproduction or FeatureAcceptance only when the issue asks for that behaviour at the input you assert, otherwise use BehaviorPreservation. Three BehaviorPreservation tests are a correct answer when the issue only describes one boundary."#;
 
     let user_prompt = format!(

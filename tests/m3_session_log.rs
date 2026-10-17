@@ -348,13 +348,18 @@ const CONTRADICTORY_INTENT_TEST: &str = r#"{"tests":[
         }
     ]}"#;
 
+/// The oracle loophole, in the exact shape the real fixture produced: the test
+/// asserts the PATCH's own arithmetic (`add(2, 3) == -1`) and legitimises it by
+/// quoting a sentence that IS verbatim in the issue — a sentence which in fact
+/// forbids the change. A presence-only quote check admits this; the quote must
+/// also name the asserted input.
 const ISSUE_SCOPE_LOOPHOLE_TEST: &str = r#"{"tests":[
         {
             "test_name":"test_patch_written_feature",
             "test_source":"from calc import add\n\ndef test_patch_written_feature():\n    assert add(2, 3) == -1\n",
             "intent":"FeatureAcceptance",
             "reason":"Reads the patched arithmetic back as if the issue had asked for it.",
-            "issue_quote":"Please make calc.add subtract instead."
+            "issue_quote":"Please fix that boundary bug without changing the existing behavior at the other thresholds."
         }
     ]}"#;
 
@@ -439,6 +444,12 @@ fn write_test_repo(root: &Path, patch_text: &str) -> (PathBuf, PathBuf, PathBuf)
             "The issue expects a bug-reproduction probe asserting add(2, 3) == 6.\n",
             "The issue expects a feature-acceptance probe asserting add(2, 3) == 7.\n",
             "Existing behavior add(2, 3) == 5 must be preserved unless the issue says otherwise.\n",
+            // [VANTA-WHY] A verbatim, quotable issue sentence that names NO input.
+            // It is the shape the real fixture produced: the Attacker quoted a
+            // genuine line ("without changing the existing behavior at the other
+            // thresholds") that forbids the very change its test encoded, and a
+            // presence-only quote check admitted it.
+            "Please fix that boundary bug without changing the existing behavior at the other thresholds.\n",
         ),
     )
     .unwrap();
@@ -1122,6 +1133,21 @@ fn a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped
     );
 }
 
+/// Regression guard for the oracle loophole: a patch must not be able to write
+/// its own acceptance test.
+///
+/// [VANTA-WHY] The Attacker writes tests FROM the patch, so it can always
+/// relabel a patch-introduced behaviour change as FeatureAcceptance — which BATE
+/// permits to fail on the baseline — and thereby approve itself. The real
+/// fixture matrix did exactly this: it labelled `shipping_band(500) -> "light"`
+/// as FeatureAcceptance and quoted a genuine issue sentence that *forbade* the
+/// change. A presence-only quote check admitted it and the bad patch was
+/// approved twice, on both binaries.
+///
+/// The stub here reproduces that shape: the quote IS verbatim in the issue, and
+/// it names no asserted input. The test must be relabelled to
+/// BehaviorPreservation, fail the original baseline as a mismatch, go back to
+/// the Attacker once, and the revised probe must reject the bad patch as Logic.
 #[test]
 fn patch_written_feature_acceptance_without_valid_issue_quote_is_relabelled_then_rejected() {
     let _serial = serial_run();
@@ -1145,14 +1171,27 @@ fn patch_written_feature_acceptance_without_valid_issue_quote_is_relabelled_then
     );
 
     let records = read_session_records(&find_session_log(workspace.path()));
+    let relabel = records
+        .iter()
+        .find(|r| r.phase == "attacker.relabel[test_patch_written_feature]")
+        .unwrap_or_else(|| {
+            panic!(
+                "the session log must record the relabel event; got phases {:?}",
+                records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>()
+            )
+        });
     assert!(
-        records.iter().any(|r| {
-            r.phase == "attacker.relabel[test_patch_written_feature]"
-                && r.summary.contains("from=FeatureAcceptance")
-                && r.summary.contains("to=BehaviorPreservation")
-        }),
-        "the session log must record the relabel event; got phases {:?}",
-        records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>()
+        relabel.summary.contains("from=FeatureAcceptance")
+            && relabel.summary.contains("to=BehaviorPreservation"),
+        "got {}",
+        relabel.summary
+    );
+    // The quote WAS found in the issue — a presence-only check would have kept
+    // FeatureAcceptance. The relabel must be caused by the input anchor.
+    assert!(
+        relabel.summary.contains("does not mention any asserted input"),
+        "the relabel must be triggered by the quote not naming the asserted input, not by an absent quote; got {}",
+        relabel.summary
     );
     assert!(
         records

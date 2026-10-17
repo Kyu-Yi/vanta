@@ -107,7 +107,7 @@ Required JSON shape:
                        IMPORTANT: Do NOT import constants or symbols that only exist in the PATCHED code (e.g. MAX_TOTAL). Use literal values instead so the test can run on BOTH original and patched code.
       "intent":      "BugReproduction" | "FeatureAcceptance" | "BehaviorPreservation",
       "reason":      string — why this test targets the patch,
-      "issue_quote": string|null — for BugReproduction or FeatureAcceptance, quote the exact issue sentence that asks for this behaviour; for BehaviorPreservation use null
+      "issue_quote": string|null — for BugReproduction or FeatureAcceptance, quote the exact issue sentence that asks for this behaviour, and that sentence MUST name the same input the test asserts (a test asserting `shipping_band(500)` needs a quote about 500). For BehaviorPreservation use null
     }
   ]
 }
@@ -123,7 +123,8 @@ CRITICAL:
 - Use assertions (assert X == Y) so failures are clean, not crashes.
 - Tests run with PYTHONPATH=src so `from heretic.modifier import X` works.
 - Expected values come from the ISSUE and the ORIGINAL code's existing behaviour, never from the patch alone.
-- A test may be BugReproduction or FeatureAcceptance ONLY if the quoted issue sentence explicitly asks for that behaviour. If the issue does not ask for it, label it BehaviorPreservation.
+- A test may be BugReproduction or FeatureAcceptance ONLY if the quoted issue sentence explicitly asks for that behaviour AT THAT INPUT. If the issue does not ask for it, label it BehaviorPreservation.
+- Quoting an issue sentence that does not mention your test's input does NOT authorise a non-preservation intent. A patch changing behaviour is NOT evidence the issue wanted the change — "the patch does X" is never a reason to label a test FeatureAcceptance.
 
 IMPORT RULES (violating these makes the test ERROR on collection — worse than failing):
 - Only import a name you can LITERALLY SEE defined in the ORIGINAL SOURCE above, and import it from the file where it is defined. Do NOT guess that a symbol lives in a module.
@@ -136,7 +137,7 @@ NO-REIMPLEMENTATION RULE:
 INTENT-vs-API RULE:
 - BehaviorPreservation may ONLY exercise APIs that already exist in the ORIGINAL source. If the behaviour you want to check uses a symbol the patch ADDS, it is a FeatureAcceptance test, not BehaviorPreservation.
 
-Write exactly 3 tests: one BugReproduction, one FeatureAcceptance, one BehaviorPreservation."#;
+Write exactly 3 tests. Label each one honestly: use BugReproduction or FeatureAcceptance only when the issue asks for that behaviour at the input you assert, otherwise use BehaviorPreservation. Three BehaviorPreservation tests are a correct answer when the issue only describes one boundary."#;
 
     let user_prompt = format!(
         "PATCH:\n```diff\n{}\n```\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nISSUE:\n{}\n\nWrite AttackerResponse JSON.",
@@ -371,8 +372,114 @@ Do NOT import constants or symbols that only exist in the PATCHED code."#;
     Ok(simplified)
 }
 
+/// Whitespace-collapsed, markdown-free view of issue text for quote matching.
+///
+/// [VANTA-WHY] Issues wrap identifiers in markdown backticks, so an Attacker
+/// that quotes the line literally *without* the backticks is not paraphrasing —
+/// it is quoting. Dropping the ticks keeps such a quote admissible instead of
+/// demoting a legitimate intent to BehaviourPreservation.
 fn normalize_issue_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    // Remove the ticks outright rather than replacing them with a space:
+    // `"standard"`, must collapse to `"standard",` and not to `"standard" ,`.
+    text.replace('`', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Literal arguments appearing inside a call in the test source.
+///
+/// `assert shipping_band(500) == "light"` → `["500"]`.
+///
+/// [VANTA-WHY] These are the inputs a non-preservation test pins, and they are
+/// the only deterministic link between a test and the issue sentence that is
+/// supposed to authorise it. Without this, ANY verbatim sentence from the issue
+/// is a licence: the fixture's real run quoted
+/// "…without changing the existing behavior at the other thresholds." — a line
+/// that forbids the very change the test encoded — and the quote check passed,
+/// so the bad patch wrote its own acceptance test again.
+fn asserted_input_literals(test_source: &str) -> Vec<String> {
+    let chars: Vec<char> = test_source.chars().collect();
+    let mut literals: Vec<String> = Vec::new();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        match chars[i] {
+            '"' | '\'' => {
+                let quote = chars[i];
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j] != quote {
+                    j += 1;
+                }
+                if depth > 0 {
+                    let literal: String = chars[start..j.min(chars.len())].iter().collect();
+                    let literal = literal.trim().to_string();
+                    if literal.chars().count() >= 2 && !literals.contains(&literal) {
+                        literals.push(literal);
+                    }
+                }
+                i = j + 1;
+                continue;
+            }
+            '(' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+            c if c.is_ascii_digit() && depth > 0 => {
+                let starts_token = chars
+                    .get(i.wrapping_sub(1))
+                    .map_or(true, |p| !(p.is_ascii_alphanumeric() || *p == '_' || *p == '.'));
+                if starts_token {
+                    let mut j = i;
+                    while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+                        j += 1;
+                    }
+                    let literal: String = chars[i..j].iter().collect();
+                    if !literals.contains(&literal) {
+                        literals.push(literal);
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    literals
+}
+
+/// Does `quote` name `literal` as a standalone token?
+///
+/// Guards `500` against matching inside `1500`, and `2` against `20`.
+fn quote_names_literal(quote: &str, literal: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(offset) = quote[from..].find(literal) {
+        let start = from + offset;
+        let end = start + literal.len();
+        let before_ok = quote[..start]
+            .chars()
+            .last()
+            .map_or(true, |c| !(c.is_alphanumeric() || c == '_' || c == '.'));
+        let after_ok = quote[end..]
+            .chars()
+            .next()
+            .map_or(true, |c| !(c.is_alphanumeric() || c == '_' || c == '.'));
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
 }
 
 pub fn relabel_test_to_issue_scope(
@@ -390,21 +497,34 @@ pub fn relabel_test_to_issue_scope(
         .map(normalize_issue_text)
         .filter(|quote| !quote.is_empty());
 
-    if normalized_quote
+    let quote_in_issue = normalized_quote
         .as_deref()
-        .is_some_and(|quote| normalized_issue.contains(quote))
-    {
+        .is_some_and(|quote| normalized_issue.contains(quote));
+
+    // The quote must also be ABOUT the behaviour under test. Presence alone is
+    // not endorsement.
+    let anchors = asserted_input_literals(&test.test_source);
+    let quote_names_input = normalized_quote.as_deref().is_some_and(|quote| {
+        anchors.is_empty() || anchors.iter().any(|a| quote_names_literal(quote, a))
+    });
+
+    if quote_in_issue && quote_names_input {
         return (test.clone(), None);
     }
 
-    let reason = match test.issue_quote.as_deref().map(str::trim) {
-        Some("") | None => format!(
+    let reason = match (test.issue_quote.as_deref().map(str::trim), quote_in_issue) {
+        (Some("") | None, _) => format!(
             "intent {:?} requires an issue_quote that appears in the issue text; no usable quote was provided",
             test.intent
         ),
-        Some(quote) => format!(
+        (Some(_), false) => format!(
             "intent {:?} requires an issue_quote that appears in the issue text; quote not found: {:?}",
-            test.intent, quote
+            test.intent,
+            test.issue_quote.as_deref().unwrap_or_default()
+        ),
+        (Some(_), true) => format!(
+            "intent {:?} requires an issue_quote that names the behaviour under test; quote does not mention any asserted input {:?}",
+            test.intent, anchors
         ),
     };
 
@@ -443,10 +563,14 @@ pub fn relabel_tests_to_issue_scope(
 mod tests {
     use super::*;
 
-    fn generated(intent: TestIntent, issue_quote: Option<&str>) -> GeneratedTest {
+    /// The real fixture issue, markdown and all — it is what exposed both
+    /// defects: the backticked line and the sentence that forbids the change.
+    const FIXTURE_ISSUE: &str = "`shipping_band(1000)` should return `\"standard\"`, not `\"heavy\"`.\n\nRight now the threshold logic treats weights strictly below `1000` grams as\n`\"standard\"` and everything else as `\"heavy\"`, so the exact `1000` gram edge\nfalls into the wrong band.\n\nPlease fix that boundary bug without changing the existing behavior at the\nother thresholds.\n";
+
+    fn generated(intent: TestIntent, test_source: &str, issue_quote: Option<&str>) -> GeneratedTest {
         GeneratedTest {
             test_name: "test_boundary".into(),
-            test_source: "def test_boundary():\n    assert True\n".into(),
+            test_source: test_source.into(),
             intent,
             reason: "exercise a boundary".into(),
             issue_quote: issue_quote.map(str::to_string),
@@ -456,26 +580,86 @@ mod tests {
     #[test]
     fn non_preservation_test_without_issue_quote_is_relabelled() {
         let (test, event) = relabel_test_to_issue_scope(
-            &generated(TestIntent::FeatureAcceptance, None),
-            "Only the 1000g boundary should change.",
+            &generated(
+                TestIntent::FeatureAcceptance,
+                "def test_boundary():\n    assert shipping_band(500) == \"light\"\n",
+                None,
+            ),
+            FIXTURE_ISSUE,
         );
         assert_eq!(test.intent, TestIntent::BehaviorPreservation);
         assert!(test.issue_quote.is_none());
+        assert_eq!(event.unwrap().from_intent, TestIntent::FeatureAcceptance);
+    }
+
+    /// The exact failure the fixture matrix produced: a verbatim issue sentence
+    /// that argues AGAINST the label, accepted by presence alone.
+    #[test]
+    fn verbatim_quote_that_does_not_name_the_asserted_input_is_relabelled() {
+        let (test, event) = relabel_test_to_issue_scope(
+            &generated(
+                TestIntent::FeatureAcceptance,
+                "def test_boundary():\n    assert shipping_band(500) == \"light\"\n",
+                Some(
+                    "Please fix that boundary bug without changing the existing behavior at the other thresholds.",
+                ),
+            ),
+            FIXTURE_ISSUE,
+        );
         assert_eq!(
-            event.unwrap().from_intent,
-            TestIntent::FeatureAcceptance
+            test.intent,
+            TestIntent::BehaviorPreservation,
+            "a quote about another threshold must not authorise the 500g behaviour"
+        );
+        let event = event.expect("relabel must be recorded");
+        assert!(
+            event.reason.contains("does not mention any asserted input"),
+            "got {}",
+            event.reason
         );
     }
 
     #[test]
-    fn valid_issue_quote_preserves_non_preservation_intent() {
-        let quote = "shipping_band(1000) should return \"standard\", not \"heavy\".";
+    fn quote_naming_a_neighbouring_input_is_not_enough() {
+        let (test, _) = relabel_test_to_issue_scope(
+            &generated(
+                TestIntent::FeatureAcceptance,
+                "def test_boundary():\n    assert shipping_band(500) == \"light\"\n",
+                Some("the exact `1000` gram edge falls into the wrong band."),
+            ),
+            FIXTURE_ISSUE,
+        );
+        assert_eq!(test.intent, TestIntent::BehaviorPreservation);
+    }
+
+    /// A legitimate intent survives, even though the Attacker dropped the
+    /// markdown backticks when quoting.
+    #[test]
+    fn quote_naming_the_asserted_input_keeps_intent_without_backticks() {
         let (test, event) = relabel_test_to_issue_scope(
-            &generated(TestIntent::BugReproduction, Some(quote)),
-            "Please fix this:\nshipping_band(1000) should return \"standard\", not \"heavy\".\nDo not change other thresholds.",
+            &generated(
+                TestIntent::BugReproduction,
+                "def test_boundary():\n    assert shipping_band(1000) == \"standard\"\n",
+                Some("shipping_band(1000) should return \"standard\", not \"heavy\"."),
+            ),
+            FIXTURE_ISSUE,
         );
         assert_eq!(test.intent, TestIntent::BugReproduction);
-        assert!(event.is_none());
+        assert!(event.is_none(), "got {:?}", event.map(|e| e.reason));
+    }
+
+    #[test]
+    fn quote_naming_the_asserted_input_keeps_intent_with_backticks() {
+        let (test, event) = relabel_test_to_issue_scope(
+            &generated(
+                TestIntent::BugReproduction,
+                "def test_boundary():\n    assert shipping_band(1000) == \"standard\"\n",
+                Some("`shipping_band(1000)` should return `\"standard\"`, not `\"heavy\"`."),
+            ),
+            FIXTURE_ISSUE,
+        );
+        assert_eq!(test.intent, TestIntent::BugReproduction);
+        assert!(event.is_none(), "got {:?}", event.map(|e| e.reason));
     }
 
     #[test]
@@ -483,11 +667,52 @@ mod tests {
         let (test, event) = relabel_test_to_issue_scope(
             &generated(
                 TestIntent::FeatureAcceptance,
+                "def test_boundary():\n    assert shipping_band(1000) == \"standard\"\n",
                 Some("shipping_band(1000)   should return  \"standard\""),
             ),
             "shipping_band(1000)\nshould return \"standard\" and not \"heavy\"",
         );
         assert_eq!(test.intent, TestIntent::FeatureAcceptance);
         assert!(event.is_none());
+    }
+
+    /// A test with no literal call arguments cannot be anchored; presence is the
+    /// most the check can ask for, so it must not demote silently.
+    #[test]
+    fn unanchorable_test_falls_back_to_presence_check() {
+        let (test, event) = relabel_test_to_issue_scope(
+            &generated(
+                TestIntent::FeatureAcceptance,
+                "def test_boundary():\n    assert compute() is not None\n",
+                Some("A new compute helper must exist."),
+            ),
+            "A new compute helper must exist.",
+        );
+        assert_eq!(test.intent, TestIntent::FeatureAcceptance);
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn asserted_input_literals_reads_call_arguments_only() {
+        assert_eq!(
+            asserted_input_literals("def t():\n    assert shipping_band(500) == \"light\"\n"),
+            vec!["500".to_string()]
+        );
+        assert!(asserted_input_literals("def t():\n    assert add(2, 3) == 5\n")
+            .iter()
+            .all(|l| l == "2" || l == "3"));
+        // `== 1500` is an expected value, not an argument.
+        assert_eq!(
+            asserted_input_literals("def t():\n    assert shipping_band(500) == 1500\n"),
+            vec!["500".to_string()]
+        );
+    }
+
+    #[test]
+    fn quote_names_literal_respects_token_boundaries() {
+        assert!(quote_names_literal("shipping_band(500) is light", "500"));
+        assert!(!quote_names_literal("shipping_band(1500) is heavy", "500"));
+        assert!(quote_names_literal("add(2, 3)", "2"));
+        assert!(!quote_names_literal("add(20, 3)", "2"));
     }
 }

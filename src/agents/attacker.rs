@@ -48,6 +48,15 @@ pub struct GeneratedTest {
     pub test_source: String,
     pub intent: TestIntent,
     pub reason: String,
+    pub issue_quote: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntentRelabel {
+    pub test_name: String,
+    pub from_intent: TestIntent,
+    pub to_intent: TestIntent,
+    pub reason: String,
 }
 
 // ============================================================================
@@ -97,7 +106,8 @@ Required JSON shape:
 
                        IMPORTANT: Do NOT import constants or symbols that only exist in the PATCHED code (e.g. MAX_TOTAL). Use literal values instead so the test can run on BOTH original and patched code.
       "intent":      "BugReproduction" | "FeatureAcceptance" | "BehaviorPreservation",
-      "reason":      string — why this test targets the patch
+      "reason":      string — why this test targets the patch,
+      "issue_quote": string|null — for BugReproduction or FeatureAcceptance, quote the exact issue sentence that asks for this behaviour; for BehaviorPreservation use null
     }
   ]
 }
@@ -112,6 +122,8 @@ CRITICAL:
 - Do NOT import symbols that only exist in the PATCHED code. Use hasattr/getattr or try/except to detect new features safely on original code.
 - Use assertions (assert X == Y) so failures are clean, not crashes.
 - Tests run with PYTHONPATH=src so `from heretic.modifier import X` works.
+- Expected values come from the ISSUE and the ORIGINAL code's existing behaviour, never from the patch alone.
+- A test may be BugReproduction or FeatureAcceptance ONLY if the quoted issue sentence explicitly asks for that behaviour. If the issue does not ask for it, label it BehaviorPreservation.
 
 IMPORT RULES (violating these makes the test ERROR on collection — worse than failing):
 - Only import a name you can LITERALLY SEE defined in the ORIGINAL SOURCE above, and import it from the file where it is defined. Do NOT guess that a symbol lives in a module.
@@ -192,6 +204,7 @@ Write exactly 3 tests: one BugReproduction, one FeatureAcceptance, one BehaviorP
 // ============================================================================
 pub async fn attacker_revise_test(
     cfg: &LlmConfig,
+    issue_text: &str,
     original_source: &str,
     prior_test: &GeneratedTest,
     mismatch_reason: &str,
@@ -210,7 +223,8 @@ Required JSON shape:
   "test_source": string — MUST be a complete pytest function: `def test_name():` with assertions inside the function body. NO module-level statements. Import at top, then `def test_...():` with body.
                    IMPORTANT: Do NOT import constants or symbols that only exist in the PATCHED code. Use literal values.
   "intent":      "BugReproduction" | "FeatureAcceptance" | "BehaviorPreservation",
-  "reason":      string — why this revised test now matches its intent
+  "reason":      string — why this revised test now matches its intent,
+  "issue_quote": string|null — for BugReproduction or FeatureAcceptance, quote the exact issue sentence that asks for this behaviour; for BehaviorPreservation use null
 }
 
 Intent rules (CRITICAL — these determine the expected baseline result):
@@ -221,10 +235,12 @@ Intent rules (CRITICAL — these determine the expected baseline result):
 If you cannot make the test match its intent, change the intent to match the test's actual behavior."#;
 
     let user_prompt = format!(
-        "ORIGINAL SOURCE:\n```\n{original_source}\n```\n\n\
+        "ISSUE:\n{issue_text}\n\n\
+         ORIGINAL SOURCE:\n```\n{original_source}\n```\n\n\
          PRIOR TEST (failed BATE):\n- name: {name}\n- intent: {intent:?}\n- source:\n```python\n{source}\n```\n\n\
          BATE MISMATCH REASON:\n{reason}\n\n\
-         Revise the test so its baseline result on the original source matches its declared intent. Output JSON.",
+         Revise the test so its baseline result on the original source matches its declared intent. Expected values come from the issue and original code, never from the patch alone. Output JSON.",
+        issue_text = issue_text,
         original_source = original_source,
         name = prior_test.test_name,
         intent = prior_test.intent,
@@ -241,7 +257,7 @@ If you cannot make the test match its intent, change the intent to match the tes
         ];
         if attempt >= 2 {
             let tail = format!(
-                "REPROMPT (attempt #{}): Write ONLY JSON object with test_name, test_source, intent, reason.",
+                "REPROMPT (attempt #{}): Write ONLY JSON object with test_name, test_source, intent, reason, issue_quote.",
                 attempt
             );
             messages.push(json!({"role": "user", "content": tail}));
@@ -300,7 +316,8 @@ Required JSON shape:
   "test_source": string — MUST be a complete pytest function: `def test_name():` with assertions inside the function body.
                    SIMPLIFY: remove network calls, time.sleep, randomness, complex setup. Use literal values. Keep the same intent.
   "intent":      "BugReproduction" | "FeatureAcceptance" | "BehaviorPreservation",
-  "reason":      string — what you simplified and why
+  "reason":      string — what you simplified and why,
+  "issue_quote": string|null — preserve the prior issue quote for BugReproduction/FeatureAcceptance; use null for BehaviorPreservation
 }
 
 Do NOT import constants or symbols that only exist in the PATCHED code."#;
@@ -324,7 +341,7 @@ Do NOT import constants or symbols that only exist in the PATCHED code."#;
         ];
         if attempt >= 2 {
             let tail = format!(
-                "REPROMPT (attempt #{}): Write ONLY JSON object with test_name, test_source, intent, reason.",
+                "REPROMPT (attempt #{}): Write ONLY JSON object with test_name, test_source, intent, reason, issue_quote.",
                 attempt
             );
             messages.push(json!({"role": "user", "content": tail}));
@@ -352,4 +369,125 @@ Do NOT import constants or symbols that only exist in the PATCHED code."#;
 
     info!(test_name = %simplified.test_name, "attacker simplify_test done");
     Ok(simplified)
+}
+
+fn normalize_issue_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub fn relabel_test_to_issue_scope(
+    test: &GeneratedTest,
+    issue_text: &str,
+) -> (GeneratedTest, Option<IntentRelabel>) {
+    if matches!(test.intent, TestIntent::BehaviorPreservation) {
+        return (test.clone(), None);
+    }
+
+    let normalized_issue = normalize_issue_text(issue_text);
+    let normalized_quote = test
+        .issue_quote
+        .as_deref()
+        .map(normalize_issue_text)
+        .filter(|quote| !quote.is_empty());
+
+    if normalized_quote
+        .as_deref()
+        .is_some_and(|quote| normalized_issue.contains(quote))
+    {
+        return (test.clone(), None);
+    }
+
+    let reason = match test.issue_quote.as_deref().map(str::trim) {
+        Some("") | None => format!(
+            "intent {:?} requires an issue_quote that appears in the issue text; no usable quote was provided",
+            test.intent
+        ),
+        Some(quote) => format!(
+            "intent {:?} requires an issue_quote that appears in the issue text; quote not found: {:?}",
+            test.intent, quote
+        ),
+    };
+
+    let mut relabeled = test.clone();
+    relabeled.intent = TestIntent::BehaviorPreservation;
+    relabeled.issue_quote = None;
+
+    (
+        relabeled,
+        Some(IntentRelabel {
+            test_name: test.test_name.clone(),
+            from_intent: test.intent.clone(),
+            to_intent: TestIntent::BehaviorPreservation,
+            reason,
+        }),
+    )
+}
+
+pub fn relabel_tests_to_issue_scope(
+    tests: &[GeneratedTest],
+    issue_text: &str,
+) -> (Vec<GeneratedTest>, Vec<IntentRelabel>) {
+    let mut relabeled_tests = Vec::with_capacity(tests.len());
+    let mut events = Vec::new();
+    for test in tests {
+        let (updated, event) = relabel_test_to_issue_scope(test, issue_text);
+        relabeled_tests.push(updated);
+        if let Some(event) = event {
+            events.push(event);
+        }
+    }
+    (relabeled_tests, events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn generated(intent: TestIntent, issue_quote: Option<&str>) -> GeneratedTest {
+        GeneratedTest {
+            test_name: "test_boundary".into(),
+            test_source: "def test_boundary():\n    assert True\n".into(),
+            intent,
+            reason: "exercise a boundary".into(),
+            issue_quote: issue_quote.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn non_preservation_test_without_issue_quote_is_relabelled() {
+        let (test, event) = relabel_test_to_issue_scope(
+            &generated(TestIntent::FeatureAcceptance, None),
+            "Only the 1000g boundary should change.",
+        );
+        assert_eq!(test.intent, TestIntent::BehaviorPreservation);
+        assert!(test.issue_quote.is_none());
+        assert_eq!(
+            event.unwrap().from_intent,
+            TestIntent::FeatureAcceptance
+        );
+    }
+
+    #[test]
+    fn valid_issue_quote_preserves_non_preservation_intent() {
+        let quote = "shipping_band(1000) should return \"standard\", not \"heavy\".";
+        let (test, event) = relabel_test_to_issue_scope(
+            &generated(TestIntent::BugReproduction, Some(quote)),
+            "Please fix this:\nshipping_band(1000) should return \"standard\", not \"heavy\".\nDo not change other thresholds.",
+        );
+        assert_eq!(test.intent, TestIntent::BugReproduction);
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn issue_quote_matching_normalizes_whitespace() {
+        let (test, event) = relabel_test_to_issue_scope(
+            &generated(
+                TestIntent::FeatureAcceptance,
+                Some("shipping_band(1000)   should return  \"standard\""),
+            ),
+            "shipping_band(1000)\nshould return \"standard\" and not \"heavy\"",
+        );
+        assert_eq!(test.intent, TestIntent::FeatureAcceptance);
+        assert!(event.is_none());
+    }
 }

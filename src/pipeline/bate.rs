@@ -16,7 +16,9 @@
 // Max 3 retries per test before scrapping.
 // ============================================================================
 
-use crate::agents::attacker::{attacker_revise_test, GeneratedTest};
+use crate::agents::attacker::{
+    GeneratedTest, IntentRelabel, attacker_revise_test, relabel_test_to_issue_scope,
+};
 use crate::config::LlmConfig;
 use crate::core::{TestIntent, TestResult};
 use crate::pipeline::candidate::TestCommand;
@@ -169,6 +171,7 @@ impl BateReport {
 pub struct BateRun {
     pub report: BateReport,
     pub valid_tests: Vec<GeneratedTest>,
+    pub relabel_events: Vec<IntentRelabel>,
 }
 
 /// Run the BATE phase over a batch of Attacker tests against the ORIGINAL code.
@@ -177,12 +180,14 @@ pub struct BateRun {
 /// their possibly-revised source.
 pub async fn run_bate(
     cfg: &LlmConfig,
+    issue_text: &str,
     original_source: &str,
     tests: &[GeneratedTest],
     test_cmd: &TestCommand,
 ) -> BateRun {
     let mut valid_tests: Vec<GeneratedTest> = Vec::new();
     let mut scrapped_tests: Vec<(String, String)> = Vec::new();
+    let mut relabel_events: Vec<IntentRelabel> = Vec::new();
 
     for test in tests {
         // [VANTA-WHY] Spec §7 "Flaky tests" row: run the baseline twice; a test
@@ -231,9 +236,23 @@ pub async fn run_bate(
                             revision = revision + 1,
                             "BATE mismatch → sending test back to Attacker for revision"
                         );
-                        match attacker_revise_test(cfg, original_source, &current_test, &reason).await
+                        match attacker_revise_test(
+                            cfg,
+                            issue_text,
+                            original_source,
+                            &current_test,
+                            &reason,
+                        )
+                        .await
                         {
-                            Ok(revised) => current_test = revised,
+                            Ok(revised) => {
+                                let (revised, relabel) =
+                                    relabel_test_to_issue_scope(&revised, issue_text);
+                                if let Some(relabel) = relabel {
+                                    relabel_events.push(relabel);
+                                }
+                                current_test = revised;
+                            }
                             Err(e) => {
                                 warn!("attacker_revise_test failed: {e} — scrapping test");
                                 final_outcome = Some(BateOutcome::Mismatch(reason));
@@ -265,6 +284,7 @@ pub async fn run_bate(
             scrapped_tests,
         },
         valid_tests,
+        relabel_events,
     }
 }
 

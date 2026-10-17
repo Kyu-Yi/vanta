@@ -201,13 +201,22 @@ impl ShuruBackend {
 
         let plan = deps::detect(repo_root);
         if plan.is_empty() {
-            info!(repo = %repo_root.display(), "no declared dependencies — using base checkpoint");
+            info!(
+                target: "vanta::sandbox::deps",
+                repo = %repo_root.display(),
+                "no declared dependencies — using base checkpoint"
+            );
             return Ok(None);
         }
 
         let name = plan.checkpoint_name();
         if Self::checkpoint_exists(&name) {
-            info!(checkpoint = %name, disk_mb = plan.disk_mb, "reusing dependency checkpoint");
+            info!(
+                target: "vanta::sandbox::deps",
+                checkpoint = %name,
+                disk_mb = plan.disk_mb,
+                "reusing dependency checkpoint"
+            );
             return Ok(Some((name, plan.disk_mb)));
         }
 
@@ -248,7 +257,11 @@ impl ShuruBackend {
 
         let name = plan.checkpoint_name();
         if Self::checkpoint_exists(&name) {
-            info!(checkpoint = %name, "reusing derived dependency checkpoint");
+            info!(
+                target: "vanta::sandbox::deps",
+                checkpoint = %name,
+                "reusing derived dependency checkpoint"
+            );
             return Ok(Some((name, plan.disk_mb)));
         }
 
@@ -269,6 +282,7 @@ impl ShuruBackend {
         plan: &crate::sandbox::deps::DependencyPlan,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!(
+            target: "vanta::sandbox::deps",
             checkpoint = %name,
             base = %base,
             packages = plan.packages.len(),

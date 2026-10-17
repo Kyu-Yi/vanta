@@ -631,6 +631,7 @@ mod tests {
             test_source: format!("from calc import add\n\ndef {name}():\n    {assertion}\n"),
             intent: TestIntent::BehaviorPreservation,
             reason: "exercise the same repo code through both harness paths".to_string(),
+            issue_quote: None,
         }
     }
 

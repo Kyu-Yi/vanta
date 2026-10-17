@@ -39,7 +39,7 @@ struct StubLlmServer {
 
 impl StubLlmServer {
     fn start(attacker_response_json: &str) -> Self {
-        Self::start_scripted(None, attacker_response_json, None, None)
+        Self::start_scripted(None, attacker_response_json, None, None, None, None)
     }
 
     fn start_with_creator_and_attacker(
@@ -49,6 +49,22 @@ impl StubLlmServer {
         Self::start_scripted(
             Some(creator_response_json),
             attacker_response_json,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn start_with_attacker_revision(
+        attacker_response_json: &str,
+        revise_response_json: &str,
+    ) -> Self {
+        Self::start_scripted(
+            None,
+            attacker_response_json,
+            Some(revise_response_json),
+            None,
             None,
             None,
         )
@@ -62,7 +78,7 @@ impl StubLlmServer {
         attacker_response_json: &str,
         on_request: Option<Box<dyn Fn(usize) + Send>>,
     ) -> Self {
-        Self::start_scripted(None, attacker_response_json, on_request, None)
+        Self::start_scripted(None, attacker_response_json, None, None, on_request, None)
     }
 
     /// Drop the TCP connection (no HTTP response) for every request whose index
@@ -70,12 +86,14 @@ impl StubLlmServer {
     /// mid-run — a stand-in for a `HarnessFailure` abort, which happens before
     /// the end-of-run session log is written.
     fn start_aborting(attacker_response_json: &str, abort_at: usize) -> Self {
-        Self::start_scripted(None, attacker_response_json, None, Some(abort_at))
+        Self::start_scripted(None, attacker_response_json, None, None, None, Some(abort_at))
     }
 
     fn start_scripted(
         creator_response_json: Option<&str>,
         attacker_response_json: &str,
+        revise_response_json: Option<&str>,
+        simplify_response_json: Option<&str>,
         on_request: Option<Box<dyn Fn(usize) + Send>>,
         abort_at: Option<usize>,
     ) -> Self {
@@ -102,6 +120,10 @@ impl StubLlmServer {
         // revision never happens.
         let attacker_value: serde_json::Value =
             serde_json::from_str(attacker_response_json).unwrap();
+        let revise_value: Option<serde_json::Value> =
+            revise_response_json.map(|json| serde_json::from_str(json).unwrap());
+        let simplify_value: Option<serde_json::Value> =
+            simplify_response_json.map(|json| serde_json::from_str(json).unwrap());
         let creator_value: Option<serde_json::Value> =
             creator_response_json.map(|json| serde_json::from_str(json).unwrap());
 
@@ -184,18 +206,25 @@ impl StubLlmServer {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .push(body.to_string());
+                        let default_single_test = || {
+                            attacker_value
+                                .get("tests")
+                                .and_then(|tests| tests.get(0))
+                                .cloned()
+                                .unwrap_or_else(|| attacker_value.clone())
+                        };
                         let content = if request_kind == "creator" {
                             creator_value
                                 .clone()
                                 .unwrap_or_else(|| serde_json::json!({"patch_text":"def add(a, b):\n    return a + b\n","explanation":"noop","files_touched":["calc.py"],"confidence":0.1}))
                         } else if request_kind == "generate" {
                             attacker_value.clone()
+                        } else if request_kind == "revise" {
+                            revise_value.clone().unwrap_or_else(default_single_test)
+                        } else if request_kind == "simplify" {
+                            simplify_value.clone().unwrap_or_else(default_single_test)
                         } else {
-                            attacker_value
-                                .get("tests")
-                                .and_then(|tests| tests.get(0))
-                                .cloned()
-                                .unwrap_or_else(|| attacker_value.clone())
+                            default_single_test()
                         };
                         // The assistant `content` field is a JSON STRING holding
                         // the model's answer, so the serialised value is quoted
@@ -283,19 +312,22 @@ const THREE_SIGNAL_TESTS: &str = r#"{"tests":[
             "test_name":"test_bug_regression_signal",
             "test_source":"from calc import add\n\ndef test_bug_regression_signal():\n    assert add(2, 3) == 6\n",
             "intent":"BugReproduction",
-            "reason":"Fails on the original baseline, so BATE admits it."
+            "reason":"Fails on the original baseline, so BATE admits it.",
+            "issue_quote":"The issue expects a bug-reproduction probe asserting add(2, 3) == 6."
         },
         {
             "test_name":"test_feature_acceptance_signal",
             "test_source":"from calc import add\n\ndef test_feature_acceptance_signal():\n    assert add(2, 3) == 7\n",
             "intent":"FeatureAcceptance",
-            "reason":"Also fails on the original baseline, so BATE admits it."
+            "reason":"Also fails on the original baseline, so BATE admits it.",
+            "issue_quote":"The issue expects a feature-acceptance probe asserting add(2, 3) == 7."
         },
         {
             "test_name":"test_behavior_preservation_signal",
             "test_source":"from calc import add\n\ndef test_behavior_preservation_signal():\n    assert add(2, 3) == 5\n",
             "intent":"BehaviorPreservation",
-            "reason":"Passes on the original baseline and fails on the bad patch."
+            "reason":"Passes on the original baseline and fails on the bad patch.",
+            "issue_quote":null
         }
     ]}"#;
 
@@ -311,9 +343,28 @@ const CONTRADICTORY_INTENT_TEST: &str = r#"{"tests":[
             "test_name":"test_intent_contradiction",
             "test_source":"from calc import add\n\ndef test_intent_contradiction():\n    assert add(2, 3) == 5\n",
             "intent":"BugReproduction",
-            "reason":"Declares a bug that the original tree does not have."
+            "reason":"Declares a bug that the original tree does not have.",
+            "issue_quote":"The issue expects a bug-reproduction probe asserting add(2, 3) == 6."
         }
     ]}"#;
+
+const ISSUE_SCOPE_LOOPHOLE_TEST: &str = r#"{"tests":[
+        {
+            "test_name":"test_patch_written_feature",
+            "test_source":"from calc import add\n\ndef test_patch_written_feature():\n    assert add(2, 3) == -1\n",
+            "intent":"FeatureAcceptance",
+            "reason":"Reads the patched arithmetic back as if the issue had asked for it.",
+            "issue_quote":"Please make calc.add subtract instead."
+        }
+    ]}"#;
+
+const ISSUE_SCOPE_REVISED_PRESERVATION_TEST: &str = r#"{
+    "test_name":"test_patch_written_feature",
+    "test_source":"from calc import add\n\ndef test_patch_written_feature():\n    assert add(2, 3) == 5\n",
+    "intent":"BehaviorPreservation",
+    "reason":"The issue never asked for subtraction, so this behavior must be preserved.",
+    "issue_quote":null
+}"#;
 
 /// Patch that makes `calc.add(2, 3)` return 6, so a probe can tell the patched
 /// tree from the original one (where it returns 5).
@@ -381,7 +432,16 @@ fn write_test_repo(root: &Path, patch_text: &str) -> (PathBuf, PathBuf, PathBuf)
     )
     .unwrap();
     let issue_path = repo_dir.join("issue.md");
-    fs::write(&issue_path, "Verify a candidate patch for calc.add.\n").unwrap();
+    fs::write(
+        &issue_path,
+        concat!(
+            "Verify a candidate patch for calc.add.\n",
+            "The issue expects a bug-reproduction probe asserting add(2, 3) == 6.\n",
+            "The issue expects a feature-acceptance probe asserting add(2, 3) == 7.\n",
+            "Existing behavior add(2, 3) == 5 must be preserved unless the issue says otherwise.\n",
+        ),
+    )
+    .unwrap();
 
     let patch_path = root.join("candidate.patch");
     fs::write(&patch_path, patch_text).unwrap();
@@ -1059,6 +1119,53 @@ fn a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped
         bate_summary.summary.contains("discard_rate_pct=100.0"),
         "a run that scraps its only test must record a 100%% discard rate; got {}",
         bate_summary.summary
+    );
+}
+
+#[test]
+fn patch_written_feature_acceptance_without_valid_issue_quote_is_relabelled_then_rejected() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start_with_attacker_revision(
+        ISSUE_SCOPE_LOOPHOLE_TEST,
+        ISSUE_SCOPE_REVISED_PRESERVATION_TEST,
+    );
+
+    let status = run_patch_mode_with(workspace.path(), &patch_path, &server, 1, &[]);
+    assert!(
+        !status.success(),
+        "a bad patch must be rejected once its patch-written acceptance test is relabelled honestly"
+    );
+    assert_eq!(
+        server.request_kinds(),
+        vec!["generate", "revise"],
+        "the invalid feature-acceptance test should be relabelled, fail BATE as preservation, and go back once for revision"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    assert!(
+        records.iter().any(|r| {
+            r.phase == "attacker.relabel[test_patch_written_feature]"
+                && r.summary.contains("from=FeatureAcceptance")
+                && r.summary.contains("to=BehaviorPreservation")
+        }),
+        "the session log must record the relabel event; got phases {:?}",
+        records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>()
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.phase == "patched.result[test_patch_written_feature]"
+                && r.summary.contains("outcome=Counterexample")
+                && r.summary.contains("failure_class=Logic")),
+        "the revised preservation probe must reject the bad patch as a Logic failure; got {:?}",
+        records
+            .iter()
+            .filter(|r| r.phase == "patched.result[test_patch_written_feature]")
+            .map(|r| r.summary.as_str())
+            .collect::<Vec<_>>()
     );
 }
 

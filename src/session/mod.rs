@@ -510,32 +510,17 @@ pub fn fresh_testing_iteration_id() -> TestingIterationId {
 /// checkable rather than a matter of trust — a run that feeds the paper must
 /// have `dirty == false`.
 ///
-/// `VANTA_COMMIT` (if set, e.g. by CI) overrides the git lookup for the commit
-/// only. `dirty` is always measured against the working tree, and a tree whose
-/// state cannot be determined (git absent, or cwd not a repo) is reported as
-/// dirty: an unverified provenance must never masquerade as a clean one.
 pub fn vanta_revision() -> (String, bool) {
-    let commit = std::env::var("VANTA_COMMIT")
-        .ok()
-        .map(|s| s.trim().to_string())
+    let commit = option_env!("VANTA_BUILD_COMMIT")
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .or_else(|| git_stdout(&["rev-parse", "--short", "HEAD"]))
-        .unwrap_or_else(|| "unknown".to_string());
-    let dirty = match git_stdout(&["status", "--porcelain"]) {
-        Some(out) => !out.is_empty(),
-        None => true,
-    };
+        .unwrap_or("unknown")
+        .to_string();
+    let dirty = option_env!("VANTA_BUILD_DIRTY")
+        .map(str::trim)
+        .map(|s| matches!(s, "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true);
     (commit, dirty)
-}
-
-/// Run `git <args>` and return trimmed stdout, or `None` if git is unavailable
-/// or the command failed (e.g. the directory is not a repository).
-fn git_stdout(args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 #[cfg(test)]

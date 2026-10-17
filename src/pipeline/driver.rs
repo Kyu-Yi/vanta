@@ -27,7 +27,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agents::attacker::{AttackerRequest, GeneratedTest, attacker_generate_tests};
+use crate::agents::attacker::{
+    AttackerRequest, GeneratedTest, IntentRelabel, attacker_generate_tests,
+    relabel_tests_to_issue_scope,
+};
 use crate::agents::creator::{
     CreatorRequest, creator_generate_patch, split_multi_file_patch, split_patch_into_files,
 };
@@ -514,7 +517,8 @@ pub async fn run(
             attacker_generate_tests(&cfg, &attacker_request).await
         })
         .await?;
-        let attacker_tests: Vec<GeneratedTest> = attacker_response.tests;
+        let (attacker_tests, initial_relabels): (Vec<GeneratedTest>, Vec<IntentRelabel>) =
+            relabel_tests_to_issue_scope(&attacker_response.tests, &repo.issue_text);
         println!("  ✔ Attacker: {} tests", attacker_tests.len());
         for t in &attacker_tests {
             println!("    - {} (intent={:?})", t.test_name, t.intent);
@@ -530,6 +534,22 @@ pub async fn run(
             benchmark_instance: None,
             benchmark_label: None,
         })?;
+        for relabel in &initial_relabels {
+            session_log.append(SessionRecord {
+                session_id: session_id.clone(),
+                patch_attempt_id: Some(patch_attempt_id.clone()),
+                testing_iteration_id: Some(testing_iteration_id.clone()),
+                test_id: Some(fresh_test_id()),
+                phase: format!("attacker.relabel[{}]", relabel.test_name),
+                summary: format!(
+                    "source=attacker.generate from={:?} to={:?} reason={}",
+                    relabel.from_intent, relabel.to_intent, relabel.reason
+                ),
+                timestamp: now_iso(),
+                benchmark_instance: None,
+                benchmark_label: None,
+            })?;
+        }
 
         // ---- 3b. Self-heal dependencies the manifest did not declare ----
         // [VANTA-WHY] The manifest says what the repo DECLARED; the tests may
@@ -552,11 +572,12 @@ pub async fn run(
         // declared the wrong intent was scrapped instead of being fixed.
         println!("\n▌ BATE: validating tests against baseline...");
         let bate_run = run_with_spinner("BATE validating tests against baseline", async {
-            run_bate(&cfg, &original_concat, &attacker_tests, &test_cmd).await
+            run_bate(&cfg, &repo.issue_text, &original_concat, &attacker_tests, &test_cmd).await
         })
         .await;
         let bate_report = bate_run.report;
         let valid_tests: Vec<GeneratedTest> = bate_run.valid_tests;
+        let bate_relabels = bate_run.relabel_events;
         let discard_rate = if attacker_tests.is_empty() {
             0.0
         } else {
@@ -584,6 +605,22 @@ pub async fn run(
             benchmark_instance: None,
             benchmark_label: None,
         })?;
+        for relabel in &bate_relabels {
+            session_log.append(SessionRecord {
+                session_id: session_id.clone(),
+                patch_attempt_id: Some(patch_attempt_id.clone()),
+                testing_iteration_id: Some(testing_iteration_id.clone()),
+                test_id: Some(fresh_test_id()),
+                phase: format!("attacker.relabel[{}]", relabel.test_name),
+                summary: format!(
+                    "source=attacker.revise from={:?} to={:?} reason={}",
+                    relabel.from_intent, relabel.to_intent, relabel.reason
+                ),
+                timestamp: now_iso(),
+                benchmark_instance: None,
+                benchmark_label: None,
+            })?;
+        }
 
         let scrapped_names: Vec<String> = bate_report
             .scrapped_tests

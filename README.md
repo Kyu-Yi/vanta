@@ -188,9 +188,9 @@ The Attacker is far more dangerous when it remembers how this codebase has broke
 - [ ] Structured JSON diagnostic payloads + session/attempt/iteration/test IDs on every result
 
 ### Milestone 3 — V1 ship 🚢
-- [ ] Fixed-N Governor + deterministic Gatekeeper
-- [ ] GitHub PR integration
-- [ ] CLI: `vanta run --repo ./target --issue ./bug.md`
+- [x] Fixed-N Governor + deterministic Gatekeeper
+- [x] GitHub PR integration
+- [x] CLI: `vanta --repo ./target --issue ./bug.md`
 - [ ] End-to-end unattended run on a real repository ← **V1 acceptance test**
 
 ### Milestone 4 — V2: proof & memory

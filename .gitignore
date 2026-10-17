@@ -24,3 +24,13 @@ target
 # Added by cargo
 
 /target
+
+# Vanta local artefacts
+# Run logs and per-run forensics — written on every execution, never source.
+vanta_sessions/
+# Scratch directories the sandbox backends create inside the working tree.
+.tmp*/
+.shurutest/
+
+# macOS / editor noise
+.DS_Store

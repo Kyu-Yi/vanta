@@ -104,7 +104,7 @@ execute_case() {
     *) echo "unknown scenario ${binary}/${scenario}" >&2; return 2 ;;
   esac
 
-  local status=0
+  local exit_code=0
   (
     cd "$run_dir"
     VANTA_SANDBOX_BACKEND="$backend" \
@@ -113,14 +113,14 @@ execute_case() {
       --issue "$run_dir/issue.md" \
       --test-cmd "$test_cmd" \
       "${extra[@]}"
-  ) >"$log_path" 2>&1 || status=$?
+  ) >"$log_path" 2>&1 || exit_code=$?
 
   if grep -q "FINAL: Rejected" "$log_path"; then
     echo "rejected"
   elif grep -q "FINAL: AllTestsPassed" "$log_path"; then
     echo "approved"
   else
-    echo "other:${status}"
+    echo "other:${exit_code}"
   fi
 }
 

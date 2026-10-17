@@ -615,8 +615,8 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
         start.summary
     );
     assert!(
-        start.summary.contains("backend="),
-        "session.start must record the sandbox backend; got {}",
+        start.summary.contains("requested_backend=") && start.summary.contains("actual_backend="),
+        "session.start must record both the requested and actual sandbox backend; got {}",
         start.summary
     );
     // A commit hash alone would name a commit that does not reproduce a run made
@@ -1311,6 +1311,7 @@ fn structured_diagnostic_payload_reaches_creator_in_repair_mode() {
         "two repair attempts must produce two Creator calls"
     );
     let second_creator_body = &creator_bodies[1];
+    let second_creator_body_lower = second_creator_body.to_lowercase();
     assert!(
         second_creator_body.contains("structured_payload=")
             && second_creator_body.contains("new_static_errors"),
@@ -1319,5 +1320,20 @@ fn structured_diagnostic_payload_reaches_creator_in_repair_mode() {
     assert!(
         second_creator_body.contains("failure_class=Static"),
         "repair-mode feedback must still include the class label alongside the payload; got {second_creator_body}"
+    );
+    assert!(
+        second_creator_body.contains("test_behavior_preservation_only"),
+        "repair-mode feedback must name the failing test so the Creator sees which behaviour broke; got {second_creator_body}"
+    );
+    assert!(
+        second_creator_body.contains("ruff_stderr")
+            || second_creator_body.contains("mypy_stderr"),
+        "repair-mode feedback must include the raw static-analysis excerpt field; got {second_creator_body}"
+    );
+    assert!(
+        second_creator_body_lower.contains("invalid syntax")
+            || second_creator_body.contains("Expected an expression")
+            || second_creator_body.contains("return a + b +"),
+        "repair-mode feedback must carry a concrete error excerpt, not just a class label; got {second_creator_body}"
     );
 }

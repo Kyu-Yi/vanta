@@ -1,0 +1,12 @@
+diff --git a/toy_calc/core.py b/toy_calc/core.py
+--- a/toy_calc/core.py
++++ b/toy_calc/core.py
+@@ -8,7 +8,7 @@ def shipping_band(weight_grams):
+     if weight_grams < 0:
+         raise ValueError("weight_grams must be non-negative")
+     if weight_grams < 500:
+         return "light"
+-    if weight_grams < 1000:
++    if weight_grams <= 1000:
+         return "standard"
+     return "heavy"

@@ -191,6 +191,8 @@ pub async fn run(
     // written once at the end, a crash would leave rows saying WHAT changed with
     // no record of WHICH model produced them, and an unattributed run is useless
     // to a study whose central comparison is across model tiers.
+    let requested_backend = crate::sandbox::requested_backend_label()?;
+    let actual_backend = crate::sandbox::actual_backend_label().await?;
     let session_id = fresh_session_id();
     let mut session_log = SessionLog::open(Path::new("vanta_sessions"), session_id.clone())?;
     let debug_dir = session_log.ensure_debug_dir(Path::new("vanta_sessions"))?;
@@ -201,16 +203,13 @@ pub async fn run(
     println!("▌ Session: {}", session_id.as_str());
     println!("▌ Forensics → {}", debug_dir.display());
     println!("▌ Max attempts: {}", config.max_attempts);
+    println!("▌ Backend requested: {requested_backend}");
+    println!("▌ Backend actual: {actual_backend}");
 
     // The run-identifying facts, written before any attempt exists so that
     // transition rows surviving a crash can always be traced to their run.
     // `prompt_version` is "unversioned": Vanta's prompts are embedded in source
     // with no version tag, and recording that is a fact, not a gap.
-    let backend_label = if crate::sandbox::shuru_available() {
-        "shuru"
-    } else {
-        "subprocess"
-    };
     let run_mode = if config.patch_path.is_some() {
         "patch_review"
     } else {
@@ -244,7 +243,7 @@ pub async fn run(
         phase: "session.start".to_string(),
         summary: format!(
             "model={} model_version={} prompt_version={} provider={} api_key={} \
-             vanta_version={} vanta_commit={} vanta_dirty={} backend={} max_attempts={} \
+             vanta_version={} vanta_commit={} vanta_dirty={} requested_backend={} actual_backend={} max_attempts={} \
              baseline_test_timeout_secs={} patched_test_timeout_secs={} test_cmd={} mode={} benchmark_instance={}",
             cfg.model_id,
             std::env::var("VANTA_MODEL_VERSION").unwrap_or_else(|_| "unknown".into()),
@@ -254,7 +253,8 @@ pub async fn run(
             env!("CARGO_PKG_VERSION"),
             vanta_commit,
             vanta_dirty,
-            backend_label,
+            requested_backend,
+            actual_backend,
             config.max_attempts,
             baseline_test_timeout_secs,
             patched_test_timeout_secs,

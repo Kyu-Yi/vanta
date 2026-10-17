@@ -17,6 +17,52 @@ use std::error::Error;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendPreference {
+    Auto,
+    Shuru,
+    Subprocess,
+}
+
+fn backend_preference() -> Result<BackendPreference, Box<dyn Error + Send + Sync>> {
+    match std::env::var("VANTA_SANDBOX_BACKEND")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None | Some("auto") => Ok(BackendPreference::Auto),
+        Some("shuru") => Ok(BackendPreference::Shuru),
+        Some("subprocess") => Ok(BackendPreference::Subprocess),
+        Some(other) => Err(format!(
+            "invalid VANTA_SANDBOX_BACKEND={other:?}; expected auto, shuru, or subprocess"
+        )
+        .into()),
+    }
+}
+
+pub fn requested_backend_label() -> Result<&'static str, Box<dyn Error + Send + Sync>> {
+    Ok(match backend_preference()? {
+        BackendPreference::Auto => "auto",
+        BackendPreference::Shuru => "shuru",
+        BackendPreference::Subprocess => "subprocess",
+    })
+}
+
+pub fn backend_kind_label(kind: SandboxKind) -> &'static str {
+    match kind {
+        SandboxKind::Subprocess => "subprocess",
+        SandboxKind::Shuru => "shuru",
+    }
+}
+
+pub async fn actual_backend_label() -> Result<&'static str, Box<dyn Error + Send + Sync>> {
+    let backend = Backend::spawn().await?;
+    let label = backend_kind_label(backend.kind());
+    backend.destroy();
+    Ok(label)
+}
+
 /// Cached result of the shuru boot test. We run it ONCE per process because
 /// booting a VM takes ~1s and doing it on every Backend::spawn() (one per
 /// test in run_tests_parallel) would make the pipeline crawl.
@@ -110,20 +156,48 @@ pub enum Backend {
 
 impl Backend {
     pub async fn spawn() -> Result<Self, Box<dyn Error + Send + Sync>> {
-        if shuru_available() && shuru_boot_ok().await {
-            match shuru::ShuruBackend::spawn().await {
-                Ok(b) => {
-                    tracing::info!("using SHURU microVM backend (preferred)");
-                    return Ok(Backend::Shuru(b));
+        match backend_preference()? {
+            BackendPreference::Subprocess => {
+                let b = subprocess::SubprocessBackend::spawn().await?;
+                tracing::warn!("using SUBPROCESS backend (forced by VANTA_SANDBOX_BACKEND)");
+                Ok(Backend::Subprocess(b))
+            }
+            BackendPreference::Shuru => {
+                if !shuru_available() {
+                    return Err(
+                        "VANTA_SANDBOX_BACKEND=shuru but the shuru CLI is not available".into(),
+                    );
                 }
-                Err(e) => {
-                    tracing::warn!("shuru spawn failed ({e}), falling back to subprocess");
+                if !shuru_boot_ok().await {
+                    return Err(
+                        "VANTA_SANDBOX_BACKEND=shuru but the shuru VM boot test failed".into(),
+                    );
                 }
+                let b = shuru::ShuruBackend::spawn().await?;
+                tracing::info!("using SHURU microVM backend (forced by VANTA_SANDBOX_BACKEND)");
+                Ok(Backend::Shuru(b))
+            }
+            BackendPreference::Auto => {
+                if shuru_available() && shuru_boot_ok().await {
+                    match shuru::ShuruBackend::spawn().await {
+                        Ok(b) => {
+                            tracing::info!("using SHURU microVM backend (preferred)");
+                            return Ok(Backend::Shuru(b));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "shuru spawn failed ({e}), falling back to subprocess"
+                            );
+                        }
+                    }
+                }
+                let b = subprocess::SubprocessBackend::spawn().await?;
+                tracing::warn!(
+                    "using SUBPROCESS backend (shuru not available — no security boundary)"
+                );
+                Ok(Backend::Subprocess(b))
             }
         }
-        let b = subprocess::SubprocessBackend::spawn().await?;
-        tracing::warn!("using SUBPROCESS backend (shuru not available — no security boundary)");
-        Ok(Backend::Subprocess(b))
     }
 
     pub fn kind(&self) -> SandboxKind {
@@ -156,6 +230,52 @@ impl Backend {
         match self {
             Backend::Subprocess(b) => b.destroy(),
             Backend::Shuru(b) => b.destroy(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn backend_preference_defaults_to_auto() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::remove_var("VANTA_SANDBOX_BACKEND");
+        }
+        assert_eq!(backend_preference().unwrap(), BackendPreference::Auto);
+    }
+
+    #[test]
+    fn backend_preference_accepts_forced_values() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::set_var("VANTA_SANDBOX_BACKEND", "shuru");
+        }
+        assert_eq!(backend_preference().unwrap(), BackendPreference::Shuru);
+        unsafe {
+            std::env::set_var("VANTA_SANDBOX_BACKEND", "subprocess");
+        }
+        assert_eq!(backend_preference().unwrap(), BackendPreference::Subprocess);
+        unsafe {
+            std::env::remove_var("VANTA_SANDBOX_BACKEND");
+        }
+    }
+
+    #[test]
+    fn backend_preference_rejects_unknown_value() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::set_var("VANTA_SANDBOX_BACKEND", "mystery");
+        }
+        let err = backend_preference().unwrap_err().to_string();
+        assert!(err.contains("invalid VANTA_SANDBOX_BACKEND"));
+        unsafe {
+            std::env::remove_var("VANTA_SANDBOX_BACKEND");
         }
     }
 }

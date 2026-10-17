@@ -6,8 +6,8 @@
 // ============================================================================
 
 pub mod deps;
-pub mod subprocess;
 pub mod shuru;
+pub mod subprocess;
 
 mod types;
 
@@ -65,13 +65,15 @@ async fn shuru_boot_ok() -> bool {
 // we want to test L3/L4 reachability, not name resolution.
 // ============================================================================
 pub async fn network_alive() -> bool {
-    use tokio::net::TcpStream;
-    match tokio::time::timeout(
-        Duration::from_secs(2),
-        TcpStream::connect("8.8.8.8:53"),
-    )
-    .await
+    if std::env::var("VANTA_TEST_FORCE_NETWORK_DOWN")
+        .ok()
+        .as_deref()
+        == Some("1")
     {
+        return false;
+    }
+    use tokio::net::TcpStream;
+    match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect("8.8.8.8:53")).await {
         Ok(Ok(_)) => true,
         _ => false,
     }

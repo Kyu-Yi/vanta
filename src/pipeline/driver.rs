@@ -218,6 +218,17 @@ pub async fn run(
     };
     let baseline_test_timeout_secs = crate::pipeline::harness::test_timeout_secs();
     let patched_test_timeout_secs = crate::pipeline::harness::patched_test_timeout_secs();
+    if baseline_test_timeout_secs != patched_test_timeout_secs {
+        tracing::warn!(
+            baseline_test_timeout_secs,
+            patched_test_timeout_secs,
+            "patched-side test timeout differs from baseline timeout; this seam exists for tests and can bias a real run"
+        );
+        eprintln!(
+            "  ⚠ patched-side test timeout differs from baseline timeout: baseline={}s patched={}s",
+            baseline_test_timeout_secs, patched_test_timeout_secs
+        );
+    }
     // [VANTA-WHY] `dirty` accompanies the commit so the reproducibility claim is
     // checkable: a run on a dirty tree includes edits that are not in HEAD, so it
     // must never claim that commit reproduces it. The paper's rule is that any
@@ -758,6 +769,20 @@ pub async fn run(
                     _ => VerificationOutcome::Counterexample,
                 },
                 failure_class,
+                structured_payload: if result == TestResult::Passed {
+                    None
+                } else {
+                    let safe_name = test
+                        .test_name
+                        .replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
+                    let diag_path = debug_dir.join(format!(
+                        "attempt_{}_diagnostic_{}.json",
+                        attempt + 1,
+                        safe_name
+                    ));
+                    read_json_value_from_debug(&diag_path)
+                        .and_then(|v| v.get("structured_payload").cloned())
+                },
                 intent: test.intent.clone(),
                 evidence_source: EvidenceSource::AttackerGenerated,
             });
@@ -1110,6 +1135,9 @@ fn build_creator_feedback(failed: &[&TestEvidence], ruff_new: bool, mypy_new: bo
             "- Test '{}' (intent={:?}) failed with failure_class={}\n",
             e.test_name, e.intent, class
         ));
+        if let Some(payload) = &e.structured_payload {
+            fb.push_str(&format!("  structured_payload={payload}\n"));
+        }
     }
 
     if ruff_new {
@@ -1123,6 +1151,12 @@ fn build_creator_feedback(failed: &[&TestEvidence], ruff_new: bool, mypy_new: bo
         "\nPlease revise the patch to fix these failures while preserving existing behavior.",
     );
     fb
+}
+
+fn read_json_value_from_debug(path: &Path) -> Option<serde_json::Value> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
 }
 
 // ============================================================================

@@ -32,13 +32,26 @@ struct StubLlmServer {
     base_url: String,
     request_count: Arc<AtomicUsize>,
     request_kinds: Arc<Mutex<Vec<String>>>,
+    request_bodies: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
 
 impl StubLlmServer {
     fn start(attacker_response_json: &str) -> Self {
-        Self::start_full(attacker_response_json, None, None)
+        Self::start_scripted(None, attacker_response_json, None, None)
+    }
+
+    fn start_with_creator_and_attacker(
+        creator_response_json: &str,
+        attacker_response_json: &str,
+    ) -> Self {
+        Self::start_scripted(
+            Some(creator_response_json),
+            attacker_response_json,
+            None,
+            None,
+        )
     }
 
     /// `on_request` runs with the 0-based index of each request, before the
@@ -49,7 +62,7 @@ impl StubLlmServer {
         attacker_response_json: &str,
         on_request: Option<Box<dyn Fn(usize) + Send>>,
     ) -> Self {
-        Self::start_full(attacker_response_json, on_request, None)
+        Self::start_scripted(None, attacker_response_json, on_request, None)
     }
 
     /// Drop the TCP connection (no HTTP response) for every request whose index
@@ -57,10 +70,11 @@ impl StubLlmServer {
     /// mid-run — a stand-in for a `HarnessFailure` abort, which happens before
     /// the end-of-run session log is written.
     fn start_aborting(attacker_response_json: &str, abort_at: usize) -> Self {
-        Self::start_full(attacker_response_json, None, Some(abort_at))
+        Self::start_scripted(None, attacker_response_json, None, Some(abort_at))
     }
 
-    fn start_full(
+    fn start_scripted(
+        creator_response_json: Option<&str>,
         attacker_response_json: &str,
         on_request: Option<Box<dyn Fn(usize) + Send>>,
         abort_at: Option<usize>,
@@ -71,10 +85,12 @@ impl StubLlmServer {
         let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
         let request_count = Arc::new(AtomicUsize::new(0));
         let request_kinds = Arc::new(Mutex::new(Vec::new()));
+        let request_bodies = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let request_count_clone = Arc::clone(&request_count);
         let request_kinds_clone = Arc::clone(&request_kinds);
+        let request_bodies_clone = Arc::clone(&request_bodies);
         let stop_clone = Arc::clone(&stop);
         // The Attacker has two call sites with different response shapes: a
         // generation call expects `{"tests":[...]}` (AttackerResponse), while a
@@ -86,6 +102,8 @@ impl StubLlmServer {
         // revision never happens.
         let attacker_value: serde_json::Value =
             serde_json::from_str(attacker_response_json).unwrap();
+        let creator_value: Option<serde_json::Value> =
+            creator_response_json.map(|json| serde_json::from_str(json).unwrap());
 
         let join = thread::spawn(move || {
             while !stop_clone.load(Ordering::SeqCst) {
@@ -147,7 +165,9 @@ impl StubLlmServer {
                         // "write adversarial tests"; revision and simplify calls
                         // want a single test object.
                         let body = String::from_utf8_lossy(&request[header_end.unwrap_or(0)..]);
-                        let request_kind = if body.contains("write adversarial tests") {
+                        let request_kind = if body.contains("You are Vanta Creator") {
+                            "creator"
+                        } else if body.contains("write adversarial tests") {
                             "generate"
                         } else if body.contains("failed BATE") {
                             "revise"
@@ -160,7 +180,15 @@ impl StubLlmServer {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .push(request_kind.to_string());
-                        let content = if request_kind == "generate" {
+                        request_bodies_clone
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(body.to_string());
+                        let content = if request_kind == "creator" {
+                            creator_value
+                                .clone()
+                                .unwrap_or_else(|| serde_json::json!({"patch_text":"def add(a, b):\n    return a + b\n","explanation":"noop","files_touched":["calc.py"],"confidence":0.1}))
+                        } else if request_kind == "generate" {
                             attacker_value.clone()
                         } else {
                             attacker_value
@@ -198,6 +226,7 @@ impl StubLlmServer {
             base_url,
             request_count,
             request_kinds,
+            request_bodies,
             stop,
             join: Some(join),
         }
@@ -209,6 +238,13 @@ impl StubLlmServer {
 
     fn request_kinds(&self) -> Vec<String> {
         self.request_kinds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn request_bodies(&self) -> Vec<String> {
+        self.request_bodies
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
@@ -295,6 +331,22 @@ const HANGING_PROBE: &str = r#"{"tests":[
             "reason":"Passes on the original tree and hangs on the patched one."
         }
     ]}"#;
+
+const SINGLE_BEHAVIOR_TEST: &str = r#"{"tests":[
+        {
+            "test_name":"test_behavior_preservation_only",
+            "test_source":"from calc import add\n\ndef test_behavior_preservation_only():\n    assert add(2, 3) == 5\n",
+            "intent":"BehaviorPreservation",
+            "reason":"Passes on the original tree and fails on the wrong patch."
+        }
+    ]}"#;
+
+const CREATOR_SYNTAX_ERROR_RESPONSE: &str = r#"{
+    "patch_text":"def add(a, b):\n    return a + b +\n",
+    "explanation":"introduce a broken patch for feedback regression coverage",
+    "files_touched":["calc.py"],
+    "confidence":0.2
+}"#;
 
 fn metric_row_from_observed_outcome(
     to_result: TestResult,
@@ -447,6 +499,16 @@ fn run_patch_mode_with(
     max_attempts: u32,
     extra_env: &[(&str, &str)],
 ) -> std::process::ExitStatus {
+    run_patch_mode_with_output(workspace, patch_path, server, max_attempts, extra_env).status
+}
+
+fn run_patch_mode_with_output(
+    workspace: &Path,
+    patch_path: &Path,
+    server: &StubLlmServer,
+    max_attempts: u32,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
     let (repo_dir, issue_path) = (
         workspace.join("repo"),
         workspace.join("repo").join("issue.md"),
@@ -477,7 +539,42 @@ fn run_patch_mode_with(
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
-    cmd.status().unwrap()
+    cmd.output().unwrap()
+}
+
+fn run_creator_mode_with_output(
+    workspace: &Path,
+    server: &StubLlmServer,
+    max_attempts: u32,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
+    let repo_dir = workspace.join("repo");
+    let issue_path = workspace.join("repo").join("issue.md");
+    let python = host_python();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_vanta_m3"));
+    cmd.current_dir(workspace)
+        .arg("--repo")
+        .arg(&repo_dir)
+        .arg("--issue")
+        .arg(&issue_path)
+        .arg("--max-attempts")
+        .arg(max_attempts.to_string())
+        .arg("--test-cmd")
+        .arg(format!("{python} -m pytest"))
+        .env(
+            "VANTA_LLM_BASE_URL",
+            format!("{}/v1", server.base_url.trim_end_matches("/v1")),
+        )
+        .env("VANTA_LLM_MODEL", "stub-model")
+        .env("VANTA_API_KEY", TEST_API_KEY)
+        .env("VANTA_LLM_TIMEOUT_SECS", "5")
+        .env("VANTA_PYTHON", python)
+        .env("PATH", "/usr/bin:/bin")
+        .env("VANTA_SANDBOX_MEMORY_MB", "0");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd.output().unwrap()
 }
 
 #[test]
@@ -954,6 +1051,15 @@ fn a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped
          scrapped, and the scrap must be recorded; got {:?}",
         records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>()
     );
+    let bate_summary = records
+        .iter()
+        .find(|r| r.phase == "bate.summary")
+        .expect("the BATE summary row must exist");
+    assert!(
+        bate_summary.summary.contains("discard_rate_pct=100.0"),
+        "a run that scraps its only test must record a 100%% discard rate; got {}",
+        bate_summary.summary
+    );
 }
 
 /// Regression guard for the timeout signal path.
@@ -981,16 +1087,22 @@ fn a_timed_out_test_is_infrastructure_and_is_rerun_once_in_a_fresh_sandbox() {
     // default. This cap applies only to the PATCHED-side execution; BATE's
     // baseline stays on its normal timeout so machine load cannot move the
     // failure earlier in the workflow.
-    let status = run_patch_mode_with(
+    let output = run_patch_mode_with_output(
         workspace.path(),
         &patch_path,
         &server,
         1,
         &[("VANTA_PATCHED_TEST_TIMEOUT_SECS", "5")],
     );
+    let status = output.status;
     assert!(
         !status.success(),
         "a patch whose test hangs must not be approved"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("patched-side test timeout differs from baseline timeout"),
+        "a run that uses the test-only timeout seam must warn about the mismatch; got {stderr:?}"
     );
 
     // Exactly one request: the Attacker generation. Classifying the timeout as
@@ -1059,5 +1171,153 @@ fn a_timed_out_test_is_infrastructure_and_is_rerun_once_in_a_fresh_sandbox() {
     assert_eq!(
         snap.excluded_non_logic, 1,
         "the exclusion must be visible so the run reads as evidence-starved, not as a silent zero"
+    );
+}
+
+#[test]
+fn an_unknown_failure_is_rerun_then_simplified_then_quarantined() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[("VANTA_TEST_FORCE_UNKNOWN", "1")],
+    );
+    assert!(
+        !output.status.success(),
+        "a quarantined Unknown must not approve the patch"
+    );
+    assert_eq!(
+        server.request_kinds(),
+        vec!["generate", "simplify"],
+        "the Unknown path must rerun locally and ask the Attacker to simplify once"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let debug_dir = workspace
+        .path()
+        .join("vanta_sessions")
+        .join(records[0].session_id.as_str())
+        .join("debug");
+    let diagnostic =
+        read_json(&debug_dir.join("attempt_1_diagnostic_test_behavior_preservation_only.json"));
+    assert!(
+        diagnostic["failure_class"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unknown"),
+        "the forced-Unknown path must stay Unknown through quarantine; got {}",
+        diagnostic["failure_class"]
+    );
+    assert!(
+        diagnostic["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("QUARANTINED"),
+        "persistent Unknowns must quarantine, not count as a model bug; got {:?}",
+        diagnostic["reason"]
+    );
+    let payload = diagnostic["structured_payload"]
+        .as_object()
+        .expect("quarantined Unknowns must write a structured payload");
+    assert_eq!(
+        payload.get("action"),
+        Some(&serde_json::Value::String("quarantine".into()))
+    );
+}
+
+#[test]
+fn a_network_failure_is_classified_infrastructure_not_logic() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[("VANTA_TEST_FORCE_NETWORK_DOWN", "1")],
+    );
+    assert!(
+        !output.status.success(),
+        "a network-down run must not approve the patch"
+    );
+    assert_eq!(
+        server.request_count(),
+        1,
+        "network-down classification must not fall through to Unknown/simplify"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let debug_dir = workspace
+        .path()
+        .join("vanta_sessions")
+        .join(records[0].session_id.as_str())
+        .join("debug");
+    let diagnostic =
+        read_json(&debug_dir.join("attempt_1_diagnostic_test_behavior_preservation_only.json"));
+    assert!(
+        diagnostic["failure_class"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Infrastructure"),
+        "network failure must classify as Infrastructure; got {}",
+        diagnostic["failure_class"]
+    );
+    assert_eq!(
+        diagnostic["structured_payload"]["signal"],
+        serde_json::Value::String("network_down".into())
+    );
+}
+
+#[test]
+fn structured_diagnostic_payload_reaches_creator_in_repair_mode() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let _ = write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start_with_creator_and_attacker(
+        CREATOR_SYNTAX_ERROR_RESPONSE,
+        SINGLE_BEHAVIOR_TEST,
+    );
+
+    let output = run_creator_mode_with_output(workspace.path(), &server, 2, &[]);
+    assert!(
+        !output.status.success(),
+        "the stub creator keeps returning a bad patch, so the run should exhaust its attempts"
+    );
+
+    let creator_bodies: Vec<String> = server
+        .request_kinds()
+        .into_iter()
+        .zip(server.request_bodies())
+        .filter_map(
+            |(kind, body)| {
+                if kind == "creator" { Some(body) } else { None }
+            },
+        )
+        .collect();
+    assert_eq!(
+        creator_bodies.len(),
+        2,
+        "two repair attempts must produce two Creator calls"
+    );
+    let second_creator_body = &creator_bodies[1];
+    assert!(
+        second_creator_body.contains("structured_payload=")
+            && second_creator_body.contains("new_static_errors"),
+        "repair-mode feedback must include the structured diagnostic payload for the Creator; got {second_creator_body}"
+    );
+    assert!(
+        second_creator_body.contains("failure_class=Static"),
+        "repair-mode feedback must still include the class label alongside the payload; got {second_creator_body}"
     );
 }

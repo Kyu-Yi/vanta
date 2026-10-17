@@ -190,12 +190,22 @@ pub async fn diagnose_failure(
     original_source: &str,
     test_cmd: &TestCommand,
 ) -> DiagnosticResult {
+    let force_unknown = std::env::var("VANTA_TEST_FORCE_UNKNOWN").ok().as_deref() == Some("1");
     // [VANTA-WHY] The FIRST classification sees the real execution: whether the
     // run timed out, whether pytest produced report.json, and the actual streams.
     // Throwing those away (as an earlier cut did) downgrades a timeout — a
     // genuine Infrastructure failure — to an unclassifiable Unknown, and an
     // Unknown triggers an Attacker call it never needed.
     let classify = |exec: &TestExecutionDetails| -> DiagnosticResult {
+        if force_unknown {
+            return DiagnosticResult {
+                failure_class: Some(FailureClass::Unknown),
+                reason: "Forced Unknown classification for regression testing".into(),
+                structured_payload: Some(json!({
+                    "signal": "forced_unknown",
+                })),
+            };
+        }
         diagnose(&DiagnosticInputs {
             import_or_syntax_error: exec.result == TestResult::Error,
             ruff_new_errors,
@@ -279,18 +289,31 @@ pub async fn diagnose_failure(
             tracing::info!(test = %test.test_name, "Unknown → rerunning in fresh sandbox");
 
             // Step 1: fresh-sandbox rerun.
-            let rerun = harness::run_single_test(patched_source, &test.test_source, test_cmd).await;
-            if rerun == TestResult::Passed {
-                return DiagnosticResult {
-                    failure_class: None,
-                    reason: "Unknown resolved on fresh-sandbox rerun".into(),
-                    structured_payload: None,
-                };
+            let rerun = harness::run_single_test_with_timeout(
+                patched_source,
+                &test.test_source,
+                test_cmd,
+                harness::patched_test_timeout_secs(),
+            )
+            .await;
+            if rerun.result == TestResult::Passed {
+                return enrich_with_sandbox_roots(
+                    DiagnosticResult {
+                        failure_class: None,
+                        reason: "Unknown resolved on fresh-sandbox rerun".into(),
+                        structured_payload: None,
+                    },
+                    execution.sandbox_root.clone(),
+                    rerun.sandbox_root.clone(),
+                );
             }
-            let rerun_exec = TestExecutionDetails::from_rerun(rerun);
-            let rerun_diag = classify(&rerun_exec);
+            let rerun_diag = classify(&rerun);
             if !matches!(rerun_diag.failure_class, Some(FailureClass::Unknown)) {
-                return rerun_diag; // resolved to a real class
+                return enrich_with_sandbox_roots(
+                    rerun_diag,
+                    execution.sandbox_root.clone(),
+                    rerun.sandbox_root.clone(),
+                );
             }
 
             // Step 2: ask the Attacker to simplify the test.
@@ -298,19 +321,31 @@ pub async fn diagnose_failure(
             match attacker_simplify_test(cfg, original_source, test).await {
                 Ok(simplified) => {
                     // Step 3: run the simplified test.
-                    let simp_result =
-                        harness::run_single_test(patched_source, &simplified.test_source, test_cmd)
-                            .await;
-                    if simp_result == TestResult::Passed {
-                        return DiagnosticResult {
-                            failure_class: None,
-                            reason: "Unknown resolved after Attacker simplification".into(),
-                            structured_payload: None,
-                        };
+                    let simp_result = harness::run_single_test_with_timeout(
+                        patched_source,
+                        &simplified.test_source,
+                        test_cmd,
+                        harness::patched_test_timeout_secs(),
+                    )
+                    .await;
+                    if simp_result.result == TestResult::Passed {
+                        return enrich_with_sandbox_roots(
+                            DiagnosticResult {
+                                failure_class: None,
+                                reason: "Unknown resolved after Attacker simplification".into(),
+                                structured_payload: None,
+                            },
+                            execution.sandbox_root.clone(),
+                            simp_result.sandbox_root.clone(),
+                        );
                     }
-                    let simp_diag = classify(&TestExecutionDetails::from_rerun(simp_result));
+                    let simp_diag = classify(&simp_result);
                     if !matches!(simp_diag.failure_class, Some(FailureClass::Unknown)) {
-                        return simp_diag;
+                        return enrich_with_sandbox_roots(
+                            simp_diag,
+                            execution.sandbox_root.clone(),
+                            simp_result.sandbox_root.clone(),
+                        );
                     }
                 }
                 Err(e) => {
@@ -326,6 +361,7 @@ pub async fn diagnose_failure(
                 structured_payload: Some(serde_json::json!({
                     "action": "quarantine",
                     "evidence_source": "AttackerGenerated",
+                    "initial_sandbox_root": execution.sandbox_root,
                     "note": "ExistingRepositoryTest and BenchmarkOracle tests escalate to human review instead of quarantine",
                 })),
             }

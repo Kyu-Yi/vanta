@@ -431,6 +431,12 @@ pub struct TestEvidence {
     // Option expresses the MAY BE ABSENT semantics without polluting the enum.
     pub failure_class: Option<FailureClass>,
 
+    // [VANTA-WHY] The Diagnostician's structured payload is what lets repair
+    // mode feed the Creator the actual machine-readable reason for a failure
+    // (ruff/mypy details, import/collect output, quarantine action, etc.),
+    // rather than collapsing everything to a class label.
+    pub structured_payload: Option<serde_json::Value>,
+
     // [VANTA-WHY] Declared TestIntent (BugReproduction / FeatureAcceptance /
     // BehaviorPreservation). ABSOLUTELY REQUIRED for BATE Phase 1. You cannot
     // judge a test on original code without knowing what it was INTENDED to do.

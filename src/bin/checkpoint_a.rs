@@ -317,6 +317,7 @@ fn main() -> Result<(), String> {
         test_name:       "test_refund_never_exceeds_charge".to_string(),
         outcome:         VerificationOutcome::VerifiedWithinBounds,
         failure_class:   None,                           // PASS = no failure class
+        structured_payload: None,
         intent:          TestIntent::BehaviorPreservation,
         evidence_source: EvidenceSource::AttackerGenerated,  // LLM wrote this test
     });
@@ -325,6 +326,7 @@ fn main() -> Result<(), String> {
         test_name:       "test_add_2_plus_3_equals_5".to_string(),
         outcome:         VerificationOutcome::Counterexample,
         failure_class:   Some(FailureClass::Logic),       // HARD Logic failure = bug
+        structured_payload: None,
         intent:          TestIntent::BugReproduction,
         evidence_source: EvidenceSource::BenchmarkOracle,  // Ground truth test
     });
@@ -333,6 +335,7 @@ fn main() -> Result<(), String> {
         test_name:       "test_api_v2_feature_flag_on".to_string(),
         outcome:         VerificationOutcome::Inconclusive,
         failure_class:   Some(FailureClass::Unknown),     // could not classify
+        structured_payload: None,
         intent:          TestIntent::FeatureAcceptance,
         evidence_source: EvidenceSource::IssueDescription, // from issue text
     });
@@ -341,6 +344,7 @@ fn main() -> Result<(), String> {
         test_name:       "test_empty_cart_checkout".to_string(),
         outcome:         VerificationOutcome::Unsupported,
         failure_class:   None,                            // backend couldn't handle it
+        structured_payload: None,
         intent:          TestIntent::FeatureAcceptance,
         evidence_source: EvidenceSource::AttackerGenerated,
     });
@@ -349,6 +353,7 @@ fn main() -> Result<(), String> {
         test_name:       "test_pagination_edge_cases".to_string(),
         outcome:         VerificationOutcome::Timeout,
         failure_class:   Some(FailureClass::Infrastructure), // timed out = infr
+        structured_payload: None,
         intent:          TestIntent::BehaviorPreservation,
         evidence_source: EvidenceSource::ExistingRepositoryTest, // pre-existing repo test
     });
@@ -357,6 +362,7 @@ fn main() -> Result<(), String> {
         test_name:       "test_jwt_expired_token".to_string(),
         outcome:         VerificationOutcome::ToolFailure,
         failure_class:   Some(FailureClass::Infrastructure), // backend crashed
+        structured_payload: None,
         intent:          TestIntent::BehaviorPreservation,
         evidence_source: EvidenceSource::HumanProvided,    // written during code review
     });
@@ -365,6 +371,7 @@ fn main() -> Result<(), String> {
         test_name:       "test_mobile_schema_backward_compat".to_string(),
         outcome:         VerificationOutcome::VerifiedWithinBounds,
         failure_class:   None,
+        structured_payload: None,
         intent:          TestIntent::BehaviorPreservation,
         evidence_source: EvidenceSource::FormalVerifier,  // from CrossHair/Kani/Z3
     });

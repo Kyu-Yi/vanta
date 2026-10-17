@@ -22,7 +22,7 @@ use crate::llm::{build_reqwest_client, extract_json_candidate, structured_call_w
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 // ============================================================================
 // AttackerRequest — input to the Attacker agent
@@ -372,6 +372,297 @@ Do NOT import constants or symbols that only exist in the PATCHED code."#;
     Ok(simplified)
 }
 
+// ============================================================================
+// INTENT AUDITOR — a separate call that never sees the patch
+// ============================================================================
+//
+// [VANTA-WHY] The Attacker declares WHY a test exists, and BATE trusts that
+// declaration: a BugReproduction/FeatureAcceptance test is ALLOWED to fail on
+// the original code, a BehaviorPreservation test is not. That asymmetry is what
+// let a bad patch write its own acceptance test — the Attacker read the patch,
+// saw a changed behaviour, and labelled the change "FeatureAcceptance", so the
+// change became the requirement it satisfied.
+//
+// The Attacker prompt forbids that. A prompt is not a guarantee. This call is
+// the independent check: it is given the ISSUE, the ORIGINAL source and the
+// test — never the patch, never the patched source. A non-preservation label
+// survives only if this audit says the issue asks for that behaviour at the
+// input the test asserts.
+//
+// [VANTA-WHY] The audit is DEMOTE-ONLY. It can turn a BugReproduction/
+// FeatureAcceptance test into a BehaviorPreservation one; it can never promote a
+// BehaviorPreservation test, and it never turns a failing candidate into a
+// passing one. An auditor that cannot answer demotes rather than letting the
+// label through: an unverified non-preservation label must not stand.
+
+/// Input to the intent audit.
+///
+/// [VANTA-WHY] Deliberately has NO patch field and no patched-source field, so
+/// there is nothing for the call to leak. A regression test asserts the request
+/// body the stub server receives contains neither.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentCheckRequest {
+    pub issue_text: String,
+    pub original_source: String,
+    pub test_name: String,
+    pub test_source: String,
+    pub declared_intent: TestIntent,
+}
+
+/// The auditor's answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntentVerdict {
+    /// Does the issue ask for the behaviour this test asserts, at the input the
+    /// test asserts?
+    pub issue_asks_for_behaviour: bool,
+    pub reason: String,
+}
+
+/// [VANTA-WHY] The deterministic quote evidence is RECORDED, never enforced. It
+/// tells a reader whether the Attacker's quote was real and whether it named the
+/// asserted input; the verdict is what decides the label.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuoteEvidence {
+    pub quote_present: bool,
+    pub quote_in_issue: bool,
+    pub quote_names_asserted_input: bool,
+    pub asserted_inputs: Vec<String>,
+}
+
+/// One audit result. Emitted for EVERY non-preservation test, kept or demoted,
+/// so a run's log shows the check ran and what it decided.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntentCheckRecord {
+    pub test_name: String,
+    pub declared_intent: TestIntent,
+    pub issue_asks_for_behaviour: bool,
+    pub reason: String,
+    pub evidence: QuoteEvidence,
+}
+
+/// [VANTA-WHY] The first line is the stub server's dispatch marker for this call
+/// kind; an integration test uses it to find the audit requests and prove their
+/// bodies carry no patch.
+const INTENT_AUDITOR_SYSTEM_PROMPT: &str = r#"You are Vanta Intent Auditor. You are given an ISSUE, the ORIGINAL source of a repository, and ONE test. You are NOT given the patch and must not speculate about it.
+
+Answer exactly one question: does the ISSUE ask for the behaviour this test asserts, AT THE INPUT THE TEST ASSERTS?
+
+Rules:
+- The issue is the only source of requirements. The original source shows what the behaviour WAS; it is evidence of existing behaviour, never of a new requirement.
+- A test asserting `shipping_band(500) == "light"` is authorised only by an issue sentence that asks for that result at that input. A sentence about a DIFFERENT input does not authorise it.
+- A sentence that forbids changing behaviour ("without changing the existing behaviour at the other thresholds") FORBIDS the change; it never authorises it.
+- If the issue does not ask for the asserted behaviour at the asserted input, answer false. Preserving existing behaviour is always a valid answer.
+
+YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
+{"issue_asks_for_behaviour": true|false, "reason": "one short sentence"}"#;
+
+/// Audit one test's declared intent against the issue.
+///
+/// Never sees the patch: `IntentCheckRequest` has no field for it.
+pub async fn attacker_check_intent(
+    cfg: &LlmConfig,
+    request: &IntentCheckRequest,
+) -> Result<IntentVerdict, Box<dyn Error + Send + Sync>> {
+    info!(
+        test_name = %request.test_name,
+        intent = ?request.declared_intent,
+        "intent auditor start"
+    );
+
+    let client = build_reqwest_client(cfg)?;
+
+    let user_prompt = format!(
+        "ISSUE:\n{}\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nTEST UNDER AUDIT ({}):\n```\n{}\n```\n\nDeclared intent: {:?}\n\nDoes the issue ask for this behaviour at the input this test asserts? Answer with JSON.",
+        request.issue_text,
+        request.original_source,
+        request.test_name,
+        request.test_source,
+        request.declared_intent
+    );
+
+    let sys_owned = INTENT_AUDITOR_SYSTEM_PROMPT.to_string();
+    let user_owned = user_prompt.clone();
+    let build_messages = move |attempt: u32| {
+        let mut messages = vec![
+            json!({"role": "system", "content": sys_owned.clone()}),
+            json!({"role": "user", "content": user_owned.clone()}),
+        ];
+        if attempt >= 2 {
+            messages.push(json!({
+                "role": "user",
+                "content": "REPROMPT: output ONLY {\"issue_asks_for_behaviour\": true|false, \"reason\": \"...\"}."
+            }));
+        }
+        messages
+    };
+
+    // temperature 0: the audit must not be a coin flip. It also never sees the
+    // patch, so there is no patch-shaped variance to average over.
+    let extras = json!({
+        "response_format": {"type": "json_object"},
+        "temperature": 0.0,
+        "max_tokens": 2048,
+        "reasoning_effort": "low",
+    });
+
+    let parse_closure = |raw: &str| -> Result<IntentVerdict, String> {
+        let cleaned = extract_json_candidate(raw).map_err(|e| format!("{e}"))?;
+        serde_json::from_str::<IntentVerdict>(cleaned).map_err(|e| {
+            format!(
+                "INTENT AUDIT PARSE FAIL (line {} col {}): {}",
+                e.line(),
+                e.column(),
+                e
+            )
+        })
+    };
+
+    let verdict: IntentVerdict =
+        structured_call_with_retry(&client, cfg, 3, build_messages, extras, parse_closure).await?;
+
+    info!(
+        test_name = %request.test_name,
+        asks = verdict.issue_asks_for_behaviour,
+        "intent auditor done"
+    );
+    Ok(verdict)
+}
+
+/// Deterministic quote evidence for the session log. RECORDED ONLY.
+pub fn observe_quote_evidence(test: &GeneratedTest, issue_text: &str) -> QuoteEvidence {
+    let normalized_issue = normalize_issue_text(issue_text);
+    let normalized_quote = test
+        .issue_quote
+        .as_deref()
+        .map(normalize_issue_text)
+        .filter(|quote| !quote.is_empty());
+
+    let quote_present = normalized_quote.is_some();
+    let quote_in_issue = normalized_quote
+        .as_deref()
+        .is_some_and(|quote| normalized_issue.contains(quote));
+
+    let asserted_inputs = asserted_input_literals(&test.test_source);
+    let quote_names_asserted_input = normalized_quote.as_deref().is_some_and(|quote| {
+        asserted_inputs.is_empty()
+            || asserted_inputs
+                .iter()
+                .any(|literal| quote_names_literal(quote, literal))
+    });
+
+    QuoteEvidence {
+        quote_present,
+        quote_in_issue,
+        quote_names_asserted_input,
+        asserted_inputs,
+    }
+}
+
+/// Audit one test, demoting it when the issue does not ask for its behaviour.
+///
+/// Returns the possibly-demoted test, the relabel event if it was demoted, and
+/// the audit record if the test declared a non-preservation intent. An auditor
+/// that cannot answer demotes: an unverified label must not stand.
+pub async fn audit_test_intent(
+    cfg: &LlmConfig,
+    issue_text: &str,
+    original_source: &str,
+    test: &GeneratedTest,
+) -> (GeneratedTest, Option<IntentRelabel>, Option<IntentCheckRecord>) {
+    let evidence = observe_quote_evidence(test, issue_text);
+
+    if matches!(test.intent, TestIntent::BehaviorPreservation) {
+        return (test.clone(), None, None);
+    }
+
+    let request = IntentCheckRequest {
+        issue_text: issue_text.to_string(),
+        original_source: original_source.to_string(),
+        test_name: test.test_name.clone(),
+        test_source: test.test_source.clone(),
+        declared_intent: test.intent.clone(),
+    };
+
+    let verdict = match attacker_check_intent(cfg, &request).await {
+        Ok(verdict) => verdict,
+        Err(e) => {
+            warn!(
+                test = %test.test_name,
+                error = %e,
+                "intent audit unavailable — demoting to BehaviorPreservation"
+            );
+            IntentVerdict {
+                issue_asks_for_behaviour: false,
+                reason: format!("intent audit unavailable ({e})"),
+            }
+        }
+    };
+
+    if verdict.issue_asks_for_behaviour {
+        return (
+            test.clone(),
+            None,
+            Some(IntentCheckRecord {
+                test_name: test.test_name.clone(),
+                declared_intent: test.intent.clone(),
+                issue_asks_for_behaviour: true,
+                reason: verdict.reason,
+                evidence,
+            }),
+        );
+    }
+
+    let mut demoted = test.clone();
+    demoted.intent = TestIntent::BehaviorPreservation;
+    demoted.issue_quote = None;
+
+    let record = IntentCheckRecord {
+        test_name: test.test_name.clone(),
+        declared_intent: test.intent.clone(),
+        issue_asks_for_behaviour: false,
+        reason: verdict.reason.clone(),
+        evidence,
+    };
+    let event = IntentRelabel {
+        test_name: test.test_name.clone(),
+        from_intent: test.intent.clone(),
+        to_intent: TestIntent::BehaviorPreservation,
+        reason: format!(
+            "the issue does not ask for {:?} at the asserted input: {}",
+            test.intent, verdict.reason
+        ),
+    };
+    (demoted, Some(event), Some(record))
+}
+
+/// Audit a whole batch.
+pub async fn audit_tests_intent(
+    cfg: &LlmConfig,
+    issue_text: &str,
+    original_source: &str,
+    tests: &[GeneratedTest],
+) -> (
+    Vec<GeneratedTest>,
+    Vec<IntentRelabel>,
+    Vec<IntentCheckRecord>,
+) {
+    let mut audited = Vec::with_capacity(tests.len());
+    let mut relabels = Vec::new();
+    let mut records = Vec::new();
+    for test in tests {
+        let (updated, relabel, record) =
+            audit_test_intent(cfg, issue_text, original_source, test).await;
+        audited.push(updated);
+        if let Some(relabel) = relabel {
+            relabels.push(relabel);
+        }
+        if let Some(record) = record {
+            records.push(record);
+        }
+    }
+    (audited, relabels, records)
+}
+
 /// Whitespace-collapsed, markdown-free view of issue text for quote matching.
 ///
 /// [VANTA-WHY] Issues wrap identifiers in markdown backticks, so an Attacker
@@ -482,82 +773,16 @@ fn quote_names_literal(quote: &str, literal: &str) -> bool {
     false
 }
 
-pub fn relabel_test_to_issue_scope(
-    test: &GeneratedTest,
-    issue_text: &str,
-) -> (GeneratedTest, Option<IntentRelabel>) {
-    if matches!(test.intent, TestIntent::BehaviorPreservation) {
-        return (test.clone(), None);
-    }
-
-    let normalized_issue = normalize_issue_text(issue_text);
-    let normalized_quote = test
-        .issue_quote
-        .as_deref()
-        .map(normalize_issue_text)
-        .filter(|quote| !quote.is_empty());
-
-    let quote_in_issue = normalized_quote
-        .as_deref()
-        .is_some_and(|quote| normalized_issue.contains(quote));
-
-    // The quote must also be ABOUT the behaviour under test. Presence alone is
-    // not endorsement.
-    let anchors = asserted_input_literals(&test.test_source);
-    let quote_names_input = normalized_quote.as_deref().is_some_and(|quote| {
-        anchors.is_empty() || anchors.iter().any(|a| quote_names_literal(quote, a))
-    });
-
-    if quote_in_issue && quote_names_input {
-        return (test.clone(), None);
-    }
-
-    let reason = match (test.issue_quote.as_deref().map(str::trim), quote_in_issue) {
-        (Some("") | None, _) => format!(
-            "intent {:?} requires an issue_quote that appears in the issue text; no usable quote was provided",
-            test.intent
-        ),
-        (Some(_), false) => format!(
-            "intent {:?} requires an issue_quote that appears in the issue text; quote not found: {:?}",
-            test.intent,
-            test.issue_quote.as_deref().unwrap_or_default()
-        ),
-        (Some(_), true) => format!(
-            "intent {:?} requires an issue_quote that names the behaviour under test; quote does not mention any asserted input {:?}",
-            test.intent, anchors
-        ),
-    };
-
-    let mut relabeled = test.clone();
-    relabeled.intent = TestIntent::BehaviorPreservation;
-    relabeled.issue_quote = None;
-
-    (
-        relabeled,
-        Some(IntentRelabel {
-            test_name: test.test_name.clone(),
-            from_intent: test.intent.clone(),
-            to_intent: TestIntent::BehaviorPreservation,
-            reason,
-        }),
-    )
-}
-
-pub fn relabel_tests_to_issue_scope(
-    tests: &[GeneratedTest],
-    issue_text: &str,
-) -> (Vec<GeneratedTest>, Vec<IntentRelabel>) {
-    let mut relabeled_tests = Vec::with_capacity(tests.len());
-    let mut events = Vec::new();
-    for test in tests {
-        let (updated, event) = relabel_test_to_issue_scope(test, issue_text);
-        relabeled_tests.push(updated);
-        if let Some(event) = event {
-            events.push(event);
-        }
-    }
-    (relabeled_tests, events)
-}
+// [VANTA-WHY] There is deliberately NO deterministic relabel rule here any more.
+// The quote-substring check (`relabel_test_to_issue_scope`) used to be the RULE:
+// a non-preservation label survived iff its `issue_quote` appeared in the issue
+// and named an asserted input. Sheriffing the label that way was still a lexical
+// test pretending to be a semantic one — it can only ask whether a string
+// appears, never whether the issue ASKS FOR the behaviour — and its own
+// "anchored" case passed a quote that forbade the change it authorised. The
+// substring evidence survives as `QuoteEvidence` on every `IntentCheckRecord`
+// (a LOGGED FIELD, for readers and for re-analysis), while the decision is made
+// by the patch-blind `attacker_check_intent` audit.
 
 #[cfg(test)]
 mod tests {
@@ -577,9 +802,11 @@ mod tests {
         }
     }
 
+    // ---- quote evidence (RECORDED, never the rule) --------------------------
+
     #[test]
-    fn non_preservation_test_without_issue_quote_is_relabelled() {
-        let (test, event) = relabel_test_to_issue_scope(
+    fn quote_evidence_reports_a_missing_quote() {
+        let evidence = observe_quote_evidence(
             &generated(
                 TestIntent::FeatureAcceptance,
                 "def test_boundary():\n    assert shipping_band(500) == \"light\"\n",
@@ -587,16 +814,16 @@ mod tests {
             ),
             FIXTURE_ISSUE,
         );
-        assert_eq!(test.intent, TestIntent::BehaviorPreservation);
-        assert!(test.issue_quote.is_none());
-        assert_eq!(event.unwrap().from_intent, TestIntent::FeatureAcceptance);
+        assert!(!evidence.quote_present);
+        assert!(!evidence.quote_in_issue);
+        assert_eq!(evidence.asserted_inputs, vec!["500".to_string()]);
     }
 
     /// The exact failure the fixture matrix produced: a verbatim issue sentence
-    /// that argues AGAINST the label, accepted by presence alone.
+    /// that argues AGAINST the label. The evidence must make that visible.
     #[test]
-    fn verbatim_quote_that_does_not_name_the_asserted_input_is_relabelled() {
-        let (test, event) = relabel_test_to_issue_scope(
+    fn quote_evidence_shows_a_verbatim_quote_that_misses_the_asserted_input() {
+        let evidence = observe_quote_evidence(
             &generated(
                 TestIntent::FeatureAcceptance,
                 "def test_boundary():\n    assert shipping_band(500) == \"light\"\n",
@@ -606,22 +833,21 @@ mod tests {
             ),
             FIXTURE_ISSUE,
         );
-        assert_eq!(
-            test.intent,
-            TestIntent::BehaviorPreservation,
-            "a quote about another threshold must not authorise the 500g behaviour"
-        );
-        let event = event.expect("relabel must be recorded");
+        assert!(evidence.quote_present);
         assert!(
-            event.reason.contains("does not mention any asserted input"),
-            "got {}",
-            event.reason
+            evidence.quote_in_issue,
+            "the quote really is verbatim in the issue — which is exactly why a \
+             substring check is not an endorsement"
+        );
+        assert!(
+            !evidence.quote_names_asserted_input,
+            "the quote is about other thresholds, not the asserted 500g input"
         );
     }
 
     #[test]
-    fn quote_naming_a_neighbouring_input_is_not_enough() {
-        let (test, _) = relabel_test_to_issue_scope(
+    fn quote_evidence_marks_a_neighbouring_input_as_unmatched() {
+        let evidence = observe_quote_evidence(
             &generated(
                 TestIntent::FeatureAcceptance,
                 "def test_boundary():\n    assert shipping_band(500) == \"light\"\n",
@@ -629,42 +855,34 @@ mod tests {
             ),
             FIXTURE_ISSUE,
         );
-        assert_eq!(test.intent, TestIntent::BehaviorPreservation);
+        assert!(evidence.quote_in_issue);
+        assert!(!evidence.quote_names_asserted_input);
     }
 
-    /// A legitimate intent survives, even though the Attacker dropped the
-    /// markdown backticks when quoting.
+    /// A quote that does name the asserted input is recorded as anchored, even
+    /// though the Attacker dropped the markdown backticks.
     #[test]
-    fn quote_naming_the_asserted_input_keeps_intent_without_backticks() {
-        let (test, event) = relabel_test_to_issue_scope(
-            &generated(
-                TestIntent::BugReproduction,
-                "def test_boundary():\n    assert shipping_band(1000) == \"standard\"\n",
-                Some("shipping_band(1000) should return \"standard\", not \"heavy\"."),
-            ),
-            FIXTURE_ISSUE,
-        );
-        assert_eq!(test.intent, TestIntent::BugReproduction);
-        assert!(event.is_none(), "got {:?}", event.map(|e| e.reason));
-    }
-
-    #[test]
-    fn quote_naming_the_asserted_input_keeps_intent_with_backticks() {
-        let (test, event) = relabel_test_to_issue_scope(
-            &generated(
-                TestIntent::BugReproduction,
-                "def test_boundary():\n    assert shipping_band(1000) == \"standard\"\n",
-                Some("`shipping_band(1000)` should return `\"standard\"`, not `\"heavy\"`."),
-            ),
-            FIXTURE_ISSUE,
-        );
-        assert_eq!(test.intent, TestIntent::BugReproduction);
-        assert!(event.is_none(), "got {:?}", event.map(|e| e.reason));
+    fn quote_evidence_accepts_a_quote_without_backticks() {
+        for quote in [
+            "shipping_band(1000) should return \"standard\", not \"heavy\".",
+            "`shipping_band(1000)` should return `\"standard\"`, not `\"heavy\"`.",
+        ] {
+            let evidence = observe_quote_evidence(
+                &generated(
+                    TestIntent::BugReproduction,
+                    "def test_boundary():\n    assert shipping_band(1000) == \"standard\"\n",
+                    Some(quote),
+                ),
+                FIXTURE_ISSUE,
+            );
+            assert!(evidence.quote_in_issue, "quote={quote}");
+            assert!(evidence.quote_names_asserted_input, "quote={quote}");
+        }
     }
 
     #[test]
-    fn issue_quote_matching_normalizes_whitespace() {
-        let (test, event) = relabel_test_to_issue_scope(
+    fn quote_evidence_matching_normalizes_whitespace() {
+        let evidence = observe_quote_evidence(
             &generated(
                 TestIntent::FeatureAcceptance,
                 "def test_boundary():\n    assert shipping_band(1000) == \"standard\"\n",
@@ -672,15 +890,15 @@ mod tests {
             ),
             "shipping_band(1000)\nshould return \"standard\" and not \"heavy\"",
         );
-        assert_eq!(test.intent, TestIntent::FeatureAcceptance);
-        assert!(event.is_none());
+        assert!(evidence.quote_in_issue);
+        assert!(evidence.quote_names_asserted_input);
     }
 
-    /// A test with no literal call arguments cannot be anchored; presence is the
-    /// most the check can ask for, so it must not demote silently.
+    /// A test with no literal call arguments cannot be anchored; the evidence
+    /// must say so rather than claiming the quote matches.
     #[test]
-    fn unanchorable_test_falls_back_to_presence_check() {
-        let (test, event) = relabel_test_to_issue_scope(
+    fn quote_evidence_reports_an_unanchorable_test() {
+        let evidence = observe_quote_evidence(
             &generated(
                 TestIntent::FeatureAcceptance,
                 "def test_boundary():\n    assert compute() is not None\n",
@@ -688,8 +906,12 @@ mod tests {
             ),
             "A new compute helper must exist.",
         );
-        assert_eq!(test.intent, TestIntent::FeatureAcceptance);
-        assert!(event.is_none());
+        assert!(evidence.quote_in_issue);
+        assert!(evidence.asserted_inputs.is_empty());
+        assert!(
+            evidence.quote_names_asserted_input,
+            "with nothing to anchor on, presence is all the evidence can report"
+        );
     }
 
     #[test]

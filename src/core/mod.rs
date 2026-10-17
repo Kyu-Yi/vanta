@@ -601,6 +601,13 @@ impl EcrEirSnapshot {
 pub enum GovernorDecision {
     // [VANTA-WHY] All shared-set tests passed on this attempt. Candidate for PR.
     AllTestsPassed,
+    // [VANTA-WHY] A REVIEWED candidate demonstrably failed — a Logic failure, or
+    // a repo-native test that passed before the patch and fails after it. In
+    // review mode the candidate is fixed, so there is nothing to repair: the
+    // answer is no. This is deliberately NOT MaxAttemptsReached. "Found a
+    // regression" and "gave up after N tries" are different claims about the
+    // model, and the PR and the paper both read this field to tell them apart.
+    Rejected,
     // [VANTA-WHY] Reached max attempts (Fixed-N = 4). Stopped without a clean pass.
     MaxAttemptsReached,
     // [VANTA-WHY] Patch failed to apply (changed == false). Cannot continue —

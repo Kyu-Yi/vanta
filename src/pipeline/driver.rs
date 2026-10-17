@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agents::attacker::{
-    AttackerRequest, GeneratedTest, IntentRelabel, attacker_generate_tests,
-    relabel_tests_to_issue_scope,
+    AttackerRequest, GeneratedTest, IntentCheckRecord, attacker_generate_tests,
+    audit_tests_intent,
 };
 use crate::agents::creator::{
     CreatorRequest, creator_generate_patch, split_multi_file_patch, split_patch_into_files,
@@ -43,7 +43,9 @@ use crate::pipeline::bate::run_bate;
 use crate::pipeline::candidate::{CandidatePair, TestCommand};
 use crate::pipeline::diagnostician::diagnose_failure;
 use crate::pipeline::gatekeeper::{Gatekeeper, GatekeeperVerdict};
-use crate::pipeline::governor::{Governor, SharedObservation};
+use crate::pipeline::governor::{
+    AttemptVerdict, Governor, GovernorMode, SharedObservation,
+};
 use crate::pipeline::harness::{self, TestExecutionDetails};
 use crate::pipeline::patch::apply_patch;
 use crate::repo::Repo;
@@ -359,6 +361,18 @@ pub async fn run(
     // Governor's in-memory transitions, because only the rows carry the patch ids
     // that separate a repair transition from a review round.
     let mut metric_rows: Vec<TransitionRow> = Vec::new();
+
+    // [VANTA-WHY] `max_attempts` means two different things and the Governor now
+    // has to be told which. With `--patch` the candidate is FIXED, so an attempt
+    // is another batch of attacks and the cap is ATTACK DEPTH; without it the
+    // Creator writes a new candidate each attempt and the cap is a PATCH BUDGET.
+    // This is the ONLY place the mode is derived, so repair and review cannot
+    // drift apart again.
+    let governor_mode = if config.patch_path.is_some() {
+        GovernorMode::Review
+    } else {
+        GovernorMode::Repair
+    };
     let decision = loop {
         let attempt = governor.current_attempt();
         println!("\n══════════════════════════════════════════════════════════════");
@@ -484,7 +498,11 @@ pub async fn run(
                 benchmark_label: None,
             })?;
 
-            let decision = governor.decide(false, false);
+            let decision = governor.decide(
+                governor_mode,
+                AttemptVerdict::Inconclusive,
+                false,
+            );
             break decision;
         }
         let _ = any_changed; // used implicitly via all_patch_failed
@@ -517,8 +535,19 @@ pub async fn run(
             attacker_generate_tests(&cfg, &attacker_request).await
         })
         .await?;
-        let (attacker_tests, initial_relabels): (Vec<GeneratedTest>, Vec<IntentRelabel>) =
-            relabel_tests_to_issue_scope(&attacker_response.tests, &repo.issue_text);
+        // [VANTA-WHY] The patch-blind intent audit runs here, before BATE: only
+        // an audit that cannot see the patch can tell whether the ISSUE asks for
+        // the behaviour a non-preservation test asserts. An Attacker that read
+        // the patch could always label the patch's own side effect
+        // "FeatureAcceptance" and then pass its own acceptance test. The
+        // quote-substring evidence is recorded, but the audit decides.
+        let (attacker_tests, initial_relabels, initial_intent_checks) = audit_tests_intent(
+            &cfg,
+            &repo.issue_text,
+            &original_concat,
+            &attacker_response.tests,
+        )
+        .await;
         println!("  ✔ Attacker: {} tests", attacker_tests.len());
         for t in &attacker_tests {
             println!("    - {} (intent={:?})", t.test_name, t.intent);
@@ -534,6 +563,7 @@ pub async fn run(
             benchmark_instance: None,
             benchmark_label: None,
         })?;
+        log_intent_checks(&mut session_log, &session_id, &patch_attempt_id, &testing_iteration_id, "attacker.generate", &initial_intent_checks)?;
         for relabel in &initial_relabels {
             session_log.append(SessionRecord {
                 session_id: session_id.clone(),
@@ -578,6 +608,7 @@ pub async fn run(
         let bate_report = bate_run.report;
         let valid_tests: Vec<GeneratedTest> = bate_run.valid_tests;
         let bate_relabels = bate_run.relabel_events;
+        let bate_intent_checks = bate_run.intent_checks;
         let discard_rate = if attacker_tests.is_empty() {
             0.0
         } else {
@@ -605,6 +636,7 @@ pub async fn run(
             benchmark_instance: None,
             benchmark_label: None,
         })?;
+        log_intent_checks(&mut session_log, &session_id, &patch_attempt_id, &testing_iteration_id, "attacker.revise", &bate_intent_checks)?;
         for relabel in &bate_relabels {
             session_log.append(SessionRecord {
                 session_id: session_id.clone(),
@@ -650,7 +682,11 @@ pub async fn run(
                     scrapped_names
                 ));
             }
-            let decision = governor.decide(false, true);
+            let decision = governor.decide(
+                governor_mode,
+                AttemptVerdict::Inconclusive,
+                true,
+            );
             if decision != GovernorDecision::Continue {
                 break decision;
             }
@@ -708,6 +744,70 @@ pub async fn run(
         let ruff_new = patch_ruff > base_ruff;
         let mypy_new = patch_mypy > base_mypy;
         println!("  Static: ruff_new={ruff_new}, mypy_new={mypy_new}");
+
+        // ---- 5b. Native suite gate — the repo's OWN tests ----
+        // [VANTA-WHY] Generated tests depend on what the Attacker sampled; the
+        // repo's own suite does not. A test that passes on the original and
+        // fails on the patch is a regression even when no generated test covers
+        // that input. This is its own `native_suite` section — not part of the
+        // shared set, never counted in EIR/ECR — because it is not a transition
+        // measurement.
+        println!("\n▌ NATIVE suite: repo's own tests (original vs patch)...");
+        let native_original = harness::run_native_suite(&original_concat, &test_cmd).await;
+        let native_patched = harness::run_native_suite(&patched_concat, &test_cmd).await;
+        let native_regressions =
+            harness::native_regressions(&native_original.tests, &native_patched.tests);
+        let native_regression = !native_regressions.is_empty();
+        println!(
+            "  Native: original ran={} ({} tests), patched ran={} ({} tests), {} regression(s)",
+            native_original.ran,
+            native_original.tests.len(),
+            native_patched.ran,
+            native_patched.tests.len(),
+            native_regressions.len()
+        );
+        session_log.append(SessionRecord {
+            session_id: session_id.clone(),
+            patch_attempt_id: Some(patch_attempt_id.clone()),
+            testing_iteration_id: Some(testing_iteration_id.clone()),
+            test_id: None,
+            phase: "native_suite.summary".to_string(),
+            summary: format!(
+                "ran_original={} ran_patched={} original_tests={} patched_tests={} regressions={}",
+                native_original.ran,
+                native_patched.ran,
+                native_original.tests.len(),
+                native_patched.tests.len(),
+                native_regressions.len()
+            ),
+            timestamp: now_iso(),
+            benchmark_instance: None,
+            benchmark_label: None,
+        })?;
+        for (nodeid, original_result) in &native_original.tests {
+            let patched_result = native_patched
+                .tests
+                .iter()
+                .find(|(n, _)| n == nodeid)
+                .map(|(_, r)| r);
+            // [VANTA-WHY] A native test already failing on the original is
+            // RECORDED, not blocking: the patch did not break it.
+            session_log.append(SessionRecord {
+                session_id: session_id.clone(),
+                patch_attempt_id: Some(patch_attempt_id.clone()),
+                testing_iteration_id: Some(testing_iteration_id.clone()),
+                test_id: Some(fresh_test_id()),
+                phase: format!("native_suite.test[{nodeid}]"),
+                summary: format!(
+                    "original={original_result:?} patched={:?} regression={}",
+                    patched_result,
+                    native_regressions.iter().any(|n| n == nodeid)
+                ),
+                timestamp: now_iso(),
+                benchmark_instance: None,
+                benchmark_label: None,
+            })?;
+        }
 
         // ---- 6. Diagnostician + build evidence ----
         println!("\n▌ DIAGNOSTICIAN: classifying failures...");
@@ -892,7 +992,11 @@ pub async fn run(
         let all_passed = patched_results
             .values()
             .all(|details| details.result == TestResult::Passed);
-        let governor_decision = governor.decide(all_passed, true);
+        // [VANTA-WHY] The Governor needs three-way evidence, not a bool. In review
+        // mode a Logic failure is a REJECTION; an Infrastructure-only round is
+        // not a finding at all and must never be reported as one.
+        let verdict = attempt_verdict(all_passed, &patched_classes, native_regression);
+        let governor_decision = governor.decide(governor_mode, verdict, true);
         let decision = if harness_collapsed {
             let next = collapse_decision(
                 harness_collapse_streak,
@@ -918,16 +1022,48 @@ pub async fn run(
         } else {
             governor_decision
         };
+        let mut failing_names: Vec<String> = attempt_evidence
+            .iter()
+            .filter(|e| e.outcome != VerificationOutcome::VerifiedWithinBounds)
+            .map(|e| e.test_name.clone())
+            .collect();
+        // [VANTA-WHY] A native-suite regression is a failing test too: when the
+        // generated tests all pass, the rejection is otherwise empty and the
+        // reader cannot tell which repo test the patch broke.
+        failing_names.extend(native_regressions.iter().cloned());
         if config.patch_path.is_some() {
-            // [VANTA-WHY] The rows ARE recorded here, but they measure attack
-            // depth against an unchanged candidate, not a patch transition. They
-            // are excluded from EIR/ECR by `from != to` on the patch ids rather
-            // than by not being written at all.
-            println!(
-                "\n▌ GOVERNOR: decision={:?}, review_round={} (candidate unchanged; rows recorded as attack depth, excluded from EIR/ECR by from_patch_attempt_id == to_patch_attempt_id)",
-                decision,
-                attempt + 1
-            );
+            // [VANTA-WHY] These rows measure attack depth against an UNCHANGED
+            // candidate, not a patch transition, so they are excluded from
+            // EIR/ECR by `from_patch_attempt_id == to_patch_attempt_id`. But on a
+            // round-1 stop there ARE no rows at all: a comparison needs two
+            // attempts, so a terminal first round records nothing. Printing
+            // "rows recorded" there sent the reader looking for a file the run
+            // never wrote.
+            if persisted_transitions == 0 {
+                println!(
+                    "\n▌ GOVERNOR: decision={:?}, review_round={} (no transition rows written — this round ended the review, and a transition needs two attempts)",
+                    decision,
+                    attempt + 1
+                );
+            } else {
+                println!(
+                    "\n▌ GOVERNOR: decision={:?}, review_round={} ({} transition row(s) recorded as attack depth, excluded from EIR/ECR by from_patch_attempt_id == to_patch_attempt_id)",
+                    decision,
+                    attempt + 1,
+                    persisted_transitions
+                );
+            }
+            if decision == GovernorDecision::Rejected {
+                println!(
+                    "  ✖ REJECTED — the candidate fails {} test(s): {}",
+                    failing_names.len(),
+                    if failing_names.is_empty() {
+                        "(classified by the repo's own suite)".to_string()
+                    } else {
+                        failing_names.join(", ")
+                    }
+                );
+            }
         } else {
             // The SAME function the M5 analysis layer runs over the on-disk rows,
             // so the live number and the paper's number cannot drift apart.
@@ -1008,6 +1144,15 @@ pub async fn run(
                 final_patched_files = Some(patched_files);
                 break decision;
             }
+            GovernorDecision::Rejected => {
+                // [VANTA-WHY] A review-mode rejection is a finding, not a budget
+                // outcome: the candidate demonstrably fails. It is recorded with
+                // the candidate attached so the failing tests can be read back
+                // from the evidence, and it never reaches the Gatekeeper — there
+                // is nothing to approve.
+                final_patched_files = Some(patched_files);
+                break decision;
+            }
             GovernorDecision::PatchApplicationFailed => {
                 break decision;
             }
@@ -1043,6 +1188,31 @@ pub async fn run(
     println!("\n══════════════════════════════════════════════════════════════");
     println!("  FINAL: {:?}", decision);
     println!("══════════════════════════════════════════════════════════════");
+
+    // [VANTA-WHY] "Fixed at attempt 1" is its own number, not a rate. A repair
+    // that passes on the first candidate has no N→N+1 transition, so ECR/EIR
+    // cannot see it by construction. Reporting it separately tells a reader what
+    // share of defects the rates actually cover.
+    let attempts_run = attempt_patch_ids.len();
+    let fixed_at_attempt_1 = decision == GovernorDecision::AllTestsPassed && attempts_run == 1;
+    session_log.append(SessionRecord {
+        session_id: session_id.clone(),
+        patch_attempt_id: attempt_patch_ids.last().cloned(),
+        testing_iteration_id: None,
+        test_id: None,
+        phase: "run.summary".to_string(),
+        summary: format!(
+            "attempts_run={} fixed_at_attempt_1={} final_decision={:?}",
+            attempts_run, fixed_at_attempt_1, decision
+        ),
+        timestamp: now_iso(),
+        benchmark_instance: None,
+        benchmark_label: None,
+    })?;
+    println!(
+        "  • attempts_run={} fixed_at_attempt_1={} — a repair with no N→N+1 transition is outside ECR/EIR by construction",
+        attempts_run, fixed_at_attempt_1
+    );
 
     // ---- Gatekeeper (only if all tests passed) ----
     if decision == GovernorDecision::AllTestsPassed {
@@ -1273,6 +1443,72 @@ fn collapse_decision(streak: u32, governor_allows_retry: bool) -> GovernorDecisi
     }
 }
 
+// [VANTA-WHY] The Governor's three-way verdict is computed here, once, from the
+// attempt's evidence. Only a Logic-class failure is a finding about the
+// candidate: it is the one class the Diagnostician can attribute to the code
+// (Spec §7). Static failures are the Gatekeeper's own concern and already block
+// approval on its path, and Infrastructure / Unknown mean we could not get clean
+// evidence — reporting either as a rejection would claim the model was wrong
+// when the environment was. A repo-native regression (`native_suite`) is a real
+// finding even though it is not part of the shared set, so it is passed in
+// separately.
+fn attempt_verdict(
+    all_passed: bool,
+    failure_classes: &[Option<FailureClass>],
+    native_regression: bool,
+) -> AttemptVerdict {
+    if native_regression
+        || failure_classes
+            .iter()
+            .any(|c| c.as_ref() == Some(&FailureClass::Logic))
+    {
+        AttemptVerdict::Rejected
+    } else if all_passed {
+        AttemptVerdict::Passed
+    } else {
+        AttemptVerdict::Inconclusive
+    }
+}
+
+/// Append one `intent.check[…]` record per audited test.
+///
+/// [VANTA-WHY] The verdict is logged for EVERY non-preservation test — kept or
+/// demoted — so a run's log proves the patch-blind check ran and what it
+/// decided. The quote-substring outcome rides along as evidence a reader can
+/// re-analyse; it is deliberately not what decided the label.
+fn log_intent_checks(
+    session_log: &mut SessionLog,
+    session_id: &SessionId,
+    patch_attempt_id: &PatchAttemptId,
+    testing_iteration_id: &crate::session::TestingIterationId,
+    source: &str,
+    checks: &[IntentCheckRecord],
+) -> Result<(), io::Error> {
+    for check in checks {
+        session_log.append(SessionRecord {
+            session_id: session_id.clone(),
+            patch_attempt_id: Some(patch_attempt_id.clone()),
+            testing_iteration_id: Some(testing_iteration_id.clone()),
+            test_id: Some(fresh_test_id()),
+            phase: format!("intent.check[{}]", check.test_name),
+            summary: format!(
+                "source={source} declared={:?} issue_asks_for_behaviour={} quote_present={} quote_in_issue={} quote_names_asserted_input={} asserted_inputs=[{}] reason={}",
+                check.declared_intent,
+                check.issue_asks_for_behaviour,
+                check.evidence.quote_present,
+                check.evidence.quote_in_issue,
+                check.evidence.quote_names_asserted_input,
+                check.evidence.asserted_inputs.join(","),
+                check.reason
+            ),
+            timestamp: now_iso(),
+            benchmark_instance: None,
+            benchmark_label: None,
+        })?;
+    }
+    Ok(())
+}
+
 fn now_iso() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1284,10 +1520,11 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collapse_decision, harness_infrastructure_collapse, patch_attempt_id_for_patch,
-        stable_patch_fingerprint,
+        attempt_verdict, collapse_decision, harness_infrastructure_collapse,
+        patch_attempt_id_for_patch, stable_patch_fingerprint,
     };
     use crate::core::{FailureClass, GovernorDecision};
+    use crate::pipeline::governor::AttemptVerdict;
 
     #[test]
     fn first_harness_collapse_retries_once() {
@@ -1355,5 +1592,56 @@ mod tests {
         let second = patch_attempt_id_for_patch("diff --git a/foo.py b/foo.py\n+print('bye')\n");
 
         assert_ne!(first.as_str(), second.as_str());
+    }
+
+    // ---- the three-way verdict -------------------------------------------------
+    //
+    // [VANTA-WHY] These pin that an environment fault is never reported as a
+    // finding about the candidate. "Found a regression" and "could not get clean
+    // evidence" must not collapse into the same decision.
+
+    #[test]
+    fn a_logic_failure_is_a_rejection() {
+        assert_eq!(
+            attempt_verdict(false, &[Some(FailureClass::Logic)], false),
+            AttemptVerdict::Rejected
+        );
+    }
+
+    #[test]
+    fn an_infrastructure_only_round_is_inconclusive_not_a_rejection() {
+        assert_eq!(
+            attempt_verdict(
+                false,
+                &[Some(FailureClass::Infrastructure), Some(FailureClass::Unknown)],
+                false
+            ),
+            AttemptVerdict::Inconclusive,
+            "a timeout says nothing about the candidate, so it must not reject it"
+        );
+    }
+
+    #[test]
+    fn a_static_only_round_is_inconclusive() {
+        assert_eq!(
+            attempt_verdict(false, &[Some(FailureClass::Static)], false),
+            AttemptVerdict::Inconclusive,
+            "Static is the Gatekeeper's own gate; it is not a Logic-class finding here"
+        );
+    }
+
+    #[test]
+    fn a_clean_round_is_a_pass() {
+        assert_eq!(attempt_verdict(true, &[], false), AttemptVerdict::Passed);
+    }
+
+    #[test]
+    fn a_native_suite_regression_rejects_even_when_the_generated_tests_pass() {
+        assert_eq!(
+            attempt_verdict(true, &[], true),
+            AttemptVerdict::Rejected,
+            "the repo's own suite failing on the patch is a regression the generated \
+             tests did not happen to cover"
+        );
     }
 }

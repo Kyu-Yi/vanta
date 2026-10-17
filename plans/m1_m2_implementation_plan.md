@@ -200,3 +200,74 @@ Set `VANTA_LOG_LEVEL=trace` to see everything. Default `info` is clean enough fo
 | Scope creep into M3 (repair loop, Gatekeeper, PR) | Hard boundary: M2 runs the shared driver with a one-attempt budget, so it stops at Diagnostician output + session log. At N=1 the Governor halts after the first attempt and no PR is opened, so M2 needs no Governor-free special case — it is the same loop, configured differently. What stays M3-only is the multi-attempt repair loop and the GitHub PR. |
 | Memory-limit regression coverage | Deferred. The small pure-Python end-to-end target will not exercise sandbox memory pressure, so a dedicated driver-level regression for memory-limit handling comes after the clean end-to-end run rather than being rushed into this slice. |
 | Network isolation on subprocess is impossible on macOS | Honest documentation (Spec §7). The subprocess backend is the fast path for trusted benchmark repos. Shuru is the real boundary. We never claim subprocess = sandbox. |
+
+---
+
+## M3 Addendum — Review-Mode Stop Rule, Intent Audit, Native Suite Gate
+
+The M3 repair loop and `--patch` review mode are configured through the same
+shared `driver.rs`. These are the deliberate decisions behind the M3 behaviours
+that are not obvious from M2 alone. They are recorded here because this is the
+project's plan doc, and because each one is a choice a future change could
+silently reverse.
+
+### 1. `max_attempts` means two different things — and that is deliberate
+
+- **Repair mode** (Creator-driven, no `--patch`): attempt N+1 is a NEW patch.
+  An attempt that passes every shared-set test is finished business, so the loop
+  stops at once (`AllTestsPassed`). The cap only bounds how many patches the
+  Creator may burn. **This stop-on-pass behaviour is unchanged and is a
+  deliberate decision** — in repair mode the goal is to reach a passing patch,
+  so continuing past one wastes Creator calls with no measurement benefit.
+- **Review mode** (`--patch`): the candidate is FIXED, so attempt N+1 is a NEW
+  batch of attacks against the same code — the cap is ATTACK DEPTH, not a patch
+  budget. A candidate that passes round k gets round k+1 (the accumulated shared
+  set plus a new batch that avoids the earlier tests) up to `max_attempts`; the
+  loop stops early ONLY on a rejection. A candidate that survives the whole depth
+  is the approval (`AllTestsPassed`).
+- Why: stopping at the first passing round in review mode threw the requested
+  depth away. On the `toy_calc` fixture that is exactly how a bad patch survived
+  — round 1's batch sampled inputs the patch did not touch, and the round that
+  would have sampled the changed input was never run.
+
+### 2. `Rejected` is a finding; `MaxAttemptsReached` is a budget outcome
+
+In review mode a candidate that demonstrably fails (a Logic-class failure, or a
+repo-native regression) yields `GovernorDecision::Rejected`, listing the failing
+tests — NOT `MaxAttemptsReached`. When the PR and the paper read that field,
+"found a regression" and "gave up" must be distinguishable. `MaxAttemptsReached`
+remains for the case where the depth was spent without a clean pass (e.g. the
+rounds were Inconclusive because the evidence was Infrastructure).
+
+### 3. The intent audit is patch-blind by construction
+
+The Attacker writes tests FROM the patch, so it could always relabel a
+patch-introduced behaviour change as `FeatureAcceptance` — which BATE permits to
+fail on the baseline — and approve itself. The fix is a separate
+`temperature: 0.0` LLM call (`attacker_check_intent`) that sees only the issue,
+the original source and the test. `IntentCheckRequest` has **no patch field and
+no patched-source field**, so there is nothing to leak; the integration test
+`intent_check_request_never_contains_the_patch` asserts this on the stub
+server's received body. The audit is demote-only and fail-closed (an unavailable
+auditor demotes). The deterministic quote-substring result
+(`QuoteEvidence`) is a LOGGED field only — `intent.check[...]` records it for
+re-analysis — and is never the rule.
+
+### 4. The native suite gate is a separate section, not a transition measurement
+
+The repo's own suite runs on the original and on the patched tree. A test that
+passes on the original and fails on the patch is a regression and the patch is
+rejected; tests already failing on the original are recorded, not blocking. It
+is logged as its own `native_suite` section (one `native_suite.summary` plus one
+`native_suite.test[<nodeid>]` per test). It is NOT part of the shared set and is
+never counted in EIR/ECR, because it is not an N→N+1 transition.
+
+### 5. Round-1 terminals write zero transition rows
+
+A transition needs two attempts. A repair/review that terminates on round 1 has
+no N→N+1 comparison, so the row store stays empty; the review-mode console line
+says so explicitly rather than pointing at a file the run never wrote. ECR/EIR
+therefore only describe defects that needed two or more attempts, so
+"fixed at attempt 1" is reported as its own number (`run.summary
+fixed_at_attempt_1=…`) next to the rates, so a reader can see what share of
+defects the rates actually cover.

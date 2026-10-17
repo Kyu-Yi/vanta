@@ -39,7 +39,7 @@ struct StubLlmServer {
 
 impl StubLlmServer {
     fn start(attacker_response_json: &str) -> Self {
-        Self::start_scripted(None, attacker_response_json, None, None, None, None)
+        Self::start_scripted(None, attacker_response_json, None, None, None, None, None)
     }
 
     fn start_with_creator_and_attacker(
@@ -53,12 +53,31 @@ impl StubLlmServer {
             None,
             None,
             None,
+            None,
         )
     }
 
-    fn start_with_attacker_revision(
+    /// As `start`, but the patch-blind intent audit answers with a scripted
+    /// verdict instead of the default "the issue asks for this behaviour".
+    fn start_with_intent_audit(attacker_response_json: &str, audit_response_json: &str) -> Self {
+        Self::start_scripted(
+            None,
+            attacker_response_json,
+            None,
+            None,
+            None,
+            None,
+            Some(audit_response_json),
+        )
+    }
+
+    /// As `start_with_intent_audit`, but the Attacker also has a scripted answer
+    /// for a revision request — a demoted test that no longer passes the
+    /// baseline goes back to the Attacker, so both scripts are needed at once.
+    fn start_with_intent_audit_and_revision(
         attacker_response_json: &str,
         revise_response_json: &str,
+        audit_response_json: &str,
     ) -> Self {
         Self::start_scripted(
             None,
@@ -67,6 +86,7 @@ impl StubLlmServer {
             None,
             None,
             None,
+            Some(audit_response_json),
         )
     }
 
@@ -78,7 +98,7 @@ impl StubLlmServer {
         attacker_response_json: &str,
         on_request: Option<Box<dyn Fn(usize) + Send>>,
     ) -> Self {
-        Self::start_scripted(None, attacker_response_json, None, None, on_request, None)
+        Self::start_scripted(None, attacker_response_json, None, None, on_request, None, None)
     }
 
     /// Drop the TCP connection (no HTTP response) for every request whose index
@@ -86,7 +106,15 @@ impl StubLlmServer {
     /// mid-run — a stand-in for a `HarnessFailure` abort, which happens before
     /// the end-of-run session log is written.
     fn start_aborting(attacker_response_json: &str, abort_at: usize) -> Self {
-        Self::start_scripted(None, attacker_response_json, None, None, None, Some(abort_at))
+        Self::start_scripted(
+            None,
+            attacker_response_json,
+            None,
+            None,
+            None,
+            Some(abort_at),
+            None,
+        )
     }
 
     fn start_scripted(
@@ -96,6 +124,7 @@ impl StubLlmServer {
         simplify_response_json: Option<&str>,
         on_request: Option<Box<dyn Fn(usize) + Send>>,
         abort_at: Option<usize>,
+        intent_audit_response_json: Option<&str>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -126,6 +155,8 @@ impl StubLlmServer {
             simplify_response_json.map(|json| serde_json::from_str(json).unwrap());
         let creator_value: Option<serde_json::Value> =
             creator_response_json.map(|json| serde_json::from_str(json).unwrap());
+        let intent_audit_value: Option<serde_json::Value> =
+            intent_audit_response_json.map(|json| serde_json::from_str(json).unwrap());
 
         let join = thread::spawn(move || {
             while !stop_clone.load(Ordering::SeqCst) {
@@ -189,6 +220,8 @@ impl StubLlmServer {
                         let body = String::from_utf8_lossy(&request[header_end.unwrap_or(0)..]);
                         let request_kind = if body.contains("You are Vanta Creator") {
                             "creator"
+                        } else if body.contains("You are Vanta Intent Auditor") {
+                            "intent_audit"
                         } else if body.contains("write adversarial tests") {
                             "generate"
                         } else if body.contains("failed BATE") {
@@ -219,6 +252,18 @@ impl StubLlmServer {
                                 .unwrap_or_else(|| serde_json::json!({"patch_text":"def add(a, b):\n    return a + b\n","explanation":"noop","files_touched":["calc.py"],"confidence":0.1}))
                         } else if request_kind == "generate" {
                             attacker_value.clone()
+                        } else if request_kind == "intent_audit" {
+                            // Default keeps existing non-preservation labels: the
+                            // audit says the issue asks for the behaviour, so a
+                            // test that bypassed the old deterministic rule still
+                            // survives its label. A test that wants a demotion
+                            // scripts `start_with_intent_audit`.
+                            intent_audit_value.clone().unwrap_or_else(|| {
+                                serde_json::json!({
+                                    "issue_asks_for_behaviour": true,
+                                    "reason": "stub default: the issue asks for this behaviour",
+                                })
+                            })
                         } else if request_kind == "revise" {
                             revise_value.clone().unwrap_or_else(default_single_test)
                         } else if request_kind == "simplify" {
@@ -306,6 +351,17 @@ const WRONG_BEHAVIOUR_PATCH: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.
 /// Infrastructure reroute only catches harness failures, and never swallows a
 /// real syntax error the model actually introduced.
 const SYNTAX_ERROR_PATCH: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a + b\n+    return a + b +\n";
+
+/// Behaviour-PRESERVING patch: it changes calc.py (so `apply_patch` reports the
+/// file as changed and the run is a real review of a real candidate) without
+/// touching what `add` returns. In review mode a candidate that PASSES round k
+/// is attacked again in round k+1, so a multi-round run needs a candidate that
+/// survives every round — this is that candidate.
+const PRESERVING_PATCH: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,3 @@\n def add(a, b):\n+    \"\"\"Return the sum of two numbers.\"\"\"\n     return a + b\n";
+
+/// The tree `PRESERVING_PATCH` produces from `write_test_repo`'s `calc.py`.
+const PRESERVING_PATCHED_SOURCE: &str =
+    "def add(a, b):\n    \"\"\"Return the sum of two numbers.\"\"\"\n    return a + b\n";
 
 const THREE_SIGNAL_TESTS: &str = r#"{"tests":[
         {
@@ -404,6 +460,21 @@ const CREATOR_SYNTAX_ERROR_RESPONSE: &str = r#"{
     "confidence":0.2
 }"#;
 
+/// Original tree for the native-suite gate: an extra function the generated
+/// tests never touch, so the patch can break it invisibly to them.
+const NATIVE_REPO_SOURCE: &str =
+    "def add(a, b):\n    return a + b\n\n\ndef scale(x, factor):\n    return x * factor\n";
+
+/// The repository's OWN test. It passes on the original tree; the generated
+/// stub tests only ever assert on `add`, so nothing they produce will notice
+/// when the patch breaks `scale`.
+const NATIVE_REPO_TEST: &str =
+    "from calc import scale\n\n\ndef test_scale_doubles():\n    assert scale(3, 2) == 6\n";
+
+/// Leaves `add` alone and breaks `scale`, so only the repo's own suite can see it.
+const NATIVE_BREAKING_PATCH: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -5,2 +5,2 @@\n def scale(x, factor):\n-    return x * factor\n+    return x * factor + 1\n";
+
+
 fn metric_row_from_observed_outcome(
     to_result: TestResult,
     to_failure_class: FailureClass,
@@ -428,31 +499,47 @@ fn metric_row_from_observed_outcome(
     }
 }
 
+/// The issue text every stub run is given. It carries one quotable sentence per
+/// intent the stub fixtures declare, plus a verbatim sentence that names NO
+/// input.
+const TEST_ISSUE_TEXT: &str = concat!(
+    "Verify a candidate patch for calc.add.\n",
+    "The issue expects a bug-reproduction probe asserting add(2, 3) == 6.\n",
+    "The issue expects a feature-acceptance probe asserting add(2, 3) == 7.\n",
+    "Existing behavior add(2, 3) == 5 must be preserved unless the issue says otherwise.\n",
+    // [VANTA-WHY] A verbatim, quotable issue sentence that names NO input.
+    // It is the shape the real fixture produced: the Attacker quoted a
+    // genuine line ("without changing the existing behavior at the other
+    // thresholds") that forbids the very change its test encoded, and a
+    // presence-only quote check admitted it.
+    "Please fix that boundary bug without changing the existing behavior at the other thresholds.\n",
+);
+
 fn write_test_repo(root: &Path, patch_text: &str) -> (PathBuf, PathBuf, PathBuf) {
+    write_test_repo_with(root, "def add(a, b):\n    return a + b\n", patch_text, None)
+}
+
+/// As `write_test_repo`, but the original source and an optional file under
+/// `tests/` are caller-supplied. The repo's own test needs both: a test that
+/// passes on the original tree only exists if the original tree defines what it
+/// calls, and a patch that breaks it must not be one the generated tests cover.
+fn write_test_repo_with(
+    root: &Path,
+    source: &str,
+    patch_text: &str,
+    native_test: Option<&str>,
+) -> (PathBuf, PathBuf, PathBuf) {
     let repo_dir = root.join("repo");
     fs::create_dir_all(&repo_dir).unwrap();
-    fs::write(
-        repo_dir.join("calc.py"),
-        "def add(a, b):\n    return a + b\n",
-    )
-    .unwrap();
+    fs::write(repo_dir.join("calc.py"), source).unwrap();
     let issue_path = repo_dir.join("issue.md");
-    fs::write(
-        &issue_path,
-        concat!(
-            "Verify a candidate patch for calc.add.\n",
-            "The issue expects a bug-reproduction probe asserting add(2, 3) == 6.\n",
-            "The issue expects a feature-acceptance probe asserting add(2, 3) == 7.\n",
-            "Existing behavior add(2, 3) == 5 must be preserved unless the issue says otherwise.\n",
-            // [VANTA-WHY] A verbatim, quotable issue sentence that names NO input.
-            // It is the shape the real fixture produced: the Attacker quoted a
-            // genuine line ("without changing the existing behavior at the other
-            // thresholds") that forbids the very change its test encoded, and a
-            // presence-only quote check admitted it.
-            "Please fix that boundary bug without changing the existing behavior at the other thresholds.\n",
-        ),
-    )
-    .unwrap();
+    fs::write(&issue_path, TEST_ISSUE_TEXT).unwrap();
+
+    if let Some(test) = native_test {
+        let tests_dir = repo_dir.join("tests");
+        fs::create_dir_all(&tests_dir).unwrap();
+        fs::write(tests_dir.join("test_core.py"), test).unwrap();
+    }
 
     let patch_path = root.join("candidate.patch");
     fs::write(&patch_path, patch_text).unwrap();
@@ -652,20 +739,25 @@ fn run_creator_mode_with_output(
 fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
     let _serial = serial_run();
     let workspace = TempDir::new().unwrap();
+    // [VANTA-WHY] In review mode `--max-attempts` is ATTACK DEPTH, and a round
+    // that finds a Logic failure ends the run at once. So a run that spans three
+    // rounds needs a candidate that SURVIVES every round — a behaviour-preserving
+    // patch and a preservation-only test set — not a bad patch that would be
+    // rejected on round 1.
     let (_repo_dir, _issue_path, patch_path) =
-        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
-    let server = StubLlmServer::start(THREE_SIGNAL_TESTS);
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
 
     let status = run_patch_mode(workspace.path(), &patch_path, &server);
 
     assert!(
-        !status.success(),
-        "the deliberately bad patch should not be approved"
+        status.success(),
+        "a candidate that survives the whole attack depth is the approval"
     );
     assert_eq!(
         server.request_count(),
         3,
-        "expected one attacker call per attempt"
+        "expected one attacker call per review round"
     );
 
     let records = read_session_records(&find_session_log(workspace.path()));
@@ -748,13 +840,15 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
     );
     assert_eq!(
         fs::read_to_string(debug_dir.join("attempt_1_patched_tree").join("calc.py")).unwrap(),
-        "def add(a, b):\n    return a - b\n"
+        PRESERVING_PATCHED_SOURCE
     );
 
     // The structural checks above prove the tree is well-formed. These prove the
-    // patched tests actually RAN against it: a wrong patch must produce Failed
-    // assertion results, not Error. Error here would mean the harness failed to
-    // import the tree — the exact bug that previously hid behind Static rows.
+    // patched tests actually RAN against it: a candidate that survives review
+    // must produce Passed assertion results, not Error. Error here would mean the
+    // harness failed to import the tree — the exact bug that previously hid
+    // behind Static rows. (The failing-result side of that pair is pinned by
+    // `review_mode_rejects_a_bad_candidate_on_round_one`.)
     let mut patched_result_kinds: Vec<String> = Vec::new();
     for entry in fs::read_dir(&debug_dir).unwrap() {
         let path = entry.unwrap().path();
@@ -765,12 +859,9 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
         }
     }
     assert!(
-        patched_result_kinds.iter().any(|r| r == "Failed"),
-        "the deliberately wrong stub patch must yield Failed patched results; got {patched_result_kinds:?}"
-    );
-    assert!(
-        !patched_result_kinds.iter().any(|r| r == "Error"),
-        "no patched test may Error — Error means the harness failed to produce a runnable tree; got {patched_result_kinds:?}"
+        patched_result_kinds.iter().all(|r| r == "Passed"),
+        "the behaviour-preserving candidate must yield Passed patched results — an Error means the \
+         harness failed to produce a runnable tree; got {patched_result_kinds:?}"
     );
 
     let attempt_start_rows: Vec<_> = records
@@ -807,7 +898,7 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
         .iter()
         .filter(|r| r.phase.starts_with("patched.result["))
         .collect();
-    assert_eq!(patched_result_rows.len(), 15);
+    assert_eq!(patched_result_rows.len(), 5);
 
     let mut per_iteration_counts: Vec<usize> = attempt_start_rows
         .iter()
@@ -824,8 +915,9 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
     per_iteration_counts.sort_unstable();
     assert_eq!(
         per_iteration_counts,
-        vec![3, 6, 6],
-        "the stub repeats the same three test names, so the shared set stabilizes at three unique tests"
+        vec![1, 2, 2],
+        "the stub repeats the same test name, so from round 2 on the shared probe and the freshly \
+         generated one are the same probe: 1 row on round 1, then 2 rows per round"
     );
 
     let unique_patch_ids: std::collections::HashSet<&str> = attempt_start_rows
@@ -838,8 +930,12 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
         "same patch should keep one stable patch_attempt_id"
     );
 
-    // 28 attempt records + the `session.start` run-identity record.
-    assert_eq!(records.len(), 29);
+    // Per round: attempt.start, attacker.summary, bate.summary,
+    // native_suite.summary, one patched.result per test run, and attempt.summary
+    // — 6 on round 1 (one probe) and 7 on rounds 2 and 3 (the shared probe plus
+    // the freshly generated copy of it). Plus the run-level session.start,
+    // run.summary and M3_repair_loop records.
+    assert_eq!(records.len(), 23);
 }
 
 /// The mirror of the import bug.
@@ -909,14 +1005,19 @@ fn syntax_error_patch_is_classified_static_not_infrastructure() {
 fn review_rounds_record_equal_patch_ids_on_every_row() {
     let _serial = serial_run();
     let workspace = TempDir::new().unwrap();
+    // [VANTA-WHY] In review mode a round that finds a Logic failure ends the run
+    // (a rejection is terminal), so only a candidate that SURVIVES every round
+    // reaches rounds 2 and 3 — and only a run that reaches them can record the
+    // 1->2 and 2->3 comparisons this test is about. A behaviour-preserving
+    // candidate plus a preservation-only probe is that candidate.
     let (_repo_dir, _issue_path, patch_path) =
-        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
-    let server = StubLlmServer::start(THREE_SIGNAL_TESTS);
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
 
     let status = run_patch_mode(workspace.path(), &patch_path, &server);
     assert!(
-        !status.success(),
-        "the deliberately bad patch should not be approved"
+        status.success(),
+        "a candidate that survives the whole attack depth is the approval"
     );
     assert_eq!(
         server.request_count(),
@@ -959,8 +1060,11 @@ fn review_rounds_record_equal_patch_ids_on_every_row() {
 fn changing_the_patch_between_rounds_records_a_patch_transition() {
     let _serial = serial_run();
     let workspace = TempDir::new().unwrap();
+    // Patch A must PRESERVE behaviour so round 1 passes and the review continues
+    // to round 2 — a rejection on round 1 is terminal and would leave no
+    // comparison to inspect.
     let (_repo_dir, _issue_path, patch_path) =
-        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
 
     // Fired on the first request — i.e. during attempt 1, after it has already
     // read patch A. Attempt 2 then reads patch B, so 1->2 is a real transition.
@@ -970,7 +1074,7 @@ fn changing_the_patch_between_rounds_records_a_patch_transition() {
             fs::write(&replacement, SYNTAX_ERROR_PATCH).unwrap();
         }
     };
-    let server = StubLlmServer::start_with_hook(THREE_SIGNAL_TESTS, Some(Box::new(hook)));
+    let server = StubLlmServer::start_with_hook(SINGLE_BEHAVIOR_TEST, Some(Box::new(hook)));
 
     let status = run_patch_mode(workspace.path(), &patch_path, &server);
     assert!(!status.success(), "neither candidate should be approved");
@@ -1013,12 +1117,16 @@ fn changing_the_patch_between_rounds_records_a_patch_transition() {
 fn transitions_survive_an_abort_after_attempt_two() {
     let _serial = serial_run();
     let workspace = TempDir::new().unwrap();
+    // [VANTA-WHY] Reaching attempt 2 needs a candidate that passes attempt 1:
+    // a review-mode rejection on round 1 is terminal and would abort on its own
+    // terms, not at the request this test drops. A preserving candidate plus a
+    // preservation-only probe gets the run as far as attempt 3.
     let (_repo_dir, _issue_path, patch_path) =
-        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
 
     // Requests 0 and 1 serve attempts 1 and 2; request 2 is attempt 3's attacker
     // call. Dropping that connection aborts the run before attempt 3 completes.
-    let server = StubLlmServer::start_aborting(THREE_SIGNAL_TESTS, 2);
+    let server = StubLlmServer::start_aborting(SINGLE_BEHAVIOR_TEST, 2);
 
     let status = run_patch_mode(workspace.path(), &patch_path, &server);
     assert!(!status.success(), "an aborted run must not report success");
@@ -1096,21 +1204,33 @@ fn a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped
         "a run whose only test is scrapped must not report success"
     );
 
-    // 1 generation + 3 revisions. Scrapping on the first mismatch — the
-    // regressed behaviour — would leave this at 1.
+    // [VANTA-WHY] Each non-preservation test is audited by the patch-blind
+    // intent check: once for the initial batch and once per revision. With one
+    // BugReproduction test that is 1 generation + 1 audit + 3 (revise + audit)
+    // = 8 LLM calls. Scrapping on the first mismatch — the regressed behaviour —
+    // would leave this at 2 (the generation and its audit).
     assert_eq!(
         server.request_count(),
-        4,
+        8,
         "a test whose baseline contradicts its intent must be sent back to the \
          Attacker for revision (up to 3 times) before being scrapped; \
-         expected 1 generation + 3 revisions = 4 LLM calls"
+         expected 1 generation + 1 batch audit + 3 (revision + revised audit) = 8 LLM calls"
     );
     assert_eq!(
         server.request_kinds(),
-        vec!["generate", "revise", "revise", "revise"],
+        vec![
+            "generate",
+            "intent_audit",
+            "revise",
+            "intent_audit",
+            "revise",
+            "intent_audit",
+            "revise",
+            "intent_audit",
+        ],
         "the regression guard must prove the exact call sequence — one generate, \
-         then three genuine revise calls — so internal parse retries cannot \
-         masquerade as a working revision path"
+         then a patch-blind audit of it, then three genuine revision/audit pairs — \
+         so internal parse retries cannot masquerade as a working revision path"
     );
 
     let records = read_session_records(&find_session_log(workspace.path()));
@@ -1144,19 +1264,25 @@ fn a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped
 /// change. A presence-only quote check admitted it and the bad patch was
 /// approved twice, on both binaries.
 ///
-/// The stub here reproduces that shape: the quote IS verbatim in the issue, and
-/// it names no asserted input. The test must be relabelled to
-/// BehaviorPreservation, fail the original baseline as a mismatch, go back to
-/// the Attacker once, and the revised probe must reject the bad patch as Logic.
+/// The fix is a PATCH-BLIND audit: a separate LLM call sees only the issue, the
+/// original source and the test — never the patch — and answers whether the
+/// issue actually asks for the asserted behaviour. The stub reproduces the
+/// loophole's exact shape: the quote IS verbatim in the issue (so any
+/// presence-only check would have admitted it), yet the audit answers that the
+/// issue does not ask for the change. The test is demoted to
+/// BehaviorPreservation, fails the original baseline as a mismatch, goes back to
+/// the Attacker once, and the revised probe rejects the bad patch as Logic.
 #[test]
 fn patch_written_feature_acceptance_without_valid_issue_quote_is_relabelled_then_rejected() {
     let _serial = serial_run();
     let workspace = TempDir::new().unwrap();
     let (_repo_dir, _issue_path, patch_path) =
         write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
-    let server = StubLlmServer::start_with_attacker_revision(
+    // The audit is what demotes: it answers "the issue does NOT ask for this".
+    let server = StubLlmServer::start_with_intent_audit_and_revision(
         ISSUE_SCOPE_LOOPHOLE_TEST,
         ISSUE_SCOPE_REVISED_PRESERVATION_TEST,
+        r#"{"issue_asks_for_behaviour":false,"reason":"the issue forbids changing the other thresholds"}"#,
     );
 
     let status = run_patch_mode_with(workspace.path(), &patch_path, &server, 1, &[]);
@@ -1164,13 +1290,40 @@ fn patch_written_feature_acceptance_without_valid_issue_quote_is_relabelled_then
         !status.success(),
         "a bad patch must be rejected once its patch-written acceptance test is relabelled honestly"
     );
+    // One generation, one patch-blind audit, one revision. The revised probe is
+    // BehaviourPreservation, so it is not audited (there is nothing to verify).
     assert_eq!(
         server.request_kinds(),
-        vec!["generate", "revise"],
-        "the invalid feature-acceptance test should be relabelled, fail BATE as preservation, and go back once for revision"
+        vec!["generate", "intent_audit", "revise"],
+        "the invalid feature-acceptance test should be audited (and demoted), fail BATE as preservation, and go back once for revision"
     );
 
     let records = read_session_records(&find_session_log(workspace.path()));
+    // The patch-blind audit must have run and decided, and it must have decided
+    // AGAINST the label while the quote evidence still looked admissible — the
+    // whole point being that the substring result is logged, not enforced.
+    let check = records
+        .iter()
+        .find(|r| r.phase == "intent.check[test_patch_written_feature]")
+        .unwrap_or_else(|| {
+            panic!(
+                "the session log must record the patch-blind intent verdict; got phases {:?}",
+                records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        check.summary.contains("issue_asks_for_behaviour=false"),
+        "the audit must decide against the declared intent; got {}",
+        check.summary
+    );
+    assert!(
+        check.summary.contains("quote_present=true")
+            && check.summary.contains("quote_in_issue=true"),
+        "the quote WAS verbatim in the issue, so a presence-only check would have kept \
+         FeatureAcceptance; the demotion must come from the audit; got {}",
+        check.summary
+    );
+
     let relabel = records
         .iter()
         .find(|r| r.phase == "attacker.relabel[test_patch_written_feature]")
@@ -1186,11 +1339,9 @@ fn patch_written_feature_acceptance_without_valid_issue_quote_is_relabelled_then
         "got {}",
         relabel.summary
     );
-    // The quote WAS found in the issue — a presence-only check would have kept
-    // FeatureAcceptance. The relabel must be caused by the input anchor.
     assert!(
-        relabel.summary.contains("does not mention any asserted input"),
-        "the relabel must be triggered by the quote not naming the asserted input, not by an absent quote; got {}",
+        relabel.summary.contains("the issue does not ask for"),
+        "the relabel must carry the audit's reason; got {}",
         relabel.summary
     );
     assert!(
@@ -1205,6 +1356,122 @@ fn patch_written_feature_acceptance_without_valid_issue_quote_is_relabelled_then
             .filter(|r| r.phase == "patched.result[test_patch_written_feature]")
             .map(|r| r.summary.as_str())
             .collect::<Vec<_>>()
+    );
+}
+
+/// The intent audit must never see the patch.
+///
+/// [VANTA-WHY] The whole reason the audit exists is that it is asked from OUTSIDE
+/// the patch: it can only judge whether the ISSUE asks for a behaviour if it does
+/// not read the patch's own answer back as the requirement. This asserts it on
+/// the wire — the bytes the stub server received for the audit request must carry
+/// the ORIGINAL source (positive control) and must NOT carry the patch diff or the
+/// patched source. The audit request body is what a future refactor would leak
+/// into first, silently re-opening the loop the auditor was added to close.
+#[test]
+fn intent_check_request_never_contains_the_patch() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    // The loophole test declares FeatureAcceptance, so exactly one audit runs. The
+    // audit keeps the label here — this test is about the request body, not the
+    // outcome — so the run does not take the revision path.
+    let server = StubLlmServer::start_with_intent_audit(
+        ISSUE_SCOPE_LOOPHOLE_TEST,
+        r#"{"issue_asks_for_behaviour":true,"reason":"stub: keep the label"}"#,
+    );
+
+    let _ = run_patch_mode_with(workspace.path(), &patch_path, &server, 1, &[]);
+
+    let kinds = server.request_kinds();
+    let bodies = server.request_bodies();
+    let audits: Vec<(usize, &str)> = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| kind.as_str() == "intent_audit")
+        .map(|(index, _)| (index, bodies[index].as_str()))
+        .collect();
+    assert_eq!(
+        audits.len(),
+        1,
+        "the single FeatureAcceptance test must be audited exactly once; got kinds {kinds:?}"
+    );
+    for (index, body) in audits {
+        assert!(
+            !body.contains("diff --git") && !body.contains("+++"),
+            "intent audit request {index} must not carry the patch diff; got {body}"
+        );
+        assert!(
+            !body.contains("return a - b"),
+            "intent audit request {index} must not carry the patched source; got {body}"
+        );
+        assert!(
+            body.contains("return a + b"),
+            "the audit must still see the ORIGINAL source, so the assertions above cannot \
+             pass on an empty body; got {body}"
+        );
+    }
+}
+
+/// The repo's OWN test suite is a gate the generated tests cannot substitute for.
+///
+/// [VANTA-WHY] Generated tests only cover what the Attacker sampled. A patch can
+/// break a function no generated test touches and still win every round — on a
+/// real repository that is a bigger hole than any single missed boundary value.
+/// The gate runs the repo's own suite on the ORIGINAL and on the PATCHED tree: a
+/// test that passes on the original and fails on the patch is a regression, and
+/// the patch is rejected. It is recorded as its own `native_suite` section — not
+/// part of the shared set, never counted in EIR/ECR.
+#[test]
+fn a_native_suite_regression_rejects_the_patch_even_when_generated_tests_pass() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    // The generated probe only asserts on `add`; the patch only breaks `scale`.
+    // So the ONLY thing that can reject this patch is the repository's own test.
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        NATIVE_BREAKING_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let status = run_patch_mode_with(workspace.path(), &patch_path, &server, 1, &[]);
+    assert!(
+        !status.success(),
+        "a patch that breaks the repository's own test must be rejected"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let summary = records
+        .iter()
+        .find(|r| r.phase == "native_suite.summary")
+        .expect("the native-suite gate must log its own summary row");
+    assert!(
+        summary.summary.contains("regressions=1"),
+        "the repo's own suite must report the one broken test; got {}",
+        summary.summary
+    );
+    assert!(
+        records.iter().any(|r| r.phase.starts_with("native_suite.test[")
+            && r.summary.contains("regression=true")),
+        "the broken repo test must be recorded as a regression with its own row; got {:?}",
+        records
+            .iter()
+            .filter(|r| r.phase.starts_with("native_suite.test["))
+            .map(|r| r.summary.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let final_row = records
+        .iter()
+        .find(|r| r.phase == "M3_repair_loop")
+        .expect("a final decision row must exist");
+    assert!(
+        final_row.summary.contains("Rejected"),
+        "a native-suite regression is a rejection, not a budget outcome; got {}",
+        final_row.summary
     );
 }
 

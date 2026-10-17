@@ -13,34 +13,46 @@ usage() {
   cat <<'EOF'
 Usage:
   zsh fixtures/toy_calc/run_matrix.sh [all|shuru|subprocess]
+      Run the whole matrix: M3 review bad, M3 review good, M3 repair, M2 review bad.
 
-Runs:
-  - M3 review bad patch
-  - M3 review good patch
-  - M3 repair buggy original
-  - M2 review bad patch
+  zsh fixtures/toy_calc/run_matrix.sh [all|shuru|subprocess] --only <scenario> [--repeat N]
+      Run ONE scenario, optionally N times, and report how many runs REJECTED the
+      candidate. The Attacker is random, so a single outcome says little; --repeat
+      measures a CATCH RATE instead of one coin flip.
+      <scenario> is review_bad, review_good or repair (or the full <binary>:<scenario>).
 
 Each run starts from a fresh copy outside the vanta repo:
-  ~/vanta-runs/toy_calc/<backend>_<binary>_<scenario>/
+  ~/vanta-runs/toy_calc/<backend>_<binary>_<scenario>[_runN]/
 EOF
 }
 
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  usage
-  exit 0
+BACKEND_ARG="all"
+ONLY=""
+REPEAT=1
+while (( $# > 0 )); do
+  case "$1" in
+    --help|-h) usage; exit 0 ;;
+    --only) ONLY="${2:-}"; shift 2 ;;
+    --only=*) ONLY="${1#--only=}"; shift ;;
+    --repeat) REPEAT="${2:-}"; shift 2 ;;
+    --repeat=*) REPEAT="${1#--repeat=}"; shift ;;
+    all|shuru|subprocess) BACKEND_ARG="$1"; shift ;;
+    *) usage; exit 1 ;;
+  esac
+done
+
+if (( REPEAT > 1 )) && [[ -z "$ONLY" ]]; then
+  echo "--repeat needs --only <scenario>: repeating the whole matrix is not what this is for" >&2
+  exit 1
 fi
 
 BACKENDS=()
-case "${1:-all}" in
+case "$BACKEND_ARG" in
   all)
     BACKENDS=("subprocess" "shuru")
     ;;
   shuru|subprocess)
-    BACKENDS=("${1}")
-    ;;
-  *)
-    usage
-    exit 1
+    BACKENDS=("$BACKEND_ARG")
     ;;
 esac
 
@@ -69,22 +81,30 @@ copy_fixture_repo() {
   git -C "$run_dir" commit -qm "Fixture baseline"
 }
 
-run_case() {
+# Run one scenario in a fresh run dir and classify the GOVERNOR decision.
+# Prints one of: rejected | approved | other:<exit-code>.
+# Does NOT call `exit` on a failing binary: a rejection exits non-zero by design,
+# and that is the outcome we are here to count.
+execute_case() {
   local backend="$1"
   local binary="$2"
   local scenario="$3"
   local test_cmd="$4"
-  shift 4
+  local run_dir="$5"
+  local log_path="$6"
 
-  local run_dir="$RUN_ROOT/${backend}_${binary}_${scenario}"
-  local log_path="$LOG_DIR/${backend}_${binary}_${scenario}.log"
   copy_fixture_repo "$run_dir"
 
-  echo
-  echo "==> backend=${backend} binary=${binary} scenario=${scenario}"
-  echo "    repo=${run_dir}"
-  echo "    log=${log_path}"
+  local extra=()
+  case "${binary}:${scenario}" in
+    vanta_m3:review_bad)  extra=(--patch "$run_dir/bad.patch" --max-attempts 3) ;;
+    vanta_m3:review_good) extra=(--patch "$run_dir/good.patch" --max-attempts 3) ;;
+    vanta_m3:repair)      extra=(--max-attempts 3) ;;
+    vanta_m2:review_bad)  extra=(--patch "$run_dir/bad.patch") ;;
+    *) echo "unknown scenario ${binary}/${scenario}" >&2; return 2 ;;
+  esac
 
+  local status=0
   (
     cd "$run_dir"
     VANTA_SANDBOX_BACKEND="$backend" \
@@ -92,9 +112,38 @@ run_case() {
       --repo "$run_dir" \
       --issue "$run_dir/issue.md" \
       --test-cmd "$test_cmd" \
-      "$@"
-  ) 2>&1 | tee "$log_path"
+      "${extra[@]}"
+  ) >"$log_path" 2>&1 || status=$?
+
+  if grep -q "FINAL: Rejected" "$log_path"; then
+    echo "rejected"
+  elif grep -q "FINAL: AllTestsPassed" "$log_path"; then
+    echo "approved"
+  else
+    echo "other:${status}"
+  fi
 }
+
+# Ordered run cases, "<binary>:<scenario>".
+CASES=(
+  "vanta_m3:review_bad"
+  "vanta_m3:review_good"
+  "vanta_m3:repair"
+  "vanta_m2:review_bad"
+)
+
+matches_only() {
+  local case_id="$1"
+  [[ -z "$ONLY" ]] && return 0
+  [[ "$case_id" == "$ONLY" ]] && return 0
+  [[ "${case_id#*:}" == "$ONLY" ]] && return 0
+  return 1
+}
+
+total_rejected=0
+total_approved=0
+total_other=0
+total_runs=0
 
 for backend in "${BACKENDS[@]}"; do
   if [[ "$backend" == "subprocess" ]]; then
@@ -103,17 +152,50 @@ for backend in "${BACKENDS[@]}"; do
     TEST_CMD="python3 -m pytest -q"
   fi
 
-  run_case "$backend" vanta_m3 review_bad "$TEST_CMD" \
-    --patch "$RUN_ROOT/${backend}_vanta_m3_review_bad/bad.patch" \
-    --max-attempts 3
+  for case_id in "${CASES[@]}"; do
+    matches_only "$case_id" || continue
+    binary="${case_id%%:*}"
+    scenario="${case_id#*:}"
 
-  run_case "$backend" vanta_m3 review_good "$TEST_CMD" \
-    --patch "$RUN_ROOT/${backend}_vanta_m3_review_good/good.patch" \
-    --max-attempts 3
+    rejected=0
+    approved=0
+    other=0
 
-  run_case "$backend" vanta_m3 repair "$TEST_CMD" \
-    --max-attempts 3
+    for i in $(seq 1 "$REPEAT"); do
+      if (( REPEAT > 1 )); then
+        run_dir="$RUN_ROOT/${backend}_${binary}_${scenario}_run${i}"
+        log_path="$LOG_DIR/${backend}_${binary}_${scenario}.run${i}.log"
+      else
+        run_dir="$RUN_ROOT/${backend}_${binary}_${scenario}"
+        log_path="$LOG_DIR/${backend}_${binary}_${scenario}.log"
+      fi
 
-  run_case "$backend" vanta_m2 review_bad "$TEST_CMD" \
-    --patch "$RUN_ROOT/${backend}_vanta_m2_review_bad/bad.patch"
+      echo
+      echo "==> backend=${backend} binary=${binary} scenario=${scenario} run=${i}/${REPEAT}"
+      echo "    repo=${run_dir}"
+      echo "    log=${log_path}"
+
+      outcome="$(execute_case "$backend" "$binary" "$scenario" "$TEST_CMD" "$run_dir" "$log_path")"
+      case "$outcome" in
+        rejected) rejected=$((rejected + 1)) ;;
+        approved) approved=$((approved + 1)) ;;
+        *)        other=$((other + 1)) ;;
+      esac
+      echo "    outcome=${outcome}"
+    done
+
+    total_rejected=$((total_rejected + rejected))
+    total_approved=$((total_approved + approved))
+    total_other=$((total_other + other))
+    total_runs=$((total_runs + REPEAT))
+
+    echo
+    echo "==> ${binary} ${scenario} @ ${backend}: rejected ${rejected}/${REPEAT}, approved ${approved}, other ${other}"
+  done
 done
+
+if (( REPEAT > 1 )); then
+  echo
+  echo "==> SUMMARY: rejected ${total_rejected}/${total_runs}, approved ${total_approved}, other ${total_other}"
+fi
+

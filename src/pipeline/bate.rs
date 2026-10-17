@@ -17,7 +17,7 @@
 // ============================================================================
 
 use crate::agents::attacker::{
-    GeneratedTest, IntentRelabel, attacker_revise_test, relabel_test_to_issue_scope,
+    GeneratedTest, IntentCheckRecord, IntentRelabel, attacker_revise_test, audit_test_intent,
 };
 use crate::config::LlmConfig;
 use crate::core::{TestIntent, TestResult};
@@ -172,6 +172,9 @@ pub struct BateRun {
     pub report: BateReport,
     pub valid_tests: Vec<GeneratedTest>,
     pub relabel_events: Vec<IntentRelabel>,
+    /// One record per non-preservation test the reviver produced, so a run's log
+    /// shows the patch-blind intent audit ran on revised tests too.
+    pub intent_checks: Vec<IntentCheckRecord>,
 }
 
 /// Run the BATE phase over a batch of Attacker tests against the ORIGINAL code.
@@ -188,6 +191,7 @@ pub async fn run_bate(
     let mut valid_tests: Vec<GeneratedTest> = Vec::new();
     let mut scrapped_tests: Vec<(String, String)> = Vec::new();
     let mut relabel_events: Vec<IntentRelabel> = Vec::new();
+    let mut intent_checks: Vec<IntentCheckRecord> = Vec::new();
 
     for test in tests {
         // [VANTA-WHY] Spec §7 "Flaky tests" row: run the baseline twice; a test
@@ -246,10 +250,19 @@ pub async fn run_bate(
                         .await
                         {
                             Ok(revised) => {
-                                let (revised, relabel) =
-                                    relabel_test_to_issue_scope(&revised, issue_text);
+                                // [VANTA-WHY] The reviver can change what a test
+                                // declares, so the revised test is audited too: a
+                                // revision that claims FeatureAcceptance for a
+                                // behaviour the issue never asked for must be
+                                // demoted before it re-enters the baseline check.
+                                let (revised, relabel, record) =
+                                    audit_test_intent(cfg, issue_text, original_source, &revised)
+                                        .await;
                                 if let Some(relabel) = relabel {
                                     relabel_events.push(relabel);
+                                }
+                                if let Some(record) = record {
+                                    intent_checks.push(record);
                                 }
                                 current_test = revised;
                             }
@@ -285,6 +298,7 @@ pub async fn run_bate(
         },
         valid_tests,
         relabel_events,
+        intent_checks,
     }
 }
 

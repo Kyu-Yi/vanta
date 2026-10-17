@@ -185,6 +185,128 @@ pub async fn run_single_test_with_timeout(
 }
 
 // ============================================================================
+// Native suite — the repo's OWN tests, run as a gate
+// ============================================================================
+//
+// [VANTA-WHY] Every other function here runs ONE generated test file. The
+// repo's own suite is a different question: it does not depend on what the
+// Attacker happened to sample, so a patch that breaks an existing repo test
+// fails here even when no generated test covers that input. It is NOT part of
+// the shared set and never contributes to EIR/ECR — it is a separate
+// `native_suite` section — because it is not a transition measurement.
+//
+// [VANTA-WHY] Per-test IDs, not one aggregate verdict: "pass on original, fail
+// on patch" is a regression; "already failing on original" is not (the patch
+// did not break it). A single pass/fail bit cannot express that difference.
+pub struct NativeSuiteReport {
+    /// nodeid → outcome. Empty when the suite could not be run at all.
+    pub tests: Vec<(String, TestResult)>,
+    /// False when no report was produced (missing pytest/plugin, timeout,
+    /// crash). A gate that could not run must never be read as "no regressions".
+    pub ran: bool,
+}
+
+/// Run the repository's own test suite against a source tree.
+///
+/// The source tree includes the repo's `tests/`, so pytest discovers them from
+/// the sandbox root; no generated test file is written.
+pub async fn run_native_suite(source: &str, test_cmd: &TestCommand) -> NativeSuiteReport {
+    let sb = match Backend::spawn().await {
+        Ok(b) => b,
+        Err(_) => {
+            return NativeSuiteReport {
+                tests: Vec::new(),
+                ran: false,
+            }
+        }
+    };
+    if write_source_files(sb.root(), source).is_err() {
+        sb.destroy();
+        return NativeSuiteReport {
+            tests: Vec::new(),
+            ran: false,
+        };
+    }
+    let _ = write_conftest(sb.root());
+
+    // No test-file argument: pytest collects the repo's own tests from rootdir.
+    let mut cmd = test_cmd.as_cmd_vec();
+    cmd.push("--json-report".to_string());
+    cmd.push("--json-report-file=report.json".to_string());
+    cmd.push("-q".to_string());
+    let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+    let exec = sb
+        .execute(&cmd_refs, Path::new(""), test_timeout_secs())
+        .await;
+    let report = match exec {
+        Ok(e) => parse_native_report(&sb.root().join("report.json"), &e),
+        Err(_) => NativeSuiteReport {
+            tests: Vec::new(),
+            ran: false,
+        },
+    };
+    sb.destroy();
+    report
+}
+
+/// Parse a pytest JSON report into per-test outcomes.
+fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuiteReport {
+    if exec.timed_out {
+        return NativeSuiteReport {
+            tests: Vec::new(),
+            ran: false,
+        };
+    }
+    let Ok(text) = fs::read_to_string(report_path) else {
+        return NativeSuiteReport {
+            tests: Vec::new(),
+            ran: false,
+        };
+    };
+    let Ok(report) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return NativeSuiteReport {
+            tests: Vec::new(),
+            ran: false,
+        };
+    };
+    let mut tests = Vec::new();
+    if let Some(arr) = report["tests"].as_array() {
+        for t in arr {
+            let nodeid = t["nodeid"].as_str().unwrap_or_default().to_string();
+            let result = match t["outcome"].as_str() {
+                Some("passed") => TestResult::Passed,
+                // "failed" = assertion failure; "error" = exception/setup error.
+                Some("failed") | Some("error") => TestResult::Failed,
+                // A skipped test is neither a pass nor a failure signal.
+                _ => continue,
+            };
+            if !nodeid.is_empty() {
+                tests.push((nodeid, result));
+            }
+        }
+    }
+    NativeSuiteReport { tests, ran: true }
+}
+
+/// Nodeids that PASS on the original and FAIL on the patch — the repo's own
+/// suite reporting a regression. Tests already failing on the original are
+/// excluded: the patch did not break them.
+pub fn native_regressions(
+    original: &[(String, TestResult)],
+    patched: &[(String, TestResult)],
+) -> Vec<String> {
+    let orig: HashMap<&str, &TestResult> =
+        original.iter().map(|(n, r)| (n.as_str(), r)).collect();
+    patched
+        .iter()
+        .filter(|(n, r)| {
+            *r == TestResult::Failed && orig.get(n.as_str()).copied() == Some(&TestResult::Passed)
+        })
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
+// ============================================================================
 // Source-tree helpers — write the concatenated source into a sandbox
 // ============================================================================
 

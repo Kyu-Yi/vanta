@@ -32,6 +32,52 @@ use crate::core::{
 // V1 generates history with fixed-N; V2 replaces with live EIR/ECR condition.
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 4;
 
+// ============================================================================
+// GovernorMode — what `max_attempts` MEANS for this run
+// ============================================================================
+//
+// [VANTA-WHY] The same number means two different things depending on whether
+// the candidate can change. In REPAIR mode attempt N+1 is a NEW patch, so an
+// attempt that passes is finished business and the loop stops at once; the cap
+// only bounds how many patches the Creator may burn. In REVIEW mode (--patch)
+// the candidate is FIXED, so attempt N+1 is a NEW batch of attacks against the
+// same code — the cap is ATTACK DEPTH, not a patch budget. Stopping on the first
+// passing round there throws away the depth that was asked for, which is exactly
+// how a bad patch survived: round 1's batch happened to sample inputs the patch
+// did not touch, and the second round that would have sampled the changed input
+// was never run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernorMode {
+    /// Creator-driven repair: stop the moment every shared-set test passes.
+    Repair,
+    /// `--patch` review: keep attacking a fixed candidate for `max_attempts`
+    /// rounds; stop early only on a rejection.
+    Review,
+}
+
+// ============================================================================
+// AttemptVerdict — what the patched run showed about the candidate
+// ============================================================================
+//
+// [VANTA-WHY] `all_shared_passed: bool` was not enough to state the stop rule.
+// "Not everything passed" lumps together "the candidate is wrong" (a Logic
+// failure, or a repo-native regression) and "we could not get clean evidence"
+// (Infrastructure / Unknown). Only the first is a rejection; the second must not
+// be reported as one, because an environment fault is not a finding about the
+// model. The three-way verdict keeps that distinction out of the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptVerdict {
+    /// Every test passed.
+    Passed,
+    /// The candidate demonstrably fails: at least one Logic-class failure, or a
+    /// repo-native test that passed on the original and fails on the candidate.
+    Rejected,
+    /// Failures exist but none is attributable to the candidate (Infrastructure,
+    /// Unknown or Static only). Not enough evidence to reject, and nothing
+    /// passed. The loop keeps going if it has budget.
+    Inconclusive,
+}
+
 /// One observation of a test inside the fixed shared set.
 ///
 /// [VANTA-WHY] `test_source` is carried rather than a precomputed hash so the
@@ -246,11 +292,26 @@ impl Governor {
         }
     }
 
-    /// Decide whether to continue the repair loop.
-    /// Returns the GovernorDecision for the current state.
+    /// Decide whether to continue the loop.
+    ///
+    /// [VANTA-WHY] The stop rule is MODE-DEPENDENT, and getting that wrong is how
+    /// a bad patch survived review. `max_attempts` bounds two different things:
+    ///
+    ///   Repair  — a budget of PATCHES. Attempt N is a brand-new candidate, so a
+    ///             clean pass ends the run immediately; there is nothing left to
+    ///             repair and burning more attempts would only invite churn.
+    ///   Review  — a budget of ATTACKS against ONE fixed candidate. A clean pass
+    ///             on round 1 is not a finding: the round's batch is a sample, and
+    ///             an untouched input is exactly what the sampler missed. The
+    ///             correct behaviour is to keep attacking to the requested depth
+    ///             and stop early ONLY on a rejection.
+    ///
+    /// `verdict` is three-way (see `AttemptVerdict`) so an environment fault is
+    /// never reported as a finding about the candidate.
     pub fn decide(
         &mut self,
-        all_shared_passed: bool,
+        mode: GovernorMode,
+        verdict: AttemptVerdict,
         patch_changed: bool,
     ) -> GovernorDecision {
         if !patch_changed {
@@ -258,20 +319,43 @@ impl Governor {
             return GovernorDecision::PatchApplicationFailed;
         }
 
-        if all_shared_passed {
-            info!(attempt = self.current_attempt, "Governor: all shared tests passed — stopping (AllTestsPassed)");
-            return GovernorDecision::AllTestsPassed;
+        match mode {
+            GovernorMode::Repair => {
+                if verdict == AttemptVerdict::Passed {
+                    info!(attempt = self.current_attempt,
+                        "Governor: all shared tests passed — stopping (AllTestsPassed)");
+                    return GovernorDecision::AllTestsPassed;
+                }
+            }
+            GovernorMode::Review => {
+                if verdict == AttemptVerdict::Rejected {
+                    info!(attempt = self.current_attempt,
+                        "Governor: candidate demonstrably failed — stopping (Rejected)");
+                    return GovernorDecision::Rejected;
+                }
+            }
         }
 
         self.current_attempt += 1;
         if self.current_attempt >= self.max_attempts {
+            // [VANTA-WHY] In review mode, spending the whole attack depth without
+            // a rejection IS the approval — the candidate survived every round we
+            // were willing to run. Reporting MaxAttemptsReached here would say
+            // "gave up", which is the opposite of what happened and is exactly the
+            // distinction the `Rejected` variant exists to preserve.
+            if mode == GovernorMode::Review && verdict == AttemptVerdict::Passed {
+                info!(attempt = self.current_attempt, depth = self.max_attempts,
+                    "Governor: attack depth exhausted with no rejection — candidate passed \
+                     all rounds (AllTestsPassed)");
+                return GovernorDecision::AllTestsPassed;
+            }
             info!(attempt = self.current_attempt, max = self.max_attempts,
                 "Governor: reached max attempts — stopping (MaxAttemptsReached)");
             return GovernorDecision::MaxAttemptsReached;
         }
 
-        debug!(attempt = self.current_attempt, max = self.max_attempts,
-            "Governor: continuing repair loop");
+        debug!(attempt = self.current_attempt, max = self.max_attempts, ?mode,
+            "Governor: continuing loop");
         GovernorDecision::Continue
     }
 
@@ -312,18 +396,28 @@ mod tests {
         obs(name, source, TestResult::Passed, None)
     }
 
+    /// Advance one REPAIR attempt whose evidence was neither a clean pass nor a
+    /// demonstrated failure (the plain "keep going" case the transition tests need).
+    fn advance_repair(g: &mut Governor) {
+        assert_eq!(
+            g.decide(GovernorMode::Repair, AttemptVerdict::Inconclusive, true),
+            GovernorDecision::Continue,
+            "an attempt that is not a clean pass must keep the repair loop going"
+        );
+    }
+
     #[test]
     fn test_stop_on_all_passed() {
         let mut g = Governor::new(4);
         g.record_shared_results(vec![passed("t1", "def test_t1():\n    assert True\n")]);
-        let decision = g.decide(true, true);
+        let decision = g.decide(GovernorMode::Repair, AttemptVerdict::Passed, true);
         assert_eq!(decision, GovernorDecision::AllTestsPassed);
     }
 
     #[test]
     fn test_stop_on_patch_failed() {
         let mut g = Governor::new(4);
-        let decision = g.decide(false, false);
+        let decision = g.decide(GovernorMode::Repair, AttemptVerdict::Inconclusive, false);
         assert_eq!(decision, GovernorDecision::PatchApplicationFailed);
     }
 
@@ -332,9 +426,83 @@ mod tests {
         let mut g = Governor::new(2);
         let src = "def test_t1():\n    assert False\n";
         g.record_shared_results(vec![failed("t1", src, FailureClass::Logic)]);
-        assert_eq!(g.decide(false, true), GovernorDecision::Continue);
+        assert_eq!(
+            g.decide(GovernorMode::Repair, AttemptVerdict::Inconclusive, true),
+            GovernorDecision::Continue
+        );
         g.record_shared_results(vec![failed("t1", src, FailureClass::Logic)]);
-        assert_eq!(g.decide(false, true), GovernorDecision::MaxAttemptsReached);
+        assert_eq!(
+            g.decide(GovernorMode::Repair, AttemptVerdict::Inconclusive, true),
+            GovernorDecision::MaxAttemptsReached
+        );
+    }
+
+    // ---- review mode: `max_attempts` is ATTACK DEPTH ------------------------
+    //
+    // [VANTA-WHY] These two tests pin the exact defect that let a bad patch
+    // through: a clean round 1 used to end the run, so the second batch of
+    // attacks — the one that would have sampled the input the patch changed —
+    // never ran.
+
+    #[test]
+    fn review_mode_runs_every_round_on_a_passing_candidate() {
+        let mut g = Governor::new(3);
+        let src = "def test_t1():\n    assert shipping_band(1000) == \"standard\"\n";
+        // Three clean rounds. The first two must NOT stop: each is one batch of
+        // attacks, and a batch is a sample, not a verdict.
+        for round in 1..=2 {
+            g.record_shared_results(vec![passed("t1", src)]);
+            assert_eq!(
+                g.decide(GovernorMode::Review, AttemptVerdict::Passed, true),
+                GovernorDecision::Continue,
+                "review round {round} passed, but the requested attack depth is 3 — \
+                 a clean sample is not an approval"
+            );
+        }
+        // The last round spends the depth and is the approval.
+        g.record_shared_results(vec![passed("t1", src)]);
+        assert_eq!(
+            g.decide(GovernorMode::Review, AttemptVerdict::Passed, true),
+            GovernorDecision::AllTestsPassed,
+            "surviving the whole attack depth without a rejection is the approval"
+        );
+    }
+
+    #[test]
+    fn review_mode_stops_early_on_a_rejection() {
+        let mut g = Governor::new(5);
+        let src = "def test_t1():\n    assert shipping_band(500) == \"standard\"\n";
+        g.record_shared_results(vec![passed("t1", src)]);
+        assert_eq!(
+            g.decide(GovernorMode::Review, AttemptVerdict::Passed, true),
+            GovernorDecision::Continue
+        );
+        // Round 2 finds the regression. Depth is 5, but a rejection is terminal.
+        g.record_shared_results(vec![failed("t1", src, FailureClass::Logic)]);
+        assert_eq!(
+            g.decide(GovernorMode::Review, AttemptVerdict::Rejected, true),
+            GovernorDecision::Rejected,
+            "a demonstrated failure ends the review at once — there is nothing to repair"
+        );
+    }
+
+    #[test]
+    fn review_mode_reports_an_unresolvable_round_as_max_attempts_not_a_rejection() {
+        let mut g = Governor::new(2);
+        let src = "def test_t1():\n    assert shipping_band(500) == \"standard\"\n";
+        // [VANTA-WHY] Infrastructure/Static-only failures are not findings about
+        // the candidate. Reviewing such a round to the point of exhaustion must
+        // read "gave up", never "found a regression".
+        g.record_shared_results(vec![failed("t1", src, FailureClass::Static)]);
+        assert_eq!(
+            g.decide(GovernorMode::Review, AttemptVerdict::Inconclusive, true),
+            GovernorDecision::Continue
+        );
+        g.record_shared_results(vec![failed("t1", src, FailureClass::Static)]);
+        assert_eq!(
+            g.decide(GovernorMode::Review, AttemptVerdict::Inconclusive, true),
+            GovernorDecision::MaxAttemptsReached
+        );
     }
 
     /// The Governor's job is to RECORD transitions; the counting rule itself
@@ -350,7 +518,7 @@ mod tests {
             failed("t1", t1, FailureClass::Logic),
             passed("t2", t2),
         ]);
-        g.decide(false, true);
+        advance_repair(&mut g);
 
         // attempt 1: t1 passed (a correction), t2 failed (an introduction)
         g.record_shared_results(vec![
@@ -389,7 +557,7 @@ mod tests {
             failed("t1", t1, FailureClass::Logic),
             passed("t2", t2),
         ]);
-        g.decide(false, true);
+        advance_repair(&mut g);
 
         // attempt 1: only t1 ran (t2 not observed this attempt)
         g.record_shared_results(vec![passed("t1", t1)]);
@@ -476,7 +644,7 @@ mod tests {
         let mut g = Governor::new(4);
         let src = "def test_t1():\n    assert add(2, 3) == 5\n";
         g.record_shared_results(vec![passed("t1", src)]);
-        g.decide(false, true);
+        advance_repair(&mut g);
         g.record_shared_results(vec![failed("t1", src, FailureClass::Logic)]);
 
         let t = &g.transitions()[0];
@@ -493,7 +661,7 @@ mod tests {
         // A test generated on the first attempt joins the shared set for the
         // NEXT comparison — but it was never part of S^(0).
         g.fold_new_tests(&[passed("later", later)]);
-        g.decide(false, true);
+        advance_repair(&mut g);
         g.record_shared_results(vec![
             failed("first", first, FailureClass::Logic),
             passed("later", later),
@@ -522,7 +690,7 @@ mod tests {
         };
 
         g.record_shared_results(vec![oracle_probe(TestResult::Passed, None)]);
-        g.decide(false, true);
+        advance_repair(&mut g);
         g.record_shared_results(vec![oracle_probe(TestResult::Failed, Some(FailureClass::Logic))]);
 
         let t = &g.transitions()[0];
@@ -542,7 +710,7 @@ mod tests {
         oracle.evidence_source = EvidenceSource::BenchmarkOracle;
 
         g.record_shared_results(vec![oracle]);
-        g.decide(false, true);
+        advance_repair(&mut g);
         // The next attempt does not observe the probe at all.
         g.record_shared_results(vec![]);
 
@@ -575,7 +743,7 @@ mod tests {
         let b = "def test_b():\n    assert add(4, 4) == 8\n";
 
         g.record_shared_results(vec![passed("a", a), passed("b", b)]);
-        g.decide(false, true);
+        advance_repair(&mut g);
         g.record_shared_results(vec![
             failed("a", a, FailureClass::Logic),
             passed("b", b),
@@ -589,7 +757,7 @@ mod tests {
         );
 
         let first_id = rows[0].shared_set_id.clone();
-        g.decide(false, true);
+        advance_repair(&mut g);
         g.record_shared_results(vec![
             failed("a", a, FailureClass::Logic),
             passed("b", b),
@@ -608,14 +776,14 @@ mod tests {
         let c = "def test_c():\n    assert add(0, 0) == 0\n";
 
         g.record_shared_results(vec![passed("a", a)]);
-        g.decide(false, true);
+        advance_repair(&mut g);
         g.record_shared_results(vec![failed("a", a, FailureClass::Logic)]);
         let before = g.transitions().last().unwrap().shared_set_id.clone();
 
         // A test generated this attempt joins the set for the NEXT comparison,
         // so the next comparison is on a strictly larger question set.
         g.fold_new_tests(&[passed("c", c)]);
-        g.decide(false, true);
+        advance_repair(&mut g);
         g.record_shared_results(vec![
             failed("a", a, FailureClass::Logic),
             passed("c", c),

@@ -40,6 +40,36 @@ struct SessionStartMeta {
     vanta_dirty: bool,
 }
 
+/// Fail early if the session-recorded tested commit cannot be used to open a PR.
+pub async fn preflight_open_pr(
+    repo_path: &Path,
+    session_log_path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let token = std::env::var("VANTA_GITHUB_TOKEN").map_err(|_| {
+        "VANTA_GITHUB_TOKEN is not set (this path never falls back to gh login)"
+    })?;
+    let repo_slug = repo_slug(repo_path)?;
+    let (owner, repo) = repo_slug
+        .split_once('/')
+        .ok_or("repository slug must be owner/repo")?;
+    let meta = read_session_start_meta(session_log_path)?;
+    let octocrab = github_client(&token)?;
+
+    let _: Value = octocrab
+        .get(
+            format!("/repos/{owner}/{repo}/git/commits/{}", meta.tested_commit),
+            None::<&()>,
+        )
+        .await
+        .map_err(|err| {
+            format!(
+                "tested_commit={} from session.start does not exist on GitHub repo {owner}/{repo}: {err}",
+                meta.tested_commit
+            )
+        })?;
+    Ok(())
+}
+
 /// Open a PR containing the patched files + accepted tests.
 pub async fn open_pr(
     repo_path: &Path,

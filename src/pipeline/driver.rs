@@ -228,6 +228,7 @@ pub async fn run(
     // edit to any one prompt surfaces in both places rather than drifting.
     let prompt_versions = crate::pipeline::prompt_versions();
     let tested_commit = tested_commit_sha(&config.repo_path);
+    let target_repo_dirty = repo_working_tree_dirty(&config.repo_path).ok();
     let run_mode = if config.patch_path.is_some() {
         "patch_review"
     } else {
@@ -261,7 +262,7 @@ pub async fn run(
         phase: "session.start".to_string(),
         summary: format!(
             "model={} model_version={} prompt_version={} provider={} api_key={} \
-             vanta_version={} vanta_commit={} vanta_dirty={} tested_commit={} requested_backend={} actual_backend={} max_attempts={} \
+             vanta_version={} vanta_commit={} vanta_dirty={} tested_commit={} target_repo_dirty={} requested_backend={} actual_backend={} max_attempts={} \
              baseline_test_timeout_secs={} patched_test_timeout_secs={} test_cmd={} mode={} benchmark_instance={}",
             cfg.model_id,
             std::env::var("VANTA_MODEL_VERSION").unwrap_or_else(|_| "unknown".into()),
@@ -272,6 +273,9 @@ pub async fn run(
             vanta_commit,
             vanta_dirty,
             tested_commit,
+            target_repo_dirty
+                .map(|dirty| if dirty { "true" } else { "false" })
+                .unwrap_or("unknown"),
             requested_backend,
             actual_backend,
             config.max_attempts,
@@ -285,6 +289,17 @@ pub async fn run(
         benchmark_instance: None,
         benchmark_label: None,
     })?;
+    if config.open_pr {
+        require_clean_target_repo_for_open_pr(target_repo_dirty)
+            .map_err(|msg| -> Box<dyn std::error::Error + Send + Sync> { msg.into() })?;
+        crate::pr::preflight_open_pr(
+            &config.repo_path,
+            session_log
+                .sink_path()
+                .ok_or("session log sink path missing for PR preflight")?,
+        )
+        .await?;
+    }
 
     // ---- Build original file map (path -> contents) ----
     // [VANTA-WHY] Spec §7: "The original is a second checkout via git worktree
@@ -1414,6 +1429,39 @@ fn tested_commit_sha(repo_path: &Path) -> String {
     }
 }
 
+fn repo_working_tree_dirty(
+    repo_path: &Path,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["status", "--porcelain"])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "failed to inspect target repo dirty state with `git -C {} status --porcelain`: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+}
+
+fn require_clean_target_repo_for_open_pr(target_repo_dirty: Option<bool>) -> Result<(), String> {
+    match target_repo_dirty {
+        Some(false) => Ok(()),
+        Some(true) => Err(
+            "--open-pr requires a clean target repository working tree; commit or stash the target repo changes first"
+                .to_string(),
+        ),
+        None => Err(
+            "--open-pr requires a git-backed target repository so Vanta can record and validate the tested commit"
+                .to_string(),
+        ),
+    }
+}
+
 fn build_creator_feedback(failed: &[&TestEvidence], ruff_new: bool, mypy_new: bool) -> String {
     let mut fb = String::new();
     fb.push_str("The previous patch failed verification:\n\n");
@@ -1639,7 +1687,8 @@ fn now_iso() -> String {
 mod tests {
     use super::{
         attempt_verdict, collapse_decision, harness_infrastructure_collapse,
-        patch_attempt_id_for_patch, stable_patch_fingerprint,
+        patch_attempt_id_for_patch, require_clean_target_repo_for_open_pr,
+        stable_patch_fingerprint,
     };
     use crate::core::{FailureClass, GovernorDecision};
     use crate::pipeline::governor::AttemptVerdict;
@@ -1761,5 +1810,19 @@ mod tests {
             "the repo's own suite failing on the patch is a regression the generated \
              tests did not happen to cover"
         );
+    }
+
+    #[test]
+    fn open_pr_requires_a_clean_target_repo() {
+        let err = require_clean_target_repo_for_open_pr(Some(true)).unwrap_err();
+        assert!(
+            err.contains("clean target repository working tree"),
+            "dirty target repos must refuse --open-pr, got {err}"
+        );
+    }
+
+    #[test]
+    fn open_pr_accepts_a_clean_target_repo() {
+        assert!(require_clean_target_repo_for_open_pr(Some(false)).is_ok());
     }
 }

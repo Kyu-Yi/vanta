@@ -812,6 +812,11 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
         start.summary
     );
     assert!(
+        start.summary.contains("target_repo_dirty="),
+        "session.start must record whether the target repo working tree was dirty; got {}",
+        start.summary
+    );
+    assert!(
         start.summary.contains("baseline_test_timeout_secs=")
             && start.summary.contains("patched_test_timeout_secs="),
         "session.start must record the effective baseline and patched-side test timeouts; got {}",

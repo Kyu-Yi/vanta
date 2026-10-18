@@ -52,7 +52,7 @@ pub const ATTACKER_PROMPT_VERSION: &str = "4.intent-and-fixture-rules";
 // requires to change. A change to THAT wording changes what a run accepts, so
 // it needs its own tag — otherwise editing the auditor would be logged as "no
 // change" because the Attacker's tag is untouched.
-pub const INTENT_AUDITOR_PROMPT_VERSION: &str = "2.review-context-bundle";
+pub const INTENT_AUDITOR_PROMPT_VERSION: &str = "3.threaded-value-rule";
 
 // ============================================================================
 // AttackerRequest — input to the Attacker agent
@@ -615,6 +615,7 @@ Rules:
 - A test asserting `shipping_band(500) == "light"` is authorised only by an issue sentence that asks for that result at that input. A sentence about a DIFFERENT input does not authorise it.
 - A sentence that forbids changing behaviour ("without changing the existing behaviour at the other thresholds") FORBIDS the change; it never authorises it and never requires one.
 - An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THIS test asserts, not for the issue in general.
+- A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
 - If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
 
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
@@ -1299,6 +1300,25 @@ mod tests {
         assert!(
             ATTACKER_SYSTEM_PROMPT.contains("implement EVERY attribute the code under test touches"),
             "fakes must be told to implement every attribute the code under test reads"
+        );
+    }
+
+    // ---- item 8: the intent auditor's threaded-value rule -------------------
+
+    /// B v1's revised caching test insisted `get_responses_batched` is called
+    /// with exactly the OLD arguments — but the issue was to THREAD the new value
+    /// through that very function. Under the old auditor wording that probe could
+    /// be answered "the issue does not ask for a change", so it landed on the
+    /// preservation label and failed a correct patch. The auditor must be told
+    /// that pinning an internal call the issue rewires REQUIRES a change.
+    #[test]
+    fn the_intent_auditor_is_told_a_pinned_internal_call_requires_a_change() {
+        assert!(
+            INTENT_AUDITOR_SYSTEM_PROMPT.contains("THREADED THROUGH")
+                && INTENT_AUDITOR_SYSTEM_PROMPT
+                    .contains("answer \"issue_requires_change\": true for it"),
+            "the auditor must answer issue_requires_change=true when a preservation probe pins an \
+             internal call the issue threads a new value through"
         );
     }
 

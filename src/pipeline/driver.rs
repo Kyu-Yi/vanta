@@ -985,8 +985,10 @@ pub async fn run(
         // error, and a genuinely new one is always caught. Only the NEW
         // diagnostics reach the Diagnostician, so its Static payload names what
         // the patch introduced — not the repo's pre-existing backlog.
-        let base_static = harness::run_static(&original_concat).await;
-        let patch_static = harness::run_static(&patched_concat).await;
+        let base_static =
+            harness::run_static(&original_concat, &test_cmd, Some(&config.repo_path)).await;
+        let patch_static =
+            harness::run_static(&patched_concat, &test_cmd, Some(&config.repo_path)).await;
         let new_ruff = harness::new_diagnostics(&base_static.ruff, &patch_static.ruff);
         let new_mypy = harness::new_diagnostics(&base_static.mypy, &patch_static.mypy);
         let ruff_new = !new_ruff.is_empty();
@@ -2211,7 +2213,12 @@ fn blocking_static_findings(
         }
     }
     for d in new_mypy {
-        if harness::path_touched(&d.file, touched) {
+        // [VANTA-WHY] Item 10: `import-not-found` / `import-untyped` say the
+        // ANALYSIS ENVIRONMENT cannot see a module (no dependencies installed),
+        // not that the candidate is wrong. Session 40e84874 rejected C on
+        // `test_auto_rank.py [import-not-found] Cannot find module "torch"`.
+        // They are recorded (see `record_new_static_findings`) but never block.
+        if !d.is_environment_finding() && harness::path_touched(&d.file, touched) {
             out.push(d.render());
         }
     }
@@ -2643,6 +2650,40 @@ mod tests {
         assert_eq!(sink[0]["blocking"], serde_json::json!(true));
         assert_eq!(sink[1]["code"], serde_json::json!("E501"));
         assert_eq!(sink[1]["blocking"], serde_json::json!(false));
+    }
+
+    /// Item 10 of the heretic fix list: a finding that says the ANALYSIS
+    /// ENVIRONMENT cannot see a module must be recorded but must never reject.
+    /// 40e84874 rejected C on `test_auto_rank.py [import-not-found] Cannot find
+    /// module "torch"` — a missing dependency, not a defect in the candidate.
+    #[test]
+    fn an_environment_finding_is_recorded_but_never_blocks() {
+        let touched = vec!["tests/test_auto_rank.py".to_string()];
+        let missing = audit_finding("tests/test_auto_rank.py", "import-not-found");
+        let untyped = audit_finding("tests/test_auto_rank.py", "import-untyped");
+
+        assert!(
+            blocking_static_findings(&[], &[&missing], &touched).is_empty(),
+            "a missing dependency must not reject the candidate"
+        );
+        assert!(
+            blocking_static_findings(&[], &[&untyped], &touched).is_empty(),
+            "a package without stubs must not reject the candidate"
+        );
+
+        // ...but the finding still reaches evidence.json, marked non-blocking.
+        let mut sink: Vec<serde_json::Value> = Vec::new();
+        record_new_static_findings(&mut sink, 0, &[], &[&missing], &[]);
+        assert_eq!(sink.len(), 1, "the environment finding must be recorded");
+        assert_eq!(sink[0]["code"], serde_json::json!("import-not-found"));
+        assert_eq!(sink[0]["blocking"], serde_json::json!(false));
+
+        // A genuine error in the same touched file still blocks.
+        let real = audit_finding("tests/test_auto_rank.py", "assignment");
+        assert!(
+            !blocking_static_findings(&[], &[&real], &touched).is_empty(),
+            "a real type error is still a finding about the candidate"
+        );
     }
 
     /// Item 4 of the heretic fix list: the rejection message must name the REAL

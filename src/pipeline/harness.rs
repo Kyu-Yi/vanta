@@ -595,6 +595,21 @@ impl std::hash::Hash for StaticDiagnostic {
 }
 
 impl StaticDiagnostic {
+    /// Is this finding a fact about the ANALYSIS ENVIRONMENT rather than the
+    /// code?
+    ///
+    /// [VANTA-WHY] Item 10. mypy's `import-not-found` / `import-untyped` mean
+    /// exactly "I cannot see this module from here" — an environment fact, not a
+    /// defect in the candidate. Session 40e84874 rejected C because the generated
+    /// `tests/test_auto_rank.py` imports `torch` and the sandbox had no
+    /// dependencies installed, so `torch` was reported as `import-not-found`.
+    /// These findings are still RECORDED (a reader must be able to see them) but
+    /// must never block a review round: blocking on one claims the candidate is
+    /// broken when it merely imports a library the analysis environment lacks.
+    pub fn is_environment_finding(&self) -> bool {
+        matches!(self.code.as_str(), "import-not-found" | "import-untyped")
+    }
+
     /// One line for the Diagnostician's payload and the session log, with the
     /// reported line number when the tool gave one.
     pub fn render(&self) -> String {
@@ -619,19 +634,156 @@ pub struct StaticRun {
     pub mypy_raw: String,
 }
 
+/// Repo config files that change what ruff / mypy / pytest report.
+///
+/// [VANTA-WHY] Item 10: the sandbox only carried `src/` and `tests/`, so ruff
+/// ran with its DEFAULT ruleset and mypy with no config at all. A repo's own
+/// config is part of how that repo defines "correct" — without it the static
+/// step reports the wrong findings and says nothing about the candidate. These
+/// are the standard discovery names of the three tools, plus pytest's, so a
+/// root `conftest.py` that adjusts `sys.path` is honoured too.
+pub const STATIC_CONFIG_FILES: &[&str] = &[
+    "pyproject.toml",
+    "setup.cfg",
+    "mypy.ini",
+    ".mypy.ini",
+    "ruff.toml",
+    ".ruff.toml",
+    "pytest.ini",
+    "tox.ini",
+    "conftest.py",
+];
+
+/// The ruff invocation, minus the interpreter.
+///
+/// [VANTA-WHY] Item 10: ruff's DEFAULT output is the multi-line "full" report
+/// (`F821 Undefined name ...` then ` --> path.py:1:5` on its own line), which
+/// `parse_ruff_line` cannot read — so every ruff run so far silently parsed to
+/// ZERO findings, whether the tree had one finding or forty. `concise` is the
+/// one-line `path.py:1:5: F821 message` form the parser expects, so the flag is
+/// part of the contract, not a preference.
+pub const RUFF_ARGS: &[&str] = &["-m", "ruff", "check", "--output-format=concise", "."];
+
+/// Copy the repo's config files from `repo_root` into the sandbox `dest`.
+///
+/// [VANTA-WHY] Only files that actually exist are copied: a repo without a
+/// `ruff.toml` must not gain an empty one, because an empty config is not the
+/// same as "no config" — it would change ruff's behaviour rather than reproduce
+/// it. Returns the names copied, so a caller can log them.
+pub fn copy_static_configs(repo_root: &Path, dest: &Path) -> Vec<String> {
+    let mut copied = Vec::new();
+    for name in STATIC_CONFIG_FILES {
+        let src = repo_root.join(name);
+        if src.is_file() && fs::copy(&src, dest.join(name)).is_ok() {
+            copied.push((*name).to_string());
+        }
+    }
+    copied
+}
+
+/// The Python interpreter a test command actually runs.
+///
+/// [VANTA-WHY] Item 10: the static tools must run under the SAME interpreter as
+/// the tests — only that interpreter has the repo's dependencies installed, so
+/// only it can resolve `torch`/`pydantic` instead of reporting them as
+/// `import-not-found`, and only under it does mypy see real types rather than
+/// treating every module as `Any`. The real heretic command is
+/// `env PYTHONPATH=src /path/.venv/bin/python -m pytest -q`, where the
+/// interpreter hides behind an `env` wrapper and an env assignment; a plain
+/// `python3 -m pytest` names it directly. Both must resolve to the venv python,
+/// never to the host's bare `python3`. Falls back to `VANTA_PYTHON` (then
+/// `python3`) when the command names no interpreter at all.
+pub fn interpreter_for(test_cmd: &TestCommand) -> String {
+    let mut tokens = vec![test_cmd.program.as_str()];
+    tokens.extend(test_cmd.args.iter().map(String::as_str));
+    for token in tokens {
+        // `PYTHONPATH=src` is an env assignment and `-m` is a flag; neither is
+        // the interpreter.
+        if token.contains('=') || token.starts_with('-') {
+            continue;
+        }
+        let name = Path::new(token)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if name.starts_with("python") {
+            return token.to_string();
+        }
+    }
+    python_exe()
+}
+
+/// Can `python` import `module`?
+///
+/// [VANTA-WHY] A cheap HOST-side probe (`import <module>` only resolves an
+/// already-installed package — no untrusted code runs). It is what lets the
+/// static step pick a runner that actually has the tool installed, instead of
+/// assuming the project interpreter and the tool interpreter are the same
+/// process.
+fn has_module(python: &str, module: &str) -> bool {
+    std::process::Command::new(python)
+        .args(["-c", &format!("import {module}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// The interpreter to RUN a static tool with.
+///
+/// [VANTA-WHY] A tool must run where the tool is installed, and mypy must still
+/// SEE the project's dependencies — and those are not always one interpreter.
+/// heretic's venv has `ruff` but no `mypy` (its dev type checker is `ty`), while
+/// Vanta's own `python3` has mypy and ruff but none of heretic's dependencies.
+/// So the runner is the PROJECT interpreter when it can import the tool, and
+/// Vanta's own (`VANTA_PYTHON` / `python3`) otherwise; mypy is separately
+/// pointed at the project interpreter with `--python-executable`. Hard-coding
+/// either one makes the step fail: the bare host python reports every dependency
+/// as `import-not-found` (the 40e84874 false reject), and the bare venv cannot
+/// run mypy at all and so reports NOTHING.
+fn static_tool_runner(project_python: &str, module: &str) -> String {
+    if has_module(project_python, module) {
+        project_python.to_string()
+    } else {
+        python_exe()
+    }
+}
+
 /// Run ruff and mypy over a source tree; parse each tool's findings into a set.
-pub async fn run_static(source: &str) -> StaticRun {
+///
+/// [VANTA-WHY] `test_cmd` and `config_root` exist so the static step is run the
+/// way the repo is actually checked (item 10): the tools run under an
+/// interpreter that has them, mypy inspects the interpreter the TESTS run under
+/// (the one with the dependencies), and the repo's own config files are copied
+/// in beside `src/` and `tests/`. Before this, the step ran the host's `python3`
+/// against a tree with no config and no dependencies — noisy (one
+/// `import-not-found` per third-party import) and blind (a missing module types
+/// as `Any`, hiding real errors).
+pub async fn run_static(
+    source: &str,
+    test_cmd: &TestCommand,
+    config_root: Option<&Path>,
+) -> StaticRun {
     let sb = match Backend::spawn().await {
         Ok(b) => b,
         Err(_) => return StaticRun::default(),
     };
     let _ = write_source_files(sb.root(), source);
+    if let Some(root) = config_root {
+        copy_static_configs(root, sb.root());
+    }
 
-    let py = python_exe();
-    let (ruff, ruff_raw) = match sb
-        .execute(&[py.as_str(), "-m", "ruff", "check", "."], Path::new(""), 30)
-        .await
-    {
+    // [VANTA-WHY] The interpreter the TESTS run under — the only one with the
+    // repo's dependencies. mypy is told to inspect it (`--python-executable`) so
+    // a third-party import resolves to the installed package rather than
+    // collapsing to `Any` (item 10).
+    let project_py = interpreter_for(test_cmd);
+
+    let ruff_py = static_tool_runner(&project_py, "ruff");
+    let mut ruff_argv = vec![ruff_py.as_str()];
+    ruff_argv.extend_from_slice(RUFF_ARGS);
+    let (ruff, ruff_raw) = match sb.execute(&ruff_argv, Path::new(""), 30).await {
         Ok(r) => {
             let raw = format!("{}\n{}", r.stdout, r.stderr);
             let findings = raw
@@ -643,8 +795,20 @@ pub async fn run_static(source: &str) -> StaticRun {
         Err(_) => (Vec::new(), String::new()),
     };
 
+    let mypy_py = static_tool_runner(&project_py, "mypy");
     let (mypy, mypy_raw) = match sb
-        .execute(&[py.as_str(), "-m", "mypy", "."], Path::new(""), 60)
+        .execute(
+            &[
+                mypy_py.as_str(),
+                "-m",
+                "mypy",
+                "--python-executable",
+                project_py.as_str(),
+                ".",
+            ],
+            Path::new(""),
+            60,
+        )
         .await
     {
         Ok(r) => {
@@ -971,10 +1135,10 @@ pub async fn heal_dependencies(
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeSuiteReport, StaticDiagnostic, native_outcome, native_regressions,
-        native_suite_collapsed, new_diagnostics, parse_mypy_line, parse_native_report,
-        parse_ruff_line, ruff_is_error_class, run_single_test, run_tests_parallel,
-        write_source_files,
+        NativeSuiteReport, RUFF_ARGS, StaticDiagnostic, copy_static_configs, interpreter_for,
+        native_outcome, native_regressions, native_suite_collapsed, new_diagnostics,
+        parse_mypy_line, parse_native_report, parse_ruff_line, ruff_is_error_class,
+        run_single_test, run_tests_parallel, static_tool_runner, write_source_files,
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{TestIntent, TestResult};
@@ -1254,6 +1418,142 @@ mod tests {
             new_diagnostics(&baseline, &[different]).len(),
             1,
             "a genuinely different finding in the same file is still new"
+        );
+    }
+
+    /// The ruff invocation must ask for the concise report.
+    ///
+    /// [VANTA-WHY] Item 10 follow-up: ruff's default "full" report is
+    /// multi-line, so `parse_ruff_line` read ZERO findings from every run no
+    /// matter what the tree contained. The flag is what makes the parser's
+    /// contract hold, so its absence is a silent blindness bug, not a style.
+    #[test]
+    fn ruff_is_asked_for_the_report_the_parser_can_read() {
+        assert!(
+            RUFF_ARGS.contains(&"--output-format=concise"),
+            "without concise output every ruff finding parses to nothing"
+        );
+
+        let concise = "pkg/core.py:3:5: F821 Undefined name `x`";
+        assert_eq!(
+            parse_ruff_line(concise).map(|d| d.code),
+            Some("F821".to_string()),
+            "the concise line is exactly the parser's input"
+        );
+
+        let full = "F821 Undefined name `x`\n  --> pkg/core.py:3:5\n   |\n 3 | x = x\n";
+        assert!(
+            full.lines().filter_map(parse_ruff_line).next().is_none(),
+            "the default full report carries no parsable one-line finding"
+        );
+    }
+
+    // ---- item 10: the static step must run like the repo does ---------------
+
+    /// The static tools must run under the interpreter the TESTS run under —
+    /// that is the only one with the repo's dependencies. Session 40e84874 was
+    /// rejected because mypy ran under the host's `python3` and reported
+    /// `import torch` as `import-not-found`.
+    #[test]
+    fn the_static_interpreter_follows_the_test_command() {
+        let heretic = TestCommand::from_shell(
+            "env PYTHONPATH=src /Users/kyu-yi/Documents/Trae/default/heretic/.venv/bin/python -m pytest -q",
+        );
+        assert_eq!(
+            interpreter_for(&heretic),
+            "/Users/kyu-yi/Documents/Trae/default/heretic/.venv/bin/python",
+            "the venv python hides behind `env` and a `PYTHONPATH=src` assignment, \
+             not behind the host's bare python3"
+        );
+
+        assert_eq!(
+            interpreter_for(&TestCommand::from_shell("python3 -m pytest")),
+            "python3"
+        );
+
+        // A command that names no interpreter at all must fall back rather than
+        // pick a token out of thin air (`pytest` is not an interpreter).
+        assert_eq!(
+            interpreter_for(&TestCommand::from_shell("pytest -q")),
+            super::python_exe()
+        );
+    }
+
+    /// The tool must RUN where it is installed, which is not always where the
+    /// project lives: heretic's venv has `ruff` but no `mypy`.
+    #[test]
+    fn a_static_tool_runs_where_it_is_installed() {
+        let host = super::python_exe();
+        // Every CPython can import `sys`, so a real interpreter is used as-is.
+        assert_eq!(static_tool_runner(&host, "sys"), host.clone());
+        // An interpreter that cannot import the tool must not be used to run it,
+        // or mypy would fail with `No module named mypy` and report NOTHING.
+        assert_eq!(
+            static_tool_runner("/nonexistent/venv/bin/python", "mypy"),
+            host
+        );
+    }
+
+    /// Only the config files the repo actually has may be copied — inventing an
+    /// empty `ruff.toml` would CHANGE ruff's behaviour instead of reproducing it.
+    #[test]
+    fn only_the_configs_that_exist_reach_the_sandbox() {
+        let repo = tempfile::tempdir().unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join("pyproject.toml"),
+            "[tool.ruff.lint]\nignore = [\"B023\"]\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("ruff.toml"), "line-length = 100\n").unwrap();
+
+        let mut copied = copy_static_configs(repo.path(), sandbox.path());
+        copied.sort();
+
+        assert_eq!(
+            copied,
+            vec!["pyproject.toml".to_string(), "ruff.toml".to_string()]
+        );
+        assert_eq!(
+            fs::read_to_string(sandbox.path().join("pyproject.toml")).unwrap(),
+            "[tool.ruff.lint]\nignore = [\"B023\"]\n",
+            "the repo's own ruff config must reach the sandbox verbatim"
+        );
+        assert!(
+            !sandbox.path().join("mypy.ini").exists(),
+            "a config the repo does not have must not be invented"
+        );
+    }
+
+    /// `import-not-found` / `import-untyped` are facts about the analysis
+    /// environment, not defects in the candidate.
+    #[test]
+    fn a_missing_dependency_is_an_environment_finding() {
+        let line = "tests/test_auto_rank.py:5: error: Cannot find implementation or library \
+                    stub for module named \"torch\"  [import-not-found]";
+        let missing = parse_mypy_line(line).expect("a mypy error line parses");
+        assert_eq!(missing.code, "import-not-found");
+        assert_eq!(missing.file, "tests/test_auto_rank.py");
+        assert_eq!(missing.line, Some(5));
+        assert!(missing.is_environment_finding());
+
+        let untyped = StaticDiagnostic {
+            file: "src/heretic/data.py".to_string(),
+            line: Some(1),
+            code: "import-untyped".to_string(),
+            message: "Library stubs not installed for \"requests\"".to_string(),
+        };
+        assert!(untyped.is_environment_finding());
+
+        let real = StaticDiagnostic {
+            file: "src/heretic/modifiers/abliteration.py".to_string(),
+            line: Some(440),
+            code: "assignment".to_string(),
+            message: "Incompatible types in assignment".to_string(),
+        };
+        assert!(
+            !real.is_environment_finding(),
+            "a genuine type error is a finding about the code"
         );
     }
 }

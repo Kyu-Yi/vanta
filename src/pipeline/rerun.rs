@@ -215,11 +215,20 @@ pub async fn rerun_signals(
             let good = harness::run_native_suite(&good_concat, &test_cmd).await;
             Some((bad, good))
         };
+    // [VANTA-WHY] Both sides must be analysed with the SAME repo config, so the
+    // set diff compares two runs of one toolchain. `base_tree` is the real repo
+    // (it holds `pyproject.toml`); when the good tree is a directory rather than
+    // a patch, that directory is the repo and supplies the config instead.
+    let config_root: Option<&Path> = match cfg.base_tree.as_deref() {
+        Some(base) => Some(base),
+        None if !good_tree_from_patch => Some(good_tree.as_path()),
+        None => None,
+    };
     let static_runs: Option<(StaticRun, StaticRun)> = if static_signals.is_empty() {
         None
     } else {
-        let bad = harness::run_static(&bad_concat).await;
-        let good = harness::run_static(&good_concat).await;
+        let bad = harness::run_static(&bad_concat, &test_cmd, config_root).await;
+        let good = harness::run_static(&good_concat, &test_cmd, config_root).await;
         Some((bad, good))
     };
 

@@ -37,6 +37,72 @@ use tracing::{debug, info, warn};
 // must bump this tag.
 pub const DIAGNOSTICIAN_PROMPT_VERSION: &str = "1";
 
+/// Cap on the pytest output saved with a failing test (the fix-list's ~4 KB).
+/// A full traceback for one test is far below this; the cap only bounds a
+/// pathological case (e.g. a dump of a huge fixture) so evidence.json stays
+/// readable.
+pub const FAILURE_OUTPUT_LIMIT: usize = 4096;
+
+/// First `limit` bytes of `s`, cut on a char boundary, with a marker when cut.
+pub fn truncate_output(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
+        return s.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n… [truncated: {} of {} bytes shown]",
+        &s[..end],
+        end,
+        s.len()
+    )
+}
+
+/// Locate a pytest failure's innermost frame.
+///
+/// [VANTA-WHY] pytest ends a traceback with a bare `path.py:LINE: ExceptionType`
+/// line — the frame where the exception was actually raised. That triple is what
+/// lets a later step tell a failure in the CODE UNDER TEST ("the patch has a
+/// bug") from one raised in the TEST's own objects ("the test is broken"):
+/// `'FakeTensor' object has no attribute 'shape'` is the test's fake, not the
+/// patch. Parsing it from the saved output keeps the classification auditable.
+///
+/// Returns `(file, line, exception_type)`, each `None` when the output has no
+/// recognisable frame (e.g. the test never got that far).
+pub fn parse_failure_site(output: &str) -> (Option<String>, Option<u32>, Option<String>) {
+    for raw in output.lines().rev() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, ':');
+        let (file, lineno, rest) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(f), Some(l), Some(r)) => (f.trim(), l.trim(), r.trim()),
+            _ => continue,
+        };
+        if !file.ends_with(".py") {
+            continue;
+        }
+        let Ok(line_no) = lineno.parse::<u32>() else {
+            continue;
+        };
+        // Exception types are Capitalised; this also rejects the `in helper`
+        // frames pytest interleaves into a traceback.
+        let exc = rest
+            .split(|c: char| c == ':' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        let capitalised = exc.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+        if !capitalised {
+            continue;
+        }
+        return (Some(file.to_string()), Some(line_no), Some(exc.to_string()));
+    }
+    (None, None, None)
+}
+
 // ============================================================================
 // DiagnosticResult — output of Diagnostician
 // ============================================================================
@@ -78,6 +144,9 @@ pub struct DiagnosticInputs {
     pub pytest_stderr: String,
     /// Whether pytest failed before producing report.json.
     pub pytest_report_missing: bool,
+    /// The failing test's own source, saved with the evidence so a reader can
+    /// see WHAT failed without hunting for the GeneratedTest artifact.
+    pub test_source: String,
 }
 
 // ============================================================================
@@ -157,12 +226,26 @@ pub fn diagnose(inputs: &DiagnosticInputs) -> DiagnosticResult {
 
     if inputs.assertion_failed {
         info!("Diagnostician → Logic (assertion failed)");
+        // [VANTA-WHY] This payload used to be `{"signal":"assertion_failed"}` and
+        // nothing more: no test source, no pytest output, no traceback. A reader
+        // of evidence.json then could not tell WHY the patch was blamed — the
+        // exact defect the heretic runs exposed. Save the test's own source, the
+        // failure output (capped), and the innermost frame so the claim "the
+        // patch has a logic bug" is auditable from the record alone.
+        let full_output = format!("{}\n{}", inputs.pytest_stdout, inputs.pytest_stderr);
+        let (frame_file, frame_line, exception_type) = parse_failure_site(&full_output);
+        let payload = serde_json::json!({
+            "signal": "assertion_failed",
+            "test_source": inputs.test_source,
+            "failure_output": truncate_output(&full_output, FAILURE_OUTPUT_LIMIT),
+            "exception_type": exception_type,
+            "frame_file": frame_file,
+            "frame_line": frame_line,
+        });
         return DiagnosticResult {
             failure_class: Some(FailureClass::Logic),
             reason: "Test ran but assertion failed — patch has a logic bug".into(),
-            structured_payload: Some(serde_json::json!({
-                "signal": "assertion_failed",
-            })),
+            structured_payload: Some(payload),
         };
     }
 
@@ -229,6 +312,7 @@ pub async fn diagnose_failure(
             pytest_stdout: exec.stdout.clone(),
             pytest_stderr: exec.stderr.clone(),
             pytest_report_missing: !exec.report_path_exists,
+            test_source: test.test_source.clone(),
         })
     };
 
@@ -424,6 +508,72 @@ mod tests {
         };
         let result = diagnose(&inputs);
         assert_eq!(result.failure_class, Some(FailureClass::Logic));
+    }
+
+    /// Item 1 of the heretic fix list: the assertion payload used to be a bare
+    /// `{"signal":"assertion_failed"}` — no test source, no output, no site. The
+    /// evidence must now let a reader audit WHY the patch was blamed.
+    #[test]
+    fn an_assertion_failure_saves_the_test_source_and_the_failure_site() {
+        let inputs = DiagnosticInputs {
+            assertion_failed: true,
+            test_source: "def test_x():\n    assert f() == 5\n".to_string(),
+            pytest_stdout: concat!(
+                "============================= test session starts ==============================\n",
+                "collected 1 item\n\n",
+                "test_x.py::test_x\n",
+                "\n",
+                "    def test_x():\n",
+                ">       assert f() == 5\n",
+                "E       assert 6 == 5\n",
+                "\n",
+                "test_x.py:2: AssertionError\n",
+            )
+            .to_string(),
+            ..Default::default()
+        };
+
+        let result = diagnose(&inputs);
+        assert_eq!(result.failure_class, Some(FailureClass::Logic));
+        let payload = result
+            .structured_payload
+            .expect("the failing test's evidence must be saved, not just its class");
+        assert_eq!(payload["signal"], json!("assertion_failed"));
+        assert_eq!(payload["exception_type"], json!("AssertionError"));
+        assert_eq!(payload["frame_file"], json!("test_x.py"));
+        assert_eq!(payload["frame_line"], json!(2));
+        assert!(
+            payload["test_source"]
+                .as_str()
+                .unwrap()
+                .contains("def test_x"),
+            "the failing test's own source must ride with the evidence"
+        );
+        assert!(
+            payload["failure_output"]
+                .as_str()
+                .unwrap()
+                .contains("assert 6 == 5"),
+            "pytest's failure output must ride with the evidence"
+        );
+    }
+
+    #[test]
+    fn a_huge_failure_output_is_truncated_with_a_marker() {
+        let big = "x".repeat(FAILURE_OUTPUT_LIMIT * 3);
+        let out = truncate_output(&big, FAILURE_OUTPUT_LIMIT);
+        assert!(out.len() < big.len());
+        assert!(out.contains("truncated"), "a cut must be visible: {out}");
+    }
+
+    #[test]
+    fn the_innermost_frame_of_an_error_in_the_test_object_is_located() {
+        // The 56eb4fd3 shape: the fake the TEST defined lacks an attribute.
+        let output = "test_x.py:9: AttributeError: 'FakeTensor' object has no attribute 'shape'\n";
+        let (file, line, exc) = parse_failure_site(output);
+        assert_eq!(file.as_deref(), Some("test_x.py"));
+        assert_eq!(line, Some(9));
+        assert_eq!(exc.as_deref(), Some("AttributeError"));
     }
 
     #[test]

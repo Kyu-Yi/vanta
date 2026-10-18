@@ -537,24 +537,55 @@ pub fn parse_pytest_report_detailed(
 // deliberately WITHOUT line numbers — and to hand the Diagnostician only the
 // findings the patch actually introduced.
 
-/// One static-analysis finding, with the line number deliberately dropped.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// One static-analysis finding.
+///
+/// [VANTA-WHY] The `(file, code, message)` triple is the IDENTITY used by the
+/// set diff, so the line number is excluded from `PartialEq`/`Hash`: the same
+/// diagnostic moving down the file after a patch is not a NEW error, and
+/// counting it as one would reject a candidate that merely changed its own line
+/// count. The line is still CARRIED whenever the tool reported one — the
+/// evidence record and the console need the exact site, the set diff must not.
+#[derive(Debug, Clone)]
 pub struct StaticDiagnostic {
     /// Repo-relative path the tool reported.
     pub file: String,
+    /// 1-based line the tool reported, when it reported one.
+    pub line: Option<u32>,
     /// ruff rule (e.g. `F821`) or mypy error code (e.g. `return-value`).
     pub code: String,
     /// The human-readable finding text, without the location.
     pub message: String,
 }
 
+// [VANTA-WHY] Identity is (file, code, message) — see the struct doc. Deriving
+// PartialEq/Hash would fold the line in and break the set diff, so they are
+// written by hand and deliberately ignore `line`.
+impl PartialEq for StaticDiagnostic {
+    fn eq(&self, other: &Self) -> bool {
+        self.file == other.file && self.code == other.code && self.message == other.message
+    }
+}
+impl Eq for StaticDiagnostic {}
+impl std::hash::Hash for StaticDiagnostic {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.file.hash(state);
+        self.code.hash(state);
+        self.message.hash(state);
+    }
+}
+
 impl StaticDiagnostic {
-    /// One line for the Diagnostician's payload and the session log.
+    /// One line for the Diagnostician's payload and the session log, with the
+    /// reported line number when the tool gave one.
     pub fn render(&self) -> String {
+        let location = match self.line {
+            Some(line) => format!("{}:{}", self.file, line),
+            None => self.file.clone(),
+        };
         if self.code.is_empty() {
-            format!("{}: {}", self.file, self.message)
+            format!("{}: {}", location, self.message)
         } else {
-            format!("{}: [{}] {}", self.file, self.code, self.message)
+            format!("{}: [{}] {}", location, self.code, self.message)
         }
     }
 }
@@ -674,6 +705,7 @@ fn parse_ruff_line(line: &str) -> Option<StaticDiagnostic> {
     };
     Some(StaticDiagnostic {
         file: file.to_string(),
+        line: parts[1].trim().parse::<u32>().ok(),
         code,
         message,
     })
@@ -683,10 +715,14 @@ fn parse_ruff_line(line: &str) -> Option<StaticDiagnostic> {
 /// column, then `error:`).
 fn parse_mypy_line(line: &str) -> Option<StaticDiagnostic> {
     let (head, tail) = line.split_once(": error:")?;
-    let file = head.split(':').next()?.trim();
+    let mut head_parts = head.split(':');
+    let file = head_parts.next()?.trim();
     if !file.ends_with(".py") {
         return None;
     }
+    // mypy prints `path.py:LINE: error: …` (a column only under
+    // --show-column-numbers, in which case the first number is still LINE).
+    let line_no = head_parts.next().and_then(|n| n.trim().parse::<u32>().ok());
     let tail = tail.trim();
     // The bracketed error code, when present, is the final `[...]` group.
     let (message, code) = match tail.rfind('[') {
@@ -698,6 +734,7 @@ fn parse_mypy_line(line: &str) -> Option<StaticDiagnostic> {
     };
     Some(StaticDiagnostic {
         file: file.to_string(),
+        line: line_no,
         code,
         message,
     })
@@ -899,8 +936,9 @@ pub async fn heal_dependencies(
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeSuiteReport, native_regressions, native_suite_collapsed, ruff_is_error_class,
-        run_single_test, run_tests_parallel, write_source_files,
+        NativeSuiteReport, StaticDiagnostic, native_regressions, native_suite_collapsed,
+        new_diagnostics, parse_mypy_line, parse_ruff_line, ruff_is_error_class, run_single_test,
+        run_tests_parallel, write_source_files,
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{TestIntent, TestResult};
@@ -1076,5 +1114,40 @@ mod tests {
         assert!(!ruff_is_error_class("UP032"), "pyupgrade style");
         assert!(!ruff_is_error_class("SIM108"), "simplify style");
         assert!(!ruff_is_error_class("TRY003"), "tryceratops style");
+    }
+
+    /// A new static finding must carry its exact site for the evidence record,
+    /// yet that site must NOT be part of the finding's identity — otherwise a
+    /// patch that merely shifts a line would read as introducing a fresh error.
+    #[test]
+    fn a_new_static_finding_keeps_its_site_but_not_as_its_identity() {
+        let ruff = parse_ruff_line("pkg/core.py:12:5: F821 Undefined name `x`").unwrap();
+        assert_eq!(ruff.line, Some(12), "the reported line must be retained");
+        assert_eq!(ruff.file, "pkg/core.py");
+        assert_eq!(ruff.code, "F821");
+
+        let mypy = parse_mypy_line("pkg/core.py:88: error: bad return  [return-value]").unwrap();
+        assert_eq!(mypy.line, Some(88), "mypy's line must be retained");
+        assert_eq!(mypy.code, "return-value");
+
+        let baseline = vec![ruff.clone()];
+        let moved = StaticDiagnostic {
+            line: Some(40),
+            ..ruff.clone()
+        };
+        assert!(
+            new_diagnostics(&baseline, &[moved]).is_empty(),
+            "the same finding moved down the file is not a NEW finding"
+        );
+
+        let different = StaticDiagnostic {
+            code: "F841".to_string(),
+            ..ruff.clone()
+        };
+        assert_eq!(
+            new_diagnostics(&baseline, &[different]).len(),
+            1,
+            "a genuinely different finding in the same file is still new"
+        );
     }
 }

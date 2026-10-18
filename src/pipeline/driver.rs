@@ -417,6 +417,12 @@ pub async fn run(
     // Governor's in-memory transitions, because only the rows carry the patch ids
     // that separate a repair transition from a review round.
     let mut metric_rows: Vec<TransitionRow> = Vec::new();
+    // [VANTA-WHY] Every NEW static finding this run's patch introduced, per
+    // attempt, so evidence.json can name the finding that rejected a review
+    // round. Session 40e84874 was rejected for a mypy finding that appeared
+    // NOWHERE in the session files: the console printed `mypy_new=true` and the
+    // detail was dropped. The record below is that missing detail.
+    let mut static_findings_records: Vec<serde_json::Value> = Vec::new();
 
     // [VANTA-WHY] `max_attempts` means two different things and the Governor now
     // has to be told which. With `--patch` the candidate is FIXED, so an attempt
@@ -994,6 +1000,18 @@ pub async fn run(
         let new_static_in_touched_files =
             new_static_findings_block(&new_ruff, &new_mypy, &touched_paths);
         println!("  Static: ruff_new={ruff_new}, mypy_new={mypy_new}");
+        // [VANTA-WHY] The two booleans above are not enough to audit a rejection.
+        // Print each NEW finding — tool, file, line, code, message — and keep it
+        // for evidence.json, so "which finding rejected this round" is answerable
+        // from the artifacts alone (the 40e84874 gap).
+        for finding in record_new_static_findings(
+            &mut static_findings_records,
+            attempt,
+            &new_ruff,
+            &new_mypy,
+        ) {
+            println!("    {finding}");
+        }
 
         // ---- 5b. Native suite gate — the repo's OWN tests ----
         // [VANTA-WHY] Generated tests depend on what the Attacker sampled; the
@@ -1586,6 +1604,7 @@ pub async fn run(
         &evidence_path,
         serde_json::to_string_pretty(&serde_json::json!({
             "apply_failed_attempts": apply_failed_attempt_indices.len(),
+            "new_static_findings": static_findings_records,
             "evidence": final_evidence,
         }))
         .unwrap(),
@@ -2143,6 +2162,36 @@ fn new_static_findings_block(
             .any(|d| static_path_touched(&d.file, touched))
 }
 
+/// Record each NEW static finding for the evidence file; return console lines.
+///
+/// [VANTA-WHY] The set diff keeps only the findings the patch introduced. This
+/// turns each into `{attempt, tool, file, line, code, message}` so a run's
+/// artifacts name the exact finding behind a review-mode rejection instead of a
+/// bare boolean. Session 40e84874 rejected on a mypy finding that the session
+/// files never recorded; this is where it is now kept.
+fn record_new_static_findings(
+    sink: &mut Vec<serde_json::Value>,
+    attempt: u32,
+    new_ruff: &[&harness::StaticDiagnostic],
+    new_mypy: &[&harness::StaticDiagnostic],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (tool, findings) in [("ruff", new_ruff), ("mypy", new_mypy)] {
+        for d in findings {
+            sink.push(serde_json::json!({
+                "attempt": attempt + 1,
+                "tool": tool,
+                "file": d.file,
+                "line": d.line,
+                "code": d.code,
+                "message": d.message,
+            }));
+            lines.push(format!("[{tool}] {}", d.render()));
+        }
+    }
+    lines
+}
+
 /// Render a tri-state audit answer for the session log.
 ///
 /// [VANTA-WHY] `issue_requires_change` is `Option<bool>` precisely because an
@@ -2242,7 +2291,8 @@ mod tests {
     use super::{
         attempt_verdict, collapse_decision, dependency_freeze_summary_value,
         harness_infrastructure_collapse, new_static_findings_block, patch_attempt_id_for_patch,
-        render_committed_test_file, require_clean_target_repo_for_open_pr,
+        record_new_static_findings, render_committed_test_file,
+        require_clean_target_repo_for_open_pr,
         review_prompt_source_concat, stamp_transition_row, stable_patch_fingerprint,
     };
     use crate::agents::creator::SourceFile;
@@ -2427,6 +2477,7 @@ mod tests {
     fn audit_finding(file: &str, code: &str) -> StaticDiagnostic {
         StaticDiagnostic {
             file: file.to_string(),
+            line: Some(1),
             code: code.to_string(),
             message: "stub finding".to_string(),
         }
@@ -2459,6 +2510,46 @@ mod tests {
         assert!(
             !new_static_findings_block(&[&elsewhere], &[], &touched),
             "an error the patch did not introduce is not a finding about the candidate"
+        );
+    }
+
+    /// Item 1 of the heretic fix list: a review-mode rejection must name the
+    /// finding that caused it. The console used to print only `mypy_new=true`
+    /// and the finding itself was dropped (session 40e84874). Every new finding
+    /// is now recorded with its site and echoed to the console.
+    #[test]
+    fn every_new_static_finding_is_recorded_with_its_site() {
+        let mut sink: Vec<serde_json::Value> = Vec::new();
+        let ruff = StaticDiagnostic {
+            file: "src/pkg/mod.py".to_string(),
+            line: Some(7),
+            code: "F821".to_string(),
+            message: "Undefined name `x`".to_string(),
+        };
+        let mypy = StaticDiagnostic {
+            file: "src/heretic/modifiers/abliteration.py".to_string(),
+            line: Some(88),
+            code: "index".to_string(),
+            message: "Item of \"list\" has no attribute ...".to_string(),
+        };
+
+        let lines = record_new_static_findings(&mut sink, 0, &[&ruff], &[&mypy]);
+
+        assert_eq!(sink.len(), 2, "both new findings must reach evidence.json");
+        assert_eq!(sink[0]["tool"], serde_json::json!("ruff"));
+        assert_eq!(sink[0]["attempt"], serde_json::json!(1));
+        assert_eq!(sink[0]["line"], serde_json::json!(7));
+        assert_eq!(sink[1]["tool"], serde_json::json!("mypy"));
+        assert_eq!(
+            sink[1]["file"],
+            serde_json::json!("src/heretic/modifiers/abliteration.py")
+        );
+        assert_eq!(sink[1]["line"], serde_json::json!(88));
+        assert_eq!(sink[1]["code"], serde_json::json!("index"));
+        assert!(
+            lines[1].contains("abliteration.py:88"),
+            "the console must name the exact site, got: {}",
+            lines[1]
         );
     }
 

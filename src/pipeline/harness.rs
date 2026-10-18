@@ -678,6 +678,21 @@ pub fn ruff_is_error_class(code: &str) -> bool {
     code.starts_with('F') || code.starts_with("E9")
 }
 
+/// Is `file` a path the patch touches?
+///
+/// [VANTA-WHY] ruff reports paths relative to the repo root and a patch names
+/// them as its headers do (`a/src/pkg/mod.py`), so neither plain equality nor a
+/// suffix match alone is right. Both are tried. One definition, shared by the
+/// static gate and the Diagnostician's "was the fault in a file the patch
+/// touched?" probe — two copies would drift exactly as M2/M3's harnesses did.
+pub fn path_touched(file: &str, touched: &[String]) -> bool {
+    let norm = file.trim_start_matches("./");
+    touched.iter().any(|p| {
+        let p = p.trim_start_matches("./");
+        p == norm || norm.ends_with(p) || p.ends_with(norm)
+    })
+}
+
 /// Render findings as one newline-separated block (the Diagnostician payload).
 pub fn render_diagnostics(findings: &[&StaticDiagnostic]) -> String {
     findings

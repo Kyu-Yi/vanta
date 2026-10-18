@@ -128,6 +128,140 @@ fn is_patch_insensitive(patched: &TestExecutionDetails, original: &TestExecution
     }
 }
 
+/// Is this path one of the test runner's own generated test files?
+fn is_test_file(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    name.starts_with("test_") || name.ends_with("_test.py") || name == "conftest.py"
+}
+
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Does `source` declare `class <name>`?
+fn declares_class(source: &str, name: &str) -> bool {
+    let needle = format!("class {name}");
+    source.match_indices(&needle).any(|(i, _)| {
+        source[i + needle.len()..]
+            .chars()
+            .next()
+            .map_or(true, |c| !(c.is_ascii_alphanumeric() || c == '_'))
+    })
+}
+
+/// Does the failure name an object of a type the TEST itself declares?
+///
+/// [VANTA-WHY] Item 3 of the heretic fix list. `'FakeTensor' object has no
+/// attribute 'shape'` is the TESTS's fake (56eb4fd3 round 2), not the patch:
+/// the test stubbed the model incompletely, so the crash is a property of the
+/// test. Recognizing the `'X' object` shape and finding `class X` in the test's
+/// own source is what tells that apart from the patch throwing on real input.
+fn names_test_defined_type(output: &str, test_source: &str) -> bool {
+    for (idx, _) in output.match_indices("' object") {
+        let before = &output[..idx];
+        let Some(open) = before.rfind('\'') else {
+            continue;
+        };
+        let name = &before[open + 1..];
+        if is_identifier(name) && declares_class(test_source, name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is an `AssertionError` the TEST's own `assert` / mock `assert_*`?
+///
+/// [VANTA-WHY] An assertion failure IS a verdict on the patch: the test checked
+/// behaviour and the behaviour was wrong. Two shapes qualify — a plain `assert`
+/// in the test file (pytest reports the test's own file as the innermost frame),
+/// and a mock assertion, whose message names `to have been called` / `Calls:`.
+/// An `AssertionError` raised anywhere else (a library, or production code's own
+/// invariant) is not the test speaking, so it does not qualify.
+fn assertion_is_the_tests_own(output: &str, frame_file: Option<&str>) -> bool {
+    const MOCK_MARKERS: [&str; 4] = [
+        "to have been called",
+        "to not have been called",
+        "Calls:",
+        "assert_called",
+    ];
+    if MOCK_MARKERS.iter().any(|m| output.contains(m)) {
+        return true;
+    }
+    match frame_file {
+        Some(f) => is_test_file(f),
+        // pytest reported an assertion but no parseable frame; the assertion is
+        // still the test's own check.
+        None => true,
+    }
+}
+
+/// Locate the fault: is this failure about the PATCH or about the TEST?
+///
+/// [VANTA-WHY] Item 3 of the heretic fix list. `Logic` means "the patch is
+/// wrong", so before blaming the patch we must find WHERE the exception was
+/// raised. `Logic` is only fair when:
+///   (a) an `AssertionError` comes from the test's own `assert`/mock `assert_*`
+///       — the test asserted and the behaviour was wrong; or
+///   (b) the exception is raised in a file the PATCH TOUCHED, on an object the
+///       test did not define itself — the patch's code threw on real input.
+/// Everything else — a `SystemExit` from a test that instantiated a CLI-reading
+/// settings object, an argparse/CLI error, an error in test setup before the
+/// code under test is called, or an exception on a test-defined fake — says
+/// nothing about the candidate. Returns the TestDefect reason + payload, or
+/// `None` when the patch is a fair target.
+///
+/// Returns `None` (do not reclassify) when no fault can be located at all: an
+/// unreadable failure must not be quietly turned into a test defect.
+pub fn locate_fault(
+    execution: &TestExecutionDetails,
+    test_source: &str,
+    touched_paths: &[String],
+) -> Option<(String, serde_json::Value)> {
+    let output = format!("{}\n{}", execution.stdout, execution.stderr);
+    let (frame_file, frame_line, exception_type) = parse_failure_site(&output);
+    let exception = exception_type.clone().unwrap_or_default();
+    if exception.is_empty() {
+        return None;
+    }
+
+    if exception == "AssertionError" && assertion_is_the_tests_own(&output, frame_file.as_deref()) {
+        return None;
+    }
+    if let Some(file) = frame_file.as_deref() {
+        if harness::path_touched(file, touched_paths)
+            && !names_test_defined_type(&output, test_source)
+        {
+            return None;
+        }
+    }
+
+    let site = format!(
+        "{}:{}",
+        frame_file.clone().unwrap_or_else(|| "?".into()),
+        frame_line.map(|l| l.to_string()).unwrap_or_else(|| "?".into()),
+    );
+    let reason = format!(
+        "Failure located in the TEST ({exception} at {site}), not in an assertion of the test nor \
+         in a file the patch touched — a property of the test, not the patch. Sent back to the \
+         Attacker for revision."
+    );
+    Some((
+        reason,
+        json!({
+            "signal": "test_defect_fault_not_in_patch",
+            "exception_type": exception_type,
+            "frame_file": frame_file,
+            "frame_line": frame_line,
+        }),
+    ))
+}
+
 // ============================================================================
 // DiagnosticResult — output of Diagnostician
 // ============================================================================
@@ -308,6 +442,7 @@ pub async fn diagnose_failure(
     cfg: &LlmConfig,
     original_source: &str,
     test_cmd: &TestCommand,
+    touched_paths: &[String],
 ) -> DiagnosticResult {
     let force_unknown = std::env::var("VANTA_TEST_FORCE_UNKNOWN").ok().as_deref() == Some("1");
     // [VANTA-WHY] The FIRST classification sees the real execution: whether the
@@ -368,6 +503,34 @@ pub async fn diagnose_failure(
         };
 
     let diag = classify(execution);
+
+    // [VANTA-WHY] Item 3 of the heretic fix list — locate the fault BEFORE
+    // blaming the patch. A `Logic` verdict asserts "the patch is wrong", so the
+    // failure has to be attributable to the patch: an assertion the test made,
+    // or an exception in a file the patch touched. A `SystemExit` from a test
+    // that built a CLI-reading settings object, a crash inside the test's own
+    // fake (`'FakeTensor' object has no attribute 'shape'`, 56eb4fd3 round 2),
+    // or an error in test setup is a property of the TEST. This runs before the
+    // (expensive) patch-insensitivity probe below because it needs no rerun.
+    if diag.failure_class == Some(FailureClass::Logic) {
+        if let Some((reason, payload)) =
+            locate_fault(execution, &test.test_source, touched_paths)
+        {
+            tracing::info!(
+                test = %test.test_name,
+                "fault located in the TEST, not the patch → TestDefect"
+            );
+            return enrich_with_sandbox_roots(
+                DiagnosticResult {
+                    failure_class: Some(FailureClass::TestDefect),
+                    reason,
+                    structured_payload: Some(payload),
+                },
+                execution.sandbox_root.clone(),
+                None,
+            );
+        }
+    }
 
     // [VANTA-WHY] Item 2 of the heretic fix list. A failure that reproduces
     // IDENTICALLY on the ORIGINAL tree says nothing about the patch. B v2's
@@ -693,6 +856,122 @@ mod tests {
             !is_patch_insensitive(&patched, &original_passed),
             "a test that passes on the original is evidence about the patch"
         );
+    }
+
+    /// Item 3 of the heretic fix list: the fault must be located before the
+    /// patch is blamed. 56eb4fd3 round 2's fake (`class FakeTensor`) has no
+    /// `.shape`, so the crash is the TEST's, not the patch's.
+    #[test]
+    fn a_failure_inside_the_tests_own_fake_is_a_test_defect() {
+        let execution = exec_at(
+            TestResult::Failed,
+            "test_run.py:9: AttributeError: 'FakeTensor' object has no attribute 'shape'\n",
+        );
+        let test_source = "class FakeTensor:\n    def __init__(self, ids):\n        self.ids = ids\n";
+        let touched = vec!["src/heretic/modifiers/abliteration.py".to_string()];
+
+        let located = locate_fault(&execution, test_source, &touched)
+            .expect("a fault in the test's own fake must not be blamed on the patch");
+        assert_eq!(located.1["signal"], json!("test_defect_fault_not_in_patch"));
+        assert_eq!(located.1["exception_type"], json!("AttributeError"));
+        assert!(located.0.contains("Attacker"), "the reason must say it goes back: {}", located.0);
+    }
+
+    /// The same shape, but raised from a file the patch TOUCHED — the patch's
+    /// code threw on an object the test itself defined, so the test is still at
+    /// fault (rule (b)'s exclusion).
+    #[test]
+    fn a_patch_file_raising_on_a_test_defined_object_is_still_a_test_defect() {
+        let execution = exec_at(
+            TestResult::Failed,
+            "src/heretic/modifiers/abliteration.py:88: AttributeError: 'FakeTensor' object has no attribute 'shape'\n",
+        );
+        let test_source = "class FakeTensor:\n    pass\n";
+        let touched = vec!["src/heretic/modifiers/abliteration.py".to_string()];
+
+        assert!(
+            locate_fault(&execution, test_source, &touched).is_some(),
+            "an exception on a type the TEST declares is the test's fault even inside the patch"
+        );
+    }
+
+    /// An exception raised in a file the patch touched, on a real object, is a
+    /// fair verdict on the patch — the patch's code threw.
+    #[test]
+    fn an_exception_in_a_file_the_patch_touched_is_blamed_on_the_patch() {
+        let execution = exec_at(
+            TestResult::Failed,
+            "src/heretic/modifiers/abliteration.py:88: TypeError: unsupported operand type(s)\n",
+        );
+        let touched = vec!["src/heretic/modifiers/abliteration.py".to_string()];
+
+        assert!(
+            locate_fault(&execution, "def test_x():\n    pass\n", &touched).is_none(),
+            "the patch's own file throwing on real input is the patch's fault"
+        );
+    }
+
+    /// A `SystemExit` from a test that instantiated a CLI-reading settings
+    /// object (B v2's `HereticSettings`) is the test's setup, not the patch.
+    #[test]
+    fn a_cli_system_exit_in_test_setup_is_a_test_defect() {
+        let execution = exec_at(
+            TestResult::Failed,
+            "test_run.py:5: SystemExit: 2\n",
+        );
+        let test_source = "class Settings:\n    pass\n";
+        let touched = vec!["src/heretic/modifiers/abliteration.py".to_string()];
+
+        let located = locate_fault(&execution, test_source, &touched)
+            .expect("a CLI/argparse SystemExit is a test defect");
+        assert_eq!(located.1["exception_type"], json!("SystemExit"));
+    }
+
+    /// The test's own `assert` failing IS a verdict on the patch.
+    #[test]
+    fn the_tests_own_assertion_is_blamed_on_the_patch() {
+        let execution = exec_at(
+            TestResult::Failed,
+            "test_x.py:2: AssertionError\n",
+        );
+        assert!(
+            locate_fault(&execution, "def test_x():\n    assert f() == 5\n", &[]).is_none(),
+            "an assertion the test made is a fair verdict on the patch"
+        );
+    }
+
+    /// A mock `assert_*` failure is likewise the test's own check.
+    #[test]
+    fn a_mock_assertion_failure_is_blamed_on_the_patch() {
+        let execution = exec_at(
+            TestResult::Failed,
+            "test_x.py:6: AssertionError: Expected 'get_responses' to have been called once. Called 0 times.\n",
+        );
+        assert!(
+            locate_fault(&execution, "def test_x():\n    m.assert_called_once()\n", &[])
+                .is_none(),
+            "a mock assertion failure is a fair verdict on the patch"
+        );
+    }
+
+    /// An unreadable failure (no traceback at all) must not be quietly turned
+    /// into a test defect.
+    #[test]
+    fn an_unlocatable_failure_is_not_reclassified() {
+        let execution = exec_at(TestResult::Failed, "no frames here\n");
+        assert!(
+            locate_fault(&execution, "def test_x():\n    pass\n", &[]).is_none(),
+            "with no fault located, the patch keeps its Logic class"
+        );
+    }
+
+    #[test]
+    fn path_touched_matches_patch_headers_and_repo_relative_reports() {
+        let touched = vec!["src/pkg/mod.py".to_string()];
+        assert!(harness::path_touched("src/pkg/mod.py", &touched));
+        assert!(harness::path_touched("a/src/pkg/mod.py", &touched));
+        assert!(harness::path_touched("./src/pkg/mod.py", &touched));
+        assert!(!harness::path_touched("src/other/mod.py", &touched));
     }
 
     #[test]

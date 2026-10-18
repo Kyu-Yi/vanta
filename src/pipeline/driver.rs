@@ -1135,6 +1135,7 @@ pub async fn run(
                     &cfg,
                     &review_prompt_concat,
                     &test_cmd,
+                    &touched_paths,
                 )
                 .await;
                 println!(
@@ -2128,19 +2129,6 @@ fn attempt_verdict(
     }
 }
 
-/// Is `file` a path the patch touches?
-///
-/// [VANTA-WHY] ruff reports paths relative to the repo root and the patch names
-/// them as its headers do (`a/src/pkg/mod.py`), so neither a plain equality nor
-/// a suffix match alone is right. Both are tried.
-fn static_path_touched(file: &str, touched: &[String]) -> bool {
-    let norm = file.trim_start_matches("./");
-    touched.iter().any(|p| {
-        let p = p.trim_start_matches("./");
-        p == norm || norm.ends_with(p) || p.ends_with(norm)
-    })
-}
-
 /// Does a new static finding BLOCK a review round?
 ///
 /// [VANTA-WHY] Extracted from the round body so the policy is unit-testable
@@ -2156,10 +2144,10 @@ fn new_static_findings_block(
 ) -> bool {
     new_ruff
         .iter()
-        .any(|d| harness::ruff_is_error_class(&d.code) && static_path_touched(&d.file, touched))
+        .any(|d| harness::ruff_is_error_class(&d.code) && harness::path_touched(&d.file, touched))
         || new_mypy
             .iter()
-            .any(|d| static_path_touched(&d.file, touched))
+            .any(|d| harness::path_touched(&d.file, touched))
 }
 
 /// Record each NEW static finding for the evidence file; return console lines.

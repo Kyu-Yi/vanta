@@ -261,7 +261,7 @@ Write exactly 3 tests. Label each one honestly: use BugReproduction or FeatureAc
     };
 
     let typed: AttackerResponse = structured_call_with_retry(
-        &client, cfg, 3, build_messages, extras, parse_closure
+        &client, cfg, 3, "", build_messages, extras, parse_closure
     ).await?;
 
     info!(test_count = typed.tests.len(), "attacker done");
@@ -363,7 +363,7 @@ If you cannot make the test match its intent, change the intent to match the tes
     };
 
     let revised: GeneratedTest = structured_call_with_retry(
-        &client, cfg, 3, build_messages, extras, parse_closure
+        &client, cfg, 3, &prior_test.test_name, build_messages, extras, parse_closure
     ).await?;
 
     info!(test_name = %revised.test_name, intent = ?revised.intent, "attacker revise_test done");
@@ -447,7 +447,7 @@ Do NOT import constants or symbols that only exist in the PATCHED code."#;
     };
 
     let simplified: GeneratedTest = structured_call_with_retry(
-        &client, cfg, 3, build_messages, extras, parse_closure
+        &client, cfg, 3, &prior_test.test_name, build_messages, extras, parse_closure
     ).await?;
 
     info!(test_name = %simplified.test_name, "attacker simplify_test done");
@@ -512,11 +512,18 @@ pub struct IntentVerdict {
     /// issue. This field asks the complementary question: does the issue require
     /// the behaviour at the asserted input to CHANGE from what the original code
     /// does? `true` means a preservation probe at that input contradicts the
-    /// issue and must be scrapped. Defaulted so an older/short answer still
-    /// parses, and a missing answer is never read as "the issue requires a
-    /// change".
+    /// issue and must be scrapped.
+    ///
+    /// [VANTA-WHY] `Option<bool>`, NOT `bool`. As a plain bool, `#[serde(default)]`
+    /// turned a field the model simply forgot to emit into `false`, and `false`
+    /// is the answer that means "the issue requires this behaviour to STAY" — so
+    /// a dropped field silently promoted a test to BehaviorPreservation with
+    /// nobody having decided that. A safety gate has to fail closed: absent is
+    /// UNKNOWN, and unknown never relabels. Every consumer therefore keys on an
+    /// EXPLICIT value — the preservation branch below scraps only on `Some(true)`,
+    /// and the relabel decision fires only on `Some(false)`.
     #[serde(default)]
-    pub issue_requires_change: bool,
+    pub issue_requires_change: Option<bool>,
     pub reason: String,
 }
 
@@ -541,8 +548,11 @@ pub struct IntentCheckRecord {
     /// [VANTA-WHY] The complementary question a preservation probe needs: does
     /// the issue require the behaviour at the asserted input to CHANGE? Logged
     /// alongside the verdict so a reader can see why a preservation test was
-    /// kept or scrapped, not just that it was.
-    pub issue_requires_change: bool,
+    /// kept or scrapped, not just that it was. `None` records that the auditor
+    /// never answered — distinct from an explicit `Some(false)`, because the two
+    /// lead to different decisions and a log that conflates them cannot explain
+    /// the decision afterwards.
+    pub issue_requires_change: Option<bool>,
     /// [VANTA-WHY] True when a BehaviorPreservation test asserts behaviour the
     /// issue requires to CHANGE. It contradicts the issue, so it is scrapped
     /// rather than demoted: there is no honest label left for it.
@@ -632,7 +642,7 @@ pub async fn attacker_check_intent(
     };
 
     let verdict: IntentVerdict =
-        structured_call_with_retry(&client, cfg, 3, build_messages, extras, parse_closure).await?;
+        structured_call_with_retry(&client, cfg, 3, &request.test_name, build_messages, extras, parse_closure).await?;
 
     info!(
         test_name = %request.test_name,
@@ -717,14 +727,18 @@ pub async fn audit_test_intent(
             );
             IntentVerdict {
                 issue_asks_for_behaviour: false,
-                issue_requires_change: false,
+                issue_requires_change: None,
                 reason: format!("intent audit unavailable ({e})"),
             }
         }
     };
 
     if matches!(test.intent, TestIntent::BehaviorPreservation) {
-        if verdict.issue_requires_change {
+        // [VANTA-WHY] Scrap only on an EXPLICIT `true`. An omitted answer is
+        // unknown, and unknown must not be read as "the issue requires a change"
+        // — that would scrap a possibly-valid preservation probe on a parse
+        // artifact.
+        if verdict.issue_requires_change == Some(true) {
             let reason = format!(
                 "the issue requires the asserted behaviour to change at the asserted input: {}",
                 verdict.reason
@@ -736,7 +750,7 @@ pub async fn audit_test_intent(
                     test_name: test.test_name.clone(),
                     declared_intent: test.intent.clone(),
                     issue_asks_for_behaviour: verdict.issue_asks_for_behaviour,
-                    issue_requires_change: true,
+                    issue_requires_change: Some(true),
                     scrapped: true,
                     reason,
                     evidence,
@@ -750,7 +764,7 @@ pub async fn audit_test_intent(
                 test_name: test.test_name.clone(),
                 declared_intent: test.intent.clone(),
                 issue_asks_for_behaviour: verdict.issue_asks_for_behaviour,
-                issue_requires_change: false,
+                issue_requires_change: verdict.issue_requires_change,
                 scrapped: false,
                 reason: verdict.reason,
                 evidence,
@@ -797,6 +811,66 @@ pub async fn audit_test_intent(
         ),
     };
     (Some(demoted), Some(event), Some(record))
+}
+
+/// Ask ONLY whether the issue requires the asserted behaviour to change.
+///
+/// [VANTA-WHY] Fix 6 — BATE's relabel-before-revise question. A BugReproduction
+/// test whose baseline PASSED did not reproduce anything: it asserts behaviour
+/// the original already has. Whether that is a legitimate probe depends on one
+/// thing — does the ISSUE require the behaviour at the asserted input to STAY as
+/// the original has it? This asks that single question and returns the verdict
+/// with an audit record, deliberately WITHOUT the demote/scrap routing
+/// `audit_test_intent` applies: BATE owns the decision here.
+///
+/// An unavailable auditor answers UNKNOWN (`None`), exactly as a present auditor
+/// that omitted the field does. Both mean "nobody decided", and BATE answers
+/// that the only safe way: take the ordinary revision path. Relabelling on an
+/// unverified answer would admit a probe the issue may want changed, which would
+/// then fail the patched side and reject a correct patch.
+pub async fn audit_issue_requires_change(
+    cfg: &LlmConfig,
+    issue_text: &str,
+    original_source: &str,
+    test: &GeneratedTest,
+) -> (Option<bool>, IntentCheckRecord) {
+    let evidence = observe_quote_evidence(test, issue_text);
+
+    let request = IntentCheckRequest {
+        issue_text: issue_text.to_string(),
+        original_source: original_source.to_string(),
+        test_name: test.test_name.clone(),
+        test_source: test.test_source.clone(),
+        declared_intent: test.intent.clone(),
+    };
+
+    let verdict = match attacker_check_intent(cfg, &request).await {
+        Ok(verdict) => verdict,
+        Err(e) => {
+            warn!(
+                test = %test.test_name,
+                error = %e,
+                "relabel question unavailable — answer is unknown, so the test takes the \
+                 ordinary revision path"
+            );
+            IntentVerdict {
+                issue_asks_for_behaviour: false,
+                issue_requires_change: None,
+                reason: format!("intent audit unavailable ({e})"),
+            }
+        }
+    };
+
+    let record = IntentCheckRecord {
+        test_name: test.test_name.clone(),
+        declared_intent: test.intent.clone(),
+        issue_asks_for_behaviour: verdict.issue_asks_for_behaviour,
+        issue_requires_change: verdict.issue_requires_change,
+        scrapped: false,
+        reason: verdict.reason,
+        evidence,
+    };
+    (verdict.issue_requires_change, record)
 }
 
 /// Audit a whole batch. Scrapped tests are dropped from the returned list; their

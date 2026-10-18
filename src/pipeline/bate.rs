@@ -17,7 +17,8 @@
 // ============================================================================
 
 use crate::agents::attacker::{
-    GeneratedTest, IntentCheckRecord, IntentRelabel, attacker_revise_test, audit_test_intent,
+    GeneratedTest, IntentCheckRecord, IntentRelabel, attacker_revise_test, audit_issue_requires_change,
+    audit_test_intent,
 };
 use crate::config::LlmConfig;
 use crate::core::{TestIntent, TestResult};
@@ -92,25 +93,34 @@ pub fn validate_test_against_baseline(
 //
 // [SYNTAX] Async function taking an async closure. Each call to run_fn is
 // awaited, allowing the test runner to be async (e.g. sandbox.execute).
+//
+// [VANTA-WHY] Returns the LAST observed baseline alongside the outcome. BATE's
+// relabel-before-revise rule (Fix 6) needs to know that the baseline PASSED — a
+// BugReproduction that passes reproduced nothing — and that fact is only
+// observable here, where the baseline actually ran. Reconstructing it from a
+// `Mismatch` would confuse "passed" with "errored", and an errored baseline must
+// not be relabelled into a preservation probe.
 pub async fn validate_with_retry<F, Fut>(
     test_name: &str,
     intent: &TestIntent,
     max_attempts: u32,
     mut run_fn: F,
-) -> BateOutcome
+) -> (BateOutcome, TestResult)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = TestResult>,
 {
     let mut last_mismatch: Option<String> = None;
+    let mut last_actual = TestResult::Error;
 
     for attempt in 1..=max_attempts {
         debug!(test = test_name, attempt, max_attempts, "BATE retry loop: running baseline test");
         let actual = run_fn().await;
+        last_actual = actual.clone();
         match validate_test_against_baseline(test_name, intent, actual) {
             BateOutcome::Valid => {
                 info!(test = test_name, attempt, "BATE: test VALID on attempt {attempt}");
-                return BateOutcome::Valid;
+                return (BateOutcome::Valid, last_actual);
             }
             BateOutcome::Mismatch(reason) => {
                 warn!(test = test_name, attempt, "BATE: mismatch on attempt {attempt}, retrying");
@@ -126,7 +136,7 @@ where
         max_attempts
     );
     warn!(test = test_name, max_attempts, "BATE: test SCRAPPED after {max_attempts} mismatches");
-    BateOutcome::Mismatch(reason)
+    (BateOutcome::Mismatch(reason), last_actual)
 }
 
 // ============================================================================
@@ -178,6 +188,51 @@ pub struct BateRun {
     pub intent_checks: Vec<IntentCheckRecord>,
 }
 
+/// What BATE should do with a BugReproduction test whose baseline mismatched.
+///
+/// [VANTA-WHY] Fix 6 — relabel before revise. A BugReproduction test that PASSES
+/// on the original reproduced nothing: it asserts behaviour the original already
+/// has. Sending it straight to revision asks the Attacker to "fix" a test that is
+/// not broken. When the issue requires that behaviour to STAY, the test is a
+/// legitimate preservation probe that was mislabelled, so it is relabelled and
+/// admitted UNCHANGED. Only when the issue requires the behaviour to change (or
+/// the auditor cannot say) does the ordinary revision path run.
+///
+/// [VANTA-WHY] The relabel only ever goes BugReproduction → BehaviorPreservation,
+/// never the other way. A preservation test whose baseline FAILED must not
+/// become a BugReproduction: that direction would launder a broken probe into
+/// one that is allowed to fail on the original, which is the loophole.
+///
+/// [VANTA-WHY] `issue_requires_change` is an `Option` and the relabel fires ONLY
+/// on an explicit `Some(false)`. A local model dropping the field must not be
+/// able to promote a test: absent means UNKNOWN, and unknown fails closed to the
+/// ordinary revision path (`Revise`). Unavailable auditors arrive here as `None`
+/// for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MislabeledReproductionOutcome {
+    /// The baseline passed and the issue explicitly requires that behaviour
+    /// preserved: relabel to BehaviorPreservation and admit the test unchanged.
+    RelabelToPreservation,
+    /// Anything else — including an unknown answer: hand the test to the
+    /// Attacker for revision as before.
+    Revise,
+}
+
+pub fn mislabeled_reproduction_decision(
+    intent: &TestIntent,
+    baseline: TestResult,
+    issue_requires_change: Option<bool>,
+) -> MislabeledReproductionOutcome {
+    if *intent == TestIntent::BugReproduction
+        && baseline == TestResult::Passed
+        && issue_requires_change == Some(false)
+    {
+        MislabeledReproductionOutcome::RelabelToPreservation
+    } else {
+        MislabeledReproductionOutcome::Revise
+    }
+}
+
 /// Run the BATE phase over a batch of Attacker tests against the ORIGINAL code.
 ///
 /// Returns the report (for discard-rate logging) and the surviving tests using
@@ -219,7 +274,7 @@ pub async fn run_bate(
             let src = original_execution_source.to_string();
             let test_source = current_test.test_source.clone();
             let cmd_template = test_cmd.clone();
-            let outcome = validate_with_retry(
+            let (outcome, baseline_result) = validate_with_retry(
                 &current_test.test_name,
                 &current_test.intent,
                 3, // Layer 1: re-run in a fresh sandbox up to 3× for flakiness
@@ -238,6 +293,62 @@ pub async fn run_bate(
                     break;
                 }
                 BateOutcome::Mismatch(reason) => {
+                    // [VANTA-WHY] Fix 6 — relabel before revise. A test labelled
+                    // BugReproduction whose baseline PASSED is not a reproduction
+                    // at all: it asserts behaviour the original already has.
+                    // Before asking the Attacker to "fix" it, ask whether the
+                    // issue requires that behaviour to stay. If it does, the
+                    // test is a legitimate — merely mislabelled — preservation
+                    // probe, so it is relabelled and admitted UNCHANGED. If the
+                    // issue requires the behaviour to change, the ordinary
+                    // revision path runs as before.
+                    if current_test.intent == TestIntent::BugReproduction
+                        && baseline_result == TestResult::Passed
+                    {
+                        let (requires_change, record) = audit_issue_requires_change(
+                            cfg,
+                            issue_text,
+                            original_prompt_source,
+                            &current_test,
+                        )
+                        .await;
+                        intent_checks.push(record);
+                        if requires_change.is_none() {
+                            // [VANTA-WHY] Fail closed. A local model that drops
+                            // the field must not be able to promote a test: an
+                            // absent answer is UNKNOWN, and unknown never
+                            // relabels. Take the ordinary revision path.
+                            info!(
+                                test = %current_test.test_name,
+                                "audit omitted issue_requires_change, not relabeling"
+                            );
+                        }
+                        if mislabeled_reproduction_decision(
+                            &current_test.intent,
+                            baseline_result.clone(),
+                            requires_change,
+                        ) == MislabeledReproductionOutcome::RelabelToPreservation
+                        {
+                            let mut relabeled = current_test.clone();
+                            relabeled.intent = TestIntent::BehaviorPreservation;
+                            relabeled.issue_quote = None;
+                            info!(
+                                test = %current_test.test_name,
+                                "relabeled BugReproduction→BehaviorPreservation (baseline passed, issue requires preservation)"
+                            );
+                            relabel_events.push(IntentRelabel {
+                                test_name: relabeled.test_name.clone(),
+                                from_intent: TestIntent::BugReproduction,
+                                to_intent: TestIntent::BehaviorPreservation,
+                                reason: "relabeled BugReproduction→BehaviorPreservation \
+                                         (baseline passed, issue requires preservation)"
+                                    .to_string(),
+                            });
+                            current_test = relabeled;
+                            final_outcome = Some(BateOutcome::Valid);
+                            break;
+                        }
+                    }
                     if revision < 3 {
                         info!(
                             test = %current_test.test_name,
@@ -388,7 +499,7 @@ mod tests {
     async fn retry_loop_scraps_after_all_mismatches() {
         // Test that ALWAYS returns Passed for a BugReproduction intent.
         // After 3 attempts it should be scrapped.
-        let outcome = validate_with_retry(
+        let (outcome, last) = validate_with_retry(
             "flaky_fail",
             &TestIntent::BugReproduction,
             3,
@@ -396,6 +507,11 @@ mod tests {
         )
         .await;
         assert!(matches!(outcome, BateOutcome::Mismatch(_)));
+        assert_eq!(
+            last,
+            TestResult::Passed,
+            "the observed baseline must ride along so BATE can tell 'passed' from 'errored'"
+        );
     }
 
     #[tokio::test]
@@ -403,7 +519,7 @@ mod tests {
         // Test that fails twice then passes. Should be Valid (not scrapped).
         use std::cell::RefCell;
         let attempts = RefCell::new(0);
-        let outcome = validate_with_retry(
+        let (outcome, _last) = validate_with_retry(
             "recovers",
             &TestIntent::BugReproduction,
             3,
@@ -420,5 +536,83 @@ mod tests {
         .await;
         assert_eq!(outcome, BateOutcome::Valid);
         assert_eq!(*attempts.borrow(), 3);
+    }
+
+    // ---- Fix 6: relabel before revise -----------------------------------------
+    //
+    // [VANTA-WHY] The decision is a pure function so the rule can be pinned
+    // without an LLM: a BugReproduction whose baseline PASSED is only a
+    // legitimate probe when the issue requires that behaviour to stay.
+
+    #[test]
+    fn a_preservation_style_test_mislabelled_bug_reproduction_is_relabelled_not_revised() {
+        assert_eq!(
+            mislabeled_reproduction_decision(
+                &TestIntent::BugReproduction,
+                TestResult::Passed,
+                Some(false),
+            ),
+            MislabeledReproductionOutcome::RelabelToPreservation,
+            "baseline passed and the issue explicitly requires preservation: keep the test, fix the label"
+        );
+    }
+
+    #[test]
+    fn a_bug_reproduction_the_issue_wants_changed_is_still_revised() {
+        assert_eq!(
+            mislabeled_reproduction_decision(
+                &TestIntent::BugReproduction,
+                TestResult::Passed,
+                Some(true),
+            ),
+            MislabeledReproductionOutcome::Revise,
+            "the issue requires the behaviour to change, so this probe is not a preservation test"
+        );
+    }
+
+    #[test]
+    fn an_errored_baseline_is_not_relabelled() {
+        assert_eq!(
+            mislabeled_reproduction_decision(
+                &TestIntent::BugReproduction,
+                TestResult::Error,
+                Some(false),
+            ),
+            MislabeledReproductionOutcome::Revise,
+            "an error is not a pass — it is not evidence the behaviour already holds"
+        );
+    }
+
+    #[test]
+    fn the_relabel_never_runs_the_other_way() {
+        // [VANTA-WHY] The loophole direction. A preservation test whose baseline
+        // FAILED must never be laundered into a BugReproduction, which is allowed
+        // to fail on the original.
+        assert_eq!(
+            mislabeled_reproduction_decision(
+                &TestIntent::BehaviorPreservation,
+                TestResult::Failed,
+                Some(false),
+            ),
+            MislabeledReproductionOutcome::Revise,
+            "a failing preservation test must not become a BugReproduction"
+        );
+    }
+
+    #[test]
+    fn no_relabel_on_missing_issue_requires_change() {
+        // [VANTA-WHY] Fail closed. The model omitting the field is exactly the
+        // case that used to promote a test: `#[serde(default)]` filled in
+        // `false`, which is the "preserve" answer. Absent must mean UNKNOWN, and
+        // unknown must take the ordinary revision path — never relabel.
+        assert_eq!(
+            mislabeled_reproduction_decision(
+                &TestIntent::BugReproduction,
+                TestResult::Passed,
+                None,
+            ),
+            MislabeledReproductionOutcome::Revise,
+            "a dropped field is unknown, not an explicit preservation answer"
+        );
     }
 }

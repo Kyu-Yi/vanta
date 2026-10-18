@@ -822,6 +822,11 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
         "session.start must record the effective baseline and patched-side test timeouts; got {}",
         start.summary
     );
+    assert!(
+        start.summary.contains("deps_freeze="),
+        "session.start must record the dependency checkpoint's installed package versions; got {}",
+        start.summary
+    );
     // The key was set for this run (`VANTA_API_KEY`), and the run-identity line
     // must say only that a key was present — never the key itself.
     assert!(

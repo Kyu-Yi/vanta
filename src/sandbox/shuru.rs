@@ -37,6 +37,12 @@ const DEFAULT_CHECKPOINT: &str = "vanta-python";
 // VANTA_SHURU_DISK_MB when a dependency checkpoint needs more space.
 const DEFAULT_DISK_MB: u64 = crate::sandbox::deps::BASE_DISK_MB;
 
+pub struct RepoCheckpoint {
+    pub name: String,
+    pub disk_mb: u64,
+    pub pip_freeze: String,
+}
+
 pub struct ShuruBackend {
     // [VANTA-WHY] temp_dir held for RAII — dropping ShuruBackend drops TempDir
     // which deletes the host directory that was mounted into VMs.
@@ -177,6 +183,34 @@ impl ShuruBackend {
             .unwrap_or(false)
     }
 
+    fn read_deps_freeze(
+        name: &str,
+        disk_mb: u64,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let disk = disk_mb.to_string();
+        let output = std::process::Command::new("shuru")
+            .args([
+                "run",
+                "--from",
+                name,
+                "--disk-size",
+                &disk,
+                "--",
+                "sh",
+                "-c",
+                "cat /opt/vanta-deps-freeze.txt",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to read pip freeze from dependency checkpoint '{name}': {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     // ------------------------------------------------------------------
     // ensure_repo_checkpoint — auto-build a checkpoint with the repo's deps
     // ------------------------------------------------------------------
@@ -185,14 +219,14 @@ impl ShuruBackend {
     // pyproject.toml) and guarantees a checkpoint exists that has them
     // installed. The checkpoint is named `vanta-deps-<fingerprint>` so an
     // identical dep set is built once and reused. Returns:
-    //   Ok(Some((name, disk_mb))) — use this checkpoint
+    //   Ok(Some(RepoCheckpoint))  — use this checkpoint
     //   Ok(None)                  — repo declares no deps; use the base
     //   Err(_)                    — detection or install failed (caller warns
     //                               and falls back to the base checkpoint)
     // ------------------------------------------------------------------
     pub fn ensure_repo_checkpoint(
         repo_root: &Path,
-    ) -> Result<Option<(String, u64)>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<RepoCheckpoint>, Box<dyn std::error::Error + Send + Sync>> {
         use crate::sandbox::deps;
 
         if !Self::shuru_available() {
@@ -208,16 +242,38 @@ impl ShuruBackend {
             );
             return Ok(None);
         }
+        if let Some(reason) = deps::policy_refusal_reason(&plan) {
+            return Err(format!("dependency checkpoint refused: {reason}").into());
+        }
 
         let name = plan.checkpoint_name();
         if Self::checkpoint_exists(&name) {
-            info!(
-                target: "vanta::sandbox::deps",
-                checkpoint = %name,
-                disk_mb = plan.disk_mb,
-                "reusing dependency checkpoint"
-            );
-            return Ok(Some((name, plan.disk_mb)));
+            match Self::read_deps_freeze(&name, plan.disk_mb) {
+                Ok(pip_freeze) => {
+                    info!(
+                        target: "vanta::sandbox::deps",
+                        checkpoint = %name,
+                        disk_mb = plan.disk_mb,
+                        "reusing dependency checkpoint"
+                    );
+                    return Ok(Some(RepoCheckpoint {
+                        name,
+                        disk_mb: plan.disk_mb,
+                        pip_freeze,
+                    }));
+                }
+                Err(err) => {
+                    warn!(
+                        target: "vanta::sandbox::deps",
+                        checkpoint = %name,
+                        error = %err,
+                        "existing dependency checkpoint missing freeze metadata — rebuilding"
+                    );
+                    let _ = std::process::Command::new("shuru")
+                        .args(["checkpoint", "delete", &name])
+                        .output();
+                }
+            }
         }
 
         // Ensure the base python checkpoint exists (deps build FROM it).
@@ -228,7 +284,12 @@ impl ShuruBackend {
         }
 
         Self::build_deps_checkpoint(&name, &base, &plan)?;
-        Ok(Some((name, plan.disk_mb)))
+        let pip_freeze = Self::read_deps_freeze(&name, plan.disk_mb)?;
+        Ok(Some(RepoCheckpoint {
+            name,
+            disk_mb: plan.disk_mb,
+            pip_freeze,
+        }))
     }
 
     // ------------------------------------------------------------------
@@ -253,6 +314,9 @@ impl ShuruBackend {
         let plan = deps::derived_plan(parent_disk_mb, missing_modules);
         if plan.is_empty() {
             return Ok(None);
+        }
+        if let Some(reason) = deps::policy_refusal_reason(&plan) {
+            return Err(format!("dependency checkpoint refused: {reason}").into());
         }
 
         let name = plan.checkpoint_name();
@@ -296,6 +360,7 @@ impl ShuruBackend {
             "set -e\n\
              echo '=== Vanta: installing repo dependencies ==='\n\
              python3 -m pip install {args}\n\
+             python3 -m pip freeze > /opt/vanta-deps-freeze.txt\n\
              touch /opt/vanta-deps-ok\n\
              echo '=== Vanta: dependency install complete ==='\n",
             args = plan.pip_args()

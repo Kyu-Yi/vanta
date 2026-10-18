@@ -134,6 +134,8 @@ where
 pub async fn run(
     config: RunConfig,
 ) -> Result<GovernorDecision, Box<dyn std::error::Error + Send + Sync>> {
+    let _terminal_restore = crate::terminal::TerminalRestoreGuard::new();
+
     // ---- Config ----
     let mut cfg = LlmConfig::from_env()?;
     if let Some(m) = &config.model_override {
@@ -178,18 +180,26 @@ pub async fn run(
     // mypy. A real repo declares its own deps which are absent inside the VM, so
     // tests die at import and BATE sees `Error` for everything. Build/cache a
     // checkpoint up front so test runs use the warmed environment.
+    let mut deps_checkpoint =
+        std::env::var("VANTA_SHURU_CHECKPOINT").unwrap_or_else(|_| "none".to_string());
+    let mut deps_freeze: Option<String> = None;
     if std::env::var("VANTA_SHURU_CHECKPOINT").is_err()
         && std::env::var("VANTA_SHURU_AUTO_DEPS").as_deref() != Ok("0")
         && crate::sandbox::shuru_available()
     {
         println!("▌ VM deps: detecting declared dependencies...");
         match crate::sandbox::shuru::ShuruBackend::ensure_repo_checkpoint(&config.repo_path) {
-            Ok(Some((name, disk_mb))) => {
-                println!("▌ VM deps checkpoint: {name} (disk {disk_mb} MB)");
+            Ok(Some(checkpoint)) => {
+                println!(
+                    "▌ VM deps checkpoint: {} (disk {} MB)",
+                    checkpoint.name, checkpoint.disk_mb
+                );
+                deps_checkpoint = checkpoint.name.clone();
+                deps_freeze = Some(checkpoint.pip_freeze.clone());
                 // SAFETY: single-threaded CLI; no other thread reads env concurrently.
                 unsafe {
-                    std::env::set_var("VANTA_SHURU_CHECKPOINT", &name);
-                    std::env::set_var("VANTA_SHURU_DISK_MB", disk_mb.to_string());
+                    std::env::set_var("VANTA_SHURU_CHECKPOINT", &checkpoint.name);
+                    std::env::set_var("VANTA_SHURU_DISK_MB", checkpoint.disk_mb.to_string());
                 }
             }
             Ok(None) => println!("▌ VM deps: none declared — using base checkpoint"),
@@ -263,7 +273,7 @@ pub async fn run(
         summary: format!(
             "model={} model_version={} prompt_version={} provider={} api_key={} \
              vanta_version={} vanta_commit={} vanta_dirty={} tested_commit={} target_repo_dirty={} requested_backend={} actual_backend={} max_attempts={} \
-             baseline_test_timeout_secs={} patched_test_timeout_secs={} test_cmd={} mode={} benchmark_instance={}",
+             baseline_test_timeout_secs={} patched_test_timeout_secs={} deps_checkpoint={} deps_freeze={} test_cmd={} mode={} benchmark_instance={}",
             cfg.model_id,
             std::env::var("VANTA_MODEL_VERSION").unwrap_or_else(|_| "unknown".into()),
             prompt_versions,
@@ -281,6 +291,8 @@ pub async fn run(
             config.max_attempts,
             baseline_test_timeout_secs,
             patched_test_timeout_secs,
+            deps_checkpoint,
+            dependency_freeze_summary_value(deps_freeze.as_deref()),
             format!("{} {}", test_cmd.program, test_cmd.args.join(" ")),
             run_mode,
             "none",
@@ -1442,6 +1454,21 @@ fn repo_working_tree_dirty(
     Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
+fn dependency_freeze_summary_value(freeze: Option<&str>) -> String {
+    let rendered = freeze
+        .unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("|");
+    if rendered.is_empty() {
+        "none".to_string()
+    } else {
+        rendered
+    }
+}
+
 fn render_committed_test_file(tests: &[GeneratedTest]) -> String {
     let mut imports: Vec<String> = Vec::new();
     let mut bodies: Vec<String> = Vec::new();
@@ -1719,8 +1746,8 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        attempt_verdict, collapse_decision, harness_infrastructure_collapse,
-        patch_attempt_id_for_patch, render_committed_test_file,
+        attempt_verdict, collapse_decision, dependency_freeze_summary_value,
+        harness_infrastructure_collapse, patch_attempt_id_for_patch, render_committed_test_file,
         require_clean_target_repo_for_open_pr,
         stable_patch_fingerprint,
     };
@@ -1888,5 +1915,22 @@ mod tests {
         );
         assert!(rendered.contains("def test_one():"));
         assert!(rendered.contains("def test_two():"));
+    }
+
+    #[test]
+    fn dependency_freeze_summary_value_is_single_line() {
+        let rendered = dependency_freeze_summary_value(Some(
+            "flake8==7.4.1\nisort==6.1.0\npytest==8.4.2\n",
+        ));
+        assert_eq!(rendered, "flake8==7.4.1|isort==6.1.0|pytest==8.4.2");
+        assert!(
+            !rendered.contains('\n'),
+            "session.start summary must stay on one line"
+        );
+    }
+
+    #[test]
+    fn dependency_freeze_summary_value_defaults_to_none() {
+        assert_eq!(dependency_freeze_summary_value(None), "none");
     }
 }

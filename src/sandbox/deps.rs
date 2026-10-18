@@ -25,6 +25,10 @@ use std::path::Path;
 /// shuru.rs creates ("vanta-python"), otherwise `shuru run --disk-size` rejects
 /// the VM with "smaller than the base image".
 pub const BASE_DISK_MB: u64 = 8192;
+/// Hard cap for auto-built dependency checkpoints. Above this we refuse to
+/// build and let the run surface an Infrastructure result instead of filling
+/// the disk with a giant environment.
+pub const MAX_CHECKPOINT_DISK_MB: u64 = 16_384;
 
 /// A repo's dependency install plan for the shuru microVM.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +71,30 @@ impl DependencyPlan {
         }
         s
     }
+}
+
+pub fn policy_refusal_reason(plan: &DependencyPlan) -> Option<String> {
+    let blocked: Vec<String> = plan
+        .packages
+        .iter()
+        .filter(|pkg| is_blocked_package(pkg))
+        .cloned()
+        .collect();
+    if !blocked.is_empty() {
+        return Some(format!(
+            "auto-dependency checkpoint refused huge package(s): {}. \
+             Mark this run Infrastructure or pass an explicit benchmark environment instead",
+            blocked.join(", ")
+        ));
+    }
+    if plan.disk_mb > MAX_CHECKPOINT_DISK_MB {
+        return Some(format!(
+            "auto-dependency checkpoint refused disk size {} MB above cap {} MB. \
+             Mark this run Infrastructure or pass an explicit benchmark environment instead",
+            plan.disk_mb, MAX_CHECKPOINT_DISK_MB
+        ));
+    }
+    None
 }
 
 // ----------------------------------------------------------------------------
@@ -253,6 +281,25 @@ fn normalize_name(spec: &str) -> String {
 
 fn is_pytorch_dist(name: &str) -> bool {
     matches!(name, "torch" | "pytorch" | "torchvision" | "torchaudio")
+}
+
+fn is_blocked_package(spec: &str) -> bool {
+    let normalized = normalize_name(spec);
+    matches!(
+        normalized.as_str(),
+        "torch"
+            | "pytorch"
+            | "torchvision"
+            | "torchaudio"
+            | "tensorflow"
+            | "tensorflow-cpu"
+            | "tensorflow-gpu"
+            | "keras"
+            | "jax"
+            | "jaxlib"
+            | "vllm"
+    ) || spec.to_ascii_lowercase().contains("cuda")
+        || spec.to_ascii_lowercase().contains("+cu")
 }
 
 /// Rough installed-size estimate in MB, used only to size the VM disk.
@@ -542,5 +589,35 @@ pytest = "*"
         // must never collide with a manifest fingerprint for the same packages
         let manifest = fnv1a_hex(&plan.packages.join("\n"));
         assert_ne!(plan.fingerprint, manifest);
+    }
+
+    #[test]
+    fn test_policy_rejects_known_huge_packages() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("requirements.txt"), "torch\npytest\n").unwrap();
+
+        let plan = detect(tmp.path());
+        let reason = policy_refusal_reason(&plan).expect("torch should be refused");
+        assert!(
+            reason.contains("torch"),
+            "refusal should name the huge package, got {reason}"
+        );
+    }
+
+    #[test]
+    fn test_policy_rejects_checkpoints_over_disk_cap() {
+        let plan = DependencyPlan {
+            packages: vec!["small-a".into(), "small-b".into()],
+            needs_pytorch_cpu_index: false,
+            disk_mb: MAX_CHECKPOINT_DISK_MB + 1024,
+            fingerprint: "abc".into(),
+        };
+
+        let reason =
+            policy_refusal_reason(&plan).expect("oversized checkpoints should be refused");
+        assert!(
+            reason.contains(&MAX_CHECKPOINT_DISK_MB.to_string()),
+            "refusal should mention the disk cap, got {reason}"
+        );
     }
 }

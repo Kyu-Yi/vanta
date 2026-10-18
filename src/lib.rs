@@ -68,4 +68,5 @@ pub mod pipeline;
 pub mod pr;
 pub mod sandbox;
 pub mod session;
+pub mod terminal;
 pub mod repo;

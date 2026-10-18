@@ -10,11 +10,16 @@
 //   Logic          → runs but wrong behavior (the patch has a logic bug)
 //   Unknown        → can't classify (default before analysis)
 //
-// Diagnostic signal: ruff + mypy diff vs baseline. If original had 0 ruff
-// errors and patched has new ones → Static. If patch adds type errors → Static.
-// If pytest dies during import/collect without new static signals, treat that as
-// Infrastructure so the harness does not blame the model for a broken tree.
-// If tests run but assert fails → Logic.
+// Diagnostic signal: ruff + mypy diff vs baseline. If pytest dies during
+// import/collect without new static signals, treat that as Infrastructure so the
+// harness does not blame the model for a broken tree. If tests run but assert
+// fails → Logic.
+//
+// [VANTA-WHY] Order matters: a test that RAN and failed is classified by its own
+// failure BEFORE the static short-circuit, and any new ruff/mypy finding is
+// recorded separately in the payload rather than overwriting that class. With
+// Static first, a real behavioural failure was labelled Static whenever the
+// patch also carried a lint/type finding (session e8d393be).
 // ============================================================================
 
 use crate::agents::attacker::{GeneratedTest, attacker_simplify_test};
@@ -343,12 +348,59 @@ pub fn diagnose(inputs: &DiagnosticInputs) -> DiagnosticResult {
         };
     }
 
+    // [VANTA-WHY] Item 5 of the heretic fix list — order: a test that RAN and
+    // failed is classified by its own failure, BEFORE the static short-circuit.
+    // The old order put "new ruff/mypy errors" above "assertion failed", so a
+    // real behavioural failure was labelled Static whenever the patch also
+    // carried a lint/type finding (e8d393be). A static finding is evidence about
+    // the patch, not a substitute for the failure that actually happened: it is
+    // recorded SEPARATELY in this payload and never overwrites the test's class.
+    if inputs.assertion_failed {
+        info!("Diagnostician → Logic (assertion failed)");
+        // [VANTA-WHY] This payload used to be `{"signal":"assertion_failed"}` and
+        // nothing more: no test source, no pytest output, no traceback. A reader
+        // of evidence.json then could not tell WHY the patch was blamed — the
+        // exact defect the heretic runs exposed. Save the test's own source, the
+        // failure output (capped), and the innermost frame so the claim "the
+        // patch has a logic bug" is auditable from the record alone.
+        let full_output = format!("{}\n{}", inputs.pytest_stdout, inputs.pytest_stderr);
+        let (frame_file, frame_line, exception_type) = parse_failure_site(&full_output);
+        let mut payload = serde_json::json!({
+            "signal": "assertion_failed",
+            "test_source": inputs.test_source,
+            "failure_output": truncate_output(&full_output, FAILURE_OUTPUT_LIMIT),
+            "exception_type": exception_type,
+            "frame_file": frame_file,
+            "frame_line": frame_line,
+        });
+        if inputs.ruff_new_errors || inputs.mypy_new_errors {
+            let mut static_errors = serde_json::json!({
+                "ruff_new_errors": inputs.ruff_new_errors,
+                "mypy_new_errors": inputs.mypy_new_errors,
+            });
+            if inputs.ruff_new_errors && !inputs.ruff_stderr.is_empty() {
+                static_errors["ruff_stderr"] = serde_json::Value::String(inputs.ruff_stderr.clone());
+            }
+            if inputs.mypy_new_errors && !inputs.mypy_stderr.is_empty() {
+                static_errors["mypy_stderr"] = serde_json::Value::String(inputs.mypy_stderr.clone());
+            }
+            payload["new_static_errors"] = static_errors;
+        }
+        return DiagnosticResult {
+            failure_class: Some(FailureClass::Logic),
+            reason: "Test ran but assertion failed — patch has a logic bug".into(),
+            structured_payload: Some(payload),
+        };
+    }
+
     if inputs.ruff_new_errors || inputs.mypy_new_errors {
         info!("Diagnostician → Static (new lint/type errors)");
         // [VANTA-WHY] Populate structured_payload with the actual ruff/mypy
         // stderr so M3's Creator can see exactly what static errors the patch
         // introduced. This is the "structured JSON diagnostic payload back to
-        // Creator" requirement from Spec §7 Phase 2.
+        // Creator" requirement from Spec §7 Phase 2. Reached only when the test
+        // did NOT run to a failure — a test that ran is classified by its
+        // failure above.
         let mut payload = serde_json::json!({
             "signal": "new_static_errors",
             "ruff_new_errors": inputs.ruff_new_errors,
@@ -380,31 +432,6 @@ pub fn diagnose(inputs: &DiagnosticInputs) -> DiagnosticResult {
                 "pytest_stderr": inputs.pytest_stderr,
                 "pytest_report_missing": inputs.pytest_report_missing,
             })),
-        };
-    }
-
-    if inputs.assertion_failed {
-        info!("Diagnostician → Logic (assertion failed)");
-        // [VANTA-WHY] This payload used to be `{"signal":"assertion_failed"}` and
-        // nothing more: no test source, no pytest output, no traceback. A reader
-        // of evidence.json then could not tell WHY the patch was blamed — the
-        // exact defect the heretic runs exposed. Save the test's own source, the
-        // failure output (capped), and the innermost frame so the claim "the
-        // patch has a logic bug" is auditable from the record alone.
-        let full_output = format!("{}\n{}", inputs.pytest_stdout, inputs.pytest_stderr);
-        let (frame_file, frame_line, exception_type) = parse_failure_site(&full_output);
-        let payload = serde_json::json!({
-            "signal": "assertion_failed",
-            "test_source": inputs.test_source,
-            "failure_output": truncate_output(&full_output, FAILURE_OUTPUT_LIMIT),
-            "exception_type": exception_type,
-            "frame_file": frame_file,
-            "frame_line": frame_line,
-        });
-        return DiagnosticResult {
-            failure_class: Some(FailureClass::Logic),
-            reason: "Test ran but assertion failed — patch has a logic bug".into(),
-            structured_payload: Some(payload),
         };
     }
 
@@ -747,6 +774,55 @@ mod tests {
         };
         let result = diagnose(&inputs);
         assert_eq!(result.failure_class, Some(FailureClass::Logic));
+    }
+
+    /// Item 5 of the heretic fix list: a test that RAN and failed is classified
+    /// by its failure, not by a static finding the patch also carries. With the
+    /// static check first, e8d393be's real failures were labelled Static and the
+    /// failure evidence was lost.
+    #[test]
+    fn a_test_that_ran_and_failed_is_logic_even_with_new_static_errors() {
+        let inputs = DiagnosticInputs {
+            assertion_failed: true,
+            ruff_new_errors: true,
+            mypy_new_errors: true,
+            ruff_stderr: "src/pkg/mod.py:7:1: F821 Undefined name `x`".to_string(),
+            pytest_stdout: "test_x.py:2: AssertionError\n".to_string(),
+            ..Default::default()
+        };
+        let result = diagnose(&inputs);
+
+        assert_eq!(
+            result.failure_class,
+            Some(FailureClass::Logic),
+            "the failure that actually happened outranks a lint finding"
+        );
+        let payload = result.structured_payload.expect("payload");
+        assert_eq!(payload["signal"], json!("assertion_failed"));
+        assert_eq!(
+            payload["new_static_errors"]["ruff_new_errors"],
+            json!(true),
+            "the static finding must still be RECORDED, just not as the class"
+        );
+        assert!(
+            payload["new_static_errors"]["ruff_stderr"]
+                .as_str()
+                .unwrap()
+                .contains("F821"),
+            "the static evidence must ride with the payload"
+        );
+    }
+
+    /// ...and Static still classifies a tree where the test never ran.
+    #[test]
+    fn new_static_errors_without_a_ran_test_are_static() {
+        let inputs = DiagnosticInputs {
+            mypy_new_errors: true,
+            mypy_stderr: "src/pkg/mod.py:7: error: incompatible type".to_string(),
+            ..Default::default()
+        };
+        let result = diagnose(&inputs);
+        assert_eq!(result.failure_class, Some(FailureClass::Static));
     }
 
     /// Item 1 of the heretic fix list: the assertion payload used to be a bare

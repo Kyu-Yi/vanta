@@ -24,7 +24,8 @@
 use crate::config::LlmConfig;
 use serde_json::{json, Value};
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tracing::{debug, info, trace, warn};
 
@@ -38,10 +39,26 @@ pub use crate::agents::creator::CreatorResponse;
 //
 // [VANTA-WHY] User explicitly requested "extensive debugging and logging".
 // When VANTA_DEBUG_DIR is set, every structured_call_with_retry attempt writes:
-//   {debug_dir}/{type_name}_attempt_{n}_raw_response.txt   — raw model output
-//   {debug_dir}/{type_name}_attempt_{n}_parsed.json        — parsed typed result (on success)
-// This lets us retroactively inspect what the model returned when a parse fails,
-// which is invaluable for linking new additions and tracking issues.
+//   {debug_dir}/{type_name}[_{tag}]_round_{R}_attempt_{n}_raw_response.txt
+//   {debug_dir}/{type_name}[_{tag}]_round_{R}_attempt_{n}_parsed.json
+// where R is the PIPELINE ROUND (the driver's attempt index) and n is the
+// structured-call RETRY index (1..=3).
+//
+// [VANTA-WHY] R used to be missing entirely, and n was the only number in the
+// name. Every pipeline round calls the Attacker/BATE/intent-audit helpers again,
+// each of which restarts n at 1, so round 2 overwrote round 1 and round 3
+// overwrote round 2: the debug folder of a three-round run held round 3 three
+// times over and the forensics for the failed rounds were gone. The round is a
+// property of the RUN, not of one call, so it lives in a process-global that the
+// driver sets once per attempt. The tag (a test name) disambiguates the per-test
+// calls within one round.
+static FORENSICS_ROUND: AtomicU32 = AtomicU32::new(0);
+
+/// Tell the forensics writer which pipeline round we are in. Called once per
+/// attempt by the driver, before any agent runs.
+pub fn set_forensics_round(round: u32) {
+    FORENSICS_ROUND.store(round, Ordering::Relaxed);
+}
 
 fn debug_dir() -> Option<PathBuf> {
     std::env::var("VANTA_DEBUG_DIR")
@@ -50,18 +67,53 @@ fn debug_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn write_forensics(type_name: &str, attempt: u32, suffix: &str, content: &str) {
+fn write_forensics(type_name: &str, tag: &str, attempt: u32, suffix: &str, content: &str) {
     let Some(dir) = debug_dir() else { return };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(err = %e, "forensics: failed to create debug dir");
         return;
     }
-    let filename = format!("{type_name}_attempt_{attempt}_{suffix}");
+    write_forensics_to(
+        &dir,
+        type_name,
+        tag,
+        FORENSICS_ROUND.load(Ordering::Relaxed),
+        attempt,
+        suffix,
+        content,
+    );
+}
+
+/// The one place a forensics filename is built. `round` is the pipeline round,
+/// `attempt` the structured-call retry index.
+fn write_forensics_to(
+    dir: &Path,
+    type_name: &str,
+    tag: &str,
+    round: u32,
+    attempt: u32,
+    suffix: &str,
+    content: &str,
+) {
+    let label = if tag.is_empty() {
+        String::new()
+    } else {
+        format!("_{}", sanitize_tag(tag))
+    };
+    let filename = format!("{type_name}{label}_round_{round}_attempt_{attempt}_{suffix}");
     let path = dir.join(filename);
     match std::fs::write(&path, content) {
         Ok(_) => debug!(path = %path.display(), "forensics written"),
         Err(e) => warn!(err = %e, path = %path.display(), "forensics write failed"),
     }
+}
+
+/// A test name can carry `/`, `[`, `]`, spaces — none of which belong in a
+/// filename.
+fn sanitize_tag(tag: &str) -> String {
+    tag.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect()
 }
 
 // ============================================================================
@@ -411,6 +463,7 @@ pub async fn structured_call_with_retry<Fm, Fp, T>(
     client: &reqwest::Client,
     cfg: &LlmConfig,
     max_attempts: u32,
+    forensics_tag: &str,
     mut build_messages: Fm,
     extras_for_attempt: Value,
     mut parse_into_typed: Fp,
@@ -442,14 +495,14 @@ where
 
         // [FORENSICS] Write the raw model response to disk before parsing,
         // so we can inspect exactly what the model returned if parsing fails.
-        write_forensics(type_name, attempt, "raw_response.txt", &raw);
+        write_forensics(type_name, forensics_tag, attempt, "raw_response.txt", &raw);
 
         match parse_into_typed(&raw) {
             Ok(typed) => {
                 debug!(attempt, type_name, "parsed typed response");
                 // [FORENSICS] Write the successfully parsed typed result as JSON.
                 if let Ok(json) = serde_json::to_string_pretty(&serde_json::to_value(&typed).unwrap_or(json!(null))) {
-                    write_forensics(type_name, attempt, "parsed.json", &json);
+                    write_forensics(type_name, forensics_tag, attempt, "parsed.json", &json);
                 }
                 return Ok(typed);
             }
@@ -526,5 +579,52 @@ mod _cleaning_tests {
     fn context_budget_exceeded_counts_prompt_output_and_overhead() {
         assert!(context_budget_exceeded(60_000, 6_000, 65_536));
         assert!(!context_budget_exceeded(20_000, 2_000, 65_536));
+    }
+
+    // ---- Fix 4 regression: round-numbered forensics do not overwrite ----
+
+    /// The old filename carried ONLY the structured-call retry index (1..=3),
+    /// which restarts every round — so a 2-round run wrote round 2 over round 1.
+    /// Both rounds' files must survive now.
+    #[test]
+    fn forensics_from_two_rounds_both_exist() {
+        use super::{write_forensics_to};
+        use std::collections::BTreeSet;
+
+        let dir = tempfile::tempdir().unwrap();
+        for round in 1..=2u32 {
+            write_forensics_to(
+                dir.path(),
+                "IntentVerdict",
+                "test_print_responses",
+                round,
+                1,
+                "parsed.json",
+                "{}",
+            );
+        }
+
+        let names: BTreeSet<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names.len(), 2, "a later round overwrote an earlier one: {names:?}");
+        assert!(
+            names.iter().any(|n| n.contains("round_1_attempt_1")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("round_2_attempt_1")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().all(|n| n.contains("test_print_responses")),
+            "intent verdicts must carry the test name: {names:?}"
+        );
+    }
+
+    #[test]
+    fn forensics_tag_is_sanitized() {
+        assert_eq!(super::sanitize_tag("tests/x.py::test[1]"), "tests_x.py__test_1_");
     }
 }

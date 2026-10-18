@@ -181,7 +181,7 @@ Required JSON schema:
     };
 
     let typed: CreatorResponse = structured_call_with_retry(
-        &client, cfg, 3, build_messages, extras, parse_closure
+        &client, cfg, 3, "", build_messages, extras, parse_closure
     ).await?;
 
     // Sanity checks

@@ -24,7 +24,7 @@ use vanta::pipeline::driver::{self, RunConfig};
 // CLI — manual arg parsing (no clap dep; keep Cargo.toml minimal)
 // ============================================================================
 struct CliArgs {
-    repo_path: PathBuf,
+    repo_path: Option<PathBuf>,
     issue_path: Option<PathBuf>,
     max_attempts: u32,
     model_override: Option<String>,
@@ -40,6 +40,16 @@ struct CliArgs {
     /// Mode B. If set, BATE runs against this tree instead of the in-memory
     /// original files. Spec §7: "both trees present simultaneously".
     original_tree: Option<PathBuf>,
+    /// If Some(session_id), do NOT run the pipeline: re-run the signals behind
+    /// that session's review-mode rejection against a known-good tree and write
+    /// the per-signal verdicts. Item 11 of the heretic fix list.
+    rerun_signals: Option<String>,
+    /// Known-good source tree for `--rerun-signals` (a directory, or a patch
+    /// file that `--base-tree` is applied to).
+    good_tree: Option<PathBuf>,
+    /// Base tree the `--good-tree` patch applies to; required only when
+    /// `--good-tree` is a patch file.
+    base_tree: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<CliArgs, String> {
@@ -52,6 +62,9 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut patch_path: Option<PathBuf> = None;
     let mut test_cmd: Option<String> = None;
     let mut original_tree: Option<PathBuf> = None;
+    let mut rerun_signals: Option<String> = None;
+    let mut good_tree: Option<PathBuf> = None;
+    let mut base_tree: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -110,6 +123,27 @@ fn parse_args() -> Result<CliArgs, String> {
                 }
                 original_tree = Some(PathBuf::from(&args[i]));
             }
+            "--rerun-signals" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--rerun-signals requires a session id".to_string());
+                }
+                rerun_signals = Some(args[i].clone());
+            }
+            "--good-tree" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--good-tree requires a path".to_string());
+                }
+                good_tree = Some(PathBuf::from(&args[i]));
+            }
+            "--base-tree" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--base-tree requires a path".to_string());
+                }
+                base_tree = Some(PathBuf::from(&args[i]));
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -126,7 +160,12 @@ fn parse_args() -> Result<CliArgs, String> {
         i += 1;
     }
 
-    let repo_path = repo_path.ok_or("missing --repo PATH")?;
+    // [VANTA-WHY] `--repo` is only required for the run path. In `--rerun-signals`
+    // mode the session artifacts and the good tree ARE the inputs, and demanding
+    // a repo would force the caller to pass a path the rerun never reads.
+    if rerun_signals.is_none() && repo_path.is_none() {
+        return Err("missing --repo PATH".to_string());
+    }
 
     Ok(CliArgs {
         repo_path,
@@ -137,6 +176,9 @@ fn parse_args() -> Result<CliArgs, String> {
         patch_path,
         test_cmd,
         original_tree,
+        rerun_signals,
+        good_tree,
+        base_tree,
     })
 }
 
@@ -144,7 +186,8 @@ fn print_help() {
     println!(
         "Vanta M3 — Adversarial verification repair loop\n\
          \n\
-         USAGE:\n    vanta --repo PATH [--issue PATH] [--max-attempts N] [--model NAME] [--open-pr] [--patch PATH] [--test-cmd CMD] [--original-tree PATH]\n\
+         USAGE:\n    vanta --repo PATH [--issue PATH] [--max-attempts N] [--model NAME] [--open-pr] [--patch PATH] [--test-cmd CMD] [--original-tree PATH]\n    \
+         vanta --rerun-signals SESSION_ID --good-tree PATH [--base-tree PATH]\n\
          \n\
          OPTIONS:\n    --repo, -r PATH        Path to the repository to repair\n    \
          --issue, -i PATH       Path to the issue/bug description (default: auto-detect)\n    \
@@ -154,6 +197,9 @@ fn print_help() {
          --patch, -p PATH       Verify an EXISTING patch (skip Creator, run Attacker+BATE on this diff)\n    \
          --test-cmd CMD         Test command (default: 'python3 -m pytest'). e.g. 'pytest tests/ -q'\n    \
          --original-tree PATH   Clean original tree (git worktree of base commit) for Mode B two-tree mode\n    \
+         --rerun-signals ID     Re-run session ID's review-mode rejection signals against --good-tree (writes vanta_sessions/ID_signal_reruns.json; no --repo needed)\n    \
+         --good-tree PATH       Known-good source: a directory, or a patch file applied onto --base-tree\n    \
+         --base-tree PATH       Base tree the --good-tree patch applies to (required only for a patch file)\n    \
          --help, -h             Show this help\n"
     );
 }
@@ -164,12 +210,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let cli = parse_args().map_err(|e| format!("CLI error: {e}\n\nUse --help for usage."))?;
 
+    // [VANTA-WHY] The rerun is a DIFFERENT program shape: it reads a finished
+    // session's artifacts instead of driving a new run, so it short-circuits
+    // before the banner and the driver. It never needs --repo, and it must not
+    // fall through to the repair loop (which would need one).
+    if let Some(session_id) = cli.rerun_signals {
+        let good_tree = cli
+            .good_tree
+            .ok_or("--rerun-signals requires --good-tree PATH")?;
+        let config = vanta::pipeline::rerun::RerunConfig {
+            session_id,
+            good_tree,
+            base_tree: cli.base_tree,
+            sessions_dir: PathBuf::from("vanta_sessions"),
+        };
+        match vanta::pipeline::rerun::rerun_signals(config).await {
+            Ok(path) => {
+                println!("▌ Signal reruns written to {}", path.display());
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("rerun-signals failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║  VANTA M3 — Repair Loop (Creator → Attacker → BATE → Governor)║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
+    let repo_path = cli
+        .repo_path
+        .ok_or("missing --repo PATH")?;
+
     let decision = driver::run(RunConfig {
-        repo_path: cli.repo_path,
+        repo_path,
         issue_path: cli.issue_path,
         max_attempts: cli.max_attempts,
         model_override: cli.model_override,

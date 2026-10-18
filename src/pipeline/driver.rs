@@ -1026,6 +1026,7 @@ pub async fn run(
             attempt,
             &new_ruff,
             &new_mypy,
+            &blocking_static,
         ) {
             println!("    {finding}");
         }
@@ -2224,11 +2225,21 @@ fn blocking_static_findings(
 /// artifacts name the exact finding behind a review-mode rejection instead of a
 /// bare boolean. Session 40e84874 rejected on a mypy finding that the session
 /// files never recorded; this is where it is now kept.
+///
+/// [VANTA-WHY] `blocking` is the rendered list of the findings that actually
+/// REJECTED the round (from `blocking_static_findings`). The `"blocking"`
+/// boolean it adds to each record is what lets an audit tell the finding that
+/// rejected the candidate apart from the findings that were merely REPORTED to
+/// the Creator: both land in the same list, and without this flag a style nit
+/// and a fatal error are indistinguishable after the run. It is a look-up of the
+/// finding's own `render()` in the SAME list the gate and the message read, so
+/// the recorded flag cannot disagree with the verdict.
 fn record_new_static_findings(
     sink: &mut Vec<serde_json::Value>,
     attempt: u32,
     new_ruff: &[&harness::StaticDiagnostic],
     new_mypy: &[&harness::StaticDiagnostic],
+    blocking: &[String],
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for (tool, findings) in [("ruff", new_ruff), ("mypy", new_mypy)] {
@@ -2240,6 +2251,7 @@ fn record_new_static_findings(
                 "line": d.line,
                 "code": d.code,
                 "message": d.message,
+                "blocking": blocking.contains(&d.render()),
             }));
             lines.push(format!("[{tool}] {}", d.render()));
         }
@@ -2589,7 +2601,7 @@ mod tests {
             message: "Item of \"list\" has no attribute ...".to_string(),
         };
 
-        let lines = record_new_static_findings(&mut sink, 0, &[&ruff], &[&mypy]);
+        let lines = record_new_static_findings(&mut sink, 0, &[&ruff], &[&mypy], &[]);
 
         assert_eq!(sink.len(), 2, "both new findings must reach evidence.json");
         assert_eq!(sink[0]["tool"], serde_json::json!("ruff"));
@@ -2607,6 +2619,30 @@ mod tests {
             "the console must name the exact site, got: {}",
             lines[1]
         );
+    }
+
+    /// Item 11 of the heretic fix list: the evidence file must mark WHICH new
+    /// finding actually rejected the round. A style rule (ruff E501) in a touched
+    /// file is reported but does not block; an error-class finding (ruff F821) in
+    /// the same touched file does. Only the latter may carry `"blocking": true`,
+    /// or an audit cannot tell the finding that rejected the candidate apart from
+    /// the nit reported beside it.
+    #[test]
+    fn record_new_static_findings_marks_only_the_blocking_finding() {
+        let touched = vec!["calc.py".to_string()];
+        let f821 = audit_finding("calc.py", "F821");
+        let style = audit_finding("calc.py", "E501");
+        let blocking = blocking_static_findings(&[&f821, &style], &[], &touched);
+        assert_eq!(blocking.len(), 1, "only the error-class finding blocks");
+
+        let mut sink: Vec<serde_json::Value> = Vec::new();
+        record_new_static_findings(&mut sink, 0, &[&f821, &style], &[], &blocking);
+
+        assert_eq!(sink.len(), 2);
+        assert_eq!(sink[0]["code"], serde_json::json!("F821"));
+        assert_eq!(sink[0]["blocking"], serde_json::json!(true));
+        assert_eq!(sink[1]["code"], serde_json::json!("E501"));
+        assert_eq!(sink[1]["blocking"], serde_json::json!(false));
     }
 
     /// Item 4 of the heretic fix list: the rejection message must name the REAL

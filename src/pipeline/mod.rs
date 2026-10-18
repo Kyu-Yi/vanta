@@ -10,6 +10,7 @@ pub mod harness;
 pub mod patch;
 pub mod governor;
 pub mod gatekeeper;
+pub mod rerun;
 
 /// The prompt versions in force for this build, as one `session.start`-ready
 /// string.

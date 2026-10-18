@@ -191,7 +191,9 @@ The Attacker is far more dangerous when it remembers how this codebase has broke
 - [x] Fixed-N Governor + deterministic Gatekeeper
 - [x] GitHub PR integration
 - [x] CLI: `vanta --repo ./target --issue ./bug.md`
-- [ ] End-to-end unattended run on a real repository ← **V1 acceptance test**
+- [x] End-to-end unattended run on a real repository ← **V1 acceptance test**
+  - Exit test evidence: [vanta-pr-test#6](https://github.com/Kyu-Yi/vanta-pr-test/pull/6)
+  - Session: `7e6d812a-6d8d-49ea-8445-c4fc916e94f5`
 
 ### Milestone 4 — V2: proof & memory
 - [ ] `zeroboot.rs`: Firecracker CoW forking (Linux, via CI)
@@ -209,7 +211,15 @@ The Attacker is far more dangerous when it remembers how this codebase has broke
 
 ## Status
 
-**Design complete · implementation in progress.** This repository currently contains the specification and research framing; code lands milestone by milestone per the roadmap above. Watch the repo or follow along. This is being built in public.
+**Milestone 3 complete.** Vanta now has an end-to-end unattended repair loop that runs on a real repository, verifies the candidate patch, and opens a draft PR when the Gatekeeper approves it. Current capstone evidence: [vanta-pr-test#6](https://github.com/Kyu-Yi/vanta-pr-test/pull/6) (session `7e6d812a-6d8d-49ea-8445-c4fc916e94f5`, Shuru backend, repair mode, native suite `455` tests with `0` regressions and `2` pre-existing failures fixed).
+
+## Known Limitations
+
+- The Attacker still sometimes misses exact boundary values. On the toy boundary fixture, the boundary rule improved the bad-patch catch rate to `5/6`, but that remains prompt-dependent and the deterministic version is intentionally deferred until the pilot justifies it.
+- Toy-fixture catch-rate numbers are a development result, not evidence.
+- On the `inflection` exit test, the repository's own suite already covered the planted bug, so the native-suite gate carried the main evidence.
+- Repair mode stops on the first passing round, so a clean first-attempt fix produces no N→N+1 transition rows and sits outside ECR/EIR by construction.
+- Shuru is the macOS stand-in for the Firecracker backend, not the final Linux production sandbox.
 
 ## FAQ
 

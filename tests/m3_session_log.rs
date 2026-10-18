@@ -57,6 +57,29 @@ impl StubLlmServer {
         )
     }
 
+    /// As `start_with_creator_and_attacker`, but `creator_responses_json` is a
+    /// JSON ARRAY of Creator answers served one per Creator call.
+    ///
+    /// [VANTA-WHY] A repair-mode regression needs the Creator to get it WRONG
+    /// once and RIGHT afterwards — that is the whole point of feeding the failure
+    /// back — and a stub that answers every call identically cannot express it.
+    /// The last element repeats if the loop asks for more, so the caller only
+    /// scripts the calls it cares about.
+    fn start_with_creator_script(
+        creator_responses_json: &str,
+        attacker_response_json: &str,
+    ) -> Self {
+        Self::start_scripted(
+            Some(creator_responses_json),
+            attacker_response_json,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
     /// As `start`, but the patch-blind intent audit answers with a scripted
     /// verdict instead of the default "the issue asks for this behaviour".
     fn start_with_intent_audit(attacker_response_json: &str, audit_response_json: &str) -> Self {
@@ -159,6 +182,9 @@ impl StubLlmServer {
             intent_audit_response_json.map(|json| serde_json::from_str(json).unwrap());
 
         let join = thread::spawn(move || {
+            // How many Creator calls have been answered, so a scripted array of
+            // answers can be served in order.
+            let mut creator_calls = 0_usize;
             while !stop_clone.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _addr)) => {
@@ -247,9 +273,21 @@ impl StubLlmServer {
                                 .unwrap_or_else(|| attacker_value.clone())
                         };
                         let content = if request_kind == "creator" {
-                            creator_value
-                                .clone()
-                                .unwrap_or_else(|| serde_json::json!({"patch_text":"def add(a, b):\n    return a + b\n","explanation":"noop","files_touched":["calc.py"],"confidence":0.1}))
+                            // [VANTA-WHY] A creator answer may be a SCRIPT: a JSON
+                            // array whose elements are served one per Creator call
+                            // (the last repeating). A repair-mode regression needs
+                            // the first candidate to be wrong and a later one to be
+                            // right, which a single fixed answer cannot express.
+                            let served = match creator_value.as_ref() {
+                                Some(serde_json::Value::Array(items)) if !items.is_empty() => {
+                                    let index = creator_calls.min(items.len() - 1);
+                                    items[index].clone()
+                                }
+                                Some(value) => value.clone(),
+                                None => serde_json::json!({"patch_text":"def add(a, b):\n    return a + b\n","explanation":"noop","files_touched":["calc.py"],"confidence":0.1}),
+                            };
+                            creator_calls += 1;
+                            served
                         } else if request_kind == "generate" {
                             attacker_value.clone()
                         } else if request_kind == "intent_audit" {
@@ -468,8 +506,18 @@ const PRESERVATION_PROBE_CONTRADICTING_THE_ISSUE: &str = r#"{"tests":[
         }
     ]}"#;
 
+/// A Creator patch that APPLIES cleanly but leaves the tree unimportable.
+///
+/// [VANTA-WHY] It has to be a real unified diff. The Creator's patch goes
+/// through the repair-mode cascade, and a *bare* source blob with a syntax error
+/// is now refused by the syntax guard (Fix 1): the original parsed and the result
+/// does not, so the apply is reported as failed and the run stops with
+/// PatchApplicationFailed before the Diagnostician ever sees it. A git-applied
+/// diff is trusted by design — a syntax error inside a valid hunk is the model's
+/// fault, not Vanta's — so this is the shape that produces the Static finding
+/// whose structured payload the second Creator call must carry.
 const CREATOR_SYNTAX_ERROR_RESPONSE: &str = r#"{
-    "patch_text":"def add(a, b):\n    return a + b +\n",
+    "patch_text":"diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a + b\n+    return a + b +\n",
     "explanation":"introduce a broken patch for feedback regression coverage",
     "files_touched":["calc.py"],
     "confidence":0.2
@@ -510,6 +558,8 @@ fn metric_row_from_observed_outcome(
         evidence_source: vanta::core::EvidenceSource::AttackerGenerated,
         test_intent: TestIntent::BehaviorPreservation,
         censored: false,
+        apply_failed: false,
+        gap: false,
         in_s0: true,
     }
 }
@@ -1027,8 +1077,10 @@ fn syntax_error_patch_is_classified_static_not_infrastructure() {
         .find(|r| r.phase == "M3_repair_loop")
         .expect("a final M3_repair_loop row must exist");
     assert!(
-        final_row.summary.contains("MaxAttemptsReached"),
-        "a real syntax error must not trip the harness-collapse ladder; got {}",
+        final_row.summary.contains("Rejected"),
+        "a syntax error the patch introduces is a Static finding in a file the \
+         patch touches, so review mode must REJECT the candidate rather than keep \
+         attacking a tree it has already found broken; got {}",
         final_row.summary
     );
 }
@@ -1236,6 +1288,12 @@ fn a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped
     let workspace = TempDir::new().unwrap();
     let (_repo_dir, _issue_path, patch_path) =
         write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    // [VANTA-WHY] Fix 6 runs a relabel gate before each revision: a
+    // BugReproduction test that keeps PASSING its baseline is asked whether the
+    // issue requires the asserted behaviour to change. The stub's DEFAULT audit
+    // answer does not carry `issue_requires_change` at all — which is the case
+    // the gate must fail CLOSED on: an omitted field is UNKNOWN, so the test
+    // takes the ordinary revision path rather than being relabelled.
     let server = StubLlmServer::start(CONTRADICTORY_INTENT_TEST);
 
     let status = run_patch_mode_with(workspace.path(), &patch_path, &server, 1, &[]);
@@ -1245,32 +1303,40 @@ fn a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped
     );
 
     // [VANTA-WHY] Each non-preservation test is audited by the patch-blind
-    // intent check: once for the initial batch and once per revision. With one
-    // BugReproduction test that is 1 generation + 1 audit + 3 (revise + audit)
-    // = 8 LLM calls. Scrapping on the first mismatch — the regressed behaviour —
-    // would leave this at 2 (the generation and its audit).
+    // intent check: once for the initial batch, once per relabel gate, and once
+    // per revision. With one BugReproduction test that is 1 generation + 1 batch
+    // audit + 3 x (relabel gate + revision + revised-test audit) + the final
+    // relabel gate that ends the budget = 12 LLM calls. Scrapping on the first
+    // mismatch — the regressed behaviour — would leave this at 2 (the generation
+    // and its audit).
     assert_eq!(
         server.request_count(),
-        8,
+        12,
         "a test whose baseline contradicts its intent must be sent back to the \
          Attacker for revision (up to 3 times) before being scrapped; \
-         expected 1 generation + 1 batch audit + 3 (revision + revised audit) = 8 LLM calls"
+         expected 1 generation + 1 batch audit + 3 x (relabel gate + revision + \
+         revised audit) + the final relabel gate = 12 LLM calls"
     );
     assert_eq!(
         server.request_kinds(),
         vec![
             "generate",
             "intent_audit",
-            "revise",
             "intent_audit",
             "revise",
             "intent_audit",
+            "intent_audit",
             "revise",
+            "intent_audit",
+            "intent_audit",
+            "revise",
+            "intent_audit",
             "intent_audit",
         ],
         "the regression guard must prove the exact call sequence — one generate, \
-         then a patch-blind audit of it, then three genuine revision/audit pairs — \
-         so internal parse retries cannot masquerade as a working revision path"
+         then a patch-blind audit of it, then three genuine revision/audit pairs \
+         (each gated by the Fix-6 relabel question) — so internal parse retries \
+         cannot masquerade as a working revision path"
     );
 
     let records = read_session_records(&find_session_log(workspace.path()));
@@ -1868,5 +1934,177 @@ fn structured_diagnostic_payload_reaches_creator_in_repair_mode() {
             || second_creator_body.contains("Expected an expression")
             || second_creator_body.contains("return a + b +"),
         "repair-mode feedback must carry a concrete error excerpt, not just a class label; got {second_creator_body}"
+    );
+}
+
+/// A Creator answer that is NOT a diff: a bare source blob whose body cannot
+/// parse.
+///
+/// [VANTA-WHY] The cascade's full-source strategy picks it up, the syntax guard
+/// refuses the result, and the apply is reported `InvalidPython` — the CONTENT
+/// failure. A diff no strategy can place is the FORMAT failure. Both must reach
+/// the Creator as feedback, and the two messages differ on purpose.
+const BARE_BROKEN_SOURCE: &str = "def add(a, b):\n    return a + b +\n";
+
+/// A Creator patch that does not apply must NOT end a repair-mode run.
+///
+/// [VANTA-WHY] The repair loop's whole premise is that the Creator gets one bad
+/// answer and fixes it from the feedback. Ending the run on the first
+/// unappliable diff makes every malformed answer cost a whole benchmark
+/// instance instead of one attempt, which drags the repair rate down for a
+/// reason that has nothing to do with the model's ability to repair. Only review
+/// mode stops — its candidate was written outside the run, so there is no
+/// Creator to tell.
+#[test]
+fn a_creator_patch_that_does_not_apply_is_fed_back_to_the_creator_not_fatal() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let _ = write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    let script = serde_json::json!([
+        {
+            "patch_text": BARE_BROKEN_SOURCE,
+            "explanation": "emit source that cannot parse",
+            "files_touched": ["calc.py"],
+            "confidence": 0.1
+        },
+        {
+            "patch_text": WRONG_BEHAVIOUR_PATCH,
+            "explanation": "correct the arithmetic",
+            "files_touched": ["calc.py"],
+            "confidence": 0.8
+        }
+    ])
+    .to_string();
+    let server = StubLlmServer::start_with_creator_script(&script, SINGLE_BEHAVIOR_TEST);
+
+    let _output = run_creator_mode_with_output(workspace.path(), &server, 2, &[]);
+
+    let creator_bodies: Vec<String> = server
+        .request_kinds()
+        .into_iter()
+        .zip(server.request_bodies())
+        .filter_map(|(kind, body)| if kind == "creator" { Some(body) } else { None })
+        .collect();
+    assert_eq!(
+        creator_bodies.len(),
+        2,
+        "a failed apply must spend the attempt and go BACK to the Creator rather than \
+         stop the run; got {:?}",
+        server.request_kinds()
+    );
+    let second_creator_body = &creator_bodies[1];
+    assert!(
+        second_creator_body.contains("patch result is not valid Python")
+            || second_creator_body.contains("patch did not apply"),
+        "the second Creator call must carry the apply failure as feedback; got {second_creator_body}"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let failed_applies: Vec<&str> = records
+        .iter()
+        .filter(|r| r.phase == "patch.apply_failed")
+        .map(|r| r.summary.as_str())
+        .collect();
+    assert_eq!(
+        failed_applies.len(),
+        1,
+        "the failed apply must be recorded exactly once in the session log; got {failed_applies:?}"
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|r| r.phase == "M3_repair_loop" && r.summary.contains("PatchApplicationFailed")),
+        "repair mode must not end at PatchApplicationFailed; got {:?}",
+        records
+            .iter()
+            .filter(|r| r.phase == "M3_repair_loop")
+            .map(|r| r.summary.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let evidence = read_json(
+        &workspace
+            .path()
+            .join("vanta_sessions")
+            .join(format!("{}_evidence.json", records[0].session_id.as_str())),
+    );
+    assert_eq!(
+        evidence["apply_failed_attempts"].as_u64(),
+        Some(1),
+        "a failed apply is counted per run so the analysis can report how many holes \
+         were Vanta's own apply path; got {evidence}"
+    );
+
+    // The failed attempt never produced a tree, so it may be recorded as a HOLE
+    // but never as an observed transition. A first attempt has nothing to be
+    // compared against, so here the honest record is "no row at all".
+    let transition_path = find_transitions(workspace.path());
+    let rows = read_transition_rows(&transition_path);
+    assert!(
+        rows.iter().all(|row| !row.apply_failed),
+        "an attempt that never ran may not be stamped onto an observed row; got {rows:?}"
+    );
+}
+
+/// The repository's own suite with FOUR tests, two of which import `scale`.
+const NATIVE_REPO_TESTS_FOUR: &str = "from calc import add, scale\n\n\ndef test_add_zero():\n    assert add(0, 0) == 0\n\n\ndef test_add_pair():\n    assert add(1, 2) == 3\n\n\ndef test_scale_pair():\n    assert scale(2, 3) == 6\n\n\ndef test_scale_other():\n    assert scale(3, 4) == 12\n";
+
+/// Removes `scale` and nothing else.
+///
+/// [VANTA-WHY] `add` is untouched, so every generated test still passes: the
+/// ONLY signal left is the repo's own suite, which now cannot even import. pytest
+/// stops at collection, so the patched side reports 0 tests.
+const DELETE_SCALE_PATCH: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1,6 +1,2 @@\n def add(a, b):\n     return a + b\n-\n-\n-def scale(x, factor):\n-    return x * factor\n";
+
+/// 4 tests → 0 tests must read as a REJECTION, not as a clean bill of health.
+///
+/// [VANTA-WHY] This is the heretic run's scariest false-clean: a patch that stops
+/// pytest at collection collects ZERO tests, and a regression walk over the
+/// PATCHED side finds nothing wrong in an empty list — so "4 tests → 0 tests"
+/// printed "0 regression(s)". The walk is over the ORIGINAL side now and "gone"
+/// is a regression, so the collapsed suite rejects. The generated probe passes
+/// here on purpose: the repo's own suite is the only thing that can catch this.
+#[test]
+fn a_native_suite_that_collapses_from_four_tests_to_zero_rejects_the_patch() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        DELETE_SCALE_PATCH,
+        Some(NATIVE_REPO_TESTS_FOUR),
+    );
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+    assert!(
+        !output.status.success(),
+        "a patch that stops the repo's own suite from collecting must be rejected"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let summary = records
+        .iter()
+        .find(|r| r.phase == "native_suite.summary")
+        .expect("the native-suite gate must log its own summary row");
+    assert!(
+        summary.summary.contains("original_tests=4") && summary.summary.contains("patched_tests=0"),
+        "the native suite must be reported as 4 → 0, not as a clean run; got {}",
+        summary.summary
+    );
+    assert!(
+        summary.summary.contains("regressions=4"),
+        "all four vanished tests are regressions, not zero; got {}",
+        summary.summary
+    );
+
+    let final_row = records
+        .iter()
+        .find(|r| r.phase == "M3_repair_loop")
+        .expect("a final decision row must exist");
+    assert!(
+        final_row.summary.contains("Rejected"),
+        "a collapsed native suite is a rejection, not a budget outcome; got {}",
+        final_row.summary
     );
 }

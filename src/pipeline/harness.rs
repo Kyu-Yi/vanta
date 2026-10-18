@@ -288,22 +288,55 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
     NativeSuiteReport { tests, ran: true }
 }
 
-/// Nodeids that PASS on the original and FAIL on the patch — the repo's own
-/// suite reporting a regression. Tests already failing on the original are
+/// Nodeids that PASS on the original and did not pass on the patch — the repo's
+/// own suite reporting a regression. Tests already failing on the original are
 /// excluded: the patch did not break them.
+///
+/// [VANTA-WHY] This used to iterate the PATCHED side only and look for
+/// `patched == Failed && original == Passed`. A patch that introduces a syntax
+/// error stops pytest at collection, so the patched side collected ZERO tests —
+/// and a filter over an empty list reports zero regressions. The heretic run
+/// went 4 tests → 0 tests and printed "0 regression(s)": the scariest possible
+/// clean bill of health for a tree that does not import.
+///
+/// So the walk is over the ORIGINAL side now, and "gone" is a regression too. A
+/// test that passed on the original and is MISSING from the patched report
+/// (collection error, crashed interpreter, deleted test file) is not evidence
+/// that the behaviour survived.
 pub fn native_regressions(
     original: &[(String, TestResult)],
     patched: &[(String, TestResult)],
 ) -> Vec<String> {
-    let orig: HashMap<&str, &TestResult> =
-        original.iter().map(|(n, r)| (n.as_str(), r)).collect();
-    patched
-        .iter()
-        .filter(|(n, r)| {
-            *r == TestResult::Failed && orig.get(n.as_str()).copied() == Some(&TestResult::Passed)
-        })
-        .map(|(n, _)| n.clone())
-        .collect()
+    let patched_map: HashMap<&str, &TestResult> =
+        patched.iter().map(|(n, r)| (n.as_str(), r)).collect();
+
+    let mut regressions: Vec<String> = Vec::new();
+    for (name, result) in original {
+        if *result != TestResult::Passed {
+            continue;
+        }
+        match patched_map.get(name.as_str()) {
+            Some(TestResult::Passed) => {}
+            // Still present and no longer passing: a plain regression.
+            Some(_) => regressions.push(name.clone()),
+            // Absent from the patched report: the suite collapsed before (or
+            // during) this test. Also a regression.
+            None => regressions.push(name.clone()),
+        }
+    }
+    regressions
+}
+
+/// Did the patched side collect FEWER tests than the original ran?
+///
+/// [VANTA-WHY] Kept separate from `native_regressions` so the console can say
+/// "the suite collapsed" rather than just listing names: 4 → 0 is a different
+/// failure from 4 → 3, even though both are regressions.
+pub fn native_suite_collapsed(
+    original: &NativeSuiteReport,
+    patched: &NativeSuiteReport,
+) -> bool {
+    original.ran && !original.tests.is_empty() && patched.tests.len() < original.tests.len()
 }
 
 // ============================================================================
@@ -489,65 +522,189 @@ pub fn parse_pytest_report_detailed(
 }
 
 // ============================================================================
-// Static analysis (ruff + mypy)
+// Static analysis (ruff + mypy) — SET differences, not COUNT differences
 // ============================================================================
+//
+// [VANTA-WHY] The old check compared COUNTS: `patch_ruff > base_ruff`. A count
+// is not a set. If the patch fixed two pre-existing ruff errors and introduced
+// two new ones, the count is identical and the run reports "no new static
+// errors" for a patch that just added two. Worse, ruff and mypy both number
+// their diagnostics by LINE, so a patch that shifts every line down by one
+// changes every diagnostic's position without changing a single finding, and the
+// raw text comparison would call all of them new.
+//
+// The fix is to compare the findings as a SET keyed on (file, code, message) —
+// deliberately WITHOUT line numbers — and to hand the Diagnostician only the
+// findings the patch actually introduced.
 
-/// Count diagnostic lines for `needle` across BOTH streams.
-///
-/// [VANTA-WHY] ruff and mypy write diagnostics to STDOUT, never stderr.
-/// Counting stderr alone made every static run look clean, silently disabling
-/// the Static class. Scan both streams.
-pub fn count_diagnostics(stdout: &str, stderr: &str, needle: &str) -> usize {
-    stdout
-        .lines()
-        .chain(stderr.lines())
-        .filter(|line| line.contains(needle))
-        .count()
+/// One static-analysis finding, with the line number deliberately dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StaticDiagnostic {
+    /// Repo-relative path the tool reported.
+    pub file: String,
+    /// ruff rule (e.g. `F821`) or mypy error code (e.g. `return-value`).
+    pub code: String,
+    /// The human-readable finding text, without the location.
+    pub message: String,
 }
 
-/// Run static analysis on both original and patched; return new-error flags.
-pub async fn run_static_diff(original: &str, patched: &str) -> (bool, bool) {
-    let (orig_ruff, _, orig_mypy, _) = run_static_raw(original).await;
-    let (patch_ruff, _, patch_mypy, _) = run_static_raw(patched).await;
-    (patch_ruff > orig_ruff, patch_mypy > orig_mypy)
+impl StaticDiagnostic {
+    /// One line for the Diagnostician's payload and the session log.
+    pub fn render(&self) -> String {
+        if self.code.is_empty() {
+            format!("{}: {}", self.file, self.message)
+        } else {
+            format!("{}: [{}] {}", self.file, self.code, self.message)
+        }
+    }
 }
 
-pub async fn run_static_raw(source: &str) -> (usize, String, usize, String) {
+/// What one static run found, per tool, plus the raw streams.
+#[derive(Debug, Clone, Default)]
+pub struct StaticRun {
+    pub ruff: Vec<StaticDiagnostic>,
+    pub mypy: Vec<StaticDiagnostic>,
+    pub ruff_raw: String,
+    pub mypy_raw: String,
+}
+
+/// Run ruff and mypy over a source tree; parse each tool's findings into a set.
+pub async fn run_static(source: &str) -> StaticRun {
     let sb = match Backend::spawn().await {
         Ok(b) => b,
-        Err(_) => return (0, String::new(), 0, String::new()),
+        Err(_) => return StaticRun::default(),
     };
     let _ = write_source_files(sb.root(), source);
 
     let py = python_exe();
-    let ruff = sb
-        .execute(
-            &[py.as_str(), "-m", "ruff", "check", "."],
-            Path::new(""),
-            30,
-        )
-        .await;
-    let (ruff_count, ruff_err) = match ruff {
-        Ok(r) => (
-            count_diagnostics(&r.stdout, &r.stderr, ".py:"),
-            format!("{}\n{}", r.stdout, r.stderr),
-        ),
-        Err(_) => (0, String::new()),
+    let (ruff, ruff_raw) = match sb
+        .execute(&[py.as_str(), "-m", "ruff", "check", "."], Path::new(""), 30)
+        .await
+    {
+        Ok(r) => {
+            let raw = format!("{}\n{}", r.stdout, r.stderr);
+            let findings = raw
+                .lines()
+                .filter_map(parse_ruff_line)
+                .collect::<Vec<_>>();
+            (findings, raw)
+        }
+        Err(_) => (Vec::new(), String::new()),
     };
 
-    let mypy = sb
+    let (mypy, mypy_raw) = match sb
         .execute(&[py.as_str(), "-m", "mypy", "."], Path::new(""), 60)
-        .await;
-    let (mypy_count, mypy_err) = match mypy {
-        Ok(r) => (
-            count_diagnostics(&r.stdout, &r.stderr, "error:"),
-            format!("{}\n{}", r.stdout, r.stderr),
-        ),
-        Err(_) => (0, String::new()),
+        .await
+    {
+        Ok(r) => {
+            let raw = format!("{}\n{}", r.stdout, r.stderr);
+            let findings = raw
+                .lines()
+                .filter_map(parse_mypy_line)
+                .collect::<Vec<_>>();
+            (findings, raw)
+        }
+        Err(_) => (Vec::new(), String::new()),
     };
 
     sb.destroy();
-    (ruff_count, ruff_err, mypy_count, mypy_err)
+    StaticRun {
+        ruff,
+        mypy,
+        ruff_raw,
+        mypy_raw,
+    }
+}
+
+/// Findings present in `patched` and absent from `baseline`.
+///
+/// [VANTA-WHY] Set difference, not a count comparison — a patch that fixes two
+/// findings and adds two must report two NEW findings, not zero.
+pub fn new_diagnostics<'a>(
+    baseline: &[StaticDiagnostic],
+    patched: &'a [StaticDiagnostic],
+) -> Vec<&'a StaticDiagnostic> {
+    let known: std::collections::HashSet<&StaticDiagnostic> = baseline.iter().collect();
+    patched.iter().filter(|d| !known.contains(d)).collect()
+}
+
+/// Is this ruff finding an ERROR — code that cannot run or cannot resolve — or a
+/// style preference?
+///
+/// [VANTA-WHY] A new finding in a file the patch touches may reject a review
+/// round, but ruff's default ruleset is mostly STYLE (B, BLE, UP, SIM, TRY, ...).
+/// Rejecting on those reports a candidate as broken when it merely has a nit,
+/// which is a false finding about the model and burns an attack round. Only rules
+/// that mean "this code is wrong" may block:
+///   - `F`  — Pyflakes: undefined names, unreachable code, broken redefinitions;
+///   - `E9` — ruff's syntax errors (`E999` unparsable).
+/// Everything else is still REPORTED (the Creator sees it, the session log keeps
+/// it); it just does not reject.
+///
+/// [VANTA-WHY] mypy needs no equivalent: its parser only accepts `: error:`
+/// lines, so every finding it produces is already error-class.
+pub fn ruff_is_error_class(code: &str) -> bool {
+    code.starts_with('F') || code.starts_with("E9")
+}
+
+/// Render findings as one newline-separated block (the Diagnostician payload).
+pub fn render_diagnostics(findings: &[&StaticDiagnostic]) -> String {
+    findings
+        .iter()
+        .map(|d| d.render())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `path.py:12:5: F821 Undefined name ...` — the code is the leading token of
+/// the text after the location.
+fn parse_ruff_line(line: &str) -> Option<StaticDiagnostic> {
+    let parts: Vec<&str> = line.splitn(4, ':').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let file = parts[0].trim();
+    if !file.ends_with(".py") || !is_line_number(parts[1]) || !is_line_number(parts[2]) {
+        return None;
+    }
+    let rest = parts[3].trim();
+    let (code, message) = match rest.split_once(char::is_whitespace) {
+        Some((c, m)) => (c.to_string(), m.trim().to_string()),
+        None => (rest.to_string(), String::new()),
+    };
+    Some(StaticDiagnostic {
+        file: file.to_string(),
+        code,
+        message,
+    })
+}
+
+/// `path.py:12: error: message  [code]` (mypy reports the line, sometimes a
+/// column, then `error:`).
+fn parse_mypy_line(line: &str) -> Option<StaticDiagnostic> {
+    let (head, tail) = line.split_once(": error:")?;
+    let file = head.split(':').next()?.trim();
+    if !file.ends_with(".py") {
+        return None;
+    }
+    let tail = tail.trim();
+    // The bracketed error code, when present, is the final `[...]` group.
+    let (message, code) = match tail.rfind('[') {
+        Some(i) if tail.ends_with(']') => (
+            tail[..i].trim().to_string(),
+            tail[i + 1..tail.len() - 1].trim().to_string(),
+        ),
+        _ => (tail.to_string(), String::new()),
+    };
+    Some(StaticDiagnostic {
+        file: file.to_string(),
+        code,
+        message,
+    })
+}
+
+fn is_line_number(token: &str) -> bool {
+    !token.trim().is_empty() && token.trim().parse::<u32>().is_ok()
 }
 
 // ============================================================================
@@ -741,7 +898,10 @@ pub async fn heal_dependencies(
 // ============================================================================
 #[cfg(test)]
 mod tests {
-    use super::{run_single_test, run_tests_parallel, write_source_files};
+    use super::{
+        NativeSuiteReport, native_regressions, native_suite_collapsed, ruff_is_error_class,
+        run_single_test, run_tests_parallel, write_source_files,
+    };
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{TestIntent, TestResult};
     use crate::pipeline::candidate::TestCommand;
@@ -839,5 +999,82 @@ mod tests {
             Some(&TestResult::Failed),
             "a semantic behavior change should stay an assertion failure, not become Error/Static"
         );
+    }
+
+    // ---- native-suite gate ----------------------------------------------------
+    //
+    // [VANTA-WHY] The heretic run went 4 tests → 0 tests and printed
+    // "0 regression(s)": a tree that does not import collected no tests, and a
+    // filter over an empty list finds nothing wrong with it. The walk is over the
+    // ORIGINAL side, and a test that passed there and is ABSENT from the patched
+    // report is a regression — that is the case these pin.
+
+    fn native_report(tests: &[(&str, TestResult)]) -> NativeSuiteReport {
+        NativeSuiteReport {
+            tests: tests
+                .iter()
+                .map(|(name, result)| ((*name).to_string(), result.clone()))
+                .collect(),
+            ran: true,
+        }
+    }
+
+    #[test]
+    fn a_suite_that_collapsed_to_zero_tests_is_four_regressions() {
+        let original = native_report(&[
+            ("test_a", TestResult::Passed),
+            ("test_b", TestResult::Passed),
+            ("test_c", TestResult::Passed),
+            ("test_d", TestResult::Passed),
+        ]);
+        let patched = native_report(&[]);
+
+        assert_eq!(
+            native_regressions(&original.tests, &patched.tests).len(),
+            4,
+            "4 tests → 0 tests is four regressions, not a clean bill of health"
+        );
+        assert!(
+            native_suite_collapsed(&original, &patched),
+            "the console must be able to say the suite COLLAPSED, not just list names"
+        );
+    }
+
+    #[test]
+    fn a_suite_that_kept_its_tests_has_not_collapsed() {
+        let original = native_report(&[("test_a", TestResult::Passed)]);
+        let patched = native_report(&[("test_a", TestResult::Passed)]);
+
+        assert!(native_regressions(&original.tests, &patched.tests).is_empty());
+        assert!(!native_suite_collapsed(&original, &patched));
+    }
+
+    #[test]
+    fn a_suite_that_never_ran_is_not_read_as_collapsed() {
+        let original = NativeSuiteReport {
+            tests: Vec::new(),
+            ran: false,
+        };
+        let patched = native_report(&[]);
+
+        assert!(
+            !native_suite_collapsed(&original, &patched),
+            "a gate that could not run must not be reported as a collapse — that would \
+             invent a finding out of a missing measurement"
+        );
+    }
+
+    // ---- static findings: error-class only ------------------------------------
+
+    #[test]
+    fn only_error_class_ruff_codes_may_block_a_review_round() {
+        assert!(ruff_is_error_class("F821"), "undefined name is code that cannot run");
+        assert!(ruff_is_error_class("E999"), "ruff's own syntax error");
+        assert!(!ruff_is_error_class("E401"), "import hygiene is a style nit");
+        assert!(!ruff_is_error_class("B008"), "flake8-bugbear style");
+        assert!(!ruff_is_error_class("BLE001"), "broad-except style");
+        assert!(!ruff_is_error_class("UP032"), "pyupgrade style");
+        assert!(!ruff_is_error_class("SIM108"), "simplify style");
+        assert!(!ruff_is_error_class("TRY003"), "tryceratops style");
     }
 }

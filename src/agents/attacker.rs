@@ -40,7 +40,7 @@ use tracing::{debug, info, trace, warn};
 // "attacker.2.boundary-probe": `session.start` writes
 // `prompt_version=attacker=<tag>;intent_check=<tag>;...`, so the prompt NAME is
 // the key and repeating it inside the value would make the field ambiguous.
-pub const ATTACKER_PROMPT_VERSION: &str = "3.review-context-bundle";
+pub const ATTACKER_PROMPT_VERSION: &str = "4.intent-and-fixture-rules";
 
 // ============================================================================
 // INTENT_AUDITOR_PROMPT_VERSION — the run-identity tag for the intent check
@@ -135,17 +135,15 @@ pub struct AttackerTestCase {
 }
 
 // ============================================================================
-// attacker_generate_tests() — call LLM, get typed AttackerResponse
+// ATTACKER_SYSTEM_PROMPT — the generation prompt, kept as a const
 // ============================================================================
-pub async fn attacker_generate_tests(
-    cfg: &LlmConfig,
-    request: &AttackerRequest,
-) -> Result<AttackerResponse, Box<dyn Error + Send + Sync>> {
-    info!(patch_len = request.patch_text.len(), "attacker start");
-
-    let client = build_reqwest_client(cfg)?;
-
-    let system_prompt = r#"You are Vanta Attacker. Given a patch, write adversarial tests designed to BREAK it. Each test MUST declare an intent. Keep reasoning SHORT (under 100 words) — save output budget for the JSON answer.
+//
+// [VANTA-WHY] Hoisted out of `attacker_generate_tests` so its rules are a
+// directly testable artifact (see the `prompt_rules` unit tests), exactly as
+// INTENT_AUDITOR_SYSTEM_PROMPT already is. A rule that lives only in a local
+// `let` can be dropped in a refactor with no test to notice; the version tag at
+// the top of this file is only meaningful if the text it names is pinned too.
+pub const ATTACKER_SYSTEM_PROMPT: &str = r#"You are Vanta Attacker. Given a patch, write adversarial tests designed to BREAK it. Each test MUST declare an intent. Keep reasoning SHORT (under 100 words) — save output budget for the JSON answer.
 
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
 
@@ -194,6 +192,16 @@ NO-REIMPLEMENTATION RULE:
 INTENT-vs-API RULE:
 - BehaviorPreservation may ONLY exercise APIs that already exist in the ORIGINAL source. If the behaviour you want to check uses a symbol the patch ADDS, it is a FeatureAcceptance test, not BehaviorPreservation.
 
+ONE INTENT PER TEST:
+- Each test declares exactly ONE intent. Do NOT mix a new-feature assertion with a preservation assertion in the same test. A test that both checks a NEW value (e.g. a new field defaults to None) AND asserts that some OTHER call is "unchanged as before" has no honest single label: split it into two tests — one FeatureAcceptance/BugReproduction for the new value, one BehaviorPreservation for the unchanged behaviour — or drop the part you cannot label.
+
+PRESERVATION SPECIFICITY:
+- A BehaviorPreservation test targets the EXACT behaviour the issue's "must stay the same" clause names — the result the ORIGINAL code returns for the asserted input. It must NOT pin the INTERNAL calls of a function the issue says to change: asserting that an inner function is called with the OLD arguments locks in internals the issue explicitly rewires, and such a test fails on a CORRECT patch.
+
+TEST FIXTURES:
+- Do NOT instantiate application settings/config objects that read CLI arguments, environment variables or files (a Settings class built from the command line, for example). Under pytest they parse pytest's OWN argv and exit, so the test fails on ANY code, original or patched. Use unittest.mock.MagicMock, or build the model with model_construct()/copy-update and set only the attributes the code under test reads.
+- Every fake/stub/mock object MUST implement EVERY attribute the code under test touches. A fake missing an attribute (e.g. no `.shape` on a fake tensor) raises inside the fake BEFORE the assertion, so the test proves nothing about the patch.
+
 BOUNDARY-PROBING RULE:
 - A patch that widens, narrows or shifts a comparison (e.g. `<` → `<=`, or a changed threshold constant) changes behaviour ONLY at the exact boundary value. A test at a nearby interior value (e.g. 499 when the boundary is 500) returns the SAME result on original and patched code and proves nothing.
 - For every comparison the patch changes, include a BehaviorPreservation test that asserts the ORIGINAL result at the EXACT boundary constant — the value named in the comparison itself, not its neighbour. Do this for every changed comparison the ISSUE does not ask to change.
@@ -202,6 +210,19 @@ BOUNDARY-PROBING RULE:
 - Read the ORIGINAL result at the boundary out of the ORIGINAL SOURCE you were given. Never copy the patched value back as the expectation.
 
 Write exactly 3 tests. Label each one honestly: use BugReproduction or FeatureAcceptance only when the issue asks for that behaviour at the input you assert, otherwise use BehaviorPreservation. Three BehaviorPreservation tests are a correct answer when the issue only describes one boundary."#;
+
+// ============================================================================
+// attacker_generate_tests() — call LLM, get typed AttackerResponse
+// ============================================================================
+pub async fn attacker_generate_tests(
+    cfg: &LlmConfig,
+    request: &AttackerRequest,
+) -> Result<AttackerResponse, Box<dyn Error + Send + Sync>> {
+    info!(patch_len = request.patch_text.len(), "attacker start");
+
+    let client = build_reqwest_client(cfg)?;
+
+    let system_prompt = ATTACKER_SYSTEM_PROMPT;
 
     // [VANTA-WHY] Round >= 2: show the probes already in the shared set, with
     // the input literals each one pins, and forbid repeating them. A duplicate
@@ -1242,6 +1263,42 @@ mod tests {
         assert_eq!(
             route_intent(&TestIntent::FeatureAcceptance, &verdict(true, None), true),
             IntentRouting::Keep
+        );
+    }
+
+    // ---- item 7: the Attacker prompt's test-hygiene rules -------------------
+
+    /// Each heretic run produced a generated test that failed for a reason that
+    /// had nothing to do with the patch: a preservation probe that also asserted
+    /// a new field's default (B v2), a test that instantiated Heretic's Settings
+    /// and so parsed pytest's own argv and exited, and a fake tensor with no
+    /// `.shape`. The prompt is the only place those mistakes can be prevented, so
+    /// the rules that forbid them must be IN it — a rule dropped in a later edit
+    /// would otherwise be invisible.
+    #[test]
+    fn the_attacker_prompt_forbids_the_test_hygiene_mistakes_the_heretic_runs_made() {
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("ONE INTENT PER TEST"),
+            "the one-intent-per-test rule must be in the prompt"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("Do NOT mix a new-feature assertion with a preservation assertion"),
+            "the mixed-intent prohibition must be explicit"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("PRESERVATION SPECIFICITY")
+                && ATTACKER_SYSTEM_PROMPT.contains("PIN the INTERNAL calls of a function the issue says to change"),
+            "a preservation probe must be told not to pin internals the issue rewires"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("TEST FIXTURES")
+                && ATTACKER_SYSTEM_PROMPT.contains("read CLI arguments, environment variables or files")
+                && ATTACKER_SYSTEM_PROMPT.contains("MagicMock"),
+            "the fixture rules must forbid CLI/env/file-reading settings objects and name the safe alternative"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("implement EVERY attribute the code under test touches"),
+            "fakes must be told to implement every attribute the code under test reads"
         );
     }
 

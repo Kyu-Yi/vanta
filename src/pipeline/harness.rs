@@ -967,6 +967,7 @@ mod tests {
             intent: TestIntent::BehaviorPreservation,
             reason: "exercise the same repo code through both harness paths".to_string(),
             issue_quote: None,
+            relabeled: false,
         }
     }
 

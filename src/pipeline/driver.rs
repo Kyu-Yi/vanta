@@ -777,10 +777,11 @@ pub async fn run(
             test_id: None,
             phase: "attacker.summary".to_string(),
             summary: format!(
-                "generated_tests={} dropped_duplicates={} intent_scrapped={} valid_tests={}",
+                "generated_tests={} dropped_duplicates={} intent_scrapped={} relabels={} valid_tests={}",
                 attacker_response.tests.len(),
                 dropped_duplicates.len(),
                 intent_scrapped,
+                initial_relabels.len(),
                 attacker_tests.len()
             ),
             timestamp: now_iso(),
@@ -859,9 +860,10 @@ pub async fn run(
             test_id: None,
             phase: "bate.summary".to_string(),
             summary: format!(
-                "valid={} scrapped={} discard_rate_pct={:.1}",
+                "valid={} scrapped={} relabels={} discard_rate_pct={:.1}",
                 bate_report.valid_tests.len(),
                 bate_report.scrapped_tests.len(),
+                bate_relabels.len(),
                 discard_rate * 100.0
             ),
             timestamp: now_iso(),
@@ -2729,6 +2731,7 @@ mod tests {
                 intent: crate::core::TestIntent::BehaviorPreservation,
                 reason: "keep 500 unchanged".into(),
                 issue_quote: None,
+                relabeled: false,
             },
             GeneratedTest {
                 test_name: "test_two".into(),
@@ -2736,6 +2739,7 @@ mod tests {
                 intent: crate::core::TestIntent::BugReproduction,
                 reason: "fix 1000 boundary".into(),
                 issue_quote: None,
+                relabeled: false,
             },
         ];
 

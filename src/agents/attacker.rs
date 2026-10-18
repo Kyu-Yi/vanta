@@ -95,6 +95,17 @@ pub struct GeneratedTest {
     pub intent: TestIntent,
     pub reason: String,
     pub issue_quote: Option<String>,
+    /// [VANTA-WHY] Item 6 — the at-most-one-relabel ceiling. A relabel is a
+    /// verdict about the test's LABEL, and each intent has exactly one other
+    /// label an audit can move it to (`BehaviorPreservation` ↔
+    /// `FeatureAcceptance`, any non-preservation → `BehaviorPreservation`), so a
+    /// SECOND relabel of the same test is necessarily a flip BACK to where it
+    /// came from. Two verdicts that disagree about the same test would otherwise
+    /// let it oscillate until it lands on the label BATE happens to accept; this
+    /// flag makes the second one a scrap instead. `#[serde(default)]` because the
+    /// Attacker never emits it — it is set by the audit, not by the model.
+    #[serde(default)]
+    pub relabeled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -471,18 +482,24 @@ Do NOT import constants or symbols that only exist in the PATCHED code."#;
 // survives only if this audit says the issue asks for that behaviour at the
 // input the test asserts.
 //
-// [VANTA-WHY] The audit never PROMOTES a label and never turns a failing
-// candidate into a passing one. It has two directions:
+// [VANTA-WHY] The audit relabels in BOTH directions, but only ever in the
+// direction that makes a test harder to admit, and always from the verdict about
+// the ISSUE rather than from a BATE result (see `route_intent`, which owns the
+// invariant). Its directions are:
 //   - a non-preservation label survives only if the audit says the issue asks
 //     for that behaviour at the asserted input; otherwise it is demoted to
 //     BehaviorPreservation. An auditor that cannot answer demotes rather than
 //     letting the label through, because an unverified non-preservation label
 //     must not stand;
-//   - a BehaviorPreservation test is scrapped when the audit says the issue
-//     REQUIRES the asserted behaviour to change at that input, because the test
-//     then contradicts the issue. This is what makes the "the issue only asks to
-//     change this one boundary" exception a checked fact rather than a sentence
-//     the Attacker may or may not have honoured.
+//   - a BehaviorPreservation test that asserts a behaviour the issue ASKS for and
+//     REQUIRES to change is a mislabelled acceptance test, and is relabelled to
+//     FeatureAcceptance — item 6. Scrapping it threw away the probe that would
+//     have failed on the broken patch (B v2);
+//   - a BehaviorPreservation test the issue requires to change but does NOT ask
+//     for is scrapped: the label is wrong and there is no honest one left.
+//     This is what makes the "the issue only asks to change this one boundary"
+//     exception a checked fact rather than a sentence the Attacker may or may
+//     not have honoured.
 // EVERY test is audited and gets a record, preservation included.
 
 /// Input to the intent audit.
@@ -511,8 +528,10 @@ pub struct IntentVerdict {
     /// answers false, which would wrongly keep a probe that contradicts the
     /// issue. This field asks the complementary question: does the issue require
     /// the behaviour at the asserted input to CHANGE from what the original code
-    /// does? `true` means a preservation probe at that input contradicts the
-    /// issue and must be scrapped.
+    /// does? `true` means the preservation label is wrong: either the issue asks
+    /// for that new behaviour (`issue_asks_for_behaviour` is then true, and the
+    /// probe is relabelled to `FeatureAcceptance` — item 6), or the issue asks for
+    /// neither and no honest label remains (scrapped).
     ///
     /// [VANTA-WHY] `Option<bool>`, NOT `bool`. As a plain bool, `#[serde(default)]`
     /// turned a field the model simply forgot to emit into `false`, and `false`
@@ -520,8 +539,8 @@ pub struct IntentVerdict {
     /// a dropped field silently promoted a test to BehaviorPreservation with
     /// nobody having decided that. A safety gate has to fail closed: absent is
     /// UNKNOWN, and unknown never relabels. Every consumer therefore keys on an
-    /// EXPLICIT value — the preservation branch below scraps only on `Some(true)`,
-    /// and the relabel decision fires only on `Some(false)`.
+    /// EXPLICIT value — `route_intent` relabels only on `Some(true)` or, for the
+    /// BATE relabel question, `Some(false)`.
     #[serde(default)]
     pub issue_requires_change: Option<bool>,
     pub reason: String,
@@ -682,25 +701,97 @@ pub fn observe_quote_evidence(test: &GeneratedTest, issue_text: &str) -> QuoteEv
     }
 }
 
+/// How the intent audit routes one test, given the auditor's verdict.
+///
+/// [VANTA-WHY] Item 6 — the whole routing is a pure function of the VERDICT, so
+/// it can be unit-tested without an LLM, and so the one invariant the relabel
+/// machinery must never break lives in one place: a relabel may only ever make a
+/// test HARDER to admit, never easier, and it may never let a test skip a BATE
+/// check. Both directions add a BATE requirement:
+///   - `BehaviorPreservation`→`FeatureAcceptance` (promotion) is safe because
+///     BATE then demands the test FAIL on the original, i.e. the test must prove
+///     the new behaviour is ABSENT before the patch is even run;
+///   - `FeatureAcceptance`→`BehaviorPreservation` (demotion) is safe because
+///     BATE then demands the test PASS on the original.
+/// A relabel is never driven by a BATE result — only by what the ISSUE asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntentRouting {
+    /// The declared label survives.
+    Keep,
+    /// BehaviorPreservation → FeatureAcceptance. The issue ASKS for the asserted
+    /// behaviour and REQUIRES it to change, so the probe is a mislabelled
+    /// acceptance test for the new behaviour rather than a preservation probe.
+    PromoteToFeature,
+    /// Non-preservation → BehaviorPreservation. The issue does not ask for the
+    /// asserted behaviour, so the only honest label left is "this is behaviour
+    /// the original already has". An auditor that cannot answer takes this path:
+    /// an unverified non-preservation label must not stand.
+    DemoteToPreservation,
+    /// BehaviorPreservation + the issue REQUIRES the asserted behaviour to
+    /// change. The test contradicts the issue and no honest label remains.
+    ScrapRequiresChange,
+    /// The test already carries one relabel, so this verdict would flip it back.
+    ScrapRelabelCeiling,
+}
+
+/// Decide the routing for one test. Pure: verdict in, routing out.
+///
+/// [VANTA-WHY] `already_relabeled` is checked FIRST and only against the two
+/// relabelling routings: keeping a label is not a relabel, so a test that was
+/// relabelled once can still be kept for the rest of a run. What it cannot do is
+/// be relabelled a second time — see `GeneratedTest::relabeled`.
+pub(crate) fn route_intent(
+    intent: &TestIntent,
+    verdict: &IntentVerdict,
+    already_relabeled: bool,
+) -> IntentRouting {
+    let wanted = match intent {
+        TestIntent::BehaviorPreservation => {
+            if verdict.issue_requires_change == Some(true) {
+                if verdict.issue_asks_for_behaviour {
+                    IntentRouting::PromoteToFeature
+                } else {
+                    IntentRouting::ScrapRequiresChange
+                }
+            } else {
+                IntentRouting::Keep
+            }
+        }
+        _ => {
+            if verdict.issue_asks_for_behaviour {
+                IntentRouting::Keep
+            } else {
+                IntentRouting::DemoteToPreservation
+            }
+        }
+    };
+
+    if already_relabeled
+        && matches!(
+            wanted,
+            IntentRouting::PromoteToFeature | IntentRouting::DemoteToPreservation
+        )
+    {
+        IntentRouting::ScrapRelabelCeiling
+    } else {
+        wanted
+    }
+}
+
 /// Audit one test against the issue.
 ///
 /// Returns the surviving test (`None` = scrapped), the relabel event if the test
-/// was demoted, and the audit record. A record is returned for EVERY test,
+/// was relabelled, and the audit record. A record is returned for EVERY test,
 /// preservation included, so the session log shows the check ran and what it
 /// decided — the demote-only asymmetry is what made a preservation test the one
 /// label nobody re-checked.
 ///
-/// Three outcomes, one per way the declared intent can relate to the issue:
-///   - non-preservation + issue asks for it  → keep.
-///   - non-preservation + issue does NOT ask → demote to BehaviorPreservation.
-///     An auditor that cannot answer takes this path: an unverified
-///     non-preservation label must not stand.
-///   - BehaviorPreservation + the issue REQUIRES the asserted behaviour to
-///     change → SCRAP. The test contradicts the issue, so no honest label
-///     remains for it. Without this, the "the issue only asks to change 1000"
-///     exception lives in prompt wording alone and a probe asserting the old
-///     value at 1000 rides into BATE, fails the patched side and rejects a
-///     correct patch.
+/// Four outcomes, one per way the declared intent can relate to the issue (see
+/// `route_intent`): keep; promote a preservation probe to FeatureAcceptance when
+/// the issue ASKS for the asserted behaviour and requires it to change (the B v2
+/// shape: a probe asserting the NEW field's default, labelled as preservation);
+/// demote an unasked-for non-preservation label; scrap when no honest label
+/// remains.
 pub async fn audit_test_intent(
     cfg: &LlmConfig,
     issue_text: &str,
@@ -733,84 +824,83 @@ pub async fn audit_test_intent(
         }
     };
 
-    if matches!(test.intent, TestIntent::BehaviorPreservation) {
-        // [VANTA-WHY] Scrap only on an EXPLICIT `true`. An omitted answer is
-        // unknown, and unknown must not be read as "the issue requires a change"
-        // — that would scrap a possibly-valid preservation probe on a parse
-        // artifact.
-        if verdict.issue_requires_change == Some(true) {
-            let reason = format!(
-                "the issue requires the asserted behaviour to change at the asserted input: {}",
-                verdict.reason
-            );
-            return (
-                None,
-                None,
-                Some(IntentCheckRecord {
-                    test_name: test.test_name.clone(),
-                    declared_intent: test.intent.clone(),
-                    issue_asks_for_behaviour: verdict.issue_asks_for_behaviour,
-                    issue_requires_change: Some(true),
-                    scrapped: true,
-                    reason,
-                    evidence,
-                }),
-            );
-        }
-        return (
-            Some(test.clone()),
-            None,
-            Some(IntentCheckRecord {
-                test_name: test.test_name.clone(),
-                declared_intent: test.intent.clone(),
-                issue_asks_for_behaviour: verdict.issue_asks_for_behaviour,
-                issue_requires_change: verdict.issue_requires_change,
-                scrapped: false,
-                reason: verdict.reason,
-                evidence,
-            }),
-        );
-    }
-
-    if verdict.issue_asks_for_behaviour {
-        return (
-            Some(test.clone()),
-            None,
-            Some(IntentCheckRecord {
-                test_name: test.test_name.clone(),
-                declared_intent: test.intent.clone(),
-                issue_asks_for_behaviour: true,
-                issue_requires_change: verdict.issue_requires_change,
-                scrapped: false,
-                reason: verdict.reason,
-                evidence,
-            }),
-        );
-    }
-
-    let mut demoted = test.clone();
-    demoted.intent = TestIntent::BehaviorPreservation;
-    demoted.issue_quote = None;
-
-    let record = IntentCheckRecord {
+    let record = |scrapped: bool, reason: String| IntentCheckRecord {
         test_name: test.test_name.clone(),
         declared_intent: test.intent.clone(),
-        issue_asks_for_behaviour: false,
+        issue_asks_for_behaviour: verdict.issue_asks_for_behaviour,
         issue_requires_change: verdict.issue_requires_change,
-        scrapped: false,
-        reason: verdict.reason.clone(),
-        evidence,
+        scrapped,
+        reason,
+        evidence: evidence.clone(),
     };
-    let event = IntentRelabel {
-        test_name: test.test_name.clone(),
-        from_intent: test.intent.clone(),
-        to_intent: TestIntent::BehaviorPreservation,
-        reason: format!(
-            "the issue does not ask for {:?} at the asserted input: {}",
-            test.intent, verdict.reason
+
+    match route_intent(&test.intent, &verdict, test.relabeled) {
+        IntentRouting::Keep => (
+            Some(test.clone()),
+            None,
+            Some(record(false, verdict.reason.clone())),
         ),
-    };
-    (Some(demoted), Some(event), Some(record))
+
+        IntentRouting::PromoteToFeature => {
+            // [VANTA-WHY] Item 6 — B v2's shape. The test declares preservation
+            // but asserts the NEW behaviour (the new field's default), and the
+            // issue asks for that behaviour and requires it to change. Scrapping
+            // it discarded the one probe that would have caught the broken patch,
+            // because the broken patch is exactly a patch that FAILS this test —
+            // which is what FeatureAcceptance's baseline rule measures. The label
+            // was wrong, not the test.
+            let mut promoted = test.clone();
+            promoted.intent = TestIntent::FeatureAcceptance;
+            promoted.relabeled = true;
+            let reason = format!(
+                "the issue asks for the asserted behaviour and requires it to change at the \
+                 asserted input, so the probe is an acceptance test for the new behaviour: {}",
+                verdict.reason
+            );
+            let event = IntentRelabel {
+                test_name: test.test_name.clone(),
+                from_intent: TestIntent::BehaviorPreservation,
+                to_intent: TestIntent::FeatureAcceptance,
+                reason: reason.clone(),
+            };
+            (Some(promoted), Some(event), Some(record(false, reason)))
+        }
+
+        IntentRouting::DemoteToPreservation => {
+            let mut demoted = test.clone();
+            demoted.intent = TestIntent::BehaviorPreservation;
+            demoted.issue_quote = None;
+            demoted.relabeled = true;
+            let event = IntentRelabel {
+                test_name: test.test_name.clone(),
+                from_intent: test.intent.clone(),
+                to_intent: TestIntent::BehaviorPreservation,
+                reason: format!(
+                    "the issue does not ask for {:?} at the asserted input: {}",
+                    test.intent, verdict.reason
+                ),
+            };
+            (Some(demoted), Some(event), Some(record(false, verdict.reason.clone())))
+        }
+
+        IntentRouting::ScrapRequiresChange => {
+            let reason = format!(
+                "the issue requires the asserted behaviour to change at the asserted input, and \
+                 the issue does not ask for it either, so no honest label remains: {}",
+                verdict.reason
+            );
+            (None, None, Some(record(true, reason)))
+        }
+
+        IntentRouting::ScrapRelabelCeiling => {
+            let reason = format!(
+                "the test already carries one relabel; a second relabel would flip it back, so it \
+                 is scrapped instead: {}",
+                verdict.reason
+            );
+            (None, None, Some(record(true, reason)))
+        }
+    }
 }
 
 /// Ask ONLY whether the issue requires the asserted behaviour to change.
@@ -1040,7 +1130,119 @@ mod tests {
             intent,
             reason: "exercise a boundary".into(),
             issue_quote: issue_quote.map(str::to_string),
+            relabeled: false,
         }
+    }
+
+    // ---- item 6: relabel routing (verdict in, routing out) ------------------
+
+    fn verdict(asks: bool, requires_change: Option<bool>) -> IntentVerdict {
+        IntentVerdict {
+            issue_asks_for_behaviour: asks,
+            issue_requires_change: requires_change,
+            reason: "the issue says so".to_string(),
+        }
+    }
+
+    /// B v2's shape: the probe declares preservation but asserts the NEW
+    /// behaviour, and the issue asks for it and requires it to change. Relabelling
+    /// to FeatureAcceptance keeps the probe — scrapping it is what let the broken
+    /// patch through.
+    #[test]
+    fn a_preservation_probe_asserting_a_required_new_behaviour_is_promoted() {
+        assert_eq!(
+            route_intent(
+                &TestIntent::BehaviorPreservation,
+                &verdict(true, Some(true)),
+                false
+            ),
+            IntentRouting::PromoteToFeature
+        );
+    }
+
+    /// The issue requires the behaviour to change but never asks for the asserted
+    /// result, so the label is wrong and no honest one is left.
+    #[test]
+    fn a_preservation_probe_the_issue_requires_to_change_but_never_asks_for_is_scrapped() {
+        assert_eq!(
+            route_intent(
+                &TestIntent::BehaviorPreservation,
+                &verdict(false, Some(true)),
+                false
+            ),
+            IntentRouting::ScrapRequiresChange
+        );
+    }
+
+    /// An omitted answer is UNKNOWN, and unknown must never be read as "the issue
+    /// requires a change" — that would relabel a possibly-valid probe on a parse
+    /// artifact.
+    #[test]
+    fn a_preservation_probe_survives_an_unknown_or_negative_change_verdict() {
+        assert_eq!(
+            route_intent(
+                &TestIntent::BehaviorPreservation,
+                &verdict(true, None),
+                false
+            ),
+            IntentRouting::Keep
+        );
+        assert_eq!(
+            route_intent(
+                &TestIntent::BehaviorPreservation,
+                &verdict(false, Some(false)),
+                false
+            ),
+            IntentRouting::Keep
+        );
+    }
+
+    /// The oracle-loophole direction is deliberately KEPT: demoting a
+    /// FeatureAcceptance test the issue does not ask for is safe because BATE then
+    /// demands the test PASS on the original, so the demotion makes the test
+    /// harder to admit, not easier.
+    #[test]
+    fn a_feature_acceptance_test_the_issue_does_not_ask_for_is_still_demoted() {
+        assert_eq!(
+            route_intent(
+                &TestIntent::FeatureAcceptance,
+                &verdict(false, Some(false)),
+                false
+            ),
+            IntentRouting::DemoteToPreservation
+        );
+    }
+
+    /// Item 6's ping-pong ceiling: a test that has already spent its one relabel
+    /// cannot be relabelled again in either direction.
+    #[test]
+    fn a_test_that_already_carries_a_relabel_is_scrapped_rather_than_relabelled_again() {
+        assert_eq!(
+            route_intent(
+                &TestIntent::BehaviorPreservation,
+                &verdict(true, Some(true)),
+                true
+            ),
+            IntentRouting::ScrapRelabelCeiling
+        );
+        assert_eq!(
+            route_intent(
+                &TestIntent::FeatureAcceptance,
+                &verdict(false, Some(false)),
+                true
+            ),
+            IntentRouting::ScrapRelabelCeiling
+        );
+    }
+
+    /// The ceiling blocks RELABELS only: keeping a label is not a relabel, so a
+    /// test that spent its one relabel still rides out the run.
+    #[test]
+    fn a_relabelled_test_whose_label_still_holds_is_kept() {
+        assert_eq!(
+            route_intent(&TestIntent::FeatureAcceptance, &verdict(true, None), true),
+            IntentRouting::Keep
+        );
     }
 
     // ---- quote evidence (RECORDED, never the rule) --------------------------

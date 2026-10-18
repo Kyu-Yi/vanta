@@ -332,6 +332,10 @@ pub async fn run_bate(
                             let mut relabeled = current_test.clone();
                             relabeled.intent = TestIntent::BehaviorPreservation;
                             relabeled.issue_quote = None;
+                            // [VANTA-WHY] Item 6 — record that this test has
+                            // spent its one relabel, so a later verdict can never
+                            // flip it back.
+                            relabeled.relabeled = true;
                             info!(
                                 test = %current_test.test_name,
                                 "relabeled BugReproduction→BehaviorPreservation (baseline passed, issue requires preservation)"
@@ -365,6 +369,13 @@ pub async fn run_bate(
                         .await
                         {
                             Ok(revised) => {
+                                // [VANTA-WHY] Item 6 — a revision is the same test
+                                // under a new body, so it inherits the relabel
+                                // ceiling: the test has already spent its one
+                                // relabel, and a verdict that would relabel it
+                                // again flips it back, which the audit scraps.
+                                let mut revised = revised;
+                                revised.relabeled = current_test.relabeled;
                                 // [VANTA-WHY] The reviver can change what a test
                                 // declares, so the revised test is audited too: a
                                 // revision that claims FeatureAcceptance for a

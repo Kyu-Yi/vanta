@@ -506,6 +506,30 @@ const PRESERVATION_PROBE_CONTRADICTING_THE_ISSUE: &str = r#"{"tests":[
         }
     ]}"#;
 
+/// A BehaviourPreservation probe that in fact asserts the NEW behaviour — the
+/// value the issue asks for — so it FAILS on the original tree.
+///
+/// [VANTA-WHY] Item 6: this is the B v2 shape. The label is wrong, not the probe.
+/// A preservation probe that passes on the original proves nothing about the
+/// patch, so scrapping it discards the one test that could catch a broken patch
+/// (a broken patch is exactly one that FAILS this assertion). The intent audit
+/// must relabel it to FeatureAcceptance, whose baseline rule then demands it fail
+/// on the original — which it does — before it is free to pass on the patched
+/// tree.
+const PRESERVATION_PROBE_ASSERTING_THE_NEW_BEHAVIOUR: &str = r#"{"tests":[
+        {
+            "test_name":"test_new_behaviour_probe",
+            "test_source":"from calc import add\n\ndef test_new_behaviour_probe():\n    assert add(2, 3) == 6\n",
+            "intent":"BehaviorPreservation",
+            "reason":"Asserts the value the issue asks for, so it is an acceptance probe wearing a preservation label."
+        }
+    ]}"#;
+
+/// A patch that implements the behaviour the promoted probe asserts: `add(2, 3)`
+/// becomes 6, the value the issue asks for. It is a CORRECT patch, so a run that
+/// wrongly scrapped the probe would report a false rejection.
+const NEW_BEHAVIOUR_PATCH: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a + b\n+    return a + b + 1\n";
+
 /// A Creator patch that APPLIES cleanly but leaves the tree unimportable.
 ///
 /// [VANTA-WHY] It has to be a real unified diff. The Creator's patch goes
@@ -1594,6 +1618,91 @@ fn a_preservation_probe_the_issue_requires_to_change_is_scrapped_by_the_intent_c
             .iter()
             .filter(|r| r.phase.starts_with("patched.result["))
             .map(|r| r.phase.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Item 6 — a preservation probe the issue ASKS FOR and REQUIRES to change is
+/// RELABELLED to FeatureAcceptance, not scrapped.
+///
+/// [VANTA-WHY] The complementary case to the scrap test above. When the issue
+/// asks for the asserted behaviour AND requires it to change at the asserted
+/// input, the preservation label is simply wrong: the probe is an acceptance
+/// test for the new behaviour, and scrapping it discards the one test that would
+/// catch a broken patch. Promoting it is safe because BATE's FeatureAcceptance
+/// rule then demands the probe FAIL on the original — it must prove the new
+/// behaviour is ABSENT before the patch is even run — so the relabel can only
+/// make the test harder to admit, never easier. This pins the whole path: the
+/// promotion is logged, the probe is admitted, and it runs against the patched
+/// tree.
+#[test]
+fn a_preservation_probe_the_issue_asks_for_is_promoted_not_scrapped() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), NEW_BEHAVIOUR_PATCH);
+    // The audit answers BOTH questions: the issue asks for the behaviour and
+    // requires it to change, which is what makes the error an acceptance probe.
+    let server = StubLlmServer::start_with_intent_audit(
+        PRESERVATION_PROBE_ASSERTING_THE_NEW_BEHAVIOUR,
+        r#"{"issue_asks_for_behaviour":true,"issue_requires_change":true,"reason":"the issue asks for the new value at this input"}"#,
+    );
+
+    let status = run_patch_mode_with(workspace.path(), &patch_path, &server, 1, &[]);
+    assert!(
+        status.success(),
+        "a probe that proves the new behaviour is absent on the original and present on the \
+         patched tree must not sink a correct patch"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    // The promotion must be logged with BOTH endpoints, so a reader can tell a
+    // promotion from a demotion without re-deriving the verdict.
+    let relabel = records
+        .iter()
+        .find(|r| r.phase == "attacker.relabel[test_new_behaviour_probe]")
+        .unwrap_or_else(|| {
+            panic!(
+                "the session log must record the promotion; got phases {:?}",
+                records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        relabel.summary.contains("from=BehaviorPreservation")
+            && relabel.summary.contains("to=FeatureAcceptance"),
+        "the promotion must name both endpoints; got {}",
+        relabel.summary
+    );
+    assert!(
+        relabel.summary.contains("the issue asks for the asserted behaviour"),
+        "the relabel must carry the audit's reason; got {}",
+        relabel.summary
+    );
+
+    // It must be admitted, not scrapped, and the promotion counted as a relabel.
+    let summary = records
+        .iter()
+        .find(|r| r.phase == "attacker.summary")
+        .expect("the Attacker summary row must exist");
+    assert!(
+        summary.summary.contains("intent_scrapped=0")
+            && summary.summary.contains("relabels=1")
+            && summary.summary.contains("valid_tests=1"),
+        "a promoted probe must survive the audit and be counted as a relabel; got {}",
+        summary.summary
+    );
+
+    // And it must actually run against the patched tree and pass.
+    assert!(
+        records
+            .iter()
+            .any(|r| r.phase == "patched.result[test_new_behaviour_probe]"
+                && r.summary.contains("outcome=Passed")),
+        "the promoted probe must run against the patched tree; got {:?}",
+        records
+            .iter()
+            .filter(|r| r.phase.starts_with("patched.result["))
+            .map(|r| r.summary.as_str())
             .collect::<Vec<_>>()
     );
 }

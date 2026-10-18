@@ -874,6 +874,25 @@ mod tests {
         );
     }
 
+    /// A test defect (a patch-insensitive failure) is a property of the TEST,
+    /// not the candidate, so it must never move EIR/ECR — the same exclusion as
+    /// any other non-Logic class.
+    #[test]
+    fn a_test_defect_is_excluded_from_eir_and_ecr() {
+        let rows = vec![
+            counting_row(TestResult::Passed, TestResult::Failed, None, Some(FailureClass::TestDefect), Some("p1"), Some("p2")),
+            counting_row(TestResult::Failed, TestResult::Passed, Some(FailureClass::TestDefect), None, Some("p0"), Some("p1")),
+        ];
+
+        let snap = ecr_eir_from_rows(&rows);
+        assert_eq!(snap.ecr_count, 0, "a test defect is not a correction");
+        assert_eq!(snap.eir_count, 0, "a test defect is not an introduction");
+        assert_eq!(
+            snap.excluded_non_logic, 2,
+            "the exclusion must be visible, never silent"
+        );
+    }
+
     /// A row censored by the Governor (an unobserved side) is not counted even
     /// when both patch ids happen to be present and equal.
     #[test]

@@ -103,6 +103,31 @@ pub fn parse_failure_site(output: &str) -> (Option<String>, Option<u32>, Option<
     (None, None, None)
 }
 
+/// The signature of a failure: `(exception_type, file, line)` from its output.
+///
+/// [VANTA-WHY] Two runs are "the same failure" when they raise the same
+/// exception at the same site. Comparing signatures — not merely "both trees
+/// failed" — is what lets a patch-insensitive failure be told apart from a
+/// coincidence: two DIFFERENT bugs that happen to both fail must stay Logic.
+fn failure_signature(exec: &TestExecutionDetails) -> Option<(String, Option<String>, Option<u32>)> {
+    let output = format!("{}\n{}", exec.stdout, exec.stderr);
+    let (file, line, exception_type) = parse_failure_site(&output);
+    exception_type.map(|e| (e, file, line))
+}
+
+/// Does the same test fail the SAME way on the unpatched tree?
+///
+/// [VANTA-WHY] Item 2 of the heretic fix list: a failure that reproduces
+/// identically on the original tree carries no information about the patch, so
+/// it must not reject. `false` whenever either side has no parseable signature
+/// — an unreadable failure must not be silently reclassified as a test defect.
+fn is_patch_insensitive(patched: &TestExecutionDetails, original: &TestExecutionDetails) -> bool {
+    match (failure_signature(patched), failure_signature(original)) {
+        (Some(p), Some(o)) => p == o,
+        _ => false,
+    }
+}
+
 // ============================================================================
 // DiagnosticResult — output of Diagnostician
 // ============================================================================
@@ -344,6 +369,57 @@ pub async fn diagnose_failure(
 
     let diag = classify(execution);
 
+    // [VANTA-WHY] Item 2 of the heretic fix list. A failure that reproduces
+    // IDENTICALLY on the ORIGINAL tree says nothing about the patch. B v2's
+    // generated test built `HereticSettings(model=...)`, whose CLI settings
+    // source parses pytest's own argv and raises `SystemExit` — on the unpatched
+    // tree exactly as on the patch. Blaming the patch there is a false finding
+    // about the model. When the failing test raises the same exception at the
+    // same file:line on the original tree, the TEST is defective, not the
+    // candidate: classify it TestDefect, never Logic.
+    if diag.failure_class == Some(FailureClass::Logic) {
+        if let Some(patched_sig) = failure_signature(execution) {
+            let original = harness::run_single_test_with_timeout(
+                original_source,
+                &test.test_source,
+                test_cmd,
+                harness::patched_test_timeout_secs(),
+            )
+            .await;
+            if is_patch_insensitive(execution, &original) {
+                let (exception, file, line) = &patched_sig;
+                let site = format!(
+                    "{}:{}",
+                    file.clone().unwrap_or_else(|| "?".into()),
+                    line.map(|l| l.to_string()).unwrap_or_else(|| "?".into()),
+                );
+                tracing::info!(
+                    test = %test.test_name,
+                    "failure reproduces on the ORIGINAL tree → TestDefect (patch-insensitive)"
+                );
+                return enrich_with_sandbox_roots(
+                    DiagnosticResult {
+                        failure_class: Some(FailureClass::TestDefect),
+                        reason: format!(
+                            "Test fails identically on the unpatched tree ({exception} at {site}) — \
+                             patch-insensitive, so the failure is a property of the test, not the \
+                             patch. Sent back to the Attacker for revision."
+                        ),
+                        structured_payload: Some(json!({
+                            "signal": "patch_insensitive_failure",
+                            "exception_type": exception,
+                            "frame_file": file,
+                            "frame_line": line,
+                            "original_sandbox_root": original.sandbox_root.clone(),
+                        })),
+                    },
+                    execution.sandbox_root.clone(),
+                    original.sandbox_root.clone(),
+                );
+            }
+        }
+    }
+
     match diag.failure_class {
         Some(FailureClass::Infrastructure) => {
             // Spec §7 Phase 2: "Infrastructure: reset backend and rerun."
@@ -574,6 +650,49 @@ mod tests {
         assert_eq!(file.as_deref(), Some("test_x.py"));
         assert_eq!(line, Some(9));
         assert_eq!(exc.as_deref(), Some("AttributeError"));
+    }
+
+    fn exec_at(result: TestResult, output: &str) -> TestExecutionDetails {
+        TestExecutionDetails {
+            result,
+            stdout: output.to_string(),
+            stderr: String::new(),
+            timed_out: false,
+            report_path_exists: true,
+            sandbox_root: Some("sandbox".to_string()),
+        }
+    }
+
+    /// Item 2 of the heretic fix list: a failure that reproduces identically on
+    /// the unpatched tree says nothing about the patch (B v2's HereticSettings
+    /// raised SystemExit on both trees). Same exception at the same site →
+    /// patch-insensitive; anything else → not.
+    #[test]
+    fn a_failure_that_reproduces_on_the_original_tree_is_patch_insensitive() {
+        let patched = exec_at(TestResult::Failed, "test_x.py:9: SystemExit\n");
+        let identical = patched.clone();
+        assert!(
+            is_patch_insensitive(&patched, &identical),
+            "same exception at the same site on both trees is the test's own defect"
+        );
+
+        let other_site = exec_at(TestResult::Failed, "test_x.py:42: SystemExit\n");
+        assert!(
+            !is_patch_insensitive(&patched, &other_site),
+            "same exception at a DIFFERENT site is not the same failure"
+        );
+
+        let other_exception = exec_at(TestResult::Failed, "test_x.py:9: AssertionError\n");
+        assert!(
+            !is_patch_insensitive(&patched, &other_exception),
+            "a different exception type is a different failure"
+        );
+
+        let original_passed = exec_at(TestResult::Passed, "");
+        assert!(
+            !is_patch_insensitive(&patched, &original_passed),
+            "a test that passes on the original is evidence about the patch"
+        );
     }
 
     #[test]

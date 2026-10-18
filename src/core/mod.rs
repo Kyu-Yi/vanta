@@ -126,6 +126,17 @@ pub enum FailureClass {
     // the reason). NOTE: Repository and benchmark oracle tests are NEVER
     // quarantined; they escalate to "human review required".
     Unknown,
+
+    // [VANTA-WHY] TestDefect = the failure is a property of the TEST, not of
+    // the candidate. Two shapes produce it: (a) the failure reproduces
+    // IDENTICALLY on the unpatched tree (patch-insensitive — B v2's
+    // HereticSettings parsed pytest's own argv and raised SystemExit on both
+    // trees); (b) the exception was raised in an object the TEST defined, or in
+    // test setup, before the code under test ran (56eb4fd3's FakeTensor had no
+    // `.shape`). Blaming the patch for either is a FALSE finding about the
+    // model, so this class is sent back to the Attacker for revision and NEVER
+    // counted as Logic. → Excluded from EIR/ECR exactly like Infrastructure.
+    TestDefect,
 }
 
 /// True when a failure was a genuine LOGIC failure — the only class that is

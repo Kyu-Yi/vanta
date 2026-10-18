@@ -2553,6 +2553,24 @@ mod tests {
         );
     }
 
+    /// Item 2 of the heretic fix list: a patch-insensitive failure (TestDefect)
+    /// must NOT reject a review round — it is a property of the test, not the
+    /// candidate. The round is Inconclusive, so the Attacker is asked to revise.
+    #[test]
+    fn a_test_defect_does_not_reject_a_review_round() {
+        assert_eq!(
+            attempt_verdict(
+                false,
+                &[Some(FailureClass::TestDefect)],
+                false,
+                false,
+                GovernorMode::Review
+            ),
+            AttemptVerdict::Inconclusive,
+            "a test defect is neither a rejection nor a pass"
+        );
+    }
+
     /// The inspectable promise of the repair-mode apply-failure path.
     ///
     /// [VANTA-WHY] This is the direct answer to "how does a failed apply count

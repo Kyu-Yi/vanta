@@ -433,6 +433,7 @@ fn failure_class_label(class: &FailureClass) -> &'static str {
         FailureClass::Static => "Static",
         FailureClass::Logic => "Logic",
         FailureClass::Unknown => "Unknown",
+        FailureClass::TestDefect => "TestDefect",
     }
 }
 

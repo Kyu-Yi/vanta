@@ -1216,13 +1216,7 @@ pub async fn run(
             GovernorDecision::AllTestsPassed => {
                 final_patched_files = Some(patched_files);
                 // Collect accepted tests (test sources) for the PR.
-                final_accepted_tests = Some(
-                    valid_tests
-                        .iter()
-                        .map(|t| t.test_source.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n\n"),
-                );
+                final_accepted_tests = Some(render_committed_test_file(&valid_tests));
                 break decision;
             }
             GovernorDecision::MaxAttemptsReached => {
@@ -1446,6 +1440,45 @@ fn repo_working_tree_dirty(
         .into());
     }
     Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+}
+
+fn render_committed_test_file(tests: &[GeneratedTest]) -> String {
+    let mut imports: Vec<String> = Vec::new();
+    let mut bodies: Vec<String> = Vec::new();
+
+    for test in tests {
+        let mut body_lines = Vec::new();
+        let mut in_body = false;
+        for line in test.test_source.lines() {
+            let trimmed = line.trim();
+            if !in_body && (trimmed.starts_with("def ") || trimmed.starts_with("@")) {
+                in_body = true;
+            }
+            if in_body {
+                body_lines.push(line);
+            } else if !trimmed.is_empty()
+                && (trimmed.starts_with("import ") || trimmed.starts_with("from "))
+                && !imports.iter().any(|existing| existing == trimmed)
+            {
+                imports.push(trimmed.to_string());
+            }
+        }
+        let body = body_lines.join("\n").trim().to_string();
+        if !body.is_empty() {
+            bodies.push(body);
+        }
+    }
+
+    let mut rendered = String::new();
+    if !imports.is_empty() {
+        rendered.push_str(&imports.join("\n"));
+        rendered.push_str("\n\n");
+    }
+    rendered.push_str(&bodies.join("\n\n\n"));
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    rendered
 }
 
 fn require_clean_target_repo_for_open_pr(target_repo_dirty: Option<bool>) -> Result<(), String> {
@@ -1687,9 +1720,11 @@ fn now_iso() -> String {
 mod tests {
     use super::{
         attempt_verdict, collapse_decision, harness_infrastructure_collapse,
-        patch_attempt_id_for_patch, require_clean_target_repo_for_open_pr,
+        patch_attempt_id_for_patch, render_committed_test_file,
+        require_clean_target_repo_for_open_pr,
         stable_patch_fingerprint,
     };
+    use crate::agents::attacker::GeneratedTest;
     use crate::core::{FailureClass, GovernorDecision};
     use crate::pipeline::governor::AttemptVerdict;
 
@@ -1824,5 +1859,34 @@ mod tests {
     #[test]
     fn open_pr_accepts_a_clean_target_repo() {
         assert!(require_clean_target_repo_for_open_pr(Some(false)).is_ok());
+    }
+
+    #[test]
+    fn committed_test_file_uses_test_prefix_and_hoists_shared_imports() {
+        let tests = vec![
+            GeneratedTest {
+                test_name: "test_one".into(),
+                test_source: "from toy_calc import shipping_band\n\ndef test_one():\n    assert shipping_band(500) == \"standard\"\n".into(),
+                intent: crate::core::TestIntent::BehaviorPreservation,
+                reason: "keep 500 unchanged".into(),
+                issue_quote: None,
+            },
+            GeneratedTest {
+                test_name: "test_two".into(),
+                test_source: "from toy_calc import shipping_band\n\ndef test_two():\n    assert shipping_band(1000) == \"heavy\"\n".into(),
+                intent: crate::core::TestIntent::BugReproduction,
+                reason: "fix 1000 boundary".into(),
+                issue_quote: None,
+            },
+        ];
+
+        let rendered = render_committed_test_file(&tests);
+        assert_eq!(
+            rendered.matches("from toy_calc import shipping_band").count(),
+            1,
+            "shared imports should be hoisted once to the top of the committed test file"
+        );
+        assert!(rendered.contains("def test_one():"));
+        assert!(rendered.contains("def test_two():"));
     }
 }

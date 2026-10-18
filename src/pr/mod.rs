@@ -22,6 +22,7 @@ use octocrab::Octocrab;
 use serde_json::{Value, json};
 
 use crate::core::TestEvidence;
+use crate::core::{FailureClass, TestIntent, VerificationOutcome};
 use crate::session::{SessionId, SessionRecord};
 
 /// Result of opening a PR.
@@ -38,6 +39,16 @@ struct SessionStartMeta {
     prompt_version: String,
     vanta_commit: String,
     vanta_dirty: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NativeSuiteSummary {
+    ran_original: bool,
+    ran_patched: bool,
+    original_tests: usize,
+    patched_tests: usize,
+    regressions: usize,
+    fixed_preexisting_failures: usize,
 }
 
 /// Fail early if the session-recorded tested commit cannot be used to open a PR.
@@ -111,7 +122,7 @@ pub async fn open_pr(
 
     let short_id = &session_id.as_str()[..session_id.as_str().len().min(8)];
     let branch = format!("vanta/fix-{short_id}");
-    let tests_path = format!("tests/vanta_{short_id}.py");
+    let tests_path = format!("tests/test_vanta_{short_id}.py");
 
     let mut entries: Vec<(String, Value)> = patched_files
         .iter()
@@ -173,7 +184,8 @@ pub async fn open_pr(
         )
         .await?;
 
-    let pr_body = build_pr_body(session_id, &meta, evidence);
+    let native_suite = read_native_suite_summary(session_log_path)?;
+    let pr_body = build_pr_body(session_id, &meta, evidence, &native_suite);
     let pr: Value = octocrab
         .post(
             format!("/repos/{owner}/{repo}/pulls"),
@@ -297,7 +309,12 @@ fn ensure_full_sha(
     Ok(())
 }
 
-fn build_pr_body(session_id: &SessionId, meta: &SessionStartMeta, evidence: &[TestEvidence]) -> String {
+fn build_pr_body(
+    session_id: &SessionId,
+    meta: &SessionStartMeta,
+    evidence: &[TestEvidence],
+    native_suite: &NativeSuiteSummary,
+) -> String {
     let mut body = String::new();
     body.push_str("## Vanta pull request\n\n");
     body.push_str("### Decision\n");
@@ -310,22 +327,113 @@ fn build_pr_body(session_id: &SessionId, meta: &SessionStartMeta, evidence: &[Te
         meta.vanta_commit, meta.vanta_dirty
     ));
     body.push_str(&format!("- prompt_version: `{}`\n\n", meta.prompt_version));
+    body.push_str("### Native Suite\n");
+    body.push_str(&format!(
+        "- original: ran=`{}` tests=`{}`\n",
+        native_suite.ran_original, native_suite.original_tests
+    ));
+    body.push_str(&format!(
+        "- patched: ran=`{}` tests=`{}`\n",
+        native_suite.ran_patched, native_suite.patched_tests
+    ));
+    body.push_str(&format!(
+        "- regressions (pass -> fail): `{}`\n",
+        native_suite.regressions
+    ));
+    body.push_str(&format!(
+        "- pre-existing failures fixed (fail -> pass): `{}`\n\n",
+        native_suite.fixed_preexisting_failures
+    ));
     body.push_str("### Evidence\n");
     for item in evidence {
         body.push_str(&format!(
-            "- `{}` intent=`{:?}` outcome=`{:?}` failure_class=`{}`\n",
+            "- `{}` intent=`{}` outcome=`{}` failure_class=`{}`\n",
             item.test_name,
-            item.intent,
-            item.outcome,
+            intent_label(item.intent.clone()),
+            outcome_label(item.intent.clone(), item.outcome.clone()),
             item.failure_class
                 .as_ref()
-                .map(|class| format!("{class:?}"))
+                .map(|class| failure_class_label(class).to_string())
                 .unwrap_or_else(|| "None".to_string())
         ));
     }
     body.push_str("\n---\n");
     body.push_str("*No credential is included in this body or its metadata.*\n");
     body
+}
+
+fn read_native_suite_summary(
+    session_log_path: &Path,
+) -> Result<NativeSuiteSummary, Box<dyn std::error::Error + Send + Sync>> {
+    let text = fs::read_to_string(session_log_path)?;
+    let records: Vec<SessionRecord> = text
+        .lines()
+        .map(serde_json::from_str::<SessionRecord>)
+        .collect::<Result<_, _>>()?;
+    let summary = records
+        .iter()
+        .find(|record| record.phase == "native_suite.summary")
+        .map(|record| parse_summary_fields(&record.summary))
+        .unwrap_or_default();
+
+    let fixed_preexisting_failures = records
+        .iter()
+        .filter(|record| record.phase.starts_with("native_suite.test["))
+        .filter(|record| {
+            let fields = parse_summary_fields(&record.summary);
+            fields.get("original").map(String::as_str) == Some("Failed")
+                && fields.get("patched").map(String::as_str) == Some("Some(Passed)")
+        })
+        .count();
+
+    Ok(NativeSuiteSummary {
+        ran_original: summary.get("ran_original").map(String::as_str) == Some("true"),
+        ran_patched: summary.get("ran_patched").map(String::as_str) == Some("true"),
+        original_tests: summary
+            .get("original_tests")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        patched_tests: summary
+            .get("patched_tests")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        regressions: summary
+            .get("regressions")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        fixed_preexisting_failures,
+    })
+}
+
+fn intent_label(intent: TestIntent) -> &'static str {
+    match intent {
+        TestIntent::BugReproduction => "BugReproduction",
+        TestIntent::FeatureAcceptance => "FeatureAcceptance",
+        TestIntent::BehaviorPreservation => "BehaviorPreservation",
+    }
+}
+
+fn outcome_label(intent: TestIntent, outcome: VerificationOutcome) -> &'static str {
+    match (intent, outcome) {
+        (TestIntent::BugReproduction, VerificationOutcome::VerifiedWithinBounds) => {
+            "failed on original, passed on patch"
+        }
+        (_, VerificationOutcome::VerifiedWithinBounds) => "passed on patch",
+        (_, VerificationOutcome::Counterexample) => "failed on patch",
+        (_, VerificationOutcome::Inconclusive) => "inconclusive",
+        (_, VerificationOutcome::Unsupported) => "unsupported",
+        (_, VerificationOutcome::Timeout) => "timed out",
+        (_, VerificationOutcome::ToolFailure) => "tool failure",
+    }
+}
+
+fn failure_class_label(class: &FailureClass) -> &'static str {
+    match class {
+        FailureClass::Infrastructure => "Infrastructure",
+        FailureClass::Static => "Static",
+        FailureClass::Logic => "Logic",
+        FailureClass::Unknown => "Unknown",
+    }
 }
 
 fn json_str<'a>(
@@ -430,6 +538,15 @@ mod tests {
             .iter()
             .find(|req| req.path.ends_with("/pulls") && req.method == "POST")
             .expect("pull request request missing");
+        let tree_body = requests
+            .iter()
+            .find(|req| req.path.ends_with("/git/trees") && req.method == "POST")
+            .expect("tree request missing");
+        assert!(
+            tree_body.body.contains("tests/test_vanta_sess-pr.py"),
+            "generated tests must be committed under pytest's test_*.py convention; got {}",
+            tree_body.body
+        );
         assert!(
             pr_body
                 .body
@@ -443,6 +560,29 @@ mod tests {
                 .contains("attacker=2;intent_check=1;creator=1;diagnostician=1"),
             "PR body must include prompt_version from session.start; got {}",
             pr_body.body
+        );
+        assert!(
+            pr_body.body.contains("regressions (pass -> fail): `0`"),
+            "PR body must summarize native-suite regressions; got {}",
+            pr_body.body
+        );
+        assert!(
+            pr_body
+                .body
+                .contains("pre-existing failures fixed (fail -> pass): `1`"),
+            "PR body must summarize fixed pre-existing native-suite failures; got {}",
+            pr_body.body
+        );
+        assert!(
+            pr_body
+                .body
+                .contains("outcome=`failed on original, passed on patch`"),
+            "BugReproduction evidence should use plain-English outcomes; got {}",
+            pr_body.body
+        );
+        assert!(
+            !pr_body.body.contains("VerifiedWithinBounds"),
+            "internal outcome enum names should not leak into the PR body"
         );
         assert!(
             !pr_body.body.contains(token),
@@ -491,7 +631,38 @@ mod tests {
                 benchmark_instance: None,
                 benchmark_label: None,
             };
-            fs::write(&path, format!("{}\n", serde_json::to_string(&record).unwrap())).unwrap();
+            let native_summary = SessionRecord {
+                session_id: session_id.clone(),
+                patch_attempt_id: None,
+                testing_iteration_id: None,
+                test_id: None,
+                phase: "native_suite.summary".into(),
+                summary: "ran_original=true ran_patched=true original_tests=4 patched_tests=4 regressions=0".into(),
+                timestamp: "2026-10-18T00:00:01Z".into(),
+                benchmark_instance: None,
+                benchmark_label: None,
+            };
+            let native_fixed = SessionRecord {
+                session_id: session_id.clone(),
+                patch_attempt_id: None,
+                testing_iteration_id: None,
+                test_id: None,
+                phase: "native_suite.test[test_status_pluralization]".into(),
+                summary: "original=Failed patched=Some(Passed) regression=false".into(),
+                timestamp: "2026-10-18T00:00:02Z".into(),
+                benchmark_instance: None,
+                benchmark_label: None,
+            };
+            fs::write(
+                &path,
+                format!(
+                    "{}\n{}\n{}\n",
+                    serde_json::to_string(&record).unwrap(),
+                    serde_json::to_string(&native_summary).unwrap(),
+                    serde_json::to_string(&native_fixed).unwrap()
+                ),
+            )
+            .unwrap();
             path
         }
     }

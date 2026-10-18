@@ -86,7 +86,7 @@ fn parse_args() -> Result<CliArgs, String> {
                 }
                 model_override = Some(args[i].clone());
             }
-            "--pr" => {
+            "--open-pr" | "--pr" => {
                 open_pr = true;
             }
             "--patch" | "-p" => {
@@ -144,13 +144,13 @@ fn print_help() {
     println!(
         "Vanta M3 — Adversarial verification repair loop\n\
          \n\
-         USAGE:\n    vanta --repo PATH [--issue PATH] [--max-attempts N] [--model NAME] [--pr] [--patch PATH] [--test-cmd CMD] [--original-tree PATH]\n\
+         USAGE:\n    vanta --repo PATH [--issue PATH] [--max-attempts N] [--model NAME] [--open-pr] [--patch PATH] [--test-cmd CMD] [--original-tree PATH]\n\
          \n\
          OPTIONS:\n    --repo, -r PATH        Path to the repository to repair\n    \
          --issue, -i PATH       Path to the issue/bug description (default: auto-detect)\n    \
          --max-attempts, -n N   Max repair attempts (default: 4)\n    \
          --model, -m NAME       Override LLM model (default: from VANTA_LLM_MODEL)\n    \
-         --pr                   Open a GitHub PR after Gatekeeper approval\n    \
+         --open-pr              Open a GitHub PR after Gatekeeper approval\n    \
          --patch, -p PATH       Verify an EXISTING patch (skip Creator, run Attacker+BATE on this diff)\n    \
          --test-cmd CMD         Test command (default: 'python3 -m pytest'). e.g. 'pytest tests/ -q'\n    \
          --original-tree PATH   Clean original tree (git worktree of base commit) for Mode B two-tree mode\n    \

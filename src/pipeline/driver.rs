@@ -26,6 +26,7 @@ use std::fs;
 use std::io;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agents::attacker::{
@@ -222,19 +223,11 @@ pub async fn run(
 
     // The run-identifying facts, written before any attempt exists so that
     // transition rows surviving a crash can always be traced to their run.
-    // [VANTA-WHY] `prompt_version` names EVERY agent prompt, not just the
-    // Attacker's: the Attacker, the patch-blind intent auditor, the Creator and
-    // the Diagnostician each change what a run can find or accept. If only the
-    // Attacker were tagged, a later edit to the intent-check or Creator prompt
-    // would be logged as "no change" and two different experiments would look
-    // identical. Keys are the prompt names, `;`-separated inside the value.
-    let prompt_versions = format!(
-        "attacker={};intent_check={};creator={};diagnostician={}",
-        crate::agents::attacker::ATTACKER_PROMPT_VERSION,
-        crate::agents::attacker::INTENT_AUDITOR_PROMPT_VERSION,
-        crate::agents::creator::CREATOR_PROMPT_VERSION,
-        crate::pipeline::diagnostician::DIAGNOSTICIAN_PROMPT_VERSION,
-    );
+    // [VANTA-WHY] `prompt_versions()` is the single definition (see
+    // `pipeline::prompt_versions`) shared by this record and the PR body, so an
+    // edit to any one prompt surfaces in both places rather than drifting.
+    let prompt_versions = crate::pipeline::prompt_versions();
+    let tested_commit = tested_commit_sha(&config.repo_path);
     let run_mode = if config.patch_path.is_some() {
         "patch_review"
     } else {
@@ -268,7 +261,7 @@ pub async fn run(
         phase: "session.start".to_string(),
         summary: format!(
             "model={} model_version={} prompt_version={} provider={} api_key={} \
-             vanta_version={} vanta_commit={} vanta_dirty={} requested_backend={} actual_backend={} max_attempts={} \
+             vanta_version={} vanta_commit={} vanta_dirty={} tested_commit={} requested_backend={} actual_backend={} max_attempts={} \
              baseline_test_timeout_secs={} patched_test_timeout_secs={} test_cmd={} mode={} benchmark_instance={}",
             cfg.model_id,
             std::env::var("VANTA_MODEL_VERSION").unwrap_or_else(|_| "unknown".into()),
@@ -278,6 +271,7 @@ pub async fn run(
             env!("CARGO_PKG_VERSION"),
             vanta_commit,
             vanta_dirty,
+            tested_commit,
             requested_backend,
             actual_backend,
             config.max_attempts,
@@ -1329,9 +1323,13 @@ pub async fn run(
                         patched,
                         &accepted_tests,
                         &final_evidence,
+                        session_log
+                            .sink_path()
+                            .ok_or("session log sink path missing for PR creation")?,
                         &session_id,
                         &repo.issue_text,
-                    ) {
+                    )
+                    .await {
                         Ok(pr) => {
                             println!("  ✔ PR branch: {}", pr.branch);
                             if let Some(url) = &pr.pr_url {
@@ -1404,6 +1402,18 @@ pub async fn run(
 // ============================================================================
 // build_creator_feedback — structured feedback for the Creator from failures
 // ============================================================================
+fn tested_commit_sha(repo_path: &Path) -> String {
+    match Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => "none".to_string(),
+    }
+}
+
 fn build_creator_feedback(failed: &[&TestEvidence], ruff_new: bool, mypy_new: bool) -> String {
     let mut fb = String::new();
     fb.push_str("The previous patch failed verification:\n\n");

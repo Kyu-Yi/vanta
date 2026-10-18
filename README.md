@@ -173,19 +173,19 @@ The Attacker is far more dangerous when it remembers how this codebase has broke
 - [x] Architecture & technical specification
 - [x] Research framing validated against Liu & Meng (2026)
 - [x] Dev environment (Rust toolchain, cargo-nextest, gh)
-- [ ] Rig spike: call an LLM API, parse structured output, chain two agent calls
+- [x] Rig spike: call an LLM API, parse structured output, chain two agent calls
 
 ### Milestone 1 — The adversarial core
-- [ ] Orchestration skeleton (Rig)
-- [ ] Creator agent: issue in, candidate patch out
-- [ ] Attacker agent: patch in, intent-labelled adversarial tests out
-- [ ] Structured Creator ⇄ Attacker loop with attempt logging
+- [x] Orchestration skeleton (Rig)
+- [x] Creator agent: issue in, candidate patch out
+- [x] Attacker agent: patch in, intent-labelled adversarial tests out
+- [x] Structured Creator ⇄ Attacker loop with attempt logging
 
 ### Milestone 2 — Ground truth
-- [ ] Sandbox trait (`mod.rs`) + `shuru.rs` macOS backend
-- [ ] Phase 1: intent-aware BATE baseline validation with 3-retry test repair
-- [ ] Phase 2: four-way Diagnostician (process-level signals, per-language static analysis, Unknown quarantine flow)
-- [ ] Structured JSON diagnostic payloads + session/attempt/iteration/test IDs on every result
+- [x] Sandbox trait (`mod.rs`) + `shuru.rs` macOS backend
+- [x] Phase 1: intent-aware BATE baseline validation with 3-retry test repair
+- [x] Phase 2: four-way Diagnostician (process-level signals, per-language static analysis, Unknown quarantine flow)
+- [x] Structured JSON diagnostic payloads + session/attempt/iteration/test IDs on every result
 
 ### Milestone 3 — V1 ship 🚢
 - [x] Fixed-N Governor + deterministic Gatekeeper

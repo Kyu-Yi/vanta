@@ -273,12 +273,8 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
     if let Some(arr) = report["tests"].as_array() {
         for t in arr {
             let nodeid = t["nodeid"].as_str().unwrap_or_default().to_string();
-            let result = match t["outcome"].as_str() {
-                Some("passed") => TestResult::Passed,
-                // "failed" = assertion failure; "error" = exception/setup error.
-                Some("failed") | Some("error") => TestResult::Failed,
-                // A skipped test is neither a pass nor a failure signal.
-                _ => continue,
+            let Some(result) = native_outcome(t["outcome"].as_str().unwrap_or_default()) else {
+                continue;
             };
             if !nodeid.is_empty() {
                 tests.push((nodeid, result));
@@ -286,6 +282,30 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
         }
     }
     NativeSuiteReport { tests, ran: true }
+}
+
+/// Map one pytest-json-report `outcome` string to a `TestResult`.
+///
+/// [VANTA-WHY] Item 9 — pytest reports a `unittest.TestCase.subTest` item with
+/// the outcome `"subtests passed"`, NOT `"passed"`. This parser used to match
+/// only `"passed"/"failed"/"error"` and drop everything else, so every subTest
+/// item silently vanished: the heretic suite has three subTest tests, and Vanta
+/// counted 4 native tests on master where pytest ran 5, and 12 on the C patch
+/// where pytest ran 15. The undercount is not merely cosmetic — a subTest item
+/// that PASSED on the original was absent from the original side, and
+/// `native_regressions` walks the ORIGINAL side, so a patch that broke such a
+/// test could never be reported as a regression. A failing subtest already
+/// arrives as `"failed"`; only the passing case needed mapping.
+fn native_outcome(outcome: &str) -> Option<TestResult> {
+    match outcome {
+        "passed" | "subtests passed" => Some(TestResult::Passed),
+        // "failed" = assertion failure (a failing subtest included); "error" =
+        // exception/setup error.
+        "failed" | "error" => Some(TestResult::Failed),
+        // A skipped test is neither a pass nor a failure signal, and an
+        // unrecognised outcome is not a licence to guess.
+        _ => None,
+    }
 }
 
 /// Nodeids that PASS on the original and did not pass on the patch — the repo's
@@ -951,13 +971,15 @@ pub async fn heal_dependencies(
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeSuiteReport, StaticDiagnostic, native_regressions, native_suite_collapsed,
-        new_diagnostics, parse_mypy_line, parse_ruff_line, ruff_is_error_class, run_single_test,
-        run_tests_parallel, write_source_files,
+        NativeSuiteReport, StaticDiagnostic, native_outcome, native_regressions,
+        native_suite_collapsed, new_diagnostics, parse_mypy_line, parse_native_report,
+        parse_ruff_line, ruff_is_error_class, run_single_test, run_tests_parallel,
+        write_source_files,
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{TestIntent, TestResult};
     use crate::pipeline::candidate::TestCommand;
+    use crate::sandbox::ExecutionResult;
     use std::fs;
 
     fn generated_test(name: &str, assertion: &str) -> GeneratedTest {
@@ -1115,6 +1137,74 @@ mod tests {
             !native_suite_collapsed(&original, &patched),
             "a gate that could not run must not be reported as a collapse — that would \
              invent a finding out of a missing measurement"
+        );
+    }
+
+    // ---- subTest parsing (item 9) --------------------------------------------
+    //
+    // [VANTA-WHY] pytest-json-report reports a `unittest.TestCase.subTest` item
+    // with outcome `"subtests passed"`. The old parser matched only
+    // `"passed"/"failed"/"error"` and silently dropped everything else, so the
+    // heretic suite's three subTest tests vanished: Vanta counted 4 where pytest
+    // ran 5 on master, and 12 where pytest ran 15 on the C patch. The undercount
+    // was not cosmetic — the dropped item was missing from the ORIGINAL side
+    // `native_regressions` walks, so a patch that broke it could never be
+    // reported. These pin that the item is counted.
+
+    #[test]
+    fn a_passing_subtest_item_is_counted_as_passed() {
+        assert_eq!(
+            native_outcome("subtests passed"),
+            Some(TestResult::Passed),
+            "pytest reports a passing subTest item as \"subtests passed\", not \"passed\""
+        );
+        assert_eq!(native_outcome("failed"), Some(TestResult::Failed));
+        assert_eq!(native_outcome("error"), Some(TestResult::Failed));
+        assert_eq!(
+            native_outcome("skipped"),
+            None,
+            "a skip is neither a pass nor a failure and must not be counted as either"
+        );
+    }
+
+    #[test]
+    fn parse_native_report_no_longer_drops_subtest_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("report.json");
+        fs::write(
+            &report_path,
+            r#"{"tests":[
+                {"nodeid":"tests/test_config.py::C::test_plain","outcome":"passed"},
+                {"nodeid":"tests/test_config.py::C::test_subtests","outcome":"subtests passed"},
+                {"nodeid":"tests/test_config.py::C::test_broken","outcome":"failed"},
+                {"nodeid":"tests/test_config.py::C::test_skipped","outcome":"skipped"}
+            ]}"#,
+        )
+        .unwrap();
+        let exec = ExecutionResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(1),
+            wall_time_ms: 0,
+            timed_out: false,
+        };
+
+        let report = parse_native_report(&report_path, &exec);
+
+        assert!(report.ran, "a readable report means the suite ran");
+        assert_eq!(
+            report.tests.len(),
+            3,
+            "the subTest item must be counted; a skipped test must not"
+        );
+        assert_eq!(
+            report
+                .tests
+                .iter()
+                .find(|(name, _)| name.ends_with("test_subtests"))
+                .map(|(_, result)| result.clone()),
+            Some(TestResult::Passed),
+            "the passing subTest item must survive parsing as a Passed test"
         );
     }
 

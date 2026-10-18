@@ -4,10 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 FIXTURE_DIR="$ROOT_DIR/fixtures/toy_calc"
 RUN_ROOT="${HOME}/vanta-runs/toy_calc"
-LOG_DIR="$RUN_ROOT/logs"
+# [VANTA-WHY] Every invocation gets its OWN timestamped batch directory and
+# writes nothing outside it. Before this, each batch reused
+# `<backend>_<binary>_<scenario>[_runN]` under a shared root, so a second batch
+# silently overwrote the first — and the pre-boundary-rule 2/5 catch-rate record
+# was lost that way. Seconds precision (not just minutes) so two batches started
+# in the same minute still cannot collide.
+BATCH_STAMP="$(date +%Y-%m-%dT%H%M%S)"
 HOST_PYTHON="$(command -v python3)"
-
-mkdir -p "$LOG_DIR"
 
 usage() {
   cat <<'EOF'
@@ -21,8 +25,11 @@ Usage:
       measures a CATCH RATE instead of one coin flip.
       <scenario> is review_bad, review_good or repair (or the full <binary>:<scenario>).
 
-Each run starts from a fresh copy outside the vanta repo:
-  ~/vanta-runs/toy_calc/<backend>_<binary>_<scenario>[_runN]/
+Each invocation writes to its own timestamped batch directory and never
+overwrites an earlier batch:
+  ~/vanta-runs/toy_calc/<timestamp>_<backend>/
+      <binary>_<scenario>[_runN]/     (fresh repo copy)
+      logs/<binary>_<scenario>[.runN].log
 EOF
 }
 
@@ -146,6 +153,10 @@ total_other=0
 total_runs=0
 
 for backend in "${BACKENDS[@]}"; do
+  BATCH_DIR="${RUN_ROOT}/${BATCH_STAMP}_${backend}"
+  BATCH_LOG_DIR="${BATCH_DIR}/logs"
+  mkdir -p "$BATCH_LOG_DIR"
+
   if [[ "$backend" == "subprocess" ]]; then
     TEST_CMD="$SUBPROCESS_TEST_CMD"
   else
@@ -163,11 +174,11 @@ for backend in "${BACKENDS[@]}"; do
 
     for i in $(seq 1 "$REPEAT"); do
       if (( REPEAT > 1 )); then
-        run_dir="$RUN_ROOT/${backend}_${binary}_${scenario}_run${i}"
-        log_path="$LOG_DIR/${backend}_${binary}_${scenario}.run${i}.log"
+        run_dir="$BATCH_DIR/${binary}_${scenario}_run${i}"
+        log_path="$BATCH_LOG_DIR/${binary}_${scenario}.run${i}.log"
       else
-        run_dir="$RUN_ROOT/${backend}_${binary}_${scenario}"
-        log_path="$LOG_DIR/${backend}_${binary}_${scenario}.log"
+        run_dir="$BATCH_DIR/${binary}_${scenario}"
+        log_path="$BATCH_LOG_DIR/${binary}_${scenario}.log"
       fi
 
       echo

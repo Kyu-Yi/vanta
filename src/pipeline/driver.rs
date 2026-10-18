@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -93,6 +94,14 @@ async fn run_with_spinner<F, T>(label: &str, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
+    // [VANTA-WHY] The dots exist so a human watching a 1-5 minute LLM call does
+    // not think the process froze. When stderr is NOT a terminal — piped to a
+    // file, run under CI, or captured by `run_matrix.sh` — they are noise that
+    // only corrupt the log, so the spinner is skipped entirely and the future
+    // is simply awaited.
+    if !io::stderr().is_terminal() {
+        return fut.await;
+    }
     eprint!("  ⏳ {label} ");
     let _ = io::Write::flush(&mut io::stderr());
     let label_owned = label.to_string();
@@ -213,9 +222,19 @@ pub async fn run(
 
     // The run-identifying facts, written before any attempt exists so that
     // transition rows surviving a crash can always be traced to their run.
-    // `prompt_version` is the ATTACKER's prompt tag (attacker.rs): the Attacker
-    // prompt is the one whose wording changes what a run can find, so a run
-    // before the boundary-probing rule and a run after it must be separable.
+    // [VANTA-WHY] `prompt_version` names EVERY agent prompt, not just the
+    // Attacker's: the Attacker, the patch-blind intent auditor, the Creator and
+    // the Diagnostician each change what a run can find or accept. If only the
+    // Attacker were tagged, a later edit to the intent-check or Creator prompt
+    // would be logged as "no change" and two different experiments would look
+    // identical. Keys are the prompt names, `;`-separated inside the value.
+    let prompt_versions = format!(
+        "attacker={};intent_check={};creator={};diagnostician={}",
+        crate::agents::attacker::ATTACKER_PROMPT_VERSION,
+        crate::agents::attacker::INTENT_AUDITOR_PROMPT_VERSION,
+        crate::agents::creator::CREATOR_PROMPT_VERSION,
+        crate::pipeline::diagnostician::DIAGNOSTICIAN_PROMPT_VERSION,
+    );
     let run_mode = if config.patch_path.is_some() {
         "patch_review"
     } else {
@@ -253,7 +272,7 @@ pub async fn run(
              baseline_test_timeout_secs={} patched_test_timeout_secs={} test_cmd={} mode={} benchmark_instance={}",
             cfg.model_id,
             std::env::var("VANTA_MODEL_VERSION").unwrap_or_else(|_| "unknown".into()),
-            crate::agents::attacker::ATTACKER_PROMPT_VERSION,
+            prompt_versions,
             cfg.base_url,
             if cfg.api_key.is_some() { "set" } else { "none" },
             env!("CARGO_PKG_VERSION"),

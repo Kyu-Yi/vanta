@@ -14,7 +14,7 @@ mod types;
 pub use types::{ExecutionResult, SandboxBackend, SandboxKind};
 
 use std::error::Error;
-use std::sync::OnceLock;
+use std::sync::{Once, OnceLock};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,10 +88,12 @@ async fn shuru_boot_ok() -> bool {
             .ok()
             .and_then(|o| String::from_utf8(o.stderr).ok())
             .unwrap_or_default();
+        let first_lines = stderr.lines().take(3).collect::<Vec<_>>().join(" | ");
         tracing::warn!(
             "shuru VM boot test failed — will use subprocess for this run. stderr: {}",
-            stderr.lines().next().unwrap_or("")
+            first_lines
         );
+        eprintln!("⚠ shuru VM boot test failed: {first_lines}");
     }
     let _ = SHURU_BOOT_OK.set(ok);
     ok
@@ -154,12 +156,32 @@ pub enum Backend {
     Shuru(shuru::ShuruBackend),
 }
 
+/// Guards the one-per-run announcement of which backend actually ran.
+///
+/// [VANTA-WHY] `Backend::spawn()` is called on every harness phase — dozens of
+/// times in a single run (61 times in one observed Shuru run) — so announcing
+/// the decision at each spawn floods the log with identical lines. The decision
+/// cannot change within a process (the env var is fixed and the VM boot test is
+/// memoized), so it is announced exactly once and later spawns stay silent.
+static ANNOUNCE_BACKEND: Once = Once::new();
+
+/// Announce the backend decision once per process (stdout).
+fn announce_backend(line: &str) {
+    ANNOUNCE_BACKEND.call_once(|| println!("{line}"));
+}
+
+/// Announce a subprocess fallback once per process (stderr — it is a warning).
+fn announce_fallback(line: &str) {
+    ANNOUNCE_BACKEND.call_once(|| eprintln!("{line}"));
+}
+
 impl Backend {
     pub async fn spawn() -> Result<Self, Box<dyn Error + Send + Sync>> {
         match backend_preference()? {
             BackendPreference::Subprocess => {
                 let b = subprocess::SubprocessBackend::spawn().await?;
                 tracing::warn!("using SUBPROCESS backend (forced by VANTA_SANDBOX_BACKEND)");
+                announce_backend("▌ Backend: subprocess (forced, NO security boundary)");
                 Ok(Backend::Subprocess(b))
             }
             BackendPreference::Shuru => {
@@ -175,26 +197,37 @@ impl Backend {
                 }
                 let b = shuru::ShuruBackend::spawn().await?;
                 tracing::info!("using SHURU microVM backend (forced by VANTA_SANDBOX_BACKEND)");
+                announce_backend("▌ Backend: SHURU microVM active (forced)");
                 Ok(Backend::Shuru(b))
             }
             BackendPreference::Auto => {
-                if shuru_available() && shuru_boot_ok().await {
+                // [VANTA-WHY] `auto` degrades to subprocess, and a SILENT degrade
+                // is indistinguishable from a real shuru run — which is exactly
+                // how a missing CLI or a failed VM boot gets misread as "shuru
+                // broke". Record the precise reason and print one greppable line
+                // so a run can be audited for which boundary actually ran.
+                let fallback_reason: String = if !shuru_available() {
+                    "shuru CLI not found in PATH".to_string()
+                } else if !shuru_boot_ok().await {
+                    "shuru VM boot test failed (see warning above for stderr)".to_string()
+                } else {
                     match shuru::ShuruBackend::spawn().await {
                         Ok(b) => {
                             tracing::info!("using SHURU microVM backend (preferred)");
+                            announce_backend("▌ Backend: SHURU microVM active (auto-selected)");
                             return Ok(Backend::Shuru(b));
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                "shuru spawn failed ({e}), falling back to subprocess"
-                            );
-                        }
+                        Err(e) => format!("shuru spawn failed: {e}"),
                     }
-                }
+                };
                 let b = subprocess::SubprocessBackend::spawn().await?;
                 tracing::warn!(
-                    "using SUBPROCESS backend (shuru not available — no security boundary)"
+                    reason = %fallback_reason,
+                    "using SUBPROCESS backend — FALLBACK (no security boundary)"
                 );
+                announce_fallback(&format!(
+                    "⚠ FALLBACK ACTIVE: subprocess backend (NO security boundary) — reason: {fallback_reason}"
+                ));
                 Ok(Backend::Subprocess(b))
             }
         }

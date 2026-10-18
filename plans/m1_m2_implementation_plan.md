@@ -262,12 +262,36 @@ is logged as its own `native_suite` section (one `native_suite.summary` plus one
 `native_suite.test[<nodeid>]` per test). It is NOT part of the shared set and is
 never counted in EIR/ECR, because it is not an N→N+1 transition.
 
-### 5. Round-1 terminals write zero transition rows
+### 6. Deterministic boundary obligations — DEFERRED, build only on pilot evidence
 
-A transition needs two attempts. A repair/review that terminates on round 1 has
-no N→N+1 comparison, so the row store stays empty; the review-mode console line
-says so explicitly rather than pointing at a file the run never wrote. ECR/EIR
-therefore only describe defects that needed two or more attempts, so
-"fixed at attempt 1" is reported as its own number (`run.summary
-fixed_at_attempt_1=…`) next to the rates, so a reader can see what share of
-defects the rates actually cover.
+Status: **not built, deliberately.** The Attacker prompt asks for a
+`BehaviorPreservation` probe at the exact changed boundary constant, but the
+model is not reliable about it — an observed M3 review run probed `499`, `501`,
+`999`, `1000`, `1001`, `1500`, `250`, `0` and a negative input, and never `500`,
+so the planted `500`-only regression went uncaught. That is Attacker sampling
+variance, not a broken part of M3: the pipeline catches the bug whenever a probe
+lands on the constant, and it is a quantity the research *measures*, not a
+correctness invariant it relies on.
+
+Proposed (deferred) mechanism — "deterministic boundary obligations":
+extract the changed comparison constants from the diff, require a test at each
+constant the issue does not already require to change, and send the Attacker
+back **once** if any is uncovered.
+
+Why it is deferred rather than built now:
+
+- **Finding the constant.** Real code compares against names, not literals
+  (`if len(batch) <= MAX_BATCH`, `if retries < self.limit`). Literal extraction
+  finds `500` in the toy fixture and misses most real cases.
+- **Synthesising the probe.** Knowing the constant is not knowing how to make
+  the comparison see it: which function, which argument, which other arguments
+  and object state. `shipping_band(500)` makes it look easy; in a BugsInPy repo
+  the comparison is several calls deep.
+- **Fixture-fitting risk.** Tuning this against one toy fixture would make the
+  toy number perfect and mean less, which is the failure mode the fixture is
+  meant to avoid.
+
+**Trigger:** build it only if the BugsInPy pilot shows boundary-type regressions
+slipping through. Until then, the honest reporting position is "rejection rate
+went up, still sometimes misses" (see `plans/dev_log.md`), not "fixed".
+

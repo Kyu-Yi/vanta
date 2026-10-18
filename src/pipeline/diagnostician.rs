@@ -27,6 +27,17 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 // ============================================================================
+// DIAGNOSTICIAN_PROMPT_VERSION — the run-identity tag for the Diagnostician
+// ============================================================================
+//
+// [VANTA-WHY] The Diagnostician is rule-based today (no prompt text of its own),
+// but its Unknown path calls the Attacker's simplify prompt. `session.start`
+// lists every agent prompt so that a future Diagnostician-side prompt change is
+// visible in the log rather than silently counted as "no change"; that change
+// must bump this tag.
+pub const DIAGNOSTICIAN_PROMPT_VERSION: &str = "1";
+
+// ============================================================================
 // DiagnosticResult — output of Diagnostician
 // ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]

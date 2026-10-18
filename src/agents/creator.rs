@@ -23,6 +23,16 @@ use std::error::Error;
 use tracing::{debug, info, trace, warn};
 
 // ============================================================================
+// CREATOR_PROMPT_VERSION — the run-identity tag for the Creator's prompt
+// ============================================================================
+//
+// [VANTA-WHY] `session.start` records a `prompt_version` that names EVERY
+// agent prompt in the run, so a later change to the Creator's Verify-First
+// wording is visible in the log instead of looking like "no change". Bump this
+// whenever the Creator system/user prompt text changes.
+pub const CREATOR_PROMPT_VERSION: &str = "1";
+
+// ============================================================================
 // CreatorRequest — input to the Creator agent
 // ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -35,7 +35,24 @@ use tracing::{debug, info, trace, warn};
 // boundary rule is exactly what the catch-rate comparison is about. Bump this
 // string whenever the prompt text changes, so `session.start` names which
 // prompt produced the rows.
-pub const ATTACKER_PROMPT_VERSION: &str = "attacker.2.boundary-probe";
+//
+// [VANTA-WHY] The tag is a bare version ("2.boundary-probe"), not
+// "attacker.2.boundary-probe": `session.start` writes
+// `prompt_version=attacker=<tag>;intent_check=<tag>;...`, so the prompt NAME is
+// the key and repeating it inside the value would make the field ambiguous.
+pub const ATTACKER_PROMPT_VERSION: &str = "2.boundary-probe";
+
+// ============================================================================
+// INTENT_AUDITOR_PROMPT_VERSION — the run-identity tag for the intent check
+// ============================================================================
+//
+// [VANTA-WHY] The intent auditor (audit_test_intent) is a SEPARATE prompt from
+// the Attacker's and it is the one that decides whether a test is honest:
+// demoting non-preservation labels and scrapping preservation probes the issue
+// requires to change. A change to THAT wording changes what a run accepts, so
+// it needs its own tag — otherwise editing the auditor would be logged as "no
+// change" because the Attacker's tag is untouched.
+pub const INTENT_AUDITOR_PROMPT_VERSION: &str = "1";
 
 // ============================================================================
 // AttackerRequest — input to the Attacker agent

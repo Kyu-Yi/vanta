@@ -176,17 +176,25 @@ pub async fn run(
         import_hint.as_deref().unwrap_or("(flat layout)")
     );
 
+    // ---- Selected backend (fixed for the process: env preference + boot test) ----
+    let requested_backend = crate::sandbox::requested_backend_label()?;
+    let backend_kind = crate::sandbox::actual_backend_kind().await?;
+    let actual_backend = crate::sandbox::backend_kind_label(backend_kind);
+
     // ---- Auto-detect repo dependencies and prepare the VM checkpoint ----
     // [VANTA-WHY] The base shuru checkpoint only ships python3 + pytest + ruff +
     // mypy. A real repo declares its own deps which are absent inside the VM, so
     // tests die at import and BATE sees `Error` for everything. Build/cache a
     // checkpoint up front so test runs use the warmed environment.
+    //
+    // Only for shuru runs: a subprocess run tests against the host environment,
+    // so a VM checkpoint would download dependencies the run never uses.
     let mut deps_checkpoint =
         std::env::var("VANTA_SHURU_CHECKPOINT").unwrap_or_else(|_| "none".to_string());
     let mut deps_freeze: Option<String> = None;
-    if std::env::var("VANTA_SHURU_CHECKPOINT").is_err()
+    if crate::sandbox::deps::auto_build_enabled(backend_kind)
+        && std::env::var("VANTA_SHURU_CHECKPOINT").is_err()
         && std::env::var("VANTA_SHURU_AUTO_DEPS").as_deref() != Ok("0")
-        && crate::sandbox::shuru_available()
     {
         println!("▌ VM deps: detecting declared dependencies...");
         match crate::sandbox::shuru::ShuruBackend::ensure_repo_checkpoint(&config.repo_path) {
@@ -217,8 +225,6 @@ pub async fn run(
     // written once at the end, a crash would leave rows saying WHAT changed with
     // no record of WHICH model produced them, and an unattributed run is useless
     // to a study whose central comparison is across model tiers.
-    let requested_backend = crate::sandbox::requested_backend_label()?;
-    let actual_backend = crate::sandbox::actual_backend_label().await?;
     let session_id = fresh_session_id();
     let mut session_log = SessionLog::open(Path::new("vanta_sessions"), session_id.clone())?;
     let debug_dir = session_log.ensure_debug_dir(Path::new("vanta_sessions"))?;

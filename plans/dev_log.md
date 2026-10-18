@@ -113,3 +113,5 @@ A development result. **Not evidence.**
 - [ ] Narrow the Creator context before the BugsInPy loader lands: pass the
   failing file, traceback-referenced files, and one-level in-repo imports
   instead of the whole repository on large projects like pandas or keras.
+
+- heretic: the hand-written pyproject parser truncated the dependency list at an extras entry (lm-eval[hf]), so declared torch was invisible to the size guard. Replaced with the toml crate; subprocess runs no longer build a VM dependency checkpoint.

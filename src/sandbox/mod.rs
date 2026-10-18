@@ -56,11 +56,17 @@ pub fn backend_kind_label(kind: SandboxKind) -> &'static str {
     }
 }
 
-pub async fn actual_backend_label() -> Result<&'static str, Box<dyn Error + Send + Sync>> {
+/// The sandbox kind this process will actually use: the env preference, with
+/// `auto` resolved through the shuru availability + boot test.
+pub async fn actual_backend_kind() -> Result<SandboxKind, Box<dyn Error + Send + Sync>> {
     let backend = Backend::spawn().await?;
-    let label = backend_kind_label(backend.kind());
+    let kind = backend.kind();
     backend.destroy();
-    Ok(label)
+    Ok(kind)
+}
+
+pub async fn actual_backend_label() -> Result<&'static str, Box<dyn Error + Send + Sync>> {
+    Ok(backend_kind_label(actual_backend_kind().await?))
 }
 
 /// Cached result of the shuru boot test. We run it ONCE per process because

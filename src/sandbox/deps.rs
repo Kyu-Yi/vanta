@@ -15,9 +15,11 @@
 // Supported manifests:
 //   - requirements.txt            (one spec per line)
 //   - pyproject.toml  [project]   (PEP 621 `dependencies = [...]`)
+//   - pyproject.toml  [project.optional-dependencies] (recorded, NOT installed)
 //   - pyproject.toml  [tool.poetry.dependencies]  (table keys)
 // ============================================================================
 
+use crate::sandbox::SandboxKind;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -73,6 +75,20 @@ impl DependencyPlan {
     }
 }
 
+/// Whether an auto-dependency checkpoint should be built for a run whose
+/// selected backend is `kind`.
+///
+/// [VANTA-WHY] The checkpoint exists to put a repo's declared dependencies
+/// INSIDE the shuru VM, whose base image ships only python3 + pytest + ruff +
+/// mypy. A subprocess run executes against the HOST environment, where those
+/// dependencies are already installed (or deliberately absent), so building a
+/// VM checkpoint for it downloads hundreds of MB the run never uses — and can
+/// fill the VM disk, as heretic's torch + CUDA stack did. Gate on the backend
+/// the run will actually use, not on whether the shuru CLI merely exists.
+pub fn auto_build_enabled(kind: SandboxKind) -> bool {
+    kind == SandboxKind::Shuru
+}
+
 pub fn policy_refusal_reason(plan: &DependencyPlan) -> Option<String> {
     let blocked: Vec<String> = plan
         .packages
@@ -107,7 +123,12 @@ pub fn detect(repo_root: &Path) -> DependencyPlan {
         specs.extend(parse_requirements(&text));
     }
     if let Ok(text) = std::fs::read_to_string(repo_root.join("pyproject.toml")) {
-        specs.extend(parse_pyproject(&text));
+        let pyproject = parse_pyproject(&text);
+        // Extras (`pyproject.optional`) are recorded but deliberately NOT
+        // installed: they are opt-in groups that pull in tooling and, often,
+        // heavyweight wheels this run does not need.
+        specs.extend(pyproject.required);
+        specs.extend(pyproject.poetry);
     }
 
     // Dedupe by normalized package name (keep the first spec seen).
@@ -166,102 +187,83 @@ fn parse_requirements(text: &str) -> Vec<String> {
 }
 
 // ----------------------------------------------------------------------------
-// pyproject.toml parsing (targeted, no TOML dependency)
+// pyproject.toml parsing (via the `toml` crate)
 // ----------------------------------------------------------------------------
-fn parse_pyproject(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
+//
+// [VANTA-WHY] This used to be hand-rolled line scanning, and it failed exactly
+// the way hand-rolled TOML parsing does: the array scan stopped at the first
+// line containing `]`, so `"lm-eval[hf]~=0.4"` — whose EXTRAS bracket holds a
+// `]` — ended the list. Every dependency after it was silently dropped,
+// including heretic's explicitly declared `torch`, so the huge-package guard
+// never saw torch and the auto-install downloaded torch + CUDA until the VM
+// disk filled. The `toml` crate handles extras, inline comments, environment
+// markers and multiline arrays correctly, so this is now a few lookups.
+// ----------------------------------------------------------------------------
 
-    // PEP 621: `dependencies = [ "a", "b" ]`
-    if let Some(arr) = extract_array(text, "dependencies") {
-        out.extend(extract_quoted_strings(&arr));
+/// What a repo's `pyproject.toml` declares.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PyprojectDeps {
+    /// PEP 621 `[project].dependencies` — installed into the checkpoint.
+    pub required: Vec<String>,
+    /// PEP 621 `[project.optional-dependencies]` extras — RECORDED, never
+    /// installed. Extras are opt-in groups (`dev`, `gpu`, ...) that routinely
+    /// pull in heavyweight wheels the run does not need.
+    pub optional: Vec<String>,
+    /// Poetry `[tool.poetry.dependencies]` table keys — installed.
+    pub poetry: Vec<String>,
+}
+
+fn parse_pyproject(text: &str) -> PyprojectDeps {
+    let mut out = PyprojectDeps::default();
+    let Ok(doc) = toml::from_str::<toml::Value>(text) else {
+        return out;
+    };
+    let Some(root) = doc.as_table() else {
+        return out;
+    };
+
+    if let Some(project) = root.get("project").and_then(toml::Value::as_table) {
+        if let Some(deps) = project.get("dependencies").and_then(toml::Value::as_array) {
+            out.required = string_array(deps);
+        }
+        if let Some(extras) = project
+            .get("optional-dependencies")
+            .and_then(toml::Value::as_table)
+        {
+            for list in extras.values() {
+                if let Some(list) = list.as_array() {
+                    out.optional.extend(string_array(list));
+                }
+            }
+        }
     }
-    // Poetry: `[tool.poetry.dependencies]` table of `name = "version"`
-    out.extend(parse_poetry_table(text));
+
+    if let Some(poetry) = root
+        .get("tool")
+        .and_then(toml::Value::as_table)
+        .and_then(|tool| tool.get("poetry"))
+        .and_then(toml::Value::as_table)
+        .and_then(|poetry| poetry.get("dependencies"))
+        .and_then(toml::Value::as_table)
+    {
+        for key in poetry.keys() {
+            // `python` is the interpreter constraint, not a package.
+            if key.as_str() != "python" {
+                out.poetry.push(key.clone());
+            }
+        }
+    }
 
     out
 }
 
-/// Extract the bracketed array value of a top-level `KEY = [ ... ]` assignment.
-/// Matches `dependencies = [` (and NOT `optional-dependencies`, which starts
-/// with `optional-`). Returns the raw text between the brackets.
-fn extract_array(text: &str, key: &str) -> Option<String> {
-    let mut capturing = false;
-    let mut buf = String::new();
-    for line in text.lines() {
-        let t = line.trim();
-        if !capturing {
-            let Some(rest) = t.strip_prefix(key) else {
-                continue;
-            };
-            let Some(rest) = rest.trim_start().strip_prefix('=') else {
-                continue;
-            };
-            let Some(rest) = rest.trim_start().strip_prefix('[') else {
-                continue;
-            };
-            capturing = true;
-            buf.push_str(rest);
-            buf.push('\n');
-            if rest.contains(']') {
-                break;
-            }
-        } else {
-            buf.push_str(t);
-            buf.push('\n');
-            if t.contains(']') {
-                break;
-            }
-        }
-    }
-    if capturing { Some(buf) } else { None }
-}
-
-/// Extract all double-quoted strings from a fragment.
-fn extract_quoted_strings(frag: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut chars = frag.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '"' {
-            continue;
-        }
-        let mut s = String::new();
-        for c in chars.by_ref() {
-            if c == '"' {
-                break;
-            }
-            s.push(c);
-        }
-        let s = s.trim().to_string();
-        if !s.is_empty() {
-            out.push(s);
-        }
-    }
-    out
-}
-
-/// Parse the keys of the `[tool.poetry.dependencies]` table (ignoring the
-/// `python` constraint key).
-fn parse_poetry_table(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut in_section = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_section = t == "[tool.poetry.dependencies]";
-            continue;
-        }
-        if !in_section {
-            continue;
-        }
-        let Some((k, _)) = t.split_once('=') else {
-            continue;
-        };
-        let k = k.trim().trim_matches('"').trim();
-        if !k.is_empty() && k != "python" {
-            out.push(k.to_string());
-        }
-    }
-    out
+/// Collect the string values of a TOML array.
+fn string_array(values: &[toml::Value]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .map(str::to_string)
+        .collect()
 }
 
 // ----------------------------------------------------------------------------
@@ -456,6 +458,40 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// heretic's real `[project].dependencies`, verbatim. The extras entry
+    /// (`lm-eval[hf]`) sits above `torch`/`torchvision`, which is what exposed
+    /// the truncation bug.
+    const HERETIC_PYPROJECT: &str = r#"
+[project]
+name = "heretic-llm"
+version = "2.0.0.dev0"
+dependencies = [
+    "accelerate~=1.15",
+    "bitsandbytes~=0.50",
+    "datasets~=5.0",
+    "huggingface-hub~=1.33",
+    "immutabledict~=4.3",
+    "langdetect~=1.0",
+    "lm-eval[hf]~=0.4",
+    "numpy~=2.2",
+    "optuna~=5.0",
+    "peft~=0.21",
+    "psutil~=7.2",
+    "py-cpuinfo~=9.0",
+    "pydantic-settings~=2.15",
+    "questionary~=2.1",
+    "rich~=15.0",
+    "tomli-w~=1.2",
+    "torch",  # version deliberately unspecified
+    "torchvision",  # version deliberately unspecified
+    "tqdm~=4.70",
+    "transformers[kernels]~=5.18",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.16.9"]
+"#;
+
     #[test]
     fn test_fnv_stable() {
         // Same input -> same hash; different input -> different hash.
@@ -478,11 +514,12 @@ dependencies = [
 dev = ["pytest"]
 "#;
         let deps = parse_pyproject(toml);
-        assert!(deps.contains(&"accelerate~=1.15".to_string()));
-        assert!(deps.contains(&"torch".to_string()));
-        assert!(deps.contains(&"lm-eval[hf]~=0.4".to_string()));
-        // optional-dependencies must NOT be picked up as the main array
-        assert!(!deps.contains(&"pytest".to_string()));
+        assert_eq!(
+            deps.required,
+            vec!["accelerate~=1.15", "torch", "lm-eval[hf]~=0.4"]
+        );
+        // extras are recorded separately, never merged into the install set
+        assert_eq!(deps.optional, vec!["pytest"]);
     }
 
     #[test]
@@ -503,11 +540,107 @@ numpy = { version = "^2.0" }
 [tool.poetry.group.dev.dependencies]
 pytest = "*"
 "#;
-        let deps = parse_poetry_table(toml);
-        assert!(deps.contains(&"torch".to_string()));
-        assert!(deps.contains(&"numpy".to_string()));
-        assert!(!deps.contains(&"python".to_string()));
-        assert!(!deps.contains(&"pytest".to_string()));
+        let deps = parse_pyproject(toml);
+        assert!(deps.poetry.contains(&"torch".to_string()));
+        assert!(deps.poetry.contains(&"numpy".to_string()));
+        assert!(!deps.poetry.contains(&"python".to_string()));
+        assert!(!deps.poetry.contains(&"pytest".to_string()));
+    }
+
+    #[test]
+    fn test_heretic_extras_do_not_truncate_the_dependency_array() {
+        // [REGRESSION] The hand-written scanner stopped at the first line
+        // containing `]`. `"lm-eval[hf]~=0.4"` carries a `]` inside its extras
+        // bracket, so every dependency below it — including the explicitly
+        // declared `torch` and `torchvision` — was silently dropped, and the
+        // huge-package guard never saw torch.
+        let deps = parse_pyproject(HERETIC_PYPROJECT);
+        assert_eq!(
+            deps.required.len(),
+            20,
+            "all 20 declared dependencies must survive parsing: {:?}",
+            deps.required
+        );
+        assert!(deps.required.contains(&"lm-eval[hf]~=0.4".to_string()));
+        assert!(
+            deps
+                .required
+                .contains(&"transformers[kernels]~=5.18".to_string())
+        );
+        assert!(deps.required.contains(&"torch".to_string()));
+        assert!(deps.required.contains(&"torchvision".to_string()));
+    }
+
+    #[test]
+    fn test_heretic_declared_torch_is_refused_up_front() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("pyproject.toml"), HERETIC_PYPROJECT).unwrap();
+
+        let plan = detect(tmp.path());
+        assert_eq!(plan.packages.len(), 20, "plan: {:?}", plan.packages);
+        let reason = policy_refusal_reason(&plan)
+            .expect("heretic declares torch, so the checkpoint must be refused up front");
+        assert!(
+            reason.contains("torch"),
+            "refusal must name the huge package, got {reason}"
+        );
+    }
+
+    #[test]
+    fn test_parse_pyproject_closing_bracket_comment_and_single_line_array() {
+        // A `]` followed by a comment ends the array — it must not be swallowed
+        // and must not make the parser read into the next key.
+        let commented =
+            "[project]\ndependencies = [\n  \"torch\",\n]  # deps\nname = \"x\"\n";
+        assert_eq!(parse_pyproject(commented).required, vec!["torch"]);
+
+        // Single-line array.
+        let single_line = "[project]\ndependencies = [\"numpy\", \"torch\"]\n";
+        assert_eq!(parse_pyproject(single_line).required, vec!["numpy", "torch"]);
+    }
+
+    #[test]
+    fn test_parse_pyproject_environment_marker_normalizes_for_the_guard() {
+        let toml = "[project]\ndependencies = [\"torch ; platform_system == 'Linux'\", \"lm-eval[hf]~=0.4\"]\n";
+        let deps = parse_pyproject(toml);
+        assert!(
+            is_blocked_package(&deps.required[0]),
+            "an environment marker must not hide torch from the guard"
+        );
+        assert_eq!(normalize_name(&deps.required[1]), "lm-eval");
+    }
+
+    #[test]
+    fn test_optional_dependencies_are_recorded_but_not_installed() {
+        let toml = r#"
+[project]
+dependencies = ["numpy"]
+[project.optional-dependencies]
+dev = ["pytest"]
+gpu = ["torch"]
+"#;
+        let deps = parse_pyproject(toml);
+        assert_eq!(deps.required, vec!["numpy"]);
+        assert!(deps.optional.contains(&"pytest".to_string()));
+        assert!(deps.optional.contains(&"torch".to_string()));
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("pyproject.toml"), toml).unwrap();
+        let plan = detect(tmp.path());
+        assert_eq!(plan.packages, vec!["numpy"], "extras must not be installed");
+        assert!(
+            policy_refusal_reason(&plan).is_none(),
+            "a torch extra alone must not refuse the run"
+        );
+    }
+
+    #[test]
+    fn test_auto_build_only_for_shuru_backend() {
+        // [REGRESSION] Auto-deps keyed off `shuru_available()`, so a subprocess
+        // run still built a VM checkpoint — heretic's torch + CUDA install
+        // filled the VM disk for a run that never used the VM.
+        assert!(!auto_build_enabled(SandboxKind::Subprocess));
+        assert!(auto_build_enabled(SandboxKind::Shuru));
     }
 
     #[test]

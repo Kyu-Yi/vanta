@@ -439,8 +439,11 @@ fn test_result_name(result: &TestResult) -> String {
 ///
 /// [VANTA-WHY] The VALUE may itself contain spaces — `test_cmd=env PYTHONPATH=src
 /// /usr/bin/python -m pytest -q mode=patch_review` — so a value does NOT end at
-/// the next space, it ends at the next ` key=` token: a space followed by an
-/// identifier-ish run of chars (`[A-Za-z_][A-Za-z0-9_]*`) and then `=`. The key
+/// the next space, it ends at the next ` key=` token: a space followed by a
+/// KEY-ish token and then `=`. A key is `[a-z_][a-z0-9_]*` — LOWERCASE — because
+/// every key the producer writes is lowercase, while the variable a `test_cmd`
+/// assigns is uppercase by convention (`env PYTHONPATH=src`). Accepting any
+/// `NAME=` would cut that value at `env` and re-run the wrong command. The key
 /// itself must sit at the start of the summary or right after a space, so
 /// searching for `mode` never matches inside `patch_mode=`. This mirrors
 /// `scripts/metrics.py::summary_field` byte for byte so the Rust producer and
@@ -469,8 +472,12 @@ fn next_key_start(summary: &str, value_start: usize) -> usize {
     while i < bytes.len() {
         if bytes[i] == b' ' {
             let mut j = i + 1;
-            if j < bytes.len() && (bytes[j].is_ascii_alphabetic() || bytes[j] == b'_') {
-                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            if j < bytes.len() && (bytes[j].is_ascii_lowercase() || bytes[j] == b'_') {
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_lowercase()
+                        || bytes[j].is_ascii_digit()
+                        || bytes[j] == b'_')
+                {
                     j += 1;
                 }
                 if j < bytes.len() && bytes[j] == b'=' {
@@ -881,6 +888,23 @@ mod tests {
             Some("python3 -m pytest -q")
         );
         assert_eq!(summary_field(summary, "mode"), Some("patch_review"));
+    }
+
+    /// [VANTA-WHY] The REAL heretic runs record `test_cmd=env PYTHONPATH=src …`,
+    /// and `PYTHONPATH=` is itself a `NAME=` token. If any `NAME=` counted as a
+    /// key, the value would be cut at `env` and the rerun would re-execute the
+    /// wrong command for every session whose test command starts with `env`.
+    /// Uppercase names are therefore NOT keys (the producer's keys are all
+    /// lowercase) and the value must survive to ` mode=`.
+    #[test]
+    fn summary_field_keeps_a_value_that_assigns_an_uppercase_variable() {
+        let summary = "deps_freeze=none test_cmd=env PYTHONPATH=src /usr/bin/python -m pytest -q mode=patch_review benchmark_instance=none";
+        assert_eq!(
+            summary_field(summary, "test_cmd"),
+            Some("env PYTHONPATH=src /usr/bin/python -m pytest -q")
+        );
+        assert_eq!(summary_field(summary, "mode"), Some("patch_review"));
+        assert_eq!(summary_field(summary, "benchmark_instance"), Some("none"));
     }
 
     /// [VANTA-WHY] A trailing key has no following ` key=` token, so the value

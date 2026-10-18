@@ -102,22 +102,33 @@ def summary_field(summary: str, key: str) -> Optional[str]:
 
 
 def _next_key_start(summary: str, value_start: int) -> int:
-    """Index where the value ends: the next ' ' that begins a `key=` token."""
+    """Index where the value ends: the next ' ' that begins a `key=` token.
+
+    [WHY] A key is `[a-z_][a-z0-9_]*` — LOWERCASE — because every key the
+    producer writes is lowercase, while the variable a `test_cmd` assigns is
+    uppercase by convention (`env PYTHONPATH=src <python> -m pytest -q`).
+    Treating any `NAME=` as a key would cut that value at `env` and make the
+    rerun re-execute the wrong command. This mirrors
+    `rerun.rs::next_key_start` byte for byte.
+    """
     index = value_start
     while True:
         space = summary.find(" ", index)
         if space == -1:
             return len(summary)
         rest = summary[space + 1 :]
-        name = ""
-        for char in rest:
-            if char.isalnum() or char == "_":
-                name += char
-            else:
-                break
-        if name and rest[len(name) : len(name) + 1] == "=":
+        length = 0
+        while length < len(rest) and _is_key_char(rest[length], first=(length == 0)):
+            length += 1
+        if length and rest[length : length + 1] == "=":
             return space
         index = space + 1
+
+
+def _is_key_char(char: str, first: bool) -> bool:
+    if ("a" <= char <= "z") or char == "_":
+        return True
+    return not first and char.isdigit()
 
 
 def read_schema_version(records: list[dict[str, Any]]) -> Optional[int]:

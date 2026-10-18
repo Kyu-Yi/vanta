@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use vanta::core::{EcrEirSnapshot, FailureClass, TestIntent, TestResult};
-use vanta::session::{PatchAttemptId, SessionId, SessionRecord, TransitionRow, ecr_eir_from_rows};
+use vanta::session::{PatchAttemptId, SessionId, SessionRecord, TransitionRow, ecr_eir_from_rows, SCHEMA_VERSION};
 
 /// These tests each spawn a `vanta_m3` process that boots sandboxes and runs
 /// real pytest. Run concurrently they saturate the machine, and the short
@@ -568,6 +568,7 @@ fn metric_row_from_observed_outcome(
 ) -> TransitionRow {
     TransitionRow {
         session_id: SessionId::new("metric-test"),
+        schema_version: Some(SCHEMA_VERSION),
         from_patch_attempt_id: Some(PatchAttemptId::new("p0")),
         to_patch_attempt_id: Some(PatchAttemptId::new("p1")),
         from_attempt: 0,

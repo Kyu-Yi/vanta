@@ -53,8 +53,9 @@ use crate::pipeline::harness::{self, TestExecutionDetails};
 use crate::pipeline::patch::{apply_patch_detailed, apply_patch_strict, ApplyFailure};
 use crate::repo::Repo;
 use crate::session::{
-    PatchAttemptId, SessionId, SessionLog, SessionRecord, TransitionRow, TransitionWriter,
-    ecr_eir_from_rows, fresh_session_id, fresh_test_id, fresh_testing_iteration_id, vanta_revision,
+    PatchAttemptId, SCHEMA_VERSION, SessionId, SessionLog, SessionRecord, TransitionRow,
+    TransitionWriter, ecr_eir_from_rows, fresh_session_id, fresh_test_id,
+    fresh_testing_iteration_id, vanta_revision,
 };
 
 // ============================================================================
@@ -271,6 +272,7 @@ pub async fn run(
     let (vanta_commit, vanta_dirty) = vanta_revision();
     session_log.append(SessionRecord {
         session_id: session_id.clone(),
+        schema_version: Some(SCHEMA_VERSION),
         // [VANTA-WHY] A run-level record: no patch attempt exists yet, so this is
         // null rather than an invented id.
         patch_attempt_id: None,
@@ -487,6 +489,7 @@ pub async fn run(
 
         session_log.append(SessionRecord {
             session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
             patch_attempt_id: Some(patch_attempt_id.clone()),
             testing_iteration_id: Some(testing_iteration_id.clone()),
             test_id: None,
@@ -610,6 +613,7 @@ pub async fn run(
             println!("  ✗ PATCH APPLICATION FAILED — see {}", faillog.display());
             session_log.append(SessionRecord {
                 session_id: session_id.clone(),
+                schema_version: Some(SCHEMA_VERSION),
                 patch_attempt_id: Some(patch_attempt_id.clone()),
                 testing_iteration_id: Some(testing_iteration_id.clone()),
                 test_id: None,
@@ -730,6 +734,7 @@ pub async fn run(
         }
         session_log.append(SessionRecord {
             session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
             patch_attempt_id: Some(patch_attempt_id.clone()),
             testing_iteration_id: Some(testing_iteration_id.clone()),
             test_id: None,
@@ -772,6 +777,7 @@ pub async fn run(
         }
         session_log.append(SessionRecord {
             session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
             patch_attempt_id: Some(patch_attempt_id.clone()),
             testing_iteration_id: Some(testing_iteration_id.clone()),
             test_id: None,
@@ -792,6 +798,7 @@ pub async fn run(
         for relabel in &initial_relabels {
             session_log.append(SessionRecord {
                 session_id: session_id.clone(),
+                schema_version: Some(SCHEMA_VERSION),
                 patch_attempt_id: Some(patch_attempt_id.clone()),
                 testing_iteration_id: Some(testing_iteration_id.clone()),
                 test_id: Some(fresh_test_id()),
@@ -855,6 +862,7 @@ pub async fn run(
         );
         session_log.append(SessionRecord {
             session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
             patch_attempt_id: Some(patch_attempt_id.clone()),
             testing_iteration_id: Some(testing_iteration_id.clone()),
             test_id: None,
@@ -874,6 +882,7 @@ pub async fn run(
         for relabel in &bate_relabels {
             session_log.append(SessionRecord {
                 session_id: session_id.clone(),
+                schema_version: Some(SCHEMA_VERSION),
                 patch_attempt_id: Some(patch_attempt_id.clone()),
                 testing_iteration_id: Some(testing_iteration_id.clone()),
                 test_id: Some(fresh_test_id()),
@@ -896,6 +905,7 @@ pub async fn run(
         for (name, reason) in &bate_report.scrapped_tests {
             session_log.append(SessionRecord {
                 session_id: session_id.clone(),
+                schema_version: Some(SCHEMA_VERSION),
                 patch_attempt_id: Some(patch_attempt_id.clone()),
                 testing_iteration_id: Some(testing_iteration_id.clone()),
                 test_id: Some(fresh_test_id()),
@@ -1062,6 +1072,7 @@ pub async fn run(
         );
         session_log.append(SessionRecord {
             session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
             patch_attempt_id: Some(patch_attempt_id.clone()),
             testing_iteration_id: Some(testing_iteration_id.clone()),
             test_id: None,
@@ -1088,6 +1099,7 @@ pub async fn run(
             // RECORDED, not blocking: the patch did not break it.
             session_log.append(SessionRecord {
                 session_id: session_id.clone(),
+                schema_version: Some(SCHEMA_VERSION),
                 patch_attempt_id: Some(patch_attempt_id.clone()),
                 testing_iteration_id: Some(testing_iteration_id.clone()),
                 test_id: Some(fresh_test_id()),
@@ -1384,6 +1396,7 @@ pub async fn run(
                 .unwrap_or_else(|| "None".to_string());
             session_log.append(SessionRecord {
                 session_id: session_id.clone(),
+                schema_version: Some(SCHEMA_VERSION),
                 patch_attempt_id: Some(patch_attempt_id.clone()),
                 testing_iteration_id: Some(testing_iteration_id.clone()),
                 test_id: Some(fresh_test_id()),
@@ -1399,6 +1412,7 @@ pub async fn run(
         }
         session_log.append(SessionRecord {
             session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
             patch_attempt_id: Some(patch_attempt_id.clone()),
             testing_iteration_id: Some(testing_iteration_id.clone()),
             test_id: None,
@@ -1488,6 +1502,7 @@ pub async fn run(
     let fixed_at_attempt_1 = decision == GovernorDecision::AllTestsPassed && attempts_run == 1;
     session_log.append(SessionRecord {
         session_id: session_id.clone(),
+        schema_version: Some(SCHEMA_VERSION),
         patch_attempt_id: attempt_patch_ids.last().cloned(),
         testing_iteration_id: None,
         test_id: None,
@@ -1577,6 +1592,7 @@ pub async fn run(
     // the attribution.
     session_log.append(SessionRecord {
         session_id: session_id.clone(),
+        schema_version: Some(SCHEMA_VERSION),
         // The candidate the run ended on, or null if no attempt ever produced
         // one (e.g. the run died before its first patch).
         patch_attempt_id: attempt_patch_ids.last().cloned(),
@@ -1610,6 +1626,7 @@ pub async fn run(
     let _ = fs::write(
         &evidence_path,
         serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": crate::session::SCHEMA_VERSION,
             "apply_failed_attempts": apply_failed_attempt_indices.len(),
             "new_static_findings": static_findings_records,
             "evidence": final_evidence,
@@ -2262,6 +2279,7 @@ fn log_intent_checks(
     for check in checks {
         session_log.append(SessionRecord {
             session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
             patch_attempt_id: Some(patch_attempt_id.clone()),
             testing_iteration_id: Some(testing_iteration_id.clone()),
             test_id: Some(fresh_test_id()),

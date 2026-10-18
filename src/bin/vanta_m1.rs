@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use vanta::agents::attacker::{AttackerRequest, AttackerResponse};
 use vanta::agents::creator::{CreatorRequest, CreatorResponse, SourceFile};
 use vanta::config::LlmConfig;
-use vanta::session::{fresh_patch_attempt_id, fresh_session_id, SessionLog, SessionRecord};
+use vanta::session::{fresh_patch_attempt_id, fresh_session_id, SCHEMA_VERSION, SessionLog, SessionRecord};
 use vanta::logging::init_logging;
 
 // Path to the sample bug repo (relative to project root when run via cargo).
@@ -78,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     session_log.push(SessionRecord {
         session_id: session_id.clone(),
+        schema_version: Some(SCHEMA_VERSION),
         patch_attempt_id: Some(patch_attempt_id.clone()),
         testing_iteration_id: None,
         test_id: None,
@@ -106,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("    [{:>2}] {} (intent={:?}) — {}", i + 1, t.test_name, t.intent, t.reason);
         session_log.push(SessionRecord {
             session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
             patch_attempt_id: Some(patch_attempt_id.clone()),
             testing_iteration_id: None,
             test_id: None,

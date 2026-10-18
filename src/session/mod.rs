@@ -29,6 +29,15 @@ use crate::core::{
     TestIntent, TestResult,
 };
 
+/// Version of the on-disk session/transition/evidence schema.
+///
+/// [VANTA-WHY] Files written before this marker existed carry NO version at all,
+/// which is a DIFFERENT fact from "written by an older version of the current
+/// schema". So the field is `Option<u32>` and absence deserialises as `None`
+/// ("v0"), never as `Some(SCHEMA_VERSION)` — a serde default would destroy
+/// exactly the distinction the marker exists to provide.
+pub const SCHEMA_VERSION: u32 = 1;
+
 // ============================================================================
 // ID NEWTYPES — compile-time type safety for every record
 // ============================================================================
@@ -113,6 +122,10 @@ impl TestId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub session_id: SessionId,
+    /// On-disk schema version; `None` for files written before the marker
+    /// existed (v0). See `SCHEMA_VERSION`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     /// [VANTA-WHY] `None` for a RUN-LEVEL record (e.g. `session.start`, written
     /// before attempt 1): there is no patch attempt yet, and inventing one would
     /// write an unobserved value to disk as a fact. A null here means "no patch
@@ -151,6 +164,10 @@ pub struct SessionRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionRow {
     pub session_id: SessionId,
+    /// On-disk schema version; `None` for rows written before the marker existed
+    /// (v0). See `SCHEMA_VERSION`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     /// Identity of the candidate the OLDER attempt ran, or `null` if that
     /// attempt produced no candidate to identify (skipped, censored, or its
     /// patch never applied).
@@ -235,6 +252,7 @@ impl TransitionRow {
         let gap = transition.to_attempt.saturating_sub(transition.from_attempt) > 1;
         Self {
             session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
             from_patch_attempt_id,
             to_patch_attempt_id,
             from_attempt: transition.from_attempt,
@@ -569,6 +587,7 @@ mod tests {
         let mut log = SessionLog::new(SessionId::new("sess-test"));
         log.push(SessionRecord {
             session_id: SessionId::new("sess-test"),
+            schema_version: Some(SCHEMA_VERSION),
             patch_attempt_id: Some(PatchAttemptId::new("pa-1")),
             testing_iteration_id: None,
             test_id: None,
@@ -582,6 +601,47 @@ mod tests {
         let content = fs::read_to_string(path).unwrap();
         assert!(content.contains("sess-test"));
         assert!(content.contains("creator"));
+    }
+
+    /// [VANTA-WHY] A file written before the marker existed carries NO
+    /// `schema_version` key. That is a DIFFERENT fact from "written by an older
+    /// version of the current schema", so absence must deserialise as `None`
+    /// (v0) — never as `Some(SCHEMA_VERSION)`. A serde default would erode
+    /// exactly that distinction; this test pins it.
+    #[test]
+    fn a_record_without_a_schema_version_deserialises_as_v0_not_as_the_current_version() {
+        let legacy = r#"{
+            "session_id": "legacy-session",
+            "patch_attempt_id": null,
+            "testing_iteration_id": null,
+            "test_id": null,
+            "phase": "session.start",
+            "summary": "written before the marker existed",
+            "timestamp": "2026-01-01T00:00:00Z"
+        }"#;
+        let record: SessionRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            record.schema_version, None,
+            "a record with no marker is v0, not the current version"
+        );
+
+        let stamped = SessionRecord {
+            session_id: SessionId::new("legacy-session"),
+            schema_version: Some(SCHEMA_VERSION),
+            patch_attempt_id: None,
+            testing_iteration_id: None,
+            test_id: None,
+            phase: "session.start".into(),
+            summary: "written by the current schema".into(),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            benchmark_instance: None,
+            benchmark_label: None,
+        };
+        let serialised = serde_json::to_string(&stamped).unwrap();
+        assert!(
+            serialised.contains("\"schema_version\":1"),
+            "a record written by the current schema must carry the marker: {serialised}"
+        );
     }
 
     /// Build a minimal Governor transition for exercising the sink.
@@ -713,6 +773,7 @@ mod tests {
 
         log.append(SessionRecord {
             session_id: SessionId::new("durable-session"),
+            schema_version: Some(SCHEMA_VERSION),
             // A run-level record: no patch attempt exists yet.
             patch_attempt_id: None,
             testing_iteration_id: None,

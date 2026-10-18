@@ -1288,7 +1288,8 @@ mod tests {
         );
         assert!(
             ATTACKER_SYSTEM_PROMPT.contains("PRESERVATION SPECIFICITY")
-                && ATTACKER_SYSTEM_PROMPT.contains("PIN the INTERNAL calls of a function the issue says to change"),
+                && ATTACKER_SYSTEM_PROMPT
+                    .contains("pin the INTERNAL calls of a function the issue says to change"),
             "a preservation probe must be told not to pin internals the issue rewires"
         );
         assert!(

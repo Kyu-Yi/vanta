@@ -1694,12 +1694,20 @@ fn a_preservation_probe_the_issue_asks_for_is_promoted_not_scrapped() {
     );
 
     // And it must actually run against the patched tree and pass.
+    //
+    // [VANTA-WHY] A passing generated test is recorded with the BATE outcome
+    // `VerifiedWithinBounds` (driver.rs maps `TestResult::Passed` to it), not
+    // with the word "Passed": the row carries a `VerificationOutcome`, and the
+    // promoted probe must also be stamped `intent=FeatureAcceptance` so a reader
+    // can see the relabel reached the run.
     assert!(
         records
             .iter()
             .any(|r| r.phase == "patched.result[test_new_behaviour_probe]"
-                && r.summary.contains("outcome=Passed")),
-        "the promoted probe must run against the patched tree; got {:?}",
+                && r.summary.contains("outcome=VerifiedWithinBounds")
+                && r.summary.contains("intent=FeatureAcceptance")
+                && r.summary.contains("failure_class=None")),
+        "the promoted probe must run against the patched tree and pass; got {:?}",
         records
             .iter()
             .filter(|r| r.phase.starts_with("patched.result["))

@@ -190,6 +190,24 @@ pub struct TransitionRow {
     /// recorded HOLE, not a deleted row: it exists so the missing observation is
     /// visible and excludable from EIR/ECR rather than silently absent.
     pub censored: bool,
+    /// The attempt on the NEWER side never applied its patch, so nothing about
+    /// that candidate was observed.
+    ///
+    /// [VANTA-WHY] `censored` already excludes these rows from EIR/ECR; this says
+    /// WHY the hole is there. "No candidate existed" and "a probe was missing
+    /// from an otherwise complete attempt" are different facts about a run, and
+    /// only the flag keeps them apart when the rows are read back months later.
+    pub apply_failed: bool,
+    /// The comparison skipped at least one attempt: `to_attempt - from_attempt`
+    /// is greater than 1, because an attempt in between observed nothing.
+    ///
+    /// [VANTA-WHY] A `1 -> 3` row is a genuine repair transition between two
+    /// real candidates, but it is NOT the N -> N+1 shape the EIR/ECR rate is
+    /// defined over, and a metrics script that pooled them would silently mix
+    /// "the next patch fixed it" with "the patch after the one that never
+    /// applied fixed it". Derived from the attempt indices rather than stored at
+    /// the source, so it cannot disagree with them.
+    pub gap: bool,
     /// Membership of S^(0), the shared set as it stood on the first attempt.
     /// The restricted analysis needs this per row and it cannot be rebuilt later.
     pub in_s0: bool,
@@ -198,12 +216,14 @@ pub struct TransitionRow {
 impl TransitionRow {
     /// Stamp a Governor-computed transition with the run identities it needs to
     /// be joined from disk. An end with no real candidate id is passed as
-    /// `None`; the row is then CENSORED, never filled in.
+    /// `None`; the row is then CENSORED, never filled in. `apply_failed` marks
+    /// rows whose newer candidate never ran at all.
     pub fn from_transition(
         transition: &AttemptTransition,
         session_id: &SessionId,
         from_patch_attempt_id: Option<PatchAttemptId>,
         to_patch_attempt_id: Option<PatchAttemptId>,
+        apply_failed: bool,
     ) -> Self {
         // [VANTA-WHY] A missing candidate id on either end is a partially
         // observed transition: it identifies a hole and must never be treated as
@@ -212,6 +232,7 @@ impl TransitionRow {
         let censored = !transition.complete
             || from_patch_attempt_id.is_none()
             || to_patch_attempt_id.is_none();
+        let gap = transition.to_attempt.saturating_sub(transition.from_attempt) > 1;
         Self {
             session_id: session_id.clone(),
             from_patch_attempt_id,
@@ -228,6 +249,8 @@ impl TransitionRow {
             evidence_source: transition.evidence_source.clone(),
             test_intent: transition.test_intent.clone(),
             censored,
+            apply_failed,
+            gap,
             in_s0: transition.in_s0,
         }
     }
@@ -586,6 +609,7 @@ mod tests {
             &SessionId::new("s1"),
             Some(PatchAttemptId::new(from_pid)),
             Some(PatchAttemptId::new(to_pid)),
+            false,
         )
     }
 
@@ -612,6 +636,8 @@ mod tests {
             "evidence_source",
             "test_intent",
             "censored",
+            "apply_failed",
+            "gap",
             "in_s0",
         ] {
             assert!(value.get(key).is_some(), "row schema is missing `{key}`");
@@ -629,6 +655,7 @@ mod tests {
             &SessionId::new("s1"),
             Some(PatchAttemptId::new("p0")),
             Some(PatchAttemptId::new("p1")),
+            false,
         );
         assert!(
             stamped.censored,
@@ -647,6 +674,7 @@ mod tests {
             &SessionId::new("s1"),
             None,
             Some(PatchAttemptId::new("p1")),
+            false,
         );
 
         assert!(
@@ -789,6 +817,7 @@ mod tests {
             &SessionId::new("s1"),
             from_pid.map(|s| PatchAttemptId::new(s)),
             to_pid.map(|s| PatchAttemptId::new(s)),
+            false,
         )
     }
 

@@ -5,14 +5,29 @@
 // [VANTA-WHY] Extracted from vanta_m2.rs into a reusable module so M3's repair
 // loop and any future caller can apply patches without copy-pasting the cascade.
 //
-// Strategy order (new formats FIRST — they don't require line counting):
+// Two policies, and the difference is the whole point:
+//
+//   Strict  (review mode, `--patch`) — `git apply` and NOTHING else. The
+//           candidate came from outside the run, so a fuzzy recovery would test
+//           a tree nobody wrote.
+//   Cascade (repair mode, Creator output) — the full chain below, because the
+//           Creator can emit a diff with wrong headers and the repair loop has a
+//           budget to recover.
+//
+// Cascade strategy order (new formats FIRST — they don't require line counting):
 //   1. Full source — model emitted the complete patched file (no diff markers)
 //   2. Search/replace blocks — ===SEARCH=== / ===REPLACE=== / ===END===
 //   3. git apply (strict unified diff)
 //   4. git apply --recount
 //   5. patch -p1 --fuzz=3
-//   6. hunk-by-hunk engine (context-anchored, no header arithmetic)
+//   6. hunk-by-hunk engine (context-anchored, running line offset)
 //   7. whole-file reconstruction — ONLY if patch has no '-' deletions
+//
+// [VANTA-WHY] Strategies 1, 2, 5, 6 and 7 are all non-git, so a `.py` result
+// they produce is `py_compile`d next to the original. If the original parsed and
+// the result does not, the apply is reported as FAILED rather than "patched
+// (changed)": a file that no longer imports is not a candidate, and reporting it
+// as one is how a syntax error gets a clean native report.
 //
 // Returns (patched_text, changed). `changed` is false when NO strategy could
 // apply the patch — the caller MUST log PatchApplicationFailed rather than
@@ -24,14 +39,176 @@
 // if any '-' line exists, skip strategy 7.
 // ============================================================================
 
+use std::collections::HashMap;
 use std::fs;
+use std::process::Command;
 use tracing::{debug, info, warn};
+
+// ============================================================================
+// apply_patch_strict — the ONLY entry point for an externally supplied `--patch`
+// ============================================================================
+//
+// [VANTA-WHY] A candidate handed to us with `--patch` was written outside the
+// run. If a fuzzy strategy "recovers" it, the tree under test is a tree nobody
+// wrote, and the resulting verdict is a statement about Vanta's repair engine
+// rather than about the candidate. So review mode gets `git apply`, then
+// `git apply --recount` as the single concession to a miscounted header, and
+// nothing else. If both fail the run stops with PatchApplicationFailed.
+//
+// [PITFALL] The repo is materialised at the patch's OWN relative paths, because
+// `git apply` resolves `a/src/heretic/plugin.py` against the working directory.
+// The previous per-file cascade wrote the one file it was given to `source.txt`
+// in a bare temp dir, so no diff header could ever name it: every git strategy
+// failed on every real patch and the hunk engine was the only thing left
+// standing — which is how a valid patch got spliced into a file that no longer
+// parses.
+//
+// Returns the touched files whose content changed, or a plain-language reason.
+pub fn apply_patch_strict(
+    repo_files: &HashMap<String, String>,
+    patch_text: &str,
+    touched: &[String],
+) -> Result<HashMap<String, String>, String> {
+    let dir = tempfile::tempdir().map_err(|e| format!("could not create a temp dir: {e}"))?;
+    let root = dir.path();
+
+    for (path, content) in repo_files {
+        let out = root.join(path);
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("{path}: {e}"))?;
+        }
+        fs::write(&out, content).map_err(|e| format!("{path}: {e}"))?;
+    }
+
+    let patch_path = root.join("vanta_candidate.diff");
+    fs::write(&patch_path, patch_text).map_err(|e| format!("could not stage the patch: {e}"))?;
+    let patch_arg = patch_path.to_string_lossy().to_string();
+
+    // `git apply` works outside a repository, but an explicit one removes any
+    // version-dependent index behaviour. Not fatal if it fails.
+    let _ = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(root)
+        .output();
+
+    if let Err(first) = git_apply(root, &patch_arg, &[]) {
+        if let Err(second) = git_apply(root, &patch_arg, &["--recount"]) {
+            return Err(format!(
+                "git apply refused the patch.\n  git apply: {first}\n  git apply --recount: {second}"
+            ));
+        }
+        debug!("git apply refused the patch but --recount accepted it (miscounted header)");
+    }
+
+    let mut changed: HashMap<String, String> = HashMap::new();
+    for path in touched {
+        let Ok(patched) = fs::read_to_string(root.join(path)) else {
+            // Deleted by the patch, or never written. Either way there is no
+            // content to test.
+            continue;
+        };
+        match repo_files.get(path) {
+            Some(original) if original == &patched => {}
+            // Changed file, or a file the patch created.
+            _ => {
+                changed.insert(path.clone(), patched);
+            }
+        }
+    }
+
+    if changed.is_empty() {
+        return Err(
+            "git apply reported success but no touched file changed — the patch is a no-op"
+                .to_string(),
+        );
+    }
+    Ok(changed)
+}
+
+/// Run `git apply` in `root`; `Err` carries git's own message.
+fn git_apply(root: &std::path::Path, patch_arg: &str, extra: &[&str]) -> Result<(), String> {
+    let mut args = vec!["apply", "-p1", "--verbose"];
+    args.extend_from_slice(extra);
+    args.push(patch_arg);
+    let out = Command::new("git")
+        .args(&args)
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("could not run git: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Err(stderr.trim().lines().take(6).collect::<Vec<_>>().join(" | "))
+}
+
+/// Why a repair-mode cascade could not produce a usable candidate.
+///
+/// [VANTA-WHY] The Creator needs the DISTINCTION, not just "failed". "I could
+/// not place your hunks" is a formatting problem the Creator can fix by
+/// re-emitting the diff; "your patch applied but the result is not valid Python"
+/// is a content problem it can only fix by changing the code. Collapsing both
+/// into one message is how a run tells the model the wrong thing to repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyFailure {
+    /// No strategy could place the patch: every hunk was rejected.
+    DidNotApply,
+    /// A strategy produced a changed file, but the original parsed as Python and
+    /// the result does not. Carries the interpreter's own message.
+    InvalidPython(String),
+}
 
 /// Apply a model-generated fix to the original source.
 ///
+/// `path` is the file's path as the patch names it — strategies 3-5 need it to
+/// recreate the layout `git apply` / `patch(1)` expect, and the syntax guard
+/// needs it to know whether the result must parse as Python.
+///
 /// Returns `(patched_text, changed)` where `changed` is false if no strategy
-/// could produce a different file.
-pub fn apply_patch(original: &str, patch_text: &str) -> (String, bool) {
+/// could produce a different, still-parsable file. Callers that must TELL the
+/// model why use `apply_patch_detailed` instead.
+pub fn apply_patch(original: &str, patch_text: &str, path: &str) -> (String, bool) {
+    let (text, changed, _) = apply_patch_detailed(original, patch_text, path);
+    (text, changed)
+}
+
+/// As `apply_patch`, but also reports WHY the apply failed.
+///
+/// [VANTA-WHY] This is a single implementation with a thin wrapper rather than a
+/// second cascade: two copies of the strategy order would drift, and the drift
+/// would only show up as a patch that applies in one path and not the other.
+pub fn apply_patch_detailed(
+    original: &str,
+    patch_text: &str,
+    path: &str,
+) -> (String, bool, Option<ApplyFailure>) {
+    // [VANTA-WHY] Every non-git strategy lands here first. A file that no longer
+    // compiles is not a candidate, and "patched (changed)" for one is a lie the
+    // rest of the pipeline cannot see through: the heretic run reported it for a
+    // file whose `if` had no body.
+    let mut failure: Option<ApplyFailure> = None;
+    let accept = |patched: String, strategy: &str| -> Result<(String, bool), ApplyFailure> {
+        let changed = patched != original;
+        if changed {
+            if let Some(err) = python_break_reason(path, original, &patched) {
+                warn!("{strategy}: result no longer parses as Python — rejecting this strategy");
+                return Err(ApplyFailure::InvalidPython(err));
+            }
+        }
+        Ok((patched, changed))
+    };
+    // A strategy that produced different text is the answer; a strategy that
+    // produced nothing different is a failure with a precise reason. Either way
+    // the cascade stops here, exactly as it did before.
+    let finish = |patched: String, changed: bool| {
+        let failure = if changed {
+            None
+        } else {
+            Some(ApplyFailure::DidNotApply)
+        };
+        (patched, changed, failure)
+    };
+
     // ---- Strategy 1: Full source (model emitted complete file) ----
     let looks_like_diff = patch_text.starts_with("--- ")
         || patch_text.starts_with("diff --git")
@@ -42,12 +219,12 @@ pub fn apply_patch(original: &str, patch_text: &str) -> (String, bool) {
         || patch_text.contains("===SEARCH===");
     if !looks_like_diff
         && (patch_text.contains("def ") || patch_text.contains("fn ") || patch_text.contains("func "))
+        && patch_text.trim() != original.trim()
     {
-        if patch_text.trim() != original.trim() {
-            debug!("patch_text is full source — using directly");
-            let patched = patch_text.to_string();
-            let changed = patched != original;
-            return (patched, changed);
+        debug!("patch_text is full source — using directly");
+        match accept(patch_text.to_string(), "full-source") {
+            Ok((patched, changed)) => return finish(patched, changed),
+            Err(refused) => failure = Some(refused),
         }
     }
 
@@ -55,51 +232,74 @@ pub fn apply_patch(original: &str, patch_text: &str) -> (String, bool) {
     if patch_text.contains("===SEARCH===") {
         if let Some(patched) = apply_search_replace(original, patch_text) {
             debug!("search/replace blocks applied");
-            let changed = patched != original;
-            return (patched, changed);
+            match accept(patched, "search/replace") {
+                Ok((patched, changed)) => return finish(patched, changed),
+                Err(refused) => failure = Some(refused),
+            }
+        } else {
+            warn!("search/replace blocks failed to apply");
         }
-        warn!("search/replace blocks failed to apply");
     }
 
     // ---- Strategies 3-5: standard diff tools (for backward compat) ----
-    let tmp = tempfile::tempdir().ok();
-    if let Some(dir) = tmp {
-        let src_path = dir.path().join("source.txt");
-        let patch_path = dir.path().join("fix.diff");
+    // [PITFALL] The file must sit at the path the diff header names. A copy
+    // called `source.txt` can never be matched by `a/src/pkg/mod.py`.
+    if let Ok(dir) = tempfile::tempdir() {
+        let root = dir.path();
+        let rel = if path.trim().is_empty() {
+            "source.txt"
+        } else {
+            path.trim()
+        };
+        let src_path = root.join(rel);
+        if let Some(parent) = src_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         let _ = fs::write(&src_path, original);
+        let patch_path = root.join("fix.diff");
         let _ = fs::write(&patch_path, patch_text);
+        let patch_arg = patch_path.to_string_lossy().to_string();
 
-        // Strategy 3: git apply (strict)
+        let via_git = |extra: &[&str]| -> Option<String> {
+            let mut args = vec!["apply", "-p1", "--verbose"];
+            args.extend_from_slice(extra);
+            args.push(&patch_arg);
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .output()
+                .ok()?;
+            if out.status.success() {
+                fs::read_to_string(&src_path).ok()
+            } else {
+                debug!(
+                    "git apply {} failed: {}",
+                    extra.join(" "),
+                    String::from_utf8_lossy(&out.stderr)
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                );
+                None
+            }
+        };
+
+        // Strategy 3: git apply (strict).
         // [PITFALL] Without --3way, git apply can hang on certain malformed
         // diffs. We add it to force non-interactive behavior.
-        let output = std::process::Command::new("git")
-            .args(["apply", "--verbose", "--3way"])
-            .current_dir(dir.path())
-            .output();
-        if let Ok(o) = output {
-            if o.status.success() {
-                if let Ok(patched) = fs::read_to_string(&src_path) {
-                    let changed = patched != original;
-                    return (patched, changed);
-                }
-            } else {
-                debug!("git apply failed: {}",
-                    String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or(""));
+        if let Some(patched) = via_git(&["--3way"]) {
+            let changed = patched != original;
+            if changed {
+                return (patched, true, None);
             }
         }
 
         // Strategy 4: git apply --recount
-        let output = std::process::Command::new("git")
-            .args(["apply", "--recount", "--verbose"])
-            .current_dir(dir.path())
-            .output();
-        if let Ok(o) = output {
-            if o.status.success() {
-                if let Ok(patched) = fs::read_to_string(&src_path) {
-                    debug!("git apply --recount succeeded");
-                    let changed = patched != original;
-                    return (patched, changed);
-                }
+        if let Some(patched) = via_git(&["--recount"]) {
+            let changed = patched != original;
+            if changed {
+                debug!("git apply --recount succeeded");
+                return (patched, true, None);
             }
         }
 
@@ -107,16 +307,18 @@ pub fn apply_patch(original: &str, patch_text: &str) -> (String, bool) {
         // [PITFALL] macOS `patch` without --batch can hang waiting for
         // interactive input when hunks don't apply cleanly. --batch forces
         // non-interactive mode (skip hunks that fail, don't prompt).
-        let output2 = std::process::Command::new("patch")
+        let out = Command::new("patch")
             .args(["-p1", "--fuzz=3", "--batch", "-i", "fix.diff"])
-            .current_dir(dir.path())
+            .current_dir(root)
             .output();
-        if let Ok(o) = output2 {
+        if let Ok(o) = out {
             if o.status.success() {
                 if let Ok(patched) = fs::read_to_string(&src_path) {
                     debug!("patch -p1 --fuzz=3 succeeded");
-                    let changed = patched != original;
-                    return (patched, changed);
+                    match accept(patched, "patch -p1") {
+                        Ok((patched, changed)) => return finish(patched, changed),
+                        Err(refused) => failure = Some(refused),
+                    }
                 }
             }
         }
@@ -125,8 +327,10 @@ pub fn apply_patch(original: &str, patch_text: &str) -> (String, bool) {
     // ---- Strategy 6: hunk-by-hunk engine (context-anchored) ----
     if let Some(patched) = apply_hunks(original, patch_text) {
         debug!("hunk-by-hunk engine succeeded");
-        let changed = patched != original;
-        return (patched, changed);
+        match accept(patched, "hunk-by-hunk") {
+            Ok((patched, changed)) => return finish(patched, changed),
+            Err(refused) => failure = Some(refused),
+        }
     }
 
     // ---- Strategy 7: whole-file reconstruction (NO deletions allowed) ----
@@ -166,8 +370,10 @@ pub fn apply_patch(original: &str, patch_text: &str) -> (String, bool) {
         if !reconstructed.is_empty() && reconstructed.len() > original.len() / 2 {
             info!("whole-file reconstruction succeeded (no deletions in patch)");
             let patched = reconstructed + "\n";
-            let changed = patched != original;
-            return (patched, changed);
+            match accept(patched, "whole-file reconstruction") {
+                Ok((patched, changed)) => return finish(patched, changed),
+                Err(refused) => failure = Some(refused),
+            }
         }
     } else {
         info!("whole-file reconstruction SKIPPED (patch contains deletions — unsafe)");
@@ -175,7 +381,67 @@ pub fn apply_patch(original: &str, patch_text: &str) -> (String, bool) {
 
     // ---- All strategies failed ----
     warn!("ALL patch strategies failed — returning original unchanged");
-    (original.to_string(), false)
+    let reason = failure.unwrap_or(ApplyFailure::DidNotApply);
+    (original.to_string(), false, Some(reason))
+}
+
+// ============================================================================
+// Python syntax guard — did a non-git strategy produce a file that cannot parse?
+// ============================================================================
+//
+// [VANTA-WHY] This is the backstop for every strategy that is not `git apply`.
+// It answers ONE question: does the original parse and the result not? A missing
+// interpreter (or an original that never parsed) answers `None` so the guard can
+// never block a run by accident.
+//
+// It returns the INTERPRETER'S OWN MESSAGE rather than a bool, because the
+// Creator has to be told what broke: "patch result is not valid Python: <stderr>"
+// is actionable, "apply failed" is not.
+fn python_break_reason(path: &str, original: &str, patched: &str) -> Option<String> {
+    if !path.trim().ends_with(".py") {
+        return None;
+    }
+    if python_parses(original) != Some(true) {
+        return None;
+    }
+    python_compile_error(patched)
+}
+
+/// `py_compile`'s stderr for a source that does not compile; `None` when it does
+/// (or when no interpreter is available, so a missing python never fails a run).
+fn python_compile_error(source: &str) -> Option<String> {
+    let dir = tempfile::tempdir().ok()?;
+    let file = dir.path().join("candidate.py");
+    fs::write(&file, source).ok()?;
+    let out = Command::new(crate::pipeline::harness::python_exe())
+        .arg("-m")
+        .arg("py_compile")
+        .arg(&file)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let message = stderr.trim();
+    Some(if message.is_empty() {
+        "py_compile rejected the result without a message".to_string()
+    } else {
+        message.lines().take(6).collect::<Vec<_>>().join(" | ")
+    })
+}
+
+fn python_parses(source: &str) -> Option<bool> {
+    let dir = tempfile::tempdir().ok()?;
+    let file = dir.path().join("candidate.py");
+    fs::write(&file, source).ok()?;
+    let out = Command::new(crate::pipeline::harness::python_exe())
+        .arg("-m")
+        .arg("py_compile")
+        .arg(&file)
+        .output()
+        .ok()?;
+    Some(out.status.success())
 }
 
 // ============================================================================
@@ -227,74 +493,184 @@ pub fn apply_search_replace(original: &str, patch_text: &str) -> Option<String> 
 // ============================================================================
 //
 // [VANTA-WHY] Model-generated unified diffs often have wrong hunk headers
-// (incorrect line counts) but correct context/content lines. This engine
-// ignores the `@@` line numbers entirely and instead uses the context lines
-// (` ` prefix) to find the correct insertion point in the original file.
+// (incorrect line counts) but correct content lines. This engine locates each
+// hunk by its CONTEXT and uses the `@@` range only as a fallback, because the
+// header counts are the least trustworthy part of a model diff.
+//
+// It also keeps a RUNNING OFFSET. A hunk's `@@ -70,6` counts lines of the
+// ORIGINAL file, so once an earlier hunk in the same file has inserted or
+// removed lines, that number is stale. The previous version indexed the buffer
+// with the raw header, so hunk 3 of the heretic patch spliced over `score_name`
+// and the head of `init()` and left an `if` with no body: a valid patch turned
+// into a file that no longer parses, and the pipeline reported "patched
+// (changed)". Strategies that cannot verify where they splice are not worth
+// having.
+//
+// Every hunk must apply, and it must apply where the hunk's own old side
+// matches byte for byte. A partial or approximate application is refused
+// outright rather than handed on as a candidate.
 // ============================================================================
-const HUNK_FUZZ: usize = 3;
 
 pub fn apply_hunks(original: &str, patch_text: &str) -> Option<String> {
-    let orig_lines: Vec<&str> = original.lines().collect();
     let hunks = parse_hunks(patch_text);
 
     if hunks.is_empty() {
         return None;
     }
 
-    let mut result_lines: Vec<String> = orig_lines.iter().map(|l| l.to_string()).collect();
-    let mut applied_any = false;
+    let mut result_lines: Vec<String> = original.lines().map(|l| l.to_string()).collect();
+    let mut offset: isize = 0;
 
     for hunk in &hunks {
-        let range = hunk
-            .old_range
-            .and_then(|(start, len)| {
-                if start == 0 {
-                    return None;
-                }
-                let start_idx = start.saturating_sub(1);
-                if start_idx > result_lines.len() {
-                    return None;
-                }
-                let end_idx = std::cmp::min(start_idx + len, result_lines.len());
-                Some((start_idx, end_idx))
-            })
-            .or_else(|| find_hunk_anchor(&result_lines, &hunk.context, HUNK_FUZZ));
+        let old_side = hunk.old_side();
+        let new_side = hunk.new_side();
+        if old_side.is_empty() {
+            debug!("hunk-by-hunk: hunk has no old-side lines — refusing the whole patch");
+            return None;
+        }
+        let Some(start) = anchor_hunk(&result_lines, hunk, &old_side, offset) else {
+            debug!(
+                "hunk-by-hunk: hunk could not be anchored ({} old-side line(s)) — refusing the whole patch",
+                old_side.len()
+            );
+            return None;
+        };
 
-        if let Some((start, end)) = range {
-            let mut new_segment: Vec<String> = Vec::new();
-            for line in &hunk.lines {
-                match line {
-                    HunkLine::Context(s) => new_segment.push(s.clone()),
-                    HunkLine::Addition(s) => new_segment.push(s.clone()),
-                    HunkLine::Deletion => {} // skip deletions
-                }
-            }
+        offset += new_side.len() as isize - old_side.len() as isize;
+        result_lines.splice(start..start + old_side.len(), new_side);
+    }
 
-            result_lines.splice(start..end, new_segment);
-            applied_any = true;
-        } else {
-            debug!("hunk-by-hunk: could not anchor hunk ({} context lines) — skipping",
-                hunk.context.len());
+    let patched = result_lines.join("\n") + "\n";
+    if patched == original {
+        return None;
+    }
+    Some(patched)
+}
+
+/// Where does this hunk's old side start in `file_lines`?
+///
+/// Context first: the longest contiguous run of context lines is far less likely
+/// to appear twice than a one-line run like `    }`. The `@@` range corrected by
+/// the running offset is the fallback. Both candidates must match the hunk's
+/// ENTIRE old side before they are accepted, so a wrong guess is a refusal, not
+/// a corruption.
+fn anchor_hunk(
+    file_lines: &[String],
+    hunk: &Hunk,
+    old_side: &[String],
+    offset: isize,
+) -> Option<usize> {
+    // Context anchor. A run is a contiguous group of context lines *within the
+    // hunk*; a deleted line may sit between two of them, so we anchor on the
+    // longest run and map it back through the run's offset in the old side.
+    for (context_index, run) in hunk.context_runs() {
+        let Some(pos) = find_subsequence(file_lines, &run) else {
+            continue;
+        };
+        let old_offset = hunk.context_offsets[context_index];
+        let Some(start) = pos.checked_sub(old_offset) else {
+            continue;
+        };
+        if matches_at(file_lines, start, old_side) {
+            return Some(start);
         }
     }
 
-    if applied_any {
-        Some(result_lines.join("\n") + "\n")
+    // Fallback: the `@@` range, shifted by everything earlier hunks changed.
+    let (header_start, _) = hunk.old_range?;
+    if header_start == 0 {
+        return None;
+    }
+    let start = (header_start as isize - 1 + offset).max(0) as usize;
+    if matches_at(file_lines, start, old_side) {
+        Some(start)
     } else {
         None
     }
 }
 
+fn matches_at(file_lines: &[String], start: usize, needle: &[String]) -> bool {
+    start + needle.len() <= file_lines.len() && file_lines[start..start + needle.len()] == *needle
+}
+
 enum HunkLine {
     Context(String),
     Addition(String),
-    Deletion,
+    Deletion(String),
 }
 
 struct Hunk {
     lines: Vec<HunkLine>,
     context: Vec<String>,
+    /// For each context entry, its index within the hunk's OLD side (context +
+    /// deletions), so an anchored context run can be mapped back to the first
+    /// old-side line of the hunk.
+    context_offsets: Vec<usize>,
     old_range: Option<(usize, usize)>,
+}
+
+impl Hunk {
+    /// The hunk's old side: context lines and deleted lines, in file order.
+    fn old_side(&self) -> Vec<String> {
+        self.lines
+            .iter()
+            .filter_map(|l| match l {
+                HunkLine::Context(s) | HunkLine::Deletion(s) => Some(s.clone()),
+                HunkLine::Addition(_) => None,
+            })
+            .collect()
+    }
+
+    /// How many old-side lines (context + deletions) the hunk has consumed so
+    /// far. Used while parsing to record where each context line sits within the
+    /// old side.
+    fn old_side_len(&self) -> usize {
+        self.lines
+            .iter()
+            .filter(|l| matches!(l, HunkLine::Context(_) | HunkLine::Deletion(_)))
+            .count()
+    }
+
+    /// The hunk's new side: context lines and added lines, in file order.
+    fn new_side(&self) -> Vec<String> {
+        self.lines
+            .iter()
+            .filter_map(|l| match l {
+                HunkLine::Context(s) | HunkLine::Addition(s) => Some(s.clone()),
+                HunkLine::Deletion(_) => None,
+            })
+            .collect()
+    }
+
+    /// Contiguous runs of context lines as `(context_index, lines)`, longest
+    /// first — a long block is a much better anchor than a one-line one.
+    fn context_runs(&self) -> Vec<(usize, Vec<String>)> {
+        let mut runs: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut current: Option<(usize, Vec<String>)> = None;
+        let mut context_index = 0usize;
+
+        for line in &self.lines {
+            match line {
+                HunkLine::Context(s) => {
+                    match current.as_mut() {
+                        Some((_, run)) => run.push(s.clone()),
+                        None => current = Some((context_index, vec![s.clone()])),
+                    }
+                    context_index += 1;
+                }
+                _ => {
+                    if let Some(run) = current.take() {
+                        runs.push(run);
+                    }
+                }
+            }
+        }
+        if let Some(run) = current.take() {
+            runs.push(run);
+        }
+        runs.sort_by_key(|(_, run)| std::cmp::Reverse(run.len()));
+        runs
+    }
 }
 
 fn parse_hunks(patch_text: &str) -> Vec<Hunk> {
@@ -309,22 +685,29 @@ fn parse_hunks(patch_text: &str) -> Vec<Hunk> {
             current = Some(Hunk {
                 lines: Vec::new(),
                 context: Vec::new(),
+                context_offsets: Vec::new(),
                 old_range: parse_old_range(line),
             });
         } else if let Some(hunk) = current.as_mut() {
+            let push_context = |hunk: &mut Hunk, ctx: String| {
+                hunk.context_offsets.push(hunk.old_side_len());
+                hunk.context.push(ctx.clone());
+                hunk.lines.push(HunkLine::Context(ctx));
+            };
             if let Some(rest) = line.strip_prefix('+') {
                 hunk.lines.push(HunkLine::Addition(rest.to_string()));
-            } else if line.starts_with('-') && !line.starts_with("---") {
-                hunk.lines.push(HunkLine::Deletion);
+            } else if let Some(rest) = line.strip_prefix('-') {
+                if line.starts_with("---") {
+                    // File header — skip.
+                } else {
+                    hunk.lines.push(HunkLine::Deletion(rest.to_string()));
+                }
             } else if let Some(rest) = line.strip_prefix(' ') {
-                let ctx = rest.to_string();
-                hunk.lines.push(HunkLine::Context(ctx.clone()));
-                hunk.context.push(ctx);
+                push_context(hunk, rest.to_string());
             } else if line.starts_with("--- ") || line.starts_with("+++ ") {
                 // File headers — skip
             } else {
-                hunk.lines.push(HunkLine::Context(line.to_string()));
-                hunk.context.push(line.to_string());
+                push_context(hunk, line.to_string());
             }
         }
     }
@@ -344,31 +727,6 @@ fn parse_old_range(header: &str) -> Option<(usize, usize)> {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(1);
     Some((start, len))
-}
-
-fn find_hunk_anchor(
-    file_lines: &[String],
-    context: &[String],
-    fuzz: usize,
-) -> Option<(usize, usize)> {
-    if context.is_empty() {
-        return None;
-    }
-
-    for top_trim in 0..=fuzz {
-        for bottom_trim in 0..=fuzz {
-            if top_trim + bottom_trim >= context.len() {
-                continue;
-            }
-            let trimmed = &context[top_trim..context.len() - bottom_trim];
-            if let Some(pos) = find_subsequence(file_lines, trimmed) {
-                let start = pos.saturating_sub(top_trim);
-                let end = std::cmp::min(pos + trimmed.len() + bottom_trim, file_lines.len());
-                return Some((start, end));
-            }
-        }
-    }
-    None
 }
 
 fn find_subsequence(haystack: &[String], needle: &[String]) -> Option<usize> {
@@ -394,7 +752,7 @@ mod tests {
     fn test_full_source_strategy() {
         let original = "def add(a, b):\n    return a - b\n";
         let patch = "def add(a, b):\n    return a + b\n";
-        let (patched, changed) = apply_patch(original, patch);
+        let (patched, changed) = apply_patch(original, patch, "cart.py");
         assert!(changed);
         assert_eq!(patched, patch);
     }
@@ -403,7 +761,7 @@ mod tests {
     fn test_search_replace_strategy() {
         let original = "def add(a, b):\n    return a - b\n";
         let patch = "===SEARCH===\n    return a - b\n===REPLACE===\n    return a + b\n===END===\n";
-        let (patched, changed) = apply_patch(original, patch);
+        let (patched, changed) = apply_patch(original, patch, "cart.py");
         assert!(changed);
         assert!(patched.contains("return a + b"));
     }
@@ -412,7 +770,7 @@ mod tests {
     fn test_no_change_returns_false() {
         let original = "def add(a, b):\n    return a + b\n";
         let patch = original.to_string();
-        let (_, changed) = apply_patch(original, &patch);
+        let (_, changed) = apply_patch(original, &patch, "cart.py");
         assert!(!changed);
     }
 
@@ -421,7 +779,7 @@ mod tests {
         // A patch with only deletions should NOT be silently reconstructed.
         let original = "line1\nline2\nline3\n";
         let patch = "--- a.txt\n+++ b.txt\n@@ -1,3 +1,2 @@\n line1\n-line2\n line3\n";
-        let (patched, changed) = apply_patch(original, patch);
+        let (patched, changed) = apply_patch(original, patch, "cart.py");
         // Strategy 7 is skipped (has deletions). Strategy 6 (hunk engine) may or
         // may not anchor. If nothing works, changed == false. Either way the
         // patched text should NOT be byte-identical to original if a deletion
@@ -438,8 +796,205 @@ mod tests {
     fn test_hunk_only_patch_is_not_treated_as_full_source() {
         let original = "def add(a, b):\n    return a + b\n";
         let patch = "@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a + b\n+    return a - b\n";
-        let (patched, changed) = apply_patch(original, patch);
+        let (patched, changed) = apply_patch(original, patch, "cart.py");
         assert_eq!(patched, "def add(a, b):\n    return a - b\n");
         assert!(changed);
+    }
+
+    // ---- Fix 1 regression: the running offset ----
+
+    /// Two hunks in one file, where hunk 1 changes the line count. Hunk 2's
+    /// header still counts ORIGINAL lines, which is exactly the shape that made
+    /// the old engine splice over the wrong buffer rows.
+    #[test]
+    fn a_second_hunk_is_placed_with_the_running_offset() {
+        let original = "def f():\n    a = 1\n    b = 2\n    c = 3\n    return a + b + c\n";
+        let patch = "\
+@@ -1,3 +1,5 @@
+ def f():
+     a = 1
++    a += 10
++    a += 20
+     b = 2
+@@ -4,2 +6,2 @@
+     c = 3
+-    return a + b + c
++    return a + b
+";
+        let patched = apply_hunks(original, patch).expect("both hunks must apply");
+        assert_eq!(
+            patched,
+            "def f():\n    a = 1\n    a += 10\n    a += 20\n    b = 2\n    c = 3\n    return a + b\n",
+            "hunk 2 must land after hunk 1's insertions"
+        );
+    }
+
+    /// A hunk whose context cannot be found must refuse the WHOLE patch: a
+    /// half-applied file is not a candidate.
+    #[test]
+    fn an_unanchorable_hunk_refuses_the_whole_patch() {
+        let original = "def f():\n    return 1\n";
+        let patch = "@@ -1,2 +1,2 @@\n def nowhere_in_this_file():\n-    return 1\n+    return 2\n";
+        assert_eq!(apply_hunks(original, patch), None);
+    }
+
+    /// A pure insertion with context still anchors, and the verification
+    /// rejects a hunk whose old side is not actually there.
+    #[test]
+    fn a_matching_old_side_is_required() {
+        let original = "def f():\n    return 1\n";
+        // Header says line 2, old side says something else — the `@@` fallback
+        // must not be trusted blindly.
+        let patch = "@@ -2,1 +2,1 @@\n    return 99\n";
+        assert_eq!(apply_hunks(original, patch), None);
+    }
+
+    // ---- Fix 1 regression: review mode applies `git apply` and nothing else ----
+
+    fn repo() -> HashMap<String, String> {
+        HashMap::from([(
+            "src/pkg/mod.py".to_string(),
+            "def f():\n    return 1\n\n\ndef g():\n    return 2\n".to_string(),
+        )])
+    }
+
+    #[test]
+    fn strict_apply_takes_a_clean_two_hunk_patch() {
+        let files = repo();
+        let patch = "\
+diff --git a/src/pkg/mod.py b/src/pkg/mod.py
+--- a/src/pkg/mod.py
++++ b/src/pkg/mod.py
+@@ -1,2 +1,4 @@
+ def f():
++    x = 1
++    y = 2
+     return 1
+@@ -5,2 +7,2 @@
+ def g():
+-    return 2
++    return 3
+";
+        let changed = apply_patch_strict(&files, patch, &["src/pkg/mod.py".to_string()])
+            .expect("a clean patch must apply");
+        assert_eq!(
+            changed.get("src/pkg/mod.py").map(String::as_str),
+            Some("def f():\n    x = 1\n    y = 2\n    return 1\n\n\ndef g():\n    return 3\n")
+        );
+    }
+
+    /// Review mode must refuse a patch `git apply` cannot apply — the fuzzy
+    /// cascade would have "recovered" this and handed the pipeline a file nobody
+    /// wrote.
+    #[test]
+    fn strict_apply_refuses_a_patch_git_cannot_apply() {
+        let files = repo();
+        let patch = "\
+--- a/src/pkg/mod.py
++++ b/src/pkg/mod.py
+@@ -1,2 +1,2 @@
+ def not_in_this_file():
+-    return 1
++    return 2
+";
+        let err = apply_patch_strict(&files, patch, &["src/pkg/mod.py".to_string()])
+            .expect_err("an inapplicable patch must be refused, not approximated");
+        assert!(err.contains("git apply"), "unhelpful reason: {err}");
+
+        // And the repair-mode cascade must NOT fabricate a tree either: no
+        // strategy can place this hunk honestly, so it reports a failed apply.
+        let original = files.get("src/pkg/mod.py").unwrap();
+        let (recovered, changed) = apply_patch(original, patch, "src/pkg/mod.py");
+        assert!(
+            !changed && recovered == *original,
+            "a hunk with no anchor must leave the file alone, not guess"
+        );
+    }
+
+    /// The required regression: a hunk header whose counts do not match its body.
+    /// `git apply` calls it corrupt and `--recount` refuses it too (verified
+    /// against git 2.x), so review mode must stop rather than test a spliced tree.
+    #[test]
+    fn strict_apply_refuses_a_header_that_does_not_match_its_body() {
+        let files = repo();
+        // Header claims 5 old / 6 new lines; the body carries 2 old / 2 new.
+        let patch = "\
+--- a/src/pkg/mod.py
++++ b/src/pkg/mod.py
+@@ -1,5 +1,6 @@
+ def f():
+-    return 1
++    return 9
+";
+        let err = apply_patch_strict(&files, patch, &["src/pkg/mod.py".to_string()])
+            .expect_err("a miscounted header must be refused");
+        assert!(err.contains("git apply"), "unhelpful reason: {err}");
+    }
+
+    /// ...whereas the repair cascade still takes what strict refuses, because a
+    /// Creator response may not be a diff at all. That difference IS the policy.
+    #[test]
+    fn the_cascade_takes_what_strict_refuses() {
+        let files = repo();
+        let original = files.get("src/pkg/mod.py").unwrap();
+        // A headerless `@@` fragment: `git apply` cannot name the file, but the
+        // hunk engine only needs the context.
+        let patch = "@@ -1,2 +1,2 @@\n def f():\n-    return 1\n+    return 7\n";
+        assert!(
+            apply_patch_strict(&files, patch, &["src/pkg/mod.py".to_string()]).is_err(),
+            "strict must refuse a headerless fragment"
+        );
+        let (recovered, changed) = apply_patch(original, patch, "src/pkg/mod.py");
+        assert!(changed, "the cascade can still apply a headerless fragment");
+        assert!(recovered.contains("return 7"));
+    }
+
+    #[test]
+    fn strict_apply_reports_a_no_op_patch() {
+        let files = repo();
+        let patch = "\
+--- a/src/pkg/mod.py
++++ b/src/pkg/mod.py
+@@ -1,2 +1,2 @@
+ def f():
+     return 1
+";
+        let err = apply_patch_strict(&files, patch, &["src/pkg/mod.py".to_string()])
+            .expect_err("a patch that changes nothing is not an application");
+        assert!(err.contains("no-op"), "unhelpful reason: {err}");
+    }
+
+    // ---- Fix 1 regression: the syntax guard ----
+
+    #[test]
+    fn a_non_git_strategy_that_breaks_python_is_refused() {
+        // Full-source strategy, so no git tool is involved: the model hands back
+        // a file with an `if` and no body.
+        let original = "def f():\n    return 1\n";
+        let patch = "def f():\n    if True:\n    return 1\n";
+        let (patched, changed) = apply_patch(original, patch, "src/pkg/mod.py");
+        assert!(
+            !changed,
+            "a result that no longer compiles must be reported as a failed apply, \
+             not as 'patched (changed)'; got:\n{patched}"
+        );
+        assert_eq!(patched, original);
+    }
+
+    #[test]
+    fn the_syntax_guard_leaves_non_python_files_alone() {
+        // The SAME content, once against a non-Python file and once against a
+        // .py file: accepted for the former (the guard only knows Python),
+        // refused for the latter (the original parsed and the result does not).
+        let broken = "def f(:\n  not python at all\n";
+
+        let (patched, changed) = apply_patch("hello\n", broken, "README.md");
+        assert!(changed, "a non-Python file has no Python syntax to preserve");
+        assert_eq!(patched, broken);
+
+        let original = "def f():\n    return 1\n";
+        let (kept, refused) = apply_patch(original, broken, "src/pkg/mod.py");
+        assert!(!refused, "the same content must be refused for a .py file");
+        assert_eq!(kept, original);
     }
 }

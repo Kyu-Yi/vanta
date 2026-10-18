@@ -50,7 +50,7 @@ use crate::pipeline::governor::{
     AttemptVerdict, Governor, GovernorMode, SharedObservation,
 };
 use crate::pipeline::harness::{self, TestExecutionDetails};
-use crate::pipeline::patch::apply_patch;
+use crate::pipeline::patch::{apply_patch_detailed, apply_patch_strict, ApplyFailure};
 use crate::repo::Repo;
 use crate::session::{
     PatchAttemptId, SessionId, SessionLog, SessionRecord, TransitionRow, TransitionWriter,
@@ -397,6 +397,14 @@ pub async fn run(
     // fixed), which is what marks those rows as attack depth rather than a patch
     // transition. The id is a deterministic fingerprint of the patch text.
     let mut attempt_patch_ids: Vec<PatchAttemptId> = Vec::new();
+    // [VANTA-WHY] Attempt indices whose patch never reached the tree. In repair
+    // mode such an attempt is NOT fatal: the Creator gets the reason as feedback
+    // and the loop tries again, so the attempt has to appear in the dataset as a
+    // recorded hole (see `Governor::record_unobserved_attempt`) rather than
+    // vanish. The index list is kept, not a bare count, because each censored row
+    // must carry `apply_failed` for ITS OWN attempt — and the same list's length
+    // is the run-level `apply_failed_attempts` counter.
+    let mut apply_failed_attempt_indices: Vec<u32> = Vec::new();
     // [VANTA-WHY] Rows are flushed to vanta_sessions/{id}_transitions.jsonl as
     // each transition is computed, so a run that aborts mid-way (HarnessFailure
     // is terminal by design) still leaves every row it produced on disk. The
@@ -423,6 +431,11 @@ pub async fn run(
     };
     let decision = loop {
         let attempt = governor.current_attempt();
+        // [VANTA-WHY] Forensics filenames carry the ROUND, not just the
+        // structured-call retry index. Without this, every round wrote over the
+        // previous one and the debug folder of a 3-round run held round 3 three
+        // times over.
+        crate::llm::set_forensics_round(attempt + 1);
         println!("\n══════════════════════════════════════════════════════════════");
         println!("  ATTEMPT {} / {}", attempt + 1, config.max_attempts);
         println!("══════════════════════════════════════════════════════════════");
@@ -493,35 +506,90 @@ pub async fn run(
         let mut patched_files = original_files.clone();
         let mut any_changed = false;
         let mut all_patch_failed = true;
+        // [VANTA-WHY] The reason a failed apply must reach the forensics file and
+        // the console in plain language. In review mode `git apply` tells us
+        // exactly which hunk it could not place; hiding that behind "no file was
+        // changed" is how three rounds were burnt re-testing a file Vanta itself
+        // had corrupted.
+        let mut patch_failure_reason: Option<String> = None;
+        // [VANTA-WHY] WHY the cascade gave up, not just THAT it did. "I could not
+        // place your hunks" is a formatting problem the Creator can fix by
+        // re-emitting the diff; "your patch applied but the result is not valid
+        // Python" is a content problem it can only fix by changing the code.
+        // Telling it the wrong one wastes the retry the failure just bought.
+        let mut apply_failure: Option<ApplyFailure> = None;
 
-        for (path, patch_content) in &patch_files {
-            print!(
-                "  ⏳ {path}: applying ({:.1}KB patch)... ",
-                patch_content.len() as f64 / 1024.0
-            );
-            let _ = io::Write::flush(&mut io::stdout());
-            if let Some(original) = original_files.get(path) {
-                let (patched, changed) = apply_patch(original, patch_content);
-                if changed {
-                    patched_files.insert(path.clone(), patched);
-                    any_changed = true;
-                    all_patch_failed = false;
-                    println!("✔ patched (changed)");
-                } else {
-                    println!("✗ patch did not change file");
+        if config.patch_path.is_some() {
+            // [VANTA-WHY] REVIEW MODE IS STRICT. The candidate was written
+            // outside this run, so only `git apply` (then `git apply --recount`
+            // for a miscounted header) may touch the tree. A fuzzy strategy that
+            // "recovers" it would put a tree nobody wrote under test, and the
+            // resulting verdict would be a statement about Vanta's repair engine
+            // rather than about the candidate. Anything else stops the run with
+            // PatchApplicationFailed.
+            let touched: Vec<String> = patch_files.keys().cloned().collect();
+            match apply_patch_strict(&original_files, &patch_text, &touched) {
+                Ok(changed) => {
+                    for (path, content) in changed {
+                        println!("  ✔ {path}: patched (git apply)");
+                        patched_files.insert(path, content);
+                        any_changed = true;
+                        all_patch_failed = false;
+                    }
                 }
-            } else {
-                // New file not in original
-                if !patch_content.trim().is_empty() {
-                    patched_files.insert(path.clone(), patch_content.clone());
-                    any_changed = true;
-                    all_patch_failed = false;
-                    println!("  ✔ {path}: new file");
+                Err(reason) => {
+                    println!("  ✗ PATCH APPLICATION FAILED — review mode applies `git apply` only");
+                    for line in reason.lines() {
+                        println!("      {line}");
+                    }
+                    patch_failure_reason = Some(reason);
+                }
+            }
+        } else {
+            // [VANTA-WHY] REPAIR MODE keeps the cascade: the Creator can emit a
+            // diff with wrong headers, and the loop has a budget to recover. The
+            // per-file path is passed through so `git apply`/`patch(1)` see the
+            // file at the name the diff header uses, and so the syntax guard
+            // knows whether the result must parse as Python.
+            for (path, patch_content) in &patch_files {
+                print!(
+                    "  ⏳ {path}: applying ({:.1}KB patch)... ",
+                    patch_content.len() as f64 / 1024.0
+                );
+                let _ = io::Write::flush(&mut io::stdout());
+                if let Some(original) = original_files.get(path) {
+                    let (patched, changed, why) =
+                        apply_patch_detailed(original, patch_content, path);
+                    if changed {
+                        patched_files.insert(path.clone(), patched);
+                        any_changed = true;
+                        all_patch_failed = false;
+                        println!("✔ patched (changed)");
+                    } else {
+                        println!("✗ patch did not change file");
+                        // Keep the FIRST reason: it is the strategy the patch was
+                        // most likely written for, and a later syntax-guard
+                        // refusal of a different strategy would otherwise hide it.
+                        if apply_failure.is_none() {
+                            apply_failure = why;
+                        }
+                    }
+                } else {
+                    // New file not in original
+                    if !patch_content.trim().is_empty() {
+                        patched_files.insert(path.clone(), patch_content.clone());
+                        any_changed = true;
+                        all_patch_failed = false;
+                        println!("  ✔ {path}: new file");
+                    }
                 }
             }
         }
 
         if all_patch_failed {
+            let reason = patch_failure_reason
+                .clone()
+                .unwrap_or_else(|| "no file was changed by any strategy".to_string());
             // Write forensics
             let faillog = debug_dir.join("patch_application_failed.json");
             let _ = fs::write(
@@ -529,7 +597,7 @@ pub async fn run(
                 serde_json::to_string_pretty(&serde_json::json!({
                     "patch_text": patch_text,
                     "files_touched": patch_files.keys().cloned().collect::<Vec<_>>(),
-                    "reason": "no file was changed by any strategy"
+                    "reason": reason
                 }))
                 .unwrap(),
             );
@@ -540,17 +608,57 @@ pub async fn run(
                 testing_iteration_id: Some(testing_iteration_id.clone()),
                 test_id: None,
                 phase: "patch.apply_failed".to_string(),
-                summary: "no file was changed by any patch strategy".to_string(),
+                summary: reason.clone(),
                 timestamp: now_iso(),
                 benchmark_instance: None,
                 benchmark_label: None,
             })?;
 
-            let decision = governor.decide(
-                governor_mode,
-                AttemptVerdict::Inconclusive,
-                false,
-            );
+            if governor_mode == GovernorMode::Repair {
+                // [VANTA-WHY] REPAIR MODE DOES NOT STOP. A Creator patch that
+                // will not apply is "the diff is malformed" or "the diff applies
+                // but the result is not valid Python" — both are things the
+                // Creator can fix when it is TOLD which one happened. Ending the
+                // run here would make every bad diff cost a whole benchmark
+                // instance instead of one attempt, which is exactly how the
+                // repair rate gets dragged down. The attempt is spent (the
+                // Governor advances the budget), the failed apply is recorded as
+                // a censored transition row, and the reason goes back as the
+                // Creator's feedback. Review mode, whose candidate was written
+                // outside the run, still stops — see `Governor::decide`.
+                let feedback = match &apply_failure {
+                    // Content problem: the diff applied, the code does not parse.
+                    Some(ApplyFailure::InvalidPython(err)) => {
+                        format!("patch result is not valid Python: {err}")
+                    }
+                    // Formatting problem: nothing could place the hunks at all.
+                    _ => format!("patch did not apply: {reason}"),
+                };
+                println!("  ↻ Returning to Creator: {feedback}");
+                apply_failed_attempt_indices.push(attempt);
+                // [VANTA-WHY] Record the hole BEFORE deciding, so the rows belong
+                // to this attempt whatever the budget does next.
+                // `previous_shared` is deliberately untouched, so the attempt
+                // that finally applies is still compared against the last
+                // candidate anyone OBSERVED — the comparison that matters ("did
+                // the patch that finally applied fix the defect the last observed
+                // patch had?") is not lost.
+                governor.record_unobserved_attempt();
+                persisted_transitions = flush_transition_rows(
+                    &governor,
+                    &mut transition_writer,
+                    persisted_transitions,
+                    &session_id,
+                    &attempt_patch_ids,
+                    &apply_failed_attempt_indices,
+                    &mut metric_rows,
+                )?;
+                prior_feedback = Some(feedback);
+            }
+            let decision = governor.decide(governor_mode, AttemptVerdict::Inconclusive, false);
+            if decision == GovernorDecision::Continue {
+                continue;
+            }
             break decision;
         }
         let _ = any_changed; // used implicitly via all_patch_failed
@@ -849,14 +957,42 @@ pub async fn run(
         })
         .await?;
 
-        // Static analysis diff — keep the raw streams so the Static payload the
-        // Creator receives names the exact diagnostics the patch introduced.
-        let (base_ruff, _base_ruff_err, base_mypy, _base_mypy_err) =
-            harness::run_static_raw(&original_concat).await;
-        let (patch_ruff, patch_ruff_err, patch_mypy, patch_mypy_err) =
-            harness::run_static_raw(&patched_concat).await;
-        let ruff_new = patch_ruff > base_ruff;
-        let mypy_new = patch_mypy > base_mypy;
+        // Static analysis diff.
+        //
+        // [VANTA-WHY] This used to compare COUNTS. Patching one line of a file
+        // that already had N findings could leave the count at N while swapping
+        // which findings exist, so a fresh error would slip through unnoticed.
+        // The set diff below keys on (file, code, message) with line numbers
+        // stripped: the same diagnostic moving down the file is not a new
+        // error, and a genuinely new one is always caught. Only the NEW
+        // diagnostics reach the Diagnostician, so its Static payload names what
+        // the patch introduced — not the repo's pre-existing backlog.
+        let base_static = harness::run_static(&original_concat).await;
+        let patch_static = harness::run_static(&patched_concat).await;
+        let new_ruff = harness::new_diagnostics(&base_static.ruff, &patch_static.ruff);
+        let new_mypy = harness::new_diagnostics(&base_static.mypy, &patch_static.mypy);
+        let ruff_new = !new_ruff.is_empty();
+        let mypy_new = !new_mypy.is_empty();
+        let ruff_new_text = harness::render_diagnostics(&new_ruff);
+        let mypy_new_text = harness::render_diagnostics(&new_mypy);
+        // [VANTA-WHY] Fix 3 — a new finding in a file the patch TOUCHES is a
+        // finding about the candidate, so review mode can reject on it. Scoped
+        // to the touched files so a pre-existing error elsewhere in the tree
+        // (the repo's backlog, which the patch did not create) cannot be
+        // mistaken for the patch's doing.
+        //
+        // [VANTA-WHY] But "a new finding" is not the same as "the candidate is
+        // broken": ruff's default ruleset is mostly style (E4 import hygiene,
+        // E7 statement style, and the B/BLE/UP/SIM/TRY families when selected by
+        // a repo config). Rejecting on those reports a candidate as broken when
+        // it merely has a nit, which is a false finding about the model and burns
+        // an attack round. Only ERROR-class findings block: ruff `F`/`E9` and
+        // every mypy error (its parser accepts `: error:` lines only). The style
+        // findings are still REPORTED — the Creator sees them and the session log
+        // keeps them — they just do not reject.
+        let touched_paths: Vec<String> = patch_files.keys().cloned().collect();
+        let new_static_in_touched_files =
+            new_static_findings_block(&new_ruff, &new_mypy, &touched_paths);
         println!("  Static: ruff_new={ruff_new}, mypy_new={mypy_new}");
 
         // ---- 5b. Native suite gate — the repo's OWN tests ----
@@ -869,16 +1005,35 @@ pub async fn run(
         println!("\n▌ NATIVE suite: repo's own tests (original vs patch)...");
         let native_original = harness::run_native_suite(&original_concat, &test_cmd).await;
         let native_patched = harness::run_native_suite(&patched_concat, &test_cmd).await;
-        let native_regressions =
+        let mut native_regressions =
             harness::native_regressions(&native_original.tests, &native_patched.tests);
+        // [VANTA-WHY] A suite that ran N>0 tests on the original and collects
+        // fewer on the patch is a regression even if every collected test
+        // passes: the missing ones never ran. A syntax error stops pytest at
+        // collection, so a patch that breaks imports reads as "4 tests → 0
+        // tests, 0 regressions" — the single most dangerous false-clean in the
+        // pipeline. `native_regressions` already names the original tests that
+        // vanished; `native_suite_collapsed` catches the edge case where the
+        // originals that vanished had not been passing either.
+        let native_collapsed = harness::native_suite_collapsed(&native_original, &native_patched);
+        if native_collapsed {
+            for (name, _) in &native_original.tests {
+                if !native_patched.tests.iter().any(|(n, _)| n == name)
+                    && !native_regressions.iter().any(|n| n == name)
+                {
+                    native_regressions.push(name.clone());
+                }
+            }
+        }
         let native_regression = !native_regressions.is_empty();
         println!(
-            "  Native: original ran={} ({} tests), patched ran={} ({} tests), {} regression(s)",
+            "  Native: original ran={} ({} tests), patched ran={} ({} tests), {} regression(s){}",
             native_original.ran,
             native_original.tests.len(),
             native_patched.ran,
             native_patched.tests.len(),
-            native_regressions.len()
+            native_regressions.len(),
+            if native_collapsed { " [SUITE COLLAPSED]" } else { "" }
         );
         session_log.append(SessionRecord {
             session_id: session_id.clone(),
@@ -955,8 +1110,8 @@ pub async fn run(
                     &execution,
                     ruff_new,
                     mypy_new,
-                    &patch_ruff_err,
-                    &patch_mypy_err,
+                    &ruff_new_text,
+                    &mypy_new_text,
                     !net_alive,
                     &patched_concat,
                     &cfg,
@@ -1075,18 +1230,15 @@ pub async fn run(
         // [VANTA-WHY] Flush the rows this attempt produced, immediately, before
         // anything else can fail. A later HarnessFailure — or a full disk — then
         // costs only the work not yet done, never the rows already computed.
-        let transitions = governor.transitions();
-        if transitions.len() > persisted_transitions {
-            let rows: Vec<TransitionRow> = transitions[persisted_transitions..]
-                .iter()
-                .map(|t| stamp_transition_row(t, &session_id, &attempt_patch_ids))
-                .collect();
-            transition_writer.append(&rows)?;
-            persisted_transitions = transitions.len();
-            // Keep the same rows in memory so the live print below derives
-            // EIR/ECR from them with the one shared function, not a second rule.
-            metric_rows.extend(rows);
-        }
+        persisted_transitions = flush_transition_rows(
+            &governor,
+            &mut transition_writer,
+            persisted_transitions,
+            &session_id,
+            &attempt_patch_ids,
+            &apply_failed_attempt_indices,
+            &mut metric_rows,
+        )?;
         // Persist the actual GeneratedTest objects for re-running next attempt.
         // A censored attempt contributes no usable evidence, so it does not grow
         // the shared corpus either — the retry then behaves like a fresh attempt.
@@ -1109,7 +1261,13 @@ pub async fn run(
         // [VANTA-WHY] The Governor needs three-way evidence, not a bool. In review
         // mode a Logic failure is a REJECTION; an Infrastructure-only round is
         // not a finding at all and must never be reported as one.
-        let verdict = attempt_verdict(all_passed, &patched_classes, native_regression);
+        let verdict = attempt_verdict(
+            all_passed,
+            &patched_classes,
+            native_regression,
+            new_static_in_touched_files,
+            governor_mode,
+        );
         let governor_decision = governor.decide(governor_mode, verdict, true);
         let decision = if harness_collapsed {
             let next = collapse_decision(
@@ -1418,9 +1576,19 @@ pub async fn run(
 
     let evidence_path =
         Path::new("vanta_sessions").join(format!("{}_evidence.json", session_id.as_str()));
+    // [VANTA-WHY] Run-level counter rides ALONGSIDE the records rather than inside
+    // them: "how many attempts spent their budget on a patch that never reached
+    // the tree" is a property of the RUN, not of any single test. It is reported
+    // separately because those attempts are censored out of EIR/ECR by
+    // construction, so without this number a repair rate cannot be told apart
+    // from a candidate that was never evaluated.
     let _ = fs::write(
         &evidence_path,
-        serde_json::to_string_pretty(&final_evidence).unwrap(),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "apply_failed_attempts": apply_failed_attempt_indices.len(),
+            "evidence": final_evidence,
+        }))
+        .unwrap(),
     );
     println!("\n▌ Evidence → {}", evidence_path.display());
     println!(
@@ -1821,10 +1989,43 @@ fn patch_attempt_id_for_patch(patch_text: &str) -> PatchAttemptId {
 // one looks like a review round). A null is filterable: `from_transition` then
 // censors the row, so the analysis counts a row only when both ids are non-null
 // and differ.
+/// Append every transition not yet persisted and return the new cursor.
+///
+/// [VANTA-WHY] One definition, called from two places: the ordinary post-attempt
+/// flush, and the repair-mode failed-apply path (which must persist its censored
+/// rows BEFORE the loop continues, because if the budget is then exhausted the
+/// ordinary flush never runs again and the hole would be lost). The rows are
+/// also kept in memory so the live EIR/ECR print derives from the same rows with
+/// the one shared function rather than a second rule.
+fn flush_transition_rows(
+    governor: &Governor,
+    writer: &mut TransitionWriter,
+    persisted: usize,
+    session_id: &SessionId,
+    attempt_patch_ids: &[PatchAttemptId],
+    apply_failed_attempts: &[u32],
+    metric_rows: &mut Vec<TransitionRow>,
+) -> Result<usize, io::Error> {
+    let transitions = governor.transitions();
+    if transitions.len() <= persisted {
+        return Ok(persisted);
+    }
+    let rows: Vec<TransitionRow> = transitions[persisted..]
+        .iter()
+        .map(|t| {
+            stamp_transition_row(t, session_id, attempt_patch_ids, apply_failed_attempts)
+        })
+        .collect();
+    writer.append(&rows)?;
+    metric_rows.extend(rows);
+    Ok(transitions.len())
+}
+
 fn stamp_transition_row(
     transition: &AttemptTransition,
     session_id: &SessionId,
     attempt_patch_ids: &[PatchAttemptId],
+    apply_failed_attempts: &[u32],
 ) -> TransitionRow {
     let from_id = attempt_patch_ids
         .get(transition.from_attempt as usize)
@@ -1832,7 +2033,12 @@ fn stamp_transition_row(
     let to_id = attempt_patch_ids
         .get(transition.to_attempt as usize)
         .cloned();
-    TransitionRow::from_transition(transition, session_id, from_id, to_id)
+    // [VANTA-WHY] The flag belongs to the NEWER side: the row exists because that
+    // attempt's patch never reached the tree. Taken from the attempt index rather
+    // than a run-level bool so a later successful attempt's rows are not tainted
+    // by an earlier hole.
+    let apply_failed = apply_failed_attempts.contains(&transition.to_attempt);
+    TransitionRow::from_transition(transition, session_id, from_id, to_id, apply_failed)
 }
 
 // [VANTA-WHY] Infrastructure is the class that gets reset, rerun, and excluded
@@ -1865,20 +2071,32 @@ fn collapse_decision(streak: u32, governor_allows_retry: bool) -> GovernorDecisi
 }
 
 // [VANTA-WHY] The Governor's three-way verdict is computed here, once, from the
-// attempt's evidence. Only a Logic-class failure is a finding about the
-// candidate: it is the one class the Diagnostician can attribute to the code
-// (Spec §7). Static failures are the Gatekeeper's own concern and already block
-// approval on its path, and Infrastructure / Unknown mean we could not get clean
-// evidence — reporting either as a rejection would claim the model was wrong
-// when the environment was. A repo-native regression (`native_suite`) is a real
-// finding even though it is not part of the shared set, so it is passed in
-// separately.
+// attempt's evidence. A Logic-class failure is a finding about the candidate: it
+// is the one class the Diagnostician can attribute to the code (Spec §7).
+// Infrastructure / Unknown mean we could not get clean evidence — reporting
+// either as a rejection would claim the model was wrong when the environment
+// was. A repo-native regression (`native_suite`) is a real finding even though
+// it is not part of the shared set, so it is passed in separately.
+//
+// [VANTA-WHY] Static used to be left entirely to the Gatekeeper, and that was a
+// dead zone. The Governor said "Static is the Gatekeeper's job", but the
+// Gatekeeper only runs after `AllTestsPassed`, so a round whose ONLY failure was
+// Static reached neither a rejection nor the gate that would have produced one.
+// In review mode there is also no Creator to repair it, so it just kept
+// attacking a candidate it had already found broken. A new static finding in a
+// file the patch touches is terminal in REVIEW mode only; in repair mode the
+// class stays non-decisive (the Creator gets it as feedback, and the Gatekeeper
+// still blocks approval if it survives).
 fn attempt_verdict(
     all_passed: bool,
     failure_classes: &[Option<FailureClass>],
     native_regression: bool,
+    new_static_in_touched_files: bool,
+    mode: GovernorMode,
 ) -> AttemptVerdict {
+    let static_rejects = new_static_in_touched_files && mode == GovernorMode::Review;
     if native_regression
+        || static_rejects
         || failure_classes
             .iter()
             .any(|c| c.as_ref() == Some(&FailureClass::Logic))
@@ -1888,6 +2106,55 @@ fn attempt_verdict(
         AttemptVerdict::Passed
     } else {
         AttemptVerdict::Inconclusive
+    }
+}
+
+/// Is `file` a path the patch touches?
+///
+/// [VANTA-WHY] ruff reports paths relative to the repo root and the patch names
+/// them as its headers do (`a/src/pkg/mod.py`), so neither a plain equality nor
+/// a suffix match alone is right. Both are tried.
+fn static_path_touched(file: &str, touched: &[String]) -> bool {
+    let norm = file.trim_start_matches("./");
+    touched.iter().any(|p| {
+        let p = p.trim_start_matches("./");
+        p == norm || norm.ends_with(p) || p.ends_with(norm)
+    })
+}
+
+/// Does a new static finding BLOCK a review round?
+///
+/// [VANTA-WHY] Extracted from the round body so the policy is unit-testable
+/// without spawning ruff: a new finding blocks only when it sits in a file the
+/// patch touches AND is of an ERROR class — ruff `F`/`E9`, or any mypy error.
+/// A style rule (B, BLE, UP, SIM, TRY, …) in a touched file is REPORTED to the
+/// Creator and kept in the session log, but must not reject: rejecting on a nit
+/// claims the candidate is broken when it is not, and burns an attack round.
+fn new_static_findings_block(
+    new_ruff: &[&harness::StaticDiagnostic],
+    new_mypy: &[&harness::StaticDiagnostic],
+    touched: &[String],
+) -> bool {
+    new_ruff
+        .iter()
+        .any(|d| harness::ruff_is_error_class(&d.code) && static_path_touched(&d.file, touched))
+        || new_mypy
+            .iter()
+            .any(|d| static_path_touched(&d.file, touched))
+}
+
+/// Render a tri-state audit answer for the session log.
+///
+/// [VANTA-WHY] `issue_requires_change` is `Option<bool>` precisely because an
+/// omitted field must mean UNKNOWN rather than the `false` ("preserve") that
+/// serde's default used to fill in. Logging it as `Some(false)`/`None` would hide
+/// which of the three states the model actually returned, and the audit record is
+/// the only place a reader can check that the gate failed closed.
+fn tri_state_text(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
     }
 }
 
@@ -1916,7 +2183,7 @@ fn log_intent_checks(
                 "source={source} declared={:?} issue_asks_for_behaviour={} issue_requires_change={} scrapped={} quote_present={} quote_in_issue={} quote_names_asserted_input={} asserted_inputs=[{}] reason={}",
                 check.declared_intent,
                 check.issue_asks_for_behaviour,
-                check.issue_requires_change,
+                tri_state_text(check.issue_requires_change),
                 check.scrapped,
                 check.evidence.quote_present,
                 check.evidence.quote_in_issue,
@@ -1974,14 +2241,16 @@ fn now_iso() -> String {
 mod tests {
     use super::{
         attempt_verdict, collapse_decision, dependency_freeze_summary_value,
-        harness_infrastructure_collapse, patch_attempt_id_for_patch, render_committed_test_file,
-        require_clean_target_repo_for_open_pr, review_prompt_source_concat,
-        stable_patch_fingerprint,
+        harness_infrastructure_collapse, new_static_findings_block, patch_attempt_id_for_patch,
+        render_committed_test_file, require_clean_target_repo_for_open_pr,
+        review_prompt_source_concat, stamp_transition_row, stable_patch_fingerprint,
     };
     use crate::agents::creator::SourceFile;
     use crate::agents::attacker::GeneratedTest;
-    use crate::core::{FailureClass, GovernorDecision};
-    use crate::pipeline::governor::AttemptVerdict;
+    use crate::core::{AttemptTransition, EvidenceSource, FailureClass, GovernorDecision, TestIntent, TestResult};
+    use crate::pipeline::governor::{AttemptVerdict, GovernorMode};
+    use crate::pipeline::harness::StaticDiagnostic;
+    use crate::session::{PatchAttemptId, SessionId};
     use std::collections::HashMap;
 
     #[test]
@@ -2061,7 +2330,13 @@ mod tests {
     #[test]
     fn a_logic_failure_is_a_rejection() {
         assert_eq!(
-            attempt_verdict(false, &[Some(FailureClass::Logic)], false),
+            attempt_verdict(
+                false,
+                &[Some(FailureClass::Logic)],
+                false,
+                false,
+                GovernorMode::Repair
+            ),
             AttemptVerdict::Rejected
         );
     }
@@ -2072,7 +2347,9 @@ mod tests {
             attempt_verdict(
                 false,
                 &[Some(FailureClass::Infrastructure), Some(FailureClass::Unknown)],
-                false
+                false,
+                false,
+                GovernorMode::Review
             ),
             AttemptVerdict::Inconclusive,
             "a timeout says nothing about the candidate, so it must not reject it"
@@ -2080,26 +2357,153 @@ mod tests {
     }
 
     #[test]
-    fn a_static_only_round_is_inconclusive() {
+    fn a_static_only_round_is_inconclusive_in_repair_mode() {
         assert_eq!(
-            attempt_verdict(false, &[Some(FailureClass::Static)], false),
+            attempt_verdict(
+                false,
+                &[Some(FailureClass::Static)],
+                false,
+                false,
+                GovernorMode::Repair
+            ),
             AttemptVerdict::Inconclusive,
-            "Static is the Gatekeeper's own gate; it is not a Logic-class finding here"
+            "in repair mode a static finding is the Creator's feedback and the \
+             Gatekeeper's gate, not a Logic-class finding"
+        );
+    }
+
+    // [VANTA-WHY] Fix 3 — the review-mode dead zone. A new static finding in a
+    // file the patch touches reaches neither the Gatekeeper (only runs on
+    // AllTestsPassed) nor a rejection under the old rule, so review kept
+    // attacking a candidate it had already found broken.
+    #[test]
+    fn a_static_failure_in_a_touched_file_rejects_in_review_mode() {
+        assert_eq!(
+            attempt_verdict(
+                false,
+                &[Some(FailureClass::Static)],
+                false,
+                true,
+                GovernorMode::Review
+            ),
+            AttemptVerdict::Rejected,
+            "review mode must be able to reject on a static regression the patch introduced"
+        );
+    }
+
+    #[test]
+    fn a_static_finding_elsewhere_does_not_reject_in_review_mode() {
+        assert_eq!(
+            attempt_verdict(
+                false,
+                &[Some(FailureClass::Static)],
+                false,
+                false,
+                GovernorMode::Review
+            ),
+            AttemptVerdict::Inconclusive,
+            "a finding the patch did not introduce is not a finding about the candidate"
         );
     }
 
     #[test]
     fn a_clean_round_is_a_pass() {
-        assert_eq!(attempt_verdict(true, &[], false), AttemptVerdict::Passed);
+        assert_eq!(
+            attempt_verdict(true, &[], false, false, GovernorMode::Repair),
+            AttemptVerdict::Passed
+        );
     }
 
     #[test]
     fn a_native_suite_regression_rejects_even_when_the_generated_tests_pass() {
         assert_eq!(
-            attempt_verdict(true, &[], true),
+            attempt_verdict(true, &[], true, false, GovernorMode::Review),
             AttemptVerdict::Rejected,
             "the repo's own suite failing on the patch is a regression the generated \
              tests did not happen to cover"
+        );
+    }
+
+    fn audit_finding(file: &str, code: &str) -> StaticDiagnostic {
+        StaticDiagnostic {
+            file: file.to_string(),
+            code: code.to_string(),
+            message: "stub finding".to_string(),
+        }
+    }
+
+    /// The relaxation the user asked for, at the exact seam that decides it: a
+    /// patch that adds ONE style finding in a file it touches must not block a
+    /// review round.
+    #[test]
+    fn a_patch_that_adds_one_style_finding_does_not_block_a_review_round() {
+        let touched = vec!["calc.py".to_string()];
+        let style = audit_finding("calc.py", "UP032");
+        assert!(
+            !new_static_findings_block(&[&style], &[], &touched),
+            "a style rule is reported, not a reason to reject the candidate"
+        );
+    }
+
+    /// ...but the error classes still do, and only inside the touched files.
+    #[test]
+    fn only_error_class_findings_in_touched_files_block_a_review_round() {
+        let touched = vec!["calc.py".to_string()];
+        let f821 = audit_finding("calc.py", "F821");
+        let e999 = audit_finding("calc.py", "E999");
+        let mypy_error = audit_finding("calc.py", "return-value");
+        let elsewhere = audit_finding("vendor/other.py", "F821");
+        assert!(new_static_findings_block(&[&f821], &[], &touched));
+        assert!(new_static_findings_block(&[&e999], &[], &touched));
+        assert!(new_static_findings_block(&[], &[&mypy_error], &touched));
+        assert!(
+            !new_static_findings_block(&[&elsewhere], &[], &touched),
+            "an error the patch did not introduce is not a finding about the candidate"
+        );
+    }
+
+    /// The inspectable promise of the repair-mode apply-failure path.
+    ///
+    /// [VANTA-WHY] This is the direct answer to "how does a failed apply count
+    /// for ECR/EIR": it does NOT. The attempt never produced a tree, so the row
+    /// is `complete: false` and therefore CENSORED, and
+    /// `is_countable_patch_transition` refuses every censored row — no failed
+    /// apply can reach the denominator. `apply_failed` rides alongside (not
+    /// instead of) so the analysis can report how many holes were Vanta's own
+    /// apply path rather than an unattributed gap.
+    #[test]
+    fn a_failed_apply_is_recorded_as_a_censored_apply_failed_row() {
+        let transition = AttemptTransition {
+            from_attempt: 0,
+            to_attempt: 1,
+            shared_set_id: "set-a".into(),
+            test_id: "hash-add".into(),
+            test_name: "test_behavior_preservation_only".into(),
+            from_result: TestResult::Passed,
+            to_result: TestResult::Error,
+            from_failure_class: None,
+            to_failure_class: None,
+            complete: false,
+            in_s0: true,
+            evidence_source: EvidenceSource::AttackerGenerated,
+            test_intent: TestIntent::BehaviorPreservation,
+        };
+        let session_id = SessionId::new("apply-failed-test");
+        let attempt_ids = vec![PatchAttemptId::new("p0"), PatchAttemptId::new("p1")];
+
+        let row = stamp_transition_row(&transition, &session_id, &attempt_ids, &[1]);
+        assert!(row.apply_failed, "the failed-apply attempt must be marked");
+        assert!(
+            row.censored,
+            "an attempt whose patch never applied is a hole, not an observation"
+        );
+        assert!(
+            !row.is_countable_patch_transition(),
+            "a hole must never reach the EIR/ECR denominator"
+        );
+        assert!(
+            row.from_patch_attempt_id.is_some() && row.to_patch_attempt_id.is_some(),
+            "both candidate ids exist even when the newer one never ran"
         );
     }
 

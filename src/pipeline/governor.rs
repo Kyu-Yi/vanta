@@ -128,6 +128,16 @@ pub struct Governor {
     // the S^(0)-restricted analysis in the paper can be reconstructed from the
     // persisted rows alone.
     s0_hashes: HashSet<String>,
+    // [VANTA-WHY] The attempt index whose observations are currently held in
+    // `previous_shared`. A transition's `from_attempt` must name the attempt the
+    // `from` observation actually came from — NOT simply `current_attempt - 1`.
+    // Those differ the moment an attempt observes nothing (its patch never
+    // applied, or the harness collapsed): the stale `previous_shared` then
+    // belongs to an earlier attempt, and labelling it `current - 1` attributes
+    // one candidate's result to another candidate's patch id. The persisted row
+    // would look like a genuine repair transition between two candidates, only
+    // one of which produced the evidence.
+    last_observed_attempt: Option<u32>,
     // [VANTA-WHY] All transitions recorded so far. Logged to session for M4.
     transitions: Vec<AttemptTransition>,
 }
@@ -142,6 +152,7 @@ impl Governor {
             name_hashes: HashMap::new(),
             name_collisions: 0,
             s0_hashes: HashSet::new(),
+            last_observed_attempt: None,
             transitions: Vec::new(),
         }
     }
@@ -200,6 +211,12 @@ impl Governor {
             // from the accumulator) is deliberate: `prev` is the set that
             // actually ran last attempt, which is what the comparison is on.
             let shared_set_id = shared_set_fingerprint(prev.keys());
+            // [VANTA-WHY] The `from` side names the attempt these observations
+            // CAME FROM, which is not `current - 1` when an attempt in between
+            // observed nothing. See `last_observed_attempt`.
+            let from_attempt = self
+                .last_observed_attempt
+                .unwrap_or_else(|| self.current_attempt.saturating_sub(1));
             for (hash, prev_obs) in prev {
                 let curr = current.get(hash);
                 let complete = curr.is_some();
@@ -208,7 +225,7 @@ impl Governor {
                 // back to the previous one when the probe only ran last time.
                 let provenance = curr.unwrap_or(prev_obs);
                 self.transitions.push(AttemptTransition {
-                    from_attempt: self.current_attempt.saturating_sub(1),
+                    from_attempt,
                     to_attempt: self.current_attempt,
                     shared_set_id: shared_set_id.clone(),
                     test_id: hash.clone(),
@@ -244,6 +261,61 @@ impl Governor {
         for (hash, obs) in current {
             self.shared_results.entry(hash).or_insert(obs);
         }
+        // This attempt DID produce observations, so it is now the attempt any
+        // later comparison's `from` side belongs to.
+        self.last_observed_attempt = Some(self.current_attempt);
+    }
+
+    /// Record an attempt that observed NOTHING — its patch never applied, so no
+    /// test ran and no shared-set result exists for it.
+    ///
+    /// [VANTA-WHY] The attempt happened and spent budget, so it must appear in
+    /// the dataset as a recorded HOLE rather than vanish: one CENSORED row per
+    /// probe of the last-observed question set, with only the `to` side missing.
+    /// Three deliberate properties:
+    ///
+    ///   - `previous_shared` is NOT touched. The next real attempt has to be
+    ///     compared against the last candidate anyone actually OBSERVED.
+    ///     Overwriting it with an empty set would silently delete the very
+    ///     comparison that matters after a failed apply — "did the patch that
+    ///     finally applied correct the error the last observed patch had?" — and
+    ///     quietly drop a real ECR opportunity.
+    ///   - it is a no-op before any observation exists, so an unobserved FIRST
+    ///     attempt cannot freeze S^(0) as an empty question set.
+    ///   - `to_result` is `Error` with no failure class, exactly like every other
+    ///     unobserved probe, so the row cannot reach EIR/ECR (`censored` already
+    ///     excludes it; the missing class excludes it again).
+    ///
+    /// Returns true when rows were recorded.
+    pub fn record_unobserved_attempt(&mut self) -> bool {
+        let Some(prev) = self.previous_shared.as_ref() else {
+            return false;
+        };
+        let from_attempt = self
+            .last_observed_attempt
+            .unwrap_or_else(|| self.current_attempt.saturating_sub(1));
+        let shared_set_id = shared_set_fingerprint(prev.keys());
+        let rows: Vec<AttemptTransition> = prev
+            .iter()
+            .map(|(hash, prev_obs)| AttemptTransition {
+                from_attempt,
+                to_attempt: self.current_attempt,
+                shared_set_id: shared_set_id.clone(),
+                test_id: hash.clone(),
+                test_name: prev_obs.test_name.clone(),
+                from_result: prev_obs.result.clone(),
+                to_result: TestResult::Error,
+                from_failure_class: prev_obs.failure_class.clone(),
+                to_failure_class: None,
+                complete: false,
+                in_s0: self.s0_hashes.contains(hash),
+                evidence_source: prev_obs.evidence_source.clone(),
+                test_intent: prev_obs.test_intent.clone(),
+            })
+            .collect();
+        let recorded = !rows.is_empty();
+        self.transitions.extend(rows);
+        recorded
     }
 
     /// Add NEW tests to the shared set (they join on the NEXT comparison).
@@ -315,8 +387,20 @@ impl Governor {
         patch_changed: bool,
     ) -> GovernorDecision {
         if !patch_changed {
-            warn!("Governor: patch did not change the file — stopping (PatchApplicationFailed)");
-            return GovernorDecision::PatchApplicationFailed;
+            if mode == GovernorMode::Review {
+                warn!("Governor: patch did not change the file — stopping (PatchApplicationFailed)");
+                return GovernorDecision::PatchApplicationFailed;
+            }
+            // [VANTA-WHY] In REPAIR mode an unappliable patch is the Creator's
+            // problem to fix, not the run's. Review mode stops because its
+            // candidate was written outside the run — there is nothing to
+            // regenerate and re-running would only re-attempt the same text. But
+            // here the Creator CAN be told why and try again, and ending the whole
+            // run on one malformed diff makes every bad diff cost a benchmark
+            // instance instead of one attempt. So fall through to the budget
+            // advance: the attempt is SPENT, the loop continues while patches
+            // remain, and the run only ends when the patch budget is exhausted.
+            warn!("Governor: patch did not change the file — spending the attempt (Repair)");
         }
 
         match mode {
@@ -416,9 +500,37 @@ mod tests {
 
     #[test]
     fn test_stop_on_patch_failed() {
+        // [VANTA-WHY] REVIEW only. The candidate was written outside the run, so
+        // an unappliable patch is terminal there — there is nothing to
+        // regenerate. Repair mode must NOT stop; see the test below.
         let mut g = Governor::new(4);
-        let decision = g.decide(GovernorMode::Repair, AttemptVerdict::Inconclusive, false);
+        let decision = g.decide(GovernorMode::Review, AttemptVerdict::Inconclusive, false);
         assert_eq!(decision, GovernorDecision::PatchApplicationFailed);
+    }
+
+    #[test]
+    fn a_failed_apply_spends_an_attempt_instead_of_ending_a_repair_run() {
+        // [VANTA-WHY] The Creator can fix a malformed diff when it is told why.
+        // Ending the run on it turns one bad attempt into a lost benchmark
+        // instance, so the attempt is spent and the loop continues.
+        let mut g = Governor::new(3);
+        assert_eq!(
+            g.decide(GovernorMode::Repair, AttemptVerdict::Inconclusive, false),
+            GovernorDecision::Continue,
+            "a patch that did not apply must go back to the Creator, not end the run"
+        );
+        assert_eq!(g.current_attempt(), 1, "the failed apply must consume an attempt");
+        // And the budget still bounds it: the third failed apply is the last one.
+        assert_eq!(
+            g.decide(GovernorMode::Repair, AttemptVerdict::Inconclusive, false),
+            GovernorDecision::Continue
+        );
+        assert_eq!(
+            g.decide(GovernorMode::Repair, AttemptVerdict::Inconclusive, false),
+            GovernorDecision::MaxAttemptsReached,
+            "a run whose every patch failed to apply exhausts its patch budget, it does not \
+             report a patch-application stop"
+        );
     }
 
     #[test]

@@ -262,5 +262,5 @@ A citation entry for the Vanta paper will be added on arXiv publication.
 ---
 
 <p align="center">
-Built by <a href="https://github.com/Kyu-Yi">Nathan Lawson</a> · KAIST MSc AI/CS · Seoul
+Built by <a href="https://github.com/Kyu-Yi">Nathan Lawson</a> · KAIST MSc AI/CS · Daejeon
 </p>

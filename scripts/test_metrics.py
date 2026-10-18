@@ -183,6 +183,34 @@ def test_false_approval_on_a_known_bad_patch(tmp_path):
     assert verdict.bucket == metrics.FALSE_APPROVAL
 
 
+def test_false_reject_on_a_known_good_patch(tmp_path):
+    """A rejection on a known-good patch is wrong even if a signal "discriminated".
+
+    [WHY] B v2 applies the fixed patch, so its candidate IS the known-good tree
+    and every signal fires on both sides — the discrimination table can never
+    prove the catch. The ground-truth label is the only thing that can say the
+    rejection was wrong, and it must win over the table.
+    """
+    write_session(tmp_path, "rejected-good", decision="Rejected", schema_version=1)
+    write_reruns(tmp_path, "rejected-good", [signal(True), signal(False)])
+
+    verdict = metrics.classify(
+        metrics.load_session(str(tmp_path), "rejected-good"), known_bad=False
+    )
+    assert verdict.bucket == metrics.FALSE_REJECT
+
+
+def test_true_approval_on_a_known_good_patch(tmp_path):
+    """Approving a labelled-good patch is correct, not "unlabelled"."""
+    write_session(tmp_path, "approved-good", decision="AllTestsPassed", schema_version=1)
+
+    verdict = metrics.classify(
+        metrics.load_session(str(tmp_path), "approved-good"), known_bad=False
+    )
+    assert verdict.bucket == metrics.TRUE_APPROVAL
+    assert verdict.bucket != metrics.APPROVED_UNLABELED
+
+
 def test_approval_without_a_ground_truth_label_claims_nothing(tmp_path):
     write_session(tmp_path, "approved-unknown", decision="AllTestsPassed", schema_version=1)
 
@@ -193,21 +221,26 @@ def test_approval_without_a_ground_truth_label_claims_nothing(tmp_path):
 
 
 def test_render_table_reports_the_buckets_separately(tmp_path):
-    """The three outcomes the study reports must never be summed together."""
+    """The outcomes the study reports must never be summed together."""
     write_session(tmp_path, "catch", decision="Rejected", schema_version=1)
     write_reruns(tmp_path, "catch", [signal(True)])
     write_session(tmp_path, "spurious", decision="Rejected", schema_version=1)
     write_reruns(tmp_path, "spurious", [signal(False)])
     write_session(tmp_path, "bad-approval", decision="AllTestsPassed", schema_version=1)
+    write_session(tmp_path, "false-reject", decision="Rejected", schema_version=1)
+    write_reruns(tmp_path, "false-reject", [signal(False)])
 
     verdicts = [
         metrics.classify(metrics.load_session(str(tmp_path), "catch"), known_bad=True),
         metrics.classify(metrics.load_session(str(tmp_path), "spurious"), known_bad=True),
         metrics.classify(metrics.load_session(str(tmp_path), "bad-approval"), known_bad=True),
+        metrics.classify(metrics.load_session(str(tmp_path), "false-reject"), known_bad=False),
     ]
     table = metrics.render_table(verdicts)
 
     assert metrics.TRUE_CATCH in table
     assert metrics.SPURIOUS_REJECT in table
     assert metrics.FALSE_APPROVAL in table
-    assert re.search(r"scored rejections\s+2", table), table
+    assert metrics.FALSE_REJECT in table
+    assert re.search(r"scored rejections\s+3", table), table
+    assert re.search(r"rejections seen\s+3", table), table

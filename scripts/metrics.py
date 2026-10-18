@@ -15,11 +15,21 @@ This script NEVER executes code. It only reads files and counts.
 
 Buckets
 -------
-true_catch         Rejected, and at least one rejecting signal fails on the bad
-                   tree and passes (or is absent) on the good tree.
-spurious_reject    Rejected, every signal could be evaluated, and none of them
-                   discriminates.
+true_catch         Rejected on a patch labelled known-bad, and at least one
+                   rejecting signal fails on the bad tree and passes (or is
+                   absent) on the good tree.
+spurious_reject    Rejected on a patch labelled known-bad, every signal could be
+                   evaluated, and none of them discriminates.
+false_reject       Rejected on a patch whose ground-truth label says it is GOOD.
+                   [WHY] This is decided by the LABEL, not by the discrimination
+                   table: when the candidate is itself the known-good code (B v2
+                   applies the fixed patch), every signal fires on the good tree
+                   too, so the table can only say "does not discriminate". A
+                   rejection there is simply wrong, and reading it as
+                   spurious_reject would hide a wrong verdict behind a
+                   measurement artefact.
 false_approval     Approved on a patch whose ground-truth label says it is bad.
+true_approval      Approved on a patch whose ground-truth label says it is good.
 undetermined       Rejected, but no signal could be evaluated (e.g. a legacy v0
                    session whose static findings were never recorded). Reported
                    separately so it is never silently folded into
@@ -40,7 +50,9 @@ SUPPORTED_SCHEMA_VERSION = 1
 
 TRUE_CATCH = "true_catch"
 SPURIOUS_REJECT = "spurious_reject"
+FALSE_REJECT = "false_reject"
 FALSE_APPROVAL = "false_approval"
+TRUE_APPROVAL = "true_approval"
 UNDETERMINED = "undetermined"
 APPROVED_UNLABELED = "approved_unlabeled"
 
@@ -227,14 +239,16 @@ class Verdict:
             return f"{self.signals_deciding} discriminating signal(s)"
         if self.bucket == SPURIOUS_REJECT:
             return f"all {self.signals_total} signal(s) evaluated, none discriminates"
+        if self.bucket == FALSE_REJECT:
+            return "rejected on a patch labelled known-good"
         if self.bucket == UNDETERMINED:
             if self.signals_total == 0:
                 return "no rejecting signal could be reconstructed"
             return f"all {self.signals_undecidable} signal(s) undecidable"
         if self.bucket == FALSE_APPROVAL:
             return "approved on a patch labelled known-bad"
-        if self.label is False:
-            return "approved, and the label agrees it is good"
+        if self.bucket == TRUE_APPROVAL:
+            return "approved on a patch labelled known-good"
         return "approved, no ground-truth label"
 
 
@@ -255,7 +269,13 @@ def classify(
     undecidable = [s for s in signals if s.get("discriminates") is None]
 
     if decision == "Rejected":
-        if deciding:
+        if known_bad is False:
+            # [WHY] The label decides, not the discrimination table. When the
+            # candidate IS the known-good code (B v2 applies the fixed patch),
+            # every signal fires on the good tree too, so no signal can ever
+            # discriminate — the table would call a wrong rejection "spurious".
+            bucket = FALSE_REJECT
+        elif deciding:
             bucket = TRUE_CATCH
         elif signals and not undecidable:
             bucket = SPURIOUS_REJECT
@@ -265,7 +285,7 @@ def classify(
         if known_bad is True:
             bucket = FALSE_APPROVAL
         elif known_bad is False:
-            bucket = APPROVED_UNLABELED  # approved and the label agrees
+            bucket = TRUE_APPROVAL
         else:
             bucket = APPROVED_UNLABELED
     else:
@@ -309,14 +329,20 @@ def render_table(verdicts: list[Verdict]) -> str:
     for bucket in (
         TRUE_CATCH,
         SPURIOUS_REJECT,
+        FALSE_REJECT,
         FALSE_APPROVAL,
+        TRUE_APPROVAL,
         UNDETERMINED,
         APPROVED_UNLABELED,
     ):
         count = sum(1 for verdict in verdicts if verdict.bucket == bucket)
         lines.append(f"  {bucket:<18} {count}")
     lines.append("")
-    scored = sum(1 for v in verdicts if v.bucket in (TRUE_CATCH, SPURIOUS_REJECT))
+    scored = sum(
+        1
+        for v in verdicts
+        if v.bucket in (TRUE_CATCH, SPURIOUS_REJECT, FALSE_REJECT)
+    )
     seen = sum(1 for v in verdicts if v.decision == "Rejected")
     lines.append(f"  {'scored rejections':<18} {scored}")
     lines.append(f"  {'rejections seen':<18} {seen}")
@@ -325,7 +351,10 @@ def render_table(verdicts: list[Verdict]) -> str:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Score Vanta sessions as true_catch / spurious_reject / false_approval."
+        description=(
+            "Score Vanta sessions as true_catch / spurious_reject / false_reject / "
+            "false_approval / true_approval."
+        )
     )
     parser.add_argument("--sessions-dir", default="vanta_sessions")
     parser.add_argument(
@@ -337,7 +366,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--labels",
         default=None,
-        help="JSON file mapping session_id -> {\"known_bad\": true|false} for approvals.",
+        help=(
+            "JSON file mapping session_id -> {\"known_bad\": true|false} ground "
+            "truth. Drives false_reject / false_approval / true_approval; an "
+            "unlabelled session claims nothing about approvals."
+        ),
     )
     parser.add_argument("--json", dest="json_out", default=None,
                         help="Also write the per-session detail to this file.")

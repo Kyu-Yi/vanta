@@ -997,8 +997,13 @@ pub async fn run(
         // findings are still REPORTED — the Creator sees them and the session log
         // keeps them — they just do not reject.
         let touched_paths: Vec<String> = patch_files.keys().cloned().collect();
-        let new_static_in_touched_files =
-            new_static_findings_block(&new_ruff, &new_mypy, &touched_paths);
+        // [VANTA-WHY] Item 4 of the heretic fix list: keep the NAME of every
+        // finding that blocks, not just a bool. A rejection must be able to say
+        // WHICH finding rejected the candidate — 40e84874 printed "fails 0
+        // test(s)" while the real signal was a mypy error no artifact recorded.
+        let blocking_static =
+            blocking_static_findings(&new_ruff, &new_mypy, &touched_paths);
+        let new_static_in_touched_files = !blocking_static.is_empty();
         println!("  Static: ruff_new={ruff_new}, mypy_new={mypy_new}");
         // [VANTA-WHY] The two booleans above are not enough to audit a rejection.
         // Print each NEW finding — tool, file, line, code, message — and keep it
@@ -1346,13 +1351,12 @@ pub async fn run(
             }
             if decision == GovernorDecision::Rejected {
                 println!(
-                    "  ✖ REJECTED — the candidate fails {} test(s): {}",
-                    failing_names.len(),
-                    if failing_names.is_empty() {
-                        "(classified by the repo's own suite)".to_string()
-                    } else {
-                        failing_names.join(", ")
-                    }
+                    "  ✖ REJECTED — {}",
+                    rejection_signal_message(
+                        &native_regressions,
+                        &blocking_static,
+                        &failing_names
+                    )
                 );
             }
         } else {
@@ -2129,25 +2133,69 @@ fn attempt_verdict(
     }
 }
 
-/// Does a new static finding BLOCK a review round?
+/// Name the REAL signal behind a review-mode rejection.
 ///
-/// [VANTA-WHY] Extracted from the round body so the policy is unit-testable
-/// without spawning ruff: a new finding blocks only when it sits in a file the
-/// patch touches AND is of an ERROR class — ruff `F`/`E9`, or any mypy error.
-/// A style rule (B, BLE, UP, SIM, TRY, …) in a touched file is REPORTED to the
-/// Creator and kept in the session log, but must not reject: rejecting on a nit
-/// claims the candidate is broken when it is not, and burns an attack round.
-fn new_static_findings_block(
+/// [VANTA-WHY] Item 4 of the heretic fix list. The old message counted only the
+/// generated tests and, when they all passed, printed "the candidate fails 0
+/// test(s): (classified by the repo's own suite)" — a sentence that names no
+/// signal at all, which is what 40e84874 did while the real reason was a mypy
+/// error no artifact recorded. This names the actual reason: the regressed
+/// native tests, the new static findings, and/or the generated tests that
+/// failed. Exactly one of those is present whenever the verdict is Rejected.
+fn rejection_signal_message(
+    native_regressions: &[String],
+    blocking_static: &[String],
+    failing_names: &[String],
+) -> String {
+    let mut signals: Vec<String> = Vec::new();
+    if !native_regressions.is_empty() {
+        signals.push(format!("native regression: {}", native_regressions.join(", ")));
+    }
+    if !blocking_static.is_empty() {
+        signals.push(format!(
+            "new static finding in a touched file: {}",
+            blocking_static.join("; ")
+        ));
+    }
+    if !failing_names.is_empty() {
+        signals.push(format!("failing test(s): {}", failing_names.join(", ")));
+    }
+    if signals.is_empty() {
+        "verdict=Rejected but no signal could be named — inspect the attempt's diagnostic \
+         payloads"
+            .to_string()
+    } else {
+        signals.join(" | ")
+    }
+}
+
+/// The new static findings that BLOCK a review round, rendered as evidence.
+///
+/// [VANTA-WHY] Item 4 of the heretic fix list: the rejection message must name
+/// the finding that rejected the candidate, so the boolean gate and the message
+/// come from ONE list. A finding blocks only when it sits in a file the patch
+/// touches AND is of an ERROR class — ruff `F`/`E9`, or any mypy error (its
+/// parser accepts `: error:` lines only). A style rule (B, BLE, UP, SIM, TRY, …)
+/// in a touched file is REPORTED to the Creator and kept in the session log, but
+/// must not reject: rejecting on a nit claims the candidate is broken when it is
+/// not, and burns an attack round.
+fn blocking_static_findings(
     new_ruff: &[&harness::StaticDiagnostic],
     new_mypy: &[&harness::StaticDiagnostic],
     touched: &[String],
-) -> bool {
-    new_ruff
-        .iter()
-        .any(|d| harness::ruff_is_error_class(&d.code) && harness::path_touched(&d.file, touched))
-        || new_mypy
-            .iter()
-            .any(|d| harness::path_touched(&d.file, touched))
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for d in new_ruff {
+        if harness::ruff_is_error_class(&d.code) && harness::path_touched(&d.file, touched) {
+            out.push(d.render());
+        }
+    }
+    for d in new_mypy {
+        if harness::path_touched(&d.file, touched) {
+            out.push(d.render());
+        }
+    }
+    out
 }
 
 /// Record each NEW static finding for the evidence file; return console lines.
@@ -2277,10 +2325,10 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        attempt_verdict, collapse_decision, dependency_freeze_summary_value,
-        harness_infrastructure_collapse, new_static_findings_block, patch_attempt_id_for_patch,
-        record_new_static_findings, render_committed_test_file,
-        require_clean_target_repo_for_open_pr,
+        attempt_verdict, blocking_static_findings, collapse_decision,
+        dependency_freeze_summary_value, harness_infrastructure_collapse,
+        patch_attempt_id_for_patch, record_new_static_findings, rejection_signal_message,
+        render_committed_test_file, require_clean_target_repo_for_open_pr,
         review_prompt_source_concat, stamp_transition_row, stable_patch_fingerprint,
     };
     use crate::agents::creator::SourceFile;
@@ -2479,7 +2527,7 @@ mod tests {
         let touched = vec!["calc.py".to_string()];
         let style = audit_finding("calc.py", "UP032");
         assert!(
-            !new_static_findings_block(&[&style], &[], &touched),
+            blocking_static_findings(&[&style], &[], &touched).is_empty(),
             "a style rule is reported, not a reason to reject the candidate"
         );
     }
@@ -2492,11 +2540,11 @@ mod tests {
         let e999 = audit_finding("calc.py", "E999");
         let mypy_error = audit_finding("calc.py", "return-value");
         let elsewhere = audit_finding("vendor/other.py", "F821");
-        assert!(new_static_findings_block(&[&f821], &[], &touched));
-        assert!(new_static_findings_block(&[&e999], &[], &touched));
-        assert!(new_static_findings_block(&[], &[&mypy_error], &touched));
+        assert!(!blocking_static_findings(&[&f821], &[], &touched).is_empty());
+        assert!(!blocking_static_findings(&[&e999], &[], &touched).is_empty());
+        assert!(!blocking_static_findings(&[], &[&mypy_error], &touched).is_empty());
         assert!(
-            !new_static_findings_block(&[&elsewhere], &[], &touched),
+            blocking_static_findings(&[&elsewhere], &[], &touched).is_empty(),
             "an error the patch did not introduce is not a finding about the candidate"
         );
     }
@@ -2539,6 +2587,60 @@ mod tests {
             "the console must name the exact site, got: {}",
             lines[1]
         );
+    }
+
+    /// Item 4 of the heretic fix list: the rejection message must name the REAL
+    /// signal. 40e84874 printed "the candidate fails 0 test(s): (classified by
+    /// the repo's own suite)" while the actual reason was a mypy finding.
+    #[test]
+    fn a_rejection_names_the_regressed_native_test_not_a_zero_count() {
+        let msg = rejection_signal_message(&["tests/test_batch.py::test_pads".to_string()], &[], &[]);
+        assert!(
+            msg.contains("native regression: tests/test_batch.py::test_pads"),
+            "the regressed native test must be named, got: {msg}"
+        );
+        assert!(!msg.contains("fails 0 test(s)"), "the old dead-end message is gone");
+        assert!(
+            !msg.contains("classified by the repo's own suite"),
+            "the old dead-end message is gone"
+        );
+    }
+
+    #[test]
+    fn a_rejection_names_the_new_static_finding() {
+        let msg = rejection_signal_message(
+            &[],
+            &["src/heretic/modifiers/abliteration.py:88: error: index".to_string()],
+            &[],
+        );
+        assert!(
+            msg.contains("new static finding in a touched file: src/heretic/modifiers/abliteration.py:88"),
+            "the finding that rejected the round must be named, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_rejection_names_the_failing_generated_tests() {
+        let msg = rejection_signal_message(&[], &[], &["test_keyword_rate_default".to_string()]);
+        assert!(
+            msg.contains("failing test(s): test_keyword_rate_default"),
+            "the failing generated test must be named, got: {msg}"
+        );
+    }
+
+    /// The message and the gate read the SAME list, so the finding a rejection
+    /// names is exactly the finding that rejected it.
+    #[test]
+    fn the_blocking_list_is_what_a_rejection_names() {
+        let touched = vec!["calc.py".to_string()];
+        let f821 = audit_finding("calc.py", "F821");
+        let style = audit_finding("calc.py", "UP032");
+        let elsewhere = audit_finding("vendor/other.py", "F821");
+
+        let blocking = blocking_static_findings(&[&f821, &style], &[], &touched);
+        assert_eq!(blocking.len(), 1);
+        assert!(blocking[0].contains("F821"));
+        assert!(blocking_static_findings(&[&elsewhere], &[], &touched).is_empty());
     }
 
     /// Item 2 of the heretic fix list: a patch-insensitive failure (TestDefect)

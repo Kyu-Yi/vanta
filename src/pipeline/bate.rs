@@ -185,7 +185,8 @@ pub struct BateRun {
 pub async fn run_bate(
     cfg: &LlmConfig,
     issue_text: &str,
-    original_source: &str,
+    original_execution_source: &str,
+    original_prompt_source: &str,
     tests: &[GeneratedTest],
     test_cmd: &TestCommand,
 ) -> BateRun {
@@ -198,8 +199,10 @@ pub async fn run_bate(
         // [VANTA-WHY] Spec §7 "Flaky tests" row: run the baseline twice; a test
         // that flips PASS↔FAIL between the two runs would silently corrupt
         // EIR/ECR, so it is scrapped as flaky before it can join the shared set.
-        let r1 = harness::run_single_test(original_source, &test.test_source, test_cmd).await;
-        let r2 = harness::run_single_test(original_source, &test.test_source, test_cmd).await;
+        let r1 =
+            harness::run_single_test(original_execution_source, &test.test_source, test_cmd).await;
+        let r2 =
+            harness::run_single_test(original_execution_source, &test.test_source, test_cmd).await;
         if r1 != r2 {
             scrapped_tests.push((
                 test.test_name.clone(),
@@ -213,7 +216,7 @@ pub async fn run_bate(
 
         // Layer 2: up to 3 Attacker revisions when the baseline mismatches intent.
         for revision in 0..=3 {
-            let src = original_source.to_string();
+            let src = original_execution_source.to_string();
             let test_source = current_test.test_source.clone();
             let cmd_template = test_cmd.clone();
             let outcome = validate_with_retry(
@@ -244,7 +247,7 @@ pub async fn run_bate(
                         match attacker_revise_test(
                             cfg,
                             issue_text,
-                            original_source,
+                            original_prompt_source,
                             &current_test,
                             &reason,
                         )
@@ -257,7 +260,12 @@ pub async fn run_bate(
                                 // behaviour the issue never asked for must be
                                 // demoted before it re-enters the baseline check.
                                 let (audited, relabel, record) =
-                                    audit_test_intent(cfg, issue_text, original_source, &revised)
+                                    audit_test_intent(
+                                        cfg,
+                                        issue_text,
+                                        original_prompt_source,
+                                        &revised,
+                                    )
                                         .await;
                                 if let Some(relabel) = relabel {
                                     relabel_events.push(relabel);

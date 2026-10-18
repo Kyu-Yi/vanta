@@ -21,7 +21,7 @@
 //   gatekeeper   — deterministic approve/reject
 // ============================================================================
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::io::IsTerminal;
@@ -34,7 +34,8 @@ use crate::agents::attacker::{
     audit_tests_intent,
 };
 use crate::agents::creator::{
-    CreatorRequest, creator_generate_patch, split_multi_file_patch, split_patch_into_files,
+    CreatorRequest, SourceFile, creator_generate_patch, split_multi_file_patch,
+    split_patch_into_files,
 };
 use crate::config::LlmConfig;
 use crate::core::{
@@ -548,12 +549,18 @@ pub async fn run(
         }
         let _ = any_changed; // used implicitly via all_patch_failed
 
-        // ---- Build original source string (for Attacker + BATE) ----
-        let original_concat = original_files
-            .iter()
-            .map(|(p, c)| format!("# FILE: {p}\n{c}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        // ---- Build source strings ----
+        let original_concat = build_source_concat(&original_files);
+        let review_prompt_concat = if config.patch_path.is_some() {
+            let narrowed = review_prompt_source_concat(&repo.source_files, &original_files, &patch_files);
+            if narrowed.trim().is_empty() {
+                original_concat.clone()
+            } else {
+                narrowed
+            }
+        } else {
+            original_concat.clone()
+        };
 
         // ---- 3. Attacker ----
         println!("\n▌ ATTACKER phase...");
@@ -569,7 +576,7 @@ pub async fn run(
         };
         let attacker_request = AttackerRequest {
             patch_text: patch_text.clone(),
-            original_source: original_concat.clone(),
+            original_source: review_prompt_concat.clone(),
             issue_text: attacker_issue,
             // [VANTA-WHY] Round >= 2: the Attacker is shown the probes already in
             // the shared set so it attacks somewhere new instead of re-deriving
@@ -628,7 +635,7 @@ pub async fn run(
         let (attacker_tests, initial_relabels, initial_intent_checks) = audit_tests_intent(
             &cfg,
             &repo.issue_text,
-            &original_concat,
+            &review_prompt_concat,
             &generated_tests,
         )
         .await;
@@ -699,7 +706,15 @@ pub async fn run(
         // declared the wrong intent was scrapped instead of being fixed.
         println!("\n▌ BATE: validating tests against baseline...");
         let bate_run = run_with_spinner("BATE validating tests against baseline", async {
-            run_bate(&cfg, &repo.issue_text, &original_concat, &attacker_tests, &test_cmd).await
+            run_bate(
+                &cfg,
+                &repo.issue_text,
+                &original_concat,
+                &review_prompt_concat,
+                &attacker_tests,
+                &test_cmd,
+            )
+            .await
         })
         .await;
         let bate_report = bate_run.report;
@@ -810,11 +825,7 @@ pub async fn run(
             valid_tests.len()
         );
 
-        let patched_concat = patched_files
-            .iter()
-            .map(|(p, c)| format!("# FILE: {p}\n{c}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let patched_concat = build_source_concat(&patched_files);
         let snapshot_root = debug_dir.join(format!("attempt_{}_patched_tree", attempt + 1));
         let _ = harness::write_tree_snapshot(&snapshot_root, &patched_concat);
 
@@ -943,7 +954,7 @@ pub async fn run(
                     !net_alive,
                     &patched_concat,
                     &cfg,
-                    &original_concat,
+                    &review_prompt_concat,
                     &test_cmd,
                 )
                 .await;
@@ -1454,6 +1465,216 @@ fn repo_working_tree_dirty(
     Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
+fn build_source_concat(files: &HashMap<String, String>) -> String {
+    let mut ordered: Vec<_> = files.iter().collect();
+    ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
+    ordered
+        .into_iter()
+        .map(|(path, contents)| format!("# FILE: {path}\n{contents}"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn review_prompt_source_concat(
+    repo_files: &[SourceFile],
+    original_files: &HashMap<String, String>,
+    patch_files: &HashMap<String, String>,
+) -> String {
+    let selected = select_review_prompt_paths(repo_files, patch_files);
+    let mut prompt_files = HashMap::new();
+    for path in selected {
+        if let Some(contents) = original_files.get(&path) {
+            prompt_files.insert(path, contents.clone());
+        }
+    }
+    build_source_concat(&prompt_files)
+}
+
+fn select_review_prompt_paths(
+    repo_files: &[SourceFile],
+    patch_files: &HashMap<String, String>,
+) -> BTreeSet<String> {
+    let touched_paths: BTreeSet<String> = patch_files.keys().cloned().collect();
+    if touched_paths.is_empty() {
+        return touched_paths;
+    }
+    let mut selected = touched_paths.clone();
+
+    let module_map = python_module_to_path(repo_files);
+    let source_by_path: BTreeMap<&str, &SourceFile> =
+        repo_files.iter().map(|file| (file.path.as_str(), file)).collect();
+
+    let touched_modules: BTreeSet<String> = selected
+        .iter()
+        .filter_map(|path| python_module_path(path))
+        .collect();
+
+    let mut related_paths = BTreeSet::new();
+    for path in selected.clone() {
+        if let Some(file) = source_by_path.get(path.as_str()) {
+            related_paths.extend(imported_repo_paths(&file.path, &file.contents, &module_map));
+        }
+    }
+    selected.extend(related_paths);
+
+    for file in repo_files.iter().filter(|file| is_test_path(&file.path)) {
+        let imports = imported_repo_paths(&file.path, &file.contents, &module_map);
+        if !imports.is_disjoint(&touched_paths)
+            || test_covers_modules(&file.contents, &touched_modules)
+        {
+            selected.insert(file.path.clone());
+        }
+    }
+
+    selected
+}
+
+fn python_module_to_path(repo_files: &[SourceFile]) -> BTreeMap<String, String> {
+    let mut module_map = BTreeMap::new();
+    for file in repo_files {
+        if let Some(module) = python_module_path(&file.path) {
+            module_map.insert(module, file.path.clone());
+        }
+    }
+    module_map
+}
+
+fn python_module_path(path: &str) -> Option<String> {
+    if !path.ends_with(".py") {
+        return None;
+    }
+    let trimmed = path.trim_end_matches(".py");
+    if let Some(pkg) = trimmed.strip_suffix("/__init__") {
+        return Some(pkg.replace('/', "."));
+    }
+    Some(trimmed.replace('/', "."))
+}
+
+fn is_test_path(path: &str) -> bool {
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    path.starts_with("tests/")
+        || path.contains("/tests/")
+        || file_name.starts_with("test_")
+        || file_name.ends_with("_test.py")
+}
+
+fn imported_repo_paths(
+    current_path: &str,
+    contents: &str,
+    module_map: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    let mut imported = BTreeSet::new();
+    let current_package = current_package_parts(current_path);
+
+    for raw_line in contents.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if let Some(rest) = line.strip_prefix("import ") {
+            for target in rest.split(',') {
+                let module = target
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if let Some(path) = module_map.get(module) {
+                    imported.insert(path.clone());
+                }
+            }
+            continue;
+        }
+
+        let Some(rest) = line.strip_prefix("from ") else {
+            continue;
+        };
+        let Some((module_part, names_part)) = rest.split_once(" import ") else {
+            continue;
+        };
+        let Some(base_module) = resolve_import_base(&current_package, module_part.trim()) else {
+            continue;
+        };
+        if let Some(path) = module_map.get(&base_module) {
+            imported.insert(path.clone());
+        }
+        for name in parse_imported_names(names_part) {
+            let candidate = if base_module.is_empty() {
+                name
+            } else {
+                format!("{base_module}.{name}")
+            };
+            if let Some(path) = module_map.get(&candidate) {
+                imported.insert(path.clone());
+            }
+        }
+    }
+
+    imported
+}
+
+fn current_package_parts(path: &str) -> Vec<String> {
+    let Some(module) = python_module_path(path) else {
+        return Vec::new();
+    };
+    let mut parts: Vec<String> = module.split('.').map(|part| part.to_string()).collect();
+    if !path.ends_with("__init__.py") {
+        let _ = parts.pop();
+    }
+    parts
+}
+
+fn resolve_import_base(current_package: &[String], module_part: &str) -> Option<String> {
+    let trimmed = module_part.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.starts_with('.') {
+        return Some(trimmed.to_string());
+    }
+
+    let dot_count = trimmed.chars().take_while(|c| *c == '.').count();
+    let remainder = trimmed[dot_count..].trim();
+    let levels_up = dot_count.saturating_sub(1);
+    if levels_up > current_package.len() {
+        return None;
+    }
+    let kept = &current_package[..current_package.len().saturating_sub(levels_up)];
+    let mut base = kept.join(".");
+    if !remainder.is_empty() {
+        if !base.is_empty() {
+            base.push('.');
+        }
+        base.push_str(remainder);
+    }
+    Some(base)
+}
+
+fn parse_imported_names(names_part: &str) -> Vec<String> {
+    names_part
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+        .filter_map(|name| {
+            let token = name
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches(',');
+            if token.is_empty() || token == "*" {
+                None
+            } else {
+                Some(token.to_string())
+            }
+        })
+        .collect()
+}
+
+fn test_covers_modules(test_source: &str, touched_modules: &BTreeSet<String>) -> bool {
+    touched_modules.iter().any(|module| test_source.contains(module))
+}
+
 fn dependency_freeze_summary_value(freeze: Option<&str>) -> String {
     let rendered = freeze
         .unwrap_or("")
@@ -1748,12 +1969,14 @@ mod tests {
     use super::{
         attempt_verdict, collapse_decision, dependency_freeze_summary_value,
         harness_infrastructure_collapse, patch_attempt_id_for_patch, render_committed_test_file,
-        require_clean_target_repo_for_open_pr,
+        require_clean_target_repo_for_open_pr, review_prompt_source_concat,
         stable_patch_fingerprint,
     };
+    use crate::agents::creator::SourceFile;
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{FailureClass, GovernorDecision};
     use crate::pipeline::governor::AttemptVerdict;
+    use std::collections::HashMap;
 
     #[test]
     fn first_harness_collapse_retries_once() {
@@ -1932,5 +2155,53 @@ mod tests {
     #[test]
     fn dependency_freeze_summary_value_defaults_to_none() {
         assert_eq!(dependency_freeze_summary_value(None), "none");
+    }
+
+    #[test]
+    fn review_prompt_context_includes_touched_imports_and_covering_tests() {
+        let repo_files = vec![
+            SourceFile {
+                path: "heretic/keyword_rate.py".into(),
+                contents: "from .plugin import Context\n\nclass KeywordRate:\n    pass\n".into(),
+            },
+            SourceFile {
+                path: "heretic/plugin.py".into(),
+                contents: "class Context:\n    pass\n".into(),
+            },
+            SourceFile {
+                path: "heretic/other.py".into(),
+                contents: "class Other:\n    pass\n".into(),
+            },
+            SourceFile {
+                path: "tests/test_keyword_rate.py".into(),
+                contents: "from heretic.keyword_rate import KeywordRate\nfrom heretic.plugin import Context\n\ndef test_keyword_rate():\n    assert KeywordRate is not None\n".into(),
+            },
+            SourceFile {
+                path: "tests/test_other.py".into(),
+                contents: "from heretic.other import Other\n\ndef test_other():\n    assert Other is not None\n".into(),
+            },
+        ];
+        let mut original_files = HashMap::new();
+        for file in &repo_files {
+            original_files.insert(file.path.clone(), file.contents.clone());
+        }
+
+        let rendered = review_prompt_source_concat(
+            &repo_files,
+            &original_files,
+            &HashMap::from([("heretic/keyword_rate.py".to_string(), "patched".to_string())]),
+        );
+
+        assert!(rendered.contains("# FILE: heretic/keyword_rate.py"));
+        assert!(rendered.contains("# FILE: heretic/plugin.py"));
+        assert!(rendered.contains("# FILE: tests/test_keyword_rate.py"));
+        assert!(
+            !rendered.contains("# FILE: heretic/other.py"),
+            "unrelated imports should stay out of the review prompt"
+        );
+        assert!(
+            !rendered.contains("# FILE: tests/test_other.py"),
+            "unrelated tests should stay out of the review prompt"
+        );
     }
 }

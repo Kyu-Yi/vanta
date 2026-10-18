@@ -40,7 +40,7 @@ use tracing::{debug, info, trace, warn};
 // "attacker.2.boundary-probe": `session.start` writes
 // `prompt_version=attacker=<tag>;intent_check=<tag>;...`, so the prompt NAME is
 // the key and repeating it inside the value would make the field ambiguous.
-pub const ATTACKER_PROMPT_VERSION: &str = "2.boundary-probe";
+pub const ATTACKER_PROMPT_VERSION: &str = "3.review-context-bundle";
 
 // ============================================================================
 // INTENT_AUDITOR_PROMPT_VERSION — the run-identity tag for the intent check
@@ -52,7 +52,7 @@ pub const ATTACKER_PROMPT_VERSION: &str = "2.boundary-probe";
 // requires to change. A change to THAT wording changes what a run accepts, so
 // it needs its own tag — otherwise editing the auditor would be logged as "no
 // change" because the Attacker's tag is untouched.
-pub const INTENT_AUDITOR_PROMPT_VERSION: &str = "1";
+pub const INTENT_AUDITOR_PROMPT_VERSION: &str = "2.review-context-bundle";
 
 // ============================================================================
 // AttackerRequest — input to the Attacker agent

@@ -76,3 +76,40 @@ n=5 (subprocess) + n=2 (shuru), one toy fixture. The correct reading is
 is deliberately deferred (`plans/m1_m2_implementation_plan.md` §M3-Addendum 6).
 
 A development result. **Not evidence.**
+
+## 2026-10-18 — Review-mode prompt narrowing
+
+Review mode no longer sends the whole repository to the Attacker. The Attacker,
+the intent audit and the attacker revision now receive the files the patch
+touches, the in-repo files those touched files import (one level deep), and the
+repo's existing tests that cover them. The execution tree used by BATE is
+unchanged — only the prompt context is narrowed. Without this, a large repo
+(`heretic`, ~261 KB of source) cannot fit the model context at all.
+
+Every LLM call now logs a prompt budget and fails closed if the request would
+exceed the model context (`VANTA_LLM_CONTEXT_TOKENS`, raised to 131072 for the
+local server).
+
+Regression check on Shuru (`review_bad` x5, `review_good` x5), same toy fixture:
+
+| Binary | Scenario | Result |
+|---|---|---|
+| `vanta_m3` | review_bad | rejected 5/5 |
+| `vanta_m3` | review_good | approved 5/5 |
+| `vanta_m2` | review_bad | rejected 3/5 |
+
+**Attack depth matters.** M3 (3 attack rounds) rejected 5/5; M2 (1 round)
+rejected 3/5 — same patch, same model, same backend. Both M2 approvals came
+from a round-1 attack set that contained no test at the 500 boundary at all
+(`1000` / `499` / `1001`). M2 was never 5/5 on this scenario in earlier batches
+either (1/1, then 0/1), so this is the one-round baseline behaving as expected,
+not a regression from the narrowing. M3 is the binding regression; M2 is kept
+as the contrast baseline.
+
+A development result. **Not evidence.**
+
+## Follow-up
+
+- [ ] Narrow the Creator context before the BugsInPy loader lands: pass the
+  failing file, traceback-referenced files, and one-level in-repo imports
+  instead of the whole repository on large projects like pandas or keras.

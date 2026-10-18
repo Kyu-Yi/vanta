@@ -115,6 +115,10 @@ pub struct LlmConfig {
     // [SYNTAX] retry_attempts: u32 = max structured_call_with_retry attempts.
     // Default: 3. Per Spec §1 reliability requirements (3 retry budget).
     pub retry_attempts: u32,
+
+    // [VANTA-WHY] Prompt-budget preflight needs the model's total context
+    // window so Vanta can fail before sending an oversized request.
+    pub context_window_tokens: u32,
 }
 
 // ----------------------------------------------------------------------------
@@ -165,6 +169,10 @@ impl Default for LlmConfig {
 
             // Spec §1: 3-attempt retry budget for structured LLM calls.
             retry_attempts: 3,
+
+            // Default to the current llama-server preset unless the user
+            // overrides it in the environment.
+            context_window_tokens: 65_536,
         }
     }
 }
@@ -197,8 +205,9 @@ impl fmt::Display for LlmConfig {
             model          : {}\n  \
             api_key        : {}\n  \
             request_timeout: {}s\n  \
-            retry_attempts : {}",
-            self.base_url, self.model_id, key_display, self.request_timeout_secs, self.retry_attempts
+            retry_attempts : {}\n  \
+            context_window : {}",
+            self.base_url, self.model_id, key_display, self.request_timeout_secs, self.retry_attempts, self.context_window_tokens
         )
     }
 }
@@ -327,6 +336,28 @@ impl LlmConfig {
             }
         }
 
+        match env::var("VANTA_LLM_CONTEXT_TOKENS") {
+            Ok(val) if !val.trim().is_empty() => {
+                let parsed: u32 = val.trim().parse::<u32>().map_err(|e| {
+                    format!(
+                        "CONFIG_ERROR: VANTA_LLM_CONTEXT_TOKENS='{}' not a valid positive integer: {e}",
+                        val.trim()
+                    )
+                })?;
+                if parsed == 0 {
+                    return Err(
+                        "CONFIG_ERROR: VANTA_LLM_CONTEXT_TOKENS must be > 0.".to_string()
+                    );
+                }
+                cfg.context_window_tokens = parsed;
+            }
+            Ok(_) => { /* keep default */ }
+            Err(env::VarError::NotPresent) => { /* keep default */ }
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err("CONFIG_ERROR: VANTA_LLM_CONTEXT_TOKENS env var contained non-UTF-8 bytes.".to_string());
+            }
+        }
+
         Ok(cfg)
     }
 
@@ -383,6 +414,7 @@ mod tests {
         assert_eq!(d.model_id, "qwen3.8-27b");
         assert!(d.api_key.is_none(), "default must be no-auth local mode");
         assert_eq!(d.request_timeout_secs, 600);
+        assert_eq!(d.context_window_tokens, 65_536);
     }
 
     #[test]
@@ -423,5 +455,17 @@ mod tests {
                    "http://127.0.0.1:8080/v1/chat/completions");
         assert!(!d.chat_completions_url().contains("//chat"),
             "URL has double slash: {}", d.chat_completions_url());
+    }
+
+    #[test]
+    fn test_context_window_tokens_from_env() {
+        unsafe {
+            env::set_var("VANTA_LLM_CONTEXT_TOKENS", "131072");
+        }
+        let cfg = LlmConfig::from_env().unwrap();
+        assert_eq!(cfg.context_window_tokens, 131_072);
+        unsafe {
+            env::remove_var("VANTA_LLM_CONTEXT_TOKENS");
+        }
     }
 }

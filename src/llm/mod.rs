@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::Instant;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 // Re-export the agent response types so bootstrap can use them too.
 pub use crate::agents::attacker::{AttackerResponse, AttackerTestCase};
@@ -94,6 +94,83 @@ pub fn strip_markdown_fences(s: &str) -> &str {
     let s = s.strip_prefix("```").unwrap_or(s).trim_start();
     let s = s.strip_suffix("```").unwrap_or(s).trim_end();
     s
+}
+
+const CHAT_OVERHEAD_TOKENS: u32 = 256;
+
+fn render_messages_for_token_estimate(messages: &[Value]) -> String {
+    messages
+        .iter()
+        .map(|message| {
+            let role = message["role"].as_str().unwrap_or("unknown");
+            let content = message["content"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| message["content"].to_string());
+            format!("<{role}>\n{content}\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn conservative_token_estimate(text: &str) -> u32 {
+    let bytes = text.as_bytes().len() as u32;
+    if bytes == 0 { 0 } else { bytes / 3 + u32::from(bytes % 3 != 0) }
+}
+
+fn context_budget_exceeded(
+    prompt_tokens: u32,
+    requested_output_tokens: u32,
+    context_window_tokens: u32,
+) -> bool {
+    prompt_tokens
+        .saturating_add(requested_output_tokens)
+        .saturating_add(CHAT_OVERHEAD_TOKENS)
+        > context_window_tokens
+}
+
+fn tokenize_url_candidates(cfg: &LlmConfig) -> Vec<String> {
+    let base = cfg.base_url.trim_end_matches('/');
+    let mut urls = Vec::new();
+    if let Some(root) = base.strip_suffix("/v1") {
+        urls.push(format!("{root}/tokenize"));
+    }
+    urls.push(format!("{base}/tokenize"));
+    urls.dedup();
+    urls
+}
+
+async fn tokenize_via_server(
+    client: &reqwest::Client,
+    cfg: &LlmConfig,
+    text: &str,
+) -> Option<u32> {
+    for url in tokenize_url_candidates(cfg) {
+        let Ok(resp) = client
+            .post(&url)
+            .json(&json!({ "content": text }))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(body) = resp.json::<Value>().await else {
+            continue;
+        };
+        if let Some(tokens) = body["tokens"].as_array() {
+            return Some(tokens.len() as u32);
+        }
+        if let Some(count) = body["count"].as_u64() {
+            return Some(count as u32);
+        }
+        if let Some(count) = body["token_count"].as_u64() {
+            return Some(count as u32);
+        }
+    }
+    None
 }
 
 // ============================================================================
@@ -235,6 +312,45 @@ pub async fn post_chat(
     }
     let full_body = Value::Object(full_body);
 
+    let requested_output_tokens = full_body["max_tokens"].as_u64().unwrap_or(16_384) as u32;
+    let prompt_render = render_messages_for_token_estimate(&messages);
+    let estimate = conservative_token_estimate(&prompt_render);
+    let mut prompt_tokens = estimate;
+    let mut token_source = "estimate";
+    // [VANTA-WHY] Ask the server for an exact count only when the conservative
+    // estimate is already about to reject. The /tokenize probe re-sends the whole
+    // prompt — exactly the cost the narrowed review context exists to avoid — so
+    // it must never run on the common path. This keeps the guard fail-closed
+    // (the estimate over-counts) while still rescuing a borderline-but-fitting
+    // request that the estimate would have refused.
+    if context_budget_exceeded(estimate, requested_output_tokens, cfg.context_window_tokens) {
+        if let Some(exact) = tokenize_via_server(client, cfg, &prompt_render).await {
+            prompt_tokens = exact;
+            token_source = "llama-server";
+        }
+    }
+    info!(
+        prompt_tokens,
+        requested_output_tokens,
+        context_window_tokens = cfg.context_window_tokens,
+        token_source,
+        "llm prompt budget"
+    );
+    if context_budget_exceeded(
+        prompt_tokens,
+        requested_output_tokens,
+        cfg.context_window_tokens,
+    ) {
+        return Err(format!(
+            "Prompt would exceed model context: prompt_tokens={} + max_tokens={} + overhead={} > context_window={}",
+            prompt_tokens,
+            requested_output_tokens,
+            CHAT_OVERHEAD_TOKENS,
+            cfg.context_window_tokens,
+        )
+        .into());
+    }
+
     let t = Instant::now();
     let resp = client.post(&url).json(&full_body).send().await
         .map_err(|e| format!("HTTP POST to {url} FAILED: {e}"))?;
@@ -356,7 +472,10 @@ where
 
 #[cfg(test)]
 mod _cleaning_tests {
-    use super::{extract_first_json_object, extract_json_candidate, strip_markdown_fences};
+    use super::{
+        context_budget_exceeded, conservative_token_estimate, extract_first_json_object,
+        extract_json_candidate, strip_markdown_fences,
+    };
 
     #[test]
     fn strips_all_fence_variants() {
@@ -393,5 +512,19 @@ mod _cleaning_tests {
     #[test]
     fn pipeline_rejects_non_object() {
         assert!(extract_json_candidate("just text").is_err());
+    }
+
+    #[test]
+    fn conservative_token_estimate_grows_with_input() {
+        assert!(
+            conservative_token_estimate("a b c d e f g h")
+                > conservative_token_estimate("a b")
+        );
+    }
+
+    #[test]
+    fn context_budget_exceeded_counts_prompt_output_and_overhead() {
+        assert!(context_budget_exceeded(60_000, 6_000, 65_536));
+        assert!(!context_budget_exceeded(20_000, 2_000, 65_536));
     }
 }

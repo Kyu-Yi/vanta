@@ -1,6 +1,32 @@
 {
-  "23999eea-da87-4688-a72f-01b7cfc57e50": {"known_bad": true},
-  "2b54cf32-e419-4bba-a006-d43c60292328": {"known_bad": true},
-  "c3f9df7b-471e-4ecf-b818-c3f6ada1038d": {"known_bad": false},
-  "f2fa1347-5012-4123-97e5-11eacbc68499": {"known_bad": false}
+  "23999eea-da87-4688-a72f-01b7cfc57e50": {
+    "known_bad": true
+  },
+  "2b54cf32-e419-4bba-a006-d43c60292328": {
+    "known_bad": true
+  },
+  "c3f9df7b-471e-4ecf-b818-c3f6ada1038d": {
+    "known_bad": false
+  },
+  "f2fa1347-5012-4123-97e5-11eacbc68499": {
+    "known_bad": false
+  },
+  "812e1c1e-f70a-44c4-908b-a70c3d6bd952": {
+    "known_bad": true
+  },
+  "0b0b9c93-9b57-4545-a991-0e38a664c9af": {
+    "known_bad": false
+  },
+  "a35207d0-8238-4396-9845-b6af8a8af69c": {
+    "known_bad": true
+  },
+  "2ae11c8a-c012-4d92-bc42-2fde240a3eaf": {
+    "known_bad": false
+  },
+  "e4c73c68-c68c-4557-9320-25045fe270cc": {
+    "known_bad": false
+  },
+  "f18c50af-1713-49ec-8df9-1a6ec0bd0b8c": {
+    "known_bad": true
+  }
 }

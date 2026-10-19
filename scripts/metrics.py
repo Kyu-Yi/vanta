@@ -266,6 +266,15 @@ def discover_sessions(sessions_dir: str) -> list[str]:
 # layer and this script all apply the counting rule to the same
 # `transitions.jsonl`. `counts_toward_metrics` in `src/core/mod.rs` is the other
 # half (the failure-class gate) and this is its mirror.
+#
+# [WHY] The rates are CONDITIONAL on the row's state at N, exactly as in Rust:
+#   ECR = rows Failed at N that Pass at N+1 / rows Failed at N
+#   EIR = rows Passed at N that Fail at N+1 / rows Passed at N
+# Per row instead (divide by every countable row) the denominator becomes the
+# size of the repo's own test suite, so 4d55123d's single native fix would read
+# 1/5 and a BugsInPy repo with hundreds of native tests would score ~0.1% for a
+# real repair. `complete` survives as the run's churn count, not as a rate
+# denominator.
 
 # [WHY] The three sources the breakdown is reported over. A source the file adds
 # later shows up on its own rather than being folded into AttackerGenerated.
@@ -305,11 +314,27 @@ def is_countable_patch_transition(row: dict[str, Any]) -> bool:
     return frm != to
 
 
+# [WHY] One counter set per scope (the totals and each source), so the totals can
+# never disagree with the breakdown. `ecr_denominator` counts rows FAILING at N,
+# `eir_denominator` counts rows PASSING at N, and `complete` counts every
+# countable row (churn).
+_EMPTY_COUNTERS = {
+    "ecr": 0,
+    "eir": 0,
+    "ecr_denominator": 0,
+    "eir_denominator": 0,
+    "complete": 0,
+}
+
+
 def compute_ecr_eir(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Combined ECR/EIR plus the per-source breakdown over transition rows."""
-    complete = 0
-    ecr = 0
-    eir = 0
+    """Combined CONDITIONAL ECR/EIR plus the per-source breakdown.
+
+    ECR = F->P / rows failing at N; EIR = P->F / rows passing at N. A row whose
+    state at N is `Error` joins neither denominator: it was neither passing nor
+    failing, so it could neither be fixed nor broken.
+    """
+    total = dict(_EMPTY_COUNTERS)
     per_source: dict[str, dict[str, int]] = {}
     for row in rows:
         if not is_countable_patch_transition(row):
@@ -321,45 +346,43 @@ def compute_ecr_eir(rows: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         if not _countable_side(row.get("to_result"), row.get("to_failure_class"), source):
             continue
-        bucket = per_source.setdefault(source, {"ecr": 0, "eir": 0, "complete": 0})
-        complete += 1
-        bucket["complete"] += 1
-        pair = (row.get("from_result"), row.get("to_result"))
-        if pair == ("Failed", "Passed"):
-            ecr += 1
-            bucket["ecr"] += 1
-        elif pair == ("Passed", "Failed"):
-            eir += 1
-            bucket["eir"] += 1
-    return {
-        "ecr": ecr,
-        "eir": eir,
-        "complete": complete,
-        "rows_total": len(rows),
-        "per_source": per_source,
-    }
+        bucket = per_source.setdefault(source, dict(_EMPTY_COUNTERS))
+        from_result = row.get("from_result")
+        pair = (from_result, row.get("to_result"))
+        for counters in (total, bucket):
+            counters["complete"] += 1
+            if from_result == "Failed":
+                counters["ecr_denominator"] += 1
+            elif from_result == "Passed":
+                counters["eir_denominator"] += 1
+            if pair == ("Failed", "Passed"):
+                counters["ecr"] += 1
+            elif pair == ("Passed", "Failed"):
+                counters["eir"] += 1
+    return {**total, "rows_total": len(rows), "per_source": per_source}
 
 
-def rate_text(count: int, complete: int) -> str:
+def rate_text(count: int, denominator: int) -> str:
     """`count/denominator (pct%)`, or `n/a` when the denominator is zero.
 
     [WHY] "No countable transition" and "every countable transition was
     uncorrected" are opposite claims about a run; `0.00%` states the second.
-    `n/a` states the first.
+    `n/a` states the first. The denominator is the CONDITIONAL one
+    (`ecr_denominator` / `eir_denominator`), never `complete`.
     """
-    if complete == 0:
+    if denominator == 0:
         return "n/a"
-    return f"{count}/{complete} ({count / complete * 100:.2f}%)"
+    return f"{count}/{denominator} ({count / denominator * 100:.2f}%)"
 
 
 def source_text(per_source: dict[str, dict[str, int]]) -> str:
     """`AttackerGenerated[ECR=… EIR=…] Native[…] Static[…]`."""
     parts = []
     for name in SOURCES:
-        bucket = per_source.get(name) or {"ecr": 0, "eir": 0, "complete": 0}
+        bucket = per_source.get(name) or _EMPTY_COUNTERS
         parts.append(
-            f"{name}[ECR={rate_text(bucket['ecr'], bucket['complete'])} "
-            f"EIR={rate_text(bucket['eir'], bucket['complete'])}]"
+            f"{name}[ECR={rate_text(bucket.get('ecr', 0), bucket.get('ecr_denominator', 0))} "
+            f"EIR={rate_text(bucket.get('eir', 0), bucket.get('eir_denominator', 0))}]"
         )
     return " ".join(parts)
 
@@ -519,31 +542,34 @@ def render_metrics(verdicts: list[Verdict]) -> str:
     repository's own suite proved. A zero denominator prints `n/a`, never
     `0.00%`.
     """
-    lines = ["", "ECR/EIR (over transition rows; n/a = no countable transition)"]
+    lines = [
+        "",
+        "ECR/EIR (conditional on the state at N; n/a = no such row)",
+    ]
     header = f"  {'SESSION':<10} {'ECR':<20} {'EIR':<20} BY SOURCE"
     lines.append(header)
     lines.append("  " + "-" * (len(header) - 2))
-    pooled = {"ecr": 0, "eir": 0, "complete": 0}
+    pooled = dict(_EMPTY_COUNTERS)
     pooled_sources: dict[str, dict[str, int]] = {}
     for verdict in verdicts:
         metrics_ = verdict.metrics or {}
         per_source = metrics_.get("per_source") or {}
         lines.append(
             f"  {verdict.session_id[:8]:<10} "
-            f"{rate_text(metrics_.get('ecr', 0), metrics_.get('complete', 0)):<20} "
-            f"{rate_text(metrics_.get('eir', 0), metrics_.get('complete', 0)):<20} "
+            f"{rate_text(metrics_.get('ecr', 0), metrics_.get('ecr_denominator', 0)):<20} "
+            f"{rate_text(metrics_.get('eir', 0), metrics_.get('eir_denominator', 0)):<20} "
             f"{source_text(per_source)}"
         )
         for key in pooled:
             pooled[key] += metrics_.get(key, 0)
         for name, bucket in per_source.items():
-            acc = pooled_sources.setdefault(name, {"ecr": 0, "eir": 0, "complete": 0})
+            acc = pooled_sources.setdefault(name, dict(_EMPTY_COUNTERS))
             for key in acc:
                 acc[key] += bucket.get(key, 0)
     lines.append(
         f"  {'POOLED':<10} "
-        f"{rate_text(pooled['ecr'], pooled['complete']):<20} "
-        f"{rate_text(pooled['eir'], pooled['complete']):<20} "
+        f"{rate_text(pooled['ecr'], pooled['ecr_denominator']):<20} "
+        f"{rate_text(pooled['eir'], pooled['eir_denominator']):<20} "
         f"{source_text(pooled_sources)}"
     )
     return "\n".join(lines)

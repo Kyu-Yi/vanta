@@ -1503,6 +1503,12 @@ pub async fn run(
         } else {
             // The SAME function the M5 analysis layer runs over the on-disk rows,
             // so the live number and the paper's number cannot drift apart.
+            // [VANTA-WHY] CONDITIONAL ECR/EIR: ECR = rows Failed at N that Pass
+            // at N+1 ÷ rows Failed at N; EIR = rows Passed at N that Fail at N+1
+            // ÷ rows Passed at N. The old per-row divisor (every countable row)
+            // made ECR shrink with the size of the repo's suite — session
+            // 4d55123d read ECR(Native)=1/5 for one fix in five native tests,
+            // and an 800-test BugsInPy repo would read ~0.1% for a real fix.
             // [VANTA-WHY] Combined AND per source: a pooled ECR hides WHICH
             // evidence moved it, and the whole point of counting native rows is
             // that session 4d55123d's correction was a repo test, not an
@@ -1650,6 +1656,11 @@ pub async fn run(
     // that passes on the first candidate has no N→N+1 transition, so ECR/EIR
     // cannot see it by construction. Reporting it separately tells a reader what
     // share of defects the rates actually cover.
+    //
+    // [VANTA-WHY] The rates printed here are CONDITIONAL: ECR = rows Failed at N
+    // that Pass at N+1 ÷ rows Failed at N, EIR = rows Passed at N that Fail at
+    // N+1 ÷ rows Passed at N. `metric_rows.len()` is the churn count (countable
+    // rows observed), NOT either denominator.
     //
     // [VANTA-WHY] The "outside ECR/EIR by construction" claim belongs ONLY to a
     // run that produced NO transition rows. Session 4d55123d wrote three

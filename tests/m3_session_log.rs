@@ -2793,13 +2793,22 @@ fn a_native_regression_fixed_on_the_next_attempt_counts_as_a_correction() {
         "ECR(Native) must count the correction the run actually made"
     );
     assert_eq!(
+        snap.native.ecr_denominator, 1,
+        "ECR is conditional: the one native test failing at N is its denominator"
+    );
+    assert_eq!(
+        snap.native.eir_denominator, 0,
+        "no native test was passing at N, so EIR(Native) has no denominator"
+    );
+    assert_eq!(
         snap.native.complete, 1,
-        "the native denominator is the one test that ran on both attempts"
+        "the Native row count is the churn number, separate from the rate denominators"
     );
     assert_eq!(
         snap.ecr_count, 1,
         "the correction must appear in the combined ECR, not only per source"
     );
+    assert_eq!(snap.ecr_denominator, 1);
     assert_eq!(
         snap.complete, 2,
         "the Attacker row (Passed->Passed) and the Native row are both countable"
@@ -2811,12 +2820,17 @@ fn a_native_regression_fixed_on_the_next_attempt_counts_as_a_correction() {
         "the run wrote transition rows, so the FINAL line must not claim none; got {stdout}"
     );
     assert!(
-        stdout.contains("ECR=1/2 (50.00%)"),
-        "the combined ECR must show the one correction over two countable rows; got {stdout}"
+        stdout.contains(
+            "attempts_run=2 fixed_at_attempt_1=false — ECR=1/1 (100.00%) EIR=0/1 (0.00%) \
+             over 2 transition row(s)"
+        ),
+        "combined ECR is conditional: the one row failing at N was fixed, so 1/1 — the \
+         Attacker bystander belongs to EIR's denominator and must not dilute ECR; got {stdout}"
     );
     assert!(
-        stdout.contains("Native[ECR=1/1 (100.00%)"),
-        "the per-source line must attribute the correction to the Native suite; got {stdout}"
+        stdout.contains("Native[ECR=1/1 (100.00%) EIR=n/a]"),
+        "the per-source line must attribute the correction to the Native suite, with \
+         no invented EIR denominator; got {stdout}"
     );
 
     // Evidence file records each attempt's native regressions under a clear key.
@@ -2900,14 +2914,23 @@ fn a_native_test_broken_on_the_next_attempt_counts_as_an_introduced_error() {
         snap.native.eir_count, 1,
         "EIR(Native) must count the newly broken repo test"
     );
+    assert_eq!(
+        snap.native.eir_denominator, 1,
+        "EIR is conditional: the one native test PASSING at N is its denominator"
+    );
+    assert_eq!(
+        snap.native.ecr_denominator, 0,
+        "nothing was failing at N under the Native source, so ECR(Native) is n/a"
+    );
     assert_eq!(snap.native.complete, 1);
     assert_eq!(
         snap.eir_count, 1,
         "the break must appear in the combined EIR, not only per source"
     );
     assert!(
-        stdout.contains("Native[ECR=0/1 (0.00%) EIR=1/1 (100.00%)]"),
-        "the per-source line must attribute the break to the Native suite; got {stdout}"
+        stdout.contains("Native[ECR=n/a EIR=1/1 (100.00%)]"),
+        "the per-source line must attribute the break to the Native suite, and ECR must \
+         read n/a rather than 0.00%; got {stdout}"
     );
 }
 

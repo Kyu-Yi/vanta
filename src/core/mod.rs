@@ -158,8 +158,8 @@ pub fn is_logic_failure(class: &Option<FailureClass>) -> bool {
 ///   failure class is Logic. An Infrastructure/Static/Unknown `Error` still
 ///   counts as a failing side, so it is excluded too;
 /// - an unchanged all-pass result carries no attribution, so it stays
-///   COUNTABLE — it remains in the denominator to keep the rate comparable
-///   across runs.
+///   COUNTABLE — under the CONDITIONAL definition below it joins EIR's
+///   denominator (the row WAS passing at N) and never ECR's.
 ///
 /// [VANTA-WHY] `source` is the ONE class that reopens the exclusion, and only
 /// for itself. `FailureClass::Static` stays uncountable for Attacker tests (an
@@ -644,11 +644,37 @@ impl AttemptTransition {
 // ============================================================================
 // EcrEirSnapshot — counted ECR/EIR over a set of complete transitions
 // ============================================================================
+//
+// [VANTA-WHY] The rates are CONDITIONAL on the state at N, not a share of every
+// observed row:
+//
+//   ECR = rows Failed at N that Pass at N+1  ÷  rows Failed at N
+//   EIR = rows Passed at N that Fail at N+1  ÷  rows Passed at N
+//
+// The per-row alternative — divide by every countable row — answers a different
+// and much weaker question, "what share of all observed tests changed in a good
+// way", and its denominator is the SIZE OF THE SUITE. Session 4d55123d fixed one
+// native regression among five native tests, so dividing by every row scores
+// ECR(Native) = 1/5; a BugsInPy repo with 800 native tests would score ~0.1%
+// for the one fix that mattered. That measures the repository, not the repair,
+// and makes two repos incomparable. Conditional gives 1/1 in both.
+//
+// `complete` is kept because it describes the run's overall CHURN — how much of
+// the observed suite moved at all. It is deliberately NOT either rate's
+// denominator.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EcrEirSnapshot {
-    pub ecr_count: usize,   // fail -> pass
-    pub eir_count: usize,   // pass -> fail
-    pub complete: usize,    // number of complete transitions observed
+    pub ecr_count: usize, // rows Failed at N that Pass at N+1
+    pub eir_count: usize, // rows Passed at N that Fail at N+1
+    // [VANTA-WHY] The two CONDITIONAL denominators. A row belongs to at most
+    // one of them — its state at N is Failed, Passed, or (for an Error) neither,
+    // which moves no rate at all — so neither rate may be read off the other's
+    // denominator.
+    #[serde(default)]
+    pub ecr_denominator: usize, // rows Failed at N
+    #[serde(default)]
+    pub eir_denominator: usize, // rows Passed at N
+    pub complete: usize, // countable rows observed (churn; not a rate denominator)
     // [VANTA-WHY] Complete transitions dropped because a failure involved was
     // not Logic-class. Reported rather than silently discarded so a run that
     // excluded most of its evidence is visible instead of looking precise.
@@ -673,20 +699,50 @@ pub struct EcrEirSnapshot {
 pub struct SourceBreakdown {
     pub ecr_count: usize,
     pub eir_count: usize,
+    #[serde(default)]
+    pub ecr_denominator: usize,
+    #[serde(default)]
+    pub eir_denominator: usize,
     pub complete: usize,
     #[serde(default)]
     pub excluded_non_logic: usize,
 }
 
+impl SourceBreakdown {
+    /// Conditional ECR for this source, e.g. `1/1 (100.00%)` or `n/a`.
+    pub fn ecr_text(&self) -> String {
+        EcrEirSnapshot::render_rate(self.ecr_count, self.ecr_denominator)
+    }
+
+    /// Conditional EIR for this source, e.g. `0/4 (0.00%)` or `n/a`.
+    pub fn eir_text(&self) -> String {
+        EcrEirSnapshot::render_rate(self.eir_count, self.eir_denominator)
+    }
+}
+
 impl EcrEirSnapshot {
     pub fn ecr_rate(&self) -> f64 {
-        if self.complete == 0 { 0.0 } else { self.ecr_count as f64 / self.complete as f64 }
+        if self.ecr_denominator == 0 {
+            0.0
+        } else {
+            self.ecr_count as f64 / self.ecr_denominator as f64
+        }
     }
     pub fn eir_rate(&self) -> f64 {
-        if self.complete == 0 { 0.0 } else { self.eir_count as f64 / self.complete as f64 }
+        if self.eir_denominator == 0 {
+            0.0
+        } else {
+            self.eir_count as f64 / self.eir_denominator as f64
+        }
     }
 
     /// Record one countable row in the totals AND in its source's breakdown.
+    ///
+    /// The row's state at N decides which denominator it joins — Failed joins
+    /// ECR's, Passed joins EIR's, an Error joins neither — and the (from, to)
+    /// pair decides whether it is a numerator. Both rates therefore stay
+    /// conditional on what was broken / passing at N, whatever the size of the
+    /// suite that produced the rows.
     pub fn record(&mut self, source: &EvidenceSource, from: &TestResult, to: &TestResult) {
         self.complete += 1;
         let breakdown = match source {
@@ -695,6 +751,17 @@ impl EcrEirSnapshot {
             _ => &mut self.attacker_generated,
         };
         breakdown.complete += 1;
+        match from {
+            TestResult::Failed => {
+                self.ecr_denominator += 1;
+                breakdown.ecr_denominator += 1;
+            }
+            TestResult::Passed => {
+                self.eir_denominator += 1;
+                breakdown.eir_denominator += 1;
+            }
+            TestResult::Error => {}
+        }
         match (from, to) {
             (TestResult::Failed, TestResult::Passed) => {
                 self.ecr_count += 1;
@@ -725,31 +792,34 @@ impl EcrEirSnapshot {
     /// transitions were countable" and "every countable transition was
     /// uncorrected" are opposite claims about a run, and a rate of 0.00% states
     /// the second one. `n/a` states the first.
-    pub fn render_rate(count: usize, complete: usize) -> String {
-        if complete == 0 {
+    ///
+    /// The denominator is the CONDITIONAL one (`ecr_denominator` /
+    /// `eir_denominator`), never `complete`: dividing by every observed row
+    /// would let the size of the repo's test suite decide the rate.
+    pub fn render_rate(count: usize, denominator: usize) -> String {
+        if denominator == 0 {
             "n/a".to_string()
         } else {
-            format!("{count}/{complete} ({:.2}%)", count as f64 / complete as f64 * 100.0)
+            format!(
+                "{count}/{denominator} ({:.2}%)",
+                count as f64 / denominator as f64 * 100.0
+            )
         }
     }
 
-    /// Combined ECR, e.g. `1/6 (16.67%)` or `n/a`.
+    /// Combined ECR, e.g. `1/1 (100.00%)` or `n/a`.
     pub fn ecr_text(&self) -> String {
-        Self::render_rate(self.ecr_count, self.complete)
+        Self::render_rate(self.ecr_count, self.ecr_denominator)
     }
 
-    /// Combined EIR, e.g. `1/6 (16.67%)` or `n/a`.
+    /// Combined EIR, e.g. `0/4 (0.00%)` or `n/a`.
     pub fn eir_text(&self) -> String {
-        Self::render_rate(self.eir_count, self.complete)
+        Self::render_rate(self.eir_count, self.eir_denominator)
     }
 
-    /// ECR and EIR for one source, e.g. `ECR=1/1 (100.00%) EIR=n/a`.
+    /// ECR and EIR for one source, e.g. `ECR=1/1 (100.00%) EIR=0/4 (0.00%)`.
     fn source_text(breakdown: &SourceBreakdown) -> String {
-        format!(
-            "ECR={} EIR={}",
-            Self::render_rate(breakdown.ecr_count, breakdown.complete),
-            Self::render_rate(breakdown.eir_count, breakdown.complete)
-        )
+        format!("ECR={} EIR={}", breakdown.ecr_text(), breakdown.eir_text())
     }
 
     /// The same metric per evidence source, so a pooled number can be read
@@ -935,7 +1005,8 @@ mod tests {
         );
     }
 
-    /// The per-source breakdown is additive to the totals.
+    /// The per-source breakdown is additive to the totals, and each rate's
+    /// denominator is the row's state at N — not the row count.
     #[test]
     fn the_source_breakdown_adds_up_to_the_totals() {
         let mut snap = EcrEirSnapshot::default();
@@ -952,14 +1023,65 @@ mod tests {
         assert_eq!(snap.ecr_count, 1);
         assert_eq!(snap.eir_count, 1);
         assert_eq!(snap.excluded_non_logic, 1);
+        assert_eq!(
+            snap.ecr_denominator, 1,
+            "only the Native row was FAILING at N, and it is the only ECR denominator"
+        );
+        assert_eq!(
+            snap.eir_denominator, 2,
+            "the Attacker and Static rows were PASSING at N, so they form EIR's denominator"
+        );
         assert_eq!(snap.attacker_generated.complete, 1);
         assert_eq!(snap.native.ecr_count, 1);
         assert_eq!(snap.native.complete, 1);
+        assert_eq!(snap.native.ecr_denominator, 1);
+        assert_eq!(
+            snap.native.eir_denominator, 0,
+            "nothing was passing at N under the Native source, so EIR(Native) is n/a"
+        );
         assert_eq!(snap.static_findings.eir_count, 1);
         assert_eq!(snap.static_findings.complete, 1);
+        assert_eq!(snap.static_findings.eir_denominator, 1);
         assert_eq!(
             snap.native.complete + snap.static_findings.complete + snap.attacker_generated.complete,
             snap.complete
         );
+    }
+
+    /// A row whose `from` side is an Error belongs to NEITHER conditional
+    /// denominator: it was not passing at N and it was not failing at N, so it
+    /// can neither be fixed nor broken.
+    #[test]
+    fn an_error_at_n_joins_neither_conditional_denominator() {
+        let mut snap = EcrEirSnapshot::default();
+        snap.record(&EvidenceSource::Native, &TestResult::Error, &TestResult::Passed);
+
+        assert_eq!(snap.complete, 1, "it is still a countable, observed row");
+        assert_eq!(snap.ecr_count, 0);
+        assert_eq!(snap.eir_count, 0);
+        assert_eq!(snap.ecr_denominator, 0);
+        assert_eq!(snap.eir_denominator, 0);
+        assert_eq!(snap.ecr_text(), "n/a");
+        assert_eq!(snap.eir_text(), "n/a");
+    }
+
+    /// The suite size must not move ECR: the same single fix scores `1/1`
+    /// whether four other tests kept passing or eight hundred did.
+    #[test]
+    fn a_fix_scores_the_same_whatever_else_the_suite_contains() {
+        let snapshot = |bystanders: usize| {
+            let mut snap = EcrEirSnapshot::default();
+            snap.record(&EvidenceSource::Native, &TestResult::Failed, &TestResult::Passed);
+            for _ in 0..bystanders {
+                snap.record(&EvidenceSource::Native, &TestResult::Passed, &TestResult::Passed);
+            }
+            snap
+        };
+
+        assert_eq!(snapshot(4).native.ecr_text(), "1/1 (100.00%)");
+        assert_eq!(snapshot(800).native.ecr_text(), "1/1 (100.00%)");
+        // ... while churn keeps growing, which is what `complete` is for.
+        assert_eq!(snapshot(4).native.complete, 5);
+        assert_eq!(snapshot(800).native.complete, 801);
     }
 }

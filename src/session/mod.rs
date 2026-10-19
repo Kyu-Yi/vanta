@@ -306,6 +306,18 @@ impl TransitionRow {
 /// fail->pass is ECR and pass->fail is EIR. Review rounds, censored holes, and
 /// non-countable transitions are excluded here, at calculation time.
 ///
+/// [VANTA-WHY] The rates are CONDITIONAL on the row's state at N:
+///
+///   ECR = rows Failed at N that Pass at N+1 ÷ rows Failed at N
+///   EIR = rows Passed at N that Fail at N+1 ÷ rows Passed at N
+///
+/// Dividing by every countable row instead would make the denominator the size
+/// of the observed suite, so the fix in 4d55123d — one native regression among
+/// five native tests — would read 1/5 rather than 1/1, and a BugsInPy repo with
+/// hundreds of native tests would drown a real repair. Rows that never moved
+/// stay counted in `complete` (the churn number) but they only enter a rate's
+/// denominator through the state they held at N.
+///
 /// [VANTA-WHY] Totals AND the per-source breakdown come out of the SAME pass
 /// over the SAME rows, so the breakdown can never disagree with the total. A
 /// run whose only real correction was a repository-native test (4d55123d) has an
@@ -932,6 +944,14 @@ mod tests {
             snap.complete, 2,
             "review rounds and censored holes are excluded from the denominator too"
         );
+        assert_eq!(
+            snap.ecr_denominator, 1,
+            "ECR is conditional: only the one row that was FAILING at N can be corrected"
+        );
+        assert_eq!(
+            snap.eir_denominator, 1,
+            "EIR is conditional: only the one row that was PASSING at N can be broken"
+        );
     }
 
     /// A non-Logic failure is evidence about the harness, not the candidate, so
@@ -954,6 +974,15 @@ mod tests {
         assert_eq!(snap.ecr_count, 0);
         assert_eq!(snap.eir_count, 1);
         assert_eq!(snap.complete, 1);
+        assert_eq!(
+            snap.eir_denominator, 1,
+            "the one surviving row was passing at N, so it is EIR's denominator"
+        );
+        assert_eq!(
+            snap.ecr_denominator, 0,
+            "no countable row was failing at N, so ECR is n/a rather than 0.00%"
+        );
+        assert_eq!(snap.ecr_text(), "n/a");
         assert_eq!(
             snap.excluded_non_logic, 3,
             "the exclusions must be visible so an evidence-starved run reads as thin"
@@ -1020,7 +1049,8 @@ mod tests {
                 Some("p1"),
                 EvidenceSource::Native,
             ),
-            // A second native test that simply kept passing: denominator only.
+            // A second native test that simply kept passing: it is EIR's
+            // denominator only — it can be broken, never "corrected".
             counting_row_from_source(
                 TestResult::Passed,
                 TestResult::Passed,
@@ -1048,17 +1078,78 @@ mod tests {
         assert_eq!(snap.complete, 4);
         assert_eq!(snap.ecr_count, 1, "the native correction is in the totals");
         assert_eq!(snap.eir_count, 1, "the static introduction is in the totals");
+        assert_eq!(snap.ecr_denominator, 1, "only the native row was failing at N");
+        assert_eq!(
+            snap.eir_denominator, 3,
+            "the two native rows and the static row were passing at N"
+        );
         assert_eq!(snap.native.complete, 2);
         assert_eq!(snap.native.ecr_count, 1);
         assert_eq!(snap.native.eir_count, 0);
+        assert_eq!(snap.native.ecr_denominator, 1);
+        assert_eq!(snap.native.eir_denominator, 1);
+        assert_eq!(
+            snap.native.ecr_text(),
+            "1/1 (100.00%)",
+            "one fix in a suite of two reads 1/1, not 1/2"
+        );
         assert_eq!(snap.static_findings.complete, 1);
         assert_eq!(snap.static_findings.eir_count, 1);
+        assert_eq!(snap.static_findings.ecr_denominator, 0);
+        assert_eq!(snap.static_findings.eir_denominator, 1);
         assert_eq!(snap.attacker_generated.complete, 1);
         assert_eq!(snap.attacker_generated.ecr_count, 0);
         assert_eq!(
             snap.excluded_non_logic, 0,
             "every row here is countable for its own source"
         );
+    }
+
+    /// Session 4d55123d's native shape, re-scored under the conditional
+    /// definition: FIVE native tests ran on both attempts and ONE of them was
+    /// fixed by attempt 2.
+    ///
+    /// [VANTA-WHY] Per row this reads `1/5`, which is exactly the dilution the
+    /// change removes — the four tests that passed on both attempts were never
+    /// broken, so they are not part of "of what was broken, how much got fixed".
+    /// Conditional reads `1/1`, and the four bystanders belong to EIR's
+    /// denominator, where "of what worked, how much got broken" = 0/4.
+    #[test]
+    fn the_4d55123d_native_shape_scores_one_of_one_fixed_and_none_of_four_broken() {
+        let mut rows = vec![counting_row_from_source(
+            TestResult::Failed,
+            TestResult::Passed,
+            Some(FailureClass::Logic),
+            None,
+            Some("p0"),
+            Some("p1"),
+            EvidenceSource::Native,
+        )];
+        for _ in 0..4 {
+            rows.push(counting_row_from_source(
+                TestResult::Passed,
+                TestResult::Passed,
+                None,
+                None,
+                Some("p0"),
+                Some("p1"),
+                EvidenceSource::Native,
+            ));
+        }
+
+        let snap = ecr_eir_from_rows(&rows);
+        assert_eq!(snap.native.complete, 5, "all five native tests are observed");
+        assert_eq!(snap.native.ecr_count, 1);
+        assert_eq!(snap.native.ecr_denominator, 1);
+        assert_eq!(snap.native.ecr_text(), "1/1 (100.00%)");
+        assert_eq!(snap.native.eir_count, 0);
+        assert_eq!(snap.native.eir_denominator, 4);
+        assert_eq!(snap.native.eir_text(), "0/4 (0.00%)");
+
+        // Combined: the five native rows are the whole run's evidence here, so
+        // the pooled rates must equal the Native ones.
+        assert_eq!(snap.ecr_text(), "1/1 (100.00%)");
+        assert_eq!(snap.eir_text(), "0/4 (0.00%)");
     }
 
     /// A Static-class failure on an ATTACKER row stays excluded, so the

@@ -126,6 +126,10 @@ def test_a_native_correction_counts_in_the_combined_ecr(tmp_path):
     [WHY] The native suite wrote no transition row at all, so ECR was 0/0 while
     the run had in fact fixed a regression. A `Native` `Failed -> Passed` row
     must move BOTH the combined ECR and the `Native` breakdown.
+
+    [WHY] The rate is CONDITIONAL: one row was failing at N and it was fixed, so
+    ECR is 1/1 — not 1/2. The Attacker row that passed twice is never in ECR's
+    denominator; it belongs to EIR's (`0/1`), where it says nothing got broken.
     """
     write_session(tmp_path, "repair", decision="AllTestsPassed", schema_version=1)
     write_transitions(
@@ -146,10 +150,25 @@ def test_a_native_correction_counts_in_the_combined_ecr(tmp_path):
     stats = verdict.metrics
 
     assert stats["ecr"] == 1
+    assert stats["ecr_denominator"] == 1
+    assert stats["eir"] == 0
+    assert stats["eir_denominator"] == 1
     assert stats["complete"] == 2
-    assert stats["per_source"]["Native"] == {"ecr": 1, "eir": 0, "complete": 1}
-    assert stats["per_source"]["AttackerGenerated"] == {"ecr": 0, "eir": 0, "complete": 1}
-    assert metrics.rate_text(stats["ecr"], stats["complete"]) == "1/2 (50.00%)"
+    assert stats["per_source"]["Native"] == {
+        "ecr": 1,
+        "eir": 0,
+        "ecr_denominator": 1,
+        "eir_denominator": 0,
+        "complete": 1,
+    }
+    assert stats["per_source"]["AttackerGenerated"] == {
+        "ecr": 0,
+        "eir": 0,
+        "ecr_denominator": 0,
+        "eir_denominator": 1,
+        "complete": 1,
+    }
+    assert metrics.rate_text(stats["ecr"], stats["ecr_denominator"]) == "1/1 (100.00%)"
 
 
 def test_a_broken_native_test_counts_as_an_introduced_error(tmp_path):
@@ -190,7 +209,13 @@ def test_a_fixed_static_error_counts_as_a_correction(tmp_path):
 
     verdict = metrics.classify(metrics.load_session(str(tmp_path), "static-fixed"), known_bad=False)
     assert verdict.metrics["ecr"] == 1
-    assert verdict.metrics["per_source"]["Static"] == {"ecr": 1, "eir": 0, "complete": 1}
+    assert verdict.metrics["per_source"]["Static"] == {
+        "ecr": 1,
+        "eir": 0,
+        "ecr_denominator": 1,
+        "eir_denominator": 0,
+        "complete": 1,
+    }
 
 
 def test_a_static_class_attacker_row_stays_excluded(tmp_path):
@@ -264,7 +289,7 @@ def test_render_metrics_reports_the_native_breakdown_separately(tmp_path):
 
     verdict = metrics.classify(metrics.load_session(str(tmp_path), "repair"), known_bad=False)
     text = metrics.render_metrics([verdict])
-    assert "Native[ECR=1/1 (100.00%) EIR=0/1 (0.00%)]" in text
+    assert "Native[ECR=1/1 (100.00%) EIR=n/a]" in text
     assert "AttackerGenerated[ECR=n/a EIR=n/a]" in text
     assert "Static[ECR=n/a EIR=n/a]" in text
 

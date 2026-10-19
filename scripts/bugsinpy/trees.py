@@ -1,0 +1,431 @@
+"""Checkouts and the SWE-bench tree split (design §1.2, §1.3).
+
+Four trees per bug, three of them seen by something:
+
+``src_buggy/``   plain buggy commit — only used to learn which failures are
+                 pre-existing (the relaxed fixed-tree gate, §1.3 step 6).
+``src_fixed/``   plain fixed commit — the gate and ``PASS_TO_PASS``.
+``vanta_tree/``  buggy source + the FIXED commit's test files, minus the hidden
+                 tests. This is what Vanta is given.
+``oracle_tree/`` the same tree with the hidden tests intact — the oracle.
+
+[VANTA-WHY] Why the fixed commit's test files at all: the fix usually *updates*
+existing tests to the new behaviour. Grading a correct fix against the old
+versions of those tests manufactures a native regression that is not the patch's
+fault — a false reject invented by the harness (design §1.2). Taking the post-fix
+test files is the standard SWE-bench split and is the fair reading.
+
+[VANTA-WHY] Why the strip is AST-level: the hidden test is the oracle. A regex
+that removed a function by name would either miss a decorator block or eat the
+next function's body, and a *partially* removed test is worse than none — it
+leaves the assertion (the answer) in the tree the Creator can read.
+
+Nothing in this module executes the project's code. Clones and tree surgery are
+git and filesystem work on the host; every suite run happens in Shuru (§suite.py).
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+import shutil
+import subprocess
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Optional
+
+from .bugsinpy_meta import BugInfo
+
+
+class TreeError(RuntimeError):
+    """A checkout or a tree operation failed."""
+
+
+# ---------------------------------------------------------------------------
+# git plumbing
+# ---------------------------------------------------------------------------
+def _git(args: list[str], *, cwd: Optional[Path]) -> str:
+    proc = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=False
+    )
+    if proc.returncode != 0:
+        raise TreeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def ensure_project_clone(cache_root: Path, project: str, url: str) -> Path:
+    """Clone (once) the upstream project repo and return the cache path."""
+    dest = cache_root / f"{project}.git"
+    if not dest.is_dir():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _git(["clone", "--quiet", "--", url, str(dest)], cwd=None)
+    return dest
+
+
+def export_tree(repo: Path, commit: str, dest: Path) -> None:
+    """Materialise ``commit`` of ``repo`` at ``dest`` as a self-contained tree.
+
+    A real clone rather than ``git archive`` or ``git worktree``: ``git worktree``
+    leaves a ``.git`` *file* whose contents are an absolute host path, which is
+    meaningless once the tree is mounted inside the microVM, and ``git archive``
+    drops the ``.git`` directory entirely, which costs us ``git apply`` and
+    ``git diff`` inside the tree for no benefit.
+    """
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _git(["clone", "--quiet", "--no-checkout", "--", str(repo), str(dest)], cwd=None)
+    try:
+        _git(["checkout", "--quiet", "--detach", commit], cwd=dest)
+    except TreeError:
+        # A commit that lives on no branch (a PR merge, a tag-only commit) is not
+        # in the clone; fetch it by sha and retry rather than failing the bug.
+        _git(["fetch", "--quiet", "origin", commit], cwd=dest)
+        _git(["checkout", "--quiet", "--detach", commit], cwd=dest)
+
+
+# ---------------------------------------------------------------------------
+# which paths are "test files"
+# ---------------------------------------------------------------------------
+def is_test_path(path: str) -> bool:
+    """Mirror of ``harness::is_native_test_path`` (Rust) for the tree split.
+
+    Kept deliberately identical in behaviour: the harness uses that function to
+    decide what the native suite owns, and the tree split uses this one to decide
+    which paths come from the fixed commit. If the two disagreed, a file could be
+    "fixed" for Vanta but "original" for the oracle.
+    """
+    name = path.rsplit("/", 1)[-1]
+    if name == "conftest.py":
+        return True
+    if not name.endswith(".py"):
+        return False
+    if name.startswith("test_") or name.endswith("_test.py"):
+        return True
+    parts = path.split("/")[:-1]
+    return any(part in ("test", "tests") for part in parts)
+
+
+@dataclass
+class PatchPaths:
+    """File paths a unified diff touches, split three ways."""
+
+    changed: list[str] = field(default_factory=list)
+    added: list[str] = field(default_factory=list)
+    deleted: list[str] = field(default_factory=list)
+
+    @property
+    def all(self) -> list[str]:
+        return sorted(set(self.changed) | set(self.added) | set(self.deleted))
+
+
+@dataclass
+class ParsedPatch:
+    paths: PatchPaths
+    added_lines: list[str]
+    removed_lines: list[str]
+
+
+_DIFF_HEADER = re.compile(r"^diff --git a/(?P<a>.+?) b/(?P<b>.+)$")
+
+
+def parse_patch(patch_text: str) -> ParsedPatch:
+    """Paths and added/removed content lines of a unified diff, by hand.
+
+    ``git apply --numstat`` needs a work tree and a repository; the split's
+    metadata is read before any tree exists, so the diff is parsed directly. Only
+    the three markers git itself emits are trusted: ``diff --git a/… b/…``,
+    ``+++ b/…`` / ``--- a/…`` with ``/dev/null`` for creations and deletions.
+    """
+    paths = PatchPaths()
+    added: list[str] = []
+    removed: list[str] = []
+    current: Optional[str] = None
+    current_is_new = False
+    current_is_del = False
+
+    for line in patch_text.splitlines():
+        header = _DIFF_HEADER.match(line)
+        if header:
+            current = header.group("b")
+            current_is_new = False
+            current_is_del = False
+            continue
+        if line.startswith("new file mode"):
+            current_is_new = True
+            continue
+        if line.startswith("deleted file mode"):
+            current_is_del = True
+            continue
+        if line.startswith("rename to "):
+            current = line[len("rename to ") :].strip()
+            continue
+        if line.startswith("--- "):
+            target = line[4:].strip()
+            if target == "/dev/null":
+                current_is_new = True
+            elif current is None:
+                current = target[2:] if target.startswith(("a/", "b/")) else target
+            continue
+        if line.startswith("+++ "):
+            target = line[4:].strip()
+            if target == "/dev/null":
+                current_is_del = True
+                if current is not None:
+                    paths.deleted.append(current)
+                current = None
+                continue
+            if target.startswith("b/"):
+                current = target[2:]
+            if current is not None:
+                if current_is_new:
+                    paths.added.append(current)
+                else:
+                    paths.changed.append(current)
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+        elif line.startswith("-") and not line.startswith("---"):
+            removed.append(line[1:])
+
+    paths.changed = sorted(set(paths.changed))
+    paths.added = sorted(set(paths.added))
+    paths.deleted = sorted(set(paths.deleted))
+    return ParsedPatch(paths=paths, added_lines=added, removed_lines=removed)
+
+
+def test_paths_from_fix(bug: BugInfo) -> list[str]:
+    """The test files Vanta must take from the FIXED commit.
+
+    Two sources, unioned:
+
+    * every path the fix patch touches that looks like a test (the fix usually
+      updates existing tests, and that update is part of the new contract);
+    * ``bug.info``'s ``test_file``, which is BugsInPy's own statement of where the
+      bug-revealing test lives — it is authoritative even if the patch's diff
+      header is unusual.
+
+    Union, not intersection: a path is included if *either* source names it.
+    """
+    parsed = parse_patch(bug.bug_patch_txt)
+    paths = {p for p in parsed.paths.all if is_test_path(p)}
+    paths.add(bug.test_file)
+    return sorted(paths)
+
+
+# ---------------------------------------------------------------------------
+# composing the trees
+# ---------------------------------------------------------------------------
+@dataclass
+class ComposeReport:
+    copied_from_fixed: list[str] = field(default_factory=list)
+    dropped_fix_deleted: list[str] = field(default_factory=list)
+    test_paths: list[str] = field(default_factory=list)
+
+
+def copy_tree(src: Path, dest: Path) -> None:
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dest, symlinks=True)
+
+
+def compose_vanta_tree(
+    buggy_dir: Path, fixed_dir: Path, dest: Path, test_paths: Iterable[str]
+) -> ComposeReport:
+    """``dest`` = ``buggy_dir`` with ``test_paths`` replaced by the fixed versions."""
+    copy_tree(buggy_dir, dest)
+    report = ComposeReport(test_paths=sorted(test_paths))
+    for rel in report.test_paths:
+        src = fixed_dir / rel
+        target = dest / rel
+        if src.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, target)
+            report.copied_from_fixed.append(rel)
+        elif target.exists():
+            # The fix deleted this test file. The fixed version's test set does not
+            # contain it, so neither does Vanta's tree — otherwise Vanta would keep
+            # running a suite the upstream project removed.
+            target.unlink()
+            report.dropped_fix_deleted.append(rel)
+    return report
+
+
+# ---------------------------------------------------------------------------
+# AST-level removal of the hidden tests
+# ---------------------------------------------------------------------------
+class StripError(RuntimeError):
+    """A hidden nodeid could not be located in the tree."""
+
+
+@dataclass
+class StripReport:
+    removed_nodeids: list[str] = field(default_factory=list)
+    deleted_files: list[str] = field(default_factory=list)
+    partially_hidden_functions: list[str] = field(default_factory=list)
+    not_found: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "removed_nodeids": sorted(set(self.removed_nodeids)),
+            "deleted_files": sorted(self.deleted_files),
+            "partially_hidden_functions": sorted(set(self.partially_hidden_functions)),
+            "not_found": sorted(self.not_found),
+        }
+
+
+def nodeid_file(nodeid: str) -> str:
+    return nodeid.split("::", 1)[0]
+
+
+def nodeid_chain(nodeid: str) -> list[str]:
+    """``a/b.py::C::test_m[3]`` → ``['C', 'test_m']`` (parametrisation stripped)."""
+    parts = nodeid.split("::")
+    chain = parts[1:]
+    if chain:
+        chain[-1] = re.sub(r"\[.*\]$", "", chain[-1])
+    return chain
+
+
+def strip_hidden_tests(
+    tree_dir: Path,
+    hidden_nodeids: Iterable[str],
+    collected_by_file: dict[str, set[str]],
+) -> StripReport:
+    """Remove the hidden tests from ``tree_dir``, in place.
+
+    A file is deleted outright when *every* test the suite collected in it is
+    hidden; otherwise only the named functions go. A function is removed whole
+    even when only one of its parametrisations is hidden — a parametrisation
+    cannot be excised from source, and keeping the function would leave the
+    assertion (the answer) in the tree. A definition removed although the oracle
+    did not name *all* of its collected nodeids is recorded in
+    ``partially_hidden_functions``, so the shrunken native suite is explainable
+    from the split instead of quietly smaller than ``FAIL_TO_PASS`` implies.
+    """
+    report = StripReport()
+    by_file: dict[str, list[str]] = {}
+    for nodeid in hidden_nodeids:
+        by_file.setdefault(nodeid_file(nodeid), []).append(nodeid)
+
+    for rel, nodeids in sorted(by_file.items()):
+        path = tree_dir / rel
+        if not path.is_file():
+            report.not_found.extend(nodeids)
+            continue
+
+        collected = collected_by_file.get(rel, set())
+        hidden_fns = {tuple(nodeid_chain(n)) for n in nodeids}
+        collected_fns = {tuple(nodeid_chain(n)) for n in collected}
+        if collected and collected_fns and collected_fns <= hidden_fns:
+            path.unlink()
+            report.deleted_files.append(rel)
+            report.removed_nodeids.extend(nodeids)
+            continue
+
+        if (path.parent / "__pycache__").is_dir():
+            shutil.rmtree(path.parent / "__pycache__", ignore_errors=True)
+
+        source = path.read_text(encoding="utf-8")
+        new_source, removed, missed = _strip_source(source, hidden_fns, rel)
+        if missed:
+            report.not_found.extend(missed)
+        if removed:
+            path.write_text(new_source, encoding="utf-8")
+            report.removed_nodeids.extend(nodeids)
+            # Counted per definition, not per file: a function whose collected
+            # nodeids were not all hidden loses a parametrisation the oracle never
+            # named, so the native suite shrinks by more than FAIL_TO_PASS explains.
+            hidden_counts = Counter(tuple(nodeid_chain(n)) for n in nodeids)
+            collected_counts = Counter(tuple(nodeid_chain(n)) for n in collected)
+            for chain in removed:
+                if hidden_counts[chain] < collected_counts[chain]:
+                    report.partially_hidden_functions.append(f"{rel}::{'::'.join(chain)}")
+
+    if report.not_found:
+        raise StripError(
+            "hidden nodeid(s) not found in the tree, so the oracle would still be "
+            f"visible to the Creator: {sorted(set(report.not_found))}"
+        )
+    return report
+
+
+def _strip_source(
+    source: str, chains: set[tuple[str, ...]], rel: str
+) -> tuple[str, list[tuple[str, ...]], list[str]]:
+    """Delete the named definitions from ``source``; return the new text.
+
+    Line-span deletion rather than ``ast.unparse``: unparsing rewrites the entire
+    file (losing comments and formatting), which would show up as a huge diff
+    against the original tree and make the "what did the harness change" question
+    unanswerable.
+    """
+    try:
+        module = ast.parse(source)
+    except SyntaxError as exc:
+        raise StripError(f"{rel}: cannot parse for stripping: {exc}") from exc
+
+    lines = source.splitlines(keepends=True)
+    drop: set[int] = set()  # 1-based line numbers
+    removed: list[tuple[str, ...]] = []
+    missed: list[str] = []
+    insert_pass_after: dict[int, str] = {}
+
+    for chain in sorted(chains):
+        node = _resolve(module, chain)
+        if node is None:
+            missed.append(f"{rel}::{'::'.join(chain)}")
+            continue
+        start = min(
+            [node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])]
+        )
+        end = node.end_lineno or node.lineno
+        for lineno in range(start, end + 1):
+            drop.add(lineno)
+        removed.append(chain)
+
+    # A class left empty by the removal needs a `pass`, or the file stops parsing.
+    for node in ast.walk(module):
+        if not isinstance(node, ast.ClassDef) or not node.body:
+            continue
+        body_lines = {stmt.lineno for stmt in node.body}
+        if body_lines and body_lines <= drop:
+            indent = " " * (node.body[0].col_offset)
+            insert_pass_after[node.lineno] = f"{indent}pass\n"
+
+    out: list[str] = []
+    for index, line in enumerate(lines, start=1):
+        if index in drop:
+            if index in insert_pass_after:
+                out.append(insert_pass_after[index])
+            continue
+        out.append(line)
+        if index in insert_pass_after:
+            out.append(insert_pass_after[index])
+
+    new_source = "".join(out)
+    try:
+        ast.parse(new_source)
+    except SyntaxError as exc:
+        raise StripError(f"{rel}: stripping produced invalid Python: {exc}") from exc
+    return new_source, removed, missed
+
+
+def _resolve(module: ast.Module, chain: tuple[str, ...]) -> Optional[ast.AST]:
+    """Walk ``chain`` down the module body and return the named node, if any."""
+    body: Optional[list[ast.stmt]] = module.body
+    node: Optional[ast.AST] = None
+    for name in chain:
+        node = None
+        for stmt in body or []:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and (
+                stmt.name == name
+            ):
+                node = stmt
+                break
+        if node is None:
+            return None
+        body = getattr(node, "body", None)
+    return node

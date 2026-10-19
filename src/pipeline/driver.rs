@@ -1795,6 +1795,32 @@ pub async fn run(
         );
     }
 
+    // ---- Final patch (written for EVERY terminal verdict) ----
+    // [VANTA-WHY] The external oracle (BugsInPy harness, plans/bugsinpy.md §5.1)
+    // consumes `final.patch` on every terminal outcome, not just approvals. A
+    // `Rejected` or `MaxAttemptsReached` run is exactly the run whose ground-truth
+    // label matters most, and writing the patch only inside the Approved branch
+    // left those runs with no patch on disk at all. `final_patched_files` is the
+    // same map in all three arms (AllTestsPassed / MaxAttemptsReached / Rejected),
+    // so one write here covers them; the Approved branch below only reports it.
+    //
+    // The diff keeps BOTH the non-test and the test hunks: it is the faithful
+    // record of what the Creator (or the reviewed candidate) changed. A consumer
+    // that must not apply test changes filters them out by path — the oracle does.
+    let final_patch_path = debug_dir.join("final.patch");
+    let final_patch_written = match &final_patched_files {
+        Some(patched) => match write_final_patch(&original_files, patched, &final_patch_path) {
+            Ok(()) => true,
+            Err(e) => {
+                println!("  ⚠ Could not write {}: {e}", final_patch_path.display());
+                false
+            }
+        },
+        // PatchApplicationFailed / HarnessFailure / InfraFailure produce no patch
+        // of their own; there is nothing to diff.
+        None => false,
+    };
+
     // ---- Gatekeeper (only if all tests passed) ----
     if decision == GovernorDecision::AllTestsPassed {
         let all_passed = final_evidence
@@ -1825,19 +1851,15 @@ pub async fn run(
                 // repo, not the staged copy. `patched_repo` is not a git repo, so
                 // the old `cd patched_repo && git diff` hint produced an error
                 // instead of a patch; final.patch is a real unified diff the
-                // reader can apply.
-                let patch_path = debug_dir.join("final.patch");
-                match write_final_patch(&original_files, patched, &patch_path) {
-                    Ok(()) => println!(
+                // reader can apply. It is written once, above, for every terminal
+                // verdict — this branch only reports it.
+                if final_patch_written {
+                    println!(
                         "  ✔ Ready for PR. Diff against the original repo: {}\n    \
                          (apply inside the original repo with: git apply {})",
-                        patch_path.display(),
-                        patch_path.display()
-                    ),
-                    Err(e) => println!(
-                        "  ⚠ Could not write {}: {e}",
-                        patch_path.display()
-                    ),
+                        final_patch_path.display(),
+                        final_patch_path.display()
+                    );
                 }
 
                 // ---- Open PR if requested ----

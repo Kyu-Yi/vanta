@@ -37,6 +37,10 @@ plans/private/
 .shurutest/
 # Bytecode caches from the analysis scripts (scripts/metrics.py and its tests).
 __pycache__/
+# BugsInPy harness artefacts: the BugsInPy clone, cached project clones, per-bug
+# worktrees, checkpoints and batch manifests. Large, machine-local, reproducible
+# from plans/bugsinpy_split.json — never source.
+runs/
 
 # macOS / editor noise
 .DS_Store

@@ -75,6 +75,200 @@ def signal(discriminates) -> dict:
     }
 
 
+def transition(
+    *,
+    from_result: str = "Passed",
+    to_result: str = "Passed",
+    from_class=None,
+    to_class=None,
+    source: str = "AttackerGenerated",
+    from_patch: str = "patch-aaa",
+    to_patch: str = "patch-bbb",
+    censored: bool = False,
+) -> dict:
+    """One transition row, with the defaults a REPAIR transition needs."""
+    return {
+        "session_id": "s",
+        "schema_version": 1,
+        "from_patch_attempt_id": from_patch,
+        "to_patch_attempt_id": to_patch,
+        "from_attempt": 0,
+        "to_attempt": 1,
+        "test_id": "id",
+        "test_name": "name",
+        "shared_set_id": "native",
+        "from_result": from_result,
+        "to_result": to_result,
+        "from_failure_class": from_class,
+        "to_failure_class": to_class,
+        "evidence_source": source,
+        "test_intent": "BehaviorPreservation",
+        "censored": censored,
+        "apply_failed": False,
+        "gap": False,
+        "in_s0": True,
+    }
+
+
+def write_transitions(tmp_path, session_id: str, rows: list[dict]) -> None:
+    path = tmp_path / f"{session_id}_transitions.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+# ============================================================================
+# ECR/EIR from transition rows (native results must count)
+# ============================================================================
+
+
+def test_a_native_correction_counts_in_the_combined_ecr(tmp_path):
+    """Session 4d55123d's shape: the only real correction was a repo test.
+
+    [WHY] The native suite wrote no transition row at all, so ECR was 0/0 while
+    the run had in fact fixed a regression. A `Native` `Failed -> Passed` row
+    must move BOTH the combined ECR and the `Native` breakdown.
+    """
+    write_session(tmp_path, "repair", decision="AllTestsPassed", schema_version=1)
+    write_transitions(
+        tmp_path,
+        "repair",
+        [
+            transition(
+                from_result="Failed",
+                from_class="Logic",
+                to_result="Passed",
+                source="Native",
+            ),
+            transition(),  # one AttackerGenerated Passed->Passed
+        ],
+    )
+
+    verdict = metrics.classify(metrics.load_session(str(tmp_path), "repair"), known_bad=False)
+    stats = verdict.metrics
+
+    assert stats["ecr"] == 1
+    assert stats["complete"] == 2
+    assert stats["per_source"]["Native"] == {"ecr": 1, "eir": 0, "complete": 1}
+    assert stats["per_source"]["AttackerGenerated"] == {"ecr": 0, "eir": 0, "complete": 1}
+    assert metrics.rate_text(stats["ecr"], stats["complete"]) == "1/2 (50.00%)"
+
+
+def test_a_broken_native_test_counts_as_an_introduced_error(tmp_path):
+    """A native test that passed at N and fails at N+1 is EIR, not silence."""
+    write_session(tmp_path, "broke-it", decision="MaxAttemptsReached", schema_version=1)
+    write_transitions(
+        tmp_path,
+        "broke-it",
+        [transition(from_result="Passed", to_result="Failed", to_class="Logic", source="Native")],
+    )
+
+    verdict = metrics.classify(metrics.load_session(str(tmp_path), "broke-it"), known_bad=True)
+    assert verdict.metrics["eir"] == 1
+    assert verdict.metrics["per_source"]["Native"]["eir"] == 1
+
+
+def test_a_fixed_static_error_counts_as_a_correction(tmp_path):
+    """A blocking finding gone by N+1 is a correction under its OWN source.
+
+    [WHY] A `Static`-class failure is normally excluded (it is the environment's
+    fault on an Attacker row). But a row whose own source IS Static is a
+    baseline-differenced blocking finding — the candidate's doing — so it must
+    count.
+    """
+    write_session(tmp_path, "static-fixed", decision="AllTestsPassed", schema_version=1)
+    write_transitions(
+        tmp_path,
+        "static-fixed",
+        [
+            transition(
+                from_result="Failed",
+                from_class="Static",
+                to_result="Passed",
+                source="Static",
+            )
+        ],
+    )
+
+    verdict = metrics.classify(metrics.load_session(str(tmp_path), "static-fixed"), known_bad=False)
+    assert verdict.metrics["ecr"] == 1
+    assert verdict.metrics["per_source"]["Static"] == {"ecr": 1, "eir": 0, "complete": 1}
+
+
+def test_a_static_class_attacker_row_stays_excluded(tmp_path):
+    """The Static allowance is for Static rows only, never for Attacker tests."""
+    write_session(tmp_path, "attacker-static", decision="Rejected", schema_version=1)
+    write_transitions(
+        tmp_path,
+        "attacker-static",
+        [transition(from_result="Failed", from_class="Static", to_result="Passed")],
+    )
+
+    verdict = metrics.classify(metrics.load_session(str(tmp_path), "attacker-static"), known_bad=True)
+    assert verdict.metrics["complete"] == 0
+    assert verdict.metrics["ecr"] == 0
+
+
+def test_a_review_round_row_is_excluded_from_ecr(tmp_path):
+    """`from == to` is the same candidate — attack depth, not a repair."""
+    write_session(tmp_path, "review", decision="Rejected", schema_version=1)
+    write_transitions(
+        tmp_path,
+        "review",
+        [
+            transition(
+                from_result="Failed",
+                from_class="Logic",
+                to_result="Passed",
+                from_patch="patch-same",
+                to_patch="patch-same",
+            )
+        ],
+    )
+
+    verdict = metrics.classify(metrics.load_session(str(tmp_path), "review"), known_bad=True)
+    assert verdict.metrics["complete"] == 0
+
+
+def test_zero_denominator_prints_not_applicable_never_a_zero_percent(tmp_path):
+    """No countable transition is `n/a`, NOT `0.00%`.
+
+    [WHY] "Nothing countable" and "nothing corrected" are opposite claims about
+    a run, and `0.00%` states the second. The distinction is the whole point of
+    printing `n/a`.
+    """
+    write_session(tmp_path, "empty", decision="AllTestsPassed", schema_version=1)
+
+    verdict = metrics.classify(metrics.load_session(str(tmp_path), "empty"), known_bad=False)
+    assert verdict.metrics["complete"] == 0
+
+    text = metrics.render_metrics([verdict])
+    assert "n/a" in text
+    assert "0.00%" not in text, text
+    assert "0/0" not in text, text
+
+
+def test_render_metrics_reports_the_native_breakdown_separately(tmp_path):
+    """A pooled number must not hide which source moved it."""
+    write_session(tmp_path, "repair", decision="AllTestsPassed", schema_version=1)
+    write_transitions(
+        tmp_path,
+        "repair",
+        [
+            transition(
+                from_result="Failed",
+                from_class="Logic",
+                to_result="Passed",
+                source="Native",
+            )
+        ],
+    )
+
+    verdict = metrics.classify(metrics.load_session(str(tmp_path), "repair"), known_bad=False)
+    text = metrics.render_metrics([verdict])
+    assert "Native[ECR=1/1 (100.00%) EIR=0/1 (0.00%)]" in text
+    assert "AttackerGenerated[ECR=n/a EIR=n/a]" in text
+    assert "Static[ECR=n/a EIR=n/a]" in text
+
+
 # ============================================================================
 # Schema handling (item 11: v0 tolerated, an explicit mismatch is loud)
 # ============================================================================

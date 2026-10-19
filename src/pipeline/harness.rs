@@ -204,6 +204,13 @@ pub async fn run_single_test_with_timeout(
 pub struct NativeSuiteReport {
     /// nodeid → outcome. Empty when the suite could not be run at all.
     pub tests: Vec<(String, TestResult)>,
+    /// nodeid → the test's own failure output, for a regression report.
+    ///
+    /// [VANTA-WHY] A regression the Creator is told about has to carry the
+    /// output that shows WHY, exactly as a generated-test failure does. Without
+    /// it the repair feedback for a native regression reduces to "a test broke"
+    /// — the model cannot act on that. Only failing/erroring tests appear here.
+    pub failure_outputs: HashMap<String, String>,
     /// False when no report was produced (missing pytest/plugin, timeout,
     /// crash). A gate that could not run must never be read as "no regressions".
     pub ran: bool,
@@ -219,6 +226,7 @@ impl NativeSuiteReport {
     fn not_run() -> Self {
         Self {
             tests: Vec::new(),
+            failure_outputs: HashMap::new(),
             ran: false,
             exit_code: None,
             stderr_tail: String::new(),
@@ -232,10 +240,16 @@ impl NativeSuiteReport {
     fn failed_run(exit_code: Option<i32>, stderr_tail: String) -> Self {
         Self {
             tests: Vec::new(),
+            failure_outputs: HashMap::new(),
             ran: false,
             exit_code,
             stderr_tail,
         }
+    }
+
+    /// The recorded failure output for a nodeid, collapsed to one line.
+    pub fn failure_output(&self, nodeid: &str) -> Option<&str> {
+        self.failure_outputs.get(nodeid).map(String::as_str)
     }
 
     /// Did this tree produce no usable test set — because the suite never ran,
@@ -317,23 +331,63 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
         return NativeSuiteReport::failed_run(exec.exit_code, tail);
     };
     let mut tests = Vec::new();
+    let mut failure_outputs: HashMap<String, String> = HashMap::new();
     if let Some(arr) = report["tests"].as_array() {
         for t in arr {
             let nodeid = t["nodeid"].as_str().unwrap_or_default().to_string();
             let Some(result) = native_outcome(t["outcome"].as_str().unwrap_or_default()) else {
                 continue;
             };
-            if !nodeid.is_empty() {
-                tests.push((nodeid, result));
+            if nodeid.is_empty() {
+                continue;
             }
+            if result != TestResult::Passed {
+                // [VANTA-WHY] pytest attaches the traceback to whichever phase
+                // produced it: `call` for an assertion, `setup`/`teardown` for a
+                // fixture or import error. Reading all three is what makes a
+                // collection-time failure explain itself instead of arriving as
+                // a bare nodeid.
+                for phase in ["call", "setup", "teardown"] {
+                    let repr = t[phase]["longrepr"]
+                        .as_str()
+                        .or_else(|| t[phase]["crash"]["message"].as_str());
+                    if let Some(repr) = repr {
+                        failure_outputs.insert(nodeid.clone(), one_line(repr));
+                        break;
+                    }
+                }
+            }
+            tests.push((nodeid, result));
         }
     }
     NativeSuiteReport {
         tests,
+        failure_outputs,
         ran: true,
         exit_code: exec.exit_code,
         stderr_tail: tail,
     }
+}
+
+/// Collapse a multi-line failure report to its last meaningful line, capped.
+///
+/// [VANTA-WHY] A pytest `longrepr` is the whole assertion block; the actionable
+/// line (the `E   TypeError: ...`) is the last one. The feedback prompt and the
+/// console both want that line, not ten lines of file context.
+fn one_line(text: &str) -> String {
+    let last = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .next_back()
+        .unwrap_or("")
+        .to_string();
+    if last.chars().count() <= 300 {
+        return last;
+    }
+    let mut out: String = last.chars().take(299).collect();
+    out.push('…');
+    out
 }
 
 /// Map one pytest-json-report `outcome` string to a `TestResult`.
@@ -409,6 +463,132 @@ pub fn native_suite_collapsed(
     patched: &NativeSuiteReport,
 ) -> bool {
     original.ran && !original.tests.is_empty() && patched.tests.len() < original.tests.len()
+}
+
+// ============================================================================
+// The native tree — the patched source graded by the ORIGINAL tests
+// ============================================================================
+//
+// [VANTA-WHY] A patch must never control the tests that grade it. The vulnerable
+// shape, seen in repair session 888b6931: the Creator's fix made
+// `keyword_rate.py` always pass `max_response_length` to `get_responses`, which
+// the issue forbids when the setting is unset — and the SAME patch edited
+// `tests/test_keyword_rate.py`'s `FakeContext.get_responses` to swallow the new
+// kwarg. The native suite ran the patched tree, so it collected the Creator's
+// edited test, the weakened test passed, Vanta reported `regressions=0`, and the
+// Gatekeeper approved a patch the repo's own test rejects with a `TypeError`.
+//
+// The native suite therefore runs the ORIGINAL test files. Every file pytest
+// would collect or load — `test_*.py`, `*_test.py`, anything under a collected
+// test directory, and every `conftest.py` — is pinned back to the contents the
+// original repo had, on top of the patched source. A patch-added test file is
+// not part of the baseline either, so it is left out of the native run
+// entirely; the baseline is the repo's ORIGINAL suite and nothing else.
+
+/// Is this a file the repo's own test suite owns — collected by pytest, or
+/// loaded by it as a conftest?
+///
+/// [VANTA-WHY] `conftest.py` is its own case because pytest loads it even though
+/// the name matches no collection pattern, and a conftest is the cheapest place
+/// to neutralize a test (`collect_ignore`, a monkeypatched fixture, a
+/// `pytest_collection_modifyitems` that deselects). Anything under a `test`/
+/// `tests` directory counts too: a helper module there changes what the tests do
+/// without being a test file itself.
+pub fn is_native_test_path(path: &str) -> bool {
+    let path_ref = Path::new(path);
+    let file_name = path_ref
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if file_name == "conftest.py" {
+        return true;
+    }
+    if !file_name.ends_with(".py") {
+        return false;
+    }
+    if file_name.starts_with("test_") || file_name.ends_with("_test.py") {
+        return true;
+    }
+    path_ref.parent().is_some_and(|dir| {
+        dir.components().any(|component| {
+            matches!(component, std::path::Component::Normal(name)
+                if name == "test" || name == "tests")
+        })
+    })
+}
+
+/// The native-suite view of one patch attempt.
+pub struct NativeTree {
+    /// The tree the native (patched-side) run is given.
+    pub files: HashMap<String, String>,
+    /// Existing test files the patch rewrote; their edits were discarded.
+    pub modified_existing_tests: Vec<String>,
+    /// Existing test files the patch deleted; they were restored.
+    pub removed_existing_tests: Vec<String>,
+    /// Test files the patch added. Not part of the baseline; reported as info.
+    pub added_test_files: Vec<String>,
+}
+
+/// Build the patched tree the native suite runs: patched source, ORIGINAL tests.
+///
+/// `patch_deleted_tests` comes from the patch TEXT, not from `patched_files`:
+/// the apply cascade leaves a deleted file at its original contents (the strict
+/// path skips a `/dev/null` destination outright), so a deletion is invisible in
+/// the file map and can only be read off the diff itself.
+pub fn native_tree_with_original_tests(
+    original_files: &HashMap<String, String>,
+    patched_files: &HashMap<String, String>,
+    patch_deleted_tests: &[String],
+) -> NativeTree {
+    let mut files: HashMap<String, String> = HashMap::new();
+    let mut modified_existing_tests: Vec<String> = Vec::new();
+    let mut added_test_files: Vec<String> = Vec::new();
+
+    let mut paths: Vec<&String> = patched_files.keys().collect();
+    paths.sort();
+    for path in paths {
+        let contents = &patched_files[path];
+        if !is_native_test_path(path) {
+            files.insert(path.clone(), contents.clone());
+            continue;
+        }
+        match original_files.get(path) {
+            Some(original) => {
+                if original != contents {
+                    modified_existing_tests.push(path.clone());
+                }
+                files.insert(path.clone(), original.clone());
+            }
+            // A test file the patch ADDED — including a new `conftest.py`. It is
+            // not part of the original baseline, so it is excluded rather than
+            // restored, and it can never be the reason an original test "passes"
+            // or disappears.
+            None => added_test_files.push(path.clone()),
+        }
+    }
+
+    // A test file the patch deleted: restore the original so the test still
+    // runs. Without this a patch could silence a test simply by removing it.
+    let mut removed_existing_tests: Vec<String> = Vec::new();
+    for path in patch_deleted_tests {
+        if !is_native_test_path(path) {
+            continue;
+        }
+        let Some(original) = original_files.get(path) else {
+            continue;
+        };
+        removed_existing_tests.push(path.clone());
+        files.insert(path.clone(), original.clone());
+    }
+    removed_existing_tests.sort();
+    removed_existing_tests.dedup();
+
+    NativeTree {
+        files,
+        modified_existing_tests,
+        removed_existing_tests,
+        added_test_files,
+    }
 }
 
 // ============================================================================
@@ -1191,12 +1371,14 @@ pub async fn heal_dependencies(
 mod tests {
     use super::{
         NativeSuiteReport, RUFF_ARGS, StaticDiagnostic, copy_static_configs, interpreter_for,
-        native_outcome, native_regressions, native_suite_collapsed, new_diagnostics,
-        parse_mypy_line, parse_native_report, parse_ruff_line, ruff_is_error_class,
-        run_single_test, run_tests_parallel, static_tool_runner, write_source_files,
+        is_native_test_path, native_outcome, native_regressions, native_suite_collapsed,
+        native_tree_with_original_tests, new_diagnostics, parse_mypy_line, parse_native_report,
+        parse_ruff_line, ruff_is_error_class, run_single_test, run_tests_parallel,
+        static_tool_runner, write_source_files,
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{TestIntent, TestResult};
+    use std::collections::HashMap;
     use crate::pipeline::candidate::TestCommand;
     use crate::sandbox::ExecutionResult;
     use std::fs;
@@ -1310,6 +1492,7 @@ mod tests {
                 .iter()
                 .map(|(name, result)| ((*name).to_string(), result.clone()))
                 .collect(),
+            failure_outputs: HashMap::new(),
             ran: true,
             exit_code: Some(0),
             stderr_tail: String::new(),
@@ -1356,6 +1539,125 @@ mod tests {
             "a gate that could not run must not be reported as a collapse — that would \
              invent a finding out of a missing measurement"
         );
+    }
+
+    // ---- the native tree is graded by the ORIGINAL tests ---------------------
+    //
+    // [VANTA-WHY] The 888b6931 hole: the native run collected the patch's OWN
+    // edited test file, so the weakened test passed and the Gatekeeper approved a
+    // patch the original test rejects. These pin that the patch's edits to
+    // existing tests never reach the native tree.
+
+    #[test]
+    fn a_collected_test_file_is_recognised_by_every_name_pytest_uses() {
+        for path in [
+            "test_core.py",
+            "tests/test_core.py",
+            "pkg/tests/test_deep.py",
+            "core_test.py",
+            "tests/helpers.py",
+            "conftest.py",
+            "tests/conftest.py",
+        ] {
+            assert!(is_native_test_path(path), "{path} is owned by the test suite");
+        }
+        for path in ["calc.py", "src/heretic/plugin.py", "latest.py"] {
+            assert!(
+                !is_native_test_path(path),
+                "{path} is not a test file and must not be pinned back"
+            );
+        }
+    }
+
+    #[test]
+    fn a_patch_that_weakens_an_existing_test_is_graded_by_the_original_test() {
+        let original = HashMap::from([
+            ("calc.py".to_string(), "def scale(x):\n    return x * 2\n".to_string()),
+            (
+                "tests/test_core.py".to_string(),
+                "def test_scale():\n    assert scale(3) == 6\n".to_string(),
+            ),
+        ]);
+        let mut patched = original.clone();
+        patched.insert(
+            "calc.py".to_string(),
+            "def scale(x):\n    return x * 2 + 1\n".to_string(),
+        );
+        patched.insert(
+            "tests/test_core.py".to_string(),
+            "def test_scale():\n    assert True\n".to_string(),
+        );
+
+        let tree = native_tree_with_original_tests(&original, &patched, &[]);
+
+        assert_eq!(
+            tree.files["tests/test_core.py"],
+            original["tests/test_core.py"],
+            "the native run must grade the patch with the ORIGINAL test, not the weakened one"
+        );
+        assert_eq!(
+            tree.files["calc.py"], patched["calc.py"],
+            "the patched source must be what the native run executes"
+        );
+        assert_eq!(tree.modified_existing_tests, vec!["tests/test_core.py"]);
+        assert!(tree.added_test_files.is_empty());
+        assert!(tree.removed_existing_tests.is_empty());
+    }
+
+    #[test]
+    fn a_patch_added_conftest_and_test_file_never_reach_the_native_tree() {
+        let original = HashMap::from([(
+            "calc.py".to_string(),
+            "def scale(x):\n    return x * 2\n".to_string(),
+        )]);
+        let mut patched = original.clone();
+        patched.insert(
+            "conftest.py".to_string(),
+            "collect_ignore = ['tests/test_core.py']\n".to_string(),
+        );
+        patched.insert(
+            "tests/test_new.py".to_string(),
+            "def test_new():\n    assert True\n".to_string(),
+        );
+
+        let tree = native_tree_with_original_tests(&original, &patched, &[]);
+
+        assert!(
+            !tree.files.contains_key("conftest.py"),
+            "a patch-added conftest.py can deselect the very tests that grade the patch"
+        );
+        assert!(
+            !tree.files.contains_key("tests/test_new.py"),
+            "a test file the patch added is not part of the original baseline"
+        );
+        assert_eq!(
+            tree.added_test_files,
+            vec!["conftest.py".to_string(), "tests/test_new.py".to_string()],
+            "added test files are reported as info"
+        );
+    }
+
+    #[test]
+    fn a_deleted_test_file_is_restored_for_the_native_run() {
+        let original = HashMap::from([
+            ("calc.py".to_string(), "def scale(x):\n    return x * 2\n".to_string()),
+            (
+                "tests/test_core.py".to_string(),
+                "def test_scale():\n    assert scale(3) == 6\n".to_string(),
+            ),
+        ]);
+        // The cascade leaves a deleted file at its original contents, so the
+        // deletion is only visible in the diff.
+        let patched = original.clone();
+        let deleted = vec!["tests/test_core.py".to_string()];
+
+        let tree = native_tree_with_original_tests(&original, &patched, &deleted);
+
+        assert_eq!(
+            tree.files["tests/test_core.py"], original["tests/test_core.py"],
+            "a deleted test must still run against the patched source"
+        );
+        assert_eq!(tree.removed_existing_tests, vec!["tests/test_core.py"]);
     }
 
     // ---- subTest parsing (item 9) --------------------------------------------

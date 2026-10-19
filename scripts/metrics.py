@@ -85,6 +85,10 @@ class SessionData:
     schema_version: Optional[int]
     warnings: list[str] = field(default_factory=list)
     reruns: Optional[dict[str, Any]] = None
+    # [WHY] `<sid>_transitions.jsonl` is a SEPARATE artifact from the session log
+    # and is where the ECR/EIR rows live. Absent for a run that produced no
+    # transition at all (a first-attempt success), which is a fact, not an error.
+    transitions: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def schema_label(self) -> str:
@@ -221,7 +225,28 @@ def load_session(sessions_dir: str, session_id: str) -> SessionData:
             "rejected but no signal was re-run, so discrimination cannot be "
             "established."
         )
+    data.transitions = load_transitions(sessions_dir, session_id)
     return data
+
+
+def load_transitions(sessions_dir: str, session_id: str) -> list[dict[str, Any]]:
+    """Read `<sid>_transitions.jsonl`, or `[]` when the run wrote none."""
+    path = os.path.join(sessions_dir, f"{session_id}_transitions.jsonl")
+    if not os.path.exists(path):
+        return []
+    rows: list[dict[str, Any]] = []
+    with open(path, encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                raise SystemExit(
+                    f"{path}:{line_number}: not valid JSON ({error})"
+                ) from error
+    return rows
 
 
 def discover_sessions(sessions_dir: str) -> list[str]:
@@ -231,6 +256,112 @@ def discover_sessions(sessions_dir: str) -> list[str]:
         if name.endswith("_session.jsonl"):
             ids.append(name[: -len("_session.jsonl")])
     return ids
+
+
+# ============================================================================
+# ECR/EIR — the SAME rule as the Rust analyser, read from transition rows
+# ============================================================================
+#
+# [WHY] One definition of the metric: the console's live print, the M5 analysis
+# layer and this script all apply the counting rule to the same
+# `transitions.jsonl`. `counts_toward_metrics` in `src/core/mod.rs` is the other
+# half (the failure-class gate) and this is its mirror.
+
+# [WHY] The three sources the breakdown is reported over. A source the file adds
+# later shows up on its own rather than being folded into AttackerGenerated.
+SOURCES = ("AttackerGenerated", "Native", "Static")
+
+
+def _countable_side(result: Any, failure_class: Any, source: str) -> bool:
+    """One side of a row may move the metric only if it is pass or Logic-class.
+
+    [WHY] `source == "Static"` reopens the exclusion for its OWN rows: a static
+    row is a blocking finding already differenced against the pre-patch
+    baseline, so the finding that remains is the candidate's and one that
+    disappears on the next attempt is a real correction. The allowance is NOT
+    given to AttackerGenerated rows — an `import-not-found` there is the
+    environment's fault.
+    """
+    if result == "Passed":
+        return True
+    if failure_class == "Logic":
+        return True
+    return source == "Static" and failure_class == "Static"
+
+
+def is_countable_patch_transition(row: dict[str, Any]) -> bool:
+    """A row counts only when both ends are observed AND different.
+
+    [WHY] `from == to` is a review round (the candidate never changed) and a
+    null end is a recorded hole. Both are excluded, never filled in — the same
+    condition as `TransitionRow::is_countable_patch_transition`.
+    """
+    if row.get("censored"):
+        return False
+    frm = row.get("from_patch_attempt_id")
+    to = row.get("to_patch_attempt_id")
+    if frm is None or to is None:
+        return False
+    return frm != to
+
+
+def compute_ecr_eir(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Combined ECR/EIR plus the per-source breakdown over transition rows."""
+    complete = 0
+    ecr = 0
+    eir = 0
+    per_source: dict[str, dict[str, int]] = {}
+    for row in rows:
+        if not is_countable_patch_transition(row):
+            continue
+        source = row.get("evidence_source") or "AttackerGenerated"
+        if not _countable_side(
+            row.get("from_result"), row.get("from_failure_class"), source
+        ):
+            continue
+        if not _countable_side(row.get("to_result"), row.get("to_failure_class"), source):
+            continue
+        bucket = per_source.setdefault(source, {"ecr": 0, "eir": 0, "complete": 0})
+        complete += 1
+        bucket["complete"] += 1
+        pair = (row.get("from_result"), row.get("to_result"))
+        if pair == ("Failed", "Passed"):
+            ecr += 1
+            bucket["ecr"] += 1
+        elif pair == ("Passed", "Failed"):
+            eir += 1
+            bucket["eir"] += 1
+    return {
+        "ecr": ecr,
+        "eir": eir,
+        "complete": complete,
+        "rows_total": len(rows),
+        "per_source": per_source,
+    }
+
+
+def rate_text(count: int, complete: int) -> str:
+    """`count/denominator (pct%)`, or `n/a` when the denominator is zero.
+
+    [WHY] "No countable transition" and "every countable transition was
+    uncorrected" are opposite claims about a run; `0.00%` states the second.
+    `n/a` states the first.
+    """
+    if complete == 0:
+        return "n/a"
+    return f"{count}/{complete} ({count / complete * 100:.2f}%)"
+
+
+def source_text(per_source: dict[str, dict[str, int]]) -> str:
+    """`AttackerGenerated[ECR=… EIR=…] Native[…] Static[…]`."""
+    parts = []
+    for name in SOURCES:
+        bucket = per_source.get(name) or {"ecr": 0, "eir": 0, "complete": 0}
+        parts.append(
+            f"{name}[ECR={rate_text(bucket['ecr'], bucket['complete'])} "
+            f"EIR={rate_text(bucket['eir'], bucket['complete'])}]"
+        )
+    return " ".join(parts)
 
 
 # ============================================================================
@@ -249,6 +380,7 @@ class Verdict:
     signals_undecidable: int
     label: Optional[bool] = None
     warnings: list[str] = field(default_factory=list)
+    metrics: dict[str, Any] = field(default_factory=dict)
 
     @property
     def explanation(self) -> str:
@@ -330,6 +462,7 @@ def classify(
         signals_undecidable=len(undecidable),
         label=known_bad,
         warnings=list(data.warnings),
+        metrics=compute_ecr_eir(data.transitions),
     )
 
 
@@ -374,6 +507,45 @@ def render_table(verdicts: list[Verdict]) -> str:
     seen = sum(1 for v in verdicts if v.decision == "Rejected")
     lines.append(f"  {'scored rejections':<18} {scored}")
     lines.append(f"  {'rejections seen':<18} {seen}")
+    return "\n".join(lines)
+
+
+def render_metrics(verdicts: list[Verdict]) -> str:
+    """ECR/EIR per session and pooled, combined and per evidence source.
+
+    [WHY] Pooled alone hides WHICH evidence moved the number. Session 4d55123d's
+    only correction was a repo test (`Native`), and reading it as an
+    AttackerGenerated result would credit the model for something the
+    repository's own suite proved. A zero denominator prints `n/a`, never
+    `0.00%`.
+    """
+    lines = ["", "ECR/EIR (over transition rows; n/a = no countable transition)"]
+    header = f"  {'SESSION':<10} {'ECR':<20} {'EIR':<20} BY SOURCE"
+    lines.append(header)
+    lines.append("  " + "-" * (len(header) - 2))
+    pooled = {"ecr": 0, "eir": 0, "complete": 0}
+    pooled_sources: dict[str, dict[str, int]] = {}
+    for verdict in verdicts:
+        metrics_ = verdict.metrics or {}
+        per_source = metrics_.get("per_source") or {}
+        lines.append(
+            f"  {verdict.session_id[:8]:<10} "
+            f"{rate_text(metrics_.get('ecr', 0), metrics_.get('complete', 0)):<20} "
+            f"{rate_text(metrics_.get('eir', 0), metrics_.get('complete', 0)):<20} "
+            f"{source_text(per_source)}"
+        )
+        for key in pooled:
+            pooled[key] += metrics_.get(key, 0)
+        for name, bucket in per_source.items():
+            acc = pooled_sources.setdefault(name, {"ecr": 0, "eir": 0, "complete": 0})
+            for key in acc:
+                acc[key] += bucket.get(key, 0)
+    lines.append(
+        f"  {'POOLED':<10} "
+        f"{rate_text(pooled['ecr'], pooled['complete']):<20} "
+        f"{rate_text(pooled['eir'], pooled['complete']):<20} "
+        f"{source_text(pooled_sources)}"
+    )
     return "\n".join(lines)
 
 
@@ -451,6 +623,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         verdicts.append(classify(data, known_bad))
 
     print(render_table(verdicts))
+    print(render_metrics(verdicts))
 
     warnings = [w for verdict in verdicts for w in verdict.warnings]
     if warnings:

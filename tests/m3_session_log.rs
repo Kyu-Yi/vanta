@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use tempfile::TempDir;
-use vanta::core::{EcrEirSnapshot, FailureClass, TestIntent, TestResult};
+use vanta::core::{EcrEirSnapshot, EvidenceSource, FailureClass, TestIntent, TestResult};
 use vanta::session::{PatchAttemptId, SessionId, SessionRecord, TransitionRow, ecr_eir_from_rows, SCHEMA_VERSION};
 
 /// These tests each spawn a `vanta_m3` process that boots sandboxes and runs
@@ -2224,5 +2224,747 @@ fn a_native_suite_that_collapses_from_four_tests_to_zero_rejects_the_patch() {
         final_row.summary.contains("Rejected"),
         "a collapsed native suite is a rejection, not a budget outcome; got {}",
         final_row.summary
+    );
+}
+
+// ============================================================================
+// Test integrity — the native suite must grade the patch with the ORIGINAL tests
+// ============================================================================
+//
+// [VANTA-WHY] Session 888b6931 approved a patch that always passed
+// `max_response_length` to `get_responses`, even when the setting was unset —
+// exactly the behaviour the issue forbade. It got through because the Creator
+// ALSO edited the repository's own test (`FakeContext.get_responses`) to accept
+// the new kwarg, and the native suite ran the Creator's edited file. Run on the
+// original test file that test fails with a TypeError. A patch must never
+// control the tests that grade it, so the native run restores every original
+// test file, drops patch-added ones, restores deleted ones, and reports the
+// pytest-config change instead of trusting it.
+
+/// A patch that breaks `scale` AND rewrites the repository's own test to accept
+/// the broken arithmetic — the 888b6931 shape. On the ORIGINAL test file the
+/// patched source fails (`scale(3, 2)` is 7, the test wants 6).
+const WEAKEN_THE_CATCHING_TEST_PATCH: &str = concat!(
+    "diff --git a/calc.py b/calc.py\n",
+    "--- a/calc.py\n",
+    "+++ b/calc.py\n",
+    "@@ -5,2 +5,2 @@\n",
+    " def scale(x, factor):\n",
+    "-    return x * factor\n",
+    "+    return x * factor + 1\n",
+    "diff --git a/tests/test_core.py b/tests/test_core.py\n",
+    "--- a/tests/test_core.py\n",
+    "+++ b/tests/test_core.py\n",
+    "@@ -1,5 +1,5 @@\n",
+    " from calc import scale\n",
+    " \n",
+    " \n",
+    " def test_scale_doubles():\n",
+    "-    assert scale(3, 2) == 6\n",
+    "+    assert scale(3, 2) == 7\n",
+);
+
+/// The same break, plus a root `conftest.py` that SKIPS the catching test — the
+/// cheapest way for a patch to neutralise the suite that grades it.
+const BREAK_AND_NEUTRALISE_WITH_CONFTEST_PATCH: &str = concat!(
+    "diff --git a/calc.py b/calc.py\n",
+    "--- a/calc.py\n",
+    "+++ b/calc.py\n",
+    "@@ -5,2 +5,2 @@\n",
+    " def scale(x, factor):\n",
+    "-    return x * factor\n",
+    "+    return x * factor + 1\n",
+    "diff --git a/conftest.py b/conftest.py\n",
+    "new file mode 100644\n",
+    "--- /dev/null\n",
+    "+++ b/conftest.py\n",
+    "@@ -0,0 +1,7 @@\n",
+    "+import pytest\n",
+    "+\n",
+    "+\n",
+    "+def pytest_collection_modifyitems(config, items):\n",
+    "+    for item in items:\n",
+    "+        if \"test_scale_doubles\" in item.nodeid:\n",
+    "+            item.add_marker(pytest.mark.skip(reason=\"neutralised by the patch\"))\n",
+);
+
+/// The same break, plus a DELETION of the catching test file.
+const BREAK_AND_DELETE_THE_TEST_PATCH: &str = concat!(
+    "diff --git a/calc.py b/calc.py\n",
+    "--- a/calc.py\n",
+    "+++ b/calc.py\n",
+    "@@ -5,2 +5,2 @@\n",
+    " def scale(x, factor):\n",
+    "-    return x * factor\n",
+    "+    return x * factor + 1\n",
+    "diff --git a/tests/test_core.py b/tests/test_core.py\n",
+    "deleted file mode 100644\n",
+    "--- a/tests/test_core.py\n",
+    "+++ /dev/null\n",
+    "@@ -1,5 +0,0 @@\n",
+    "-from calc import scale\n",
+    "-\n",
+    "-\n",
+    "-def test_scale_doubles():\n",
+    "-    assert scale(3, 2) == 6\n",
+);
+
+/// A patch that adds ONLY a new test file and touches no source.
+const ADD_ONLY_A_NEW_TEST_FILE_PATCH: &str = concat!(
+    "diff --git a/tests/test_new_probe.py b/tests/test_new_probe.py\n",
+    "new file mode 100644\n",
+    "--- /dev/null\n",
+    "+++ b/tests/test_new_probe.py\n",
+    "@@ -0,0 +1,5 @@\n",
+    "+from calc import scale\n",
+    "+\n",
+    "+\n",
+    "+def test_scale_new_probe():\n",
+    "+    assert scale(3, 2) == 6\n",
+);
+
+/// The repo scanner only picks up source extensions, so a pytest-config file is
+/// never in the original file map; the patch therefore ADDS the config section.
+/// What matters is that the change is detected from the diff and recorded.
+const EDIT_PYTEST_CONFIG_PATCH: &str = concat!(
+    "diff --git a/pyproject.toml b/pyproject.toml\n",
+    "new file mode 100644\n",
+    "--- /dev/null\n",
+    "+++ b/pyproject.toml\n",
+    "@@ -0,0 +1,2 @@\n",
+    "+[tool.pytest.ini_options]\n",
+    "+markers = [\"slow: marks slow tests\", \"flaky: marks flaky tests\"]\n",
+);
+
+/// The evidence file path for the single session a toy run writes.
+fn evidence_for(workspace: &Path, records: &[SessionRecord]) -> serde_json::Value {
+    read_json(
+        &workspace
+            .join("vanta_sessions")
+            .join(format!("{}_evidence.json", records[0].session_id.as_str())),
+    )
+}
+
+/// A patch that breaks the behaviour AND rewrites the very test that catches it
+/// must still be graded by the ORIGINAL test.
+///
+/// [VANTA-WHY] This is 888b6931 exactly. The Creator's edit made the test pass
+/// on its own broken tree, the native suite ran the edited file, and a bad patch
+/// was approved. The native run must restore the original test file, find the
+/// regression, reject, and say in the rejection that the patch itself modified
+/// the test the rejection rests on.
+#[test]
+fn a_patch_that_weakens_the_test_it_breaks_is_graded_by_the_original_test() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        WEAKEN_THE_CATCHING_TEST_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+    assert!(
+        !output.status.success(),
+        "a patch that rewrote the test it breaks must still be rejected"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let summary = records
+        .iter()
+        .find(|r| r.phase == "native_suite.summary")
+        .expect("the native-suite gate must log its own summary row");
+    assert!(
+        summary.summary.contains("regressions=1") && summary.summary.contains("patched_tests=1"),
+        "the native run must grade the patch with the ORIGINAL test — one test collected, one \
+         regression; got {}",
+        summary.summary
+    );
+    assert!(
+        records.iter().any(|r| r.phase
+            == "native_suite.test[tests/test_core.py::test_scale_doubles]"
+            && r.summary.contains("regression=true")),
+        "the rewritten test must be recorded as a regression under its original name; got {:?}",
+        records
+            .iter()
+            .filter(|r| r.phase.starts_with("native_suite.test["))
+            .map(|r| r.summary.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Test integrity: native_test_source=original")
+            && stdout.contains("modified_existing_tests=[tests/test_core.py]"),
+        "the run output must report that the native suite ran the original tests and which \
+         existing test the patch rewrote; got {stdout}"
+    );
+    assert!(
+        stdout.contains("REJECTED") && stdout.contains("the patch also modified tests/test_core.py"),
+        "the review-mode rejection must name the regressing test and say the patch itself \
+         modified it; got {stdout}"
+    );
+
+    let evidence = evidence_for(workspace.path(), &records);
+    assert_eq!(evidence["native_test_source"], serde_json::json!("original"));
+    assert_eq!(
+        evidence["modified_existing_tests"],
+        serde_json::json!(["tests/test_core.py"])
+    );
+    assert_eq!(evidence["removed_existing_tests"], serde_json::json!([]));
+    assert_eq!(evidence["added_test_files"], serde_json::json!([]));
+    assert_eq!(evidence["modified_test_config"], serde_json::json!([]));
+}
+
+/// A root `conftest.py` that skips the catching test must not reach the native
+/// run: the added conftest is excluded, so the original test still executes and
+/// the regression is still found.
+///
+/// [VANTA-WHY] `patched_tests=1` is the assertion that matters. Had the added
+/// conftest been collected, the test would have been SKIPPED — pytest reports
+/// `skipped` and the native parser drops it, so the patched side would have
+/// collected zero tests and the regression would have been found for the wrong
+/// reason (absence, not failure). One collected test that FAILS is the original
+/// test doing the grading.
+#[test]
+fn a_patch_added_conftest_cannot_skip_the_regressing_test() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        BREAK_AND_NEUTRALISE_WITH_CONFTEST_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+    assert!(
+        !output.status.success(),
+        "a conftest that skips the catching test must not save the patch"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let summary = records
+        .iter()
+        .find(|r| r.phase == "native_suite.summary")
+        .expect("the native-suite gate must log its own summary row");
+    assert!(
+        summary.summary.contains("patched_tests=1") && summary.summary.contains("regressions=1"),
+        "the added conftest must be excluded, so the original test still runs and fails; got {}",
+        summary.summary
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("added_test_files=[conftest.py]"),
+        "the added conftest must be reported as info, not silently dropped; got {stdout}"
+    );
+
+    let evidence = evidence_for(workspace.path(), &records);
+    assert_eq!(
+        evidence["added_test_files"],
+        serde_json::json!(["conftest.py"])
+    );
+    assert_eq!(evidence["modified_existing_tests"], serde_json::json!([]));
+    assert_eq!(evidence["removed_existing_tests"], serde_json::json!([]));
+}
+
+/// Deleting the catching test file must not silence the regression: the file is
+/// read off the diff (`+++ /dev/null` is invisible in the resulting file map)
+/// and restored for the native run.
+#[test]
+fn a_patch_that_deletes_the_test_file_has_it_restored_for_the_native_run() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        BREAK_AND_DELETE_THE_TEST_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+    assert!(
+        !output.status.success(),
+        "deleting the catching test must not turn a broken patch into an approval"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let summary = records
+        .iter()
+        .find(|r| r.phase == "native_suite.summary")
+        .expect("the native-suite gate must log its own summary row");
+    assert!(
+        summary.summary.contains("patched_tests=1") && summary.summary.contains("regressions=1"),
+        "the deleted test must be restored, so it runs on the patched side and fails; got {}",
+        summary.summary
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("removed_existing_tests=[tests/test_core.py]"),
+        "the run output must report the restored test file; got {stdout}"
+    );
+
+    let evidence = evidence_for(workspace.path(), &records);
+    assert_eq!(
+        evidence["removed_existing_tests"],
+        serde_json::json!(["tests/test_core.py"])
+    );
+    assert_eq!(evidence["modified_existing_tests"], serde_json::json!([]));
+    assert_eq!(evidence["added_test_files"], serde_json::json!([]));
+}
+
+/// A patch that only ADDS a new test file changes neither the source nor the
+/// baseline: it is reported as info and never counts toward approval.
+#[test]
+fn a_patch_added_test_file_is_information_not_baseline() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        ADD_ONLY_A_NEW_TEST_FILE_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+    assert!(
+        output.status.success(),
+        "adding a test file must not change the verdict; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let summary = records
+        .iter()
+        .find(|r| r.phase == "native_suite.summary")
+        .expect("the native-suite gate must log its own summary row");
+    assert!(
+        summary.summary.contains("patched_tests=1") && summary.summary.contains("regressions=0"),
+        "the new test file is not part of the native baseline, so the patched side still \
+         collects only the repo's own test; got {}",
+        summary.summary
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("added_test_files=[tests/test_new_probe.py]"),
+        "the added test file must be reported in the run output; got {stdout}"
+    );
+
+    let evidence = evidence_for(workspace.path(), &records);
+    assert_eq!(
+        evidence["added_test_files"],
+        serde_json::json!(["tests/test_new_probe.py"])
+    );
+    assert_eq!(evidence["modified_existing_tests"], serde_json::json!([]));
+    assert_eq!(evidence["removed_existing_tests"], serde_json::json!([]));
+    assert_eq!(evidence["modified_test_config"], serde_json::json!([]));
+}
+
+/// A patch that carries a `[tool.pytest.ini_options]` change is recorded with
+/// its diff instead of being trusted — the section is not restored (pyproject
+/// also carries non-test content), so the change is surfaced for an audit.
+#[test]
+fn a_patch_that_edits_pytest_config_is_recorded_with_its_diff() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        EDIT_PYTEST_CONFIG_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("modified_test_config=[pyproject.toml]")
+            && stdout.contains("pytest config 'pyproject.toml' changed by the patch"),
+        "a pytest-config edit must be warned about and named in the run output; got {stdout}"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let evidence = evidence_for(workspace.path(), &records);
+    let config = evidence["modified_test_config"]
+        .as_array()
+        .expect("modified_test_config must be an array");
+    assert_eq!(
+        config.len(),
+        1,
+        "exactly one pytest-config change must be recorded; got {config:?}"
+    );
+    assert_eq!(config[0]["path"], serde_json::json!("pyproject.toml"));
+    let diff = config[0]["diff"].as_str().unwrap_or_default();
+    assert!(
+        diff.contains("tool.pytest.ini_options") && diff.contains("flaky: marks flaky tests"),
+        "the recorded config change must carry its diff; got {diff:?}"
+    );
+    assert_eq!(evidence["modified_existing_tests"], serde_json::json!([]));
+    assert_eq!(evidence["removed_existing_tests"], serde_json::json!([]));
+    assert_eq!(evidence["added_test_files"], serde_json::json!([]));
+}
+
+/// In repair mode the Creator is TOLD that its edits to an existing test were
+/// discarded, and given the native regression with its failure output — so it
+/// does not "fix" the same test again on the next attempt.
+#[test]
+fn repair_mode_tells_the_creator_its_test_edits_were_discarded() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let _ = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        WEAKEN_THE_CATCHING_TEST_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+
+    // The Creator's multi-file answer is the SAME bad patch every attempt: the
+    // feedback is what is under test, not the Creator's ability to fix it.
+    let creator_patch = concat!(
+        "===FILE: calc.py===\n",
+        "diff --git a/calc.py b/calc.py\n",
+        "--- a/calc.py\n",
+        "+++ b/calc.py\n",
+        "@@ -5,2 +5,2 @@\n",
+        " def scale(x, factor):\n",
+        "-    return x * factor\n",
+        "+    return x * factor + 1\n",
+        "===FILE: tests/test_core.py===\n",
+        "diff --git a/tests/test_core.py b/tests/test_core.py\n",
+        "--- a/tests/test_core.py\n",
+        "+++ b/tests/test_core.py\n",
+        "@@ -1,5 +1,5 @@\n",
+        " from calc import scale\n",
+        " \n",
+        " \n",
+        " def test_scale_doubles():\n",
+        "-    assert scale(3, 2) == 6\n",
+        "+    assert scale(3, 2) == 7\n",
+    );
+    let script = serde_json::json!([
+        {
+            "patch_text": creator_patch,
+            "explanation": "make scale add one and relax the repo's own test",
+            "files_touched": ["calc.py", "tests/test_core.py"],
+            "confidence": 0.3
+        }
+    ])
+    .to_string();
+    let server = StubLlmServer::start_with_creator_script(&script, SINGLE_BEHAVIOR_TEST);
+
+    let output = run_creator_mode_with_output(workspace.path(), &server, 2, &[]);
+    assert!(
+        !output.status.success(),
+        "the stub creator never repairs the patch, so the run must exhaust its budget"
+    );
+
+    let creator_bodies: Vec<String> = server
+        .request_kinds()
+        .into_iter()
+        .zip(server.request_bodies())
+        .filter_map(|(kind, body)| if kind == "creator" { Some(body) } else { None })
+        .collect();
+    assert_eq!(
+        creator_bodies.len(),
+        2,
+        "a rejected attempt must be fed back to the Creator as a second call"
+    );
+    let feedback = &creator_bodies[1];
+    assert!(
+        feedback.contains("You modified or deleted existing test file(s). Those edits were \
+                           DISCARDED")
+            || feedback.contains("Those edits were DISCARDED"),
+        "the Creator must be told its test edits were discarded; got {feedback}"
+    );
+    assert!(
+        feedback.contains("modified (discarded): tests/test_core.py"),
+        "the discarded file must be named; got {feedback}"
+    );
+    assert!(
+        feedback.contains("tests/test_core.py::test_scale_doubles"),
+        "the native regression must be named; got {feedback}"
+    );
+    assert!(
+        feedback.contains("failure:"),
+        "the native regression must carry its failure output; got {feedback}"
+    );
+    assert!(
+        feedback.contains(
+            "Do not modify or delete existing tests. If you need a new test, put it in a NEW \
+             test file."
+        ),
+        "the Creator must be told the rule, not just the consequence; got {feedback}"
+    );
+}
+
+/// ECR/EIR pass — session 4d55123d, reproduced end to end.
+///
+/// [VANTA-WHY] In that run the ONE real correction was to a repository-native
+/// test the previous attempt had broken, and it was invisible: the native suite
+/// wrote only session records, so the transitions file held three
+/// AttackerGenerated `Passed -> Passed` rows, ECR read 0/0, and the FINAL line
+/// still claimed there had been no transition. A native regression is evidence
+/// about the candidate, so it must produce a row like any other.
+#[test]
+fn a_native_regression_fixed_on_the_next_attempt_counts_as_a_correction() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let _ = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        NATIVE_BREAKING_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+
+    // Attempt 1 breaks `scale`, which the repo's own test asserts and the
+    // generated probe never touches. Attempt 2 stops touching `scale` (it only
+    // adds a docstring to `add`), so the native test passes again.
+    let script = serde_json::json!([
+        {
+            "patch_text": NATIVE_BREAKING_PATCH,
+            "explanation": "break scale by adding one",
+            "files_touched": ["calc.py"],
+            "confidence": 0.3
+        },
+        {
+            "patch_text": PRESERVING_PATCH,
+            "explanation": "leave scale alone and document add",
+            "files_touched": ["calc.py"],
+            "confidence": 0.8
+        }
+    ])
+    .to_string();
+    let server = StubLlmServer::start_with_creator_script(&script, SINGLE_BEHAVIOR_TEST);
+
+    let output = run_creator_mode_with_output(workspace.path(), &server, 2, &[]);
+    assert!(
+        output.status.success(),
+        "the second attempt repairs the regression, so the run must be approved; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // The native regression went through the SAME failure path to the Creator as
+    // any generated failure, and it is counted there.
+    assert!(
+        stdout.contains(
+            "Feeding 1 failure(s) back to Creator for retry (0 generated, 1 native, 0 static)"
+        ),
+        "the native regression must be counted as a failure fed back to the Creator; got {stdout}"
+    );
+
+    let rows = read_transition_rows(&find_transitions(workspace.path()));
+    let native_rows: Vec<&TransitionRow> = rows
+        .iter()
+        .filter(|r| r.evidence_source == EvidenceSource::Native)
+        .collect();
+    assert_eq!(
+        native_rows.len(),
+        1,
+        "one native test ran on both attempts, so exactly one Native row must exist; got {:?}",
+        rows.iter()
+            .map(|r| (&r.evidence_source, &r.from_result, &r.to_result))
+            .collect::<Vec<_>>()
+    );
+    let native = native_rows[0];
+    assert_eq!(
+        native.shared_set_id, "native",
+        "a native row is its own question set, not the Attacker's"
+    );
+    assert!(
+        native.test_id.contains("test_scale_doubles"),
+        "the row's test_id must be the native nodeid; got {}",
+        native.test_id
+    );
+    assert_eq!(native.from_result, TestResult::Failed);
+    assert_eq!(native.to_result, TestResult::Passed);
+
+    let snap = ecr_eir_from_rows(&rows);
+    assert_eq!(
+        snap.native.ecr_count, 1,
+        "ECR(Native) must count the correction the run actually made"
+    );
+    assert_eq!(
+        snap.native.complete, 1,
+        "the native denominator is the one test that ran on both attempts"
+    );
+    assert_eq!(
+        snap.ecr_count, 1,
+        "the correction must appear in the combined ECR, not only per source"
+    );
+    assert_eq!(
+        snap.complete, 2,
+        "the Attacker row (Passed->Passed) and the Native row are both countable"
+    );
+
+    // The FINAL line must not claim there was no transition: rows exist.
+    assert!(
+        !stdout.contains("no N→N+1 transition"),
+        "the run wrote transition rows, so the FINAL line must not claim none; got {stdout}"
+    );
+    assert!(
+        stdout.contains("ECR=1/2 (50.00%)"),
+        "the combined ECR must show the one correction over two countable rows; got {stdout}"
+    );
+    assert!(
+        stdout.contains("Native[ECR=1/1 (100.00%)"),
+        "the per-source line must attribute the correction to the Native suite; got {stdout}"
+    );
+
+    // Evidence file records each attempt's native regressions under a clear key.
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let evidence = evidence_for(workspace.path(), &records);
+    let regressions = evidence["native_regressions"]
+        .as_array()
+        .expect("evidence.json must record native regressions under a clear key");
+    let attempt_one = regressions
+        .iter()
+        .find(|r| r["attempt"] == serde_json::json!(1))
+        .expect("attempt 1 must have a native-regression entry");
+    assert!(
+        attempt_one["regressions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap_or("").contains("test_scale_doubles")),
+        "attempt 1's native regression must be recorded; got {attempt_one}"
+    );
+}
+
+/// The mirror image: attempt 2 breaks a native test that PASSED at attempt 1, so
+/// `EIR(Native)` must count the introduction.
+#[test]
+fn a_native_test_broken_on_the_next_attempt_counts_as_an_introduced_error() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let _ = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        WRONG_BEHAVIOUR_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+
+    // Attempt 1 leaves `scale` alone (the native test passes) and gets `add`
+    // wrong. Attempt 2 leaves `add` alone (the generated probe passes) but breaks
+    // `scale`, which was passing the attempt before.
+    let script = serde_json::json!([
+        {
+            "patch_text": WRONG_BEHAVIOUR_PATCH,
+            "explanation": "break add instead of scale",
+            "files_touched": ["calc.py"],
+            "confidence": 0.4
+        },
+        {
+            "patch_text": NATIVE_BREAKING_PATCH,
+            "explanation": "break scale, which passed on the previous attempt",
+            "files_touched": ["calc.py"],
+            "confidence": 0.2
+        }
+    ])
+    .to_string();
+    let server = StubLlmServer::start_with_creator_script(&script, SINGLE_BEHAVIOR_TEST);
+
+    let output = run_creator_mode_with_output(workspace.path(), &server, 2, &[]);
+    assert!(
+        !output.status.success(),
+        "the Creator never reaches a clean patch, so the budget must be exhausted"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let rows = read_transition_rows(&find_transitions(workspace.path()));
+    let native_rows: Vec<&TransitionRow> = rows
+        .iter()
+        .filter(|r| r.evidence_source == EvidenceSource::Native)
+        .collect();
+    assert_eq!(
+        native_rows.len(),
+        1,
+        "one native test ran on both attempts; got {:?}",
+        rows.iter()
+            .map(|r| (&r.evidence_source, &r.from_result, &r.to_result))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(native_rows[0].from_result, TestResult::Passed);
+    assert_eq!(native_rows[0].to_result, TestResult::Failed);
+
+    let snap = ecr_eir_from_rows(&rows);
+    assert_eq!(
+        snap.native.eir_count, 1,
+        "EIR(Native) must count the newly broken repo test"
+    );
+    assert_eq!(snap.native.complete, 1);
+    assert_eq!(
+        snap.eir_count, 1,
+        "the break must appear in the combined EIR, not only per source"
+    );
+    assert!(
+        stdout.contains("Native[ECR=0/1 (0.00%) EIR=1/1 (100.00%)]"),
+        "the per-source line must attribute the break to the Native suite; got {stdout}"
+    );
+}
+
+/// A run whose every transition is excluded (here: attempt 1 never applied its
+/// patch, so the only transition is a censored hole) has a ZERO denominator, and
+/// a zero denominator must print `n/a`, never `0.00%`.
+///
+/// [VANTA-WHY] "nothing countable" and "nothing corrected" are opposite claims,
+/// and `0.00%` states the second. The FINAL line here also exercises the other
+/// half of the fix: it may say "no N→N+1 transition" ONLY when there are no
+/// transition rows at all — which is exactly this run.
+#[test]
+fn a_zero_denominator_prints_not_applicable_never_a_zero_percent() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let _ = write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+
+    // Attempt 1 emits source that cannot parse, so nothing was observed for it
+    // and its transition is a censored hole. Attempt 2 applies but fails the
+    // generated probe — still nothing countable, because the `from` side never
+    // produced an observation.
+    let script = serde_json::json!([
+        {
+            "patch_text": BARE_BROKEN_SOURCE,
+            "explanation": "emit source that cannot parse",
+            "files_touched": ["calc.py"],
+            "confidence": 0.1
+        },
+        {
+            "patch_text": WRONG_BEHAVIOUR_PATCH,
+            "explanation": "correct only the arithmetic, still wrong",
+            "files_touched": ["calc.py"],
+            "confidence": 0.8
+        }
+    ])
+    .to_string();
+    let server = StubLlmServer::start_with_creator_script(&script, SINGLE_BEHAVIOR_TEST);
+
+    let output = run_creator_mode_with_output(workspace.path(), &server, 2, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("ECR=n/a EIR=n/a"),
+        "a zero denominator must render n/a on the combined metric; got {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "per source: AttackerGenerated[ECR=n/a EIR=n/a] Native[ECR=n/a EIR=n/a] Static[ECR=n/a EIR=n/a]"
+        ),
+        "every source with an empty denominator must render n/a; got {stdout}"
+    );
+    assert!(
+        !stdout.contains("0.00%"),
+        "a zero denominator must never be printed as a rate; got {stdout}"
+    );
+    assert!(
+        stdout.contains("a repair with no N→N+1 transition is outside ECR/EIR by construction"),
+        "with no transition rows at all, the FINAL line may say so; got {stdout}"
     );
 }

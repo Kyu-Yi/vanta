@@ -39,8 +39,8 @@ use crate::agents::creator::{
 };
 use crate::config::LlmConfig;
 use crate::core::{
-    AttemptTransition, EvidenceSource, FailureClass, GovernorDecision, TestEvidence, TestResult,
-    VerificationOutcome, VerificationPolicy,
+    AttemptTransition, EvidenceSource, FailureClass, GovernorDecision, TestEvidence, TestIntent,
+    TestResult, VerificationOutcome, VerificationPolicy, static_finding_identity,
 };
 use crate::pipeline::bate::run_bate;
 use crate::pipeline::candidate::{CandidatePair, TestCommand};
@@ -50,7 +50,9 @@ use crate::pipeline::governor::{
     AttemptVerdict, Governor, GovernorMode, SharedObservation,
 };
 use crate::pipeline::harness::{self, TestExecutionDetails};
-use crate::pipeline::patch::{apply_patch_detailed, apply_patch_strict, ApplyFailure};
+use crate::pipeline::patch::{
+    ApplyFailure, apply_patch_detailed, apply_patch_strict, patch_deleted_paths,
+};
 use crate::repo::Repo;
 use crate::session::{
     PatchAttemptId, SCHEMA_VERSION, SessionId, SessionLog, SessionRecord, TransitionRow,
@@ -419,12 +421,37 @@ pub async fn run(
     // Governor's in-memory transitions, because only the rows carry the patch ids
     // that separate a repair transition from a review round.
     let mut metric_rows: Vec<TransitionRow> = Vec::new();
+    // [VANTA-WHY] The native suite and the static gate observe the SAME candidate
+    // the Governor does, but they do not go through it, so until now they wrote
+    // no transition row at all. Repair session 4d55123d's only real correction
+    // was a native test the previous attempt had broken, and it was invisible to
+    // ECR/EIR for exactly that reason. These two carry the PREVIOUS attempt's
+    // effective outcome so the current attempt can be differenced against it and
+    // emit ordinary rows.
+    let mut previous_native: Option<(u32, PatchAttemptId, AttemptNativeOutcome)> = None;
+    let mut previous_static: Option<(u32, PatchAttemptId, AttemptStaticOutcome)> = None;
+    // [VANTA-WHY] Per-attempt native regressions for evidence.json. The console
+    // printed them and the Creator was fed them, but no artifact kept them, so
+    // "which repo test did attempt 1 break?" could not be answered from the
+    // run's files alone.
+    let mut native_regression_records: Vec<serde_json::Value> = Vec::new();
     // [VANTA-WHY] Every NEW static finding this run's patch introduced, per
     // attempt, so evidence.json can name the finding that rejected a review
     // round. Session 40e84874 was rejected for a mypy finding that appeared
     // NOWHERE in the session files: the console printed `mypy_new=true` and the
     // detail was dropped. The record below is that missing detail.
     let mut static_findings_records: Vec<serde_json::Value> = Vec::new();
+    // [VANTA-WHY] Test-integrity records for the evidence file. A patch must
+    // never control the tests that grade it, so the native suite runs the
+    // ORIGINAL test files and these four lists are what make that visible after
+    // the run: which existing tests the patch rewrote (their edits discarded),
+    // which it deleted (restored), which it added (left out of the baseline),
+    // and which pytest config section it changed. They are refreshed per attempt
+    // — the LAST attempt is the one the run's verdict is about.
+    let mut modified_existing_tests: Vec<String> = Vec::new();
+    let mut removed_existing_tests: Vec<String> = Vec::new();
+    let mut added_test_files: Vec<String> = Vec::new();
+    let mut modified_test_config: Vec<serde_json::Value> = Vec::new();
 
     // [VANTA-WHY] `max_attempts` means two different things and the Governor now
     // has to be told which. With `--patch` the candidate is FIXED, so an attempt
@@ -1015,8 +1042,14 @@ pub async fn run(
         // finding that blocks, not just a bool. A rejection must be able to say
         // WHICH finding rejected the candidate — 40e84874 printed "fails 0
         // test(s)" while the real signal was a mypy error no artifact recorded.
-        let blocking_static =
-            blocking_static_findings(&new_ruff, &new_mypy, &touched_paths);
+        //
+        // [VANTA-WHY] The diagnostics themselves are kept (not just their
+        // rendered text) so the transition-row writer can key a Static row on
+        // the finding's IDENTITY rather than on a string that carries the line
+        // number the finding happened to sit on.
+        let blocking_diags = blocking_static_diagnostics(&new_ruff, &new_mypy, &touched_paths);
+        let blocking_static: Vec<String> =
+            blocking_diags.iter().map(|d| d.render()).collect();
         let new_static_in_touched_files = !blocking_static.is_empty();
         println!("  Static: ruff_new={ruff_new}, mypy_new={mypy_new}");
         // [VANTA-WHY] The two booleans above are not enough to audit a rejection.
@@ -1032,6 +1065,28 @@ pub async fn run(
         ) {
             println!("    {finding}");
         }
+        // [VANTA-WHY] A blocking finding is evidence about the candidate, so it
+        // produces a transition row like any other: present at N and gone at
+        // N+1 is a CORRECTION (Failed -> Passed under `evidence_source: Static`),
+        // which is what makes a static error fixed in the next attempt visible
+        // instead of structurally excluded. Only blocking (error-class, touched)
+        // findings participate — a style nit never moved the metric.
+        let current_static = AttemptStaticOutcome::from_findings(&blocking_diags);
+        if let Some((from_attempt, from_patch, previous)) = &previous_static {
+            if from_patch != &patch_attempt_id {
+                let rows = static_transition_rows(
+                    &session_id,
+                    from_patch,
+                    &patch_attempt_id,
+                    *from_attempt,
+                    attempt,
+                    previous,
+                    &current_static,
+                );
+                append_derived_rows(&mut transition_writer, rows, &mut metric_rows)?;
+            }
+        }
+        previous_static = Some((attempt, patch_attempt_id.clone(), current_static));
 
         // ---- 5b. Native suite gate — the repo's OWN tests ----
         // [VANTA-WHY] Generated tests depend on what the Attacker sampled; the
@@ -1041,8 +1096,43 @@ pub async fn run(
         // shared set, never counted in EIR/ECR — because it is not a transition
         // measurement.
         println!("\n▌ NATIVE suite: repo's own tests (original vs patch)...");
+        // [VANTA-WHY] The native suite grades the patched SOURCE with the
+        // ORIGINAL tests. Session 888b6931 approved a patch that broke
+        // `get_responses` because the Creator also edited the very test that
+        // catches it, and the native run collected the edited file. The patch's
+        // test edits are discarded here — existing tests restored to their
+        // original contents, a deleted test restored, an added test file left
+        // out of the baseline — so the patch cannot grade itself.
+        let native_tree = harness::native_tree_with_original_tests(
+            &original_files,
+            &patched_files,
+            &patch_deleted_paths(&patch_text),
+        );
+        let native_patched_concat = build_source_concat(&native_tree.files);
+        modified_existing_tests = native_tree.modified_existing_tests.clone();
+        removed_existing_tests = native_tree.removed_existing_tests.clone();
+        added_test_files = native_tree.added_test_files.clone();
+        modified_test_config = modified_test_config_records(&patch_files);
+        if !modified_existing_tests.is_empty()
+            || !removed_existing_tests.is_empty()
+            || !added_test_files.is_empty()
+            || !modified_test_config.is_empty()
+        {
+            println!(
+                "  Test integrity: native_test_source=original modified_existing_tests=[{}] \
+                 removed_existing_tests=[{}] added_test_files=[{}] modified_test_config=[{}]",
+                modified_existing_tests.join(", "),
+                removed_existing_tests.join(", "),
+                added_test_files.join(", "),
+                modified_test_config
+                    .iter()
+                    .filter_map(|v| v["path"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         let native_original = harness::run_native_suite(&original_concat, &test_cmd).await;
-        let native_patched = harness::run_native_suite(&patched_concat, &test_cmd).await;
+        let native_patched = harness::run_native_suite(&native_patched_concat, &test_cmd).await;
         let mut native_regressions =
             harness::native_regressions(&native_original.tests, &native_patched.tests);
         // [VANTA-WHY] A suite that ran N>0 tests on the original and collects
@@ -1117,6 +1207,39 @@ pub async fn run(
                 benchmark_label: None,
             })?;
         }
+
+        // [VANTA-WHY] A native regression is evidence about the candidate, so it
+        // produces a transition row like any other: one row per repo test that
+        // ran on BOTH attempts, `Failed -> Passed` when the next attempt fixed a
+        // regression the previous one introduced (the correction 4d55123d hid),
+        // `Passed -> Failed` when it introduced one. Emitted only between two
+        // DIFFERENT patches, so a review round (same candidate) stays excluded,
+        // exactly as before.
+        let current_native =
+            AttemptNativeOutcome::from_suites(&native_original, &native_patched);
+        if let Some((from_attempt, from_patch, previous)) = &previous_native {
+            if from_patch != &patch_attempt_id {
+                let rows = native_transition_rows(
+                    &session_id,
+                    from_patch,
+                    &patch_attempt_id,
+                    *from_attempt,
+                    attempt,
+                    previous,
+                    &current_native,
+                );
+                append_derived_rows(&mut transition_writer, rows, &mut metric_rows)?;
+            }
+        }
+        previous_native = Some((attempt, patch_attempt_id.clone(), current_native));
+        // [VANTA-WHY] Keep this attempt's regressions in evidence.json, keyed by
+        // attempt, so the artifact answers "which repo test did this attempt
+        // break?" without replaying the console.
+        native_regression_records.push(serde_json::json!({
+            "attempt": attempt + 1,
+            "patch_attempt_id": patch_attempt_id.as_str(),
+            "regressions": &native_regressions,
+        }));
 
         // ---- 6. Diagnostician + build evidence ----
         println!("\n▌ DIAGNOSTICIAN: classifying failures...");
@@ -1372,22 +1495,28 @@ pub async fn run(
                     rejection_signal_message(
                         &native_regressions,
                         &blocking_static,
-                        &failing_names
+                        &failing_names,
+                        &modified_existing_tests
                     )
                 );
             }
         } else {
             // The SAME function the M5 analysis layer runs over the on-disk rows,
             // so the live number and the paper's number cannot drift apart.
+            // [VANTA-WHY] Combined AND per source: a pooled ECR hides WHICH
+            // evidence moved it, and the whole point of counting native rows is
+            // that session 4d55123d's correction was a repo test, not an
+            // AttackerGenerated one. A zero denominator prints `n/a`, never
+            // `0.00%` — "nothing countable" and "nothing corrected" are opposite
+            // claims about the run.
             let snap = ecr_eir_from_rows(&metric_rows);
             println!(
-                "\n▌ GOVERNOR: decision={:?}, ECR={} ({:.2}%), EIR={} ({:.2}%)",
+                "\n▌ GOVERNOR: decision={:?}, ECR={} EIR={}",
                 decision,
-                snap.ecr_count,
-                snap.ecr_rate() * 100.0,
-                snap.eir_count,
-                snap.eir_rate() * 100.0
+                snap.ecr_text(),
+                snap.eir_text()
             );
+            println!("            per source: {}", snap.per_source_text());
         }
 
         final_evidence = attempt_evidence;
@@ -1482,10 +1611,30 @@ pub async fn run(
                     );
                 } else {
                     // Build structured feedback for Creator.
-                    prior_feedback = Some(build_creator_feedback(&failed, ruff_new, mypy_new));
+                    // [VANTA-WHY] The count is every failure the Creator is being
+                    // sent, not just the generated-test ones: a run whose ONLY
+                    // signal was a native regression (or a blocking static error)
+                    // used to print "Feeding 0 failure(s)" while handing the
+                    // Creator a non-empty message — session 4d55123d.
+                    let native_failure_count = native_regressions.len();
+                    let static_failure_count = blocking_static.len();
+                    prior_feedback = Some(build_creator_feedback(
+                        &failed,
+                        ruff_new,
+                        mypy_new,
+                        &native_regressions,
+                        &native_patched,
+                        &native_tree.modified_existing_tests,
+                        &native_tree.removed_existing_tests,
+                        &blocking_static,
+                    ));
                     println!(
-                        "  → Feeding {} failure(s) back to Creator for retry",
-                        failed.len()
+                        "  → Feeding {} failure(s) back to Creator for retry \
+                         ({} generated, {} native, {} static)",
+                        failed.len() + native_failure_count + static_failure_count,
+                        failed.len(),
+                        native_failure_count,
+                        static_failure_count
                     );
                 }
             }
@@ -1501,6 +1650,12 @@ pub async fn run(
     // that passes on the first candidate has no N→N+1 transition, so ECR/EIR
     // cannot see it by construction. Reporting it separately tells a reader what
     // share of defects the rates actually cover.
+    //
+    // [VANTA-WHY] The "outside ECR/EIR by construction" claim belongs ONLY to a
+    // run that produced NO transition rows. Session 4d55123d wrote three
+    // AttackerGenerated rows and the line still claimed there was no transition,
+    // which is false about the file on disk. When rows exist, print the metric
+    // they carry instead.
     let attempts_run = attempt_patch_ids.len();
     let fixed_at_attempt_1 = decision == GovernorDecision::AllTestsPassed && attempts_run == 1;
     session_log.append(SessionRecord {
@@ -1518,10 +1673,23 @@ pub async fn run(
         benchmark_instance: None,
         benchmark_label: None,
     })?;
-    println!(
-        "  • attempts_run={} fixed_at_attempt_1={} — a repair with no N→N+1 transition is outside ECR/EIR by construction",
-        attempts_run, fixed_at_attempt_1
-    );
+    let final_snapshot = ecr_eir_from_rows(&metric_rows);
+    if metric_rows.is_empty() {
+        println!(
+            "  • attempts_run={} fixed_at_attempt_1={} — a repair with no N→N+1 transition is outside ECR/EIR by construction",
+            attempts_run, fixed_at_attempt_1
+        );
+    } else {
+        println!(
+            "  • attempts_run={} fixed_at_attempt_1={} — ECR={} EIR={} over {} transition row(s), per source: {}",
+            attempts_run,
+            fixed_at_attempt_1,
+            final_snapshot.ecr_text(),
+            final_snapshot.eir_text(),
+            metric_rows.len(),
+            final_snapshot.per_source_text()
+        );
+    }
 
     // ---- Gatekeeper (only if all tests passed) ----
     if decision == GovernorDecision::AllTestsPassed {
@@ -1632,6 +1800,23 @@ pub async fn run(
             "schema_version": crate::session::SCHEMA_VERSION,
             "apply_failed_attempts": apply_failed_attempt_indices.len(),
             "new_static_findings": static_findings_records,
+            // [VANTA-WHY] The repo's own suite, per attempt. `native_test_source`
+            // says the suite ran the ORIGINAL tests; this key names WHICH of them
+            // each attempt regressed, so the correction a later attempt made is
+            // recorded in the run's artifacts and not only in the transitions
+            // file the metric counts from.
+            "native_regressions": native_regression_records,
+            // [VANTA-WHY] Test-integrity evidence. `native_test_source` names the
+            // rule the native suite ran under — the ORIGINAL tests — and the four
+            // lists name every way the patch tried to influence them, so an audit
+            // can see that the patch's control over its own tests was removed
+            // rather than trusted. All four are empty on a patch that leaves the
+            // test files and pytest config alone.
+            "native_test_source": "original",
+            "modified_existing_tests": modified_existing_tests,
+            "removed_existing_tests": removed_existing_tests,
+            "added_test_files": added_test_files,
+            "modified_test_config": modified_test_config,
             "evidence": final_evidence,
         }))
         .unwrap(),
@@ -1640,7 +1825,7 @@ pub async fn run(
     println!(
         "▌ Transitions → {} ({} row(s))",
         transitions_path.display(),
-        persisted_transitions
+        metric_rows.len()
     );
     let session_path = session_log
         .sink_path()
@@ -1963,7 +2148,16 @@ fn require_clean_target_repo_for_open_pr(target_repo_dirty: Option<bool>) -> Res
     }
 }
 
-fn build_creator_feedback(failed: &[&TestEvidence], ruff_new: bool, mypy_new: bool) -> String {
+fn build_creator_feedback(
+    failed: &[&TestEvidence],
+    ruff_new: bool,
+    mypy_new: bool,
+    native_regressions: &[String],
+    native_patched: &harness::NativeSuiteReport,
+    modified_existing_tests: &[String],
+    removed_existing_tests: &[String],
+    blocking_static: &[String],
+) -> String {
     let mut fb = String::new();
     fb.push_str("The previous patch failed verification:\n\n");
 
@@ -1987,6 +2181,47 @@ fn build_creator_feedback(failed: &[&TestEvidence], ruff_new: bool, mypy_new: bo
     }
     if mypy_new {
         fb.push_str("- New mypy type errors were introduced.\n");
+    }
+
+    // [VANTA-WHY] The repo's OWN suite is a failure signal the generated tests
+    // cannot express, and the Creator has to be told BOTH that it regressed and
+    // that any edit it made to an existing test was thrown away — otherwise it
+    // will "fix" the same test again and burn the next attempt the same way.
+    if !modified_existing_tests.is_empty() || !removed_existing_tests.is_empty() {
+        fb.push_str(
+            "- You modified or deleted existing test file(s). Those edits were DISCARDED: the \
+             repo's own tests are run from their ORIGINAL contents, so a patch cannot weaken the \
+             test that grades it.\n",
+        );
+        for path in modified_existing_tests {
+            fb.push_str(&format!("  modified (discarded): {path}\n"));
+        }
+        for path in removed_existing_tests {
+            fb.push_str(&format!("  deleted (restored): {path}\n"));
+        }
+        fb.push_str(
+            "  Do not modify or delete existing tests. If you need a new test, put it in a NEW \
+             test file.\n",
+        );
+    }
+    if !native_regressions.is_empty() {
+        fb.push_str("- The repository's own tests regressed (run with the ORIGINAL test files):\n");
+        for nodeid in native_regressions {
+            fb.push_str(&format!("  - {nodeid}\n"));
+            if let Some(output) = native_patched.failure_output(nodeid) {
+                fb.push_str(&format!("    failure: {output}\n"));
+            }
+        }
+    }
+    // [VANTA-WHY] A blocking static error is a failure the Creator has to fix,
+    // and it reaches it through the SAME feedback the generated-test failures
+    // do. `ruff_new`/`mypy_new` above only say a category fired; naming the
+    // finding is what lets the Creator fix the right line.
+    if !blocking_static.is_empty() {
+        fb.push_str("- Blocking static errors were introduced in the file(s) you touched:\n");
+        for finding in blocking_static {
+            fb.push_str(&format!("  - {finding}\n"));
+        }
     }
 
     fb.push_str(
@@ -2035,6 +2270,221 @@ fn patch_attempt_id_for_patch(patch_text: &str) -> PatchAttemptId {
 // one looks like a review round). A null is filterable: `from_transition` then
 // censors the row, so the analysis counts a row only when both ids are non-null
 // and differ.
+// ============================================================================
+// Native + static transition rows — candidate evidence the Governor never saw
+// ============================================================================
+//
+// [VANTA-WHY] EIR/ECR is defined over TRANSITION ROWS, and until this pass only
+// the Governor wrote them. The native suite and the static gate observe the same
+// candidate without going through the Governor, so a repair that fixed ONLY a
+// native regression (session 4d55123d) wrote no row and the metric could not see
+// it. These helpers difference one attempt's observation against the previous
+// attempt's and emit ordinary rows, so the metric keeps ONE definition and one
+// source of truth.
+
+/// One attempt's effective native-suite outcome, per repo test.
+///
+/// [VANTA-WHY] "Effective" uses the regression walk's own semantics: a test that
+/// PASSED on the original tree and fails (or is absent) on the patched tree is a
+/// FAILURE at that attempt; a test already failing on the original is not the
+/// patch's doing and is left out entirely, exactly as `native_regressions` skips
+/// it.
+#[derive(Debug, Default, Clone)]
+struct AttemptNativeOutcome {
+    results: HashMap<String, TestResult>,
+}
+
+impl AttemptNativeOutcome {
+    fn from_suites(
+        original: &harness::NativeSuiteReport,
+        patched: &harness::NativeSuiteReport,
+    ) -> Self {
+        let mut results = HashMap::new();
+        for (nodeid, original_result) in &original.tests {
+            if *original_result != TestResult::Passed {
+                continue;
+            }
+            // A vanished test is a regression (`native_suite_collapsed` also
+            // names it), so "absent on the patched tree" is a failure here too.
+            let outcome = match patched.tests.iter().find(|(n, _)| n == nodeid) {
+                Some((_, TestResult::Passed)) => TestResult::Passed,
+                _ => TestResult::Failed,
+            };
+            results.insert(nodeid.clone(), outcome);
+        }
+        Self { results }
+    }
+}
+
+/// One attempt's BLOCKING static findings, keyed by normalised identity.
+#[derive(Debug, Default, Clone)]
+struct AttemptStaticOutcome {
+    /// identity -> rendered finding (kept for the row's `test_name`).
+    findings: BTreeMap<String, String>,
+}
+
+impl AttemptStaticOutcome {
+    fn from_findings(findings: &[&harness::StaticDiagnostic]) -> Self {
+        let mut map = BTreeMap::new();
+        for d in findings {
+            map.insert(
+                static_finding_identity(&d.code, &d.file, &d.message),
+                d.render(),
+            );
+        }
+        Self { findings: map }
+    }
+}
+
+/// One row per native test that ran on BOTH attempts.
+///
+/// [VANTA-WHY] `test_id` is the nodeid itself, not a fresh id and not the
+/// normalised body hash: a repo test's identity IS its nodeid, and it is what
+/// makes the same test match across attempts.
+fn native_transition_rows(
+    session_id: &SessionId,
+    from_patch: &PatchAttemptId,
+    to_patch: &PatchAttemptId,
+    from_attempt: u32,
+    to_attempt: u32,
+    previous: &AttemptNativeOutcome,
+    current: &AttemptNativeOutcome,
+) -> Vec<TransitionRow> {
+    let mut rows: Vec<TransitionRow> = current
+        .results
+        .iter()
+        .filter_map(|(nodeid, to_result)| {
+            let from_result = previous.results.get(nodeid)?;
+            Some(TransitionRow {
+                session_id: session_id.clone(),
+                schema_version: Some(SCHEMA_VERSION),
+                from_patch_attempt_id: Some(from_patch.clone()),
+                to_patch_attempt_id: Some(to_patch.clone()),
+                from_attempt,
+                to_attempt,
+                test_id: nodeid.clone(),
+                test_name: nodeid.clone(),
+                shared_set_id: "native".to_string(),
+                from_result: from_result.clone(),
+                to_result: to_result.clone(),
+                from_failure_class: native_failure_class(from_result),
+                to_failure_class: native_failure_class(to_result),
+                evidence_source: EvidenceSource::Native,
+                test_intent: TestIntent::BehaviorPreservation,
+                censored: false,
+                apply_failed: false,
+                gap: to_attempt.saturating_sub(from_attempt) > 1,
+                in_s0: true,
+            })
+        })
+        .collect();
+    // Deterministic order so two runs of the same comparison write the same
+    // file — HashMap iteration order is not stable.
+    rows.sort_by(|a, b| a.test_id.cmp(&b.test_id));
+    rows
+}
+
+/// The class of a native-suite failure.
+///
+/// [VANTA-WHY] A repo test that passed on the original and fails on the
+/// candidate is a behaviour regression — the same Logic class the Diagnostician
+/// gives an assertion failure. That is what makes the row countable under the
+/// ordinary Logic gate with `evidence_source = Native`, without weakening the
+/// gate for anyone else.
+fn native_failure_class(result: &TestResult) -> Option<FailureClass> {
+    match result {
+        TestResult::Passed => None,
+        _ => Some(FailureClass::Logic),
+    }
+}
+
+/// One row per blocking static finding identity seen on either attempt, so a
+/// static error introduced at N and fixed at N+1 counts as a correction.
+fn static_transition_rows(
+    session_id: &SessionId,
+    from_patch: &PatchAttemptId,
+    to_patch: &PatchAttemptId,
+    from_attempt: u32,
+    to_attempt: u32,
+    previous: &AttemptStaticOutcome,
+    current: &AttemptStaticOutcome,
+) -> Vec<TransitionRow> {
+    let mut identities: Vec<&String> = previous
+        .findings
+        .keys()
+        .chain(current.findings.keys())
+        .collect();
+    identities.sort();
+    identities.dedup();
+    identities
+        .into_iter()
+        .map(|identity| {
+            let from_present = previous.findings.get(identity);
+            let to_present = current.findings.get(identity);
+            TransitionRow {
+                session_id: session_id.clone(),
+                schema_version: Some(SCHEMA_VERSION),
+                from_patch_attempt_id: Some(from_patch.clone()),
+                to_patch_attempt_id: Some(to_patch.clone()),
+                from_attempt,
+                to_attempt,
+                test_id: identity.clone(),
+                test_name: to_present
+                    .or(from_present)
+                    .cloned()
+                    .unwrap_or_else(|| identity.clone()),
+                shared_set_id: "static".to_string(),
+                from_result: presence_result(from_present),
+                to_result: presence_result(to_present),
+                from_failure_class: presence_class(from_present),
+                to_failure_class: presence_class(to_present),
+                evidence_source: EvidenceSource::Static,
+                test_intent: TestIntent::BugReproduction,
+                censored: false,
+                apply_failed: false,
+                gap: to_attempt.saturating_sub(from_attempt) > 1,
+                in_s0: true,
+            }
+        })
+        .collect()
+}
+
+/// A static finding PRESENT at an attempt is a failure there; absent is a pass.
+fn presence_result(present: Option<&String>) -> TestResult {
+    if present.is_some() {
+        TestResult::Failed
+    } else {
+        TestResult::Passed
+    }
+}
+
+fn presence_class(present: Option<&String>) -> Option<FailureClass> {
+    if present.is_some() {
+        Some(FailureClass::Static)
+    } else {
+        None
+    }
+}
+
+/// Append rows the Governor did not compute to BOTH the on-disk file and the
+/// in-memory set the live metric is computed from.
+///
+/// [VANTA-WHY] The two must be updated together: a row written only to disk
+/// would make the console print a different number from `metrics.py`, and a row
+/// kept only in memory would vanish from the dataset the paper reads.
+fn append_derived_rows(
+    writer: &mut TransitionWriter,
+    rows: Vec<TransitionRow>,
+    metric_rows: &mut Vec<TransitionRow>,
+) -> Result<(), io::Error> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    writer.append(&rows)?;
+    metric_rows.extend(rows);
+    Ok(())
+}
+
 /// Append every transition not yet persisted and return the new cursor.
 ///
 /// [VANTA-WHY] One definition, called from two places: the ordinary post-attempt
@@ -2164,14 +2614,28 @@ fn attempt_verdict(
 /// error no artifact recorded. This names the actual reason: the regressed
 /// native tests, the new static findings, and/or the generated tests that
 /// failed. Exactly one of those is present whenever the verdict is Rejected.
+///
+/// [VANTA-WHY] A regressing test that the patch ALSO rewrote stays a regression
+/// (the native run was graded with the original file), but it is annotated. A
+/// human patch may legitimately change a test's expected behaviour, and the
+/// reviewer must be able to see that the rejection rests on a file the candidate
+/// itself touched rather than discovering it later.
 fn rejection_signal_message(
     native_regressions: &[String],
     blocking_static: &[String],
     failing_names: &[String],
+    modified_existing_tests: &[String],
 ) -> String {
     let mut signals: Vec<String> = Vec::new();
     if !native_regressions.is_empty() {
-        signals.push(format!("native regression: {}", native_regressions.join(", ")));
+        let rendered: Vec<String> = native_regressions
+            .iter()
+            .map(|nodeid| match modified_test_file_for(nodeid, modified_existing_tests) {
+                Some(path) => format!("{nodeid} (the patch also modified {path})"),
+                None => nodeid.clone(),
+            })
+            .collect();
+        signals.push(format!("native regression: {}", rendered.join(", ")));
     }
     if !blocking_static.is_empty() {
         signals.push(format!(
@@ -2191,6 +2655,69 @@ fn rejection_signal_message(
     }
 }
 
+/// The modified test file a pytest nodeid belongs to, if the patch rewrote one.
+///
+/// A pytest nodeid is `<path>` for a module-level item or `<path>::<name>` for a
+/// function/class — both start with the file path, which is how a regression can
+/// be matched back to the `modified_existing_tests` entry that caused it.
+fn modified_test_file_for<'a>(
+    nodeid: &str,
+    modified_existing_tests: &'a [String],
+) -> Option<&'a String> {
+    modified_existing_tests
+        .iter()
+        .find(|path| nodeid == path.as_str() || nodeid.starts_with(&format!("{path}::")))
+}
+
+/// The pytest config files a patch must not be able to grade itself with.
+///
+/// [VANTA-WHY] `pyproject.toml` cannot be reverted wholesale: it also carries
+/// dependencies, build config and tool settings that have nothing to do with
+/// tests, and restoring the whole file would discard a legitimate change. So a
+/// change is detected SECTION-scoped and recorded with its diff. This is the one
+/// case the native run CANNOT neutralise by restoration — a patched `addopts`
+/// or `collect_ignore` would reach pytest — so it is reported loudly instead,
+/// and the native verdict is annotated as resting on a config the patch touched.
+const PYTEST_CONFIG_SECTIONS: &[(&str, &str)] = &[
+    ("pytest.ini", ""),
+    ("pyproject.toml", "tool.pytest.ini_options"),
+    ("setup.cfg", "tool:pytest"),
+    ("tox.ini", "[pytest]"),
+];
+
+/// Record every pytest-config change a patch carries, with its diff.
+fn modified_test_config_records(
+    patch_files: &HashMap<String, String>,
+) -> Vec<serde_json::Value> {
+    let mut records = Vec::new();
+    let mut paths: Vec<&String> = patch_files.keys().collect();
+    paths.sort();
+    for path in paths {
+        let Some((config_path, marker)) = PYTEST_CONFIG_SECTIONS
+            .iter()
+            .find(|(name, _)| *name == path.as_str())
+        else {
+            continue;
+        };
+        let diff = &patch_files[path];
+        // An empty marker means the whole file is pytest config (`pytest.ini`).
+        if !marker.is_empty() && !diff.contains(marker) {
+            continue;
+        }
+        println!(
+            "  ⚠ pytest config '{config_path}' changed by the patch — recorded as \
+             modified_test_config with its diff. This section is the one the native run cannot \
+             restore (pyproject also carries non-test content), so the patched config is used \
+             and the native verdict must be read with that in mind"
+        );
+        records.push(serde_json::json!({
+            "path": config_path,
+            "diff": diff,
+        }));
+    }
+    records
+}
+
 /// The new static findings that BLOCK a review round, rendered as evidence.
 ///
 /// [VANTA-WHY] Item 4 of the heretic fix list: the rejection message must name
@@ -2201,15 +2728,35 @@ fn rejection_signal_message(
 /// in a touched file is REPORTED to the Creator and kept in the session log, but
 /// must not reject: rejecting on a nit claims the candidate is broken when it is
 /// not, and burns an attack round.
+#[cfg(test)]
 fn blocking_static_findings(
     new_ruff: &[&harness::StaticDiagnostic],
     new_mypy: &[&harness::StaticDiagnostic],
     touched: &[String],
 ) -> Vec<String> {
+    blocking_static_diagnostics(new_ruff, new_mypy, touched)
+        .iter()
+        .map(|d| d.render())
+        .collect()
+}
+
+/// The blocking findings THEMSELVES, so a Static transition row can key on a
+/// finding's identity instead of its rendered text.
+///
+/// [VANTA-WHY] `blocking_static_findings` is this list rendered, so the gate,
+/// the rejection message and the rows all read ONE filter. Two copies of the
+/// error-class/environment/touched conditions would drift, and a row keyed on a
+/// different set of findings than the one that rejected the candidate would be
+/// an invisible inconsistency in the metric.
+fn blocking_static_diagnostics<'a>(
+    new_ruff: &[&'a harness::StaticDiagnostic],
+    new_mypy: &[&'a harness::StaticDiagnostic],
+    touched: &[String],
+) -> Vec<&'a harness::StaticDiagnostic> {
     let mut out = Vec::new();
     for d in new_ruff {
         if harness::ruff_is_error_class(&d.code) && harness::path_touched(&d.file, touched) {
-            out.push(d.render());
+            out.push(*d);
         }
     }
     for d in new_mypy {
@@ -2219,7 +2766,7 @@ fn blocking_static_findings(
         // `test_auto_rank.py [import-not-found] Cannot find module "torch"`.
         // They are recorded (see `record_new_static_findings`) but never block.
         if !d.is_environment_finding() && harness::path_touched(&d.file, touched) {
-            out.push(d.render());
+            out.push(*d);
         }
     }
     out
@@ -2366,9 +2913,10 @@ mod tests {
     use super::{
         attempt_verdict, blocking_static_findings, collapse_decision,
         dependency_freeze_summary_value, harness_infrastructure_collapse,
-        patch_attempt_id_for_patch, record_new_static_findings, rejection_signal_message,
-        render_committed_test_file, require_clean_target_repo_for_open_pr,
-        review_prompt_source_concat, stamp_transition_row, stable_patch_fingerprint,
+        modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
+        rejection_signal_message, render_committed_test_file,
+        require_clean_target_repo_for_open_pr, review_prompt_source_concat, stamp_transition_row,
+        stable_patch_fingerprint,
     };
     use crate::agents::creator::SourceFile;
     use crate::agents::attacker::GeneratedTest;
@@ -2691,7 +3239,12 @@ mod tests {
     /// the repo's own suite)" while the actual reason was a mypy finding.
     #[test]
     fn a_rejection_names_the_regressed_native_test_not_a_zero_count() {
-        let msg = rejection_signal_message(&["tests/test_batch.py::test_pads".to_string()], &[], &[]);
+        let msg = rejection_signal_message(
+            &["tests/test_batch.py::test_pads".to_string()],
+            &[],
+            &[],
+            &[],
+        );
         assert!(
             msg.contains("native regression: tests/test_batch.py::test_pads"),
             "the regressed native test must be named, got: {msg}"
@@ -2709,6 +3262,7 @@ mod tests {
             &[],
             &["src/heretic/modifiers/abliteration.py:88: error: index".to_string()],
             &[],
+            &[],
         );
         assert!(
             msg.contains("new static finding in a touched file: src/heretic/modifiers/abliteration.py:88"),
@@ -2718,10 +3272,98 @@ mod tests {
 
     #[test]
     fn a_rejection_names_the_failing_generated_tests() {
-        let msg = rejection_signal_message(&[], &[], &["test_keyword_rate_default".to_string()]);
+        let msg = rejection_signal_message(
+            &[],
+            &[],
+            &["test_keyword_rate_default".to_string()],
+            &[],
+        );
         assert!(
             msg.contains("failing test(s): test_keyword_rate_default"),
             "the failing generated test must be named, got: {msg}"
+        );
+    }
+
+    /// A regressing test the patch also rewrote stays a regression, and the
+    /// rejection says so — a human patch may legitimately change a test's
+    /// expected behaviour, and the reviewer must see that the rejection rests on
+    /// a file the candidate itself touched.
+    #[test]
+    fn a_regression_the_patch_itself_modified_is_still_a_regression_and_is_marked() {
+        let msg = rejection_signal_message(
+            &["tests/test_keyword_rate.py::test_print_responses_shows_brackets_literally".to_string()],
+            &[],
+            &[],
+            &["tests/test_keyword_rate.py".to_string()],
+        );
+
+        assert!(
+            msg.contains("native regression: tests/test_keyword_rate.py::test_print_responses_shows_brackets_literally"),
+            "the weakened test's regression must survive the annotation, got: {msg}"
+        );
+        assert!(
+            msg.contains("the patch also modified tests/test_keyword_rate.py"),
+            "the rejection must say the patch modified this test, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_regression_in_an_untouched_test_carries_no_modification_note() {
+        let msg = rejection_signal_message(
+            &["tests/test_other.py::test_x".to_string()],
+            &[],
+            &[],
+            &["tests/test_keyword_rate.py".to_string()],
+        );
+
+        assert!(msg.contains("native regression: tests/test_other.py::test_x"));
+        assert!(
+            !msg.contains("the patch also modified"),
+            "a test the patch never touched must not be annotated, got: {msg}"
+        );
+    }
+
+    /// A pytest-config change is recorded with the diff that carries it, and a
+    /// pyproject.toml edit that has nothing to do with pytest is not.
+    #[test]
+    fn a_pytest_config_change_is_recorded_with_its_diff() {
+        let patch_files = HashMap::from([
+            (
+                "pyproject.toml".to_string(),
+                "@@ -0,0 +1 @@\n+[tool.pytest.ini_options]\n+addopts = \"-p no:cacheprovider\"\n"
+                    .to_string(),
+            ),
+            (
+                "tox.ini".to_string(),
+                "@@ -1 +1 @@\n-[pytest]\n+[pytest]\n+addopts = -x\n".to_string(),
+            ),
+        ]);
+
+        let records = modified_test_config_records(&patch_files);
+
+        let paths: Vec<&str> = records
+            .iter()
+            .filter_map(|r| r["path"].as_str())
+            .collect();
+        assert_eq!(paths, vec!["pyproject.toml", "tox.ini"]);
+        assert!(
+            records
+                .iter()
+                .all(|r| r["diff"].as_str().is_some_and(|d| !d.is_empty())),
+            "each config change must carry its diff"
+        );
+    }
+
+    #[test]
+    fn a_non_pytest_config_edit_is_not_recorded() {
+        let patch_files = HashMap::from([(
+            "pyproject.toml".to_string(),
+            "@@ -1 +1 @@\n-dependencies = [\"a\"]\n+dependencies = [\"a\", \"b\"]\n".to_string(),
+        )]);
+
+        assert!(
+            modified_test_config_records(&patch_files).is_empty(),
+            "pyproject.toml carries non-test content; an unrelated edit is not a test-config change"
         );
     }
 

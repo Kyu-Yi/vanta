@@ -125,6 +125,33 @@ pub fn apply_patch_strict(
     Ok(changed)
 }
 
+/// The paths a patch DELETES (`--- a/<path>` … `+++ /dev/null`).
+///
+/// [VANTA-WHY] A deletion cannot be read off the resulting file map: the strict
+/// path reads its destination from `+++ b/...` and skips a `/dev/null` outright,
+/// so a deleted file simply keeps its original entry in `patched_files`. The
+/// native-suite gate must restore a deleted test, and the evidence must name it,
+/// so the deletion is read from the diff itself — the only place it is visible.
+pub fn patch_deleted_paths(patch_text: &str) -> Vec<String> {
+    let mut deleted: Vec<String> = Vec::new();
+    let mut pending_source: Option<String> = None;
+    for line in patch_text.lines() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            let rest = rest.trim();
+            pending_source = rest.strip_prefix("a/").map(str::to_string);
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            if rest.trim() == "/dev/null" {
+                if let Some(path) = pending_source.take() {
+                    deleted.push(path);
+                }
+            }
+        }
+    }
+    deleted.sort();
+    deleted.dedup();
+    deleted
+}
+
 /// Run `git apply` in `root`; `Err` carries git's own message.
 fn git_apply(root: &std::path::Path, patch_arg: &str, extra: &[&str]) -> Result<(), String> {
     let mut args = vec!["apply", "-p1", "--verbose"];
@@ -790,6 +817,26 @@ mod tests {
         } else {
             assert_eq!(patched, original);
         }
+    }
+
+    /// A path is read from the diff, not from the file map: the strict apply
+    /// leaves a deleted file at its original contents, so the deletion only
+    /// exists in the patch text.
+    #[test]
+    fn patch_deleted_paths_names_only_files_sent_to_dev_null() {
+        let patch = "diff --git a/tests/test_core.py b/tests/test_core.py\n--- a/tests/test_core.py\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-def test_scale():\n-    assert scale(3) == 6\n";
+        assert_eq!(
+            patch_deleted_paths(patch),
+            vec!["tests/test_core.py".to_string()]
+        );
+    }
+
+    #[test]
+    fn patch_deleted_paths_is_empty_for_additions_and_modifications() {
+        let addition = "diff --git a/pyproject.toml b/pyproject.toml\n--- /dev/null\n+++ b/pyproject.toml\n@@ -0,0 +1 @@\n+[tool.pytest.ini_options]\n";
+        assert!(patch_deleted_paths(addition).is_empty());
+        let edit = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a - b\n+    return a + b\n";
+        assert!(patch_deleted_paths(edit).is_empty());
     }
 
     #[test]

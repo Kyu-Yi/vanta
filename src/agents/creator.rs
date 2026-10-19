@@ -30,7 +30,7 @@ use tracing::{debug, info, trace, warn};
 // agent prompt in the run, so a later change to the Creator's Verify-First
 // wording is visible in the log instead of looking like "no change". Bump this
 // whenever the Creator system/user prompt text changes.
-pub const CREATOR_PROMPT_VERSION: &str = "1";
+pub const CREATOR_PROMPT_VERSION: &str = "2";
 
 // ============================================================================
 // CreatorRequest — input to the Creator agent
@@ -126,6 +126,8 @@ OPTION B (for larger files where full source is wasteful): Use SEARCH/REPLACE bl
     ===END===
 
   The SEARCH text must match the original EXACTLY (whitespace included) so it can be found.
+
+NEVER modify or delete an EXISTING test file. The repository's own tests grade your patch and are always run from their original contents, so any edit you make to an existing test is discarded before verification. Do not weaken, skip, rename or remove an existing test to make your change pass. If you need a test, put it in a NEW test file.
 
 Required JSON schema:
 {

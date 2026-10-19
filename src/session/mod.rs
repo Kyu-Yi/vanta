@@ -302,9 +302,15 @@ impl TransitionRow {
 /// call, so there is exactly one definition of the metric and a single test
 /// covers both. A row counts only if it is a genuine, complete patch transition
 /// (`TransitionRow::is_countable_patch_transition`) whose failing side is
-/// Logic-class (`counts_toward_metrics`); then fail->pass is ECR and pass->fail
-/// is EIR. Review rounds, censored holes, and non-Logic transitions are excluded
-/// here, at calculation time.
+/// countable for its own evidence source (`counts_toward_metrics`); then
+/// fail->pass is ECR and pass->fail is EIR. Review rounds, censored holes, and
+/// non-countable transitions are excluded here, at calculation time.
+///
+/// [VANTA-WHY] Totals AND the per-source breakdown come out of the SAME pass
+/// over the SAME rows, so the breakdown can never disagree with the total. A
+/// run whose only real correction was a repository-native test (4d55123d) has an
+/// ECR that is entirely Native, and the pooled number alone would credit the
+/// Attacker for it.
 pub fn ecr_eir_from_rows(rows: &[TransitionRow]) -> EcrEirSnapshot {
     let mut snap = EcrEirSnapshot::default();
     for row in rows {
@@ -316,16 +322,12 @@ pub fn ecr_eir_from_rows(rows: &[TransitionRow]) -> EcrEirSnapshot {
             &row.to_result,
             &row.from_failure_class,
             &row.to_failure_class,
+            &row.evidence_source,
         ) {
-            snap.excluded_non_logic += 1;
+            snap.record_excluded(&row.evidence_source);
             continue;
         }
-        snap.complete += 1;
-        match (&row.from_result, &row.to_result) {
-            (TestResult::Failed, TestResult::Passed) => snap.ecr_count += 1,
-            (TestResult::Passed, TestResult::Failed) => snap.eir_count += 1,
-            _ => {}
-        }
+        snap.record(&row.evidence_source, &row.from_result, &row.to_result);
     }
     snap
 }
@@ -858,6 +860,29 @@ mod tests {
         from_pid: Option<&str>,
         to_pid: Option<&str>,
     ) -> TransitionRow {
+        counting_row_from_source(
+            from_result,
+            to_result,
+            from_class,
+            to_class,
+            from_pid,
+            to_pid,
+            EvidenceSource::AttackerGenerated,
+        )
+    }
+
+    /// As `counting_row`, with an explicit evidence source, so a Native or
+    /// Static row can be exercised through the SAME counting function.
+    #[allow(clippy::too_many_arguments)]
+    fn counting_row_from_source(
+        from_result: TestResult,
+        to_result: TestResult,
+        from_class: Option<FailureClass>,
+        to_class: Option<FailureClass>,
+        from_pid: Option<&str>,
+        to_pid: Option<&str>,
+        source: EvidenceSource,
+    ) -> TransitionRow {
         let bare = AttemptTransition {
             from_attempt: 0,
             to_attempt: 1,
@@ -870,7 +895,7 @@ mod tests {
             to_failure_class: to_class,
             complete: true,
             in_s0: true,
-            evidence_source: EvidenceSource::AttackerGenerated,
+            evidence_source: source,
             test_intent: TestIntent::BugReproduction,
         };
         TransitionRow::from_transition(
@@ -972,5 +997,87 @@ mod tests {
         assert_eq!(snap.complete, 0);
         assert_eq!(snap.ecr_count, 0);
         assert_eq!(snap.eir_count, 0);
+    }
+
+    /// Native and Static rows move the metric under their OWN source, and the
+    /// breakdown keeps them apart from the Attacker's rows.
+    ///
+    /// [VANTA-WHY] This is 4d55123d's ECR: the only real correction in the run
+    /// was a repository-native test the previous attempt had broken. Pooled into
+    /// one number it credits the Attacker; split by source it says who proved
+    /// it. A Static-class failure is countable here ONLY because the row's own
+    /// source is Static — see `counts_toward_metrics`.
+    #[test]
+    fn native_and_static_rows_count_under_their_own_source() {
+        let rows = vec![
+            // A native test the patch broke, fixed by the next patch -> ECR.
+            counting_row_from_source(
+                TestResult::Failed,
+                TestResult::Passed,
+                Some(FailureClass::Logic),
+                None,
+                Some("p0"),
+                Some("p1"),
+                EvidenceSource::Native,
+            ),
+            // A second native test that simply kept passing: denominator only.
+            counting_row_from_source(
+                TestResult::Passed,
+                TestResult::Passed,
+                None,
+                None,
+                Some("p0"),
+                Some("p1"),
+                EvidenceSource::Native,
+            ),
+            // A blocking static error the next patch introduced -> EIR.
+            counting_row_from_source(
+                TestResult::Passed,
+                TestResult::Failed,
+                None,
+                Some(FailureClass::Static),
+                Some("p0"),
+                Some("p1"),
+                EvidenceSource::Static,
+            ),
+            // The Attacker's rows, unchanged by any of this.
+            counting_row(TestResult::Passed, TestResult::Passed, None, None, Some("p0"), Some("p1")),
+        ];
+
+        let snap = ecr_eir_from_rows(&rows);
+        assert_eq!(snap.complete, 4);
+        assert_eq!(snap.ecr_count, 1, "the native correction is in the totals");
+        assert_eq!(snap.eir_count, 1, "the static introduction is in the totals");
+        assert_eq!(snap.native.complete, 2);
+        assert_eq!(snap.native.ecr_count, 1);
+        assert_eq!(snap.native.eir_count, 0);
+        assert_eq!(snap.static_findings.complete, 1);
+        assert_eq!(snap.static_findings.eir_count, 1);
+        assert_eq!(snap.attacker_generated.complete, 1);
+        assert_eq!(snap.attacker_generated.ecr_count, 0);
+        assert_eq!(
+            snap.excluded_non_logic, 0,
+            "every row here is countable for its own source"
+        );
+    }
+
+    /// A Static-class failure on an ATTACKER row stays excluded, so the
+    /// per-source allowance does not leak into the ordinary rule.
+    #[test]
+    fn a_static_class_attacker_row_remains_excluded() {
+        let rows = vec![counting_row(
+            TestResult::Passed,
+            TestResult::Failed,
+            None,
+            Some(FailureClass::Static),
+            Some("p0"),
+            Some("p1"),
+        )];
+
+        let snap = ecr_eir_from_rows(&rows);
+        assert_eq!(snap.complete, 0);
+        assert_eq!(snap.eir_count, 0);
+        assert_eq!(snap.excluded_non_logic, 1);
+        assert_eq!(snap.attacker_generated.excluded_non_logic, 1);
     }
 }

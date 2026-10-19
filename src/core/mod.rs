@@ -161,6 +161,16 @@ pub fn is_logic_failure(class: &Option<FailureClass>) -> bool {
 ///   COUNTABLE — it remains in the denominator to keep the rate comparable
 ///   across runs.
 ///
+/// [VANTA-WHY] `source` is the ONE class that reopens the exclusion, and only
+/// for itself. `FailureClass::Static` stays uncountable for Attacker tests (an
+/// `import-not-found` is the environment's fault, not the candidate's), but a
+/// row whose OWN source is `EvidenceSource::Static` is a blocking finding that
+/// was already differenced against the pre-patch baseline — everything the
+/// patch did not introduce is gone, so the finding that remains is the
+/// candidate's and a finding that disappears on the next attempt is a real
+/// correction. Without this, a static error fixed in N+1 would be structurally
+/// invisible exactly like the native correction in 4d55123d.
+///
 /// The other half of the rule — that the row must be a genuine patch
 /// transition, both ends observed and different — is
 /// `TransitionRow::is_countable_patch_transition`.
@@ -169,13 +179,17 @@ pub fn counts_toward_metrics(
     to_result: &TestResult,
     from_failure_class: &Option<FailureClass>,
     to_failure_class: &Option<FailureClass>,
+    source: &EvidenceSource,
 ) -> bool {
-    let side_is_logic_or_pass = |result: &TestResult, class: &Option<FailureClass>| {
-        matches!(result, TestResult::Passed) || is_logic_failure(class)
+    let static_finding = matches!(source, EvidenceSource::Static);
+    let side_is_countable = |result: &TestResult, class: &Option<FailureClass>| {
+        matches!(result, TestResult::Passed)
+            || is_logic_failure(class)
+            || (static_finding && matches!(class, Some(FailureClass::Static)))
     };
 
-    side_is_logic_or_pass(from_result, from_failure_class)
-        && side_is_logic_or_pass(to_result, to_failure_class)
+    side_is_countable(from_result, from_failure_class)
+        && side_is_countable(to_result, to_failure_class)
 }
 
 /// FNV-1a 64-bit, hex-encoded. Deterministic across runs and platforms.
@@ -404,6 +418,51 @@ pub enum EvidenceSource {
     // "add(2,3) returns 4 but should be 7". Weakest form of property — may be
     // miswritten, ambiguous, or partial. Logged separately from repo tests.
     IssueDescription,
+
+    // [VANTA-WHY] THE REPOSITORY'S OWN test suite, run on the candidate's tree
+    // (Spec §5 native-suite gate). It is not `ExistingRepositoryTest` in the
+    // sense above: that variant describes a repo test used as part of the shared
+    // question set. These are the repo's existing tests run as a whole, and they
+    // are the only evidence that does not depend on what the Attacker happened
+    // to sample.
+    //
+    // [VANTA-WHY] Session 4d55123d approved a patch whose ONE real correction
+    // was to a native test the previous attempt had broken. The correction was
+    // invisible: the native suite wrote only session records, never transition
+    // rows, so ECR read 0/0 and the only thing the run actually fixed counted
+    // for nothing. A native row has the same fail->pass / pass->fail shape as a
+    // shared-set row, keyed by the pytest nodeid, so it can be counted the same
+    // way — and, like every other row, separately.
+    Native,
+
+    // [VANTA-WHY] A BLOCKING static finding: an error-class diagnostic (ruff
+    // `F`/`E9`, or any mypy error) in a file the patch touches, differenced
+    // against the pre-patch baseline. Its class is `FailureClass::Static`, and
+    // that class is normally NOT countable — an environment-induced
+    // `import-not-found` is a fact about the analysis environment, not about the
+    // candidate. This source is the discriminator: baseline differencing already
+    // removed every finding the patch did not introduce, so what is left IS the
+    // candidate's doing, and a finding that disappears on the next attempt is a
+    // genuine correction. Rows carry this source so the class gate can count
+    // them without reopening the non-Logic exclusion for Attacker-generated
+    // tests.
+    Static,
+}
+
+/// Normalised identity of a blocking static finding: rule + file + message.
+///
+/// [VANTA-WHY] A static finding has no name and no body hash to key on, so its
+/// identity has to be derived from what identifies it: the rule that fired, the
+/// file it fired in, and its message. The line number is deliberately EXCLUDED —
+/// a finding that survives an edit and only moves down the file is the SAME
+/// finding, and keying on the line would read as "the old one was fixed and a
+/// new one appeared", which is exactly the false correction this identity
+/// exists to prevent. The message is collapsed to single spaces so pure
+/// reflowing of a wrapped diagnostic (mypy wraps long type names) does not fork
+/// the identity either.
+pub fn static_finding_identity(rule: &str, file: &str, message: &str) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("{rule}|{file}|{normalized}")
 }
 
 // ============================================================================
@@ -577,6 +636,7 @@ impl AttemptTransition {
             &self.to_result,
             &self.from_failure_class,
             &self.to_failure_class,
+            &self.evidence_source,
         )
     }
 }
@@ -594,6 +654,28 @@ pub struct EcrEirSnapshot {
     // excluded most of its evidence is visible instead of looking precise.
     #[serde(default)]
     pub excluded_non_logic: usize,
+    // [VANTA-WHY] The same counts, split by where the evidence came from, and
+    // additive to the totals above. A pooled ECR of 1/6 says nothing about
+    // WHICH evidence moved: session 4d55123d's only correction was a native
+    // test, and reading the number as an Attacker-test result would credit the
+    // model for something the repository's own suite proved. `#[serde(default)]`
+    // so snapshots written before the breakdown existed still load.
+    #[serde(default)]
+    pub attacker_generated: SourceBreakdown,
+    #[serde(default)]
+    pub native: SourceBreakdown,
+    #[serde(default)]
+    pub static_findings: SourceBreakdown,
+}
+
+/// ECR/EIR counts for ONE evidence source. See `EcrEirSnapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct SourceBreakdown {
+    pub ecr_count: usize,
+    pub eir_count: usize,
+    pub complete: usize,
+    #[serde(default)]
+    pub excluded_non_logic: usize,
 }
 
 impl EcrEirSnapshot {
@@ -602,6 +684,83 @@ impl EcrEirSnapshot {
     }
     pub fn eir_rate(&self) -> f64 {
         if self.complete == 0 { 0.0 } else { self.eir_count as f64 / self.complete as f64 }
+    }
+
+    /// Record one countable row in the totals AND in its source's breakdown.
+    pub fn record(&mut self, source: &EvidenceSource, from: &TestResult, to: &TestResult) {
+        self.complete += 1;
+        let breakdown = match source {
+            EvidenceSource::Native => &mut self.native,
+            EvidenceSource::Static => &mut self.static_findings,
+            _ => &mut self.attacker_generated,
+        };
+        breakdown.complete += 1;
+        match (from, to) {
+            (TestResult::Failed, TestResult::Passed) => {
+                self.ecr_count += 1;
+                breakdown.ecr_count += 1;
+            }
+            (TestResult::Passed, TestResult::Failed) => {
+                self.eir_count += 1;
+                breakdown.eir_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    /// Record one excluded (non-countable-class) row in the totals and in its
+    /// source's breakdown.
+    pub fn record_excluded(&mut self, source: &EvidenceSource) {
+        self.excluded_non_logic += 1;
+        match source {
+            EvidenceSource::Native => self.native.excluded_non_logic += 1,
+            EvidenceSource::Static => self.static_findings.excluded_non_logic += 1,
+            _ => self.attacker_generated.excluded_non_logic += 1,
+        }
+    }
+
+    /// `count/denominator (pct%)`, or `n/a` when the denominator is zero.
+    ///
+    /// [VANTA-WHY] A zero denominator must NEVER render as `0.00%`. "No
+    /// transitions were countable" and "every countable transition was
+    /// uncorrected" are opposite claims about a run, and a rate of 0.00% states
+    /// the second one. `n/a` states the first.
+    pub fn render_rate(count: usize, complete: usize) -> String {
+        if complete == 0 {
+            "n/a".to_string()
+        } else {
+            format!("{count}/{complete} ({:.2}%)", count as f64 / complete as f64 * 100.0)
+        }
+    }
+
+    /// Combined ECR, e.g. `1/6 (16.67%)` or `n/a`.
+    pub fn ecr_text(&self) -> String {
+        Self::render_rate(self.ecr_count, self.complete)
+    }
+
+    /// Combined EIR, e.g. `1/6 (16.67%)` or `n/a`.
+    pub fn eir_text(&self) -> String {
+        Self::render_rate(self.eir_count, self.complete)
+    }
+
+    /// ECR and EIR for one source, e.g. `ECR=1/1 (100.00%) EIR=n/a`.
+    fn source_text(breakdown: &SourceBreakdown) -> String {
+        format!(
+            "ECR={} EIR={}",
+            Self::render_rate(breakdown.ecr_count, breakdown.complete),
+            Self::render_rate(breakdown.eir_count, breakdown.complete)
+        )
+    }
+
+    /// The same metric per evidence source, so a pooled number can be read
+    /// apart: `AttackerGenerated[ECR=n/a EIR=n/a] Native[ECR=1/1 (100.00%) …] …`
+    pub fn per_source_text(&self) -> String {
+        format!(
+            "AttackerGenerated[{}] Native[{}] Static[{}]",
+            Self::source_text(&self.attacker_generated),
+            Self::source_text(&self.native),
+            Self::source_text(&self.static_findings)
+        )
     }
 }
 
@@ -633,4 +792,174 @@ pub enum GovernorDecision {
     HarnessFailure,
     // [VANTA-WHY] Loop should continue (used internally; never a final decision).
     Continue,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The identity of a blocking static finding is rule + file + message. The
+    /// line number is NOT part of it.
+    #[test]
+    fn a_static_finding_identity_ignores_the_line_it_sits_on() {
+        let a = static_finding_identity("F821", "calc.py", "Undefined name `x`");
+        let b = static_finding_identity("F821", "calc.py", "Undefined name `x`");
+        assert_eq!(a, b, "the same finding must have one identity");
+
+        // The identity does not even take a line, so a finding that only moved
+        // down the file keeps it. A message that itself carries a colon (mypy
+        // writes "path:line: error: ..." style text) must survive intact — the
+        // identity is never split on one.
+        let with_colon = static_finding_identity("index", "mod.py", "Incompatible type: int");
+        assert_eq!(with_colon, "index|mod.py|Incompatible type: int");
+    }
+
+    /// A message that is re-wrapped by the analyzer is the SAME finding.
+    #[test]
+    fn a_static_finding_identity_normalises_whitespace_in_the_message() {
+        let wrapped = static_finding_identity(
+            "index",
+            "mod.py",
+            "Item of \"list\" has no\n   attribute \"shape\"",
+        );
+        let flat =
+            static_finding_identity("index", "mod.py", "Item of \"list\" has no attribute \"shape\"");
+        assert_eq!(
+            wrapped, flat,
+            "re-wrapping a diagnostic must not fork the identity"
+        );
+        assert_eq!(
+            flat,
+            r#"index|mod.py|Item of "list" has no attribute "shape""#,
+            "the identity is readable: rule | file | normalised message"
+        );
+    }
+
+    /// Different rule, file, or message -> different identity.
+    #[test]
+    fn a_static_finding_identity_separates_rule_file_and_message() {
+        let base = static_finding_identity("F821", "calc.py", "Undefined name `x`");
+        assert_ne!(base, static_finding_identity("F401", "calc.py", "Undefined name `x`"));
+        assert_ne!(base, static_finding_identity("F821", "other.py", "Undefined name `x`"));
+        assert_ne!(base, static_finding_identity("F821", "calc.py", "Undefined name `y`"));
+    }
+
+    /// A Static-class failure counts ONLY on a row whose own source is Static.
+    ///
+    /// [VANTA-WHY] This is the whole reason the gate takes a source: the static
+    /// class is uncountable for Attacker evidence (an `import-not-found` blames
+    /// the environment) but countable for a blocking finding that was already
+    /// differenced against the baseline.
+    #[test]
+    fn a_static_class_failure_counts_only_for_static_source_rows() {
+        let passed = TestResult::Passed;
+        let failed = TestResult::Failed;
+        let static_class = Some(FailureClass::Static);
+
+        assert!(
+            counts_toward_metrics(
+                &failed,
+                &passed,
+                &static_class,
+                &None,
+                &EvidenceSource::Static
+            ),
+            "a blocking static error fixed on the next attempt is a correction"
+        );
+        assert!(
+            counts_toward_metrics(
+                &passed,
+                &failed,
+                &None,
+                &static_class,
+                &EvidenceSource::Static
+            ),
+            "a blocking static error introduced on the next attempt is an introduction"
+        );
+        assert!(
+            !counts_toward_metrics(
+                &failed,
+                &passed,
+                &static_class,
+                &None,
+                &EvidenceSource::AttackerGenerated
+            ),
+            "an Attacker test that merely classified Static must stay excluded"
+        );
+        assert!(
+            !counts_toward_metrics(
+                &failed,
+                &passed,
+                &static_class,
+                &None,
+                &EvidenceSource::Native
+            ),
+            "the allowance is for Static-source rows only, not for every source"
+        );
+    }
+
+    /// Native rows carry Logic on their failing side, so a repo-native
+    /// regression and its repair are countable under the ordinary rule.
+    #[test]
+    fn a_native_regression_counts_under_the_ordinary_logic_rule() {
+        assert!(counts_toward_metrics(
+            &TestResult::Failed,
+            &TestResult::Passed,
+            &Some(FailureClass::Logic),
+            &None,
+            &EvidenceSource::Native
+        ));
+        assert!(counts_toward_metrics(
+            &TestResult::Passed,
+            &TestResult::Failed,
+            &None,
+            &Some(FailureClass::Logic),
+            &EvidenceSource::Native
+        ));
+    }
+
+    /// A zero denominator renders `n/a`, never `0.00%`.
+    #[test]
+    fn a_zero_denominator_renders_not_applicable_never_a_zero_percent() {
+        assert_eq!(EcrEirSnapshot::render_rate(0, 0), "n/a");
+        assert_eq!(EcrEirSnapshot::render_rate(0, 3), "0/3 (0.00%)");
+        assert_eq!(EcrEirSnapshot::render_rate(1, 2), "1/2 (50.00%)");
+
+        let empty = EcrEirSnapshot::default();
+        assert_eq!(empty.ecr_text(), "n/a");
+        assert_eq!(empty.eir_text(), "n/a");
+        assert!(
+            !empty.per_source_text().contains("0.00%"),
+            "an empty snapshot must not state a rate: {}",
+            empty.per_source_text()
+        );
+    }
+
+    /// The per-source breakdown is additive to the totals.
+    #[test]
+    fn the_source_breakdown_adds_up_to_the_totals() {
+        let mut snap = EcrEirSnapshot::default();
+        snap.record(
+            &EvidenceSource::AttackerGenerated,
+            &TestResult::Passed,
+            &TestResult::Passed,
+        );
+        snap.record(&EvidenceSource::Native, &TestResult::Failed, &TestResult::Passed);
+        snap.record(&EvidenceSource::Static, &TestResult::Passed, &TestResult::Failed);
+        snap.record_excluded(&EvidenceSource::AttackerGenerated);
+
+        assert_eq!(snap.complete, 3);
+        assert_eq!(snap.ecr_count, 1);
+        assert_eq!(snap.eir_count, 1);
+        assert_eq!(snap.excluded_non_logic, 1);
+        assert_eq!(snap.attacker_generated.complete, 1);
+        assert_eq!(snap.native.ecr_count, 1);
+        assert_eq!(snap.native.complete, 1);
+        assert_eq!(snap.static_findings.eir_count, 1);
+        assert_eq!(snap.static_findings.complete, 1);
+        assert_eq!(
+            snap.native.complete + snap.static_findings.complete + snap.attacker_generated.complete,
+            snap.complete
+        );
+    }
 }

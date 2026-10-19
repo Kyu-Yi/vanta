@@ -1376,6 +1376,7 @@ mod tests {
                 .iter()
                 .map(|(name, result)| ((*name).to_string(), result.clone()))
                 .collect(),
+            failure_outputs: std::collections::HashMap::new(),
             ran,
             exit_code: Some(0),
             stderr_tail: String::new(),
@@ -1408,6 +1409,7 @@ mod tests {
         let bad = suite_report(&[("tests/test_k.py::K::test_x", TestResult::Failed)], true);
         let good = NativeSuiteReport {
             tests: Vec::new(),
+            failure_outputs: std::collections::HashMap::new(),
             ran: false,
             exit_code: Some(127),
             stderr_tail:

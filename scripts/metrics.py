@@ -30,6 +30,13 @@ false_reject       Rejected on a patch whose ground-truth label says it is GOOD.
                    measurement artefact.
 false_approval     Approved on a patch whose ground-truth label says it is bad.
 true_approval      Approved on a patch whose ground-truth label says it is good.
+unresolved         The run stopped at its attempt budget without an approved
+                   patch (`MaxAttemptsReached`). The Governor returns that only
+                   after a round that did not pass, and the Gatekeeper — the only
+                   component that approves — runs solely on `AllTestsPassed`, so
+                   nothing this run produced was ever accepted. It is "gave up",
+                   never an approval: counted on its own so it can never inflate
+                   an approval bucket, whatever ground-truth label it carries.
 undetermined       Rejected, but no signal could be evaluated (e.g. a legacy v0
                    session whose static findings were never recorded). Reported
                    separately so it is never silently folded into
@@ -53,10 +60,15 @@ SPURIOUS_REJECT = "spurious_reject"
 FALSE_REJECT = "false_reject"
 FALSE_APPROVAL = "false_approval"
 TRUE_APPROVAL = "true_approval"
+UNRESOLVED = "unresolved"
 UNDETERMINED = "undetermined"
 APPROVED_UNLABELED = "approved_unlabeled"
 
-APPROVED_DECISIONS = {"AllTestsPassed", "MaxAttemptsReached"}
+# [WHY] `AllTestsPassed` alone. `MaxAttemptsReached` used to live here and was
+# bucketed as an approval; it is the opposite — the Creator exhausted the budget
+# without an approved patch (see the `unresolved` bucket).
+APPROVED_DECISIONS = {"AllTestsPassed"}
+UNRESOLVED_DECISIONS = {"MaxAttemptsReached"}
 
 
 # ============================================================================
@@ -80,20 +92,20 @@ class SessionData:
             return "v0 (legacy)"
         return f"v{self.schema_version}"
 
-    def field(self, phase: str, key: str) -> Optional[str]:
-        """Value of `key` from the `key=value` summary of the given phase.
 
-        [WHY] Values may contain spaces (`test_cmd=env PYTHONPATH=src ... -m
-        pytest -q`), so a value ends at the next ` key=` token rather than at the
-        next space.
-        """
-        for record in self.records:
-            if record.get("phase") != phase:
-                continue
-            value = summary_field(record.get("summary", ""), key)
-            if value is not None:
-                return value
-        return None
+def final_decision(records: list[dict[str, Any]]) -> Optional[str]:
+    """The run's `final_decision`, or None when the run summary is absent.
+
+    [WHY] Both the bucketing and the "is there anything to re-run?" question
+    read this one field, so they can never disagree about what the run decided.
+    """
+    for record in records:
+        if record.get("phase") != "run.summary":
+            continue
+        value = summary_field(record.get("summary", ""), "final_decision")
+        if value is not None:
+            return value
+    return None
 
 
 def summary_field(summary: str, key: str) -> Optional[str]:
@@ -199,10 +211,15 @@ def load_session(sessions_dir: str, session_id: str) -> SessionData:
     if os.path.exists(reruns_path):
         with open(reruns_path, encoding="utf-8") as handle:
             data.reruns = json.load(handle)
-    else:
+    elif final_decision(records) == "Rejected":
+        # [WHY] Only a rejection produces signals worth re-running. An approval
+        # (or a run that stopped without a verdict) was never owed a probe, so
+        # warning about the absent file would blame the session for a measurement
+        # nobody needed.
         data.warnings.append(
-            f"{session_id}: no {os.path.basename(reruns_path)} — no signal was "
-            "re-run, so discrimination cannot be established."
+            f"{session_id}: no {os.path.basename(reruns_path)} — the session was "
+            "rejected but no signal was re-run, so discrimination cannot be "
+            "established."
         )
     return data
 
@@ -249,6 +266,8 @@ class Verdict:
             return "approved on a patch labelled known-bad"
         if self.bucket == TRUE_APPROVAL:
             return "approved on a patch labelled known-good"
+        if self.bucket == UNRESOLVED:
+            return "attempt budget exhausted with no approved patch (not an approval)"
         return "approved, no ground-truth label"
 
 
@@ -256,7 +275,7 @@ def classify(
     data: SessionData, known_bad: Optional[bool]
 ) -> Verdict:
     """Bucket one session. Never guesses: an un-evaluated signal is not a pass."""
-    decision = data.field("run.summary", "final_decision") or "unknown"
+    decision = final_decision(data.records) or "unknown"
     reruns = data.reruns
 
     signals: list[dict[str, Any]] = []
@@ -281,6 +300,14 @@ def classify(
             bucket = SPURIOUS_REJECT
         else:
             bucket = UNDETERMINED
+    elif decision in UNRESOLVED_DECISIONS:
+        # [WHY] The attempt budget ran out with no approved patch. The Governor
+        # only returns this after a round whose verdict was not `Passed` (a
+        # `Passed` round returns AllTestsPassed first), and the Gatekeeper — the
+        # only component that emits `Approved` — runs solely on AllTestsPassed.
+        # So nothing here was accepted, and no ground-truth label can make it an
+        # approval: it is unresolved whatever the label says.
+        bucket = UNRESOLVED
     elif decision in APPROVED_DECISIONS:
         if known_bad is True:
             bucket = FALSE_APPROVAL
@@ -332,6 +359,7 @@ def render_table(verdicts: list[Verdict]) -> str:
         FALSE_REJECT,
         FALSE_APPROVAL,
         TRUE_APPROVAL,
+        UNRESOLVED,
         UNDETERMINED,
         APPROVED_UNLABELED,
     ):
@@ -369,7 +397,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         help=(
             "JSON file mapping session_id -> {\"known_bad\": true|false} ground "
             "truth. Drives false_reject / false_approval / true_approval; an "
-            "unlabelled session claims nothing about approvals."
+            "unlabelled session claims nothing about approvals. When given, only "
+            "the labelled sessions are reported unless --all is passed."
+        ),
+    )
+    parser.add_argument(
+        "--all",
+        dest="include_all",
+        action="store_true",
+        help=(
+            "With --labels, report every session in the directory, not just the "
+            "labelled ones."
         ),
     )
     parser.add_argument("--json", dest="json_out", default=None,
@@ -389,6 +427,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not session_ids:
         print(f"error: no *_session.jsonl under {args.sessions_dir}", file=sys.stderr)
         return 1
+
+    if args.labels and not args.include_all:
+        # [WHY] A label file is the study's declared evaluation set. Reporting
+        # unlabelled sessions next to it invites a reader to add rows whose
+        # ground truth nobody checked into a count that is supposed to be
+        # label-driven. `--all` is the explicit opt-in for the wider view.
+        session_ids = [sid for sid in session_ids if sid in labels]
+        if not session_ids:
+            print(
+                f"error: none of the {len(labels)} session(s) in {args.labels} has "
+                f"a *_session.jsonl under {args.sessions_dir} (pass --all to "
+                "report unlabelled sessions)",
+                file=sys.stderr,
+            )
+            return 1
 
     verdicts: list[Verdict] = []
     for session_id in session_ids:

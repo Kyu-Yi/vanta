@@ -220,6 +220,62 @@ def test_approval_without_a_ground_truth_label_claims_nothing(tmp_path):
     assert verdict.bucket == metrics.APPROVED_UNLABELED
 
 
+# ============================================================================
+# MaxAttemptsReached is a give-up, not an approval (`unresolved`)
+# ============================================================================
+
+
+def test_max_attempts_reached_is_unresolved_whatever_the_label(tmp_path):
+    """Burning the attempt budget is "gave up", never an approval.
+
+    [WHY] The Governor returns MaxAttemptsReached only after a round that did
+    not pass (a passing round returns AllTestsPassed first), and the Gatekeeper —
+    the only component that approves — runs solely on AllTestsPassed. So no
+    ground-truth label can turn this into a false_approval or a true_approval.
+    """
+    write_session(tmp_path, "gave-up", decision="MaxAttemptsReached", schema_version=1)
+    data = metrics.load_session(str(tmp_path), "gave-up")
+
+    for label in (True, False, None):
+        verdict = metrics.classify(data, label)
+        assert verdict.bucket == metrics.UNRESOLVED, label
+        assert verdict.bucket not in (
+            metrics.FALSE_APPROVAL,
+            metrics.TRUE_APPROVAL,
+            metrics.APPROVED_UNLABELED,
+        ), label
+
+
+def test_unresolved_is_counted_on_its_own_line(tmp_path):
+    """The give-up must not be summed into any approval bucket."""
+    write_session(tmp_path, "gave-up", decision="MaxAttemptsReached", schema_version=1)
+    verdicts = [
+        metrics.classify(metrics.load_session(str(tmp_path), "gave-up"), known_bad=True)
+    ]
+    table = metrics.render_table(verdicts)
+
+    assert re.search(r"unresolved\s+1", table), table
+    assert re.search(r"false_approval\s+0", table), table
+    assert re.search(r"true_approval\s+0", table), table
+    assert re.search(r"scored rejections\s+0", table), table
+
+
+def test_only_a_rejection_owes_a_signal_rerun(tmp_path):
+    """An approval has nothing to re-run, so the absent probe file is not a warning.
+
+    [WHY] Only a rejection produces rejecting signals worth re-running. Warning
+    on an approval would blame the session for a measurement nobody needed.
+    """
+    write_session(tmp_path, "approved", decision="AllTestsPassed", schema_version=1)
+    write_session(tmp_path, "gave-up", decision="MaxAttemptsReached", schema_version=1)
+
+    approved = metrics.load_session(str(tmp_path), "approved")
+    gave_up = metrics.load_session(str(tmp_path), "gave-up")
+
+    assert not any("signal_reruns" in w for w in approved.warnings), approved.warnings
+    assert not any("signal_reruns" in w for w in gave_up.warnings), gave_up.warnings
+
+
 def test_render_table_reports_the_buckets_separately(tmp_path):
     """The outcomes the study reports must never be summed together."""
     write_session(tmp_path, "catch", decision="Rejected", schema_version=1)
@@ -244,3 +300,53 @@ def test_render_table_reports_the_buckets_separately(tmp_path):
     assert metrics.FALSE_REJECT in table
     assert re.search(r"scored rejections\s+3", table), table
     assert re.search(r"rejections seen\s+3", table), table
+
+
+# ============================================================================
+# --labels scopes the report to the declared evaluation set; --all widens it
+# ============================================================================
+
+
+def write_labels(tmp_path, mapping: dict) -> str:
+    path = tmp_path / "labels.json"
+    path.write_text(json.dumps(mapping), encoding="utf-8")
+    return str(path)
+
+
+def test_labels_report_only_labelled_sessions_by_default(tmp_path, capsys):
+    """A label file is the study's evaluation set, not a filter over everything.
+
+    [WHY] Reporting unlabelled sessions beside the labelled ones invites a reader
+    to add rows whose ground truth nobody checked to a count that is supposed to
+    be label-driven.
+    """
+    write_session(tmp_path, "keep-session", decision="AllTestsPassed", schema_version=1)
+    write_session(tmp_path, "drop-session", decision="AllTestsPassed", schema_version=1)
+    labels = write_labels(tmp_path, {"keep-session": {"known_bad": False}})
+
+    assert metrics.main(["--sessions-dir", str(tmp_path), "--labels", labels]) == 0
+    out = capsys.readouterr().out
+    assert "keep-ses" in out
+    assert "drop-ses" not in out
+
+
+def test_all_flag_reports_unlabelled_sessions_too(tmp_path, capsys):
+    write_session(tmp_path, "keep-session", decision="AllTestsPassed", schema_version=1)
+    write_session(tmp_path, "drop-session", decision="AllTestsPassed", schema_version=1)
+    labels = write_labels(tmp_path, {"keep-session": {"known_bad": False}})
+
+    assert (
+        metrics.main(["--sessions-dir", str(tmp_path), "--labels", labels, "--all"]) == 0
+    )
+    out = capsys.readouterr().out
+    assert "keep-ses" in out
+    assert "drop-ses" in out
+
+
+def test_labels_with_no_matching_session_is_an_error(tmp_path, capsys):
+    """A label file that matches nothing is loud, not an empty table."""
+    write_session(tmp_path, "drop-session", decision="AllTestsPassed", schema_version=1)
+    labels = write_labels(tmp_path, {"other-session": {"known_bad": True}})
+
+    assert metrics.main(["--sessions-dir", str(tmp_path), "--labels", labels]) == 1
+    assert "none of the" in capsys.readouterr().err

@@ -69,6 +69,7 @@ def select(
     only: list[str],
     waves: list[int],
     reserves: str,
+    measure_only: bool = False,
 ) -> list[tuple[dict[str, Any], bool]]:
     """``[(entry, full)]`` in the committed file order.
 
@@ -77,6 +78,13 @@ def select(
     that ``context_sizes.md`` can justify promoting it, but its suites are not run
     until someone changes its ``role`` and re-runs prepare (§8). Naming a bug with
     ``--only`` is an explicit request, so it is always ``full``.
+
+    ``measure_only`` forces every candidate to ``full=False`` — the checkout, the
+    SWE-bench trees and the §1.6 context precheck, and nothing that boots a VM.
+    That is what makes the pilot set a *measured* choice: the sizes of all
+    candidates, pilots and reserves, are available before a single checkpoint is
+    baked or a wave scheduled. The numbers it produces are the pre-strip tree's
+    (§1.6 step 1), so they are an upper bound on what Vanta is finally handed.
     """
     entries = split.bugs
 
@@ -86,7 +94,7 @@ def select(
         if unknown:
             raise SplitError(f"--only names bugs that are not in the split: {unknown}")
         wanted = set(only)
-        return [(entry, True) for entry in entries if bug_key(entry) in wanted]
+        return [(entry, not measure_only) for entry in entries if bug_key(entry) in wanted]
 
     if waves:
         wanted_waves = set(waves)
@@ -94,7 +102,9 @@ def select(
 
     selected: list[tuple[dict[str, Any], bool]] = []
     for entry in entries:
-        if entry.get("role", "pilot") == "pilot":
+        if measure_only:
+            selected.append((entry, False))
+        elif entry.get("role", "pilot") == "pilot":
             selected.append((entry, True))
         elif reserves == "measure":
             selected.append((entry, False))
@@ -123,7 +133,11 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     split_path: Path = args.split.resolve()
     split = load_split(split_path)
     selected = select(
-        split, only=args.only, waves=parse_waves(args.waves), reserves=args.reserves
+        split,
+        only=args.only,
+        waves=parse_waves(args.waves),
+        reserves=args.reserves,
+        measure_only=args.measure_only,
     )
     if not selected:
         raise SplitError("the selection is empty")
@@ -352,6 +366,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("measure", "skip"),
         default="measure",
         help="what to do with role=reserve bugs (default: measure their context only)",
+    )
+    prep.add_argument(
+        "--measure-only",
+        action="store_true",
+        help=(
+            "context-measure every selected bug without running a suite or booting a "
+            "VM (§1.6); this is how the pilot set is chosen from data"
+        ),
     )
     prep.add_argument(
         "--plan",

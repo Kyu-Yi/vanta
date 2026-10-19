@@ -49,6 +49,7 @@ from bugsinpy import split as split_mod  # noqa: E402
 from bugsinpy import suite as suite_mod  # noqa: E402
 from bugsinpy import trees as tree_mod  # noqa: E402
 from bugsinpy.split import SplitError, load_split  # noqa: E402
+import bugsinpy_run as run_mod  # noqa: E402
 
 SPLIT_PATH = REPO_ROOT / "plans" / "bugsinpy_split.json"
 BUGSINPY_CLONE = REPO_ROOT / "runs" / "bugsinpy" / "bugsinpy"
@@ -676,6 +677,192 @@ class TestContextConstants:
         assert number("MAX_FILE_BYTES") == ctx.MAX_FILE_BYTES
         assert number("MAX_TOTAL_SOURCE_BYTES") == ctx.MAX_TOTAL_SOURCE_BYTES
 
+    def test_the_estimator_and_the_output_reserve_match_the_run_time_guard(self):
+        """The precheck's boundary must be the guard's boundary, not near it.
+
+        The same three numbers appear in three files: the token estimator and the
+        chat overhead in ``src/llm/mod.rs`` (where ``context_budget_exceeded``
+        compares ``prompt + output + overhead > n_ctx``), and the output reserve in
+        ``src/agents/creator.rs``. If the Creator's ``max_tokens`` grows and this
+        module keeps subtracting 32768, the precheck silently starts accepting
+        prompts the guard rejects — and the run dies at attempt 1 after a checkpoint
+        and a wave have been spent. So the duplication is asserted, not trusted.
+        """
+        llm = (REPO_ROOT / "src" / "llm" / "mod.rs").read_text(encoding="utf-8")
+        creator = (REPO_ROOT / "src" / "agents" / "creator.rs").read_text(encoding="utf-8")
+
+        bytes_per_token = re.search(
+            r"const TOKEN_ESTIMATE_BYTES_PER_TOKEN: u32 = (\d+);", llm
+        )
+        overhead = re.search(r"const CHAT_OVERHEAD_TOKENS: u32 = (\d+);", llm)
+        assert bytes_per_token, "TOKEN_ESTIMATE_BYTES_PER_TOKEN not found in src/llm/mod.rs"
+        assert overhead, "CHAT_OVERHEAD_TOKENS not found in src/llm/mod.rs"
+        assert int(bytes_per_token.group(1)) == ctx.BYTES_PER_TOKEN_ESTIMATE
+        assert int(overhead.group(1)) == ctx.CHAT_OVERHEAD_TOKENS
+
+        max_tokens = re.search(r'"max_tokens":\s*(\d+)', creator)
+        assert max_tokens, '"max_tokens" not found in src/agents/creator.rs'
+        assert int(max_tokens.group(1)) == ctx.OUTPUT_RESERVE_TOKENS
+
+    def test_estimate_tokens_rounds_up_like_the_rust_does(self):
+        """``conservative_token_estimate`` ceils; a truncated mirror under-counts."""
+        rust = (REPO_ROOT / "src" / "llm" / "mod.rs").read_text(encoding="utf-8")
+        assert "bytes % TOKEN_ESTIMATE_BYTES_PER_TOKEN != 0" in rust  # the ceil
+
+        assert ctx.estimate_tokens(0) == 0
+        assert ctx.estimate_tokens(1) == 1
+        assert ctx.estimate_tokens(4) == 1
+        assert ctx.estimate_tokens(5) == 2
+        assert ctx.estimate_tokens(4097) == 1025
+
+
+class TestContextBudget:
+    """``budget = n_ctx − output reserve − overhead − 25 % of n_ctx`` (§1.6.2)."""
+
+    def test_the_headers_window_yields_the_documented_budget(self):
+        budget, margin = ctx.budget_tokens(131_072)
+        assert budget == 65_280
+        assert margin == 32_768
+        assert 131_072 - ctx.OUTPUT_RESERVE_TOKENS - ctx.CHAT_OVERHEAD_TOKENS - margin == budget
+
+    def test_the_budget_is_just_under_vantas_own_source_cap(self):
+        """A coincidence worth keeping an eye on: 65280 tok ~ 255 KB < 256 KB."""
+        budget, _ = ctx.budget_tokens(131_072)
+        assert budget * ctx.BYTES_PER_TOKEN_ESTIMATE < ctx.MAX_TOTAL_SOURCE_BYTES
+
+    def test_headroom_is_what_the_prompt_may_still_grow_by(self, tmp_path):
+        write(tmp_path / "a.py", "x = 1\n")
+        verdict = ctx.precheck(tmp_path, "", n_ctx=131_072, n_ctx_source="test")
+        assert verdict.headroom_tokens == verdict.budget_tokens - verdict.estimated_prompt_tokens
+        assert verdict.output_reserve_tokens == ctx.OUTPUT_RESERVE_TOKENS
+        assert verdict.as_dict()["headroom_tokens"] == verdict.headroom_tokens
+
+    def test_a_window_below_the_output_reserve_has_no_prompt_budget(self, tmp_path):
+        """Every real prompt is rejected *and* the reason says the window itself is
+        the problem — otherwise a misconfigured server looks like a fat repo."""
+        write(tmp_path / "a.py", "x = 1\n")
+        verdict = ctx.precheck(tmp_path, "", n_ctx=32_768, n_ctx_source="test")
+        assert verdict.context_ok is False
+        assert any(r.startswith("no_prompt_budget") for r in verdict.reasons)
+        assert verdict.budget_tokens <= 0
+
+    def test_the_source_cap_alone_can_exceed_the_budget(self, tmp_path):
+        """The 256 KB cap is *not* the binding constraint — this budget is.
+
+        Filling Vanta's own total cap exactly (untruncated, so the walk reports no
+        rejection of its own) still estimates at 65536 tok, and 65536 + the 3000-tok
+        frame is over the 65280 budget. So a repo can pass Vanta's cap and still be
+        refused here, for a reason that is about the model's window rather than
+        about the walk.
+        """
+        for index in range(4):  # 4 x 64 KB = the total cap exactly, none oversize
+            blob(tmp_path / f"f{index}.py", ctx.MAX_FILE_BYTES)
+        verdict = ctx.precheck(tmp_path, "", n_ctx=131_072, n_ctx_source="test")
+
+        assert verdict.stats.bytes_included == ctx.MAX_TOTAL_SOURCE_BYTES
+        assert verdict.stats.truncated is False
+        assert verdict.reasons == [
+            r for r in verdict.reasons if r.startswith("prompt_exceeds_budget")
+        ]
+        assert verdict.estimated_prompt_tokens == 65_536 + ctx.PROMPT_FRAME_TOKENS
+        assert verdict.estimated_prompt_tokens > verdict.budget_tokens
+        assert verdict.context_ok is False
+
+    def test_the_precheck_is_stricter_than_the_guard_by_exactly_the_margin(self, tmp_path):
+        """A prompt between the budget and the guard's limit: Vanta would run it,
+        the harness refuses it — and the gap *is* the feedback-growth margin.
+
+        The issue text is what makes that band reachable: it is not part of the
+        source walk and therefore not capped by ``MAX_TOTAL_SOURCE_BYTES``.
+        """
+        n_ctx = 131_072
+        budget, margin = ctx.budget_tokens(n_ctx)
+        guard_limit = n_ctx - ctx.OUTPUT_RESERVE_TOKENS - ctx.CHAT_OVERHEAD_TOKENS
+        assert guard_limit - budget == margin
+
+        write(tmp_path / "a.py", "x = 1\n")
+        issue = "a" * ((budget + 512 - ctx.PROMPT_FRAME_TOKENS - 2) * 4)
+        verdict = ctx.precheck(tmp_path, issue, n_ctx=n_ctx, n_ctx_source="test")
+        assert verdict.estimated_prompt_tokens > budget
+        assert verdict.estimated_prompt_tokens <= guard_limit
+        assert verdict.context_ok is False
+
+
+class TestRenderContextSizes:
+    """``context_sizes.md`` is read to *choose the pilot set*, so it states the rule."""
+
+    def test_the_report_shows_the_budget_derivation(self, tmp_path):
+        write(tmp_path / "a.py", "x = 1\n")
+        verdict = ctx.precheck(tmp_path, "", n_ctx=131_072, n_ctx_source="test")
+        text = ctx.render_markdown([("Demo/1", "pilot", verdict)])
+        assert "budget = n_ctx" in text
+        assert "65280 = 131072 − 32768 − 256 − 32768" in text
+        assert "`TOKEN_ESTIMATE_BYTES_PER_TOKEN`" in text
+        assert "| Demo/1 | pilot | ok | 131072 (test)" in text
+        assert "| headroom |" in text
+
+    def test_a_mixed_window_is_called_out_rather_than_averaged(self, tmp_path):
+        write(tmp_path / "a.py", "x = 1\n")
+        rows = [
+            ("Demo/1", "pilot", ctx.precheck(tmp_path, "", n_ctx=131_072, n_ctx_source="a")),
+            ("Demo/2", "reserve", ctx.precheck(tmp_path, "", n_ctx=65_536, n_ctx_source="b")),
+        ]
+        text = ctx.render_markdown(rows)
+        assert "More than one window was measured" in text
+
+    def test_a_fallback_window_is_flagged_as_not_a_decision(self, tmp_path):
+        """The first measure-only run silently used the 65536 fallback and rejected
+        13 of 14 candidates; a report that can be read as a decision must say so."""
+        write(tmp_path / "a.py", "x = 1\n")
+        verdict = ctx.precheck(
+            tmp_path, "", n_ctx=ctx.FALLBACK_CONTEXT_TOKENS,
+            n_ctx_source="fallback (server unreachable)",
+        )
+        text = ctx.render_markdown([("Demo/1", "pilot", verdict)])
+        assert "**Not a decision.**" in text
+        assert f"against the {ctx.FALLBACK_CONTEXT_TOKENS} fallback" in text
+        assert "VANTA_LLM_CONTEXT_TOKENS" in text
+
+
+class TestSelectMeasureOnly:
+    """``--measure-only`` is how the pilot set becomes a measured choice (§8)."""
+
+    def test_measure_only_forces_every_candidate_to_context_only(self):
+        split = split_mod.Split(
+            split_data(
+                bugs=[
+                    bug_entry(role="pilot", bug_id=1),
+                    bug_entry(role="reserve", bug_id=2),
+                    bug_entry(role="pilot", bug_id=3),
+                ]
+            )
+        )
+        selected = run_mod.select(
+            split, only=[], waves=[], reserves="measure", measure_only=True
+        )
+        assert [full for _, full in selected] == [False, False, False]
+        assert len(selected) == 3
+
+    def test_measure_only_also_covers_an_explicitly_named_bug(self):
+        """``--only X --measure-only`` must not quietly boot a VM for X: the point
+        of the flag is that no third-party code runs on the host or in Shuru."""
+        split = split_mod.Split(split_data())
+        selected = run_mod.select(
+            split, only=["Demo/1"], waves=[], reserves="measure", measure_only=True
+        )
+        assert selected == [(split.bugs[0], False)]
+
+    def test_without_the_flag_a_pilot_is_still_full(self):
+        split = split_mod.Split(split_data(bugs=[bug_entry(role="pilot")]))
+        selected = run_mod.select(split, only=[], waves=[], reserves="measure")
+        assert selected == [(split.bugs[0], True)]
+
+    def test_the_flag_exists_on_the_prepare_subcommand(self):
+        args = run_mod.build_parser().parse_args(["prepare", "--measure-only", "--plan"])
+        assert args.measure_only is True
+        args = run_mod.build_parser().parse_args(["prepare", "--plan"])
+        assert args.measure_only is False
+
 
 class TestMeasureTree:
     def test_filters_extensions_and_skip_dirs(self, tmp_path):
@@ -713,10 +900,6 @@ class TestMeasureTree:
         stats = ctx.measure_tree(tmp_path)
         assert stats.largest_files[0][0] == "b.py"
 
-    def test_estimate_tokens(self):
-        assert ctx.estimate_tokens(int(ctx.BYTES_PER_TOKEN_ESTIMATE * 360)) == 360
-        assert ctx.estimate_tokens(0) == 0
-
 
 class TestPrecheck:
     def test_accepts_a_tree_that_fits(self, tmp_path):
@@ -724,7 +907,7 @@ class TestPrecheck:
         verdict = ctx.precheck(tmp_path, "hello", n_ctx=65536, n_ctx_source="test")
         assert verdict.context_ok is True
         assert verdict.reasons == []
-        assert verdict.budget_tokens == int(65536 * (1 - ctx.CONTEXT_MARGIN_FRACTION))
+        assert verdict.budget_tokens == ctx.budget_tokens(65536)[0]
 
     def test_rejects_a_truncated_source(self, tmp_path):
         blob(tmp_path / "big.py", ctx.MAX_FILE_BYTES + 1)
@@ -741,11 +924,13 @@ class TestPrecheck:
         assert verdict.reasons[0].startswith("prompt_exceeds_budget")
 
     def test_the_margin_is_reserved_for_feedback_growth(self, tmp_path):
+        """Same tree, two windows: the tighter one leaves no room for attempt 2."""
         write(tmp_path / "a.py", "x" * 3000 + "\n")
-        tight = ctx.precheck(tmp_path, "", n_ctx=4000, n_ctx_source="test")
-        roomy = ctx.precheck(tmp_path, "", n_ctx=8000, n_ctx_source="test")
+        tight = ctx.precheck(tmp_path, "", n_ctx=48_000, n_ctx_source="test")
+        roomy = ctx.precheck(tmp_path, "", n_ctx=96_000, n_ctx_source="test")
         assert tight.context_ok is False
         assert roomy.context_ok is True
+        assert roomy.headroom_tokens > tight.headroom_tokens
 
     def test_env_override_wins(self, tmp_path, monkeypatch):
         monkeypatch.setenv("VANTA_LLM_CONTEXT_TOKENS", "12345")

@@ -380,6 +380,125 @@ def write_context_sizes(batch_dir: Path, preps: list[BugPrep]) -> Path:
     return path
 
 
+def write_context_report(batch_dir: Path, preps: list[BugPrep]) -> Path:
+    """``context_report.json`` — the machine-readable half of §1.6.
+
+    [VANTA-WHY] Measurements land here and in ``prepare.json``, never in
+    ``plans/bugsinpy_split.json``. The split is an *input* the user reviews and
+    edits; a stage that rewrites it silently turns a measurement into a decision,
+    and the difference between "the plan says this" and "this run observed that" is
+    the whole point of keeping the two files apart.
+
+    ``prompt_tokens_real`` is null until a session has actually paid for the prompt:
+    the estimate is ``ceil(source_bytes / 4)`` plus a frame and runs high (measured
+    ~1.5x on the heretic sessions), so a pilot set chosen from the estimate alone is
+    uncalibrated. ``prompt_tokens_real_source`` names the session that filled it in.
+    """
+    path = batch_dir / "context_report.json"
+    measured = [prep for prep in preps if prep.context is not None]
+    windows = {prep.context.n_ctx for prep in measured}
+    budgets = {prep.context.budget_tokens for prep in measured}
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "context_report",
+        "created_utc": utc_now(),
+        "estimator": {
+            "bytes_per_token": ctx.BYTES_PER_TOKEN_ESTIMATE,
+            "prompt_frame_tokens": ctx.PROMPT_FRAME_TOKENS,
+            "output_reserve_tokens": ctx.OUTPUT_RESERVE_TOKENS,
+            "chat_overhead_tokens": ctx.CHAT_OVERHEAD_TOKENS,
+            "margin_fraction": ctx.CONTEXT_MARGIN_FRACTION,
+        },
+        "n_ctx": next(iter(windows)) if len(windows) == 1 else None,
+        "n_ctx_source": measured[0].context.n_ctx_source if len(windows) == 1 else None,
+        "windows_measured": sorted(windows),
+        "budget_tokens": next(iter(budgets)) if len(budgets) == 1 else None,
+        "budgets_measured": sorted(budgets),
+        "fallback_window": any(
+            prep.context.n_ctx_source.startswith("fallback") for prep in measured
+        ),
+        "bugs": [_context_record(prep) for prep in preps],
+    }
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return path
+
+
+def _context_record(prep: BugPrep) -> dict[str, Any]:
+    verdict = prep.context
+    if verdict is None:
+        return {
+            "bug": prep.key,
+            "wave": prep.wave,
+            "role": prep.role,
+            "prepare_mode": prep.prepare_mode,
+            "verdict": "not_measured",
+            "context_ok": None,
+            "estimated_prompt_tokens": None,
+            "prompt_tokens_real": None,
+            "prompt_tokens_real_source": None,
+            "budget_tokens": None,
+            "headroom_tokens": None,
+            "n_ctx": None,
+            "n_ctx_source": None,
+            "source_bytes": None,
+            "file_count": None,
+            "source_bytes_eligible": None,
+            "files_eligible": None,
+            "files_skipped_oversize": None,
+            "files_skipped_budget": None,
+            "reasons": list(prep.gate_failures),
+        }
+    stats = verdict.stats
+    return {
+        "bug": prep.key,
+        "wave": prep.wave,
+        "role": prep.role,
+        "prepare_mode": prep.prepare_mode,
+        "verdict": "ok" if verdict.context_ok else "reject",
+        "context_ok": verdict.context_ok,
+        "estimated_prompt_tokens": verdict.estimated_prompt_tokens,
+        "prompt_tokens_real": None,
+        "prompt_tokens_real_source": None,
+        "budget_tokens": verdict.budget_tokens,
+        "headroom_tokens": verdict.headroom_tokens,
+        "n_ctx": verdict.n_ctx,
+        "n_ctx_source": verdict.n_ctx_source,
+        "source_bytes": stats.bytes_included,
+        "file_count": stats.files_included,
+        "source_bytes_eligible": stats.bytes_eligible,
+        "files_eligible": stats.files_eligible,
+        "files_skipped_oversize": stats.files_skipped_oversize,
+        "files_skipped_budget": stats.files_skipped_budget,
+        "reasons": verdict.reasons,
+    }
+
+
+def render_context_table(preps: list[BugPrep]) -> str:
+    """The same numbers as ``context_report.json``, as a table on stdout."""
+    head = (
+        f"{'bug':<18} {'mode':<12} {'est tok':>8} {'real tok':>9} {'budget':>7} "
+        f"{'headroom':>9} {'src B':>9} {'files':>6}  verdict"
+    )
+    lines = [head, "-" * len(head)]
+    for prep in preps:
+        verdict = prep.context
+        if verdict is None:
+            lines.append(
+                f"{prep.key:<18} {prep.prepare_mode:<12} {'—':>8} {'—':>9} {'—':>7} "
+                f"{'—':>9} {'—':>9} {'—':>6}  not measured"
+            )
+            continue
+        lines.append(
+            f"{prep.key:<18} {prep.prepare_mode:<12} {verdict.estimated_prompt_tokens:>8} "
+            f"{'—':>9} {verdict.budget_tokens:>7} {verdict.headroom_tokens:>+9} "
+            f"{verdict.stats.bytes_included:>9} {verdict.stats.files_included:>6}  "
+            f"{'ok' if verdict.context_ok else 'REJECT'}"
+        )
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------

@@ -170,10 +170,25 @@ context guard — *after* a checkpoint has been baked and a wave has been schedu
 2. **Reject** a bug whose estimate — plus the issue text, plus the feedback and completion budget we
    cannot shrink — exceeds the window with **margin**. The margin is a documented constant (default:
    **25 % of `n_ctx` left free**), not a magic number.
-3. `prepare` writes **every candidate's** size, not only the rejects, to
-   `runs/bugsinpy/<batch>/context_sizes.md` — bytes, estimated tokens, share of the window, verdict.
-   That file is the artifact the review asked for, and it is what justifies the reserves in §8.
-4. **Narrowing files to fit is v2 work**, explicitly out of scope. A rejected bug is replaced from
+3. `prepare` writes **every candidate's** size, not only the rejects, to two files:
+   `runs/bugsinpy/<batch>/context_sizes.md` for reading and `context_report.json` for tooling. The
+   JSON carries, per bug: `estimated_prompt_tokens`, `prompt_tokens_real` (**null** until a session
+   has actually paid for the prompt, with `prompt_tokens_real_source` naming the session that filled
+   it in), `budget_tokens`, `verdict`, `source_bytes` and `file_count`, plus the reasons for a
+   rejection. `prepare` prints the same numbers as a table on stdout.
+4. **`plans/bugsinpy_split.json` is an input and is never written by a stage.** Measurements live in
+   the batch directory (`context_report.json`, `prepare.json`); the split only changes through a
+   deliberate edit that is reviewed. A stage that rewrites the split turns a measurement into a
+   decision while looking like it only recorded something, and the difference between "the plan says
+   this" and "this run observed that" is what the two files exist to keep apart. `prepare` hashes the
+   file before and after and fails if it moved; a test asserts no production module contains
+   `set_derived(` or `.save(`.
+5. **Calibrate before substituting.** The estimate is `ceil(source_bytes / 4)` plus a frame and runs
+   high (measured ~1.5× on the heretic sessions: 84.5k estimated vs 55.3k real), so a swap chosen
+   from the estimate alone is uncalibrated. Wave 1's real `usage.prompt_tokens` is the calibration;
+   waves 2–3 are re-measured against it and any proposed swap shows **both** the estimate and the
+   observed number.
+6. **Narrowing files to fit is v2 work**, explicitly out of scope. A rejected bug is replaced from
    the reserve list (§8); it is not patched up.
 
 ---
@@ -667,7 +682,10 @@ misbehaves there, `run` stops and reports instead of building wave 2.
 ### 7.2 Split file — `plans/bugsinpy_split.json`
 
 Committed **before any run**; `plans/` is not gitignored (verified), so this tracks as intended.
-It is both the plan and the frozen record of the experimental design:
+It is both the plan and the frozen record of the experimental design, and it is **hand-authored**:
+no stage rewrites it (§1.6.4), so every value in it is a decision that was reviewed. Measurements a
+run makes — sizes, verdicts, `FAIL_TO_PASS`, flakiness — live under `runs/bugsinpy/<batch>/` and only
+enter this file through a deliberate edit:
 
 ```json
 {
@@ -705,6 +723,11 @@ It is both the plan and the frozen record of the experimental design:
 
 `vanta_planner` is listed in the doc and supported by the env switch but **not** in `configs` until
 it exists. `seeds` is `[0]` for the pilot; seeds are a later, paper-only sweep (§8.3).
+
+The `fail_to_pass` / `prompt_tokens_estimate` / `context_ok` / `issue_text` fields above are shown in
+their *frozen* state: they are what a reviewed edit writes back into this file once the batch artifacts
+exist. `prepare` itself never writes it — it writes `runs/bugsinpy/<batch>/prepare.json` and
+`context_report.json` — so the committed file never contains a value no one approved.
 
 ### 7.3 Manifest — one record per (bug, config, seed)
 
@@ -940,12 +963,12 @@ New files:
 
 ```
 plans/bugsinpy.md                  ← this document
-plans/bugsinpy_split.json          ← committed list (frozen issue text + FAIL_TO_PASS + per-bug test_cmd)
+plans/bugsinpy_split.json          ← hand-authored list (per-bug test_cmd, layer, issue text once frozen)
 scripts/bugsinpy_run.py            ← loader + split + runner + oracle + leak gate + precheck + resume
 scripts/metrics.py                 ← additive only: pooled rates, Wilson, provenance grouping
 runs/bugsinpy/<batch>/             ← gitignored (one new .gitignore line)
-    manifest.jsonl, state.json, context_sizes.md, issue_texts/, issue_texts_all.md,
-    leak_gate/, oracle/, <session>/attempt_N_graded_tree.diff + _manifest.json
+    manifest.jsonl, state.json, context_report.json, context_sizes.md, issue_texts/,
+    issue_texts_all.md, leak_gate/, oracle/, <session>/attempt_N_graded_tree.diff + _manifest.json
 ```
 
 ---
@@ -990,7 +1013,7 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
 | D8 | Test trees | **SWE-bench split** (§1.2–§1.3): Vanta's tree = buggy source + **fixed** test files − `FAIL_TO_PASS`. `PASS_TO_PASS` is the native suite. Fixed-tree gate relaxed to "no fixed-only failures"; pre-existing failures recorded; every suite run twice to flag flaky nodeids. |
 | D9 | Oracle & labels | `final.patch` built for **every** terminal verdict (§5.1). The oracle applies **only non-test hunks**; test files are always the fixed version's. `patch_good = hidden_pass ∧ suite_regressions == 0`, and the label table keys off `patch_good` (§5.3). |
 | D10 | Waves & budget | Wave 1 = PySnooper (py3.8, `[0]`) as a **go/no-go gate**; wave 2 = thefuck + httpie (py3.7, `[0]`); wave 3 = cookiecutter (py3.6, `[0]`). 10 bugs, 60 runs, ~12–20 h. Budgets in §8.1. |
-| D11 | Context precheck | `prepare` estimates each bug's source-concat tokens and **rejects** over-budget bugs with a documented 25 % margin, writing `context_sizes.md` for **all** candidates. Narrowing files to fit is v2. |
+| D11 | Context precheck | `prepare` estimates each bug's source-concat tokens and **rejects** over-budget bugs with a documented 25 % margin, writing `context_sizes.md` **and** `context_report.json` for **all** candidates and printing the table. The split is an input and is never rewritten by a stage. Substitutions wait for wave 1's real `usage.prompt_tokens` — the estimate runs ~1.5× high. Narrowing files to fit is v2. |
 | D12 | Review coverage | Review mode on **every** bug, both candidate sets (developer fix = known-good, failed Creator patch = known-bad), applied with test hunks dropped, deduplicated by patch hash, each recording its producing session. |
 | D13 | Run order | baseline review (no LLM) → baseline repair → vanta repair → vanta review. |
 | D14 | Artifacts | `runs/bugsinpy/<batch>/`, with a `.gitignore` line so the path stays readable. |

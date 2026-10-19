@@ -864,6 +864,130 @@ class TestSelectMeasureOnly:
         assert args.measure_only is False
 
 
+class TestContextReport:
+    """§1.6 measurements live here and in ``prepare.json``, never in the split."""
+
+    @staticmethod
+    def _verdict(tmp_path, n_ctx=131_072, source="test"):
+        write(tmp_path / "a.py", "x = 1\n")
+        return ctx.precheck(tmp_path, "", n_ctx=n_ctx, n_ctx_source=source)
+
+    def test_the_report_carries_what_a_swap_decision_needs(self, tmp_path):
+        verdict = self._verdict(tmp_path)
+        path = prepare_mod.write_context_report(tmp_path, [prep(context=verdict)])
+        report = json.loads(path.read_text(encoding="utf-8"))
+        assert report["kind"] == "context_report"
+        assert report["n_ctx"] == 131_072
+        assert report["budget_tokens"] == 65_280
+        assert report["fallback_window"] is False
+        bug = report["bugs"][0]
+        assert bug["bug"] == "Demo/1"
+        assert bug["verdict"] == "ok"
+        assert bug["estimated_prompt_tokens"] == verdict.estimated_prompt_tokens
+        assert bug["budget_tokens"] == 65_280
+        assert bug["headroom_tokens"] == verdict.headroom_tokens
+        assert bug["source_bytes"] == verdict.stats.bytes_included
+        assert bug["file_count"] == verdict.stats.files_included
+
+    def test_real_tokens_are_null_until_a_run_has_paid_for_the_prompt(self, tmp_path):
+        """The estimate is uncalibrated (~1.5x high on heretic), so the real number
+        has to be a separate, explicitly-empty field rather than the same one."""
+        verdict = self._verdict(tmp_path)
+        report = json.loads(
+            prepare_mod.write_context_report(
+                tmp_path, [prep(context=verdict)]
+            ).read_text(encoding="utf-8")
+        )
+        bug = report["bugs"][0]
+        assert bug["prompt_tokens_real"] is None
+        assert bug["prompt_tokens_real_source"] is None
+        assert bug["prompt_tokens_real"] != bug["estimated_prompt_tokens"]
+
+    def test_a_reject_carries_its_reasons(self, tmp_path):
+        for index in range(5):
+            blob(tmp_path / f"mod{index}.py", 60_000)
+        verdict = ctx.precheck(tmp_path, "", n_ctx=131_072, n_ctx_source="test")
+        assert verdict.context_ok is False
+        report = json.loads(
+            prepare_mod.write_context_report(
+                tmp_path, [prep(context=verdict)]
+            ).read_text(encoding="utf-8")
+        )
+        bug = report["bugs"][0]
+        assert bug["verdict"] == "reject"
+        assert bug["reasons"] == verdict.reasons
+        assert "truncated" in bug["reasons"][0]
+
+    def test_a_bug_that_was_never_measured_says_why(self, tmp_path):
+        report = json.loads(
+            prepare_mod.write_context_report(
+                tmp_path, [prep(gate_failures=["boom"])]
+            ).read_text(encoding="utf-8")
+        )
+        bug = report["bugs"][0]
+        assert bug["verdict"] == "not_measured"
+        assert bug["context_ok"] is None
+        assert bug["estimated_prompt_tokens"] is None
+        assert bug["reasons"] == ["boom"]
+
+    def test_a_fallback_window_is_flagged_in_the_json(self, tmp_path):
+        verdict = self._verdict(
+            tmp_path,
+            n_ctx=ctx.FALLBACK_CONTEXT_TOKENS,
+            source="fallback (server unreachable)",
+        )
+        report = json.loads(
+            prepare_mod.write_context_report(
+                tmp_path, [prep(context=verdict)]
+            ).read_text(encoding="utf-8")
+        )
+        assert report["fallback_window"] is True
+        assert report["n_ctx"] == ctx.FALLBACK_CONTEXT_TOKENS
+
+    def test_the_table_prints_both_token_columns(self, tmp_path):
+        verdict = self._verdict(tmp_path)
+        table = prepare_mod.render_context_table(
+            [prep(context=verdict), prep(bug=bug_info(bug_id=2))]
+        )
+        assert "est tok" in table
+        assert "real tok" in table
+        assert str(verdict.estimated_prompt_tokens) in table
+        assert "—" in table
+        assert "Demo/2" in table
+        assert "not measured" in table
+
+
+class TestTheSplitIsAnInput:
+    """The split is hand-authored and reviewed; no stage may write to it.
+
+    The rule is enforced against the sources rather than promised in a comment,
+    because the failure it prevents is silent: a stage that rewrites the split turns
+    a measurement into a decision while looking like it only recorded something.
+    """
+
+    @staticmethod
+    def _source(name: str) -> str:
+        return (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("name", ["bugsinpy_run.py", "bugsinpy/prepare.py"])
+    def test_no_production_module_mutates_the_split(self, name):
+        text = self._source(name)
+        assert "set_derived(" not in text, f"{name} mutates the split"
+        assert ".save(" not in text, f"{name} saves the split"
+
+    def test_prepare_writes_the_context_report_instead(self):
+        text = self._source("bugsinpy_run.py")
+        assert "write_context_report(" in text
+        assert "render_context_table(" in text
+        assert "split.save(" not in text
+
+    def test_the_committed_split_has_no_derived_keys(self):
+        """A run that rewrote the split would leave derived keys in the commit."""
+        data = json.loads(SPLIT_PATH.read_text(encoding="utf-8"))
+        for entry in data["bugs"]:
+            assert not (set(entry) & split_mod.DERIVED_BUG_KEYS), entry["project"]
+
+
 class TestMeasureTree:
     def test_filters_extensions_and_skip_dirs(self, tmp_path):
         write(tmp_path / "pkg" / "mod.py", "x = 1\n")

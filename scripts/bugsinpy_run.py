@@ -37,6 +37,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from bugsinpy import bake as bake_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
+from bugsinpy import split as split_mod  # noqa: E402
 from bugsinpy.shuru import ShuruError  # noqa: E402
 from bugsinpy.split import Split, SplitError, load_split, sha256_text  # noqa: E402
 
@@ -187,20 +188,12 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         except Exception as exc:  # one bug must not take the batch down
             detail = f"{type(exc).__name__}: {exc}"
             broken.append((key, detail))
-            split.set_derived(
-                entry["project"],
-                int(entry["bug_id"]),
-                gate_failures=[detail],
-            )
             print(f"[{key}] FAILED — {detail}", flush=True)
             if args.traceback:
                 traceback.print_exc()
             continue
 
         preps.append(prep)
-        split.set_derived(
-            entry["project"], int(entry["bug_id"]), **prepare_mod.derive_verdict(prep)
-        )
         print(f"[{key}] {'ok' if prep.runnable else 'not runnable'}", flush=True)
 
     for prep in preps:
@@ -208,9 +201,14 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             prepare_mod.write_leak_gate(batch_dir, prep)
     prepare_mod.write_issue_texts(batch_dir, preps)
     prepare_mod.write_context_sizes(batch_dir, preps)
+    prepare_mod.write_context_report(batch_dir, preps)
 
     summary = prepare_mod.render_summary(preps)
     (batch_dir / "prepare_summary.md").write_text(summary, encoding="utf-8")
+    # The split is an input, never an output: how many bugs this run measured, and
+    # which of them it rejected, belongs in the batch's own artifacts. Rehashing the
+    # file after the work is the evidence that nothing here wrote to it.
+    split_sha_before = split_mod.sha256_file(split_path)
     (batch_dir / "prepare.json").write_text(
         json.dumps(
             {
@@ -220,6 +218,8 @@ def cmd_prepare(args: argparse.Namespace) -> int:
                 "batch_dir": str(batch_dir),
                 "split": str(split_path),
                 "split_sha256_before": sha256_text(split.to_json()),
+                "split_file_sha256_before": split_sha_before,
+                "split_written": False,
                 "bugsinpy_commit": commit,
                 "bugsinpy_root": str(bugsinpy_root),
                 "selected": [bug_key(entry) for entry, _ in selected],
@@ -232,14 +232,26 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         + "\n",
         encoding="utf-8",
     )
-
-    split.save(split_path)
+    split_sha_after = split_mod.sha256_file(split_path)
+    if split_sha_after != split_sha_before:
+        raise SplitError(
+            f"{split_path} changed during prepare ({split_sha_before} → "
+            f"{split_sha_after}). The split is an input; something wrote to it."
+        )
 
     print()
     print(summary)
+    print()
+    print(prepare_mod.render_context_table(preps))
+    print()
     print(f"batch dir : {batch_dir}")
-    print(f"split     : {split_path}")
-    for artifact in ("context_sizes.md", "issue_texts_all.md", "prepare_summary.md"):
+    print(f"split     : {split_path} (read-only; {split_sha_after[:12]} unchanged)")
+    for artifact in (
+        "context_report.json",
+        "context_sizes.md",
+        "issue_texts_all.md",
+        "prepare_summary.md",
+    ):
         print(f"  {artifact}")
 
     failed = [prep for prep in preps if not prep.runnable] + [

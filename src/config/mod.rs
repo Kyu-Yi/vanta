@@ -102,15 +102,27 @@ pub struct LlmConfig {
     //   → code reads env::var() here
     pub api_key: Option<String>,
 
-    // [SYNTAX] request_timeout_secs: u64 = per-HTTP-request hard timeout.
-    // Default: 600 seconds (10 minutes). The local qwen3.8-27b model on Metal
-    // takes 2-5 minutes per generation, so 120s would time out before the
-    // response arrives. Override with VANTA_LLM_TIMEOUT_SECS for faster models.
+    // [SYNTAX] idle_timeout_secs: u64 = seconds with NO NEW TOKEN before the
+    // stream is abandoned. Default 180. Override with VANTA_LLM_IDLE_TIMEOUT_SECS.
     //
-    // [VANTA-WHY] Local models: 4B class with Metal should stream a response
-    // in < 30 s. Large frontier models (27B+): p99 latency 120-300 s is common.
-    // 600s is a safe default that won't cut off a slow 27B generation.
-    pub request_timeout_secs: u64,
+    // [VANTA-WHY] There used to be ONE total timeout of 600s for the whole
+    // request. A watch-the-clock deadline is the wrong shape for a generation
+    // that legitimately takes 15 minutes: it killed a Creator call that was
+    // still producing tokens, and because the connection was never dropped,
+    // llama-server kept generating the orphan while the retry started a second
+    // generation beside it until the shared KV cache overflowed. Progress, not
+    // elapsed time, is what tells a slow generation from a dead one.
+    pub idle_timeout_secs: u64,
+
+    // [SYNTAX] max_call_secs: u64 = overall backstop for ONE streamed call.
+    // Default 3600. Override with VANTA_LLM_MAX_SECS.
+    //
+    // [VANTA-WHY] Not redundant with the idle timeout: a server that keeps
+    // dribbling one token forever would never trip the idle timer, so a single
+    // call still needs an outer bound. It is deliberately 20x the idle default
+    // — it exists to catch a pathological stream, not to second-guess a slow
+    // model.
+    pub max_call_secs: u64,
 
     // [SYNTAX] retry_attempts: u32 = max structured_call_with_retry attempts.
     // Default: 3. Per Spec §1 reliability requirements (3 retry budget).
@@ -118,7 +130,14 @@ pub struct LlmConfig {
 
     // [VANTA-WHY] Prompt-budget preflight needs the model's total context
     // window so Vanta can fail before sending an oversized request.
-    pub context_window_tokens: u32,
+    //
+    // [VANTA-WHY] Option, not a u32 defaulting to 65536. A hardcoded window is
+    // a guess about someone else's server: llama-server is started with a
+    // specific `--ctx-size`, and Vanta guessing low refuses prompts that fit
+    // while guessing high lets an oversized one through. None means "ask the
+    // server's /props" (see llm::context_window_tokens); Some(v) is
+    // VANTA_LLM_CONTEXT_TOKENS, which wins but is checked against /props.
+    pub context_window_tokens: Option<u32>,
 }
 
 // ----------------------------------------------------------------------------
@@ -164,15 +183,18 @@ impl Default for LlmConfig {
             // If setting a remote key: env::var("VANTA_API_KEY") returns Some.
             api_key: None,
 
-            // 2 minutes. M3+ tunable.
-            request_timeout_secs: 600,
+            // Seconds with no new token before a stream is abandoned.
+            idle_timeout_secs: 180,
+
+            // Overall backstop for one streamed call.
+            max_call_secs: 3600,
 
             // Spec §1: 3-attempt retry budget for structured LLM calls.
             retry_attempts: 3,
 
-            // Default to the current llama-server preset unless the user
-            // overrides it in the environment.
-            context_window_tokens: 65_536,
+            // None = read n_ctx from the server's /props (llm module), falling
+            // back to 65536 only when the server cannot be asked.
+            context_window_tokens: None,
         }
     }
 }
@@ -204,10 +226,16 @@ impl fmt::Display for LlmConfig {
             endpoint       : {}\n  \
             model          : {}\n  \
             api_key        : {}\n  \
-            request_timeout: {}s\n  \
+            idle_timeout   : {}s (abandon after no new token)\n  \
+            max_call       : {}s (backstop per call)\n  \
             retry_attempts : {}\n  \
             context_window : {}",
-            self.base_url, self.model_id, key_display, self.request_timeout_secs, self.retry_attempts, self.context_window_tokens
+            self.base_url, self.model_id, key_display,
+            self.idle_timeout_secs, self.max_call_secs, self.retry_attempts,
+            match self.context_window_tokens {
+                Some(v) => format!("{v} (VANTA_LLM_CONTEXT_TOKENS)"),
+                None => "auto (server /props, fallback 65536)".to_string(),
+            }
         )
     }
 }
@@ -229,7 +257,10 @@ impl LlmConfig {
     //   VANTA_LLM_BASE_URL         | HTTP endpoint /v1 prefix           | localhost:8080/v1
     //   VANTA_LLM_MODEL            | Model identifier string           | Qwen3.5-4B
     //   VANTA_API_KEY              | Bearer token / API key (optional) | None
-    //   VANTA_LLM_TIMEOUT_SECS     | Per-request hard timeout          | 600
+    //   VANTA_LLM_IDLE_TIMEOUT_SECS| Seconds with NO new token          | 180
+    //   VANTA_LLM_MAX_SECS         | Overall backstop per LLM call      | 3600
+    //   VANTA_LLM_CONTEXT_TOKENS   | Model context window (else /props) | unset
+    //   VANTA_LLM_RETRY_ATTEMPTS   | structured_call retry budget       | 3
     //
     // All four are optional to set (defaults used). If any of them contain
     // non-UTF-8 bytes (shouldn't happen in normal shell use), we return Err
@@ -292,26 +323,44 @@ impl LlmConfig {
             }
         }
 
-        // ---- request_timeout_secs override ---------------------------------
-        match env::var("VANTA_LLM_TIMEOUT_SECS") {
+        // ---- idle_timeout_secs override -------------------------------------
+        match env::var("VANTA_LLM_IDLE_TIMEOUT_SECS") {
             Ok(val) if !val.trim().is_empty() => {
-                // [SYNTAX] val.trim().parse::<u64>() = parse str slice as u64.
-                // Returns Result<u64, ParseIntError>. map_err to readable String.
                 let parsed: u64 = val.trim().parse::<u64>()
                     .map_err(|e| format!(
-                        "CONFIG_ERROR: VANTA_LLM_TIMEOUT_SECS='{}' not a \
+                        "CONFIG_ERROR: VANTA_LLM_IDLE_TIMEOUT_SECS='{}' not a \
                          valid non-negative integer: {e}", val.trim()))?;
                 if parsed == 0 {
-                    return Err("CONFIG_ERROR: VANTA_LLM_TIMEOUT_SECS must be > 0. \
+                    return Err("CONFIG_ERROR: VANTA_LLM_IDLE_TIMEOUT_SECS must be > 0. \
                                 (0 would mean 'abort instantly' — almost certainly a typo.)"
                                .to_string());
                 }
-                cfg.request_timeout_secs = parsed;
+                cfg.idle_timeout_secs = parsed;
             }
             Ok(_) => { /* keep default */ }
             Err(env::VarError::NotPresent) => { /* keep default */ }
             Err(env::VarError::NotUnicode(_)) => {
-                return Err("CONFIG_ERROR: VANTA_LLM_TIMEOUT_SECS env var contained \
+                return Err("CONFIG_ERROR: VANTA_LLM_IDLE_TIMEOUT_SECS env var contained \
+                            non-UTF-8 bytes.".to_string());
+            }
+        }
+
+        // ---- max_call_secs override -----------------------------------------
+        match env::var("VANTA_LLM_MAX_SECS") {
+            Ok(val) if !val.trim().is_empty() => {
+                let parsed: u64 = val.trim().parse::<u64>()
+                    .map_err(|e| format!(
+                        "CONFIG_ERROR: VANTA_LLM_MAX_SECS='{}' not a valid \
+                         non-negative integer: {e}", val.trim()))?;
+                if parsed == 0 {
+                    return Err("CONFIG_ERROR: VANTA_LLM_MAX_SECS must be > 0.".to_string());
+                }
+                cfg.max_call_secs = parsed;
+            }
+            Ok(_) => { /* keep default */ }
+            Err(env::VarError::NotPresent) => { /* keep default */ }
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err("CONFIG_ERROR: VANTA_LLM_MAX_SECS env var contained \
                             non-UTF-8 bytes.".to_string());
             }
         }
@@ -349,7 +398,7 @@ impl LlmConfig {
                         "CONFIG_ERROR: VANTA_LLM_CONTEXT_TOKENS must be > 0.".to_string()
                     );
                 }
-                cfg.context_window_tokens = parsed;
+                cfg.context_window_tokens = Some(parsed);
             }
             Ok(_) => { /* keep default */ }
             Err(env::VarError::NotPresent) => { /* keep default */ }
@@ -413,8 +462,10 @@ mod tests {
         assert_eq!(d.base_url, "http://127.0.0.1:8080/v1");
         assert_eq!(d.model_id, "qwen3.8-27b");
         assert!(d.api_key.is_none(), "default must be no-auth local mode");
-        assert_eq!(d.request_timeout_secs, 600);
-        assert_eq!(d.context_window_tokens, 65_536);
+        assert_eq!(d.idle_timeout_secs, 180);
+        assert_eq!(d.max_call_secs, 3600);
+        // [SYNTAX] None = "do not guess the server's window; ask /props".
+        assert_eq!(d.context_window_tokens, None);
     }
 
     #[test]
@@ -463,7 +514,7 @@ mod tests {
             env::set_var("VANTA_LLM_CONTEXT_TOKENS", "131072");
         }
         let cfg = LlmConfig::from_env().unwrap();
-        assert_eq!(cfg.context_window_tokens, 131_072);
+        assert_eq!(cfg.context_window_tokens, Some(131_072));
         unsafe {
             env::remove_var("VANTA_LLM_CONTEXT_TOKENS");
         }

@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 
+use vanta::core::GovernorDecision;
 use vanta::logging::init_logging;
 use vanta::pipeline::driver::{self, RunConfig};
 
@@ -135,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("║  VANTA M2 — Creator → Attacker → BATE → Diagnostician       ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
-    driver::run(RunConfig {
+    let decision = driver::run(RunConfig {
         repo_path: cli.repo_path,
         issue_path: cli.issue_path,
         max_attempts: 1,
@@ -146,6 +147,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         original_tree: cli.original_tree,
     })
     .await?;
+
+    // [VANTA-WHY] M2's job is a single verification pass, not a repair, so it
+    // does not gate on approval the way M3 does. It MUST still refuse to claim
+    // success after an infrastructure failure: no test ever judged the patch,
+    // so "M2 PIPELINE COMPLETE" would be a lie. Exit 2 mirrors M3's distinct
+    // InfraFailure code.
+    if decision == GovernorDecision::InfraFailure {
+        println!("\n  ✗ M2 stopped on an infrastructure failure (see the summary above)");
+        std::process::exit(2);
+    }
 
     println!("\n╔══════════════════════════════════════════════════════════════╗");
     println!("║  M2 PIPELINE COMPLETE                                        ║");

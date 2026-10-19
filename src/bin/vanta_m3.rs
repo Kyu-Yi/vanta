@@ -266,10 +266,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })
     .await?;
 
-    // Exit code: 0 if approved, 1 otherwise
-    if decision == GovernorDecision::AllTestsPassed {
-        Ok(())
-    } else {
-        std::process::exit(1);
+    // Exit codes: 0 = approved, 2 = infrastructure failure, 1 = any other
+    // negative verdict. [VANTA-WHY] An InfraFailure is not a verdict about the
+    // candidate at all — no Attacker test ever judged the patch — so it must be
+    // distinguishable from a plain rejection by whatever script drives this
+    // binary. It also gets its own exit code so a harness can retry the target
+    // without mistaking it for a clean "no".
+    match decision {
+        GovernorDecision::AllTestsPassed => Ok(()),
+        GovernorDecision::InfraFailure => std::process::exit(2),
+        _ => std::process::exit(1),
     }
 }

@@ -22,11 +22,14 @@
 // ============================================================================
 
 use crate::config::LlmConfig;
+use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::sync::OnceCell;
 use tracing::{debug, info, trace, warn};
 
 // Re-export the agent response types so bootstrap can use them too.
@@ -120,7 +123,6 @@ fn sanitize_tag(tag: &str) -> String {
 // HELPER: build_reqwest_client(&cfg) → reqwest::Client
 // ============================================================================
 pub fn build_reqwest_client(cfg: &LlmConfig) -> Result<reqwest::Client, reqwest::Error> {
-    use std::time::Duration;
     let mut headers = reqwest::header::HeaderMap::new();
 
     if let Some(key) = &cfg.api_key {
@@ -131,10 +133,15 @@ pub fn build_reqwest_client(cfg: &LlmConfig) -> Result<reqwest::Client, reqwest:
         headers.insert(AUTHORIZATION, val);
     }
 
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(cfg.request_timeout_secs))
-        .default_headers(headers)
-        .build()
+    // [VANTA-WHY] There is deliberately NO `.timeout(...)` here. A single
+    // total deadline measures the wrong thing: a 27B model legitimately
+    // generating for 20 minutes is progress, and killing it at 600s left
+    // llama-server generating an orphan while the retry opened a second slot
+    // against the same KV cache ("Context size has been exceeded"), after which
+    // the run crashed with no final decision. Liveness is enforced per call
+    // instead — an IDLE timeout between stream chunks plus an overall backstop —
+    // see `assemble_sse_stream`.
+    reqwest::Client::builder().default_headers(headers).build()
 }
 
 // ============================================================================
@@ -165,9 +172,26 @@ fn render_messages_for_token_estimate(messages: &[Value]) -> String {
         .join("\n")
 }
 
+/// Bytes-per-token divisor for the pre-flight prompt estimate.
+///
+/// [VANTA-WHY] The estimate was `bytes / 3` and ran ~1.5× high — the heretic
+/// run logged 84500 estimated against 55300 real prompt tokens (server usage),
+/// i.e. ~4.6 bytes/token for this pipeline's mixed Rust/Python/English prompts.
+/// A 1.5× over-count is not free: it is what refused prompts that would have
+/// fit. `/ 4` keeps ~15% headroom over the measured ratio, so the guard stays
+/// fail-closed (it must never under-count) while no longer tripping on a prompt
+/// that fits. Every call now also logs the server's own `usage.prompt_tokens`
+/// next to this estimate, so the ratio is re-measurable instead of assumed.
+const TOKEN_ESTIMATE_BYTES_PER_TOKEN: u32 = 4;
+
 fn conservative_token_estimate(text: &str) -> u32 {
     let bytes = text.as_bytes().len() as u32;
-    if bytes == 0 { 0 } else { bytes / 3 + u32::from(bytes % 3 != 0) }
+    if bytes == 0 {
+        0
+    } else {
+        bytes / TOKEN_ESTIMATE_BYTES_PER_TOKEN
+            + u32::from(bytes % TOKEN_ESTIMATE_BYTES_PER_TOKEN != 0)
+    }
 }
 
 fn context_budget_exceeded(
@@ -223,6 +247,244 @@ async fn tokenize_via_server(
         }
     }
     None
+}
+
+// ============================================================================
+// HELPER: context_window_tokens(&client, &cfg) -> u32
+// ============================================================================
+//
+// [VANTA-WHY] The context window used to be a compile-time 65536 unless
+// VANTA_LLM_CONTEXT_TOKENS said otherwise. A wrong window is a wrong guard: too
+// small and the pre-flight check refuses prompts that fit (the 1.5×-high
+// estimate made that a real cost), too large and the check passes a prompt the
+// server then rejects mid-run. llama-server knows its own value and publishes it
+// at `/props` (`default_generation_settings.n_ctx`), so ask it — once per
+// process, because /props is a genuine HTTP call and the answer cannot change
+// inside one run.
+static CONTEXT_WINDOW: OnceCell<u32> = OnceCell::const_new();
+
+fn props_url_candidates(cfg: &LlmConfig) -> Vec<String> {
+    let base = cfg.base_url.trim_end_matches('/');
+    let mut urls = Vec::new();
+    if let Some(root) = base.strip_suffix("/v1") {
+        urls.push(format!("{root}/props"));
+    }
+    urls.push(format!("{base}/props"));
+    urls.dedup();
+    urls
+}
+
+async fn probe_server_context_window(client: &reqwest::Client, cfg: &LlmConfig) -> Option<u32> {
+    for url in props_url_candidates(cfg) {
+        let Ok(resp) = client.get(&url).send().await else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(body) = resp.json::<Value>().await else {
+            continue;
+        };
+        if let Some(n_ctx) = body["default_generation_settings"]["n_ctx"].as_u64() {
+            return Some(n_ctx as u32);
+        }
+        if let Some(n_ctx) = body["n_ctx"].as_u64() {
+            return Some(n_ctx as u32);
+        }
+    }
+    None
+}
+
+/// Resolve the model's context window for THIS run.
+///
+/// Order: `VANTA_LLM_CONTEXT_TOKENS` if set (it wins, but a disagreement with
+/// the server is logged, because a stale override silently starves the guard),
+/// else the server's `/props` `n_ctx`, else 65536 with a warning.
+pub async fn context_window_tokens(client: &reqwest::Client, cfg: &LlmConfig) -> u32 {
+    *CONTEXT_WINDOW
+        .get_or_init(|| async {
+            let probed = probe_server_context_window(client, cfg).await;
+            match (cfg.context_window_tokens, probed) {
+                (Some(configured), Some(n_ctx)) => {
+                    if configured != n_ctx {
+                        warn!(
+                            configured_context_window = configured,
+                            server_n_ctx = n_ctx,
+                            "VANTA_LLM_CONTEXT_TOKENS disagrees with the server's /props n_ctx; \
+                             using the configured value"
+                        );
+                    }
+                    configured
+                }
+                (Some(configured), None) => configured,
+                (None, Some(n_ctx)) => {
+                    info!(
+                        n_ctx,
+                        "context window taken from the server's /props (VANTA_LLM_CONTEXT_TOKENS unset)"
+                    );
+                    n_ctx
+                }
+                (None, None) => {
+                    warn!(
+                        "could not read n_ctx from the server's /props; falling back to 65536"
+                    );
+                    65_536
+                }
+            }
+        })
+        .await
+}
+
+// ============================================================================
+// HELPER: assemble_sse_stream — consume a streamed chat completion
+// ============================================================================
+//
+// [VANTA-WHY] Every chat completion is requested with `stream: true` so that
+// LIVENESS is observable. A non-streaming POST has exactly one observable event
+// (the response) and therefore can only be policed by a total deadline — which
+// cannot tell "still generating" from "dead", so it killed healthy 20-minute
+// generations. A stream emits an event per token, so the same watchdog can ask
+// the only question that matters: has ANYTHING arrived recently?
+//
+// Two independent limits, both enforced here:
+//   * idle timeout  — no new chunk for N seconds → the model is not generating.
+//   * overall backstop — the whole call may not exceed N seconds, so a server
+//     that emits a token just often enough to defeat the idle timeout still
+//     cannot hold the run forever.
+//
+// On either limit the byte stream is DROPPED before the error is returned. That
+// drop is the cancel: hyper abandons the in-flight response body and closes the
+// socket, which is what tells llama-server to stop generating, so no orphan task
+// survives into the retry to fight over the shared KV cache.
+#[derive(Debug, Default)]
+struct StreamedCompletion {
+    content: String,
+    reasoning: String,
+    prompt_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+/// Fold ONE `\n\n`-delimited SSE event into the accumulator.
+/// Returns true when the stream announced `[DONE]`.
+fn consume_sse_event(event: &str, out: &mut StreamedCompletion) -> Result<bool, String> {
+    let mut done = false;
+    for line in event.lines() {
+        let Some(payload) = line.trim_end().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() {
+            continue;
+        }
+        if payload == "[DONE]" {
+            done = true;
+            continue;
+        }
+        let value: Value = match serde_json::from_str(payload) {
+            Ok(value) => value,
+            Err(e) => {
+                // Keep-alive comments and vendor fields are not ours to parse;
+                // a frame we cannot read is skipped rather than fatal.
+                trace!(err = %e, "sse: skipping unparsable data frame");
+                continue;
+            }
+        };
+        // A server-side failure arrives INSIDE the stream, not as an HTTP
+        // status: llama-server reports an overflowing KV cache this way. It must
+        // be an error, not an empty completion, or the run would record a
+        // nonsense answer.
+        if let Some(error) = value.get("error") {
+            let message = error["message"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| error.to_string());
+            return Err(format!("LLM server reported an error mid-stream: {message}"));
+        }
+        if let Some(choice) = value["choices"].as_array().and_then(|c| c.first()) {
+            let delta = &choice["delta"];
+            if delta.is_object() {
+                if let Some(s) = delta["content"].as_str() {
+                    out.content.push_str(s);
+                }
+                if let Some(s) = delta["reasoning_content"].as_str() {
+                    out.reasoning.push_str(s);
+                }
+            } else if let Some(message) = choice.get("message") {
+                // A server that ignores `stream` but answers with an SSE
+                // envelope still produces a usable response.
+                if let Some(s) = message["content"].as_str() {
+                    out.content.push_str(s);
+                }
+                if let Some(s) = message["reasoning_content"].as_str() {
+                    out.reasoning.push_str(s);
+                }
+            }
+        }
+        if let Some(usage) = value.get("usage").filter(|u| u.is_object()) {
+            if let Some(prompt_tokens) = usage["prompt_tokens"].as_u64() {
+                out.prompt_tokens = Some(prompt_tokens);
+            }
+            if let Some(total_tokens) = usage["total_tokens"].as_u64() {
+                out.total_tokens = Some(total_tokens);
+            }
+        }
+    }
+    Ok(done)
+}
+
+async fn assemble_sse_stream(
+    mut chunks: Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>> + Send>>,
+    idle_timeout: Duration,
+    max_call: Duration,
+) -> Result<StreamedCompletion, String> {
+    // tokio's clock, not std's: this instant is compared against deadlines
+    // produced by tokio::time::timeout, so both must read the same clock.
+    let started = tokio::time::Instant::now();
+    let mut buffer = String::new();
+    let mut out = StreamedCompletion::default();
+
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= max_call {
+            return Err(format!(
+                "LLM call abandoned: exceeded the overall backstop of {}s \
+                 (VANTA_LLM_MAX_SECS) after {:.1}s; connection dropped to cancel the server task",
+                max_call.as_secs(),
+                elapsed.as_secs_f64()
+            ));
+        }
+        // Never wait longer than the backstop has left, so a stream whose idle
+        // timeout is larger than the remaining budget still ends on time.
+        let wait = idle_timeout.min(max_call - elapsed);
+        let chunk = match tokio::time::timeout(wait, chunks.next()).await {
+            Err(_elapsed) => {
+                drop(chunks);
+                return Err(format!(
+                    "LLM stream stalled: no new data for {}s (VANTA_LLM_IDLE_TIMEOUT_SECS); \
+                     connection dropped to cancel the server task",
+                    idle_timeout.as_secs()
+                ));
+            }
+            Ok(None) => break,
+            Ok(Some(Err(e))) => {
+                drop(chunks);
+                return Err(format!("LLM stream error: {e}"));
+            }
+            Ok(Some(Ok(bytes))) => bytes,
+        };
+        // SSE frames are delimited by a blank line; normalise CRLF so both
+        // line endings split the same way.
+        buffer.push_str(&String::from_utf8_lossy(&chunk).replace('\r', ""));
+        while let Some(end) = buffer.find("\n\n") {
+            let event: String = buffer[..end].to_string();
+            buffer.drain(..end + 2);
+            if consume_sse_event(&event, &mut out)? {
+                return Ok(out);
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 // ============================================================================
@@ -354,6 +616,12 @@ pub async fn post_chat(
         "messages": messages,
         "max_tokens": 16384,
         "temperature": 0.2,
+        // [VANTA-WHY] Streamed, always. The response is reassembled below into
+        // exactly the same `===CONTENT===/===REASONING===` string a
+        // non-streaming call produced, so every parser, retry and agent on top
+        // of this function is unaffected — what changes is that liveness is now
+        // observable while the model generates (see `assemble_sse_stream`).
+        "stream": true,
     });
 
     let mut full_body = body.as_object().cloned().unwrap_or_default();
@@ -364,6 +632,7 @@ pub async fn post_chat(
     }
     let full_body = Value::Object(full_body);
 
+    let context_window = context_window_tokens(client, cfg).await;
     let requested_output_tokens = full_body["max_tokens"].as_u64().unwrap_or(16_384) as u32;
     let prompt_render = render_messages_for_token_estimate(&messages);
     let estimate = conservative_token_estimate(&prompt_render);
@@ -375,7 +644,7 @@ pub async fn post_chat(
     // it must never run on the common path. This keeps the guard fail-closed
     // (the estimate over-counts) while still rescuing a borderline-but-fitting
     // request that the estimate would have refused.
-    if context_budget_exceeded(estimate, requested_output_tokens, cfg.context_window_tokens) {
+    if context_budget_exceeded(estimate, requested_output_tokens, context_window) {
         if let Some(exact) = tokenize_via_server(client, cfg, &prompt_render).await {
             prompt_tokens = exact;
             token_source = "llama-server";
@@ -384,28 +653,47 @@ pub async fn post_chat(
     info!(
         prompt_tokens,
         requested_output_tokens,
-        context_window_tokens = cfg.context_window_tokens,
+        context_window_tokens = context_window,
         token_source,
         "llm prompt budget"
     );
-    if context_budget_exceeded(
-        prompt_tokens,
-        requested_output_tokens,
-        cfg.context_window_tokens,
-    ) {
+    if context_budget_exceeded(prompt_tokens, requested_output_tokens, context_window) {
+        // [VANTA-WHY] This is a DETERMINISTIC local failure: the same prompt
+        // against the same window fails identically on every attempt. Retrying
+        // it three times only delayed the run and dressed a known-bad request up
+        // as a flaky one, so `structured_call_with_retry` returns on the first
+        // occurrence (it matches this exact prefix).
         return Err(format!(
             "Prompt would exceed model context: prompt_tokens={} + max_tokens={} + overhead={} > context_window={}",
             prompt_tokens,
             requested_output_tokens,
             CHAT_OVERHEAD_TOKENS,
-            cfg.context_window_tokens,
+            context_window,
         )
         .into());
     }
 
     let t = Instant::now();
-    let resp = client.post(&url).json(&full_body).send().await
-        .map_err(|e| format!("HTTP POST to {url} FAILED: {e}"))?;
+    // The idle timeout covers the WAIT FOR HEADERS too: a server that accepts
+    // the connection and then says nothing is as dead as one that stops
+    // mid-stream. Dropping this future closes the socket.
+    let send_future = client.post(&url).json(&full_body).send();
+    let resp = match tokio::time::timeout(
+        Duration::from_secs(cfg.idle_timeout_secs),
+        send_future,
+    )
+    .await
+    {
+        Err(_elapsed) => {
+            return Err(format!(
+                "HTTP POST to {url} timed out: no response headers for {}s (VANTA_LLM_IDLE_TIMEOUT_SECS); connection dropped",
+                cfg.idle_timeout_secs
+            )
+            .into());
+        }
+        Ok(Err(e)) => return Err(format!("HTTP POST to {url} FAILED: {e}").into()),
+        Ok(Ok(resp)) => resp,
+    };
 
     let status = resp.status();
     if !status.is_success() {
@@ -417,19 +705,49 @@ pub async fn post_chat(
         ).into());
     }
 
-    let json_resp: Value = resp.json().await
-        .map_err(|e| format!("FAILED to parse HTTP response as JSON: {e}"))?;
+    let byte_stream = resp.bytes_stream();
+    let chunks: Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>> + Send>> = Box::pin(
+        byte_stream.map(|chunk| chunk.map(|b| b.to_vec()).map_err(|e| e.to_string())),
+    );
+    let streamed = assemble_sse_stream(
+        chunks,
+        Duration::from_secs(cfg.idle_timeout_secs),
+        Duration::from_secs(cfg.max_call_secs),
+    )
+    .await?;
 
-    let choices = json_resp["choices"].as_array()
-        .ok_or("response JSON missing 'choices' array")?;
-    let first_choice = choices.first()
-        .ok_or("choices array was empty")?;
-    let msg = &first_choice["message"];
-    let content = msg["content"].as_str().unwrap_or("").trim().to_string();
-    let reasoning = msg["reasoning_content"].as_str().unwrap_or("").trim().to_string();
+    let content = streamed.content.trim().to_string();
+    let reasoning = streamed.reasoning.trim().to_string();
 
     if content.is_empty() && reasoning.is_empty() {
         return Err("Assistant response: BOTH content AND reasoning_content empty".into());
+    }
+
+    // [VANTA-WHY] The server's own count, printed beside ours. The local
+    // estimate is what the pre-flight guard acts on, so the only way to know
+    // whether its calibration is still right is to compare the two on real runs
+    // — which is exactly the measurement that showed the old /3 heuristic was
+    // ~1.5× high.
+    match streamed.prompt_tokens {
+        Some(actual) => {
+            let ratio = if estimate == 0 {
+                0.0
+            } else {
+                actual as f64 / f64::from(estimate)
+            };
+            info!(
+                estimated_prompt_tokens = estimate,
+                actual_prompt_tokens = actual,
+                estimate_over_actual = format!("{ratio:.2}"),
+                "llm prompt tokens: local estimate vs server usage"
+            );
+        }
+        None => {
+            info!(
+                estimated_prompt_tokens = estimate,
+                "llm prompt tokens: server returned no usage block, estimate only"
+            );
+        }
     }
 
     debug!(content_len = content.len(), reasoning_len = reasoning.len(), "model response received");
@@ -450,8 +768,12 @@ pub async fn post_chat(
     );
 
     let ms = t.elapsed().as_millis();
-    let tok_total = json_resp["usage"]["total_tokens"].as_u64().unwrap_or(0);
-    debug!(status = status.as_u16(), elapsed_ms = ms, total_tokens = tok_total, "http post complete");
+    debug!(
+        status = status.as_u16(),
+        elapsed_ms = ms,
+        total_tokens = streamed.total_tokens.unwrap_or(0),
+        "streamed chat completion complete"
+    );
 
     Ok(combined)
 }
@@ -459,6 +781,32 @@ pub async fn post_chat(
 // ============================================================================
 // HELPER: structured_call_with_retry<T> — N-attempt retry + typed parse
 // ============================================================================
+/// Prefix of the pre-flight budget failure. Kept as one constant because the
+/// producer (`post_chat`) and the consumer (the retry loop below) must agree on
+/// it exactly.
+const DETERMINISTIC_CONTEXT_PREFIX: &str = "Prompt would exceed model context";
+
+/// Backoff before retry `attempt` (1-based): 500ms, 1s, 2s, 4s, 8s, 8s…
+///
+/// [VANTA-WHY] A retry that starts the instant the previous connection dropped
+/// races the server: llama-server still holds the slot (and the KV cache) for a
+/// moment after the socket closes, so an immediate retry piles a second
+/// generation onto a cache that has not been freed — the "Context size has been
+/// exceeded" cascade. The pause is what lets the cancel land.
+const RETRY_BACKOFF_BASE_MS: u64 = 500;
+const RETRY_BACKOFF_MAX_MS: u64 = 8_000;
+
+async fn back_off(attempt: u32) {
+    let shift = attempt.saturating_sub(1).min(4);
+    let delay = Duration::from_millis((RETRY_BACKOFF_BASE_MS << shift).min(RETRY_BACKOFF_MAX_MS));
+    debug!(
+        attempt,
+        delay_ms = delay.as_millis() as u64,
+        "backing off before the next attempt"
+    );
+    tokio::time::sleep(delay).await;
+}
+
 pub async fn structured_call_with_retry<Fm, Fp, T>(
     client: &reqwest::Client,
     cfg: &LlmConfig,
@@ -484,9 +832,27 @@ where
         let raw = match post_chat(client, cfg, messages, extras_for_attempt.clone()).await {
             Ok(r) => r,
             Err(http_e) => {
+                let http_e = http_e.to_string();
+                // [VANTA-WHY] A prompt that cannot fit the context window fails
+                // IDENTICALLY on every attempt — it is decided by arithmetic
+                // before a byte leaves the process. Retrying it three times
+                // cannot change the outcome; it only pretended the failure was
+                // transient and delayed the run. Fail once, loudly, with what to
+                // change.
+                if http_e.contains(DETERMINISTIC_CONTEXT_PREFIX) {
+                    return Err(format!(
+                        "{http_e}\nThis is a deterministic local failure — the prompt does not fit \
+                         the model's context window — so it is NOT retried. Raise the server's n_ctx \
+                         (or VANTA_LLM_CONTEXT_TOKENS to match it), or shrink the prompt."
+                    )
+                    .into());
+                }
                 let msg = format!("attempt {attempt} HTTP err: {http_e}");
                 warn!(%msg);
                 last_err = Some(msg);
+                if attempt < max_attempts {
+                    back_off(attempt).await;
+                }
                 continue;
             }
         };
@@ -512,6 +878,9 @@ where
                     "attempt {attempt} PARSE ERR: {}\n  model-preview: {preview}",
                     parse_err
                 ));
+                if attempt < max_attempts {
+                    back_off(attempt).await;
+                }
             }
         }
     }
@@ -626,5 +995,169 @@ mod _cleaning_tests {
     #[test]
     fn forensics_tag_is_sanitized() {
         assert_eq!(super::sanitize_tag("tests/x.py::test[1]"), "tests_x.py__test_1_");
+    }
+}
+
+// ============================================================================
+// Streaming / liveness tests
+// ============================================================================
+//
+// [VANTA-WHY] These run on tokio's PAUSED clock (`start_paused = true`), which
+// is the only way to assert the thing the incident was about: a stream that
+// keeps producing tokens for 700 seconds must survive, while one that stops
+// producing must be abandoned. Real time would make both untestable. The stub
+// here is an in-memory byte stream rather than a socket, because the clock is
+// what is under test, not the transport.
+#[cfg(test)]
+mod _streaming_tests {
+    use super::{StreamedCompletion, assemble_sse_stream, consume_sse_event};
+    use futures::Stream;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    type Chunks = Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>> + Send>>;
+
+    /// One SSE data frame carrying the single token `x`, exactly as
+    /// llama-server emits it under `stream: true`.
+    fn token_event() -> Vec<u8> {
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n".to_vec()
+    }
+
+    /// A stream that emits one token and then never produces anything again —
+    /// the stall the old total-timeout could not tell apart from slow work. It
+    /// records whether it was DROPPED, because that drop is the cancel: hyper
+    /// abandons the response body and closes the socket.
+    struct StallingStream {
+        sent: bool,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Stream for StallingStream {
+        type Item = Result<Vec<u8>, String>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if !self.sent {
+                self.sent = true;
+                return Poll::Ready(Some(Ok(token_event())));
+            }
+            Poll::Pending
+        }
+    }
+
+    impl Drop for StallingStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_but_steady_stream_completes_past_six_hundred_simulated_seconds() {
+        const TOKENS: u32 = 700;
+        let stream: Chunks = Box::pin(futures::stream::unfold(0_u32, |i| async move {
+            if i >= TOKENS {
+                return None;
+            }
+            // One token per simulated second: the whole generation spans 700
+            // SIMULATED seconds, well past the 600s total timeout that used to
+            // kill exactly this call, while no individual gap ever approaches
+            // the 180s idle timeout.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Some((Ok(token_event()), i + 1))
+        }));
+
+        let out = assemble_sse_stream(
+            stream,
+            Duration::from_secs(180),
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("a stream that keeps producing tokens must never be abandoned");
+
+        assert_eq!(
+            out.content,
+            "x".repeat(TOKENS as usize),
+            "every delta must be assembled into the response"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_stream_fires_the_idle_timeout_and_the_connection_is_dropped() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let stream: Chunks = Box::pin(StallingStream {
+            sent: false,
+            dropped: Arc::clone(&dropped),
+        });
+
+        let err = assemble_sse_stream(
+            stream,
+            Duration::from_secs(180),
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect_err("a stream silent for the idle timeout must be abandoned");
+
+        assert!(err.contains("stalled"), "got: {err}");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the byte stream must be dropped before the error is returned — that drop is what \
+             closes the socket and cancels the server's generation"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_overall_backstop_ends_a_stream_that_never_stalls() {
+        // A server that emits a token just often enough to defeat the idle
+        // timeout still must not be able to hold the run forever.
+        let stream: Chunks = Box::pin(futures::stream::unfold(0_u32, |i| async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Some((Ok(token_event()), i + 1))
+        }));
+
+        let err = assemble_sse_stream(
+            stream,
+            Duration::from_secs(180),
+            Duration::from_secs(120),
+        )
+        .await
+        .expect_err("the overall backstop must end the call");
+
+        assert!(err.contains("overall backstop"), "got: {err}");
+    }
+
+    #[test]
+    fn an_error_frame_inside_the_stream_is_an_error_not_an_empty_answer() {
+        let mut out = StreamedCompletion::default();
+        let err = consume_sse_event(
+            "data: {\"error\":{\"message\":\"Context size has been exceeded\"}}",
+            &mut out,
+        )
+        .expect_err("a server-reported failure must not be read as an empty completion");
+        assert!(err.contains("Context size has been exceeded"), "got: {err}");
+    }
+
+    #[test]
+    fn deltas_usage_and_done_are_read_from_the_stream() {
+        let mut out = StreamedCompletion::default();
+        assert!(
+            !consume_sse_event(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}",
+                &mut out
+            )
+            .unwrap()
+        );
+        assert!(
+            !consume_sse_event(
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"total_tokens\":22}}",
+                &mut out
+            )
+            .unwrap()
+        );
+        assert!(consume_sse_event("data: [DONE]", &mut out).unwrap());
+        assert_eq!(out.content, "hi");
+        assert_eq!(out.prompt_tokens, Some(11));
+        assert_eq!(out.total_tokens, Some(22));
     }
 }

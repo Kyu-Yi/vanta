@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-reqwest = { version = "0.13.5", features = ["json"] }
+reqwest = { version = "0.13.5", features = ["json", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tempfile = "3.27.0"
@@ -17,3 +17,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.28.0", features = ["v4"] }
 libc = "0.2"
 octocrab = "0.54.5"
+
+[dev-dependencies]
+# [VANTA-WHY] `test-util` (NOT part of tokio's `full`) provides
+# `tokio::time::pause`, which the streaming tests need: they assert a stream that
+# keeps delivering tokens for 700 SIMULATED seconds completes while one that goes
+# quiet is abandoned after the idle timeout. Real time made those untestable —
+# nobody waits 700 real seconds in a test suite.
+tokio = { version = "1.53.1", features = ["full", "test-util"] }

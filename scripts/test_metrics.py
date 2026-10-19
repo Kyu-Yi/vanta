@@ -479,6 +479,50 @@ def test_unresolved_is_counted_on_its_own_line(tmp_path):
     assert re.search(r"scored rejections\s+0", table), table
 
 
+# ============================================================================
+# InfraFailure is a harness fault, never approval / rejection / unresolved
+# ============================================================================
+
+
+def test_infra_failure_gets_its_own_bucket_whatever_the_label(tmp_path):
+    """An LLM call that failed after its retries is not a verdict about the model.
+
+    [WHY] No Attacker test ever ran, so the run says nothing about the candidate.
+    Bucketing it as approval, rejection, or the budget-exhausted `unresolved`
+    would all be false claims; it must be counted on its own.
+    """
+    write_session(tmp_path, "infra", decision="InfraFailure", schema_version=1)
+    data = metrics.load_session(str(tmp_path), "infra")
+
+    for label in (True, False, None):
+        verdict = metrics.classify(data, label)
+        assert verdict.bucket == metrics.INFRA_FAILURE, label
+        assert verdict.bucket not in (
+            metrics.FALSE_APPROVAL,
+            metrics.TRUE_APPROVAL,
+            metrics.APPROVED_UNLABELED,
+            metrics.UNRESOLVED,
+            metrics.TRUE_CATCH,
+            metrics.SPURIOUS_REJECT,
+            metrics.FALSE_REJECT,
+        ), label
+
+
+def test_infra_failure_is_counted_on_its_own_line(tmp_path):
+    """The harness fault must not be summed into any approval or reject bucket."""
+    write_session(tmp_path, "infra", decision="InfraFailure", schema_version=1)
+    verdicts = [
+        metrics.classify(metrics.load_session(str(tmp_path), "infra"), known_bad=True)
+    ]
+    table = metrics.render_table(verdicts)
+
+    assert re.search(r"infra_failure\s+1", table), table
+    assert re.search(r"false_approval\s+0", table), table
+    assert re.search(r"true_approval\s+0", table), table
+    assert re.search(r"unresolved\s+0", table), table
+    assert re.search(r"scored rejections\s+0", table), table
+
+
 def test_only_a_rejection_owes_a_signal_rerun(tmp_path):
     """An approval has nothing to re-run, so the absent probe file is not a warning.
 

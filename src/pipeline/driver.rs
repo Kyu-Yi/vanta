@@ -464,6 +464,13 @@ pub async fn run(
     } else {
         GovernorMode::Repair
     };
+    // [VANTA-WHY] The message from an LLM call that failed every attempt it was
+    // allowed. It is carried OUT of the loop so the run can end as a recorded
+    // verdict (`final_decision=InfraFailure`) with the session summary, evidence
+    // and transitions written exactly as they are for any other outcome. Before
+    // this, a dead LLM call propagated with `?` and the process exited with a
+    // stack-style error and NO final decision on disk — the run was unreadable.
+    let mut infra_failure_error: Option<String> = None;
     let decision = loop {
         let attempt = governor.current_attempt();
         // [VANTA-WHY] Forensics filenames carry the ROUND, not just the
@@ -493,10 +500,17 @@ pub async fn run(
                 source_files: repo.source_files.clone(),
                 prior_feedback: prior_feedback.clone(),
             };
-            let creator_response = run_with_spinner("Creator generating patch", async {
+            let creator_response = match run_with_spinner("Creator generating patch", async {
                 creator_generate_patch(&cfg, &creator_request).await
             })
-            .await?;
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    infra_failure_error = Some(format!("Creator LLM call failed: {error}"));
+                    break GovernorDecision::InfraFailure;
+                }
+            };
             println!(
                 "  ✔ Creator: patch_text={} chars, files_touched={:?}, confidence={}",
                 creator_response.patch_text.len(),
@@ -740,10 +754,17 @@ pub async fn run(
                 })
                 .collect(),
         };
-        let attacker_response = run_with_spinner("Attacker generating tests", async {
+        let attacker_response = match run_with_spinner("Attacker generating tests", async {
             attacker_generate_tests(&cfg, &attacker_request).await
         })
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                infra_failure_error = Some(format!("Attacker LLM call failed: {error}"));
+                break GovernorDecision::InfraFailure;
+            }
+        };
         // [VANTA-WHY] A probe whose body is already in the shared set adds no
         // coverage: it will be BATE-validated and patched-run again, and the
         // comparison it produces is a self-transition. Identity is the
@@ -1639,6 +1660,14 @@ pub async fn run(
                 // Infrastructure attempt.
                 break decision;
             }
+            GovernorDecision::InfraFailure => {
+                // [VANTA-WHY] Reached only when an LLM call fails, which the two
+                // call sites above handle by breaking out with the error text
+                // already captured. Kept as an arm so the match stays exhaustive
+                // and so a future LLM call site cannot silently fall through to
+                // the Creator-feedback path with no patch to feed back.
+                break decision;
+            }
             GovernorDecision::Continue => {
                 let failed: Vec<&TestEvidence> = final_evidence
                     .iter()
@@ -1685,6 +1714,36 @@ pub async fn run(
     println!("\n══════════════════════════════════════════════════════════════");
     println!("  FINAL: {:?}", decision);
     println!("══════════════════════════════════════════════════════════════");
+
+    // [VANTA-WHY] The error text travels WITH the verdict. "InfraFailure" on its
+    // own says the run died but not why, and the reason is what the reader acts
+    // on: an idle timeout, a prompt refused by the pre-flight guard and an
+    // unreachable server all need different responses. Recorded as its own
+    // phase so it cannot be mistaken for a statement about the candidate.
+    if let Some(error) = &infra_failure_error {
+        println!("  ✗ INFRASTRUCTURE FAILURE: {error}");
+        let one_line = error
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        session_log.append(SessionRecord {
+            session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
+            patch_attempt_id: attempt_patch_ids.last().cloned(),
+            testing_iteration_id: None,
+            test_id: None,
+            phase: "run.infra_failure".to_string(),
+            summary: format!(
+                "final_decision=InfraFailure error={}",
+                one_line.chars().take(1000).collect::<String>()
+            ),
+            timestamp: now_iso(),
+            benchmark_instance: None,
+            benchmark_label: None,
+        })?;
+    }
 
     // [VANTA-WHY] "Fixed at attempt 1" is its own number, not a rate. A repair
     // that passes on the first candidate has no N→N+1 transition, so ECR/EIR
@@ -1762,10 +1821,24 @@ pub async fn run(
                     let _ = fs::write(&out_path, content);
                 }
                 println!("  ✔ Patched files written to {}", stage_dir.display());
-                println!(
-                    "  ✔ Ready for PR. Use: cd {} && git diff",
-                    stage_dir.display()
-                );
+                // [VANTA-WHY] The review artifact is a DIFF against the original
+                // repo, not the staged copy. `patched_repo` is not a git repo, so
+                // the old `cd patched_repo && git diff` hint produced an error
+                // instead of a patch; final.patch is a real unified diff the
+                // reader can apply.
+                let patch_path = debug_dir.join("final.patch");
+                match write_final_patch(&original_files, patched, &patch_path) {
+                    Ok(()) => println!(
+                        "  ✔ Ready for PR. Diff against the original repo: {}\n    \
+                         (apply inside the original repo with: git apply {})",
+                        patch_path.display(),
+                        patch_path.display()
+                    ),
+                    Err(e) => println!(
+                        "  ⚠ Could not write {}: {e}",
+                        patch_path.display()
+                    ),
+                }
 
                 // ---- Open PR if requested ----
                 if config.open_pr {
@@ -1879,6 +1952,64 @@ pub async fn run(
     println!("▌ Session  → {session_path}");
 
     Ok(decision)
+}
+
+// ============================================================================
+// write_final_patch — the run's diff against the ORIGINAL repo
+// ============================================================================
+//
+// [VANTA-WHY] The Gatekeeper used to point the reader at `cd patched_repo && git
+// diff`. That command cannot work: `patched_repo` is a flat copy of the written
+// files, not a git repository, so `git diff` there fails with "not a git
+// repository" and the reader is left with no diff at all. `git diff --no-index`
+// compares two DIRECTORIES and needs no repository; with `--no-prefix` its
+// headers come out as the canonical `a/<path>` / `b/<path>`, so the file applies
+// with a plain `git apply` inside the original repo.
+fn write_final_patch(
+    original_files: &HashMap<String, String>,
+    patched_files: &HashMap<String, String>,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let scratch = tempfile::tempdir()?;
+    let before = scratch.path().join("a");
+    let after = scratch.path().join("b");
+    write_diff_tree(&before, original_files)?;
+    write_diff_tree(&after, patched_files)?;
+
+    let output = Command::new("git")
+        .arg("diff")
+        .arg("--no-index")
+        .arg("--no-color")
+        .arg("--no-prefix")
+        .arg("--")
+        .arg("a")
+        .arg("b")
+        .current_dir(scratch.path())
+        .output()?;
+    // [VANTA-WHY] `git diff --no-index` exits 1 whenever the two trees differ,
+    // which is the NORMAL case here. Treating that as failure would mean the
+    // patch is only ever written when there is nothing to write.
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(format!(
+            "git diff --no-index failed (status {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    fs::write(destination, &output.stdout)?;
+    Ok(())
+}
+
+fn write_diff_tree(root: &Path, files: &HashMap<String, String>) -> io::Result<()> {
+    for (path, contents) in files {
+        let out_path = root.join(path);
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&out_path, contents)?;
+    }
+    Ok(())
 }
 
 // ============================================================================

@@ -28,11 +28,65 @@ fn serial_run() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Block until the client closes `stream`, then bump `disconnects`.
+///
+/// [VANTA-WHY] `Ok(0)` is a clean FIN: the client hung up, which is exactly the
+/// cancel the idle timeout is supposed to send. A read error (RST) means the
+/// same thing. `WouldBlock` is not a disconnect — the accepted socket may be
+/// non-blocking — so it polls until a deadline rather than being mistaken for
+/// one.
+fn wait_for_disconnect(stream: &mut std::net::TcpStream, disconnects: &AtomicUsize) {
+    let mut scratch = [0_u8; 256];
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match stream.read(&mut scratch) {
+            Ok(0) => {
+                disconnects.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                disconnects.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+        }
+    }
+}
+
+/// How the stub behaves on a chat-completion request.
+///
+/// [VANTA-WHY] `stream: true` means a liveness bug only shows up over TIME, so
+/// the stub must be able to model time: answer promptly (Normal), emit one token
+/// and then go silent (`Stall`), or refuse the call outright (`Fail`).
+#[derive(Clone, Copy)]
+enum StubBehaviour {
+    /// Answer every chat call with a complete SSE stream (the old JSON answer,
+    /// re-framed as events). Used by every pre-existing test.
+    Normal,
+    /// Emit one `content` event and then send nothing more, holding the socket
+    /// open. The client must idle-time-out and close the connection; the stub
+    /// records that disconnection.
+    Stall,
+    /// Answer every chat call with HTTP 500, so the client's retry loop burns
+    /// its attempts and the run ends as an infrastructure failure.
+    Fail,
+}
+
 struct StubLlmServer {
     base_url: String,
     request_count: Arc<AtomicUsize>,
     request_kinds: Arc<Mutex<Vec<String>>>,
     request_bodies: Arc<Mutex<Vec<String>>>,
+    /// Number of stalled chat connections the client closed on us. It is how a
+    /// test proves the cancel reached the SERVER (not just the client's future).
+    disconnects: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
@@ -149,6 +203,47 @@ impl StubLlmServer {
         abort_at: Option<usize>,
         intent_audit_response_json: Option<&str>,
     ) -> Self {
+        Self::start_scripted_impl(
+            creator_response_json,
+            attacker_response_json,
+            revise_response_json,
+            simplify_response_json,
+            on_request,
+            abort_at,
+            intent_audit_response_json,
+            StubBehaviour::Normal,
+        )
+    }
+
+    /// As `start_scripted`, but with an explicit chat-completion behaviour and a
+    /// Creator answer, for the streaming/liveness tests.
+    fn start_streaming(
+        creator_response_json: Option<&str>,
+        attacker_response_json: &str,
+        behaviour: StubBehaviour,
+    ) -> Self {
+        Self::start_scripted_impl(
+            creator_response_json,
+            attacker_response_json,
+            None,
+            None,
+            None,
+            None,
+            None,
+            behaviour,
+        )
+    }
+
+    fn start_scripted_impl(
+        creator_response_json: Option<&str>,
+        attacker_response_json: &str,
+        revise_response_json: Option<&str>,
+        simplify_response_json: Option<&str>,
+        on_request: Option<Box<dyn Fn(usize) + Send>>,
+        abort_at: Option<usize>,
+        intent_audit_response_json: Option<&str>,
+        behaviour: StubBehaviour,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -156,11 +251,13 @@ impl StubLlmServer {
         let request_count = Arc::new(AtomicUsize::new(0));
         let request_kinds = Arc::new(Mutex::new(Vec::new()));
         let request_bodies = Arc::new(Mutex::new(Vec::new()));
+        let disconnects = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
 
         let request_count_clone = Arc::clone(&request_count);
         let request_kinds_clone = Arc::clone(&request_kinds);
         let request_bodies_clone = Arc::clone(&request_bodies);
+        let disconnects_clone = Arc::clone(&disconnects);
         let stop_clone = Arc::clone(&stop);
         // The Attacker has two call sites with different response shapes: a
         // generation call expects `{"tests":[...]}` (AttackerResponse), while a
@@ -188,10 +285,6 @@ impl StubLlmServer {
             while !stop_clone.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _addr)) => {
-                        let index = request_count_clone.fetch_add(1, Ordering::SeqCst);
-                        if let Some(hook) = &on_request {
-                            hook(index);
-                        }
                         let mut request = Vec::new();
                         let mut buf = [0_u8; 4096];
                         let mut header_end = None;
@@ -232,6 +325,49 @@ impl StubLlmServer {
                                 }
                                 Err(_) => break,
                             }
+                        }
+
+                        // [VANTA-WHY] `/props` and `/tokenize` are PROBES, not
+                        // chat completions: the client asks the server for its
+                        // context window and (rarely) for an exact token count.
+                        // They are answered here and deliberately NOT counted, so
+                        // every pre-existing request-count assertion, and the
+                        // `abort_at` index that drops the Nth CHAT call, keep
+                        // meaning exactly what they meant before streaming.
+                        let head_end = header_end.unwrap_or(request.len());
+                        let head = String::from_utf8_lossy(&request[..head_end]).to_string();
+                        let request_line = head.lines().next().unwrap_or("").to_string();
+                        let path = request_line
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("")
+                            .to_string();
+                        if path.ends_with("/props") {
+                            let body = "{\"default_generation_settings\":{\"n_ctx\":131072},\"n_ctx\":131072}";
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                            continue;
+                        }
+                        if path.ends_with("/tokenize") {
+                            let body = "{\"count\":1}";
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                            continue;
+                        }
+
+                        let index = request_count_clone.fetch_add(1, Ordering::SeqCst);
+                        if let Some(hook) = &on_request {
+                            hook(index);
                         }
 
                         if abort_at.map_or(false, |at| index >= at) {
@@ -309,21 +445,50 @@ impl StubLlmServer {
                         } else {
                             default_single_test()
                         };
-                        // The assistant `content` field is a JSON STRING holding
-                        // the model's answer, so the serialised value is quoted
-                        // once more before it is embedded in the envelope.
+                        // [VANTA-WHY] Every chat completion is now answered as
+                        // `text/event-stream`, because the client asks with
+                        // `stream: true` and reassembles the events. The frames
+                        // carry exactly the payload the old JSON envelope did —
+                        // the answer in `choices[0].delta.content` — so a parser
+                        // on top of `post_chat` cannot tell the difference.
                         let content_text = content.to_string();
-                        let response_body = format!(
-                            "{{\"choices\":[{{\"message\":{{\"content\":{},\"reasoning_content\":\"\"}}}}],\"usage\":{{\"total_tokens\":1}}}}",
-                            serde_json::to_string(&content_text).unwrap()
-                        );
 
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                            response_body.len(),
-                            response_body
+                        if matches!(behaviour, StubBehaviour::Fail) {
+                            let response = "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                            continue;
+                        }
+
+                        let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+                        let token_frame = format!(
+                            "data: {}\n\n",
+                            serde_json::json!({
+                                "choices": [{"delta": {"content": content_text}}]
+                            })
                         );
-                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(headers.as_bytes());
+                        let _ = stream.write_all(token_frame.as_bytes());
+                        let _ = stream.flush();
+
+                        if matches!(behaviour, StubBehaviour::Stall) {
+                            // One token, then silence. The client's idle timeout
+                            // must fire and close the socket; we sit here until it
+                            // does and record that we saw the disconnect — proof
+                            // the cancel reached the SERVER, not merely the
+                            // client's own future.
+                            wait_for_disconnect(&mut stream, &disconnects_clone);
+                            continue;
+                        }
+
+                        let tail = format!(
+                            "data: {}\n\ndata: [DONE]\n\n",
+                            serde_json::json!({
+                                "choices": [{"delta": {}}],
+                                "usage": {"prompt_tokens": 1, "total_tokens": 1}
+                            })
+                        );
+                        let _ = stream.write_all(tail.as_bytes());
                         let _ = stream.flush();
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -339,6 +504,7 @@ impl StubLlmServer {
             request_count,
             request_kinds,
             request_bodies,
+            disconnects,
             stop,
             join: Some(join),
         }
@@ -346,6 +512,11 @@ impl StubLlmServer {
 
     fn request_count(&self) -> usize {
         self.request_count.load(Ordering::SeqCst)
+    }
+
+    /// How many stalled chat connections the client has closed on us.
+    fn disconnects(&self) -> usize {
+        self.disconnects.load(Ordering::SeqCst)
     }
 
     fn request_kinds(&self) -> Vec<String> {
@@ -780,7 +951,7 @@ fn run_patch_mode_with_output(
         )
         .env("VANTA_LLM_MODEL", "stub-model")
         .env("VANTA_API_KEY", TEST_API_KEY)
-        .env("VANTA_LLM_TIMEOUT_SECS", "5")
+        .env("VANTA_LLM_IDLE_TIMEOUT_SECS", "5")
         .env("VANTA_PYTHON", python)
         .env("PATH", "/usr/bin:/bin")
         .env("VANTA_SANDBOX_MEMORY_MB", "0");
@@ -815,7 +986,7 @@ fn run_creator_mode_with_output(
         )
         .env("VANTA_LLM_MODEL", "stub-model")
         .env("VANTA_API_KEY", TEST_API_KEY)
-        .env("VANTA_LLM_TIMEOUT_SECS", "5")
+        .env("VANTA_LLM_IDLE_TIMEOUT_SECS", "5")
         .env("VANTA_PYTHON", python)
         .env("PATH", "/usr/bin:/bin")
         .env("VANTA_SANDBOX_MEMORY_MB", "0");
@@ -1269,9 +1440,18 @@ fn transitions_survive_an_abort_after_attempt_two() {
         records.iter().any(|r| r.phase == "attempt.start"),
         "attempts 1 and 2 ran before the abort, so their start records must be on disk too"
     );
+    // [VANTA-WHY] A dropped LLM call no longer kills the process. It ends the run
+    // cleanly as `InfraFailure`, so the end-of-run records NOW EXIST — the
+    // attribution and the on-disk rows are what must survive, and the decision
+    // must say the HARNESS failed, never that the candidate was approved.
+    let decision_record = records
+        .iter()
+        .find(|r| r.phase == "M3_repair_loop")
+        .expect("an LLM call that failed must end the run with a recorded decision");
     assert!(
-        !records.iter().any(|r| r.phase == "M3_repair_loop"),
-        "the run aborted before end-of-run, so no final-decision record may exist"
+        decision_record.summary.contains("final_decision=InfraFailure"),
+        "an aborted LLM call is an infrastructure failure, not an approval; got {}",
+        decision_record.summary
     );
 
     // read_transition_rows parses line by line, so a clean read proves the rows
@@ -3306,3 +3486,177 @@ fn a_zero_denominator_prints_not_applicable_never_a_zero_percent() {
         "with no transition rows at all, the FINAL line may say so; got {stdout}"
     );
 }
+
+// ============================================================================
+// LLM call robustness: streaming liveness, cancel, InfraFailure
+// ============================================================================
+//
+// [VANTA-WHY] The issue2 repair runs died because a healthy 600s generation was
+// killed by a TOTAL deadline; llama-server kept generating the orphan, the retry
+// opened a second slot against the same KV cache, and the run crashed with no
+// final decision. These tests pin the three behaviours that replace that: a
+// stalled stream is cancelled at the SOCKET (not merely abandoned), a prompt the
+// server can never accept is refused once instead of three times, and an
+// unrecoverable LLM failure ends the run as a clean `InfraFailure`.
+//
+// The "slow but steady stream completes past 600s of simulated time" case lives
+// in `src/llm/mod.rs` (`_streaming_tests`): it needs a PAUSED clock, so 700
+// simulated seconds cost no real time — impossible against a real subprocess.
+
+/// A stalled stream fires the idle timeout, and the SERVER sees the disconnect.
+#[test]
+fn a_stalled_stream_is_cancelled_and_the_stub_sees_the_disconnect() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start_streaming(None, SINGLE_BEHAVIOR_TEST, StubBehaviour::Stall);
+
+    // A one-second idle timeout makes the test quick while still exercising the
+    // real watchdog. The 3600s backstop is far away, so the IDLE limit is what
+    // must fire — and one second is well under 600s, so this proves the timeout
+    // is driven by SILENCE, not by total elapsed time.
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        3,
+        &[("VANTA_LLM_IDLE_TIMEOUT_SECS", "1")],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an idle timeout must end the run with the distinct InfraFailure exit code; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        server.disconnects() >= 1,
+        "the client must CLOSE the stalled connection so the server cancels the task; \
+         the stub saw {} disconnect(s)",
+        server.disconnects()
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("INFRASTRUCTURE FAILURE"),
+        "the run must say why it ended; got {stdout}"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let infra = records
+        .iter()
+        .find(|r| r.phase == "run.infra_failure")
+        .expect("a run that gave up on the LLM must record why");
+    assert!(
+        infra.summary.contains("stalled"),
+        "the recorded error must name the idle timeout; got {}",
+        infra.summary
+    );
+}
+
+/// A prompt that cannot fit the window is refused ONCE, without retrying.
+#[test]
+fn the_context_precheck_fails_once_without_retrying() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start_streaming(None, SINGLE_BEHAVIOR_TEST, StubBehaviour::Normal);
+
+    // A one-token window makes EVERY prompt exceed the budget. That is decided
+    // by arithmetic before a byte leaves the process, so it cannot succeed on a
+    // retry.
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        3,
+        &[("VANTA_LLM_CONTEXT_TOKENS", "1"), ("VANTA_LLM_RETRY_ATTEMPTS", "3")],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a refused prompt is an infrastructure failure, not a verdict; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hits = combined
+        .matches("does not fit the model's context window")
+        .count();
+    assert_eq!(
+        hits, 1,
+        "a deterministic pre-flight failure must be surfaced ONCE, not once per attempt; \
+         got {hits} in:\n{combined}"
+    );
+    // Nothing was ever POSTed as a chat completion: the guard refuses first.
+    assert!(
+        !server
+            .request_kinds()
+            .iter()
+            .any(|kind| kind == "generate" || kind == "creator"),
+        "the pre-flight guard must refuse BEFORE sending a chat completion; kinds={:?}",
+        server.request_kinds()
+    );
+}
+
+/// An LLM failure that survives its retries ends the run as an `InfraFailure`.
+#[test]
+fn an_llm_failure_after_retries_writes_an_infrafailure_run_summary() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start_streaming(None, SINGLE_BEHAVIOR_TEST, StubBehaviour::Fail);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        3,
+        &[("VANTA_LLM_RETRY_ATTEMPTS", "2")],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an unrecoverable LLM failure must exit with the distinct InfraFailure code; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        server.request_count() >= 2,
+        "the call must actually have been retried before giving up; got {}",
+        server.request_count()
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let summary = records
+        .iter()
+        .find(|r| r.phase == "run.summary")
+        .expect("the run must write a summary row even when the LLM never answered");
+    assert!(
+        summary.summary.contains("final_decision=InfraFailure"),
+        "the summary must carry the verdict; got {}",
+        summary.summary
+    );
+    assert!(
+        records.iter().any(|r| r.phase == "run.infra_failure"),
+        "the error text must be recorded beside the verdict"
+    );
+
+    // Evidence and transitions must be flushed even on this path: a reader has
+    // to be able to tell an infrastructure failure from a candidate verdict.
+    let evidence = evidence_for(workspace.path(), &records);
+    assert!(
+        evidence.is_object(),
+        "evidence.json must exist after an InfraFailure run"
+    );
+    assert!(find_transitions(workspace.path()).exists());
+}
+

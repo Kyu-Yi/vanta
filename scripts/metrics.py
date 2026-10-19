@@ -42,6 +42,12 @@ undetermined       Rejected, but no signal could be evaluated (e.g. a legacy v0
                    separately so it is never silently folded into
                    spurious_reject.
 approved_unlabeled Approved with no ground-truth label, so nothing is claimed.
+infra_failure      The run ended because an LLM call failed for every attempt
+                   the retry loop was allowed (`final_decision=InfraFailure`).
+                   No test ever judged the candidate, so this is neither an
+                   approval, a rejection, nor an "unresolved" budget exhaustion —
+                   it is a property of the harness, not of the model. Counted on
+                   its own so it can never inflate or deflate any other bucket.
 """
 
 from __future__ import annotations
@@ -63,12 +69,17 @@ TRUE_APPROVAL = "true_approval"
 UNRESOLVED = "unresolved"
 UNDETERMINED = "undetermined"
 APPROVED_UNLABELED = "approved_unlabeled"
+INFRA_FAILURE = "infra_failure"
 
 # [WHY] `AllTestsPassed` alone. `MaxAttemptsReached` used to live here and was
 # bucketed as an approval; it is the opposite — the Creator exhausted the budget
 # without an approved patch (see the `unresolved` bucket).
 APPROVED_DECISIONS = {"AllTestsPassed"}
 UNRESOLVED_DECISIONS = {"MaxAttemptsReached"}
+# [WHY] An LLM call failed after its retries. Kept in its own set, never merged
+# into APPROVED_DECISIONS or UNRESOLVED_DECISIONS: the run produced no verdict
+# about the candidate at all.
+INFRA_FAILURE_DECISIONS = {"InfraFailure"}
 
 
 # ============================================================================
@@ -423,6 +434,8 @@ class Verdict:
             return "approved on a patch labelled known-good"
         if self.bucket == UNRESOLVED:
             return "attempt budget exhausted with no approved patch (not an approval)"
+        if self.bucket == INFRA_FAILURE:
+            return "LLM call failed after its retries (not a verdict about the candidate)"
         return "approved, no ground-truth label"
 
 
@@ -463,6 +476,14 @@ def classify(
         # So nothing here was accepted, and no ground-truth label can make it an
         # approval: it is unresolved whatever the label says.
         bucket = UNRESOLVED
+    elif decision in INFRA_FAILURE_DECISIONS:
+        # [WHY] The LLM call failed for every attempt the retry loop was allowed,
+        # so the pipeline never reached the Governor's Passed/Failed branch and
+        # no test ever judged the candidate. Checked BEFORE the labelled-approval
+        # and final fallthrough arms: an infrastructure failure is not a claim
+        # about the model, so it must be neither approval, rejection, nor the
+        # budget-exhausted `unresolved`. It goes in its own bucket.
+        bucket = INFRA_FAILURE
     elif decision in APPROVED_DECISIONS:
         if known_bad is True:
             bucket = FALSE_APPROVAL
@@ -518,6 +539,7 @@ def render_table(verdicts: list[Verdict]) -> str:
         UNRESOLVED,
         UNDETERMINED,
         APPROVED_UNLABELED,
+        INFRA_FAILURE,
     ):
         count = sum(1 for verdict in verdicts if verdict.bucket == bucket)
         lines.append(f"  {bucket:<18} {count}")

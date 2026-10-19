@@ -848,8 +848,17 @@ pub enum GovernorDecision {
     // regression" and "gave up after N tries" are different claims about the
     // model, and the PR and the paper both read this field to tell them apart.
     Rejected,
-    // [VANTA-WHY] Reached max attempts (Fixed-N = 4). Stopped without a clean pass.
+    // [VANTA-WHY] Reached the attempt budget without a clean pass. The number is
+    // the run's own `--max-attempts` (the driver logs `attempts_run`); it is NOT
+    // a fixed 4.
     MaxAttemptsReached,
+    // [VANTA-WHY] An LLM call failed for every attempt the retry loop was
+    // allowed. This says NOTHING about the candidate: the model never produced an
+    // answer, so there is no evidence for or against the patch. It exists so the
+    // run can end as a RECORDED outcome — final_decision, session summary,
+    // evidence and transitions all on disk — instead of a crash with no verdict.
+    // metrics.py must never score it as approval, rejection or unresolved.
+    InfraFailure,
     // [VANTA-WHY] Patch failed to apply (changed == false). Cannot continue —
     // the Creator produced no usable change.
     PatchApplicationFailed,

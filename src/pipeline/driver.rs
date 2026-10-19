@@ -859,12 +859,20 @@ pub async fn run(
         // revisions when the baseline still disagrees with the declared intent
         // (Layer 2). M3's local copy had dropped Layer 2, so a test that merely
         // declared the wrong intent was scrapped instead of being fixed.
+        //
+        // [VANTA-WHY] BATE runs on the patch-FREE ORIGINAL tree
+        // (`bate_baseline_concat`), unlike the patched-side Attacker run, which
+        // runs on the graded tree. BATE's question is "does this test fail on the
+        // code as it was?", so the fix must not be present — a tree containing the
+        // patch would make a correct probe look wrong. This is also why BATE
+        // needs no sanitizing of its own: it never receives a patch-added
+        // `conftest.py` or an edited test in the first place.
         println!("\n▌ BATE: validating tests against baseline...");
         let bate_run = run_with_spinner("BATE validating tests against baseline", async {
             run_bate(
                 &cfg,
                 &repo.issue_text,
-                &original_concat,
+                &bate_baseline_concat(&original_files),
                 &review_prompt_concat,
                 &attacker_tests,
                 &test_cmd,
@@ -988,6 +996,32 @@ pub async fn run(
         let snapshot_root = debug_dir.join(format!("attempt_{}_patched_tree", attempt + 1));
         let _ = harness::write_tree_snapshot(&snapshot_root, &patched_concat);
 
+        // [VANTA-WHY] The Attacker's generated tests must be graded on the SAME
+        // sanitized tree the native suite uses, so a patch cannot silence them
+        // either. `patched_concat` above is the patch's own tree, tests and all:
+        // a patch-added root `conftest.py` carrying a `pytest_runtest_makereport`
+        // hook can rewrite every outcome to "passed", and a patch-added
+        // `pytest_collection_modifyitems` (or a narrowed `addopts`) can deselect
+        // tests outright. Running the generated tests there let the candidate
+        // grade itself — the same hole the native gate closed for the repo's own
+        // suite. The graded tree pins every collected test and every
+        // `conftest.py` back to its original contents and drops patch-added test
+        // files, so what the patch claims about its own tests cannot reach the
+        // run that judges it.
+        let native_tree = harness::native_tree_with_original_tests(
+            &original_files,
+            &patched_files,
+            &patch_deleted_paths(&patch_text),
+        );
+        let graded_concat = build_source_concat(&native_tree.files);
+        // [VANTA-WHY] Snapshot the graded tree per attempt. `--rerun-signals`
+        // reads it back for a session that predates this key, and it is the ONLY
+        // artifact that reproduces the exact tree the Attacker ran on (the
+        // `_patched_tree` snapshot above is the patch's own, tests included).
+        let graded_snapshot_root =
+            debug_dir.join(format!("attempt_{}_graded_tree", attempt + 1));
+        let _ = harness::write_tree_snapshot(&graded_snapshot_root, &graded_concat);
+
         // Build the combined test list: shared first, then new.
         let mut tests_to_run: Vec<&GeneratedTest> = Vec::new();
         for t in &shared_tests {
@@ -998,7 +1032,7 @@ pub async fn run(
         }
 
         let patched_results = run_with_spinner("Running tests on patched code", async {
-            harness::run_tests_parallel_detailed(&patched_concat, &tests_to_run, &test_cmd).await
+            harness::run_tests_parallel_detailed(&graded_concat, &tests_to_run, &test_cmd).await
         })
         .await?;
 
@@ -1103,12 +1137,12 @@ pub async fn run(
         // test edits are discarded here — existing tests restored to their
         // original contents, a deleted test restored, an added test file left
         // out of the baseline — so the patch cannot grade itself.
-        let native_tree = harness::native_tree_with_original_tests(
-            &original_files,
-            &patched_files,
-            &patch_deleted_paths(&patch_text),
-        );
-        let native_patched_concat = build_source_concat(&native_tree.files);
+        //
+        // `native_tree` / `graded_concat` were built before the Attacker run (see
+        // step 5) so the generated tests and the repo's own suite are graded on
+        // the SAME sanitized tree; the two can never disagree about which tests
+        // were allowed to run.
+        let native_patched_concat = graded_concat.clone();
         modified_existing_tests = native_tree.modified_existing_tests.clone();
         removed_existing_tests = native_tree.removed_existing_tests.clone();
         added_test_files = native_tree.added_test_files.clone();
@@ -1276,7 +1310,7 @@ pub async fn run(
                     &ruff_new_text,
                     &mypy_new_text,
                     !net_alive,
-                    &patched_concat,
+                    &graded_concat,
                     &cfg,
                     &review_prompt_concat,
                     &test_cmd,
@@ -1889,6 +1923,18 @@ fn build_source_concat(files: &HashMap<String, String>) -> String {
         .map(|(path, contents)| format!("# FILE: {path}\n{contents}"))
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+// [VANTA-WHY] BATE validates the Attacker's declared intent against the
+// BASELINE, so it must see the patch-FREE original tree. It is deliberately not
+// given the patched (let alone the graded) tree: a candidate must never be
+// allowed to validate its own tests, and BATE's job is to check that a test
+// actually fails on the ORIGINAL code — a tree that already contains the fix
+// would make every correct probe look wrong. This named seam is what the
+// regression test asserts against, so "BATE gets the original tree" is enforced
+// by a test rather than by a comment.
+fn bate_baseline_concat(original_files: &HashMap<String, String>) -> String {
+    build_source_concat(original_files)
 }
 
 fn review_prompt_source_concat(
@@ -2922,8 +2968,8 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        attempt_verdict, blocking_static_findings, collapse_decision,
-        dependency_freeze_summary_value, harness_infrastructure_collapse,
+        attempt_verdict, bate_baseline_concat, blocking_static_findings, build_source_concat,
+        collapse_decision, dependency_freeze_summary_value, harness_infrastructure_collapse,
         modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
         rejection_signal_message, render_committed_test_file,
         require_clean_target_repo_for_open_pr, review_prompt_source_concat, stamp_transition_row,
@@ -3564,5 +3610,64 @@ mod tests {
             !rendered.contains("# FILE: tests/test_other.py"),
             "unrelated tests should stay out of the review prompt"
         );
+    }
+
+    // [VANTA-WHY] BATE's tree is the patch-free ORIGINAL tree (see
+    // `bate_baseline_concat`). "Document only" is not enough here: a candidate
+    // that could reach BATE with its own `conftest.py` or an edited test could
+    // validate itself. This locks the invariant in place so a future edit that
+    // hands BATE the patched tree fails here.
+    #[test]
+    fn bate_validates_against_a_tree_with_no_patch_added_or_modified_test_files() {
+        let original_files = HashMap::from([
+            (
+                "calc.py".to_string(),
+                "def double(x):\n    return x\n".to_string(),
+            ),
+            (
+                "tests/test_core.py".to_string(),
+                "from calc import double\n\n\ndef test_double():\n    assert double(2) == 4\n"
+                    .to_string(),
+            ),
+        ]);
+
+        // The candidate the run would otherwise be tempted to hand BATE: it
+        // breaks the source, adds a root conftest that forces every outcome to
+        // "passed", and rewrites the covering test to assert nothing.
+        let mut patched_files = original_files.clone();
+        patched_files.insert(
+            "calc.py".to_string(),
+            "def double(x):\n    return x + 1\n".to_string(),
+        );
+        patched_files.insert(
+            "conftest.py".to_string(),
+            "import pytest\n\n\ndef pytest_runtest_makereport(item, call):\n    pass\n".to_string(),
+        );
+        patched_files.insert(
+            "tests/test_core.py".to_string(),
+            "from calc import double\n\n\ndef test_double():\n    assert True\n".to_string(),
+        );
+
+        let bate_tree = bate_baseline_concat(&original_files);
+        let patched_tree = build_source_concat(&patched_files);
+
+        assert_ne!(
+            bate_tree, patched_tree,
+            "the two trees must genuinely differ, or this test proves nothing"
+        );
+        assert_eq!(
+            bate_tree,
+            build_source_concat(&original_files),
+            "BATE must receive exactly the patch-free original tree"
+        );
+        assert!(
+            !bate_tree.contains("pytest_runtest_makereport"),
+            "a patch-added conftest must never reach BATE's tree"
+        );
+        assert!(
+            !bate_tree.contains("assert True"),
+            "a patch-modified test must never reach BATE's tree"
+        );
+        assert!(bate_tree.contains("assert double(2) == 4"));
     }
 }

@@ -2336,6 +2336,91 @@ const EDIT_PYTEST_CONFIG_PATCH: &str = concat!(
     "+markers = [\"slow: marks slow tests\", \"flaky: marks flaky tests\"]\n",
 );
 
+/// `WRONG_BEHAVIOUR_PATCH` plus a root `conftest.py` that REWRITES every test
+/// outcome to `passed`.
+///
+/// [VANTA-WHY] The strongest form of "let the candidate grade itself": it does
+/// not deselect the probe, it makes a failing probe REPORT as passing. Measured
+/// against pytest 9, a generated probe that fails on the broken tree reports
+/// `passed` while this conftest is present, and `failed` once Vanta's own root
+/// `conftest.py` is written over it. It is the vector the generated-test run had
+/// and the repo's own suite did not.
+const BREAK_ADD_AND_FORCE_PASS_WITH_CONFTEST_PATCH: &str = concat!(
+    "diff --git a/calc.py b/calc.py\n",
+    "--- a/calc.py\n",
+    "+++ b/calc.py\n",
+    "@@ -1,5 +1,5 @@\n",
+    " def add(a, b):\n",
+    "-    return a + b\n",
+    "+    return a - b\n",
+    " \n",
+    " \n",
+    " def scale(x, factor):\n",
+    "diff --git a/conftest.py b/conftest.py\n",
+    "new file mode 100644\n",
+    "--- /dev/null\n",
+    "+++ b/conftest.py\n",
+    "@@ -0,0 +1,8 @@\n",
+    "+import pytest\n",
+    "+\n",
+    "+\n",
+    "+@pytest.hookimpl(hookwrapper=True)\n",
+    "+def pytest_runtest_makereport(item, call):\n",
+    "+    outcome = yield\n",
+    "+    report = outcome.get_result()\n",
+    "+    report.outcome = \"passed\"\n",
+);
+
+/// A patch that touches NO source and adds only a pytest config that DESELECTS
+/// the repo's own catching test.
+///
+/// [VANTA-WHY] `modified_test_config` is warn-only, so `addopts` is free for a
+/// patch to rewrite; this one makes `-k` drop `test_scale_doubles` from the
+/// patched run entirely. Measured against pytest 9: `1 deselected`, and the JSON
+/// report carries no entry for the test at all. Because the patch breaks nothing,
+/// the vanished test is the ONLY signal — a walk that did not treat absence as a
+/// regression would approve this candidate with zero findings.
+const DESELECT_THE_CATCHING_TEST_WITH_ADDOPS_PATCH: &str = concat!(
+    "diff --git a/pyproject.toml b/pyproject.toml\n",
+    "new file mode 100644\n",
+    "--- /dev/null\n",
+    "+++ b/pyproject.toml\n",
+    "@@ -0,0 +1,2 @@\n",
+    "+[tool.pytest.ini_options]\n",
+    "+addopts = \"-k 'not test_scale_doubles'\"\n",
+);
+
+/// A patch that touches NO source and SILENCES the repo's own test through a
+/// pytest plugin loaded from `addopts`.
+///
+/// [VANTA-WHY] This is the `skipped` outcome, not deselection: the test is still
+/// collected and executed, and reports `skipped`. `native_outcome` maps only
+/// passed/failed/error, so `skipped` becomes `None` and the test drops out of the
+/// patched report — a different route into the same `None` branch. Measured
+/// against pytest 9: the JSON report carries
+/// `("tests/test_core.py::test_scale_doubles", "skipped")`.
+const SILENCE_THE_CATCHING_TEST_WITH_A_SKIP_PLUGIN_PATCH: &str = concat!(
+    "diff --git a/pyproject.toml b/pyproject.toml\n",
+    "new file mode 100644\n",
+    "--- /dev/null\n",
+    "+++ b/pyproject.toml\n",
+    "@@ -0,0 +1,2 @@\n",
+    "+[tool.pytest.ini_options]\n",
+    "+addopts = \"-p skip_plugin\"\n",
+    "diff --git a/skip_plugin.py b/skip_plugin.py\n",
+    "new file mode 100644\n",
+    "--- /dev/null\n",
+    "+++ b/skip_plugin.py\n",
+    "@@ -0,0 +1,7 @@\n",
+    "+import pytest\n",
+    "+\n",
+    "+\n",
+    "+def pytest_collection_modifyitems(config, items):\n",
+    "+    for item in items:\n",
+    "+        if \"test_scale_doubles\" in item.nodeid:\n",
+    "+            item.add_marker(pytest.mark.skip(reason=\"neutralised by the patch\"))\n",
+);
+
 /// The evidence file path for the single session a toy run writes.
 fn evidence_for(workspace: &Path, records: &[SessionRecord]) -> serde_json::Value {
     read_json(
@@ -2702,6 +2787,236 @@ fn repair_mode_tells_the_creator_its_test_edits_were_discarded() {
              test file."
         ),
         "the Creator must be told the rule, not just the consequence; got {feedback}"
+    );
+}
+
+// ============================================================================
+// Gap 1 — the generated tests must be graded on the SAME sanitized tree
+// ============================================================================
+//
+// [VANTA-WHY] The repo's own suite already ran the patch's SOURCE with the
+// ORIGINAL tests. The generated tests did not: they ran on the patch's own tree,
+// `conftest.py` and all, so a candidate could reach the run that judges it. A
+// root `conftest.py` carrying a `pytest_runtest_makereport` hook that rewrites
+// every outcome to `passed` is the sharpest version — it does not even need to
+// know the probe's name. The patched-side run now uses the same graded tree the
+// native suite uses, so the two can never disagree about which tests ran.
+
+/// A patch-added root `conftest.py` that forces every outcome to `passed` must
+/// NOT save the patch from the generated probe.
+///
+/// [VANTA-WHY] Measured against pytest 9: on the patch's own tree this conftest
+/// makes the probe report `passed` even though `add(2, 3)` is `-1`. If the
+/// generated tests ran there, this candidate would be approved with nothing
+/// failing. The graded tree drops the added conftest, so the probe still fails
+/// and the run is rejected on the generated test.
+#[test]
+fn a_patch_added_conftest_cannot_force_the_generated_test_to_pass() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        BREAK_ADD_AND_FORCE_PASS_WITH_CONFTEST_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+    assert!(
+        !output.status.success(),
+        "a conftest that rewrites every outcome to 'passed' must not save a patch the generated \
+         probe catches; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let result_row = records
+        .iter()
+        .find(|r| r.phase == "patched.result[test_behavior_preservation_only]")
+        .expect("the generated test must have a patched-side result row");
+    assert!(
+        result_row.summary.contains("outcome=Counterexample"),
+        "the probe must still be recorded as failing on the graded tree, not as verified on the \
+         patch's own; got {}",
+        result_row.summary
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("added_test_files=[conftest.py]"),
+        "the patch-added conftest must be surfaced as an added test file, never silently \
+         honoured; got {stdout}"
+    );
+    assert!(
+        stdout.contains("✖ REJECTED")
+            && stdout.contains("failing test(s): test_behavior_preservation_only"),
+        "the rejection must name the generated test that failed; got {stdout}"
+    );
+
+    let evidence = evidence_for(workspace.path(), &records);
+    assert_eq!(
+        evidence["added_test_files"],
+        serde_json::json!(["conftest.py"])
+    );
+    assert_eq!(evidence["modified_existing_tests"], serde_json::json!([]));
+}
+
+// ============================================================================
+// Gap 2 — a SILENCED native test is a regression, not a clean round
+// ============================================================================
+//
+// [VANTA-WHY] `modified_test_config` is warn-only: a patch that rewrites
+// `[tool.pytest.ini_options]` is reported, never itself rejected. So the only
+// defence against a silenced test is that a silenced test is a MISSING test, and
+// a missing test is a regression. `native_regressions` walks the ORIGINAL side
+// and counts a test that no longer reports `passed` OR is absent — which is
+// exactly how pass -> skipped / xfail / deselected is caught, since
+// `native_outcome` drops anything that is not passed/failed/error. Both patches
+// below touch no source at all, so the vanished test is the entire signal.
+
+/// Deselecting the repo's own test through `addopts` is a regression.
+#[test]
+fn a_patch_that_deselects_a_native_test_through_addopts_is_a_regression() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        DESELECT_THE_CATCHING_TEST_WITH_ADDOPS_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+    assert!(
+        !output.status.success(),
+        "a patch that deselects the repo's own test must be rejected; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let summary = records
+        .iter()
+        .find(|r| r.phase == "native_suite.summary")
+        .expect("the native-suite gate must log its own summary row");
+    assert!(
+        summary.summary.contains("original_tests=1")
+            && summary.summary.contains("patched_tests=0")
+            && summary.summary.contains("regressions=1"),
+        "the deselected test must read as gone, not as passing; got {}",
+        summary.summary
+    );
+
+    let row = records
+        .iter()
+        .find(|r| r.phase == "native_suite.test[tests/test_core.py::test_scale_doubles]")
+        .expect("the original test must be recorded even when the patch deselects it");
+    assert!(
+        row.summary.contains("original=Passed")
+            && row.summary.contains("patched=None")
+            && row.summary.contains("regression=true"),
+        "pass -> deselected is recorded as `patched=None` with regression=true; got {}",
+        row.summary
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("modified_test_config=[pyproject.toml]"),
+        "the pytest-config change must still be reported, even though it never rejects on its \
+         own; got {stdout}"
+    );
+    assert!(
+        stdout.contains("✖ REJECTED")
+            && stdout.contains("native regression: tests/test_core.py::test_scale_doubles"),
+        "the rejection must rest on the vanished native test; got {stdout}"
+    );
+
+    let evidence = evidence_for(workspace.path(), &records);
+    let regressions = evidence["native_regressions"]
+        .as_array()
+        .expect("evidence.json must record native regressions under a clear key");
+    assert!(
+        regressions.iter().any(|r| r["attempt"] == serde_json::json!(1)
+            && r["regressions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str().unwrap_or("").contains("test_scale_doubles"))),
+        "attempt 1's native regression must name the deselected test; got {regressions:?}"
+    );
+}
+
+/// Making the repo's own test SKIP is a regression.
+#[test]
+fn a_patch_that_skips_a_native_test_is_a_regression() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        SILENCE_THE_CATCHING_TEST_WITH_A_SKIP_PLUGIN_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+    assert!(
+        !output.status.success(),
+        "a patch that skips the repo's own test must be rejected; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let summary = records
+        .iter()
+        .find(|r| r.phase == "native_suite.summary")
+        .expect("the native-suite gate must log its own summary row");
+    assert!(
+        summary.summary.contains("original_tests=1")
+            && summary.summary.contains("patched_tests=0")
+            && summary.summary.contains("regressions=1"),
+        "a skipped test is neither a pass nor a failure, so it must read as gone; got {}",
+        summary.summary
+    );
+
+    let row = records
+        .iter()
+        .find(|r| r.phase == "native_suite.test[tests/test_core.py::test_scale_doubles]")
+        .expect("the original test must be recorded even when the patch skips it");
+    assert!(
+        row.summary.contains("original=Passed")
+            && row.summary.contains("patched=None")
+            && row.summary.contains("regression=true"),
+        "`skipped` is dropped by the native parser, so pass -> skipped is `patched=None` with \
+         regression=true; got {}",
+        row.summary
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("✖ REJECTED")
+            && stdout.contains("native regression: tests/test_core.py::test_scale_doubles"),
+        "the rejection must rest on the skipped native test; got {stdout}"
+    );
+
+    let evidence = evidence_for(workspace.path(), &records);
+    assert_eq!(
+        evidence["added_test_files"],
+        serde_json::json!([]),
+        "the silencing plugin is not a test file, so it must not be reported as an added test"
+    );
+    let regressions = evidence["native_regressions"]
+        .as_array()
+        .expect("evidence.json must record native regressions under a clear key");
+    assert!(
+        regressions.iter().any(|r| r["attempt"] == serde_json::json!(1)
+            && r["regressions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str().unwrap_or("").contains("test_scale_doubles"))),
+        "attempt 1's native regression must name the skipped test; got {regressions:?}"
     );
 }
 

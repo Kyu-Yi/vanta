@@ -25,7 +25,7 @@
 // `blocking` flag (identified by a MISSING `schema_version`) are reported as
 // "static signals unavailable" instead of as "no static signals".
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,6 +34,7 @@ use crate::agents::attacker::GeneratedTest;
 use crate::core::TestResult;
 use crate::pipeline::candidate::TestCommand;
 use crate::pipeline::harness::{self, NativeSuiteReport, StaticDiagnostic, StaticRun, TestExecutionDetails};
+use crate::pipeline::patch::patch_deleted_paths;
 use crate::sandbox::{SandboxKind, backend_kind_label};
 use crate::session::SessionRecord;
 
@@ -194,21 +195,40 @@ pub async fn rerun_signals(
     let (static_signals, static_signals_available) =
         load_blocking_static_signals(sessions, sid, final_attempt)?;
 
-    // ---- 6. The bad tree is the patched snapshot the session already kept ----
-    let bad_tree = sessions
-        .join(sid)
-        .join("debug")
-        .join(format!("attempt_{final_attempt}_patched_tree"));
-    if !bad_tree.is_dir() {
-        return Err(format!(
-            "patched tree for attempt {final_attempt} not found at {} — cannot reconstruct the bad side",
-            bad_tree.display()
-        )
-        .into());
-    }
+    // ---- 6. The bad tree: the GRADED snapshot the session kept ----
+    // [VANTA-WHY] The bad side has to be the tree the driver actually GRADED —
+    // the sanitized one, where every collected test and every `conftest.py` is
+    // the original and patch-added test files are dropped. Re-running the
+    // signals on the patch's own tree (`attempt_N_patched_tree`) is precisely
+    // the hole the graded tree closes: a patch-added `conftest.py` can force
+    // every outcome to "passed" and make a true signal read as spurious.
+    let (bad_tree, bad_tree_source, _bad_tmp_guard) =
+        resolve_bad_tree(sessions, sid, final_attempt, cfg.base_tree.as_deref())?;
+    println!(
+        "  bad tree: {} → {}",
+        bad_tree_source.label(),
+        bad_tree.display()
+    );
 
     // ---- 7. The good tree: a directory, or base + patch ----
     let (good_tree, good_tree_from_patch, _good_tmp_guard) = resolve_good_tree(&cfg)?;
+    // [VANTA-WHY] The same removal has to hold on BOTH sides, or the comparison
+    // measures the tree construction rather than the patch. When the good tree
+    // was materialised from a patch, its patch-added test files are dropped and
+    // its patch-modified ones restored from the base — the rule the driver
+    // applies to the bad side.
+    let (good_tree, good_tree_sanitized, _good_sanitize_guard) = sanitize_good_tree(
+        &good_tree,
+        good_tree_from_patch,
+        cfg.base_tree.as_deref(),
+        &cfg.good_tree,
+    )?;
+    if good_tree_sanitized {
+        println!(
+            "  good tree: sanitized (patch-added test files dropped, modified ones restored) → {}",
+            good_tree.display()
+        );
+    }
 
     // ---- 8. The test command to re-run with ----
     let (test_cmd_text, test_cmd) = match test_cmd_str {
@@ -431,8 +451,13 @@ pub async fn rerun_signals(
         "rerun_backend": rerun_backend,
         "test_cmd": test_cmd_text,
         "bad_tree": bad_tree.display().to_string(),
+        // [VANTA-WHY] Which construction produced the bad side, so a reader can
+        // tell a re-run on the exact graded tree from one on a legacy session
+        // whose tree had to be rebuilt from the recorded integrity lists.
+        "bad_tree_source": bad_tree_source.label(),
         "good_tree": good_tree.display().to_string(),
         "good_tree_from_patch": good_tree_from_patch,
+        "good_tree_sanitized": good_tree_sanitized,
         "static_signals_available": static_signals_available,
         "signals": entries,
     });
@@ -948,6 +973,180 @@ fn static_discriminates(bad_present: bool, good_present: bool) -> Option<bool> {
         (true, false) => Some(true),
         (true, true) => Some(false),
     }
+}
+
+/// Where the bad side's tree came from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BadTreeSource {
+    /// `debug/attempt_N_graded_tree` — the exact sanitized tree the driver graded.
+    GradedSnapshot,
+    /// Rebuilt from `debug/attempt_N_patched_tree` plus the session's recorded
+    /// test-integrity lists, for a session that predates the graded snapshot.
+    RebuiltFromRecords,
+}
+
+impl BadTreeSource {
+    fn label(self) -> &'static str {
+        match self {
+            BadTreeSource::GradedSnapshot => "graded_snapshot",
+            BadTreeSource::RebuiltFromRecords => "rebuilt_from_records",
+        }
+    }
+}
+
+/// Resolve the bad side's tree: the graded snapshot, or a rebuild from the
+/// session's own records for a session that predates it.
+///
+/// [VANTA-WHY] The fallback REFUSES rather than guesses. The recorded lists say
+/// which files the patch ADDED and which existing tests it REWROTE. The added
+/// ones can be deleted exactly. A rewritten test's original contents are not in
+/// the session at all, so they can only come from `base_tree` (the original
+/// repo); without either the snapshot or those originals, a rebuilt tree would
+/// run the patch's own version of a test — the exact thing the graded tree
+/// exists to prevent — so the rerun stops instead.
+fn resolve_bad_tree(
+    sessions: &Path,
+    sid: &str,
+    final_attempt: u32,
+    base_tree: Option<&Path>,
+) -> Result<(PathBuf, BadTreeSource, Option<tempfile::TempDir>), Box<dyn std::error::Error + Send + Sync>>
+{
+    let debug = sessions.join(sid).join("debug");
+    let graded = debug.join(format!("attempt_{final_attempt}_graded_tree"));
+    if graded.is_dir() {
+        return Ok((graded, BadTreeSource::GradedSnapshot, None));
+    }
+    let patched = debug.join(format!("attempt_{final_attempt}_patched_tree"));
+    if !patched.is_dir() {
+        return Err(format!(
+            "no tree for attempt {final_attempt}: neither {} nor {} exists — cannot reconstruct \
+             the bad side",
+            graded.display(),
+            patched.display()
+        )
+        .into());
+    }
+
+    let (added, modified) = read_recorded_test_integrity(sessions, sid)?;
+    let guard = tempfile::TempDir::new()?;
+    let tree = guard.path().to_path_buf();
+    copy_tree_recursive(&patched, &tree)?;
+    for rel in &added {
+        let target = tree.join(rel);
+        if target.is_file() {
+            fs::remove_file(&target)?;
+        }
+    }
+    for rel in &modified {
+        let base = base_tree.ok_or_else(|| {
+            format!(
+                "attempt {final_attempt} has no graded-tree snapshot and the patch rewrote {}; \
+                 their originals are not recorded, so --base-tree (the original tree) is required \
+                 — refusing to guess",
+                modified.join(", ")
+            )
+        })?;
+        let src = base.join(rel);
+        let contents = fs::read_to_string(&src).map_err(|e| {
+            format!(
+                "the original of the patch-modified test {rel} is not readable at {} ({e}) — \
+                 refusing to guess",
+                src.display()
+            )
+        })?;
+        let dst = tree.join(rel);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dst, contents)?;
+    }
+    Ok((tree, BadTreeSource::RebuiltFromRecords, Some(guard)))
+}
+
+/// The session's recorded test-integrity lists: `(added_test_files,
+/// modified_existing_tests)`.
+///
+/// [VANTA-WHY] `Err` when the evidence file is absent or lacks either key: a v0
+/// evidence file records nothing about the patch's test edits, and rebuilding
+/// from it would be a guess.
+fn read_recorded_test_integrity(
+    sessions: &Path,
+    sid: &str,
+) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
+    let path = sessions.join(format!("{sid}_evidence.json"));
+    let text = fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "{} is unreadable ({e}) — no graded-tree snapshot and no recorded test-integrity \
+             lists; refusing to guess the sanitized tree",
+            path.display()
+        )
+    })?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("{} is not valid JSON ({e})", path.display()))?;
+    let list = |key: &str| -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let arr = json.get(key).and_then(|v| v.as_array()).ok_or_else(|| {
+            format!(
+                "{} has no `{key}` list (v0 evidence?) — this session predates the graded-tree \
+                 snapshot and records nothing to rebuild the sanitized tree from; refusing to guess",
+                path.display()
+            )
+        })?;
+        Ok(arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect())
+    };
+    Ok((list("added_test_files")?, list("modified_existing_tests")?))
+}
+
+/// Apply the driver's sanitizing rule to the good side.
+///
+/// [VANTA-WHY] A directory handed in as-is is already a tree the caller vouches
+/// for and there is no patch to derive an added/modified list from, so nothing
+/// is removed. A tree materialised from a patch gets the full rule: every
+/// collected test and `conftest.py` present in the base is restored to its
+/// original contents, anything the patch added is dropped. Returns
+/// `(tree, sanitized, tempdir_guard)`; the guard must outlive the measurements.
+fn sanitize_good_tree(
+    good_tree: &Path,
+    good_tree_from_patch: bool,
+    base_tree: Option<&Path>,
+    good_patch: &Path,
+) -> Result<(PathBuf, bool, Option<tempfile::TempDir>), Box<dyn std::error::Error + Send + Sync>> {
+    if !good_tree_from_patch {
+        return Ok((good_tree.to_path_buf(), false, None));
+    }
+    let base = base_tree.ok_or(
+        "--good-tree is a patch file; --base-tree PATH (the tree it applies to) is required",
+    )?;
+    let patch_text = fs::read_to_string(good_patch)?;
+    let base_files = tree_files_map(base)?;
+    let good_files = tree_files_map(good_tree)?;
+    let tree = harness::native_tree_with_original_tests(
+        &base_files,
+        &good_files,
+        &patch_deleted_paths(&patch_text),
+    );
+    if tree.added_test_files.is_empty() && tree.modified_existing_tests.is_empty() {
+        return Ok((good_tree.to_path_buf(), false, None));
+    }
+    let guard = tempfile::TempDir::new()?;
+    for (path, contents) in &tree.files {
+        let out = guard.path().join(path);
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&out, contents)?;
+    }
+    Ok((guard.path().to_path_buf(), true, Some(guard)))
+}
+
+/// Read a whole tree into `path -> contents`, under the same noise rules as
+/// `read_tree_concat`.
+fn tree_files_map(root: &Path) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut files: Vec<(String, String)> = Vec::new();
+    collect_tree_files(root, root, &mut files)?;
+    Ok(files.into_iter().collect())
 }
 
 /// Resolve the good tree: a directory used as-is, or a patch applied to a copy

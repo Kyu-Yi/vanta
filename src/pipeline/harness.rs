@@ -429,6 +429,23 @@ fn native_outcome(outcome: &str) -> Option<TestResult> {
 /// test that passed on the original and is MISSING from the patched report
 /// (collection error, crashed interpreter, deleted test file) is not evidence
 /// that the behaviour survived.
+///
+/// [VANTA-WHY] "Gone" is also how pass -> SKIPPED / XFAIL / DESELECTED is
+/// caught, and that is deliberate rather than incidental. `native_outcome` maps
+/// only `passed`/`subtests passed` and `failed`/`error`; a `skipped` (or an
+/// unknown future) outcome becomes `None` and is dropped from the patched
+/// report entirely, so the test lands in the `None` branch below and is counted
+/// as a regression. The same holds for a test pytest never ran at all because a
+/// config change deselected it (`-k`, `--deselect`, `--ignore`, a narrowed
+/// `python_files`): it is absent, so it is a regression.
+///
+/// This is the ONLY thing that catches those cases. `modified_test_config` is
+/// warn-only by design — a patch that rewrites `[tool.pytest.ini_options]` is
+/// reported, never itself rejected — so a patch CAN silence a test through
+/// `addopts` or a plugin, and the only defence is that a silenced test is a
+/// missing test and a missing test is a regression. Adding an explicit
+/// `Some(Skipped)` arm here would be redundant: the outcome is discarded before
+/// this function is ever called.
 pub fn native_regressions(
     original: &[(String, TestResult)],
     patched: &[(String, TestResult)],

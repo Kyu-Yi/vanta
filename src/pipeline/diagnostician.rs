@@ -896,6 +896,7 @@ mod tests {
             result,
             stdout: output.to_string(),
             stderr: String::new(),
+            exit_code: Some(1),
             timed_out: false,
             report_path_exists: true,
             sandbox_root: Some("sandbox".to_string()),

@@ -69,6 +69,19 @@ pub async fn actual_backend_label() -> Result<&'static str, Box<dyn Error + Send
     Ok(backend_kind_label(actual_backend_kind().await?))
 }
 
+/// Whether the shuru backend can actually be used on this machine right now:
+/// the CLI is present AND the VM boot test passes.
+///
+/// [VANTA-WHY] `actual_backend_kind` answers a different question — "what would
+/// `auto` pick under the current env?" With `VANTA_SANDBOX_BACKEND=subprocess`
+/// exported it reports `subprocess` even on a machine where shuru boots fine.
+/// The rerun needs the machine fact, not the preference: it must know whether a
+/// session recorded as `shuru` can be replayed at all, and whether an explicit
+/// subprocess→shuru upgrade is even possible.
+pub async fn shuru_usable() -> bool {
+    shuru_available() && shuru_boot_ok().await
+}
+
 /// Cached result of the shuru boot test. We run it ONCE per process because
 /// booting a VM takes ~1s and doing it on every Backend::spawn() (one per
 /// test in run_tests_parallel) would make the pipeline crawl.

@@ -50,6 +50,9 @@ struct CliArgs {
     /// Base tree the `--good-tree` patch applies to; required only when
     /// `--good-tree` is a patch file.
     base_tree: Option<PathBuf>,
+    /// Explicit opt-in to re-run a `subprocess`-recorded session under shuru.
+    /// Refused when the recorded `test_cmd` names a host path the VM cannot see.
+    allow_backend_upgrade: bool,
 }
 
 fn parse_args() -> Result<CliArgs, String> {
@@ -65,6 +68,7 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut rerun_signals: Option<String> = None;
     let mut good_tree: Option<PathBuf> = None;
     let mut base_tree: Option<PathBuf> = None;
+    let mut allow_backend_upgrade = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -144,6 +148,9 @@ fn parse_args() -> Result<CliArgs, String> {
                 }
                 base_tree = Some(PathBuf::from(&args[i]));
             }
+            "--allow-backend-upgrade" => {
+                allow_backend_upgrade = true;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -179,6 +186,7 @@ fn parse_args() -> Result<CliArgs, String> {
         rerun_signals,
         good_tree,
         base_tree,
+        allow_backend_upgrade,
     })
 }
 
@@ -187,7 +195,7 @@ fn print_help() {
         "Vanta M3 — Adversarial verification repair loop\n\
          \n\
          USAGE:\n    vanta --repo PATH [--issue PATH] [--max-attempts N] [--model NAME] [--open-pr] [--patch PATH] [--test-cmd CMD] [--original-tree PATH]\n    \
-         vanta --rerun-signals SESSION_ID --good-tree PATH [--base-tree PATH]\n\
+         vanta --rerun-signals SESSION_ID --good-tree PATH [--base-tree PATH] [--allow-backend-upgrade]\n\
          \n\
          OPTIONS:\n    --repo, -r PATH        Path to the repository to repair\n    \
          --issue, -i PATH       Path to the issue/bug description (default: auto-detect)\n    \
@@ -200,6 +208,7 @@ fn print_help() {
          --rerun-signals ID     Re-run session ID's review-mode rejection signals against --good-tree (writes vanta_sessions/ID_signal_reruns.json; no --repo needed)\n    \
          --good-tree PATH       Known-good source: a directory, or a patch file applied onto --base-tree\n    \
          --base-tree PATH       Base tree the --good-tree patch applies to (required only for a patch file)\n    \
+         --allow-backend-upgrade  Re-run a subprocess-recorded session under shuru (refused if test_cmd names a host path)\n    \
          --help, -h             Show this help\n"
     );
 }
@@ -222,6 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             session_id,
             good_tree,
             base_tree: cli.base_tree,
+            allow_backend_upgrade: cli.allow_backend_upgrade,
             sessions_dir: PathBuf::from("vanta_sessions"),
         };
         match vanta::pipeline::rerun::rerun_signals(config).await {

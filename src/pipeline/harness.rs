@@ -37,6 +37,7 @@ pub struct TestExecutionDetails {
     pub result: TestResult,
     pub stdout: String,
     pub stderr: String,
+    pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub report_path_exists: bool,
     pub sandbox_root: Option<String>,
@@ -48,6 +49,7 @@ impl TestExecutionDetails {
             result: TestResult::Error,
             stdout: String::new(),
             stderr: String::new(),
+            exit_code: None,
             timed_out: false,
             report_path_exists: false,
             sandbox_root: None,
@@ -65,6 +67,7 @@ impl TestExecutionDetails {
             result,
             stdout: String::new(),
             stderr: String::new(),
+            exit_code: None,
             timed_out: false,
             report_path_exists: true,
             sandbox_root: None,
@@ -204,6 +207,69 @@ pub struct NativeSuiteReport {
     /// False when no report was produced (missing pytest/plugin, timeout,
     /// crash). A gate that could not run must never be read as "no regressions".
     pub ran: bool,
+    /// The test command's exit status, when it ran at all.
+    pub exit_code: Option<i32>,
+    /// The last few non-empty stderr lines, for a run-failure report.
+    pub stderr_tail: String,
+}
+
+impl NativeSuiteReport {
+    /// The suite never started: the backend could not spawn, or the source tree
+    /// could not be written into the sandbox.
+    fn not_run() -> Self {
+        Self {
+            tests: Vec::new(),
+            ran: false,
+            exit_code: None,
+            stderr_tail: String::new(),
+        }
+    }
+
+    /// The suite started but produced no usable report (timeout, crash, bad
+    /// JSON, or a collection error). Carries the exit code and stderr tail so a
+    /// caller can REPORT why the tree could not be measured instead of reading
+    /// the emptiness as "the tree has no tests".
+    fn failed_run(exit_code: Option<i32>, stderr_tail: String) -> Self {
+        Self {
+            tests: Vec::new(),
+            ran: false,
+            exit_code,
+            stderr_tail,
+        }
+    }
+
+    /// Did this tree produce no usable test set — because the suite never ran,
+    /// or because it ran and collected ZERO tests?
+    ///
+    /// [VANTA-WHY] Fix 2 of the rerun fixes. `lookup_native` returns `None` both
+    /// when a tree's suite ran and genuinely lacks a nodeid (item 11's absence,
+    /// which discriminates) and when the suite produced nothing at all (a broken
+    /// command, which measures nothing). The two are only distinguishable by
+    /// asking whether the tree collected anything, so that question is a method.
+    pub fn collected_nothing(&self) -> bool {
+        !self.ran || self.tests.is_empty()
+    }
+}
+
+/// The last few non-empty lines of a tool's stderr, for a run-failure note.
+///
+/// [VANTA-WHY] A failed test command explains itself at the END of stderr —
+/// pytest prints the collection error and its traceback last. The whole stream
+/// can be tens of KB, so the tail is what makes a `tree_run_failed` note
+/// actionable without burying the reader.
+pub fn stderr_tail(text: &str) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let tail = lines[lines.len().saturating_sub(3)..].join(" | ");
+    if tail.chars().count() <= 300 {
+        return tail;
+    }
+    let mut out: String = tail.chars().take(299).collect();
+    out.push('…');
+    out
 }
 
 /// Run the repository's own test suite against a source tree.
@@ -213,19 +279,11 @@ pub struct NativeSuiteReport {
 pub async fn run_native_suite(source: &str, test_cmd: &TestCommand) -> NativeSuiteReport {
     let sb = match Backend::spawn().await {
         Ok(b) => b,
-        Err(_) => {
-            return NativeSuiteReport {
-                tests: Vec::new(),
-                ran: false,
-            }
-        }
+        Err(_) => return NativeSuiteReport::not_run(),
     };
     if write_source_files(sb.root(), source).is_err() {
         sb.destroy();
-        return NativeSuiteReport {
-            tests: Vec::new(),
-            ran: false,
-        };
+        return NativeSuiteReport::not_run();
     }
     let _ = write_conftest(sb.root());
 
@@ -240,10 +298,7 @@ pub async fn run_native_suite(source: &str, test_cmd: &TestCommand) -> NativeSui
         .await;
     let report = match exec {
         Ok(e) => parse_native_report(&sb.root().join("report.json"), &e),
-        Err(_) => NativeSuiteReport {
-            tests: Vec::new(),
-            ran: false,
-        },
+        Err(_) => NativeSuiteReport::not_run(),
     };
     sb.destroy();
     report
@@ -251,23 +306,15 @@ pub async fn run_native_suite(source: &str, test_cmd: &TestCommand) -> NativeSui
 
 /// Parse a pytest JSON report into per-test outcomes.
 fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuiteReport {
+    let tail = stderr_tail(&exec.stderr);
     if exec.timed_out {
-        return NativeSuiteReport {
-            tests: Vec::new(),
-            ran: false,
-        };
+        return NativeSuiteReport::failed_run(exec.exit_code, tail);
     }
     let Ok(text) = fs::read_to_string(report_path) else {
-        return NativeSuiteReport {
-            tests: Vec::new(),
-            ran: false,
-        };
+        return NativeSuiteReport::failed_run(exec.exit_code, tail);
     };
     let Ok(report) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return NativeSuiteReport {
-            tests: Vec::new(),
-            ran: false,
-        };
+        return NativeSuiteReport::failed_run(exec.exit_code, tail);
     };
     let mut tests = Vec::new();
     if let Some(arr) = report["tests"].as_array() {
@@ -281,7 +328,12 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
             }
         }
     }
-    NativeSuiteReport { tests, ran: true }
+    NativeSuiteReport {
+        tests,
+        ran: true,
+        exit_code: exec.exit_code,
+        stderr_tail: tail,
+    }
 }
 
 /// Map one pytest-json-report `outcome` string to a `TestResult`.
@@ -501,6 +553,7 @@ pub fn parse_pytest_report_detailed(
             result: TestResult::Error,
             stdout: exec.stdout.clone(),
             stderr: exec.stderr.clone(),
+            exit_code: exec.exit_code,
             timed_out: true,
             report_path_exists: report_path.exists(),
             sandbox_root,
@@ -522,6 +575,7 @@ pub fn parse_pytest_report_detailed(
                             result,
                             stdout: exec.stdout.clone(),
                             stderr: exec.stderr.clone(),
+                            exit_code: exec.exit_code,
                             timed_out: false,
                             report_path_exists: true,
                             sandbox_root,
@@ -535,6 +589,7 @@ pub fn parse_pytest_report_detailed(
         result: TestResult::Error,
         stdout: exec.stdout.clone(),
         stderr: exec.stderr.clone(),
+        exit_code: exec.exit_code,
         timed_out: false,
         report_path_exists: false,
         sandbox_root,
@@ -1256,6 +1311,8 @@ mod tests {
                 .map(|(name, result)| ((*name).to_string(), result.clone()))
                 .collect(),
             ran: true,
+            exit_code: Some(0),
+            stderr_tail: String::new(),
         }
     }
 
@@ -1291,10 +1348,7 @@ mod tests {
 
     #[test]
     fn a_suite_that_never_ran_is_not_read_as_collapsed() {
-        let original = NativeSuiteReport {
-            tests: Vec::new(),
-            ran: false,
-        };
+        let original = NativeSuiteReport::not_run();
         let patched = native_report(&[]);
 
         assert!(

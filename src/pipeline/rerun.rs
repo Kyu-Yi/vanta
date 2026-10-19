@@ -21,7 +21,8 @@
 //   - native (the repo's own) tests that regressed original-pass -> patched-fail;
 //   - new static findings in a touched file that BLOCKED the round.
 // The first two ride in the session JSONL; the third only exists in the
-// evidence file, which is why v0 sessions (no `blocking` flag) are reported as
+// evidence file, which is why sessions whose evidence file predates the
+// `blocking` flag (identified by a MISSING `schema_version`) are reported as
 // "static signals unavailable" instead of as "no static signals".
 
 use std::collections::HashSet;
@@ -32,7 +33,7 @@ use std::process::Command;
 use crate::agents::attacker::GeneratedTest;
 use crate::core::TestResult;
 use crate::pipeline::candidate::TestCommand;
-use crate::pipeline::harness::{self, NativeSuiteReport, StaticDiagnostic, StaticRun};
+use crate::pipeline::harness::{self, NativeSuiteReport, StaticDiagnostic, StaticRun, TestExecutionDetails};
 use crate::sandbox::{SandboxKind, backend_kind_label};
 use crate::session::SessionRecord;
 
@@ -51,6 +52,14 @@ pub struct RerunConfig {
     pub good_tree: PathBuf,
     /// Required when `good_tree` is a patch file: the tree the patch applies to.
     pub base_tree: Option<PathBuf>,
+    /// Explicit opt-in to re-run a `subprocess` session under shuru.
+    ///
+    /// [VANTA-WHY] Default is to honour the RECORDED backend, because a rerun
+    /// exists to explain the original rejection and a different isolation
+    /// boundary is a different experiment. Upgrading to shuru is stricter and so
+    /// is allowed — but only when asked for, and only when the test command can
+    /// actually run inside the VM (see `test_cmd_points_at_host_path`).
+    pub allow_backend_upgrade: bool,
     /// Directory holding the session artifacts (the driver hardcodes
     /// `vanta_sessions`, and this defaults to the same path at the call site).
     pub sessions_dir: PathBuf,
@@ -118,32 +127,51 @@ pub async fn rerun_signals(
     let test_cmd_str = summary_field(&start.summary, "test_cmd").map(str::to_string);
     let mode = summary_field(&start.summary, "mode").unwrap_or("unknown");
 
-    // ---- 3. Backend pinning — a rerun must not silently weaken isolation ----
+    // ---- 3. Backend pinning — a rerun must not silently change isolation ----
     // [VANTA-WHY] The recorded backend is the SECURITY BOUNDARY the original
-    // rejection was produced under. If the run used shuru (a microVM) and this
-    // machine can only do subprocess, re-running the untrusted generated tests
-    // would execute them straight on the host with no isolation — and, worse,
-    // any difference in result would be attributable to the missing boundary
-    // rather than to the patch, invalidating the comparison. So a shuru
-    // session on a non-shuru machine is a hard error, never a silent downgrade.
-    // The other direction is fine: running a subprocess session under shuru is
-    // STRICTER, so it is allowed, and the two recorded fields let a reader see
-    // the mismatch for themselves.
-    let rerun_kind = crate::sandbox::actual_backend_kind().await?;
+    // rejection was produced under, so the rerun runs under THAT boundary by
+    // default. This used to consult `actual_backend_kind()` instead, which on a
+    // machine where shuru boots resolved to shuru: session 23999eea recorded
+    // `subprocess` and its `test_cmd` was the HOST venv python
+    // (/Users/.../heretic/.venv/bin/python), which does not exist inside the
+    // VM — so pytest never ran on either tree and the empty result was misread
+    // as "the test is absent". Honouring the record keeps the rerun the SAME
+    // experiment as the original.
+    //   - shuru recorded → re-run under shuru; a machine that cannot boot shuru
+    //     is a hard error (a silent downgrade would run untrusted generated code
+    //     with no boundary, invalidating the comparison);
+    //   - subprocess recorded → re-run under subprocess. Upgrading to shuru is
+    //     stricter and is allowed, but ONLY as an explicit opt-in, and never when
+    //     the test command points at a host path the VM cannot see.
+    let need_shuru = recorded_backend == "shuru"
+        || (recorded_backend == "subprocess" && cfg.allow_backend_upgrade);
+    let shuru_usable = if need_shuru {
+        crate::sandbox::shuru_usable().await
+    } else {
+        false
+    };
+    let rerun_kind = resolve_rerun_backend(
+        &recorded_backend,
+        cfg.allow_backend_upgrade,
+        test_cmd_str.as_deref(),
+        shuru_usable,
+    )
+    .map_err(|reason| format!("refusing to re-run session {sid}: {reason}"))?;
     let rerun_backend = backend_kind_label(rerun_kind).to_string();
-    if recorded_backend == "shuru" && rerun_kind != SandboxKind::Shuru {
-        return Err(format!(
-            "refusing to re-run session {sid}: it recorded actual_backend=shuru but this machine's \
-             backend is {rerun_backend}. Downgrading to subprocess would run untrusted generated \
-             code without the security boundary the original session had, invalidating the rerun."
-        )
-        .into());
-    }
-    if recorded_backend == "subprocess" && rerun_kind == SandboxKind::Shuru {
+    if recorded_backend != rerun_backend {
         eprintln!(
-            "⚠ session {sid} recorded actual_backend=subprocess; re-running under shuru (stricter, \
-             not a downgrade)"
+            "⚠ session {sid} recorded actual_backend={recorded_backend}; re-running under \
+             {rerun_backend} (explicit --allow-backend-upgrade)"
         );
+    }
+    // [VANTA-WHY] `Backend::spawn()` resolves the backend from
+    // `VANTA_SANDBOX_BACKEND`, so pinning the variable here is what makes every
+    // harness call below run under the boundary just resolved — not under
+    // whatever the invoking shell happened to prefer.
+    // SAFETY: the rerun short-circuits before the driver; no other thread in
+    // this process reads or writes the environment at this point.
+    unsafe {
+        std::env::set_var("VANTA_SANDBOX_BACKEND", rerun_backend.as_str());
     }
 
     // ---- 4. The FINAL attempt and where its records begin ----
@@ -249,6 +277,7 @@ pub async fn rerun_signals(
                 bad: None,
                 good: None,
                 disc: None,
+                note: Some("source unavailable in shared_tests.json".to_string()),
                 entry: serde_json::json!({
                     "kind": "generated_test",
                     "id": name,
@@ -260,36 +289,36 @@ pub async fn rerun_signals(
             });
             continue;
         };
-        let bad = harness::run_single_test_with_timeout(
+        let bad_details = harness::run_single_test_with_timeout(
             &bad_concat,
             &test.test_source,
             &test_cmd,
             timeout,
         )
-        .await
-        .result;
-        let good = harness::run_single_test_with_timeout(
+        .await;
+        let good_details = harness::run_single_test_with_timeout(
             &good_concat,
             &test.test_source,
             &test_cmd,
             timeout,
         )
-        .await
-        .result;
-        let disc = outcome_discriminates(Some(&bad), Some(&good));
+        .await;
+        let (bad_label, good_label, disc, note) =
+            generated_signal_observation(&bad_details, &good_details);
         results.push(SignalResult {
             kind: "generated_test",
             id: name.clone(),
-            bad: Some(test_result_name(&bad)),
-            good: Some(test_result_name(&good)),
+            bad: Some(bad_label.clone()),
+            good: Some(good_label.clone()),
             disc,
+            note: note.clone(),
             entry: serde_json::json!({
                 "kind": "generated_test",
                 "id": name,
-                "bad_outcome": test_result_name(&bad),
-                "good_outcome": test_result_name(&good),
+                "bad_outcome": bad_label,
+                "good_outcome": good_label,
                 "discriminates": option_bool(disc),
-                "note": serde_json::Value::Null,
+                "note": note.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
             }),
         });
     }
@@ -297,20 +326,7 @@ pub async fn rerun_signals(
     for nodeid in &native_regressions {
         let (bad, good, note) = match &native_reports {
             Some((bad_report, good_report)) => {
-                let bad_result = lookup_native(bad_report, nodeid);
-                let good_result = lookup_native(good_report, nodeid);
-                // [VANTA-WHY] Item 11: a native test present-and-failing on the
-                // bad tree and ABSENT from the good tree DOES discriminate — the
-                // good tree does not even contain the test the bad tree regressed,
-                // which is as strong a difference as pass-vs-fail. `None` here is
-                // the "absent" observation, not a missing measurement, and
-                // `outcome_discriminates` already maps Failed/absent -> Some(true).
-                let note = if good_result.is_none() {
-                    Some("absent from the good tree".to_string())
-                } else {
-                    None
-                };
-                (bad_result, good_result, note)
+                native_signal_observation(bad_report, good_report, nodeid)
             }
             None => (None, None, Some("native suite not re-run".to_string())),
         };
@@ -323,6 +339,7 @@ pub async fn rerun_signals(
             bad: bad_name.clone(),
             good: good_name.clone(),
             disc,
+            note: note.clone(),
             entry: serde_json::json!({
                 "kind": "native_test",
                 "id": nodeid,
@@ -353,6 +370,7 @@ pub async fn rerun_signals(
             bad: Some(bad_present.to_string()),
             good: Some(good_present.to_string()),
             disc,
+            note: None,
             entry: serde_json::json!({
                 "kind": "static_finding",
                 "tool": signal.tool,
@@ -379,13 +397,22 @@ pub async fn rerun_signals(
             Some(false) => "no",
             None => "?",
         };
+        // [VANTA-WHY] Fix 2: a `tree_run_failed` note has to be VISIBLE, not only
+        // in the JSON. Without it a failed run reads as `bad=- good=- ?` and the
+        // reader cannot tell "the suite could not run" from "the signal did not
+        // reproduce", which are different facts about the session.
+        let note = match &r.note {
+            Some(note) => format!("  {}", truncate(note, 90)),
+            None => String::new(),
+        };
         println!(
-            "{:<16} {:<46} {:<8} {:<8} {}",
+            "{:<16} {:<46} {:<8} {:<8} {}{}",
             r.kind,
             truncate(&r.id, 46),
             r.bad.clone().unwrap_or_else(|| "-".to_string()),
             r.good.clone().unwrap_or_else(|| "-".to_string()),
             verdict,
+            note,
         );
     }
     let total = results.len();
@@ -423,6 +450,9 @@ struct SignalResult {
     bad: Option<String>,
     good: Option<String>,
     disc: Option<bool>,
+    /// A human-readable caveat for the row — a run failure, an unavailable
+    /// source. `None` when the row is a plain observation.
+    note: Option<String>,
     entry: serde_json::Value,
 }
 
@@ -564,13 +594,13 @@ fn collect_native_regressions(records: &[SessionRecord], start_index: usize) -> 
 
 /// The blocking static findings the final attempt recorded in the evidence file.
 ///
-/// Returns `(signals, available)`. `available == false` is the LEGACY-v0 case:
-/// the evidence file is missing, has no `new_static_findings` key, or none of
-/// its entries carries a `blocking` key at all. In every one of those cases the
-/// caller must report static signals as UNAVAILABLE and never as "there were
-/// none" — a v0 run recorded its findings but not which of them rejected, so
-/// reading absence as a clean bill of health would hide the very signal the
-/// 40e84874 post-mortem was about.
+/// Returns `(signals, available)`. `available == false` is the LEGACY case: the
+/// evidence file is missing, or it has NO top-level `schema_version`, which is
+/// the marker of the pre-`blocking` format. In the legacy case the caller must
+/// report static signals as UNAVAILABLE and never as "there were none" — a v0
+/// run recorded its findings but not which of them rejected, so reading absence
+/// as a clean bill of health would hide the very signal the 40e84874 post-mortem
+/// was about.
 fn load_blocking_static_signals(
     sessions_dir: &Path,
     sid: &str,
@@ -587,25 +617,32 @@ fn load_blocking_static_signals(
     let text = fs::read_to_string(&path)?;
     let value: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| format!("{}: not valid JSON: {e}", path.display()))?;
-    let Some(array) = value.get("new_static_findings").and_then(|v| v.as_array()) else {
+    // [VANTA-WHY] Fix 3. The ONLY thing that makes an evidence file legacy is the
+    // ABSENCE of `schema_version`: every file the stamped writer produces carries
+    // it, and a file without it predates the `blocking` flag. This used to infer
+    // legacy from "no entry has a `blocking` key" instead, which misfires on the
+    // most common current file — `schema_version: 1` with an EMPTY
+    // `new_static_findings` array — because an empty array trivially has no
+    // entry carrying any key. An empty finding list is a statement ("no new
+    // findings"), never a missing measurement.
+    if value.get("schema_version").is_none() {
         eprintln!(
-            "⚠ {} has no `new_static_findings` key — static signals are UNAVAILABLE",
-            path.display()
-        );
-        return Ok((Vec::new(), false));
-    };
-    // [VANTA-WHY] The `blocking` key is what distinguishes "the finding that
-    // rejected" from "the findings that were merely reported". Its TOTAL
-    // absence means the file predates the flag (v0), so which findings blocked
-    // cannot be reconstructed — mark the whole category unavailable rather than
-    // pretending the findings below are the blocking set.
-    if !array.iter().any(|entry| entry.get("blocking").is_some()) {
-        eprintln!(
-            "⚠ {} records static findings without a `blocking` key (legacy v0) — static signals are UNAVAILABLE",
+            "⚠ {} has no `schema_version` (legacy format, pre-`blocking`) — static signals are UNAVAILABLE",
             path.display()
         );
         return Ok((Vec::new(), false));
     }
+    let Some(array) = value.get("new_static_findings").and_then(|v| v.as_array()) else {
+        eprintln!(
+            "⚠ {} has a `schema_version` but no `new_static_findings` array — static signals are UNAVAILABLE",
+            path.display()
+        );
+        return Ok((Vec::new(), false));
+    };
+    // [VANTA-WHY] The `blocking` key distinguishes "the finding that rejected"
+    // from "the findings that were merely reported". With `schema_version`
+    // present, the flag is part of the schema, so an empty array means "no
+    // blocking findings" — a real, reportable zero.
     let mut signals = Vec::new();
     for entry in array {
         if entry.get("attempt").and_then(|v| v.as_u64()) != Some(u64::from(final_attempt)) {
@@ -668,6 +705,210 @@ fn lookup_native(report: &NativeSuiteReport, nodeid: &str) -> Option<TestResult>
         .iter()
         .find(|(name, _)| name == nodeid)
         .map(|(_, result)| result.clone())
+}
+
+/// Which backend a rerun must run under, given what its session recorded.
+///
+/// [VANTA-WHY] Fix 1: the rerun runs under the RECORDED backend by default. The
+/// old code asked this machine's `actual_backend_kind()` instead, so on a Mac
+/// where shuru boots a `subprocess` session was silently re-run inside the VM —
+/// and since its `test_cmd` named a HOST venv python, pytest never started, and
+/// the empty result was reported as the test being absent. Honouring the record
+/// keeps the rerun the same experiment as the original run.
+///
+/// `shuru_usable` is passed in rather than probed here so the decision is a pure
+/// function of the machine facts (and therefore unit-testable).
+///
+/// * `shuru` recorded → shuru, and a machine that cannot boot shuru is a hard
+///   error: a silent downgrade would run untrusted generated code with no
+///   boundary at all, invalidating the comparison.
+/// * `subprocess` recorded → subprocess. Upgrading to shuru is STRICTER and
+///   allowed, but only via `allow_upgrade`, and never when `test_cmd` names a
+///   host path — the VM cannot see it, so the suite would fail to run and the
+///   rerun would measure nothing.
+/// * anything else → an error. An unrecognised record is not a licence to guess
+///   which boundary to run untrusted code under.
+fn resolve_rerun_backend(
+    recorded_backend: &str,
+    allow_upgrade: bool,
+    test_cmd: Option<&str>,
+    shuru_usable: bool,
+) -> Result<SandboxKind, String> {
+    match recorded_backend {
+        "shuru" => {
+            if !shuru_usable {
+                return Err(
+                    "it recorded actual_backend=shuru but shuru is not usable on this machine. \
+                     Downgrading to subprocess would run untrusted generated code without the \
+                     security boundary the original session had, invalidating the rerun."
+                        .to_string(),
+                );
+            }
+            Ok(SandboxKind::Shuru)
+        }
+        "subprocess" => {
+            if !allow_upgrade {
+                return Ok(SandboxKind::Subprocess);
+            }
+            if test_cmd_points_at_host_path(test_cmd) {
+                return Err(format!(
+                    "--allow-backend-upgrade was given, but test_cmd names a host path \
+                     ({}). That path does not exist inside the shuru VM, so the suite would \
+                     fail to run there and the rerun would measure nothing. Drop \
+                     --allow-backend-upgrade to re-run under the recorded subprocess backend.",
+                    test_cmd.unwrap_or("")
+                ));
+            }
+            if !shuru_usable {
+                return Err(
+                    "--allow-backend-upgrade was given but shuru is not usable on this machine."
+                        .to_string(),
+                );
+            }
+            Ok(SandboxKind::Shuru)
+        }
+        other => Err(format!(
+            "it recorded actual_backend={other}, which is neither `subprocess` nor `shuru`; \
+             cannot decide which security boundary to re-run the untrusted code under"
+        )),
+    }
+}
+
+/// Does a test command name a path that only exists on the host?
+///
+/// [VANTA-WHY] A shuru run happens inside a Linux microVM that does not mount the
+/// host's home directory. A command like
+/// `/Users/nathan/heretic/.venv/bin/python -m pytest` therefore CANNOT run in the
+/// VM — and that failure is silent: pytest simply never starts. The check is
+/// deliberately a small, explicit prefix list rather than "any absolute path":
+/// `/usr/bin/python` and `/usr/local/bin/...` are perfectly valid INSIDE the VM,
+/// so treating every absolute path as host-only would refuse upgrades that would
+/// have worked.
+fn test_cmd_points_at_host_path(test_cmd: Option<&str>) -> bool {
+    let Some(cmd) = test_cmd else {
+        return false;
+    };
+    cmd.split_whitespace()
+        .any(|token| looks_like_host_path(token.trim_matches(|c| c == '"' || c == '\'')))
+}
+
+/// Is this single token a macOS host path (user home, mounted volume, or the
+/// Homebrew prefix)?
+fn looks_like_host_path(token: &str) -> bool {
+    token.starts_with("/Users/")
+        || token.starts_with("/Volumes/")
+        || token.starts_with("/opt/homebrew/")
+}
+
+/// The observation for one generated-test signal, from both trees' runs.
+///
+/// [VANTA-WHY] Fix 2: `report_path_exists == false` means the test command did
+/// NOT produce a usable report on that tree — it never started, or pytest
+/// collected nothing. That tree was never measured, so the signal is
+/// UNDECIDABLE (`None`), not "the test is absent" and certainly not
+/// discriminating. `report_path_exists` is exactly the "did this tree reach a
+/// verdict at all" flag — a plain assertion failure sets it true.
+///
+/// Returns `(bad_label, good_label, discriminates, note)`.
+fn generated_signal_observation(
+    bad: &TestExecutionDetails,
+    good: &TestExecutionDetails,
+) -> (String, String, Option<bool>, Option<String>) {
+    let bad_failed_to_run = !bad.report_path_exists;
+    let good_failed_to_run = !good.report_path_exists;
+    if !bad_failed_to_run && !good_failed_to_run {
+        return (
+            test_result_name(&bad.result),
+            test_result_name(&good.result),
+            outcome_discriminates(Some(&bad.result), Some(&good.result)),
+            None,
+        );
+    }
+    let (bad_label, note) = if bad_failed_to_run {
+        (
+            "run_failed".to_string(),
+            tree_run_failed_note("bad", bad.exit_code, &harness::stderr_tail(&bad.stderr)),
+        )
+    } else {
+        (test_result_name(&bad.result), String::new())
+    };
+    let (good_label, note) = if good_failed_to_run {
+        (
+            "run_failed".to_string(),
+            tree_run_failed_note("good", good.exit_code, &harness::stderr_tail(&good.stderr)),
+        )
+    } else {
+        (test_result_name(&good.result), note)
+    };
+    (bad_label, good_label, None, Some(note))
+}
+
+/// The observation for one native-test signal, from both trees' suite reports.
+///
+/// [VANTA-WHY] Fix 2: `lookup_native` returning `None` used to mean one thing —
+/// "absent". It means two. Either the tree's suite RAN and simply does not
+/// contain the nodeid (item 11's absence: a real difference, and it
+/// discriminates), or the suite produced NO usable report at all (a command
+/// that could not run, which measured nothing). Reading the second as the first
+/// manufactured a discriminating signal out of a tree that was never tested —
+/// exactly the 23999eea misreport. `collected_nothing` is the discriminator, and
+/// a failed run is reported as `tree_run_failed` with its exit code and stderr.
+///
+/// Returns `(bad, good, note)`.
+fn native_signal_observation(
+    bad_report: &NativeSuiteReport,
+    good_report: &NativeSuiteReport,
+    nodeid: &str,
+) -> (Option<TestResult>, Option<TestResult>, Option<String>) {
+    if bad_report.collected_nothing() {
+        return (
+            None,
+            None,
+            Some(tree_run_failed_note(
+                "bad",
+                bad_report.exit_code,
+                &bad_report.stderr_tail,
+            )),
+        );
+    }
+    if good_report.collected_nothing() {
+        return (
+            None,
+            None,
+            Some(tree_run_failed_note(
+                "good",
+                good_report.exit_code,
+                &good_report.stderr_tail,
+            )),
+        );
+    }
+    let bad_result = lookup_native(bad_report, nodeid);
+    let good_result = lookup_native(good_report, nodeid);
+    let note = if good_result.is_none() {
+        Some("absent from the good tree".to_string())
+    } else {
+        None
+    };
+    (bad_result, good_result, note)
+}
+
+/// The note for a tree whose test command produced no usable measurement.
+///
+/// [VANTA-WHY] Fix 2: the exit code and the last stderr lines are what turn "we
+/// have no number" into something a reader can act on — a nonzero exit with
+/// "No such file or directory" says the command never started, while exit 2 with
+/// a collection error says the tree does not import. Both must be reported as
+/// `tree_run_failed`, never as the test being absent.
+fn tree_run_failed_note(tree: &str, exit_code: Option<i32>, stderr_tail: &str) -> String {
+    let exit = exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let tail = stderr_tail.trim();
+    if tail.is_empty() {
+        format!("tree_run_failed: {tree} tree produced no test report (exit={exit})")
+    } else {
+        format!("tree_run_failed: {tree} tree produced no test report (exit={exit}); stderr: {tail}")
+    }
 }
 
 /// The discrimination rule for a test signal.
@@ -1032,5 +1273,289 @@ mod tests {
         let a = concat.find("# FILE: pkg/a.py").unwrap();
         let b = concat.find("# FILE: pkg/b.py").unwrap();
         assert!(a < b, "files must be sorted by relative path, got: {concat}");
+    }
+
+    // ---- Fix 1: the rerun honours the RECORDED backend -----------------------
+
+    /// [VANTA-WHY] Fix 1: a `subprocess` session is re-run under subprocess even
+    /// on a machine that CAN boot shuru. The old code asked the machine instead
+    /// of the record, silently moved the rerun into the VM, and the host-path
+    /// test command then never ran — session 23999eea's misreport.
+    #[test]
+    fn a_subprocess_session_reruns_under_subprocess_without_an_explicit_upgrade() {
+        let kind = resolve_rerun_backend(
+            "subprocess",
+            false,
+            Some("env PYTHONPATH=src /Users/nathan/heretic/.venv/bin/python -m pytest -q"),
+            true,
+        )
+        .expect("no upgrade was asked for, so the host path is irrelevant");
+        assert_eq!(kind, SandboxKind::Subprocess);
+    }
+
+    #[test]
+    fn a_shuru_session_reruns_under_shuru() {
+        assert_eq!(
+            resolve_rerun_backend("shuru", false, None, true).unwrap(),
+            SandboxKind::Shuru
+        );
+    }
+
+    /// [VANTA-WHY] A recorded shuru session on a machine that cannot boot shuru
+    /// must be a hard error: a silent downgrade would run the untrusted
+    /// generated tests on the host with no boundary at all.
+    #[test]
+    fn a_shuru_session_on_a_machine_without_shuru_is_refused() {
+        let err = resolve_rerun_backend("shuru", false, None, false).unwrap_err();
+        assert!(err.contains("shuru is not usable"), "got: {err}");
+    }
+
+    /// [VANTA-WHY] The explicit upgrade is the ONLY way a subprocess session may
+    /// leave subprocess, and it is refused when the recorded test command names a
+    /// host path — the VM cannot see it, so the suite would fail to run there and
+    /// the rerun would measure nothing.
+    #[test]
+    fn a_backend_upgrade_is_refused_when_the_test_cmd_names_a_host_path() {
+        let err = resolve_rerun_backend(
+            "subprocess",
+            true,
+            Some("/Users/nathan/heretic/.venv/bin/python -m pytest -q"),
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("host path"), "got: {err}");
+    }
+
+    #[test]
+    fn an_explicit_backend_upgrade_needs_a_machine_that_can_run_shuru() {
+        assert_eq!(
+            resolve_rerun_backend("subprocess", true, Some("python3 -m pytest -q"), true).unwrap(),
+            SandboxKind::Shuru
+        );
+        assert!(
+            resolve_rerun_backend("subprocess", true, None, false).is_err(),
+            "asking for an upgrade on a machine that cannot run shuru is an error"
+        );
+    }
+
+    /// [VANTA-WHY] An unrecognised record is not a licence to guess which
+    /// boundary to run untrusted code under.
+    #[test]
+    fn an_unknown_recorded_backend_is_refused() {
+        let err = resolve_rerun_backend("unknown", false, None, true).unwrap_err();
+        assert!(err.contains("neither `subprocess` nor `shuru`"), "got: {err}");
+    }
+
+    /// [VANTA-WHY] The host-path check must stay NARROW: `/usr/bin/python` is
+    /// perfectly valid INSIDE the VM, so treating every absolute path as
+    /// host-only would refuse upgrades that would have worked.
+    #[test]
+    fn host_path_detection_is_narrow() {
+        assert!(test_cmd_points_at_host_path(Some(
+            "/Users/nathan/heretic/.venv/bin/python -m pytest"
+        )));
+        assert!(test_cmd_points_at_host_path(Some(
+            "env PYTHONPATH=src /Volumes/Data/heretic/.venv/bin/python -m pytest"
+        )));
+        assert!(test_cmd_points_at_host_path(Some(
+            "\"/Users/nathan/venv/bin/python\" -m pytest"
+        )));
+        assert!(!test_cmd_points_at_host_path(Some("python3 -m pytest -q")));
+        assert!(!test_cmd_points_at_host_path(Some("/usr/bin/python3 -m pytest")));
+        assert!(!test_cmd_points_at_host_path(Some(
+            "env PYTHONPATH=src /usr/local/bin/python -m pytest"
+        )));
+        assert!(!test_cmd_points_at_host_path(None));
+    }
+
+    // ---- Fix 2: a tree that could not run is never "absent" ------------------
+
+    fn suite_report(tests: &[(&str, TestResult)], ran: bool) -> NativeSuiteReport {
+        NativeSuiteReport {
+            tests: tests
+                .iter()
+                .map(|(name, result)| ((*name).to_string(), result.clone()))
+                .collect(),
+            ran,
+            exit_code: Some(0),
+            stderr_tail: String::new(),
+        }
+    }
+
+    fn details(
+        result: TestResult,
+        report_path_exists: bool,
+        exit_code: Option<i32>,
+        stderr: &str,
+    ) -> TestExecutionDetails {
+        TestExecutionDetails {
+            result,
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+            exit_code,
+            timed_out: false,
+            report_path_exists,
+            sandbox_root: None,
+        }
+    }
+
+    /// [VANTA-WHY] Fix 2, the 23999eea case verbatim: the good tree's suite
+    /// produced nothing at all, so the nodeid is not "absent" — the tree was
+    /// never measured. The signal must be UNDECIDABLE and must carry the exit
+    /// code and stderr, never read as a discriminating difference.
+    #[test]
+    fn a_good_tree_that_could_not_run_is_tree_run_failed_not_absent() {
+        let bad = suite_report(&[("tests/test_k.py::K::test_x", TestResult::Failed)], true);
+        let good = NativeSuiteReport {
+            tests: Vec::new(),
+            ran: false,
+            exit_code: Some(127),
+            stderr_tail:
+                "env: /Users/nathan/heretic/.venv/bin/python: No such file or directory".to_string(),
+        };
+
+        let (bad_r, good_r, note) =
+            native_signal_observation(&bad, &good, "tests/test_k.py::K::test_x");
+
+        let note = note.expect("a failed run must carry a note");
+        assert!(note.starts_with("tree_run_failed"), "got: {note}");
+        assert!(note.contains("good tree"), "got: {note}");
+        assert!(note.contains("exit=127"), "got: {note}");
+        assert!(note.contains("No such file or directory"), "got: {note}");
+        assert_eq!(
+            outcome_discriminates(bad_r.as_ref(), good_r.as_ref()),
+            None,
+            "a tree that never ran cannot discriminate anything"
+        );
+    }
+
+    /// [VANTA-WHY] Fix 2 must NOT break item 11's real absence: when BOTH suites
+    /// ran and the good tree simply does not contain the regressed test, that is
+    /// a genuine difference and still discriminates.
+    #[test]
+    fn a_genuine_absence_still_discriminates() {
+        let bad = suite_report(&[("tests/test_k.py::K::test_x", TestResult::Failed)], true);
+        let good = suite_report(
+            &[("tests/test_k.py::K::test_other", TestResult::Passed)],
+            true,
+        );
+
+        let (bad_r, good_r, note) =
+            native_signal_observation(&bad, &good, "tests/test_k.py::K::test_x");
+
+        assert_eq!(note.as_deref(), Some("absent from the good tree"));
+        assert_eq!(bad_r, Some(TestResult::Failed));
+        assert_eq!(good_r, None);
+        assert_eq!(
+            outcome_discriminates(bad_r.as_ref(), good_r.as_ref()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_generated_test_whose_command_did_not_run_is_tree_run_failed() {
+        let bad = details(TestResult::Failed, true, Some(1), "");
+        let good = details(
+            TestResult::Error,
+            false,
+            Some(2),
+            "ERROR: file or directory not found: test_bate.py",
+        );
+
+        let (bad_label, good_label, disc, note) = generated_signal_observation(&bad, &good);
+
+        assert_eq!(bad_label, "Failed", "the tree that ran keeps its real outcome");
+        assert_eq!(good_label, "run_failed");
+        assert_eq!(disc, None);
+        let note = note.expect("a failed run must carry a note");
+        assert!(note.starts_with("tree_run_failed"), "got: {note}");
+        assert!(note.contains("exit=2"), "got: {note}");
+        assert!(note.contains("test_bate.py"), "got: {note}");
+    }
+
+    /// [VANTA-WHY] The untouched path must be unchanged: both trees ran, bad
+    /// failed, good passed → discriminates, no note.
+    #[test]
+    fn a_clean_generated_test_comparison_still_discriminates() {
+        let bad = details(TestResult::Failed, true, Some(1), "");
+        let good = details(TestResult::Passed, true, Some(0), "");
+
+        let (bad_label, good_label, disc, note) = generated_signal_observation(&bad, &good);
+
+        assert_eq!((bad_label.as_str(), good_label.as_str()), ("Failed", "Passed"));
+        assert_eq!(disc, Some(true));
+        assert!(note.is_none());
+    }
+
+    // ---- Fix 3: `schema_version`, not the `blocking` key, marks legacy -------
+
+    fn write_evidence(dir: &Path, sid: &str, json: &str) {
+        fs::write(dir.join(format!("{sid}_evidence.json")), json).unwrap();
+    }
+
+    /// [VANTA-WHY] Fix 3: the common CURRENT file — `schema_version: 1` with an
+    /// EMPTY `new_static_findings` array — must report static signals as
+    /// AVAILABLE with zero signals. The old code inferred legacy from "no entry
+    /// carries a `blocking` key", which an empty array satisfies vacuously.
+    #[test]
+    fn an_empty_finding_list_with_a_schema_version_is_available_not_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        write_evidence(
+            dir.path(),
+            "s1",
+            r#"{"schema_version":1,"new_static_findings":[]}"#,
+        );
+
+        let (signals, available) = load_blocking_static_signals(dir.path(), "s1", 1).unwrap();
+
+        assert!(available, "schema_version=1 means the file is current");
+        assert!(
+            signals.is_empty(),
+            "an empty list is zero signals, not an unknown"
+        );
+    }
+
+    /// [VANTA-WHY] Fix 3: legacy is exactly "no schema_version". A file that
+    /// predates the stamp recorded findings but not which blocked, so the
+    /// category is UNAVAILABLE — never "there were none".
+    #[test]
+    fn a_file_without_a_schema_version_is_legacy_and_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        write_evidence(
+            dir.path(),
+            "s2",
+            r#"{"new_static_findings":[{"attempt":1,"tool":"ruff","file":"a.py","code":"F821","message":"Undefined name"}]}"#,
+        );
+
+        let (signals, available) = load_blocking_static_signals(dir.path(), "s2", 1).unwrap();
+
+        assert!(
+            !available,
+            "no schema_version means the pre-`blocking` format"
+        );
+        assert!(signals.is_empty());
+    }
+
+    /// [VANTA-WHY] Fix 3 must not stop a current file from reporting its real
+    /// blocking findings — the whole reason the file is read.
+    #[test]
+    fn a_current_file_still_reports_its_blocking_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        write_evidence(
+            dir.path(),
+            "s3",
+            r#"{"schema_version":1,"new_static_findings":[
+                {"attempt":1,"tool":"ruff","file":"a.py","code":"F821","message":"Undefined name","blocking":true},
+                {"attempt":1,"tool":"mypy","file":"b.py","code":"return-value","message":"bad return","blocking":false},
+                {"attempt":2,"tool":"ruff","file":"c.py","code":"E501","message":"line too long","blocking":true}
+            ]}"#,
+        );
+
+        let (signals, available) = load_blocking_static_signals(dir.path(), "s3", 1).unwrap();
+
+        assert!(available);
+        assert_eq!(signals.len(), 1, "only attempt 1's BLOCKING finding counts");
+        assert_eq!(signals[0].code, "F821");
+        assert_eq!(signals[0].tool, "ruff");
     }
 }

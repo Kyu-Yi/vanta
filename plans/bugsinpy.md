@@ -394,18 +394,56 @@ token of each line) is the only function that answers "does this layer exist". `
 calls it too, rather than holding its own import binding, so the two stages cannot disagree about a
 name — only about a name that moved between them, which `plan_layers` above is what prevents.
 
-**Where the specs come from — four sources, unioned per bug, resolved at bake time.** BugsInPy's own
-install step is `setup.sh` (`python setup.py install`, plus extra `pip install`s), and
-`requirements.txt` is frequently empty — 0 bytes on all three PySnooper bugs, while `python_toolbox`
+**Where the specs come from — every source, read at both commits, unioned per bug, resolved at bake
+time.** BugsInPy's own install step is `setup.sh` (`python setup.py install`, plus extra `pip install`s),
+and `requirements.txt` is frequently empty — 0 bytes on all three PySnooper bugs, while `python_toolbox`
 and `decorator` exist only in `setup.sh` at bug 3. One source alone under-provisions, so
-`bake.resolve_bug_deps` unions, in this order:
+`bake.resolve_bug_deps` unions five sources:
 
 1. the BugsInPy `requirements.txt` for the bug;
 2. the `pip install …` lines of the BugsInPy `setup.sh` (parsed, measured — never guessed);
-3. the project's own declared **test** requirements at the buggy commit (`test_requirements.txt`,
-   `tests_require`, or a `tests` extra in `setup.py`);
+3. the project's own declared **test** requirements (`test_requirements.txt`, `tests_require`, or a
+   `tests` extra in `setup.py`);
 4. `install_requires`, read **statically** from `setup.py` (an AST walk, plus the file it names —
-   PySnooper/1–2 read `requirements.in`, PySnooper/3 `requirements.txt`).
+   PySnooper/1–2 read `requirements.in`, PySnooper/3 `requirements.txt`);
+5. the test side's **import closure** — the third-party top-level modules the test-side files
+   themselves import (`bake.test_import_closure`).
+
+Sources 3 and 4 are read at **both commits**, and source 5 at the **fixed** one. That is the graded
+tree (§1.2) rather than a preference: the source under test is the buggy commit's and the test side is
+the fix's, so a requirement the fix added is a requirement of the tree a run is graded on. Measured:
+PySnooper/2's fix vendors `tests/mini_toolbox/pathlib.py`, which does `import six` at module scope —
+`six` is named by no requirements file, no `setup.sh` and no `extras_require` at either commit, and
+`python-toolbox`, whose sources that helper was copied from, declares no dependencies of its own, so the
+union of sources 1–4 is a **no-op** for that bug. The tree under test imports `six`, so the layer has to
+have it.
+
+Read the other way, though, the fix is not authoritative either: a requirement the fix *drops* was
+still there for the buggy code. So each reference carries the commit it was read from (`DepRef.commit`)
+and §3.2's date rule below is applied **per declaration** — a fix-only requirement is held to the
+*fix's* date, not back-dated to the buggy commit's. BugsInPy's own two files are the exception: they are
+one file pair per bug describing the benchmark, so they are left unstamped and keep the buggy commit's
+date as their cutoff.
+
+Source 5's scope, since "the test side's imports" can be read several ways:
+
+- **Only the tree under test's test side** — `conftest.py`, `test_*`/`*_test.py`, and every `.py` under
+  a `test`/`tests` directory (`bake.test_side_paths` + `trees.is_test_path`). That is where a vendored
+  helper like `tests/mini_toolbox/` lives.
+- **Parsed with `ast`, never imported or executed.** Nothing third-party runs on the host (C3). A file
+  that does not parse as Python 3 is recorded and skipped: the target interpreter could not collect it
+  either, so its imports cannot be imports the suite makes.
+- **Third-party top-level modules only.** The interpreter's stdlib, the project's own package, and the
+  test side's own local modules are excluded. `bake.PY38_STDLIB` is a committed literal because 3.8
+  predates `sys.stdlib_module_names`, so the harness's own Python cannot be asked what is standard.
+- **An optional import is recorded, never installed.** An import inside `try/except ImportError`, or
+  behind a version check (`sys.version_info`, `PY2`, `six.PY3`), is a fallback: it goes in
+  `optional_imports` and not into `installs`, because installing a Python-2-only fallback on 3.8 would
+  fail the bake over a branch that can never be taken.
+- **An ambiguous module name stops the bake.** `import yaml` is PyYAML and `import bs4` is
+  beautifulsoup4; no canonicalisation recovers that. The closure names the module and refuses, and the
+  fix is a reviewed `module_distributions` entry in the split — a decision recorded in the protocol,
+  never a guess in the harness.
 
 Nothing is taken from anywhere else, and no package is ever chosen by hand. The union is **merged to
 one entry per package**, and every claim in that group must agree on one version, or `bake.DepConflict`
@@ -420,9 +458,14 @@ fails that bug and names every claim rather than picking one:
   different `==` pins, or two different bounds, are real conflicts and fail loudly. Not being able to
   reproduce the environment is the failure this check exists to surface.
 
-**Pinning.** Every third-party dep is pinned to the newest release published on or before the buggy
-commit's date (`bake.resolve_pins`, the only PyPI contact, at bake time while network is available),
-with two exceptions:
+**Pinning.** Every third-party dep is pinned to the newest release published on or before **its own
+declaration's** commit date — the buggy commit's date for a reference the buggy commit declared, or for
+anything BugsInPy's own files carry; the fixed commit's date for a reference only the fix declares and
+for every closure entry (`bake.resolve_pins`, the only PyPI contact, at bake time while network is
+available). The cutoff is per **declaration**, not per bug: a requirement the fix added was never in the
+buggy tree, so the buggy date would refuse the very release the fix's own environment had — and,
+read the other way, a requirement the buggy tree already declared is stamped with the buggy date and so
+cannot be upgraded past it. Two exceptions:
 
 - A package the harness already provides (`pytest`, `pytest-json-report`) is left at the harness
   version and recorded as such — in particular `pytest` is never downgraded, which would break the
@@ -436,9 +479,16 @@ with two exceptions:
   released after its 2018-03-29 commit) therefore resolves instead of refusing — see the split's
   `reviewed_changes` for what then has to be checked about the sandbox's ability to build it.
 
+`pins_after_commit_date` therefore has **two** expected reasons, and `pin_rule` distinguishes them: a
+BugsInPy reference pin installed as written, and a requirement only the fix declared, held to the fix's
+own date. A pin *inside* the window carries the same fields — `released_at`, `pin_rule`, and the
+`commit` its declaration came from — so that question can be asked of it too, instead of only of a late
+pin.
+
 Attribution is **per reference**, not per package (`DepRef.pin_source`): a pin the *project* wrote
 still obeys the date rule even when BugsInPy declared the same package as a range, and vice versa. The
-resolved set, each dep's source (file + line), the pin, the pin rule, the release date, and the
+resolved set, each dep's source (file + line), the pin, the pin rule, the release date, and the commit
+its declaration came from, the optional imports the closure found, and the
 skipped `setup.sh` lines all go into `runs/bugsinpy/deps/<checkpoint>.json` and, as derived data, into
 the split's `deps` key. That file's `installs` list is **exactly** what the layer's recipe passes to
 pip (`bake.installs_of`, the one function both the recipe and the record use): a harness package
@@ -493,7 +543,7 @@ back years later.
   (`python setup.py build`) before its own tests can import it. BugsInPy's `bugsinpy-compile` does
   exactly this.
 
-So `deps::detect` alone will under-provision. The mitigation is the four-source union in §3.2, built
+So `deps::detect` alone will under-provision. The mitigation is the five-source union in §3.2, built
 by `bake.resolve_bug_deps`, with two rules that were learned the hard way:
 
 1. **Read `setup.py`, never execute it.** At the buggy commit, `setup.py` is how these projects
@@ -930,10 +980,13 @@ enter this file through a deliberate edit:
         "schema_version": 1,
         "checkpoint": "vanta-bi-PySnooper-3",
         "buggy_commit": "6e3d797…", "commit_date": "2019-04-22",
+        "fixed_commit": "15555ed…", "fixed_commit_date": "2019-04-22",
         "import_name": "pysnooper",
         "harness_pins": {"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
         "installs": ["decorator==4.4.0", "future==0.17.1", "six==1.12.0", "python-toolbox==0.9.3"],
-        "dependencies": [{"name": "decorator", "spec": "decorator>=4.3.0", "sources": ["install_requires (requirements.txt) line 1"], "pin": "decorator==4.4.0", "provisioned_by": "pinned at bake time"}],
+        "dependencies": [{"name": "decorator", "spec": "decorator>=4.3.0", "sources": ["install_requires (requirements.txt) line 1"], "pin": "decorator==4.4.0", "provisioned_by": "pinned at bake time", "pin_rule": "the newest release on or before the buggy commit's date", "released_at": "2019-03-16", "commit": "6e3d797…", "commit_date": "2019-04-22"}],
+        "pins_after_commit_date": [],
+        "optional_imports": [],
         "skipped": [{"source": "setup.sh", "line": 1, "text": "python setup.py install", "reason": "…"}],
         "notes": ["…"]
       }
@@ -1000,7 +1053,7 @@ every field comes back equal. No VM, no clone.
 ```json
 {
   "schema_version": 1,
-  "batch_id": "…", "wave": 1, "bug": "PySnooper/1",
+  "batch_id": "…", "wave": 1, "bug": "PySnooper/2",
   "config": "vanta", "mode": "repair", "seed": 0,
   "session_id": "…",
   "harness_commit": "<git HEAD of this repo when the batch started>", "harness_dirty": false,
@@ -1129,17 +1182,18 @@ build is the only step that can invalidate a whole batch:
 
 | Wave | Python | Bugs | Seeds | Purpose |
 |---|---|---|---|---|
-| 1 | 3.8.1 | PySnooper 1, 2, 3 | `[0]` | **go/no-go gate** — checkpoint, `import ssl`+pip gate, oracle, leak gate, runner |
+| 1 | 3.8.1 | PySnooper 2, 3 | `[0]` | **go/no-go gate** — checkpoint, `import ssl`+pip gate, oracle, leak gate, runner |
 | 2 | 3.7.0 / 3.7.3 | thefuck 1–3, httpie 1–3 | `[0]` | the pilot proper |
 | 3 | 3.6.9 | cookiecutter 1 | `[0]` | the last pilot slot; the two-repo `setup.py build` case |
 
-Pilot = waves 1 + 2 + 3 = **10 bugs**.
+Pilot = waves 1 + 2 + 3 = **9 bugs** (`PySnooper/1` is excluded — a Python-2-only encoding bug that
+passes on both commits under 3.8; see the split's `reviewed_changes`).
 
 Per-bug environment notes that shape the estimates:
 
 | Bug | py | Checkpoint | Notes |
 |---|---|---|---|
-| PySnooper/1..3 | 3.8.1 | `vanta-bugsinpy-py3.8` | clean, no `pythonpath`, no build step — cheapest, standalone Python |
+| PySnooper/2..3 | 3.8.1 | `vanta-bugsinpy-py3.8` | clean, no `pythonpath`, no build step — cheapest, standalone Python |
 | thefuck/1..3 | 3.7.0 | `vanta-bugsinpy-py3.7` | pytest-native suite, no build step; **context borderline** |
 | httpie/1..3 | 3.7.3 | `vanta-bugsinpy-py3.7` | pytest-native, `requests`-like deps |
 | cookiecutter/1 | 3.6.9 | `vanta-bugsinpy-py3.6` | **`pythonpath=cookiecutter/build/lib/` → needs `setup.py build`** |
@@ -1190,8 +1244,8 @@ Explicitly, wave 1 must demonstrate all of:
 
 1. `vanta-bugsinpy-py3.8` passes `import ssl`, a real `pip install`, and `pytest --version` (§3.2).
 2. The per-bug layers bake and `pytest --collect-only -q` succeeds inside them.
-3. `prepare` derives a non-empty `FAIL_TO_PASS` for all three PySnooper bugs, with no flaky escapes.
-4. The leak gate produces a clean text for all three, and `issue_texts_all.md` reads as actionable.
+3. `prepare` derives a non-empty `FAIL_TO_PASS` for both PySnooper bugs, with no flaky escapes.
+4. The leak gate produces a clean text for both, and `issue_texts_all.md` reads as actionable.
 5. The oracle returns `patch_good = true` for the developer fix and `false` for the no-op patch, and
    the pooled candidate set for a bug is reproducible from the manifest alone.
 6. Baseline review (Attacker off) drives all its runs to completion with a consistent manifest, and

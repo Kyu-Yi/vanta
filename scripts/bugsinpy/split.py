@@ -32,12 +32,25 @@ TOP_LEVEL_KEYS = frozenset(
         "seeds",
         "review_mode",
         "sampling",
+        "module_distributions",
         "reviewed_changes",
         "bugs",
     }
 )
 
-OPTIONAL_TOP_LEVEL_KEYS = frozenset({"bugsinpy_root", "reviewed_changes"})
+OPTIONAL_TOP_LEVEL_KEYS = frozenset(
+    {"bugsinpy_root", "module_distributions", "reviewed_changes"}
+)
+
+MODULE_DISTRIBUTIONS_DOC = """``{import module: distribution}``, for the test-import closure.
+
+[VANTA-WHY] Some modules are not importable under their distribution's name
+(``import yaml`` is PyYAML; ``import bs4`` is beautifulsoup4), and no
+canonicalisation recovers that from the module alone. The closure (§3.2) refuses to
+guess: it stops the bake and names the module. This mapping is where the answer goes,
+in the protocol, where a reviewer can see the decision — rather than a table inside
+the harness, where an unreviewed guess would silently become part of every layer.
+"""
 
 REVIEWED_CHANGE_KEYS = frozenset({"change", "reason", "decided_by", "rule", "measurements"})
 """``reviewed_changes`` is the split's audit trail (§8): every departure from the
@@ -177,6 +190,17 @@ class Split:
     def sampling(self) -> dict[str, Any]:
         return dict(self.data.get("sampling") or {})
 
+    def module_distributions(self) -> dict[str, str]:
+        """Reviewed ``{import module: distribution}`` overrides for the closure (§3.2).
+
+        Empty when the key is absent, which is the normal case: nearly every module is
+        importable under its distribution's canonical name.
+        """
+        return {
+            str(module): str(distribution)
+            for module, distribution in (self.data.get("module_distributions") or {}).items()
+        }
+
     @property
     def bugs(self) -> list[dict[str, Any]]:
         return self.data["bugs"]
@@ -279,6 +303,24 @@ def validate(data: dict[str, Any], path: Optional[Path] = None) -> None:
             raise SplitError(f"{where}reviewed_changes must be a non-empty list when present")
         for index, entry in enumerate(reviewed):
             _validate_reviewed_change(entry, where, index)
+
+    distributions = data.get("module_distributions")
+    if distributions is not None:
+        _validate_module_distributions(distributions, where)
+
+
+def _validate_module_distributions(distributions: Any, where: str) -> None:
+    tag = f"{where}module_distributions"
+    if not isinstance(distributions, dict) or not distributions:
+        raise SplitError(f"{tag} must be a non-empty object when present")
+    for module, distribution in distributions.items():
+        if not isinstance(module, str) or not module.strip():
+            raise SplitError(f"{tag}: keys must be non-empty module names, got {module!r}")
+        if not isinstance(distribution, str) or not distribution.strip():
+            raise SplitError(
+                f"{tag}[{module!r}] must be a non-empty distribution name, got "
+                f"{distribution!r}"
+            )
 
 
 def _validate_reviewed_change(entry: Any, where: str, index: int) -> None:

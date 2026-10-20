@@ -30,6 +30,7 @@ import shlex
 import subprocess
 import sys
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -325,6 +326,27 @@ class TestSplit:
         split = load_split(SPLIT_PATH)
         assert split.waves() == [1, 2, 3]
         assert len(split.bugs_in_wave(1)) == 2
+
+    def test_module_distributions_is_optional(self):
+        """The split is valid without it: only a divergent module name needs a mapping."""
+        assert split_mod.validate(split_data()) is None
+        assert split_mod.Split(split_data()).module_distributions() == {}
+
+    def test_a_reviewed_module_mapping_is_read_back(self):
+        split = split_mod.Split(split_data(module_distributions={"yaml": "PyYAML"}))
+        assert split.module_distributions() == {"yaml": "PyYAML"}
+
+    def test_a_module_mapping_must_be_a_non_empty_object(self):
+        with pytest.raises(SplitError, match="module_distributions"):
+            split_mod.validate(split_data(module_distributions={}))
+        with pytest.raises(SplitError, match="module_distributions"):
+            split_mod.validate(split_data(module_distributions=["yaml"]))
+
+    def test_a_module_mapping_needs_both_sides_named(self):
+        with pytest.raises(SplitError, match="non-empty module names"):
+            split_mod.validate(split_data(module_distributions={"": "PyYAML"}))
+        with pytest.raises(SplitError, match="non-empty distribution name"):
+            split_mod.validate(split_data(module_distributions={"yaml": "  "}))
 
     def test_unknown_top_level_key_is_an_error(self):
         with pytest.raises(SplitError, match="unknown top-level keys"):
@@ -3284,6 +3306,305 @@ class TestMergeRefs:
         assert "'six<1.11' from setup.sh line 4" in message
 
 
+class TestUnionAcrossCommits:
+    """A bug's dependencies are the union of what each commit declares (§3.2).
+
+    [VANTA-WHY] The graded tree is a mixture of the two commits (§1.2): the source
+    under test is the buggy commit's and the test side is the fix's. A requirement the
+    *fix* added is therefore a requirement of the tree a run is graded on — but it was
+    never in the buggy tree either, so it is held to the fix's own date instead of
+    being back-dated to the buggy commit's. A requirement the *buggy* commit declared
+    keeps the buggy date: the fix dropping it does not license an upgrade.
+    """
+
+    BUGGY = "b" * 40
+    FIXED = "f" * 40
+    BUGGY_DATE = "2019-04-22"
+    FIXED_DATE = "2019-07-30"
+
+    def _sources(self, *refs: bake_mod.DepRef) -> bake_mod.DepSources:
+        return bake_mod.DepSources(
+            project="Demo",
+            bug_id=1,
+            checkpoint="vanta-bi-Demo-1",
+            buggy_commit=self.BUGGY,
+            commit_date=self.BUGGY_DATE,
+            fixed_commit=self.FIXED,
+            fixed_commit_date=self.FIXED_DATE,
+            import_name="demo",
+            refs=tuple(refs),
+        )
+
+    def _ref(self, spec: str, source: str, *, fixed: bool) -> bake_mod.DepRef:
+        return replace(
+            bake_mod.dep_ref(spec, source),
+            commit=self.FIXED if fixed else self.BUGGY,
+            commit_date=self.FIXED_DATE if fixed else self.BUGGY_DATE,
+        )
+
+    def _resolve(self, *refs: bake_mod.DepRef) -> list[bake_mod.ResolvedDep]:
+        return bake_mod.resolve_deps(
+            self._sources(*refs), releases=TestResolvePinsByDate.RELEASES, harness_pins={}
+        )
+
+    def _provenance(self, *refs: bake_mod.DepRef) -> dict:
+        sources = self._sources(*refs)
+        resolved = bake_mod.resolve_deps(
+            sources, releases=TestResolvePinsByDate.RELEASES, harness_pins={}
+        )
+        return bake_mod.deps_provenance(sources, resolved, harness_pins={})
+
+    def test_a_requirement_only_the_fix_declares_is_held_to_the_fixed_date(self):
+        """decorator 4.4.1 (2019-06-01) postdates the buggy commit; the fix's date allows it."""
+        (dep,) = self._resolve(
+            self._ref("decorator>=4.3.0", "install_requires (setup.py) line 1", fixed=True)
+        )
+        assert dep.pin == "decorator==4.4.1"
+        assert dep.fixed is True
+        assert dep.commit == self.FIXED
+        assert dep.commit_date == self.FIXED_DATE
+        assert dep.pin_rule == "the newest release on or before the fixed commit's date"
+
+    def test_the_same_spec_on_the_buggy_commit_stops_at_the_buggy_date(self):
+        """The cutoff is per declaration, not per bug: 4.4.1 is out of reach here."""
+        (dep,) = self._resolve(
+            self._ref("decorator>=4.3.0", "install_requires (setup.py) line 1", fixed=False)
+        )
+        assert dep.pin == "decorator==4.4.0"
+        assert dep.fixed is False
+        assert dep.commit == self.BUGGY
+        assert dep.pin_rule == "the newest release on or before the buggy commit's date"
+
+    def test_one_resolve_holds_each_ref_to_its_own_commit(self):
+        """Both cutoffs in one call: the buggy ref is not silently upgraded by the fix."""
+        by_name = {
+            dep.name: dep
+            for dep in self._resolve(
+                self._ref("decorator>=4.3.0", "install_requires (setup.py) line 1", fixed=True),
+                self._ref("future>=0.15.0", "install_requires (setup.py) line 2", fixed=False),
+            )
+        }
+        assert by_name["decorator"].pin == "decorator==4.4.1"
+        assert by_name["future"].pin == "future==0.17.1"
+
+    def test_a_package_both_commits_declare_is_one_entry(self):
+        """One requirement written twice is one requirement — the union, then the merge."""
+        resolved = self._resolve(
+            self._ref("six", "install_requires (setup.py) line 3", fixed=False),
+            self._ref("six", "tests_require (setup.py) line 20", fixed=True),
+        )
+        assert len(resolved) == 1
+        assert resolved[0].pin == "six==1.12.0"
+        assert "install_requires (setup.py) line 3" in resolved[0].sources[0]
+        assert "tests_require (setup.py) line 20" in resolved[0].sources[0]
+
+    def test_the_two_commits_disagreeing_on_a_pin_fails_loudly(self):
+        sources = self._sources(
+            self._ref("six==1.11.0", "install_requires (setup.py) line 3", fixed=False),
+            self._ref("six==1.12.0", "install_requires (setup.py) line 3", fixed=True),
+        )
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            bake_mod.resolve_deps(
+                sources, releases=TestResolvePinsByDate.RELEASES, harness_pins={}
+            )
+        message = str(excinfo.value)
+        assert "Demo/1" in message
+        assert "'six==1.11.0'" in message
+        assert "'six==1.12.0'" in message
+        assert "does not pick one of them" in message
+
+    def test_every_entry_records_the_commit_its_declaration_came_from(self):
+        """The rule is per declaration, so the record has to name the declaration."""
+        provenance = self._provenance(
+            self._ref("decorator>=4.3.0", "install_requires (setup.py) line 1", fixed=True),
+            self._ref("future>=0.15.0", "install_requires (setup.py) line 2", fixed=False),
+        )
+        by_name = {dep["name"]: dep for dep in provenance["dependencies"]}
+        assert by_name["decorator"]["commit"] == self.FIXED
+        assert by_name["decorator"]["commit_date"] == self.FIXED_DATE
+        assert (
+            by_name["decorator"]["pin_rule"]
+            == "the newest release on or before the fixed commit's date"
+        )
+        assert by_name["future"]["commit"] == self.BUGGY
+        assert by_name["future"]["commit_date"] == self.BUGGY_DATE
+        assert provenance["fixed_commit"] == self.FIXED
+        assert provenance["fixed_commit_date"] == self.FIXED_DATE
+
+    def test_a_fix_only_pin_newer_than_the_buggy_commit_is_recorded_as_late(self):
+        """The second expected reason a pin postdates the buggy tree, queryable."""
+        provenance = self._provenance(
+            self._ref("decorator>=4.3.0", "install_requires (setup.py) line 1", fixed=True)
+        )
+        assert provenance["installs"] == ["decorator==4.4.1"]
+        assert provenance["pins_after_commit_date"] == [
+            {
+                "name": "decorator",
+                "pin": "decorator==4.4.1",
+                "released_at": "2019-06-01",
+                "pin_rule": "the newest release on or before the fixed commit's date",
+            }
+        ]
+
+    def test_without_the_buggy_sha_a_stamped_ref_counts_as_the_fix(self):
+        """The documented default for a caller that passes no ``buggy_commit``."""
+        ref = replace(
+            bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1"),
+            commit=self.FIXED,
+            commit_date=self.FIXED_DATE,
+        )
+        (dep,) = bake_mod.resolve_pins(
+            [ref],
+            releases=TestResolvePinsByDate.RELEASES,
+            commit_date=self.BUGGY_DATE,
+            harness_pins={},
+        )
+        assert dep.pin == "decorator==4.4.1"
+        assert dep.fixed is True
+
+
+class TestTestImportClosure:
+    """The fifth source: the test side's own imports, read at the fixed commit (§3.2).
+
+    [VANTA-WHY] PySnooper/2's fix vendors ``tests/mini_toolbox/pathlib.py``, which does
+    ``import six`` at module scope. ``six`` is named by no requirements file, no
+    ``setup.sh`` and no ``extras_require`` at either commit, and ``python-toolbox`` —
+    whose sources the helper was copied from — declares no dependencies of its own, so
+    the union of the four declarations is a no-op for that bug. The tree under test
+    imports it, so the layer has to have it, and the test side's own source is the only
+    place that fact exists.
+
+    Read with ``ast`` and never by importing: these are third-party files and nothing
+    third-party runs on the host (design C3). The whole walk is offline — no network, no
+    VM, and no 3.8 interpreter, since ``stdlib`` is a parameter.
+    """
+
+    def _closure(
+        self,
+        files: dict,
+        *,
+        import_name: str = "pysnooper",
+        distributions: dict | None = None,
+        stdlib=None,
+    ) -> tuple:
+        return bake_mod.test_import_closure(
+            files=sorted(files),
+            read_file=files.get,
+            import_name=import_name,
+            distributions=distributions,
+            stdlib=bake_mod.PY38_STDLIB if stdlib is None else stdlib,
+        )
+
+    def test_a_third_party_import_no_declaration_names_is_a_dependency(self):
+        refs, optional, notes = self._closure(
+            {"tests/mini_toolbox/pathlib.py": "import six\n"}
+        )
+        assert optional == []
+        assert [ref.name for ref in refs] == ["six"]
+        assert refs[0].spec == "six"
+        assert refs[0].source == "import closure: tests/mini_toolbox/pathlib.py line 1"
+
+    def test_the_source_names_the_file_and_the_line_it_was_found_on(self):
+        refs, _, _ = self._closure({"tests/test_demo.py": "import os\n\nimport six\n"})
+        assert [ref.source for ref in refs] == ["import closure: tests/test_demo.py line 3"]
+
+    def test_a_dotted_import_is_recorded_under_its_top_level_module(self):
+        refs, _, _ = self._closure({"tests/test_demo.py": "import six.moves\n"})
+        assert [ref.spec for ref in refs] == ["six"]
+
+    def test_the_same_module_imported_twice_in_one_file_is_one_dependency(self):
+        refs, _, _ = self._closure(
+            {"tests/test_demo.py": "import six\nfrom six import text_type\n"}
+        )
+        assert [ref.spec for ref in refs] == ["six"]
+
+    def test_the_interpreter_stdlib_is_not_a_dependency(self):
+        """3.8 has no ``sys.stdlib_module_names``, so the set travels as a literal."""
+        refs, _, _ = self._closure({"tests/test_demo.py": "import os\nimport json\n"})
+        assert refs == []
+        refs, _, _ = self._closure(
+            {"tests/test_demo.py": "import os\nimport json\n"}, stdlib=("os",)
+        )
+        assert [ref.spec for ref in refs] == ["json"]
+
+    def test_the_project_is_not_a_dependency_of_itself(self):
+        refs, _, _ = self._closure({"tests/test_demo.py": "import pysnooper\n"})
+        assert refs == []
+
+    def test_a_test_local_module_is_not_a_distribution(self):
+        """``from tests import utils`` and ``import mini_toolbox`` are the tree's own files."""
+        refs, optional, _ = self._closure(
+            {
+                "tests/test_demo.py": (
+                    "from . import helper\nfrom tests import utils\nimport mini_toolbox\n"
+                ),
+                "tests/helper.py": "",
+                "tests/mini_toolbox/__init__.py": "",
+            }
+        )
+        assert refs == []
+        assert optional == []
+
+    def test_an_import_behind_an_importerror_guard_is_optional_and_not_installed(self):
+        """A py2-only fallback must not break the bake over a branch 3.8 never takes."""
+        refs, optional, _ = self._closure(
+            {"tests/test_demo.py": "try:\n    import scandir\nexcept ImportError:\n    pass\n"}
+        )
+        assert refs == []
+        assert optional == [
+            bake_mod.OptionalImport(
+                module="scandir",
+                source="import closure: tests/test_demo.py line 2",
+                reason="behind an ImportError guard",
+            )
+        ]
+
+    def test_an_import_behind_a_version_check_is_optional(self):
+        refs, optional, _ = self._closure(
+            {"tests/test_demo.py": "import sys\nif sys.version_info < (3,):\n    import pathlib2\n"}
+        )
+        assert refs == []
+        assert [item.module for item in optional] == ["pathlib2"]
+        assert optional[0].reason == "behind a version check"
+
+    def test_a_relative_import_is_the_trees_own_file(self):
+        refs, optional, _ = self._closure({"tests/test_demo.py": "from . import helper\n"})
+        assert refs == []
+        assert optional == []
+
+    def test_an_ambiguous_module_name_stops_the_bake_rather_than_guessing(self):
+        with pytest.raises(bake_mod.BakeError, match="module_distributions"):
+            self._closure({"tests/test_demo.py": "import yaml\n"})
+
+    def test_a_reviewed_mapping_resolves_an_ambiguous_name(self):
+        refs, _, _ = self._closure(
+            {"tests/test_demo.py": "import yaml\n"}, distributions={"yaml": "PyYAML"}
+        )
+        assert refs[0].name == "pyyaml"
+        assert refs[0].spec == "yaml"
+
+    def test_a_file_that_does_not_parse_is_noted_and_skipped(self):
+        """The target interpreter could not collect it either, so its imports are not ours."""
+        refs, _, notes = self._closure(
+            {"tests/broken.py": "def f(:\n", "tests/test_demo.py": "import six\n"}
+        )
+        assert [ref.spec for ref in refs] == ["six"]
+        assert any("tests/broken.py does not parse as Python 3" in note for note in notes)
+
+    def test_a_file_in_the_tree_that_cannot_be_read_is_noted(self):
+        refs, _, notes = self._closure(
+            {"tests/gone.py": None, "tests/test_demo.py": "import six\n"}
+        )
+        assert [ref.spec for ref in refs] == ["six"]
+        assert any("tests/gone.py is in the tree but could not be read" in n for n in notes)
+
+    def test_future_imports_are_not_a_dependency(self):
+        refs, _, _ = self._closure(
+            {"tests/test_demo.py": "from __future__ import annotations\n"}
+        )
+        assert refs == []
+
+
 class TestDependencyProvenance:
     """What the bake decided is data a later stage reads back, not a re-derivation."""
 
@@ -3496,8 +3817,25 @@ class TestRealPySnooperDependencies:
             if not item.checkpoint.endswith("-3")
         }
         assert got == {
-            "vanta-bi-PySnooper-2": {"python-toolbox==0.9.3"},
+            "vanta-bi-PySnooper-2": {"python-toolbox==0.9.3", "six==1.12.0"},
         }
+
+    def test_bug_two_gets_six_from_the_test_sides_own_imports(self):
+        """The vendored ``tests/mini_toolbox/pathlib.py`` does ``import six`` at module
+        scope, and no declaration file at either commit names ``six``: the four-source
+        union is a no-op for this bug. The fifth source is where it comes from, and it
+        is held to the *fix's* date (2019-07-30), which is 1.12.0 — the buggy date would
+        have allowed the same release, but the record has to say which declaration
+        decided it."""
+        _, entries = self._entries()
+        item = next(d for d in self._resolve(entries) if d.checkpoint.endswith("-2"))
+        six = next(d for d in item.provenance["dependencies"] if d["name"] == "six")
+        assert six["pin"] == "six==1.12.0"
+        assert six["commit"] == "814abc34a098c1b98cb327105ac396f985d2413e"
+        assert six["commit_date"] == "2019-07-30"
+        assert six["pin_rule"] == "the newest release on or before the fixed commit's date"
+        assert six["sources"] == ["import closure: tests/mini_toolbox/pathlib.py line 13"]
+        assert "six==1.12.0" in item.installs
 
     def test_the_setup_py_install_line_is_recorded_as_skipped_on_every_bug(self):
         _, entries = self._entries()

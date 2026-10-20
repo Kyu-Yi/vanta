@@ -49,10 +49,10 @@ import re
 import shlex
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -321,6 +321,18 @@ class DepRef:
     mis-attribute a project pin whenever BugsInPy declared the same package as a
     range instead of a pin.
     """
+    commit: Optional[str] = None
+    """The commit this declaration was read from — the buggy one, or the fixed one.
+
+    [VANTA-WHY] Per reference and not per bug, because the rule is per reference: a
+    requirement the *fix* added was never in the graded tree, so holding it to the
+    buggy commit's date would refuse a release the fix's own environment had; a
+    requirement the buggy tree already declared must not be upgraded past it.
+    Recorded as the sha, so the provenance names the commit rather than describing
+    it.
+    """
+    commit_date: Optional[str] = None
+    """``commit``'s own date — the cutoff :func:`resolve_pins` applies to this ref."""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -328,6 +340,8 @@ class DepRef:
             "spec": self.spec,
             "source": self.source,
             "pin_source": self.pin_source,
+            "commit": self.commit,
+            "commit_date": self.commit_date,
         }
 
 
@@ -580,6 +594,7 @@ def _entry_refs(
     read_file: Callable[[str], Optional[str]],
     notes: list[str],
     skip_files: Optional[set[str]] = None,
+    commit_label: str = "the buggy commit",
 ) -> tuple[list[DepRef], list[SkippedLine]]:
     """One ``setup.py`` declaration → refs, following a file name when it has one."""
     if node is None:
@@ -595,7 +610,7 @@ def _entry_refs(
             skip_files.add(name)
         text = read_file(name)
         if text is None:
-            notes.append(f"{source} names {name!r}, which is not at the buggy commit")
+            notes.append(f"{source} names {name!r}, which is not at {commit_label}")
             continue
         part, part_skipped = requirements_refs(text, source=f"{source} ({name})")
         refs += part
@@ -614,13 +629,22 @@ def setup_py_refs(
     setup_py: str,
     read_file: Callable[[str], Optional[str]],
     notes: list[str],
+    *,
+    commit: Optional[str] = None,
+    commit_date: Optional[str] = None,
+    commit_label: str = "the buggy commit",
 ) -> tuple[list[DepRef], list[SkippedLine]]:
     """``setup.py`` → ``install_requires`` plus the project's test requirements.
 
-    The last two of the four approved sources. ``setup.py`` itself is never run
-    (design C3): it is Python, and asking setuptools what it wants *is* executing
-    it. Everything here comes from the AST, and anything the AST cannot see is
-    recorded as a note for a human rather than guessed at.
+    Two of the approved sources. ``setup.py`` itself is never run (design C3): it is
+    Python, and asking setuptools what it wants *is* executing it. Everything here
+    comes from the AST, and anything the AST cannot see is recorded as a note for a
+    human rather than guessed at.
+
+    Read once per commit (see :func:`bug_sources`), so ``commit``/``commit_date``
+    stamp the refs with where they came from and ``commit_label`` says so in the
+    notes — a note reading "not at the buggy commit" while the reader was looking at
+    the fix would be a fact about the wrong tree.
     """
     kwargs = _setup_kwargs(setup_py)
     seen: set[str] = set()
@@ -632,7 +656,12 @@ def setup_py_refs(
         ("extras_require['tests']", _extras_tests_node(kwargs.get("extras_require"))),
     ):
         part, part_skipped = _entry_refs(
-            node, source=source, read_file=read_file, notes=notes, skip_files=seen
+            node,
+            source=source,
+            read_file=read_file,
+            notes=notes,
+            skip_files=seen,
+            commit_label=commit_label,
         )
         if not part and node is not None and _file_literals(node):
             notes.append(f"{source}: declares no requirements")
@@ -645,13 +674,28 @@ def setup_py_refs(
     if "test_requirements.txt" not in seen:
         text = read_file("test_requirements.txt")
         if text is None:
-            notes.append("test_requirements.txt: not at the buggy commit")
+            notes.append(f"test_requirements.txt: not at {commit_label}")
         else:
             seen.add("test_requirements.txt")
             part, part_skipped = requirements_refs(text, source="test_requirements.txt")
             refs += part
             skipped += part_skipped
-    return refs, skipped
+    return _stamped(refs, commit=commit, commit_date=commit_date), skipped
+
+
+def _stamped(
+    refs: Sequence[DepRef], *, commit: Optional[str], commit_date: Optional[str]
+) -> list[DepRef]:
+    """``refs`` with the commit they were read from attached.
+
+    Applied at the edge of each reader rather than threaded through it: the parsing
+    of a requirements file, a ``setup.sh`` line or a ``setup.py`` literal has nothing
+    to do with which commit it came out of, and every one of them is also used
+    directly by tests that care only about the parse.
+    """
+    if commit is None and commit_date is None:
+        return list(refs)
+    return [replace(ref, commit=commit, commit_date=commit_date) for ref in refs]
 
 
 def import_name_of(setup_py: str) -> str:
@@ -682,15 +726,324 @@ def import_name_of(setup_py: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# the fifth source: the test side's import closure (§3.2)
+# ---------------------------------------------------------------------------
+PY38_STDLIB = frozenset(
+    """
+    __future__ __main__ _abc _ast _bisect _blake2 _bootlocale _codecs _collections
+    _collections_abc _compat_pickle _contextvars _ctypes _curses _curses_panel _datetime
+    _decimal _dummy_thread _elementtree _functools _hashlib _heapq _imp _io _json _locale
+    _lzma _markupbase _md5 _msi _multibytecodec _opcode _operator _osx_support _pickle
+    _posixsubprocess _py_abc _pydecimal _pyio _queue _random _sha1 _sha256 _sha512 _signal
+    _sitebuiltins _socket _sqlite3 _ssl _stat _statistics _string _strptime _struct
+    _symtable _thread _threading_local _tkinter _tracemalloc _uuid _warnings _weakref
+    _weakrefset _winapi abc aifc antigravity argparse array ast asynchat asyncio asyncore
+    atexit audioop base64 bdb binascii binhex bisect builtins bz2 cProfile calendar cgi
+    cgitb chunk cmath cmd code codecs codeop collections colorsys compileall concurrent
+    configparser contextlib contextvars copy copyreg crypt csv ctypes curses dataclasses
+    datetime dbm decimal difflib dis distutils doctest dummy_threading email encodings
+    ensurepip enum errno faulthandler fcntl filecmp fileinput fnmatch formatter fractions
+    ftplib functools gc genericpath getopt getpass gettext glob grp gzip hashlib heapq hmac
+    html http imaplib imghdr imp importlib inspect io ipaddress itertools json keyword
+    lib2to3 linecache locale logging lzma mailbox mailcap marshal math mimetypes mmap
+    modulefinder msilib msvcrt multiprocessing netrc nis nntplib nt ntpath nturl2path
+    numbers operator optparse os ossaudiodev parser pathlib pdb pickle pickletools pipes
+    pkgutil platform plistlib poplib posix posixpath pprint profile pstats pty pwd
+    py_compile pyclbr pydoc pydoc_data queue quopri random re readline reprlib resource
+    rlcompleter runpy sched secrets select selectors shelve shlex shutil signal site smtpd
+    smtplib sndhdr socket socketserver spwd sqlite3 sre_compile sre_constants sre_parse
+    ssl stat statistics string stringprep struct subprocess sunau symbol symtable sys
+    sysconfig syslog tabnanny tarfile telnetlib tempfile termios test textwrap this
+    threading time timeit tkinter token tokenize trace traceback tracemalloc tty turtle
+    turtledemo types typing unicodedata unittest urllib uu uuid venv warnings wave weakref
+    webbrowser winreg winsound wsgiref xdrlib xml xmlrpc zipapp zipfile zipimport zlib
+    """.split()
+)
+"""Python 3.8's standard-library top-level module names, as a literal.
+
+[VANTA-WHY] Committed rather than computed. The interpreter running the harness is
+not the interpreter running the bug, and 3.8 predates ``sys.stdlib_module_names``
+(added in 3.10), so asking this process what is standard library would answer for
+the harness's own Python. Measured off the 3.8 module index — 210 top-level names,
+which do include ``pwd`` and ``grp`` — plus CPython's private modules and the
+platform and path modules the index omits: 281 names. Measured while writing this,
+two of those omissions matter: ``ntpath``, which PySnooper/2's vendored
+``tests/mini_toolbox/pathlib.py`` imports at module scope, and ``nt``, which it
+imports under ``if os.name == 'nt'``. Neither is a distribution PyPI publishes, so
+without them the closure would try to pin a package that does not exist — and fail
+the bake for a module the target interpreter would never load.
+"""
+
+AMBIGUOUS_MODULE_DISTRIBUTIONS = frozenset(
+    {
+        "Crypto",
+        "OpenSSL",
+        "PIL",
+        "attr",
+        "bs4",
+        "cv2",
+        "dateutil",
+        "dotenv",
+        "jwt",
+        "serial",
+        "sklearn",
+        "yaml",
+    }
+)
+"""Modules whose import name is a different word from their distribution's.
+
+[VANTA-WHY] ``import yaml`` is PyYAML, ``import bs4`` is beautifulsoup4, and no
+canonicalisation recovers that. Guessing would fetch release dates for a package
+nobody publishes and stop with a message about PyPI; refusing instead names the
+actual fix, which is a reviewed mapping entry in the split's ``module_distributions``
+(design §3.2) — a decision recorded in the protocol, never a guess in the harness.
+A module *not* in this list is still not taken on faith: an unknown name has no
+release dates, and :func:`resolve_pins` stops the bake on that.
+"""
+
+
+def module_distribution(module: str, *, distributions: Mapping[str, str]) -> str:
+    """The distribution that provides an imported ``module``.
+
+    The default is the module name canonicalised (``python_toolbox`` →
+    ``python-toolbox``), which is what nearly every package does. The exceptions are
+    the reviewed mappings in the split and the known-divergent names, which fail
+    loudly rather than being guessed at.
+    """
+    reviewed = distributions.get(module)
+    if reviewed:
+        return canonicalize_name(reviewed)
+    if module in AMBIGUOUS_MODULE_DISTRIBUTIONS:
+        raise BakeError(
+            f"the test side imports {module!r}, whose distribution is not named by its "
+            "module, so the harness will not guess at it. Record the reviewed mapping "
+            f"in the split's module_distributions ({module!r}: <distribution>) and bake "
+            "again (design §3.2)."
+        )
+    return canonicalize_name(module)
+
+
+@dataclass(frozen=True)
+class OptionalImport:
+    """A third-party import that is only reached on an optional path.
+
+    [VANTA-WHY] Recorded, never installed. PySnooper/2's vendored helper imports
+    ``scandir`` inside ``try: … except ImportError:`` for Python 2, and ``urllib``
+    for the platform it is not running on. Installing those on 3.8 would provision a
+    dependency the tree never loads — and a py2-only fallback does not install on 3.8
+    at all, so the bake would fail over a branch that can never be taken.
+    """
+
+    module: str
+    source: str
+    reason: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"module": self.module, "source": self.source, "reason": self.reason}
+
+
+_IMPORT_GUARDS = frozenset(
+    {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"}
+)
+"""What a ``try`` must catch before its body's imports are optional. A bare
+``except:`` counts too — it is how the Python 2 code writes the same thing."""
+
+_VERSION_GUARDS = frozenset(
+    {
+        "PY2",
+        "PY3",
+        "PY27",
+        "PY35",
+        "PY36",
+        "PY37",
+        "PY38",
+        "PY39",
+        "python_implementation",
+        "python_version",
+        "version_info",
+    }
+)
+"""Names that make an ``if`` a version check: ``sys.version_info[:2] >= (3, 6)``,
+``if PY2:``, ``six.PY3``. Either branch is then the other branch's fallback."""
+
+
+@dataclass(frozen=True)
+class _ImportSite:
+    module: str
+    line: int
+    optional: Optional[str]
+    """Why this import is optional, or ``None`` when the module is always loaded."""
+
+
+def _names_in(node: ast.AST) -> set[str]:
+    """Every ``Name``/``Attribute`` a test mentions — ``sys.version_info`` → both."""
+    out: set[str] = set()
+    for item in ast.walk(node):
+        if isinstance(item, ast.Name):
+            out.add(item.id)
+        elif isinstance(item, ast.Attribute):
+            out.add(item.attr)
+    return out
+
+
+def _guard_reason(node: ast.Try) -> Optional[str]:
+    """Why this ``try`` makes its body's imports optional, or ``None``."""
+    for handler in node.handlers:
+        if handler.type is None:
+            return "behind a bare except"
+        if _names_in(handler.type) & _IMPORT_GUARDS:
+            return "behind an ImportError guard"
+    return None
+
+
+def _collect_imports(
+    node: ast.AST, *, optional: Optional[str], out: list[_ImportSite]
+) -> None:
+    """Record every import reachable from ``node``, and whether it is optional.
+
+    [VANTA-WHY] Optional propagates *into* a branch and never back out: an import
+    inside ``try: import x  except ImportError:`` is a fallback, and so is one inside
+    a function defined in that try. A relative import (``from . import helper``) is
+    the tree's own file rather than a distribution, and is skipped — the absolute
+    spelling of the same thing (``import tests``) is excluded by name instead, in
+    :func:`test_import_closure`.
+    """
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            out.append(_ImportSite(alias.name, node.lineno, optional))
+        return
+    if isinstance(node, ast.ImportFrom):
+        if node.level == 0 and node.module:
+            out.append(_ImportSite(node.module, node.lineno, optional))
+        return
+    if isinstance(node, ast.Try):
+        inner = _guard_reason(node) or optional
+        for branch in (*node.body, *node.handlers, *node.orelse, *node.finalbody):
+            _collect_imports(branch, optional=inner, out=out)
+        return
+    if isinstance(node, ast.If):
+        guard = _names_in(node.test) & _VERSION_GUARDS
+        inner = "behind a version check" if guard else optional
+        for branch in (*node.body, *node.orelse):
+            _collect_imports(branch, optional=inner, out=out)
+        return
+    for child in ast.iter_child_nodes(node):
+        _collect_imports(child, optional=optional, out=out)
+
+
+def test_side_paths(repo: Path, commit: str) -> list[str]:
+    """The test-side Python files the tree at ``commit`` carries.
+
+    The scope the closure walks (design §3.2). It is the *fixed* commit's list,
+    because that is the test side the graded tree has (§1.2): pytest's own
+    ``conftest.py``, the ``test_*``/``*_test.py`` modules, and every file under a
+    ``test``/``tests`` directory — which is where a vendored helper like
+    PySnooper/2's ``tests/mini_toolbox/`` lives.
+    """
+    return [
+        path
+        for path in tree_mod.list_files_at(repo, commit)
+        if path.endswith(".py") and tree_mod.is_test_path(path)
+    ]
+
+
+def _test_local_modules(files: Sequence[str]) -> set[str]:
+    """Top-level module names the test side provides for itself.
+
+    ``tests/utils.py`` is importable as ``tests`` (the tree has ``tests/__init__.py``)
+    and as ``utils`` (pytest puts the file's own directory on ``sys.path``); a file
+    under ``tests/mini_toolbox/`` is importable as ``mini_toolbox``. None of those is
+    a distribution, and resolving one against PyPI would either stop the bake for the
+    wrong reason or install an unrelated package.
+    """
+    names: set[str] = set()
+    for path in files:
+        parts = path.split("/")
+        names.update(parts[:-1])
+        names.add(parts[-1].rsplit(".", 1)[0])
+    return names
+
+
+def test_import_closure(
+    *,
+    files: Sequence[str],
+    read_file: Callable[[str], Optional[str]],
+    import_name: str,
+    distributions: Optional[Mapping[str, str]] = None,
+    stdlib: Iterable[str] = PY38_STDLIB,
+) -> tuple[list[DepRef], list[OptionalImport], list[str]]:
+    """The third-party modules the *test side* imports, and no source declares.
+
+    [VANTA-WHY] Why this source exists: the four declaration sources say what a
+    project *claims* it needs, and measured, that is a different set. PySnooper/2's
+    fix vendors ``tests/mini_toolbox/pathlib.py``, which does ``import six`` at module
+    scope; ``six`` is named by no requirements file, no ``setup.sh`` and no
+    ``extras_require`` at either commit, and ``python-toolbox`` — whose sources the
+    helper was copied from — declares no dependencies of its own. The tree under test
+    imports it, so the layer has to have it.
+
+    Read with ``ast``, never imported or executed: these are third-party files and
+    nothing third-party runs on the host (design C3). A file that does not parse as
+    Python 3 is recorded and skipped — the target interpreter could not collect it
+    either, so its imports cannot be imports the suite makes.
+
+    ``stdlib`` is a parameter so the walk is testable without a 3.8 interpreter and
+    without the 280-name literal (design §3.2 pins the closure by module name, not by
+    running anything).
+    """
+    reviewed = distributions or {}
+    stdlib_names = set(stdlib)
+    local = _test_local_modules(files)
+    refs: list[DepRef] = []
+    optional: list[OptionalImport] = []
+    notes: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    seen_optional: set[tuple[str, str]] = set()
+    for path in sorted(files):
+        text = read_file(path)
+        if text is None:
+            notes.append(f"import closure: {path} is in the tree but could not be read")
+            continue
+        try:
+            parsed = ast.parse(text)
+        except SyntaxError as exc:
+            notes.append(f"import closure: {path} does not parse as Python 3 ({exc.msg})")
+            continue
+        sites: list[_ImportSite] = []
+        _collect_imports(parsed, optional=None, out=sites)
+        for site in sites:
+            top = site.module.split(".")[0]
+            if not top or top == "__future__":
+                continue
+            if top in stdlib_names or top == import_name or top in local:
+                continue
+            source = f"import closure: {path} line {site.line}"
+            if site.optional is not None:
+                if (top, source) not in seen_optional:
+                    seen_optional.add((top, source))
+                    optional.append(
+                        OptionalImport(module=top, source=source, reason=site.optional)
+                    )
+                continue
+            distribution = module_distribution(top, distributions=reviewed)
+            if (distribution, path) in seen:
+                continue
+            seen.add((distribution, path))
+            refs.append(DepRef(name=distribution, spec=top, source=source))
+    return refs, optional, notes
+
+
 def requirements_recipe(install_specs: Sequence[str]) -> str:
     """Install one bug's *resolved* dependencies on top of the interpreter layer.
 
     Takes pins (:func:`resolve_deps`) rather than the project's own requirement
     strings, because a layer has to be a fact: the requirements are ranges
     (``decorator>=4.3.0``), and "whatever pip resolves today" is a different
-    environment every time the layer is rebuilt. Nothing here is a guess — every
-    spec was named by one of the four approved sources and pinned to a release that
-    existed on the buggy commit's date.
+    environment every time the layer is rebuilt. Nothing here is a guess — every spec
+    was named by one of the five approved sources and pinned to the newest release on
+    or before the date of the commit that declared it (a fix-only requirement is held
+    to the *fix's* date, everything else to the buggy commit's).
     """
     body = "\n".join(spec.strip() for spec in install_specs if spec.strip()).strip()
 
@@ -737,18 +1090,25 @@ def setup_sh_for(bugsinpy_root: Path, project: str, bug_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# the four dependency sources, unioned, then pinned by date (§3.2, §3.3)
+# every dependency source, unioned, then pinned by date (§3.2, §3.3)
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class DepSources:
-    """Everything the four approved sources declared for one bug, before pinning.
+    """Everything the five approved sources declared for one bug, before pinning.
 
-    The four, in the order the design fixes them: BugsInPy's per-bug
-    ``requirements.txt``; the ``pip install`` lines in BugsInPy's ``setup.sh``; the
-    project's own declared test requirements at the buggy commit (``tests_require``,
+    Four of them are declarations, read at the buggy commit **and** at the fixed one:
+    BugsInPy's per-bug ``requirements.txt``; the ``pip install`` lines in BugsInPy's
+    ``setup.sh``; the project's own declared test requirements (``tests_require``,
     the ``tests`` extra, a root ``test_requirements.txt``); and ``install_requires``.
-    Nothing is taken from anywhere else, and no package is ever chosen by the
-    harness.
+    The fifth is not a declaration at all — the test side's own import closure
+    (:func:`test_import_closure`), read at the fixed commit because that is whose
+    test side the graded tree carries. Nothing is taken from anywhere else, and no
+    package is ever chosen by the harness.
+
+    Both commits, because the graded tree is a mixture of the two (§1.2): the source
+    under test is the buggy commit's, the test side is the fix's. A requirement only
+    the fix declares is a requirement of the tree a run is graded on — see
+    :func:`bug_sources`.
     """
 
     project: str
@@ -757,7 +1117,13 @@ class DepSources:
     buggy_commit: str
     commit_date: str
     import_name: str
+    fixed_commit: Optional[str] = None
+    """The commit the fix's declarations and the test side's closure were read from."""
+    fixed_commit_date: Optional[str] = None
+    """``fixed_commit``'s date — the cutoff for a ref the fix declared."""
     refs: tuple[DepRef, ...] = ()
+    optional_imports: tuple[OptionalImport, ...] = ()
+    """Third-party imports on an optional path: recorded, never installed."""
     skipped: tuple[SkippedLine, ...] = ()
     notes: tuple[str, ...] = ()
 
@@ -800,6 +1166,18 @@ class ResolvedDep:
     date of every such pin is recorded, and any pin released *after* the buggy commit
     is listed at the top level of the provenance.
     """
+    commit: Optional[str] = None
+    """The commit whose declaration decided this pin — the source commit, recorded.
+
+    [VANTA-WHY] The rule is per declaration, so the record has to say *which*
+    declaration: "pinned to the newest release on or before the fix's date" is only
+    checkable if the fix's sha is next to it, and a reader asking why a package the
+    buggy tree never declared is in the layer gets an answer rather than a shrug.
+    """
+    commit_date: Optional[str] = None
+    """``commit``'s date — the cutoff that was applied."""
+    fixed: bool = False
+    """Whether this declaration came from the fix's commit rather than the buggy one."""
 
     @property
     def pin_rule(self) -> str:
@@ -808,6 +1186,8 @@ class ResolvedDep:
             return "provisioned by the interpreter layer"
         if self.exempt:
             return "BugsInPy's own exact pin, installed as written"
+        if self.fixed:
+            return "the newest release on or before the fixed commit's date"
         return "the newest release on or before the buggy commit's date"
 
     def as_dict(self) -> dict[str, Any]:
@@ -818,6 +1198,8 @@ class ResolvedDep:
             "pin": self.pin,
             "provisioned_by": "interpreter layer" if self.harness else "pinned at bake time",
             "pin_rule": self.pin_rule,
+            "commit": self.commit,
+            "commit_date": self.commit_date,
             "released_at": self.released_at,
         }
         if self.pin_source:
@@ -943,6 +1325,8 @@ def merge_refs(refs: Sequence[DepRef]) -> tuple[list[DepRef], list[DepConflict]]
                     spec=pinned.spec,
                     source="; ".join(ref.source for ref in group),
                     pin_source=pinned.source,
+                    commit=pinned.commit,
+                    commit_date=pinned.commit_date,
                 )
             )
             continue
@@ -956,6 +1340,8 @@ def merge_refs(refs: Sequence[DepRef]) -> tuple[list[DepRef], list[DepConflict]]
                 name=name,
                 spec=chosen.spec,
                 source="; ".join(ref.source for ref in group),
+                commit=chosen.commit,
+                commit_date=chosen.commit_date,
             )
         )
     return merged, conflicts
@@ -984,12 +1370,22 @@ def resolve_pins(
     releases: Mapping[str, Mapping[str, str]],
     commit_date: str,
     harness_pins: Mapping[str, str],
+    buggy_commit: Optional[str] = None,
 ) -> list[ResolvedDep]:
-    """Pin each dependency to the newest release on or before ``commit_date``.
+    """Pin each dependency to the newest release on or before its declaration's date.
 
     Pure, and deliberately so: ``releases`` is passed in, so every rule here — the
     cutoff, the two exceptions, "no candidate" — is exercised by a test that never
     touches the network (design §3.2).
+
+    The cutoff is **per declaration** and not per bug. ``commit_date`` is the buggy
+    commit's date and the default; a ref carrying its own ``commit_date`` — one the
+    *fix* declared, read at the fixed commit — is held to that date instead. A
+    requirement the fix added was never in the buggy tree, so the buggy date would
+    refuse the very release the fix's own environment had; and a ref the buggy tree
+    already declared is stamped with the buggy date and so cannot be upgraded past
+    it. ``buggy_commit`` is what tells the two apart, and the answer travels into
+    :attr:`ResolvedDep.fixed` so the provenance can say which rule was used.
 
     Two exceptions, and both are checks rather than decisions:
 
@@ -1006,12 +1402,15 @@ def resolve_pins(
       visible rather than silent.
 
     For everything else the rule is unchanged, and it takes precedence over
-    convenience: if the constraint has no release on or before the commit date, the
-    bug cannot be rebuilt and the bake stops rather than installing today's version.
+    convenience: if the constraint has no release on or before the declaration's date,
+    the bug cannot be rebuilt and the bake stops rather than installing today's
+    version.
     """
     resolved: list[ResolvedDep] = []
     for ref in refs:
         requirement = _requirement(ref.spec, ref.source)
+        cutoff = ref.commit_date or commit_date
+        fixed = ref.commit is not None and ref.commit != buggy_commit
         if ref.name in HARNESS_PACKAGES:
             provided = harness_pins.get(ref.name)
             if provided is None:
@@ -1064,13 +1463,14 @@ def resolve_pins(
                 )
         else:
             pin_source = ref.pin_source
-            matching = [item for item in matching if item[1][:10] <= commit_date]
+            matching = [item for item in matching if item[1][:10] <= cutoff]
             if not matching:
                 newest = _newest_release(available)
                 raise BakeError(
-                    f"{ref.source}: {ref.spec} has no release on or before {commit_date} "
+                    f"{ref.source}: {ref.spec} has no release on or before {cutoff} "
                     f"(newest {ref.name} is {newest[0]}, released {newest[1][:10]}). "
-                    "The buggy tree could not have been built with this requirement."
+                    "The tree this requirement was declared in could not have been "
+                    "built with it."
                 )
         version, released_at = max(matching, key=lambda item: Version(item[0]))
         resolved.append(
@@ -1083,6 +1483,9 @@ def resolve_pins(
                 released_at=released_at[:10],
                 pin_source=pin_source,
                 exempt=exempt,
+                commit=ref.commit,
+                commit_date=ref.commit_date,
+                fixed=fixed,
             )
         )
     return resolved
@@ -1143,6 +1546,7 @@ def resolve_deps(
         releases=releases,
         commit_date=sources.commit_date,
         harness_pins=harness_pins,
+        buggy_commit=sources.buggy_commit,
     )
 
 
@@ -1151,22 +1555,48 @@ def bug_sources(
     *,
     bugsinpy_root: Path,
     repo: Path,
+    module_distributions: Optional[Mapping[str, str]] = None,
 ) -> DepSources:
-    """Read the four approved sources for one bug, at the buggy commit.
+    """Read every approved source for one bug, at the buggy **and** the fixed commit.
 
-    [VANTA-WHY] At the *buggy* commit and not at the fix: a dependency added by the
-    fix is not a dependency the graded tree has, and installing it would provision
-    an environment the bug never ran in.
+    [VANTA-WHY] Both commits, because the graded tree is a mixture of the two (§1.2).
+    The *source* under test is the buggy commit's; the *test side* is the fix's, which
+    is what makes the bug a bug. Reading the declarations at the buggy commit alone
+    therefore describes an environment the suite never runs in: PySnooper/2's fix
+    vendors ``tests/mini_toolbox/pathlib.py``, whose ``import six`` is at module scope
+    and named by no requirements file, no ``setup.sh`` and no ``extras_require`` at
+    either commit. The tree under test imports it, so the layer has to have it.
+
+    Read the other way, though, the fix is not authoritative either: a requirement the
+    fix *adds* must not be back-dated, and one it *drops* was still there for the
+    buggy code. So the two commits are unioned, each ref carries the commit it was
+    read from (:attr:`DepRef.commit`), and :func:`resolve_pins` holds each to its own
+    commit's date. A package both commits declare goes through the merge in
+    :func:`merge_refs` — one requirement written twice, or a real conflict that stops
+    the bake.
+
+    BugsInPy's own ``requirements.txt``/``setup.sh`` are **not** read per commit: they
+    are the benchmark's description of the bug, one file pair per bug, and they are the
+    reference environment the bug's ``run_test.sh`` was validated against. They are
+    left unstamped so they keep the buggy commit's date as their cutoff.
+
+    The fifth source is the test side's own import closure (:func:`test_import_closure`),
+    read at the fixed commit because that is whose test side the graded tree carries.
+    A module whose distribution is not named by the module fails the bake rather than
+    being guessed at; the fix is a reviewed ``module_distributions`` entry in the split.
     """
     project = str(entry["project"])
     bug_id = int(entry["bug_id"])
-    commit = str(entry["buggy_commit"])
+    buggy = str(entry["buggy_commit"])
+    fixed = str(entry["fixed_commit"])
+    buggy_date = tree_mod.commit_date(repo, buggy)
+    fixed_date = tree_mod.commit_date(repo, fixed)
     notes: list[str] = []
     refs: list[DepRef] = []
     skipped: list[SkippedLine] = []
 
     # 1. BugsInPy's per-bug requirements.txt. Measured: 0 bytes for PySnooper 1-3,
-    # which is exactly why the other three sources exist.
+    # which is exactly why the other sources exist.
     requirements_text = requirements_for(bugsinpy_root, project, bug_id)
     part, part_skipped = requirements_refs(requirements_text, source="requirements.txt")
     refs += part
@@ -1182,27 +1612,56 @@ def bug_sources(
     if not setup_sh.strip():
         notes.append("setup.sh (BugsInPy): empty for this bug")
 
-    # 3 + 4. The project's own declarations at the buggy commit.
-    read_at = partial(tree_mod.read_file_at, repo, commit)
-    setup_py = read_at("setup.py")
-    if setup_py is None:
+    # The import name comes from the *buggy* ``setup.py``: that is the package under
+    # test, and the closure needs it to exclude the project's own modules.
+    buggy_setup = tree_mod.read_file_at(repo, buggy, "setup.py")
+    if buggy_setup is None:
         raise BakeError(
-            f"{project}/{bug_id}: no setup.py at {commit}, so install_requires and the "
+            f"{project}/{bug_id}: no setup.py at {buggy}, so install_requires and the "
             "declared test requirements cannot be read. Flag this bug rather than "
             "guessing at its dependencies (design §3.2)."
         )
-    part, part_skipped = setup_py_refs(setup_py, read_at, notes)
-    refs += part
-    skipped += part_skipped
+    import_name = import_name_of(buggy_setup)
+
+    # 3 + 4. The project's own declarations, once per commit.
+    for label, sha, date in (("buggy", buggy, buggy_date), ("fixed", fixed, fixed_date)):
+        read_at = partial(tree_mod.read_file_at, repo, sha)
+        setup_py = read_at("setup.py")
+        if setup_py is None:
+            notes.append(f"setup.py: not at the {label} commit ({sha[:12]})")
+            continue
+        part, part_skipped = setup_py_refs(
+            setup_py,
+            read_at,
+            notes,
+            commit=sha,
+            commit_date=date,
+            commit_label=f"the {label} commit",
+        )
+        refs += part
+        skipped += part_skipped
+
+    # 5. The test side's own imports, at the fixed commit.
+    closure_refs, optional, closure_notes = test_import_closure(
+        files=test_side_paths(repo, fixed),
+        read_file=partial(tree_mod.read_file_at, repo, fixed),
+        import_name=import_name,
+        distributions=module_distributions,
+    )
+    refs += _stamped(closure_refs, commit=fixed, commit_date=fixed_date)
+    notes += closure_notes
 
     return DepSources(
         project=project,
         bug_id=bug_id,
         checkpoint=bug_checkpoint_name(entry),
-        buggy_commit=commit,
-        commit_date=tree_mod.commit_date(repo, commit),
-        import_name=import_name_of(setup_py),
+        buggy_commit=buggy,
+        commit_date=buggy_date,
+        fixed_commit=fixed,
+        fixed_commit_date=fixed_date,
+        import_name=import_name,
         refs=tuple(refs),
+        optional_imports=tuple(optional),
         skipped=tuple(skipped),
         notes=tuple(notes),
     )
@@ -1234,15 +1693,25 @@ def deps_provenance(
     by the bug layer while the recipe never asked for it, which is the kind of
     contradiction that makes a provenance file not worth reading.
 
-    ``pins_after_commit_date`` is the record of the one place the layer departs from
-    §3.2's date rule: a BugsInPy reference pin is installed as written, so a pin
-    released *after* the buggy commit is in the layer while the tree it is used with
-    is older. That is not an error — it is what a pip-freeze-style
-    ``requirements.txt`` means — but it is the first thing to look at when a wave
-    misbehaves against what the bug's date suggests, so it is a queryable list and
-    not a sentence in a docstring. Every dependency also carries ``released_at`` and
-    ``pin_rule``, so the same question can be asked of a pin that is *inside* the
-    window.
+    ``pins_after_commit_date`` is the record of the places the layer's environment is
+    newer than the *buggy* tree. Two of them are expected, and neither is an error:
+
+    * a BugsInPy reference pin, installed as written — a pip-freeze-style
+      ``requirements.txt`` is from a different era than the commit it is used with;
+    * a requirement only the *fix* declared, held to the fix's own date — such a pin
+      can legitimately postdate the buggy commit, since the fix's environment is the
+      one that had it.
+
+    Both are still the first thing to look at when a wave misbehaves against what the
+    bug's date suggests, so this is a queryable list and not a sentence in a
+    docstring. ``pin_rule`` distinguishes the two, and every dependency carries
+    ``released_at``, ``pin_rule`` and the ``commit`` its declaration came from, so the
+    same question can be asked of a pin that is *inside* the window.
+
+    ``optional_imports`` is the other half of the closure: third-party modules the test
+    side imports only on a Python-2 or platform-specific branch. They are recorded and
+    deliberately **not** installed — installing a py2-only fallback on 3.8 would fail
+    the bake over a branch that can never be taken.
     """
     return {
         "schema_version": 1,
@@ -1251,6 +1720,8 @@ def deps_provenance(
         "checkpoint": sources.checkpoint,
         "buggy_commit": sources.buggy_commit,
         "commit_date": sources.commit_date,
+        "fixed_commit": sources.fixed_commit,
+        "fixed_commit_date": sources.fixed_commit_date,
         "import_name": sources.import_name,
         "harness_pins": dict(harness_pins),
         "installs": list(installs_of(resolved)),
@@ -1265,6 +1736,7 @@ def deps_provenance(
             for dep in resolved
             if dep.released_at is not None and dep.released_at > sources.commit_date
         ],
+        "optional_imports": [item.as_dict() for item in sources.optional_imports],
         "skipped": [line.as_dict() for line in sources.skipped],
         "notes": list(sources.notes),
     }
@@ -1301,9 +1773,13 @@ def resolve_bug_deps(
     exception — is testable without the network.
     """
     out: list[BugDeps] = []
+    distributions = split.module_distributions()
     for entry in entries:
         sources = bug_sources(
-            entry, bugsinpy_root=bugsinpy_root, repo=repo_for(str(entry["project"]))
+            entry,
+            bugsinpy_root=bugsinpy_root,
+            repo=repo_for(str(entry["project"])),
+            module_distributions=distributions,
         )
         pin = pins_for_python(split, minor_version(str(entry["python_version"])))
         harness_pins = {"pytest": pin.pytest, "pytest-json-report": pin.json_report}

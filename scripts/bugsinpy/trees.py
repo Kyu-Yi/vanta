@@ -99,6 +99,18 @@ def commit_date(repo: Path, commit: str) -> str:
     return date
 
 
+def list_files_at(repo: Path, commit: str) -> list[str]:
+    """Every path in ``commit``'s tree, relative to the repository root.
+
+    [VANTA-WHY] A list and not a checkout: the dependency closure (§3.2) has to ask
+    which test-side files the tree under test carries, and it asks that question at
+    bake time, before any tree is materialised. Reading a file is
+    :func:`read_file_at`; this is only the index of what could be read.
+    """
+    out = _git(["ls-tree", "-r", "--name-only", commit], cwd=repo)
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
 def export_tree(repo: Path, commit: str, dest: Path) -> None:
     """Materialise ``commit`` of ``repo`` at ``dest`` as a self-contained tree.
 

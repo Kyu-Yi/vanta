@@ -15,36 +15,226 @@
     "policy": "pinned_per_call_plus_server_top_p",
     "note": "temperature/max_tokens come from the pipeline's per-call pins (design §4.3); top_p is the one value read from the server's /props. The harness adds no run-level value."
   },
-  "bugs": [
+  "reviewed_changes": [
     {
-      "project": "PySnooper",
-      "bug_id": 1,
-      "python_version": "3.8.1",
-      "buggy_commit": "e21a31162f4c54be693d8ca8260e42393b39abd3",
-      "fixed_commit": "56f22f8ffe1c6b2be4d2cf3ad1987fdb66113da2",
-      "test_file": "tests/test_chinese.py",
-      "pythonpath": null,
-      "needs_build": false,
-      "native_test_paths": [
-        "tests"
-      ],
-      "test_cmd": [
-        "python",
-        "-m",
-        "pytest",
-        "tests",
-        "-p",
-        "no:cacheprovider",
-        "--json-report",
-        "--json-report-file={report}"
-      ],
-      "pytest_version": "8.0.2",
-      "json_report_version": "1.5.0",
-      "checkpoint": "vanta-bi-PySnooper-1",
-      "wave": 1,
-      "role": "pilot",
-      "notes": "Cheapest environment: pure Python 3.8, no pythonpath, no build step, tiny suite. Wave-1 go/no-go gate (§8.2)."
+      "change": "PySnooper/1 is removed from `bugs`. It was wave 1, role pilot, and its slot in the wave-1 go/no-go gate is taken by black/22 (`bugs[2]`, promoted from the py3.8 candidate pool).",
+      "reason": "PySnooper/1 is a Python-2-only encoding bug. Its run_test.sh test passes on both the buggy commit and the fixed commit under Python 3.8, so the bug is never reproduced, FAIL_TO_PASS is empty, and no oracle can be derived from it. Prepare cannot detect this: the three-suite derivation would simply record `empty FAIL_TO_PASS` and the slot would be spent. This is the exclusion §8 anticipates, and it is recorded here rather than applied silently to `bugs`.",
+      "decided_by": "user review, 2026-10-20"
     },
+    {
+      "change": "black/22 is promoted into wave 1 as a pilot, in the PySnooper/1 slot. No cap was raised and the context gate's constants are unchanged.",
+      "reason": "The §1.6 context gate is the only rule that can reject a candidate, and black/22 is the first py3.8 candidate in the reserve-then-split order that passes it: ~58497 estimated prompt tokens against a 65280 token budget (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin), with no file skipped by the per-file or total cap. black/1 and black/2, the split's own declared wave-1 reserves, both reject — black/1 also exceeds the budget and both truncate the source — so the pool continues past them, which is why the search walks the whole black block. Every candidate is listed below with its own measurement. The measurements were re-taken from the current code, after the test-path change of item 4 / e7fdb41 moved the vanta_tree the precheck walks; the earlier scratch sweep (including its black/22 row) predates that change and was discarded rather than allowed to inform the pick.",
+      "decided_by": "user review, 2026-10-20",
+      "rule": "\"in a wave\" means already scheduled to run as a pilot; reserves are the substitution pool by design. Order: the remaining wave-1 reserves first in the split's reserve order, then other py3.8 bugs in split order; the first candidate that passes the gate at n_ctx 131072 with the current caps unchanged wins. Measure-only: no suite run and no Vanta run per candidate. If no py3.8 candidate fits, wave 1 falls back to the two remaining PySnooper bugs, with both exclusion reasons recorded.",
+      "measurements": [
+        {
+          "bug": "black/1",
+          "estimated_prompt_tokens": 68376,
+          "headroom_tokens": -3096,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 3 file(s) over the 262144 B total budget — Vanta would show the Creator 261502 B of 4596238 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~68376 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/2",
+          "estimated_prompt_tokens": 67039,
+          "headroom_tokens": -1759,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 256155 B of 4456744 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~67039 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/3",
+          "estimated_prompt_tokens": 66979,
+          "headroom_tokens": -1699,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 255915 B of 4456179 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~66979 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/4",
+          "estimated_prompt_tokens": 58572,
+          "headroom_tokens": 6708,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 222286 B of 4409951 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/5",
+          "estimated_prompt_tokens": 57903,
+          "headroom_tokens": 7377,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 219611 B of 4400877 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/6",
+          "estimated_prompt_tokens": 57590,
+          "headroom_tokens": 7690,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 218360 B of 4396499 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/7",
+          "estimated_prompt_tokens": 57299,
+          "headroom_tokens": 7981,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 217194 B of 4392547 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/8",
+          "estimated_prompt_tokens": 57226,
+          "headroom_tokens": 8054,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 216902 B of 4391534 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/9",
+          "estimated_prompt_tokens": 57046,
+          "headroom_tokens": 8234,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 1 file(s) over the 262144 B total budget — Vanta would show the Creator 216184 B of 4388636 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/10",
+          "estimated_prompt_tokens": 56506,
+          "headroom_tokens": 8774,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 1 file(s) over the 262144 B total budget — Vanta would show the Creator 214021 B of 4384141 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/11",
+          "estimated_prompt_tokens": 56476,
+          "headroom_tokens": 8804,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 1 file(s) over the 262144 B total budget — Vanta would show the Creator 213901 B of 4382725 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/12",
+          "estimated_prompt_tokens": 67871,
+          "headroom_tokens": -2591,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 259483 B of 4361783 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~67871 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/13",
+          "estimated_prompt_tokens": 67614,
+          "headroom_tokens": -2334,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 258456 B of 4360303 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~67614 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/14",
+          "estimated_prompt_tokens": 66773,
+          "headroom_tokens": -1493,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 255089 B of 4354148 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~66773 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/15",
+          "estimated_prompt_tokens": 66214,
+          "headroom_tokens": -934,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 252853 B of 4354602 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~66214 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/16",
+          "estimated_prompt_tokens": 65651,
+          "headroom_tokens": -371,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 250601 B of 4347801 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~65651 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/17",
+          "estimated_prompt_tokens": 60100,
+          "headroom_tokens": 5180,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 1 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 228398 B of 338960 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/18",
+          "estimated_prompt_tokens": 59837,
+          "headroom_tokens": 5443,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 1 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 227346 B of 336740 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/19",
+          "estimated_prompt_tokens": 48683,
+          "headroom_tokens": 16597,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 1 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 182731 B of 266575 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/20",
+          "estimated_prompt_tokens": 48082,
+          "headroom_tokens": 17198,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 1 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 180326 B of 263855 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/21",
+          "estimated_prompt_tokens": 45929,
+          "headroom_tokens": 19351,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 1 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 171715 B of 250354 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/22",
+          "estimated_prompt_tokens": 58497,
+          "headroom_tokens": 6783,
+          "verdict": "pass",
+          "reasons": []
+        }
+      ]
+    }
+  ],
+  "bugs": [
     {
       "project": "PySnooper",
       "bug_id": 2,
@@ -102,6 +292,35 @@
       "wave": 1,
       "role": "pilot",
       "notes": "Wave-1 go/no-go gate (§8.2)."
+    },
+    {
+      "project": "black",
+      "bug_id": 22,
+      "python_version": "3.8.3",
+      "buggy_commit": "728c56c986bc5aea4d9897d3fce3159f89991b8e",
+      "fixed_commit": "c55d08d0b96c8de8bd867ca315e380d9e9d2d7ec",
+      "test_file": "tests/comments3.py;tests/test_black.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-black-22",
+      "wave": 1,
+      "role": "pilot",
+      "notes": "Promoted from the py3.8 candidate pool into the PySnooper/1 slot (see reviewed_changes): the first candidate in the reserve-then-split order that passes the §1.6 context gate at n_ctx 131072 with the caps unchanged. Reuses the py3.8 interpreter. test_file is BugsInPy's own semicolon-joined pair — a data fixture plus the test module; run_test.sh names tests.test_black.BlackTestCase.test_comments3, and the F2P nodeid's file is the second element, so the nodeid-ownership guard resolves it through run_test.sh rather than through test_file."
     },
     {
       "project": "thefuck",

@@ -190,9 +190,9 @@ class TestSplit:
             if e.get("role") == "reserve"
         }
         assert pilot_keys == {
-            "PySnooper/1",
             "PySnooper/2",
             "PySnooper/3",
+            "black/22",
             "thefuck/1",
             "thefuck/2",
             "thefuck/3",
@@ -208,6 +208,110 @@ class TestSplit:
             "youtube-dl/1",
         }
         assert not (pilot_keys & reserve_keys)
+
+    def test_real_split_reviewed_changes_carry_the_rule_and_its_measurements(self):
+        """§8's substitution is the one place the split departs from §8's own plan.
+
+        Pinned so the amendment cannot be edited away or have its evidence thinned:
+        the rule that chose the substitute, the exclusion it substitutes for, and a
+        measurement for every candidate the rule walked are all in the file a
+        reviewer reads.
+        """
+        split = load_split(SPLIT_PATH)
+        changes = split.data["reviewed_changes"]
+        assert len(changes) == 2
+        excluded, promoted = changes
+        assert "PySnooper/1" in excluded["change"]
+        assert "Python-2-only" in excluded["reason"]
+
+        assert "black/22" in promoted["change"]
+        assert "\"in a wave\" means already scheduled to run as a pilot" in promoted["rule"]
+        measurements = promoted["measurements"]
+        assert [m["bug"] for m in measurements] == [f"black/{i}" for i in range(1, 23)]
+        # The rule stops at the FIRST passer, so exactly the last measurement passes
+        # and every one before it carries the reason the precheck fired.
+        assert [m["bug"] for m in measurements if m["verdict"] == "pass"] == ["black/22"]
+        assert all(m["reasons"] for m in measurements[:-1])
+
+    def test_reviewed_change_validates(self):
+        data = split_data(
+            reviewed_changes=[
+                {
+                    "change": "black/22 replaces PySnooper/1",
+                    "reason": "the first context-gate passer in the py3.8 pool",
+                    "decided_by": "review",
+                    "rule": "first candidate that passes the gate wins",
+                    "measurements": [
+                        {
+                            "bug": "black/1",
+                            "estimated_prompt_tokens": 68376,
+                            "headroom_tokens": -3096,
+                            "verdict": "reject",
+                            "reasons": ["source_truncated_by_cap: ..."],
+                        }
+                    ],
+                }
+            ]
+        )
+        split_mod.validate(data)
+
+    def test_reviewed_change_needs_a_change_and_a_reason(self):
+        for field in ("change", "reason"):
+            entry = {"change": "x", "reason": "y"}
+            entry[field] = ""
+            with pytest.raises(SplitError, match=field):
+                split_mod.validate(split_data(reviewed_changes=[entry]))
+
+    def test_reviewed_change_rejects_unknown_keys(self):
+        with pytest.raises(SplitError, match="unknown keys"):
+            split_mod.validate(
+                split_data(reviewed_changes=[{"change": "x", "reason": "y", "why": "z"}])
+            )
+
+    def test_a_rejected_measurement_must_say_which_rule_fired(self):
+        """A bare "black/1 rejects" is an assertion; the reasons are the evidence."""
+        with pytest.raises(SplitError, match="must carry its reasons"):
+            split_mod.validate(
+                split_data(
+                    reviewed_changes=[
+                        {
+                            "change": "substitute",
+                            "reason": "no reserve fits",
+                            "measurements": [
+                                {
+                                    "bug": "black/1",
+                                    "estimated_prompt_tokens": 68376,
+                                    "headroom_tokens": -3096,
+                                    "verdict": "reject",
+                                    "reasons": [],
+                                }
+                            ],
+                        }
+                    ]
+                )
+            )
+
+    def test_a_measurement_verdict_is_pass_or_reject(self):
+        with pytest.raises(SplitError, match="verdict"):
+            split_mod.validate(
+                split_data(
+                    reviewed_changes=[
+                        {
+                            "change": "substitute",
+                            "reason": "no reserve fits",
+                            "measurements": [
+                                {
+                                    "bug": "black/1",
+                                    "estimated_prompt_tokens": 1,
+                                    "headroom_tokens": 1,
+                                    "verdict": "maybe",
+                                    "reasons": [],
+                                }
+                            ],
+                        }
+                    ]
+                )
+            )
 
     def test_waves_group_the_pilot(self):
         split = load_split(SPLIT_PATH)

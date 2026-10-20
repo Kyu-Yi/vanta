@@ -32,9 +32,35 @@ TOP_LEVEL_KEYS = frozenset(
         "seeds",
         "review_mode",
         "sampling",
+        "reviewed_changes",
         "bugs",
     }
 )
+
+OPTIONAL_TOP_LEVEL_KEYS = frozenset({"bugsinpy_root", "reviewed_changes"})
+
+REVIEWED_CHANGE_KEYS = frozenset({"change", "reason", "decided_by", "rule", "measurements"})
+"""``reviewed_changes`` is the split's audit trail (§8): every departure from the
+first-authored protocol — an excluded bug, a promoted reserve, a changed selection
+rule — is recorded here with its reason, in the split itself rather than in a
+commit message or a design-doc prose block.
+
+[VANTA-WHY] It lives in the protocol because the protocol is what a reviewer reads
+to know what the experiment was. A substitution decided in chat and applied to
+``bugs`` would be indistinguishable from a bug that was always there; the same
+substitution *with its measurements* next to it is checkable. The measurements are
+per-candidate and machine-readable for the same reason: "black/1 rejects" is an
+assertion, whereas ``est 68376 / budget 65280 / source_truncated_by_cap`` is the
+evidence, and a reader can re-run it.
+
+The shape stays closed (unknown keys are an error) so a hand-edited record cannot
+quietly grow an unvalidated field.
+"""
+
+MEASUREMENT_KEYS = frozenset(
+    {"bug", "estimated_prompt_tokens", "headroom_tokens", "verdict", "reasons"}
+)
+MEASUREMENT_VERDICTS = ("pass", "reject")
 
 # Hand-authored: the plan for the bug, known before any checkout.
 DECLARED_BUG_KEYS = frozenset(
@@ -211,7 +237,7 @@ def validate(data: dict[str, Any], path: Optional[Path] = None) -> None:
     unknown = set(data) - TOP_LEVEL_KEYS
     if unknown:
         raise SplitError(f"{where}unknown top-level keys: {sorted(unknown)}")
-    missing = TOP_LEVEL_KEYS - {"bugsinpy_root"} - set(data)
+    missing = TOP_LEVEL_KEYS - OPTIONAL_TOP_LEVEL_KEYS - set(data)
     if missing:
         raise SplitError(f"{where}missing top-level keys: {sorted(missing)}")
 
@@ -246,6 +272,70 @@ def validate(data: dict[str, Any], path: Optional[Path] = None) -> None:
     seen: set[str] = set()
     for index, entry in enumerate(bugs):
         _validate_bug(entry, where, index, seen)
+
+    reviewed = data.get("reviewed_changes")
+    if reviewed is not None:
+        if not isinstance(reviewed, list) or not reviewed:
+            raise SplitError(f"{where}reviewed_changes must be a non-empty list when present")
+        for index, entry in enumerate(reviewed):
+            _validate_reviewed_change(entry, where, index)
+
+
+def _validate_reviewed_change(entry: Any, where: str, index: int) -> None:
+    tag = f"{where}reviewed_changes[{index}]"
+    if not isinstance(entry, dict):
+        raise SplitError(f"{tag}: must be an object")
+
+    unknown = set(entry) - REVIEWED_CHANGE_KEYS
+    if unknown:
+        raise SplitError(f"{tag}: unknown keys {sorted(unknown)}")
+
+    for key in ("change", "reason"):
+        value = entry.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise SplitError(f"{tag}: {key} must be a non-empty string")
+
+    for key in ("decided_by", "rule"):
+        if key in entry and (not isinstance(entry[key], str) or not entry[key].strip()):
+            raise SplitError(f"{tag}: {key} must be a non-empty string when present")
+
+    measurements = entry.get("measurements")
+    if measurements is None:
+        return
+    if not isinstance(measurements, list) or not measurements:
+        raise SplitError(f"{tag}: measurements must be a non-empty list when present")
+    for m_index, measurement in enumerate(measurements):
+        _validate_measurement(measurement, tag, m_index)
+
+
+def _validate_measurement(entry: Any, tag: str, index: int) -> None:
+    where = f"{tag}.measurements[{index}]"
+    if not isinstance(entry, dict):
+        raise SplitError(f"{where}: must be an object")
+
+    unknown = set(entry) - MEASUREMENT_KEYS
+    if unknown:
+        raise SplitError(f"{where}: unknown keys {sorted(unknown)}")
+
+    bug = entry.get("bug")
+    if not isinstance(bug, str) or not bug.strip():
+        raise SplitError(f"{where}: bug must be a non-empty string")
+
+    if entry.get("verdict") not in MEASUREMENT_VERDICTS:
+        raise SplitError(f"{where}: verdict must be one of {list(MEASUREMENT_VERDICTS)}")
+
+    for key in ("estimated_prompt_tokens", "headroom_tokens"):
+        if not isinstance(entry.get(key), int):
+            raise SplitError(f"{where}: {key} must be an int")
+
+    reasons = entry.get("reasons")
+    if not isinstance(reasons, list) or not all(isinstance(r, str) for r in reasons):
+        raise SplitError(f"{where}: reasons must be a list of strings")
+    if entry["verdict"] == "reject" and not reasons:
+        raise SplitError(
+            f"{where}: a reject must carry its reasons — the precheck's verdict is only "
+            "auditable if the record says which rules fired"
+        )
 
 
 def _validate_bug(entry: Any, where: str, index: int, seen: set[str]) -> None:

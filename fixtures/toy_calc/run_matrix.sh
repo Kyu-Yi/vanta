@@ -63,13 +63,20 @@ case "$BACKEND_ARG" in
     ;;
 esac
 
+# [VANTA-WHY] The test command names the `tests` directory ON PURPOSE. A
+# single-test run must REPLACE this selection with the generated test file; the
+# old harness APPENDED the generated file instead, so pytest collected the repo's
+# own suite first and the report reader graded the generated test against the
+# repo's (passing) first result. Every BugReproduction test was therefore scrapped
+# and a bad patch was approved. If this fixture is run with a command that names
+# no path, that bug cannot be seen at all.
 if "$HOST_PYTHON" - <<'PY'
 import importlib.util, sys
 ok = all(importlib.util.find_spec(name) for name in ("pytest", "pytest_jsonreport"))
 sys.exit(0 if ok else 1)
 PY
 then
-  SUBPROCESS_TEST_CMD="$HOST_PYTHON -m pytest -q"
+  SUBPROCESS_TEST_CMD="$HOST_PYTHON -m pytest tests -q"
 else
   echo "python3 is missing pytest or pytest-json-report; create a venv before running subprocess cases" >&2
   exit 1
@@ -160,7 +167,7 @@ for backend in "${BACKENDS[@]}"; do
   if [[ "$backend" == "subprocess" ]]; then
     TEST_CMD="$SUBPROCESS_TEST_CMD"
   else
-    TEST_CMD="python3 -m pytest -q"
+    TEST_CMD="python3 -m pytest tests -q"
   fi
 
   for case_id in "${CASES[@]}"; do

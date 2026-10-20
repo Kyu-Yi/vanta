@@ -11,7 +11,7 @@
 // functions, so a fix to test execution lands once.
 // ============================================================================
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -100,7 +100,7 @@ pub async fn run_tests_parallel_detailed(
             }
             let _ = write_conftest(sb.root());
             let _ = fs::write(sb.root().join("test_run.py"), &test.test_source);
-            let cmd = build_test_cmd(&cmd_template, "test_run.py");
+            let cmd = build_single_test_cmd(&cmd_template, "test_run.py", &source);
             let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
             let sandbox_root = sb.root().display().to_string();
             let exec = sb
@@ -111,6 +111,7 @@ pub async fn run_tests_parallel_detailed(
                     sb.root().join("report.json"),
                     &e,
                     Some(sandbox_root),
+                    "test_run.py",
                 ),
                 Err(_) => TestExecutionDetails::infrastructure_error(),
             };
@@ -173,14 +174,17 @@ pub async fn run_single_test_with_timeout(
     let _ = write_source_files(sb.root(), source_concat);
     let _ = write_conftest(sb.root());
     let _ = fs::write(sb.root().join("test_bate.py"), test_source);
-    let cmd = build_test_cmd(test_cmd, "test_bate.py");
+    let cmd = build_single_test_cmd(test_cmd, "test_bate.py", source_concat);
     let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
     let sandbox_root = sb.root().display().to_string();
     let exec = sb.execute(&cmd_refs, Path::new(""), timeout_secs).await;
     let result = match exec {
-        Ok(e) => {
-            parse_pytest_report_detailed(sb.root().join("report.json"), &e, Some(sandbox_root))
-        }
+        Ok(e) => parse_pytest_report_detailed(
+            sb.root().join("report.json"),
+            &e,
+            Some(sandbox_root),
+            "test_bate.py",
+        ),
         Err(_) => TestExecutionDetails::infrastructure_error(),
     };
     sb.destroy();
@@ -731,19 +735,26 @@ for _p in (os.path.join(_here, 'src'), _here):
 // pytest report parsing
 // ============================================================================
 
-/// Parse pytest's JSON report into a single TestResult.
+/// Parse pytest's JSON report into the outcome of a specific generated test
+/// file.
 ///
 /// [VANTA-WHY] An "error" outcome (ImportError/AttributeError during the test
 /// body) means the test did NOT pass — equivalent to "failed". `TestResult::Error`
-/// is reserved for INFRASTRUCTURE failures (timeout, missing report, crash).
-pub fn parse_pytest_report(report_path: PathBuf, exec: &ExecutionResult) -> TestResult {
-    parse_pytest_report_detailed(report_path, exec, None).result
+/// is reserved for INFRASTRUCTURE failures (timeout, missing report, crash),
+/// which now also covers "the report does not contain the generated test".
+pub fn parse_pytest_report(
+    report_path: PathBuf,
+    exec: &ExecutionResult,
+    generated_test_file: &str,
+) -> TestResult {
+    parse_pytest_report_detailed(report_path, exec, None, generated_test_file).result
 }
 
 pub fn parse_pytest_report_detailed(
     report_path: PathBuf,
     exec: &ExecutionResult,
     sandbox_root: Option<String>,
+    generated_test_file: &str,
 ) -> TestExecutionDetails {
     if exec.timed_out {
         return TestExecutionDetails {
@@ -759,29 +770,25 @@ pub fn parse_pytest_report_detailed(
     if report_path.exists() {
         if let Ok(text) = fs::read_to_string(&report_path) {
             if let Ok(report) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(tests) = report["tests"].as_array() {
-                    if let Some(t) = tests.first() {
-                        let result = match t["outcome"].as_str() {
-                            Some("passed") => TestResult::Passed,
-                            // "failed" = assertion failure; "error" = exception
-                            // during test body. Both mean the test didn't pass.
-                            Some("failed") | Some("error") => TestResult::Failed,
-                            _ => TestResult::Error,
-                        };
-                        return TestExecutionDetails {
-                            result,
-                            stdout: exec.stdout.clone(),
-                            stderr: exec.stderr.clone(),
-                            exit_code: exec.exit_code,
-                            timed_out: false,
-                            report_path_exists: true,
-                            sandbox_root,
-                        };
-                    }
+                if let Some(result) = generated_test_outcome(&report, generated_test_file) {
+                    return TestExecutionDetails {
+                        result,
+                        stdout: exec.stdout.clone(),
+                        stderr: exec.stderr.clone(),
+                        exit_code: exec.exit_code,
+                        timed_out: false,
+                        report_path_exists: true,
+                        sandbox_root,
+                    };
                 }
             }
         }
     }
+    // [VANTA-WHY] Fail closed. The report exists but the GENERATED test's nodeid
+    // is not in it (or there is no usable report at all): the generated test was
+    // never graded, so `report_path_exists == false` — "this tree did not reach a
+    // verdict" — and the result is `Error`, never `Passed`. `tests.first()` used
+    // to stand here, and the first entry was a passing repository test.
     TestExecutionDetails {
         result: TestResult::Error,
         stdout: exec.stdout.clone(),
@@ -791,6 +798,52 @@ pub fn parse_pytest_report_detailed(
         report_path_exists: false,
         sandbox_root,
     }
+}
+
+/// The outcome of the GENERATED test file, selected by the file part of its
+/// nodeid.
+///
+/// [VANTA-WHY] The grading bug. A `--test-cmd` that named a test path (e.g.
+/// `python -m pytest tests`) made pytest collect the repository's own suite
+/// before the generated file, and this reader took `report["tests"].first()` as
+/// the generated test's result. That first entry was always one of the repo's
+/// tests — which passes — so every BugReproduction test was recorded as "passed
+/// on the buggy original", scrapped by BATE, and no candidate could ever be
+/// rejected for failing to reproduce the bug. The generated file is written into
+/// the sandbox as one fixed name (`test_run.py` / `test_bate.py`), so its nodeid
+/// is identified by that FILE. A nodeid that is absent from the report yields
+/// `None` — the caller fails closed rather than reading someone else's result.
+fn generated_test_outcome(
+    report: &serde_json::Value,
+    generated_test_file: &str,
+) -> Option<TestResult> {
+    let wanted = nodeid_file(generated_test_file);
+    for t in report["tests"].as_array()? {
+        let nodeid = t["nodeid"].as_str().unwrap_or_default();
+        if nodeid_file(nodeid) == wanted {
+            let result = match t["outcome"].as_str().unwrap_or_default() {
+                "passed" | "subtests passed" => TestResult::Passed,
+                // "failed" = assertion failure; "error" = exception during the
+                // test body. Both mean the generated test did not pass.
+                "failed" | "error" => TestResult::Failed,
+                // An outcome we do not recognise is not a licence to pass.
+                _ => TestResult::Error,
+            };
+            return Some(result);
+        }
+    }
+    None
+}
+
+/// The file part of a pytest nodeid, normalised so `./a.py` and `a.py` match.
+fn nodeid_file(nodeid: &str) -> String {
+    nodeid
+        .split("::")
+        .next()
+        .unwrap_or(nodeid)
+        .trim()
+        .trim_start_matches("./")
+        .replace('\\', "/")
 }
 
 // ============================================================================
@@ -1199,11 +1252,123 @@ fn is_line_number(token: &str) -> bool {
 // Command construction
 // ============================================================================
 
-/// Build the sandbox command vector from the user's TestCommand + a test file.
-/// [VANTA-WHY] The user supplies the base runner (e.g. `pytest` or
-/// `python -m pytest`); we append the generated test file + json-report flags.
-pub fn build_test_cmd(test_cmd: &TestCommand, test_file: &str) -> Vec<String> {
-    let mut cmd = test_cmd.as_cmd_vec();
+/// Options that consume the NEXT argument as their value.
+///
+/// [VANTA-WHY] Needed to tell a positional TEST PATH from the value of a flag.
+/// `python -m pytest tests` and `pytest -m slow` look identical to a reader that
+/// does not know the option set: in the first the trailing token is a path to be
+/// REPLACED, in the second it is a marker expression to KEEP. Getting it wrong
+/// in either direction is expensive — dropping an option's value breaks the
+/// command, keeping a test path re-collects the repository's own suite (the bug
+/// `build_single_test_cmd` exists to fix). Only this table can separate them.
+const VALUE_TAKING_OPTIONS: &[&str] = &[
+    "-k", "-m", "-p", "-c", "-n", "-o", "-W", "-r",
+    "--rootdir", "--ignore", "--ignore-glob", "--deselect", "--maxfail",
+    "--tb", "--timeout", "--junitxml", "--junit-xml", "--basetemp", "--dist",
+    "--durations", "--capture", "--override-ini", "--import-mode",
+    "--log-level", "--log-file", "--log-cli-level", "--json-report-file",
+];
+
+/// Every path in the tree under test, plus every ancestor directory.
+///
+/// [VANTA-WHY] A test selection may name a file (`tests/test_x.py`, with or
+/// without a `::nodeid` suffix) or the directory above it (`tests`), so the set
+/// holds the PREFIXES of each path rather than only whole files. Membership is
+/// then what distinguishes a selection from a flag value that happens to look
+/// like one.
+pub fn selection_paths(source_concat: &str) -> HashSet<String> {
+    let mut paths = HashSet::new();
+    let Ok(files) = parse_source_files(source_concat) else {
+        return paths;
+    };
+    for (path, _) in files {
+        let path = path
+            .trim_start_matches("./")
+            .trim_end_matches('/')
+            .replace('\\', "/");
+        if path.is_empty() {
+            continue;
+        }
+        let mut prefix = String::new();
+        for part in path.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            paths.insert(prefix.clone());
+        }
+    }
+    paths
+}
+
+/// The path part of a test-selection argument, normalised for comparison.
+fn selection_target(arg: &str) -> String {
+    arg.split("::")
+        .next()
+        .unwrap_or(arg)
+        .trim()
+        .trim_end_matches('/')
+        .trim_start_matches("./")
+        .replace('\\', "/")
+}
+
+/// True when `arg` names a path inside the tree under test — i.e. a test
+/// selection to be replaced, not a flag to be kept.
+fn is_test_selection(arg: &str, selection: &HashSet<String>) -> bool {
+    if arg.starts_with('-') {
+        return false;
+    }
+    let target = selection_target(arg);
+    target.is_empty() || target == "." || selection.contains(&target)
+}
+
+/// Build the command that runs **only** the generated test file.
+///
+/// [VANTA-WHY] The user's test command still supplies the interpreter, the flags
+/// and (through the backend) the cwd — but its test SELECTION is replaced, not
+/// extended. Appending the generated file to a command that already named a path
+/// (`python -m pytest tests`) made pytest collect the repository's own suite
+/// first, and the report reader then took the first result in the report as the
+/// generated test's. Every BugReproduction test was therefore graded against a
+/// passing repository test: it "passed on the buggy original", so BATE scrapped
+/// it, so no candidate could ever be rejected for failing to reproduce the bug.
+/// The two halves — this and `generated_file_outcome` — are fixed together.
+pub fn build_single_test_cmd(
+    test_cmd: &TestCommand,
+    test_file: &str,
+    source_concat: &str,
+) -> Vec<String> {
+    let selection = selection_paths(source_concat);
+    let mut cmd = vec![test_cmd.program.clone()];
+    let args = &test_cmd.args;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            // Everything after `--` is positional by definition, and positional
+            // arguments to pytest ARE test selections. The marker itself only
+            // exists to introduce them, so it goes too.
+            break;
+        }
+        if VALUE_TAKING_OPTIONS.contains(&arg.as_str()) {
+            cmd.push(arg.clone());
+            if let Some(value) = args.get(i + 1) {
+                cmd.push(value.clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if is_test_selection(arg, &selection) {
+            i += 1;
+            continue;
+        }
+        cmd.push(arg.clone());
+        i += 1;
+    }
+
     cmd.push(test_file.to_string());
     cmd.push("--json-report".to_string());
     cmd.push("--json-report-file=report.json".to_string());
@@ -1387,9 +1552,10 @@ pub async fn heal_dependencies(
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeSuiteReport, RUFF_ARGS, StaticDiagnostic, copy_static_configs, interpreter_for,
-        is_native_test_path, native_outcome, native_regressions, native_suite_collapsed,
-        native_tree_with_original_tests, new_diagnostics, parse_mypy_line, parse_native_report,
+        NativeSuiteReport, RUFF_ARGS, StaticDiagnostic, build_single_test_cmd,
+        copy_static_configs, interpreter_for, is_native_test_path, native_outcome,
+        native_regressions, native_suite_collapsed, native_tree_with_original_tests,
+        new_diagnostics, parse_mypy_line, parse_native_report, parse_pytest_report_detailed,
         parse_ruff_line, ruff_is_error_class, run_single_test, run_tests_parallel,
         static_tool_runner, write_source_files,
     };
@@ -1927,6 +2093,175 @@ mod tests {
         assert!(
             !real.is_environment_finding(),
             "a genuine type error is a finding about the code"
+        );
+    }
+
+    // ---- the generated test is graded by ITS OWN nodeid -----------------------
+    //
+    // [VANTA-WHY] The grading bug. A `--test-cmd` that named a test path
+    // (`python -m pytest tests`) made the one-test run collect the repository's
+    // own suite FIRST, and the reader took `report["tests"].first()` as the
+    // generated test's result. That first entry was a repo test — which passes —
+    // so every BugReproduction test was recorded as "passed on the buggy
+    // original", BATE scrapped it, and no candidate could ever be rejected for
+    // failing to reproduce the bug. These pin both halves of the fix: the run
+    // REPLACES the selection with the generated file, and the reader selects only
+    // that file's result and fails closed when it is absent.
+
+    fn buggy_exec() -> ExecutionResult {
+        ExecutionResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(1),
+            wall_time_ms: 0,
+            timed_out: false,
+        }
+    }
+
+    fn written_report(tests_json: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.json");
+        fs::write(&path, format!("{{\"tests\":[{tests_json}]}}")).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn a_report_where_repo_tests_come_first_grades_the_generated_test() {
+        let (_dir, path) = written_report(concat!(
+            r#"{"nodeid":"tests/test_core.py::test_a","outcome":"passed"},"#,
+            r#"{"nodeid":"tests/test_core.py::test_b","outcome":"passed"},"#,
+            r#"{"nodeid":"test_bate.py::test_reproduces_bug","outcome":"failed"}"#
+        ));
+
+        let details = parse_pytest_report_detailed(path, &buggy_exec(), None, "test_bate.py");
+
+        assert_eq!(
+            details.result,
+            TestResult::Failed,
+            "the generated test FAILED on the buggy original; the passing repo test that \
+             happened to come first must not be read as its result"
+        );
+        assert!(
+            details.report_path_exists,
+            "a graded test reached a verdict, even though it failed"
+        );
+    }
+
+    #[test]
+    fn a_report_missing_the_generated_nodeid_fails_closed() {
+        let (_dir, path) = written_report(concat!(
+            r#"{"nodeid":"tests/test_core.py::test_a","outcome":"passed"},"#,
+            r#"{"nodeid":"tests/test_core.py::test_b","outcome":"passed"}"#
+        ));
+
+        let details = parse_pytest_report_detailed(path, &buggy_exec(), None, "test_bate.py");
+
+        assert_eq!(
+            details.result,
+            TestResult::Error,
+            "a report without the generated nodeid is a harness error, never a Passed"
+        );
+        assert!(
+            !details.report_path_exists,
+            "the generated test was never graded, so this tree did not reach a verdict"
+        );
+    }
+
+    #[test]
+    fn a_generated_file_named_with_a_leading_dot_slash_still_matches() {
+        let (_dir, path) =
+            written_report(r#"{"nodeid":"./test_run.py::test_x","outcome":"passed"}"#);
+
+        let details = parse_pytest_report_detailed(path, &buggy_exec(), None, "test_run.py");
+
+        assert_eq!(
+            details.result,
+            TestResult::Passed,
+            "rootdir-relative nodeids may carry a `./` prefix and must still match"
+        );
+    }
+
+    #[test]
+    fn a_test_cmd_that_names_a_path_has_it_replaced_not_extended() {
+        let source = concat!(
+            "# FILE: calc.py\n",
+            "def add(a, b):\n",
+            "    return a + b\n",
+            "\n",
+            "# FILE: tests/test_core.py\n",
+            "def test_add():\n",
+            "    assert add(1, 2) == 3\n",
+        );
+
+        let cmd = build_single_test_cmd(
+            &TestCommand::from_shell("python3 -m pytest tests -q"),
+            "test_bate.py",
+            source,
+        );
+
+        assert!(
+            !cmd.iter().any(|arg| arg == "tests"),
+            "the repository's own test path must be REPLACED, not extended: {cmd:?}"
+        );
+        assert_eq!(
+            cmd,
+            vec![
+                "python3",
+                "-m",
+                "pytest",
+                "-q",
+                "test_bate.py",
+                "--json-report",
+                "--json-report-file=report.json",
+                "-q",
+            ],
+            "the interpreter and flags are kept; only the test selection is replaced"
+        );
+    }
+
+    #[test]
+    fn a_value_taking_flag_keeps_its_value_and_is_not_read_as_a_path() {
+        let source = "# FILE: calc.py\ndef add(a, b):\n    return a + b\n";
+
+        let cmd = build_single_test_cmd(
+            &TestCommand::from_shell("python3 -m pytest -k test_add -m slow tests"),
+            "test_bate.py",
+            source,
+        );
+
+        assert!(
+            cmd.windows(2).any(|w| w == ["-k", "test_add"]),
+            "`-k`'s value is a marker expression, not a path to drop: {cmd:?}"
+        );
+        assert!(
+            cmd.windows(2).any(|w| w == ["-m", "slow"]),
+            "`-m`'s value is a marker expression, not a path to drop: {cmd:?}"
+        );
+        assert!(
+            !cmd.iter().any(|arg| arg == "tests"),
+            "the trailing path is still a selection and must be replaced: {cmd:?}"
+        );
+        assert!(cmd.iter().any(|arg| arg == "test_bate.py"), "{cmd:?}");
+    }
+
+    #[test]
+    fn a_test_cmd_without_a_path_keeps_its_flags_and_gains_the_generated_file() {
+        let source = "# FILE: calc.py\ndef add(a, b):\n    return a + b\n";
+
+        let cmd = build_single_test_cmd(&TestCommand::default(), "test_run.py", source);
+
+        assert_eq!(
+            cmd,
+            vec![
+                "python3",
+                "-m",
+                "pytest",
+                "test_run.py",
+                "--json-report",
+                "--json-report-file=report.json",
+                "-q",
+            ],
+            "with no selection in the command the behaviour is unchanged, minus the append"
         );
     }
 }

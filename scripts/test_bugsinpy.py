@@ -2375,8 +2375,7 @@ class TestBake:
         would die on ``ModuleNotFoundError``.
         """
         root = BUGSINPY_CLONE
-        assert bake_mod.requirements_for(root, "PySnooper", 1) == ""
-        assert bake_mod.declared_deps(bake_mod.setup_sh_for(root, "PySnooper", 1)) == []
+        assert bake_mod.requirements_for(root, "PySnooper", 2) == ""
         assert bake_mod.declared_deps(bake_mod.setup_sh_for(root, "PySnooper", 2)) == [
             "python_toolbox"
         ]
@@ -2390,7 +2389,9 @@ class TestBake:
             split, pythons=["3.8"], only=[], roles={"pilot"}
         )
         assert minors == ["3.8"]
-        assert [entry["project"] for entry in entries] == ["PySnooper"] * 3
+        # The third pilot is the promoted substitute and shares the py3.8
+        # interpreter with the two PySnooper bugs (see reviewed_changes).
+        assert [entry["project"] for entry in entries] == ["PySnooper", "PySnooper", "black"]
         layers = bake_mod.layer_recipes(
             split,
             pythons=minors,
@@ -2399,13 +2400,17 @@ class TestBake:
         )
         assert [name for name, _, _ in layers] == [
             "vanta-bugsinpy-py3.8",
-            "vanta-bi-PySnooper-1",
             "vanta-bi-PySnooper-2",
             "vanta-bi-PySnooper-3",
+            "vanta-bi-black-22",
         ]
         assert layers[0][1] == bake_mod.DEFAULT_BASE
         assert all(base == "vanta-bugsinpy-py3.8" for _, base, _ in layers[1:])
-        assert "python-toolbox==0.9.3" in layers[2][2]
+        recipe_by_name = {name: script for name, _, script in layers}
+        assert "python-toolbox==0.9.3" in recipe_by_name["vanta-bi-PySnooper-2"]
+        assert recipe_by_name["vanta-bi-black-22"].count("pip install") == 0, (
+            "black/22 has no resolved third-party dependency in this fixture"
+        )
 
     def test_a_bug_without_resolved_dependencies_is_refused_not_baked_dependency_free(self):
         """``layer_recipes`` must not silently build a layer that installs nothing.
@@ -3125,7 +3130,7 @@ needs_bare_repos = pytest.mark.skipif(
 @needs_bare_repos
 @needs_clone
 class TestRealPySnooperDependencies:
-    """The measured bug, end to end: PySnooper 1-3 resolve to the right layers.
+    """The measured bug, end to end: PySnooper 2-3 resolve to the right layers.
 
     PySnooper/3 is the failure this whole path was written for. Its layer used to
     be ``decorator`` alone, while ``tests/test_pysnooper.py`` imports
@@ -3138,7 +3143,7 @@ class TestRealPySnooperDependencies:
 
     def _entries(self) -> tuple[split_mod.Split, list[dict]]:
         split = load_split(SPLIT_PATH)
-        entries = [split.bug("PySnooper", bug_id) for bug_id in (1, 2, 3)]
+        entries = [split.bug("PySnooper", bug_id) for bug_id in (2, 3)]
         return split, entries
 
     def _resolve(self, entries):
@@ -3186,7 +3191,7 @@ class TestRealPySnooperDependencies:
         assert item.provenance["installs"] == list(item.installs)
         assert item.provenance["harness_pins"]["pytest"] == "8.0.2"
 
-    def test_bug_one_and_two_get_python_toolbox_from_the_tests_extra(self):
+    def test_bug_two_gets_python_toolbox_from_the_tests_extra(self):
         _, entries = self._entries()
         got = {
             item.checkpoint: set(item.installs)
@@ -3194,7 +3199,6 @@ class TestRealPySnooperDependencies:
             if not item.checkpoint.endswith("-3")
         }
         assert got == {
-            "vanta-bi-PySnooper-1": {"python-toolbox==0.9.3"},
             "vanta-bi-PySnooper-2": {"python-toolbox==0.9.3"},
         }
 

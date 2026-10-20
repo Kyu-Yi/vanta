@@ -196,7 +196,7 @@ def build_trees(bug: BugInfo, repo_cache: Path, bug_root: Path) -> list[str]:
     # `oracle_tree` is the pre-strip Vanta tree: buggy source + the FIXED commit's
     # test files, hidden tests intact. `vanta_tree`/`vanta_clean` are cut from it
     # after the hidden tests have been identified.
-    test_paths = tree_mod.test_paths_from_fix(bug)
+    test_paths = tree_mod.test_paths_from_fix(bug, bug_root / "src_fixed")
     tree_mod.compose_vanta_tree(
         bug_root / "src_buggy", bug_root / "src_fixed", bug_root / "oracle_tree", test_paths
     )

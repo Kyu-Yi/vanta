@@ -226,22 +226,66 @@ def parse_patch(patch_text: str) -> ParsedPatch:
     return ParsedPatch(paths=paths, added_lines=added, removed_lines=removed)
 
 
-def test_paths_from_fix(bug: BugInfo) -> list[str]:
-    """The test files Vanta must take from the FIXED commit.
+def test_dirs_from_fix(test_paths: Iterable[str]) -> list[str]:
+    """The top-level directories the fix-side test paths live in.
 
-    Two sources, unioned:
+    [VANTA-WHY] The top-level directory, not the module's own directory. Helpers
+    are placed beside the test *package*, not beside the test module:
+    ``tests/rules/test_x.py`` imports ``tests.utils``. Syncing only
+    ``tests/rules`` would leave that import broken.
+    """
+    dirs = set()
+    for path in test_paths:
+        parts = path.split("/")
+        if len(parts) > 1:
+            dirs.add(parts[0])
+    return sorted(dirs)
+
+
+def test_paths_from_fix(bug: BugInfo, fixed_dir: Path) -> list[str]:
+    """The files Vanta must take from the FIXED commit.
+
+    Three sources, unioned:
 
     * every path the fix patch touches that looks like a test (the fix usually
       updates existing tests, and that update is part of the new contract);
     * ``bug.info``'s ``test_file``, which is BugsInPy's own statement of where the
       bug-revealing test lives — it is authoritative even if the patch's diff
-      header is unusual.
+      header is unusual;
+    * every file under the top-level test directory each of those paths lives in,
+      read from ``fixed_dir``.
 
-    Union, not intersection: a path is included if *either* source names it.
+    [VANTA-WHY] The third source is not tidiness, it is the difference between a
+    tree that can be collected and one that cannot. The first two sources name test
+    *modules*, and a module is not self-contained: the fixed test file imports
+    helpers from beside it (``tests/utils.py``, a ``tests/mini_toolbox/`` package,
+    ``tests/__init__.py``), and those helpers are regularly only present — or only
+    current — in the fixed commit. Copying the module alone hands Vanta a tree that
+    dies at collection with ImportError, which the harness reads as "0 tests
+    collected", indistinguishable from a broken environment. The first real
+    prepare run lost PySnooper/2 exactly that way: its test file does
+    ``from . import mini_toolbox``, and ``tests/mini_toolbox/`` does not exist in
+    the buggy tree at all.
+
+    Whole directory rather than "the helpers it imports": which helper a test
+    imports is a question the harness cannot answer without importing the test
+    module, which is the thing it is not allowed to run outside Shuru. What keeps
+    the hidden tests out of the tree is the strip below, not the copy — the copy
+    brings everything, ``strip_hidden_tests`` then removes every hidden nodeid, so
+    a newly-synced test module is present only as far as it has kept tests.
+
+    Union, not intersection: a path is included if *any* source names it.
     """
     parsed = parse_patch(bug.bug_patch_txt)
     paths = {p for p in parsed.paths.all if is_test_path(p)}
     paths.add(bug.test_file)
+    for rel_dir in test_dirs_from_fix(paths):
+        src_dir = fixed_dir / rel_dir
+        if not src_dir.is_dir():
+            continue
+        for file in src_dir.rglob("*"):
+            if file.is_file():
+                paths.add(file.relative_to(fixed_dir).as_posix())
     return sorted(paths)
 
 

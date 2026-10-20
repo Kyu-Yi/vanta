@@ -360,7 +360,13 @@ class TestMetadata:
         for entry in split.bugs:
             bug = meta_mod.load_bug_info(BUGSINPY_CLONE, entry["project"], entry["bug_id"])
             assert prepare_mod.check_declared(entry, bug) == []
-            assert bug.test_file in tree_mod.test_paths_from_fix(bug)
+            # No checkout here: this assertion is about the declared split
+            # agreeing with bug.info, and that lives in the first two sources.
+            # The third source (whole test directories) needs a fixed tree, which
+            # only exists after prepare, so a path that cannot exist is passed.
+            assert bug.test_file in tree_mod.test_paths_from_fix(
+                bug, Path("/nonexistent-fixed-tree")
+            )
 
 
 # ============================================================================
@@ -436,15 +442,17 @@ index 4444444..0000000
 
 
 class TestTestPathsFromFix:
-    def test_unions_patch_test_paths_with_bug_info(self):
+    def test_unions_patch_test_paths_with_bug_info(self, tmp_path):
         """Union, not intersection: either source naming a path includes it."""
         bug = bug_info(
             test_file="tests/test_untouched.py",
             bug_patch_txt=TestParsePatch.PATCH,
         )
-        assert tree_mod.test_paths_from_fix(bug) == ["tests/test_untouched.py"]
+        assert tree_mod.test_paths_from_fix(bug, tmp_path / "fixed") == [
+            "tests/test_untouched.py"
+        ]
 
-    def test_patch_that_touches_a_test_file(self):
+    def test_patch_that_touches_a_test_file(self, tmp_path):
         patch = (
             "diff --git a/tests/test_a.py b/tests/test_a.py\n"
             "--- a/tests/test_a.py\n"
@@ -454,7 +462,46 @@ class TestTestPathsFromFix:
             "+y\n"
         )
         bug = bug_info(test_file="tests/test_b.py", bug_patch_txt=patch)
-        assert tree_mod.test_paths_from_fix(bug) == ["tests/test_a.py", "tests/test_b.py"]
+        fixed = tmp_path / "fixed"
+        write(fixed / "tests" / "test_a.py", "def test_a():\n    pass\n")
+        write(fixed / "tests" / "test_b.py", "def test_b():\n    pass\n")
+        assert tree_mod.test_paths_from_fix(bug, fixed) == [
+            "tests/test_a.py",
+            "tests/test_b.py",
+        ]
+
+    def test_syncs_the_whole_test_directory_not_only_the_named_module(self, tmp_path):
+        """A test module is not self-contained; the helper beside it must come too.
+
+        PySnooper/2 is the case in point: its test file does
+        ``from . import mini_toolbox`` and ``tests/mini_toolbox/`` exists only in
+        the fixed commit, so a tree holding just the named module dies at
+        collection with ImportError (which the harness reads as "0 tests
+        collected"). Only the named module is named by the first two sources;
+        the third source is what brings the helper.
+        """
+        bug = bug_info(test_file="tests/test_pysnooper.py", bug_patch_txt="")
+        fixed = tmp_path / "fixed"
+        write(fixed / "tests" / "__init__.py", "")
+        write(fixed / "tests" / "test_pysnooper.py", "from . import mini_toolbox\n")
+        write(fixed / "tests" / "mini_toolbox" / "__init__.py", "CONTEXTMANAGER = 1\n")
+
+        paths = tree_mod.test_paths_from_fix(bug, fixed)
+
+        assert "tests/test_pysnooper.py" in paths, "the named module is still there"
+        assert "tests/__init__.py" in paths, "the package marker a relative import needs"
+        assert "tests/mini_toolbox/__init__.py" in paths, "the helper the module imports"
+
+    def test_no_third_source_when_the_test_directory_is_absent(self, tmp_path):
+        """The third source is a union, so a missing directory contributes nothing.
+
+        This is what keeps the split-agreement guard (which has no checkout)
+        meaningful instead of crashing on a path that does not exist.
+        """
+        bug = bug_info(test_file="tests/test_untouched.py", bug_patch_txt="")
+        assert tree_mod.test_paths_from_fix(bug, tmp_path / "no-such-fixed") == [
+            "tests/test_untouched.py"
+        ]
 
 
 class TestNodeIds:
@@ -503,6 +550,57 @@ class TestComposeVantaTree:
 
         assert not (dest / "tests" / "test_gone.py").exists()
         assert report.dropped_fix_deleted == ["tests/test_gone.py"]
+
+    def test_helper_the_kept_tests_import_is_present_and_the_f2p_test_is_absent(
+        self, tmp_path
+    ):
+        """The whole PySnooper/2 chain in one place: copy, then strip.
+
+        After ``test_paths_from_fix`` brings the helper into ``vanta_tree`` and
+        ``strip_hidden_tests`` removes the hidden test, the tree must contain the
+        helper the kept test imports and must not contain the fail-to-pass test —
+        neither by name nor by body.
+        """
+        buggy = tmp_path / "buggy"
+        fixed = tmp_path / "fixed"
+        kept_test = (
+            "from . import mini_toolbox\n"
+            "\n"
+            "\n"
+            "def test_kept():\n"
+            "    assert mini_toolbox.CONTEXTMANAGER\n"
+        )
+        f2p_test = (
+            "def test_hidden_f2p():\n"
+            "    assert 'F2P-BODY-MARKER' == 'leaked'\n"
+        )
+        write(buggy / "demo.py", "VALUE = 'buggy'\n")
+        write(buggy / "tests" / "__init__.py", "")
+        write(buggy / "tests" / "test_pysnooper.py", kept_test)
+        write(fixed / "demo.py", "VALUE = 'fixed'\n")
+        write(fixed / "tests" / "__init__.py", "")
+        write(fixed / "tests" / "test_pysnooper.py", kept_test + "\n\n" + f2p_test)
+        write(fixed / "tests" / "mini_toolbox" / "__init__.py", "CONTEXTMANAGER = 1\n")
+
+        bug = bug_info(test_file="tests/test_pysnooper.py", bug_patch_txt="")
+        test_paths = tree_mod.test_paths_from_fix(bug, fixed)
+
+        dest = tmp_path / "vanta"
+        tree_mod.compose_vanta_tree(buggy, fixed, dest, test_paths)
+        rel = "tests/test_pysnooper.py"
+        tree_mod.strip_hidden_tests(
+            dest,
+            [f"{rel}::test_hidden_f2p"],
+            {rel: {f"{rel}::test_kept", f"{rel}::test_hidden_f2p"}},
+        )
+
+        assert (dest / "tests" / "mini_toolbox" / "__init__.py").is_file(), (
+            "the helper the kept test imports must survive into vanta_tree"
+        )
+        text = (dest / rel).read_text()
+        assert "def test_kept" in text
+        assert "test_hidden_f2p" not in text, "the F2P test must not survive by name"
+        assert "F2P-BODY-MARKER" not in text, "nor may its body appear anywhere"
 
 
 class TestStripHiddenTests:

@@ -24,6 +24,7 @@ never by booting a VM.
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import re
 import shlex
@@ -4631,6 +4632,149 @@ class TestOracleGrade:
         """Session ids and patch hashes are used as path components."""
         self._grade(wired, tmp_path, label="a/b c")
         assert wired["copies"][0][1].name == "Demo_1__a_b_c"
+
+
+class TestDevFixSelfCheck:
+    """prepare grades the developer fix with the real oracle and refuses the bug if it fails.
+
+    [VANTA-WHY] PySnooper/2 shipped a whole wave with its own developer fix grading
+    ``patch_good = false``: ``bug_patch.txt`` is a strict subset of the fix commit, so the
+    patched tree cannot import the package and *no* patch of any kind could be graded good.
+    Nothing in the artifacts said so — every candidate simply graded bad, which is
+    indistinguishable from Vanta being conservative. These tests pin the gate that turns it
+    into a refusal at the cheapest point in the pipeline.
+    """
+
+    SOURCE_DIFF = (
+        "diff --git a/pkg/mod.py b/pkg/mod.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/pkg/mod.py\n"
+        "+++ b/pkg/mod.py\n"
+        "@@ -1,3 +1,4 @@\n"
+        " one\n"
+        " two\n"
+        " three\n"
+        "+four\n"
+    )
+    TEST_DIFF = (
+        "diff --git a/tests/test_demo.py b/tests/test_demo.py\n"
+        "index 3333333..4444444 100644\n"
+        "--- a/tests/test_demo.py\n"
+        "+++ b/tests/test_demo.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " def test_fix():\n"
+        "+    assert True\n"
+        "     pass\n"
+    )
+
+    @pytest.fixture
+    def graded(self, monkeypatch):
+        """``grade`` recorded rather than run: no VM, and the arguments stay inspectable."""
+        calls: dict = {}
+
+        def fake_grade(**kwargs):
+            calls.setdefault("gradings", []).append(kwargs)
+            return calls["result"]
+
+        monkeypatch.setattr(oracle_mod, "grade", fake_grade)
+        calls["result"] = oracle_mod.OracleResult(
+            apply_ok=True,
+            hidden_pass=True,
+            hidden_nodeids=["tests/test_demo.py::test_fix"],
+            patch_good=True,
+        )
+        return calls
+
+    def _run(self, tmp_path, *, text=None, fail_to_pass=None):
+        prep = oracle_prep(
+            bug=bug_info(bug_patch_txt=self.SOURCE_DIFF if text is None else text)
+        )
+        if fail_to_pass is not None:
+            prep.fail_to_pass = list(fail_to_pass)
+        ok = prepare_mod.selfcheck_dev_fix(
+            prep, batch_dir=tmp_path / "batch", checkpoint="vanta-bi-Demo-1"
+        )
+        return ok, prep
+
+    def test_a_good_developer_fix_lets_the_bug_continue(self, graded, tmp_path):
+        ok, prep = self._run(tmp_path)
+        assert ok is True
+        assert prep.gate_failures == []
+
+    def test_the_graded_patch_is_the_one_candidate_set_will_grade(self, graded, tmp_path):
+        """Same source through the same filter as ``runner.candidate_set``: two gradings of
+        one artifact have to be one question, not two similar ones."""
+        self._run(tmp_path)
+        call = graded["gradings"][0]
+        assert call["patch_path"].name == "Demo_1-dev_fix.patch"
+        assert call["patch_path"].read_text() == suite_mod.drop_test_file_hunks(self.SOURCE_DIFF)
+        assert call["prep"].key == "Demo/1"
+        assert call["label"] == oracle_mod.DEV_FIX_STEM
+
+    def test_test_hunks_are_dropped_from_the_graded_patch(self, graded, tmp_path):
+        ok, _ = self._run(tmp_path, text=self.SOURCE_DIFF + self.TEST_DIFF)
+        assert ok is True
+        written = (
+            tmp_path / "batch" / oracle_mod.SELFCHECK_DIR / "Demo_1-dev_fix.patch"
+        ).read_text()
+        assert "pkg/mod.py" in written
+        assert "test_demo.py" not in written
+
+    def test_a_developer_fix_that_is_not_patch_good_refuses_the_bug(self, graded, tmp_path):
+        graded["result"] = oracle_mod.OracleResult(
+            apply_ok=True,
+            hidden_pass=False,
+            hidden_nodeids=["tests/test_demo.py::test_fix"],
+            hidden_outcomes={"tests/test_demo.py::test_fix": "absent"},
+            suite_regressions=["tests/test_demo.py::test_other"],
+            patch_good=False,
+        )
+        ok, prep = self._run(tmp_path)
+        assert ok is False
+        assert prep.runnable is False
+        failure = prep.gate_failures[0]
+        assert len(prep.gate_failures) == 1, "one reason, not a wall of them"
+        assert "developer fix" in failure
+        assert "'absent'" in failure
+        assert "tests/test_demo.py::test_other" in failure
+
+    def test_the_refusal_quotes_the_reason_the_rule_exists_for(self):
+        assert "PySnooper/2" in prepare_mod.DEV_FIX_SELFCHECK_REASON
+
+    def test_the_grading_is_recorded_next_to_the_patch(self, graded, tmp_path):
+        """A refused bug has to leave behind which patch it graded and what it saw."""
+        self._run(tmp_path)
+        saved = json.loads(
+            (
+                tmp_path / "batch" / oracle_mod.SELFCHECK_DIR / "Demo_1-dev_fix.oracle.json"
+            ).read_text()
+        )
+        assert saved["patch_good"] is True
+        assert saved["hidden_nodeids"] == ["tests/test_demo.py::test_fix"]
+
+    def test_a_test_only_developer_fix_is_refused_without_grading(self, graded, tmp_path):
+        """Nothing to apply means no suite may boot — the same rule ``test_hunk_free`` applies
+        to a review candidate (§5.4)."""
+        ok, prep = self._run(tmp_path, text=self.TEST_DIFF)
+        assert ok is False
+        assert "gradings" not in graded
+        assert "nothing but test hunks" in prep.gate_failures[0]
+
+    def test_a_bug_with_no_oracle_is_not_self_checked(self, graded, tmp_path):
+        """An empty FAIL_TO_PASS is already gated by the derivation; adding a second,
+        contradicting failure here would report the wrong cause."""
+        ok, prep = self._run(tmp_path, fail_to_pass=[])
+        assert ok is True
+        assert prep.gate_failures == []
+        assert "gradings" not in graded
+
+    def test_prepare_one_runs_it_after_the_strip_and_before_the_issue(self):
+        """Wiring, not behaviour: the check needs the post-strip baseline, and a bug it
+        refuses must not go on to be measured as a candidate."""
+        source = inspect.getsource(prepare_mod.prepare_one)
+        assert 0 <= source.index("strip_and_baseline(")
+        assert source.index("strip_and_baseline(") < source.index("selfcheck_dev_fix(")
+        assert source.index("selfcheck_dev_fix(") < source.index("build_issue(")
 
 
 # ============================================================================

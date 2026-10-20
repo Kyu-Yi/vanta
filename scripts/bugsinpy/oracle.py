@@ -268,6 +268,62 @@ def grade(
     return result
 
 
+DEV_FIX_STEM = "dev_fix"
+"""Label for the developer-fix self-check: names its work tree, its patch and its grading."""
+
+SELFCHECK_DIR = "oracle/selfcheck"
+"""Where ``prepare`` keeps the self-check's patch and its ``oracle.json``."""
+
+
+def grade_dev_fix(
+    *,
+    prep: BugPrep,
+    batch_dir: Path,
+    checkpoint: str,
+    disk_mb: int,
+    timeout_secs: int = 1800,
+) -> OracleResult:
+    """Grade the developer fix against the oracle ``prep`` just derived (§11 step 2).
+
+    [VANTA-WHY] The developer fix is the one patch that must be ``patch_good`` *by
+    construction*, so grading it checks the **oracle**, not a model. Measured on
+    PySnooper/2: ``bug_patch.txt`` touches only ``pysnooper/tracer.py`` while the fix
+    commit also adds ``pycompat.PY2`` and ``utils.get_shortish_repr(..., custom_repr=)``,
+    so the patched tree cannot import ``pysnooper``, all three ``FAIL_TO_PASS`` nodeids
+    read ``absent``, and no patch of any kind could ever be graded good — every
+    PySnooper/2 row was measuring the oracle. That is exactly the failure this check
+    turns from a plausible wrong label into a refusal.
+
+    The graded bytes are the ones ``runner.candidate_set`` will grade for the same bug:
+    the same source (``bug_patch_txt``) through the same filter (test hunks dropped), so
+    the two gradings are comparable rather than merely similar.
+    """
+    stem = f"{SELFCHECK_DIR}/{prep.slug}-{DEV_FIX_STEM}"
+    patch_path = batch_dir / f"{stem}.patch"
+    result = OracleResult(apply_ok=False, hidden_nodeids=sorted(prep.fail_to_pass))
+
+    text = suite_mod.drop_test_file_hunks(prep.bug.bug_patch_txt)
+    if not text.strip():
+        result.apply_detail = "the developer fix is nothing but test hunks"
+        result.error = result.apply_detail
+        save(batch_dir / f"{stem}.oracle.json", result)
+        return result
+
+    patch_path.parent.mkdir(parents=True, exist_ok=True)
+    patch_path.write_text(text, encoding="utf-8")
+    result = grade(
+        prep=prep,
+        batch_dir=batch_dir,
+        checkpoint=checkpoint,
+        patch_path=patch_path,
+        label=DEV_FIX_STEM,
+        disk_mb=disk_mb,
+        timeout_secs=timeout_secs,
+    )
+    save(batch_dir / f"{stem}.oracle.json", result)
+    return result
+
+
 def save(path: Path, result: OracleResult) -> Path:
     """Write ``oracle.json`` for a session (§5.2 step 6)."""
     path.parent.mkdir(parents=True, exist_ok=True)

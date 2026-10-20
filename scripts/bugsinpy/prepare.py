@@ -68,6 +68,26 @@ asked to run. The rule is BugsInPy's own declaration, not a judgement about whic
 look related: ``bug.info``'s ``test_file`` plus the nodeids ``run_test.sh`` names."""
 
 
+DEV_FIX_SELFCHECK_REASON = (
+    "the bug's own developer fix does not grade patch_good against the oracle this batch "
+    "just derived from it, so no candidate of any kind could be graded against this bug: a "
+    "perfect patch would at best tie the developer fix, and every verdict, ECR and EIR on "
+    "this bug would be measuring the oracle rather than Vanta. Refusing the bug here is the "
+    "point — an oracle nothing can pass produces a plausible wrong label instead of an "
+    "error, which is the failure mode this gate exists for. Measured cause on PySnooper/2: "
+    "bug_patch.txt touches only pysnooper/tracer.py while the fix commit also adds "
+    "pycompat.PY2 and utils.get_shortish_repr(..., custom_repr=), so the patched tree cannot "
+    "import pysnooper and all three FAIL_TO_PASS nodeids read 'absent'."
+)
+"""[VANTA-WHY] The developer fix is the harness's own ground truth for "a patch that
+fixes the bug", so it is the one candidate whose grading cannot be attributed to a model.
+PySnooper/2 shipped a whole wave with it grading ``patch_good=false``, and the symptom was
+indistinguishable from Vanta being conservative: the baseline approved a no-op, Vanta
+rejected everything, and the gate the batch was supposed to enforce had never been asked
+about the one patch it could not get wrong. Grading it at prepare time is cheap next to
+the run it invalidates."""
+
+
 class PrepareError(RuntimeError):
     """prepare could not proceed."""
 
@@ -456,6 +476,38 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> No
     prep.native_green_on_vanta_tree = not prep.native_failure_baseline
 
     tree_mod.copy_tree(vanta, prep.root / "vanta_clean")
+
+
+def selfcheck_dev_fix(prep: BugPrep, *, batch_dir: Path, checkpoint: str) -> bool:
+    """Grade the developer fix with the real oracle; refuse the bug unless it is good.
+
+    Returns whether the bug may continue. Called last, after the strip, because the
+    regression comparison needs ``native_failure_baseline`` — the same baseline
+    ``runner.grade_candidate`` leaves implicit when it grades a candidate, so the two
+    gradings of the same bytes answer the same question.
+
+    A bug with no ``FAIL_TO_PASS`` is passed through: the derivation has already gated
+    it, and there is no oracle for this check to grade against.
+    """
+    # Deferred: ``oracle`` imports ``BugPrep`` from this module, so a module-level
+    # import here would close the cycle before ``BugPrep`` exists.
+    from . import oracle as oracle_mod
+
+    if not prep.fail_to_pass:
+        return True
+
+    result = oracle_mod.grade_dev_fix(
+        prep=prep, batch_dir=batch_dir, checkpoint=checkpoint, disk_mb=DISK_MB
+    )
+    if result.patch_good:
+        return True
+
+    prep.gate_failures.append(
+        f"{DEV_FIX_SELFCHECK_REASON} Measured: apply_ok={result.apply_ok} "
+        f"({result.apply_detail}), hidden_outcomes={result.hidden_outcomes}, "
+        f"suite_regressions={result.suite_regressions}, error={result.error!r}"
+    )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -945,6 +997,17 @@ def prepare_one(
         strip_and_baseline(prep, checkpoint=checkpoint, batch_dir=batch_dir)
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(f"post-strip suite run failed: {exc}")
+        return prep
+
+    # The oracle's own validity check (§11 step 2). It runs before the issue text and
+    # the authoritative context measurement because a bug refused here must not be
+    # measured as a candidate; those two numbers would only describe a bug no run will
+    # ever use.
+    try:
+        if not selfcheck_dev_fix(prep, batch_dir=batch_dir, checkpoint=checkpoint):
+            return prep
+    except suite_mod.SuiteError as exc:
+        prep.gate_failures.append(f"developer-fix self-check failed to run: {exc}")
         return prep
 
     build_issue(prep, repo_cache=repo_cache, batch_dir=batch_dir)

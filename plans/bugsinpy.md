@@ -1366,7 +1366,18 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
 2. Split file + loader + `prepare`: checkout, **SWE-bench split**, two-run flaky-flagged
    `FAIL_TO_PASS` / `PASS_TO_PASS` derivation, AST strip, relaxed fixed-tree gate, **context
    precheck** (§1.6) with `context_sizes.md`, leak gate, collectability gate, the **dependency gate**
-   (§3.4: collection + import-from-the-tree, reported before oracle derivation) and the
+   (§3.4: collection + import-from-the-tree, reported before oracle derivation), the **developer-fix
+   self-check** (§8.2 item 5 made enforceable: grade the bug's own `bug_patch.txt` — test hunks
+   dropped, exactly the bytes §7.1 grades as `dev` — against the oracle this stage just derived, and
+   **refuse the bug** unless it is `patch_good`. It runs after the strip, so the regression comparison
+   uses the same post-strip baseline `runner.grade_candidate` leaves implicit, and before the issue
+   text and the authoritative context measurement, so a refused bug is never measured as a candidate.
+   [VANTA-WHY] PySnooper/2 shipped a whole wave with `bug_patch.txt` grading `patch_good = false`
+   because it touches only `pysnooper/tracer.py` while the fix commit also adds `pycompat.PY2` and
+   `utils.get_shortish_repr(..., custom_repr=)` — the patched tree cannot import the package, so *no*
+   patch of any kind could be graded good and every row measured the oracle. The symptom was
+   indistinguishable from Vanta being conservative, which is why the check has to be a refusal and not
+   a warning.) and the
    `issue_texts_all.md` review dump with its `NEEDS DECISION` section. No LLM, no Vanta.
 3. **py3.8 checkpoint only**, standalone Python, with the `import ssl` + `pip install` + `pytest`
    assertions, plus the PySnooper per-bug layers.

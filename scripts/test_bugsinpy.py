@@ -1046,6 +1046,187 @@ class TestStripHiddenTests:
 
 
 # ============================================================================
+# F2P is the flipping set ∩ what BugsInPy declares (§1.3)
+# ============================================================================
+class TestDeclaredFailToPass:
+    """A flipping test is not automatically the oracle.
+
+    Measured on PySnooper/2: the fix adds ``tests/test_utils/test_ensure_tuple.py``
+    for a helper it also adds, so that test flips because the helper does not exist
+    on the buggy source — not because of the bug — and the gate used to refuse the
+    whole bug over it. The rule is BugsInPy's own declaration, not a judgement about
+    which tests look related: ``bug.info``'s ``test_file`` plus the nodeids
+    ``run_test.sh`` names. Everything else is undeclared, so it is neither the
+    oracle nor a test the Creator may read.
+    """
+
+    @staticmethod
+    def _pair(failures: dict[str, str]) -> suite_mod.SuitePair:
+        run = suite_mod.SuiteRun(outcomes=dict(failures), exit_code=0, report_found=True)
+        return suite_mod.compare_runs(run, run)
+
+    @staticmethod
+    def _patched_suites(monkeypatch, pairs: dict[str, suite_mod.SuitePair]) -> None:
+        monkeypatch.setattr(
+            prepare_mod,
+            "_suite",
+            lambda checkpoint, batch_dir, prep, tree_name, stem_suffix: pairs[tree_name],
+        )
+
+    def test_the_bug_s_own_file_is_declared_and_anything_else_is_not(self):
+        bug = bug_info(test_file="tests/test_pysnooper.py")
+        declared, undeclared = prepare_mod.split_declared_f2p(
+            [
+                "tests/test_pysnooper.py::test_custom_repr",
+                "tests/test_pysnooper.py::test_disable",
+                "tests/test_utils/test_ensure_tuple.py::test_ensure_tuple",
+            ],
+            bug,
+        )
+        assert declared == [
+            "tests/test_pysnooper.py::test_custom_repr",
+            "tests/test_pysnooper.py::test_disable",
+        ]
+        assert undeclared == ["tests/test_utils/test_ensure_tuple.py::test_ensure_tuple"]
+
+    def test_a_nodeid_only_the_projects_runner_names_is_still_declared(self):
+        """``run_test.sh`` can name a nodeid in a file ``test_file`` does not."""
+        bug = bug_info(
+            test_file="tests/test_demo.py",
+            run_test_sh="# a comment\npytest -q -s tests/other/test_named.py::test_named\n",
+        )
+        declared, undeclared = prepare_mod.split_declared_f2p(
+            ["tests/other/test_named.py::test_named", "tests/stray.py::test_stray"], bug
+        )
+        assert declared == ["tests/other/test_named.py::test_named"]
+        assert undeclared == ["tests/stray.py::test_stray"]
+
+    def test_derive_hidden_keeps_the_declared_and_records_the_undeclared(
+        self, tmp_path, monkeypatch
+    ):
+        """PySnooper/2's shape: four flip, three are BugsInPy's own test file."""
+        bug = bug_info(
+            test_file="tests/test_pysnooper.py",
+            run_test_sh="pytest -q -s tests/test_pysnooper.py::test_custom_repr_single\n",
+        )
+        flipping = {
+            "tests/test_pysnooper.py::test_custom_repr": "failed",
+            "tests/test_pysnooper.py::test_custom_repr_single": "failed",
+            "tests/test_pysnooper.py::test_disable": "failed",
+            "tests/test_utils/test_ensure_tuple.py::test_ensure_tuple": "failed",
+        }
+        green = {nodeid: "passed" for nodeid in flipping}
+        self._patched_suites(
+            monkeypatch,
+            {
+                "src_buggy": self._pair(flipping),
+                "oracle_tree": self._pair(flipping),
+                "src_fixed": self._pair(green),
+            },
+        )
+        bug_prep = prep(bug=bug, root=tmp_path / "batch" / "worktrees" / "Demo_1")
+
+        prepare_mod.derive_hidden(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", collected=set()
+        )
+
+        assert bug_prep.fail_to_pass == [
+            "tests/test_pysnooper.py::test_custom_repr",
+            "tests/test_pysnooper.py::test_custom_repr_single",
+            "tests/test_pysnooper.py::test_disable",
+        ]
+        assert bug_prep.f2p_undeclared == [
+            "tests/test_utils/test_ensure_tuple.py::test_ensure_tuple"
+        ]
+        assert bug_prep.f2p_undeclared_reason == prepare_mod.UNDECLARED_F2P_REASON
+        assert bug_prep.gate_failures == [], "an undeclared flipper is not a gate failure"
+
+    def test_an_empty_declared_intersection_is_still_a_gate_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """Every flipping test undeclared means there is no oracle — as PySnooper/1."""
+        bug = bug_info(test_file="tests/test_pysnooper.py")
+        flipping = {
+            "tests/test_utils/test_ensure_tuple.py::test_ensure_tuple": "failed",
+            "tests/test_other/test_new.py::test_new": "failed",
+        }
+        green = {nodeid: "passed" for nodeid in flipping}
+        self._patched_suites(
+            monkeypatch,
+            {
+                "src_buggy": self._pair(flipping),
+                "oracle_tree": self._pair(flipping),
+                "src_fixed": self._pair(green),
+            },
+        )
+        bug_prep = prep(bug=bug, root=tmp_path / "batch" / "worktrees" / "Demo_1")
+
+        prepare_mod.derive_hidden(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", collected=set()
+        )
+
+        assert bug_prep.fail_to_pass == []
+        assert bug_prep.f2p_undeclared == sorted(flipping)
+        assert any("empty FAIL_TO_PASS" in f for f in bug_prep.gate_failures)
+
+    def test_strip_and_baseline_hides_the_undeclared_test_too(self, tmp_path, monkeypatch):
+        """Hidden from the tree, and therefore from the P2P suite as well."""
+        root = tmp_path / "batch" / "worktrees" / "Demo_1"
+        declared_file = "tests/test_pysnooper.py"
+        undeclared_file = "tests/test_utils/test_ensure_tuple.py"
+        write(
+            root / "oracle_tree" / declared_file,
+            "def test_custom_repr():\n    assert 1\n\n\ndef test_disable():\n    assert 2\n",
+        )
+        write(
+            root / "oracle_tree" / undeclared_file,
+            "def test_ensure_tuple():\n    assert 1\n",
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "_read_report",
+            lambda batch_dir, stem: {
+                "tests": [
+                    {"nodeid": f"{declared_file}::test_custom_repr"},
+                    {"nodeid": f"{declared_file}::test_disable"},
+                    {"nodeid": f"{undeclared_file}::test_ensure_tuple"},
+                ]
+            },
+        )
+        seen: dict = {}
+
+        def fake_suite(*args, **kwargs):
+            seen["tree_name"] = args[3]
+            run = suite_mod.SuiteRun(
+                outcomes={f"{declared_file}::test_disable": "passed"},
+                exit_code=0,
+                report_found=True,
+            )
+            return suite_mod.compare_runs(run, run)
+
+        monkeypatch.setattr(prepare_mod, "_suite", fake_suite)
+        bug_prep = prep(
+            root=root,
+            test_paths=["tests"],
+            fail_to_pass=[f"{declared_file}::test_custom_repr"],
+            f2p_undeclared=[f"{undeclared_file}::test_ensure_tuple"],
+        )
+
+        prepare_mod.strip_and_baseline(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch"
+        )
+
+        assert not (root / "vanta_tree" / undeclared_file).exists(), (
+            "the Creator must not be able to read a test the oracle does not grade"
+        )
+        kept = (root / "vanta_tree" / declared_file).read_text()
+        assert "test_disable" in kept
+        assert "test_custom_repr" not in kept
+        assert bug_prep.hidden_files_deleted == [undeclared_file]
+        assert seen["tree_name"] == "vanta_tree"
+
+
+# ============================================================================
 # context.py — the precheck must measure Vanta's walk, not a similar one
 # ============================================================================
 class TestContextConstants:
@@ -2169,6 +2350,8 @@ class TestPrepareRunRecordContract:
             prepare_mode=prepare_mod.FULL,
             test_paths=["tests"],
             fail_to_pass=["tests/test_demo.py::test_a"],
+            f2p_undeclared=["tests/test_utils/test_ensure_tuple.py::test_ensure_tuple"],
+            f2p_undeclared_reason=prepare_mod.UNDECLARED_F2P_REASON,
             pass_to_pass_count=7,
             flaky_nodeids=["tests/test_demo.py::test_flaky"],
             preexisting_failures=["tests/test_demo.py::test_pre"],
@@ -2202,6 +2385,8 @@ class TestPrepareRunRecordContract:
         assert loaded.prepare_mode == original.prepare_mode
         assert loaded.test_paths == original.test_paths
         assert loaded.fail_to_pass == sorted(original.fail_to_pass)
+        assert loaded.f2p_undeclared == sorted(original.f2p_undeclared)
+        assert loaded.f2p_undeclared_reason == original.f2p_undeclared_reason
         assert loaded.pass_to_pass_count == original.pass_to_pass_count
         assert loaded.flaky_nodeids == sorted(original.flaky_nodeids)
         assert loaded.preexisting_failures == sorted(original.preexisting_failures)

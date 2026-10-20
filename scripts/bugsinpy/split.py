@@ -105,6 +105,8 @@ DERIVED_BUG_KEYS = frozenset(
         "bug_patch_sha256",
         "test_paths_from_fixed",
         "fail_to_pass",
+        "f2p_undeclared",
+        "f2p_undeclared_reason",
         "pass_to_pass_count",
         "flaky_nodeids",
         "preexisting_failures",

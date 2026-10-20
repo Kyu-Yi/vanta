@@ -48,6 +48,26 @@ for a reserve, and it costs a checkout instead of hours of suite runs. Promoting
 reserve to the pilot means changing its ``role`` and re-running ``prepare``."""
 
 
+UNDECLARED_F2P_REASON = (
+    "flips between the buggy source and the fixed commit's tests, but it is not a test "
+    "BugsInPy declares for this bug — its file is not bug.info's test_file and it is not "
+    "named by run_test.sh — so BugsInPy never meant to run it and it is not part of the "
+    "oracle. It is removed from FAIL_TO_PASS and from the PASS_TO_PASS suite, and it is "
+    "hidden from vanta_tree so that the Creator cannot chase a test the benchmark does "
+    "not ask for. Measured cause on PySnooper/2: the fix adds the test file for a new "
+    "helper, so the test flips because the helper does not exist on the buggy source "
+    "rather than because of the bug."
+)
+"""[VANTA-WHY] A flipping test is not automatically an oracle. PySnooper/2's fix adds
+``tests/test_utils/test_ensure_tuple.py`` for a helper the fix also adds, so the test
+fails on the buggy source for a reason that is not the bug — and the gate refused the
+whole bug over it. Excluding it is the narrow fix; letting prepare carry it would put a
+test the benchmark does not name into the Creator's tree *and* into the regression
+baseline, where a patch could be marked a regression for failing a test BugsInPy never
+asked to run. The rule is BugsInPy's own declaration, not a judgement about which tests
+look related: ``bug.info``'s ``test_file`` plus the nodeids ``run_test.sh`` names."""
+
+
 class PrepareError(RuntimeError):
     """prepare could not proceed."""
 
@@ -64,6 +84,10 @@ class BugPrep:
     prepare_mode: str = FULL
     test_paths: list[str] = field(default_factory=list)
     fail_to_pass: list[str] = field(default_factory=list)
+    f2p_undeclared: list[str] = field(default_factory=list)
+    """Flipping tests BugsInPy does not declare: not an oracle, and hidden from the tree."""
+    f2p_undeclared_reason: str = ""
+    """Why they were removed, as one rule — see :data:`UNDECLARED_F2P_REASON`."""
     pass_to_pass_count: int = 0
     flaky_nodeids: list[str] = field(default_factory=list)
     preexisting_failures: list[str] = field(default_factory=list)
@@ -111,6 +135,8 @@ class BugPrep:
             "runnable": self.runnable,
             "test_paths": self.test_paths,
             "fail_to_pass": sorted(self.fail_to_pass),
+            "f2p_undeclared": sorted(self.f2p_undeclared),
+            "f2p_undeclared_reason": self.f2p_undeclared_reason,
             "pass_to_pass_count": self.pass_to_pass_count,
             "flaky_nodeids": sorted(self.flaky_nodeids),
             "preexisting_failures": sorted(self.preexisting_failures),
@@ -155,6 +181,10 @@ class BugPrep:
             prepare_mode=str(field_of(payload, "prepare_mode", owner=owner, where=where)),
             test_paths=strings_of(payload, "test_paths", owner=owner, where=where),
             fail_to_pass=strings_of(payload, "fail_to_pass", owner=owner, where=where),
+            f2p_undeclared=strings_of(payload, "f2p_undeclared", owner=owner, where=where),
+            f2p_undeclared_reason=str(
+                field_of(payload, "f2p_undeclared_reason", owner=owner, where=where)
+            ),
             pass_to_pass_count=int(
                 field_of(payload, "pass_to_pass_count", owner=owner, where=where)
             ),
@@ -310,24 +340,17 @@ def derive_hidden(
     f_before = before.stable_failures
     f_after = after.stable_failures
     prep.preexisting_failures = sorted(f_buggy_pre)
-    prep.fail_to_pass = sorted(f_before - f_after)
+
+    declared, undeclared = split_declared_f2p(sorted(f_before - f_after), prep.bug)
+    prep.fail_to_pass = declared
+    prep.f2p_undeclared = undeclared
+    prep.f2p_undeclared_reason = UNDECLARED_F2P_REASON if undeclared else ""
 
     if not prep.fail_to_pass:
         prep.gate_failures.append(
-            "empty FAIL_TO_PASS: the bug is not reproduced by the fixed commit's test "
-            "files on the buggy source, so there is no oracle to grade against"
-        )
-
-    unowned = [
-        nodeid
-        for nodeid in prep.fail_to_pass
-        if tree_mod.nodeid_file(nodeid) != prep.bug.test_file
-        and not _named_by_run_test(nodeid, prep.bug)
-    ]
-    if unowned:
-        prep.gate_failures.append(
-            "FAIL_TO_PASS nodeid(s) outside bug.info's test_file and not named by "
-            f"run_test.sh: {unowned} — the suite runner is not running what BugsInPy intends"
+            "empty FAIL_TO_PASS: no test BugsInPy declares for this bug flips between the "
+            "buggy source and the fixed commit's tests, so there is no oracle to grade "
+            "against"
         )
 
     fixed_only = sorted(f_after - f_buggy_pre)
@@ -336,6 +359,32 @@ def derive_hidden(
             "the fixed tree fails tests the buggy tree does not — the relaxed fixed-tree "
             f"gate (F_after \\ F_buggy_pre == empty) is violated: {fixed_only}"
         )
+
+
+def split_declared_f2p(
+    flipping: Sequence[str], bug: BugInfo
+) -> tuple[list[str], list[str]]:
+    """Split flipping nodeids into the ones BugsInPy declares and the ones it does not.
+
+    ``declared`` is the oracle (``FAIL_TO_PASS``); ``undeclared`` is returned rather
+    than dropped because the caller has to hide it from the tree as well as from the
+    oracle — see :data:`UNDECLARED_F2P_REASON` for why both halves matter.
+    """
+    declared: list[str] = []
+    undeclared: list[str] = []
+    for nodeid in flipping:
+        target = declared if _declared_by_bugsinpy(nodeid, bug) else undeclared
+        target.append(nodeid)
+    return declared, undeclared
+
+
+def _declared_by_bugsinpy(nodeid: str, bug: BugInfo) -> bool:
+    """The bug's own statement of which tests it means: ``test_file`` or ``run_test.sh``.
+
+    The two ways a nodeid can be declared, and no third: the file ``bug.info`` names,
+    or a nodeid the project's own runner names.
+    """
+    return tree_mod.nodeid_file(nodeid) == bug.test_file or _named_by_run_test(nodeid, bug)
 
 
 def _named_by_run_test(nodeid: str, bug: BugInfo) -> bool:
@@ -366,6 +415,13 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> No
 
     The pre-strip collected set is what decides "this file is entirely hidden" in
     the stripper, so it is read from the oracle run's report rather than guessed.
+
+    [VANTA-WHY] The hidden set is ``FAIL_TO_PASS`` *plus* the undeclared flippers. A
+    test the creator can read but the oracle does not grade is worse than either: the
+    creator can spend a round satisfying it, and the native baseline can mark a patch a
+    regression for failing a test BugsInPy never runs. Removing it from
+    ``oracle_tree``'s derivative is what excludes it from the PASS_TO_PASS suite, since
+    the suite is whatever the tree collects.
     """
     oracle = prep.root / "oracle_tree"
     vanta = prep.root / "vanta_tree"
@@ -380,7 +436,11 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> No
 
     tree_mod.copy_tree(oracle, vanta)
     try:
-        strip = tree_mod.strip_hidden_tests(vanta, prep.fail_to_pass, collected_by_file)
+        strip = tree_mod.strip_hidden_tests(
+            vanta,
+            [*prep.fail_to_pass, *prep.f2p_undeclared],
+            collected_by_file,
+        )
     except tree_mod.StripError as exc:
         prep.gate_failures.append(f"hidden-test strip failed: {exc}")
         return
@@ -444,6 +504,7 @@ def write_issue_texts(batch_dir: Path, preps: list[BugPrep]) -> Path:
             f"- role: `{prep.role}`  wave: **{prep.wave}**",
             f"- python: `{prep.bug.python_version}`  test_file: `{prep.bug.test_file}`",
             f"- FAIL_TO_PASS: {prep.fail_to_pass}",
+            f"- undeclared F2P (excluded, hidden from vanta_tree): {prep.f2p_undeclared}",
             f"- failure kinds: {prep.issue.failure_kinds}",
             f"- gate: {'ok' if prep.issue.ok else '**NEEDS DECISION**'}",
             "",
@@ -907,6 +968,8 @@ def derive_verdict(prep: BugPrep) -> dict[str, Any]:
         "bug_patch_sha256": sha256_text(prep.bug.bug_patch_txt),
         "test_paths_from_fixed": prep.test_paths,
         "fail_to_pass": sorted(prep.fail_to_pass),
+        "f2p_undeclared": sorted(prep.f2p_undeclared),
+        "f2p_undeclared_reason": prep.f2p_undeclared_reason,
         "pass_to_pass_count": prep.pass_to_pass_count,
         "flaky_nodeids": sorted(prep.flaky_nodeids),
         "preexisting_failures": sorted(prep.preexisting_failures),
@@ -990,5 +1053,12 @@ def render_summary(
     for prep in preps:
         for failure in prep.gate_failures:
             lines.append(f"- **{prep.key}**: {failure}")
+    for prep in preps:
+        if prep.f2p_undeclared:
+            lines.append(
+                f"- **{prep.key}**: hidden and not graded — {len(prep.f2p_undeclared)} "
+                "flipping test(s) BugsInPy does not declare for this bug, removed from "
+                f"FAIL_TO_PASS and from vanta_tree: {prep.f2p_undeclared}"
+            )
     lines.append("")
     return "\n".join(lines)

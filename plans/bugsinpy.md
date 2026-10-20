@@ -86,7 +86,7 @@ split so that the grade is fair:
 |---|---|---|
 | `src_buggy/` | plain `git checkout <buggy_commit_id>` — buggy source, **buggy** tests, no fix | prepare only (pre-existing-failure baseline) |
 | `src_fixed/` | plain `git checkout <fixed_commit_id>` — fixed source, **fixed** tests | prepare only (gate, `PASS_TO_PASS`) |
-| **`vanta_tree/`** | buggy source **+ the fixed commit's test files**, minus `FAIL_TO_PASS` | **Vanta (`--repo`)** |
+| **`vanta_tree/`** | buggy source **+ the fixed commit's test files**, minus `FAIL_TO_PASS` and minus the undeclared flippers | **Vanta (`--repo`)** |
 | `vanta_clean/` | byte-identical pristine copy of `vanta_tree/` | Vanta (`--original-tree`) — two-tree mode in [driver.rs](file:///Users/kyu-yi/vanta/src/pipeline/driver.rs#L332-L350) |
 | `oracle_tree/` | buggy source **+ the fixed commit's test files**, hidden tests **intact** | the oracle (§5), and prepare's known-good check |
 
@@ -114,13 +114,22 @@ Do **not** trust `test_file` / `run_test.sh` as the definition. Derive it empiri
 3. **Every suite is run twice.** Any nodeid whose outcome differs between the two runs is flagged
    **flaky**, excluded from both sets, and recorded in `flaky_nodeids` in the prepared manifest. A
    flaky nodeid must never silently become the oracle.
-4. `FAIL_TO_PASS = F_before \ F_after` (nodeids) — fails on buggy source + fixed tests, passes on
-   fixed. **This is the hidden oracle.**
+4. Split the flipping set `F_before \ F_after` by **what BugsInPy declares for this bug** — the file
+   `bug.info`'s `test_file` names, plus any nodeid `run_test.sh` names, and nothing else:
+   - `FAIL_TO_PASS` = the flipping nodeids that *are* declared. **This is the hidden oracle**, and
+     `patch_good` is judged only on it.
+   - `f2p_undeclared` = the flipping nodeids that are *not* declared. They are recorded with a
+     `f2p_undeclared_reason`, excluded from the oracle **and** from `PASS_TO_PASS`, and hidden from
+     `vanta_tree/` as well (step 7) so the Creator never chases a test the benchmark does not ask
+     for. Measured cause on PySnooper/2: the fix commit adds
+     `tests/test_utils/test_ensure_tuple.py` for a helper it also adds, so that test flips because
+     the helper is absent on the buggy source — not because of the bug. A flipping test is a
+     *candidate* oracle, not an oracle.
 5. `PASS_TO_PASS` = everything that passes on `src_fixed/` — this is Vanta's native suite.
 6. Sanity gates (prepare fails loudly if any trips):
-   - `FAIL_TO_PASS` is non-empty → otherwise the bug is not reproduced at all;
-   - every nodeid in `FAIL_TO_PASS` is inside `test_file` (or is what `run_test.sh` names) →
-     otherwise our suite runner is not running what BugsInPy intends;
+   - the **declared intersection is non-empty** → otherwise there is no oracle to grade against at
+     all, even though tests flip (PySnooper/1's shape). An empty `FAIL_TO_PASS` after the split is a
+     gate failure, not a silent pass;
    - **`F_after \ F_buggy_pre = ∅`**, where `F_buggy_pre` = failures on the *plain* `src_buggy/`
      tree (buggy source + buggy tests). Reading: **the fixed tree has no failure that the buggy tree
      does not also have.** This replaces the previous "`F_fixed` must be empty" gate, which the
@@ -129,15 +138,16 @@ Do **not** trust `test_file` / `run_test.sh` as the definition. Derive it empiri
      removal*: a failure that is fixed-only is still a hard stop, because it means the environment is
      wrong.
    - `vanta_tree/`'s suite is green again after stripping (§1.5).
-7. **Strip**: remove the `FAIL_TO_PASS` nodeids from `vanta_tree/` and `vanta_clean/`. If a test
-   *file* is entirely hidden, delete the file; otherwise delete only the named functions
-   (**AST-level, not regex**). Record `hidden_removed` and `hidden_files_deleted` in the prepared
-   manifest.
+7. **Strip**: remove `FAIL_TO_PASS` **and** `f2p_undeclared` from `vanta_tree/` and `vanta_clean/`.
+   If a test *file* is entirely hidden, delete the file; otherwise delete only the named functions
+   (**AST-level, not regex**). Record `hidden_files_deleted` and `partially_hidden_functions` in the
+   prepared manifest, alongside the `f2p_undeclared` list and its reason. The leak checks (§2.2) run
+   against this stripped tree, so removing the extra tests must keep them passing.
 
 ### 1.4 What Vanta sees
 
-`vanta_tree/` = buggy source + the **fixed** test suite minus the `FAIL_TO_PASS` tests: no fix, no
-oracle. The `Repo` is loaded by [driver.rs](file:///Users/kyu-yi/vanta/src/pipeline/driver.rs#L152)
+`vanta_tree/` = buggy source + the **fixed** test suite minus the `FAIL_TO_PASS` tests and minus the
+undeclared flippers: no fix, no oracle. The `Repo` is loaded by [driver.rs](file:///Users/kyu-yi/vanta/src/pipeline/driver.rs#L152)
 from `--repo` and the issue text from `--issue` — **no pipeline change needed** for either.
 
 ### 1.5 Consequence we must state explicitly (not a bug, a property)
@@ -753,7 +763,8 @@ on disk at all**.
    - `apply_ok = false` ⇒ outcome `unobservable`, recorded as such and never counted as a failure.
      This mirrors the M5 censoring rule (partially observed transitions are censored with null IDs)
      rather than inventing a new convention.
-3. Run the **hidden tests** (`FAIL_TO_PASS`) → `hidden_pass` (bool).
+3. Run the **hidden tests** (the declared `FAIL_TO_PASS` derived in §1.3) → `hidden_pass` (bool).
+   Tests that flip but are not declared for the bug are not in this set, so they cannot be graded.
 4. Run the **native suite** (`PASS_TO_PASS`) → failure set `F_patched`.
    `suite_regressions = F_patched \ F_buggy_baseline` (set difference against the prepare-time
    baseline from §1.3/§1.5, so pre-existing failures are not charged to the patch).
@@ -1244,7 +1255,9 @@ Explicitly, wave 1 must demonstrate all of:
 
 1. `vanta-bugsinpy-py3.8` passes `import ssl`, a real `pip install`, and `pytest --version` (§3.2).
 2. The per-bug layers bake and `pytest --collect-only -q` succeeds inside them.
-3. `prepare` derives a non-empty `FAIL_TO_PASS` for both PySnooper bugs, with no flaky escapes.
+3. `prepare` derives a non-empty `FAIL_TO_PASS` for both PySnooper bugs (the declared intersection of
+   §1.3), with no flaky escapes. PySnooper/2 additionally records `f2p_undeclared` — the fix adds a
+   test for a helper it also adds — and that test must be absent from `vanta_tree`.
 4. The leak gate produces a clean text for both, and `issue_texts_all.md` reads as actionable.
 5. The oracle returns `patch_good = true` for the developer fix and `false` for the no-op patch, and
    the pooled candidate set for a bug is reproducible from the manifest alone.
@@ -1387,7 +1400,7 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
 | D5 | Provenance | Config, mode, seed, model id, the per-call sampling schedule + server `top_p`, pinned pytest versions and Vanta commit recorded in **both** `run.summary` (lowercase keys + the existing `benchmark_instance` / `benchmark_label` fields) and the batch manifest. `metrics.py` groups by all of them. |
 | D6 | Disk | Harness-side compaction to diff + manifest. **Rerun-safety rule:** a session with a rejecting signal keeps its full graded snapshot until its rerun is written, or the rerun rebuilds from base + diff. A test covers both branches. |
 | D7 | Metrics location | Additive section in `scripts/metrics.py`. |
-| D8 | Test trees | **SWE-bench split** (§1.2–§1.3): Vanta's tree = buggy source + **fixed** test files − `FAIL_TO_PASS`. `PASS_TO_PASS` is the native suite. Fixed-tree gate relaxed to "no fixed-only failures"; pre-existing failures recorded; every suite run twice to flag flaky nodeids. |
+| D8 | Test trees | **SWE-bench split** (§1.2–§1.3): Vanta's tree = buggy source + **fixed** test files − the declared `FAIL_TO_PASS` − the undeclared flippers (`f2p_undeclared`, recorded with a reason). `PASS_TO_PASS` is the native suite. Fixed-tree gate relaxed to "no fixed-only failures"; pre-existing failures recorded; every suite run twice to flag flaky nodeids. |
 | D9 | Oracle & labels | `final.patch` built for **every** terminal verdict (§5.1). The oracle applies **only non-test hunks**; test files are always the fixed version's. `patch_good = hidden_pass ∧ suite_regressions == 0`, and the label table keys off `patch_good` (§5.3). |
 | D10 | Waves & budget | Wave 1 = PySnooper (py3.8, `[0]`) as a **go/no-go gate**; wave 2 = thefuck + httpie (py3.7, `[0]`); wave 3 = cookiecutter (py3.6, `[0]`). 10 bugs, 60–100 runs, ~12–22 h. Budgets in §8.1. |
 | D11 | Context precheck | `prepare` estimates each bug's source-concat tokens and **rejects** over-budget bugs with a documented 25 % margin, writing `context_sizes.md` **and** `context_report.json` for **all** candidates and printing the table. The split is an input and is never rewritten by a stage. Substitutions wait for wave 1's real `usage.prompt_tokens` — the estimate runs ~1.5× high. Narrowing files to fit is v2. |

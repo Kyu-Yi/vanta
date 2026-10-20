@@ -452,6 +452,140 @@ class TestMetadata:
         bug = meta_mod.load_bug_info(BUGSINPY_CLONE, "youtube-dl", 1)
         assert re.fullmatch(r"[0-9a-f]{40}", bug.fixed_commit), bug.fixed_commit
 
+    # -- encodings ----------------------------------------------------------
+    # BugsInPy's corpus is not uniformly UTF-8: black/22's requirements.txt is
+    # UTF-16 with a mark. Reading it as UTF-8 with errors="replace" turned its
+    # first line into mojibake that reached the requirement parser, which then
+    # reported "Expected package name at the start of dependency specifier" —
+    # an error naming the parser for a fault in the reader.
+    def test_utf16_le_with_a_mark(self):
+        data = "accessify==0.3.1\n".encode("utf-16")  # LE + BOM
+        assert meta_mod.decode_metadata(data, path=Path("requirements.txt")) == (
+            "accessify==0.3.1\n"
+        )
+
+    def test_utf16_be_with_a_mark(self):
+        data = b"\xfe\xff" + "accessify==0.3.1\n".encode("utf-16-be")
+        assert meta_mod.decode_metadata(data, path=Path("requirements.txt")) == (
+            "accessify==0.3.1\n"
+        )
+
+    def test_utf8_sig_mark_is_stripped(self):
+        data = b"\xef\xbb\xbf" + "typed-ast==1.4.0\n".encode("utf-8")
+        text = meta_mod.decode_metadata(data, path=Path("requirements.txt"))
+        assert text == "typed-ast==1.4.0\n"
+        # Not merely "contains the line": a surviving U+FEFF would become part of
+        # the first requirement's name.
+        assert not text.startswith("\ufeff")
+
+    def test_plain_utf8_passes_through(self):
+        assert meta_mod.decode_metadata(b"a==1\n", path=Path("r.txt")) == "a==1\n"
+
+    def test_utf16_without_a_mark_is_refused_not_guessed(self):
+        """The one case where a guess *would* work is the one we refuse.
+
+        BOM-less UTF-16LE of ASCII is valid UTF-8, so it decodes and leaves NULs.
+        Guessing LE here would be right; guessing on a UTF-16BE file with the same
+        bytes would not, and a wrong guess corrupts a requirement silently.
+        """
+        data = "accessify==0.3.1\n".encode("utf-16-le")
+        with pytest.raises(meta_mod.MetadataError, match="NUL bytes"):
+            meta_mod.decode_metadata(data, path=Path("requirements.txt"))
+
+    def test_non_utf8_names_the_file_and_the_byte(self):
+        data = b"caf\xe9==1.0\n"  # latin-1, not UTF-8
+        with pytest.raises(meta_mod.MetadataError) as excinfo:
+            meta_mod.decode_metadata(data, path=Path("projects/Demo/bugs/1/r.txt"))
+        message = str(excinfo.value)
+        assert "projects/Demo/bugs/1/r.txt" in message
+        assert "0xe9" in message
+        assert "not UTF-8" in message
+
+    def test_read_metadata_text_reads_a_file(self, tmp_path):
+        path = write(tmp_path / "requirements.txt", "decorator>=4.3.0\n")
+        assert meta_mod.read_metadata_text(path) == "decorator>=4.3.0\n"
+
+    def test_read_metadata_text_reports_an_unreadable_file(self, tmp_path):
+        with pytest.raises(meta_mod.MetadataError, match="cannot read"):
+            meta_mod.read_metadata_text(tmp_path / "absent.txt")
+
+    def test_load_bug_info_reads_a_utf16_bug_info(self, tmp_path):
+        """``bug.info`` itself is swept by the reader, not just ``requirements.txt``."""
+        path = tmp_path / "projects" / "Demo" / "bugs" / "1" / "bug.info"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(
+            (
+                'python_version="3.8.3"\n'
+                f'buggy_commit_id="{"b" * 40}"\n'
+                f'fixed_commit_id="{"f" * 40}"\n'
+                'test_file="tests/test_demo.py"\n'
+            ).encode("utf-16")
+        )
+        bug = meta_mod.load_bug_info(tmp_path, "Demo", 1)
+        assert bug.python_version == "3.8.3"
+        assert bug.test_file == "tests/test_demo.py"
+
+    def test_bake_reads_a_utf16_requirements_txt(self, tmp_path):
+        """The reported failure, end to end: black/22's requirements.txt.
+
+        Before the reader, this raised ``BakeError`` from the requirement parser
+        with a message about dependency specifiers, on a file whose only fault was
+        its encoding.
+        """
+        bug_dir = tmp_path / "projects" / "Demo" / "bugs" / "1"
+        bug_dir.mkdir(parents=True, exist_ok=True)
+        (bug_dir / "requirements.txt").write_bytes(
+            "# a comment\naccessify==0.3.1\n\n-rmore.txt\n".encode("utf-16")
+        )
+        text = bake_mod.requirements_for(tmp_path, "Demo", 1)
+        refs, skipped = bake_mod.requirements_refs(text, source="requirements.txt")
+        assert [(ref.name, ref.spec) for ref in refs] == [("accessify", "accessify==0.3.1")]
+        # And the line that is not a requirement is recorded, not silently dropped.
+        assert [line.text for line in skipped] == ["-rmore.txt"]
+
+    def test_bake_reads_a_utf16_setup_sh(self, tmp_path):
+        bug_dir = tmp_path / "projects" / "Demo" / "bugs" / "1"
+        bug_dir.mkdir(parents=True, exist_ok=True)
+        (bug_dir / "setup.sh").write_bytes(
+            "pip install decorator>=4.3.0\npython setup.py install\n".encode("utf-16")
+        )
+        assert bake_mod.declared_deps(bake_mod.setup_sh_for(tmp_path, "Demo", 1)) == [
+            "decorator>=4.3.0"
+        ]
+
+    @needs_clone
+    def test_every_bugsinpy_file_the_split_reads_is_decodable(self):
+        """Every metadata file of every bug in the split, read through the reader.
+
+        Written as a sweep because the corpus is not uniformly UTF-8 and the next
+        file like black/22's is not predictable: a bug whose ``setup.sh`` or
+        ``bug.info`` is UTF-16 must fail here, in a second, rather than inside a
+        bake after a checkpoint name has been created.
+        """
+        split = load_split(SPLIT_PATH)
+        poisoned: list[str] = []
+        for entry in split.bugs:
+            project = str(entry["project"])
+            bug_dir = BUGSINPY_CLONE / "projects" / project / "bugs" / str(entry["bug_id"])
+            for name in (
+                "bug.info",
+                "requirements.txt",
+                "setup.sh",
+                "run_test.sh",
+                "bug_patch.txt",
+            ):
+                path = bug_dir / name
+                if not path.is_file():
+                    continue
+                try:
+                    meta_mod.read_metadata_text(path)
+                except meta_mod.MetadataError as exc:
+                    poisoned.append(str(exc))
+            assert meta_mod.read_metadata_text(
+                BUGSINPY_CLONE / "projects" / project / "project.info"
+            )
+        assert poisoned == [], "\n".join(poisoned)
+
     @needs_clone
     def test_split_agrees_with_bugsinpy_metadata(self):
         """The declared half of the split must still match ``bug.info``.

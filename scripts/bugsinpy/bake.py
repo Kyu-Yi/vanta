@@ -58,6 +58,7 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
+from .bugsinpy_meta import read_metadata_text
 from . import suite as suite_mod
 from . import trees as tree_mod
 from .shuru import ExecResult, checkpoint_create, checkpoint_delete, checkpoint_exists
@@ -708,14 +709,14 @@ def requirements_for(bugsinpy_root: Path, project: str, bug_id: int) -> str:
     path = bugsinpy_root / "projects" / project / "bugs" / str(bug_id) / "requirements.txt"
     if not path.is_file():
         return ""
-    return path.read_text(encoding="utf-8", errors="replace")
+    return read_metadata_text(path)
 
 
 def setup_sh_for(bugsinpy_root: Path, project: str, bug_id: int) -> str:
     path = bugsinpy_root / "projects" / project / "bugs" / str(bug_id) / "setup.sh"
     if not path.is_file():
         return ""
-    return path.read_text(encoding="utf-8", errors="replace")
+    return read_metadata_text(path)
 
 
 # ---------------------------------------------------------------------------

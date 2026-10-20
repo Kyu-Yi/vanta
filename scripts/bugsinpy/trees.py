@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .bugsinpy_meta import BugInfo
+from .bugsinpy_meta import BugInfo, decode_metadata
 
 
 class TreeError(RuntimeError):
@@ -77,7 +77,12 @@ def read_file_at(repo: Path, commit: str, path: str) -> Optional[str]:
     )
     if proc.returncode != 0:
         return None
-    return proc.stdout.decode("utf-8", "replace")
+    # The same reader the BugsInPy metadata goes through. This path feeds the other
+    # half of the dependency sources — the project's own ``setup.py``, the file its
+    # ``install_requires`` names, and ``test_requirements.txt`` — so a UTF-16
+    # requirements file in the *repo* would corrupt a requirement exactly the way
+    # black/22's did in BugsInPy's copy of it.
+    return decode_metadata(proc.stdout, path=Path(f"{repo.name}:{path}@{commit[:12]}"))
 
 
 def commit_date(repo: Path, commit: str) -> str:

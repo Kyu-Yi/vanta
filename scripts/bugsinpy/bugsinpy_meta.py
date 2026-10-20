@@ -11,10 +11,23 @@ corpus (``youtube-dl/1``) writes ``fixed_commit_id ="..."`` with whitespace befo
 the ``=``. A parser that split on ``"`` or used a regex anchored on ``=`` would
 silently return the wrong commit for that bug and check out the wrong tree, so the
 parser splits on the FIRST ``=`` and strips both sides.
+
+[VANTA-WHY] Every one of those files goes through :func:`read_metadata_text`, and
+the encoding rule is not decoration. ``black/22``'s ``requirements.txt`` is UTF-16
+with a byte-order mark, and reading it as UTF-8 with ``errors="replace"`` turned
+its first line into ``'\ufffd\ufffda\x00c\x00c\x00e\x00s\x00s\x00...'`` — a string
+that reached the requirement parser and failed there, as
+``Expected package name at the start of dependency specifier``. That message names
+the parser, not the file, so the real cause (an encoding the reader never
+considered) took a detour through the wrong half of the pipeline to be found. The
+reader therefore decodes what it can identify and **fails loudly on what it
+cannot**: a wrong guess at an encoding corrupts a requirement silently, which is
+exactly the failure a fix here is supposed to prevent rather than relocate.
 """
 
 from __future__ import annotations
 
+import codecs
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,9 +35,77 @@ from typing import Optional
 
 BUGSINPY_URL = "https://github.com/soarsmu/BugsInPy"
 
+BOMS: tuple[tuple[bytes, str], ...] = (
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    # After the utf-32 pair: BOM_UTF32_LE starts with BOM_UTF16_LE, so a UTF-32 file
+    # tested against the utf-16 mark first would decode as utf-16 and come back with
+    # a NUL between every character.
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
+)
+"""Every byte-order mark this reader recognises, longest first."""
+
 
 class MetadataError(RuntimeError):
     """BugsInPy metadata is missing or malformed."""
+
+
+def decode_metadata(data: bytes, *, path: Path) -> str:
+    """BugsInPy metadata bytes → text, or a clear error naming the problem.
+
+    A mark is decoded by the codec it names. Without one the file must be UTF-8:
+    anything else — a stray byte, or NULs from a UTF-16 file that lost its mark —
+    is an error, because the alternative is a string that looks like text and is
+    not, and the ``errors="replace"`` that produced such a string is what let a
+    mojibake requirement travel as far as the requirement parser.
+    """
+    for bom, encoding in BOMS:
+        if data.startswith(bom):
+            try:
+                return data.decode(encoding)
+            except UnicodeDecodeError as exc:
+                raise MetadataError(
+                    f"{path}: carries a {encoding} byte-order mark but does not decode "
+                    f"as {encoding} (byte {exc.start} is 0x{data[exc.start]:02x}, first "
+                    f"bytes {data[:16].hex(' ')})"
+                ) from exc
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MetadataError(
+            f"{path}: is not UTF-8 (byte {exc.start} is 0x{data[exc.start]:02x}, first "
+            f"bytes {data[:16].hex(' ')}). BugsInPy's corpus really does contain "
+            "non-UTF-8 files (black/22's requirements.txt is UTF-16), so this is read "
+            "strictly rather than approximated: re-export the file as UTF-8, or with "
+            "its mark, and re-run."
+        ) from exc
+    if "\x00" in text:
+        raise MetadataError(
+            f"{path}: decodes as UTF-8 but contains NUL bytes (first bytes "
+            f"{data[:16].hex(' ')}), which is what UTF-16 without a byte-order mark "
+            "looks like. This reader does not guess an encoding — a wrong guess "
+            "corrupts a requirement without saying so — so the file needs its mark or "
+            "a UTF-8 export."
+        )
+    return text
+
+
+def read_metadata_text(path: Path) -> str:
+    """One BugsInPy metadata file → text. The only reader the harness uses for them.
+
+    Named for what it reads rather than for what it does, so a new caller reads as
+    "this file comes from BugsInPy" at the call site. ``bug.info``, ``project.info``,
+    ``requirements.txt``, ``setup.sh``, ``run_test.sh`` and ``bug_patch.txt`` all go
+    through it — the last three because a project's own dependency lines and the
+    issue text are exactly what a mojibake decode would quietly corrupt.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise MetadataError(f"cannot read {path}: {exc}") from exc
+    return decode_metadata(data, path=path)
 
 
 @dataclass(frozen=True)
@@ -91,7 +172,7 @@ def load_bug_info(bugsinpy_root: Path, project: str, bug_id: int) -> BugInfo:
     info_path = bug_dir / "bug.info"
     if not info_path.is_file():
         raise MetadataError(f"missing bug.info: {info_path}")
-    fields = parse_bug_info(info_path.read_text(encoding="utf-8", errors="replace"))
+    fields = parse_bug_info(read_metadata_text(info_path))
 
     try:
         return BugInfo(
@@ -117,9 +198,7 @@ def project_github_url(bugsinpy_root: Path, project: str) -> Optional[str]:
     info_path = bugsinpy_root / "projects" / project / "project.info"
     if not info_path.is_file():
         return None
-    return parse_bug_info(info_path.read_text(encoding="utf-8", errors="replace")).get(
-        "github_url"
-    )
+    return parse_bug_info(read_metadata_text(info_path)).get("github_url")
 
 
 def ensure_clone(root: Path, *, commit: Optional[str] = None, url: str = BUGSINPY_URL) -> str:
@@ -157,4 +236,4 @@ def _required(fields: dict[str, str], key: str, path: Path) -> str:
 def _read_optional(path: Path) -> str:
     if not path.is_file():
         return ""
-    return path.read_text(encoding="utf-8", errors="replace")
+    return read_metadata_text(path)

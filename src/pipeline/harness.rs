@@ -11,7 +11,7 @@
 // functions, so a fix to test execution lands once.
 // ============================================================================
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -100,7 +100,7 @@ pub async fn run_tests_parallel_detailed(
             }
             let _ = write_conftest(sb.root());
             let _ = fs::write(sb.root().join("test_run.py"), &test.test_source);
-            let cmd = build_single_test_cmd(&cmd_template, "test_run.py", &source);
+            let cmd = build_single_test_cmd(&cmd_template, "test_run.py");
             let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
             let sandbox_root = sb.root().display().to_string();
             let exec = sb
@@ -174,7 +174,7 @@ pub async fn run_single_test_with_timeout(
     let _ = write_source_files(sb.root(), source_concat);
     let _ = write_conftest(sb.root());
     let _ = fs::write(sb.root().join("test_bate.py"), test_source);
-    let cmd = build_single_test_cmd(test_cmd, "test_bate.py", source_concat);
+    let cmd = build_single_test_cmd(test_cmd, "test_bate.py");
     let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
     let sandbox_root = sb.root().display().to_string();
     let exec = sb.execute(&cmd_refs, Path::new(""), timeout_secs).await;
@@ -1269,59 +1269,6 @@ const VALUE_TAKING_OPTIONS: &[&str] = &[
     "--log-level", "--log-file", "--log-cli-level", "--json-report-file",
 ];
 
-/// Every path in the tree under test, plus every ancestor directory.
-///
-/// [VANTA-WHY] A test selection may name a file (`tests/test_x.py`, with or
-/// without a `::nodeid` suffix) or the directory above it (`tests`), so the set
-/// holds the PREFIXES of each path rather than only whole files. Membership is
-/// then what distinguishes a selection from a flag value that happens to look
-/// like one.
-pub fn selection_paths(source_concat: &str) -> HashSet<String> {
-    let mut paths = HashSet::new();
-    let Ok(files) = parse_source_files(source_concat) else {
-        return paths;
-    };
-    for (path, _) in files {
-        let path = path
-            .trim_start_matches("./")
-            .trim_end_matches('/')
-            .replace('\\', "/");
-        if path.is_empty() {
-            continue;
-        }
-        let mut prefix = String::new();
-        for part in path.split('/') {
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
-            prefix.push_str(part);
-            paths.insert(prefix.clone());
-        }
-    }
-    paths
-}
-
-/// The path part of a test-selection argument, normalised for comparison.
-fn selection_target(arg: &str) -> String {
-    arg.split("::")
-        .next()
-        .unwrap_or(arg)
-        .trim()
-        .trim_end_matches('/')
-        .trim_start_matches("./")
-        .replace('\\', "/")
-}
-
-/// True when `arg` names a path inside the tree under test — i.e. a test
-/// selection to be replaced, not a flag to be kept.
-fn is_test_selection(arg: &str, selection: &HashSet<String>) -> bool {
-    if arg.starts_with('-') {
-        return false;
-    }
-    let target = selection_target(arg);
-    target.is_empty() || target == "." || selection.contains(&target)
-}
-
 /// Build the command that runs **only** the generated test file.
 ///
 /// [VANTA-WHY] The user's test command still supplies the interpreter, the flags
@@ -1332,13 +1279,22 @@ fn is_test_selection(arg: &str, selection: &HashSet<String>) -> bool {
 /// generated test's. Every BugReproduction test was therefore graded against a
 /// passing repository test: it "passed on the buggy original", so BATE scrapped
 /// it, so no candidate could ever be rejected for failing to reproduce the bug.
-/// The two halves — this and `generated_file_outcome` — are fixed together.
-pub fn build_single_test_cmd(
-    test_cmd: &TestCommand,
-    test_file: &str,
-    source_concat: &str,
-) -> Vec<String> {
-    let selection = selection_paths(source_concat);
+/// The two halves — this and `generated_test_outcome` — are fixed together.
+///
+/// [VANTA-WHY] Every non-flag argument is dropped, because in a pytest
+/// invocation a positional argument has exactly one meaning: a test selection.
+/// The tempting alternative — drop the positionals that name a path *in the
+/// tree* — needs the tree, and the only tree available here is the source
+/// concat, which is capped at 64 KB per file and 256 KB in total. The
+/// repository's own test file is regularly the thing that falls outside those
+/// caps (black's `tests/test_black.py` is ~200 KB), so a membership test would
+/// miss, `tests` would be kept, and the repository's suite would be
+/// re-collected: the bug this function exists to fix comes straight back, and
+/// this time only for the largest repositories. The rule's cost is the opposite
+/// direction — an option missing from `VALUE_TAKING_OPTIONS` loses its value —
+/// and that is the benign failure: a reporting flag falls back to its default,
+/// instead of a test being graded against the wrong result with nobody noticing.
+pub fn build_single_test_cmd(test_cmd: &TestCommand, test_file: &str) -> Vec<String> {
     let mut cmd = vec![test_cmd.program.clone()];
     let args = &test_cmd.args;
 
@@ -1361,11 +1317,11 @@ pub fn build_single_test_cmd(
             }
             continue;
         }
-        if is_test_selection(arg, &selection) {
-            i += 1;
-            continue;
+        if arg.starts_with('-') {
+            cmd.push(arg.clone());
         }
-        cmd.push(arg.clone());
+        // Anything else is a positional test selection: replaced, not extended,
+        // by the generated file pushed below.
         i += 1;
     }
 
@@ -2183,20 +2139,9 @@ mod tests {
 
     #[test]
     fn a_test_cmd_that_names_a_path_has_it_replaced_not_extended() {
-        let source = concat!(
-            "# FILE: calc.py\n",
-            "def add(a, b):\n",
-            "    return a + b\n",
-            "\n",
-            "# FILE: tests/test_core.py\n",
-            "def test_add():\n",
-            "    assert add(1, 2) == 3\n",
-        );
-
         let cmd = build_single_test_cmd(
             &TestCommand::from_shell("python3 -m pytest tests -q"),
             "test_bate.py",
-            source,
         );
 
         assert!(
@@ -2221,12 +2166,9 @@ mod tests {
 
     #[test]
     fn a_value_taking_flag_keeps_its_value_and_is_not_read_as_a_path() {
-        let source = "# FILE: calc.py\ndef add(a, b):\n    return a + b\n";
-
         let cmd = build_single_test_cmd(
             &TestCommand::from_shell("python3 -m pytest -k test_add -m slow tests"),
             "test_bate.py",
-            source,
         );
 
         assert!(
@@ -2246,9 +2188,7 @@ mod tests {
 
     #[test]
     fn a_test_cmd_without_a_path_keeps_its_flags_and_gains_the_generated_file() {
-        let source = "# FILE: calc.py\ndef add(a, b):\n    return a + b\n";
-
-        let cmd = build_single_test_cmd(&TestCommand::default(), "test_run.py", source);
+        let cmd = build_single_test_cmd(&TestCommand::default(), "test_run.py");
 
         assert_eq!(
             cmd,

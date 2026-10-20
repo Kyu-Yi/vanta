@@ -274,7 +274,7 @@ fn props_url_candidates(cfg: &LlmConfig) -> Vec<String> {
     urls
 }
 
-async fn probe_server_context_window(client: &reqwest::Client, cfg: &LlmConfig) -> Option<u32> {
+async fn fetch_props(client: &reqwest::Client, cfg: &LlmConfig) -> Option<Value> {
     for url in props_url_candidates(cfg) {
         let Ok(resp) = client.get(&url).send().await else {
             continue;
@@ -285,14 +285,68 @@ async fn probe_server_context_window(client: &reqwest::Client, cfg: &LlmConfig) 
         let Ok(body) = resp.json::<Value>().await else {
             continue;
         };
-        if let Some(n_ctx) = body["default_generation_settings"]["n_ctx"].as_u64() {
-            return Some(n_ctx as u32);
-        }
-        if let Some(n_ctx) = body["n_ctx"].as_u64() {
-            return Some(n_ctx as u32);
-        }
+        return Some(body);
     }
     None
+}
+
+async fn probe_server_context_window(client: &reqwest::Client, cfg: &LlmConfig) -> Option<u32> {
+    let body = fetch_props(client, cfg).await?;
+    if let Some(n_ctx) = body["default_generation_settings"]["n_ctx"].as_u64() {
+        return Some(n_ctx as u32);
+    }
+    if let Some(n_ctx) = body["n_ctx"].as_u64() {
+        return Some(n_ctx as u32);
+    }
+    None
+}
+
+/// The sampling the harness PINS, per call site (plans/bugsinpy.md §4.3).
+///
+/// [VANTA-WHY] §4.3's first draft said the harness sets no `temperature` /
+/// `top_p` / `max_tokens` at all, and told the provenance block to record the
+/// server's `/props` defaults instead. That was wrong about this codebase: every
+/// M3 agent passes its own `temperature` / `max_tokens` through `extra_fields`,
+/// which `post_chat` merges AFTER the body defaults — so the agent's value is
+/// what the request carries, and `post_chat`'s own 0.2 / 16384 are dead for
+/// every M3 call. Writing `default_generation_settings.temperature` into
+/// `run.summary` would therefore have recorded a number the model never sampled
+/// with.
+///
+/// [VANTA-WHY] There is also no single run-level value to record: the call sites
+/// disagree on purpose (the intent audit is deterministic at 0.0, the Creator is
+/// near-deterministic at 0.1, generation is 0.2, revision is 0.3). So the record
+/// is per call site, and this table is it.
+///
+/// [VANTA-WHY] These are part of v0.2's behaviour — the sampling the collected
+/// baseline ran under — so they are NOT configurable and no env var may override
+/// them; moving them would move the control the pilot is measured against. The
+/// values are duplicated at the call sites rather than read from this table on
+/// purpose: `tests/m3_session_log.rs::the_recorded_sampling_schedule_matches_the_request_bodies`
+/// compares this table against the bodies actually sent, which is the guard
+/// against the two copies drifting.
+pub const SAMPLING_SCHEDULE: &[(&str, f64, u32)] = &[
+    ("creator", 0.1, 32768),
+    ("attacker_generate", 0.2, 32768),
+    ("attacker_revise", 0.3, 32768),
+    ("attacker_simplify", 0.3, 32768),
+    ("intent_audit", 0.0, 2048),
+];
+
+/// The server's own `top_p` default — the sampler parameter NO call site pins,
+/// so every request inherits whatever the server is configured with.
+///
+/// [VANTA-WHY] This is the one value `run.summary` really does have to read from
+/// `/props` (§4.3): `temperature` and `max_tokens` are pinned per call (see
+/// `SAMPLING_SCHEDULE`), `top_p` is not, so the server's answer is the only
+/// truthful source. `None` means the server did not publish the key — a minimal
+/// stub, or a llama.cpp build that omits it — and it is recorded as unset rather
+/// than replaced by a plausible default, because a fabricated sampler value in
+/// the provenance block is precisely the kind of claim this project exists to
+/// avoid.
+pub async fn server_top_p_default(client: &reqwest::Client, cfg: &LlmConfig) -> Option<f64> {
+    let body = fetch_props(client, cfg).await?;
+    body["default_generation_settings"]["top_p"].as_f64()
 }
 
 /// Resolve the model's context window for THIS run.
@@ -614,6 +668,11 @@ pub async fn post_chat(
     let body: Value = json!({
         "model": cfg.model_id,
         "messages": messages,
+        // [VANTA-WHY] These two are the M0 spike's values, not the pipeline's:
+        // every M3 agent passes its own through `extra_fields`, which is merged
+        // below and therefore WINS. Kept as the fallback for a caller that sends
+        // no `extras` (bootstrap does), and left at the values the baseline was
+        // collected under rather than "tidied" — see `SAMPLING_SCHEDULE`.
         "max_tokens": 16384,
         "temperature": 0.2,
         // [VANTA-WHY] Streamed, always. The response is reassembled below into
@@ -629,6 +688,18 @@ pub async fn post_chat(
         for (k, v) in obj {
             full_body.insert(k.clone(), v.clone());
         }
+    }
+    // [VANTA-WHY] The seed is inserted ONLY when one was asked for
+    // (VANTA_LLM_SEED). An unset seed must leave the request body BYTE-for-byte
+    // identical to what it was before this field existed — a `"seed": null`
+    // would be a change to what every server sees, and `"seed": 0` would move
+    // the sampling baseline the existing measurements were taken under. The
+    // harness asserts the byte-identity; this is where it is kept.
+    //
+    // Placed after the `extra_fields` merge so a caller cannot smuggle one in
+    // that disagrees with the configuration the run records as its provenance.
+    if let Some(seed) = cfg.seed {
+        full_body.insert("seed".to_string(), json!(seed));
     }
     let full_body = Value::Object(full_body);
 

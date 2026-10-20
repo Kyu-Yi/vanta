@@ -459,27 +459,52 @@ defaults reproduce today's behaviour byte-for-byte):
 config that "passes" because it does nothing is exactly the failure mode this project exists to
 catch.
 
-### 4.3 Sampling and seeds — leave the sampler alone
+### 4.3 Sampling — corrected: the harness PINS `temperature` / `max_tokens` per call
 
-**Corrected after review.** The previous draft's manifest example showed
-`temperature: 0.2, top_p: 0.95, max_tokens: 4096`. Both halves of that were wrong:
+**Corrected after review, twice.** The first draft's manifest example showed
+`temperature: 0.2, top_p: 0.95, max_tokens: 4096`. The second draft over-corrected to "the harness
+sets no `temperature` / `top_p` / `max_tokens` at all, and the record shows the server's effective
+values." **That was factually wrong about this codebase** and is retracted here: the pipeline has
+always pinned `temperature` and `max_tokens` **per call site**.
 
-- **`max_tokens: 4096` would truncate the Creator**, which needs on the order of 32 k.
-- **Setting `temperature` / `top_p` changes behaviour** relative to the v0.2 baseline this pilot is
-  compared against. Unset is not merely safer, it is the *correct control*.
+**What the code actually does.** Every M3 agent passes its own sampling through `extra_fields`, and
+[post_chat](file:///Users/kyu-yi/vanta/src/llm/mod.rs#L686-L691) merges those **after** the body
+defaults — so the agent's value WINS. `post_chat`'s own `max_tokens: 16384` / `temperature: 0.2` are
+the M0 spike's values and are dead for every M3 caller (live only for `bootstrap`). The real schedule:
+
+| Call site | `temperature` | `max_tokens` |
+|---|---|---|
+| `creator` | 0.1 | 32768 |
+| `attacker_generate` | 0.2 | 32768 |
+| `attacker_revise` | 0.3 | 32768 |
+| `attacker_simplify` | 0.3 | 32768 |
+| `intent_audit` | 0.0 | 2048 |
+
+These pins are **part of v0.2's behaviour** — the sampling the baseline was collected under. They are
+therefore **not configurable**, no env var may override them, and the harness must never *add* a cap
+of its own. `top_p` is the one parameter **no call site pins**, so every request inherits whatever the
+server is configured with and the server's answer is the only truthful source for it.
 
 **Decided:**
 
 1. **Seed: implemented** — `VANTA_LLM_SEED`, `LlmConfig` gains `seed: Option<u64>`, added to the
-   chat-completion body when set.
-2. **`temperature` / `top_p` / `max_tokens`: not set at all for the pilot.** No env, no body field,
-   no CLI flag. `LlmConfig` therefore does **not** gain those fields — the change inventory shrinks.
-3. **Record the effective values.** `/props` already returns `default_generation_settings`
-   ([llm/mod.rs](file:///Users/kyu-yi/vanta/src/llm/mod.rs#L266-L299) reads `n_ctx` from it today).
-   The probe is extended to capture the sampler defaults actually in force
-   (`temperature`, `top_p`, `n_predict`), and those **effective** values are written to
-   `run.summary` provenance keys and to the batch manifest. So the record shows what the server
-   really used, without the harness ever forcing a value.
+   chat-completion body **only when set** (unset adds no key at all — not `null`, not `0`).
+2. **No new sampling knobs.** `LlmConfig` does not gain `temperature` / `top_p` / `max_tokens`.
+3. **Record the real per-call schedule**, not a run-level scalar. The pinned table lives in
+   `llm::SAMPLING_SCHEDULE` and is written to `run.summary` as one pair per site
+   (`temperature_creator=0.1 max_tokens_creator=32768 … max_tokens_intent_audit=2048`), with the
+   **server's** `top_p` from `/props` beside them (`top_p=…`, or `unset` when the server publishes
+   nothing). A single run-level `temperature` would be a fabricated claim — one review run samples at
+   0.0, 0.2 *and* 0.3. Recording the server's own `temperature` / `n_predict` would be worse: numbers
+   the model never sampled with.
+   **Keys are underscored, not dotted** (`temperature_creator`, not `temperature.creator`):
+   `rerun.rs::summary_field` and `scripts/metrics.py::summary_field` both accept a key only when it
+   matches `[a-z_][a-z0-9_]*`, so a dot would not terminate the value and *both* consumers would
+   silently read the wrong string.
+4. **A test asserts the record is real.**
+   `tests/m3_session_log.rs::the_recorded_sampling_schedule_matches_the_request_bodies` compares the
+   `run.summary` schedule against the `temperature` / `max_tokens` actually present in the bodies the
+   stub server received.
 
 **Honest limitation:** llama.cpp determinism under a fixed seed is **not guaranteed** — the prompt
 cache, continuous batching, and non-deterministic float reduction order across threads all perturb
@@ -489,21 +514,31 @@ claim bit-exact reruns**.
 ### 4.4 Provenance (decided)
 
 An env var alone is not provenance: a session directory copied out of the batch must be
-self-describing. Every run records **config, mode, seed, model id, effective sampling params, pinned
-pytest versions, and the Vanta git commit** in two places:
+self-describing. Every run records **config, mode, seed, model id, the per-call sampling schedule
+plus the server's `top_p`, pinned pytest versions, and the Vanta git commit** in two places:
 
 1. **`run.summary`** — the existing free-form `summary` string gains lowercase keys
-   (`config=… mode=… seed=… model=… temperature=… top_p=… max_tokens=… commit=… dirty=…`),
-   satisfying the repo's lowercase-only summary rule, **and** the two already-present-but-always-
-   `None` fields are populated: `benchmark_instance = <config>` and
-   `benchmark_label = <oracle label>`. This is one construction site (the `run.summary` record), not
-   a struct change — `SessionRecord` keeps its shape
-   ([session/mod.rs](file:///Users/kyu-yi/vanta/src/session/mod.rs#L123)).
+   (`config=… mode=… seed=… model=… top_p=… commit=… dirty=…` plus one
+   `temperature_<site>=…` / `max_tokens_<site>=…` pair per call site in §4.3), satisfying the repo's
+   lowercase-only summary rule, **and** the two already-present-but-always-`None` fields are
+   populated: `benchmark_instance = <config>` and `benchmark_label = <oracle label>`. This is one
+   construction site (the `run.summary` record), not a struct change — `SessionRecord` keeps its
+   shape ([session/mod.rs](file:///Users/kyu-yi/vanta/src/session/mod.rs#L123)).
+   `benchmark_label` is the **oracle** label (§5.3), and the oracle runs from the harness *after*
+   `vanta_m3` exits, so a run can settle only the one label its own verdict already fixes:
+   `InfraFailure` → `infra_failure`. Every other row needs `patch_good` and stays `None` for the
+   manifest to fill — guessing from the verdict would write `true_approval` for a patch the oracle
+   may well call a `false_approval`.
 2. **The batch manifest** (§7.3) — the same fields, structured.
 
 `metrics.py` **groups by all of them** (§9.1), so any table can be cut by config × seed × model
 without re-running anything. `commit` / `dirty` come from the existing build-time
 `VANTA_BUILD_COMMIT` / `VANTA_BUILD_DIRTY` provenance, not from a runtime `git` call.
+
+[VANTA-WHY] The `top_p` probe is the **only** HTTP call in the run that carries a deadline (5 s). It
+fires *after* the verdict, so an unreachable or wedged `/props` must not be able to stop the session
+from writing its own `run.summary` — the row that records the verdict. On timeout the key is recorded
+as `unset`, which is the truth.
 
 ---
 
@@ -695,11 +730,15 @@ enter this file through a deliberate edit:
   "configs": ["baseline", "vanta"],
   "seeds": [0],
   "review_mode": true,
-  "sampling": {"policy": "server_defaults", "values_sent": null},
+  "sampling": {
+    "source": "pinned_per_call_plus_server_top_p",
+    "pinned_sites": ["creator", "attacker_generate", "attacker_revise", "attacker_simplify", "intent_audit"],
+    "server_top_p": "read from /props at run time"
+  },
   "bugs": [
     {
       "project": "PySnooper", "bug_id": 1,
-      "python_version": "3.8.1",
+      "python_version": "3.8.20", "python_version_pinned": "3.8.1",
       "buggy_commit": "…", "fixed_commit": "…",
       "test_file": "tests/test_chinese.py",
       "pythonpath": null,
@@ -740,9 +779,20 @@ exist. `prepare` itself never writes it — it writes `runs/bugsinpy/<batch>/pre
   "config": "vanta", "mode": "repair", "seed": 0,
   "session_id": "…", "vanta_commit": "<build commit>", "vanta_dirty": false,
   "model": "…",
-  "sampling": {"source": "server_defaults", "temperature": null, "top_p": null, "max_tokens": null,
-               "effective_from_props": {"temperature": 0.8, "top_p": 0.95, "n_predict": -1}},
-  "checkpoint": "vanta-bi-PySnooper-1", "python_version": "3.8.1",
+  "sampling": {
+    "source": "pinned_per_call_plus_server_top_p",
+    "pinned": [
+      {"site": "creator",           "temperature": 0.1, "max_tokens": 32768},
+      {"site": "attacker_generate", "temperature": 0.2, "max_tokens": 32768},
+      {"site": "attacker_revise",   "temperature": 0.3, "max_tokens": 32768},
+      {"site": "attacker_simplify", "temperature": 0.3, "max_tokens": 32768},
+      {"site": "intent_audit",      "temperature": 0.0, "max_tokens": 2048}
+    ],
+    "server_top_p": null,
+    "server_top_p_note": "unset — /props did not publish it"
+  },
+  "checkpoint": "vanta-bi-PySnooper-1",
+  "python_version": "3.8.20", "python_version_pinned": "3.8.1",
   "pytest_version": "8.0.2", "json_report_version": "1.5.0",
   "candidate": {"kind": "creator_patch", "patch_sha256": "…", "produced_by_session": "…"},
   "verdict": "Rejected", "exit_code": 1,
@@ -755,9 +805,14 @@ exist. `prepare` itself never writes it — it writes `runs/bugsinpy/<batch>/pre
 }
 ```
 
-Note `sampling`: `source = "server_defaults"`, the sent values are `null` (§4.3), and
-`effective_from_props` carries the numbers the server was actually running with. The manifest never
-*implies* the harness set them.
+Note `sampling`: the harness chooses **no** run-level value. `pinned` is the per-call schedule the
+pipeline itself enforces (§4.3), so a run's parameters are several rather than one, and
+`server_top_p` is the one parameter no call site pins, read from `/props` (`null` when the server
+publishes nothing). The manifest never *implies* the harness picked them.
+
+Note `python_version`: that is the interpreter the checkpoint **actually** contains, not the version
+BugsInPy's `bug.info` pins. The two differ (§12.3) and both are recorded, so the gap is auditable
+rather than hidden by writing the actual number into a field that claims to be the pinned one.
 
 `config` / `mode` / `seed` / `model` / `sampling` / `vanta_commit` are the provenance axes §4.4 and
 §9.1 group by. `candidate` is `null` for repair runs and, for review runs, names the patch under test
@@ -987,9 +1042,12 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
    assertions, plus the PySnooper per-bug layers.
 4. Oracle standalone (test-hunk filter, hidden run, suite diff ×2) — fully testable on known-good
    **and** known-bad with no Vanta run at all. This is what makes wave-1 baseline review possible.
-5. `VANTA_ATTACKER` / `VANTA_PLANNER` / `VANTA_LLM_SEED` plumbing, the `/props` sampler-default
-   capture, and the §4.4 provenance keys in `run.summary`. Test that unset reproduces today
-   byte-for-byte, and that `VANTA_ATTACKER=off` skips the Attacker without changing any verdict.
+5. `VANTA_ATTACKER` / `VANTA_PLANNER` / `VANTA_LLM_SEED` plumbing, the per-call sampling schedule
+   plus the server-`top_p` probe (§4.3), and the §4.4 provenance keys in `run.summary`. Tests: with
+   the env unset the request bodies are byte-identical (no `seed` key) and the existing suite gives
+   the same verdicts; `VANTA_ATTACKER=off` makes zero Attacker LLM calls without changing a verdict;
+   `VANTA_PLANNER=on` exits 2 with `final_decision=InfraFailure`; and the recorded schedule equals the
+   `temperature` / `max_tokens` the request bodies actually carried.
 6. Runner + manifest + resume; baseline-review jobs scheduled first. `.gitignore` line.
 7. Compaction (diff + manifest) with the §6.3 rerun-safety test.
 8. **Wave 1 gate run** (§8.2) → report it, and only then bake py3.7 and py3.6 and schedule waves 2–3.
@@ -1006,8 +1064,8 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
 | D1 | Issue text | Derived from the stripped fix-commit message + an LLM behavioural paraphrase, with a **hard leak gate** (§2.2). Step 2 strips **diff and code blocks only** (no symbol rule). The gate rejects or strips any token that exists only in the fix diff or the hidden test, logs every removal, and flags unactionable texts under `NEEDS DECISION` in `issue_texts_all.md` before any run. |
 | D2 | Python environments | One checkpoint **per version** + thin per-bug layers, using the existing `vanta-deps-<fingerprint>` marker/freeze pattern. **py3.8 via standalone Python; py3.6/3.7 build OpenSSL 1.1.1 into the checkpoint** (or an older Debian base). `import ssl` + a real `pip install` + `pytest --version` are part of the wave-1 gate. **pytest / pytest-json-report pinned per version.** |
 | D3 | `baseline` | Env-gated `VANTA_ATTACKER=off` in `driver.rs`; skips the Attacker and restricts Creator feedback to native/static. Defaults to today's behaviour. |
-| D4 | Seeds / sampling | `VANTA_LLM_SEED` implemented and stored. **`temperature` / `top_p` / `max_tokens` are never set** (server defaults; `max_tokens: 4096` would truncate the Creator). The **effective** defaults are read from `/props` and recorded in `run.summary` and the manifest. Determinism under a seed is not claimed. |
-| D5 | Provenance | Config, mode, seed, model id, effective sampling params, pinned pytest versions and Vanta commit recorded in **both** `run.summary` (lowercase keys + the existing `benchmark_instance` / `benchmark_label` fields) and the batch manifest. `metrics.py` groups by all of them. |
+| D4 | Seeds / sampling | `VANTA_LLM_SEED` implemented and stored (the `seed` key is added to the body **only** when set; unset leaves it byte-identical). The pipeline's own **per-call** `temperature` / `max_tokens` pins (§4.3) are kept exactly as they are and recorded per site; `top_p` is the only server-sourced value, read from `/props`. No new sampling knobs, and the harness adds no cap of its own. Determinism under a seed is not claimed. |
+| D5 | Provenance | Config, mode, seed, model id, the per-call sampling schedule + server `top_p`, pinned pytest versions and Vanta commit recorded in **both** `run.summary` (lowercase keys + the existing `benchmark_instance` / `benchmark_label` fields) and the batch manifest. `metrics.py` groups by all of them. |
 | D6 | Disk | Harness-side compaction to diff + manifest. **Rerun-safety rule:** a session with a rejecting signal keeps its full graded snapshot until its rerun is written, or the rerun rebuilds from base + diff. A test covers both branches. |
 | D7 | Metrics location | Additive section in `scripts/metrics.py`. |
 | D8 | Test trees | **SWE-bench split** (§1.2–§1.3): Vanta's tree = buggy source + **fixed** test files − `FAIL_TO_PASS`. `PASS_TO_PASS` is the native suite. Fixed-tree gate relaxed to "no fixed-only failures"; pre-existing failures recorded; every suite run twice to flag flaky nodeids. |
@@ -1043,6 +1101,14 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
 - Sanitizing `vanta_tree/` makes the native suite green by construction, so `baseline` is a one-shot
   repair with no iterative signal — its approvals are unverified by construction. That is the base
   rate `vanta` is measured against, not a defect of the harness (§1.5).
+- **Interpreter version divergence (measured).** BugsInPy pins `python_version="3.8.1"` in each
+  `bug.info`, but the py3.8 checkpoint actually built is **3.8.20** — the last 3.8 release that still
+  builds against the base image's OpenSSL. Every environment-dependent result therefore runs on a
+  different *patch release* than the record's own `bug.info` names. Both numbers are recorded side by
+  side in the manifest (`python_version` = actual, `python_version_pinned` = BugsInPy's), so the gap
+  is auditable rather than papered over by writing the actual number into a field that claims to be
+  the pinned one. Nothing in the pilot is sensitive to 3.8.1-versus-3.8.20 (all three projects are
+  pure Python at these versions), but the write-up must not claim the pinned interpreter.
 - `PASS_TO_PASS` comes from the fixed tree, so a bug whose fix deleted tests has a smaller native
   suite than the buggy commit had. That is the SWE-bench convention, and it is the fair one, but it
   means "native suite" is not a constant per project.

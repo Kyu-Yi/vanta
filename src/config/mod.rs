@@ -138,6 +138,27 @@ pub struct LlmConfig {
     // server's /props" (see llm::context_window_tokens); Some(v) is
     // VANTA_LLM_CONTEXT_TOKENS, which wins but is checked against /props.
     pub context_window_tokens: Option<u32>,
+
+    // [SYNTAX] seed: Option<u64> = "maybe the caller pinned a sampler seed".
+    // Set with VANTA_LLM_SEED. None = the field is ABSENT from the request body.
+    //
+    // [VANTA-WHY] None must mean ABSENT, not `seed: 0`. The measurement
+    // baseline this project is compared against was collected with whatever
+    // the server's own default sampling was; a body that suddenly carried a
+    // seed would move the control rather than repeat it. So the key is added
+    // only when the caller asked for it (llm::post_chat), and "unset
+    // reproduces today byte-for-byte" is an assertion, not an intention.
+    //
+    // [VANTA-WHY] A seed is a reproducibility HINT, not a guarantee. llama.cpp
+    // perturbs sampling through the prompt cache, continuous batching, and a
+    // non-deterministic float reduction order across threads, so the same seed
+    // is a *repeat key* for a run — never a claim of bit-exact reruns.
+    //
+    // [VANTA-WHY] Option<u64> and no "-1 = random" sentinel: llama.cpp's seed
+    // is 64-bit, and "let the server decide" is exactly what an absent key
+    // already says without inventing a magic number that a stricter backend
+    // might read as a real seed.
+    pub seed: Option<u64>,
 }
 
 // ----------------------------------------------------------------------------
@@ -195,6 +216,11 @@ impl Default for LlmConfig {
             // None = read n_ctx from the server's /props (llm module), falling
             // back to 65536 only when the server cannot be asked.
             context_window_tokens: None,
+
+            // None = no `seed` key in the request; the server samples with its
+            // own default, which is what the existing baseline was measured
+            // under. Set VANTA_LLM_SEED to pin one.
+            seed: None,
         }
     }
 }
@@ -229,12 +255,21 @@ impl fmt::Display for LlmConfig {
             idle_timeout   : {}s (abandon after no new token)\n  \
             max_call       : {}s (backstop per call)\n  \
             retry_attempts : {}\n  \
-            context_window : {}",
+            context_window : {}\n  \
+            seed           : {}",
             self.base_url, self.model_id, key_display,
             self.idle_timeout_secs, self.max_call_secs, self.retry_attempts,
             match self.context_window_tokens {
                 Some(v) => format!("{v} (VANTA_LLM_CONTEXT_TOKENS)"),
                 None => "auto (server /props, fallback 65536)".to_string(),
+            },
+            // [VANTA-WHY] Printed because a run's sampling is part of its
+            // identity: two runs whose banners differ only here are not the
+            // same experiment, and the banner is the only place a human sees it
+            // before the session log exists.
+            match self.seed {
+                Some(v) => format!("{v} (VANTA_LLM_SEED)"),
+                None => "unset (server default)".to_string(),
             }
         )
     }
@@ -261,8 +296,9 @@ impl LlmConfig {
     //   VANTA_LLM_MAX_SECS         | Overall backstop per LLM call      | 3600
     //   VANTA_LLM_CONTEXT_TOKENS   | Model context window (else /props) | unset
     //   VANTA_LLM_RETRY_ATTEMPTS   | structured_call retry budget       | 3
+    //   VANTA_LLM_SEED             | Sampler seed (else server default) | unset
     //
-    // All four are optional to set (defaults used). If any of them contain
+    // All of them are optional to set (defaults used). If any of them contain
     // non-UTF-8 bytes (shouldn't happen in normal shell use), we return Err
     // rather than silently continuing with malformed config.
     //
@@ -407,6 +443,29 @@ impl LlmConfig {
             }
         }
 
+        // ---- seed override (OPTIONAL, None default) -------------------------
+        // [VANTA-WHY] No "must be > 0" check, unlike the timeouts above: 0 is a
+        // perfectly good seed, and rejecting it would be inventing a constraint
+        // the sampler does not have. Only "set but not a number" is an error —
+        // a silently ignored seed would make two runs that claim the same seed
+        // differ for a reason no artifact records.
+        match env::var("VANTA_LLM_SEED") {
+            Ok(val) if !val.trim().is_empty() => {
+                let parsed: u64 = val.trim().parse::<u64>().map_err(|e| {
+                    format!(
+                        "CONFIG_ERROR: VANTA_LLM_SEED='{}' not a valid non-negative integer: {e}",
+                        val.trim()
+                    )
+                })?;
+                cfg.seed = Some(parsed);
+            }
+            Ok(_) => { /* keep default None */ }
+            Err(env::VarError::NotPresent) => { /* keep default None */ }
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err("CONFIG_ERROR: VANTA_LLM_SEED env var contained non-UTF-8 bytes.".to_string());
+            }
+        }
+
         Ok(cfg)
     }
 
@@ -466,6 +525,9 @@ mod tests {
         assert_eq!(d.max_call_secs, 3600);
         // [SYNTAX] None = "do not guess the server's window; ask /props".
         assert_eq!(d.context_window_tokens, None);
+        // [VANTA-WHY] None means the request body carries no `seed` key at all.
+        // A default of Some(0) would silently change every existing run's body.
+        assert_eq!(d.seed, None);
     }
 
     #[test]

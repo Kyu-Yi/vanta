@@ -3660,3 +3660,347 @@ fn an_llm_failure_after_retries_writes_an_infrafailure_run_summary() {
     assert!(find_transitions(workspace.path()).exists());
 }
 
+// ============================================================================
+// BugsInPy harness — §11 step 5: env switches + per-call provenance
+// ============================================================================
+//
+// The harness drives the SAME binary the existing suite exercises, so these
+// tests are the guard that the three new env switches change nothing about the
+// verdict machinery and that the provenance block records what really happened.
+
+/// The stub's `request_kinds` labels (detected by body substring) mapped onto the
+/// call-site names in `vanta::llm::SAMPLING_SCHEDULE`.
+const SITE_FOR_KIND: &[(&str, &str)] = &[
+    ("creator", "creator"),
+    ("generate", "attacker_generate"),
+    ("revise", "attacker_revise"),
+    ("simplify", "attacker_simplify"),
+    ("intent_audit", "intent_audit"),
+];
+
+/// The one `run.summary` record a terminal run must write.
+fn run_summary(workspace: &Path) -> vanta::session::SessionRecord {
+    read_session_records(&find_session_log(workspace))
+        .into_iter()
+        .find(|r| r.phase == "run.summary")
+        .expect("every terminal run must write a run.summary row")
+}
+
+/// Read one `key=value` pair out of the free-form `run.summary` line.
+fn summary_value(summary: &str, key: &str) -> String {
+    let needle = format!("{key}=");
+    let start = summary
+        .find(&needle)
+        .unwrap_or_else(|| panic!("run.summary has no `{key}`: {summary}"))
+        + needle.len();
+    let rest = &summary[start..];
+    let end = rest
+        .find(|c: char| c == ' ' || c == '\n' || c == '\r')
+        .unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// The request body as JSON with any `seed` key removed — a body from a seeded
+/// run must be otherwise identical to the same body from an unseeded one.
+fn body_without_seed(body: &str) -> serde_json::Value {
+    let mut value: serde_json::Value = serde_json::from_str(body)
+        .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("seed");
+    }
+    value
+}
+
+/// Assert that the `run.summary` schedule is the one the request bodies carried,
+/// and return the call sites that were actually cross-checked.
+///
+/// [VANTA-WHY] §4.3: the harness PINS `temperature`/`max_tokens` per call site,
+/// which is why one run samples at several temperatures and why a single
+/// run-level pair would be a fabricated claim. The record is the SCHEDULE, so
+/// every pinned site must appear even if this run never reached it; and wherever
+/// a body WAS sent, its numbers must equal the recorded ones — otherwise the
+/// provenance block describes a run that did not happen.
+fn assert_schedule_matches_bodies(workspace: &Path, server: &StubLlmServer) -> Vec<String> {
+    let summary = run_summary(workspace).summary;
+
+    for (site, temperature, max_tokens) in vanta::llm::SAMPLING_SCHEDULE {
+        assert_eq!(
+            summary_value(&summary, &format!("temperature_{site}")),
+            format!("{temperature:?}"),
+            "run.summary must record the pinned temperature for `{site}`"
+        );
+        assert_eq!(
+            summary_value(&summary, &format!("max_tokens_{site}")),
+            max_tokens.to_string(),
+            "run.summary must record the pinned max_tokens for `{site}`"
+        );
+    }
+
+    let kinds = server.request_kinds();
+    let bodies = server.request_bodies();
+    assert_eq!(kinds.len(), bodies.len(), "one kind per recorded body");
+
+    let mut checked: Vec<String> = Vec::new();
+    for (kind, body) in kinds.iter().zip(bodies.iter()) {
+        let site = SITE_FOR_KIND
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map(|(_, site)| *site)
+            .unwrap_or_else(|| panic!("stub saw an unmapped request kind `{kind}`"));
+        let value: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+        let body_temperature = value
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .unwrap_or_else(|| panic!("the `{kind}` body carries no temperature: {body}"));
+        let body_max_tokens = value
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| panic!("the `{kind}` body carries no max_tokens: {body}"));
+        assert_eq!(
+            summary_value(&summary, &format!("temperature_{site}")),
+            format!("{body_temperature:?}"),
+            "the recorded schedule disagrees with the `{kind}` body actually sent"
+        );
+        assert_eq!(
+            summary_value(&summary, &format!("max_tokens_{site}")),
+            body_max_tokens.to_string(),
+            "the recorded schedule disagrees with the `{kind}` body actually sent"
+        );
+        checked.push(site.to_string());
+    }
+    assert!(
+        !checked.is_empty(),
+        "no chat body was sent, so the schedule was never cross-checked"
+    );
+    checked
+}
+
+/// `VANTA_LLM_SEED` must be invisible when unset and present in every chat body
+/// when set.
+///
+/// [VANTA-WHY] An unset seed has to leave the request body byte-for-byte what it
+/// was before the field existed: `"seed": null` would change what every server
+/// sees, and `"seed": 0` would move the sampling baseline every existing
+/// measurement was taken under. A test cannot run the pre-seed binary, so the
+/// guard is twofold — no key at all when unset, exactly that key when set, and
+/// the two bodies equal once the key is removed.
+#[test]
+fn unset_seed_leaves_request_bodies_unseeded_and_the_verdict_unchanged() {
+    let _serial = serial_run();
+
+    let plain = TempDir::new().unwrap();
+    let (_repo, _issue, patch_path) = write_test_repo(plain.path(), PRESERVING_PATCH);
+    let plain_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let plain_output =
+        run_patch_mode_with_output(plain.path(), &patch_path, &plain_server, 3, &[]);
+    assert_eq!(
+        plain_output.status.code(),
+        Some(0),
+        "the reference run must be the approval; stdout:\n{}",
+        String::from_utf8_lossy(&plain_output.stdout)
+    );
+    let plain_bodies = plain_server.request_bodies();
+    assert!(!plain_bodies.is_empty(), "the run must have called the LLM");
+    for body in &plain_bodies {
+        assert!(
+            !body.contains("\"seed\""),
+            "an unset VANTA_LLM_SEED must add NO seed key to the body; got: {body}"
+        );
+    }
+
+    let seeded = TempDir::new().unwrap();
+    let (_repo, _issue, patch_path) = write_test_repo(seeded.path(), PRESERVING_PATCH);
+    let seeded_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let seeded_output = run_patch_mode_with_output(
+        seeded.path(),
+        &patch_path,
+        &seeded_server,
+        3,
+        &[("VANTA_LLM_SEED", "4242")],
+    );
+    assert_eq!(
+        seeded_output.status.code(),
+        Some(0),
+        "the seed is a sampling hint, not a verdict input, so the verdict must be the same; \
+         stdout:\n{}",
+        String::from_utf8_lossy(&seeded_output.stdout)
+    );
+    let seeded_bodies = seeded_server.request_bodies();
+    assert_eq!(
+        seeded_bodies.len(),
+        plain_bodies.len(),
+        "the seed must not change how many calls the run makes"
+    );
+    for body in &seeded_bodies {
+        assert!(
+            body.contains("\"seed\":4242"),
+            "a set VANTA_LLM_SEED must reach every chat body; got: {body}"
+        );
+    }
+    // The ONLY difference the new field may introduce is the key itself.
+    for (unseeded, seeded) in plain_bodies.iter().zip(seeded_bodies.iter()) {
+        assert_eq!(
+            body_without_seed(seeded),
+            body_without_seed(unseeded),
+            "with the seed key removed, a seeded body must be byte-identical to the unseeded one"
+        );
+    }
+}
+
+/// §4.2 `baseline`: `VANTA_ATTACKER=off` skips the Attacker phase entirely, so
+/// the verdict comes from the repo's own suite and static analysis — and not one
+/// Attacker LLM call is made.
+#[test]
+fn attacker_off_makes_zero_attacker_calls_and_grades_on_native_and_static() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    // A real native suite, so the approval rests on a test that actually ran
+    // rather than on a vacuously-empty one.
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        PRESERVING_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    // A stub that WOULD answer an Attacker call: if one is made, this test sees it.
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        3,
+        &[("VANTA_ATTACKER", "off")],
+    );
+
+    assert!(
+        output.status.success(),
+        "a behaviour-preserving patch with a passing native suite and clean static \
+         analysis is the native+static baseline approval; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        server.request_count(),
+        0,
+        "VANTA_ATTACKER=off must skip the Attacker phase — zero LLM calls; kinds={:?}",
+        server.request_kinds()
+    );
+
+    let summary = run_summary(workspace.path());
+    assert!(
+        summary.summary.contains("config=baseline"),
+        "the config is derived from the switches, so Attacker-off must record `baseline`; got {}",
+        summary.summary
+    );
+}
+
+/// §4.2 third configuration: `VANTA_PLANNER=on` is a PLACEHOLDER. It must end as
+/// an explicit `InfraFailure` instead of a fabricated result, and it must not do
+/// any work — no LLM call, no verdict about a candidate.
+#[test]
+fn planner_on_ends_as_an_explicit_infrastructure_failure() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        3,
+        &[("VANTA_PLANNER", "on")],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the planner placeholder must reuse the InfraFailure exit code; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        server.request_count(),
+        0,
+        "the placeholder must stop before any work; kinds={:?}",
+        server.request_kinds()
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let summary = records
+        .iter()
+        .find(|r| r.phase == "run.summary")
+        .expect("even the placeholder must write a run.summary row");
+    assert!(
+        summary.summary.contains("config=vanta_planner"),
+        "got {}",
+        summary.summary
+    );
+    assert!(
+        summary.summary.contains("final_decision=InfraFailure"),
+        "got {}",
+        summary.summary
+    );
+    assert_eq!(
+        summary.benchmark_instance.as_deref(),
+        Some("vanta_planner"),
+        "the manifest groups by benchmark_instance, so it must name the config"
+    );
+    assert_eq!(
+        summary.benchmark_label.as_deref(),
+        Some("infra_failure"),
+        "an InfraFailure is the one verdict a run can label itself (§5.3)"
+    );
+    assert!(
+        records.iter().any(|r| r.phase == "run.infra_failure"),
+        "the reason must be recorded beside the verdict"
+    );
+}
+
+/// §4.3 (corrected): the harness PINS `temperature`/`max_tokens` per call site,
+/// so the provenance record is a per-agent SCHEDULE, not a run-level scalar. The
+/// recorded schedule must be the one the bodies actually carried.
+#[test]
+fn the_recorded_sampling_schedule_matches_the_request_bodies() {
+    let _serial = serial_run();
+
+    // (1) Review mode: no Creator call, but the Attacker's generate and the
+    //     patch-blind intent audit both fire.
+    let review = TempDir::new().unwrap();
+    let (_repo, _issue, patch_path) = write_test_repo(review.path(), PRESERVING_PATCH);
+    let review_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let status = run_patch_mode(review.path(), &patch_path, &review_server);
+    assert!(status.success(), "the reference run must reach a verdict");
+    let checked = assert_schedule_matches_bodies(review.path(), &review_server);
+    for required in ["attacker_generate", "intent_audit"] {
+        assert!(
+            checked.iter().any(|site| site == required),
+            "review mode must exercise `{required}`; checked={checked:?}"
+        );
+    }
+
+    // (2) Repair mode: the Creator call runs too, so its site is covered as well —
+    //     the schedule table names five sites and this is what keeps the Creator
+    //     one from being a value nothing ever checks.
+    let repair = TempDir::new().unwrap();
+    let _ = write_test_repo(repair.path(), PRESERVING_PATCH);
+    let creator_answer = serde_json::json!({
+        "patch_text": WRONG_BEHAVIOUR_PATCH,
+        "explanation": "stub candidate for the sampling-schedule test",
+        "files_touched": ["calc.py"],
+        "confidence": 0.2
+    })
+    .to_string();
+    let repair_server =
+        StubLlmServer::start_with_creator_and_attacker(&creator_answer, THREE_SIGNAL_TESTS);
+    let _ = run_creator_mode_with_output(repair.path(), &repair_server, 1, &[]);
+    let checked = assert_schedule_matches_bodies(repair.path(), &repair_server);
+    for required in ["creator", "attacker_generate", "intent_audit"] {
+        assert!(
+            checked.iter().any(|site| site == required),
+            "repair mode must exercise `{required}`; checked={checked:?}"
+        );
+    }
+}
+

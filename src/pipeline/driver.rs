@@ -42,6 +42,7 @@ use crate::core::{
     AttemptTransition, EvidenceSource, FailureClass, GovernorDecision, TestEvidence, TestIntent,
     TestResult, VerificationOutcome, VerificationPolicy, static_finding_identity,
 };
+use crate::llm::{build_reqwest_client, server_top_p_default};
 use crate::pipeline::bate::run_bate;
 use crate::pipeline::candidate::{CandidatePair, TestCommand};
 use crate::pipeline::diagnostician::diagnose_failure;
@@ -133,6 +134,101 @@ where
 }
 
 // ============================================================================
+// env_flag — read a boolean harness switch
+// ============================================================================
+//
+// [VANTA-WHY] Strict on purpose. `VANTA_ATTACKER=offf` quietly meaning "on"
+// would produce a `vanta` run that the batch manifest records as `baseline` —
+// a mislabelled datum, which is worse than a failed run, because nothing
+// downstream can detect it. An unrecognised value is an error, and an absent
+// var is the documented default (plans/bugsinpy.md §4.2).
+//
+// `on`/`off` are the documented spellings; the usual aliases are accepted
+// because a shell that exports `VANTA_ATTACKER=0` means the same thing.
+fn env_flag(name: &str, default: bool) -> Result<bool, String> {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "on" | "1" | "true" | "yes" => Ok(true),
+            "off" | "0" | "false" | "no" => Ok(false),
+            other => Err(format!(
+                "CONFIG_ERROR: {name}='{other}' is not a switch value (expected on|off)."
+            )),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "CONFIG_ERROR: {name} env var contained non-UTF-8 bytes."
+        )),
+    }
+}
+
+/// The `baseline` / `vanta` / `vanta_planner` name for a pair of switches.
+///
+/// [VANTA-WHY] Deriving the name from the switches instead of taking a fourth
+/// env var means the config a session records CANNOT disagree with the config
+/// it ran: §4.2 defines the three configurations as exactly these switch
+/// settings, so this is the single definition of the mapping.
+fn benchmark_config_name(attacker_enabled: bool, planner_enabled: bool) -> &'static str {
+    if planner_enabled {
+        "vanta_planner"
+    } else if attacker_enabled {
+        "vanta"
+    } else {
+        "baseline"
+    }
+}
+
+/// Render one effective sampling value for the `run.summary` provenance keys.
+///
+/// [VANTA-WHY] `unset` (not `null`, not a plausible default) is what an absent
+/// `/props` key becomes. The published numbers are the SERVER's, and the record
+/// must say so by showing nothing when the server showed nothing.
+fn sampling_value(value: Option<f64>) -> String {
+    value.map(|v| v.to_string()).unwrap_or_else(|| "unset".to_string())
+}
+
+/// Render the pinned per-call-site sampling schedule as `run.summary` keys.
+///
+/// [VANTA-WHY] Underscores, not dots. `rerun.rs::summary_field` and
+/// `scripts/metrics.py::summary_field` both accept a key only if it matches
+/// `[a-z_][a-z0-9_]*`, so `temperature.creator=0.1` would not terminate at the
+/// next key — the dot is not a key character, the value would run on through the
+/// rest of the line, and BOTH consumers would silently read the wrong thing.
+/// `{v:?}` for the float so `0.0` stays `0.0` and the record matches the
+/// request body byte for byte.
+fn sampling_schedule_keys() -> String {
+    crate::llm::SAMPLING_SCHEDULE
+        .iter()
+        .map(|(site, temperature, max_tokens)| {
+            format!("temperature_{site}={temperature:?} max_tokens_{site}={max_tokens}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Read the server's own `top_p` default for the provenance block.
+///
+/// [VANTA-WHY] Bounded, unlike every other HTTP call in this file.
+/// [`build_reqwest_client`] deliberately carries NO total timeout — a 27B model
+/// legitimately streams for 20 minutes and a deadline there killed it mid-
+/// generation (see the note in `llm::build_reqwest_client`). That is right for a
+/// generation and wrong for this probe: it runs AFTER the run has already
+/// reached its verdict, so an unreachable or wedged `/props` must not be able to
+/// stop the session from ever writing its own `run.summary` — the row that
+/// records the verdict. On timeout the key is recorded as unset, which is the
+/// truth: the server did not answer.
+async fn server_top_p_for_provenance(cfg: &LlmConfig) -> Option<f64> {
+    let Ok(client) = build_reqwest_client(cfg) else {
+        return None;
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        server_top_p_default(&client, cfg),
+    )
+    .await
+    .unwrap_or(None)
+}
+
+// ============================================================================
 // run — drive one full Vanta run and return the Governor's final decision
 // ============================================================================
 pub async fn run(
@@ -146,6 +242,23 @@ pub async fn run(
         cfg.model_id = m.clone();
     }
     println!("{cfg}\n");
+
+    // ---- Harness switches (plans/bugsinpy.md §4.2) ----
+    // [VANTA-WHY] Read ONCE, here, so no later code can disagree about which
+    // configuration this run is. Both default to today's behaviour, so an
+    // ordinary invocation is unchanged; the same binary then serves every
+    // configuration the harness runs, which is what keeps the comparison
+    // honest — two binaries could drift and the difference would be attributed
+    // to the configuration.
+    let attacker_enabled = env_flag("VANTA_ATTACKER", true)?;
+    let planner_enabled = env_flag("VANTA_PLANNER", false)?;
+    if !attacker_enabled {
+        println!(
+            "▌ Config: {} — Attacker off (VANTA_ATTACKER=off): the repo's own suite and static \
+             analysis are the whole question.",
+            benchmark_config_name(attacker_enabled, planner_enabled)
+        );
+    }
 
     // ---- Load repo ----
     println!("▌ Loading repo: {}", config.repo_path.display());
@@ -473,6 +586,26 @@ pub async fn run(
     let mut infra_failure_error: Option<String> = None;
     let decision = loop {
         let attempt = governor.current_attempt();
+
+        // [VANTA-WHY] `VANTA_PLANNER=on` is the third configuration in §4.2 and
+        // it is a PLACEHOLDER: no planner half of the pipeline exists. It ends
+        // as an explicit `InfraFailure` before any work is attempted, and the
+        // message says why. A config that "succeeds" because it does nothing is
+        // exactly the failure mode this project exists to catch, and a
+        // fabricated `vanta_planner` row in the manifest would be worse than a
+        // missing one — so the switch is addressable and cannot silently pass.
+        // It reuses the existing InfraFailure machinery (run.infra_failure row,
+        // run.summary with final_decision=InfraFailure, exit code 2) rather
+        // than inventing a fourth exit path the harness would have to learn.
+        if planner_enabled {
+            infra_failure_error = Some(
+                "VANTA_PLANNER=on: the planner configuration is not implemented \
+                 (plans/bugsinpy.md §4.2) — no planner stage exists, so this run \
+                 cannot produce a result about a candidate."
+                    .to_string(),
+            );
+            break GovernorDecision::InfraFailure;
+        }
         // [VANTA-WHY] Forensics filenames carry the ROUND, not just the
         // structured-call retry index. Without this, every round wrote over the
         // previous one and the debug folder of a 3-round run held round 3 three
@@ -728,138 +861,162 @@ pub async fn run(
         };
 
         // ---- 3. Attacker ----
-        println!("\n▌ ATTACKER phase...");
-        // [VANTA-WHY] Spec §7 "Import paths" row: append the detected import
-        // path to the issue text so the Attacker writes tests with the correct
-        // `from heretic.foo import bar` instead of `from foo import bar`.
-        let attacker_issue = match &import_hint {
-            Some(hint) => format!(
-                "{}\n\n[IMPORT PATH HINT] This repo uses import path: `{}`. Generated tests MUST import using this path. If the repo has a src/ layout, the package is under src/.",
-                repo.issue_text, hint
-            ),
-            None => repo.issue_text.clone(),
-        };
-        let attacker_request = AttackerRequest {
-            patch_text: patch_text.clone(),
-            original_source: review_prompt_concat.clone(),
-            issue_text: attacker_issue,
-            // [VANTA-WHY] Round >= 2: the Attacker is shown the probes already in
-            // the shared set so it attacks somewhere new instead of re-deriving
-            // the same boundary test. Empty on round 1.
-            existing_tests: shared_tests
-                .iter()
-                .map(|t| SharedProbe {
-                    test_name: t.test_name.clone(),
-                    test_source: t.test_source.clone(),
-                })
-                .collect(),
-        };
-        let attacker_response = match run_with_spinner("Attacker generating tests", async {
-            attacker_generate_tests(&cfg, &attacker_request).await
-        })
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                infra_failure_error = Some(format!("Attacker LLM call failed: {error}"));
-                break GovernorDecision::InfraFailure;
-            }
-        };
-        // [VANTA-WHY] A probe whose body is already in the shared set adds no
-        // coverage: it will be BATE-validated and patched-run again, and the
-        // comparison it produces is a self-transition. Identity is the
-        // content-based `normalized_test_body_hash`, so a rename is still a
-        // duplicate. The count of drops is logged per round — silently keeping
-        // them would make a stalled Attacker look like a productive one.
-        let (generated_tests, dropped_duplicates) =
-            drop_shared_duplicates(&attacker_response.tests, &shared_tests);
-        if !dropped_duplicates.is_empty() {
+        // [VANTA-WHY] `VANTA_ATTACKER=off` (the `baseline` configuration,
+        // plans/bugsinpy.md §4.2) asks a different question: what does this
+        // candidate look like with NO adversarial tests at all? The repo's own
+        // suite and static analysis are then the whole question. The phase is
+        // SKIPPED rather than run-and-emptied: an `attacker.summary` row saying
+        // `generated_tests=0` would assert "the Attacker ran and found nothing",
+        // which is a different fact from "the Attacker did not run", and no
+        // reader could tell the two apart in the artifact afterwards.
+        //
+        // Nothing about the verdict machinery changes here: with no generated
+        // tests, `all_passed` is vacuously true and `patched_classes` is empty,
+        // so `attempt_verdict` can only reject on a native regression or a
+        // blocking static finding — which is exactly the native+static-only
+        // verdict this configuration is defined by. `attempt_verdict` itself is
+        // untouched (C2).
+        let attacker_tests: Vec<GeneratedTest> = if !attacker_enabled {
             println!(
-                "  ⚠ Attacker repeated {} probe(s) already in the shared set: {:?}",
-                dropped_duplicates.len(),
-                dropped_duplicates
+                "\n▌ ATTACKER phase skipped (VANTA_ATTACKER=off): the repo's own suite and static \
+                 analysis are the whole question."
             );
-        }
-        session_log.append(SessionRecord {
-            session_id: session_id.clone(),
-            schema_version: Some(SCHEMA_VERSION),
-            patch_attempt_id: Some(patch_attempt_id.clone()),
-            testing_iteration_id: Some(testing_iteration_id.clone()),
-            test_id: None,
-            phase: "attacker.dedup".to_string(),
-            summary: format!(
-                "shared_set_size={} generated={} dropped_duplicates={} remaining={} dropped=[{}]",
-                shared_tests.len(),
-                attacker_response.tests.len(),
-                dropped_duplicates.len(),
-                generated_tests.len(),
-                dropped_duplicates.join(",")
-            ),
-            timestamp: now_iso(),
-            benchmark_instance: None,
-            benchmark_label: None,
-        })?;
-        // [VANTA-WHY] The patch-blind intent audit runs here, before BATE: only
-        // an audit that cannot see the patch can tell whether the ISSUE asks for
-        // the behaviour a non-preservation test asserts. An Attacker that read
-        // the patch could always label the patch's own side effect
-        // "FeatureAcceptance" and then pass its own acceptance test. The
-        // quote-substring evidence is recorded, but the audit decides.
-        let (attacker_tests, initial_relabels, initial_intent_checks) = audit_tests_intent(
-            &cfg,
-            &repo.issue_text,
-            &review_prompt_concat,
-            &generated_tests,
-        )
-        .await;
-        let intent_scrapped = initial_intent_checks.iter().filter(|c| c.scrapped).count();
-        println!(
-            "  ✔ Attacker: {} tests ({} generated, {} duplicate(s) dropped, {} scrapped by the intent check)",
-            attacker_tests.len(),
-            attacker_response.tests.len(),
-            dropped_duplicates.len(),
-            intent_scrapped
-        );
-        for t in &attacker_tests {
-            println!("    - {} (intent={:?})", t.test_name, t.intent);
-        }
-        session_log.append(SessionRecord {
-            session_id: session_id.clone(),
-            schema_version: Some(SCHEMA_VERSION),
-            patch_attempt_id: Some(patch_attempt_id.clone()),
-            testing_iteration_id: Some(testing_iteration_id.clone()),
-            test_id: None,
-            phase: "attacker.summary".to_string(),
-            summary: format!(
-                "generated_tests={} dropped_duplicates={} intent_scrapped={} relabels={} valid_tests={}",
-                attacker_response.tests.len(),
-                dropped_duplicates.len(),
-                intent_scrapped,
-                initial_relabels.len(),
-                attacker_tests.len()
-            ),
-            timestamp: now_iso(),
-            benchmark_instance: None,
-            benchmark_label: None,
-        })?;
-        log_intent_checks(&mut session_log, &session_id, &patch_attempt_id, &testing_iteration_id, "attacker.generate", &initial_intent_checks)?;
-        for relabel in &initial_relabels {
+            Vec::new()
+        } else {
+            println!("\n▌ ATTACKER phase...");
+            // [VANTA-WHY] Spec §7 "Import paths" row: append the detected import
+            // path to the issue text so the Attacker writes tests with the correct
+            // `from heretic.foo import bar` instead of `from foo import bar`.
+            let attacker_issue = match &import_hint {
+                Some(hint) => format!(
+                    "{}\n\n[IMPORT PATH HINT] This repo uses import path: `{}`. Generated tests MUST import using this path. If the repo has a src/ layout, the package is under src/.",
+                    repo.issue_text, hint
+                ),
+                None => repo.issue_text.clone(),
+            };
+            let attacker_request = AttackerRequest {
+                patch_text: patch_text.clone(),
+                original_source: review_prompt_concat.clone(),
+                issue_text: attacker_issue,
+                // [VANTA-WHY] Round >= 2: the Attacker is shown the probes already in
+                // the shared set so it attacks somewhere new instead of re-deriving
+                // the same boundary test. Empty on round 1.
+                existing_tests: shared_tests
+                    .iter()
+                    .map(|t| SharedProbe {
+                        test_name: t.test_name.clone(),
+                        test_source: t.test_source.clone(),
+                    })
+                    .collect(),
+            };
+            let attacker_response = match run_with_spinner("Attacker generating tests", async {
+                attacker_generate_tests(&cfg, &attacker_request).await
+            })
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    infra_failure_error = Some(format!("Attacker LLM call failed: {error}"));
+                    break GovernorDecision::InfraFailure;
+                }
+            };
+            // [VANTA-WHY] A probe whose body is already in the shared set adds no
+            // coverage: it will be BATE-validated and patched-run again, and the
+            // comparison it produces is a self-transition. Identity is the
+            // content-based `normalized_test_body_hash`, so a rename is still a
+            // duplicate. The count of drops is logged per round — silently keeping
+            // them would make a stalled Attacker look like a productive one.
+            let (generated_tests, dropped_duplicates) =
+                drop_shared_duplicates(&attacker_response.tests, &shared_tests);
+            if !dropped_duplicates.is_empty() {
+                println!(
+                    "  ⚠ Attacker repeated {} probe(s) already in the shared set: {:?}",
+                    dropped_duplicates.len(),
+                    dropped_duplicates
+                );
+            }
             session_log.append(SessionRecord {
                 session_id: session_id.clone(),
                 schema_version: Some(SCHEMA_VERSION),
                 patch_attempt_id: Some(patch_attempt_id.clone()),
                 testing_iteration_id: Some(testing_iteration_id.clone()),
-                test_id: Some(fresh_test_id()),
-                phase: format!("attacker.relabel[{}]", relabel.test_name),
+                test_id: None,
+                phase: "attacker.dedup".to_string(),
                 summary: format!(
-                    "source=attacker.generate from={:?} to={:?} reason={}",
-                    relabel.from_intent, relabel.to_intent, relabel.reason
+                    "shared_set_size={} generated={} dropped_duplicates={} remaining={} dropped=[{}]",
+                    shared_tests.len(),
+                    attacker_response.tests.len(),
+                    dropped_duplicates.len(),
+                    generated_tests.len(),
+                    dropped_duplicates.join(",")
                 ),
                 timestamp: now_iso(),
                 benchmark_instance: None,
                 benchmark_label: None,
             })?;
-        }
+            // [VANTA-WHY] The patch-blind intent audit runs here, before BATE: only
+            // an audit that cannot see the patch can tell whether the ISSUE asks for
+            // the behaviour a non-preservation test asserts. An Attacker that read
+            // the patch could always label the patch's own side effect
+            // "FeatureAcceptance" and then pass its own acceptance test. The
+            // quote-substring evidence is recorded, but the audit decides.
+            let (attacker_tests, initial_relabels, initial_intent_checks) = audit_tests_intent(
+                &cfg,
+                &repo.issue_text,
+                &review_prompt_concat,
+                &generated_tests,
+            )
+            .await;
+            let intent_scrapped = initial_intent_checks.iter().filter(|c| c.scrapped).count();
+            println!(
+                "  ✔ Attacker: {} tests ({} generated, {} duplicate(s) dropped, {} scrapped by the intent check)",
+                attacker_tests.len(),
+                attacker_response.tests.len(),
+                dropped_duplicates.len(),
+                intent_scrapped
+            );
+            for t in &attacker_tests {
+                println!("    - {} (intent={:?})", t.test_name, t.intent);
+            }
+            session_log.append(SessionRecord {
+                session_id: session_id.clone(),
+                schema_version: Some(SCHEMA_VERSION),
+                patch_attempt_id: Some(patch_attempt_id.clone()),
+                testing_iteration_id: Some(testing_iteration_id.clone()),
+                test_id: None,
+                phase: "attacker.summary".to_string(),
+                summary: format!(
+                    "generated_tests={} dropped_duplicates={} intent_scrapped={} relabels={} valid_tests={}",
+                    attacker_response.tests.len(),
+                    dropped_duplicates.len(),
+                    intent_scrapped,
+                    initial_relabels.len(),
+                    attacker_tests.len()
+                ),
+                timestamp: now_iso(),
+                benchmark_instance: None,
+                benchmark_label: None,
+            })?;
+            log_intent_checks(&mut session_log, &session_id, &patch_attempt_id, &testing_iteration_id, "attacker.generate", &initial_intent_checks)?;
+            for relabel in &initial_relabels {
+                session_log.append(SessionRecord {
+                    session_id: session_id.clone(),
+                    schema_version: Some(SCHEMA_VERSION),
+                    patch_attempt_id: Some(patch_attempt_id.clone()),
+                    testing_iteration_id: Some(testing_iteration_id.clone()),
+                    test_id: Some(fresh_test_id()),
+                    phase: format!("attacker.relabel[{}]", relabel.test_name),
+                    summary: format!(
+                        "source=attacker.generate from={:?} to={:?} reason={}",
+                        relabel.from_intent, relabel.to_intent, relabel.reason
+                    ),
+                    timestamp: now_iso(),
+                    benchmark_instance: None,
+                    benchmark_label: None,
+                })?;
+            }
+            attacker_tests
+        };
 
         // ---- 3b. Self-heal dependencies the manifest did not declare ----
         // [VANTA-WHY] The manifest says what the repo DECLARED; the tests may
@@ -973,7 +1130,17 @@ pub async fn run(
             })?;
         }
 
-        if valid_tests.is_empty() && shared_tests.is_empty() {
+        // [VANTA-WHY] With the Attacker off there is never a generated test for
+        // BATE to validate, so `valid_tests` and `shared_tests` are permanently
+        // empty. Entering this branch would turn that permanent emptiness into
+        // `Inconclusive` → `MaxAttemptsReached` — a verdict about the harness,
+        // not about the candidate — when the entire point of `baseline` is the
+        // native-and-static verdict. Skipping it lets the attempt fall through
+        // to the graded run, where the native suite and static analysis are the
+        // evidence (§4.2). `valid_tests` stays empty, so the patched run runs no
+        // generated tests and `all_passed` is vacuously true — which is exactly
+        // what `attempt_verdict` needs to decide on native+static alone.
+        if attacker_enabled && valid_tests.is_empty() && shared_tests.is_empty() {
             // No valid new tests AND no shared set from previous attempts — nothing to run.
             println!("  ⚠ No valid tests after BATE and no shared set — cannot verify patch");
             if config.patch_path.is_none() {
@@ -995,7 +1162,7 @@ pub async fn run(
             }
             continue;
         }
-        if valid_tests.is_empty() {
+        if attacker_enabled && valid_tests.is_empty() {
             // New tests failed BATE, but we have a shared set from previous attempts.
             // Run only the shared set (no new tests to fold in).
             println!("  ⚠ No new valid tests after BATE — running shared set only");
@@ -1669,6 +1836,13 @@ pub async fn run(
                 break decision;
             }
             GovernorDecision::Continue => {
+                // [VANTA-WHY] With `VANTA_ATTACKER=off` this list is empty by
+                // construction, not by filtering: `final_evidence` is built from
+                // the graded run of the generated tests, and the Attacker-off
+                // path never produces one. So `baseline`'s Creator is fed the
+                // native regressions and the blocking static findings and nothing
+                // else — the configuration §4.2 defines — and there is no
+                // generated-test signal that could be dropped from it silently.
                 let failed: Vec<&TestEvidence> = final_evidence
                     .iter()
                     .filter(|e| e.outcome != VerificationOutcome::VerifiedWithinBounds)
@@ -1762,6 +1936,51 @@ pub async fn run(
     // they carry instead.
     let attempts_run = attempt_patch_ids.len();
     let fixed_at_attempt_1 = decision == GovernorDecision::AllTestsPassed && attempts_run == 1;
+
+    // ---- Provenance (plans/bugsinpy.md §4.4) ----
+    // [VANTA-WHY] A session directory copied out of a batch has to be
+    // self-describing: an env var is not provenance, because the shell that set
+    // it is gone by the time anyone reads the record. The same fields also go
+    // into the batch manifest (§7.3), and `metrics.py` groups by them (§9.1), so
+    // any table can be cut by config × seed × model without re-running.
+    //
+    // [VANTA-WHY] `config` is DERIVED from the two switches rather than read
+    // from a fourth env var, so the config the record claims cannot disagree
+    // with the config the run executed (§4.2 defines the three configurations as
+    // exactly these switch settings — one definition, `benchmark_config_name`).
+    //
+    // [VANTA-WHY] The sampling record is the REAL per-call schedule, not a
+    // run-level scalar. The harness pins `temperature` and `max_tokens` per call
+    // site — each agent's `extra_fields`, merged in `llm::post_chat` AFTER the
+    // body defaults so the agent's value WINS — which is why one review run
+    // samples at 0.1 (Creator), 0.2 (Attacker generate), 0.3 (Attacker
+    // revise/simplify) and 0.0 (Intent Auditor). Those pins are part of v0.2's
+    // behaviour; the harness must never override them, only record them.
+    // `SAMPLING_SCHEDULE` names them (underscore keys — see its `[VANTA-WHY]`),
+    // and `m3_session_log.rs` asserts the table equals the `temperature` /
+    // `max_tokens` actually present in the request bodies. `top_p` is the ONE
+    // parameter no call site pins, so its value is the SERVER's own default read
+    // from `/props`. `seed` is what the HARNESS asked for. `unset` means the
+    // server did not publish the key — never a plausible-looking default, which
+    // would be a fabricated claim about a sampler nobody pinned.
+    let config_name = benchmark_config_name(attacker_enabled, planner_enabled);
+    let top_p_value = sampling_value(server_top_p_for_provenance(&cfg).await);
+    let seed_value = cfg
+        .seed
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "unset".to_string());
+    // [VANTA-WHY] `benchmark_label` is the ORACLE label (§5.3), and the oracle
+    // runs from the harness AFTER this process exits (§5.2) — it needs
+    // `final.patch` and a fresh tree. So a run can label itself only where its
+    // own verdict already settles the question: every other row of §5.3's table
+    // needs `patch_good`, which is not knowable here. Those stay `None` and are
+    // filled in by the manifest; the alternative — guessing from the verdict —
+    // would write `true_approval` for a patch the oracle may well call a
+    // `false_approval`.
+    let benchmark_label = match decision {
+        GovernorDecision::InfraFailure => Some("infra_failure".to_string()),
+        _ => None,
+    };
     session_log.append(SessionRecord {
         session_id: session_id.clone(),
         schema_version: Some(SCHEMA_VERSION),
@@ -1770,12 +1989,24 @@ pub async fn run(
         test_id: None,
         phase: "run.summary".to_string(),
         summary: format!(
-            "attempts_run={} fixed_at_attempt_1={} final_decision={:?}",
-            attempts_run, fixed_at_attempt_1, decision
+            "attempts_run={} fixed_at_attempt_1={} final_decision={:?} \
+             config={} mode={} seed={} model={} top_p={} {} \
+             commit={} dirty={}",
+            attempts_run,
+            fixed_at_attempt_1,
+            decision,
+            config_name,
+            run_mode,
+            seed_value,
+            cfg.model_id,
+            top_p_value,
+            sampling_schedule_keys(),
+            vanta_commit,
+            vanta_dirty,
         ),
         timestamp: now_iso(),
-        benchmark_instance: None,
-        benchmark_label: None,
+        benchmark_instance: Some(config_name.to_string()),
+        benchmark_label,
     })?;
     let final_snapshot = ecr_eir_from_rows(&metric_rows);
     if metric_rows.is_empty() {

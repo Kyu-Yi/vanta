@@ -61,6 +61,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
+from . import compact as compact_mod
 from . import manifest as manifest_mod
 from . import oracle as oracle_mod
 from . import prepare as prepare_mod
@@ -799,6 +800,7 @@ def build_record(
     oracle_reused: bool,
     python_version: str,
     oracle_json: Optional[Path],
+    compaction: "compact_mod.Compaction",
 ) -> dict[str, Any]:
     """One ``manifest.jsonl`` line (§7.3)."""
     summary = outcome.summary
@@ -851,9 +853,10 @@ def build_record(
             "final_patch": str(outcome.final_patch) if outcome.final_patch else None,
             "oracle_json": str(oracle_json) if oracle_json else None,
             "run_log": str(outcome.log_path),
-            "graded_tree_diff": None,
+            "graded_tree_diff": compaction.diff,
             "issue_sha256": issue_sha256,
-            "compact_state": "full",
+            "compact_state": compaction.state,
+            "compact_reason": compaction.reason,
         },
     }
 
@@ -1045,6 +1048,19 @@ def run_job(
         )
         oracle_mod.save(oracle_json, oracle)
 
+    # BEFORE the row is written, not after: `artifacts.compact_state` and
+    # `graded_tree_diff` are the row's own statement about where the snapshots
+    # went, and a row that said `full` about a tree compaction had just deleted
+    # would misdescribe the session the manifest is the evidence for (§6.3, §7.3).
+    compaction = compact_mod.compact_session(
+        session_dir=sessions_dir() / outcome.session_id,
+        base_tree=prep.root / "vanta_clean",
+        verdict=outcome.decision,
+        session_id=outcome.session_id,
+        sessions_dir=sessions_dir(),
+        base_commit=prep.bug.buggy_commit,
+    )
+
     record = build_record(
         job=job,
         prep=prep,
@@ -1060,6 +1076,7 @@ def run_job(
         oracle_reused=oracle_reused,
         python_version=python_version,
         oracle_json=oracle_json,
+        compaction=compaction,
     )
     manifest.append(record)
     manifest.mark(job.key, DONE)

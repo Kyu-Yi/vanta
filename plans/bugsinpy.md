@@ -679,15 +679,27 @@ The harness is the only consumer that cares about pilot-scale disk. So:
    The middle case is the "keep it" branch; the last is the "rebuild" branch — the rebuild is what
    lets us compact aggressively, and it is also how equivalence gets proven.
 3. After the oracle, the harness compacts an eligible session: write
-   `attempt_N_graded_tree.diff` (unified diff vs. `vanta_clean/`, pinned by commit SHA) +
-   `attempt_N_graded_tree_manifest.json` (`{path: blake3}`), then delete
-   `attempt_N_{patched,graded}_tree/`.
-4. **Test, either way** (decided): a harness test asserts that (a) a session with a rejecting signal
+   `attempt_N_<kind>_tree.diff` (unified diff vs. `vanta_clean/`, pinned by commit SHA) +
+   `attempt_N_<kind>_tree.hashes.json` (`{path: sha256}`, plus the tree's `concat_sha256`), then delete
+   `attempt_N_{patched,graded}_tree/`. **Both** snapshots are diffed, not just the graded one: the
+   graded tree is what the rerun reads and the patched tree is its documented fallback, so deleting
+   either without its diff would destroy evidence the rule never described. Three deliberate
+   deviations from the sketch above: `sha256` rather than `blake3`, because `split.py`'s
+   `sha256_text` / `sha256_file` are the harness's only hash and a second algorithm is a second thing
+   to get right; `_tree.hashes.json` rather than `_manifest.json`, because Vanta already writes
+   `attempt_N_<kind>_tree_manifest.json` and `rerun.rs`'s tree reader **skips** `*_manifest.json`, so
+   reusing that name would either overwrite Vanta's own forensics or be invisible to the reader that
+   matters; and `concat_sha256`, because the concatenation is the unit the test below compares, which
+   is what lets the replay be checked against an artifact on disk rather than against a tree the test
+   still happened to hold in memory.
+4. **Test** (decided): a harness test asserts that (a) a session with a rejecting signal
    is *not* compacted before its rerun, and (b) a compacted session replays to a byte-identical tree
    from base + diff — i.e. `read_tree_concat`
    ([rerun.rs](file:///Users/kyu-yi/vanta/src/pipeline/rerun.rs#L1239)) over the reconstructed tree
    equals the recorded concat. Fails when the evidence for replayability is absent, rather than
-   trusting the implementation.
+   trusting the implementation. The test reads the diff and the hashes **back off disk** and rebuilds
+   the tree with `git apply`, so a compaction that deleted the only copy without leaving a replayable
+   artifact fails the test instead of surfacing later as a fabricated `spurious_reject`.
 
 Every pilot bug's base tree is small and pinned by commit SHA, so "base + diff" is complete and far
 smaller than a full copy. The alternative — an env-gated `VANTA_SNAPSHOT_MODE=diff` inside the
@@ -838,7 +850,8 @@ exist. `prepare` itself never writes it — it writes `runs/bugsinpy/<batch>/pre
   "label": "false_reject",
   "timings": {"prepare_s": 0, "run_s": 0, "oracle_s": 0, "total_s": 0},
   "artifacts": {"session_dir": "…", "final_patch": "…", "graded_tree_diff": "…",
-                "issue_sha256": "…", "compact_state": "full|compacted"}
+                "issue_sha256": "…", "compact_state": "full|compacted|none",
+                "compact_reason": "…"}
 }
 ```
 
@@ -850,6 +863,13 @@ publishes nothing). The manifest never *implies* the harness picked them.
 Note `python_version`: that is the interpreter the checkpoint **actually** contains, not the version
 BugsInPy's `bug.info` pins. The two differ (§12.3) and both are recorded, so the gap is auditable
 rather than hidden by writing the actual number into a field that claims to be the pinned one.
+
+Note `artifacts.compact_state`: `full` (snapshots still on disk), `compacted` (replaced by a diff +
+hashes), or `none` (the session wrote no snapshot at all — an `InfraFailure`, or a patch that never
+applied). `none` is a third value rather than a reuse of `full` because "the snapshots are still
+here" and "there never were any" are different facts; `compact_reason` records which §6.3 branch
+decided it. Compaction runs **before** the row is written, so the row states what actually happened
+rather than what was planned.
 
 `config` / `mode` / `seed` / `model` / `sampling` / `vanta_commit` are the provenance axes §4.4 and
 §9.1 group by. `candidate` is `null` for **repair** runs. For review runs it names the patch under
@@ -1070,7 +1090,8 @@ scripts/bugsinpy_run.py            ← loader + split + runner + oracle + leak g
 scripts/metrics.py                 ← additive only: pooled rates, Wilson, provenance grouping
 runs/bugsinpy/<batch>/             ← gitignored (one new .gitignore line)
     manifest.jsonl, state.json, context_report.json, context_sizes.md, issue_texts/,
-    issue_texts_all.md, leak_gate/, oracle/, <session>/attempt_N_graded_tree.diff + _manifest.json
+    issue_texts_all.md, leak_gate/, oracle/, <session>/attempt_N_{patched,graded}_tree.diff +
+    _tree.hashes.json
 ```
 
 ---

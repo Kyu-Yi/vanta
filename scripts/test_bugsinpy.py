@@ -40,6 +40,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from bugsinpy import bake as bake_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
+from bugsinpy import compact as compact_mod  # noqa: E402
 from bugsinpy import context as ctx  # noqa: E402
 from bugsinpy import issue as issue_mod  # noqa: E402
 from bugsinpy import manifest as manifest_mod  # noqa: E402
@@ -3501,3 +3502,314 @@ class TestPythonVersionProbe:
         cached = json.loads((paths.env_cache / "chk.json").read_text())
         assert cached["checkpoint"] == "chk"
         assert cached["python_version"] == "3.8.20"
+
+
+class TestCompaction:
+    """§6.3 + D6: hold a rejecting session's snapshot until its rerun is recorded,
+    and prove a compacted one replays byte-identically from base + diff.
+
+    Everything lives under `tmp_path` and no VM boots. What these tests refuse to
+    take on trust is the replay: they read the diff and the hashes back **off disk**
+    and rebuild the tree from them, so a compaction that deleted the only copy
+    without leaving a replayable artifact fails here rather than at the first
+    `--rerun-signals` run against a real batch — where the failure would look like
+    "the signal did not reproduce", i.e. a fabricated `spurious_reject`.
+    """
+
+    @staticmethod
+    def _base(root: Path) -> Path:
+        """The sanitized base: one file to edit, one to delete, one untouched."""
+        base = root / "vanta_clean"
+        write(base / "pkg" / "mod.py", "one = 1\nsecond = 2\n")
+        write(base / "pkg" / "gone.py", "third = 3\n")
+        write(base / "README.md", "hello\n")
+        return base
+
+    @staticmethod
+    def _snapshot(session_dir: Path, name: str) -> Path:
+        """A snapshot that edits, adds and deletes a file — every header shape the
+        diff rewriter has to strip, including the two where git names both sides of
+        the `diff --git` line after the same tree."""
+        tree = session_dir / "debug" / name
+        write(tree / "pkg" / "mod.py", "one = 1\nsecond = 22\nthird = 3\n")
+        write(tree / "pkg" / "added.py", "four = 4\n")
+        write(tree / "README.md", "hello\n")
+        return tree
+
+    @staticmethod
+    def _write_rerun(sessions: Path, session_id: str, text: str) -> Path:
+        return write(sessions / f"{session_id}_signal_reruns.json", text)
+
+    # -- the rule ----------------------------------------------------------
+    def test_a_rejecting_session_is_held_until_its_rerun_is_recorded(self, tmp_path):
+        base = self._base(tmp_path)
+        sessions = tmp_path / "vanta_sessions"
+        session_dir = sessions / "sid"
+        tree = self._snapshot(session_dir, "attempt_1_graded_tree")
+
+        result = compact_mod.compact_session(
+            session_dir=session_dir,
+            base_tree=base,
+            verdict="Rejected",
+            session_id="sid",
+            sessions_dir=sessions,
+        )
+
+        assert result.state == compact_mod.FULL
+        assert "rerun" in result.reason
+        assert result.diff is None
+        assert result.trees == ["attempt_1_graded_tree"]
+        assert tree.is_dir(), "the snapshot the rerun reads must still be there"
+        assert not (tree.parent / f"{tree.name}.diff").exists()
+
+    def test_a_rejected_session_compacts_once_the_rerun_artifact_exists(self, tmp_path):
+        base = self._base(tmp_path)
+        sessions = tmp_path / "vanta_sessions"
+        session_dir = sessions / "sid"
+        tree = self._snapshot(session_dir, "attempt_1_graded_tree")
+        self._write_rerun(
+            sessions, "sid", json.dumps({"signals": [], "final_decision": "Rejected"})
+        )
+
+        result = compact_mod.compact_session(
+            session_dir=session_dir,
+            base_tree=base,
+            verdict="Rejected",
+            session_id="sid",
+            sessions_dir=sessions,
+        )
+
+        assert result.state == compact_mod.COMPACTED
+        assert "rerun recorded" in result.reason
+        assert not tree.exists()
+
+    @pytest.mark.parametrize("verdict", ["AllTestsPassed", "MaxAttemptsReached", ""])
+    def test_only_a_rejection_holds_a_snapshot(self, tmp_path, verdict):
+        """A verdict with no rejection to explain has nothing a rerun could settle."""
+        base = self._base(tmp_path)
+        sessions = tmp_path / "vanta_sessions"
+        session_dir = sessions / "sid"
+        tree = self._snapshot(session_dir, "attempt_1_graded_tree")
+
+        result = compact_mod.compact_session(
+            session_dir=session_dir,
+            base_tree=base,
+            verdict=verdict,
+            session_id="sid",
+            sessions_dir=sessions,
+        )
+
+        assert compact_mod.has_rejecting_signal(verdict) is False
+        assert result.state == compact_mod.COMPACTED
+        assert not tree.exists()
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"signals": [',  # a truncated write
+            '{"signals": [], "final_decision": ""}',  # no decision
+            '{"final_decision": "Rejected"}',  # no signals list
+            "not json at all",
+        ],
+    )
+    def test_a_truncated_rerun_artifact_does_not_count_as_recorded(self, tmp_path, text):
+        """Half a rerun must not license deleting the tree it would have needed."""
+        sessions = tmp_path / "vanta_sessions"
+        self._write_rerun(sessions, "sid", text)
+
+        assert compact_mod.rerun_recorded(sessions, "sid") is False
+        state, _ = compact_mod.compaction_plan(
+            verdict="Rejected", session_id="sid", sessions_dir=sessions
+        )
+        assert state == compact_mod.FULL
+
+    def test_a_session_that_wrote_no_snapshot_reports_none(self, tmp_path):
+        """`none` is a third state, not `full`: "never any" vs "still here" differ."""
+        sessions = tmp_path / "vanta_sessions"
+        session_dir = sessions / "sid"
+        (session_dir / "debug").mkdir(parents=True)
+
+        result = compact_mod.compact_session(
+            session_dir=session_dir,
+            base_tree=tmp_path / "missing",
+            verdict="Rejected",
+            session_id="sid",
+            sessions_dir=sessions,
+        )
+
+        assert result.state == compact_mod.NONE
+        assert result.diff is None
+        assert list((session_dir / "debug").iterdir()) == []
+
+    def test_compacting_without_a_base_tree_raises(self, tmp_path):
+        """No base means no diff, and a diff-less deletion is unrecoverable."""
+        sessions = tmp_path / "vanta_sessions"
+        session_dir = sessions / "sid"
+        self._snapshot(session_dir, "attempt_1_graded_tree")
+
+        with pytest.raises(compact_mod.CompactError, match="diff against"):
+            compact_mod.compact_session(
+                session_dir=session_dir,
+                base_tree=tmp_path / "missing",
+                verdict="AllTestsPassed",
+                session_id="sid",
+                sessions_dir=sessions,
+            )
+
+    # -- the replay --------------------------------------------------------
+    def test_a_compacted_tree_replays_byte_identically_from_base_plus_diff(self, tmp_path):
+        """§6.3's replayability proof, read back off disk rather than trusted.
+
+        The test keeps the pre-deletion concat and hashes only as *expected* values;
+        what it replays from is the diff and the artifact compaction actually wrote.
+        """
+        base = self._base(tmp_path)
+        sessions = tmp_path / "vanta_sessions"
+        session_dir = sessions / "sid"
+        tree = self._snapshot(session_dir, "attempt_1_graded_tree")
+        expected_concat = compact_mod.tree_concat(tree)
+        expected_hashes = compact_mod.tree_manifest(tree)
+
+        result = compact_mod.compact_session(
+            session_dir=session_dir,
+            base_tree=base,
+            verdict="AllTestsPassed",
+            session_id="sid",
+            sessions_dir=sessions,
+        )
+
+        assert result.state == compact_mod.COMPACTED
+        assert result.diff == "debug/attempt_1_graded_tree.diff"
+        assert not tree.exists(), "the directory is replaced by the diff"
+
+        artifact = json.loads((tree.parent / f"{tree.name}.hashes.json").read_text())
+        assert artifact["file_count"] == len(expected_hashes)
+        assert artifact["files"] == expected_hashes
+        assert artifact["concat_sha256"] == split_mod.sha256_text(expected_concat)
+
+        diff_text = (tree.parent / artifact["diff"]).read_text()
+        assert artifact["diff_sha256"] == split_mod.sha256_text(diff_text)
+
+        rebuilt = compact_mod.reconstruct(base, diff_text, tmp_path / "rebuilt")
+        assert compact_mod.tree_concat(rebuilt) == expected_concat
+        assert compact_mod.tree_manifest(rebuilt) == expected_hashes
+        assert (
+            split_mod.sha256_text(compact_mod.tree_concat(rebuilt))
+            == artifact["concat_sha256"]
+        )
+
+    def test_reconstruct_refuses_a_diff_that_does_not_apply(self, tmp_path):
+        """The replay is the evidence, so a bogus diff has to fail loudly."""
+        base = self._base(tmp_path)
+
+        with pytest.raises(compact_mod.CompactError, match="failed"):
+            compact_mod.reconstruct(base, "not a patch\n", tmp_path / "rebuilt")
+
+    def test_both_snapshots_are_diffed_before_they_are_deleted(self, tmp_path):
+        """The graded tree is what the rerun reads; the patched one is its fallback."""
+        base = self._base(tmp_path)
+        sessions = tmp_path / "vanta_sessions"
+        session_dir = sessions / "sid"
+        self._snapshot(session_dir, "attempt_1_graded_tree")
+        self._snapshot(session_dir, "attempt_1_patched_tree")
+
+        result = compact_mod.compact_session(
+            session_dir=session_dir,
+            base_tree=base,
+            verdict="AllTestsPassed",
+            session_id="sid",
+            sessions_dir=sessions,
+        )
+
+        assert result.state == compact_mod.COMPACTED
+        assert result.trees == ["attempt_1_graded_tree", "attempt_1_patched_tree"]
+        assert result.diff == "debug/attempt_1_graded_tree.diff", (
+            "the row must point at the snapshot the rerun reads"
+        )
+        for name in result.trees:
+            assert (session_dir / "debug" / f"{name}.diff").is_file()
+            assert (session_dir / "debug" / f"{name}.hashes.json").is_file()
+            assert not (session_dir / "debug" / name).exists()
+
+    def test_the_hashes_and_the_concat_ignore_what_the_rerun_ignores(self, tmp_path):
+        """Same filter as `rerun.rs::collect_tree_files`, or the evidence describes
+        files nobody reads."""
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "mod.py", "one = 1\n")
+        write(tree / "pkg" / "__pycache__" / "mod.cpython-38.pyc", "cached\n")
+        write(tree / "pkg" / "stale.pyc", "cached\n")
+        write(tree / "pkg" / "stale.pyo", "cached\n")
+        write(tree / "pkg" / "mod_manifest.json", '{"paths": []}')
+        write(tree / ".git" / "HEAD", "ref: refs/heads/main\n")
+
+        assert compact_mod.tree_manifest(tree) == {
+            "pkg/mod.py": split_mod.sha256_text("one = 1\n")
+        }
+        assert compact_mod.tree_concat(tree) == "# FILE: pkg/mod.py\none = 1\n"
+
+
+class TestRunJobCompaction:
+    """`run_job` applies §6.3 **before** it writes the row (§7.3's `artifacts`).
+
+    A row that claimed `full` about a snapshot compaction had just deleted would
+    misdescribe the session the manifest is the evidence for, so the state has to
+    come from the compaction that actually ran.
+    """
+
+    def _fixture(self, tmp_path: Path, *, session_id: str = "sess-1") -> tuple[Path, Path]:
+        base = tmp_path / "root" / "vanta_clean"
+        write(base / "pkg" / "mod.py", "one = 1\n")
+        sessions = tmp_path / "vanta_sessions"
+        tree = sessions / session_id / "debug" / "attempt_1_graded_tree"
+        write(tree / "pkg" / "mod.py", "one = 2\n")
+        return sessions, tree
+
+    def _run(self, tmp_path, monkeypatch, *, decision: str, sessions: Path) -> dict:
+        monkeypatch.setattr(runner_mod, "sessions_dir", lambda: sessions)
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, decision=decision, final_patch=tmp_path / "final.patch"
+            ),
+        )
+        monkeypatch.setattr(
+            oracle_mod,
+            "grade",
+            lambda **kwargs: oracle_mod.OracleResult(apply_ok=True, patch_good=True),
+        )
+        return runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")),
+            paths=runner_mod.BatchPaths.under(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4,
+            disk_mb=8192,
+            python_version="3.8.20",
+        )
+
+    def test_a_compacted_session_is_reported_as_compacted_in_the_row(
+        self, tmp_path, monkeypatch
+    ):
+        sessions, tree = self._fixture(tmp_path)
+
+        record = self._run(
+            tmp_path, monkeypatch, decision="AllTestsPassed", sessions=sessions
+        )
+
+        assert record["artifacts"]["compact_state"] == compact_mod.COMPACTED
+        assert record["artifacts"]["graded_tree_diff"] == "debug/attempt_1_graded_tree.diff"
+        assert not tree.exists()
+        assert (sessions / "sess-1" / "debug" / "attempt_1_graded_tree.diff").is_file()
+
+    def test_a_rejected_session_keeps_its_snapshot_and_the_row_says_full(
+        self, tmp_path, monkeypatch
+    ):
+        sessions, tree = self._fixture(tmp_path)
+
+        record = self._run(tmp_path, monkeypatch, decision="Rejected", sessions=sessions)
+
+        assert record["artifacts"]["compact_state"] == compact_mod.FULL
+        assert record["artifacts"]["graded_tree_diff"] is None
+        assert "rerun" in record["artifacts"]["compact_reason"]
+        assert tree.is_dir(), "§6.3: the rerun has not run yet"

@@ -1,181 +1,186 @@
 # Vanta
 
-**Adversarial verification for AI-generated code patches.**
+**Autonomous adversarial verification for AI-generated code.**
 
-[![Status](https://img.shields.io/badge/status-research%20prototype-blue)]()
-[![Version](https://img.shields.io/badge/version-v0.2-informational)]()
+> AI coding tools are getting better at producing code.
+> The hard part is proving it doesn't break anything.
+
+[![Status](https://img.shields.io/badge/status-v0.2%20research%20prototype-blue)]()
 [![Rust](https://img.shields.io/badge/rust-stable-orange)](https://rustup.rs)
 [![Sandbox](https://img.shields.io/badge/sandbox-macOS%20(Shuru)-lightgrey)]()
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-
-Most coding agents are built to answer one question: *can I make the failing test pass?* Vanta answers a stricter one: **did this change fix the issue without breaking anything else?** It does that by actively trying to break a patch with generated tests, running the repository's own tests in a form the patch cannot tamper with, and only approving when every piece of evidence agrees. The patch can come from Vanta's own Creator agent, from another coding agent, or from a person, so Vanta works both as a repair loop and as an independent reviewer.
-
-Vanta is a research prototype written in Rust, developed for a KAIST MSc thesis and an accompanying paper. It runs end to end on real Python repositories today, but it has not yet been evaluated at scale, and this README tries to be precise about which parts are built, which are experimental, and which are still plans.
+[![Paper](https://img.shields.io/badge/paper-in%20preparation-purple)]()
 
 ---
 
-## Contents
+## The problem
 
-- [Status at a glance](#status-at-a-glance)
-- [How it works](#how-it-works)
-- [Two modes: review and repair](#two-modes-review-and-repair)
-- [Why the verdict can be trusted](#why-the-verdict-can-be-trusted)
-- [Measuring repair: ECR and EIR](#measuring-repair-ecr-and-eir)
-- [Quickstart](#quickstart)
-- [Configuration](#configuration)
-- [Outputs](#outputs)
-- [Opening pull requests](#opening-pull-requests)
-- [Security model](#security-model)
-- [Evaluation](#evaluation)
-- [Limitations and open questions](#limitations-and-open-questions)
-- [Roadmap](#roadmap)
-- [Repository layout](#repository-layout)
-- [Citation](#citation)
+Every mainstream coding agent optimises for one question:
 
----
+> *Can I make the failing test pass?*
 
-## Status at a glance
+Vanta answers a stricter one:
 
-| | |
-|---|---|
-| **Current version** | v0.2 |
-| **Works today** | Review and repair modes on Python repositories, sandboxed execution on macOS, intent-checked adversarial tests, tamper-resistant native test gate, failure triage, ECR/EIR reporting, draft PRs |
-| **In progress** | A BugsInPy benchmark harness that compares Vanta against a no-Attacker baseline on real historical bugs |
-| **Not built yet** | Formal verifier backends, a live ECR/EIR stopping rule, a planner for multiple Attackers, institutional memory, Linux and Windows sandboxes |
-| **Evidence** | One end-to-end acceptance run on a real repository and one development case study. There are no benchmark results yet, so there is no evidence either way on whether Vanta beats a simpler baseline. |
+> *Did this change fix the issue **without breaking anything else**?*
 
-Status labels used throughout: **Shipped** means it is in v0.2 and exercised by tests or real runs, **Experimental** means the code exists but has not been validated, and **Planned** means it has not been built.
-
----
+A patch that fixes the reported bug while silently regressing three unrelated code paths is often worse than no patch at all, and an agent that can edit the tests it is graded by can make almost anything look green. Vanta exists to close that gap: it attacks every patch with new tests, grades it with tests the patch cannot tamper with, and only approves when every independent signal agrees.
 
 ## How it works
 
-A run takes a repository and an issue description, and either produces a patch (repair mode) or receives one (review mode). That patch then goes through a fixed sequence of stages, and only a patch that survives all of them is approved.
+Two adversarial LLM agents, several independent non-LLM sources of truth. The patch under verification can come from Vanta's own Creator agent, an external coding agent, or a human, so Vanta is a verification layer first and a repair loop second.
 
 ```
-   repository + issue text
-            │
-            ▼
-   ┌──────────────────┐   repair mode: writes the patch
-   │     Creator      │   review mode: skipped, the patch is given
-   └────────┬─────────┘
-            ▼
-   ┌──────────────────┐   writes new tests aimed at the patch,
-   │     Attacker     │   each with a declared intent
-   └────────┬─────────┘
-            ▼
-   ┌──────────────────┐   runs each new test on the ORIGINAL code and
-   │       BATE       │   keeps it only if the result matches its intent
-   └────────┬─────────┘
-            ▼
-   ┌──────────────────────────────────────────────┐
-   │  Patched run inside the sandbox               │
-   │   · the repository's original tests (native)  │
-   │   · the surviving Attacker tests              │
-   │   · static checks                             │
-   └────────┬─────────────────────────────────────┘
-            ▼
-   ┌──────────────────┐   sorts every failure into infrastructure,
-   │  Diagnostician   │   static, logic or unknown
-   └────────┬─────────┘
-            ▼
-   ┌──────────────────┐   decides whether to stop or try again,
-   │     Governor     │   and records every attempt-to-attempt transition
-   └────────┬─────────┘
-            ▼
-   ┌──────────────────┐   approves only when every required signal passes;
-   │    Gatekeeper    │   optionally opens a draft PR
-   └──────────────────┘
+                Target codebase + bug report
+                           │
+                           ▼
+        ┌──────────────────────────────────────┐
+        │       RUST ORCHESTRATION PLANE        │
+        │                                        │
+        │   Creator Agent ──── writes patch      │
+        │   (or patch arrives from an external   │
+        │    agent / human developer)            │
+        │        │                               │
+        │        ▼                               │
+        │   Attacker Agent ─── writes tests,     │
+        │        │            each with a        │
+        │        │            declared INTENT    │
+        │        ▼                               │
+        │   PHASE 1 · BATE                       │
+        │   baseline result on UNMODIFIED code   │
+        │   must MATCH each test's intent        │
+        │        │                               │
+        │        ▼                               │
+        │   SANDBOXED RUN (microVM)              │
+        │   original repo tests + Attacker tests │
+        │   + static checks → 4-way triage       │
+        │        │                               │
+        │        ▼                               │
+        │   PHASE 3 · GOVERNOR                   │
+        │   attempt cap today; EIR/ECR           │
+        │   stability rule planned               │
+        │        │                               │
+        │        ▼                               │
+        │   GATEKEEPER ── all pass → open PR     │
+        │              └─ any fail → retry       │
+        └──────────────────────────────────────┘
+                           │
+              ┌ ─ ─ ─ ─ ─ ┴ ─ ─ ─ ─ ─ ┐
+                  planned for V2:
+              │   formal verifiers,     │
+                  institutional memory
+              └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
 ```
 
-**Creator** (Shipped). An LLM agent that reads the issue and the relevant source and writes a minimal patch. In repair mode it receives structured feedback after a failed attempt and tries again, up to the attempt limit. Its prompt explicitly forbids weakening or deleting existing tests, and the native test gate described below enforces that rule rather than trusting it.
+| Component | Role | Trusts the LLM? | Status |
+|---|---|---|---|
+| **Creator** | Reads issue + source, writes a minimal patch, retries on structured feedback | (is the LLM) | ✅ shipped |
+| **Attacker** | Writes adversarial regression tests tied to the issue, not the patch | (is the LLM) | ✅ shipped |
+| **BATE** | Checks every generated test against the original code before it may judge anything | No, deterministic | ✅ shipped |
+| **Diagnostician** | Triages every failure: infrastructure / static / logic / unknown | No, deterministic | ✅ shipped |
+| **Governor** | Decides when to stop; logs every attempt-to-attempt transition | No, arithmetic | ✅ fixed cap · 🔜 live EIR/ECR rule |
+| **Gatekeeper** | Approves, and opens a PR, only when every required signal passes | No, deterministic | ✅ shipped |
+| **Verifier backends** | Formal/symbolic checks behind one trait | No, mathematical | 🔜 V2 |
 
-**Attacker** (Shipped). A second LLM agent whose only job is to break the patch. It writes new regression tests, and each test declares an *intent*: `bug_reproduction` (it should fail on the original code, because that failure is what proves the bug was reproduced), `feature_acceptance`, or `behavior_preservation` (it should pass on the original code). The Attacker's tests are tied to the issue text rather than to the patch, so a wrong patch cannot steer the tests that judge it, and the Attacker is prompted to probe exact boundary values.
+## What makes Vanta different
 
-**BATE, baseline-validated tests** (Shipped). Every Attacker test is run against the *unmodified* code first, and its result must match the intent it declared. A test that does not match is sent back for revision up to three times and then discarded, and the discard rate is logged as a measure of how reliable the Attacker is. This filters out malformed tests and pins a baseline for every test, so a patch is only ever penalised for failures it caused. BATE is a filter, not a proof that a test is semantically right.
+**1 · Adversarial by construction.** A dedicated Attacker agent actively tries to break every patch, writing new tests each round based on the issue, instead of passively checking a fixed suite. Its tests are derived from the issue text rather than the patch, so a wrong patch can never steer the tests that judge it, and it is prompted to probe exact boundary values. In review mode every extra round is a fresh batch of attacks against the same patch, because one round can easily sample inputs the patch never touches.
 
-**Native suite and static checks** (Shipped). The repository's own tests run against the patched source, together with the surviving Attacker tests and per-language static analysis. How the native tests are protected from the patch is covered in [Why the verdict can be trusted](#why-the-verdict-can-be-trusted).
+**2 · Intent-labelled, baseline-validated tests (BATE).** Every Attacker test declares its intent: `bug_reproduction` (should FAIL on the original code, since that failure proves the bug was reproduced), `feature_acceptance`, or `behavior_preservation` (should PASS on the original code). BATE runs each test against the *unmodified* codebase and checks the result **matches the declared intent**. Mismatches are returned for revision (max 3 retries) then scrapped, and the discard rate is logged as an Attacker-reliability metric. This filters malformed adversarial tests, pins every baseline, and excludes pre-existing failures from regression counting, so a patch is only ever penalised for damage *it* caused.
 
-**Diagnostician** (Shipped). Not every red test means the model got something wrong, so each failure is classified before it counts:
+**3 · A grader the patch can't tamper with.** The repository's own tests always run in their *original* form, restored onto the patched source: modified test files are reverted, deleted tests are restored, and any `conftest.py` or test config the patch added is removed. A test that used to pass and is now skipped, xfailed, deselected or missing counts as a regression, exactly like a failure. What the patch tried to change is still recorded as evidence, so tampering is visible rather than silently undone. Attacker tests run on the same graded snapshot, so every stage judges the same code.
 
-| Class | What it catches | Counts against the patch? |
+**4 · Four-way failure triage.** Not every red test means the model failed:
+
+| Class | Catches | Counted as a model error? |
 |---|---|---|
-| Infrastructure | Sandbox crashes, timeouts, out-of-memory, runner failures, detected from process-level signals | No. The run is reset and retried. |
-| Static | Errors before execution: syntax, types, imports | Tracked separately |
-| Logic | The test ran and an assertion failed | **Yes.** This is the only class that counts as a model error. |
-| Unknown | Execution failures that cannot be classified | No. Generated tests are rerun, logged and quarantined; repository tests are flagged for human review instead. |
+| Infrastructure | Sandbox/timeout/OOM/runner failures, caught by process-level signals (timeouts, exit codes, memory limits, health checks) | **No**, sandbox reset & rerun |
+| Static | Pre-execution errors (syntax, types, imports), caught by per-language static analysis | Tracked separately |
+| Logic | Genuine logic failures: test ran, assertion failed | **Yes**, the only class that counts |
+| Unknown | Unclassifiable execution failures | **No**: rerun → capture logs → quarantine (generated tests only; repository tests instead become *human review required*) |
 
-**Governor** (Shipped as a fixed attempt cap; the stability rule is Planned). The Governor decides whether the loop continues. Today that decision is a fixed cap on attempts, with one meaning per mode (see the next section). It also records every transition between consecutive attempts on a fixed shared test set, which is the data the planned stability rule needs. ECR and EIR are computed and reported from that data today, but they do not yet make stop decisions.
+A model endpoint that stalls or disappears ends the run as `InfraFailure` with its own exit code, never as a rejection. Logic-class diagnostics travel back to the Creator as structured JSON payloads; a token-optimised [GCF](https://www.gcformat.com/) variant is a planned ablation.
 
-**Gatekeeper** (Shipped). A deterministic final check. It approves only when every required signal passes, and it is the only component allowed to open a pull request.
+**5 · Provenance on every signal, and reproducible rejections.** Every result records where it came from (repository test, Attacker-generated, static check, and later verifier or benchmark oracle), so generated-test evidence is never mistaken for ground truth. A rejected session keeps its graded snapshot, and its rejecting signals can be re-run later under the exact sandbox backend that produced them, so "the Attacker caught it" is something you can reproduce, not just a log line.
 
----
+**6 · Formal verification as a second, independent verdict (V2).** One Rust `Verifier` trait over language-specific backends, each returning a structured outcome: `VerifiedWithinBounds` / `Counterexample` / `Inconclusive` / `Unsupported` / `Timeout` / `ToolFailure`. The outcome type exists today; the backends do not yet. On real code *inconclusive* is a first-class result, and "verified within bounds" is an honest claim where "mathematically proven" would not be. One rule is fixed in advance: a property is only as independent as its source, so a property written by an LLM is logged as generated evidence, and only properties from a human-written specification count as ground truth.
 
-## Two modes: review and repair
+| Target language | Backend | Status |
+|---|---|---|
+| Python | CrossHair (uses Z3 internally) | 🔜 V2 · Python-only by necessity: it hooks the Python runtime itself |
+| Rust | Kani | 🔜 V2 |
+| Pure properties | Z3 direct | 🔜 optional backend |
+| Java | OpenJML | future |
+| C / C++ | CBMC | future |
+| JS / TS | none | no viable backend; adversarial suite only |
 
-**Review mode** checks a patch that already exists, whether it came from a person or another agent. The Creator is skipped, and the patch is held fixed while the Attacker attacks it.
+**7 · Language-agnostic.** Vanta itself is 100% Rust. The code it verifies can be anything: per-language test runners, linters, and verifiers are dispatched as subprocesses inside the sandbox, the way a build script calls `git`.
 
-```bash
-./target/release/vanta_m3 --repo ./target-repo --issue ./issue.md --patch ./candidate.diff --max-attempts 3
+## The research angle
+
+Vanta's planned stopping rule implements **Liu & Meng, *"Self-Correction as Feedback Control"* ([arXiv:2604.22273](https://arxiv.org/abs/2604.22273))**, which models LLM self-correction as a two-state Markov chain and derives a measurable stability threshold:
+
+```
+ continue only while    ECR / EIR  >  Acc / (1 − Acc)
+
+ ECR = of the tests that FAILED at attempt N, the share that PASS at N+1   (fixing a broken thing)
+ EIR = of the tests that PASSED at attempt N, the share that FAIL at N+1   (breaking a working thing)
 ```
 
-In review mode, `--max-attempts` is **attack depth**: each round is a fresh batch of Attacker tests against the same patch, and the run stops early only if the patch is rejected. A single round can happen to sample inputs the patch never touches, which is exactly how a bad patch slips through, so depth matters.
+Vanta already computes both rates from its attempt logs, per evidence source (native, static, Attacker-generated) and combined, with `n/a` reported when a denominator is zero. The Governor still stops on a fixed attempt cap; turning the condition into a live stopping rule is V2 work, and only worth doing if the evaluation shows it helps.
 
-**Repair mode** lets the Creator write the patch and retry on feedback.
+The original paper validates the threshold on reasoning benchmarks under *intrinsic* self-correction and names its limitations as future work. Vanta is built to test whether it survives the move:
 
-```bash
-./target/release/vanta_m3 --repo ./target-repo --issue ./issue.md --max-attempts 4
-```
+- **Domain transfer.** Vanta's loop is driven by *external* test feedback on code repair, graded across an entire evolving test suite rather than one answer string. Whether the threshold still means anything there is the core open question, not an assumption.
+- **Non-stationarity.** Because the Attacker generates harder tests each round, error rates are non-stationary *by construction*. Vanta measures transitions on a **fixed shared test set** between attempts: new tests can reject a patch immediately, but only join the set for the following comparison, so adversarial escalation never contaminates the error definition.
+- **Clean inputs.** Only genuine, patch-caused, logic-level changes on baseline-validated tests enter the calculation. Review-mode rounds, censored transitions, defective tests and non-logic failures are excluded.
 
-In repair mode, `--max-attempts` is a **patch budget** (default 4). The loop stops as soon as an attempt passes every check, and otherwise feeds the logic-class failures back to the Creator as structured JSON for the next attempt.
+**Evaluation:** BugsInPy (primary, Python, harness in progress) · Defects4J (cross-language check, Java) · SWE-bench-Lite with a regression-rate metric layered on top.
+**Paper:** in preparation, targeting arXiv (cs.SE) → ICSE / FSE or co-located workshop, alongside a KAIST MSc thesis.
 
----
+## Evaluation design
 
-## Why the verdict can be trusted
+The BugsInPy harness (`scripts/bugsinpy_run.py`, full design in [`plans/bugsinpy.md`](plans/bugsinpy.md)) turns real historical bugs into a fair test of what the Attacker adds:
 
-A verification tool is only as good as its resistance to being fooled, including by the patch it is checking. Vanta's grading rules exist because each one closed a real hole found during development.
+- **A hidden oracle.** Vanta sees the buggy source plus the fixed version's tests, *minus* the tests the real fix makes pass. Those hidden fail-to-pass tests are the oracle, and a patch is labelled good only if they pass and nothing else in the suite regresses.
+- **A paired baseline.** Every bug runs under Vanta and under a baseline with the Attacker switched off, first in repair mode, then in review mode where both configurations judge the **identical** candidates: the developer's real fix, a no-op, and up to two failed patches pooled from the repair runs.
+- **Faithful environments.** Each bug's dependencies are pinned to versions released before its commit, every suite runs inside Shuru, the project is never installed into site-packages (so tests always import the patched tree), and every run records full provenance.
+- **Sanity gates.** Waves stop if the developer's fix grades as bad, the no-op grades as good, or any review row is missing its pair.
 
-**The patch cannot edit its own grader.** The native suite always runs the repository's *original* test files, restored onto the patched source. Test files the patch modified are reverted, tests it deleted are restored, and any `conftest.py` or test configuration it added is removed before grading. What the patch tried to change is still recorded as evidence (`modified_existing_tests`, `removed_existing_tests`, `added_test_files`, `modified_test_config`), so tampering is visible rather than silently undone.
+## Sandboxing
 
-**Silencing a test counts as breaking it.** A test that passed on the original code and is now skipped, marked as an expected failure, deselected or missing is counted as a regression, exactly like a test that now fails.
+Untrusted code (the target repository and every LLM-written test) executes only inside a sandbox, behind one Rust trait. The orchestrator never knows which platform it's on, and the backend that actually ran is recorded in every session, so a run can't quietly downgrade from a microVM to a plain process.
 
-**Every test runs against the same tree.** Attacker tests run on the same graded snapshot the native suite saw, and BATE runs on the untouched original, so no stage judges a different version of the code from the one that was approved.
+| Platform | Backend | Tech | Status |
+|---|---|---|---|
+| macOS | `shuru.rs` | [Shuru](https://github.com/superhq-ai/shuru) / Apple Virtualization.framework | ✅ primary backend |
+| any | `subprocess.rs` | process limits only, **no isolation** | ✅ development on trusted code only |
+| Linux | `zeroboot.rs` | Firecracker (KVM), sub-ms CoW forking | 🔜 V2 production target |
+| Windows | `wsl.rs` | WSL2 (Hyper-V) | 🔜 weakest isolation; built last |
 
-**Pre-existing failures are not the patch's fault.** BATE pins the baseline result of every test, and the native suite compares against the original run, so a test that was already failing before the patch never counts as a regression.
+## Institutional memory (V2)
 
-**Infrastructure noise is never a model error.** The Diagnostician keeps sandbox and timeout failures out of the logic class, and an LLM endpoint that times out or goes away ends the run as `InfraFailure` with its own exit code rather than as a rejection.
+The Attacker is far more dangerous when it remembers how this codebase has broken before.
 
-**Every signal carries its provenance.** Each result records where it came from (repository test, Attacker-generated test, static check, and later verifier or benchmark oracle), so evidence from a generated test is never mistaken for ground truth.
+- **Step 1:** flat JSON incident files. Simple lookup, proves the concept.
+- **Step 2:** [Graphiti](https://github.com/getzep/graphiti) bi-temporal knowledge graph. Tracks *event time* and *ingestion time* independently, preserving the causal chains (`Incident → Caused_By → PR → Violates → Policy`) that a similarity-ranked store collapses.
 
-**Rejections can be re-checked.** A rejected session's graded snapshot is kept, and the rejecting signals can be re-run later under the backend that originally produced them. That turns "the Attacker caught it" from a claim into something you can reproduce.
+## Tech stack
 
----
-
-## Measuring repair: ECR and EIR
-
-Repair loops can make things worse: a later attempt can fix one test while breaking another. Vanta measures that directly with two rates computed over consecutive attempts on a fixed shared test set:
-
-- **ECR, error correction rate**: of the tests that *failed* at attempt N, the fraction that *pass* at attempt N+1.
-- **EIR, error introduction rate**: of the tests that *passed* at attempt N, the fraction that *fail* at attempt N+1.
-
-Both are conditional rates, so their denominators are only the tests that could have changed in that direction, and a rate with a zero denominator is reported as `n/a` rather than as zero. They are computed separately for each evidence source (native, static, Attacker-generated) and combined. Transitions from review mode, censored transitions (an attempt that did not finish the shared set or whose patch failed to apply), tests that BATE identified as defective, and non-logic failures are all excluded, so only genuine, patch-caused logic changes enter the calculation. Newly generated tests can reject a patch immediately, but they only join the shared set for the *next* comparison, so a harder round of attacks never contaminates the rates.
-
-The motivation comes from Liu and Meng, [*Self-Correction as Feedback Control*](https://arxiv.org/abs/2604.22273), which models LLM self-correction as a two-state Markov chain and derives a stability condition: correction is worth continuing only while `ECR / EIR > Acc / (1 − Acc)`. Vanta records everything needed to apply that condition, but its Governor still stops on a fixed cap. Whether the condition carries over is an open research question rather than an assumption, because the paper derives it for *intrinsic* self-correction on reasoning benchmarks, while Vanta's loop is driven by *external* test feedback against a test set that grows harder over time. The evaluation is designed to answer that question.
-
-One consequence worth knowing: repair mode stops at the first attempt that passes, so a clean first-attempt fix produces no transition and contributes nothing to ECR or EIR.
-
----
+| Layer | Technology |
+|---|---|
+| Orchestration | Rust (tokio) |
+| LLM client | OpenAI-compatible client on `reqwest`, streaming with idle timeouts and cancellation · local `llama-server` or any hosted OpenAI-compatible API |
+| Sandboxing | Shuru (macOS) · Firecracker (Linux, V2) · WSL2 (Windows, V2) |
+| Test execution | `pytest --json-report` (Python) · `cargo-nextest` (Rust targets) · per-language equivalents |
+| Failure triage | process-level signals (timeouts, exit codes, memory limits, health checks) · `ruff`/`mypy`/`clippy`/`tsc` |
+| Diagnostics wire format | structured JSON · [GCF](https://www.gcformat.com/) as V2 ablation |
+| PRs | `octocrab` (GitHub API) |
+| Verification | `Verifier` trait: CrossHair / Kani / Z3-direct (V2) |
+| Memory | JSON → [Graphiti](https://github.com/getzep/graphiti) (V2) |
 
 ## Quickstart
 
-### Requirements
-
-- **Rust** (stable) and Cargo.
-- **macOS with [Shuru](https://github.com/superhq-ai/shuru)** for sandboxed runs. Shuru runs code in microVMs through Apple's Virtualization framework. On other platforms only the unsandboxed subprocess backend is available, which is meant for development on trusted code (see [Security model](#security-model)).
-- **An OpenAI-compatible LLM endpoint.** Vanta is developed against a local [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` running a 27B-class Qwen model with a 131k context. Smaller models tend to fail at producing valid structured output and patches. Run the server with a single slot (`parallel = 1`), because concurrent slots share one KV cache and long agent prompts will overflow it.
-- **Python 3 and pytest** inside the sandbox image for Python targets.
-
-### Build and run
+**You need:** Rust (stable), macOS with [Shuru](https://github.com/superhq-ai/shuru) for sandboxed runs, and an OpenAI-compatible model endpoint. Vanta is developed against a local [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` running a 27B-class Qwen model with a 131k context; smaller models struggle with structured output. Run the server with **one slot** (`parallel = 1`), since parallel slots share one KV cache and long agent prompts will overflow it.
 
 ```bash
 git clone https://github.com/Kyu-Yi/vanta.git
@@ -183,16 +188,20 @@ cd vanta
 cargo build --release
 
 export VANTA_LLM_BASE_URL=http://localhost:8080/v1
-export VANTA_LLM_MODEL=<your-model-name>
+export VANTA_LLM_MODEL=<your-model>
 export VANTA_LLM_CONTEXT_TOKENS=131072
 
-./target/release/vanta_m3 --help
-./target/release/vanta_m3 --repo fixtures/toy_calc --issue fixtures/toy_calc/issue.md --patch fixtures/toy_calc/bad.patch
+# review an existing patch (rounds = attack depth)
+./target/release/vanta_m3 --repo fixtures/toy_calc --issue fixtures/toy_calc/issue.md --patch fixtures/toy_calc/bad.patch -n 3
+
+# let the Creator repair it (attempts = patch budget, default 4)
+./target/release/vanta_m3 --repo fixtures/toy_calc --issue fixtures/toy_calc/issue.md
 ```
 
-`fixtures/toy_calc` is a small repository with a planted bug and a good and a bad patch, useful for checking that a setup works. See its own README for the expected results.
+Each run writes `vanta_sessions/<session-id>/`: a JSONL event log ending in a `run.summary` (decision, backend that ran, prompt versions, sampling, build commit), the attempt-to-attempt transition rows ECR/EIR are computed from, the shared test set, and per-attempt tree snapshots. Exit codes: `0` approved · `1` rejected / max attempts / patch didn't apply / harness failure · `2` infrastructure failure.
 
-### CLI options
+<details>
+<summary><b>CLI options</b></summary>
 
 | Option | Meaning |
 |---|---|
@@ -201,171 +210,152 @@ export VANTA_LLM_CONTEXT_TOKENS=131072
 | `--patch, -p PATH` | Review an existing patch instead of generating one |
 | `--max-attempts, -n N` | Attack depth in review mode, patch budget in repair mode (default 4) |
 | `--test-cmd CMD` | Test command (default `python3 -m pytest`) |
-| `--original-tree PATH` | A clean checkout of the base commit, for two-tree runs |
+| `--original-tree PATH` | Clean checkout of the base commit, for two-tree runs |
 | `--model, -m NAME` | Override `VANTA_LLM_MODEL` |
 | `--open-pr` | Open a draft PR after Gatekeeper approval |
-| `--rerun-signals` | Re-run a recorded session's rejecting signals (see `--help` for usage) |
+| `--rerun-signals` | Re-run a recorded session's rejecting signals under its original backend (see `--help`) |
 
----
+</details>
 
-## Configuration
-
-Vanta is configured through environment variables. Unset variables use the defaults below.
+<details>
+<summary><b>Environment variables</b></summary>
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `VANTA_LLM_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible endpoint |
-| `VANTA_LLM_MODEL` | built-in default | Model identifier sent with each request |
+| `VANTA_LLM_MODEL` | built-in | Model identifier |
 | `VANTA_API_KEY` | unset | Bearer token, if the endpoint needs one |
-| `VANTA_LLM_CONTEXT_TOKENS` | `65536` | Context size used to budget prompts. Set it to your server's real context; Vanta also reads `n_ctx` from llama-server's `/props` when available. |
-| `VANTA_LLM_IDLE_TIMEOUT_SECS` | `180` | Give up on a streaming response that sends nothing for this long |
-| `VANTA_LLM_MAX_SECS` | `3600` | Hard limit on a single LLM call |
-| `VANTA_LLM_RETRY_ATTEMPTS` | built-in default | Retries for a failed LLM call |
-| `VANTA_LLM_SEED` | unset | Sampling seed. Unset sends no seed, so requests are byte-identical to an unseeded run. |
-| `VANTA_ATTACKER` | `on` | `off` disables the Attacker, which gives the no-Attacker baseline used in evaluation |
-| `VANTA_PLANNER` | `off` | Reserved for the planned multi-Attacker planner. `on` currently ends the run as `InfraFailure`. |
+| `VANTA_LLM_CONTEXT_TOKENS` | `65536` | Context used to budget prompts; set it to your server's real context |
+| `VANTA_LLM_IDLE_TIMEOUT_SECS` | `180` | Abandon a stream that sends nothing for this long |
+| `VANTA_LLM_MAX_SECS` | `3600` | Hard limit on one LLM call |
+| `VANTA_LLM_RETRY_ATTEMPTS` | built-in | Retries for a failed call |
+| `VANTA_LLM_SEED` | unset | Sampling seed; unset sends no seed, so requests stay byte-identical |
+| `VANTA_ATTACKER` | `on` | `off` gives the no-Attacker baseline used in evaluation |
+| `VANTA_PLANNER` | `off` | Reserved for the V2 planner; `on` currently ends the run as `InfraFailure` |
 | `VANTA_SANDBOX_BACKEND` | `auto` | `auto`, `shuru` or `subprocess` |
-| `VANTA_SHURU_CHECKPOINT` | `vanta-python` | Shuru checkpoint to boot test VMs from |
-| `VANTA_SHURU_DISK_MB` | built-in default | Disk size for Shuru VMs |
-| `VANTA_SHURU_AUTO_DEPS` | on | Build a dependency checkpoint for the target repository automatically |
-| `VANTA_TEST_TIMEOUT_SECS` | built-in default | Timeout for a test run |
-| `VANTA_GITHUB_TOKEN` | unset | Token for `--open-pr` (see below) |
+| `VANTA_SHURU_CHECKPOINT` | `vanta-python` | Checkpoint test VMs boot from |
+| `VANTA_SHURU_DISK_MB` | built-in | VM disk size |
+| `VANTA_SHURU_AUTO_DEPS` | on | Build a dependency checkpoint for the target repo automatically |
+| `VANTA_TEST_TIMEOUT_SECS` | built-in | Timeout for one test run |
+| `VANTA_GITHUB_TOKEN` | unset | Token for `--open-pr` |
 | `VANTA_LOG_LEVEL` | `info` | Log verbosity |
 
----
+</details>
 
-## Outputs
-
-Each run writes a session directory under `vanta_sessions/<session-id>/`:
-
-- a JSON Lines session log with one event per stage, every result tagged with session, attempt, iteration and test IDs, ending in a `run.summary` event that records the final decision, the backend that actually ran, prompt versions, sampling settings and the build commit;
-- `<session-id>_transitions.jsonl`, the attempt-to-attempt rows that ECR and EIR are computed from;
-- `shared_tests.json`, the fixed shared test set;
-- `debug/`, the patched and graded tree snapshots for each attempt.
-
-The final decision is one of:
-
-| Decision | Meaning | Exit code |
-|---|---|---|
-| `AllTestsPassed` | Approved by the Gatekeeper | 0 |
-| `Rejected` | The patch demonstrably fails a logic-class check or regresses a native test | 1 |
-| `MaxAttemptsReached` | Repair mode used its whole budget without an approved patch | 1 |
-| `PatchApplicationFailed` | The patch did not apply | 1 |
-| `HarnessFailure` | The test harness itself could not produce usable evidence | 1 |
-| `InfraFailure` | The LLM endpoint or another dependency failed, so nothing was learned about the patch | 2 |
-
-`scripts/metrics.py` summarises sessions against a labels file into true and false approvals and rejections, unresolved runs and infrastructure failures, and reports ECR and EIR.
-
----
-
-## Opening pull requests
-
-With `--open-pr`, Vanta opens a pull request only after the Gatekeeper approves, and opens it as a draft by default. It authenticates only with `VANTA_GITHUB_TOKEN`, which should be a fine-grained token scoped to the one repository you intend to target, and it never falls back to `gh` or `git` credentials. It refuses to open a PR from a target repository with uncommitted changes, and the PR body records the session ID, the tested commit and a summary of the evidence. An example from the v1 acceptance run is [vanta-pr-test#6](https://github.com/Kyu-Yi/vanta-pr-test/pull/6).
-
----
-
-## Security model
-
-Vanta executes code it did not write and cannot trust: the target repository's own code and tests, and tests written by an LLM. All of it runs inside a sandbox behind a single Rust `Sandbox` trait, so the orchestration code does not know or care which backend is underneath.
-
-| Backend | Platform | Isolation | Status |
-|---|---|---|---|
-| Shuru | macOS | microVM (Apple Virtualization framework) | Shipped, the default for real runs |
-| Subprocess | any | process limits only, **no isolation** | Shipped, for development on trusted code |
-| Firecracker | Linux | microVM (KVM) | Planned |
-| WSL2 | Windows | Hyper-V | Planned |
-
-The backend that actually ran is recorded in every session, and re-running a session's signals uses that same backend, so a run can never be quietly downgraded from a microVM to a plain subprocess.
-
----
-
-## Evaluation
-
-**What exists.** The v1 acceptance test was an unattended repair run on a real Python repository, which produced an approved patch with zero regressions across a 455-test native suite and opened [vanta-pr-test#6](https://github.com/Kyu-Yi/vanta-pr-test/pull/6). In that run the repository's own suite already covered the planted bug, so the native gate carried most of the evidence. Separately, Vanta was developed against a real-world case study of six review and repair cases on a local fork of an open-source project, where it reached the correct verdict in four cases, with no false rejections and two false approvals. Both false approvals came from a clause of the issue that no test exercised: one needed a test that a function is still called exactly as before, the other needed real GPU hardware to show a device-placement bug. That case study was used to find and fix weaknesses in Vanta itself, including the test-tampering hole described above, so it is a development set and its numbers are not a measurement.
-
-**What is being built.** The measurement comes from a [BugsInPy](https://github.com/soarsmu/BugsInPy) harness (`scripts/bugsinpy_run.py`, design in [`plans/bugsinpy.md`](plans/bugsinpy.md)), currently **in progress**. For each historical bug, Vanta sees the buggy source together with the fixed version's tests, minus the tests that the real fix makes pass. Those hidden fail-to-pass tests become an oracle Vanta never sees, and a patch is labelled good only if the hidden tests pass and no other test in the suite regresses. Each bug is run under two configurations, Vanta and a baseline with the Attacker turned off, in repair mode first and then in review mode, where both configurations review the identical set of candidates: the developer's real fix, a no-op patch, and up to two failed patches pooled from the repair runs. Because both configurations judge exactly the same patches, the comparison isolates what the Attacker adds. The harness pins each bug's dependencies to versions released before the bug's commit, runs every suite inside Shuru, records full provenance, and stops between waves if a sanity gate fails, for example if the developer's fix is graded as bad or the no-op is graded as good.
-
-**What comes after.** Defects4J as a cross-language check, SWE-bench-Lite with a regression-rate metric, and comparisons of ECR and EIR across model tiers.
-
----
-
-## Limitations and open questions
-
-- **The evidence is thin.** One acceptance run, one development case study and toy fixtures. Toy catch rates (for example 5 of 6 bad patches caught on the boundary fixture) are development results, not evidence, and nothing yet shows that Vanta beats a simple baseline.
-- **Untested requirements can still pass.** Vanta can only reject what some test can observe. If no test, native or generated, exercises a clause of the issue, a patch that ignores that clause can be approved. Both false approvals in the case study were this kind.
-- **The stopping theory may not transfer.** See [Measuring repair](#measuring-repair-ecr-and-eir). This is the main research question, not a settled design.
-- **Generated tests are only as good as the Attacker.** BATE filters malformed tests but cannot prove a test checks the right thing, and the boundary-value behaviour is still prompt-dependent.
-- **Local models are slow.** A single repair run on a local 27B model can take tens of minutes, and long prompts need a large context window and a single-slot server.
-- **macOS only, for now.** Sandboxed runs need Shuru, and the Linux backend is planned.
-- **Single maintainer.** The scope is large for one person, and the roadmap is ordered so that evidence comes before new features.
-
----
+**Pull requests.** With `--open-pr`, Vanta opens a PR only after Gatekeeper approval, as a **draft** by default. It authenticates only with `VANTA_GITHUB_TOKEN` (use a fine-grained token scoped to the one target repo), never falls back to `gh` or `git` credentials, and refuses to run from a dirty target repo. The PR body carries the session ID, tested commit and an evidence summary.
 
 ## Roadmap
 
-**Shipped (v0.2)**
-- [x] Creator and Attacker agents with intent-labelled tests tied to the issue
-- [x] BATE baseline validation with revise-then-discard
-- [x] Four-way Diagnostician with quarantine for unknown failures
-- [x] Tamper-resistant native test gate, with silenced tests counted as regressions
-- [x] Review mode with attack depth, and repair mode with feedback
-- [x] Fixed-cap Governor with transition logging on a fixed shared test set
-- [x] Conditional ECR and EIR per evidence source, and session metrics
-- [x] Re-running rejecting signals under the recorded backend
-- [x] Streaming LLM calls with idle timeouts, and `InfraFailure` as a separate outcome
-- [x] Shuru sandbox backend and draft PR integration
+**Definition of done for V1:** *given a real Python repo and a bug description, Vanta produces a PR containing a patch plus Attacker-generated tests that pass baseline validation, with the whole loop running unattended.* ✅ Met.
 
-**In progress**
-- [ ] BugsInPy harness: paired baseline-versus-Vanta runs with hidden-test oracles
-- [ ] Wilson confidence intervals for pooled ECR and EIR
+### Milestone 0 — Foundations
+- [x] Architecture & technical specification
+- [x] Research framing validated against Liu & Meng (2026)
+- [x] Dev environment (Rust toolchain, cargo-nextest, gh)
+- [x] LLM client spike: Rig trialled, plain `reqwest` chosen (see FAQ)
 
-**Planned**
-- [ ] Live ECR/EIR stopping rule in the Governor
-- [ ] A planner and shared board that coordinate several Attackers on a pool of VMs without overlapping work
-- [ ] Formal verifier backends behind a `Verifier` trait (CrossHair for Python, Kani for Rust), whose outcomes are already defined as `VerifiedWithinBounds`, `Counterexample`, `Inconclusive`, `Unsupported`, `Timeout` and `ToolFailure`. Where the properties come from is still open, and it matters: properties written by an LLM would not be an independent check, so a verifier verdict will carry the provenance of its property, and only properties from a human-written specification will count as ground truth.
-- [ ] Institutional memory of how a codebase has broken before, starting with JSON incident files and moving to a [Graphiti](https://github.com/getzep/graphiti) bi-temporal graph
-- [ ] Firecracker (Linux) and WSL2 (Windows) sandbox backends
-- [ ] Defects4J and SWE-bench-Lite evaluations, and comparisons across model tiers
-- [ ] The paper, from real results, on arXiv (cs.SE)
+### Milestone 1 — The adversarial core
+- [x] Orchestration skeleton
+- [x] Creator agent: issue in, candidate patch out
+- [x] Attacker agent: intent-labelled adversarial tests out, tied to the issue
+- [x] Structured Creator ⇄ Attacker loop with attempt logging
 
----
+### Milestone 2 — Ground truth
+- [x] Sandbox trait (`mod.rs`) + `shuru.rs` macOS backend
+- [x] Phase 1: intent-aware BATE baseline validation with 3-retry test repair
+- [x] Phase 2: four-way Diagnostician (process-level signals, per-language static analysis, Unknown quarantine flow)
+- [x] Structured JSON diagnostic payloads + session/attempt/iteration/test IDs on every result
+
+### Milestone 3 — V1 ship 🚢
+- [x] Fixed-N Governor + deterministic Gatekeeper
+- [x] GitHub PR integration
+- [x] CLI: review (`--patch`) and repair modes
+- [x] End-to-end unattended run on a real repository ← **V1 acceptance test**
+  - Exit test evidence: [vanta-pr-test#6](https://github.com/Kyu-Yi/vanta-pr-test/pull/6)
+  - Session: `7e6d812a-6d8d-49ea-8445-c4fc916e94f5`
+
+### Milestone 3.5 — v0.2 hardening
+- [x] Tamper-resistant native suite: original tests restored, patch-added test config removed, silenced tests counted as regressions
+- [x] Attacker tests graded on the same tree as the native suite
+- [x] Conditional EIR/ECR per evidence source over attempt logs (fixed-shared-set protocol)
+- [x] Re-running rejecting signals under the recorded sandbox backend
+- [x] Streaming LLM calls with idle timeout, cancellation and `InfraFailure` as its own outcome
+- [x] Session metrics against ground-truth labels (`scripts/metrics.py`)
+- [x] Real-world development case study (6 review/repair cases), tagged `v0.2`
+
+### Milestone 4 — V2: proof, memory & scale
+- [ ] Planner + shared board coordinating several Attackers on a VM pool without overlap
+- [ ] Live Governor (stability condition) + Verify-First intervention
+- [ ] Verifier trait + backends: CrossHair (Python), Kani (Rust), Z3 direct
+- [ ] `zeroboot.rs`: Firecracker CoW forking (Linux, via CI)
+- [ ] GCF vs JSON payload ablation
+- [ ] JSON → Graphiti memory migration
+
+### Milestone 5 — Research
+- [ ] BugsInPy evaluation harness ← **in progress**
+- [ ] Defects4J / SWE-bench-Lite evaluations
+- [ ] EIR/ECR experiments across model tiers
+- [ ] Paper: results section from real data → arXiv (cs.SE)
+- [ ] `wsl.rs` Windows backend
+
+## Status
+
+**v0.2 tagged; BugsInPy evaluation in progress.** Vanta runs unattended on real repositories in both review and repair mode, verifies candidates in a microVM against a grader they can't edit, and opens a draft PR when the Gatekeeper approves. V1 acceptance evidence: [vanta-pr-test#6](https://github.com/Kyu-Yi/vanta-pr-test/pull/6) (Shuru backend, repair mode, native suite of `455` tests with `0` regressions and `2` pre-existing failures fixed).
+
+v0.2 was hardened against a six-case review/repair study on a real-world open-source project: **4/6 correct verdicts, 0 false rejections, 2 false approvals**. Both misses were the same gap, an issue requirement no test exercised: one needed a check that a function is still *called exactly as before*, the other needed real GPU hardware to expose a device-placement bug. That study was used to find and fix weaknesses in Vanta (including a patch weakening its own native test), so it is a development set, and its numbers are not a benchmark result.
+
+## Known limitations
+
+- **Thin evidence so far.** One acceptance run, one development study and toy fixtures; nothing yet shows Vanta beats a simple baseline. That's what the BugsInPy harness is for.
+- **Untested requirements can still pass.** Vanta can only reject what some test observes. If no native or generated test exercises a clause of the issue, a patch that ignores it can be approved, which is exactly how both development-study misses happened.
+- **The stopping theory may not transfer** from intrinsic self-correction to externally-graded code repair. That's the research question, not a settled design.
+- The Attacker still sometimes misses exact boundary values. On the toy boundary fixture the boundary rule lifted the bad-patch catch rate to `5/6`, but it remains prompt-dependent; toy-fixture numbers are development results, not evidence.
+- Repair mode stops on the first passing attempt, so a clean first-attempt fix produces no N→N+1 transition and sits outside EIR/ECR by construction.
+- Local 27B models are slow (tens of minutes per repair run) and need a large context and a single-slot server.
+- Sandboxed runs are macOS-only until the Firecracker backend lands.
+
+## FAQ
+
+**Why Rust for an AI tool?**
+The hard part of Vanta isn't calling a model, it's orchestrating untrusted processes reliably: booting sandboxes, enforcing timeouts, cleaning up after crashes, and never losing evidence. Rust's type safety, explicit ownership and dependable process control fit that well, and one trait serves every sandbox backend.
+
+**Why plain `reqwest` instead of an agent framework like Rig?**
+Rig was trialled in the M0 spike and dropped. Vanta's agents are prompt-in, structured-JSON-out, so a framework adds little, while owning the client keeps every request body visible and controlled: streaming with idle timeouts and cancellation, exact sampling parameters recorded per call, and byte-identical requests when no seed is set. That matters for reproducibility and for fair comparisons across models. Any OpenAI-compatible endpoint works, local or hosted. A framework may earn its place later if the agents start calling tools.
+
+**Then why does CrossHair need Python?**
+Because the *artifact being verified* is Python, and CrossHair symbolically executes it inside the Python interpreter itself. It's a system dependency called as a subprocess, not Python code inside Vanta.
+
+**Isn't this just AI code review?**
+Review tools comment on diffs. Vanta *executes* the patch in hardware isolation, *attacks* it with generated regression tests, grades it with tests it can't tamper with, and records exactly why it approved or rejected. Then it opens the PR itself.
+
+**Can the Attacker write bad tests?**
+Yes, it's an LLM. That's what Phase 1 exists for: every test declares its intent, and its result on the original codebase must *match that intent* before it's allowed to judge anything, with a 3-retry-then-scrap rule and the discard rate logged as an Attacker-reliability metric. BATE is a filter, not semantic proof. Every generated test carries provenance so it's never mistaken for ground truth.
+
+**Can a patch cheat by editing the tests?**
+It can try, and it will be recorded, but it won't help. The native suite always runs the original tests, and silencing a test counts as breaking it. This rule exists because a real patch did exactly that during development.
 
 ## Repository layout
 
 ```
-src/
-  agents/        Creator and Attacker
-  pipeline/      driver, BATE, harness, patch application, Diagnostician, Governor, Gatekeeper
-  sandbox/       Sandbox trait with the Shuru and subprocess backends
-  llm/           OpenAI-compatible client with streaming and timeouts
-  config/        environment-variable configuration
-  core/          shared types: test results, intents, evidence sources, decisions
-  session/       session logs and transition records
-  pr/            GitHub pull request integration
-  bin/vanta_m3.rs  the CLI
-scripts/         metrics and the BugsInPy harness, with its tests
-fixtures/        small repositories with planted bugs and good and bad patches
-plans/           design documents, including the BugsInPy evaluation plan
-tests/           Rust integration tests
+src/agents/      Creator and Attacker
+src/pipeline/    driver, BATE, harness, patch application, Diagnostician, Governor, Gatekeeper
+src/sandbox/     Sandbox trait + Shuru and subprocess backends
+src/llm/         OpenAI-compatible streaming client
+src/core/        shared types: results, intents, evidence sources, decisions
+src/pr/          GitHub PR integration
+src/bin/         vanta_m3 (the CLI)
+scripts/         metrics + BugsInPy harness and its tests
+fixtures/        small repos with planted bugs and good/bad patches
+plans/           design docs, including the BugsInPy evaluation plan
 ```
-
-`vanta_sessions/` and `runs/` hold run output and are not committed.
-
----
-
-## Why Rust?
-
-The hard part of Vanta is not calling an LLM, it is orchestrating untrusted processes reliably: booting sandboxes, enforcing timeouts, cleaning up after crashes and never losing evidence. Rust's type system and explicit ownership make that kind of process control dependable, and the one `Sandbox` trait over several platform backends is a natural fit for it. The code being verified can be in any language, since test runners and analysers are called as subprocesses.
-
----
 
 ## Contributing
 
-Vanta is in early, single-maintainer development, but issues, ideas and discussion are welcome, especially from anyone who has watched a coding agent confidently break something in production.
+Vanta is in early single-maintainer development, but issues, ideas, and discussion are welcome, especially from anyone who has fought LLM coding agents in production.
 
 ## Citation
 
-If you build on the stopping-rule design, please cite the framework it is based on:
+If you build on the stability-governor design, please cite the underlying framework:
 
 ```bibtex
 @article{liu2026selfcorrection,
@@ -377,7 +367,7 @@ If you build on the stopping-rule design, please cite the framework it is based 
 }
 ```
 
-A citation for the Vanta paper will be added once it is on arXiv.
+A citation entry for the Vanta paper will be added on arXiv publication.
 
 ## License
 

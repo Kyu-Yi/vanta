@@ -1040,13 +1040,32 @@ def bug_sources(
     )
 
 
+def installs_of(resolved: Sequence[ResolvedDep]) -> tuple[str, ...]:
+    """The pins the layer's recipe installs.
+
+    One definition, used by both the recipe (via :class:`BugDeps`) and the
+    provenance, so "what was recorded" and "what pip was told" cannot drift apart.
+    """
+    return tuple(dep.pin for dep in resolved if not dep.harness)
+
+
 def deps_provenance(
     sources: DepSources,
     resolved: Sequence[ResolvedDep],
     *,
     harness_pins: Mapping[str, str],
 ) -> dict[str, Any]:
-    """What the bake decided for one bug, as data a later stage can read."""
+    """What the bake decided for one bug, as data a later stage can read.
+
+    ``installs`` is **exactly** what the layer's recipe passes to pip: a package the
+    interpreter layer already provides is not in it. It is not a loss of
+    information — every dependency, provisioned or not, is in ``dependencies`` with
+    ``provisioned_by`` saying which, and the harness pins are in their own key — but
+    it does mean ``installs`` can be compared against the built recipe without a
+    filter in between. It could not before: ``pytest==8.0.2`` appeared "installed"
+    by the bug layer while the recipe never asked for it, which is the kind of
+    contradiction that makes a provenance file not worth reading.
+    """
     return {
         "schema_version": 1,
         "project": sources.project,
@@ -1056,7 +1075,7 @@ def deps_provenance(
         "commit_date": sources.commit_date,
         "import_name": sources.import_name,
         "harness_pins": dict(harness_pins),
-        "installs": [dep.pin for dep in resolved],
+        "installs": list(installs_of(resolved)),
         "dependencies": [dep.as_dict() for dep in resolved],
         "skipped": [line.as_dict() for line in sources.skipped],
         "notes": list(sources.notes),
@@ -1109,7 +1128,7 @@ def resolve_bug_deps(
             BugDeps(
                 entry=dict(entry),
                 checkpoint=sources.checkpoint,
-                installs=tuple(dep.pin for dep in resolved if not dep.harness),
+                installs=installs_of(resolved),
                 provenance=deps_provenance(sources, resolved, harness_pins=harness_pins),
             )
         )
@@ -1288,5 +1307,238 @@ def render_plan(split: Split, *, pythons: list[str], entries: Sequence[dict[str,
     return "\n".join(lines) + "\n"
 
 
-def frozen(name: str) -> bool:
+def children_of(split: Split) -> dict[str, str]:
+    """``{per-bug layer: its interpreter layer}`` for **every** bug in the split.
+
+    Not just the selected ones: :func:`plan_layers` needs the whole tree to find the
+    stale children of a rebuilt base, and those are exactly the layers nobody
+    selected to rebuild.
+    """
+    return {
+        bug_checkpoint_name(entry): python_checkpoint_name(
+            minor_version(str(entry["python_version"]))
+        )
+        for entry in split.bugs
+    }
+
+
+def layer_exists(name: str) -> bool:
+    """The **single** existence check for a baked layer.
+
+    [VANTA-WHY] ``bake``'s skip/rebuild decision and ``prepare``'s preflight both
+    go through this one function, so "bake says the layer exists, prepare says it
+    does not" can only ever mean the layer really changed in between. It did once,
+    and the reason was not the check: ``checkpoint_create`` treats a failed build
+    as "delete the name and report the error", so a rebuild that failed with
+    *``checkpoint 'x' already exists``* deleted the perfectly good layer it had
+    collided with. Two readers of one function cannot disagree about a name; they
+    can only disagree about a name that moved. :func:`plan_layers` is what stops it
+    from moving under them.
+    """
     return checkpoint_exists(name)
+
+
+def frozen(name: str) -> bool:
+    """Kept as the bake's own word for the same check, so no caller has a reason
+    to reach for ``shuru`` directly and invent a second opinion."""
+    return layer_exists(name)
+
+
+@dataclass(frozen=True)
+class LayerAction:
+    """What the bake will do to one layer, decided before anything is touched."""
+
+    name: str
+    base: str
+    script: str
+    delete: bool
+    build: bool
+    reason: str
+
+    def describe(self) -> str:
+        verb = []
+        if self.delete:
+            verb.append("delete")
+        if self.build:
+            verb.append("rebuild" if self.delete else "build")
+        else:
+            verb.append("skip")
+        return f"{self.name}: {'+'.join(verb)} — {self.reason}"
+
+
+def plan_layers(
+    layers: Sequence[tuple[str, str, str]],
+    *,
+    force: bool,
+    children: Mapping[str, str],
+    exists: Callable[[str], bool] = layer_exists,
+) -> list[LayerAction]:
+    """``layers`` → what to delete, build and skip, in delete-then-build order.
+
+    [VANTA-WHY] ``--force`` used to mean nothing to shuru: it was a *skip*
+    suppression, not a replacement, so ``checkpoint create`` was called on a name
+    that already existed, shuru refused, and ``checkpoint_create``'s failure path
+    deleted the existing layer — turning "rebuild this" into "destroy this". A
+    forced rebuild therefore has to delete first, and that delete has to be planned
+    before any of it runs.
+
+    [VANTA-WHY] A rebuilt interpreter layer invalidates everything stacked on it:
+    ``vanta-bi-<project>-<N>`` inherits its interpreter, pytest and json-report from
+    ``vanta-bugsinpy-py3.<v>``, so a child left behind is a layer ``prepare`` would
+    happily run suites in — the exact failure mode of a stale layer that looks
+    valid. Children of a rebuilt base are therefore deleted too. ``children`` is
+    every per-bug layer in the split (not just the selected ones), because the stale
+    child that matters most is the one nobody selected.
+
+    A layer outside the selection is never deleted except as such a stale child,
+    and every action carries a ``reason`` so the log says which case it was.
+
+    Pure: ``exists`` is injected, which is what makes the ordering and the
+    non-deletion rules testable without a microVM.
+    """
+    selected = {name for name, _, _ in layers}
+    present = {name for name, _, _ in layers if exists(name)}
+    rebuilt = {name for name, _, _ in layers if force or name not in present}
+
+    actions: list[LayerAction] = []
+    for name, base, script in layers:
+        if force and name in present:
+            reason = "--force: replaced (an existing layer is deleted first)"
+        elif force:
+            reason = "--force: built (nothing with this name yet)"
+        elif name in present:
+            reason = "already baked"
+        else:
+            reason = "not baked yet"
+        actions.append(
+            LayerAction(
+                name=name,
+                base=base,
+                script=script,
+                delete=force and name in present,
+                build=force or name not in present,
+                reason=reason,
+            )
+        )
+
+    for name, base in sorted(children.items()):
+        if name in selected or base not in rebuilt or not exists(name):
+            continue
+        actions.append(
+            LayerAction(
+                name=name,
+                base=base,
+                script="",
+                delete=True,
+                build=False,
+                reason=(
+                    f"stale layer on {base}, which is being rebuilt in this run; "
+                    "deleted so prepare cannot run a suite in an environment baked "
+                    "from the old base (it must be rebaked before it is used)"
+                ),
+            )
+        )
+    return actions
+
+
+def delete_order(
+    actions: Sequence[LayerAction], children: Mapping[str, str]
+) -> list[LayerAction]:
+    """The deletions, children before their base.
+
+    The order is defensive rather than observed: shuru does not currently refuse to
+    delete a layer that other layers derive from, but deleting a base first and then
+    failing on a child would leave the tree in a state no plan describes.
+    """
+    return sorted(
+        (action for action in actions if action.delete),
+        key=lambda action: 0 if action.name in children else 1,
+    )
+
+
+def build_order(actions: Sequence[LayerAction]) -> list[LayerAction]:
+    """The builds, in the order ``layer_recipes`` produced them: base before child.
+
+    A child is baked ``--from`` its base, so this order is a correctness
+    requirement, not a preference.
+    """
+    return [action for action in actions if action.build]
+
+
+def summarise(actions: Sequence[LayerAction], *, failed: Sequence[str] = ()) -> str:
+    """The bake's one-line-per-layer record, for the log and for the failure path."""
+    lines = ["bake summary:"]
+    for action in actions:
+        state = "FAILED" if action.name in failed else "done" if action.build else "skipped"
+        lines.append(f"  [{state}] {action.describe()}")
+    if failed:
+        lines.append(
+            f"  {len(failed)} layer(s) failed: {', '.join(failed)} — nothing was "
+            "left behind for prepare to treat as valid"
+        )
+    return "\n".join(lines)
+
+
+def _bake_layer(name: str, script: str, base: str) -> ExecResult:
+    """The default ``build`` callable.
+
+    ``cmd_bake`` injects its own, so ``--disk-mb`` reaches the recipe; this is the
+    same call with the default disk size, and it exists so the ordering logic has a
+    real default rather than being untestable without one.
+    """
+    return bake(name, script, base=base)
+
+
+def run_bake_actions(
+    actions: Sequence[LayerAction],
+    *,
+    children: Mapping[str, str],
+    exists: Callable[[str], bool] = layer_exists,
+    remove: Callable[[str], None] = checkpoint_delete,
+    build: Callable[[str, str, str], ExecResult] = _bake_layer,
+    log: Callable[[str], None] = print,
+) -> str:
+    """Delete, then build, and stop at the first failure with a full summary.
+
+    Takes the plan :func:`plan_layers` produced rather than re-deriving it: what is
+    logged before the run has to be the same list that is executed, or the log is
+    describing a different bake.
+
+    [VANTA-WHY] Fail fast, and fail *clean*: a layer that failed to build must not
+    survive under a name ``prepare`` will accept. ``checkpoint_create`` deletes on
+    a failed inner command, but a failed ``delete`` of its own would leave the name
+    in place, so the absence is verified here rather than assumed — this is the one
+    post-condition where "probably" is not good enough, because a surviving
+    half-baked layer is invisible to every later stage.
+
+    Injected ``exists``/``remove``/``build``/``log`` so the whole sequence is a
+    structural test rather than something only a real bake can exercise.
+    """
+    for action in delete_order(actions, children):
+        log(f"[{action.name}] deleting — {action.reason}")
+        remove(action.name)
+
+    failed: list[str] = []
+    for action in build_order(actions):
+        log(f"[{action.name}] building from {action.base} — {action.reason}")
+        result = build(action.name, action.script, action.base)
+        if not result.ok:
+            failed.append(action.name)
+            if exists(action.name):
+                remove(action.name)
+            if exists(action.name):
+                raise BakeError(
+                    f"baking {action.name} failed and the layer could not be removed, "
+                    "so it would be treated as valid by prepare; delete it by hand "
+                    f"before running anything.\n\n{summarise(actions, failed=failed)}\n"
+                    f"--- build log (tail) ---\n"
+                    f"{(result.stdout + result.stderr).strip()[-2000:]}"
+                )
+            raise BakeError(
+                f"baking {action.name} failed (exit {result.exit_code}): "
+                f"{(result.stdout + result.stderr).strip()[-2000:]}\n\n"
+                f"{summarise(actions, failed=failed)}"
+            )
+        log(f"[{action.name}] ok — marker {MARKER} verified")
+
+    return summarise(actions)

@@ -352,19 +352,25 @@ def cmd_bake(args: argparse.Namespace) -> int:
     layers = bake_mod.layer_recipes(
         split, pythons=minors, entries=entries, deps=bug_deps
     )
-    for name, base, script in layers:
-        if not args.force and bake_mod.frozen(name):
-            print(f"[{name}] already baked — skipping (use --force to rebuild)", flush=True)
-            continue
-        print(f"[{name}] baking from {base} ...", flush=True)
-        result = bake_mod.bake(name, script, base=base, disk_mb=args.disk_mb)
-        if not result.ok:
-            detail = (result.stdout + result.stderr).strip()[-2000:]
-            raise ShuruError(
-                f"baking {name} failed (exit {result.exit_code}): {detail}"
-            )
-        print(f"[{name}] ok — marker {bake_mod.MARKER} verified", flush=True)
 
+    # --force means "replace", which for shuru means delete-then-create, and a
+    # rebuilt interpreter layer makes every layer stacked on it stale. Both are
+    # decided up front (bake.plan_layers) so the deletions happen children-first and
+    # a layer this run is not going to rebuild is never deleted for another reason.
+    children = bake_mod.children_of(split)
+    actions = bake_mod.plan_layers(layers, force=args.force, children=children)
+    print(f"bake plan ({len(actions)} layers):", flush=True)
+    for action in actions:
+        print(f"  {action.describe()}", flush=True)
+
+    summary = bake_mod.run_bake_actions(
+        actions,
+        children=children,
+        build=lambda name, script, base: bake_mod.bake(
+            name, script, base=base, disk_mb=args.disk_mb
+        ),
+    )
+    print(summary, flush=True)
     print("bake complete", flush=True)
     return EXIT_OK
 
@@ -692,6 +698,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         return args.func(args)
     except SplitError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_HARNESS_FAILED
+    except bake_mod.BakeError as exc:
+        # A bake that failed still owes the reader the summary of what it rebuilt,
+        # skipped and failed, so the message is printed rather than traced.
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_HARNESS_FAILED
     except prepare_mod.PrepareError as exc:

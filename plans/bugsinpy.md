@@ -337,6 +337,32 @@ shuru checkpoint create vanta-bi-<project>-<N> --from vanta-bugsinpy-py3.<v> --a
 This mirrors the existing `vanta-deps-<fingerprint>` + `/opt/vanta-deps-ok` marker + freeze-file
 pattern exactly, so nothing new has to be invented for verification.
 
+**Rebuild semantics — `--force` means replace, and a rebuilt base invalidates its children.** A layer
+is deleted *before* it is created, never merely created over (shuru refuses a duplicate name with
+`checkpoint '<name>' already exists, delete it first`; `checkpoint_create` treats any non-zero result
+as "the name must not survive", so a colliding create destroys the layer it collided with — which is
+exactly how a `--force` rebake once named `vanta-bi-PySnooper-1` and then deleted it). `bake.plan_layers`
+decides the whole run before touching anything, in this order:
+
+1. **delete** every selected layer that exists and is being rebuilt, **children before their base**;
+2. **delete** the *stale children* of any rebuilt base — the per-bug layers stacked on an interpreter
+   layer rebuilt in this run, whatever minor version they belong to, **even if nobody selected them**.
+   A layer baked from a base that no longer exists is not the layer the selection asked for, so it is
+   removed and listed with its reason rather than left for `prepare` to run a suite in;
+3. **build** base before child (`layer_recipes` order).
+
+A layer outside the selection is never touched except as a stale child in step 2. The bake then stops
+at the first failed build, deletes whatever the failure left behind (`shuru checkpoint create` saves a
+checkpoint *before* reporting the inner command failed), and prints a one-line-per-layer summary
+(`rebuilt` / `skipped` / `FAILED`) so a half-finished run cannot leave a name that `prepare` would
+treat as valid. `bake` exits non-zero on any failure, and the commands are chained with `&&` so
+`prepare` never runs against a broken set.
+
+**One existence check, shared.** `bake.layer_exists` (→ `shuru.checkpoint list`, matching the first
+token of each line) is the only function that answers "does this layer exist". `prepare`'s preflight
+calls it too, rather than holding its own import binding, so the two stages cannot disagree about a
+name — only about a name that moved between them, which `plan_layers` above is what prevents.
+
 **Where the specs come from — four sources, unioned per bug, resolved at bake time.** BugsInPy's own
 install step is `setup.sh` (`python setup.py install`, plus extra `pip install`s), and
 `requirements.txt` is frequently empty — 0 bytes on all three PySnooper bugs, while `python_toolbox`
@@ -360,7 +386,11 @@ A package the harness already provides (`pytest`, `pytest-json-report`) is left 
 version and recorded as such — in particular `pytest` is never downgraded, which would break the
 json-report plugin. The resolved set, each dep's source (file + line), the pin, and the skipped
 `setup.sh` lines all go into `runs/bugsinpy/deps/<checkpoint>.json` and, as derived data, into the
-split's `deps` key.
+split's `deps` key. That file's `installs` list is **exactly** what the layer's recipe passes to pip
+(`bake.installs_of`, the one function both the recipe and the record use): a harness package appears
+in `dependencies` with its `provisioned_by` but is **not** in `installs`, because the interpreter layer
+already provides it and the recipe never re-pins it. A record that disagrees with the recipe is worse
+than no record.
 
 **What the layer deliberately does not install.** The project's own install line is dropped, for two
 reasons:

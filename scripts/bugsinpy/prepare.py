@@ -31,7 +31,6 @@ from . import issue as issue_mod
 from . import suite as suite_mod
 from . import trees as tree_mod
 from .bugsinpy_meta import BugInfo, MetadataError, load_bug_info
-from .shuru import checkpoint_exists
 from .split import Split, sha256_text
 
 DISK_MB = 16384
@@ -610,7 +609,7 @@ def load_bug(split: Split, bugsinpy_root: Path, project: str, bug_id: int) -> Bu
 
 
 def require_checkpoint(name: str) -> None:
-    if not checkpoint_exists(name):
+    if not bake_mod.layer_exists(name):
         raise PrepareError(
             f"checkpoint {name!r} does not exist. Bake it first (design §11 step 3 for "
             "py3.8, §3.2 for the older interpreters); prepare runs every suite inside "
@@ -626,8 +625,12 @@ def require_checkpoints(names: list[str]) -> None:
     wave), not a property of a bug, and discovering it after three full oracle
     derivations would waste the expensive part of ``prepare`` on work that cannot
     be completed.
+
+    The check is ``bake.layer_exists`` — the same function ``bake`` decides
+    skip-vs-rebuild with. Two opinions about whether a layer exists is how this
+    stage came to report "does not exist" about a layer the bake had just named.
     """
-    missing = sorted({name for name in names if not checkpoint_exists(name)})
+    missing = sorted({name for name in names if not bake_mod.layer_exists(name)})
     if missing:
         raise PrepareError(
             "these checkpoints do not exist: "

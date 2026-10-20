@@ -1564,8 +1564,12 @@ class TestPrepareInvariants:
         ) == []
 
     def test_require_checkpoints_names_every_missing_layer(self, monkeypatch):
+        # Patched on ``bake``, not on ``prepare``: prepare has to reach the layer
+        # through the same function the bake decides skip-vs-rebuild with, and this
+        # is what makes that shared. A patch on prepare's own module namespace would
+        # pass while the two stages used different checks.
         monkeypatch.setattr(
-            prepare_mod, "checkpoint_exists", lambda name: name == "vanta-bugsinpy-py3.8"
+            bake_mod, "layer_exists", lambda name: name == "vanta-bugsinpy-py3.8"
         )
         with pytest.raises(prepare_mod.PrepareError) as excinfo:
             prepare_mod.require_checkpoints(
@@ -1575,6 +1579,17 @@ class TestPrepareInvariants:
         assert "vanta-bi-httpie-1" in message
         assert "vanta-bi-thefuck-1" in message
         assert "vanta-bugsinpy-py3.8" not in message
+
+    def test_prepare_and_bake_ask_the_same_question_about_a_layer(self, monkeypatch):
+        """``require_checkpoint`` and ``bake.frozen`` must not be two opinions."""
+        for seen in (True, False):
+            monkeypatch.setattr(bake_mod, "layer_exists", lambda name, seen=seen: seen)
+            assert bake_mod.frozen("vanta-bi-Demo-1") is seen
+            if seen:
+                prepare_mod.require_checkpoint("vanta-bi-Demo-1")
+            else:
+                with pytest.raises(prepare_mod.PrepareError, match="does not exist"):
+                    prepare_mod.require_checkpoint("vanta-bi-Demo-1")
 
     def test_render_summary_lists_bugs_and_gate_failures(self):
         summary = prepare_mod.render_summary(
@@ -1845,6 +1860,260 @@ class TestBake:
         """Measured: ``shuru: --disk-size 4096MB is smaller than the base image``."""
         with pytest.raises(SplitError, match="below the base image"):
             bake_mod.bake("vanta-bugsinpy-py3.8", "true", disk_mb=4096)
+
+
+# ============================================================================
+# --force means replace (§3.2) — the second half of the failed rebake
+# ============================================================================
+PY38 = "vanta-bugsinpy-py3.8"
+"""The interpreter layer the three PySnooper bugs are baked on."""
+
+
+def _layers(*names: str) -> list[tuple[str, str, str]]:
+    """``layer_recipes``' output shape: ``(name, base, script)``, base before child."""
+    return [
+        (name, bake_mod.DEFAULT_BASE if name == PY38 else PY38, f"recipe for {name}")
+        for name in names
+    ]
+
+
+class TestBakeLayerPlan:
+    """What ``--force`` does to a layer that is already baked.
+
+    Measured failure: ``bake --force`` passed ``checkpoint create`` a name that
+    already existed, shuru refused, and ``checkpoint_create``'s failure path deleted
+    the layer it had collided with. The next ``prepare`` then reported "these
+    checkpoints do not exist: vanta-bi-PySnooper-1" about a layer the bake had just
+    named, and ran PySnooper/3 against a *stale* layer — the old environment, baked
+    without the dependency the fix was about. Every test here is about that pair of
+    properties: a forced layer is replaced, and a stale child is not left behind
+    looking valid.
+    """
+
+    CHILDREN = {"vanta-bi-Demo-1": PY38, "vanta-bi-Demo-2": PY38}
+
+    def test_force_deletes_the_layer_before_recreating_it(self):
+        plan = bake_mod.plan_layers(
+            _layers(PY38, "vanta-bi-Demo-1"),
+            force=True,
+            children=self.CHILDREN,
+            exists=lambda name: True,
+        )
+        actions = {action.name: action for action in plan}
+        assert actions[PY38].delete and actions[PY38].build
+        assert actions["vanta-bi-Demo-1"].delete and actions["vanta-bi-Demo-1"].build
+        assert "--force" in actions["vanta-bi-Demo-1"].reason
+
+    def test_without_force_an_existing_layer_is_skipped_and_never_deleted(self):
+        plan = bake_mod.plan_layers(
+            _layers(PY38, "vanta-bi-Demo-1"),
+            force=False,
+            children=self.CHILDREN,
+            exists=lambda name: True,
+        )
+        assert [action.name for action in plan] == [PY38, "vanta-bi-Demo-1"]
+        assert all(not action.delete and not action.build for action in plan)
+        assert all(action.reason == "already baked" for action in plan)
+
+    def test_a_layer_that_is_not_baked_yet_is_built_without_a_delete(self):
+        plan = bake_mod.plan_layers(
+            _layers(PY38, "vanta-bi-Demo-1"),
+            force=False,
+            children=self.CHILDREN,
+            exists=lambda name: name == PY38,
+        )
+        actions = {action.name: action for action in plan}
+        assert not actions[PY38].delete and not actions[PY38].build
+        assert not actions["vanta-bi-Demo-1"].delete and actions["vanta-bi-Demo-1"].build
+        assert actions["vanta-bi-Demo-1"].reason == "not baked yet"
+
+    def test_deletions_run_children_before_the_base_they_derive_from(self):
+        plan = bake_mod.plan_layers(
+            _layers(PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"),
+            force=True,
+            children=self.CHILDREN,
+            exists=lambda name: True,
+        )
+        order = [action.name for action in bake_mod.delete_order(plan, self.CHILDREN)]
+        assert order[-1] == PY38, "the base is deleted last"
+        assert set(order) == {PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"}
+
+    def test_builds_run_base_before_child(self):
+        plan = bake_mod.plan_layers(
+            _layers(PY38, "vanta-bi-Demo-1"),
+            force=True,
+            children=self.CHILDREN,
+            exists=lambda name: True,
+        )
+        assert [action.name for action in bake_mod.build_order(plan)] == [
+            PY38,
+            "vanta-bi-Demo-1",
+        ]
+
+    def test_a_rebuilt_base_takes_its_unselected_children_with_it(self):
+        """The stale layer that matters most is the one nobody selected.
+
+        Rebuilding ``vanta-bugsinpy-py3.8`` invalidates every layer stacked on it,
+        and ``vanta-bi-Demo-2`` is not in this run — so it would keep the old
+        interpreter and keep being accepted by ``prepare``.
+        """
+        plan = bake_mod.plan_layers(
+            _layers(PY38, "vanta-bi-Demo-1"),
+            force=True,
+            children=self.CHILDREN,
+            exists=lambda name: True,
+        )
+        actions = {action.name: action for action in plan}
+        stale = actions["vanta-bi-Demo-2"]
+        assert stale.delete and not stale.build
+        assert PY38 in stale.reason and "stale layer" in stale.reason
+        assert "rebaked before it is used" in stale.reason
+
+    def test_a_base_that_is_not_rebuilt_never_deletes_its_children(self):
+        """Skipping the base leaves its children valid, so nothing is deleted."""
+        plan = bake_mod.plan_layers(
+            _layers(PY38, "vanta-bi-Demo-1"),
+            force=False,
+            children=self.CHILDREN,
+            exists=lambda name: True,
+        )
+        assert [action.name for action in plan] == [PY38, "vanta-bi-Demo-1"]
+
+    def test_a_layer_outside_the_selection_is_only_deleted_as_a_stale_child(self):
+        """A child of a base that is *not* part of this run is left alone.
+
+        ``--pythons 3.8 --only PySnooper/*`` must not touch a 3.7 layer.
+        """
+        children = dict(self.CHILDREN, **{"vanta-bi-Other-1": "vanta-bugsinpy-py3.7"})
+        plan = bake_mod.plan_layers(
+            _layers(PY38, "vanta-bi-Demo-1"),
+            force=True,
+            children=children,
+            exists=lambda name: True,
+        )
+        assert "vanta-bi-Other-1" not in {action.name for action in plan}
+
+    def test_every_per_bug_layer_in_the_split_is_a_known_child(self):
+        """``children_of`` covers the reserves too, or the stale-child rule misses them."""
+        split = split_mod.Split(
+            split_data(
+                bugs=[
+                    bug_entry(checkpoint="vanta-bi-Demo-1"),
+                    bug_entry(bug_id=2, checkpoint="vanta-bi-Demo-2", role="reserve"),
+                    bug_entry(
+                        bug_id=3,
+                        checkpoint="vanta-bi-Demo-3",
+                        python_version="3.7.3",
+                        role="reserve",
+                    ),
+                ]
+            )
+        )
+        assert bake_mod.children_of(split) == {
+            "vanta-bi-Demo-1": PY38,
+            "vanta-bi-Demo-2": PY38,
+            "vanta-bi-Demo-3": "vanta-bugsinpy-py3.7",
+        }
+
+
+class TestRunBakeActions:
+    """The delete/build sequence, driven with the VM calls injected out."""
+
+    CHILDREN = {"vanta-bi-Demo-1": PY38, "vanta-bi-Demo-2": PY38}
+
+    class Recorder:
+        """Collects the calls, and owns which layers exist."""
+
+        def __init__(self, present: set[str], failing: set[str] | None = None, sticky: set[str] | None = None):
+            self.present = set(present)
+            self.failing = set(failing or ())
+            self.sticky = set(sticky or ())
+            self.calls: list[tuple[str, str]] = []
+
+        def exists(self, name: str) -> bool:
+            return name in self.present
+
+        def remove(self, name: str) -> None:
+            self.calls.append(("remove", name))
+            if name in self.sticky:
+                return  # a delete that silently does nothing, as a failed one would
+            self.present.discard(name)
+
+        def build(self, name: str, script: str, base: str) -> bake_mod.ExecResult:
+            self.calls.append(("build", name))
+            if name in self.failing:
+                # Measured in shuru: the checkpoint is saved *before* the inner
+                # command's failure is reported, so a failed build leaves a name
+                # behind. ``checkpoint_create`` deletes it; this asserts that if that
+                # delete does not take, the name does not survive as "baked".
+                self.present.add(name)
+                return bake_mod.ExecResult(
+                    stdout="", stderr=f"shuru: refusing to build {name}", exit_code=1, timed_out=False
+                )
+            self.present.add(name)
+            return bake_mod.ExecResult(stdout="ok", stderr="", exit_code=0, timed_out=False)
+
+    def _run(self, layers, recorder, *, force):
+        return bake_mod.run_bake_actions(
+            bake_mod.plan_layers(
+                layers, force=force, children=self.CHILDREN, exists=recorder.exists
+            ),
+            children=self.CHILDREN,
+            exists=recorder.exists,
+            remove=recorder.remove,
+            build=recorder.build,
+            log=lambda line: None,
+        )
+
+    def test_all_deletions_happen_before_any_build(self):
+        recorder = self.Recorder(present={PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"})
+        self._run(_layers(PY38, "vanta-bi-Demo-1"), recorder, force=True)
+        verbs = [verb for verb, _ in recorder.calls]
+        assert verbs == ["remove", "remove", "remove", "build", "build"], recorder.calls
+        assert [name for verb, name in recorder.calls if verb == "remove"] == [
+            "vanta-bi-Demo-1",
+            "vanta-bi-Demo-2",
+            PY38,
+        ]
+
+    def test_a_failed_build_stops_the_run_and_leaves_nothing_behind(self):
+        recorder = self.Recorder(
+            present={PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"},
+            failing={"vanta-bi-Demo-1"},
+        )
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._run(_layers(PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"), recorder, force=True)
+        message = str(excinfo.value)
+        # Fail fast: the layer after the failure is not attempted.
+        assert [name for verb, name in recorder.calls if verb == "build"] == [PY38, "vanta-bi-Demo-1"]
+        # And the half-baked name is gone, so prepare cannot accept it.
+        assert not recorder.exists("vanta-bi-Demo-1")
+        assert "FAILED" in message and "vanta-bi-Demo-1" in message
+        assert "bake summary:" in message
+
+    def test_a_layer_that_survives_its_own_failure_is_reported_not_hidden(self):
+        """If the cleanup delete does not take, say so instead of leaving it live."""
+        recorder = self.Recorder(
+            present={PY38, "vanta-bi-Demo-1"},
+            failing={"vanta-bi-Demo-1"},
+            sticky={"vanta-bi-Demo-1"},
+        )
+        with pytest.raises(bake_mod.BakeError, match="could not be removed"):
+            self._run(_layers(PY38, "vanta-bi-Demo-1"), recorder, force=True)
+        assert recorder.exists("vanta-bi-Demo-1"), "the test's own premise"
+
+    def test_the_summary_names_what_was_rebuilt_skipped_and_failed(self):
+        recorder = self.Recorder(present={PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"})
+        summary = self._run(_layers(PY38, "vanta-bi-Demo-1"), recorder, force=True)
+        assert "[done] vanta-bi-Demo-1: delete+rebuild" in summary
+        assert "[skipped] vanta-bi-Demo-2: delete" in summary
+        assert "[done] vanta-bugsinpy-py3.8" in summary
+
+    def test_without_force_a_baked_layer_is_not_touched(self):
+        recorder = self.Recorder(present={PY38, "vanta-bi-Demo-1"})
+        summary = self._run(_layers(PY38, "vanta-bi-Demo-1"), recorder, force=False)
+        assert recorder.calls == []
+        assert summary.count("[skipped]") == 2
 
 
 # ============================================================================
@@ -2213,7 +2482,11 @@ class TestDependencyProvenance:
             sources, releases=TestResolvePinsByDate.RELEASES, harness_pins={"pytest": "8.0.2"}
         )
         provenance = bake_mod.deps_provenance(sources, resolved, harness_pins={"pytest": "8.0.2"})
-        assert provenance["installs"] == ["decorator==4.4.0", "pytest==8.0.2"]
+        # ``installs`` is what the layer's recipe passes to pip, so a package the
+        # interpreter layer already provides is not in it (it is still recorded, in
+        # ``dependencies`` with its ``provisioned_by``).
+        assert provenance["installs"] == ["decorator==4.4.0"]
+        assert [dep["name"] for dep in provenance["dependencies"]] == ["decorator", "pytest"]
         assert provenance["skipped"] == [
             {
                 "source": "setup.sh",
@@ -2306,6 +2579,13 @@ class TestRealPySnooperDependencies:
             assert not any(spec.startswith("pysnooper") for spec in item.installs)
 
     def test_the_harness_pytest_is_recorded_but_never_installed_by_the_layer(self):
+        """Both halves: out of the installs, still in the record.
+
+        The layer must not re-install a package the interpreter layer provides (a
+        downgrade underneath pytest-json-report would make the oracle's report
+        unreadable), and the provenance must not claim the layer installed it
+        either — a record that disagrees with the recipe is worse than no record.
+        """
         _, entries = self._entries()
         item = next(d for d in self._resolve(entries) if d.checkpoint.endswith("-3"))
         assert not any(spec.startswith("pytest==") for spec in item.installs)
@@ -2314,7 +2594,9 @@ class TestRealPySnooperDependencies:
         )
         assert pytest_dep["pin"] == "pytest==8.0.2"
         assert pytest_dep["provisioned_by"] == "interpreter layer"
-        assert "pytest==8.0.2" in item.provenance["installs"]
+        assert "pytest==8.0.2" not in item.provenance["installs"]
+        assert item.provenance["installs"] == list(item.installs)
+        assert item.provenance["harness_pins"]["pytest"] == "8.0.2"
 
     def test_bug_one_and_two_get_python_toolbox_from_the_tests_extra(self):
         _, entries = self._entries()

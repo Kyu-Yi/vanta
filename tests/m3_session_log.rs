@@ -485,7 +485,19 @@ impl StubLlmServer {
                             "data: {}\n\ndata: [DONE]\n\n",
                             serde_json::json!({
                                 "choices": [{"delta": {}}],
-                                "usage": {"prompt_tokens": 1, "total_tokens": 1}
+                                // [VANTA-WHY] 777/123/900, not 1/1/2. A token
+                                // count a local estimate could plausibly have
+                                // produced would let a test that reads the
+                                // estimate pass for a test that reads the
+                                // server; these numbers cannot come from
+                                // anywhere but this frame. `completion_tokens`
+                                // is the field a streamed response omits unless
+                                // `stream_options.include_usage` was asked for.
+                                "usage": {
+                                    "prompt_tokens": 777,
+                                    "completion_tokens": 123,
+                                    "total_tokens": 900
+                                }
                             })
                         );
                         let _ = stream.write_all(tail.as_bytes());
@@ -1219,7 +1231,19 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
     // attempt.summary — 7, plus the round-1 intent.check row for the freshly
     // generated probe. Plus the run-level session.start, run.summary and
     // M3_repair_loop records.
-    assert_eq!(records.len(), 25);
+    //
+    // [VANTA-WHY] Counted over the ATTEMPT-STRUCTURE rows only. Token accounting
+    // writes one `call.usage` row per chat call, and how many calls a round makes
+    // depends on retries and BATE revisions — pinning the total here would make a
+    // test about the repair loop's record shape fail for a reason outside it.
+    // Those rows have their own test
+    // (`token_accounting_records_the_servers_counts_per_call_and_a_run_total`).
+    let structure_rows: Vec<_> = records.iter().filter(|r| r.phase != "call.usage").collect();
+    assert_eq!(structure_rows.len(), 25);
+    assert!(
+        records.iter().any(|r| r.phase == "call.usage"),
+        "this run called the model, so it must record token usage"
+    );
 }
 
 /// The mirror of the import bug.
@@ -3757,6 +3781,21 @@ fn assert_schedule_matches_bodies(workspace: &Path, server: &StubLlmServer) -> V
             .get("max_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or_else(|| panic!("the `{kind}` body carries no max_tokens: {body}"));
+        // [VANTA-WHY] Token accounting reads the server's own counts, and a
+        // STREAMED response only carries a `usage` block when the request asks
+        // for one — this key is the ask. Without it every recorded cost falls
+        // back to the CHARACTER-derived estimate, which over-counts by ~1.5x and
+        // cannot see a completion count at all, so a paper table built from it
+        // would be wrong in a way nothing marked. Asserted on EVERY body: one
+        // call site that forgot to ask is a hole in the run total.
+        assert_eq!(
+            value
+                .get("stream_options")
+                .and_then(|v| v.get("include_usage"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "the `{kind}` body must ask for the usage block (`stream_options.include_usage`): {body}"
+        );
         assert_eq!(
             summary_value(&summary, &format!("temperature_{site}")),
             format!("{body_temperature:?}"),
@@ -4002,5 +4041,109 @@ fn the_recorded_sampling_schedule_matches_the_request_bodies() {
             "repair mode must exercise `{required}`; checked={checked:?}"
         );
     }
+}
+
+/// §4.3 token accounting: the numbers a cost table is built from are the
+/// SERVER's, recorded per call, and `run.summary` totals exactly those.
+///
+/// [VANTA-WHY] Before this, the only prompt figure anywhere was
+/// `conservative_token_estimate`, derived from CHARACTERS and deliberately high,
+/// and NO completion count existed at all — so any cost number was inflated by
+/// an unknown factor with nothing marking it. The stub advertises 777/123/900,
+/// which no local estimate can produce (the estimate cannot see completions at
+/// all), so the assertions below distinguish a measurement from the fallback by
+/// the values themselves rather than by trusting the label.
+#[test]
+fn token_accounting_records_the_servers_counts_per_call_and_a_run_total() {
+    let _serial = serial_run();
+
+    let workspace = TempDir::new().unwrap();
+    let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let status = run_patch_mode(workspace.path(), &patch_path, &server);
+    assert!(status.success(), "the reference run must reach a verdict");
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let usages: Vec<&SessionRecord> = records
+        .iter()
+        .filter(|r| r.phase == "call.usage")
+        .collect();
+    assert!(
+        !usages.is_empty(),
+        "a run that called the model must write one `call.usage` row per call"
+    );
+
+    for usage in &usages {
+        assert_eq!(
+            summary_value(&usage.summary, "prompt_tokens"),
+            "777",
+            "the prompt count must be the server's, not the character estimate: {}",
+            usage.summary
+        );
+        assert_eq!(
+            summary_value(&usage.summary, "completion_tokens"),
+            "123",
+            "a completion count exists only because the request asked for usage: {}",
+            usage.summary
+        );
+        assert_eq!(
+            summary_value(&usage.summary, "total_tokens"),
+            "900",
+            "total must come from the same usage block: {}",
+            usage.summary
+        );
+        assert_eq!(
+            summary_value(&usage.summary, "source"),
+            "server-usage",
+            "the row must say the numbers were measured, not estimated: {}",
+            usage.summary
+        );
+        let site = summary_value(&usage.summary, "site");
+        assert!(
+            vanta::llm::SAMPLING_SCHEDULE
+                .iter()
+                .any(|(s, _, _)| *s == site),
+            "`{site}` is not a call site in SAMPLING_SCHEDULE"
+        );
+    }
+
+    // `seq` is the only ordering key the rows carry — timestamps are wall-clock
+    // and two calls can share a second — so it must be dense and increasing, or
+    // the order of calls within a run is unrecoverable.
+    let seqs: Vec<u64> = usages
+        .iter()
+        .map(|u| {
+            summary_value(&u.summary, "seq")
+                .parse::<u64>()
+                .expect("seq must be a number")
+        })
+        .collect();
+    assert_eq!(
+        seqs,
+        (0..seqs.len() as u64).collect::<Vec<_>>(),
+        "seq must start at 0 and increment by one call"
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(
+        summary_value(&summary, "llm_calls"),
+        usages.len().to_string(),
+        "the run total must count every recorded call"
+    );
+    assert_eq!(
+        summary_value(&summary, "llm_calls_measured"),
+        usages.len().to_string(),
+        "every call received a usage block, so every call counts as measured"
+    );
+    assert_eq!(
+        summary_value(&summary, "llm_prompt_tokens"),
+        (777 * usages.len()).to_string(),
+        "the run total must sum the server's prompt counts"
+    );
+    assert_eq!(
+        summary_value(&summary, "llm_completion_tokens"),
+        (123 * usages.len()).to_string(),
+        "the run total must sum the server's completion counts"
+    );
 }
 

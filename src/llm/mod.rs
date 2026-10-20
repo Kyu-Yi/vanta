@@ -23,11 +23,13 @@
 
 use crate::config::LlmConfig;
 use futures::{Stream, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 use tracing::{debug, info, trace, warn};
@@ -61,6 +63,77 @@ static FORENSICS_ROUND: AtomicU32 = AtomicU32::new(0);
 /// attempt by the driver, before any agent runs.
 pub fn set_forensics_round(round: u32) {
     FORENSICS_ROUND.store(round, Ordering::Relaxed);
+}
+
+// ============================================================================
+// TOKEN ACCOUNTING — what each chat call really cost
+// ============================================================================
+//
+// [VANTA-WHY] Before this, NO completion token count existed anywhere in the
+// codebase and the only prompt count was `conservative_token_estimate`, which is
+// computed from CHARACTERS and deliberately over-counts (see
+// `TOKEN_ESTIMATE_BYTES_PER_TOKEN`: it ran ~1.5x high on real runs). A cost
+// figure taken from the estimate is therefore not a measurement, and the paper's
+// cost numbers would be inflated by that factor with no way to detect it. The
+// estimate stays — the pre-flight guard needs a number BEFORE the request is
+// sent — but it is now labelled as an estimate wherever it is recorded, and the
+// server's own counts are what the cost tables are built from.
+//
+// [VANTA-WHY] A process-global accumulator rather than a return value. The
+// counts are known at the bottom of `post_chat`, but the durable record is
+// written by the driver, and between the two sit `structured_call_with_retry`
+// and every agent without a channel for usage. Threading a sink through all of
+// them would change agent signatures that decide verdicts; a global drained by
+// the driver leaves every verdict path untouched. The cost is that the driver
+// must `reset_call_usages` when a run starts (this process may run several
+// sessions, and a test process certainly does).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallUsage {
+    /// Monotonic index of the call within the run, so rows can be ordered
+    /// without trusting wall-clock timestamps.
+    pub seq: u64,
+    /// The call site, named exactly as in `SAMPLING_SCHEDULE` for the pipeline;
+    /// the M0 spike names its own (it is not part of the schedule).
+    pub site: String,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    /// Where the numbers came from: `server-usage` (the `usage` block that
+    /// `stream_options.include_usage` asks for), `server-timings` (llama-server's
+    /// own final-frame `timings`), or `estimate` (the server published neither,
+    /// so only the local pre-flight estimate exists — prompt only, no completion
+    /// count). A cost table must be able to exclude `estimate` rows instead of
+    /// silently averaging a measurement with a guess.
+    pub source: String,
+}
+
+static CALL_USAGES: Mutex<Vec<CallUsage>> = Mutex::new(Vec::new());
+static USAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn call_usages() -> MutexGuard<'static, Vec<CallUsage>> {
+    // A panic in another thread must not make token accounting fatal: the lock is
+    // pushed to and drained, never held across an await, so the data behind a
+    // poisoned lock is still structurally sound.
+    CALL_USAGES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn record_call_usage(usage: CallUsage) {
+    call_usages().push(usage);
+}
+
+/// Every chat call recorded so far, oldest first, and empty the accumulator.
+///
+/// Draining (rather than reading) is what stops a second run in the same process
+/// from re-writing the first run's calls into its own record.
+pub fn drain_call_usages() -> Vec<CallUsage> {
+    std::mem::take(&mut *call_usages())
+}
+
+/// Drop any usage recorded by an earlier run in this process. Called by the
+/// driver at the start of a session.
+pub fn reset_call_usages() {
+    call_usages().clear();
+    USAGE_SEQ.store(0, Ordering::Relaxed);
 }
 
 fn debug_dir() -> Option<PathBuf> {
@@ -414,8 +487,15 @@ pub async fn context_window_tokens(client: &reqwest::Client, cfg: &LlmConfig) ->
 struct StreamedCompletion {
     content: String,
     reasoning: String,
+    /// From the `usage` block (`stream_options.include_usage`).
     prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    /// From llama-server's own final frame, which carries `timings` whether or
+    /// not the server honours `stream_options`. `prompt_n` is the number of
+    /// prompt tokens it processed and `predicted_n` the number it generated.
+    timings_prompt_tokens: Option<u64>,
+    timings_completion_tokens: Option<u64>,
 }
 
 /// Fold ONE `\n\n`-delimited SSE event into the accumulator.
@@ -478,8 +558,22 @@ fn consume_sse_event(event: &str, out: &mut StreamedCompletion) -> Result<bool, 
             if let Some(prompt_tokens) = usage["prompt_tokens"].as_u64() {
                 out.prompt_tokens = Some(prompt_tokens);
             }
+            if let Some(completion_tokens) = usage["completion_tokens"].as_u64() {
+                out.completion_tokens = Some(completion_tokens);
+            }
             if let Some(total_tokens) = usage["total_tokens"].as_u64() {
                 out.total_tokens = Some(total_tokens);
+            }
+        }
+        // llama-server's non-OpenAI tail. Read even when `usage` arrived, as a
+        // fallback for a build that ignores `stream_options`: without it, a
+        // completion count would not exist at all on such a server.
+        if let Some(timings) = value.get("timings").filter(|t| t.is_object()) {
+            if let Some(prompt_n) = timings["prompt_n"].as_u64() {
+                out.timings_prompt_tokens = Some(prompt_n);
+            }
+            if let Some(predicted_n) = timings["predicted_n"].as_u64() {
+                out.timings_completion_tokens = Some(predicted_n);
             }
         }
     }
@@ -654,14 +748,17 @@ pub fn extract_json_candidate<'a>(raw: &'a str) -> Result<&'a str, String> {
 }
 
 // ============================================================================
-// HELPER: post_chat(&client, &cfg, messages, extra_fields) -> Result<String>
+// HELPER: post_chat(&client, &cfg, messages, extra_fields, site) -> Result<String>
 //   Returns assistant content string (fusion: content + reasoning_content).
+//   `site` is the call-site name from `SAMPLING_SCHEDULE`; it labels the token
+//   accounting row this call records (see `CallUsage`).
 // ============================================================================
 pub async fn post_chat(
     client: &reqwest::Client,
     cfg: &LlmConfig,
     messages: Vec<Value>,
     extra_fields: Value,
+    site: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let url = cfg.chat_completions_url();
 
@@ -681,6 +778,13 @@ pub async fn post_chat(
         // of this function is unaffected — what changes is that liveness is now
         // observable while the model generates (see `assemble_sse_stream`).
         "stream": true,
+        // [VANTA-WHY] A streamed response does not carry a `usage` block unless
+        // it is asked for, so without this the completion token count does not
+        // exist — and it cannot be derived from the content (bytes per token is
+        // exactly the ratio the pre-flight estimate gets wrong). This is the one
+        // request-body change token accounting needs; it asks the server to
+        // measure, it does not change what is sampled.
+        "stream_options": {"include_usage": true},
     });
 
     let mut full_body = body.as_object().cloned().unwrap_or_default();
@@ -821,6 +925,57 @@ pub async fn post_chat(
         }
     }
 
+    // ---- Token accounting (see `CallUsage`) ----
+    // The numbers the server measured, in preference order, with the local
+    // estimate kept ONLY as a labelled last resort. `total` is derived when the
+    // server gives the two parts but not their sum, and the completion count is
+    // derived from `total - prompt` when the server gives only those two — both
+    // are arithmetic on measurements, not estimates.
+    let measured_prompt = streamed.prompt_tokens.or(streamed.timings_prompt_tokens);
+    let measured_completion = streamed
+        .completion_tokens
+        .or(streamed.timings_completion_tokens)
+        .or_else(|| {
+            streamed
+                .total_tokens
+                .zip(measured_prompt)
+                .map(|(total, prompt)| total.saturating_sub(prompt))
+        });
+    let measured_total = streamed
+        .total_tokens
+        .or_else(|| match (measured_prompt, measured_completion) {
+            (Some(prompt), Some(completion)) => Some(prompt + completion),
+            _ => None,
+        });
+    let (prompt_tokens_recorded, usage_source) = match measured_prompt {
+        Some(prompt) => (
+            prompt,
+            if streamed.prompt_tokens.is_some() {
+                "server-usage"
+            } else {
+                "server-timings"
+            },
+        ),
+        // Nothing from the server: record the estimate, but SAY it is one.
+        None => (u64::from(estimate), "estimate"),
+    };
+    let usage = CallUsage {
+        seq: USAGE_SEQ.fetch_add(1, Ordering::Relaxed),
+        site: site.to_string(),
+        prompt_tokens: Some(prompt_tokens_recorded),
+        completion_tokens: measured_completion,
+        total_tokens: measured_total,
+        source: usage_source.to_string(),
+    };
+    debug!(
+        site,
+        prompt_tokens = prompt_tokens_recorded,
+        completion_tokens = ?measured_completion,
+        token_source = usage_source,
+        "llm call token usage recorded"
+    );
+    record_call_usage(usage);
+
     debug!(content_len = content.len(), reasoning_len = reasoning.len(), "model response received");
     trace!(content = %content.chars().take(500).collect::<String>(), "model content");
     trace!(reasoning = %reasoning.chars().take(500).collect::<String>(), "model reasoning");
@@ -883,6 +1038,8 @@ pub async fn structured_call_with_retry<Fm, Fp, T>(
     cfg: &LlmConfig,
     max_attempts: u32,
     forensics_tag: &str,
+    // Call-site name for the token-accounting row; forwarded to `post_chat`.
+    site: &str,
     mut build_messages: Fm,
     extras_for_attempt: Value,
     mut parse_into_typed: Fp,
@@ -900,7 +1057,7 @@ where
             warn!(attempt, max_attempts, "retrying structured call");
         }
 
-        let raw = match post_chat(client, cfg, messages, extras_for_attempt.clone()).await {
+        let raw = match post_chat(client, cfg, messages, extras_for_attempt.clone(), site).await {
             Ok(r) => r,
             Err(http_e) => {
                 let http_e = http_e.to_string();

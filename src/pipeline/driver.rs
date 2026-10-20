@@ -42,7 +42,7 @@ use crate::core::{
     AttemptTransition, EvidenceSource, FailureClass, GovernorDecision, TestEvidence, TestIntent,
     TestResult, VerificationOutcome, VerificationPolicy, static_finding_identity,
 };
-use crate::llm::{build_reqwest_client, server_top_p_default};
+use crate::llm::{build_reqwest_client, drain_call_usages, reset_call_usages, server_top_p_default};
 use crate::pipeline::bate::run_bate;
 use crate::pipeline::candidate::{CandidatePair, TestCommand};
 use crate::pipeline::diagnostician::diagnose_failure;
@@ -184,6 +184,35 @@ fn benchmark_config_name(attacker_enabled: bool, planner_enabled: bool) -> &'sta
 /// must say so by showing nothing when the server showed nothing.
 fn sampling_value(value: Option<f64>) -> String {
     value.map(|v| v.to_string()).unwrap_or_else(|| "unset".to_string())
+}
+
+/// Render a token count for a record line, `unset` when the server published
+/// nothing — the same word the sampling provenance uses for the same fact, never
+/// a zero, which would be a claim that the call used no tokens.
+fn token_value(value: Option<u64>) -> String {
+    value.map(|v| v.to_string()).unwrap_or_else(|| "unset".to_string())
+}
+
+/// Sum the server-measured token counts over one run's chat calls.
+///
+/// [VANTA-WHY] Returns the call counts beside the sums, because a total over
+/// every call and a total over the calls the server actually measured are
+/// different numbers and the record must not conflate them. A call whose
+/// `source` is `estimate` (see `llm::CallUsage`) carries a prompt figure derived
+/// from CHARACTERS — deliberately high — and no completion figure at all, so
+/// folding it into the sum would mix an over-count into a measurement.
+/// `(calls, measured, prompt_total, completion_total)`.
+fn token_totals(calls: &[crate::llm::CallUsage]) -> (usize, usize, u64, Option<u64>) {
+    let measured: Vec<&crate::llm::CallUsage> =
+        calls.iter().filter(|c| c.source != "estimate").collect();
+    let prompt: u64 = measured.iter().filter_map(|c| c.prompt_tokens).sum();
+    let completions: Vec<u64> = measured.iter().filter_map(|c| c.completion_tokens).collect();
+    let completion = if completions.is_empty() {
+        None
+    } else {
+        Some(completions.iter().sum())
+    };
+    (calls.len(), measured.len(), prompt, completion)
 }
 
 /// Render the pinned per-call-site sampling schedule as `run.summary` keys.
@@ -343,6 +372,12 @@ pub async fn run(
     // to a study whose central comparison is across model tiers.
     let session_id = fresh_session_id();
     let mut session_log = SessionLog::open(Path::new("vanta_sessions"), session_id.clone())?;
+    // [VANTA-WHY] Token accounting is a process-global accumulator (see
+    // `llm::CallUsage`), so a second run in the same process — the batch runner,
+    // or a test process — would otherwise attribute the previous run's calls to
+    // this one. Cleared before the first agent call, not at the end, so a run
+    // that dies still leaves only its own calls behind.
+    reset_call_usages();
     let debug_dir = session_log.ensure_debug_dir(Path::new("vanta_sessions"))?;
     // SAFETY: single-threaded CLI; no other thread reads env concurrently.
     unsafe {
@@ -1937,6 +1972,39 @@ pub async fn run(
     let attempts_run = attempt_patch_ids.len();
     let fixed_at_attempt_1 = decision == GovernorDecision::AllTestsPassed && attempts_run == 1;
 
+    // ---- Per-call token accounting (plans/bugsinpy.md §4.3) ----
+    // [VANTA-WHY] The counts are measured by the server (see `llm::CallUsage`);
+    // this is where they become a durable record. One row per chat call, so a
+    // cost figure can be cut by call site, plus run totals in `run.summary` for
+    // the batch tables. The `source` travels on every row rather than being
+    // assumed, because a cost table has to be able to drop `estimate` rows
+    // instead of averaging a measurement with a guess.
+    let call_usages = drain_call_usages();
+    for usage in &call_usages {
+        session_log.append(SessionRecord {
+            session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
+            patch_attempt_id: attempt_patch_ids.last().cloned(),
+            testing_iteration_id: None,
+            test_id: None,
+            phase: "call.usage".to_string(),
+            summary: format!(
+                "seq={} site={} prompt_tokens={} completion_tokens={} total_tokens={} source={}",
+                usage.seq,
+                usage.site,
+                token_value(usage.prompt_tokens),
+                token_value(usage.completion_tokens),
+                token_value(usage.total_tokens),
+                usage.source,
+            ),
+            timestamp: now_iso(),
+            benchmark_instance: None,
+            benchmark_label: None,
+        })?;
+    }
+    let (llm_calls, llm_calls_measured, llm_prompt_tokens, llm_completion_tokens) =
+        token_totals(&call_usages);
+
     // ---- Provenance (plans/bugsinpy.md §4.4) ----
     // [VANTA-WHY] A session directory copied out of a batch has to be
     // self-describing: an env var is not provenance, because the shell that set
@@ -1991,6 +2059,7 @@ pub async fn run(
         summary: format!(
             "attempts_run={} fixed_at_attempt_1={} final_decision={:?} \
              config={} mode={} seed={} model={} top_p={} {} \
+             llm_calls={} llm_calls_measured={} llm_prompt_tokens={} llm_completion_tokens={} \
              commit={} dirty={}",
             attempts_run,
             fixed_at_attempt_1,
@@ -2001,6 +2070,10 @@ pub async fn run(
             cfg.model_id,
             top_p_value,
             sampling_schedule_keys(),
+            llm_calls,
+            llm_calls_measured,
+            llm_prompt_tokens,
+            token_value(llm_completion_tokens),
             vanta_commit,
             vanta_dirty,
         ),

@@ -293,7 +293,7 @@ pub async fn attacker_generate_tests(
     };
 
     let typed: AttackerResponse = structured_call_with_retry(
-        &client, cfg, cfg.retry_attempts, "", build_messages, extras, parse_closure
+        &client, cfg, cfg.retry_attempts, "", "attacker_generate", build_messages, extras, parse_closure
     ).await?;
 
     info!(test_count = typed.tests.len(), "attacker done");
@@ -395,7 +395,7 @@ If you cannot make the test match its intent, change the intent to match the tes
     };
 
     let revised: GeneratedTest = structured_call_with_retry(
-        &client, cfg, cfg.retry_attempts, &prior_test.test_name, build_messages, extras, parse_closure
+        &client, cfg, cfg.retry_attempts, &prior_test.test_name, "attacker_revise", build_messages, extras, parse_closure
     ).await?;
 
     info!(test_name = %revised.test_name, intent = ?revised.intent, "attacker revise_test done");
@@ -479,7 +479,7 @@ Do NOT import constants or symbols that only exist in the PATCHED code."#;
     };
 
     let simplified: GeneratedTest = structured_call_with_retry(
-        &client, cfg, cfg.retry_attempts, &prior_test.test_name, build_messages, extras, parse_closure
+        &client, cfg, cfg.retry_attempts, &prior_test.test_name, "attacker_simplify", build_messages, extras, parse_closure
     ).await?;
 
     info!(test_name = %simplified.test_name, "attacker simplify_test done");
@@ -683,7 +683,7 @@ pub async fn attacker_check_intent(
     };
 
     let verdict: IntentVerdict =
-        structured_call_with_retry(&client, cfg, cfg.retry_attempts, &request.test_name, build_messages, extras, parse_closure).await?;
+        structured_call_with_retry(&client, cfg, cfg.retry_attempts, &request.test_name, "intent_audit", build_messages, extras, parse_closure).await?;
 
     info!(
         test_name = %request.test_name,

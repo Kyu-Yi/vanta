@@ -42,8 +42,10 @@ from bugsinpy import bake as bake_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
 from bugsinpy import context as ctx  # noqa: E402
 from bugsinpy import issue as issue_mod  # noqa: E402
+from bugsinpy import manifest as manifest_mod  # noqa: E402
 from bugsinpy import oracle as oracle_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
+from bugsinpy import runner as runner_mod  # noqa: E402
 from bugsinpy import shuru as shuru_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
 from bugsinpy import suite as suite_mod  # noqa: E402
@@ -2147,3 +2149,1355 @@ class TestOracleGrade:
         """Session ids and patch hashes are used as path components."""
         self._grade(wired, tmp_path, label="a/b c")
         assert wired["copies"][0][1].name == "Demo_1__a_b_c"
+
+
+# ============================================================================
+# §11 step 6 — manifest, resume, the candidate set and its gate
+# ============================================================================
+# The runner decides what a row *is* and what "already done" means. Both fail
+# silently: a key that is not content-based re-runs a graded candidate after a
+# resume (and the duplicate row looks like a fresh observation), and a cursor
+# that trusts `running` skips a job whose artifacts are half-written.
+def _diff(rel: str, added: str, *, index: str = "1111111..2222222") -> str:
+    """A minimal non-test unified diff, in the shape `write_final_patch` emits."""
+    return (
+        f"diff --git a/{rel} b/{rel}\n"
+        f"index {index} 100644\n"
+        f"--- a/{rel}\n"
+        f"+++ b/{rel}\n"
+        "@@ -1,3 +1,4 @@\n"
+        " one\n"
+        " two\n"
+        " three\n"
+        f"+{added}\n"
+    )
+
+
+DIFF_LOOSE = _diff("pkg/mod.py", "four")
+DIFF_TIDY = (
+    # The same tree change, written the other way round: no `index` line, no
+    # `a/`/`b/` prefixes, trailing whitespace on one line.
+    "diff --git pkg/mod.py pkg/mod.py\n"
+    "--- pkg/mod.py \n"
+    "+++ pkg/mod.py\n"
+    "@@ -1,3 +1,4 @@\n"
+    " one\n"
+    " two\n"
+    " three\n"
+    "+four\n"
+)
+
+
+def _pool_row(path: Path, text: str, **over) -> dict:
+    """A manifest row whose patch exists on disk, as `pool_failed_patches` reads it."""
+    write(path, text)
+    row = {
+        "verdict": "Rejected",
+        "config": "vanta",
+        "session_id": "sess-1",
+        "oracle": {"apply_ok": True, "patch_good": False},
+        "artifacts": {"final_patch": str(path)},
+    }
+    row.update(over)
+    return row
+
+
+class TestJobKey:
+    """The key is the resume cursor, so its identity must be content, not a counter."""
+
+    def test_a_repair_key_has_an_empty_candidate_component(self):
+        key = manifest_mod.job_key(
+            batch_id="b1", bug="Demo/1", config="vanta", mode="repair", seed=0
+        )
+        assert key == "b1#Demo/1#vanta#repair#0#"
+
+    def test_a_review_key_embeds_the_candidate_patch_hash(self):
+        key = manifest_mod.job_key(
+            batch_id="b1",
+            bug="Demo/1",
+            config="baseline",
+            mode="review",
+            seed=0,
+            candidate="a" * 64,
+        )
+        assert key.endswith("#" + "a" * 64)
+
+    def test_two_candidates_of_one_bug_do_not_collide(self):
+        """A review pass is one session *per candidate* (§7.1) — the second must not shadow the first."""
+        first = manifest_mod.job_key(
+            batch_id="b1", bug="Demo/1", config="vanta", mode="review", seed=0,
+            candidate="a" * 64,
+        )
+        second = manifest_mod.job_key(
+            batch_id="b1", bug="Demo/1", config="vanta", mode="review", seed=0,
+            candidate="b" * 64,
+        )
+        assert first != second
+
+    def test_a_pooled_patch_reuses_its_key_across_a_resume(self):
+        """Session ids are fresh UUIDs; keying on one would make the same bytes look new."""
+        candidate = split_mod.sha256_text(DIFF_LOOSE)
+        assert manifest_mod.job_key(
+            batch_id="b1", bug="Demo/1", config="vanta", mode="review", seed=0,
+            candidate=candidate,
+        ) == manifest_mod.job_key(
+            batch_id="b1", bug="Demo/1", config="vanta", mode="review", seed=0,
+            candidate=candidate,
+        )
+
+
+class TestManifest:
+    """Evidence is append-only; the cursor is the only thing that is rewritten (§7.3)."""
+
+    def test_rows_round_trip_one_json_object_per_line(self, tmp_path):
+        manifest = manifest_mod.Manifest(tmp_path)
+        manifest.append({"key": "k1", "bug": "Demo/1"})
+        manifest.append({"key": "k2", "bug": "Demo/1"})
+        text = (tmp_path / manifest_mod.MANIFEST_NAME).read_text()
+        assert text.endswith("\n")
+        assert len(text.splitlines()) == 2
+        assert [row["key"] for row in manifest.records()] == ["k1", "k2"]
+
+    def test_appending_never_rewrites_an_earlier_row(self, tmp_path):
+        """A row a paper cites must not be able to change under a reader."""
+        manifest = manifest_mod.Manifest(tmp_path)
+        manifest.append({"key": "k1"})
+        first = (tmp_path / manifest_mod.MANIFEST_NAME).read_text()
+        manifest.append({"key": "k2"})
+        assert (tmp_path / manifest_mod.MANIFEST_NAME).read_text().startswith(first)
+
+    def test_a_torn_last_line_is_dropped_not_raised(self, tmp_path):
+        """A process killed mid-write must leave the batch readable."""
+        manifest = manifest_mod.Manifest(tmp_path)
+        manifest.append({"key": "k1"})
+        with open(manifest.path, "a", encoding="utf-8") as handle:
+            handle.write('{"key": "k2", "bug": "Dem')
+        assert [row["key"] for row in manifest.records()] == ["k1"]
+
+    def test_find_returns_the_latest_row_for_a_key(self, tmp_path):
+        manifest = manifest_mod.Manifest(tmp_path)
+        manifest.append({"key": "k1", "label": "first"})
+        manifest.append({"key": "k1", "label": "second"})
+        assert manifest.find("k1")["label"] == "second"
+        assert manifest.find("absent") is None
+
+    def test_only_done_is_skipped_so_running_and_failed_are_re_run(self, tmp_path):
+        """`running` means "no trustworthy row yet", and `failed` means "no evidence at all"."""
+        manifest = manifest_mod.Manifest(tmp_path)
+        manifest.mark("k1", manifest_mod.DONE)
+        manifest.mark("k2", manifest_mod.RUNNING)
+        manifest.mark("k3", manifest_mod.FAILED)
+        assert manifest.is_done("k1") is True
+        assert manifest.is_done("k2") is False
+        assert manifest.is_done("k3") is False
+        assert manifest.is_done("never-seen") is False
+
+    def test_mark_leaves_no_temp_file_behind(self, tmp_path):
+        """`mark` writes a temp file then `os.replace`s it — atomicity is the whole point."""
+        manifest = manifest_mod.Manifest(tmp_path)
+        manifest.mark("k1", manifest_mod.DONE)
+        assert [p.name for p in tmp_path.iterdir()] == [manifest_mod.STATE_NAME]
+
+    def test_a_corrupt_cursor_reads_as_empty_rather_than_crashing(self, tmp_path):
+        write(tmp_path / manifest_mod.STATE_NAME, "{not json")
+        assert manifest_mod.Manifest(tmp_path).state() == {}
+
+    def test_a_missing_cursor_reads_as_empty(self, tmp_path):
+        assert manifest_mod.Manifest(tmp_path).state() == {}
+
+    def test_pending_keeps_everything_that_is_not_done(self, tmp_path):
+        class FakeJob:
+            def __init__(self, key):
+                self.key = key
+
+        manifest = manifest_mod.Manifest(tmp_path)
+        manifest.mark("k1", manifest_mod.DONE)
+        assert [job.key for job in manifest.pending([FakeJob("k1"), FakeJob("k2")])] == ["k2"]
+
+    def test_a_cursor_that_is_not_a_dict_reads_as_empty(self, tmp_path):
+        write(tmp_path / manifest_mod.STATE_NAME, '["k1"]')
+        assert manifest_mod.Manifest(tmp_path).state() == {}
+
+
+class TestVantaTestCmd:
+    """Vanta splits `--test-cmd` on whitespace with no quoting (`harness::build_test_cmd`)."""
+
+    def test_it_drops_the_split_report_flag_but_keeps_the_target(self):
+        assert runner_mod.vanta_test_cmd(
+            ["python", "-m", "pytest", "tests", "--json-report-file={report}"]
+        ) == "python -m pytest tests"
+
+    def test_it_drops_every_json_report_spelling(self):
+        assert runner_mod.vanta_test_cmd(
+            ["python", "-m", "pytest", "tests", "--json-report", "--json-report-file={report}"]
+        ) == "python -m pytest tests"
+
+    def test_whitespace_in_an_element_is_an_error_not_a_silent_split(self):
+        """A silently split element would run a different test target than the split named."""
+        with pytest.raises(runner_mod.RunnerError, match="whitespace"):
+            runner_mod.vanta_test_cmd(["python", "-m", "pytest", "tests/test a.py"])
+
+    def test_a_command_that_is_nothing_but_report_flags_is_an_error(self):
+        with pytest.raises(runner_mod.RunnerError, match="empty"):
+            runner_mod.vanta_test_cmd(["--json-report-file={report}"])
+
+
+class TestNormalizedDiff:
+    """§7.1's dedup key: two patches that produce the same tree are one candidate."""
+
+    def test_the_index_line_is_not_part_of_the_identity(self):
+        assert "index " not in runner_mod.normalized_diff(DIFF_LOOSE)
+
+    def test_a_and_b_prefixes_are_stripped(self):
+        normalized = runner_mod.normalized_diff(DIFF_LOOSE)
+        assert "diff --git pkg/mod.py pkg/mod.py" in normalized
+        assert "--- pkg/mod.py" in normalized
+        assert "+++ pkg/mod.py" in normalized
+        assert "a/pkg" not in normalized and "b/pkg" not in normalized
+
+    def test_trailing_whitespace_is_not_part_of_the_identity(self):
+        assert runner_mod.normalized_diff(DIFF_LOOSE) == runner_mod.normalized_diff(DIFF_TIDY)
+
+    def test_the_normal_form_is_idempotent(self):
+        once = runner_mod.normalized_diff(DIFF_LOOSE)
+        assert runner_mod.normalized_diff(once) == once
+
+    def test_two_real_differences_stay_two_candidates(self):
+        assert runner_mod.normalized_diff(DIFF_LOOSE) != runner_mod.normalized_diff(
+            _diff("pkg/mod.py", "five")
+        )
+
+
+class TestNoopPatch:
+    """The floor case must apply cleanly and change nothing(*§5.4*)."""
+
+    def _tree(self, tmp_path: Path) -> Path:
+        root = tmp_path / "vanta_tree"
+        write(root / "pkg" / "zeta.py", "z = 1\n")
+        write(root / "pkg" / "alpha.py", "a = 1\n")
+        write(root / "tests" / "test_alpha.py", "def test_a():\n    assert True\n")
+        write(root / "pkg" / "__pycache__" / "junk.py", "junk = 1\n")
+        return root
+
+    def test_the_source_file_is_chosen_by_sorted_path_so_the_bytes_are_stable(self, tmp_path):
+        rel, _ = runner_mod.noop_patch_text(self._tree(tmp_path))
+        assert rel == "pkg/alpha.py"
+
+    def test_the_same_tree_yields_the_same_bytes(self, tmp_path):
+        tree = self._tree(tmp_path)
+        assert runner_mod.noop_patch_text(tree) == runner_mod.noop_patch_text(tree)
+
+    def test_it_is_a_real_diff_and_not_an_empty_patch(self, tmp_path):
+        """An empty patch is a no-op failure in `apply_patch_strict`, which would measure application."""
+        _, text = runner_mod.noop_patch_text(self._tree(tmp_path))
+        assert text.startswith("diff --git a/pkg/alpha.py b/pkg/alpha.py\n")
+        assert "--- a/pkg/alpha.py" in text and "+++ b/pkg/alpha.py" in text
+        assert "\n+\n" in text, "the floor change should be one added blank line"
+
+    def test_it_survives_the_test_hunk_filter(self, tmp_path):
+        _, text = runner_mod.noop_patch_text(self._tree(tmp_path))
+        assert runner_mod.test_hunk_free(text, what="noop") == text
+
+    def test_a_tree_with_no_non_test_module_is_an_error(self, tmp_path):
+        write(tmp_path / "vanta_tree" / "tests" / "test_only.py", "def test_x(): pass\n")
+        with pytest.raises(runner_mod.RunnerError, match="no-op floor"):
+            runner_mod.noop_patch_text(tmp_path / "vanta_tree")
+
+
+class TestTestHunkFree:
+    """A candidate that is only test edits is not reviewable (§5.4)."""
+
+    def test_a_test_only_patch_is_refused(self):
+        with pytest.raises(runner_mod.RunnerError, match="changes only test files"):
+            runner_mod.test_hunk_free(_diff("tests/test_mod.py", "assert True"), what="x")
+
+    def test_the_test_section_is_dropped_and_the_source_section_kept(self):
+        combined = _diff("tests/test_mod.py", "assert True") + _diff("pkg/mod.py", "four")
+        kept = runner_mod.test_hunk_free(combined, what="x")
+        assert "pkg/mod.py" in kept
+        assert "tests/test_mod.py" not in kept
+
+
+class TestPoolFailedPatches:
+    """§7.1: the known-bad pool is deduplicated by normalized diff and capped at two."""
+
+    def _pool(self, tmp_path, rows):
+        return runner_mod.pool_failed_patches(
+            batch_dir=tmp_path, prep=prep(root=tmp_path), records=rows
+        )
+
+    def test_equivalent_patches_collapse_to_one_candidate(self, tmp_path):
+        rows = [
+            _pool_row(tmp_path / "loose.patch", DIFF_LOOSE, session_id="sess-a"),
+            _pool_row(tmp_path / "tidy.patch", DIFF_TIDY, session_id="sess-b"),
+        ]
+        pool = self._pool(tmp_path, rows)
+        assert len(pool) == 1
+        assert pool[0].normalized_sha256 == split_mod.sha256_text(
+            runner_mod.normalized_diff(DIFF_LOOSE)
+        )
+
+    def test_the_survivor_is_the_smaller_hash_so_the_choice_is_reproducible(self, tmp_path):
+        rows = [
+            _pool_row(tmp_path / "loose.patch", DIFF_LOOSE, session_id="sess-a"),
+            _pool_row(tmp_path / "tidy.patch", DIFF_TIDY, session_id="sess-b"),
+        ]
+        pool = self._pool(tmp_path, rows)
+        assert pool[0].patch_sha256 == min(
+            split_mod.sha256_text(DIFF_LOOSE), split_mod.sha256_text(DIFF_TIDY)
+        )
+
+    def test_at_most_two_candidates_survive_and_they_are_the_smallest_hashes(self, tmp_path):
+        texts = [
+            _diff("pkg/one.py", "a1"),
+            _diff("pkg/two.py", "a2"),
+            _diff("pkg/three.py", "a3"),
+        ]
+        rows = [
+            _pool_row(tmp_path / f"p{i}.patch", text, session_id=f"sess-{i}")
+            for i, text in enumerate(texts)
+        ]
+        pool = self._pool(tmp_path, rows)
+        assert runner_mod.MAX_POOLED_CANDIDATES == 2
+        assert [c.patch_sha256 for c in pool] == sorted(
+            split_mod.sha256_text(text) for text in texts
+        )[:2]
+
+    def test_both_configs_contribute_and_the_source_says_which(self, tmp_path):
+        rows = [
+            _pool_row(tmp_path / "a.patch", _diff("pkg/one.py", "a1"),
+                      config="baseline", session_id="sess-base"),
+            _pool_row(tmp_path / "b.patch", _diff("pkg/two.py", "a2"),
+                      config="vanta", session_id="sess-vanta"),
+        ]
+        sources = {c.source for c in self._pool(tmp_path, rows)}
+        assert sources == {"repair:baseline:sess-base", "repair:vanta:sess-vanta"}
+
+    def test_pooled_candidates_keep_the_label_their_bytes_were_graded_with(self, tmp_path):
+        row = _pool_row(
+            tmp_path / "a.patch",
+            _diff("pkg/one.py", "a1"),
+            oracle={"apply_ok": True, "patch_good": False, "hidden_pass": False},
+        )
+        pool = self._pool(tmp_path, [row])
+        assert pool[0].kind == runner_mod.FAILED_PATCH
+        assert pool[0].oracle.apply_ok is True
+        assert pool[0].oracle.patch_good is False
+
+    def test_an_infra_failure_is_not_a_patch_to_review(self, tmp_path):
+        row = _pool_row(tmp_path / "a.patch", _diff("pkg/one.py", "a1"),
+                        verdict="InfraFailure")
+        assert self._pool(tmp_path, [row]) == []
+
+    def test_a_patch_that_never_applied_is_not_a_patch(self, tmp_path):
+        row = _pool_row(tmp_path / "a.patch", _diff("pkg/one.py", "a1"),
+                        oracle={"apply_ok": False, "patch_good": False})
+        assert self._pool(tmp_path, [row]) == []
+
+    def test_a_good_patch_is_not_known_bad(self, tmp_path):
+        row = _pool_row(tmp_path / "a.patch", _diff("pkg/one.py", "a1"),
+                        oracle={"apply_ok": True, "patch_good": True})
+        assert self._pool(tmp_path, [row]) == []
+
+    def test_a_row_without_a_patch_file_is_skipped(self, tmp_path):
+        row = _pool_row(tmp_path / "a.patch", _diff("pkg/one.py", "a1"))
+        row["artifacts"] = {"final_patch": str(tmp_path / "gone.patch")}
+        assert self._pool(tmp_path, [row]) == []
+
+    def test_a_repair_row_with_no_patch_at_all_is_skipped(self, tmp_path):
+        row = _pool_row(tmp_path / "a.patch", _diff("pkg/one.py", "a1"))
+        row["artifacts"] = {"final_patch": None}
+        assert self._pool(tmp_path, [row]) == []
+
+    def test_a_test_only_patch_is_skipped_rather_than_taking_the_batch_down(self, tmp_path):
+        row = _pool_row(tmp_path / "a.patch", _diff("tests/test_mod.py", "assert True"))
+        assert self._pool(tmp_path, [row]) == []
+
+
+class TestCandidateSet:
+    """The set is built once per bug and reused by both configs — that is what pairs the rows."""
+
+    def _prep(self, tmp_path):
+        root = tmp_path / "root"
+        write(root / "vanta_tree" / "pkg" / "mod.py", "one\ntwo\nthree\n")
+        return prep(root=root, bug=bug_info(bug_patch_txt=_diff("pkg/mod.py", "fix")))
+
+    def test_it_is_the_developer_fix_then_the_noop_then_the_pooled_patches(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(  # grading needs a VM; the ordering is what this test is about
+            runner_mod, "grade_candidate", lambda **kw: kw["candidate"]
+        )
+        bug_prep = self._prep(tmp_path)
+        rows = [_pool_row(tmp_path / "a.patch", _diff("pkg/other.py", "a1"))]
+        candidates = runner_mod.candidate_set(
+            batch_dir=tmp_path, prep=bug_prep, checkpoint="chk", disk_mb=8192, records=rows
+        )
+        assert [c.kind for c in candidates] == [
+            runner_mod.DEV_FIX, runner_mod.NOOP, runner_mod.FAILED_PATCH
+        ]
+
+    def test_the_developer_fix_is_source_dev_and_carries_its_own_diff(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kw: kw["candidate"])
+        candidates = runner_mod.candidate_set(
+            batch_dir=tmp_path, prep=self._prep(tmp_path), checkpoint="chk", disk_mb=8192,
+            records=[],
+        )
+        dev = candidates[0]
+        assert dev.source == "dev"
+        assert dev.patch_path.read_text() == _diff("pkg/mod.py", "fix")
+
+    def test_a_bug_with_no_failed_patch_has_the_two_known_candidates_only(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kw: kw["candidate"])
+        candidates = runner_mod.candidate_set(
+            batch_dir=tmp_path, prep=self._prep(tmp_path), checkpoint="chk", disk_mb=8192,
+            records=[],
+        )
+        assert [c.kind for c in candidates] == [runner_mod.DEV_FIX, runner_mod.NOOP]
+
+    def test_the_noop_names_the_file_it_touched(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kw: kw["candidate"])
+        candidates = runner_mod.candidate_set(
+            batch_dir=tmp_path, prep=self._prep(tmp_path), checkpoint="chk", disk_mb=8192,
+            records=[],
+        )
+        assert candidates[1].source == "noop:pkg/mod.py"
+
+
+class TestLabelFor:
+    """§5.3's label table, as a pure function of (verdict, oracle)."""
+
+    @pytest.mark.parametrize(
+        "verdict,apply_ok,patch_good,expected",
+        [
+            ("AllTestsPassed", True, True, "true_approval"),
+            ("AllTestsPassed", True, False, "false_approval"),
+            ("Rejected", True, True, "false_reject"),
+            ("Rejected", True, False, "true_reject"),
+            ("MaxAttemptsReached", True, True, "unresolved_but_fixed"),
+            ("MaxAttemptsReached", True, False, "unresolved"),
+            ("InfraFailure", False, False, "infra_failure"),
+            ("InfraFailure", True, True, "infra_failure"),
+            # The censor wins over the verdict: a patch that never applied told us
+            # nothing, so it cannot become a `true_reject` for Vanta (§5.2 step 2).
+            ("Rejected", False, True, "unobservable"),
+            ("PatchApplicationFailed", False, False, "unobservable"),
+            ("HarnessFailure", False, False, "unobservable"),
+            ("SomethingNobodyNamed", True, True, "unobservable"),
+        ],
+    )
+    def test_the_table(self, verdict, apply_ok, patch_good, expected):
+        oracle = oracle_mod.OracleResult(apply_ok=apply_ok, patch_good=patch_good)
+        assert runner_mod.label_for(verdict, oracle) == expected
+
+    def test_a_censored_oracle_states_its_reason(self):
+        bug_prep = prep(fail_to_pass=["tests/test_a.py::test_b", "tests/test_a.py::test_a"])
+        result = runner_mod.censored_oracle(bug_prep, "no final.patch for verdict Rejected")
+        assert result.apply_ok is False
+        assert result.patch_good is False
+        assert result.label_input == "unobservable"
+        assert result.apply_detail == "no final.patch for verdict Rejected"
+        assert result.hidden_nodeids == sorted(bug_prep.fail_to_pass)
+
+
+class TestParseSummary:
+    """Key/value pairs, in the order the pipeline wrote them."""
+
+    def test_pairs_are_read_in_order(self, tmp_path):
+        path = write(
+            tmp_path / "sess_session.jsonl",
+            json.dumps({"phase": "session.start", "summary": "model=x"}) + "\n"
+            + json.dumps({"phase": "run.summary", "summary": "attempts_run=1 commit=abc"}) + "\n",
+        )
+        raw, parsed = runner_mod.read_run_summary(path)
+        assert raw == "attempts_run=1 commit=abc"
+        assert list(parsed) == ["attempts_run", "commit"]
+
+    def test_the_last_run_summary_wins(self, tmp_path):
+        path = write(
+            tmp_path / "sess_session.jsonl",
+            json.dumps({"phase": "run.summary", "summary": "attempts_run=1"}) + "\n"
+            + json.dumps({"phase": "run.summary", "summary": "attempts_run=3"}) + "\n",
+        )
+        assert runner_mod.read_run_summary(path)[1]["attempts_run"] == "3"
+
+    def test_torn_and_foreign_lines_are_ignored(self, tmp_path):
+        path = write(
+            tmp_path / "sess_session.jsonl",
+            '{"phase": "run.summary", "summary": "attempts_run=2"}\n{"phase": "run.sum\n',
+        )
+        assert runner_mod.read_run_summary(path)[1] == {"attempts_run": "2"}
+
+    def test_a_missing_session_reads_as_empty(self, tmp_path):
+        assert runner_mod.read_run_summary(tmp_path / "absent_session.jsonl") == ("", {})
+
+
+class TestSamplingBlock:
+    """§7.3's provenance block: the pipeline's per-call schedule plus the server's `top_p`."""
+
+    SUMMARY = (
+        "attempts_run=2 fixed_at_attempt_1=false final_decision=Rejected config=vanta "
+        "mode=repair seed=0 model=qwen3.5-27b top_p=unset "
+        "temperature_creator=0.1 max_tokens_creator=32768 "
+        "temperature_attacker_generate=0.2 max_tokens_attacker_generate=32768 "
+        "temperature_intent_audit=0.0 max_tokens_intent_audit=2048 "
+        "commit=" + "d" * 40 + " dirty=false"
+    )
+
+    def test_the_policy_named_is_the_split_s_own_constant(self):
+        block = runner_mod.sampling_block(runner_mod.parse_summary(self.SUMMARY))
+        assert block["source"] == split_mod.SAMPLING_POLICY
+
+    def test_the_sites_come_back_in_the_order_the_pipeline_emitted_them(self):
+        block = runner_mod.sampling_block(runner_mod.parse_summary(self.SUMMARY))
+        assert [entry["site"] for entry in block["pinned"]] == [
+            "creator", "attacker_generate", "intent_audit"
+        ]
+
+    def test_numbers_keep_their_type(self):
+        block = runner_mod.sampling_block(runner_mod.parse_summary(self.SUMMARY))
+        by_site = {entry["site"]: entry for entry in block["pinned"]}
+        assert by_site["creator"] == {"site": "creator", "temperature": 0.1, "max_tokens": 32768}
+        assert by_site["intent_audit"]["temperature"] == 0.0
+        assert by_site["intent_audit"]["max_tokens"] == 2048
+
+    def test_an_unset_top_p_is_recorded_as_unset_not_as_a_plausible_default(self):
+        block = runner_mod.sampling_block(runner_mod.parse_summary(self.SUMMARY))
+        assert block["server_top_p"] is None
+        assert "unset" in block["server_top_p_note"]
+
+    def test_a_published_top_p_is_recorded_with_its_source(self):
+        summary = runner_mod.parse_summary(self.SUMMARY.replace("top_p=unset", "top_p=0.95"))
+        block = runner_mod.sampling_block(summary)
+        assert block["server_top_p"] == 0.95
+        assert "/props" in block["server_top_p_note"]
+
+    def test_an_empty_summary_claims_nothing(self):
+        block = runner_mod.sampling_block({})
+        assert block["pinned"] == []
+        assert block["server_top_p"] is None
+
+    def test_the_pinned_schedule_matches_the_pipeline_constant(self):
+        """`SAMPLING_SCHEDULE` is the only definition of the per-call schedule (§4.3)."""
+        text = (REPO_ROOT / "src" / "llm" / "mod.rs").read_text(encoding="utf-8")
+        block = text.split("pub const SAMPLING_SCHEDULE", 1)[1].split("];", 1)[0]
+        entries = re.findall(r'\("([a-z_]+)",\s*([0-9.]+),\s*(\d+)\)', block)
+        assert entries, "could not read SAMPLING_SCHEDULE out of src/llm/mod.rs"
+        summary = runner_mod.parse_summary(
+            " ".join(
+                f"temperature_{site}={temperature} max_tokens_{site}={max_tokens}"
+                for site, temperature, max_tokens in entries
+            )
+        )
+        assert runner_mod.sampling_block(summary)["pinned"] == [
+            {"site": site, "temperature": float(temperature), "max_tokens": int(max_tokens)}
+            for site, temperature, max_tokens in entries
+        ]
+
+
+def _gate_row(
+    *,
+    bug: str = "Demo/1",
+    config: str = "vanta",
+    mode: str = "repair",
+    seed: int = 0,
+    verdict: str = "Rejected",
+    label: str = "true_reject",
+    kind: str | None = None,
+    normalized: str | None = None,
+    candidate_good: bool = False,
+) -> dict:
+    """A manifest row in the shape `wave_gate_failures` inspects."""
+    row = {
+        "bug": bug,
+        "config": config,
+        "mode": mode,
+        "seed": seed,
+        "verdict": verdict,
+        "label": label,
+        "session_id": f"{config}-{mode}-{kind or 'repair'}",
+        "oracle": {"apply_ok": True, "patch_good": candidate_good, "apply_detail": "", "error": ""},
+        "candidate": None,
+    }
+    if kind is not None:
+        row["candidate"] = {
+            "kind": kind,
+            "source": "dev" if kind == runner_mod.DEV_FIX else "noop",
+            "normalized_sha256": normalized or (kind[0] * 64),
+            "oracle": {"apply_ok": True, "patch_good": candidate_good},
+        }
+    return row
+
+
+def _healthy_wave() -> list[dict]:
+    """Both configs, one repair row each, and the same two candidates reviewed by both."""
+    rows: list[dict] = []
+    for config in ("baseline", "vanta"):
+        rows.append(_gate_row(config=config, mode="repair"))
+        rows.append(
+            _gate_row(config=config, mode="review", kind=runner_mod.DEV_FIX,
+                      verdict="Rejected", label="false_reject", normalized="d" * 64,
+                      candidate_good=True)
+        )
+        rows.append(
+            _gate_row(config=config, mode="review", kind=runner_mod.NOOP,
+                      verdict="Rejected", label="true_reject", normalized="n" * 64)
+        )
+    return rows
+
+
+class TestWaveGate:
+    """§8.2's go/no-go gate: only the failures that invalidate every later number."""
+
+    def test_a_healthy_wave_reports_nothing(self):
+        assert runner_mod.wave_gate_failures(_healthy_wave()) == []
+
+    def test_an_empty_wave_is_a_failure(self):
+        assert runner_mod.wave_gate_failures([]) == ["the wave produced no records at all"]
+
+    def test_an_infra_failure_stops_the_wave(self):
+        rows = _healthy_wave()
+        rows[0]["verdict"] = "InfraFailure"
+        problems = runner_mod.wave_gate_failures(rows)
+        assert any("InfraFailure" in problem for problem in problems)
+
+    def test_a_censored_row_stops_the_wave_and_names_the_reason(self):
+        rows = _healthy_wave()
+        rows[0]["verdict"] = "PatchApplicationFailed"
+        rows[0]["label"] = "unobservable"
+        rows[0]["oracle"]["apply_ok"] = False
+        rows[0]["oracle"]["apply_detail"] = "does not apply"
+        problems = runner_mod.wave_gate_failures(rows)
+        assert any("unobservable" in problem and "does not apply" in problem for problem in problems)
+
+    def test_a_developer_fix_that_grades_bad_proves_the_oracle_is_wrong(self):
+        rows = _healthy_wave()
+        for row in rows:
+            if row["candidate"] and row["candidate"]["kind"] == runner_mod.DEV_FIX:
+                row["candidate"]["oracle"]["patch_good"] = False
+        problems = runner_mod.wave_gate_failures(rows)
+        assert any("developer fix graded patch_good=false" in problem for problem in problems)
+
+    def test_a_noop_that_grades_good_proves_the_oracle_is_wrong(self):
+        rows = _healthy_wave()
+        for row in rows:
+            if row["candidate"] and row["candidate"]["kind"] == runner_mod.NOOP:
+                row["candidate"]["oracle"]["patch_good"] = True
+        problems = runner_mod.wave_gate_failures(rows)
+        assert any("no-op floor graded patch_good=true" in problem for problem in problems)
+
+    def test_a_review_row_without_its_counterpart_is_an_incomplete_pair(self):
+        """The comparison is the point: a lone row silently halves it instead of failing."""
+        rows = [
+            row
+            for row in _healthy_wave()
+            if not (
+                row["config"] == "baseline"
+                and row["candidate"]
+                and row["candidate"]["kind"] == runner_mod.DEV_FIX
+            )
+        ]
+        problems = runner_mod.wave_gate_failures(rows)
+        assert any("the pair is incomplete" in problem for problem in problems)
+
+    def test_repair_rows_alone_do_not_trip_the_pairing_check(self):
+        """There is no candidate to pair before the review passes run."""
+        rows = [_gate_row(config=config, mode="repair") for config in ("baseline", "vanta")]
+        assert runner_mod.wave_gate_failures(rows) == []
+
+
+class TestDigestAndLabels:
+    """The report is a view of the rows, built from the rows and nothing else."""
+
+    ROWS = [
+        {
+            "bug": "Demo/1", "config": "vanta", "mode": "repair", "seed": 0,
+            "model": "qwen3.5-27b", "vanta_commit": "d" * 40, "vanta_dirty": False,
+            "label": "true_reject", "session_id": "sess-1", "candidate": None,
+        },
+        {
+            "bug": "Demo/1", "config": "vanta", "mode": "review", "seed": 0,
+            "model": "qwen3.5-27b", "vanta_commit": "d" * 40, "vanta_dirty": False,
+            "label": "false_reject", "session_id": "sess-2",
+            "candidate": {
+                "kind": "dev_fix", "source": "dev",
+                "oracle": {"apply_ok": True, "patch_good": True},
+            },
+        },
+        {
+            "bug": "Demo/1", "config": "baseline", "mode": "review", "seed": 0,
+            "model": "qwen3.5-27b", "vanta_commit": "d" * 40, "vanta_dirty": False,
+            "label": "true_reject", "session_id": "sess-3",
+            "candidate": {
+                "kind": "noop", "source": "noop:pkg/mod.py",
+                "oracle": {"apply_ok": True, "patch_good": False},
+            },
+        },
+    ]
+
+    def test_only_review_rows_are_labelled(self, tmp_path):
+        """A repair row's patch has no declared truth — that is what its oracle column is for."""
+        path = runner_mod.write_labels(self.ROWS, tmp_path / "run_labels.json")
+        labels = json.loads(path.read_text())
+        assert set(labels) == {"sess-2", "sess-3"}
+        assert labels["sess-2"] == {
+            "known_bad": False, "bug": "Demo/1", "config": "vanta",
+            "mode": "review", "kind": "dev_fix", "source": "dev",
+        }
+        assert labels["sess-3"]["known_bad"] is True
+
+    def test_a_row_without_a_session_is_not_labelled(self, tmp_path):
+        rows = [dict(self.ROWS[1], session_id=None)]
+        labels = json.loads(runner_mod.write_labels(rows, tmp_path / "l.json").read_text())
+        assert labels == {}
+
+    def test_the_digest_groups_by_the_provenance_axes(self):
+        payload = runner_mod.digest(self.ROWS)
+        assert payload["runs"] == 3
+        # config, mode, seed, model and commit are the axes: a repair row and a
+        # review row of the same config are two groups, not one.
+        assert len(payload["groups"]) == 3
+        vanta_review = [
+            g for g in payload["groups"] if g["config"] == "vanta" and g["mode"] == "review"
+        ]
+        assert len(vanta_review) == 1
+        assert vanta_review[0]["runs"] == 1
+        assert vanta_review[0]["labels"] == {"false_reject": 1}
+        assert vanta_review[0]["model"] == "qwen3.5-27b"
+        assert vanta_review[0]["vanta_dirty"] is False
+
+    def test_the_model_is_one_of_the_grouping_axes(self):
+        other = dict(self.ROWS[0], model="gemma-3-12b")
+        assert len(runner_mod.digest(self.ROWS + [other])["groups"]) == 4
+
+    def test_two_commits_do_not_share_a_group(self):
+        other = dict(self.ROWS[0], vanta_commit="e" * 40)
+        assert len(runner_mod.digest(self.ROWS + [other])["groups"]) == 4
+
+    def test_the_rendered_digest_has_a_header_and_one_line_per_group(self):
+        rendered = runner_mod.render_digest(runner_mod.digest(self.ROWS))
+        lines = rendered.splitlines()
+        assert "config" in lines[0] and "labels" in lines[0]
+        assert len(lines) == 2 + len(runner_mod.digest(self.ROWS)["groups"])
+
+    def test_write_batch_report_writes_all_three_artifacts(self, tmp_path):
+        labels_path, payload = runner_mod.write_batch_report(tmp_path, self.ROWS)
+        assert labels_path == tmp_path / "run_labels.json"
+        assert payload["runs"] == 3
+        assert json.loads((tmp_path / "run_digest.json").read_text()) == payload
+        assert (tmp_path / "run_digest.md").read_text().startswith("config")
+
+
+class TestPhaseOrder:
+    """D13: repairs first, then both reviews. The ordering is a correctness property."""
+
+    def test_the_declared_order_is_repairs_then_reviews(self):
+        assert runner_mod.PHASES == (
+            ("repair", "baseline"),
+            ("repair", "vanta"),
+            ("review", "baseline"),
+            ("review", "vanta"),
+        )
+
+    def test_the_split_s_own_configs_match_it(self):
+        runner_mod._require_phase_order(["baseline", "vanta"])
+
+    def test_naming_the_planner_placeholder_is_refused(self):
+        """`vanta_planner` is a §4.4 placeholder: it would only add InfraFailure rows."""
+        with pytest.raises(runner_mod.RunnerError) as caught:
+            runner_mod._require_phase_order(["baseline", "vanta", "vanta_planner"])
+        message = str(caught.value)
+        assert "split configs must be exactly ['baseline', 'vanta'] for paired review" in message
+        assert "got ['baseline', 'vanta', 'vanta_planner']" in message
+        assert "vanta_planner is a placeholder that returns InfraFailure" in message
+        assert "must not be in a run split" in message
+
+    def test_the_message_is_about_the_config_list_not_about_the_ordering(self):
+        """A one-config split cannot produce paired rows, so the sentence must say so."""
+        with pytest.raises(runner_mod.RunnerError, match="must be exactly"):
+            runner_mod._require_phase_order(["vanta"])
+
+    def test_a_reordered_schedule_is_refused_rather_than_run(self, monkeypatch):
+        monkeypatch.setattr(
+            runner_mod,
+            "PHASES",
+            (
+                ("review", "baseline"),
+                ("repair", "baseline"),
+                ("review", "vanta"),
+                ("repair", "vanta"),
+            ),
+        )
+        with pytest.raises(runner_mod.RunnerError, match="correctness property"):
+            runner_mod._require_phase_order(["baseline", "vanta"])
+
+    def test_the_paired_configs_are_the_two_the_design_names(self):
+        assert runner_mod.REVIEW_CONFIGS == ("baseline", "vanta")
+
+
+class TestVantaEnv:
+    """§7.4's controlled environment, derived from the same switch pair the record names."""
+
+    def _env(self, **over):
+        args = dict(config="vanta", seed=0, checkpoint="chk", disk_mb=8192, base={})
+        args.update(over)
+        return runner_mod.vanta_env(**args)
+
+    def test_config_switches(self):
+        assert runner_mod.config_switches("baseline") == (False, False)
+        assert runner_mod.config_switches("vanta") == (True, False)
+        assert runner_mod.config_switches("vanta_planner") == (True, True)
+        with pytest.raises(runner_mod.RunnerError, match="unknown config"):
+            runner_mod.config_switches("turbo")
+
+    def test_the_baseline_turns_the_attacker_off(self):
+        assert self._env(config="baseline")["VANTA_ATTACKER"] == "off"
+        assert self._env(config="vanta")["VANTA_ATTACKER"] == "on"
+
+    def test_the_planner_placeholder_stays_off(self):
+        assert self._env(config="vanta_planner")["VANTA_PLANNER"] == "on"
+        assert self._env(config="vanta")["VANTA_PLANNER"] == "off"
+
+    def test_seed_zero_is_still_sent_as_a_seed(self):
+        """Unset means "no seed key in the body"; 0 is a request to pin 0 (§4.4)."""
+        assert self._env(seed=0)["VANTA_LLM_SEED"] == "0"
+        assert self._env(seed=7)["VANTA_LLM_SEED"] == "7"
+
+    def test_the_dependency_self_heal_is_disabled(self):
+        """Left on, it would build a derived checkpoint the per-run VM has no network for."""
+        env = self._env()
+        assert env["VANTA_SHURU_AUTO_DEPS"] == "0"
+        assert env["VANTA_SANDBOX_BACKEND"] == "shuru"
+        assert env["VANTA_SHURU_CHECKPOINT"] == "chk"
+        assert env["VANTA_SHURU_DISK_MB"] == "8192"
+
+    def test_it_does_not_invent_a_model_or_a_base_url(self):
+        env = self._env(base={"VANTA_LLM_BASE_URL": "http://127.0.0.1:8080"})
+        assert env["VANTA_LLM_BASE_URL"] == "http://127.0.0.1:8080"
+        assert "VANTA_LLM_MODEL" not in env
+
+
+class TestPreflight:
+    """Shuru mounts only paths inside the process CWD, so both guards are load-bearing."""
+
+    def test_the_runner_refuses_a_foreign_working_directory(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(runner_mod.RunnerError, match="CWD"):
+            runner_mod.require_repo_cwd()
+
+    def test_the_repo_root_is_accepted(self, monkeypatch):
+        monkeypatch.chdir(REPO_ROOT)
+        assert runner_mod.require_repo_cwd() == REPO_ROOT
+
+    def test_a_batch_outside_the_repo_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(REPO_ROOT)
+        with pytest.raises(runner_mod.RunnerError, match="not inside"):
+            runner_mod.require_batch_dir(tmp_path / "batch")
+
+    def test_a_batch_under_runs_bugsinpy_is_accepted(self, monkeypatch):
+        monkeypatch.chdir(REPO_ROOT)
+        assert runner_mod.require_batch_dir(runner_mod.RUNS_DIR / "wave1") == (
+            runner_mod.RUNS_DIR / "wave1"
+        )
+
+    def test_a_missing_binary_says_how_to_build_it(self, tmp_path):
+        with pytest.raises(runner_mod.RunnerError, match="cargo build"):
+            runner_mod.require_vanta_bin(tmp_path / "vanta_m3")
+
+    def test_a_present_binary_is_returned(self, tmp_path):
+        binary = write(tmp_path / "vanta_m3", "#!/bin/sh\n")
+        assert runner_mod.require_vanta_bin(binary) == binary
+
+
+def _outcome(tmp_path: Path, **over) -> runner_mod.SessionOutcome:
+    """One finished `vanta_m3` invocation, with a plausible `run.summary`."""
+    base = dict(
+        session_id="sess-1",
+        exit_code=0,
+        timed_out=False,
+        decision="Rejected",
+        summary={
+            "attempts_run": "2",
+            "fixed_at_attempt_1": "false",
+            "final_decision": "Rejected",
+            "config": "vanta",
+            "mode": "repair",
+            "seed": "0",
+            "model": "qwen3.5-27b",
+            "top_p": "unset",
+            "temperature_creator": "0.1",
+            "max_tokens_creator": "32768",
+            "commit": "d" * 40,
+            "dirty": "false",
+        },
+        raw_summary="attempts_run=2 final_decision=Rejected",
+        session_path=tmp_path / "vanta_sessions" / "sess-1" / "sess-1_session.jsonl",
+        debug_dir=None,
+        final_patch=None,
+        log_path=tmp_path / "run_logs" / "sess-1.log",
+        run_secs=1.5,
+    )
+    base.update(over)
+    return runner_mod.SessionOutcome(**base)
+
+
+def _job(bug_prep, *, config="vanta", mode=runner_mod.REPAIR, candidate=None) -> runner_mod.Job:
+    return runner_mod.Job(
+        batch_id="b1",
+        wave=1,
+        bug=bug_prep.key,
+        prep=bug_prep,
+        entry={
+            "python_version": "3.8.1",
+            "pytest_version": "8.0.2",
+            "json_report_version": "1.5.0",
+            "checkpoint": "chk",
+        },
+        config=config,
+        mode=mode,
+        seed=0,
+        checkpoint="chk",
+        python_version_pinned="3.8.1",
+        candidate=candidate,
+    )
+
+
+class TestRunJob:
+    """The row, the censor and the resume ordering — all three fail silently if wrong."""
+
+    def _paths(self, tmp_path):
+        return runner_mod.BatchPaths.under(tmp_path)
+
+    def test_running_is_marked_before_the_work_and_done_only_after_the_row(
+        self, tmp_path, monkeypatch
+    ):
+        paths = self._paths(tmp_path)
+        manifest = manifest_mod.Manifest(tmp_path)
+        bug_prep = prep(root=tmp_path / "root")
+        job = _job(bug_prep)
+        seen: dict[str, object] = {}
+        real_append = manifest_mod.Manifest.append
+
+        def spy_append(self, record):
+            seen["state_at_append"] = self.state().get(record["key"])
+            return real_append(self, record)
+
+        def fake_invoke(**kwargs):
+            seen["state_at_invoke"] = manifest.state().get(job.key)
+            return _outcome(tmp_path)
+
+        monkeypatch.setattr(manifest_mod.Manifest, "append", spy_append)
+        monkeypatch.setattr(runner_mod, "invoke_vanta", fake_invoke)
+        monkeypatch.setattr(
+            oracle_mod,
+            "grade",
+            lambda **kwargs: oracle_mod.OracleResult(apply_ok=True, apply_detail="applied"),
+        )
+
+        record = runner_mod.run_job(
+            job=job, paths=paths, manifest=manifest, vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+
+        assert seen["state_at_invoke"] == manifest_mod.RUNNING
+        assert seen["state_at_append"] == manifest_mod.RUNNING, (
+            "`done` before the row is flushed would let a crash skip a job with no evidence"
+        )
+        assert manifest.state()[job.key] == manifest_mod.DONE
+        assert manifest.find(job.key)["key"] == job.key
+        assert record["key"] == job.key
+
+    def test_the_row_records_the_actual_and_the_pinned_interpreter(self, tmp_path, monkeypatch):
+        """§12.3: the checkpoint holds 3.8.20 while the bug declares 3.8.1."""
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert record["python_version"] == "3.8.20"
+        assert record["python_version_pinned"] == "3.8.1"
+        assert record["sampling"]["source"] == split_mod.SAMPLING_POLICY
+        assert record["artifacts"]["session_dir"] == "vanta_sessions/sess-1"
+        assert record["oracle_reused"] is False
+
+    def test_a_review_row_reuses_the_candidate_label_and_never_re_grades(
+        self, tmp_path, monkeypatch
+    ):
+        """The same bytes were graded already; a second grading repeats an experiment."""
+        bug_prep = prep(root=tmp_path / "root", bug=bug_info(bug_patch_txt=_diff("pkg/mod.py", "fix")))
+        candidate = runner_mod.write_candidate_patch(
+            tmp_path, bug_prep, runner_mod.DEV_FIX, _diff("pkg/mod.py", "fix"), source="dev"
+        )
+        candidate.oracle = oracle_mod.OracleResult(apply_ok=True, patch_good=True)
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, decision="AllTestsPassed", final_patch=tmp_path / "final.patch"
+            ),
+        )
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: pytest.fail("the oracle was re-run")
+        )
+        record = runner_mod.run_job(
+            job=_job(bug_prep, mode=runner_mod.REVIEW, candidate=candidate),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert record["oracle_reused"] is True
+        assert record["label"] == "true_approval"
+        assert record["artifacts"]["oracle_json"] is None
+        assert record["candidate"]["kind"] == runner_mod.DEV_FIX
+
+    def test_a_review_row_that_produced_no_patch_is_censored_not_graded(
+        self, tmp_path, monkeypatch
+    ):
+        """A verdict the run never reached must not be credited to Vanta (§5.4)."""
+        bug_prep = prep(root=tmp_path / "root", bug=bug_info(bug_patch_txt=_diff("pkg/mod.py", "fix")))
+        candidate = runner_mod.write_candidate_patch(
+            tmp_path, bug_prep, runner_mod.DEV_FIX, _diff("pkg/mod.py", "fix"), source="dev"
+        )
+        candidate.oracle = oracle_mod.OracleResult(apply_ok=True, patch_good=True)
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, decision="PatchApplicationFailed", final_patch=None
+            ),
+        )
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: pytest.fail("the candidate was re-graded")
+        )
+        record = runner_mod.run_job(
+            job=_job(bug_prep, mode=runner_mod.REVIEW, candidate=candidate),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert record["oracle_reused"] is False
+        assert record["label"] == "unobservable"
+        assert record["oracle"]["apply_ok"] is False
+        assert "no final.patch" in record["oracle"]["apply_detail"]
+
+    def test_a_job_that_left_no_session_writes_no_row_and_stays_failed(
+        self, tmp_path, monkeypatch
+    ):
+        """A half-written row would be a fabricated dataset entry."""
+        paths = self._paths(tmp_path)
+        manifest = manifest_mod.Manifest(tmp_path)
+        job = _job(prep(root=tmp_path / "root"))
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, session_id=None, decision="", error="no session banner"
+            ),
+        )
+        record = runner_mod.run_job(
+            job=job, paths=paths, manifest=manifest, vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert record is None
+        assert manifest.find(job.key) is None
+        assert manifest.state()[job.key] == manifest_mod.FAILED
+        assert manifest.is_done(job.key) is False
+        failure = json.loads(paths.failures.read_text().splitlines()[0])
+        assert failure["key"] == job.key
+        assert failure["error"] == "no session banner"
+
+    def test_the_verdict_comes_from_the_summary_not_the_exit_code(self, tmp_path, monkeypatch):
+        """§7.4's request-H contract: a nonzero exit can still be a recorded verdict."""
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(tmp_path, exit_code=101, decision="AllTestsPassed"),
+        )
+        monkeypatch.setattr(
+            oracle_mod,
+            "grade",
+            lambda **kwargs: oracle_mod.OracleResult(apply_ok=True, patch_good=True),
+        )
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert record["exit_code"] == 101
+        assert record["verdict"] == "AllTestsPassed"
+        assert record["label"] == "true_approval"
+
+
+class _FakeSplit:
+    """A `Split` with only the field `run_batch` reads, so no split file is needed."""
+
+    def __init__(self, configs):
+        self.configs = list(configs)
+
+
+class TestRunBatchLoop:
+    """§7.1's phase loop: the schedule, not the work.
+
+    `run_job` is replaced, so no VM boots and nothing is written outside `tmp_path`.
+    What is under test is the order the phases run in, that both configs review one
+    candidate set, and that `state.json` — not the file system — decides what a
+    resumed run repeats.
+    """
+
+    DEV_ONE = _diff("pkg/mod.py", "developer-fix-one")
+    DEV_TWO = _diff("pkg/mod.py", "developer-fix-two")
+    FAILED_ONE = _diff("pkg/one.py", "baseline-attempt")
+    FAILED_TWO = _diff("pkg/two.py", "vanta-attempt")
+    GOOD = _diff("pkg/three.py", "a-real-fix")
+
+    # -- fixture -----------------------------------------------------------
+    @staticmethod
+    def _tree(tmp_path: Path, name: str) -> Path:
+        root = tmp_path / name
+        write(root / "vanta_tree" / "pkg" / "mod.py", f"{name} = 1\nsecond = 2\nthird = 3\n")
+        return root
+
+    def _fixture(self, tmp_path, *, configs=("baseline", "vanta")):
+        preps = [
+            prep(
+                bug=bug_info(bug_id=1, bug_patch_txt=self.DEV_ONE),
+                root=self._tree(tmp_path, "one"),
+                wave=1,
+            ),
+            prep(
+                bug=bug_info(bug_id=2, bug_patch_txt=self.DEV_TWO),
+                root=self._tree(tmp_path, "two"),
+                wave=1,
+            ),
+        ]
+        entries = {
+            bug_prep.key: {
+                "checkpoint": f"vanta-bi-{bug_prep.slug.lower()}",
+                "python_version": "3.8.1",
+            }
+            for bug_prep in preps
+        }
+        return preps, entries, _FakeSplit(configs)
+
+    # -- the stub ----------------------------------------------------------
+    def _stub(self, tmp_path, calls, *, leave_running=None):
+        """A `run_job` that writes a gate-passing row and records the schedule."""
+
+        def stub(*, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version):
+            calls.append(job)
+            record = self._row(tmp_path, job)
+            manifest.append(record)
+            stuck = leave_running is not None and leave_running(job)
+            manifest.mark(job.key, manifest_mod.RUNNING if stuck else manifest_mod.DONE)
+            return record
+
+        return stub
+
+    def _repair_result(self, job) -> tuple[str, bool]:
+        """Bug 1's two repairs both fail — so they pool; bug 2's both succeed."""
+        if job.bug.endswith("/1"):
+            text = self.FAILED_ONE if job.config == "baseline" else self.FAILED_TWO
+            return text, False
+        return self.GOOD, True
+
+    def _row(self, tmp_path: Path, job) -> dict:
+        patch = None
+        candidate = None
+        if job.mode == runner_mod.REPAIR:
+            text, good = self._repair_result(job)
+            patch = write(
+                tmp_path / "rows" / f"{job.bug.replace('/', '_')}-{job.config}.patch", text
+            )
+        else:
+            candidate = job.candidate
+            good = candidate.kind == runner_mod.DEV_FIX
+        row = {
+            "schema": manifest_mod.SCHEMA_VERSION,
+            "key": job.key,
+            "batch": job.batch_id,
+            "bug": job.bug,
+            "wave": job.wave,
+            "config": job.config,
+            "mode": job.mode,
+            "seed": job.seed,
+            "checkpoint": job.checkpoint,
+            "session_id": f"{job.bug.replace('/', '_')}-{job.config}-{job.mode}",
+            "verdict": "Rejected",
+            "label": "false_reject" if good else "true_reject",
+            "oracle": {"apply_ok": True, "patch_good": good, "apply_detail": "", "error": ""},
+            "candidate": None,
+            "artifacts": {
+                "final_patch": str(patch) if patch else None,
+                "session_dir": None,
+                "oracle_json": None,
+            },
+        }
+        if candidate is not None:
+            row["candidate"] = {
+                "kind": candidate.kind,
+                "source": candidate.source,
+                "patch_sha256": candidate.patch_sha256,
+                "normalized_sha256": candidate.normalized_sha256,
+                "oracle": {"apply_ok": True, "patch_good": good},
+            }
+        return row
+
+    # -- driving it --------------------------------------------------------
+    def _prepare(self, monkeypatch, tmp_path, *, configs=("baseline", "vanta"), running=None):
+        preps, entries, split = self._fixture(tmp_path, configs=configs)
+        calls: list = []
+        monkeypatch.setattr(runner_mod, "python_version_of", lambda *a, **k: "3.8.20")
+        monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kwargs: kwargs["candidate"])
+        monkeypatch.setattr(runner_mod, "run_job", self._stub(tmp_path, calls, leave_running=running))
+        return preps, entries, split, calls, tmp_path / "batch"
+
+    def _run(self, preps, entries, split, batch_dir):
+        return runner_mod.run_batch(
+            batch_dir=batch_dir,
+            batch_id="b1",
+            split=split,
+            preps=preps,
+            entries=entries,
+            seeds=[0],
+            waves=[1],
+            vanta_bin=Path("/nonexistent/vanta_m3"),
+            max_attempts=4,
+            disk_mb=8192,
+        )
+
+    @staticmethod
+    def _reviews(calls):
+        return [job for job in calls if job.mode == runner_mod.REVIEW]
+
+    def test_every_repair_pass_runs_before_any_review_pass(self, tmp_path, monkeypatch):
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        code, _ = self._run(preps, entries, split, batch_dir)
+        assert code == 0, "the stub rows should pass the wave gate"
+        modes = [job.mode for job in calls]
+        assert modes[:4] == [runner_mod.REPAIR] * 4
+        assert modes.count(runner_mod.REPAIR) == 4, "2 bugs x 2 configs"
+        assert modes == [runner_mod.REPAIR] * 4 + [runner_mod.REVIEW] * 12
+
+    def test_each_review_set_is_the_dev_fix_the_noop_and_the_pooled_repairs(
+        self, tmp_path, monkeypatch
+    ):
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        self._run(preps, entries, split, batch_dir)
+        kinds: dict[tuple, list] = {}
+        for job in self._reviews(calls):
+            kinds.setdefault((job.bug, job.config), []).append(job.candidate.kind)
+        assert kinds[("Demo/1", "baseline")] == [
+            runner_mod.DEV_FIX, runner_mod.NOOP, runner_mod.FAILED_PATCH, runner_mod.FAILED_PATCH
+        ]
+        assert kinds[("Demo/2", "baseline")] == [runner_mod.DEV_FIX, runner_mod.NOOP]
+        pooled = {
+            job.candidate.patch_sha256
+            for job in self._reviews(calls)
+            if job.candidate.kind == runner_mod.FAILED_PATCH
+        }
+        assert pooled == {
+            split_mod.sha256_text(self.FAILED_ONE), split_mod.sha256_text(self.FAILED_TWO)
+        }, "the pooled patches are the repair stubs' own bytes, deduplicated"
+        assert all(
+            job.candidate.source.startswith("repair:")
+            for job in self._reviews(calls)
+            if job.candidate.kind == runner_mod.FAILED_PATCH
+        )
+
+    def test_both_configs_review_the_same_candidate_set_at_the_same_seed(
+        self, tmp_path, monkeypatch
+    ):
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        self._run(preps, entries, split, batch_dir)
+        by_bug: dict[str, dict[str, set]] = {}
+        for job in self._reviews(calls):
+            identity = f"{job.candidate.kind}:{job.candidate.patch_sha256}"
+            by_bug.setdefault(job.bug, {}).setdefault(job.config, set()).add(identity)
+        for bug in ("Demo/1", "Demo/2"):
+            assert by_bug[bug]["baseline"] == by_bug[bug]["vanta"], (
+                "an asymmetric set would silently halve the comparison"
+            )
+        reviews = self._reviews(calls)
+        baseline_keys = {job.key for job in reviews if job.config == "baseline"}
+        vanta_keys = {job.key for job in reviews if job.config == "vanta"}
+        assert baseline_keys and vanta_keys
+        assert {
+            key.replace("#baseline#", "#vanta#") for key in baseline_keys
+        } == vanta_keys, "the paired keys differ in the config component only"
+
+    def test_a_resumed_run_skips_done_rows_and_repeats_the_running_one(
+        self, tmp_path, monkeypatch
+    ):
+        def mid_flight(job) -> bool:
+            return (
+                job.mode == runner_mod.REVIEW
+                and job.bug.endswith("/1")
+                and job.config == "vanta"
+                and job.candidate.kind == runner_mod.NOOP
+            )
+
+        preps, entries, split, first, batch_dir = self._prepare(
+            monkeypatch, tmp_path, running=mid_flight
+        )
+        code, _ = self._run(preps, entries, split, batch_dir)
+        assert code == 0
+        stuck = [job for job in first if mid_flight(job)]
+        assert len(stuck) == 1
+        manifest = manifest_mod.Manifest(batch_dir)
+        assert manifest.state()[stuck[0].key] == manifest_mod.RUNNING
+        assert len(manifest.records()) == len(first)
+
+        # A second `run_batch` over the same manifest: the same work, resumed.
+        preps, entries, split, second, same_batch_dir = self._prepare(monkeypatch, tmp_path)
+        assert same_batch_dir == batch_dir
+        code, _ = self._run(preps, entries, split, batch_dir)
+        assert code == 0
+        assert [job.key for job in second] == [stuck[0].key], (
+            "only the key left `running` may be repeated"
+        )
+        manifest = manifest_mod.Manifest(batch_dir)
+        assert manifest.state()[stuck[0].key] == manifest_mod.DONE
+        assert all(manifest.is_done(key) for key in {job.key for job in first})
+        assert len(manifest.records()) == len(first) + 1, (
+            "the re-run appends a second row for the same key; the evidence stays append-only"
+        )
+
+    def test_a_split_that_names_the_planner_placeholder_is_refused_before_any_work(
+        self, tmp_path, monkeypatch
+    ):
+        preps, entries, split, calls, batch_dir = self._prepare(
+            monkeypatch, tmp_path, configs=("baseline", "vanta", "vanta_planner")
+        )
+        with pytest.raises(runner_mod.RunnerError, match="vanta_planner is a placeholder"):
+            self._run(preps, entries, split, batch_dir)
+        assert calls == [], "the guard must fire before the first job"
+        assert not (batch_dir / manifest_mod.MANIFEST_NAME).exists()
+
+
+class TestPythonVersionProbe:
+    """The interpreter probe is one boot per checkpoint, cached for every later row."""
+
+    def test_a_cached_probe_is_used_without_booting_a_vm(self, tmp_path, monkeypatch):
+        paths = runner_mod.BatchPaths.under(tmp_path)
+        write(paths.env_cache / "chk.json", json.dumps({"python_version": "3.8.20"}))
+        monkeypatch.setattr(
+            shuru_mod, "run", lambda **kwargs: pytest.fail("the checkpoint was re-probed")
+        )
+        assert runner_mod.python_version_of(paths, "chk", 8192) == "3.8.20"
+
+    def test_a_probe_reads_the_version_and_caches_it(self, tmp_path, monkeypatch):
+        paths = runner_mod.BatchPaths.under(tmp_path)
+
+        class FakeResult:
+            stdout = "Python 3.8.20"
+            stderr = ""
+            exit_code = 0
+            timed_out = False
+
+        monkeypatch.setattr(shuru_mod, "run", lambda **kwargs: FakeResult())
+        assert runner_mod.python_version_of(paths, "chk", 8192) == "3.8.20"
+        cached = json.loads((paths.env_cache / "chk.json").read_text())
+        assert cached["checkpoint"] == "chk"
+        assert cached["python_version"] == "3.8.20"

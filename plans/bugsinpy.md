@@ -619,18 +619,25 @@ Review mode is the sharper instrument, because both candidates have a known labe
   `projects/<p>/bugs/<N>/bug_patch.txt` to `oracle_tree/` → `hidden_pass = true` by construction,
   asserted at prepare. Then run `vanta_m3 --patch <fix.patch>` against `vanta_tree/`. Any `Rejected`
   verdict here is a **false reject** — Vanta refused a patch that the ground truth says is correct.
-- **known-bad**: a patch that is not `patch_good` — taken from the `baseline` / `vanta` repair runs'
-  own failed Creator patches (`hidden_pass = false`), plus, if needed, a trivial
-  "no-op / whitespace-only" patch as a floor case. Then `--patch` against `vanta_tree/`. Any
-  `AllTestsPassed` here is a **false approval**. Candidates are **deduplicated by patch hash** (two
-  byte-identical failed patches are one candidate, run once) and each records the session that
-  produced it — see §7.3.
+- **known-bad**: the **no-op / whitespace-only** floor case, plus up to **2** failed Creator patches
+  pooled from *both* configs' repair runs. A pooled patch is a reviewable known-bad candidate when the
+  oracle says it **applied cleanly and is not `patch_good`** — `apply_ok = true` and
+  (`hidden_pass = false` or `suite_regressions > 0`). `InfraFailure` runs and patches with
+  `apply_ok = false` are **skipped**: a patch that never applied is not a patch, so reviewing it would
+  measure nothing. If a bug produced no failed patches, its set is just {dev fix, no-op}. Then
+  `--patch` against `vanta_tree/`. Any `AllTestsPassed` here is a **false approval**. Candidates are
+  **deduplicated by their *normalized* diff** — index lines, `a/`/`b/` prefixes and trailing
+  whitespace stripped, so two patches that differ only in those are one candidate, run once — and each
+  records its source (`dev` / `noop` / `repair:<config>:<session>`) and its oracle label in the
+  manifest — see §7.1 and §7.3.
 
 Both candidate kinds are applied with their **test hunks dropped**, same rule as the oracle, so a
 candidate cannot smuggle a change into the test file.
 
 These feed `metrics.py`'s existing `--labels` mechanism (`{session_id: {"known_bad": bool}}`) — the
-harness generates this file. Note the existing project rule: a review-mode `Rejected` counts as a
+harness generates this file from the `candidate.oracle` label recorded in the manifest (§7.3), so no
+oracle is re-run to score a review row. Note the existing project rule: a review-mode `Rejected`
+counts as a
 true catch **only if it discriminates** (the signal must rerun as `Failed→Passed`); otherwise it is
 labelled `spurious_reject`. The harness must therefore also record the rerun-signal outcome, which
 means retaining the graded tree or its reconstruction (§6).
@@ -698,18 +705,44 @@ python3 scripts/bugsinpy_run.py run     --split plans/bugsinpy_split.json   # th
 python3 scripts/bugsinpy_run.py report  --split plans/bugsinpy_split.json   # metrics per config
 ```
 
-`run` = prepare-or-resume → for each (bug, config, seed) in a committed order → `vanta_m3` (with a
-Shuru checkpoint for **prepare's** suite runs too, C3) → oracle → manifest append → compaction.
+`run` = prepare-or-resume → for each wave → dispatch the four job kinds in the order below → oracle →
+manifest append → compaction.
 
-**Ordering (decided).** Within a wave, jobs are emitted in this order:
+**Ordering (decided).** Repair passes run **first**, review passes **last**, so the failed Creator
+patches a review needs already exist when the first review starts (§5.4). Within a wave:
 
-1. **baseline review** (`--patch`, Attacker off) — **no LLM calls at all**, so it is the fast sanity
-   pass that proves prepare, the checkpoints, the oracle and the manifest work before a single token
-   is spent. It also establishes the plumbing-level floor: the developer fix is `Approved`, and a
-   known-bad patch passes the sanitized suite (degenerate, but it is the baseline's honest ceiling).
-2. **baseline repair**, then
-3. **vanta repair**, then
-4. **vanta review** — the expensive LLM attack on both candidate sets.
+1. **baseline repair** — one job per (bug, seed).
+2. **vanta repair** — one job per (bug, seed).
+3. **baseline review** (`--patch`, `VANTA_ATTACKER=off`) — **no LLM calls at all**, so it is the fast
+   plumbing check: it proves the candidate set, the strict `--patch` apply, the oracle and the manifest
+   work before a token is spent on the vanta review. It also establishes the plumbing-level floor: the
+   developer fix is `Approved`, and a known-bad patch passes the sanitized suite (degenerate, but it is
+   the baseline's honest ceiling).
+4. **vanta review** (`--patch`) — the expensive LLM attack on the same candidate set.
+
+**Review candidate set (decided, symmetric).** Once both repair passes for a bug are done, the runner
+pools the failed Creator patches from *both* configs' repair runs. A pooled patch is a candidate when
+the oracle says it **applied cleanly and is not `patch_good`** — `apply_ok = true` and
+(`hidden_pass = false` or `suite_regressions > 0`); `InfraFailure` runs and `apply_ok = false` patches
+are **skipped**, because a patch that never applied cannot be reviewed. The set is:
+
+- the **developer fix** (known-good by construction, §5.4), and
+- the **no-op / whitespace floor** (always present), and
+- **up to 2** of the pooled failed patches, after dedup.
+
+If a bug produced no failed patches, its set is just {dev fix, no-op}; the manifest records that.
+**Baseline and vanta review exactly the same set at the same seed**, so every review row is a **paired
+comparison** — the only thing that differs between the two rows is the config.
+
+*Dedup key.* Two failed patches are the same candidate when their **normalized** diffs are equal: the
+diff text with the `index` lines, the `a/` / `b/` prefixes and trailing whitespace stripped. A patch
+that differs only in an index line or trailing space is one candidate, run once. When more than 2
+distinct failed patches survive dedup, the runner keeps the **2 with the smallest `patch_sha256`** — a
+deterministic, content-based choice, so the candidate set is reproducible from the manifest alone.
+
+Each candidate's **source** and **oracle label** are recorded in the manifest — `dev`, `noop`, or
+`repair:<config>:<session>`, plus `{apply_ok, hidden_pass, suite_regressions, patch_good}` (§7.3) — so
+`metrics.py` can score review rows without re-running the oracle.
 
 Wave 1 is a **go/no-go gate** (§8.2): if the checkpoint build, the oracle or the leak gate
 misbehaves there, `run` stops and reports instead of building wave 2.
@@ -793,7 +826,12 @@ exist. `prepare` itself never writes it — it writes `runs/bugsinpy/<batch>/pre
   "checkpoint": "vanta-bi-PySnooper-1",
   "python_version": "3.8.20", "python_version_pinned": "3.8.1",
   "pytest_version": "8.0.2", "json_report_version": "1.5.0",
-  "candidate": {"kind": "creator_patch", "patch_sha256": "…", "produced_by_session": "…"},
+  "candidate": {
+    "kind": "dev_fix", "source": "dev",
+    "patch_sha256": "…", "normalized_sha256": "…",
+    "oracle": {"apply_ok": true, "hidden_pass": true, "suite_regressions": 0,
+               "suite_regressions_count": 0, "patch_good": true}
+  },
   "verdict": "Rejected", "exit_code": 1,
   "oracle": {"apply_ok": true, "hidden_pass": true, "suite_regressions": 0,
              "suite_regressions_count": 0, "patch_good": true},
@@ -814,12 +852,18 @@ BugsInPy's `bug.info` pins. The two differ (§12.3) and both are recorded, so th
 rather than hidden by writing the actual number into a field that claims to be the pinned one.
 
 `config` / `mode` / `seed` / `model` / `sampling` / `vanta_commit` are the provenance axes §4.4 and
-§9.1 group by. `candidate` is `null` for repair runs and, for review runs, names the patch under test
-and the session that produced it.
+§9.1 group by. `candidate` is `null` for **repair** runs. For review runs it names the patch under
+test: `kind` is `dev_fix` / `noop` / `failed_patch`, `source` is `dev` / `noop` /
+`repair:<config>:<session>` (which repair run produced it), and `patch_sha256` /
+`normalized_sha256` are its identity — `normalized_sha256` is the dedup key (§7.1). The nested
+`candidate.oracle` is the **label computed when that patch was produced**: it lets `metrics.py` score
+every review row against the true label without re-running the oracle (§5.4).
 
-**Known-bad dedup (decided):** review candidates are deduplicated by `patch_sha256` — two
-byte-identical failed Creator patches are one candidate, run once — and every candidate records
-`produced_by_session`, so a known-bad result is traceable back to the repair run that generated it.
+**Known-bad dedup (decided):** pooled failed patches are deduplicated by their **normalized diff**
+(`normalized_sha256`), not by raw bytes — two patches that differ only in an index line, an `a/`/`b/`
+prefix or trailing whitespace are one candidate, run once. When more than 2 distinct patches survive,
+the 2 with the smallest `patch_sha256` are kept. Every candidate records `source`, so a known-bad
+result is traceable back to the repair run that generated it.
 
 Append-only + a separate `state.json` (`{key: "done"|"running"|"failed"}`) makes **resume** trivial:
 on start, replay `state.json`; at most one entry may be `running`, and it is re-run (Vanta runs are
@@ -895,21 +939,23 @@ type:
 
 | Run type | LLM calls | Estimate |
 |---|---|---|
-| `baseline` review (`--patch`, Attacker off) | **0** | 1–3 min |
 | `baseline` repair (no Attacker, ~1–2 attempts) | 1–2 | 4–12 min |
 | `vanta` repair (Attacker + more test rounds, ~2–4 attempts) | 3–8 | 10–30 min |
-| `vanta` review (attack one fixed candidate) | 3–6 | 10–25 min |
+| review, one candidate (`baseline` = 0 calls, `vanta` = 3–6) | 0 / 3–6 | 1–3 min / 10–25 min |
 | oracle (filtered patch + hidden run + suite ×2) | 0 | 2–5 min |
 
-Runs per bug = `2 + 2·|seeds|` (2 baseline-review + |seeds| baseline-repair + |seeds| vanta-repair +
-2·|seeds| vanta-review). At **`seeds=[0]` that is 6 runs/bug**, so:
+Runs per bug = `|seeds| · (2 + 2·|candidates|)`, where `|candidates|` — the per-bug review set (§7.1) —
+is **2 to 4** (dev fix + no-op, plus up to 2 pooled failed patches). Both configs review the same set,
+so the reviews contribute `2·|candidates|` per seed. `|candidates|` is not known until the repair runs
+finish, so the counts below are ranges: at `seeds=[0]` a bug takes **6–10 runs**, and the reviews alone
+are 4–8 of them.
 
 | Wave | Bugs | Seeds | Runs | Checkpoint bake | Estimated wall clock |
 |---|---|---|---|---|---|
-| 1 (gate) | 3 | `[0]` | 18 | 20–40 min (py3.8, standalone) | 3–5 h |
-| 2 (pilot) | 6 | `[0]` | 36 | 30–70 min (py3.7 + OpenSSL 1.1.1) | 6–10 h |
-| 3 (last slot) | 1 | `[0]` | 6 | 30–70 min (py3.6 + OpenSSL 1.1.1) | 1–2 h |
-| **total** | **10** | `[0]` | **60** | ~1.5–3 h | **~12–20 h → 2 overnight batches** |
+| 1 (gate) | 3 | `[0]` | 18–30 | 20–40 min (py3.8, standalone) | 3–6 h |
+| 2 (pilot) | 6 | `[0]` | 36–60 | 30–70 min (py3.7 + OpenSSL 1.1.1) | 6–12 h |
+| 3 (last slot) | 1 | `[0]` | 6–10 | 30–70 min (py3.6 + OpenSSL 1.1.1) | 1–2 h |
+| **total** | **10** | `[0]` | **60–100** | ~1.5–3 h | **~12–22 h → 2 overnight batches** |
 
 Runs are strictly sequential (one LLM slot), so wall clock is the **sum**, not the max. At
 `seeds=[0]` the whole pilot fits comfortably; the previous `seeds=[0,1,2]` plan (98 runs in wave 2
@@ -918,7 +964,7 @@ alone) did not fit and is dropped (§8.3). Adding `vanta_planner` later multipli
 
 **Wave 1 is the go/no-go gate (decided).** If the checkpoint build, the `import ssl` + pip assertion,
 the oracle, or the leak gate misbehaves on wave 1, `run` **stops and reports** before any wave-2 work
-is scheduled. Wave 1 is deliberately cheap — 18 runs, `seeds=[0]`, one interpreter — so a bad
+is scheduled. Wave 1 is deliberately cheap — 18–30 runs, `seeds=[0]`, one interpreter — so a bad
 assumption costs hours, not days.
 
 **Calibration step (mandatory).** Before wave 2, replace this table with measured wave-1 timings.
@@ -932,8 +978,10 @@ Explicitly, wave 1 must demonstrate all of:
 2. The per-bug layers bake and `pytest --collect-only -q` succeeds inside them.
 3. `prepare` derives a non-empty `FAIL_TO_PASS` for all three PySnooper bugs, with no flaky escapes.
 4. The leak gate produces a clean text for all three, and `issue_texts_all.md` reads as actionable.
-5. The oracle returns `patch_good = true` for the developer fix and `false` for the no-op patch.
-6. Baseline review (Attacker off) drives all 18 runs to completion with a consistent manifest.
+5. The oracle returns `patch_good = true` for the developer fix and `false` for the no-op patch, and
+   the pooled candidate set for a bug is reproducible from the manifest alone.
+6. Baseline review (Attacker off) drives all its runs to completion with a consistent manifest, and
+   the paired vanta review rows exist for the same candidate set and seed.
 
 ### 8.3 Seeds
 
@@ -1040,14 +1088,16 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
 3. **py3.8 checkpoint only**, standalone Python, with the `import ssl` + `pip install` + `pytest`
    assertions, plus the PySnooper per-bug layers.
 4. Oracle standalone (test-hunk filter, hidden run, suite diff ×2) — fully testable on known-good
-   **and** known-bad with no Vanta run at all. This is what makes wave-1 baseline review possible.
+   **and** known-bad with no Vanta run at all. This is what lets every review candidate carry its
+   oracle label, so the review passes can be scored without re-running the oracle.
 5. `VANTA_ATTACKER` / `VANTA_PLANNER` / `VANTA_LLM_SEED` plumbing, the per-call sampling schedule
    plus the server-`top_p` probe (§4.3), and the §4.4 provenance keys in `run.summary`. Tests: with
    the env unset the request bodies are byte-identical (no `seed` key) and the existing suite gives
    the same verdicts; `VANTA_ATTACKER=off` makes zero Attacker LLM calls without changing a verdict;
    `VANTA_PLANNER=on` exits 2 with `final_decision=InfraFailure`; and the recorded schedule equals the
    `temperature` / `max_tokens` the request bodies actually carried.
-6. Runner + manifest + resume; baseline-review jobs scheduled first. `.gitignore` line.
+6. Runner + manifest + resume: repair passes first, then both review passes over a **symmetric,
+   deduplicated** candidate set (§7.1). `.gitignore` line.
 7. Compaction (diff + manifest) with the §6.3 rerun-safety test.
 8. **Wave 1 gate run** (§8.2) → report it, and only then bake py3.7 and py3.6 and schedule waves 2–3.
 9. Metrics additions + Wilson; calibration numbers written back into §8.1.
@@ -1069,16 +1119,18 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
 | D7 | Metrics location | Additive section in `scripts/metrics.py`. |
 | D8 | Test trees | **SWE-bench split** (§1.2–§1.3): Vanta's tree = buggy source + **fixed** test files − `FAIL_TO_PASS`. `PASS_TO_PASS` is the native suite. Fixed-tree gate relaxed to "no fixed-only failures"; pre-existing failures recorded; every suite run twice to flag flaky nodeids. |
 | D9 | Oracle & labels | `final.patch` built for **every** terminal verdict (§5.1). The oracle applies **only non-test hunks**; test files are always the fixed version's. `patch_good = hidden_pass ∧ suite_regressions == 0`, and the label table keys off `patch_good` (§5.3). |
-| D10 | Waves & budget | Wave 1 = PySnooper (py3.8, `[0]`) as a **go/no-go gate**; wave 2 = thefuck + httpie (py3.7, `[0]`); wave 3 = cookiecutter (py3.6, `[0]`). 10 bugs, 60 runs, ~12–20 h. Budgets in §8.1. |
+| D10 | Waves & budget | Wave 1 = PySnooper (py3.8, `[0]`) as a **go/no-go gate**; wave 2 = thefuck + httpie (py3.7, `[0]`); wave 3 = cookiecutter (py3.6, `[0]`). 10 bugs, 60–100 runs, ~12–22 h. Budgets in §8.1. |
 | D11 | Context precheck | `prepare` estimates each bug's source-concat tokens and **rejects** over-budget bugs with a documented 25 % margin, writing `context_sizes.md` **and** `context_report.json` for **all** candidates and printing the table. The split is an input and is never rewritten by a stage. Substitutions wait for wave 1's real `usage.prompt_tokens` — the estimate runs ~1.5× high. Narrowing files to fit is v2. |
-| D12 | Review coverage | Review mode on **every** bug, both candidate sets (developer fix = known-good, failed Creator patch = known-bad), applied with test hunks dropped, deduplicated by patch hash, each recording its producing session. |
-| D13 | Run order | baseline review (no LLM) → baseline repair → vanta repair → vanta review. |
+| D12 | Review coverage | Review mode on **every** bug over a **symmetric** per-bug candidate set — developer fix (`dev`, known-good) + no-op floor (`noop`) + up to 2 pooled failed Creator patches (`repair:<config>:<session>`, known-bad). `InfraFailure` / `apply_ok = false` skipped; deduplicated by **normalized diff**; each candidate records its source and oracle label. Baseline and vanta review the same set at the same seed (paired). Applied with test hunks dropped. |
+| D13 | Run order | baseline repair → vanta repair → baseline review (no LLM) → vanta review. Repair first, so failed patches exist before any review; reviews last, so both configs see the same set. |
 | D14 | Artifacts | `runs/bugsinpy/<batch>/`, with a `.gitignore` line so the path stays readable. |
 
 ### 12.2 Still open — defaults chosen, flag if you disagree
 
 1. **Review runs re-roll per seed** (the Attacker is stochastic), which is why runs/bug is
-   `2 + 2·|seeds|`. At `seeds=[0]` this is moot; it matters again when the paper sweep arrives.
+   `|seeds| · (2 + 2·|candidates|)`. At `seeds=[0]` this is moot; it matters again when the paper
+   sweep arrives. The **candidate count** itself is data-dependent (2–4, §7.1) and is fixed by the
+   repair runs, not chosen per seed.
 2. **`vanta_planner` placeholder returns `InfraFailure`** rather than a silent pass, so the config is
    addressable but cannot produce a fake result.
 3. **black is the first reserve**, not a pilot bug. If a wave-2 bug dies at prepare, black/1 takes its

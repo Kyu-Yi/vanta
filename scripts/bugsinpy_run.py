@@ -3,27 +3,41 @@
 
     python3 scripts/bugsinpy_run.py bake    --pythons 3.8 --yes   # §11 step 3
     python3 scripts/bugsinpy_run.py prepare --split plans/bugsinpy_split.json
+    python3 scripts/bugsinpy_run.py run     --batch runs/bugsinpy/<batch>
+    python3 scripts/bugsinpy_run.py report  --batch runs/bugsinpy/<batch>
 
 ``bake`` builds the Shuru checkpoints the split names — one interpreter layer per
 Python minor version plus a thin per-bug dependency layer — and is the only stage
 that needs network. ``prepare`` is the stage after it: it reads BugsInPy's own
 metadata, cuts the SWE-bench trees, derives ``FAIL_TO_PASS`` / ``PASS_TO_PASS``,
 strips the hidden tests, runs the context precheck and the leak gate, and writes
-the derived half back into the committed split. Neither makes LLM calls or runs
-Vanta — ``run`` (the batch runner) and ``report`` (metrics) are later stages.
+``prepare.json`` plus ``context_report.json`` into the batch directory. ``run``
+consumes that prepared batch: per wave, baseline repair → vanta repair → baseline
+review → vanta review (§7.1, D13), one ``vanta_m3`` process at a time, appending a
+row per job to the manifest and resuming from ``state.json``. ``report`` reads the
+manifest alone and re-derives the digest, the ``metrics.py --labels`` file and the
+per-config scoring.
+
+``run`` needs ``--batch`` because the batch directory is where the resume cursor
+lives: a runner that invented a fresh directory on every start could never resume,
+and ``prepare``'s artifacts would be in the other one. That is the whole of
+"prepare-or-resume" — ``prepare`` once, then ``run`` as often as it takes.
 
 Nothing third-party executes on the host. Checkouts and tree surgery are host-side
 ``git`` and filesystem work; every command that imports the project under test is
-issued inside Shuru (design C3, ``suite.py``).
+issued inside Shuru (design C3, ``suite.py``). ``run`` also invokes Vanta as a
+subprocess, and Vanta's sandbox backend is Shuru.
 
-Exit codes: ``0`` everything prepared, ``1`` a bug or several did not prepare,
-``2`` the harness itself could not proceed (missing checkpoint, moved metadata).
+Exit codes: ``0`` everything prepared/ran, ``1`` a bug or several did not prepare
+(or a wave failed its gate), ``2`` the harness itself could not proceed (missing
+checkpoint, moved metadata, missing ``vanta_m3``).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -36,7 +50,9 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from bugsinpy import bake as bake_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
+from bugsinpy import manifest as manifest_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
+from bugsinpy import runner as runner_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
 from bugsinpy.shuru import ShuruError  # noqa: E402
 from bugsinpy.split import Split, SplitError, load_split, sha256_text  # noqa: E402
@@ -345,6 +361,142 @@ def parse_waves(raw: str) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
+# run — the batch runner (§7.1, §7.4)
+# ---------------------------------------------------------------------------
+def select_preps(
+    preps: list[prepare_mod.BugPrep],
+    *,
+    only: list[str],
+    waves: list[int],
+) -> list[prepare_mod.BugPrep]:
+    """The bugs this invocation runs, in the split's own file order.
+
+    Only *runnable* preps are eligible. ``prepare`` may have recorded a bug as a
+    reserve (context-measured, its suites never run) or failed its gate, and running
+    one of those would either grade against a tree with no derived oracle or fail
+    inside Vanta for a reason the harness already knows. Refusing loudly beats a
+    wave that quietly looks short.
+    """
+    chosen = preps
+    if only:
+        wanted = set(only)
+        unknown = sorted(wanted - {prep.key for prep in chosen})
+        if unknown:
+            raise SplitError(f"--only names bugs that are not in this batch: {unknown}")
+        chosen = [prep for prep in chosen if prep.key in wanted]
+    if waves:
+        wanted_waves = set(waves)
+        chosen = [prep for prep in chosen if prep.wave in wanted_waves]
+    if not chosen:
+        raise SplitError("the selection is empty")
+    blocked = [
+        f"{prep.key} (prepare_mode={prep.prepare_mode}, gate: {'; '.join(prep.gate_failures) or 'none'})"
+        for prep in chosen
+        if not prep.runnable
+    ]
+    if blocked:
+        raise SplitError(
+            "these bugs did not prepare as runners, so a run against them would "
+            f"grade a tree with no derived oracle: {blocked}"
+        )
+    return chosen
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Run a prepared batch: repairs first, then both reviews, one job at a time.
+
+    The repo-root check comes before anything else. ``shuru run --mount`` requires
+    the mounted host path to be inside the process CWD, so a run started from the
+    wrong directory would mount nothing and fail per job instead of once.
+    """
+    runner_mod.require_repo_cwd()
+    split = load_split(args.split.resolve())
+    batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
+    bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
+    preps, entries = runner_mod.load_prepared(
+        batch_dir=batch_dir, split=split, bugsinpy_root=bugsinpy_root
+    )
+    waves = parse_waves(args.waves)
+    selected = select_preps(preps, only=args.only, waves=waves)
+    vanta_bin = runner_mod.require_vanta_bin(args.vanta_bin.resolve())
+
+    code, results = runner_mod.run_batch(
+        batch_dir=batch_dir,
+        batch_id=batch_dir.name,
+        split=split,
+        preps=selected,
+        entries=entries,
+        seeds=split.seeds,
+        waves=waves or sorted({prep.wave for prep in selected}),
+        vanta_bin=vanta_bin,
+        max_attempts=args.max_attempts,
+        disk_mb=args.disk_mb,
+        plan_only=args.plan,
+    )
+    if args.plan:
+        return EXIT_OK
+
+    # The report is derived from the manifest on disk, not from this invocation's
+    # return value: a resumed run must summarise the whole batch, not the tail of it.
+    records = manifest_mod.Manifest(batch_dir).records()
+    if records:
+        labels_path, payload = runner_mod.write_batch_report(batch_dir, records)
+        print()
+        print(runner_mod.render_digest(payload))
+        print()
+        print(f"{payload['runs']} rows -> {batch_dir / 'run_digest.md'}")
+        print(f"labels for metrics.py -> {labels_path}")
+
+    broke = sum(result.failed for result in results)
+    if broke:
+        print(
+            f"\n{broke} job(s) left no usable session and were written to "
+            f"{batch_dir / 'failures.jsonl'}; their keys stay `failed` in "
+            "state.json, so the next `run` re-runs them.",
+            file=sys.stderr,
+        )
+        return EXIT_BUG_FAILED
+    return code
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """Re-derive the batch report from the manifest, then score the review rows.
+
+    A pure function of the evidence: no VM, no LLM, and nothing written that is not
+    a view of ``manifest.jsonl``. The scoring step is ``scripts/metrics.py`` itself
+    (§5.4, §9) — the harness does not re-implement the classifier the rest of the
+    project already uses, because two implementations of "what counts as a false
+    approval" is how two numbers disagree.
+    """
+    batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
+    records = manifest_mod.Manifest(batch_dir).records()
+    if not records:
+        raise runner_mod.RunnerError(f"no manifest rows in {batch_dir}; run it first")
+    labels_path, payload = runner_mod.write_batch_report(batch_dir, records)
+    print(runner_mod.render_digest(payload))
+    print()
+    print(f"{payload['runs']} rows -> {batch_dir / 'run_digest.md'}")
+    print(f"labels -> {labels_path}")
+    if not any(record.get("candidate") for record in records):
+        print(
+            "\nno review rows yet: metrics.py scores labelled sessions, and only a "
+            "review pass over a known-good/known-bad candidate produces one (§5.4)."
+        )
+        return EXIT_OK
+    argv = [
+        sys.executable,
+        str(SCRIPTS_DIR / "metrics.py"),
+        "--sessions-dir",
+        str(runner_mod.sessions_dir()),
+        "--labels",
+        str(labels_path),
+    ]
+    print()
+    print("$ " + " ".join(argv), flush=True)
+    return EXIT_OK if subprocess.run(argv, cwd=str(REPO_ROOT)).returncode == 0 else EXIT_BUG_FAILED
+
+
+# ---------------------------------------------------------------------------
 # cli
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
@@ -440,6 +592,68 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bake.set_defaults(func=cmd_bake)
 
+    run = sub.add_parser(
+        "run",
+        help=(
+            "run a prepared batch: baseline repair, vanta repair, baseline review, "
+            "vanta review (§7.1); resumable"
+        ),
+    )
+    run.add_argument("--split", type=Path, default=DEFAULT_SPLIT)
+    run.add_argument(
+        "--batch",
+        type=Path,
+        required=True,
+        help="the batch directory `prepare` created — the resume cursor lives there",
+    )
+    run.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="PROJECT/BUG",
+        help="run only these bugs (repeatable)",
+    )
+    run.add_argument("--waves", default="", help="comma-separated wave numbers")
+    run.add_argument(
+        "--vanta-bin",
+        type=Path,
+        default=runner_mod.DEFAULT_VANTA_BIN,
+        help="the vanta_m3 binary to invoke (default: target/release/vanta_m3)",
+    )
+    run.add_argument(
+        "--max-attempts",
+        type=int,
+        default=4,
+        help="Vanta's repair budget per run (default: 4, the binary's own)",
+    )
+    run.add_argument(
+        "--disk-mb",
+        type=int,
+        default=prepare_mod.DISK_MB,
+        help=(
+            "shuru disk in MB for every VM this stage boots; the default matches "
+            f"the suites prepare ran ({prepare_mod.DISK_MB})"
+        ),
+    )
+    run.add_argument(
+        "--plan",
+        action="store_true",
+        help="print the schedule (and the honest floor on review rows) and exit",
+    )
+    run.set_defaults(func=cmd_run)
+
+    rep = sub.add_parser(
+        "report",
+        help="re-derive the batch digest, the label file and the per-config metrics",
+    )
+    rep.add_argument(
+        "--batch",
+        type=Path,
+        required=True,
+        help="the batch directory `run` wrote its manifest into",
+    )
+    rep.set_defaults(func=cmd_report)
+
     return parser
 
 
@@ -457,6 +671,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_HARNESS_FAILED
     except ShuruError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_HARNESS_FAILED
+    except runner_mod.RunnerError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_HARNESS_FAILED
     except KeyboardInterrupt:

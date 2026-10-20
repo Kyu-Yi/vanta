@@ -766,7 +766,7 @@ class TestContextBudget:
         verdict = ctx.precheck(tmp_path, "", n_ctx=131_072, n_ctx_source="test")
         assert verdict.headroom_tokens == verdict.budget_tokens - verdict.estimated_prompt_tokens
         assert verdict.output_reserve_tokens == ctx.OUTPUT_RESERVE_TOKENS
-        assert verdict.as_dict()["headroom_tokens"] == verdict.headroom_tokens
+        assert verdict.to_dict()["headroom_tokens"] == verdict.headroom_tokens
 
     def test_a_window_below_the_output_reserve_has_no_prompt_budget(self, tmp_path):
         """Every real prompt is rejected *and* the reason says the window itself is
@@ -987,6 +987,48 @@ class TestContextReport:
         assert "Demo/2" in table
         assert "not measured" in table
 
+    def test_the_report_records_the_window_the_batch_was_sized_against(self, tmp_path):
+        """The caller-resolved window wins over the per-verdict one: it is the one
+        number ``run`` compares its own against (§1.6.1)."""
+        verdict = self._verdict(tmp_path, n_ctx=131_072, source="server /props")
+        report = json.loads(
+            prepare_mod.write_context_report(
+                tmp_path, [prep(context=verdict)], n_ctx=131_072, n_ctx_source="--n-ctx"
+            ).read_text(encoding="utf-8")
+        )
+        assert report["n_ctx"] == 131_072
+        assert report["n_ctx_source"] == "--n-ctx"
+
+    def test_the_report_still_records_the_window_with_no_measurements(self, tmp_path):
+        """A batch where every bug failed the gate has no verdict to copy from, so
+        the window has to come from the caller or the report leaves it implicit."""
+        report = json.loads(
+            prepare_mod.write_context_report(
+                tmp_path, [prep(gate_failures=["boom"])],
+                n_ctx=131_072, n_ctx_source="VANTA_LLM_CONTEXT_TOKENS",
+            ).read_text(encoding="utf-8")
+        )
+        assert report["n_ctx"] == 131_072
+        assert report["n_ctx_source"] == "VANTA_LLM_CONTEXT_TOKENS"
+
+
+class TestTheSummaryNamesTheWindow:
+    """``prepare_summary.md`` states which window it sized against, and its source."""
+
+    def test_the_window_and_its_source_are_printed_above_the_table(self, tmp_path):
+        write(tmp_path / "a.py", "x = 1\n")
+        verdict = ctx.precheck(tmp_path, "", n_ctx=131_072, n_ctx_source="--n-ctx")
+        text = prepare_mod.render_summary(
+            [prep(context=verdict)], n_ctx=131_072, n_ctx_source="--n-ctx"
+        )
+        assert "n_ctx=131072" in text
+        assert "--n-ctx" in text
+        lines = text.splitlines()
+        assert lines[0].startswith("Context window:"), "the window must come first"
+
+    def test_without_a_window_the_line_is_simply_absent(self):
+        assert "Context window:" not in prepare_mod.render_summary([prep()])
+
 
 class TestTheSplitIsAnInput:
     """The split is hand-authored and reviewed; no stage may write to it.
@@ -1103,6 +1145,69 @@ class TestPrecheck:
             ctx.FALLBACK_CONTEXT_TOKENS,
             "fallback (server unreachable)",
         )
+
+
+class TestExplicitContextWindow:
+    """The gate may only size against a window the run will actually use (§1.6.1).
+
+    [VANTA-WHY] The first full prepare ran with ``VANTA_LLM_CONTEXT_TOKENS`` unset
+    in the shell, fell through to the 65536 fallback and rejected PySnooper/1 and /2
+    for a 16128-token budget instead of 65280 — a rejection about a prompt no run
+    would have sent. ``explicit_context_window`` therefore *refuses* where
+    ``server_context_window`` (the run-time mirror) falls back, and the two are
+    tested apart on purpose: the mirror must keep falling back, the gate must not.
+    """
+
+    @staticmethod
+    def _no_sources(monkeypatch):
+        monkeypatch.delenv("VANTA_LLM_CONTEXT_TOKENS", raising=False)
+        monkeypatch.setenv("VANTA_LLM_BASE_URL", "http://127.0.0.1:1/v1")
+
+    def test_it_refuses_when_no_source_offers_a_window(self, monkeypatch):
+        self._no_sources(monkeypatch)
+        with pytest.raises(ctx.ContextError, match="refusing to run the context gate"):
+            ctx.explicit_context_window()
+
+    def test_the_refusal_names_the_three_ways_out(self, monkeypatch):
+        self._no_sources(monkeypatch)
+        with pytest.raises(ctx.ContextError) as excinfo:
+            ctx.explicit_context_window()
+        message = str(excinfo.value)
+        assert "VANTA_LLM_CONTEXT_TOKENS" in message
+        assert "--n-ctx" in message
+        assert "/props" in message
+        assert str(ctx.FALLBACK_CONTEXT_TOKENS) in message
+
+    def test_the_precheck_goes_through_the_refusal_not_the_fallback(self, tmp_path, monkeypatch):
+        """A caller that forgot to thread a window fails here rather than producing
+        a verdict sized against 65536 that somebody then acts on."""
+        write(tmp_path / "a.py", "x = 1\n")
+        self._no_sources(monkeypatch)
+        with pytest.raises(ctx.ContextError, match="refusing to run the context gate"):
+            ctx.precheck(tmp_path, "")
+
+    def test_the_env_variable_is_an_explicit_source(self, monkeypatch):
+        monkeypatch.setenv("VANTA_LLM_CONTEXT_TOKENS", "131072")
+        assert ctx.explicit_context_window() == (131072, "VANTA_LLM_CONTEXT_TOKENS")
+
+    def test_a_flag_that_disagrees_with_the_variable_is_refused(self, monkeypatch):
+        """The flag is *checked*, not obeyed: a run resolves the window from the
+        variable, so a flag that disagreed would size the gate against a window the
+        run will not use — the footgun in a different coat."""
+        monkeypatch.setenv("VANTA_LLM_CONTEXT_TOKENS", "131072")
+        monkeypatch.setenv("VANTA_LLM_BASE_URL", "http://127.0.0.1:1/v1")
+        with pytest.raises(ctx.ContextError, match="disagrees with VANTA_LLM_CONTEXT_TOKENS"):
+            ctx.explicit_context_window(n_ctx=65_536)
+
+    def test_a_flag_that_agrees_is_recorded_as_its_own_source(self, monkeypatch):
+        monkeypatch.setenv("VANTA_LLM_CONTEXT_TOKENS", "131072")
+        monkeypatch.setenv("VANTA_LLM_BASE_URL", "http://127.0.0.1:1/v1")
+        assert ctx.explicit_context_window(n_ctx=131_072) == (131_072, "--n-ctx")
+
+    def test_the_flag_exists_on_the_prepare_subcommand(self):
+        args = run_mod.build_parser().parse_args(["prepare", "--n-ctx", "131072", "--plan"])
+        assert args.n_ctx == 131_072
+        assert run_mod.build_parser().parse_args(["prepare", "--plan"]).n_ctx is None
 
 
 # ============================================================================
@@ -1603,6 +1708,286 @@ class TestPrepareInvariants:
         summary = prepare_mod.render_summary([prep(prepare_mode=prepare_mod.MEASURE_ONLY)])
         assert "measured" in summary
         assert "—" in summary
+
+
+class TestPrepareRunRecordContract:
+    """``prepare.json`` has one writer and one reader, and they cannot drift.
+
+    [VANTA-WHY] The first smoke run crashed in ``runner.load_prepared`` with
+    ``TypeError: IssueText.__init__() missing 3 required positional arguments:
+    'leak', 'failure_kinds', and 'needs_decision'`` — ``IssueText`` had grown three
+    fields and the runner's hand-written reader was still constructing the old
+    shape. The reader and the writer were two copies of one format living in two
+    modules. The round trip below is the test that would have caught it: it builds a
+    prep the way ``prepare`` does, writes it with prepare's own writer, and reads it
+    back with the runner's — asserting every field, not just the ones the crash
+    happened to touch.
+
+    Nothing here touches a VM or a clone: ``load_bug`` is injected, because the
+    contract under test is the record's shape, not BugsInPy's metadata.
+    """
+
+    @staticmethod
+    def _issue() -> issue_mod.IssueText:
+        """A *real* ``IssueText`` from the real builder, with all six fields set.
+
+        The message is nothing but answer-only tokens, so the leak gate strips all
+        of them and ``is_actionable`` refuses the result: ``ok`` is False and
+        ``needs_decision`` carries the reason. Those two are exactly the fields the
+        old reader guessed at, so a round trip that loses them has to fail here.
+        """
+        built = issue_mod.build_issue_text(
+            stripped_message="fix_widget_flag alpha_widget beta_widget",
+            failure_kinds=["AssertionError"],
+            answer_tokens={"fix_widget_flag": 2, "alpha_widget": 1, "beta_widget": 1},
+            tree_tokens={},
+            paraphrase=lambda body, kinds: "",
+        )
+        assert built.needs_decision is not None, "the fixture must exercise the field"
+        assert built.ok is False
+        assert len(built.leak.removals) == 3
+        return built
+
+    @staticmethod
+    def _write_batch(tmp_path: Path, *, preps, n_ctx=131_072, n_ctx_source="--n-ctx"):
+        """Write ``prepare.json`` with the writer the *stage* uses, not a copy of it."""
+        split = split_mod.Split(split_data())
+        batch_dir = tmp_path / "batch"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        manifest = prepare_mod.prepare_manifest(
+            split=split,
+            split_path=tmp_path / "split.json",
+            split_sha_before="0" * 64,
+            batch_dir=batch_dir,
+            commit="a" * 40,
+            bugsinpy_root=tmp_path / "bugsinpy",
+            selected=["Demo/1"],
+            broken=[],
+            preps=list(preps),
+            n_ctx=n_ctx,
+            n_ctx_source=n_ctx_source,
+        )
+        (batch_dir / "prepare.json").write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        return split, batch_dir, manifest
+
+    @staticmethod
+    def _store_manifest(batch_dir: Path, manifest: dict) -> None:
+        (batch_dir / "prepare.json").write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+
+    @staticmethod
+    def _load(monkeypatch, split, batch_dir, tmp_path):
+        monkeypatch.setattr(
+            prepare_mod, "load_bug", lambda split, root, project, bug_id: bug_info()
+        )
+        return runner_mod.load_prepared(
+            batch_dir=batch_dir, split=split, bugsinpy_root=tmp_path / "bugsinpy"
+        )
+
+    def test_a_prepared_bug_round_trips_every_field(self, tmp_path, monkeypatch):
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "mod.py", "def parse():\n    return None\n")
+        issue = self._issue()
+        verdict = ctx.precheck(tree, issue.text, n_ctx=131_072, n_ctx_source="--n-ctx")
+        deps = {
+            "checkpoint": "vanta-bi-demo-1",
+            "installs": ["pytest==8.0.2", "pytest-json-report==1.5.0"],
+            "dependencies": [{"name": "pytest", "version": "8.0.2"}],
+        }
+        original = prep(
+            root=tmp_path / "batch" / "worktrees" / "Demo_1",
+            prepare_mode=prepare_mod.FULL,
+            test_paths=["tests"],
+            fail_to_pass=["tests/test_demo.py::test_a"],
+            pass_to_pass_count=7,
+            flaky_nodeids=["tests/test_demo.py::test_flaky"],
+            preexisting_failures=["tests/test_demo.py::test_pre"],
+            native_failure_baseline=["tests/test_demo.py::test_native"],
+            native_green_on_vanta_tree=True,
+            hidden_files_deleted=["tests/test_hidden.py"],
+            partially_hidden_functions=["hidden_fn"],
+            gate_failures=[],
+            context=verdict,
+            issue=issue,
+            deps=deps,
+        )
+        split, batch_dir, _ = self._write_batch(tmp_path, preps=[original])
+        batch = self._load(monkeypatch, split, batch_dir, tmp_path)
+
+        assert batch.n_ctx == 131_072
+        assert batch.n_ctx_source == "--n-ctx"
+        assert len(batch.preps) == 1
+        loaded = batch.preps[0]
+
+        # Injected rather than stored: the metadata, the batch directory and the
+        # reviewed split's own command.
+        assert loaded.bug == original.bug
+        assert loaded.root == batch_dir / "worktrees" / "Demo_1"
+        assert loaded.test_cmd == [
+            "python", "-m", "pytest", "tests", "--json-report-file={report}"
+        ]
+
+        assert loaded.role == original.role
+        assert loaded.wave == original.wave
+        assert loaded.prepare_mode == original.prepare_mode
+        assert loaded.test_paths == original.test_paths
+        assert loaded.fail_to_pass == sorted(original.fail_to_pass)
+        assert loaded.pass_to_pass_count == original.pass_to_pass_count
+        assert loaded.flaky_nodeids == sorted(original.flaky_nodeids)
+        assert loaded.preexisting_failures == sorted(original.preexisting_failures)
+        assert loaded.native_failure_baseline == sorted(original.native_failure_baseline)
+        assert loaded.native_green_on_vanta_tree is True
+        assert loaded.hidden_files_deleted == original.hidden_files_deleted
+        assert loaded.partially_hidden_functions == original.partially_hidden_functions
+        assert loaded.gate_failures == original.gate_failures
+        # The pair the crash was about, and the two that were never restored at all.
+        assert loaded.issue == issue
+        assert loaded.issue.needs_decision == issue.needs_decision
+        assert loaded.issue.leak.removals == issue.leak.removals
+        assert loaded.context == verdict
+        assert loaded.deps == deps
+        assert loaded.runnable == original.runnable
+        assert batch.entries["Demo/1"]["checkpoint"] == "vanta-bi-demo-1"
+
+    @pytest.mark.parametrize(
+        "drop",
+        [
+            pytest.param(("issue", "leak"), id="issue.leak"),
+            pytest.param(("issue", "needs_decision"), id="issue.needs_decision"),
+            pytest.param(("context",), id="context"),
+            pytest.param(("deps",), id="deps"),
+        ],
+    )
+    def test_a_missing_field_names_the_field_and_the_batch(
+        self, tmp_path, monkeypatch, drop
+    ):
+        """A reader that fell behind the writer has to say *what* and *where*.
+
+        The crash this replaces was a ``TypeError`` naming neither the field nor the
+        batch, which is why it took a full prepare and a smoke run to diagnose.
+        """
+        tree = tmp_path / "tree"
+        write(tree / "a.py", "x = 1\n")
+        issue = self._issue()
+        verdict = ctx.precheck(tree, issue.text, n_ctx=131_072, n_ctx_source="--n-ctx")
+        original = prep(context=verdict, issue=issue, deps={})
+        split, batch_dir, manifest = self._write_batch(tmp_path, preps=[original])
+
+        target = manifest["bugs"][0]
+        for key in drop[:-1]:
+            target = target[key]
+        del target[drop[-1]]
+        self._store_manifest(batch_dir, manifest)
+
+        with pytest.raises(runner_mod.RunnerError) as excinfo:
+            self._load(monkeypatch, split, batch_dir, tmp_path)
+        message = str(excinfo.value)
+        assert repr(drop[-1]) in message, message
+        assert "Demo/1" in message, message
+        assert str(batch_dir) in message, message
+
+    def test_a_context_the_reader_failed_to_restore_is_loud(self, tmp_path, monkeypatch):
+        """The other drift, found while fixing the first one.
+
+        ``prepare`` wrote ``context`` and ``deps`` and the old reader restored
+        *neither*, while every other field was read with a ``.get(name, default)``
+        fallback that hid the same kind of gap. ``BugPrep.runnable`` requires
+        ``context``, so a loaded batch could never pass ``select_preps`` — the run
+        would have failed with "these bugs did not prepare as runners" about bugs
+        that had prepared perfectly.
+        """
+        tree = tmp_path / "tree"
+        write(tree / "a.py", "x = 1\n")
+        issue = self._issue()
+        verdict = ctx.precheck(tree, issue.text, n_ctx=131_072, n_ctx_source="--n-ctx")
+        original = prep(context=verdict, issue=issue, deps={})
+        assert original.runnable is False  # needs_decision: not a candidate to run
+
+        runnable = prep(
+            context=verdict,
+            issue=issue_mod.IssueText(
+                text="Fix the parser.",
+                pre_gate="Fix the parser.",
+                leak=issue_mod.LeakResult(text="Fix the parser."),
+                failure_kinds=["AssertionError"],
+                ok=True,
+                needs_decision=None,
+            ),
+            deps={},
+        )
+        assert runnable.runnable is True
+
+        split, batch_dir, _ = self._write_batch(tmp_path, preps=[runnable])
+        loaded = self._load(monkeypatch, split, batch_dir, tmp_path).preps[0]
+        assert loaded.runnable is True, "a restored prep must still be a runner"
+        assert loaded.context is not None and loaded.deps == {}
+
+    def test_a_bare_string_where_a_list_belongs_is_an_error(self, tmp_path, monkeypatch):
+        """``strings_of`` checks the shape too: a bare string read as a list would
+        silently become a list of characters."""
+        original = prep()
+        split, batch_dir, manifest = self._write_batch(tmp_path, preps=[original])
+        manifest["bugs"][0]["fail_to_pass"] = "tests/test_demo.py::test_a"
+        self._store_manifest(batch_dir, manifest)
+        with pytest.raises(runner_mod.RunnerError) as excinfo:
+            self._load(monkeypatch, split, batch_dir, tmp_path)
+        assert "'fail_to_pass'" in str(excinfo.value)
+        assert "not a list" in str(excinfo.value)
+
+    def test_a_non_integer_recorded_window_is_an_error(self, tmp_path, monkeypatch):
+        split, batch_dir, manifest = self._write_batch(tmp_path, preps=[prep()])
+        manifest["n_ctx"] = "131072"
+        self._store_manifest(batch_dir, manifest)
+        with pytest.raises(runner_mod.RunnerError, match="'n_ctx'"):
+            self._load(monkeypatch, split, batch_dir, tmp_path)
+
+    def test_a_batch_with_no_prepare_json_says_how_to_make_one(self, tmp_path):
+        split = split_mod.Split(split_data())
+        with pytest.raises(runner_mod.RunnerError, match="no prepare.json"):
+            runner_mod.load_prepared(
+                batch_dir=tmp_path, split=split, bugsinpy_root=tmp_path / "bugsinpy"
+            )
+
+
+class TestContextWindowWarning:
+    """A run whose window differs from the batch's is measuring a different prompt.
+
+    ``prepare`` refuses to gate against a window the run will not use; this is the
+    other half of that rule (§1.6.1) — the run still resolves its own window the way
+    ``llm::context_window_tokens`` does, so the two can drift between the prepare
+    and the run, and the drift is invisible without a warning.
+    """
+
+    @staticmethod
+    def _batch(tmp_path, *, n_ctx, source="test"):
+        return runner_mod.PreparedBatch(
+            batch_dir=tmp_path, preps=[], entries={}, n_ctx=n_ctx, n_ctx_source=source
+        )
+
+    def test_no_warning_when_the_windows_agree(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("VANTA_LLM_CONTEXT_TOKENS", "131072")
+        assert runner_mod.context_window_warning(self._batch(tmp_path, n_ctx=131_072)) is None
+
+    def test_a_mismatch_names_both_windows_and_both_budgets(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("VANTA_LLM_CONTEXT_TOKENS", "65536")
+        warning = runner_mod.context_window_warning(
+            self._batch(tmp_path, n_ctx=131_072, source="--n-ctx")
+        )
+        assert warning is not None
+        assert "131072" in warning and "65536" in warning
+        assert "65280" in warning, "the budget prepare gated against"
+        assert "16128" in warning, "the budget this run would use"
+        assert "--n-ctx" in warning
+        assert "VANTA_LLM_CONTEXT_TOKENS" in warning
+
+    def test_a_batch_that_recorded_no_window_says_so(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("VANTA_LLM_CONTEXT_TOKENS", "131072")
+        warning = runner_mod.context_window_warning(self._batch(tmp_path, n_ctx=None))
+        assert warning is not None
+        assert "records no n_ctx" in warning
 
 
 # ============================================================================

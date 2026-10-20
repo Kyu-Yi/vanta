@@ -23,7 +23,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from . import bake as bake_mod
 from . import context as ctx
@@ -31,7 +31,8 @@ from . import issue as issue_mod
 from . import suite as suite_mod
 from . import trees as tree_mod
 from .bugsinpy_meta import BugInfo, MetadataError, load_bug_info
-from .split import Split, sha256_text
+from .records import field_of, strings_of
+from .split import Split, sha256_file, sha256_text
 
 DISK_MB = 16384
 """Shuru disk size for suite runs. The base image is 1.5 GB and a checkpoint
@@ -95,7 +96,13 @@ class BugPrep:
             and self.issue.ok
         )
 
-    def as_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
+        """The writer for :meth:`from_dict`, and the only shape ``prepare.json`` has.
+
+        ``runnable`` is recorded for the reader's benefit but recomputed by the
+        property; everything else round-trips exactly, which is what the
+        round-trip test in ``test_bugsinpy.py`` asserts.
+        """
         return {
             "bug": self.key,
             "role": self.role,
@@ -112,10 +119,70 @@ class BugPrep:
             "hidden_files_deleted": self.hidden_files_deleted,
             "partially_hidden_functions": self.partially_hidden_functions,
             "gate_failures": self.gate_failures,
-            "context": self.context.as_dict() if self.context else None,
-            "issue": self.issue.as_dict() if self.issue else None,
+            "context": self.context.to_dict() if self.context else None,
+            "issue": self.issue.to_dict() if self.issue else None,
             "deps": self.deps,
         }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        *,
+        bug: BugInfo,
+        root: Path,
+        test_cmd: Sequence[str],
+        where: str = "",
+    ) -> "BugPrep":
+        """Rebuild a prep from :meth:`to_dict`, or a :class:`RecordError` naming the field.
+
+        Three fields are injected rather than read: ``bug``, ``root`` and
+        ``test_cmd`` are not properties ``prepare`` recorded, they come from the
+        BugsInPy metadata, the batch directory and the reviewed split — which is
+        also why the runner re-reads ``bug.info`` on the way in. Every field
+        ``prepare.json`` *does* carry is required, so a reader that fell behind the
+        writer fails with the field's name instead of a constructor ``TypeError``.
+        """
+        owner = cls.__name__
+        context_payload = field_of(payload, "context", owner=owner, where=where)
+        issue_payload = field_of(payload, "issue", owner=owner, where=where)
+        return cls(
+            bug=bug,
+            root=root,
+            test_cmd=[str(part) for part in test_cmd],
+            role=str(field_of(payload, "role", owner=owner, where=where)),
+            wave=int(field_of(payload, "wave", owner=owner, where=where)),
+            prepare_mode=str(field_of(payload, "prepare_mode", owner=owner, where=where)),
+            test_paths=strings_of(payload, "test_paths", owner=owner, where=where),
+            fail_to_pass=strings_of(payload, "fail_to_pass", owner=owner, where=where),
+            pass_to_pass_count=int(
+                field_of(payload, "pass_to_pass_count", owner=owner, where=where)
+            ),
+            flaky_nodeids=strings_of(payload, "flaky_nodeids", owner=owner, where=where),
+            preexisting_failures=strings_of(
+                payload, "preexisting_failures", owner=owner, where=where
+            ),
+            native_failure_baseline=strings_of(
+                payload, "native_failure_baseline", owner=owner, where=where
+            ),
+            native_green_on_vanta_tree=bool(
+                field_of(payload, "native_green_on_vanta_tree", owner=owner, where=where)
+            ),
+            hidden_files_deleted=strings_of(
+                payload, "hidden_files_deleted", owner=owner, where=where
+            ),
+            partially_hidden_functions=strings_of(
+                payload, "partially_hidden_functions", owner=owner, where=where
+            ),
+            gate_failures=strings_of(payload, "gate_failures", owner=owner, where=where),
+            context=None
+            if context_payload is None
+            else ctx.ContextVerdict.from_dict(context_payload, where=where),
+            issue=None
+            if issue_payload is None
+            else issue_mod.IssueText.from_dict(issue_payload, where=where),
+            deps=field_of(payload, "deps", owner=owner, where=where),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +427,7 @@ def build_issue(prep: BugPrep, *, repo_cache: Path, batch_dir: Path) -> None:
 def write_leak_gate(batch_dir: Path, prep: BugPrep) -> Path:
     path = batch_dir / "leak_gate" / f"{prep.slug}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = prep.issue.as_dict() if prep.issue else {"ok": False, "reason": "no issue text"}
+    payload = prep.issue.to_dict() if prep.issue else {"ok": False, "reason": "no issue text"}
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return path
 
@@ -457,7 +524,13 @@ def write_context_sizes(batch_dir: Path, preps: list[BugPrep]) -> Path:
     return path
 
 
-def write_context_report(batch_dir: Path, preps: list[BugPrep]) -> Path:
+def write_context_report(
+    batch_dir: Path,
+    preps: list[BugPrep],
+    *,
+    n_ctx: Optional[int] = None,
+    n_ctx_source: Optional[str] = None,
+) -> Path:
     """``context_report.json`` — the machine-readable half of §1.6.
 
     [VANTA-WHY] Measurements land here and in ``prepare.json``, never in
@@ -470,11 +543,21 @@ def write_context_report(batch_dir: Path, preps: list[BugPrep]) -> Path:
     the estimate is ``ceil(source_bytes / 4)`` plus a frame and runs high (measured
     ~1.5x on the heretic sessions), so a pilot set chosen from the estimate alone is
     uncalibrated. ``prompt_tokens_real_source`` names the session that filled it in.
+
+    The top-level ``n_ctx``/``n_ctx_source`` are the window the batch was *sized*
+    against, which the caller resolved once (§1.6.1) — recorded here even when a
+    batch measured no bug at all, so a report never leaves the window implicit.
     """
     path = batch_dir / "context_report.json"
     measured = [prep for prep in preps if prep.context is not None]
     windows = {prep.context.n_ctx for prep in measured}
     budgets = {prep.context.budget_tokens for prep in measured}
+    resolved = n_ctx if n_ctx is not None else (next(iter(windows)) if len(windows) == 1 else None)
+    resolved_source = (
+        n_ctx_source
+        if n_ctx_source is not None
+        else (measured[0].context.n_ctx_source if len(windows) == 1 else None)
+    )
     payload: dict[str, Any] = {
         "schema_version": 1,
         "kind": "context_report",
@@ -486,20 +569,67 @@ def write_context_report(batch_dir: Path, preps: list[BugPrep]) -> Path:
             "chat_overhead_tokens": ctx.CHAT_OVERHEAD_TOKENS,
             "margin_fraction": ctx.CONTEXT_MARGIN_FRACTION,
         },
-        "n_ctx": next(iter(windows)) if len(windows) == 1 else None,
-        "n_ctx_source": measured[0].context.n_ctx_source if len(windows) == 1 else None,
+        "n_ctx": resolved,
+        "n_ctx_source": resolved_source,
         "windows_measured": sorted(windows),
         "budget_tokens": next(iter(budgets)) if len(budgets) == 1 else None,
         "budgets_measured": sorted(budgets),
-        "fallback_window": any(
-            prep.context.n_ctx_source.startswith("fallback") for prep in measured
-        ),
+        "fallback_window": bool(resolved_source and resolved_source.startswith("fallback"))
+        or any(prep.context.n_ctx_source.startswith("fallback") for prep in measured),
         "bugs": [_context_record(prep) for prep in preps],
     }
     path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     return path
+
+
+def prepare_manifest(
+    *,
+    split: Split,
+    split_path: Path,
+    split_sha_before: str,
+    batch_dir: Path,
+    commit: str,
+    bugsinpy_root: Path,
+    selected: list[str],
+    broken: list[tuple[str, str]],
+    preps: list[BugPrep],
+    n_ctx: int,
+    n_ctx_source: str,
+) -> dict[str, Any]:
+    """The whole ``prepare.json`` payload — the one writer ``run`` reads back.
+
+    Kept as a function rather than inlined into ``cmd_prepare`` so the round-trip
+    test builds the file with the same writer the stage does: a test that assembled
+    the payload by hand would pin the reader against a *second* copy of the format,
+    which is the drift this contract exists to prevent. Every dataclass below
+    ``bugs`` is serialised by its own ``to_dict``, and ``run`` reads it back through
+    the matching ``from_dict`` (``records.py``).
+
+    ``n_ctx``/``n_ctx_source`` are the window the gate was sized against (§1.6.1):
+    recorded here, and compared against the run's own window by
+    ``runner.context_window_warning``.
+    """
+    return {
+        "schema_version": 1,
+        "kind": "prepare",
+        "created_utc": utc_now(),
+        "batch_dir": str(batch_dir),
+        "split": str(split_path),
+        "split_sha256_before": sha256_text(split.to_json()),
+        "split_file_sha256_before": split_sha_before,
+        "split_written": False,
+        "bugsinpy_commit": commit,
+        "bugsinpy_root": str(bugsinpy_root),
+        # The window every verdict in this batch was sized against, and where that
+        # number came from. ``run`` reads these back and warns when its own differs.
+        "n_ctx": n_ctx,
+        "n_ctx_source": n_ctx_source,
+        "selected": list(selected),
+        "breaks": [{"bug": key, "detail": detail} for key, detail in broken],
+        "bugs": [prep.to_dict() for prep in preps],
+    }
 
 
 def _context_record(prep: BugPrep) -> dict[str, Any]:
@@ -680,8 +810,15 @@ def prepare_one(
     batch_dir: Path,
     deps_dir: Path,
     full: bool,
+    n_ctx: int,
+    n_ctx_source: str,
 ) -> BugPrep:
-    """Everything ``prepare`` does for one bug, in the order §1.3 fixes."""
+    """Everything ``prepare`` does for one bug, in the order §1.3 fixes.
+
+    ``n_ctx`` is required and threaded into both prechecks: the gate is only worth
+    running if it measures the window the *run* will use, and the caller resolves
+    that once for the whole batch (§1.6.1) rather than each bug guessing.
+    """
     project = entry["project"]
     bug_id = int(entry["bug_id"])
     bug = load_bug(split, bugsinpy_root, project, bug_id)
@@ -705,7 +842,9 @@ def prepare_one(
     # (the strip only removes test functions), so measuring it costs nothing and
     # saves the three double suite runs on a bug that cannot fit anyway — which is
     # the whole point of the precheck for a candidate like youtube-dl.
-    early = ctx.precheck(prep.root / "oracle_tree", "")
+    early = ctx.precheck(
+        prep.root / "oracle_tree", "", n_ctx=n_ctx, n_ctx_source=n_ctx_source
+    )
     if not early.context_ok:
         prep.context = early
         return prep
@@ -752,7 +891,10 @@ def prepare_one(
     # Authoritative measurement: the tree Vanta will actually be given, with the
     # issue text it will actually be given. Smaller than `early`, never larger.
     prep.context = ctx.precheck(
-        prep.root / "vanta_tree", prep.issue.text if prep.issue else ""
+        prep.root / "vanta_tree",
+        prep.issue.text if prep.issue else "",
+        n_ctx=n_ctx,
+        n_ctx_source=n_ctx_source,
     )
     return prep
 
@@ -790,9 +932,26 @@ def derive_verdict(prep: BugPrep) -> dict[str, Any]:
     }
 
 
-def render_summary(preps: list[BugPrep]) -> str:
-    """The ``prepare`` console + ``prepare_summary.md`` table."""
-    lines = [
+def render_summary(
+    preps: list[BugPrep],
+    *,
+    n_ctx: Optional[int] = None,
+    n_ctx_source: Optional[str] = None,
+) -> str:
+    """The ``prepare`` console + ``prepare_summary.md`` table.
+
+    The window is printed above the table (§1.6.1) because every ``context tok``
+    below it is meaningless without it: the first full prepare sized against the
+    65536 fallback and rejected two PySnooper bugs, and nothing in the table said so.
+    """
+    lines: list[str] = []
+    if n_ctx is not None:
+        lines += [
+            f"Context window: n_ctx={n_ctx} (source: {n_ctx_source or 'unknown'}) — "
+            "every verdict below was sized against this window.",
+            "",
+        ]
+    lines += [
         "| bug | role | wave | mode | verdict | F2P | collected | native fails | context tok | issue |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]

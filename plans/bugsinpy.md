@@ -175,7 +175,8 @@ context guard — *after* a checkpoint has been baked and a wave has been schedu
    JSON carries, per bug: `estimated_prompt_tokens`, `prompt_tokens_real` (**null** until a session
    has actually paid for the prompt, with `prompt_tokens_real_source` naming the session that filled
    it in), `budget_tokens`, `verdict`, `source_bytes` and `file_count`, plus the reasons for a
-   rejection. `prepare` prints the same numbers as a table on stdout.
+   rejection. Its top level carries the batch's `n_ctx` / `n_ctx_source` (the window the gate was
+   sized against — §1.6.1), and `prepare` prints the same numbers as a table on stdout.
 4. **`plans/bugsinpy_split.json` is an input and is never written by a stage.** Measurements live in
    the batch directory (`context_report.json`, `prepare.json`); the split only changes through a
    deliberate edit that is reviewed. A stage that rewrites the split turns a measurement into a
@@ -190,6 +191,36 @@ context guard — *after* a checkpoint has been baked and a wave has been schedu
    observed number.
 6. **Narrowing files to fit is v2 work**, explicitly out of scope. A rejected bug is replaced from
    the reserve list (§8); it is not patched up.
+
+#### 1.6.1 The gate may only size against a window the run will use
+
+The precheck is only worth running if it measures the prompt the *run* will send. The run resolves
+its window the way `llm::context_window_tokens` does — `VANTA_LLM_CONTEXT_TOKENS`, else the server's
+`/props`, else **65536** — and that fallback is a wrong answer that looks like a right one:
+
+> The first full `prepare` ran with `VANTA_LLM_CONTEXT_TOKENS` unset in the shell. The gate sized
+> against the 65536 fallback and gave a **16128**-token budget instead of **65280**, then rejected
+> `PySnooper/1` and `/2` as `source_truncated_by_cap` — for a prompt no run would ever have sent.
+
+So `prepare` **refuses** to run the context gate unless the window comes from an explicit source, in
+this order:
+
+| source | how |
+|---|---|
+| `VANTA_LLM_CONTEXT_TOKENS` | the variable the run itself reads first — wins |
+| `--n-ctx TOKENS` | a per-invocation flag, **checked against** the other two rather than overriding them |
+| the server's `/props` | `default_generation_settings.n_ctx` or top-level `n_ctx`, base URL `VANTA_LLM_BASE_URL` |
+
+If none is available, `prepare` fails before the first checkout with a `ContextError` naming all
+three ways out. `--n-ctx` is deliberately *not* an override: a run never reads the flag, so a flag
+that disagreed with the variable or with `/props` would size the gate against a window the run will
+not use — the same footgun in a different coat. A disagreement is an error, not a preference.
+
+The resolved window and its source are printed above the summary table, recorded at the top level of
+`prepare.json` (`n_ctx`, `n_ctx_source`) and of `context_report.json`, and re-read by `run`, which
+**warns loudly on stderr** when its own window differs from the batch's — before `--plan` prints, so
+the cheap moment to notice is the moment it is noticed. The two halves are the rule: `prepare`
+refuses to start without an explicit source, `run` refuses to stay silent about a drift.
 
 ---
 
@@ -899,6 +930,45 @@ The `fail_to_pass` / `prompt_tokens_estimate` / `context_ok` / `issue_text` fiel
 their *frozen* state: they are what a reviewed edit writes back into this file once the batch artifacts
 exist. `prepare` itself never writes it — it writes `runs/bugsinpy/<batch>/prepare.json` and
 `context_report.json` — so the committed file never contains a value no one approved.
+
+#### 7.2.1 `prepare.json` ⇄ `load_prepared` — one record contract, not two copies
+
+`prepare` writes `runs/bugsinpy/<batch>/prepare.json` and `run` reads it back with
+`runner.load_prepared`. Those two halves were hand-written in different modules and **drifted**: the
+first smoke run died with
+
+```
+TypeError: IssueText.__init__() missing 3 required positional arguments:
+'leak', 'failure_kinds', and 'needs_decision'
+```
+
+because `IssueText` had grown three fields and the runner's reader was still building the old shape —
+and a `TypeError` names neither the field nor the batch, which is what a reader needs in order to fix
+it. The same audit found a second, quieter drift: `prepare` wrote `context` and `deps` and the reader
+restored **neither**, while every other field was read with a `.get(name, default)` fallback that hid
+the gap. `BugPrep.runnable` requires `context`, so a loaded batch could never pass `select_preps` and
+the run would have failed with "these bugs did not prepare as runners" about bugs that had prepared
+perfectly.
+
+The rule is now structural (`scripts/bugsinpy/records.py`):
+
+- Every dataclass `prepare.json` stores — `BugPrep`, `IssueText`, `LeakResult`, `LeakRemoval`,
+  `ContextVerdict`, `ConcatStats` — owns exactly one `to_dict` / `from_dict` pair, and **both sides
+  call it**: `prepare`'s writer and the runner's loader are the same code, not two copies.
+- `field_of` / `strings_of` read a stored field or raise `RecordError` naming **the field and the
+  record** (for `prepare.json`, the bug and the batch directory). A missing field is `"missing field
+  'leak'"` in `IssueText in PySnooper/3 of batch runs/bugsinpy/<batch>`, not a constructor
+  `TypeError`. `strings_of` additionally checks the value is a list, so a bare string is a loud error
+  rather than a silent list-of-characters.
+- `prepare_manifest()` is the only writer of the file's envelope, so the round-trip test builds the
+  payload with the writer the stage uses instead of a second copy of the format.
+- `prepare.json`'s top level also records `n_ctx` / `n_ctx_source` (§1.6.1); `run` compares them with
+  its own window and warns on a mismatch.
+
+The round-trip test builds a `BugPrep` the way `prepare` does — a real `IssueText` from
+`build_issue_text`, with `leak`, `failure_kinds` and `needs_decision` set, a measured `ContextVerdict`
+and real `deps` — serialises it with `prepare_manifest`, loads it with `load_prepared` and asserts
+every field comes back equal. No VM, no clone.
 
 ### 7.3 Manifest — one record per (bug, config, seed)
 

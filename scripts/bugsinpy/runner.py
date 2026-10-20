@@ -62,9 +62,11 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
 from . import compact as compact_mod
+from . import context as ctx_mod
 from . import manifest as manifest_mod
 from . import oracle as oracle_mod
 from . import prepare as prepare_mod
+from . import records as records_mod
 from . import suite as suite_mod
 from . import trees as tree_mod
 from .manifest import DONE, FAILED, RUNNING, Manifest, job_key
@@ -1425,19 +1427,35 @@ def _render_schedule(
 # ---------------------------------------------------------------------------
 # reading back a prepared batch (resume)
 # ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class PreparedBatch:
+    """``prepare.json`` read back — the batch's preps, entries and its window."""
+
+    batch_dir: Path
+    preps: list[prepare_mod.BugPrep]
+    entries: dict[str, dict[str, Any]]
+    n_ctx: Optional[int]
+    """The window ``prepare`` sized the context gate against (§1.6.1), as recorded.
+    ``None`` means the batch predates the field, which :func:`context_window_warning`
+    reports rather than inventing a value."""
+
+    n_ctx_source: Optional[str]
+
+
 def load_prepared(
     *,
     batch_dir: Path,
     split: Split,
     bugsinpy_root: Path,
-) -> tuple[list[prepare_mod.BugPrep], dict[str, dict[str, Any]]]:
+) -> PreparedBatch:
     """Rebuild genuine :class:`BugPrep` objects from ``prepare.json``.
 
-    No second persisted format: the runner reads the *same* artifact ``prepare``
-    wrote, so a batch that was prepared in one process can be run in another
-    without re-deriving three double suite runs per bug. Every field ``oracle.grade``
-    reads is restored, and ``load_bug`` re-reads ``bug.info`` so a moved clone
-    fails loudly here rather than silently grading against a tree nobody prepared.
+    No second persisted format: the runner calls the *same* ``to_dict``/``from_dict``
+    pair ``prepare`` wrote with (``records.py``), so a batch prepared in one process
+    can be run in another without re-deriving three double suite runs per bug, and a
+    field the reader does not know about cannot be dropped silently. ``load_bug``
+    re-reads ``bug.info`` so a moved clone fails loudly here rather than silently
+    grading against a tree nobody prepared.
     """
     payload = _read_json(batch_dir / "prepare.json")
     if not payload:
@@ -1455,44 +1473,70 @@ def load_prepared(
         project = str(entry["project"])
         bug_id = int(entry["bug_id"])
         bug = prepare_mod.load_bug(split, bugsinpy_root, project, bug_id)
-        prep = prepare_mod.BugPrep(
-            bug=bug,
-            root=batch_dir / "worktrees" / f"{project}_{bug_id}",
-            role=str(raw.get("role") or entry.get("role", "pilot")),
-            wave=int(raw.get("wave") or entry["wave"]),
-            test_cmd=[str(part) for part in entry["test_cmd"]],
-            prepare_mode=str(raw.get("prepare_mode") or prepare_mod.FULL),
-            test_paths=[str(p) for p in raw.get("test_paths", [])],
-            fail_to_pass=[str(n) for n in raw.get("fail_to_pass", [])],
-            pass_to_pass_count=int(raw.get("pass_to_pass_count") or 0),
-            flaky_nodeids=[str(n) for n in raw.get("flaky_nodeids", [])],
-            preexisting_failures=[str(n) for n in raw.get("preexisting_failures", [])],
-            native_failure_baseline=[
-                str(n) for n in raw.get("native_failure_baseline", [])
-            ],
-            native_green_on_vanta_tree=bool(raw.get("native_green_on_vanta_tree")),
-            hidden_files_deleted=[str(p) for p in raw.get("hidden_files_deleted", [])],
-            partially_hidden_functions=[
-                str(p) for p in raw.get("partially_hidden_functions", [])
-            ],
-            gate_failures=[str(f) for f in raw.get("gate_failures", [])],
-        )
-        issue = raw.get("issue") or {}
-        if issue:
-            prep.issue = _issue_from_dict(issue)
+        try:
+            prep = prepare_mod.BugPrep.from_dict(
+                raw,
+                bug=bug,
+                root=batch_dir / "worktrees" / f"{project}_{bug_id}",
+                test_cmd=[str(part) for part in entry["test_cmd"]],
+                where=f"{key} of batch {batch_dir}",
+            )
+        except records_mod.RecordError as exc:
+            # The record contract's error already names the field and the batch;
+            # re-raising as a RunnerError is what turns it into a clean CLI message
+            # instead of a traceback, without rewriting the message.
+            raise RunnerError(f"{batch_dir / 'prepare.json'}: {exc}") from exc
         preps.append(prep)
-    return preps, entries
+    recorded_n_ctx = payload.get("n_ctx")
+    if recorded_n_ctx is not None and not isinstance(recorded_n_ctx, int):
+        raise RunnerError(
+            f"{batch_dir / 'prepare.json'}: field 'n_ctx' is "
+            f"{type(recorded_n_ctx).__name__}, not an integer"
+        )
+    return PreparedBatch(
+        batch_dir=batch_dir,
+        preps=preps,
+        entries=entries,
+        n_ctx=recorded_n_ctx,
+        n_ctx_source=payload.get("n_ctx_source"),
+    )
 
 
-def _issue_from_dict(payload: dict[str, Any]):
-    """The smallest object ``.text``/``.ok`` satisfy for the runner's uses."""
-    from .issue import IssueText
+def context_window_warning(batch: PreparedBatch) -> Optional[str]:
+    """Warn when this run's window is not the one ``prepare`` sized against (§1.6.1).
 
-    text = str(payload.get("text") or "")
-    issue = IssueText(text=text, pre_gate=str(payload.get("pre_gate") or ""), ok=bool(payload.get("ok")))
-    issue.needs_decision = payload.get("needs_decision")
-    issue.failure_kinds = list(payload.get("failure_kinds") or [])
-    return issue
+    ``prepare`` refuses to gate against the 65536 fallback, but the *run* still
+    resolves its own window the way ``llm::context_window_tokens`` does — the
+    variable, then ``/props``, then the fallback — and that can move between the two
+    (a server restarted with a different ``-c``, an exported variable left out of the
+    shell that starts the run). When it does, every context verdict in the batch was
+    measured against a prompt the run will not send, which is exactly how PySnooper/1
+    and /2 came to be rejected for a window no run would have used.
+
+    Returns the message, or ``None`` when they agree; printing is the caller's job so
+    the comparison is testable without a batch or a server.
+    """
+    if batch.n_ctx is None:
+        return (
+            f"{batch.batch_dir / 'prepare.json'} records no n_ctx, so this run cannot "
+            "check that it uses the window prepare sized the context gate against. "
+            "That batch predates the recorded window; re-run prepare before trusting "
+            "its context verdicts."
+        )
+    run_n_ctx, run_source = ctx_mod.server_context_window()
+    if run_n_ctx == batch.n_ctx:
+        return None
+    prepare_budget, _ = ctx_mod.budget_tokens(batch.n_ctx)
+    run_budget, _ = ctx_mod.budget_tokens(run_n_ctx)
+    return (
+        f"context window mismatch: prepare sized this batch against n_ctx="
+        f"{batch.n_ctx} (source: {batch.n_ctx_source or 'unrecorded'}) but this run "
+        f"resolves n_ctx={run_n_ctx} (source: {run_source}). The prompt budget moves "
+        f"with it ({prepare_budget} tok at prepare, {run_budget} tok now), so the "
+        "batch's context verdicts describe a window this run will not use. Export "
+        "VANTA_LLM_CONTEXT_TOKENS (or point VANTA_LLM_BASE_URL at the server prepare "
+        "measured) so the two agree, or re-run prepare."
+    )
 
 
 def _bug_key(entry: dict[str, Any]) -> str:

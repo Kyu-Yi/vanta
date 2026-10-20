@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
+from .records import RecordError, field_of, strings_of
 from .trees import nodeid_chain, nodeid_file
 
 MIN_ACTIONABLE_WORDS = 8
@@ -181,6 +182,32 @@ class LeakRemoval:
     occurrences_in_vanta_tree: int
     action: str  # "stripped"
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "token": self.token,
+            "token_class": self.token_class,
+            "reason": self.reason,
+            "occurrences_in_answer": self.occurrences_in_answer,
+            "occurrences_in_vanta_tree": self.occurrences_in_vanta_tree,
+            "action": self.action,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object, *, where: str = "") -> "LeakRemoval":
+        owner = cls.__name__
+        return cls(
+            token=str(field_of(payload, "token", owner=owner, where=where)),
+            token_class=str(field_of(payload, "token_class", owner=owner, where=where)),
+            reason=str(field_of(payload, "reason", owner=owner, where=where)),
+            occurrences_in_answer=int(
+                field_of(payload, "occurrences_in_answer", owner=owner, where=where)
+            ),
+            occurrences_in_vanta_tree=int(
+                field_of(payload, "occurrences_in_vanta_tree", owner=owner, where=where)
+            ),
+            action=str(field_of(payload, "action", owner=owner, where=where)),
+        )
+
 
 @dataclass
 class LeakResult:
@@ -190,13 +217,37 @@ class LeakResult:
     ok: bool = True
     reason: Optional[str] = None
 
-    def as_dict(self) -> dict[str, object]:
+    def to_dict(self) -> dict[str, object]:
+        """Lossless: the round trip is what keeps the reader honest.
+
+        The ungated list is stored verbatim rather than deduplicated here, because
+        ``load_prepared`` has to give back the same ``LeakResult`` the gate produced.
+        ``write_leak_gate`` sorts and deduplicates for the human-readable report.
+        """
         return {
+            "text": self.text,
             "ok": self.ok,
             "reason": self.reason,
-            "removals": [r.__dict__ for r in self.removals],
-            "ungated_prose_only_in_answer": sorted(set(self.ungated_prose)),
+            "removals": [r.to_dict() for r in self.removals],
+            "ungated_prose": list(self.ungated_prose),
         }
+
+    @classmethod
+    def from_dict(cls, payload: object, *, where: str = "") -> "LeakResult":
+        owner = cls.__name__
+        removals = field_of(payload, "removals", owner=owner, where=where)
+        if not isinstance(removals, list):
+            raise RecordError(
+                f"{owner} in {where}: field 'removals' is "
+                f"{type(removals).__name__}, not a list"
+            )
+        return cls(
+            text=str(field_of(payload, "text", owner=owner, where=where)),
+            removals=[LeakRemoval.from_dict(item, where=where) for item in removals],
+            ungated_prose=strings_of(payload, "ungated_prose", owner=owner, where=where),
+            ok=bool(field_of(payload, "ok", owner=owner, where=where)),
+            reason=field_of(payload, "reason", owner=owner, where=where),
+        )
 
 
 def normalise_token(token: str) -> str:
@@ -359,15 +410,36 @@ class IssueText:
     ok: bool
     needs_decision: Optional[str]
 
-    def as_dict(self) -> dict[str, object]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "text": self.text,
             "pre_gate": self.pre_gate,
-            "failure_kinds": self.failure_kinds,
+            "failure_kinds": list(self.failure_kinds),
             "ok": self.ok,
             "needs_decision": self.needs_decision,
-            "leak": self.leak.as_dict(),
+            "leak": self.leak.to_dict(),
         }
+
+    @classmethod
+    def from_dict(cls, payload: object, *, where: str = "") -> "IssueText":
+        """The reader for :meth:`to_dict` — the one ``runner.load_prepared`` uses.
+
+        Every field is required, including the ones a previous reader guessed at:
+        the crash this pair exists to prevent was a reader constructing an
+        ``IssueText`` without ``leak``/``failure_kinds``/``needs_decision`` and
+        setting them afterwards, which is exactly how the two sides drifted.
+        """
+        owner = cls.__name__
+        return cls(
+            text=str(field_of(payload, "text", owner=owner, where=where)),
+            pre_gate=str(field_of(payload, "pre_gate", owner=owner, where=where)),
+            leak=LeakResult.from_dict(
+                field_of(payload, "leak", owner=owner, where=where), where=where
+            ),
+            failure_kinds=strings_of(payload, "failure_kinds", owner=owner, where=where),
+            ok=bool(field_of(payload, "ok", owner=owner, where=where)),
+            needs_decision=field_of(payload, "needs_decision", owner=owner, where=where),
+        )
 
 
 def build_issue_text(

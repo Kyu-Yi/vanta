@@ -50,12 +50,13 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from bugsinpy import bake as bake_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
+from bugsinpy import context as context_mod  # noqa: E402
 from bugsinpy import manifest as manifest_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
 from bugsinpy import runner as runner_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
 from bugsinpy.shuru import ShuruError  # noqa: E402
-from bugsinpy.split import Split, SplitError, load_split, sha256_text  # noqa: E402
+from bugsinpy.split import Split, SplitError, load_split  # noqa: E402
 
 DEFAULT_SPLIT = REPO_ROOT / "plans" / "bugsinpy_split.json"
 RUNS_DIR = REPO_ROOT / "runs" / "bugsinpy"
@@ -67,10 +68,6 @@ EXIT_HARNESS_FAILED = 2
 
 def utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +168,18 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             "Refusing to derive ground truth from metadata that moved."
         )
 
+    # The context window, resolved once for the whole batch and from an *explicit*
+    # source only (§1.6.1). This happens before the first checkout on purpose: with
+    # the window unresolved the gate would size against the 65536 fallback and
+    # reject bugs for a prompt no run would ever send, and it would do that after
+    # hours of suite runs rather than before them.
+    n_ctx, n_ctx_source = context_mod.explicit_context_window(n_ctx=args.n_ctx)
+    print(
+        f"context window: n_ctx={n_ctx} (source: {n_ctx_source}) — the context gate "
+        "is sized against this window",
+        flush=True,
+    )
+
     # Preflight the checkpoints for everything that will run a suite, before the
     # first checkout: a missing layer is a batch-level mistake (§3.3).
     prepare_mod.require_checkpoints(
@@ -207,6 +216,8 @@ def cmd_prepare(args: argparse.Namespace) -> int:
                 batch_dir=batch_dir,
                 deps_dir=deps_dir,
                 full=full,
+                n_ctx=n_ctx,
+                n_ctx_source=n_ctx_source,
             )
         except Exception as exc:  # one bug must not take the batch down
             detail = f"{type(exc).__name__}: {exc}"
@@ -224,35 +235,31 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             prepare_mod.write_leak_gate(batch_dir, prep)
     prepare_mod.write_issue_texts(batch_dir, preps)
     prepare_mod.write_context_sizes(batch_dir, preps)
-    prepare_mod.write_context_report(batch_dir, preps)
+    prepare_mod.write_context_report(
+        batch_dir, preps, n_ctx=n_ctx, n_ctx_source=n_ctx_source
+    )
 
-    summary = prepare_mod.render_summary(preps)
+    summary = prepare_mod.render_summary(preps, n_ctx=n_ctx, n_ctx_source=n_ctx_source)
     (batch_dir / "prepare_summary.md").write_text(summary, encoding="utf-8")
     # The split is an input, never an output: how many bugs this run measured, and
     # which of them it rejected, belongs in the batch's own artifacts. Rehashing the
     # file after the work is the evidence that nothing here wrote to it.
     split_sha_before = split_mod.sha256_file(split_path)
+    manifest = prepare_mod.prepare_manifest(
+        split=split,
+        split_path=split_path,
+        split_sha_before=split_sha_before,
+        batch_dir=batch_dir,
+        commit=commit,
+        bugsinpy_root=bugsinpy_root,
+        selected=[bug_key(entry) for entry, _ in selected],
+        broken=broken,
+        preps=preps,
+        n_ctx=n_ctx,
+        n_ctx_source=n_ctx_source,
+    )
     (batch_dir / "prepare.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "kind": "prepare",
-                "created_utc": utc_now(),
-                "batch_dir": str(batch_dir),
-                "split": str(split_path),
-                "split_sha256_before": sha256_text(split.to_json()),
-                "split_file_sha256_before": split_sha_before,
-                "split_written": False,
-                "bugsinpy_commit": commit,
-                "bugsinpy_root": str(bugsinpy_root),
-                "selected": [bug_key(entry) for entry, _ in selected],
-                "breaks": [{"bug": key, "detail": detail} for key, detail in broken],
-                "bugs": [prep.as_dict() for prep in preps],
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-        + "\n",
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     split_sha_after = split_mod.sha256_file(split_path)
@@ -449,11 +456,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     split = load_split(args.split.resolve())
     batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
     bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
-    preps, entries = runner_mod.load_prepared(
+    batch = runner_mod.load_prepared(
         batch_dir=batch_dir, split=split, bugsinpy_root=bugsinpy_root
     )
+    # Before anything runs, and before --plan prints: a run whose window differs
+    # from the one prepare sized against is measuring a different prompt than the
+    # batch's verdicts describe (§1.6.1), and the cheap moment to notice is now.
+    window_warning = runner_mod.context_window_warning(batch)
+    if window_warning:
+        print(f"WARNING: {window_warning}", file=sys.stderr, flush=True)
     waves = parse_waves(args.waves)
-    selected = select_preps(preps, only=args.only, waves=waves)
+    selected = select_preps(batch.preps, only=args.only, waves=waves)
     vanta_bin = runner_mod.require_vanta_bin(args.vanta_bin.resolve())
 
     code, results = runner_mod.run_batch(
@@ -461,7 +474,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         batch_id=batch_dir.name,
         split=split,
         preps=selected,
-        entries=entries,
+        entries=batch.entries,
         seeds=split.seeds,
         waves=waves or sorted({prep.wave for prep in selected}),
         vanta_bin=vanta_bin,
@@ -561,6 +574,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="prepare only these bugs (repeatable); forces full preparation",
     )
     prep.add_argument("--waves", default="", help="comma-separated wave numbers")
+    prep.add_argument(
+        "--n-ctx",
+        type=int,
+        default=None,
+        metavar="TOKENS",
+        help=(
+            "the context window the context gate is sized against (§1.6.1). Checked "
+            "against VANTA_LLM_CONTEXT_TOKENS and the server's /props n_ctx rather "
+            "than overriding them: a run resolves the window from those two, so a "
+            "flag that disagreed would size the gate against a prompt no run sends."
+        ),
+    )
     prep.add_argument(
         "--reserves",
         choices=("measure", "skip"),

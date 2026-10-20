@@ -48,6 +48,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .records import RecordError, field_of, strings_of
+
 # ---- mirrors of src/repo/mod.rs -------------------------------------------
 SOURCE_EXTENSIONS = frozenset(
     {"py", "rs", "go", "js", "ts", "jsx", "tsx", "java", "c", "cpp", "h", "hpp"}
@@ -111,7 +113,11 @@ server adds around the rendered messages. Small, but it is inside the guard's
 comparison, so leaving it out would put the two boundaries 256 tokens apart."""
 
 FALLBACK_CONTEXT_TOKENS = 65_536
+FALLBACK_SOURCE = "fallback (server unreachable)"
 DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
+ENV_SOURCE = "VANTA_LLM_CONTEXT_TOKENS"
+FLAG_SOURCE = "--n-ctx"
+PROPS_SOURCE = "server /props"
 
 
 class ContextError(RuntimeError):
@@ -133,6 +139,40 @@ class ConcatStats:
     @property
     def truncated(self) -> bool:
         return self.files_skipped_oversize > 0 or self.files_skipped_budget > 0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "files_eligible": self.files_eligible,
+            "bytes_eligible": self.bytes_eligible,
+            "files_included": self.files_included,
+            "bytes_included": self.bytes_included,
+            "files_skipped_oversize": self.files_skipped_oversize,
+            "files_skipped_budget": self.files_skipped_budget,
+            "largest_files": [[rel, size] for rel, size in self.largest_files],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object, *, where: str = "") -> "ConcatStats":
+        owner = cls.__name__
+        largest = field_of(payload, "largest_files", owner=owner, where=where)
+        if not isinstance(largest, list):
+            raise RecordError(
+                f"{owner} in {where}: field 'largest_files' is "
+                f"{type(largest).__name__}, not a list"
+            )
+        return cls(
+            files_eligible=int(field_of(payload, "files_eligible", owner=owner, where=where)),
+            bytes_eligible=int(field_of(payload, "bytes_eligible", owner=owner, where=where)),
+            files_included=int(field_of(payload, "files_included", owner=owner, where=where)),
+            bytes_included=int(field_of(payload, "bytes_included", owner=owner, where=where)),
+            files_skipped_oversize=int(
+                field_of(payload, "files_skipped_oversize", owner=owner, where=where)
+            ),
+            files_skipped_budget=int(
+                field_of(payload, "files_skipped_budget", owner=owner, where=where)
+            ),
+            largest_files=[(str(rel), int(size)) for rel, size in largest],
+        )
 
 
 def measure_tree(tree: Path) -> ConcatStats:
@@ -190,24 +230,42 @@ class ContextVerdict:
         """How much the estimate could grow before it hits the budget."""
         return self.budget_tokens - self.estimated_prompt_tokens
 
-    def as_dict(self) -> dict[str, object]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "context_ok": self.context_ok,
-            "reasons": self.reasons,
+            "reasons": list(self.reasons),
             "estimated_prompt_tokens": self.estimated_prompt_tokens,
             "budget_tokens": self.budget_tokens,
+            # Derived, but recorded: it is the number a reader compares against the
+            # estimate, and leaving it out would push the reader into recomputing it.
             "headroom_tokens": self.headroom_tokens,
             "n_ctx": self.n_ctx,
             "n_ctx_source": self.n_ctx_source,
             "output_reserve_tokens": self.output_reserve_tokens,
             "margin_tokens": self.margin_tokens,
-            "source_bytes_included": self.stats.bytes_included,
-            "source_bytes_eligible": self.stats.bytes_eligible,
-            "files_included": self.stats.files_included,
-            "files_eligible": self.stats.files_eligible,
-            "files_skipped_oversize": self.stats.files_skipped_oversize,
-            "files_skipped_budget": self.stats.files_skipped_budget,
+            "stats": self.stats.to_dict(),
         }
+
+    @classmethod
+    def from_dict(cls, payload: object, *, where: str = "") -> "ContextVerdict":
+        owner = cls.__name__
+        return cls(
+            context_ok=bool(field_of(payload, "context_ok", owner=owner, where=where)),
+            reasons=strings_of(payload, "reasons", owner=owner, where=where),
+            estimated_prompt_tokens=int(
+                field_of(payload, "estimated_prompt_tokens", owner=owner, where=where)
+            ),
+            budget_tokens=int(field_of(payload, "budget_tokens", owner=owner, where=where)),
+            n_ctx=int(field_of(payload, "n_ctx", owner=owner, where=where)),
+            n_ctx_source=str(field_of(payload, "n_ctx_source", owner=owner, where=where)),
+            stats=ConcatStats.from_dict(
+                field_of(payload, "stats", owner=owner, where=where), where=where
+            ),
+            output_reserve_tokens=int(
+                field_of(payload, "output_reserve_tokens", owner=owner, where=where)
+            ),
+            margin_tokens=int(field_of(payload, "margin_tokens", owner=owner, where=where)),
+        )
 
 
 def estimate_tokens(text_bytes: int) -> int:
@@ -244,7 +302,11 @@ def precheck(
 ) -> ContextVerdict:
     stats = measure_tree(tree)
     if n_ctx is None:
-        n_ctx, n_ctx_source = server_context_window()
+        # ``explicit_context_window``, not ``server_context_window``: the gate
+        # refuses to run against the 65536 fallback (see that function). A caller
+        # that forgot to thread an explicit window therefore fails here instead of
+        # producing a verdict nobody should act on.
+        n_ctx, n_ctx_source = explicit_context_window()
 
     source_tokens = estimate_tokens(stats.bytes_included)
     issue_tokens = estimate_tokens(len(issue_text.encode("utf-8")))
@@ -288,28 +350,88 @@ def precheck(
 # ---------------------------------------------------------------------------
 # the server's own `n_ctx`
 # ---------------------------------------------------------------------------
+def env_context_window() -> Optional[tuple[int, str]]:
+    """``VANTA_LLM_CONTEXT_TOKENS`` as ``(n_ctx, source)``, or ``None`` if unset."""
+    override = os.environ.get(ENV_SOURCE, "").strip()
+    if not override:
+        return None
+    try:
+        value = int(override)
+    except ValueError as exc:
+        raise ContextError(f"{ENV_SOURCE}={override!r} is not an integer") from exc
+    if value <= 0:
+        raise ContextError(f"{ENV_SOURCE}={override!r} is not a positive window")
+    return value, ENV_SOURCE
+
+
 def server_context_window() -> tuple[int, str]:
     """``n_ctx`` the way ``llm::context_window_tokens`` resolves it.
 
     Order: ``VANTA_LLM_CONTEXT_TOKENS`` (wins), else the server's ``/props``,
     else 65536. Same order as the Rust, so the precheck and the run-time guard
-    agree about the window they are enforcing.
+    agree about the window they are enforcing. The fallback is *returned* here —
+    this is the run-time mirror, and a run really does fall back — but the
+    precheck does not go through this function: see
+    :func:`explicit_context_window`.
     """
-    override = os.environ.get("VANTA_LLM_CONTEXT_TOKENS", "").strip()
-    if override:
-        try:
-            value = int(override)
-        except ValueError as exc:
-            raise ContextError(
-                f"VANTA_LLM_CONTEXT_TOKENS={override!r} is not an integer"
-            ) from exc
-        if value > 0:
-            return value, "VANTA_LLM_CONTEXT_TOKENS"
-
+    env = env_context_window()
+    if env is not None:
+        return env
     probed = probe_props_n_ctx()
     if probed is not None:
-        return probed, "server /props"
-    return FALLBACK_CONTEXT_TOKENS, "fallback (server unreachable)"
+        return probed, PROPS_SOURCE
+    return FALLBACK_CONTEXT_TOKENS, FALLBACK_SOURCE
+
+
+def explicit_context_window(*, n_ctx: Optional[int] = None) -> tuple[int, str]:
+    """The window to size the context gate against, from an **explicit** source.
+
+    Either ``VANTA_LLM_CONTEXT_TOKENS``, ``--n-ctx``, or a reachable server's
+    ``/props`` — and if none of the three is available this **refuses** rather than
+    falling back to 65536.
+
+    [VANTA-WHY] The fallback is not a neutral default, it is a wrong answer that
+    looks like a right one. The first full prepare ran with the variable unset in
+    the shell, sized against 65536, and got a 16128-token budget instead of 65280:
+    PySnooper/1 and /2 were then rejected as "source_truncated_by_cap" for a window
+    no run would ever have used. A gate is only worth running if it measures the
+    prompt the run will actually send, so the missing window is an error here and
+    not a warning in a report.
+
+    ``--n-ctx`` is checked against the other two sources instead of overriding
+    them: a run resolves the window from the variable, then ``/props``, then the
+    fallback — it never reads this flag — so a flag that disagrees would size
+    against a window the run will not use, which is the bug this whole function
+    exists to prevent.
+    """
+    env = env_context_window()
+    probed = probe_props_n_ctx()
+    if n_ctx is not None:
+        if env is not None and env[0] != n_ctx:
+            raise ContextError(
+                f"--n-ctx {n_ctx} disagrees with {ENV_SOURCE}={env[0]}. The variable "
+                "wins at run time, so the flag would size the gate against a window "
+                "the run will not use. Keep one of the two."
+            )
+        if probed is not None and probed != n_ctx:
+            raise ContextError(
+                f"--n-ctx {n_ctx} disagrees with the server's /props n_ctx ({probed}). "
+                "A run reads /props when the variable is unset, so the flag would "
+                "size the gate against a window the run will not use."
+            )
+        return n_ctx, FLAG_SOURCE
+    if env is not None:
+        return env
+    if probed is not None:
+        return probed, PROPS_SOURCE
+    raise ContextError(
+        "refusing to run the context gate: no explicit context size. Set "
+        f"{ENV_SOURCE}, pass --n-ctx, or start the server so /props answers. "
+        f"Sizing against the {FALLBACK_CONTEXT_TOKENS}-token fallback is not an "
+        "option — that window is not the one the run will use, and a verdict "
+        "measured against it (16128 tok of budget instead of 65280) rejects bugs "
+        "for a reason that does not exist."
+    )
 
 
 def probe_props_n_ctx(timeout_secs: float = 5.0) -> Optional[int]:

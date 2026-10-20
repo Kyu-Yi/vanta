@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
@@ -309,9 +310,25 @@ class DepRef:
     name: str
     spec: str
     source: str
+    pin_source: Optional[str] = None
+    """The one source that wrote the exact ``==`` pin, when one did.
+
+    [VANTA-WHY] Kept apart from ``source`` (which accumulates every spelling of the
+    requirement) because it decides §3.2's date rule. A pin BugsInPy wrote itself is
+    the benchmark's reference environment and is installed as written; a pin the
+    *project* wrote is subject to the buggy commit's date like any other
+    requirement. Asking "did any of these sources pin it?" after merging would
+    mis-attribute a project pin whenever BugsInPy declared the same package as a
+    range instead of a pin.
+    """
 
     def as_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "spec": self.spec, "source": self.source}
+        return {
+            "name": self.name,
+            "spec": self.spec,
+            "source": self.source,
+            "pin_source": self.pin_source,
+        }
 
 
 def _bare(spec: str) -> str:
@@ -769,30 +786,127 @@ class ResolvedDep:
     sources: tuple[str, ...]
     pin: str
     harness: bool
+    released_at: Optional[str] = None
+    """The pinned release's first upload date, when PyPI lists it (``YYYY-MM-DD``)."""
+    pin_source: Optional[str] = None
+    """The source that wrote the exact ``==`` pin, when the pin came from one."""
+    exempt: bool = False
+    """Whether this is a BugsInPy reference pin, so §3.2's date rule was not applied.
+
+    A pip-freeze-style ``requirements.txt`` predates nothing: black/22's pins are from
+    2020 while its buggy commit is from 2018, and the date rule would refuse every one
+    of them. Rebuilding the benchmark's own environment is the point, so the pin is
+    installed as written — and because that is a departure from the rule, the release
+    date of every such pin is recorded, and any pin released *after* the buggy commit
+    is listed at the top level of the provenance.
+    """
+
+    @property
+    def pin_rule(self) -> str:
+        """How the pinned version was chosen, in one phrase, for the provenance."""
+        if self.harness:
+            return "provisioned by the interpreter layer"
+        if self.exempt:
+            return "BugsInPy's own exact pin, installed as written"
+        return "the newest release on or before the buggy commit's date"
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "name": self.name,
             "spec": self.spec,
             "sources": list(self.sources),
             "pin": self.pin,
             "provisioned_by": "interpreter layer" if self.harness else "pinned at bake time",
+            "pin_rule": self.pin_rule,
+            "released_at": self.released_at,
         }
+        if self.pin_source:
+            data["pinned_by"] = self.pin_source
+        return data
+
+
+def _specifier_of(ref: DepRef) -> SpecifierSet:
+    """The version constraint of one requirement — an empty set when there is none."""
+    return _requirement(ref.spec, ref.source).specifier
 
 
 def _specifier_text(ref: DepRef) -> str:
     """The version constraint of one requirement, as a string — ``""`` if none."""
-    return str(_requirement(ref.spec, ref.source).specifier)
+    return str(_specifier_of(ref))
+
+
+def _exact_version(specifier: SpecifierSet) -> Optional[Version]:
+    """The single version of a ``==``-only constraint, or ``None``.
+
+    ``==1.2.*`` is not a pin: it matches a range of releases, so it is a bound like
+    any other and never the one claim a merge settles on.
+    """
+    clauses = list(specifier)
+    if len(clauses) != 1 or clauses[0].operator != "==":
+        return None
+    try:
+        return Version(clauses[0].version)
+    except InvalidVersion:
+        return None
+
+
+BUGSINPY_PIN_SOURCES = ("requirements.txt", "setup.sh")
+"""The source labels of the two files BugsInPy ships per bug (design §3.2).
+
+Matched as a prefix of a ``DepRef.source`` label, which is how
+:func:`requirements_refs` and :func:`parse_setup_sh` write them
+(``requirements.txt line 7``). A project's own ``test_requirements.txt`` and a
+``setup.py`` declaration that *names* ``requirements.txt`` both carry a different
+prefix (``test_requirements.txt``, ``install_requires (requirements.txt) …``), so
+they are not mistaken for BugsInPy's file.
+"""
+
+
+def reference_pin(ref: DepRef) -> bool:
+    """Whether ``ref`` is an exact pin written in BugsInPy's own metadata.
+
+    [VANTA-WHY] This is the one exception to §3.2's date rule. The rule exists so a
+    layer cannot install a release the buggy tree could not have been built with;
+    BugsInPy's ``requirements.txt``/``setup.sh`` *are* the reference environment that
+    its own ``run_test.sh`` was validated against, so if the benchmark pinned an
+    older-or-newer exact release, installing it is reproducing the benchmark rather
+    than guessing. A range from those files is not exempt: only an exact ``==`` claim
+    says which release the reference environment had, and the date rule still picks
+    the release for a range. Which pins were exempt, and the date each was released,
+    is recorded in the provenance (:func:`deps_provenance`).
+    """
+    if _exact_version(_specifier_of(ref)) is None:
+        return False
+    labels = (ref.pin_source or ref.source).split("; ")
+    return any(label.startswith(BUGSINPY_PIN_SOURCES) for label in labels)
+
+
+def _claims(refs: Sequence[DepRef]) -> tuple[tuple[str, str], ...]:
+    """``(spec, source)`` for every claim in a group that has a constraint."""
+    return tuple((ref.spec, ref.source) for ref in refs if _specifier_text(ref))
 
 
 def merge_refs(refs: Sequence[DepRef]) -> tuple[list[DepRef], list[DepConflict]]:
     """One entry per package, plus every specifier disagreement that was found.
 
-    A bare name is absorbed by a constrained one: PySnooper/3 declares ``decorator``
-    in ``setup.sh`` and ``decorator>=4.3.0`` in ``install_requires``, which is one
-    requirement written twice, not a conflict. Two *different* specifier sets are
-    returned as a conflict and never picked between (design §3.3: a bug with
-    contradictory constraints is not reproducible from its declared sources).
+    Three cases, and nothing else is decided here:
+
+    * A bare name is absorbed by a constrained one: PySnooper/3 declares ``decorator``
+      in ``setup.sh`` and ``decorator>=4.3.0`` in ``install_requires``, which is one
+      requirement written twice, not a conflict.
+    * An exact ``==`` pin **intersects** with the bounds around it. black/22's
+      ``requirements.txt`` pins ``attrs==19.3.0`` while the project's
+      ``install_requires`` asks for ``attrs>=17.4.0``; the pin satisfies the bound, so
+      the requirement *is* the pin. Which source wrote the pin travels with the merged
+      ref in :attr:`DepRef.pin_source`, because that is what decides whether §3.2's
+      date rule applies to it.
+    * Anything else is a conflict and is never picked between (design §3.3). Two
+      different ``==`` pins for one package are jointly unsatisfiable, and so is a pin
+      that violates another source's bound — the bug is then not reproducible from its
+      declared sources, which is a decision for the split, not for the harness. Two
+      *different bounds* are a conflict too: their intersection is a constraint no
+      source wrote, and a layer must install what was declared rather than a range the
+      harness computed.
     """
     grouped: dict[str, list[DepRef]] = {}
     order: list[str] = []
@@ -806,16 +920,35 @@ def merge_refs(refs: Sequence[DepRef]) -> tuple[list[DepRef], list[DepConflict]]
     conflicts: list[DepConflict] = []
     for name in order:
         group = grouped[name]
-        specifiers = {_specifier_text(ref) for ref in group if _specifier_text(ref)}
-        if len(specifiers) > 1:
-            conflicts.append(
-                DepConflict(
+        pins = [
+            (ref, version)
+            for ref in group
+            if (version := _exact_version(_specifier_of(ref))) is not None
+        ]
+        if len({version for _, version in pins}) > 1:
+            conflicts.append(DepConflict(name=name, claims=_claims(group)))
+            continue
+        if pins:
+            pinned, version = pins[0]
+            if any(
+                _specifier_text(ref) and version not in _specifier_of(ref)
+                for ref in group
+                if ref is not pinned
+            ):
+                conflicts.append(DepConflict(name=name, claims=_claims(group)))
+                continue
+            merged.append(
+                DepRef(
                     name=name,
-                    claims=tuple(
-                        (ref.spec, ref.source) for ref in group if _specifier_text(ref)
-                    ),
+                    spec=pinned.spec,
+                    source="; ".join(ref.source for ref in group),
+                    pin_source=pinned.source,
                 )
             )
+            continue
+        specifiers = {_specifier_text(ref) for ref in group if _specifier_text(ref)}
+        if len(specifiers) > 1:
+            conflicts.append(DepConflict(name=name, claims=_claims(group)))
             continue
         chosen = next((ref for ref in group if _specifier_text(ref)), group[0])
         merged.append(
@@ -836,6 +969,15 @@ def _parseable(version: str) -> bool:
     return True
 
 
+def _newest_release(available: Mapping[str, str]) -> tuple[str, str]:
+    """``(version, date)`` of the newest parseable release PyPI lists."""
+    return max(
+        ((version, date) for version, date in available.items() if _parseable(version)),
+        key=lambda item: Version(item[0]),
+        default=("?", "?"),
+    )
+
+
 def resolve_pins(
     refs: Sequence[DepRef],
     *,
@@ -846,14 +988,26 @@ def resolve_pins(
     """Pin each dependency to the newest release on or before ``commit_date``.
 
     Pure, and deliberately so: ``releases`` is passed in, so every rule here — the
-    cutoff, the harness exception, "no candidate" — is exercised by a test that
-    never touches the network (design §3.2).
+    cutoff, the two exceptions, "no candidate" — is exercised by a test that never
+    touches the network (design §3.2).
 
-    The exception is a package the interpreter layer already provides. Its
-    constraint is *checked* against the harness version and recorded; it is never
-    installed over it, because the json-report plugin is what produces the report
-    the oracle is read from and a project asking for ``pytest>=4.4.1`` would
-    otherwise silently downgrade it.
+    Two exceptions, and both are checks rather than decisions:
+
+    * A package the interpreter layer already provides. Its constraint is *checked*
+      against the harness version and recorded; it is never installed over it,
+      because the json-report plugin is what produces the report the oracle is read
+      from and a project asking for ``pytest>=4.4.1`` would otherwise silently
+      downgrade it.
+    * A BugsInPy reference pin (:func:`reference_pin`). The date rule is what stops a
+      layer from installing a release the buggy tree could not have been built with,
+      and it is the wrong rule for the benchmark's *own* frozen environment, which is
+      what ``requirements.txt`` in a pip-freeze-style bug is. Such a pin is installed
+      as written, and its release date is recorded in the provenance so a late pin is
+      visible rather than silent.
+
+    For everything else the rule is unchanged, and it takes precedence over
+    convenience: if the constraint has no release on or before the commit date, the
+    bug cannot be rebuilt and the bake stops rather than installing today's version.
     """
     resolved: list[ResolvedDep] = []
     for ref in refs:
@@ -890,25 +1044,35 @@ def resolve_pins(
                 f"{ref.source}: no release dates for {ref.name!r} were fetched; the "
                 "bake cannot pin it (design §3.2 pins by date, not by guess)"
             )
-        candidates = [
+        matching = [
             (version, date)
             for version, date in available.items()
-            if date[:10] <= commit_date
-            and _parseable(version)
+            if _parseable(version)
             and (not requirement.specifier or Version(version) in requirement.specifier)
         ]
-        if not candidates:
-            newest = max(
-                (item for item in available.items() if _parseable(item[0])),
-                key=lambda item: Version(item[0]),
-                default=("?", "?"),
-            )
-            raise BakeError(
-                f"{ref.source}: {ref.spec} has no release on or before {commit_date} "
-                f"(newest {ref.name} is {newest[0]}, released {newest[1][:10]}). "
-                "The buggy tree could not have been built with this requirement."
-            )
-        version = max(candidates, key=lambda item: Version(item[0]))[0]
+        exempt = reference_pin(ref)
+        if exempt:
+            pin_source = ref.pin_source or ref.source
+            if not matching:
+                newest = _newest_release(available)
+                raise BakeError(
+                    f"{ref.source}: {ref.spec} is a reference pin from BugsInPy's own "
+                    f"metadata, and PyPI lists no such release of {ref.name!r} (newest "
+                    f"{ref.name} is {newest[0]}, released {newest[1][:10]}). The "
+                    "benchmark's environment cannot be reproduced from a pin whose "
+                    "release does not exist."
+                )
+        else:
+            pin_source = ref.pin_source
+            matching = [item for item in matching if item[1][:10] <= commit_date]
+            if not matching:
+                newest = _newest_release(available)
+                raise BakeError(
+                    f"{ref.source}: {ref.spec} has no release on or before {commit_date} "
+                    f"(newest {ref.name} is {newest[0]}, released {newest[1][:10]}). "
+                    "The buggy tree could not have been built with this requirement."
+                )
+        version, released_at = max(matching, key=lambda item: Version(item[0]))
         resolved.append(
             ResolvedDep(
                 name=ref.name,
@@ -916,6 +1080,9 @@ def resolve_pins(
                 sources=(ref.source,),
                 pin=f"{ref.name}=={version}",
                 harness=False,
+                released_at=released_at[:10],
+                pin_source=pin_source,
+                exempt=exempt,
             )
         )
     return resolved
@@ -1066,6 +1233,16 @@ def deps_provenance(
     filter in between. It could not before: ``pytest==8.0.2`` appeared "installed"
     by the bug layer while the recipe never asked for it, which is the kind of
     contradiction that makes a provenance file not worth reading.
+
+    ``pins_after_commit_date`` is the record of the one place the layer departs from
+    §3.2's date rule: a BugsInPy reference pin is installed as written, so a pin
+    released *after* the buggy commit is in the layer while the tree it is used with
+    is older. That is not an error — it is what a pip-freeze-style
+    ``requirements.txt`` means — but it is the first thing to look at when a wave
+    misbehaves against what the bug's date suggests, so it is a queryable list and
+    not a sentence in a docstring. Every dependency also carries ``released_at`` and
+    ``pin_rule``, so the same question can be asked of a pin that is *inside* the
+    window.
     """
     return {
         "schema_version": 1,
@@ -1078,6 +1255,16 @@ def deps_provenance(
         "harness_pins": dict(harness_pins),
         "installs": list(installs_of(resolved)),
         "dependencies": [dep.as_dict() for dep in resolved],
+        "pins_after_commit_date": [
+            {
+                "name": dep.name,
+                "pin": dep.pin,
+                "released_at": dep.released_at,
+                "pin_rule": dep.pin_rule,
+            }
+            for dep in resolved
+            if dep.released_at is not None and dep.released_at > sources.commit_date
+        ],
         "skipped": [line.as_dict() for line in sources.skipped],
         "notes": list(sources.notes),
     }

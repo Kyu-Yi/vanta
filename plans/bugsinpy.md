@@ -407,21 +407,44 @@ and `decorator` exist only in `setup.sh` at bug 3. One source alone under-provis
 4. `install_requires`, read **statically** from `setup.py` (an AST walk, plus the file it names —
    PySnooper/1–2 read `requirements.in`, PySnooper/3 `requirements.txt`).
 
-Nothing is taken from anywhere else, and no package is ever chosen by hand. The union is resolved,
-not merged: if two sources constrain one package differently, `bake.DepConflict` fails that bug and
-names both claims rather than picking one.
+Nothing is taken from anywhere else, and no package is ever chosen by hand. The union is **merged to
+one entry per package**, and every claim in that group must agree on one version, or `bake.DepConflict`
+fails that bug and names every claim rather than picking one:
+
+- an exact `==` pin **narrows** the bounds around it. If the pin satisfies every other claim, the
+  requirement *is* the pin — `attrs==19.3.0` (BugsInPy `requirements.txt`) beside `attrs>=17.4.0`
+  (`install_requires`) is one requirement, because the reference pin is a legitimate narrowing of the
+  project's range. `==1.2.*` is **not** a pin: it matches a range of releases, so it is a bound like
+  any other and never the claim a merge settles on.
+- a pin that **violates** another source's bound (`attrs==17.1.0` against `attrs>=17.4.0`), two
+  different `==` pins, or two different bounds, are real conflicts and fail loudly. Not being able to
+  reproduce the environment is the failure this check exists to surface.
 
 **Pinning.** Every third-party dep is pinned to the newest release published on or before the buggy
-commit's date (`bake.resolve_pins`, the only PyPI contact, at bake time while network is available).
-A package the harness already provides (`pytest`, `pytest-json-report`) is left at the harness
-version and recorded as such — in particular `pytest` is never downgraded, which would break the
-json-report plugin. The resolved set, each dep's source (file + line), the pin, and the skipped
-`setup.sh` lines all go into `runs/bugsinpy/deps/<checkpoint>.json` and, as derived data, into the
-split's `deps` key. That file's `installs` list is **exactly** what the layer's recipe passes to pip
-(`bake.installs_of`, the one function both the recipe and the record use): a harness package appears
-in `dependencies` with its `provisioned_by` but is **not** in `installs`, because the interpreter layer
-already provides it and the recipe never re-pins it. A record that disagrees with the recipe is worse
-than no record.
+commit's date (`bake.resolve_pins`, the only PyPI contact, at bake time while network is available),
+with two exceptions:
+
+- A package the harness already provides (`pytest`, `pytest-json-report`) is left at the harness
+  version and recorded as such — in particular `pytest` is never downgraded, which would break the
+  json-report plugin.
+- An exact `==` pin **written in BugsInPy's own two per-bug files** (`requirements.txt`, `setup.sh`) is
+  the benchmark's **reference environment**: it is installed as written and exempt from the date rule,
+  because that pin is what `run_test.sh` was validated against. Whatever its release date, it is
+  recorded in the provenance's `pins_after_commit_date` list (with the release date and the rule that
+  chose it), so "this pin is newer than the bug" is a recorded fact rather than an invisible one. A
+  bug whose `requirements.txt` is a corpus-era **pip freeze** (black/22's is: 71 pins, 65 of them
+  released after its 2018-03-29 commit) therefore resolves instead of refusing — see the split's
+  `reviewed_changes` for what then has to be checked about the sandbox's ability to build it.
+
+Attribution is **per reference**, not per package (`DepRef.pin_source`): a pin the *project* wrote
+still obeys the date rule even when BugsInPy declared the same package as a range, and vice versa. The
+resolved set, each dep's source (file + line), the pin, the pin rule, the release date, and the
+skipped `setup.sh` lines all go into `runs/bugsinpy/deps/<checkpoint>.json` and, as derived data, into
+the split's `deps` key. That file's `installs` list is **exactly** what the layer's recipe passes to
+pip (`bake.installs_of`, the one function both the recipe and the record use): a harness package
+appears in `dependencies` with its `provisioned_by` but is **not** in `installs`, because the
+interpreter layer already provides it and the recipe never re-pins it. A record that disagrees with
+the recipe is worse than no record.
 
 **What the layer deliberately does not install.** The project's own install line is dropped, for two
 reasons:

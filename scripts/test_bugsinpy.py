@@ -192,7 +192,6 @@ class TestSplit:
         assert pilot_keys == {
             "PySnooper/2",
             "PySnooper/3",
-            "black/22",
             "thefuck/1",
             "thefuck/2",
             "thefuck/3",
@@ -210,17 +209,17 @@ class TestSplit:
         assert not (pilot_keys & reserve_keys)
 
     def test_real_split_reviewed_changes_carry_the_rule_and_its_measurements(self):
-        """§8's substitution is the one place the split departs from §8's own plan.
+        """§8's substitutions are where the split departs from §8's own plan.
 
-        Pinned so the amendment cannot be edited away or have its evidence thinned:
-        the rule that chose the substitute, the exclusion it substitutes for, and a
+        Pinned so an amendment cannot be edited away or have its evidence thinned:
+        the rule that chose each substitute, the exclusion it substitutes for, and a
         measurement for every candidate the rule walked are all in the file a
         reviewer reads.
         """
         split = load_split(SPLIT_PATH)
         changes = split.data["reviewed_changes"]
-        assert len(changes) == 2
-        excluded, promoted = changes
+        assert len(changes) == 3
+        excluded, promoted, removed = changes
         assert "PySnooper/1" in excluded["change"]
         assert "Python-2-only" in excluded["reason"]
 
@@ -232,6 +231,15 @@ class TestSplit:
         # and every one before it carries the reason the precheck fired.
         assert [m["bug"] for m in measurements if m["verdict"] == "pass"] == ["black/22"]
         assert all(m["reasons"] for m in measurements[:-1])
+
+        # The third entry retires that promotion: black/22 is out of `bugs`, so wave
+        # 1 is the two PySnooper bugs. Its evidence is the mechanical per-pin count
+        # in the rule text, not a per-candidate measurement table — the exclusion is
+        # a property of BugsInPy's own metadata, not a decision about the bug.
+        assert "black/22 is removed from `bugs`" in removed["change"]
+        assert "pip freeze" in removed["reason"]
+        assert "aarch64" in removed["rule"]
+        assert "measurements" not in removed
 
     def test_reviewed_change_validates(self):
         data = split_data(
@@ -316,7 +324,7 @@ class TestSplit:
     def test_waves_group_the_pilot(self):
         split = load_split(SPLIT_PATH)
         assert split.waves() == [1, 2, 3]
-        assert len(split.bugs_in_wave(1)) == 3
+        assert len(split.bugs_in_wave(1)) == 2
 
     def test_unknown_top_level_key_is_an_error(self):
         with pytest.raises(SplitError, match="unknown top-level keys"):
@@ -2517,15 +2525,15 @@ class TestBake:
             "decorator"
         ]
 
-    def test_wave_1_layers_are_one_interpreter_and_three_bug_layers(self):
+    def test_wave_1_layers_are_one_interpreter_and_two_bug_layers(self):
         split = load_split(SPLIT_PATH)
         minors, entries = bake_mod.select_layers(
             split, pythons=["3.8"], only=[], roles={"pilot"}
         )
         assert minors == ["3.8"]
-        # The third pilot is the promoted substitute and shares the py3.8
-        # interpreter with the two PySnooper bugs (see reviewed_changes).
-        assert [entry["project"] for entry in entries] == ["PySnooper", "PySnooper", "black"]
+        # Wave 1 is the two PySnooper bugs: black/22's promotion was retired (see
+        # the third reviewed_change), so the interpreter carries two bug layers.
+        assert [entry["project"] for entry in entries] == ["PySnooper", "PySnooper"]
         layers = bake_mod.layer_recipes(
             split,
             pythons=minors,
@@ -2536,15 +2544,11 @@ class TestBake:
             "vanta-bugsinpy-py3.8",
             "vanta-bi-PySnooper-2",
             "vanta-bi-PySnooper-3",
-            "vanta-bi-black-22",
         ]
         assert layers[0][1] == bake_mod.DEFAULT_BASE
         assert all(base == "vanta-bugsinpy-py3.8" for _, base, _ in layers[1:])
         recipe_by_name = {name: script for name, _, script in layers}
         assert "python-toolbox==0.9.3" in recipe_by_name["vanta-bi-PySnooper-2"]
-        assert recipe_by_name["vanta-bi-black-22"].count("pip install") == 0, (
-            "black/22 has no resolved third-party dependency in this fixture"
-        )
 
     def test_a_bug_without_resolved_dependencies_is_refused_not_baked_dependency_free(self):
         """``layer_recipes`` must not silently build a layer that installs nothing.
@@ -3106,6 +3110,50 @@ class TestResolvePinsByDate:
         )
         assert self._resolve([bake_mod.dep_ref("six", "setup.sh line 1")])[0].pin == "six==1.12.0"
 
+    # ---- the BugsInPy reference-pin exception -----------------------------
+    def test_a_bugsinpy_pin_is_installed_as_written_even_when_it_postdates_the_commit(self):
+        """A pip-freeze-style ``requirements.txt`` *is* the reference environment.
+
+        black/22's pins are from 2020 and its buggy commit is from 2018. The date rule
+        would refuse every one of them, which would make the benchmark's own frozen
+        environment unbakeable; the pin is what ``run_test.sh`` was validated against.
+        """
+        refs = [bake_mod.dep_ref("six==1.13.0", "requirements.txt line 12")]
+        resolved = self._resolve(refs)
+        assert resolved[0].pin == "six==1.13.0"
+        assert resolved[0].exempt is True
+        assert resolved[0].released_at == "2020-05-31"
+        assert resolved[0].pin_rule == "BugsInPy's own exact pin, installed as written"
+        assert resolved[0].as_dict()["pinned_by"] == "requirements.txt line 12"
+
+    def test_a_setup_sh_pin_is_a_bugsinpy_pin_too(self):
+        """Both of BugsInPy's per-bug files are the benchmark's environment."""
+        refs = [bake_mod.dep_ref("decorator==4.4.1", "setup.sh line 2")]
+        assert self._resolve(refs)[0].pin == "decorator==4.4.1"
+
+    def test_a_range_from_bugsinpys_own_files_is_not_exempt(self):
+        """Only an exact pin says which release the reference environment had."""
+        refs = [bake_mod.dep_ref("six>=1.13.0", "requirements.txt line 12")]
+        with pytest.raises(bake_mod.BakeError, match="no release on or before 2019-04-22"):
+            self._resolve(refs)
+
+    def test_the_same_pin_from_the_project_still_obeys_the_date_rule(self):
+        refs = [bake_mod.dep_ref("six==1.13.0", "install_requires (setup.py) line 4")]
+        with pytest.raises(bake_mod.BakeError, match="no release on or before 2019-04-22"):
+            self._resolve(refs)
+
+    def test_an_exempt_pin_naming_no_release_is_an_error_not_a_guess(self):
+        refs = [bake_mod.dep_ref("six==9.9.9", "requirements.txt line 12")]
+        with pytest.raises(bake_mod.BakeError, match="PyPI lists no such release of 'six'"):
+            self._resolve(refs)
+
+    def test_a_pin_inside_the_window_records_the_same_release_date(self):
+        """The record is not only for late pins: every pin carries its release date."""
+        refs = [bake_mod.dep_ref("decorator==4.4.0", "requirements.txt line 3")]
+        resolved = self._resolve(refs)
+        assert resolved[0].pin == "decorator==4.4.0"
+        assert resolved[0].released_at == "2019-03-16"
+
 
 class TestMergeRefs:
     """One requirement written twice is one requirement; two constraints disagree."""
@@ -3144,6 +3192,76 @@ class TestMergeRefs:
         assert len(conflicts) == 1
         assert conflicts[0].name == "six"
         assert "does not pick one of them" in conflicts[0].message()
+
+    # ---- an exact pin narrows a bound instead of conflicting with it ------
+    def test_an_exact_pin_intersects_with_the_bound_it_satisfies(self):
+        """black/22: ``attrs==19.3.0`` in requirements.txt, ``attrs>=17.4.0`` in setup.py.
+
+        The pin is inside the bound, so the requirement *is* the pin. The source that
+        wrote the pin travels with the merged ref: it is what decides whether §3.2's
+        date rule applies.
+        """
+        merged, conflicts = bake_mod.merge_refs(
+            [
+                bake_mod.dep_ref("attrs==19.3.0", "requirements.txt line 7"),
+                bake_mod.dep_ref("attrs>=17.4.0", "install_requires (setup.py) line 43"),
+            ]
+        )
+        assert conflicts == []
+        assert [ref.spec for ref in merged] == ["attrs==19.3.0"]
+        assert merged[0].pin_source == "requirements.txt line 7"
+        assert bake_mod.reference_pin(merged[0]) is True
+
+    def test_a_pin_that_violates_another_sources_bound_is_a_conflict(self):
+        """``attrs==17.1.0`` cannot satisfy ``attrs>=17.4.0``: not reproducible."""
+        merged, conflicts = bake_mod.merge_refs(
+            [
+                bake_mod.dep_ref("attrs==17.1.0", "requirements.txt line 7"),
+                bake_mod.dep_ref("attrs>=17.4.0", "install_requires (setup.py) line 43"),
+            ]
+        )
+        assert merged == []
+        assert conflicts[0].claims == (
+            ("attrs==17.1.0", "requirements.txt line 7"),
+            ("attrs>=17.4.0", "install_requires (setup.py) line 43"),
+        )
+
+    def test_two_different_pins_are_a_conflict(self):
+        merged, conflicts = bake_mod.merge_refs(
+            [
+                bake_mod.dep_ref("six==1.11.0", "requirements.txt line 3"),
+                bake_mod.dep_ref("six==1.12.0", "install_requires (setup.py) line 9"),
+            ]
+        )
+        assert merged == []
+        assert conflicts[0].name == "six"
+
+    def test_a_project_pin_beside_bugsinpys_bound_is_not_a_reference_pin(self):
+        """The pin's own source decides — not "did any of these sources pin it".
+
+        A pin the project wrote is subject to the date rule even when BugsInPy declared
+        the same package as a range; otherwise a project pin would inherit the
+        benchmark's exemption.
+        """
+        merged, conflicts = bake_mod.merge_refs(
+            [
+                bake_mod.dep_ref("attrs>=17.4.0", "requirements.txt line 7"),
+                bake_mod.dep_ref("attrs==19.3.0", "install_requires (setup.py) line 43"),
+            ]
+        )
+        assert conflicts == []
+        assert merged[0].spec == "attrs==19.3.0"
+        assert merged[0].pin_source == "install_requires (setup.py) line 43"
+        assert bake_mod.reference_pin(merged[0]) is False
+
+    def test_a_wildcard_equality_is_a_bound_not_a_pin(self):
+        """``==1.2.*`` matches a range of releases, so it pins nothing."""
+        merged, conflicts = bake_mod.merge_refs(
+            [bake_mod.dep_ref("six==1.12.*", "requirements.txt line 3")]
+        )
+        assert conflicts == []
+        assert merged[0].pin_source is None
+        assert bake_mod.reference_pin(merged[0]) is False
 
     def test_resolve_deps_fails_the_bug_loudly_and_names_both_claims(self):
         sources = bake_mod.DepSources(
@@ -3198,10 +3316,55 @@ class TestDependencyProvenance:
         by_name = {dep["name"]: dep for dep in provenance["dependencies"]}
         assert by_name["decorator"]["pin"] == "decorator==4.4.0"
         assert by_name["decorator"]["sources"] == ["install_requires (requirements.txt) line 1"]
+        assert by_name["decorator"]["released_at"] == "2019-03-16"
+        assert (
+            by_name["decorator"]["pin_rule"]
+            == "the newest release on or before the buggy commit's date"
+        )
         assert by_name["pytest"]["pin"] == "pytest==8.0.2"
         assert by_name["pytest"]["provisioned_by"] == "interpreter layer"
+        assert by_name["pytest"]["pin_rule"] == "provisioned by the interpreter layer"
         assert provenance["import_name"] == "demo"
         assert provenance["harness_pins"] == {"pytest": "8.0.2"}
+
+    def test_a_reference_pin_released_after_the_buggy_commit_is_recorded_as_late(self):
+        """The one departure from §3.2's date rule, as a queryable list.
+
+        A pip-freeze-style bug is pinned to releases newer than its own commit, so
+        ``pins_after_commit_date`` is where a reader finds out that a run's layer is
+        newer than its tree — without re-deriving anything.
+        """
+        sources = bake_mod.DepSources(
+            project="Demo",
+            bug_id=4,
+            checkpoint="vanta-bi-Demo-4",
+            buggy_commit="b" * 40,
+            commit_date="2019-04-22",
+            import_name="demo",
+            refs=(bake_mod.dep_ref("six==1.13.0", "requirements.txt line 12"),),
+        )
+        resolved = bake_mod.resolve_deps(
+            sources, releases=TestResolvePinsByDate.RELEASES, harness_pins={}
+        )
+        provenance = bake_mod.deps_provenance(sources, resolved, harness_pins={})
+        assert provenance["installs"] == ["six==1.13.0"]
+        assert provenance["pins_after_commit_date"] == [
+            {
+                "name": "six",
+                "pin": "six==1.13.0",
+                "released_at": "2020-05-31",
+                "pin_rule": "BugsInPy's own exact pin, installed as written",
+            }
+        ]
+        assert provenance["dependencies"][0]["pinned_by"] == "requirements.txt line 12"
+
+    def test_a_pin_inside_the_window_is_not_recorded_as_late(self):
+        sources = self._sources()
+        resolved = bake_mod.resolve_deps(
+            sources, releases=TestResolvePinsByDate.RELEASES, harness_pins={"pytest": "8.0.2"}
+        )
+        provenance = bake_mod.deps_provenance(sources, resolved, harness_pins={"pytest": "8.0.2"})
+        assert provenance["pins_after_commit_date"] == []
 
     def test_the_skipped_setup_sh_lines_are_part_of_the_record(self):
         sources = self._sources()

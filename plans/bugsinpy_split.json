@@ -232,6 +232,12 @@
           "reasons": []
         }
       ]
+    },
+    {
+      "change": "black/22 is removed from `bugs`, which supersedes the promotion in the change above: it was wave 1, role pilot, and wave 1 is now the two remaining PySnooper bugs (PySnooper/2 and PySnooper/3), both already pilots. Nothing was promoted into the slot — the pool was not searched again — so wave 1 runs with two pilots rather than three.",
+      "reason": "black/22's BugsInPy `requirements.txt` is a pip freeze of the corpus author's own environment, not black's dependency list, and the environment it names cannot be built in the sandbox. Decoded (the file is UTF-16 LE with a BOM; see the reader change of 2043f64) it is 71 requirement lines, all 71 exact `==` pins, carrying black's whole dev toolchain and an unrelated application stack with it — sphinx, mypy, flake8, coverage, aiohttp plus its 12 transitive packages, typed-ast, PyYAML. Its buggy commit is dated 2018-03-29 and 65 of the 71 pins were released after that date (newest tqdm==4.44.1, 2020-03-29), so the file is a freeze taken about two years after the commit it is attached to. Mechanically, 10 of the 71 pins have no cp38 aarch64 wheel and would have to build from source inside the sandbox: accessify==0.3.1 and distlib==3.0.0 (sdist only), typed-ast==1.4.0 (its wheels are x86_64-only), pyyaml==5.1 (no aarch64 wheel at any version), cffi==1.14.0, coverage==5.0.4, multidict==4.7.5, regex==2020.2.20 and yarl==1.4.2 (wheels exist, none for this platform), and cryptography==2.8 (needs Rust and OpenSSL headers in the layer). The sandbox has a C toolchain, so a few of these would compile; typed-ast 1.4.0 and PyYAML 5.1 are the ones that do not build against this interpreter, and a 90-minute bake is the wrong place to discover it. The exclusion is therefore a property of the benchmark's own metadata — the reference environment is a snapshot of somebody's laptop from 2020 — and not a judgement about the bug, its difficulty or its context size, all of which are fine (it is the only candidate the §1.6 gate accepted: ~58497 estimated prompt tokens against a 65280 budget, no file skipped). The resolver no longer refuses this bug, so nothing here is left of the dependency-conflict stop that prompted this review: with the pin-intersects-bound rule the `attrs==19.3.0` / `attrs>=17.4.0` disagreement is one requirement, and with the reference-pin exemption all 71 pins resolve and all 71 would be installed. The two rules are recorded in the design (§3.3) and are general for the later waves; this entry is only the black/22 consequence.",
+      "decided_by": "user review, 2026-10-20",
+      "rule": "A candidate whose resolved dependency set cannot be built in the sandbox's own environment is excluded before a slot is spent on it, by the same principle as the §1.6 context gate. The check is per pin and mechanical: for every resolved pin, does PyPI list a wheel whose platform tag is `any` or `aarch64` and whose Python tag matches the bug's interpreter? A pin with no such wheel is a source build. A single pin that has no aarch64 wheel at all makes the layer unbuildable rather than merely slow, and its count is the measurement, not a judgement. Measured for black/22 on 2026-10-20: 71 pins, 65 released after the buggy commit, 10 with no cp38/aarch64 wheel. The same check is what the wave-2/3 freeze-file rule has to be applied with, and it is recorded here because a later wave must not re-derive it by hand."
     }
   ],
   "bugs": [
@@ -292,35 +298,6 @@
       "wave": 1,
       "role": "pilot",
       "notes": "Wave-1 go/no-go gate (§8.2)."
-    },
-    {
-      "project": "black",
-      "bug_id": 22,
-      "python_version": "3.8.3",
-      "buggy_commit": "728c56c986bc5aea4d9897d3fce3159f89991b8e",
-      "fixed_commit": "c55d08d0b96c8de8bd867ca315e380d9e9d2d7ec",
-      "test_file": "tests/comments3.py;tests/test_black.py",
-      "pythonpath": null,
-      "needs_build": false,
-      "native_test_paths": [
-        "tests"
-      ],
-      "test_cmd": [
-        "python",
-        "-m",
-        "pytest",
-        "tests",
-        "-p",
-        "no:cacheprovider",
-        "--json-report",
-        "--json-report-file={report}"
-      ],
-      "pytest_version": "8.0.2",
-      "json_report_version": "1.5.0",
-      "checkpoint": "vanta-bi-black-22",
-      "wave": 1,
-      "role": "pilot",
-      "notes": "Promoted from the py3.8 candidate pool into the PySnooper/1 slot (see reviewed_changes): the first candidate in the reserve-then-split order that passes the §1.6 context gate at n_ctx 131072 with the caps unchanged. Reuses the py3.8 interpreter. test_file is BugsInPy's own semicolon-joined pair — a data fixture plus the test module; run_test.sh names tests.test_black.BlackTestCase.test_comments3, and the F2P nodeid's file is the second element, so the nodeid-ownership guard resolves it through run_test.sh rather than through test_file."
     },
     {
       "project": "thefuck",

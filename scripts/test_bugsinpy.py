@@ -46,6 +46,7 @@ from bugsinpy import issue as issue_mod  # noqa: E402
 from bugsinpy import manifest as manifest_mod  # noqa: E402
 from bugsinpy import oracle as oracle_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
+from bugsinpy import records as records_mod  # noqa: E402
 from bugsinpy import runner as runner_mod  # noqa: E402
 from bugsinpy import shuru as shuru_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
@@ -3220,6 +3221,45 @@ class TestCollectedOrRaise:
         with pytest.raises(suite_mod.SuiteError, match="exited 2 while collecting"):
             suite_mod.collected_or_raise({"tests/x.py::t"}, exit_code=2, output="ImportError tail")
 
+    def test_the_message_carries_the_error_not_the_tail_of_the_run(self):
+        """PySnooper/2, verbatim in shape: the ImportError is in the middle, and the
+        last 800 characters are warnings plus the sandbox's own boot chatter. The
+        tail-only message sent the reader back into the VM to find the error."""
+        output = (
+            "shuru: booting VM…\n"
+            "collected 0 items / 1 error\n\n"
+            "==================================== ERRORS ====================================\n"
+            "___________________ ERROR collecting tests/test_pysnooper.py ___________________\n"
+            "ImportError while importing test module 'tests/test_pysnooper.py'.\n"
+            "Hint: make sure your test modules/packages have valid Python names.\n"
+            "Traceback:\n"
+            "  /usr/lib/python3.8/importlib/__init__.py:127: in import_module\n"
+            "      return _bootstrap._gcd_import(name[level:], package, level)\n"
+            "      from . import mini_toolbox\n"
+            "E   ImportError: cannot import name 'mini_toolbox' from 'tests'\n"
+            "ERROR tests/test_pysnooper.py\n"
+            "!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!\n"
+            "no tests collected, 1 error in 0.13s\n" + "warnings summary\n" * 200
+        )
+        with pytest.raises(suite_mod.SuiteError) as caught:
+            suite_mod.collected_or_raise(set(), exit_code=2, output=output)
+        message = str(caught.value)
+        assert "cannot import name 'mini_toolbox'" in message
+        assert "ERROR tests/test_pysnooper.py" in message
+        assert "warnings summary" not in message, "the tail is what hid the error"
+        assert "error lines:" in message
+
+    def test_output_with_no_error_lines_still_reports_something(self):
+        """The fallback, so a failure with an unfamiliar shape is not a blank message."""
+        with pytest.raises(suite_mod.SuiteError, match="tail:"):
+            suite_mod.collected_or_raise(set(), exit_code=2, output="nothing here\n" * 50)
+
+    def test_the_excerpt_is_bounded(self):
+        output = "\n".join(f"E   ValueError: {index}" for index in range(60))
+        excerpt = suite_mod.failure_excerpt(output)
+        assert excerpt.count("\n") == 26, "25 lines plus the '… N more' line"
+        assert "more" in excerpt
+
 
 # ============================================================================
 # a tiny independent check of the strip, so a broken strip cannot pass silently
@@ -4226,12 +4266,16 @@ class TestDigestAndLabels:
     ROWS = [
         {
             "bug": "Demo/1", "config": "vanta", "mode": "repair", "seed": 0,
-            "model": "qwen3.5-27b", "vanta_commit": "d" * 40, "vanta_dirty": False,
+            "model": "qwen3.5-27b",
+            "harness_commit": "c" * 40, "harness_dirty": False,
+            "vanta_build_commit": "d" * 40, "vanta_build_dirty": False,
             "label": "true_reject", "session_id": "sess-1", "candidate": None,
         },
         {
             "bug": "Demo/1", "config": "vanta", "mode": "review", "seed": 0,
-            "model": "qwen3.5-27b", "vanta_commit": "d" * 40, "vanta_dirty": False,
+            "model": "qwen3.5-27b",
+            "harness_commit": "c" * 40, "harness_dirty": False,
+            "vanta_build_commit": "d" * 40, "vanta_build_dirty": False,
             "label": "false_reject", "session_id": "sess-2",
             "candidate": {
                 "kind": "dev_fix", "source": "dev",
@@ -4240,7 +4284,9 @@ class TestDigestAndLabels:
         },
         {
             "bug": "Demo/1", "config": "baseline", "mode": "review", "seed": 0,
-            "model": "qwen3.5-27b", "vanta_commit": "d" * 40, "vanta_dirty": False,
+            "model": "qwen3.5-27b",
+            "harness_commit": "c" * 40, "harness_dirty": False,
+            "vanta_build_commit": "d" * 40, "vanta_build_dirty": False,
             "label": "true_reject", "session_id": "sess-3",
             "candidate": {
                 "kind": "noop", "source": "noop:pkg/mod.py",
@@ -4268,7 +4314,7 @@ class TestDigestAndLabels:
     def test_the_digest_groups_by_the_provenance_axes(self):
         payload = runner_mod.digest(self.ROWS)
         assert payload["runs"] == 3
-        # config, mode, seed, model and commit are the axes: a repair row and a
+        # config, mode, seed, model and both commits are the axes: a repair row and a
         # review row of the same config are two groups, not one.
         assert len(payload["groups"]) == 3
         vanta_review = [
@@ -4278,20 +4324,32 @@ class TestDigestAndLabels:
         assert vanta_review[0]["runs"] == 1
         assert vanta_review[0]["labels"] == {"false_reject": 1}
         assert vanta_review[0]["model"] == "qwen3.5-27b"
-        assert vanta_review[0]["vanta_dirty"] is False
+        assert vanta_review[0]["vanta_build_dirty"] is False
+        assert vanta_review[0]["harness_dirty"] is False
 
     def test_the_model_is_one_of_the_grouping_axes(self):
         other = dict(self.ROWS[0], model="gemma-3-12b")
         assert len(runner_mod.digest(self.ROWS + [other])["groups"]) == 4
 
-    def test_two_commits_do_not_share_a_group(self):
-        other = dict(self.ROWS[0], vanta_commit="e" * 40)
+    def test_two_builds_of_vanta_do_not_share_a_group(self):
+        other = dict(self.ROWS[0], vanta_build_commit="e" * 40)
+        assert len(runner_mod.digest(self.ROWS + [other])["groups"]) == 4
+
+    def test_two_harness_commits_do_not_share_a_group(self):
+        """The commit that was reported as `vanta_commit` was the binary's; the
+        harness's own is a separate axis now, so a harness that changed mid-batch
+        cannot be pooled with the rows it did not run."""
+        other = dict(self.ROWS[0], harness_commit="e" * 40)
         assert len(runner_mod.digest(self.ROWS + [other])["groups"]) == 4
 
     def test_the_rendered_digest_has_a_header_and_one_line_per_group(self):
         rendered = runner_mod.render_digest(runner_mod.digest(self.ROWS))
         lines = rendered.splitlines()
         assert "config" in lines[0] and "labels" in lines[0]
+        assert "harness" in lines[0] and "build" in lines[0], (
+            "both commits are provenance, and a column that names neither is the"
+            " bug that made a digest claim 44f58ab for a batch at b2efa49"
+        )
         assert len(lines) == 2 + len(runner_mod.digest(self.ROWS)["groups"])
 
     def test_write_batch_report_writes_all_three_artifacts(self, tmp_path):
@@ -4300,6 +4358,90 @@ class TestDigestAndLabels:
         assert payload["runs"] == 3
         assert json.loads((tmp_path / "run_digest.json").read_text()) == payload
         assert (tmp_path / "run_digest.md").read_text().startswith("config")
+
+
+class TestStaleBinary:
+    """§7.3: two commits, and a binary older than the Rust it claims to be built from.
+
+    The bug this covers was a digest whose `commit` column read `44f58ab` while HEAD
+    was `b2efa49` — the binary's build commit under a name that read like the
+    harness's. Something must now say so *before* the wave runs, because after it the
+    only honest option is to relabel the results.
+    """
+
+    HEAD = runner_mod.Revision(commit="b2efa49", dirty=False)
+    BUILD = runner_mod.Revision(commit="44f58ab", dirty=False)
+
+    def test_the_binary_matching_the_working_tree_is_silent(self):
+        assert runner_mod.stale_binary_message(
+            binary=self.HEAD, head=self.HEAD, changed=[]
+        ) is None
+
+    def test_rust_changes_since_the_build_are_named(self):
+        message = runner_mod.stale_binary_message(
+            binary=self.BUILD, head=self.HEAD,
+            changed=["src/agents/attacker.rs", "Cargo.toml"],
+        )
+        assert message is not None
+        assert "44f58ab" in message and "b2efa49" in message
+        assert "src/agents/attacker.rs" in message
+
+    def test_a_harness_only_change_is_not_a_stale_binary(self):
+        """The normal case, and the one that produced the bad digest: HEAD moved on
+        with `scripts/` while `src/` did not, so the binary is fine."""
+        assert runner_mod.stale_binary_message(
+            binary=self.BUILD, head=self.HEAD, changed=[]
+        ) is None
+
+    def test_a_dirty_build_has_no_commit_that_describes_it(self):
+        message = runner_mod.stale_binary_message(
+            binary=runner_mod.Revision(commit="44f58ab", dirty=True),
+            head=self.HEAD, changed=[],
+        )
+        assert message is not None and "dirty" in message
+
+    def test_an_unreadable_build_commit_is_admitted_rather_than_guessed(self):
+        message = runner_mod.stale_binary_message(
+            binary=runner_mod.Revision(), head=self.HEAD, changed=None
+        )
+        assert message is not None and "could not be read" in message
+
+    def test_the_build_commit_is_read_from_cargos_build_script_output(self, tmp_path):
+        binary = write(tmp_path / "target" / "release" / "vanta_m3", "")
+        write(
+            tmp_path / "target" / "release" / "build" / "vanta-ef12b856" / "output",
+            "cargo:rerun-if-changed=build.rs\n"
+            "cargo:rustc-env=VANTA_BUILD_COMMIT=44f58ab\n"
+            "cargo:rustc-env=VANTA_BUILD_DIRTY=false\n",
+        )
+        assert runner_mod.binary_revision(binary) == runner_mod.Revision("44f58ab", False)
+
+    def test_two_build_script_outputs_disagreeing_yield_no_commit(self, tmp_path):
+        binary = write(tmp_path / "target" / "release" / "vanta_m3", "")
+        for hash_ in ("aaaa", "bbbb"):
+            write(
+                tmp_path / "target" / "release" / "build" / f"vanta-{hash_}" / "output",
+                f"cargo:rustc-env=VANTA_BUILD_COMMIT={hash_}\n",
+            )
+        assert runner_mod.binary_revision(binary) == runner_mod.Revision()
+
+    def test_no_build_directory_yields_no_commit(self, tmp_path):
+        binary = write(tmp_path / "target" / "release" / "vanta_m3", "")
+        assert runner_mod.binary_revision(binary) == runner_mod.Revision()
+
+    def test_the_warning_reads_git_and_the_binary_through_one_seam(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runner_mod, "git_revision", lambda *a, **k: self.HEAD)
+        monkeypatch.setattr(runner_mod, "binary_revision", lambda path: self.BUILD)
+        monkeypatch.setattr(runner_mod, "changed_since", lambda *a: ["src/lib.rs"])
+        warning = runner_mod.stale_binary_warning(tmp_path / "vanta_m3")
+        assert warning is not None and "src/lib.rs" in warning
+
+    def test_the_rust_paths_exclude_the_harness_itself(self):
+        """A warning that fired on every `scripts/` edit would be ignored, which is
+        the one thing a run-start warning cannot afford."""
+        assert "src" in runner_mod.VANTA_SOURCE_PATHS
+        assert "build.rs" in runner_mod.VANTA_SOURCE_PATHS
+        assert not any(path.startswith("scripts") for path in runner_mod.VANTA_SOURCE_PATHS)
 
 
 class TestPhaseOrder:
@@ -4455,7 +4597,14 @@ def _outcome(tmp_path: Path, **over) -> runner_mod.SessionOutcome:
     return runner_mod.SessionOutcome(**base)
 
 
-def _job(bug_prep, *, config="vanta", mode=runner_mod.REPAIR, candidate=None) -> runner_mod.Job:
+def _job(
+    bug_prep,
+    *,
+    config="vanta",
+    mode=runner_mod.REPAIR,
+    candidate=None,
+    harness=None,
+) -> runner_mod.Job:
     return runner_mod.Job(
         batch_id="b1",
         wave=1,
@@ -4473,6 +4622,7 @@ def _job(bug_prep, *, config="vanta", mode=runner_mod.REPAIR, candidate=None) ->
         checkpoint="chk",
         python_version_pinned="3.8.1",
         candidate=candidate,
+        harness=harness,
     )
 
 
@@ -4537,6 +4687,49 @@ class TestRunJob:
         assert record["sampling"]["source"] == split_mod.SAMPLING_POLICY
         assert record["artifacts"]["session_dir"] == "vanta_sessions/sess-1"
         assert record["oracle_reused"] is False
+
+    def test_the_row_names_the_binary_s_build_commit_and_the_harness_s_own(
+        self, tmp_path, monkeypatch
+    ):
+        """§7.3: two commits, because they are two trees and they routinely differ.
+
+        `run.summary`'s `commit` is baked in at cargo build time; the harness commit
+        is HEAD when the batch runs. Recording the first under a name that reads like
+        the second is what made a digest claim 44f58ab for a batch whose HEAD was
+        b2efa49.
+        """
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        record = runner_mod.run_job(
+            job=_job(
+                prep(root=tmp_path / "root"),
+                harness=runner_mod.Revision(commit="b2efa49", dirty=False),
+            ),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert record["vanta_build_commit"] == "d" * 40
+        assert record["vanta_build_dirty"] is False
+        assert record["harness_commit"] == "b2efa49"
+        assert record["harness_dirty"] is False
+
+    def test_a_row_without_a_harness_revision_says_unknown_rather_than_guessing(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert record["harness_commit"] is None
+        assert record["harness_dirty"] is None
 
     def test_a_review_row_reuses_the_candidate_label_and_never_re_grades(
         self, tmp_path, monkeypatch
@@ -4786,6 +4979,31 @@ class TestRunBatchLoop:
     @staticmethod
     def _reviews(calls):
         return [job for job in calls if job.mode == runner_mod.REVIEW]
+
+    def test_every_job_carries_the_batch_s_harness_revision(self, tmp_path, monkeypatch):
+        """Read once, at the start: rows of one batch must not disagree about which
+        harness produced them (§4.4)."""
+        monkeypatch.setattr(
+            runner_mod, "git_revision", lambda *a, **k: runner_mod.Revision("h" * 40, False)
+        )
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        self._run(preps, entries, split, batch_dir)
+        assert calls, "the stub should have been called"
+        assert {job.harness for job in calls} == {runner_mod.Revision("h" * 40, False)}
+
+    def test_the_harness_revision_is_read_before_the_first_phase_runs(
+        self, tmp_path, monkeypatch
+    ):
+        """A `git` call per row would let a mid-batch edit relabel the earlier rows."""
+        seen: list[int] = []
+        monkeypatch.setattr(
+            runner_mod,
+            "git_revision",
+            lambda *a, **k: (seen.append(1), runner_mod.Revision("h" * 40, False))[1],
+        )
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        self._run(preps, entries, split, batch_dir)
+        assert len(seen) == 1
 
     def test_every_repair_pass_runs_before_any_review_pass(self, tmp_path, monkeypatch):
         preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
@@ -5228,3 +5446,47 @@ class TestRunJobCompaction:
         assert record["artifacts"]["graded_tree_diff"] is None
         assert "rerun" in record["artifacts"]["compact_reason"]
         assert tree.is_dir(), "§6.3: the rerun has not run yet"
+
+
+class TestExpectedErrorsExitCleanly:
+    """A refusal is a message and an exit code; only a harness bug is a traceback.
+
+    Every error class in `EXPECTED_ERRORS` already spells out its own report, so a
+    traceback buries the sentence that matters under frames the reader did not ask
+    for. `ContextError` was missing from the list, so the context gate's refusals —
+    the ones that tell you which window to export — arrived as a stack dump.
+    """
+
+    def test_a_context_error_is_a_line_not_a_traceback(self, tmp_path, monkeypatch, capsys):
+        def boom(*args, **kwargs):
+            raise ctx.ContextError("no explicit window source: export VANTA_LLM_CONTEXT_TOKENS")
+
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(run_mod, "load_split", boom)
+
+        code = run_mod.main(["run", "--batch", str(tmp_path)])
+
+        captured = capsys.readouterr()
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert captured.err.startswith("error: no explicit window source")
+        assert "Traceback" not in captured.err
+
+    def test_the_harness_error_vocabulary_is_all_caught(self):
+        """A class raised on purpose but missing here exits as an unhandled
+        exception — which is indistinguishable from a crash in the harness."""
+        assert set(run_mod.EXPECTED_ERRORS) >= {
+            split_mod.SplitError,
+            bake_mod.BakeError,
+            prepare_mod.PrepareError,
+            meta_mod.MetadataError,
+            shuru_mod.ShuruError,
+            runner_mod.RunnerError,
+            ctx.ContextError,
+            oracle_mod.OracleError,
+            suite_mod.SuiteError,
+            tree_mod.TreeError,
+            tree_mod.StripError,
+            issue_mod.IssueError,
+            compact_mod.CompactError,
+            records_mod.RecordError,
+        }

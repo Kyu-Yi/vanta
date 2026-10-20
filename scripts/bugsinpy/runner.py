@@ -78,6 +78,17 @@ RUNS_DIR = REPO_ROOT / "runs" / "bugsinpy"
 SESSIONS_DIRNAME = "vanta_sessions"
 DEFAULT_VANTA_BIN = REPO_ROOT / "target" / "release" / "vanta_m3"
 
+VANTA_SOURCE_PATHS = ("src", "Cargo.toml", "Cargo.lock", "build.rs")
+"""What "the binary matches the sources" is about (§7.3).
+
+The binary embeds the commit ``build.rs`` saw when cargo last built it, so a row's
+Vanta provenance is the **build** commit. The harness is a different tree with its
+own commit, and it is deliberately absent from this list: a change under
+``scripts/`` makes the binary old, not stale — the Rust it was built from is
+untouched. Conflating the two is the bug that produced ``44f58ab`` in a digest
+whose HEAD was ``b2efa49``.
+"""
+
 # §8.1's worst single run is ~30 min for a vanta repair; 3 h is a backstop, not an
 # estimate. A run that hits it is a failure to report, not a result to grade.
 RUN_TIMEOUT_SECS = 3 * 60 * 60
@@ -145,6 +156,156 @@ def require_vanta_bin(path: Path) -> Path:
             "    cargo build --release --bin vanta_m3"
         )
     return path
+
+
+# ---------------------------------------------------------------------------
+# provenance: two trees, two commits (§7.3)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Revision:
+    """A commit and whether the tree it was taken from was dirty.
+
+    Both fields may be ``None``: ``commit`` when the revision could not be read at
+    all, ``dirty`` when nothing could say. A missing commit is not the same as a
+    clean tree, which is why it is not spelled ``""``.
+    """
+
+    commit: Optional[str] = None
+    dirty: Optional[bool] = None
+
+
+def _git(repo_root: Path, *args: str) -> Optional[str]:
+    """Stdout of a ``git`` command in *repo_root*, or ``None`` if it did not run."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def git_revision(repo_root: Path = REPO_ROOT) -> Revision:
+    """The harness tree's own revision, right now.
+
+    Read at the moment the batch starts rather than per row: the rows of one batch
+    are one experiment, and a harness that changed halfway through it would make
+    the wave-gate comparison a comparison of two harnesses (§4.4).
+    """
+    commit = _git(repo_root, "rev-parse", "--short", "HEAD")
+    status = _git(repo_root, "status", "--porcelain")
+    return Revision(commit=commit or None, dirty=None if status is None else bool(status))
+
+
+def _rustc_env(path: Path) -> dict[str, str]:
+    """The ``cargo:rustc-env=KEY=VALUE`` pairs of one build-script output file."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        if line.startswith("cargo:rustc-env="):
+            key, _, value = line[len("cargo:rustc-env=") :].partition("=")
+            fields[key] = value
+    return fields
+
+
+def binary_revision(vanta_bin: Path) -> Revision:
+    """The commit cargo baked into *vanta_bin* (``build.rs`` → ``rustc-env``).
+
+    Read from cargo's build-script output next to the binary rather than by asking
+    the binary: the pipeline does report the same pair in ``run.summary``, but only
+    *after* a session has run, and the staleness check has to fire before the first
+    job starts. An unreadable or ambiguous build directory yields an empty
+    :class:`Revision` — never a guess.
+    """
+    commits: set[str] = set()
+    dirty: Optional[bool] = None
+    for output in sorted((vanta_bin.parent / "build").glob("vanta-*/output")):
+        fields = _rustc_env(output)
+        commit = fields.get("VANTA_BUILD_COMMIT")
+        if commit:
+            commits.add(commit)
+            dirty = fields.get("VANTA_BUILD_DIRTY") == "true"
+    if len(commits) != 1:
+        return Revision()
+    return Revision(commit=commits.pop(), dirty=dirty)
+
+
+def changed_since(
+    repo_root: Path, commit: str, paths: Sequence[str]
+) -> Optional[list[str]]:
+    """Paths among *paths* that differ between *commit* and the working tree.
+
+    ``git diff <commit>`` compares against the working tree, so committed and
+    uncommitted changes both count: a binary built at *commit* is equally stale
+    either way.
+    """
+    out = _git(repo_root, "diff", "--name-only", commit, "--", *paths)
+    if out is None:
+        return None
+    return sorted({line.strip() for line in out.splitlines() if line.strip()})
+
+
+def stale_binary_message(
+    *,
+    binary: Revision,
+    head: Revision,
+    changed: Optional[Sequence[str]],
+) -> Optional[str]:
+    """The staleness warning as a pure function — ``None`` when the binary matches.
+
+    Split from :func:`stale_binary_warning` so every branch is testable without a
+    git repo, a cargo target directory or a binary on disk.
+    """
+    where = f"was built at {binary.commit}" if binary.commit else "has no readable build commit"
+    head_text = f"HEAD is {head.commit}" if head.commit else "HEAD is unknown"
+    if binary.commit is None or changed is None:
+        return (
+            "the vanta_m3 binary's build commit could not be read (no cargo "
+            "build-script output beside it, or no git to diff with), so this batch "
+            f"cannot check whether the Rust sources moved on since it was built "
+            f"({head_text}). Rows still carry the binary's own commit from "
+            "run.summary; rebuilding with `cargo build --release --bin vanta_m3` "
+            "restores the check."
+        )
+    if not changed and not binary.dirty:
+        return None
+    reasons = []
+    if changed:
+        shown = ", ".join(changed[:8]) + ("…" if len(changed) > 8 else "")
+        reasons.append(f"{len(changed)} Rust source path(s) changed since: {shown}")
+    if binary.dirty:
+        reasons.append(
+            "it was built from a dirty tree, so no commit describes the sources it "
+            "was built from"
+        )
+    return (
+        f"the vanta_m3 binary {where} but {head_text}, and "
+        + "; ".join(reasons)
+        + ". Every row of this batch measures that binary, not the tree at HEAD: "
+        "rebuild (`cargo build --release --bin vanta_m3`) or record the batch as "
+        f"measuring {binary.commit}."
+    )
+
+
+def stale_binary_warning(vanta_bin: Path, *, repo_root: Path = REPO_ROOT) -> Optional[str]:
+    """§7.3's run-start check, read off disk. Printing is the caller's job."""
+    binary = binary_revision(vanta_bin)
+    head = git_revision(repo_root)
+    changed = (
+        changed_since(repo_root, binary.commit, VANTA_SOURCE_PATHS)
+        if binary.commit
+        else None
+    )
+    return stale_binary_message(binary=binary, head=head, changed=changed)
 
 
 # ---------------------------------------------------------------------------
@@ -819,8 +980,16 @@ def build_record(
         "mode": job.mode,
         "seed": job.seed,
         "session_id": outcome.session_id,
-        "vanta_commit": summary.get("commit"),
-        "vanta_dirty": _bool(summary.get("dirty")),
+        # Two trees, two commits (§7.3). `vanta_build_commit` is what `build.rs` baked
+        # into the binary at cargo build time and what `run.summary` reports;
+        # `harness_commit` is this repo's HEAD when the batch started — a different
+        # commit whenever `scripts/` moved on after the last `cargo build`, which is
+        # the normal case and not a defect. Recording one under the other's name is
+        # what made a digest whose HEAD was b2efa49 claim 44f58ab.
+        "harness_commit": job.harness.commit if job.harness else None,
+        "harness_dirty": job.harness.dirty if job.harness else None,
+        "vanta_build_commit": summary.get("commit"),
+        "vanta_build_dirty": _bool(summary.get("dirty")),
         "model": summary.get("model"),
         "sampling": sampling_block(summary),
         "checkpoint": job.checkpoint,
@@ -892,6 +1061,11 @@ class Job:
     checkpoint: str
     python_version_pinned: str
     candidate: Optional[Candidate] = None
+    harness: Optional[Revision] = None
+    """The harness's own revision, captured once when the batch started (§7.3).
+    Carried on the job so the row can state it without a second `git` call per
+    row, which would let two rows of one batch disagree about which harness ran
+    them."""
 
     @property
     def key(self) -> str:
@@ -1140,6 +1314,10 @@ def run_batch(
     """The whole batch: per wave, D13's four phases, then the wave-1 gate."""
     paths = BatchPaths.under(batch_dir)
     manifest = Manifest(batch_dir)
+    # The harness's own revision, read once for the whole batch (§7.3). The binary's
+    # is read per row from `run.summary`, because it belongs to the binary and not to
+    # this tree.
+    harness = git_revision()
     # Not filtered down to the two known names: a filter here would drop
     # `vanta_planner` before the guard could refuse it, and a split that names the
     # placeholder must not start at all (§4.4).
@@ -1152,6 +1330,11 @@ def run_batch(
         return 0, []
 
     checkpoint_pythons: dict[str, str] = {}
+    print(
+        f"[env] harness {harness.commit or 'unknown'}"
+        f"{' (dirty)' if harness.dirty else ''}",
+        flush=True,
+    )
     for prep in preps:
         checkpoint = entries[prep.key]["checkpoint"]
         if checkpoint not in checkpoint_pythons:
@@ -1190,6 +1373,7 @@ def run_batch(
                                 seed=seed,
                                 checkpoint=checkpoint,
                                 python_version_pinned=entry["python_version"],
+                                harness=harness,
                             )
                         ]
                     else:
@@ -1206,6 +1390,7 @@ def run_batch(
                                 checkpoint=checkpoint,
                                 python_version_pinned=entry["python_version"],
                                 candidate=candidate,
+                                harness=harness,
                             )
                             for candidate in _review_candidates(
                                 batch_dir=batch_dir,
@@ -1581,7 +1766,12 @@ def write_labels(records: Iterable[dict[str, Any]], path: Path) -> Path:
 
 
 def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """Counts per (§4.4 provenance axes), plus the label histogram per config."""
+    """Counts per (§4.4 provenance axes), plus the label histogram per config.
+
+    Both commits are axes: a row produced by the harness at HEAD *and* the rows
+    produced by a binary built three commits earlier are two different provenance
+    claims, and pooling them would report one number for two experiments.
+    """
     groups: dict[tuple, dict[str, Any]] = {}
     for record in records:
         key = (
@@ -1589,7 +1779,8 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
             record.get("mode"),
             record.get("seed"),
             record.get("model"),
-            record.get("vanta_commit"),
+            record.get("harness_commit"),
+            record.get("vanta_build_commit"),
         )
         group = groups.setdefault(
             key,
@@ -1598,8 +1789,10 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
                 "mode": record.get("mode"),
                 "seed": record.get("seed"),
                 "model": record.get("model"),
-                "vanta_commit": record.get("vanta_commit"),
-                "vanta_dirty": record.get("vanta_dirty"),
+                "harness_commit": record.get("harness_commit"),
+                "harness_dirty": record.get("harness_dirty"),
+                "vanta_build_commit": record.get("vanta_build_commit"),
+                "vanta_build_dirty": record.get("vanta_build_dirty"),
                 "runs": 0,
                 "labels": {},
             },
@@ -1612,17 +1805,18 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 def render_digest(payload: dict[str, Any]) -> str:
     lines = [
-        f"{'config':<10} {'mode':<8} {'seed':>4} {'model':<18} {'commit':<10} "
-        f"{'runs':>5}  labels",
-        "-" * 96,
+        f"{'config':<10} {'mode':<8} {'seed':>4} {'model':<18} {'harness':<10} "
+        f"{'build':<10} {'runs':>5}  labels",
+        "-" * 106,
     ]
     for group in payload.get("groups", []):
-        commit = str(group.get("vanta_commit") or "")[:9]
+        harness = str(group.get("harness_commit") or "")[:9]
+        build = str(group.get("vanta_build_commit") or "")[:9]
         model = str(group.get("model") or "")[:18]
         labels = " ".join(f"{k}={v}" for k, v in sorted(group["labels"].items()))
         lines.append(
             f"{str(group['config']):<10} {str(group['mode']):<8} {str(group['seed']):>4} "
-            f"{model:<18} {commit:<10} {group['runs']:>5}  {labels}"
+            f"{model:<18} {harness:<10} {build:<10} {group['runs']:>5}  {labels}"
         )
     return "\n".join(lines)
 

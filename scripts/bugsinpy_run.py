@@ -50,13 +50,44 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from bugsinpy import bake as bake_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
+from bugsinpy import compact as compact_mod  # noqa: E402
 from bugsinpy import context as context_mod  # noqa: E402
+from bugsinpy import issue as issue_mod  # noqa: E402
 from bugsinpy import manifest as manifest_mod  # noqa: E402
+from bugsinpy import oracle as oracle_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
+from bugsinpy import records as records_mod  # noqa: E402
 from bugsinpy import runner as runner_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
+from bugsinpy import suite as suite_mod  # noqa: E402
+from bugsinpy import trees as tree_mod  # noqa: E402
 from bugsinpy.shuru import ShuruError  # noqa: E402
 from bugsinpy.split import Split, SplitError, load_split  # noqa: E402
+
+EXPECTED_ERRORS = (
+    SplitError,
+    bake_mod.BakeError,
+    prepare_mod.PrepareError,
+    meta_mod.MetadataError,
+    ShuruError,
+    runner_mod.RunnerError,
+    context_mod.ContextError,
+    oracle_mod.OracleError,
+    suite_mod.SuiteError,
+    tree_mod.TreeError,
+    tree_mod.StripError,
+    issue_mod.IssueError,
+    compact_mod.CompactError,
+    records_mod.RecordError,
+)
+"""Every failure the harness raises on purpose, and the reason the CLI prints them.
+
+[VANTA-WHY] Each of these already carries the whole report in its message — which
+stage refused, what it saw, what to do — so a traceback adds frames the reader has
+to walk past to reach the sentence that matters, and it hides the exit code that
+says *this is a refusal, not a crash*. An error class missing from this tuple exits
+as an unhandled exception instead, which is how ``ContextError`` used to look.
+"""
 
 DEFAULT_SPLIT = REPO_ROOT / "plans" / "bugsinpy_split.json"
 RUNS_DIR = REPO_ROOT / "runs" / "bugsinpy"
@@ -468,6 +499,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     waves = parse_waves(args.waves)
     selected = select_preps(batch.preps, only=args.only, waves=waves)
     vanta_bin = runner_mod.require_vanta_bin(args.vanta_bin.resolve())
+    # Also before anything runs: the rows record two commits (§7.3), and a binary
+    # built before the Rust sources moved on is measuring a Vanta that is not in
+    # this repo. The check is cheap and it is the only moment it can still be acted
+    # on — mid-wave it is just a note about results already produced.
+    stale_warning = runner_mod.stale_binary_warning(vanta_bin)
+    if stale_warning:
+        print(f"WARNING: {stale_warning}", file=sys.stderr, flush=True)
 
     code, results = runner_mod.run_batch(
         batch_dir=batch_dir,
@@ -722,24 +760,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except SplitError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_HARNESS_FAILED
-    except bake_mod.BakeError as exc:
+    except EXPECTED_ERRORS as exc:
         # A bake that failed still owes the reader the summary of what it rebuilt,
-        # skipped and failed, so the message is printed rather than traced.
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_HARNESS_FAILED
-    except prepare_mod.PrepareError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_HARNESS_FAILED
-    except meta_mod.MetadataError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_HARNESS_FAILED
-    except ShuruError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_HARNESS_FAILED
-    except runner_mod.RunnerError as exc:
+        # skipped and failed, and every other expected error owes the reader its own
+        # message; both are printed, not traced (see EXPECTED_ERRORS).
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_HARNESS_FAILED
     except KeyboardInterrupt:

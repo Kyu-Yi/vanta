@@ -979,7 +979,9 @@ every field comes back equal. No VM, no clone.
   "schema_version": 1,
   "batch_id": "…", "wave": 1, "bug": "PySnooper/1",
   "config": "vanta", "mode": "repair", "seed": 0,
-  "session_id": "…", "vanta_commit": "<build commit>", "vanta_dirty": false,
+  "session_id": "…",
+  "harness_commit": "<git HEAD of this repo when the batch started>", "harness_dirty": false,
+  "vanta_build_commit": "<VANTA_BUILD_COMMIT of the binary that ran>", "vanta_build_dirty": false,
   "model": "…",
   "sampling": {
     "source": "pinned_per_call_plus_server_top_p",
@@ -1029,8 +1031,19 @@ here" and "there never were any" are different facts; `compact_reason` records w
 decided it. Compaction runs **before** the row is written, so the row states what actually happened
 rather than what was planned.
 
-`config` / `mode` / `seed` / `model` / `sampling` / `vanta_commit` are the provenance axes §4.4 and
-§9.1 group by. `candidate` is `null` for **repair** runs. For review runs it names the patch under
+Note the **two commits**: `harness_commit` is this repo's HEAD (`git rev-parse --short HEAD`, taken
+once per batch when `run` starts, with `harness_dirty` from `git status --porcelain`), while
+`vanta_build_commit` is what `build.rs` baked into the binary at cargo build time and what
+`run.summary` reports — the same value §4.4 attributes to `VANTA_BUILD_COMMIT`. They are different
+trees and routinely differ: the harness changes between the build and the batch. One column cannot
+serve both, and treating the build commit as "the commit the batch ran at" is what made a digest
+claim `44f58ab` for a batch whose HEAD was `b2efa49`. At run start, `run` diffs `src/`,
+`Cargo.toml`, `Cargo.lock` and `build.rs` between `vanta_build_commit` and HEAD and prints
+`WARNING: …` to stderr when they differ or the build was dirty — that, not the digest, is what says
+the binary is stale. A change under `scripts/` alone is a harness change and is not a stale binary.
+
+`config` / `mode` / `seed` / `model` / `sampling` / `harness_commit` / `vanta_build_commit` are the
+provenance axes §4.4 and §9.1 group by. `candidate` is `null` for **repair** runs. For review runs it names the patch under
 test: `kind` is `dev_fix` / `noop` / `failed_patch`, `source` is `dev` / `noop` /
 `repair:<config>:<session>` (which repair run produced it), and `patch_sha256` /
 `normalized_sha256` are its identity — `normalized_sha256` is the dedup key (§7.1). The nested

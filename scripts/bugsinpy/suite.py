@@ -20,6 +20,7 @@ what the Creator is shown.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -203,6 +204,37 @@ def parse_collected(stdout: str) -> set[str]:
     return nodeids
 
 
+_ERROR_LINE = re.compile(
+    r"^(?:E\s+\S|ERROR\b|Traceback \(most recent call last\):|[\w.]*(?:Error|Exception)(?::|\b))"
+)
+"""Lines that name a failure, in pytest's own vocabulary.
+
+``E   ImportError: cannot import name 'mini_toolbox'`` is the line that explains a
+collection failure; the traceback header and pytest's ``ERROR`` summary line are
+the two that point at *which* module failed. Everything else in a collection run is
+progress, warnings, and the sandbox's own chatter.
+"""
+
+
+def failure_excerpt(output: str, *, limit: int = 25) -> str:
+    """The failure lines of a run, or a bounded tail when there are none.
+
+    [VANTA-WHY] The tail of a collection run is the wrong end of the output. On
+    PySnooper/2 the real error was ``ImportError: cannot import name
+    'mini_toolbox' from 'tests'``, printed in the middle; the last 800 characters
+    were pytest's warnings summary plus the sandbox's "booting VM" lines, so the
+    gate's message described neither the error nor the file that caused it, and the
+    failure had to be re-run by hand inside the VM to be read. The excerpt is the
+    error lines; the tail survives only as the fallback for output that has none.
+    """
+    lines = [line.rstrip() for line in output.splitlines() if _ERROR_LINE.match(line.strip())]
+    if not lines:
+        return f"tail: {output[-800:]!r}"
+    kept = lines[:limit]
+    more = f"\n    … {len(lines) - limit} more" if len(lines) > limit else ""
+    return "error lines:\n" + "\n".join(f"    {line.strip()}" for line in kept) + more
+
+
 def collected_or_raise(
     nodeids: set[str], *, exit_code: Optional[int], output: str
 ) -> set[str]:
@@ -217,14 +249,13 @@ def collected_or_raise(
     """
     if not nodeids:
         raise SuiteError(
-            f"pytest collected nothing (exit {exit_code}); tail: "
-            f"{output[-800:]!r}"
+            f"pytest collected nothing (exit {exit_code}); {failure_excerpt(output)}"
         )
     if exit_code != 0:
         raise SuiteError(
             f"pytest exited {exit_code} while collecting ({len(nodeids)} test(s) "
             f"collected): a collection error means the suite is not what the oracle "
-            f"would grade; tail: {output[-800:]!r}"
+            f"would grade; {failure_excerpt(output)}"
         )
     return nodeids
 

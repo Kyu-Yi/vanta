@@ -81,6 +81,7 @@ DERIVED_BUG_KEYS = frozenset(
         "issue_text_sha256",
         "issue_ok",
         "issue_needs_decision",
+        "deps",
     }
 )
 

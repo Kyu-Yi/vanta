@@ -142,6 +142,27 @@ def prep(**over) -> prepare_mod.BugPrep:
     return prepare_mod.BugPrep(**base)
 
 
+def _bug_deps(
+    entries, installs_by_checkpoint: dict | None = None
+) -> list[bake_mod.BugDeps]:
+    """The ``BugDeps`` :func:`layer_recipes` needs, built without PyPI or a repo.
+
+    Resolving real dependencies is :func:`resolve_bug_deps`'s job and it is tested
+    on its own; these tests are about the *shape* of the layers, so they hand the
+    recipes the pins directly.
+    """
+    installs = installs_by_checkpoint or {}
+    return [
+        bake_mod.BugDeps(
+            entry=dict(entry),
+            checkpoint=bake_mod.bug_checkpoint_name(entry),
+            installs=tuple(installs.get(bake_mod.bug_checkpoint_name(entry), ())),
+            provenance={},
+        )
+        for entry in entries
+    ]
+
+
 # ============================================================================
 # split.py — the committed protocol
 # ============================================================================
@@ -1683,7 +1704,7 @@ class TestBake:
         run time as a ``ModuleNotFoundError`` that looks like a model failure.
         """
         assert "sys.prefix != sys.base_prefix" in self._recipe()
-        assert "sys.prefix != sys.base_prefix" in bake_mod.requirements_recipe("", [])
+        assert "sys.prefix != sys.base_prefix" in bake_mod.requirements_recipe([])
 
     def test_recipes_do_not_reinstall_pip(self):
         """``uv venv --seed`` already provides a current pip.
@@ -1691,11 +1712,11 @@ class TestBake:
         Measured: against a bare interpreter, ``pip install --upgrade pip`` is the
         line that dies on PEP 668 — it was the wave-1 bake's first failure.
         """
-        for recipe in (self._recipe(), bake_mod.requirements_recipe("", ["decorator"])):
+        for recipe in (self._recipe(), bake_mod.requirements_recipe(["decorator"])):
             assert "--upgrade pip" not in recipe
 
     def test_marker_is_touched_last(self):
-        for recipe in (self._recipe(), bake_mod.requirements_recipe("", ["decorator"])):
+        for recipe in (self._recipe(), bake_mod.requirements_recipe(["decorator"])):
             assert recipe.strip().splitlines()[-1] == f"touch {bake_mod.MARKER}"
 
     # ---- the per-bug recipe ----------------------------------------------
@@ -1723,15 +1744,21 @@ class TestBake:
         setup = "# install deps\n\npython -m pip install decorator\npython3 -m pip install decorator\n"
         assert bake_mod.declared_deps(setup) == ["decorator"]
 
-    def test_requirements_recipe_installs_both_sources_and_never_swallows_errors(self):
-        recipe = bake_mod.requirements_recipe("requests==2.0\n", ["decorator"])
-        assert "decorator" in recipe
+    def test_requirements_recipe_installs_the_resolved_pins_and_never_swallows_errors(self):
+        """The recipe takes pins, not the project's own ranges.
+
+        ``decorator>=4.3.0`` would install a different environment every time the
+        layer is rebuilt; the layer has to be a fact, so what goes on the command
+        line is what :func:`resolve_pins` decided.
+        """
+        recipe = bake_mod.requirements_recipe(["requests==2.0", "decorator==4.4.0"])
         assert "requests==2.0" in recipe
+        assert "decorator==4.4.0" in recipe
         assert "|| true" not in recipe
         assert "VANTA_REQUIREMENTS" in recipe
 
     def test_requirements_recipe_without_deps_still_asserts_the_interpreter(self):
-        recipe = bake_mod.requirements_recipe("", [])
+        recipe = bake_mod.requirements_recipe([])
         assert "import ssl" in recipe
         assert "python -m pytest --version" in recipe
         assert "cat >" not in recipe, "an empty heredoc would install nothing useful"
@@ -1754,7 +1781,6 @@ class TestBake:
             "decorator"
         ]
 
-    @needs_clone
     def test_wave_1_layers_are_one_interpreter_and_three_bug_layers(self):
         split = load_split(SPLIT_PATH)
         minors, entries = bake_mod.select_layers(
@@ -1763,7 +1789,10 @@ class TestBake:
         assert minors == ["3.8"]
         assert [entry["project"] for entry in entries] == ["PySnooper"] * 3
         layers = bake_mod.layer_recipes(
-            split, pythons=minors, entries=entries, bugsinpy_root=BUGSINPY_CLONE
+            split,
+            pythons=minors,
+            entries=entries,
+            deps=_bug_deps(entries, {"vanta-bi-PySnooper-2": ("python-toolbox==0.9.3",)}),
         )
         assert [name for name, _, _ in layers] == [
             "vanta-bugsinpy-py3.8",
@@ -1773,7 +1802,19 @@ class TestBake:
         ]
         assert layers[0][1] == bake_mod.DEFAULT_BASE
         assert all(base == "vanta-bugsinpy-py3.8" for _, base, _ in layers[1:])
-        assert "python_toolbox" in layers[2][2]
+        assert "python-toolbox==0.9.3" in layers[2][2]
+
+    def test_a_bug_without_resolved_dependencies_is_refused_not_baked_dependency_free(self):
+        """``layer_recipes`` must not silently build a layer that installs nothing.
+
+        The layer's installs come from :func:`resolve_bug_deps`, and a bug missing
+        from that list was never resolved — baking it anyway would produce exactly
+        the PySnooper/3 failure this whole path exists to prevent.
+        """
+        split = split_mod.Split(split_data(bugs=[bug_entry(checkpoint="vanta-bi-Demo-1")]))
+        entry = split.bug("Demo", 1)
+        with pytest.raises(bake_mod.BakeError, match="resolve_bug_deps"):
+            bake_mod.layer_recipes(split, pythons=["3.8"], entries=[entry], deps=[])
 
     # ---- selection and the plan ------------------------------------------
     def test_select_layers_defaults_to_pilots_only(self):
@@ -1804,6 +1845,713 @@ class TestBake:
         """Measured: ``shuru: --disk-size 4096MB is smaller than the base image``."""
         with pytest.raises(SplitError, match="below the base image"):
             bake_mod.bake("vanta-bugsinpy-py3.8", "true", disk_mb=4096)
+
+
+# ============================================================================
+# the four dependency sources (§3.2, §3.3) — the fix for the wave-1 failure
+# ============================================================================
+class TestSetupShParsing:
+    """``setup.sh`` is shell: its pip lines are deps, its project install is not.
+
+    Measured on PySnooper: ``setup.sh`` is the *only* source that carries
+    ``python_toolbox`` (bug 2) and ``decorator`` (bug 3) — BugsInPy's
+    ``requirements.txt`` is 0 bytes for all three bugs. A layer that read only
+    ``requirements.txt`` installs nothing, and the failure surfaces as
+    ``pytest collected nothing`` — a dependency problem wearing the costume of an
+    oracle problem.
+    """
+
+    def test_pip_lines_are_kept_and_the_self_install_is_skipped_and_recorded(self):
+        refs, skipped = bake_mod.parse_setup_sh(
+            "python setup.py install\npip install python_toolbox\n"
+        )
+        assert [ref.spec for ref in refs] == ["python_toolbox"]
+        assert refs[0].source == "setup.sh line 2"
+        assert [line.line for line in skipped] == [1]
+        assert skipped[0].text == "python setup.py install"
+        assert skipped[0].reason == bake_mod._SETUP_PY_REASON
+
+    def test_the_self_install_is_skipped_because_it_shadows_the_graded_tree(self):
+        """The reason has to name the failure it prevents, or it reads as noise."""
+        _, skipped = bake_mod.parse_setup_sh("python setup.py install\n")
+        assert "site-packages" in skipped[0].reason
+        assert "every patch would then grade the same" in skipped[0].reason
+
+    def test_a_non_pip_shell_line_is_recorded_rather_than_silently_dropped(self):
+        _, skipped = bake_mod.parse_setup_sh("export FOO=1\npip install decorator\n")
+        assert [line.line for line in skipped] == [1]
+        assert skipped[0].reason == "not a pip install line"
+
+    def test_editable_path_and_requirements_file_lines_are_refused(self):
+        refs, skipped = bake_mod.parse_setup_sh(
+            "\n".join(
+                [
+                    "pip install -e .",
+                    "pip install -e./pkg",
+                    "pip install ./local",
+                    "pip install -r requirements.txt",
+                    "pip install decorator",
+                ]
+            )
+        )
+        assert [ref.spec for ref in refs] == ["decorator"]
+        reasons = [line.reason for line in skipped]
+        assert reasons[:3] == [bake_mod._PROJECT_REASON] * 3
+        assert reasons[3] == bake_mod._REQUIREMENTS_FILE_REASON
+
+    def test_a_vcs_target_is_refused_rather_than_guessed_at(self):
+        refs, skipped = bake_mod.parse_setup_sh(
+            "pip install git+https://github.com/x/y.git#egg=y\n"
+        )
+        assert refs == []
+        assert skipped[0].reason == bake_mod._VCS_REASON
+
+    def test_a_quoted_pinned_spec_is_parsed_without_its_shell_quotes(self):
+        """The record keeps the line as written; the parse sees what pip received."""
+        refs, _ = bake_mod.parse_setup_sh('pip install "requests>=2,<3"\n')
+        assert refs[0].spec == '"requests>=2,<3"'
+        assert bake_mod._specifier_text(refs[0]) == "<3,>=2"
+
+    def test_a_duplicate_spec_is_not_declared_twice(self):
+        refs, _ = bake_mod.parse_setup_sh("pip install decorator\npip install decorator\n")
+        assert [ref.spec for ref in refs] == ["decorator"]
+
+    def test_comments_and_blank_lines_yield_nothing(self):
+        refs, skipped = bake_mod.parse_setup_sh("# deps\n\n   \n")
+        assert refs == []
+        assert skipped == []
+
+
+class TestSetupPyStaticReader:
+    """``setup.py`` is read with ``ast`` and never executed (design C3)."""
+
+    def test_a_comment_only_file_named_by_setup_py_yields_no_refs(self):
+        """Bug 1/2 name ``requirements.in``; bug 3 names ``requirements.txt``."""
+        setup = "setup(name='X', install_requires=read_file('requirements.in'))\n"
+        refs, _ = setup_py_refs(setup, {"requirements.in": "# no dependencies!\n"}, [])
+        assert refs == []
+
+    def test_a_comment_only_install_requires_is_noted_not_silently_empty(self):
+        notes: list[str] = []
+        setup_py_refs(
+            "setup(name='X', install_requires=read_file('requirements.in'))\n",
+            {"requirements.in": "# That's right baby! No dependencies!\n"},
+            notes,
+        )
+        assert "install_requires: declares no requirements" in notes
+
+    def test_install_requires_via_a_read_split_chain_keeps_every_entry(self):
+        setup = (
+            "setup(name='PySnooper',\n"
+            "      install_requires=open('requirements.txt','r').read().split('\\n'))\n"
+        )
+        text = "decorator>=4.3.0\nfuture>=0.17.1\nsix>=1.12.0\n"
+        refs, _ = setup_py_refs(setup, {"requirements.txt": text}, [])
+        assert [ref.spec for ref in refs] == ["decorator>=4.3.0", "future>=0.17.1", "six>=1.12.0"]
+        assert refs[0].source == "install_requires (requirements.txt) line 1"
+
+    def test_a_trailing_blank_entry_is_skipped_not_resolved_as_a_package(self):
+        """``split('\\n')`` on a newline-terminated file yields an empty string."""
+        setup = (
+            "setup(name='X',\n"
+            "      tests_require=open('test_requirements.txt','r').read().split('\\n'))\n"
+        )
+        refs, _ = setup_py_refs(setup, {"test_requirements.txt": "python_toolbox>=0.9.3\n"}, [])
+        assert [ref.spec for ref in refs] == ["python_toolbox>=0.9.3"]
+
+    def test_tests_require_and_the_tests_extra_are_both_read(self):
+        setup = (
+            "setup(name='X',\n"
+            "      tests_require=['python_toolbox>=0.9.3'],\n"
+            "      extras_require={'tests': {'pytest', 'python-toolbox'}})\n"
+        )
+        refs, _ = setup_py_refs(setup, {}, [])
+        assert {ref.name for ref in refs} == {"python-toolbox", "pytest"}
+        assert any("tests_require (setup.py) line" in ref.source for ref in refs)
+        assert any("extras_require['tests'] (setup.py) line" in ref.source for ref in refs)
+
+    def test_a_root_test_requirements_file_is_read_even_when_setup_py_never_names_it(self):
+        """PySnooper/3's ``test_requirements.txt`` is reachable only this way."""
+        setup = "setup(name='PySnooper', install_requires=['decorator>=4.3.0'])\n"
+        refs, _ = setup_py_refs(
+            setup, {"test_requirements.txt": "python_toolbox>=0.9.3\npytest>=4.4.1\n"}, []
+        )
+        assert "python_toolbox>=0.9.3" == next(
+            ref.spec for ref in refs if ref.name == "python-toolbox"
+        )
+        assert any(ref.source == "test_requirements.txt line 1" for ref in refs)
+
+    def test_a_file_setup_py_names_but_the_commit_does_not_have_is_noted(self):
+        notes: list[str] = []
+        refs, _ = setup_py_refs(
+            "setup(name='X', install_requires=read_file('requirements.in'))\n", {}, notes
+        )
+        assert refs == []
+        assert any("requirements.in" in note and "not at the buggy commit" in note for note in notes)
+
+    def test_a_declaration_that_is_absent_is_noted_per_source(self):
+        notes: list[str] = []
+        setup_py_refs("setup(name='X')\n", {}, notes)
+        assert "install_requires: not declared in setup.py" in notes
+        assert "tests_require: not declared in setup.py" in notes
+
+    def test_setup_py_is_parsed_not_executed(self):
+        """A ``setup.py`` that raises on import still yields its declarations.
+
+        This is the C3 guarantee in a form a test can see: executing this file
+        would kill the reader, so a reader that survives it read the AST.
+        """
+        setup = (
+            "raise SystemExit('executing this setup.py would abort the host')\n"
+            "setup(name='Demo', install_requires=['decorator>=4.3.0'])\n"
+        )
+        refs, _ = setup_py_refs(setup, {}, [])
+        assert [ref.spec for ref in refs] == ["decorator>=4.3.0"]
+
+    def test_import_name_comes_from_name_then_from_the_first_non_test_package(self):
+        assert bake_mod.import_name_of("setup(name='PySnooper')\n") == "pysnooper"
+        assert bake_mod.import_name_of("setup(packages=['pkg', 'tests'])\n") == "pkg"
+
+    def test_import_name_that_cannot_be_read_is_flagged_not_guessed(self):
+        with pytest.raises(bake_mod.BakeError, match="neither name= nor a packages="):
+            bake_mod.import_name_of("setup(version='1.0')\n")
+
+    def test_setup_py_that_is_not_python_is_an_error(self):
+        with pytest.raises(bake_mod.BakeError, match="does not parse as Python"):
+            bake_mod.setup_py_refs("setup(name=\n", {}, [])
+
+
+def setup_py_refs(setup_py: str, files: dict, notes: list) -> tuple:
+    """``bake_mod.setup_py_refs`` with a dict standing in for the buggy commit."""
+    return bake_mod.setup_py_refs(setup_py, files.get, notes)
+
+
+class TestResolvePinsByDate:
+    """Pin by release date, with the dates passed in — no network in a test."""
+
+    RELEASES = {
+        "decorator": {"4.3.0": "2018-02-03", "4.4.0": "2019-03-16", "4.4.1": "2019-06-01"},
+        "future": {"0.17.1": "2018-10-31"},
+        "six": {"1.12.0": "2018-12-10", "1.13.0": "2020-05-31"},
+        "python-toolbox": {"0.9.3": "2016-06-07"},
+    }
+
+    def _resolve(self, refs, *, commit_date="2019-04-22", harness_pins=None):
+        return bake_mod.resolve_pins(
+            refs,
+            releases=self.RELEASES,
+            commit_date=commit_date,
+            harness_pins=harness_pins or {},
+        )
+
+    def test_the_newest_release_on_or_before_the_commit_date_wins(self):
+        refs = [bake_mod.dep_ref("decorator>=4.3.0", "install_requires (requirements.txt) line 1")]
+        resolved = self._resolve(refs)
+        assert resolved[0].pin == "decorator==4.4.0"
+        assert resolved[0].harness is False
+
+    def test_a_release_newer_than_the_commit_is_excluded_even_when_it_is_newest(self):
+        """4.4.1 exists, and the buggy tree could not have been built with it."""
+        refs = [bake_mod.dep_ref("decorator", "setup.sh line 2")]
+        assert self._resolve(refs)[0].pin == "decorator==4.4.0"
+
+    def test_a_constraint_with_no_release_before_the_commit_date_is_an_error(self):
+        """Installing today's version would provision an environment the bug never ran in."""
+        refs = [bake_mod.dep_ref("six>=1.13.0", "install_requires (requirements.txt) line 3")]
+        with pytest.raises(bake_mod.BakeError, match="no release on or before 2019-04-22"):
+            self._resolve(refs)
+
+    def test_the_error_names_the_newest_release_it_actually_found(self):
+        refs = [bake_mod.dep_ref("six>=1.13.0", "install_requires (requirements.txt) line 3")]
+        with pytest.raises(bake_mod.BakeError, match="newest six is 1.13.0"):
+            self._resolve(refs)
+
+    def test_a_package_with_no_release_dates_is_not_guessed_at(self):
+        refs = [bake_mod.dep_ref("mystery", "setup.sh line 2")]
+        with pytest.raises(bake_mod.BakeError, match="no release dates for 'mystery'"):
+            self._resolve(refs)
+
+    def test_an_unparseable_release_is_ignored_rather_than_crashing_the_pin(self):
+        refs = [bake_mod.dep_ref("mystery", "setup.sh line 2")]
+        resolved = bake_mod.resolve_pins(
+            refs,
+            releases={"mystery": {"not-a-version": "2019-01-01", "1.0": "2019-01-02"}},
+            commit_date="2019-04-22",
+            harness_pins={},
+        )
+        assert resolved[0].pin == "mystery==1.0"
+
+    # ---- the harness exception -------------------------------------------
+    def test_a_harness_provided_package_keeps_the_harness_version(self):
+        """pytest is what ``pytest-json-report`` is installed against and what the
+        oracle is read from; re-pinning it is a silent downgrade of the report."""
+        refs = [bake_mod.dep_ref("pytest>=4.4.1", "test_requirements.txt line 2")]
+        resolved = self._resolve(refs, harness_pins={"pytest": "8.0.2"})
+        assert resolved[0].pin == "pytest==8.0.2"
+        assert resolved[0].harness is True
+        assert resolved[0].as_dict()["provisioned_by"] == "interpreter layer"
+
+    def test_a_constraint_that_excludes_the_harness_version_needs_a_decision(self):
+        refs = [bake_mod.dep_ref("pytest<5", "test_requirements.txt line 2")]
+        with pytest.raises(bake_mod.BakeError, match="will not downgrade pytest"):
+            self._resolve(refs, harness_pins={"pytest": "8.0.2"})
+
+    def test_a_harness_package_the_layer_does_not_provide_is_an_error(self):
+        refs = [bake_mod.dep_ref("pytest>=4.4.1", "test_requirements.txt line 2")]
+        with pytest.raises(bake_mod.BakeError, match="does not provide it"):
+            self._resolve(refs)
+
+    def test_resolution_never_reaches_the_network(self, monkeypatch):
+        """The dates are an argument, so a test can prove the pin offline."""
+        monkeypatch.setattr(
+            bake_mod,
+            "pypi_releases",
+            lambda name: pytest.fail("the pin path performed a network lookup"),
+        )
+        assert self._resolve([bake_mod.dep_ref("six", "setup.sh line 1")])[0].pin == "six==1.12.0"
+
+
+class TestMergeRefs:
+    """One requirement written twice is one requirement; two constraints disagree."""
+
+    def test_a_bare_name_is_absorbed_by_a_constrained_one(self):
+        """PySnooper/3: ``decorator`` in setup.sh, ``decorator>=4.3.0`` in setup.py."""
+        merged, conflicts = bake_mod.merge_refs(
+            [
+                bake_mod.dep_ref("decorator", "setup.sh line 2"),
+                bake_mod.dep_ref("decorator>=4.3.0", "install_requires (requirements.txt) line 1"),
+            ]
+        )
+        assert conflicts == []
+        assert [ref.spec for ref in merged] == ["decorator>=4.3.0"]
+        assert "setup.sh line 2" in merged[0].source
+        assert "install_requires" in merged[0].source
+
+    def test_two_spellings_of_one_name_are_one_package(self):
+        merged, conflicts = bake_mod.merge_refs(
+            [
+                bake_mod.dep_ref("python_toolbox>=0.9.3", "tests_require (test_requirements.txt) line 1"),
+                bake_mod.dep_ref("python-toolbox", "extras_require['tests'] (setup.py) line 28"),
+            ]
+        )
+        assert conflicts == []
+        assert [ref.name for ref in merged] == ["python-toolbox"]
+
+    def test_two_different_constraints_are_a_conflict_and_are_not_picked_between(self):
+        merged, conflicts = bake_mod.merge_refs(
+            [
+                bake_mod.dep_ref("six>=1.12.0", "install_requires (requirements.txt) line 3"),
+                bake_mod.dep_ref("six<1.11", "setup.sh line 4"),
+            ]
+        )
+        assert merged == []
+        assert len(conflicts) == 1
+        assert conflicts[0].name == "six"
+        assert "does not pick one of them" in conflicts[0].message()
+
+    def test_resolve_deps_fails_the_bug_loudly_and_names_both_claims(self):
+        sources = bake_mod.DepSources(
+            project="Demo",
+            bug_id=1,
+            checkpoint="vanta-bi-Demo-1",
+            buggy_commit="b" * 40,
+            commit_date="2019-04-22",
+            import_name="demo",
+            refs=(
+                bake_mod.dep_ref("six>=1.12.0", "install_requires (requirements.txt) line 3"),
+                bake_mod.dep_ref("six<1.11", "setup.sh line 4"),
+            ),
+        )
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            bake_mod.resolve_deps(sources, releases=TestResolvePinsByDate.RELEASES, harness_pins={})
+        message = str(excinfo.value)
+        assert "Demo/1" in message
+        assert "'six>=1.12.0' from install_requires (requirements.txt) line 3" in message
+        assert "'six<1.11' from setup.sh line 4" in message
+
+
+class TestDependencyProvenance:
+    """What the bake decided is data a later stage reads back, not a re-derivation."""
+
+    def _sources(self) -> bake_mod.DepSources:
+        return bake_mod.DepSources(
+            project="Demo",
+            bug_id=3,
+            checkpoint="vanta-bi-Demo-3",
+            buggy_commit="b" * 40,
+            commit_date="2019-04-22",
+            import_name="demo",
+            refs=(
+                bake_mod.dep_ref("decorator>=4.3.0", "install_requires (requirements.txt) line 1"),
+                bake_mod.dep_ref("pytest>=4.4.1", "test_requirements.txt line 2"),
+            ),
+            skipped=(
+                bake_mod.SkippedLine(
+                    "setup.sh", 1, "python setup.py install", bake_mod._SETUP_PY_REASON
+                ),
+            ),
+            notes=("requirements.txt (BugsInPy): empty for this bug",),
+        )
+
+    def test_every_dependency_records_its_source_its_pin_and_its_provisioner(self):
+        sources = self._sources()
+        resolved = bake_mod.resolve_deps(
+            sources, releases=TestResolvePinsByDate.RELEASES, harness_pins={"pytest": "8.0.2"}
+        )
+        provenance = bake_mod.deps_provenance(sources, resolved, harness_pins={"pytest": "8.0.2"})
+        by_name = {dep["name"]: dep for dep in provenance["dependencies"]}
+        assert by_name["decorator"]["pin"] == "decorator==4.4.0"
+        assert by_name["decorator"]["sources"] == ["install_requires (requirements.txt) line 1"]
+        assert by_name["pytest"]["pin"] == "pytest==8.0.2"
+        assert by_name["pytest"]["provisioned_by"] == "interpreter layer"
+        assert provenance["import_name"] == "demo"
+        assert provenance["harness_pins"] == {"pytest": "8.0.2"}
+
+    def test_the_skipped_setup_sh_lines_are_part_of_the_record(self):
+        sources = self._sources()
+        resolved = bake_mod.resolve_deps(
+            sources, releases=TestResolvePinsByDate.RELEASES, harness_pins={"pytest": "8.0.2"}
+        )
+        provenance = bake_mod.deps_provenance(sources, resolved, harness_pins={"pytest": "8.0.2"})
+        assert provenance["installs"] == ["decorator==4.4.0", "pytest==8.0.2"]
+        assert provenance["skipped"] == [
+            {
+                "source": "setup.sh",
+                "line": 1,
+                "text": "python setup.py install",
+                "reason": bake_mod._SETUP_PY_REASON,
+            }
+        ]
+        assert provenance["notes"] == ["requirements.txt (BugsInPy): empty for this bug"]
+
+    def test_write_load_and_preflight_round_trip(self, tmp_path):
+        deps_dir = tmp_path / "deps"
+        item = bake_mod.BugDeps(
+            entry={"project": "Demo", "bug_id": 3},
+            checkpoint="vanta-bi-Demo-3",
+            installs=("decorator==4.4.0",),
+            provenance={"installs": ["decorator==4.4.0"], "import_name": "demo"},
+        )
+        path = bake_mod.write_deps(deps_dir, item)
+        assert path.name == "vanta-bi-Demo-3.json"
+        assert bake_mod.load_deps(deps_dir, "vanta-bi-Demo-3")["import_name"] == "demo"
+        bake_mod.require_deps(deps_dir, ["vanta-bi-Demo-3"])
+
+    def test_a_layer_with_no_recorded_provenance_must_be_rebaked(self, tmp_path):
+        deps_dir = tmp_path / "deps"
+        with pytest.raises(bake_mod.BakeError, match="re-run bake"):
+            bake_mod.load_deps(deps_dir, "vanta-bi-Demo-3")
+        with pytest.raises(bake_mod.BakeError, match="vanta-bi-Demo-3"):
+            bake_mod.require_deps(deps_dir, ["vanta-bi-Demo-3"])
+
+    def test_a_file_that_is_not_provenance_is_an_error_not_an_empty_provenance(self, tmp_path):
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        write(deps_dir / "vanta-bi-Demo-3.json", "{oops\n")
+        with pytest.raises(bake_mod.BakeError, match="not valid JSON"):
+            bake_mod.load_deps(deps_dir, "vanta-bi-Demo-3")
+        write(deps_dir / "vanta-bi-Demo-3.json", json.dumps({"import_name": "demo"}))
+        with pytest.raises(bake_mod.BakeError, match="not dependency provenance"):
+            bake_mod.load_deps(deps_dir, "vanta-bi-Demo-3")
+
+
+needs_bare_repos = pytest.mark.skipif(
+    not (REPO_ROOT / "runs" / "bugsinpy" / "repos" / "PySnooper.git").is_dir(),
+    reason="the bare project clones are not present (runs/ is not committed)",
+)
+
+
+@needs_bare_repos
+@needs_clone
+class TestRealPySnooperDependencies:
+    """The measured bug, end to end: PySnooper 1-3 resolve to the right layers.
+
+    PySnooper/3 is the failure this whole path was written for. Its layer used to
+    be ``decorator`` alone, while ``tests/test_pysnooper.py`` imports
+    ``python_toolbox``; prepare then reported a 0-test collection as a bug. The
+    union of the four sources has to produce ``decorator``, ``future``, ``six`` and
+    ``python-toolbox``, and must not install the project itself.
+    """
+
+    RELEASE_DATES = TestResolvePinsByDate.RELEASES
+
+    def _entries(self) -> tuple[split_mod.Split, list[dict]]:
+        split = load_split(SPLIT_PATH)
+        entries = [split.bug("PySnooper", bug_id) for bug_id in (1, 2, 3)]
+        return split, entries
+
+    def _resolve(self, entries):
+        return bake_mod.resolve_bug_deps(
+            load_split(SPLIT_PATH),
+            entries,
+            bugsinpy_root=BUGSINPY_CLONE,
+            repo_for=lambda project: REPO_ROOT / "runs" / "bugsinpy" / "repos" / f"{project}.git",
+            fetch=lambda name: self.RELEASE_DATES[name],
+        )
+
+    def test_bug_three_installs_every_declared_dependency_and_not_the_project(self):
+        _, entries = self._entries()
+        item = next(d for d in self._resolve(entries) if d.checkpoint.endswith("-3"))
+        assert set(item.installs) == {
+            "decorator==4.4.0",
+            "future==0.17.1",
+            "python-toolbox==0.9.3",
+            "six==1.12.0",
+        }
+
+    def test_the_project_is_never_among_the_installs(self):
+        """A copy of ``pysnooper`` in site-packages would make every patch grade the same."""
+        _, entries = self._entries()
+        for item in self._resolve(entries):
+            assert not any(spec.startswith("pysnooper") for spec in item.installs)
+
+    def test_the_harness_pytest_is_recorded_but_never_installed_by_the_layer(self):
+        _, entries = self._entries()
+        item = next(d for d in self._resolve(entries) if d.checkpoint.endswith("-3"))
+        assert not any(spec.startswith("pytest==") for spec in item.installs)
+        pytest_dep = next(
+            dep for dep in item.provenance["dependencies"] if dep["name"] == "pytest"
+        )
+        assert pytest_dep["pin"] == "pytest==8.0.2"
+        assert pytest_dep["provisioned_by"] == "interpreter layer"
+        assert "pytest==8.0.2" in item.provenance["installs"]
+
+    def test_bug_one_and_two_get_python_toolbox_from_the_tests_extra(self):
+        _, entries = self._entries()
+        got = {
+            item.checkpoint: set(item.installs)
+            for item in self._resolve(entries)
+            if not item.checkpoint.endswith("-3")
+        }
+        assert got == {
+            "vanta-bi-PySnooper-1": {"python-toolbox==0.9.3"},
+            "vanta-bi-PySnooper-2": {"python-toolbox==0.9.3"},
+        }
+
+    def test_the_setup_py_install_line_is_recorded_as_skipped_on_every_bug(self):
+        _, entries = self._entries()
+        for item in self._resolve(entries):
+            skipped = item.provenance["skipped"]
+            assert any(
+                line["source"] == "setup.sh"
+                and line["text"] == "python setup.py install"
+                and "site-packages" in line["reason"]
+                for line in skipped
+            ), item.checkpoint
+
+    def test_the_import_name_is_read_from_the_projects_own_setup_py(self):
+        _, entries = self._entries()
+        for item in self._resolve(entries):
+            assert item.provenance["import_name"] == "pysnooper"
+
+
+class TestDepGate:
+    """The dependency gate runs before the derivation, with its own messages (§3.3).
+
+    Measured: a missing ``python_toolbox`` made ``--collect-only`` collect nothing,
+    and prepare reported ``hidden-oracle derivation failed``. A dependency problem
+    and an oracle problem need different fixes, so they must not share a message.
+    """
+
+    @staticmethod
+    def _prep(tmp_path: Path) -> prepare_mod.BugPrep:
+        batch = tmp_path / "batch"
+        return prep(root=batch / "worktrees" / "Demo_1")
+
+    def _deps(self) -> dict:
+        return {"import_name": "pysnooper"}
+
+    def test_a_healthy_layer_returns_the_collected_nodeids(self, tmp_path, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: seen.update(collect=kwargs) or {"tests/test_x.py::test_a"},
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "import_probe",
+            lambda **kwargs: seen.update(probe=kwargs)
+            or "/workspace/worktrees/Demo_1/oracle_tree/pysnooper/__init__.py",
+        )
+        bug_prep = self._prep(tmp_path)
+
+        nodeids = prepare_mod.check_deps(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", deps=self._deps()
+        )
+
+        assert nodeids == {"tests/test_x.py::test_a"}
+        for call in (seen["collect"], seen["probe"]):
+            assert call["checkpoint"] == "chk"
+            assert call["tree_rel"] == "worktrees/Demo_1/oracle_tree"
+            assert call["test_cmd"] == bug_prep.test_cmd, (
+                "the gate must run exactly the invocation the suites run"
+            )
+        assert seen["probe"]["module"] == "pysnooper"
+
+    def test_a_collection_failure_is_reported_as_a_dependency_failure(self, tmp_path, monkeypatch):
+        def boom(**kwargs):
+            raise suite_mod.SuiteError("pytest collected nothing (exit 2)")
+
+        monkeypatch.setattr(suite_mod, "collect_only", boom)
+        monkeypatch.setattr(
+            suite_mod, "import_probe", lambda **kwargs: pytest.fail("probe ran anyway")
+        )
+
+        with pytest.raises(suite_mod.SuiteError, match="^deps: collection failed:"):
+            prepare_mod.check_deps(
+                self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
+                deps=self._deps(),
+            )
+
+    def test_an_import_from_site_packages_is_named_as_such(self, tmp_path, monkeypatch):
+        """The failure a ``setup.py install`` in the bake would cause."""
+        monkeypatch.setattr(suite_mod, "collect_only", lambda **kwargs: {"tests/x.py::t"})
+        monkeypatch.setattr(
+            suite_mod,
+            "import_probe",
+            lambda **kwargs: (
+                "/opt/venv38/lib/python3.8/site-packages/pysnooper/__init__.py"
+            ),
+        )
+
+        with pytest.raises(
+            suite_mod.SuiteError, match="^deps: package imports from site-packages, not the tree:"
+        ):
+            prepare_mod.check_deps(
+                self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
+                deps=self._deps(),
+            )
+
+    def test_a_module_that_does_not_import_at_all_is_reported_distinctly(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(suite_mod, "collect_only", lambda **kwargs: {"tests/x.py::t"})
+
+        def boom(**kwargs):
+            raise suite_mod.SuiteError("exited 1 without printing a path")
+
+        monkeypatch.setattr(suite_mod, "import_probe", boom)
+        with pytest.raises(suite_mod.SuiteError, match="^deps: pysnooper does not import"):
+            prepare_mod.check_deps(
+                self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
+                deps=self._deps(),
+            )
+
+    def test_the_derivation_reuses_the_gate_s_collection(self, tmp_path, monkeypatch):
+        """Two collections of one tree are two chances to disagree."""
+        calls: list = []
+        monkeypatch.setattr(
+            suite_mod, "collect_only", lambda **kwargs: calls.append(kwargs) or set()
+        )
+
+        class ReachedTheSuites(RuntimeError):
+            pass
+
+        def stop(*args, **kwargs):
+            raise ReachedTheSuites()
+
+        monkeypatch.setattr(prepare_mod, "_suite", stop)
+        with pytest.raises(ReachedTheSuites):
+            prepare_mod.derive_hidden(
+                self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
+                collected={"tests/x.py::t"},
+            )
+        assert calls == [], "`collected` was handed in; the gate already paid for it"
+
+
+class TestImportProbe:
+    """``import_probe`` reuses the suite invocation, not a convenient one."""
+
+    @staticmethod
+    def _result(stdout: str, *, exit_code: int = 0):
+        return shuru_mod.ExecResult(
+            stdout=stdout, stderr="", exit_code=exit_code, timed_out=False
+        )
+
+    def test_the_probe_runs_the_suite_interpreter_in_the_suite_cwd(self, monkeypatch):
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod.shuru,
+            "run",
+            lambda **kwargs: seen.update(kwargs)
+            or self._result("/workspace/w/Demo_1/oracle_tree/pysnooper/__init__.py\n"),
+        )
+
+        where = suite_mod.import_probe(
+            checkpoint="chk",
+            batch_dir=Path("/tmp/batch"),
+            tree_rel="w/Demo_1/oracle_tree",
+            test_cmd=["python", "-m", "pytest", "tests"],
+            module="pysnooper",
+            disk_mb=8192,
+        )
+
+        assert where == "/workspace/w/Demo_1/oracle_tree/pysnooper/__init__.py"
+        assert seen["guest_cwd"] == "/workspace/w/Demo_1/oracle_tree"
+        assert seen["command"][:2] == ["sh", "-c"], "the probe runs as one shell command"
+        probe = seen["command"][2]
+        assert "python -c" in probe, "the suite's own interpreter is used"
+        assert "import pysnooper" in probe
+        assert "PYTHONPATH" not in seen["env"], (
+            "a PYTHONPATH would prove an import path the suites do not have"
+        )
+        assert "PYTHONPATH" not in probe
+
+    def test_a_module_that_does_not_import_raises_rather_than_returning_a_path(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            suite_mod.shuru,
+            "run",
+            lambda **kwargs: shuru_mod.ExecResult(
+                stdout="", stderr="ModuleNotFoundError: No module named 'pysnooper'",
+                exit_code=1, timed_out=False,
+            ),
+        )
+        with pytest.raises(suite_mod.SuiteError, match="ModuleNotFoundError"):
+            suite_mod.import_probe(
+                checkpoint="chk", batch_dir=Path("/tmp/batch"),
+                tree_rel="w/Demo_1/oracle_tree",
+                test_cmd=["python", "-m", "pytest", "tests"], module="pysnooper",
+                disk_mb=8192,
+            )
+
+    def test_a_module_name_that_is_not_an_identifier_is_refused_before_any_vm(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            suite_mod.shuru, "run", lambda **kwargs: pytest.fail("a VM was booted")
+        )
+        with pytest.raises(suite_mod.SuiteError, match="not a Python identifier"):
+            suite_mod.import_probe(
+                checkpoint="chk", batch_dir=Path("/tmp/batch"),
+                tree_rel="w/Demo_1/oracle_tree",
+                test_cmd=["python", "-m", "pytest", "tests"], module="pysnooper; rm -rf /",
+                disk_mb=8192,
+            )
+
+    def test_the_tree_root_the_suites_use_is_one_definition(self):
+        assert suite_mod.guest_tree_root("w/Demo_1/oracle_tree") == (
+            "/workspace/w/Demo_1/oracle_tree"
+        )
+
+
+class TestCollectedOrRaise:
+    """A non-empty collection can still hide a collection error."""
+
+    def test_a_clean_collection_passes(self):
+        nodeids = {"tests/x.py::t"}
+        assert suite_mod.collected_or_raise(nodeids, exit_code=0, output="") == nodeids
+
+    def test_nothing_collected_is_an_error(self):
+        with pytest.raises(suite_mod.SuiteError, match="collected nothing"):
+            suite_mod.collected_or_raise(set(), exit_code=2, output="ImportError")
+
+    def test_a_non_zero_exit_is_an_error_even_when_something_was_collected(self):
+        """Measured: one bad test module leaves the others collected and pytest exits 2."""
+        with pytest.raises(suite_mod.SuiteError, match="exited 2 while collecting"):
+            suite_mod.collected_or_raise({"tests/x.py::t"}, exit_code=2, output="ImportError tail")
 
 
 # ============================================================================

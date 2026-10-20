@@ -63,6 +63,37 @@ def ensure_project_clone(cache_root: Path, project: str, url: str) -> Path:
     return dest
 
 
+def read_file_at(repo: Path, commit: str, path: str) -> Optional[str]:
+    """One file out of a clone at ``commit``, or ``None`` when it is not there.
+
+    [VANTA-WHY] Read through ``git`` rather than from a checked-out tree: a bake
+    needs a project's *buggy-commit* ``setup.py`` and ``requirements.txt`` before any
+    tree exists, and a checkout would be a second materialisation of the same commit
+    that could disagree with the one the suites run. The file is read as text and
+    never executed — C3 has no exception for "just asking setuptools what it wants".
+    """
+    proc = subprocess.run(
+        ["git", "show", f"{commit}:{path}"], cwd=repo, capture_output=True, check=False
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def commit_date(repo: Path, commit: str) -> str:
+    """``YYYY-MM-DD`` of a commit's own date — the cutoff for date-pinned deps (§3.2).
+
+    [VANTA-WHY] The date is read in the commit's own offset and not converted to
+    UTC. Dependencies are pinned to the newest release on or before the day the tree
+    was committed, and a release published while the author's working day was half
+    over is not a release that tree could have used.
+    """
+    date = _git(["show", "-s", "--format=%cI", commit], cwd=repo).strip()[:10]
+    if len(date) != 10 or date[4] != "-":
+        raise TreeError(f"cannot read a commit date for {commit} in {repo}: {date!r}")
+    return date
+
+
 def export_tree(repo: Path, commit: str, dest: Path) -> None:
     """Materialise ``commit`` of ``repo`` at ``dest`` as a self-contained tree.
 

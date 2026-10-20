@@ -330,19 +330,40 @@ then a thin per-bug layer on top:
 
 ```
 shuru checkpoint create vanta-bi-<project>-<N> --from vanta-bugsinpy-py3.<v> --allow-net \
-  -- sh -c 'set -e; pip install -r bug_requirements.txt; pip install <setup.sh deps>; \
+  -- sh -c 'set -e; pip install -r /tmp/req.txt; \
             pip freeze > /opt/vanta-deps-freeze.txt; touch /opt/vanta-deps-ok'
 ```
 
 This mirrors the existing `vanta-deps-<fingerprint>` + `/opt/vanta-deps-ok` marker + freeze-file
 pattern exactly, so nothing new has to be invented for verification.
 
-**What the per-bug layer installs, and what it deliberately does not.** BugsInPy's own install step
-is `setup.sh` (`python setup.py install`, plus extra `pip install`s), and `requirements.txt` is
-frequently empty — 0 bytes on all three PySnooper bugs, while `python_toolbox` and `decorator` exist
-only in `setup.sh`. So the layer takes its specs from **both**, reading the `pip install …` lines of
-`setup.sh` (measured, not guessed) and the whole of `requirements.txt`. The project's own install
-line is dropped, for two reasons:
+**Where the specs come from — four sources, unioned per bug, resolved at bake time.** BugsInPy's own
+install step is `setup.sh` (`python setup.py install`, plus extra `pip install`s), and
+`requirements.txt` is frequently empty — 0 bytes on all three PySnooper bugs, while `python_toolbox`
+and `decorator` exist only in `setup.sh` at bug 3. One source alone under-provisions, so
+`bake.resolve_bug_deps` unions, in this order:
+
+1. the BugsInPy `requirements.txt` for the bug;
+2. the `pip install …` lines of the BugsInPy `setup.sh` (parsed, measured — never guessed);
+3. the project's own declared **test** requirements at the buggy commit (`test_requirements.txt`,
+   `tests_require`, or a `tests` extra in `setup.py`);
+4. `install_requires`, read **statically** from `setup.py` (an AST walk, plus the file it names —
+   PySnooper/1–2 read `requirements.in`, PySnooper/3 `requirements.txt`).
+
+Nothing is taken from anywhere else, and no package is ever chosen by hand. The union is resolved,
+not merged: if two sources constrain one package differently, `bake.DepConflict` fails that bug and
+names both claims rather than picking one.
+
+**Pinning.** Every third-party dep is pinned to the newest release published on or before the buggy
+commit's date (`bake.resolve_pins`, the only PyPI contact, at bake time while network is available).
+A package the harness already provides (`pytest`, `pytest-json-report`) is left at the harness
+version and recorded as such — in particular `pytest` is never downgraded, which would break the
+json-report plugin. The resolved set, each dep's source (file + line), the pin, and the skipped
+`setup.sh` lines all go into `runs/bugsinpy/deps/<checkpoint>.json` and, as derived data, into the
+split's `deps` key.
+
+**What the layer deliberately does not install.** The project's own install line is dropped, for two
+reasons:
 
 1. **A baked copy would be graded instead of the tree.** Every suite runs `python -m pytest` with its
    cwd set to the tree root, so `import <package>` resolves to the mounted tree — the copy the run is
@@ -388,14 +409,19 @@ back years later.
   (`python setup.py build`) before its own tests can import it. BugsInPy's `bugsinpy-compile` does
   exactly this.
 
-So `deps::detect` alone will under-provision. Two mitigations, both already present in our code:
+So `deps::detect` alone will under-provision. The mitigation is the four-source union in §3.2, built
+by `bake.resolve_bug_deps`, with two rules that were learned the hard way:
 
-1. **Prepare-time install**: the per-bug checkpoint build runs the project's own
-   `setup.py` / `pip install -e .` and its `requirements.txt` **verbatim**, so the authoritative dep
-   list comes from the project, not from our detector.
-2. **Self-heal**: [`parse_missing_modules`](file:///Users/kyu-yi/vanta/src/sandbox/deps.rs) +
-   [`ensure_derived_checkpoint`](file:///Users/kyu-yi/vanta/src/sandbox/shuru.rs) is the fallback if
-   a run still hits `ModuleNotFoundError`.
+1. **Read `setup.py`, never execute it.** At the buggy commit, `setup.py` is how these projects
+   declare their deps (`install_requires`, `tests_require`, a `tests` extra, or a file they read from
+   `install_requires`), so it is source 4 in §3.2 — parsed with `ast`, never run on the host. Running
+   it would mean executing third-party code outside Shuru (C3). If a future project's deps genuinely
+   cannot be read statically, that bug is flagged, not improvised around.
+2. **Install the deps, never the project.** `python setup.py install` is deliberately *not* run: it
+   writes the buggy package into `site-packages`, where it would shadow the patched tree under test
+   and make every patch grade the same (§3.2). The skipped line is recorded in the layer's provenance
+   with the reason, so "the dep was not installed" is never indistinguishable from "the dep is not
+   needed".
 
 **Blocker to accept up front:** `--allow-net` is required while building every checkpoint. If the
 sandbox has no network at bake time, `prepare` cannot succeed. `network_alive()` already exists to
@@ -414,6 +440,23 @@ and **rejects the bug from the split** if it does not collect. The resolved `tes
 pinned `pytest` / `pytest-json-report` versions (§3.2), are stored per bug in the split.
 `run_test.sh` is still read, but used as the *cross-check* on which nodeid is the hidden test
 (§1.3), not as the executor.
+
+**Prepare-time dependency gate.** Collectability is not only about pytest: a bug whose layer is
+missing a declared dep collects *zero* tests, and that failure is indistinguishable from a broken
+oracle. PySnooper/3 failed exactly this way — `tests/test_pysnooper.py` imports `python_toolbox`,
+which no BugsInPy source installs. So `prepare` runs two checks in the bug's layer, **before** oracle
+derivation, and reports them as dependency failures, never as oracle failures:
+
+| Check | Failure message |
+| --- | --- |
+| `pytest --collect-only -q` over the oracle tree's test files collects >0 with no collection errors, using the suite's `test_cmd` | `deps: collection failed` |
+| the project package imports **from the tree under test** — `python -c "import <name>; print(<name>.__file__)"`, then assert that path is inside the tree, not `site-packages` | `deps: package imports from site-packages, not the tree` |
+
+The import check reuses **exactly** the suite invocation — same interpreter (`test_cmd[0]`), same
+cwd (the tree root), same env, and no `PYTHONPATH` — because that is the only import path the suites
+actually have. The module name comes from the project's own `setup.py` (`name=`, or its first
+non-`tests` package), never from a guess. A tree that passes both checks is one whose suite can
+import what it tests.
 
 ---
 
@@ -798,11 +841,26 @@ enter this file through a deliberate edit:
       "prompt_tokens_estimate": 41000,
       "context_ok": true,
       "issue_text": "…frozen, leak-gated…",
-      "issue_text_sha256": "…"
+      "issue_text_sha256": "…",
+      "deps": {
+        "schema_version": 1,
+        "checkpoint": "vanta-bi-PySnooper-3",
+        "buggy_commit": "6e3d797…", "commit_date": "2019-04-22",
+        "import_name": "pysnooper",
+        "harness_pins": {"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
+        "installs": ["decorator==4.4.0", "future==0.17.1", "six==1.12.0", "python-toolbox==0.9.3"],
+        "dependencies": [{"name": "decorator", "spec": "decorator>=4.3.0", "sources": ["install_requires (requirements.txt) line 1"], "pin": "decorator==4.4.0", "provisioned_by": "pinned at bake time"}],
+        "skipped": [{"source": "setup.sh", "line": 1, "text": "python setup.py install", "reason": "…"}],
+        "notes": ["…"]
+      }
     }
   ]
 }
 ```
+
+`deps` is the derived half of §3.2: it mirrors the per-bug layer's `runs/bugsinpy/deps/<checkpoint>.json`
+verbatim, so a graded run can be traced back to the exact pins that were installed and to the
+`setup.sh` lines that were deliberately skipped.
 
 `vanta_planner` is listed in the doc and supported by the env switch but **not** in `configs` until
 it exists. `seeds` is `[0]` for the pilot; seeds are a later, paper-only sweep (§8.3).
@@ -1104,7 +1162,8 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
    deliberately-rejected patch and assert `debug/final.patch` exists and applies cleanly.
 2. Split file + loader + `prepare`: checkout, **SWE-bench split**, two-run flaky-flagged
    `FAIL_TO_PASS` / `PASS_TO_PASS` derivation, AST strip, relaxed fixed-tree gate, **context
-   precheck** (§1.6) with `context_sizes.md`, leak gate, collectability gate, and the
+   precheck** (§1.6) with `context_sizes.md`, leak gate, collectability gate, the **dependency gate**
+   (§3.4: collection + import-from-the-tree, reported before oracle derivation) and the
    `issue_texts_all.md` review dump with its `NEEDS DECISION` section. No LLM, no Vanta.
 3. **py3.8 checkpoint only**, standalone Python, with the `import ssl` + `pip install` + `pytest`
    assertions, plus the PySnooper per-bug layers.

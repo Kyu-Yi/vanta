@@ -176,6 +176,12 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     prepare_mod.require_checkpoints(
         [entry["checkpoint"] for entry, full in selected if full]
     )
+    # And the dependency provenance the bake recorded. prepare installs nothing; it
+    # reads back what the layer was built from, so a layer baked without a record —
+    # or by a harness that did not record one — is a batch-level mistake too, not a
+    # per-bug surprise three suite runs later.
+    deps_dir = RUNS_DIR / "deps"
+    bake_mod.require_deps(deps_dir, [entry["checkpoint"] for entry, full in selected if full])
 
     batch_dir: Path = (args.batch or (RUNS_DIR / f"prepare-{utc_stamp()}")).resolve()
     batch_dir.mkdir(parents=True, exist_ok=True)
@@ -199,6 +205,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
                 bugsinpy_root=bugsinpy_root,
                 repo_cache=repo,
                 batch_dir=batch_dir,
+                deps_dir=deps_dir,
                 full=full,
             )
         except Exception as exc:  # one bug must not take the batch down
@@ -319,8 +326,31 @@ def cmd_bake(args: argparse.Namespace) -> int:
             "clone it, so per-bug requirements can be read"
         )
 
+    # Dependencies are resolved (and their provenance written) before anything is
+    # baked, so a bug whose four declared sources contradict each other, or that
+    # names a release which did not exist yet at its commit date, fails the whole
+    # bake here rather than producing a layer nobody can defend. This is the only
+    # place the harness talks to PyPI; every decision it makes is taken from the
+    # dates that call returns.
+    repo_cache = RUNS_DIR / "repos"
+    deps_dir = RUNS_DIR / "deps"
+
+    def repo_for(project: str) -> Path:
+        url = meta_mod.project_github_url(bugsinpy_root, project)
+        if not url:
+            raise SplitError(f"no github_url for {project} in project.info")
+        return tree_cache(repo_cache, project, url)
+
+    bug_deps = bake_mod.resolve_bug_deps(
+        split, entries, bugsinpy_root=bugsinpy_root, repo_for=repo_for
+    )
+    for item in bug_deps:
+        path = bake_mod.write_deps(deps_dir, item)
+        print(f"[{item.checkpoint}] installs: {', '.join(item.installs) or '—'}")
+        print(f"[{item.checkpoint}] provenance: {path}", flush=True)
+
     layers = bake_mod.layer_recipes(
-        split, pythons=minors, entries=entries, bugsinpy_root=bugsinpy_root
+        split, pythons=minors, entries=entries, deps=bug_deps
     )
     for name, base, script in layers:
         if not args.force and bake_mod.frozen(name):

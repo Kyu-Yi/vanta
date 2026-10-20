@@ -43,12 +43,24 @@ The disk requirement is a measured fact, not a tuning knob: the base image is
 
 from __future__ import annotations
 
+import ast
+import json
 import re
+import shlex
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
-from .shuru import ExecResult, checkpoint_create, checkpoint_exists
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
+
+from . import suite as suite_mod
+from . import trees as tree_mod
+from .shuru import ExecResult, checkpoint_create, checkpoint_delete, checkpoint_exists
 from .split import Split, SplitError
 
 DEFAULT_BASE = "vanta-python"
@@ -61,6 +73,28 @@ MIN_DISK_MB = 8192
 BAKE_DISK_MB = 16384
 BAKE_TIMEOUT_SECS = 5400
 """90 min. py3.6/3.7 may compile OpenSSL 1.1.1 and CPython from source here."""
+
+HARNESS_PACKAGES = frozenset({"pytest", "pytest-json-report"})
+"""Installed by the *interpreter* layer and never touched by a per-bug layer.
+
+[VANTA-WHY] A project's own ``pytest>=4.4.1`` (PySnooper's
+``test_requirements.txt``) is a constraint on a package the harness already
+provides. Installing the project's choice would downgrade pytest under
+``pytest-json-report``, whose plugin is what produces the reports the oracle is
+read from. The constraint is therefore *checked* against the harness pin and
+recorded; a project that pins an incompatible pytest fails the bug loudly instead
+of silently re-pinning the interpreter every wave.
+"""
+
+DEPS_DIRNAME = "deps"
+"""Where ``bake`` leaves each per-bug layer's dependency provenance.
+
+[VANTA-WHY] The provenance lives outside the layer, in ``runs/bugsinpy/deps/``,
+because ``prepare`` has to read it *before* it runs anything inside the layer and
+the checkpoint format offers no way to read a file out of a layer without booting
+it. It is the record of what the bake decided — sources, pins, skipped lines — so
+``prepare`` never has to re-derive a decision that needed the network.
+"""
 
 
 class BakeError(RuntimeError):
@@ -223,54 +257,424 @@ here — ``requirements.txt`` is 0 bytes on all three — so a layer that read o
 """
 
 
-def _installs_the_project_itself(args: str) -> bool:
-    """``python setup.py install`` / ``pip install -e .`` — the project, not a dep."""
+SETUP_PY_RE = re.compile(
+    r"^(?:python[0-9.]*\s+)?setup\.py\s+(?:install|develop|build)(?:\s|$)"
+)
+"""``python setup.py install`` — the project, not a dependency."""
+
+_PROJECT_REASON = (
+    "installs the project itself: a copy in site-packages would be imported instead "
+    "of the graded tree, so every patch would grade the same"
+)
+_REQUIREMENTS_FILE_REASON = (
+    "reads a requirements file (-r); its contents are not one of the four declared "
+    "dependency sources, so nothing is guessed from it"
+)
+_VCS_REASON = (
+    "a VCS/URL target: the harness cannot tell whether it is the project or a "
+    "dependency, and installing the project would shadow the graded tree"
+)
+_SETUP_PY_REASON = (
+    "runs the project's own setup.py: a non-editable install would put the buggy "
+    "package in site-packages, where the tests could import it instead of the patched "
+    "tree — every patch would then grade the same (design C3, §3.2)"
+)
+"""The four "we did not install this" reasons, kept as constants so the recorded
+provenance and the tests quote the same words."""
+
+
+@dataclass(frozen=True)
+class SkippedLine:
+    """A line that looked like an install and was deliberately not run."""
+
+    source: str
+    line: int
+    text: str
+    reason: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "line": self.line,
+            "text": self.text,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class DepRef:
+    """One requirement exactly as written, and where it was written."""
+
+    name: str
+    spec: str
+    source: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "spec": self.spec, "source": self.source}
+
+
+def _bare(spec: str) -> str:
+    """``spec`` without the shell quoting it was written with.
+
+    ``setup.sh`` is shell, so a requirement that contains a comma is normally
+    quoted (``pip install "requests>=2,<3"``) and the token the shell would have
+    removed the quotes from still carries them here. ``DepRef.spec`` keeps them —
+    that is the line as written, and the provenance quotes it verbatim — but the
+    parse must see what pip would have received.
+    """
+    bare = spec.strip()
+    for quote in ("'", '"'):
+        if len(bare) >= 2 and bare.startswith(quote) and bare.endswith(quote):
+            return bare[1:-1]
+    return bare
+
+
+def _requirement(spec: str, source: str) -> Requirement:
+    try:
+        return Requirement(_bare(spec))
+    except InvalidRequirement as exc:
+        raise BakeError(
+            f"{source}: {spec!r} is not a requirement this harness can resolve: {exc}"
+        ) from exc
+
+
+def dep_ref(spec: str, source: str) -> DepRef:
+    return DepRef(name=canonicalize_name(_requirement(spec, source).name), spec=spec, source=source)
+
+
+def _pip_args(args: str) -> tuple[list[str], Optional[str]]:
+    """``(third-party specs, skip reason)`` for one ``pip install`` argument list.
+
+    The reason is set when the whole line is dropped rather than partially read: a
+    line that installs the project cannot be half-honoured, because the half that
+    would be honoured is the buggy package landing in site-packages.
+    """
+    specs: list[str] = []
     for token in args.split():
-        if token in ("-e", "--editable") or token.startswith(("-e.", "-e/", ".", "/")):
-            return True
-        if token.endswith(".py"):
-            return True
-    return False
+        if token.startswith("-"):
+            if token.startswith("-e") or token.startswith("--editable"):
+                return [], _PROJECT_REASON
+            if token.startswith(("-r", "--requirement")):
+                return [], _REQUIREMENTS_FILE_REASON
+            continue  # an ordinary pip flag (-U, --user, --no-deps, ...)
+        if token.startswith((".", "/")) or token.endswith(".py"):
+            return [], _PROJECT_REASON
+        if token.startswith(
+            ("git+", "hg+", "svn+", "bzr+", "http://", "https://")
+        ) or "#egg=" in token:
+            return [], _VCS_REASON
+        specs.append(token)
+    return specs, None
+
+
+def parse_setup_sh(setup_sh: str) -> tuple[list[DepRef], list[SkippedLine]]:
+    """``setup.sh`` → its third-party specs and every line that was skipped.
+
+    [VANTA-WHY] The project's own install line is dropped deliberately, and the
+    line is *recorded* rather than ignored. The graded tree is mounted at
+    ``/workspace/...`` and every suite runs ``python -m pytest`` with its cwd set to
+    the tree root, so ``import <package>`` resolves to the tree — the copy a run is
+    being graded on. Baking ``setup.py install`` into a layer would instead put a
+    *frozen* copy in site-packages, and a Creator patch could then pass while having
+    no effect at all. Projects that need a real build
+    (``pythonpath=<pkg>/build/lib/``) get it per tree, at prepare time, in Shuru.
+
+    A line that is neither a pip install nor a ``setup.py`` run is recorded too:
+    silently dropped shell is how a missing dependency becomes a mystery.
+    """
+    refs: list[DepRef] = []
+    skipped: list[SkippedLine] = []
+    seen: set[str] = set()
+    for number, raw in enumerate(setup_sh.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        source = f"setup.sh line {number}"
+        match = PIP_LINE_RE.match(line)
+        if match:
+            specs, reason = _pip_args(match.group("args"))
+            if reason is not None:
+                skipped.append(SkippedLine("setup.sh", number, line, reason))
+                continue
+            for spec in specs:
+                if spec not in seen:
+                    seen.add(spec)
+                    refs.append(dep_ref(spec, source))
+            continue
+        if SETUP_PY_RE.match(line):
+            skipped.append(SkippedLine("setup.sh", number, line, _SETUP_PY_REASON))
+            continue
+        skipped.append(SkippedLine("setup.sh", number, line, "not a pip install line"))
+    return refs, skipped
 
 
 def declared_deps(setup_sh: str) -> list[str]:
-    """Third-party specs from ``setup.sh``, in file order, de-duplicated.
+    """Third-party specs from ``setup.sh``, in file order, de-duplicated."""
+    return [ref.spec for ref in parse_setup_sh(setup_sh)[0]]
 
-    [VANTA-WHY] The project's own install line is dropped deliberately. The graded
-    tree is mounted at ``/workspace/...`` and every suite runs ``python -m pytest``
-    with its cwd set to the tree root, so ``import <package>`` resolves to the tree
-    — the copy a run is being graded on. Baking ``setup.py install`` into a layer
-    would instead put a *frozen* copy in site-packages and a Creator patch could
-    then pass while having no effect at all. Projects that need a real build
-    (``pythonpath=<pkg>/build/lib/``) get it per tree, at prepare time, in Shuru.
-    """
-    specs: list[str] = []
-    for line in setup_sh.splitlines():
-        line = line.strip()
+
+def _requirement_line_reason(line: str) -> Optional[str]:
+    """Why a requirements-file line is not a third-party spec, or ``None``."""
+    if line.startswith(("-r", "--requirement")):
+        return _REQUIREMENTS_FILE_REASON
+    if line.startswith(("-e", "--editable")):
+        return _PROJECT_REASON
+    if line.startswith((".", "/")) or line.endswith(".py"):
+        return _PROJECT_REASON
+    if line.startswith(
+        ("git+", "hg+", "svn+", "bzr+", "http://", "https://")
+    ) or "#egg=" in line:
+        return _VCS_REASON
+    if line.startswith("-"):
+        return "a pip option, not a requirement"
+    return None
+
+
+def requirements_refs(text: str, *, source: str) -> tuple[list[DepRef], list[SkippedLine]]:
+    """One requirements file → its specs, with every non-spec line recorded."""
+    refs: list[DepRef] = []
+    skipped: list[SkippedLine] = []
+    label = source.split(" line ", 1)[0]
+    seen: set[str] = set()
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        match = PIP_LINE_RE.match(line)
-        if not match:
+        reason = _requirement_line_reason(line)
+        if reason is not None:
+            skipped.append(SkippedLine(label, number, line, reason))
             continue
-        args = match.group("args")
-        if _installs_the_project_itself(args):
+        if line in seen:
             continue
-        specs.append(args)
+        seen.add(line)
+        refs.append(dep_ref(line, f"{source} line {number}"))
+    return refs, skipped
+
+
+# ---------------------------------------------------------------------------
+# setup.py, read statically — never executed
+# ---------------------------------------------------------------------------
+def _setup_kwargs(setup_py: str) -> dict[str, ast.expr]:
+    """``setup(...)``'s keyword arguments, as AST nodes.
+
+    [VANTA-WHY] The project's ``setup.py`` is not run, on the host or anywhere else
+    (design C3: nothing third-party executes outside Shuru, and "just asking
+    setuptools what it wants" is executing it). It is Python; it can do anything.
+    Reading it with ``ast`` is the only safe way to learn what it declares, and what
+    ``ast`` cannot see — a ``**kwargs`` splat, a computed keyword name — is recorded
+    as a note instead of guessed at.
+    """
+    try:
+        tree = ast.parse(setup_py)
+    except SyntaxError as exc:
+        raise BakeError(f"setup.py does not parse as Python: {exc}") from exc
+
+    assigned: dict[str, ast.expr] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assigned[target.id] = node.value
+
+    kwargs: dict[str, ast.expr] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_setup = (isinstance(func, ast.Attribute) and func.attr == "setup") or (
+            isinstance(func, ast.Name) and func.id == "setup"
+        )
+        if not is_setup:
+            continue
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                continue
+            value = keyword.value
+            if isinstance(value, ast.Name) and value.id in assigned:
+                value = assigned[value.id]
+            kwargs[keyword.arg] = value
+    return kwargs
+
+
+def _literal_nodes(node: ast.expr) -> list[ast.Constant]:
+    """The string literals in ``node``, *with* their line numbers in ``setup.py``."""
+    return [
+        item
+        for item in ast.walk(node)
+        if isinstance(item, ast.Constant) and isinstance(item.value, str)
+    ]
+
+
+def _string_literals(node: ast.expr) -> list[str]:
+    return [item.value for item in _literal_nodes(node)]
+
+
+FILE_UNSAFE_CHARS = frozenset("><=!~;[] \t")
+"""Characters a requirement has and a filename this harness reads does not.
+
+[VANTA-WHY] Measured while writing the tests for this path:
+``install_requires=['python_toolbox>=0.9.3']`` was read as *a file named
+``python_toolbox>=0.9.3``*, because the literal has a dot in its last segment and
+the filter below only required that. The requirement was then silently dropped and
+recorded as "names a file which is not at the buggy commit" — a dependency missing
+for a reason that reads like a fact about the commit. A version operator, an
+extras bracket or a marker means the string is a requirement, never a filename.
+"""
+
+
+def _file_literals(node: ast.expr) -> list[str]:
+    """String literals in ``node`` that name a file this harness could read.
+
+    ``install_requires`` is not always a list of requirements: at some commits it is
+    ``read_file('requirements.in')`` and at others
+    ``open('requirements.txt').read().split('\\n')``, so the reader has to find the
+    *file* the project itself names rather than assume a filename. The filter is
+    deliberately narrow — the walk also sees ``'r'`` and ``'\\n'`` as literals, and
+    a requirement is not a file (``FILE_UNSAFE_CHARS``).
+    """
+    out: list[str] = []
+    for text in _string_literals(node):
+        stripped = text.strip()
+        if not stripped or "." not in stripped.rsplit("/", 1)[-1]:
+            continue
+        if any(char in stripped for char in FILE_UNSAFE_CHARS):
+            continue
+        if stripped.startswith(("http://", "https://", "git+")):
+            continue
+        if stripped not in out:
+            out.append(stripped)
+    return out
+
+
+def _extras_tests_node(extras: Optional[ast.expr]) -> Optional[ast.expr]:
+    """The value of ``extras_require={'tests': ...}``, when there is one."""
+    if isinstance(extras, ast.Dict):
+        for key, value in zip(extras.keys, extras.values):
+            if isinstance(key, ast.Constant) and key.value == "tests":
+                return value
+    return None
+
+
+def _entry_refs(
+    node: Optional[ast.expr],
+    *,
+    source: str,
+    read_file: Callable[[str], Optional[str]],
+    notes: list[str],
+    skip_files: Optional[set[str]] = None,
+) -> tuple[list[DepRef], list[SkippedLine]]:
+    """One ``setup.py`` declaration → refs, following a file name when it has one."""
+    if node is None:
+        notes.append(f"{source}: not declared in setup.py")
+        return [], []
+    refs: list[DepRef] = []
+    skipped: list[SkippedLine] = []
+    files = _file_literals(node)
+    for name in files:
+        if skip_files is not None:
+            if name in skip_files:
+                continue
+            skip_files.add(name)
+        text = read_file(name)
+        if text is None:
+            notes.append(f"{source} names {name!r}, which is not at the buggy commit")
+            continue
+        part, part_skipped = requirements_refs(text, source=f"{source} ({name})")
+        refs += part
+        skipped += part_skipped
+    if files:
+        return refs, skipped
+    for literal in _literal_nodes(node):
+        text = literal.value.strip()
+        if not text or text.startswith("#"):
+            continue
+        refs.append(dep_ref(text, f"{source} (setup.py) line {literal.lineno}"))
+    return refs, skipped
+
+
+def setup_py_refs(
+    setup_py: str,
+    read_file: Callable[[str], Optional[str]],
+    notes: list[str],
+) -> tuple[list[DepRef], list[SkippedLine]]:
+    """``setup.py`` → ``install_requires`` plus the project's test requirements.
+
+    The last two of the four approved sources. ``setup.py`` itself is never run
+    (design C3): it is Python, and asking setuptools what it wants *is* executing
+    it. Everything here comes from the AST, and anything the AST cannot see is
+    recorded as a note for a human rather than guessed at.
+    """
+    kwargs = _setup_kwargs(setup_py)
     seen: set[str] = set()
-    unique: list[str] = []
-    for spec in specs:
-        if spec not in seen:
-            seen.add(spec)
-            unique.append(spec)
-    return unique
+    refs: list[DepRef] = []
+    skipped: list[SkippedLine] = []
+    for source, node in (
+        ("install_requires", kwargs.get("install_requires")),
+        ("tests_require", kwargs.get("tests_require")),
+        ("extras_require['tests']", _extras_tests_node(kwargs.get("extras_require"))),
+    ):
+        part, part_skipped = _entry_refs(
+            node, source=source, read_file=read_file, notes=notes, skip_files=seen
+        )
+        if not part and node is not None and _file_literals(node):
+            notes.append(f"{source}: declares no requirements")
+        refs += part
+        skipped += part_skipped
+
+    # A root ``test_requirements.txt`` the project never names in ``setup.py`` is
+    # still a declared test requirement, and the one source BugsInPy's own metadata
+    # does not carry at all.
+    if "test_requirements.txt" not in seen:
+        text = read_file("test_requirements.txt")
+        if text is None:
+            notes.append("test_requirements.txt: not at the buggy commit")
+        else:
+            seen.add("test_requirements.txt")
+            part, part_skipped = requirements_refs(text, source="test_requirements.txt")
+            refs += part
+            skipped += part_skipped
+    return refs, skipped
 
 
-def requirements_recipe(requirements_txt: str, extra_specs: Sequence[str] = ()) -> str:
-    """Install one bug's dependencies on top of the interpreter layer."""
-    body = "\n".join(
-        [spec for spec in extra_specs if spec.strip()]
-        + [line.strip() for line in requirements_txt.splitlines() if line.strip() and not line.strip().startswith("#")]
-    ).strip()
+def import_name_of(setup_py: str) -> str:
+    """The module the import-path check must load, named by ``setup.py`` itself.
+
+    ``name='PySnooper'`` → ``pysnooper``: the canonical name is what PyPI knows and
+    the import name is that name with dashes as underscores. When there is no
+    ``name=`` the first ``packages=[...]`` literal is used instead. When neither is
+    there the bug is flagged rather than guessed at — a wrong module name would make
+    the check pass for the wrong reason.
+    """
+    kwargs = _setup_kwargs(setup_py)
+    name = kwargs.get("name")
+    if name is not None:
+        for literal in _string_literals(name):
+            if literal.strip():
+                return canonicalize_name(literal.strip()).replace("-", "_")
+    packages = kwargs.get("packages")
+    if packages is not None:
+        for literal in _string_literals(packages):
+            candidate = literal.strip().split(".")[0]
+            if candidate and candidate != "tests":
+                return candidate
+    raise BakeError(
+        "setup.py declares neither name= nor a packages=[...] literal, so the "
+        "import-path check cannot name the project's package; flag this bug "
+        "(design §3.2)"
+    )
+
+
+def requirements_recipe(install_specs: Sequence[str]) -> str:
+    """Install one bug's *resolved* dependencies on top of the interpreter layer.
+
+    Takes pins (:func:`resolve_deps`) rather than the project's own requirement
+    strings, because a layer has to be a fact: the requirements are ranges
+    (``decorator>=4.3.0``), and "whatever pip resolves today" is a different
+    environment every time the layer is rebuilt. Nothing here is a guess — every
+    spec was named by one of the four approved sources and pinned to a release that
+    existed on the buggy commit's date.
+    """
+    body = "\n".join(spec.strip() for spec in install_specs if spec.strip()).strip()
 
     lines = [
         "set -eux",
@@ -312,6 +716,452 @@ def setup_sh_for(bugsinpy_root: Path, project: str, bug_id: int) -> str:
     if not path.is_file():
         return ""
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# the four dependency sources, unioned, then pinned by date (§3.2, §3.3)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class DepSources:
+    """Everything the four approved sources declared for one bug, before pinning.
+
+    The four, in the order the design fixes them: BugsInPy's per-bug
+    ``requirements.txt``; the ``pip install`` lines in BugsInPy's ``setup.sh``; the
+    project's own declared test requirements at the buggy commit (``tests_require``,
+    the ``tests`` extra, a root ``test_requirements.txt``); and ``install_requires``.
+    Nothing is taken from anywhere else, and no package is ever chosen by the
+    harness.
+    """
+
+    project: str
+    bug_id: int
+    checkpoint: str
+    buggy_commit: str
+    commit_date: str
+    import_name: str
+    refs: tuple[DepRef, ...] = ()
+    skipped: tuple[SkippedLine, ...] = ()
+    notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DepConflict:
+    """One package two sources disagree about. Never resolved automatically."""
+
+    name: str
+    claims: tuple[tuple[str, str], ...]
+
+    def message(self) -> str:
+        return (
+            f"{self.name}: the declared sources disagree — "
+            + "; ".join(f"{spec!r} from {source}" for spec, source in self.claims)
+            + " (the harness does not pick one of them)"
+        )
+
+
+@dataclass(frozen=True)
+class ResolvedDep:
+    """One dependency, with the single version the layer will install."""
+
+    name: str
+    spec: str
+    sources: tuple[str, ...]
+    pin: str
+    harness: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "spec": self.spec,
+            "sources": list(self.sources),
+            "pin": self.pin,
+            "provisioned_by": "interpreter layer" if self.harness else "pinned at bake time",
+        }
+
+
+def _specifier_text(ref: DepRef) -> str:
+    """The version constraint of one requirement, as a string — ``""`` if none."""
+    return str(_requirement(ref.spec, ref.source).specifier)
+
+
+def merge_refs(refs: Sequence[DepRef]) -> tuple[list[DepRef], list[DepConflict]]:
+    """One entry per package, plus every specifier disagreement that was found.
+
+    A bare name is absorbed by a constrained one: PySnooper/3 declares ``decorator``
+    in ``setup.sh`` and ``decorator>=4.3.0`` in ``install_requires``, which is one
+    requirement written twice, not a conflict. Two *different* specifier sets are
+    returned as a conflict and never picked between (design §3.3: a bug with
+    contradictory constraints is not reproducible from its declared sources).
+    """
+    grouped: dict[str, list[DepRef]] = {}
+    order: list[str] = []
+    for ref in refs:
+        if ref.name not in grouped:
+            grouped[ref.name] = []
+            order.append(ref.name)
+        grouped[ref.name].append(ref)
+
+    merged: list[DepRef] = []
+    conflicts: list[DepConflict] = []
+    for name in order:
+        group = grouped[name]
+        specifiers = {_specifier_text(ref) for ref in group if _specifier_text(ref)}
+        if len(specifiers) > 1:
+            conflicts.append(
+                DepConflict(
+                    name=name,
+                    claims=tuple(
+                        (ref.spec, ref.source) for ref in group if _specifier_text(ref)
+                    ),
+                )
+            )
+            continue
+        chosen = next((ref for ref in group if _specifier_text(ref)), group[0])
+        merged.append(
+            DepRef(
+                name=name,
+                spec=chosen.spec,
+                source="; ".join(ref.source for ref in group),
+            )
+        )
+    return merged, conflicts
+
+
+def _parseable(version: str) -> bool:
+    try:
+        Version(version)
+    except InvalidVersion:
+        return False
+    return True
+
+
+def resolve_pins(
+    refs: Sequence[DepRef],
+    *,
+    releases: Mapping[str, Mapping[str, str]],
+    commit_date: str,
+    harness_pins: Mapping[str, str],
+) -> list[ResolvedDep]:
+    """Pin each dependency to the newest release on or before ``commit_date``.
+
+    Pure, and deliberately so: ``releases`` is passed in, so every rule here — the
+    cutoff, the harness exception, "no candidate" — is exercised by a test that
+    never touches the network (design §3.2).
+
+    The exception is a package the interpreter layer already provides. Its
+    constraint is *checked* against the harness version and recorded; it is never
+    installed over it, because the json-report plugin is what produces the report
+    the oracle is read from and a project asking for ``pytest>=4.4.1`` would
+    otherwise silently downgrade it.
+    """
+    resolved: list[ResolvedDep] = []
+    for ref in refs:
+        requirement = _requirement(ref.spec, ref.source)
+        if ref.name in HARNESS_PACKAGES:
+            provided = harness_pins.get(ref.name)
+            if provided is None:
+                raise BakeError(
+                    f"{ref.source}: {ref.name} is declared, but the interpreter layer "
+                    f"does not provide it (harness pins: {dict(harness_pins)})"
+                )
+            if requirement.specifier and Version(provided) not in requirement.specifier:
+                raise BakeError(
+                    f"{ref.source}: {ref.spec} excludes the harness's "
+                    f"{ref.name}=={provided}, which the interpreter layer installs and "
+                    "pytest-json-report needs. The harness will not re-pin a package it "
+                    "provides, and it will not downgrade pytest underneath the plugin — "
+                    "this bug needs a decision."
+                )
+            resolved.append(
+                ResolvedDep(
+                    name=ref.name,
+                    spec=ref.spec,
+                    sources=(ref.source,),
+                    pin=f"{ref.name}=={provided}",
+                    harness=True,
+                )
+            )
+            continue
+
+        available = releases.get(ref.name)
+        if not available:
+            raise BakeError(
+                f"{ref.source}: no release dates for {ref.name!r} were fetched; the "
+                "bake cannot pin it (design §3.2 pins by date, not by guess)"
+            )
+        candidates = [
+            (version, date)
+            for version, date in available.items()
+            if date[:10] <= commit_date
+            and _parseable(version)
+            and (not requirement.specifier or Version(version) in requirement.specifier)
+        ]
+        if not candidates:
+            newest = max(
+                (item for item in available.items() if _parseable(item[0])),
+                key=lambda item: Version(item[0]),
+                default=("?", "?"),
+            )
+            raise BakeError(
+                f"{ref.source}: {ref.spec} has no release on or before {commit_date} "
+                f"(newest {ref.name} is {newest[0]}, released {newest[1][:10]}). "
+                "The buggy tree could not have been built with this requirement."
+            )
+        version = max(candidates, key=lambda item: Version(item[0]))[0]
+        resolved.append(
+            ResolvedDep(
+                name=ref.name,
+                spec=ref.spec,
+                sources=(ref.source,),
+                pin=f"{ref.name}=={version}",
+                harness=False,
+            )
+        )
+    return resolved
+
+
+PYPI_JSON = "https://pypi.org/pypi/{name}/json"
+PYPI_TIMEOUT_SECS = 60
+
+
+def pypi_releases(name: str) -> dict[str, str]:
+    """``{version: "YYYY-MM-DD"}`` for one package, from PyPI's JSON API.
+
+    The first upload date of each version, which is when the tree at the buggy
+    commit could first have installed it. Called only by the bake; everything that
+    *decides* anything takes this mapping as an argument instead.
+    """
+    url = PYPI_JSON.format(name=name)
+    try:
+        with urllib.request.urlopen(url, timeout=PYPI_TIMEOUT_SECS) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise BakeError(f"cannot read release dates for {name!r} from {url}: {exc}") from exc
+
+    releases = payload.get("releases")
+    if not isinstance(releases, dict):
+        raise BakeError(f"{url} returned no 'releases' mapping")
+    dates: dict[str, str] = {}
+    for version, files in releases.items():
+        stamps = [
+            str(item["upload_time_iso_8601"])
+            for item in (files or [])
+            if item.get("upload_time_iso_8601")
+        ]
+        if stamps:
+            dates[str(version)] = min(stamps)[:10]
+    if not dates:
+        raise BakeError(f"{url} lists no released files for {name!r}")
+    return dates
+
+
+def resolve_deps(
+    sources: DepSources,
+    *,
+    releases: Mapping[str, Mapping[str, str]],
+    harness_pins: Mapping[str, str],
+) -> list[ResolvedDep]:
+    """Union → conflict check → date pin, for one bug."""
+    merged, conflicts = merge_refs(sources.refs)
+    if conflicts:
+        raise BakeError(
+            f"{sources.project}/{sources.bug_id}: "
+            + " | ".join(conflict.message() for conflict in conflicts)
+            + " — name the source that should win and the split will be amended rather "
+            "than guessed at"
+        )
+    return resolve_pins(
+        merged,
+        releases=releases,
+        commit_date=sources.commit_date,
+        harness_pins=harness_pins,
+    )
+
+
+def bug_sources(
+    entry: Mapping[str, Any],
+    *,
+    bugsinpy_root: Path,
+    repo: Path,
+) -> DepSources:
+    """Read the four approved sources for one bug, at the buggy commit.
+
+    [VANTA-WHY] At the *buggy* commit and not at the fix: a dependency added by the
+    fix is not a dependency the graded tree has, and installing it would provision
+    an environment the bug never ran in.
+    """
+    project = str(entry["project"])
+    bug_id = int(entry["bug_id"])
+    commit = str(entry["buggy_commit"])
+    notes: list[str] = []
+    refs: list[DepRef] = []
+    skipped: list[SkippedLine] = []
+
+    # 1. BugsInPy's per-bug requirements.txt. Measured: 0 bytes for PySnooper 1-3,
+    # which is exactly why the other three sources exist.
+    requirements_text = requirements_for(bugsinpy_root, project, bug_id)
+    part, part_skipped = requirements_refs(requirements_text, source="requirements.txt")
+    refs += part
+    skipped += part_skipped
+    if not requirements_text.strip():
+        notes.append("requirements.txt (BugsInPy): empty for this bug")
+
+    # 2. setup.sh, minus its install of the project itself.
+    setup_sh = setup_sh_for(bugsinpy_root, project, bug_id)
+    part, part_skipped = parse_setup_sh(setup_sh)
+    refs += part
+    skipped += part_skipped
+    if not setup_sh.strip():
+        notes.append("setup.sh (BugsInPy): empty for this bug")
+
+    # 3 + 4. The project's own declarations at the buggy commit.
+    read_at = partial(tree_mod.read_file_at, repo, commit)
+    setup_py = read_at("setup.py")
+    if setup_py is None:
+        raise BakeError(
+            f"{project}/{bug_id}: no setup.py at {commit}, so install_requires and the "
+            "declared test requirements cannot be read. Flag this bug rather than "
+            "guessing at its dependencies (design §3.2)."
+        )
+    part, part_skipped = setup_py_refs(setup_py, read_at, notes)
+    refs += part
+    skipped += part_skipped
+
+    return DepSources(
+        project=project,
+        bug_id=bug_id,
+        checkpoint=bug_checkpoint_name(entry),
+        buggy_commit=commit,
+        commit_date=tree_mod.commit_date(repo, commit),
+        import_name=import_name_of(setup_py),
+        refs=tuple(refs),
+        skipped=tuple(skipped),
+        notes=tuple(notes),
+    )
+
+
+def deps_provenance(
+    sources: DepSources,
+    resolved: Sequence[ResolvedDep],
+    *,
+    harness_pins: Mapping[str, str],
+) -> dict[str, Any]:
+    """What the bake decided for one bug, as data a later stage can read."""
+    return {
+        "schema_version": 1,
+        "project": sources.project,
+        "bug_id": sources.bug_id,
+        "checkpoint": sources.checkpoint,
+        "buggy_commit": sources.buggy_commit,
+        "commit_date": sources.commit_date,
+        "import_name": sources.import_name,
+        "harness_pins": dict(harness_pins),
+        "installs": [dep.pin for dep in resolved],
+        "dependencies": [dep.as_dict() for dep in resolved],
+        "skipped": [line.as_dict() for line in sources.skipped],
+        "notes": list(sources.notes),
+    }
+
+
+@dataclass(frozen=True)
+class BugDeps:
+    """One bug's layer: what gets installed, and the record of why.
+
+    ``installs`` is what the layer's recipe may put on the command line, so a
+    package the interpreter layer already provides is **not** in it: re-pinning
+    pytest would either be a no-op that re-downloads it or a silent downgrade
+    underneath ``pytest-json-report``, which is the plugin the oracle is read from.
+    The full set — including what was left to the harness — is in ``provenance``.
+    """
+
+    entry: dict[str, Any]
+    checkpoint: str
+    installs: tuple[str, ...]
+    provenance: dict[str, Any]
+
+
+def resolve_bug_deps(
+    split: Split,
+    entries: Sequence[dict[str, Any]],
+    *,
+    bugsinpy_root: Path,
+    repo_for: Callable[[str], Path],
+    fetch: Callable[[str], Mapping[str, str]] = pypi_releases,
+) -> list[BugDeps]:
+    """Resolve every selected bug's layer, pinning by date from PyPI.
+
+    ``fetch`` is injected so the entire chain — union, conflict, cutoff, harness
+    exception — is testable without the network.
+    """
+    out: list[BugDeps] = []
+    for entry in entries:
+        sources = bug_sources(
+            entry, bugsinpy_root=bugsinpy_root, repo=repo_for(str(entry["project"]))
+        )
+        pin = pins_for_python(split, minor_version(str(entry["python_version"])))
+        harness_pins = {"pytest": pin.pytest, "pytest-json-report": pin.json_report}
+        needed = sorted(
+            {ref.name for ref in sources.refs if ref.name not in HARNESS_PACKAGES}
+        )
+        releases = {name: fetch(name) for name in needed}
+        resolved = resolve_deps(sources, releases=releases, harness_pins=harness_pins)
+        out.append(
+            BugDeps(
+                entry=dict(entry),
+                checkpoint=sources.checkpoint,
+                installs=tuple(dep.pin for dep in resolved if not dep.harness),
+                provenance=deps_provenance(sources, resolved, harness_pins=harness_pins),
+            )
+        )
+    return out
+
+
+def deps_path(deps_dir: Path, checkpoint: str) -> Path:
+    return deps_dir / f"{checkpoint}.json"
+
+
+def write_deps(deps_dir: Path, deps: BugDeps) -> Path:
+    deps_dir.mkdir(parents=True, exist_ok=True)
+    path = deps_path(deps_dir, deps.checkpoint)
+    path.write_text(
+        json.dumps(deps.provenance, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return path
+
+
+def load_deps(deps_dir: Path, checkpoint: str) -> dict[str, Any]:
+    """The provenance ``bake`` recorded for one bug layer.
+
+    [VANTA-WHY] Read from disk rather than re-derived: re-deriving needs PyPI
+    release dates and the network, and the layer was baked from *these* pins. A bug
+    with no provenance was baked by a harness that did not record what it installs,
+    and the only honest answer is to rebuild it.
+    """
+    path = deps_path(deps_dir, checkpoint)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise BakeError(
+            f"no dependency provenance for {checkpoint} at {path}: re-run bake for "
+            "this bug (design §3.2)"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise BakeError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict) or "installs" not in data:
+        raise BakeError(f"{path} is not dependency provenance")
+    return data
+
+
+def require_deps(deps_dir: Path, checkpoints: Sequence[str]) -> None:
+    """Preflight every selected bug's provenance, before any checkout."""
+    missing = sorted(name for name in checkpoints if not deps_path(deps_dir, name).is_file())
+    if missing:
+        raise BakeError(
+            "no dependency provenance for "
+            + ", ".join(missing)
+            + f" under {deps_dir}. Re-run bake for these bugs — prepare reads the "
+            "recorded pins rather than trusting a layer baked without one."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +1226,7 @@ def layer_recipes(
     *,
     pythons: list[str],
     entries: Sequence[dict[str, Any]],
-    bugsinpy_root: Path,
+    deps: Sequence[BugDeps],
 ) -> list[tuple[str, str, str]]:
     """``[(checkpoint name, base, script)]`` — every layer the bake would create.
 
@@ -384,7 +1234,14 @@ def layer_recipes(
     what makes the recipes testable without a VM: the assertions they contain are
     the wave-1 gate, and a gate that is only exercised by a real bake is a gate
     nobody re-checks.
+
+    The per-bug layer's installs arrive as resolved pins rather than being read
+    again from ``setup.sh``/``requirements.txt`` here: :func:`resolve_bug_deps` is
+    the single place that talks to PyPI, and it is also the place that writes the
+    provenance ``prepare`` reads back. Two readers of the same sources would be two
+    chances to install something other than what was recorded.
     """
+    by_checkpoint = {item.checkpoint: item for item in deps}
     layers: list[tuple[str, str, str]] = []
     for minor in pythons:
         layers.append(
@@ -395,18 +1252,18 @@ def layer_recipes(
             )
         )
     for entry in entries:
-        base = python_checkpoint_name(minor_version(entry["python_version"]))
-        specs = declared_deps(
-            setup_sh_for(bugsinpy_root, entry["project"], entry["bug_id"])
-        )
-        requirements = requirements_for(
-            bugsinpy_root, entry["project"], entry["bug_id"]
-        )
+        name = bug_checkpoint_name(entry)
+        item = by_checkpoint.get(name)
+        if item is None:
+            raise BakeError(
+                f"no resolved dependencies for {name}: resolve_bug_deps has to run "
+                "before the recipes are built (design §3.2)"
+            )
         layers.append(
             (
-                bug_checkpoint_name(entry),
-                base,
-                requirements_recipe(requirements, specs),
+                name,
+                python_checkpoint_name(minor_version(entry["python_version"])),
+                requirements_recipe(item.installs),
             )
         )
     return layers

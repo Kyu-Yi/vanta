@@ -168,7 +168,7 @@ def run_suite_twice(
         host_root=batch_dir,
         command=["sh", "-c", script],
         disk_mb=disk_mb,
-        guest_cwd=f"/workspace/{tree_rel}",
+        guest_cwd=guest_tree_root(tree_rel),
         timeout_secs=timeout_secs,
         env=env,
     )
@@ -179,6 +179,63 @@ def run_suite_twice(
 
     _clean_tree_noise(batch_dir / tree_rel)
     return pair
+
+
+def collect_command(test_cmd: Sequence[str]) -> list[str]:
+    """``test_cmd`` reduced to a collection-only run — the collectability gate (§3.4).
+
+    Split out of ``collect_only`` because the bake needs the *same* command: the
+    per-bug layer's collect check must not be a second interpretation of
+    ``test_cmd`` that can drift from the one prepare runs.
+    """
+    return [
+        str(part) for part in test_cmd if not str(part).startswith("--json-report")
+    ] + ["--collect-only", "-q", "-p", "no:cacheprovider"]
+
+
+def parse_collected(stdout: str) -> set[str]:
+    """``-q`` collection output → nodeids. One nodeid per line, no spaces."""
+    nodeids: set[str] = set()
+    for line in stdout.splitlines():
+        line = line.strip()
+        if "::" in line and " " not in line:
+            nodeids.add(line)
+    return nodeids
+
+
+def collected_or_raise(
+    nodeids: set[str], *, exit_code: Optional[int], output: str
+) -> set[str]:
+    """A collectable suite: pytest exited cleanly and there is something to grade.
+
+    ``exit_code`` is part of the check, not decoration. Measured on PySnooper/3: a
+    test module that raises on import makes pytest collect 0 tests and exit 2 — and
+    the same import failure inside *one* of several test files leaves a non-empty
+    collection set. Without the exit-status check that gate would pass while the
+    file holding the hidden test was never collected, and the bug would be graded
+    against a suite it does not have (§3.4: "no collection errors").
+    """
+    if not nodeids:
+        raise SuiteError(
+            f"pytest collected nothing (exit {exit_code}); tail: "
+            f"{output[-800:]!r}"
+        )
+    if exit_code != 0:
+        raise SuiteError(
+            f"pytest exited {exit_code} while collecting ({len(nodeids)} test(s) "
+            f"collected): a collection error means the suite is not what the oracle "
+            f"would grade; tail: {output[-800:]!r}"
+        )
+    return nodeids
+
+
+def guest_tree_root(tree_rel: str) -> str:
+    """Where a tree appears inside the VM.
+
+    One definition, so a probe can never disagree with the suites about which
+    directory the suite ran in.
+    """
+    return f"/workspace/{tree_rel}"
 
 
 def collect_only(
@@ -198,33 +255,75 @@ def collect_only(
     a JSON report we can read. If a bug does not collect here it is rejected from
     the split rather than run and failed.
     """
-    cmd = [
-        part
-        for part in test_cmd
-        if not str(part).startswith("--json-report")
-    ]
-    cmd += ["--collect-only", "-q", "-p", "no:cacheprovider"]
     result = shuru.run(
         checkpoint=checkpoint,
         host_root=batch_dir,
-        command=["sh", "-c", _shell_quote(cmd)],
+        command=["sh", "-c", _shell_quote(collect_command(test_cmd))],
         disk_mb=disk_mb,
-        guest_cwd=f"/workspace/{tree_rel}",
+        guest_cwd=guest_tree_root(tree_rel),
         timeout_secs=timeout_secs,
         env={"PYTHONDONTWRITEBYTECODE": "1"},
     )
-    nodeids: set[str] = set()
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if "::" in line and " " not in line:
-            nodeids.add(line)
-    if not nodeids:
-        raise SuiteError(
-            "pytest collected nothing (exit "
-            f"{result.exit_code}); tail: {result.stdout[-800:]!r} {result.stderr[-400:]!r}"
-        )
+    nodeids = collected_or_raise(
+        parse_collected(result.stdout),
+        exit_code=result.exit_code,
+        output=f"{result.stdout} {result.stderr}",
+    )
     _clean_tree_noise(batch_dir / tree_rel)
     return nodeids
+
+
+def import_probe(
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    tree_rel: str,
+    test_cmd: Sequence[str],
+    module: str,
+    disk_mb: int,
+    timeout_secs: int = 300,
+) -> str:
+    """``import <module>; print(<module>.__file__)``, run exactly as the suites run.
+
+    [VANTA-WHY] The suites run ``python -m pytest`` with their cwd set to the tree
+    root and no ``PYTHONPATH``, so the tree reaches ``sys.path`` through ``python
+    -m``'s CWD prepend and nothing else. This probe reuses that invocation — same
+    interpreter (``test_cmd[0]``), same cwd, same env, no ``PYTHONPATH``. A probe
+    that set ``PYTHONPATH`` would prove an import path the suites do not have, and
+    one that ran the module the suite does not import could pass while the suite
+    still died on ``ModuleNotFoundError``. The version installed in site-packages
+    is exactly what this must catch: a buggy copy there would be imported instead
+    of the graded tree, and every patch would then grade the same.
+
+    Returns the path the interpreter actually loaded.
+    """
+    if not module.isidentifier():
+        raise SuiteError(
+            f"import_probe was given {module!r}, which is not a Python identifier; "
+            "the module name is read from the project's own setup.py"
+        )
+    python = str(test_cmd[0]) if test_cmd else "python"
+    code = f"import {module} as _vanta_probe; print(_vanta_probe.__file__)"
+    result = shuru.run(
+        checkpoint=checkpoint,
+        host_root=batch_dir,
+        command=["sh", "-c", _shell_quote([python, "-c", code])],
+        disk_mb=disk_mb,
+        guest_cwd=guest_tree_root(tree_rel),
+        timeout_secs=timeout_secs,
+        env={"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"},
+    )
+    where = next(
+        (line.strip() for line in reversed(result.stdout.splitlines()) if line.strip()),
+        "",
+    )
+    if not result.ok or not where:
+        raise SuiteError(
+            f"`{python} -c` importing {module} in {guest_tree_root(tree_rel)} exited "
+            f"{result.exit_code} without printing a path: "
+            f"{(result.stderr + result.stdout).strip()[-800:]!r}"
+        )
+    return where
 
 
 # ---------------------------------------------------------------------------

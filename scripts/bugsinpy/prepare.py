@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from . import bake as bake_mod
 from . import context as ctx
 from . import issue as issue_mod
 from . import suite as suite_mod
@@ -73,6 +74,7 @@ class BugPrep:
     gate_failures: list[str] = field(default_factory=list)
     context: Optional[ctx.ContextVerdict] = None
     issue: Optional[issue_mod.IssueText] = None
+    deps: Optional[dict[str, Any]] = None
 
     @property
     def key(self) -> str:
@@ -113,6 +115,7 @@ class BugPrep:
             "gate_failures": self.gate_failures,
             "context": self.context.as_dict() if self.context else None,
             "issue": self.issue.as_dict() if self.issue else None,
+            "deps": self.deps,
         }
 
 
@@ -135,18 +138,93 @@ def build_trees(bug: BugInfo, repo_cache: Path, bug_root: Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# the dependency gate (§3.3) — before any oracle work
+# ---------------------------------------------------------------------------
+def check_deps(
+    prep: BugPrep,
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    deps: dict[str, Any],
+) -> set[str]:
+    """Prove the bug's layer can run its suite *before* the derivation spends it.
+
+    [VANTA-WHY] This is the measured failure it exists for. PySnooper/3's layer was
+    baked from ``requirements.txt`` (0 bytes) and ``setup.sh`` (``setup.py install``
+    plus ``decorator``), so ``python_toolbox`` and ``future`` were missing;
+    ``tests/test_pysnooper.py`` died on import, ``--collect-only`` collected nothing,
+    and prepare reported ``hidden-oracle derivation failed`` — a dependency problem
+    reported as a property of the *bug*. The two need different fixes, and that
+    message sent a debugging session after the wrong suspect.
+
+    Both checks run inside the finished per-bug layer and both run the way the
+    suites run — same interpreter, same cwd, same (absent) ``PYTHONPATH``, same
+    pytest entry point:
+
+    (a) the oracle tree's tests collect, with no collection error;
+    (b) the project's own package imports **from the tree under test**, not from
+        site-packages, where a ``setup.py install`` would have left a frozen copy
+        that makes every patch grade the same.
+
+    The two failures are raised as separate messages, so neither can be mistaken
+    for the other or for the derivation. The collected nodeids are returned, so the
+    derivation can use them instead of collecting the same tree a second time.
+    """
+    module = str(deps["import_name"])
+    tree_rel = _rel(prep, "oracle_tree")
+
+    try:
+        nodeids = suite_mod.collect_only(
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            tree_rel=tree_rel,
+            test_cmd=prep.test_cmd,
+            disk_mb=DISK_MB,
+        )
+    except suite_mod.SuiteError as exc:
+        raise suite_mod.SuiteError(f"deps: collection failed: {exc}") from exc
+
+    try:
+        where = suite_mod.import_probe(
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            tree_rel=tree_rel,
+            test_cmd=prep.test_cmd,
+            module=module,
+            disk_mb=DISK_MB,
+        )
+    except suite_mod.SuiteError as exc:
+        raise suite_mod.SuiteError(
+            f"deps: {module} does not import from the tree under test: {exc}"
+        ) from exc
+
+    root = suite_mod.guest_tree_root(tree_rel)
+    if not where.startswith(root + "/"):
+        raise suite_mod.SuiteError(
+            f"deps: package imports from site-packages, not the tree: {module} "
+            f"loaded {where}, which is not under {root}"
+        )
+    return nodeids
+
+
+# ---------------------------------------------------------------------------
 # FAIL_TO_PASS / PASS_TO_PASS derivation (§1.3)
 # ---------------------------------------------------------------------------
-def derive_hidden(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> None:
-    test_cmd = prep.test_cmd
-
-    suite_mod.collect_only(
-        checkpoint=checkpoint,
-        batch_dir=batch_dir,
-        tree_rel=_rel(prep, "oracle_tree"),
-        test_cmd=test_cmd,
-        disk_mb=DISK_MB,
-    )
+def derive_hidden(
+    prep: BugPrep,
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    collected: Optional[set[str]] = None,
+) -> None:
+    if collected is None:
+        suite_mod.collect_only(
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            tree_rel=_rel(prep, "oracle_tree"),
+            test_cmd=prep.test_cmd,
+            disk_mb=DISK_MB,
+        )
 
     buggy = _suite(checkpoint, batch_dir, prep, "src_buggy", "src_buggy")
     before = _suite(checkpoint, batch_dir, prep, "oracle_tree", "oracle")
@@ -597,6 +675,7 @@ def prepare_one(
     bugsinpy_root: Path,
     repo_cache: Path,
     batch_dir: Path,
+    deps_dir: Path,
     full: bool,
 ) -> BugPrep:
     """Everything ``prepare`` does for one bug, in the order §1.3 fixes."""
@@ -633,8 +712,28 @@ def prepare_one(
         return prep
 
     checkpoint = entry["checkpoint"]
+    # The dependency gate comes first, and comes before the derivation, because a
+    # missing dependency must never be reported as an oracle failure (§3.3). It
+    # needs no oracle work at all: the layer is baked, the trees are on disk.
     try:
-        derive_hidden(prep, checkpoint=checkpoint, batch_dir=batch_dir)
+        deps = bake_mod.load_deps(deps_dir, checkpoint)
+        prep.deps = deps
+    except bake_mod.BakeError as exc:
+        prep.gate_failures.append(f"deps: {exc}")
+        return prep
+
+    try:
+        collected = check_deps(
+            prep, checkpoint=checkpoint, batch_dir=batch_dir, deps=deps
+        )
+    except suite_mod.SuiteError as exc:
+        prep.gate_failures.append(str(exc))
+        return prep
+
+    try:
+        derive_hidden(
+            prep, checkpoint=checkpoint, batch_dir=batch_dir, collected=collected
+        )
     except (suite_mod.SuiteError, tree_mod.TreeError) as exc:
         prep.gate_failures.append(f"hidden-oracle derivation failed: {exc}")
         return prep
@@ -684,6 +783,7 @@ def derive_verdict(prep: BugPrep) -> dict[str, Any]:
             if prep.issue
             else "issue text was not built (context-rejected or measurement-only)"
         ),
+        "deps": prep.deps,
     }
 
 

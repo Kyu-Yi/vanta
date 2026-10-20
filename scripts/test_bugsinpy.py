@@ -126,7 +126,7 @@ def split_data(**over) -> dict:
         configs=["baseline", "vanta"],
         seeds=[0],
         review_mode=True,
-        sampling={"policy": "server_defaults", "values_sent": None},
+        sampling={"policy": split_mod.SAMPLING_POLICY},
         bugs=[bug_entry()],
     )
     data.update(over)
@@ -148,7 +148,7 @@ class TestSplit:
         assert split.seeds == [0], "the pilot runs a single seed (§8.3)"
         assert split.configs == ["baseline", "vanta"]
         assert split.review_mode is True
-        assert split.sampling["policy"] == "server_defaults"
+        assert split.sampling["policy"] == split_mod.SAMPLING_POLICY
 
     def test_real_split_pilot_set_is_frozen(self):
         """The split is the protocol, so a silent edit has to fail a test.
@@ -219,9 +219,16 @@ class TestSplit:
         with pytest.raises(SplitError, match="seeds"):
             split_mod.validate(split_data(seeds=["0"]))
 
-    def test_sampling_policy_must_be_server_defaults(self):
-        """The harness never sets temperature/top_p/max_tokens (§4.3)."""
-        with pytest.raises(SplitError, match="server_defaults"):
+    def test_sampling_policy_must_state_where_sampling_comes_from(self):
+        """The policy names the real source (§4.3): per-call pins + server top_p.
+
+        The retired ``server_defaults`` claimed the harness lets the server decide
+        everything, which is not what the pipeline does — it pins temperature and
+        max_tokens at each call site. A split that says otherwise is rejected.
+        """
+        with pytest.raises(SplitError, match="sampling.policy"):
+            split_mod.validate(split_data(sampling={"policy": "server_defaults"}))
+        with pytest.raises(SplitError, match="sampling.policy"):
             split_mod.validate(split_data(sampling={"policy": "fixed", "temperature": 0.2}))
 
     def test_test_cmd_must_carry_the_report_placeholder(self):

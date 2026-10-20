@@ -12,8 +12,8 @@
   ],
   "review_mode": true,
   "sampling": {
-    "policy": "server_defaults",
-    "values_sent": null
+    "policy": "pinned_per_call_plus_server_top_p",
+    "note": "temperature/max_tokens come from the pipeline's per-call pins (design §4.3); top_p is the one value read from the server's /props. The harness adds no run-level value."
   },
   "bugs": [
     {

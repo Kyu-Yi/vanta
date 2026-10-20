@@ -731,14 +731,13 @@ enter this file through a deliberate edit:
   "seeds": [0],
   "review_mode": true,
   "sampling": {
-    "source": "pinned_per_call_plus_server_top_p",
-    "pinned_sites": ["creator", "attacker_generate", "attacker_revise", "attacker_simplify", "intent_audit"],
-    "server_top_p": "read from /props at run time"
+    "policy": "pinned_per_call_plus_server_top_p",
+    "note": "temperature/max_tokens come from the pipeline's per-call pins (§4.3); top_p is the one value read from the server's /props. The harness adds no run-level value."
   },
   "bugs": [
     {
       "project": "PySnooper", "bug_id": 1,
-      "python_version": "3.8.20", "python_version_pinned": "3.8.1",
+      "python_version": "3.8.1",
       "buggy_commit": "…", "fixed_commit": "…",
       "test_file": "tests/test_chinese.py",
       "pythonpath": null,

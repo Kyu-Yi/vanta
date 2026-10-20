@@ -89,6 +89,18 @@ BUG_KEYS = DECLARED_BUG_KEYS | DERIVED_BUG_KEYS
 CONFIGS = ("baseline", "vanta")  # `vanta_planner` is addressable but not implemented (§4.2)
 ROLES = ("pilot", "reserve")
 
+SAMPLING_POLICY = "pinned_per_call_plus_server_top_p"
+"""The split's declaration of where a run's sampling comes from (§4.3).
+
+[VANTA-WHY] This replaced ``server_defaults``, which encoded a retracted premise:
+that the harness lets the server decide everything. The pipeline has always pinned
+``temperature`` / ``max_tokens`` **per call site** (creator 0.1, attacker_generate
+0.2, attacker_revise/simplify 0.3, intent_audit 0.0), and only ``top_p`` is left to
+the server. A policy string that says "server defaults" would have made the split
+disagree with the run it describes, and the validator would then have rejected the
+truthful file.
+"""
+
 
 class SplitError(RuntimeError):
     """The split file is missing, malformed, or contradicts itself."""
@@ -219,10 +231,11 @@ def validate(data: dict[str, Any], path: Optional[Path] = None) -> None:
         raise SplitError(f"{where}seeds must be a non-empty list of ints")
 
     sampling = data.get("sampling") or {}
-    if sampling.get("policy") != "server_defaults":
+    if sampling.get("policy") != SAMPLING_POLICY:
         raise SplitError(
-            f"{where}sampling.policy must be 'server_defaults' — the harness never "
-            f"sets temperature/top_p/max_tokens (design §4.3)"
+            f"{where}sampling.policy must be {SAMPLING_POLICY!r}: the pipeline pins "
+            "temperature/max_tokens per call site and top_p is read from the server's "
+            "/props, so the harness adds no run-level value (design §4.3)"
         )
 
     bugs = data["bugs"]

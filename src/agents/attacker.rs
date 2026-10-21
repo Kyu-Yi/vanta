@@ -710,7 +710,7 @@ impl IntentBatchVerdict {
 /// bodies carry no patch.
 const INTENT_AUDITOR_SYSTEM_PROMPT: &str = r#"You are Vanta Intent Auditor. You are given an ISSUE, the ORIGINAL source of a repository, and ONE test. You are NOT given the patch and must not speculate about it.
 
-Answer two questions about the input the test asserts:
+Answer these questions about the input the test asserts:
 1. "issue_asks_for_behaviour": does the ISSUE ask for the result this test asserts, AT THE INPUT THE TEST ASSERTS?
 2. "issue_requires_change": does the ISSUE require the behaviour at that input to CHANGE from what the ORIGINAL source does there — that is, does the issue ask for a DIFFERENT result than the original returns at that input?
 
@@ -746,7 +746,7 @@ YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
 /// `BugReproduction` test is routed on the answer).
 const INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED: &str = r#"You are Vanta Intent Auditor. You are given an ISSUE, the ORIGINAL source of a repository, and ONE test. You are NOT given the patch and must not speculate about it.
 
-Answer two questions about the input the test asserts:
+Answer these questions about the input the test asserts:
 1. "issue_asks_for_behaviour": does the ISSUE ask for the result this test asserts, AT THE INPUT THE TEST ASSERTS?
 2. "issue_requires_change": does the ISSUE require the behaviour at that input to CHANGE from what the ORIGINAL source does there — that is, does the issue ask for a DIFFERENT result than the original returns at that input?
 
@@ -782,7 +782,7 @@ YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
 /// because the stub server dispatches this call kind on it.
 const INTENT_AUDITOR_BATCH_SYSTEM_PROMPT: &str = r#"You are Vanta Intent Auditor. You are given an ISSUE, the ORIGINAL source of a repository, and SEVERAL tests, each numbered from 1. You are NOT given the patch and must not speculate about it.
 
-Answer these two questions about the input EACH test asserts:
+Answer these questions about the input EACH test asserts:
 1. "issue_asks_for_behaviour": does the ISSUE ask for the result that test asserts, AT THE INPUT THE TEST ASSERTS?
 2. "issue_requires_change": does the ISSUE require the behaviour at that input to CHANGE from what the ORIGINAL source does there — that is, does the issue ask for a DIFFERENT result than the original returns at that input?
 
@@ -808,7 +808,7 @@ YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
 /// are added.
 const INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED: &str = r#"You are Vanta Intent Auditor. You are given an ISSUE, the ORIGINAL source of a repository, and SEVERAL tests, each numbered from 1. You are NOT given the patch and must not speculate about it.
 
-Answer these two questions about the input EACH test asserts:
+Answer these questions about the input EACH test asserts:
 1. "issue_asks_for_behaviour": does the ISSUE ask for the result that test asserts, AT THE INPUT THE TEST ASSERTS?
 2. "issue_requires_change": does the ISSUE require the behaviour at that input to CHANGE from what the ORIGINAL source does there — that is, does the issue ask for a DIFFERENT result than the original returns at that input?
 
@@ -2457,6 +2457,34 @@ mod tests {
             INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED.contains("for EACH numbered test"),
             "the batch prompt must speak about each numbered test"
         );
+    }
+
+    /// [VANTA-WHY] A8 (§14.10) — all four auditor prompts opened with "Answer two
+    /// questions", a count that is only true of the two flag-off prompts: with
+    /// `VANTA_GROUNDED_AUDIT=on` a third question follows and the JSON contract
+    /// gains a third key. A model that trusts the count can answer the two named
+    /// questions and stop, dropping `assertions_grounded` — the answer the whole
+    /// grounded variant exists to collect. Let the heading promise the questions
+    /// actually printed below it.
+    #[test]
+    fn the_auditor_heading_does_not_count_a_question_it_may_not_ask() {
+        for prompt in [
+            INTENT_AUDITOR_SYSTEM_PROMPT,
+            INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED,
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT,
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED,
+        ] {
+            assert!(
+                !prompt.contains("Answer two questions")
+                    && !prompt.contains("Answer these two questions"),
+                "an auditor prompt may not promise a fixed count of two questions: the \
+                 grounded variants ask three"
+            );
+            assert!(
+                prompt.contains("Answer these questions about the input"),
+                "the heading must promise the questions it actually prints"
+            );
+        }
     }
 
     // ---- §14.5 batched audit (schema, transport-neutral decision) -----------

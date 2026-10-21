@@ -4879,20 +4879,71 @@ fn the_recorded_sampling_schedule_matches_the_request_bodies() {
     }
 }
 
-/// §14.11: `VANTA_SAMPLING=coding` moves the GENERATIVE sites to the coding
-/// sampler and leaves the auditor on the `pinned` row.
+/// §14.11: `VANTA_SAMPLING=coding` moves EVERY call site — the auditor included —
+/// to the coding sampler, and leaves the `pinned` run's bodies exactly as they
+/// were.
 ///
-/// [VANTA-WHY] The preset is a sampling choice, not a verdict input, so the run
-/// must reach the SAME verdict an otherwise identical `pinned` run reaches — and
-/// the change must be visible in three places at once: the recorded preset, the
-/// per-role values, and the bodies the server actually received. Checking the
-/// auditor separately is the point: a preset that quietly warmed the auditor
-/// would make the patch-blind judgement noisier, which is not what "coding
-/// sampling for the generators" asks for.
+/// [VANTA-WHY] The preset is a sampling choice, not a verdict input, so a `coding`
+/// run must reach the SAME verdict an otherwise identical `pinned` run reaches.
+/// The auditor used to be excluded from the preset (`site != "intent_audit"`),
+/// which left it judging a 0.6-sampled Attacker's tests at 0.0 — the one site
+/// whose output is a judgement on the run's noisiest generation. It is now covered
+/// like the rest, while `max_tokens` is NOT part of the preset: the auditor keeps
+/// its 2048 cap, so a cut-off audit at 0.6 takes the retry path (temperature
+/// above 0.0) instead of the temperature-0.0 fail-fast. Both halves are asserted
+/// here, against the recorded schedule AND the bodies the server received.
 #[test]
-fn the_coding_preset_pins_the_generative_sites_and_leaves_the_auditor_alone() {
+fn the_coding_preset_covers_every_site_including_the_auditor() {
     let _serial = serial_run();
 
+    // (1) A `pinned` run, to pin what the auditor must NOT do: 0.0 and none of the
+    //     coding keys.
+    let plain = TempDir::new().unwrap();
+    let (_repo, _issue, plain_patch) = write_test_repo(plain.path(), PRESERVING_PATCH);
+    let plain_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let plain_output = run_patch_mode_with_output(plain.path(), &plain_patch, &plain_server, 3, &[]);
+    assert_eq!(
+        plain_output.status.code(),
+        Some(0),
+        "the reference run must be the approval; stdout:\n{}",
+        String::from_utf8_lossy(&plain_output.stdout)
+    );
+    let plain_summary = run_summary(plain.path()).summary;
+    assert_eq!(
+        summary_value(&plain_summary, "temperature_intent_audit"),
+        "0.0"
+    );
+    assert!(
+        !plain_summary.contains("top_p_intent_audit"),
+        "a pinned run must not record a coding pin for the auditor: {plain_summary}"
+    );
+    let mut pinned_audits = 0usize;
+    for (kind, body) in plain_server
+        .request_kinds()
+        .iter()
+        .zip(plain_server.request_bodies().iter())
+    {
+        if kind != "intent_audit" {
+            continue;
+        }
+        pinned_audits += 1;
+        assert!(
+            body.contains("\"temperature\":0.0"),
+            "the pinned auditor body must sample at 0.0: {body}"
+        );
+        for key in ["top_p", "top_k", "min_p", "presence_penalty"] {
+            assert!(
+                !body.contains(&format!("\"{key}\"")),
+                "the pinned auditor body must carry no coding `{key}` pin: {body}"
+            );
+        }
+    }
+    assert!(
+        pinned_audits > 0,
+        "the pinned run must have audited something, or (1) proves nothing"
+    );
+
+    // (2) The coding run.
     let workspace = TempDir::new().unwrap();
     let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), PRESERVING_PATCH);
     let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
@@ -4918,12 +4969,13 @@ fn the_coding_preset_pins_the_generative_sites_and_leaves_the_auditor_alone() {
         "run.summary must name the active preset: {summary}"
     );
 
-    // The four generative sites take the coding sampler.
+    // Every site, the auditor included, takes the coding sampler.
     for site in [
         "creator",
         "attacker_generate",
         "attacker_revise",
         "attacker_simplify",
+        "intent_audit",
     ] {
         assert_eq!(summary_value(&summary, &format!("temperature_{site}")), "0.6");
         assert_eq!(summary_value(&summary, &format!("top_p_{site}")), "0.95");
@@ -4934,17 +4986,12 @@ fn the_coding_preset_pins_the_generative_sites_and_leaves_the_auditor_alone() {
             "0.0"
         );
     }
-
-    // The auditor keeps the pinned row, under BOTH presets.
-    assert_eq!(summary_value(&summary, "temperature_intent_audit"), "0.0");
+    // The preset moves samplers, not caps: the auditor keeps its 2048.
     assert_eq!(summary_value(&summary, "max_tokens_intent_audit"), "2048");
-    assert!(
-        !summary.contains("top_p_intent_audit"),
-        "the auditor must not take a coding pin: {summary}"
-    );
+    assert_eq!(summary_value(&summary, "max_tokens_attacker_generate"), "32768");
 
-    // The recorded schedule must be the one the bodies carried, and the auditor
-    // body must carry none of the coding keys.
+    // The recorded schedule must be the one the bodies carried — the auditor's
+    // body is the one this test exists for.
     let checked =
         assert_schedule_matches_bodies(workspace.path(), &server, vanta::llm::SamplingPreset::Coding);
     for required in ["attacker_generate", "intent_audit"] {
@@ -4953,6 +5000,7 @@ fn the_coding_preset_pins_the_generative_sites_and_leaves_the_auditor_alone() {
             "the coding run must exercise `{required}`; checked={checked:?}"
         );
     }
+    let mut coding_audits = 0usize;
     for (kind, body) in server
         .request_kinds()
         .iter()
@@ -4961,13 +5009,24 @@ fn the_coding_preset_pins_the_generative_sites_and_leaves_the_auditor_alone() {
         if kind != "intent_audit" {
             continue;
         }
-        for key in ["top_p", "top_k", "min_p", "presence_penalty"] {
-            assert!(
-                !body.contains(&format!("\"{key}\"")),
-                "the auditor body must not carry a coding `{key}` pin: {body}"
-            );
-        }
+        coding_audits += 1;
+        let value: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+        assert_eq!(value.get("temperature").and_then(|v| v.as_f64()), Some(0.6));
+        assert_eq!(value.get("top_p").and_then(|v| v.as_f64()), Some(0.95));
+        assert_eq!(value.get("top_k").and_then(|v| v.as_u64()), Some(20));
+        assert_eq!(value.get("min_p").and_then(|v| v.as_f64()), Some(0.0));
+        assert_eq!(
+            value.get("max_tokens").and_then(|v| v.as_u64()),
+            Some(2048),
+            "the coding preset must not move the auditor's cap: {body}"
+        );
     }
+    assert!(
+        coding_audits > 0,
+        "the coding run must have audited something, or the auditor's coding pins \
+         were never sent"
+    );
 }
 
 /// §4.3 token accounting: the numbers a cost table is built from are the

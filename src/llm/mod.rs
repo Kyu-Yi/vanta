@@ -428,13 +428,18 @@ pub const SAMPLING_SCHEDULE: &[(&str, f64, u32)] = &[
     ("intent_audit", 0.0, 2048),
 ];
 
-/// The `coding` preset's sampler pins, for the GENERATIVE roles only (§14.11).
+/// The `coding` preset's sampler pins, for EVERY site including the auditor (§14.11).
 ///
 /// [VANTA-WHY] One temperature / top_p / top_k / min_p / presence_penalty set,
-/// not a second schedule: the preset changes HOW the generators sample, not how
-/// many tokens they may emit (`max_tokens` stays the `pinned` row's). The
-/// auditor is deliberately absent — it keeps `pinned`'s row under both presets,
-/// because a noisier auditor is not a fix for a noisier Attacker.
+/// not a second schedule: the preset changes HOW a site samples, not how many
+/// tokens it may emit (`max_tokens` stays the `pinned` row's, so the auditor keeps
+/// its 2048-token cap). The auditor is covered like every other site: under
+/// `coding` it samples at 0.6 alongside the Attacker whose tests it judges, which
+/// is the condition the preset exists for — a pinned-0.0 auditor grades a noisy
+/// Attacker's output as if that output were the only reading of the issue. A
+/// truncated audit at 0.6 is NOT deterministic, so it takes the retry path with
+/// the seed advanced, never the temperature-0.0 fail-fast
+/// (`structured_call_with_retry` reads the temperature off the request itself).
 const CODING_TEMPERATURE: f64 = 0.6;
 const CODING_TOP_P: f64 = 0.95;
 const CODING_TOP_K: u32 = 20;
@@ -516,7 +521,7 @@ fn sampling_pin_table(preset: SamplingPreset, site: &str) -> Vec<(&'static str, 
         ("temperature", PinValue::Float(temperature)),
         ("max_tokens", PinValue::Int(max_tokens)),
     ];
-    if preset == SamplingPreset::Coding && site != "intent_audit" {
+    if preset == SamplingPreset::Coding {
         pins[0] = ("temperature", PinValue::Float(CODING_TEMPERATURE));
         pins.push(("top_p", PinValue::Float(CODING_TOP_P)));
         pins.push(("top_k", PinValue::Int(CODING_TOP_K)));

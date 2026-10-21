@@ -255,9 +255,10 @@ fn truncation_counts(calls: &[crate::llm::CallUsage]) -> (u64, u64, u64) {
 /// request body byte for byte.
 ///
 /// [VANTA-WHY] §14.11 — the record is the EFFECTIVE schedule, not the static
-/// `pinned` table: under `VANTA_SAMPLING=coding` the generative sites sample at
-/// 0.6 with `top_p`/`top_k`/`min_p`/`presence_penalty` pinned, and a summary that
-/// still said 0.1 would describe a run nobody made. The preset names itself
+/// `pinned` table: under `VANTA_SAMPLING=coding` every site, the intent auditor
+/// included, samples at 0.6 with `top_p`/`top_k`/`min_p`/`presence_penalty`
+/// pinned (the auditor's 2048-token cap is not part of the preset), and a summary
+/// that still said 0.1 would describe a run nobody made. The preset names itself
 /// first, and the per-role keys come from `llm::sampling_pins_text`, the same
 /// table the request bodies are built from, so the record cannot drift from the
 /// sampling that actually happened.

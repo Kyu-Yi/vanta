@@ -170,9 +170,9 @@ Required JSON shape:
   ]
 }
 
-Intent rules — each test MUST produce a DIFFERENT result on original vs patched (except BehaviorPreservation):
-- BugReproduction: reproduces a bug that the patch fixes. The test MUST FAIL on the ORIGINAL code and PASS on the PATCHED code. It exercises the exact code path the patch changes.
-- FeatureAcceptance: checks a NEW capability added by the patch. The test MUST FAIL on the ORIGINAL code (feature absent) and PASS on the PATCHED code (feature present).
+Intent rules — every rule below describes what a CORRECT patch produces; it is an EXPECTATION, never a requirement the patch must satisfy, and never a reason to change the test. Each test is expected to produce a DIFFERENT result on original vs patched (except BehaviorPreservation): if the PATCHED code does not give a test its expected result, that is a FINDING about the patch, not a mistake in the test.
+- BugReproduction: reproduces a bug that the patch fixes. On a correct patch it is FAIL on the ORIGINAL code and PASS on the PATCHED code — if it FAILS on the PATCHED code, that failure IS the finding. It exercises the exact code path the patch changes.
+- FeatureAcceptance: checks a NEW capability added by the patch. On a correct patch: FAIL on the ORIGINAL code (feature absent) and PASS on the PATCHED code (feature present) — if it FAILS on the PATCHED code, that failure IS the finding.
 - BehaviorPreservation: checks EXISTING behavior the issue does NOT ask to change. The test MUST PASS on the ORIGINAL code (BATE checks this). It is EXPECTED to pass on a correct patch — but that is not a requirement you may test the patch against: if it FAILS on the PATCHED code, that failure IS the finding, because a bad patch breaking existing behavior is exactly what this test exists to catch. NEVER drop a boundary probe because you expect the patch to break it. Test only functionality that existed before the patch.
 
 CRITICAL:
@@ -1961,6 +1961,48 @@ mod tests {
         assert!(
             ATTACKER_SYSTEM_PROMPT.contains("BOUNDARY-PROBING RULE"),
             "the boundary-probing rule must still be in the prompt"
+        );
+    }
+
+    /// [VANTA-WHY] A2 (§14.10) — only the BehaviorPreservation bullet carried the
+    /// qualifier that makes a failure on the patched tree evidence rather than an
+    /// error. The intent umbrella and the BugReproduction / FeatureAcceptance
+    /// bullets still stated the expected original/patched results as a
+    /// REQUIREMENT ("The test MUST FAIL on the ORIGINAL code and PASS on the
+    /// PATCHED code"), which the BOUNDARY-PROBING RULE orders the very probes that
+    /// break it. The run logs show models resolving that contradiction by
+    /// inventing a rule to be violated ("violates the intent rule", "violates the
+    /// \"MUST PASS on BOTH\" rule") and looping to the output cap, across models,
+    /// binaries and attempts. Every intent rule must read as an expectation.
+    #[test]
+    fn every_intent_rule_reads_as_an_expectation_not_a_requirement() {
+        for gone in [
+            "each test MUST produce a DIFFERENT result on original vs patched",
+            "The test MUST FAIL on the ORIGINAL code and PASS on the PATCHED code.",
+            "The test MUST FAIL on the ORIGINAL code (feature absent) and PASS on the PATCHED code (feature present).",
+        ] {
+            assert!(
+                !ATTACKER_SYSTEM_PROMPT.contains(gone),
+                "a requirement-shaped intent rule must be gone from the prompt: {gone}"
+            );
+        }
+        for present in [
+            "it is an EXPECTATION, never a requirement the patch must satisfy",
+            "On a correct patch it is FAIL on the ORIGINAL code and PASS on the PATCHED code",
+            "On a correct patch: FAIL on the ORIGINAL code (feature absent) and PASS on the PATCHED code (feature present)",
+        ] {
+            assert!(
+                ATTACKER_SYSTEM_PROMPT.contains(present),
+                "the expectation-shaped intent rule must be in the prompt: {present}"
+            );
+        }
+        assert_eq!(
+            ATTACKER_SYSTEM_PROMPT
+                .matches("that failure IS the finding")
+                .count(),
+            3,
+            "all three intent bullets must carry the same qualifier the preservation \
+             bullet already had"
         );
     }
 

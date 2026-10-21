@@ -229,6 +229,23 @@ def main() -> int:
                 ),
                 "decided_by": "user review, 2026-10-21",
                 "rule": ROUND_ROBIN_RULE,
+            },
+            {
+                "change": (
+                    "Excluded from the candidate pool: ansible, keras and tornado. "
+                    "No bug of theirs in the pinned clone declares "
+                    "``python_version`` 3.8 (0 of 18, 0 of 45, 0 of 16), so the "
+                    "§1.6 context gate can never pass for them and §14.7's "
+                    "round-robin has nothing to take from these projects."
+                ),
+                "reason": (
+                    "Recorded so the skip reads as a decision rather than an "
+                    "omission: a reader comparing the clone's projects with the "
+                    "seven in the round-robin would otherwise have to re-derive "
+                    "it from the corpus. They are not evaluation-wave projects "
+                    "either, and the same fact is noted in the plan doc (§14.7)."
+                ),
+                "decided_by": "user review, 2026-10-21",
             }
         ],
         "bugs": bugs,

@@ -21,6 +21,11 @@
       "reason": "Items 1-3 of §14 are developed on bugs no evaluation number will be computed from, so no number is produced by a pipeline tuned on the bug it measures. Flat directory order was rejected: it makes the first ten candidates ten fastapi bugs, so every item would be developed against one codebase's idioms. Round-robin gives one bug per project.",
       "decided_by": "user review, 2026-10-21",
       "rule": "Round-robin across projects in clone order (fastapi, luigi, matplotlib, pandas, sanic, scrapy, spacy): take the first bug in each project that passes both gates, until 5. If a project has no bug that passes, skip it and continue. One pass over the projects gives their next py3.8 bug in ascending id and the pass repeats until 10 candidates are listed; the first 5 are pilots, the rest the substitution pool. The two gates are the existing ones -- the §1.6 context gate and the §8.2 dev-fix self-check -- neither is loosened and no cap is raised. Recorded before any gate was run and before any Vanta result was looked at."
+    },
+    {
+      "change": "Excluded from the candidate pool: ansible, keras and tornado. No bug of theirs in the pinned clone declares ``python_version`` 3.8 (0 of 18, 0 of 45, 0 of 16), so the §1.6 context gate can never pass for them and §14.7's round-robin has nothing to take from these projects.",
+      "reason": "Recorded so the skip reads as a decision rather than an omission: a reader comparing the clone's projects with the seven in the round-robin would otherwise have to re-derive it from the corpus. They are not evaluation-wave projects either, and the same fact is noted in the plan doc (§14.7).",
+      "decided_by": "user review, 2026-10-21"
     }
   ],
   "bugs": [

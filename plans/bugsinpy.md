@@ -1851,3 +1851,37 @@ python3 scripts/bugsinpy_run.py run     --split plans/bugsinpy_dev_split.json --
 with `prepare` + `run` repeated once with the three flags in the environment of the `vanta_m3`
 child. The evaluation waves are not touched: no `plans/bugsinpy_split.json` entry, no wave-1 batch
 and no evaluation number changes.
+
+---
+
+## 15. Model screen
+
+Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy
+waves, the candidates were screened on the toy fixture (`fixtures/toy_calc`), whose six bad cases and
+three good cases are the same shape §14.8 uses as its end-to-end guard:
+
+| model | bad cases | good cases | wall time |
+|---|---|---|---|
+| 27B | 6/6 | 3/3 | 39.0 min |
+| 35B-A3B | 6/6 | 3/3 | 32.9 min |
+| Flash | 6/6 | 3/3 | 15.3 min |
+| Ornith-1.0 | 6/6 | 3/3 | 22.0 min |
+| Coder-Next | 1/6 | — | 6.3 min |
+
+Four of the five candidates reach the fixture's full score; Coder-Next reaches 1 of 6 bad cases and
+is out (the good-case cell is one the screen did not fill in). The screen says which candidates are
+still *eligible*, not which one to use: **the evaluation model is not chosen yet** — that choice is
+to be made on the dev split (§14.7), not on these nine cases.
+
+**Ornith-1.5 is shelved.** It runs into the `creator`/`attacker` **32768** output cap and the
+`intent_audit` **2048** cap at Vanta's low sampling temperatures (§4.3 — 0.1 / 0.2 / 0.3 / 0.0),
+producing truncated answers rather than wrong ones. That is a sampling-pin problem, not a model
+verdict, and it is not a candidate for the waves until the pins can be overridden.
+
+Future work:
+
+- **A temperature-override flag**, to be tested across all the models above on the dev split (§14.7).
+  The temperatures are a fixed schedule (§4.3) and the schedule is part of a run's identity (§13), so
+  the flag has to make the override visible in `run.summary` alongside the §14 flags. Ornith-1.5 is
+  the model that motivates it: the question the flag answers is whether Vanta's low temperatures —
+  rather than the models — are what the output caps are hitting.

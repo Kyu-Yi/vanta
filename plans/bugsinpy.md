@@ -1983,7 +1983,7 @@ history is reproducible from the references.
 | A19d | `INTENT_AUDIT_BATCH_TOKENS_PER_TEST` / `INTENT_AUDIT_BATCH_TOKENS_CEILING` (2048 / 16384) and the auditor's schedule cap | an audit that legitimately exceeds the cap: 21 truncations across 8 of 12 runs, the largest ending mid-reasoning ("Let me reconsider grounded once more…") with no JSON | `f10858d` | `698933e` |
 | A19e | `write_forensics_to`: the type name in the filename is not sanitised | the batched audit writes `IntentVerdict>_intent_audit_batch_round_1_attempt_1_raw_response.txt` — the `>` is `Vec<IntentVerdict>`'s closing bracket, and shell-hostile | `5f8af2f` | `60e2c08` |
 | A19f | prompt provenance: the version label had no content hash beside it | `3588728` (A3 follow-up) and `d4ea314` (A10 follow-up) reworded prompts after the `a2617b3` bump without bumping, so one tag covers two prompt texts and the log cannot tell them apart | `a2617b3` | `6c337eb` |
-| A21 | generate prompt: the A3 leftover-slot default — "an input where the ORIGINAL source returns a DIFFERENT result than at the inputs you have already tested" — has no terminal case | a late round where every meaningful input is already in the shared set: round 3 on the toy looped **45×** on `"Let me pick the three most valuable tests"` / `"Both are shared"` / `"-1 is shared"`, hunting for a novel input that does not exist, instead of spending the slots and finishing | `3588728` | `70fdc50` |
+| A21 | generate prompt: the A3 leftover-slot default — "an input where the ORIGINAL source returns a DIFFERENT result than at the inputs you have already tested" — has no terminal case; **and** the round>=2 user-prompt section said `DO NOT REPEAT ANY OF THESE` while the new terminal fallback says `A repeat of an existing test is an ACCEPTABLE answer here` — a rule pair pulling opposite ways in exactly the late-round state that looped | a late round where every meaningful input is already in the shared set: round 3 on the toy looped **45×** on `"Let me pick the three most valuable tests"` / `"Both are shared"` / `"-1 is shared"`, hunting for a novel input that does not exist, instead of spending the slots and finishing | `3588728` | `70fdc50` + `745cafb` + `2bd4c50` + `5526621` |
 
 **Evidence — the same contradictions, quoted by the models, across models, binaries and attempts.**
 A grep over `~/vanta-runs`, `runs/bugsinpy` and `vanta_sessions` for the rules' own words returns:
@@ -2042,8 +2042,40 @@ band that is already covered** (a midpoint of the band, or the value on the othe
 already probed), chosen on the spot without weighing alternatives. A repeat of an existing test is an
 **acceptable** answer there: the driver drops duplicates before BATE, so a round of three repeats still
 carries its three tests, while a round that keeps hunting loses all of them. Still exactly 3 tests; the
-toy fixture's issue text is **not** touched. The tag is
+toy fixture's issue text is **not** touched. The first follow-up commit lands the tag
 `ATTACKER_PROMPT_VERSION = 8.shared-band-terminal-fallback`.
+
+**A21 follow-up — the fallback's two loose ends (`745cafb`, `2bd4c50`, `5526621`).** Adding the
+fallback exposed a rule pair that pulled opposite ways and left the plan unbounded:
+
+- **The clash (`745cafb`).** The round>=2 user-prompt section said `DO NOT REPEAT ANY OF THESE` about
+  the shared set, while the new terminal fallback said `A repeat of an existing test is an ACCEPTABLE
+  answer here`. In exactly the late-round state the fallback exists for, the two sentences disagree:
+  one forbids the repeat, the other permits it. The section is now **one rule** — *aim for a probe
+  that is not already in the shared set; when every useful input is already covered, use the TERMINAL
+  FALLBACK, where a repeat is acceptable because duplicates are discarded automatically*. The
+  `a duplicate does not count as an attack` information is kept (it is what makes the repeat
+  harmless). `the_round_two_section_points_at_the_terminal_fallback_instead_of_forbidding_repeats`
+  pins that no **unqualified** `DO NOT REPEAT` survives beside the fallback.
+- **The unbounded plan (`2bd4c50`).** The 45× loop was also a *re-listing* loop: the model re-picked
+  and re-ranked the same three candidates. The generate prompt now carries one `ONE PASS:` line near
+  the FINAL line — list candidate tests at most once, do not re-list/re-rank/re-check a candidate you
+  have already considered, and once you have three, write them.
+  `the_prompt_limits_the_plan_to_one_pass` pins it.
+- **The dedup is a no-op, not a stall (`5526621`).** The fallback's licence to repeat rests on the
+  driver discarding duplicates before BATE. `a_round_of_all_duplicates_is_dropped_and_the_run_advances`
+  (review mode, three rounds) pins the other half: a round whose three tests are all duplicates of the
+  shared set drops all three (`dropped_duplicates=3`, `remaining=0`), makes **no** intent-audit call,
+  and the run still advances to the approval — nothing is an error and the round still runs the shared
+  set.
+
+Both prompt edits land under **one** tag, `ATTACKER_PROMPT_VERSION = 9.one-pass-plan-and-qualified-repeat`,
+and the run records the content hash beside it:
+`prompt_hash=attacker=be8be62cb889;intent_check=bbed28c47b1c;creator=53883e3b1c81;diagnostician=e3b0c44298fc`
+(SHA-256 of each role's system-prompt text joined with `U+001F`, first 12 hex — `pipeline::prompt_hashes`).
+**Disclosure:** `attacker`'s hash covers the three system prompts only, so `745cafb`'s rewording of the
+round>=2 **user**-prompt section does not move it; that change is carried by the version tag alone. Only
+`2bd4c50`'s `ONE PASS` line, which is in the system prompt, moves `be8be62cb889`.
 
 **Auditor-truncation follow-up — the batch that changes no verdict (`961e42f`, `8e09513`, `d75a60c`,
 `698933e`, `60e2c08`, `6c337eb`).** The post-fix coding run on the toy (Ornith-1.5, 12 runs, **every
@@ -2097,9 +2129,11 @@ prompts; `forensics_type_name_is_sanitized` pins the (e) filename. The toy fixtu
 them: `attacker=6.expected-on-a-correct-patch` and `intent_check=4.audit-questions-renamed` in
 `run.summary` separate the two sets. Runs after this batch carry
 `attacker=7.priority-overlap-and-simplify-assertion` and `intent_check=5.preservation-q1-and-grounded-scope`
-and, crucially, a `prompt_hash=` that differs whenever the wording does. The A21 follow-up then bumps the
-Attacker tag once more, to `8.shared-band-terminal-fallback`, so a run after it is separable from a run
-after this batch.
+and, crucially, a `prompt_hash=` that differs whenever the wording does. The A21 work then bumps the
+Attacker tag twice more — `8.shared-band-terminal-fallback` for the terminal fallback, then
+`9.one-pass-plan-and-qualified-repeat` for the round>=2 reconciliation and the `ONE PASS` line — so a
+run after A21 is separable from a run after this batch by both the tag and the hash
+(`attacker=be8be62cb889`).
 
 **Evidence and disclosure.** The finding was made on the **toy dev fixture** (§14.7), by reading the
 session debug artifact rather than by inspecting an evaluation result, and it is disclosed here as a

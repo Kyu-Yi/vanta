@@ -2161,6 +2161,10 @@ fn the_batched_audit_is_one_call_per_round_with_the_same_decisions() {
 /// output; and when it finally fails, every test falls back to EXACTLY the
 /// single-call failure shape. Both halves are asserted against the flag-off run
 /// of the same fixture, whose calls fail the same way at the same place.
+///
+/// This is also the other half of the truncation test's contract: an answer that
+/// was NOT cut off keeps its retries, and the session log tells the two events
+/// apart by name — `malformed_retried` here against `truncated_fallback` there.
 #[test]
 fn a_batch_the_auditor_cannot_answer_falls_back_to_the_single_call_failure_shape() {
     let _serial = serial_run();
@@ -2181,11 +2185,23 @@ fn a_batch_the_auditor_cannot_answer_falls_back_to_the_single_call_failure_shape
             .filter(|r| r.phase.starts_with("intent.check["))
             .map(|r| r.summary.clone())
             .collect();
-        (server.request_kinds(), server.request_bodies(), decisions, output)
+        let transports: Vec<String> = records
+            .iter()
+            .filter(|r| r.phase == "intent.audit_batch")
+            .map(|r| r.summary.clone())
+            .collect();
+        (
+            server.request_kinds(),
+            server.request_bodies(),
+            decisions,
+            transports,
+            output,
+        )
     };
 
-    let (kinds_off, bodies_off, decisions_off, output_off) = run(&[]);
-    let (kinds_on, bodies_on, decisions_on, output_on) = run(&[("VANTA_BATCH_AUDIT", "on")]);
+    let (kinds_off, bodies_off, decisions_off, transports_off, output_off) = run(&[]);
+    let (kinds_on, bodies_on, decisions_on, transports_on, output_on) =
+        run(&[("VANTA_BATCH_AUDIT", "on")]);
 
     // Off: three tests, each call retried the full budget = 1 + 3x3.
     assert_eq!(
@@ -2204,11 +2220,24 @@ fn a_batch_the_auditor_cannot_answer_falls_back_to_the_single_call_failure_shape
         ],
         "with the flag off an unparseable audit is retried per test"
     );
-    // On: ONE logical call, retried three times.
+    // On: ONE logical call, retried three times. The retries are the point: this
+    // answer was NOT cut off, so the model can answer it differently next time,
+    // and only a cut-off answer skips the budget (see the truncation test).
     assert_eq!(
         kinds_on,
         vec!["generate", "intent_audit", "intent_audit", "intent_audit"],
         "an incomplete batch must be retried as ONE call, not split into three"
+    );
+    // …and the session log names the event, since the call count no longer has to
+    // carry that distinction on its own.
+    assert!(
+        transports_off.is_empty(),
+        "with the flag off no batched call is made; got {transports_off:?}"
+    );
+    assert_eq!(
+        transports_on,
+        vec!["source=attacker.generate transport=malformed_retried tests=3"],
+        "the record must say the batch was MALFORMED and retried, not cut off"
     );
     for body in &bodies_on[1..] {
         assert!(
@@ -2287,17 +2316,24 @@ fn a_batch_cut_off_at_the_cap_falls_back_to_per_test_audits_with_the_same_decisi
             .filter(|r| r.phase.starts_with("intent.check["))
             .map(|r| (r.phase.clone(), r.summary.clone()))
             .collect();
+        let transports: Vec<String> = records
+            .iter()
+            .filter(|r| r.phase == "intent.audit_batch")
+            .map(|r| r.summary.clone())
+            .collect();
         (
             server.request_kinds(),
             server.request_bodies(),
             decisions,
+            transports,
             run_summary(workspace.path()).summary,
             workspace,
         )
     };
 
-    let (kinds_off, _bodies_off, decisions_off, summary_off, _off_workspace) = run(&[], false);
-    let (kinds_on, bodies_on, decisions_on, summary_on, _on_workspace) =
+    let (kinds_off, _bodies_off, decisions_off, transports_off, summary_off, _off_workspace) =
+        run(&[], false);
+    let (kinds_on, bodies_on, decisions_on, transports_on, summary_on, _on_workspace) =
         run(&[("VANTA_BATCH_AUDIT", "on")], true);
 
     assert_eq!(
@@ -2309,28 +2345,30 @@ fn a_batch_cut_off_at_the_cap_falls_back_to_per_test_audits_with_the_same_decisi
         kinds_on,
         vec![
             "generate",
-            // the batch, retried whole, cut off every time
-            "intent_audit",
-            "intent_audit",
+            // the batch, ONCE: a cut-off answer is not retried, because the cap
+            // that cut it off is pinned and the next call would stop at the same
+            // point — three more full-length generations for nothing
             "intent_audit",
             // then the fallback: one call per test, which is answered
             "intent_audit",
             "intent_audit",
             "intent_audit",
         ],
-        "a batch cut off at the cap must be followed by one audit call PER TEST, not by an \
-         unavailable verdict for the whole round"
+        "a batch cut off at the cap must fall back after ONE call, to one audit call PER TEST, \
+         not after the retry budget and not to an unavailable verdict for the whole round"
     );
 
-    // Which call was which is the point: the retries carried the round, the
-    // fallback carried one test each.
-    for body in &bodies_on[1..4] {
-        assert!(
-            body.contains("TESTS TO AUDIT"),
-            "the first three audit calls are the batch, re-sent whole; got {body}"
-        );
-    }
-    for body in &bodies_on[4..] {
+    // Which call was which is the point: the batch carried the whole round ONCE,
+    // the fallback carried one test each. The two are not told apart by counting
+    // calls any more — a cut-off batch makes one call and a malformed one makes
+    // the whole budget — so the bodies pin the shapes and the record below names
+    // which event this was.
+    assert!(
+        bodies_on[1].contains("TESTS TO AUDIT"),
+        "the second audit call is the batch; got {}",
+        bodies_on[1]
+    );
+    for body in &bodies_on[2..] {
         assert!(
             body.contains("TEST UNDER AUDIT") && !body.contains("TESTS TO AUDIT"),
             "the fallback audits one test per call; got {body}"
@@ -2349,6 +2387,20 @@ fn a_batch_cut_off_at_the_cap_falls_back_to_per_test_audits_with_the_same_decisi
              unavailable; got {phase}: {summary:?}"
         );
     }
+
+    // The session log names the event, because the call pattern can no longer:
+    // no record with the flag off (there was no batched call), and exactly one
+    // `truncated_fallback` with it on.
+    assert!(
+        transports_off.is_empty(),
+        "with the flag off no batched call is made, so the log must not claim one; got \
+         {transports_off:?}"
+    );
+    assert_eq!(
+        transports_on,
+        vec!["source=attacker.generate transport=truncated_fallback tests=3"],
+        "the record must say the batch was CUT OFF and fell back per test"
+    );
 
     // The output cap is a recorded property of the run: one test's allowance per
     // test in the round, under the ceiling.

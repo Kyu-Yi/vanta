@@ -20,7 +20,7 @@ use crate::config::LlmConfig;
 use crate::core::TestIntent;
 use crate::llm::{
     build_reqwest_client, extract_json_candidate, structured_call_with_retry,
-    TRUNCATED_OUTPUT_PREFIX,
+    PARSE_FAILURE_PREFIX, TRUNCATED_OUTPUT_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1298,6 +1298,46 @@ pub async fn audit_issue_requires_change(
     (verdict.issue_requires_change, record)
 }
 
+/// What happened to a round's single batched intent-audit call (§14.5).
+///
+/// [VANTA-WHY] `truncated_fallback` and `malformed_retried` are the two ways a
+/// batched round can fail to be answered by its batch, and they are NOT the same
+/// event: the first is a fact about the request's output cap and is answered by
+/// asking one test at a time, the second is a fact about the answer and is
+/// answered by sending the same request again. Because the first now stops after
+/// a single call and the second still spends the retry budget, the two are
+/// distinguishable in the session log by this record rather than by counting
+/// calls. `None` — no batched call was made — is the flag-off schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchAuditTransport {
+    /// One batched call answered the whole round.
+    Batched,
+    /// The batched answer was CUT OFF at its `max_tokens` cap
+    /// (`finish_reason: "length"`) and was therefore not retried; the round was
+    /// re-audited one test per call.
+    TruncatedFallback,
+    /// The batched answer was malformed WITHOUT being cut off. It was retried to
+    /// the retry budget, and every test then fell back to the single-call
+    /// failure shape.
+    MalformedRetried,
+    /// The batched call never produced a parseable answer at all — a transport
+    /// error, or a prompt that cannot fit the context window (which is not
+    /// retried either). Every test fell back to the single-call failure shape.
+    Unavailable,
+}
+
+impl BatchAuditTransport {
+    /// The token written into the session log's `intent.audit_batch` record.
+    pub fn code(&self) -> &'static str {
+        match self {
+            BatchAuditTransport::Batched => "batched",
+            BatchAuditTransport::TruncatedFallback => "truncated_fallback",
+            BatchAuditTransport::MalformedRetried => "malformed_retried",
+            BatchAuditTransport::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// Output allowance the batched audit is given PER TEST in the round (§14.5).
 ///
 /// [VANTA-WHY] The batch answers with one entry per test, so the 2048 the
@@ -1452,6 +1492,10 @@ async fn attacker_check_intent_batch(
 /// `scrapped = true`) are still returned for logging. Either way the records
 /// come out in the order the tests went in, so a session log cannot be a
 /// permutation of another run's.
+///
+/// The fourth element reports what happened to the batched call, for the run's
+/// log (§14.5). It is `None` when the flag was off, because then no batched call
+/// was made and the flag-off log stays what it was.
 pub async fn audit_tests_intent(
     cfg: &LlmConfig,
     issue_text: &str,
@@ -1463,39 +1507,39 @@ pub async fn audit_tests_intent(
     Vec<GeneratedTest>,
     Vec<IntentRelabel>,
     Vec<IntentCheckRecord>,
+    Option<BatchAuditTransport>,
 ) {
     // [VANTA-WHY] §14.5 — with the flag off this is the v0.2 path unchanged: the
     // same per-test call, through the same function, in the same order.
     if !batch {
-        return audit_tests_intent_per_test(cfg, issue_text, original_source, tests, grounded).await;
+        let (audited, relabels, records) =
+            audit_tests_intent_per_test(cfg, issue_text, original_source, tests, grounded).await;
+        return (audited, relabels, records, None);
     }
 
-    let verdicts: Vec<IntentVerdict> =
+    let (verdicts, transport): (Vec<IntentVerdict>, BatchAuditTransport) =
         match attacker_check_intent_batch(cfg, issue_text, original_source, tests, grounded).await {
-            Ok(verdicts) => verdicts,
+            Ok(verdicts) => (verdicts, BatchAuditTransport::Batched),
             Err(e) if e.to_string().contains(TRUNCATED_OUTPUT_PREFIX) => {
                 // [VANTA-WHY] §14.5 — a truncated batch is the one batch failure
                 // the per-test path FIXES, because it is caused by the request
-                // asking for N answers in one capped generation. Falling through
-                // to the per-test loop asks the same questions one at a time —
-                // each well inside the single call's own 2048 — so the round keeps
-                // its verdicts instead of losing all of them to a cap no retry of
-                // the batch can clear. This is also why the truncation flag is
-                // carried out of the retry loop at all.
+                // asking for N answers in one capped generation. `max_tokens` is
+                // pinned, so the same batch is cut off at the same point: the
+                // call is not retried at all (see `structured_call_with_retry`),
+                // and falling through to the per-test loop asks the same
+                // questions one at a time — each well inside the single call's
+                // own 2048 — so the round keeps its verdicts instead of losing
+                // all of them to a cap no retry of the batch can clear.
                 warn!(
                     tests = tests.len(),
                     error = %e,
                     "batched intent audit was CUT OFF at max_tokens — re-auditing the round one \
                      test per call"
                 );
-                return audit_tests_intent_per_test(
-                    cfg,
-                    issue_text,
-                    original_source,
-                    tests,
-                    grounded,
-                )
-                .await;
+                let (audited, relabels, records) =
+                    audit_tests_intent_per_test(cfg, issue_text, original_source, tests, grounded)
+                        .await;
+                return (audited, relabels, records, Some(BatchAuditTransport::TruncatedFallback));
             }
             Err(e) => {
                 // [VANTA-WHY] §14.5 — one failed batch call must not be one
@@ -1509,10 +1553,21 @@ pub async fn audit_tests_intent(
                     "batched intent audit unavailable — every test in the round takes the \
                      single-call failure path"
                 );
-                tests
-                    .iter()
-                    .map(|_| audit_unavailable_verdict(&e))
-                    .collect()
+                // Which of the two retried-and-failed shapes this is changes what
+                // a reader should do about it: a malformed answer is the model's,
+                // and the retries spent on it are the point of the retry budget;
+                // a transport failure is the machine's. `PARSE ERR` is the marker
+                // `structured_call_with_retry` puts on an attempt that reached
+                // the parser — i.e. the model DID answer, and the answer was
+                // wrong — so it is what separates them.
+                let transport = if e.to_string().contains(PARSE_FAILURE_PREFIX) {
+                    BatchAuditTransport::MalformedRetried
+                } else {
+                    BatchAuditTransport::Unavailable
+                };
+                let verdicts: Vec<IntentVerdict> =
+                    tests.iter().map(|_| audit_unavailable_verdict(&e)).collect();
+                (verdicts, transport)
             }
         };
 
@@ -1531,7 +1586,7 @@ pub async fn audit_tests_intent(
             records.push(record);
         }
     }
-    (audited, relabels, records)
+    (audited, relabels, records, Some(transport))
 }
 
 /// Audit a round one test per call — the unbatched path.

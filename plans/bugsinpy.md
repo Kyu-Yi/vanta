@@ -1726,12 +1726,21 @@ Contract:
   `batch_audit_max_tokens=` (the largest cap any round of the run was given; `unset` when the flag is
   off);
 - a reply the server itself reports as **cut off at the cap** (`finish_reason: "length"`) falls back
-  to **one audit call per test for that round**. The truncation is a fact about the *request* — N
-  answers in one capped generation — so re-sending the same batch cannot clear it, while the per-test
-  path asks the same questions one at a time, each well inside its own 2048, and the round keeps its
-  verdicts instead of losing every one of them to "audit unavailable". Only the **final** attempt's
-  `finish_reason` decides this; the retry budget is unchanged, so a truncation and a malformed answer
-  stay distinguishable in the log;
+  to **one audit call per test for that round**, after **one** batch call. The truncation is a fact
+  about the *request* — N answers in one capped generation — and `max_tokens` is pinned per call site,
+  so the same batch is cut off at the same point every time: the retries are deterministic, and on
+  local hardware each one is a full-length generation (up to the 16384 ceiling) spent to reach the
+  identical prefix. So a cut-off answer is **not retried at all** — it fails the call immediately —
+  and the per-test path takes over on the first attempt, asking the same questions one at a time,
+  each well inside its own 2048. The round keeps its verdicts instead of losing every one of them to
+  "audit unavailable";
+- a **malformed** answer that was *not* cut off keeps its retries: the model can answer that one
+  differently, which is what the retry budget is for. Because a cut-off batch now makes one call and
+  a malformed one makes the whole budget, the call count no longer says which happened, so the
+  session log says it outright: one `intent.audit_batch` record per round, written **only** when a
+  batched call was made, with `transport=` one of `batched`, `truncated_fallback`,
+  `malformed_retried`, `unavailable` (the batched call never produced an answer at all — a transport
+  error, or the deterministic context gate);
 - the flag is **off** by default precisely because the call schedule is part of a run's identity
   (§13), so a re-batched auditor is a different run, not a faster one.
 
@@ -1821,8 +1830,11 @@ One per rule and per new parse, plus the regression that matters most:
   missing/duplicate index fails the batch; a failed batch falls back to the unbatched failure shape;
 - the batched audit's **output cap** — one test's allowance per test in the round, clamped to the
   ceiling, recorded in `run.summary` — and the **truncation fallback**: a batch the server reports as
-  cut off at that cap (`finish_reason: "length"`) is re-audited one test per call, and that round's
-  verdicts and records are the unbatched run's, with no record saying the audit was unavailable;
+  cut off at that cap (`finish_reason: "length"`) is re-audited one test per call after **one** batch
+  call, not after the retry budget, and that round's verdicts and records are the unbatched run's,
+  with no record saying the audit was unavailable. Its mirror is the malformed batch, which is
+  asserted to **still** spend the whole retry budget, and each of the two is asserted to write its own
+  `transport=` value in the `intent.audit_batch` record;
 - `metrics.py`'s two new buckets and `label_for`'s new branch, and that the wave gate ignores a
   `NeedsReview` row;
 - `plans/bugsinpy_dev_split.json` loads under `load_split`; the only bug it shares with the

@@ -1044,15 +1044,42 @@ pub async fn run(
                 );
                 batch_audit_max_tokens = Some(batch_audit_max_tokens.map_or(cap, |m| m.max(cap)));
             }
-            let (attacker_tests, initial_relabels, initial_intent_checks) = audit_tests_intent(
-                &cfg,
-                &repo.issue_text,
-                &review_prompt_concat,
-                &generated_tests,
-                grounded_audit_enabled,
-                batch_audit_enabled,
-            )
-            .await;
+            let (attacker_tests, initial_relabels, initial_intent_checks, batch_audit_transport) =
+                audit_tests_intent(
+                    &cfg,
+                    &repo.issue_text,
+                    &review_prompt_concat,
+                    &generated_tests,
+                    grounded_audit_enabled,
+                    batch_audit_enabled,
+                )
+                .await;
+            // [VANTA-WHY] §14.5 — what the batched call DID, recorded once per
+            // round and only when such a call was made: `Some` here is exactly
+            // "a batched call happened", so the flag-off log is unchanged. A
+            // cut-off answer stops after one call and falls back to per-test
+            // audits; a malformed one spends the whole retry budget and then
+            // gives every test the single-call failure shape. The two used to be
+            // told apart by counting calls, which the fail-fast makes impossible,
+            // so the record says it outright.
+            if let Some(transport) = batch_audit_transport {
+                session_log.append(SessionRecord {
+                    session_id: session_id.clone(),
+                    schema_version: Some(SCHEMA_VERSION),
+                    patch_attempt_id: Some(patch_attempt_id.clone()),
+                    testing_iteration_id: Some(testing_iteration_id.clone()),
+                    test_id: None,
+                    phase: "intent.audit_batch".to_string(),
+                    summary: format!(
+                        "source=attacker.generate transport={} tests={}",
+                        transport.code(),
+                        generated_tests.len()
+                    ),
+                    timestamp: now_iso(),
+                    benchmark_instance: None,
+                    benchmark_label: None,
+                })?;
+            }
             let intent_scrapped = initial_intent_checks.iter().filter(|c| c.scrapped).count();
             println!(
                 "  ✔ Attacker: {} tests ({} generated, {} duplicate(s) dropped, {} scrapped by the intent check)",

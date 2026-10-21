@@ -1060,6 +1060,18 @@ const DETERMINISTIC_CONTEXT_PREFIX: &str = "Prompt would exceed model context";
 /// consumer does not have to re-spell the string.
 pub const TRUNCATED_OUTPUT_PREFIX: &str = "LLM response truncated at max_tokens";
 
+/// Marker `structured_call_with_retry` puts on an attempt that reached the
+/// PARSER and did not satisfy it.
+///
+/// [VANTA-WHY] §14.5 — this is the difference between "the model answered, and
+/// the answer was wrong" and "the model never answered" (a transport error, or a
+/// context gate that never sent a request). Both exhaust the same retry budget
+/// and produce the same final failure shape, and only one of them is the model's
+/// behaviour, so a reader — and the batched audit's log — has to be able to tell
+/// them apart. Public for the same reason as `TRUNCATED_OUTPUT_PREFIX`: so the
+/// consumer does not have to re-spell the string.
+pub const PARSE_FAILURE_PREFIX: &str = "PARSE ERR";
+
 /// Backoff before retry `attempt` (1-based): 500ms, 1s, 2s, 4s, 8s, 8s…
 ///
 /// [VANTA-WHY] A retry that starts the instant the previous connection dropped
@@ -1102,12 +1114,17 @@ where
     // at `max_tokens`. Kept so the FINAL failure can say so: every attempt that
     // ends this way parses as nothing and looks, from the parse error alone,
     // exactly like an answer the model got wrong. Only the server's own
-    // `finish_reason` separates the two, and only the last attempt describes the
-    // failure this function reports.
+    // `finish_reason` separates the two, and the two have opposite remedies —
+    // which is why a cut-off answer is not retried at all (below).
     let mut last_was_truncated = false;
+    // Attempts that actually reached the parse step, so the failure can report
+    // how many were spent rather than how many were allowed: a call that stops
+    // early (a cut-off answer) did not fail `max_attempts` times.
+    let mut attempts_made = 0_u32;
 
     for attempt in 1..=max_attempts {
         let messages = build_messages(attempt);
+        attempts_made = attempt;
         if attempt > 1 {
             warn!(attempt, max_attempts, "retrying structured call");
         }
@@ -1172,6 +1189,19 @@ where
                     "attempt {attempt} PARSE ERR: {}\n  model-preview: {preview}",
                     parse_err
                 ));
+                // [VANTA-WHY] §14.5 — a CUT-OFF answer is NOT retried. The cap
+                // that cut it off is a property of the request, and `max_tokens`
+                // is pinned per call site, so the same request is cut off at the
+                // same point: the retries are deterministic, and on local
+                // hardware each one is a full-length generation spent to reach
+                // the identical prefix. Failing here is what lets the callers
+                // that can ask a SMALLER question (the batched audit, one test
+                // per call) do it on the first attempt instead of the fourth.
+                // A malformed answer that was NOT cut off is a different fact —
+                // the model can answer it differently — so it keeps its retries.
+                if last_was_truncated {
+                    break;
+                }
                 if attempt < max_attempts {
                     back_off(attempt).await;
                 }
@@ -1180,7 +1210,8 @@ where
     }
 
     let mut message = format!(
-        "structured_call_with_retry all {} attempts FAILED. Last:\n{}",
+        "structured_call_with_retry {}/{} attempts FAILED. Last:\n{}",
+        attempts_made,
         max_attempts,
         last_err.as_deref().unwrap_or("(no details)")
     );
@@ -1193,7 +1224,8 @@ where
         message.push_str(&format!(
             "\n{TRUNCATED_OUTPUT_PREFIX}: the server stopped this answer at the request's \
              `max_tokens` cap, so the reply is a prefix of the intended one and could not be \
-             parsed. Re-sending the same request cannot fix that — ask for less, or raise the cap."
+             parsed. The call was NOT retried: `max_tokens` is pinned for this call site, so the \
+             same request is cut off at the same point every time. Ask for less, or raise the cap."
         ));
     }
     Err(message.into())

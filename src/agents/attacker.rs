@@ -767,6 +767,7 @@ Rules:
 - An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THIS test asserts, not for the issue in general.
 - A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
 - If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
+- For a BehaviorPreservation test, when the asserted input is one the issue does NOT ask to change, both answers are already fixed: "issue_requires_change": false (the issue requires no change there) and "issue_asks_for_behaviour": false (a clause that forbids a change never ASKS for the old result). Do not deliberate over whether a "must stay the same" clause counts as asking: it forbids, so both answers are false. Decide once and move on.
 
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
 {"issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "reason": "one short sentence"}"#;
@@ -803,6 +804,7 @@ Rules:
 - An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THIS test asserts, not for the issue in general.
 - A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
 - If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
+- For a BehaviorPreservation test, when the asserted input is one the issue does NOT ask to change, both answers are already fixed: "issue_requires_change": false (the issue requires no change there) and "issue_asks_for_behaviour": false (a clause that forbids a change never ASKS for the old result). Do not deliberate over whether a "must stay the same" clause counts as asking: it forbids, so both answers are false. Decide once and move on.
 
 3. "assertions_grounded": does this test assert ONLY behaviour the ISSUE describes, at the input the ISSUE names — or does it also pin a SPECIFIC VALUE the issue never states?
 
@@ -839,6 +841,7 @@ Rules:
 - An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THAT numbered test asserts, not for the issue in general.
 - A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
 - If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
+- For a BehaviorPreservation test, when the asserted input is one the issue does NOT ask to change, both answers are already fixed: "issue_requires_change": false (the issue requires no change there) and "issue_asks_for_behaviour": false (a clause that forbids a change never ASKS for the old result). Do not deliberate over whether a "must stay the same" clause counts as asking: it forbids, so both answers are false. Decide once and move on.
 - Answer EVERY numbered test exactly once and no test that was not given to you. "index" is the number printed above that test.
 
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
@@ -865,6 +868,7 @@ Rules:
 - An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THAT numbered test asserts, not for the issue in general.
 - A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
 - If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
+- For a BehaviorPreservation test, when the asserted input is one the issue does NOT ask to change, both answers are already fixed: "issue_requires_change": false (the issue requires no change there) and "issue_asks_for_behaviour": false (a clause that forbids a change never ASKS for the old result). Do not deliberate over whether a "must stay the same" clause counts as asking: it forbids, so both answers are false. Decide once and move on.
 - Answer EVERY numbered test exactly once and no test that was not given to you. "index" is the number printed above that test.
 
 3. "assertions_grounded": does that test assert ONLY behaviour the ISSUE describes, at the input the ISSUE names — or does it also pin a SPECIFIC VALUE the issue never states?
@@ -2670,6 +2674,78 @@ mod tests {
                 false
             ),
             IntentRouting::DemoteToPreservation
+        );
+    }
+
+    /// [VANTA-WHY] A19 (§14.10) — the auditor's Q1 for a preservation test. The
+    /// post-fix coding run (toy, Ornith-1.5, 12 runs, all verdicts correct, 0
+    /// Attacker truncations) shows the auditor burning its budget debating whether
+    /// the issue's "without changing the existing behavior at the other
+    /// thresholds" counts as the issue ASKING for the original result at 0/999/1002:
+    /// the question is quoted 17x, "Preserving existing behaviour is always a valid
+    /// answer" 23x, "FORBIDS the change; it never authorises it" 18x.
+    ///
+    /// The routing does not depend on that answer. For a BehaviorPreservation test
+    /// Q1 is consulted only when `issue_requires_change == Some(true)`, and a
+    /// "must not change" input is exactly one the issue requires no change at. So
+    /// the prompt fixes both answers to false and forbids the deliberation.
+    ///
+    /// The value chosen is `issue_asks_for_behaviour: false` — what the
+    /// "forbids, never authorises" rule already implies, and what
+    /// `audit_unavailable_verdict` defaults to. Both values leave routing identical
+    /// here (pinned below), so the choice is which one cannot manufacture a
+    /// relabel: when `requires_change` is mis-answered `Some(true)`, `asks = false`
+    /// SCRAPS and `asks = true` PROMOTES, and a promotion is a relabel.
+    #[test]
+    fn the_prompt_fixes_q1_for_a_preservation_test_the_issue_does_not_ask_to_change() {
+        for prompt in [
+            INTENT_AUDITOR_SYSTEM_PROMPT,
+            INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED,
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT,
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED,
+        ] {
+            assert!(
+                prompt.contains("when the asserted input is one the issue does NOT ask to change"),
+                "every auditor prompt must fix both answers for a preservation input the issue \
+                 does not ask to change"
+            );
+            assert!(
+                prompt.contains("a clause that forbids a change never ASKS for the old result"),
+                "the fixed answer must be justified by the forbids-never-authorises rule"
+            );
+            assert!(
+                prompt.contains("Decide once and move on"),
+                "the rule must forbid the deliberation the run showed"
+            );
+        }
+
+        // The routing the fixed answer must not move: with the issue requiring no
+        // change at the asserted input, a preservation test keeps whether the model
+        // would have answered Q1 true or false.
+        for asks in [false, true] {
+            let v = IntentVerdict {
+                issue_asks_for_behaviour: asks,
+                issue_requires_change: Some(false),
+                assertions_grounded: None,
+                reason: "the issue does not ask for a change here".to_string(),
+            };
+            assert_eq!(
+                route_intent(&TestIntent::BehaviorPreservation, &v, false),
+                IntentRouting::Keep,
+                "a preservation test at an input the issue does not ask to change must keep \
+                 (asks={asks})"
+            );
+        }
+        // ...and no answer to Q2 at all (the resolved-unknown case) keeps too.
+        let unknown = IntentVerdict {
+            issue_asks_for_behaviour: false,
+            issue_requires_change: None,
+            assertions_grounded: None,
+            reason: "resolved".to_string(),
+        };
+        assert_eq!(
+            route_intent(&TestIntent::BehaviorPreservation, &unknown, false),
+            IntentRouting::Keep
         );
     }
 

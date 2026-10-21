@@ -412,12 +412,50 @@ and `decorator` exist only in `setup.sh` at bug 3. One source alone under-provis
 
 1. the BugsInPy `requirements.txt` for the bug;
 2. the `pip install …` lines of the BugsInPy `setup.sh` (parsed, measured — never guessed);
-3. the project's own declared **test** requirements (`test_requirements.txt`, `tests_require`, or a
-   `tests` extra in `setup.py`);
-4. `install_requires`, read **statically** from `setup.py` (an AST walk, plus the file it names —
-   PySnooper/1–2 read `requirements.in`, PySnooper/3 `requirements.txt`);
+3. the project's own declared **test** requirements (`test_requirements.txt`, `tests_require`, a
+   `tests` extra in `setup.py`, or a test extra in `pyproject.toml`);
+4. the project's own runtime dependencies, read **statically** from `setup.py` (`install_requires`,
+   an AST walk, plus the file it names — PySnooper/1–2 read `requirements.in`, PySnooper/3
+   `requirements.txt`) **or** from `pyproject.toml` (PEP 621 / flit / poetry — see below);
 5. the test side's **import closure** — the third-party top-level modules the test-side files
    themselves import (`bake.test_import_closure`).
+
+**`setup.py` or `pyproject.toml` — whichever the commit actually carries.** Packaging moved, and a
+bug's dependencies are wherever its own metadata put them, so sources 3 and 4 are read from
+`setup.py` *or* `pyproject.toml` at each commit, never assumed from one file. `fastapi/1`
+(`766157bf`) is the measured case: it is a **flit** project with no `setup.py` at all, so reading
+`setup.py` alone refused the bug at `bake` before `prepare` ever ran. The reader (`bake.pyproject_refs`)
+covers three spellings, exactly as written, parsed — never executed:
+
+- **PEP 621** `[project] dependencies` and `[project.optional-dependencies]` (the standard);
+- **flit** `[tool.flit.metadata] requires` and `[tool.flit.metadata.requires-extra]` (fastapi's shape:
+  `requires = ["starlette ==0.13.2", "pydantic >=0.32.2,<2.0.0"]`, `requires-extra.test`, `.doc`,
+  `.dev`, `.all`);
+- **poetry** `[tool.poetry.dependencies]`, when present (`python` itself is skipped — it names the
+  interpreter, not a distribution).
+
+A **test extra** — a key named `test`, `testing`, `dev`, or `all` — counts as a declared test
+requirement the same way `setup.py`'s `tests` extra does, and **every extra that was taken is
+recorded** (`DepRef.source` names the extra, e.g. `extras_require['test'] (pyproject.toml)`), so the
+record says which table the requirement came from rather than only that it was declared. The
+resulting refs go through the same rules as `setup.py`: stamped with the commit they were read from,
+read at **both** commits, unioned, and each held to its own commit's date. `import_name` is read the
+same way — from `[project].name`, `[tool.flit.metadata].module`/`name`, or `[tool.poetry].name`, with
+the same dashes→underscores canonicalisation — because a flit project has no `setup.py` to name the
+package. A commit that has **neither** `setup.py` nor a readable `pyproject.toml` keeps today's
+refusal, per bug; an unparseable `pyproject.toml` is a refusal too, never a silent empty read.
+
+**A refusal is one bug's, never the batch's.** `bake` and `prepare` both read the metadata per bug, so
+a bug whose dependencies cannot be read is recorded as **flagged** with the reason, the rest of the
+split carries on, and the flagged bugs are printed as a list at the end of the run — the same shape
+`prepare` already uses for a bug whose `prepare_one` raised (`prepare.json`'s `breaks`). The one bug
+that stops everything is one the *harness* cannot proceed on at all (a missing checkpoint, a moved
+BugsInPy clone), and that is exit code 2. A flagged-unreadable bug is **not** either of the two §14.7
+gates — the §1.6 context gate and the §8.2 dev-fix self-check — so it never silently promotes a
+reserve: the flagged list is printed **separately** from the gate results, and promoting a reserve to
+replace a flagged bug is a decision taken by hand (amend the split, §8), not by the harness. This is
+also measured: `fastapi/1`'s refusal stopped a whole dev-split bake before a single other bug was
+resolved.
 
 Sources 3 and 4 are read at **both commits**, and source 5 at the **fixed** one. That is the graded
 tree (§1.2) rather than a preference: the source under test is the buggy commit's and the test side is

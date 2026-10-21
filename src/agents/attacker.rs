@@ -146,7 +146,7 @@ pub struct AttackerTestCase {
 // INTENT_AUDITOR_SYSTEM_PROMPT already is. A rule that lives only in a local
 // `let` can be dropped in a refactor with no test to notice; the version tag at
 // the top of this file is only meaningful if the text it names is pinned too.
-pub const ATTACKER_SYSTEM_PROMPT: &str = r#"You are Vanta Attacker. Given a patch, write adversarial tests designed to BREAK it. Each test MUST declare an intent. Keep reasoning SHORT (under 100 words) — save output budget for the JSON answer.
+pub const ATTACKER_SYSTEM_PROMPT: &str = r#"You are Vanta Attacker. Given a patch, write adversarial tests designed to BREAK it. Each test MUST declare an intent. Save output budget for the JSON answer.
 
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
 
@@ -2210,6 +2210,28 @@ mod tests {
                 .contains("ORIGINAL source. If the behaviour you want to check uses a symbol the patch ADDS")
                 && ATTACKER_SYSTEM_PROMPT.contains("That source may be an excerpt (see IMPORT RULES)"),
             "the INTENT-vs-API rule must read the excerpt as unknown rather than absent"
+        );
+    }
+
+    /// [VANTA-WHY] A18 (§14.10) — the prompt opened by telling the Attacker to
+    /// "Keep reasoning SHORT (under 100 words)". A thinking model cannot obey
+    /// that: its reasoning is generated before the answer is written, against a
+    /// token budget the prompt does not set, and the instruction can only be read
+    /// as a limit on the answer that follows (Ornith reasoned ~30k tokens before
+    /// any JSON appeared). The rule therefore did nothing except invite the model
+    /// to truncate its answer to satisfy a word count, which reads to the caller
+    /// as a cut-off reply. Keep the budget advice, drop the count.
+    #[test]
+    fn the_prompt_does_not_demand_a_word_count_a_thinking_model_cannot_keep() {
+        assert!(
+            !ATTACKER_SYSTEM_PROMPT.contains("under 100 words")
+                && !ATTACKER_SYSTEM_PROMPT.contains("Keep reasoning SHORT"),
+            "no word count on reasoning: a thinking model reasons before the answer and \
+             cannot budget it here, and a model that tries will cut its own JSON short"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("Save output budget for the JSON answer"),
+            "the budget advice must survive the removal of the count"
         );
     }
 

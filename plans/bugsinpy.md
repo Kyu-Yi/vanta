@@ -432,11 +432,17 @@ covers three spellings, exactly as written, parsed — never executed:
   `requires = ["starlette ==0.13.2", "pydantic >=0.32.2,<2.0.0"]`, `requires-extra.test`, `.doc`,
   `.dev`, `.all`);
 - **poetry** `[tool.poetry.dependencies]`, when present (`python` itself is skipped — it names the
-  interpreter, not a distribution).
+  interpreter, not a distribution). Poetry's constraint syntax is not PEP 440 — `^2.22` is a caret
+  range, `~1.4` a tilde range, `1.4.*` a wildcard — and translating a caret range would mean
+  reimplementing poetry's resolver here, so only the spellings that can be read *exactly* are taken
+  (a bare version, whose poetry meaning is `==`; a PEP 440 specifier written as such; `*` as no
+  constraint) and the rest are **recorded and skipped**, never guessed at.
 
 A **test extra** — a key named `test`, `testing`, `dev`, or `all` — counts as a declared test
 requirement the same way `setup.py`'s `tests` extra does, and **every extra that was taken is
-recorded** (`DepRef.source` names the extra, e.g. `extras_require['test'] (pyproject.toml)`), so the
+recorded** (`DepRef.source` names the table *and* the extra, e.g.
+`project.optional-dependencies['test'] (pyproject.toml)` or
+`tool.flit.metadata.requires-extra['test'] (pyproject.toml)`), so the
 record says which table the requirement came from rather than only that it was declared. The
 resulting refs go through the same rules as `setup.py`: stamped with the commit they were read from,
 read at **both** commits, unioned, and each held to its own commit's date. `import_name` is read the

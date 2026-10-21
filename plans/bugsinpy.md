@@ -1465,3 +1465,35 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
   reported alongside (§9.3).
 - Seeds do not guarantee reproducibility (§4.3), and the pilot runs a single seed (§8.3), so every
   pilot rate is one sample per (bug, config).
+- **Two harness bugs were found while gating wave 1 and were fixed before the reported runs; every
+  reported result uses the fixed harness.** One was in how a candidate's reproduction tests are
+  graded (the BATE path); the other was in the Diagnostician's failure-location step, which read
+  pytest's warnings summary as the failure site and demoted any failure whose innermost frame was not
+  in a file the patch touched to a test defect — so the BugReproduction counterexamples that argued
+  for rejection were discarded, and PySnooper/3's no-op was approved. Repairing a scorer mid-study is
+  legitimate provided the before/after is disclosed and the affected rows are re-run on the fixed
+  harness, which is what the wave-1 re-run and §11 step 9 are for; the rows a broken grader produced
+  are not reported. Neither fix touches the verdict rule, ECR/EIR or sampling. Recording the two
+  graders as defects is also the honest reading of the gate: finding them is what the gate is for
+  (§8.2), and both were found by running on BugsInPy rather than by inspection.
+
+---
+
+## 13. Future work (not in this pilot)
+
+- **Batch the intent audits.** In the first full wave-1 run `intent_audit` was **60 of 88** LLM calls
+  (the rest: `creator` 6, `attacker_generate` 19, `attacker_revise` 3), so auditing each generated
+  test on its own dominates the cost of a round. Auditing a round's intents in one call — one prompt
+  carrying every generated test and its claimed intent, one decision returned per test — keeps the
+  per-test decision while cutting the call count, and is the next speed item. It is not done here
+  because it changes the auditor's call schedule, and the schedule is part of the run identity
+  (§4.3): a re-batched auditor is a different run, not a faster one.
+- **Real issue text from the upstream issue a bug cites.** Vanta's issue text is *derived from the fix
+  commit* (§2.3), and for PySnooper/2 the derived text was `Support single tuple to , fix #144` plus a
+  single generic sentence — too thin for the Attacker to write even one reproduction test, which is
+  why that bug's no-op was approved with no BugReproduction evidence at all. (`fix #144` names a real
+  GitHub issue.) Fetching the cited issue's own body — the issue, not the pull request that closed it
+  — and passing it through the same leak gate (§2.2, rule A) would give Vanta independently written,
+  realistic bug reports, which is the SWE-bench convention. It is future work rather than part of this
+  pilot because it changes what the model is given: the pilot's issue text has to stay the derived one
+  for its numbers to be comparable to the §8.2 gate.

@@ -765,7 +765,7 @@ Rules for question 3:
 - Ungrounded: an assertion that pins wording, an exact output string, an exact message, a format or a number the issue never mentions ("the output CONTAINS 'Starting var'", "the repr is exactly ...", "the log line begins with a timestamp").
 - The issue is the only source of requirements. "It should not raise NameError" is grounded; "it should print exactly this string" is grounded only if the issue prints that string.
 - A test may assert more than the issue asks about ONLY when the extra assertion is a direct consequence of what the issue requires. Invented specifics are ungrounded.
-- Answer this for every test you are given, whatever its declared intent.
+- Answer question 3 for the test you are given, whatever its declared intent.
 
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
 {"issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "assertions_grounded": true|false, "reason": "one short sentence"}"#;
@@ -828,7 +828,7 @@ Rules for question 3:
 - Ungrounded: an assertion that pins wording, an exact output string, an exact message, a format or a number the issue never mentions ("the output CONTAINS 'Starting var'", "the repr is exactly ...", "the log line begins with a timestamp").
 - The issue is the only source of requirements. "It should not raise NameError" is grounded; "it should print exactly this string" is grounded only if the issue prints that string.
 - A test may assert more than the issue asks about ONLY when the extra assertion is a direct consequence of what the issue requires. Invented specifics are ungrounded.
-- Answer this for every test you are given, whatever its declared intent.
+- Answer question 3 for EACH numbered test, whatever its declared intent.
 
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
 {"tests": [{"index": 1, "issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "assertions_grounded": true|false, "reason": "one short sentence"}]}"#;
@@ -2423,6 +2423,39 @@ mod tests {
         assert_eq!(
             intent_auditor_system_prompt(true),
             INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED
+        );
+    }
+
+    /// [VANTA-WHY] A7 (§14.10) — the closing line of the grounding rules was
+    /// written as if the auditor had been handed several tests ("every test you
+    /// are given"), in a prompt whose own first line says it is given ONE test,
+    /// and it never named WHICH question it was closing. Read literally it asked
+    /// for answers to a question about tests that were not in the message. Name
+    /// question 3 and the test it belongs to.
+    #[test]
+    fn the_grounding_rule_names_the_question_and_the_test_it_closes() {
+        for prompt in [
+            INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED,
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED,
+        ] {
+            assert!(
+                !prompt.contains("Answer this for every test you are given"),
+                "the grounding rule may not address 'every test you are given': in the \
+                 one-test prompt there is no such set, and in the batch prompt 'this' \
+                 names no question"
+            );
+            assert!(
+                prompt.contains("Answer question 3 for"),
+                "the closing grounding rule must name the question it closes"
+            );
+        }
+        assert!(
+            INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED.contains("for the test you are given"),
+            "the one-test prompt must speak about the single test it was given"
+        );
+        assert!(
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED.contains("for EACH numbered test"),
+            "the batch prompt must speak about each numbered test"
         );
     }
 

@@ -280,12 +280,13 @@ pub async fn attacker_generate_tests(
         messages
     };
 
-    let extras = json!({
-        "response_format": {"type": "json_object"},
-        "temperature": 0.2,
-        "max_tokens": 32768,
-        "reasoning_effort": "low",
-    });
+    let extras = crate::llm::with_sampling(
+        json!({
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": "low",
+        }),
+        "attacker_generate",
+    );
 
     let parse_closure = |raw: &str| -> Result<AttackerResponse, String> {
         let cleaned = extract_json_candidate(raw).map_err(|e| format!("{e}"))?;
@@ -383,12 +384,13 @@ If you cannot make the test match its intent, change the intent to match the tes
         messages
     };
 
-    let extras = json!({
-        "response_format": {"type": "json_object"},
-        "temperature": 0.3,
-        "max_tokens": 32768,
-        "reasoning_effort": "low",
-    });
+    let extras = crate::llm::with_sampling(
+        json!({
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": "low",
+        }),
+        "attacker_revise",
+    );
 
     let parse_closure = |raw: &str| -> Result<GeneratedTest, String> {
         let cleaned = extract_json_candidate(raw).map_err(|e| format!("{e}"))?;
@@ -467,12 +469,13 @@ Do NOT import constants or symbols that only exist in the PATCHED code."#;
         messages
     };
 
-    let extras = json!({
-        "response_format": {"type": "json_object"},
-        "temperature": 0.3,
-        "max_tokens": 32768,
-        "reasoning_effort": "low",
-    });
+    let extras = crate::llm::with_sampling(
+        json!({
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": "low",
+        }),
+        "attacker_simplify",
+    );
 
     let parse_closure = |raw: &str| -> Result<GeneratedTest, String> {
         let cleaned = extract_json_candidate(raw).map_err(|e| format!("{e}"))?;

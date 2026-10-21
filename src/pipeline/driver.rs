@@ -244,7 +244,7 @@ fn truncation_counts(calls: &[crate::llm::CallUsage]) -> (u64, u64, u64) {
     counts
 }
 
-/// Render the pinned per-call-site sampling schedule as `run.summary` keys.
+/// Render the run's EFFECTIVE per-call-site sampling as `run.summary` keys.
 ///
 /// [VANTA-WHY] Underscores, not dots. `rerun.rs::summary_field` and
 /// `scripts/metrics.py::summary_field` both accept a key only if it matches
@@ -253,14 +253,23 @@ fn truncation_counts(calls: &[crate::llm::CallUsage]) -> (u64, u64, u64) {
 /// rest of the line, and BOTH consumers would silently read the wrong thing.
 /// `{v:?}` for the float so `0.0` stays `0.0` and the record matches the
 /// request body byte for byte.
+///
+/// [VANTA-WHY] §14.11 — the record is the EFFECTIVE schedule, not the static
+/// `pinned` table: under `VANTA_SAMPLING=coding` the generative sites sample at
+/// 0.6 with `top_p`/`top_k`/`min_p`/`presence_penalty` pinned, and a summary that
+/// still said 0.1 would describe a run nobody made. The preset names itself
+/// first, and the per-role keys come from `llm::sampling_pins_text`, the same
+/// table the request bodies are built from, so the record cannot drift from the
+/// sampling that actually happened.
 fn sampling_schedule_keys() -> String {
-    crate::llm::SAMPLING_SCHEDULE
-        .iter()
-        .map(|(site, temperature, max_tokens)| {
-            format!("temperature_{site}={temperature:?} max_tokens_{site}={max_tokens}")
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let preset = crate::llm::sampling_preset();
+    let mut keys = vec![format!("sampling_preset={}", preset.name())];
+    for (site, _, _) in crate::llm::SAMPLING_SCHEDULE {
+        for (key, value) in crate::llm::sampling_pins_text(preset, site) {
+            keys.push(format!("{key}_{site}={value}"));
+        }
+    }
+    keys.join(" ")
 }
 
 /// Read the server's own `top_p` default for the provenance block.
@@ -2262,12 +2271,15 @@ pub async fn run(
     // revise/simplify) and 0.0 (Intent Auditor). Those pins are part of v0.2's
     // behaviour; the harness must never override them, only record them.
     // `SAMPLING_SCHEDULE` names them (underscore keys — see its `[VANTA-WHY]`),
-    // and `m3_session_log.rs` asserts the table equals the `temperature` /
-    // `max_tokens` actually present in the request bodies. `top_p` is the ONE
-    // parameter no call site pins, so its value is the SERVER's own default read
-    // from `/props`. `seed` is what the HARNESS asked for. `unset` means the
-    // server did not publish the key — never a plausible-looking default, which
-    // would be a fabricated claim about a sampler nobody pinned.
+    // and `m3_session_log.rs` asserts the schedule equals the `temperature` /
+    // `max_tokens` actually present in the request bodies. `top_p` is not pinned
+    // by any call site under the default preset, so its value is the SERVER's own
+    // default read from `/props` — unless `VANTA_SAMPLING=coding` (§14.11) pins
+    // it on the generative sites, in which case those pins appear per role as
+    // `top_p_<site>` and the `/props` value states only what the auditor
+    // inherits. `seed` is what the HARNESS asked for. `unset` means the server
+    // did not publish the key — never a plausible-looking default, which would be
+    // a fabricated claim about a sampler nobody pinned.
     let config_name = benchmark_config_name(attacker_enabled, planner_enabled);
     let top_p_value = sampling_value(server_top_p_for_provenance(&cfg).await);
     let seed_value = cfg

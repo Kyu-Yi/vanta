@@ -29,7 +29,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 use tracing::{debug, info, trace, warn};
@@ -410,13 +410,16 @@ async fn probe_server_context_window(client: &reqwest::Client, cfg: &LlmConfig) 
 /// near-deterministic at 0.1, generation is 0.2, revision is 0.3). So the record
 /// is per call site, and this table is it.
 ///
-/// [VANTA-WHY] These are part of v0.2's behaviour — the sampling the collected
-/// baseline ran under — so they are NOT configurable and no env var may override
-/// them; moving them would move the control the pilot is measured against. The
-/// values are duplicated at the call sites rather than read from this table on
-/// purpose: `tests/m3_session_log.rs::the_recorded_sampling_schedule_matches_the_request_bodies`
-/// compares this table against the bodies actually sent, which is the guard
-/// against the two copies drifting.
+/// [VANTA-WHY] This table is the `pinned` preset — part of v0.2's behaviour, the
+/// sampling the collected baseline ran under — and it is the DEFAULT:
+/// `VANTA_SAMPLING` unset (or `pinned`) gives exactly these values at every call
+/// site, byte for byte. `VANTA_SAMPLING=coding` (§14.11) overrides the sampler
+/// pins of the four GENERATIVE sites only; the auditor's row is never overridden,
+/// because the audit is a judgement rather than a generation. The values reach the
+/// request bodies through [`with_sampling`], and
+/// `tests/m3_session_log.rs::the_recorded_sampling_schedule_matches_the_request_bodies`
+/// compares the EFFECTIVE schedule against the bodies actually sent, which is the
+/// guard against a call site and this table drifting apart.
 pub const SAMPLING_SCHEDULE: &[(&str, f64, u32)] = &[
     ("creator", 0.1, 32768),
     ("attacker_generate", 0.2, 32768),
@@ -425,8 +428,157 @@ pub const SAMPLING_SCHEDULE: &[(&str, f64, u32)] = &[
     ("intent_audit", 0.0, 2048),
 ];
 
-/// The server's own `top_p` default — the sampler parameter NO call site pins,
-/// so every request inherits whatever the server is configured with.
+/// The `coding` preset's sampler pins, for the GENERATIVE roles only (§14.11).
+///
+/// [VANTA-WHY] One temperature / top_p / top_k / min_p / presence_penalty set,
+/// not a second schedule: the preset changes HOW the generators sample, not how
+/// many tokens they may emit (`max_tokens` stays the `pinned` row's). The
+/// auditor is deliberately absent — it keeps `pinned`'s row under both presets,
+/// because a noisier auditor is not a fix for a noisier Attacker.
+const CODING_TEMPERATURE: f64 = 0.6;
+const CODING_TOP_P: f64 = 0.95;
+const CODING_TOP_K: u32 = 20;
+const CODING_MIN_P: f64 = 0.0;
+const CODING_PRESENCE_PENALTY: f64 = 0.0;
+
+/// The sampling preset a run is under (`VANTA_SAMPLING`, §14.11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplingPreset {
+    /// Today's per-site schedule — the default, byte-identical to v0.2.
+    Pinned,
+    /// Higher-temperature sampling for the generative roles.
+    Coding,
+}
+
+impl SamplingPreset {
+    /// Parse `VANTA_SAMPLING`. `None` (unset) is the default, `Pinned`.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("pinned") => Ok(Self::Pinned),
+            Some("coding") => Ok(Self::Coding),
+            Some(other) => Err(format!(
+                "CONFIG_ERROR: VANTA_SAMPLING='{other}' is not a preset (expected pinned|coding)."
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pinned => "pinned",
+            Self::Coding => "coding",
+        }
+    }
+}
+
+/// The preset this process runs under, read from `VANTA_SAMPLING` once.
+///
+/// [VANTA-WHY] Read once, like the other run-identity switches: a call site late
+/// in a run must not be able to disagree with the one that built the earlier
+/// request bodies. An unparsable value is reported and falls back to `Pinned`
+/// rather than failing a generation mid-flight — the effective preset is written
+/// into `run.summary`, so a run that fell back says so.
+pub fn sampling_preset() -> SamplingPreset {
+    static PRESET: OnceLock<SamplingPreset> = OnceLock::new();
+    *PRESET.get_or_init(|| {
+        let raw = std::env::var("VANTA_SAMPLING").ok();
+        match SamplingPreset::parse(raw.as_deref()) {
+            Ok(preset) => preset,
+            Err(e) => {
+                warn!("{e} — falling back to `pinned`");
+                SamplingPreset::Pinned
+            }
+        }
+    })
+}
+
+/// One pinned sampler key's value, typed so it renders the same way a request
+/// body carries it (`0.0` stays `0.0`).
+#[derive(Debug, Clone, Copy)]
+enum PinValue {
+    Float(f64),
+    Int(u32),
+}
+
+/// The sampler keys `site` pins under `preset`, in a fixed order.
+///
+/// [VANTA-WHY] One table feeds both the request body ([`with_sampling`]) and the
+/// `run.summary` record (`driver::sampling_schedule_keys`) through the two
+/// renderers below, so the number a session records cannot drift from the number
+/// its bodies carried.
+fn sampling_pin_table(preset: SamplingPreset, site: &str) -> Vec<(&'static str, PinValue)> {
+    let (temperature, max_tokens) = SAMPLING_SCHEDULE
+        .iter()
+        .find(|(name, ..)| *name == site)
+        .map(|(_, temperature, max_tokens)| (*temperature, *max_tokens))
+        .unwrap_or_else(|| panic!("`{site}` is not a site in SAMPLING_SCHEDULE"));
+
+    let mut pins = vec![
+        ("temperature", PinValue::Float(temperature)),
+        ("max_tokens", PinValue::Int(max_tokens)),
+    ];
+    if preset == SamplingPreset::Coding && site != "intent_audit" {
+        pins[0] = ("temperature", PinValue::Float(CODING_TEMPERATURE));
+        pins.push(("top_p", PinValue::Float(CODING_TOP_P)));
+        pins.push(("top_k", PinValue::Int(CODING_TOP_K)));
+        pins.push(("min_p", PinValue::Float(CODING_MIN_P)));
+        pins.push(("presence_penalty", PinValue::Float(CODING_PRESENCE_PENALTY)));
+    }
+    pins
+}
+
+/// The pins as a JSON object, for a request body.
+fn sampling_pins_json(preset: SamplingPreset, site: &str) -> Value {
+    let mut object = serde_json::Map::new();
+    for (key, value) in sampling_pin_table(preset, site) {
+        let rendered = match value {
+            PinValue::Float(v) => json!(v),
+            PinValue::Int(v) => json!(v),
+        };
+        object.insert(key.to_string(), rendered);
+    }
+    Value::Object(object)
+}
+
+/// The same pins as `key=value` pairs for `run.summary`, values rendered exactly
+/// as a body carries them.
+pub fn sampling_pins_text(preset: SamplingPreset, site: &str) -> Vec<(&'static str, String)> {
+    sampling_pin_table(preset, site)
+        .into_iter()
+        .map(|(key, value)| {
+            let text = match value {
+                PinValue::Float(v) => format!("{v:?}"),
+                PinValue::Int(v) => v.to_string(),
+            };
+            (key, text)
+        })
+        .collect()
+}
+
+/// Merge the active preset's sampler pins for `site` into a call site's extras
+/// (§14.11).
+///
+/// [VANTA-WHY] Each call site keeps its own `response_format` /
+/// `reasoning_effort`; only the sampler keys are applied here, so the preset
+/// cannot drift between sites. Under `pinned` (the default) this inserts exactly
+/// the `temperature` / `max_tokens` the call site used to hard-code, so a default
+/// run's request bodies are unchanged. A `coding` run additionally pins `top_p` /
+/// `top_k` / `min_p` / `presence_penalty` on the generative sites.
+pub fn with_sampling(mut extras: Value, site: &str) -> Value {
+    let pins = sampling_pins_json(sampling_preset(), site);
+    let object = extras
+        .as_object_mut()
+        .expect("call-site extras are always a JSON object");
+    if let Value::Object(pins) = pins {
+        for (key, value) in pins {
+            object.insert(key, value);
+        }
+    }
+    extras
+}
+
+/// The server's own `top_p` default — the sampler parameter no call site pins
+/// under the `pinned` preset, so every request inherits whatever the server is
+/// configured with.
 ///
 /// [VANTA-WHY] This is the one value `run.summary` really does have to read from
 /// `/props` (§4.3): `temperature` and `max_tokens` are pinned per call (see
@@ -436,6 +588,12 @@ pub const SAMPLING_SCHEDULE: &[(&str, f64, u32)] = &[
 /// than replaced by a plausible default, because a fabricated sampler value in
 /// the provenance block is precisely the kind of claim this project exists to
 /// avoid.
+///
+/// [VANTA-WHY] §14.11 — under `VANTA_SAMPLING=coding` the GENERATIVE sites pin
+/// `top_p` themselves, so this server value describes only what the intent
+/// auditor (which never pins `top_p`) inherits. The generative sites' pinned
+/// values are recorded per role as `top_p_<site>`, so both facts are in the
+/// record and neither is a claim about a call it does not describe.
 pub async fn server_top_p_default(client: &reqwest::Client, cfg: &LlmConfig) -> Option<f64> {
     let body = fetch_props(client, cfg).await?;
     body["default_generation_settings"]["top_p"].as_f64()

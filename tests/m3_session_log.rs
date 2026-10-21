@@ -4566,20 +4566,31 @@ fn body_without_seed(body: &str) -> serde_json::Value {
 /// every pinned site must appear even if this run never reached it; and wherever
 /// a body WAS sent, its numbers must equal the recorded ones — otherwise the
 /// provenance block describes a run that did not happen.
-fn assert_schedule_matches_bodies(workspace: &Path, server: &StubLlmServer) -> Vec<String> {
+fn assert_schedule_matches_bodies(
+    workspace: &Path,
+    server: &StubLlmServer,
+    preset: vanta::llm::SamplingPreset,
+) -> Vec<String> {
     let summary = run_summary(workspace).summary;
 
-    for (site, temperature, max_tokens) in vanta::llm::SAMPLING_SCHEDULE {
-        assert_eq!(
-            summary_value(&summary, &format!("temperature_{site}")),
-            format!("{temperature:?}"),
-            "run.summary must record the pinned temperature for `{site}`"
-        );
-        assert_eq!(
-            summary_value(&summary, &format!("max_tokens_{site}")),
-            max_tokens.to_string(),
-            "run.summary must record the pinned max_tokens for `{site}`"
-        );
+    // [VANTA-WHY] §14.11: the record is the EFFECTIVE schedule for the active
+    // preset, and `sampling_pins_text` is the SAME table `with_sampling` builds
+    // the request bodies from — so a site that forgot a pin, or a preset that
+    // stopped pinning one, surfaces here as a missing key rather than as a
+    // silently different sampling.
+    assert_eq!(
+        summary_value(&summary, "sampling_preset"),
+        preset.name(),
+        "run.summary must name the active sampling preset (§14.11)"
+    );
+    for (site, ..) in vanta::llm::SAMPLING_SCHEDULE {
+        for (key, value) in vanta::llm::sampling_pins_text(preset, site) {
+            assert_eq!(
+                summary_value(&summary, &format!("{key}_{site}")),
+                value,
+                "run.summary must record the pinned `{key}` for `{site}`"
+            );
+        }
     }
 
     let kinds = server.request_kinds();
@@ -4595,14 +4606,6 @@ fn assert_schedule_matches_bodies(workspace: &Path, server: &StubLlmServer) -> V
             .unwrap_or_else(|| panic!("stub saw an unmapped request kind `{kind}`"));
         let value: serde_json::Value = serde_json::from_str(body)
             .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
-        let body_temperature = value
-            .get("temperature")
-            .and_then(|v| v.as_f64())
-            .unwrap_or_else(|| panic!("the `{kind}` body carries no temperature: {body}"));
-        let body_max_tokens = value
-            .get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or_else(|| panic!("the `{kind}` body carries no max_tokens: {body}"));
         // [VANTA-WHY] Token accounting reads the server's own counts, and a
         // STREAMED response only carries a `usage` block when the request asks
         // for one — this key is the ask. Without it every recorded cost falls
@@ -4618,16 +4621,25 @@ fn assert_schedule_matches_bodies(workspace: &Path, server: &StubLlmServer) -> V
             Some(true),
             "the `{kind}` body must ask for the usage block (`stream_options.include_usage`): {body}"
         );
-        assert_eq!(
-            summary_value(&summary, &format!("temperature_{site}")),
-            format!("{body_temperature:?}"),
-            "the recorded schedule disagrees with the `{kind}` body actually sent"
-        );
-        assert_eq!(
-            summary_value(&summary, &format!("max_tokens_{site}")),
-            body_max_tokens.to_string(),
-            "the recorded schedule disagrees with the `{kind}` body actually sent"
-        );
+        // Every pin the preset gives this site must be BOTH recorded and
+        // actually carried by the body — the recorded schedule is the effective
+        // one, so a missing body key is a call site that forgot `with_sampling`.
+        for (key, expected) in vanta::llm::sampling_pins_text(preset, site) {
+            let actual = value
+                .get(key)
+                .unwrap_or_else(|| panic!("the `{kind}` body carries no `{key}`: {body}"));
+            let actual_text = if let Some(n) = actual.as_u64() {
+                n.to_string()
+            } else {
+                actual.as_f64().map(|v| format!("{v:?}")).unwrap_or_else(|| {
+                    panic!("the `{kind}` body's `{key}` is not a number: {body}")
+                })
+            };
+            assert_eq!(
+                actual_text, expected,
+                "the `{kind}` body must carry the `{key}` the preset pins for `{site}`"
+            );
+        }
         checked.push(site.to_string());
     }
     assert!(
@@ -4833,7 +4845,8 @@ fn the_recorded_sampling_schedule_matches_the_request_bodies() {
     let review_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
     let status = run_patch_mode(review.path(), &patch_path, &review_server);
     assert!(status.success(), "the reference run must reach a verdict");
-    let checked = assert_schedule_matches_bodies(review.path(), &review_server);
+    let checked =
+        assert_schedule_matches_bodies(review.path(), &review_server, vanta::llm::SamplingPreset::Pinned);
     for required in ["attacker_generate", "intent_audit"] {
         assert!(
             checked.iter().any(|site| site == required),
@@ -4856,12 +4869,104 @@ fn the_recorded_sampling_schedule_matches_the_request_bodies() {
     let repair_server =
         StubLlmServer::start_with_creator_and_attacker(&creator_answer, THREE_SIGNAL_TESTS);
     let _ = run_creator_mode_with_output(repair.path(), &repair_server, 1, &[]);
-    let checked = assert_schedule_matches_bodies(repair.path(), &repair_server);
+    let checked =
+        assert_schedule_matches_bodies(repair.path(), &repair_server, vanta::llm::SamplingPreset::Pinned);
     for required in ["creator", "attacker_generate", "intent_audit"] {
         assert!(
             checked.iter().any(|site| site == required),
             "repair mode must exercise `{required}`; checked={checked:?}"
         );
+    }
+}
+
+/// §14.11: `VANTA_SAMPLING=coding` moves the GENERATIVE sites to the coding
+/// sampler and leaves the auditor on the `pinned` row.
+///
+/// [VANTA-WHY] The preset is a sampling choice, not a verdict input, so the run
+/// must reach the SAME verdict an otherwise identical `pinned` run reaches — and
+/// the change must be visible in three places at once: the recorded preset, the
+/// per-role values, and the bodies the server actually received. Checking the
+/// auditor separately is the point: a preset that quietly warmed the auditor
+/// would make the patch-blind judgement noisier, which is not what "coding
+/// sampling for the generators" asks for.
+#[test]
+fn the_coding_preset_pins_the_generative_sites_and_leaves_the_auditor_alone() {
+    let _serial = serial_run();
+
+    let workspace = TempDir::new().unwrap();
+    let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        3,
+        &[("VANTA_SAMPLING", "coding")],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the preset is a sampling choice, not a verdict input, so an approving run \
+         stays the approval; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(
+        summary_value(&summary, "sampling_preset"),
+        "coding",
+        "run.summary must name the active preset: {summary}"
+    );
+
+    // The four generative sites take the coding sampler.
+    for site in [
+        "creator",
+        "attacker_generate",
+        "attacker_revise",
+        "attacker_simplify",
+    ] {
+        assert_eq!(summary_value(&summary, &format!("temperature_{site}")), "0.6");
+        assert_eq!(summary_value(&summary, &format!("top_p_{site}")), "0.95");
+        assert_eq!(summary_value(&summary, &format!("top_k_{site}")), "20");
+        assert_eq!(summary_value(&summary, &format!("min_p_{site}")), "0.0");
+        assert_eq!(
+            summary_value(&summary, &format!("presence_penalty_{site}")),
+            "0.0"
+        );
+    }
+
+    // The auditor keeps the pinned row, under BOTH presets.
+    assert_eq!(summary_value(&summary, "temperature_intent_audit"), "0.0");
+    assert_eq!(summary_value(&summary, "max_tokens_intent_audit"), "2048");
+    assert!(
+        !summary.contains("top_p_intent_audit"),
+        "the auditor must not take a coding pin: {summary}"
+    );
+
+    // The recorded schedule must be the one the bodies carried, and the auditor
+    // body must carry none of the coding keys.
+    let checked =
+        assert_schedule_matches_bodies(workspace.path(), &server, vanta::llm::SamplingPreset::Coding);
+    for required in ["attacker_generate", "intent_audit"] {
+        assert!(
+            checked.iter().any(|site| site == required),
+            "the coding run must exercise `{required}`; checked={checked:?}"
+        );
+    }
+    for (kind, body) in server
+        .request_kinds()
+        .iter()
+        .zip(server.request_bodies().iter())
+    {
+        if kind != "intent_audit" {
+            continue;
+        }
+        for key in ["top_p", "top_k", "min_p", "presence_penalty"] {
+            assert!(
+                !body.contains(&format!("\"{key}\"")),
+                "the auditor body must not carry a coding `{key}` pin: {body}"
+            );
+        }
     }
 }
 

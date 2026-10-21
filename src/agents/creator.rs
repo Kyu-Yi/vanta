@@ -167,12 +167,13 @@ Required JSON schema:
         messages
     };
 
-    let extras = json!({
-        "response_format": {"type": "json_object"},
-        "temperature": 0.1,
-        "max_tokens": 32768,
-        "reasoning_effort": "low",
-    });
+    let extras = crate::llm::with_sampling(
+        json!({
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": "low",
+        }),
+        "creator",
+    );
 
     let parse_closure = |raw: &str| -> Result<CreatorResponse, String> {
         let cleaned = extract_json_candidate(raw).map_err(|e| format!("{e}"))?;

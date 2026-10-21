@@ -362,6 +362,14 @@ If the baseline still does not match the declared intent, fix the TEST first —
 // but never said the ASSERTION had to survive, and the Diagnostician then read a
 // passing simplified test as "Unknown resolved" — including a body whose
 // assertion had been deleted. The corrected text is pinned by a test.
+//
+// [VANTA-WHY] This constant is the ONLY copy of the simplify prompt and the call
+// site sends exactly it (`let system_prompt = ATTACKER_SIMPLIFY_SYSTEM_PROMPT;`),
+// so the test below pins what the call really sends. The A10 follow-up found the
+// hoisted text still carrying the sentence that let the assertion be reduced
+// away — "Keep the same intent" — which is why the test refuses that phrase
+// rather than only requiring the new one: the prompt no longer licenses a
+// simplification that keeps the label and drops the claim.
 pub const ATTACKER_SIMPLIFY_SYSTEM_PROMPT: &str = r#"You are Vanta Attacker. A test you wrote produced an UNKNOWN result (could not be classified as Pass/Fail/Infrastructure/Static). The test may be too complex, non-deterministic, or have side effects. Simplify it so it produces a clear PASS or FAIL.
 
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
@@ -370,7 +378,7 @@ Required JSON shape:
 {
   "test_name":   string,
   "test_source": string — MUST be a complete pytest function: `def test_name():` with assertions inside the function body.
-                   SIMPLIFY: remove network calls, time.sleep, randomness, complex setup. Use literal values. Keep the same intent.
+                   SIMPLIFY: remove network calls, time.sleep, randomness, complex setup. Use literal values.
                    KEEP THE ASSERTION: the simplified test MUST still assert the SAME input and the SAME expected value as the test you were given. Dropping the assertion — or replacing it with `assert True`, an `is not None` check, or a bare call — makes the test pass without testing anything, and it is then SCRAPPED and the failure stands. Simplify the SETUP, never the claim.
   "intent":      "BugReproduction" | "FeatureAcceptance" | "BehaviorPreservation",
   "reason":      string — what you simplified and why,
@@ -378,6 +386,18 @@ Required JSON shape:
 }
 
 Do NOT import constants or symbols that only exist in the PATCHED code."#;
+
+/// The simplify prompt the call site sends.
+///
+/// Routed through an accessor for the same reason `intent_auditor_system_prompt`
+/// is: "the prompt the call sends" and "the prompt the test pins" are then one
+/// value by construction. The A10 follow-up is what makes that worth pinning —
+/// the simplify text existed twice while it was being rewritten (a `pub const`
+/// and the function-local literal), so a test could pin the copy the call does
+/// not send.
+pub fn attacker_simplify_system_prompt() -> &'static str {
+    ATTACKER_SIMPLIFY_SYSTEM_PROMPT
+}
 
 // ============================================================================
 // attacker_revise_test() — BATE feedback loop: revise a mismatched test
@@ -478,7 +498,7 @@ pub async fn attacker_simplify_test(
 
     let client = build_reqwest_client(cfg)?;
 
-    let system_prompt = ATTACKER_SIMPLIFY_SYSTEM_PROMPT;
+    let system_prompt = attacker_simplify_system_prompt();
 
     let user_prompt = format!(
         "ORIGINAL SOURCE:\n```\n{original_source}\n```\n\n\
@@ -2386,11 +2406,23 @@ mod tests {
     /// read a passing simplified test as "Unknown resolved", so a body reduced to
     /// `add(2, 3)` — the same inputs, no assertion — retired a real failure. The
     /// rule must now say the assertion and its expected value are kept.
+    ///
+    /// [VANTA-WHY] A10 follow-up: the reworded rule went into the hoisted
+    /// constant while the sentence it replaced stayed beside it, and the first
+    /// version of this test only banned the two sentences together — so it
+    /// passed over a prompt that still licensed the reduction. It now reads the
+    /// prompt through the accessor the call site uses and refuses the old phrase
+    /// on its own.
     #[test]
     fn the_simplify_prompt_keeps_the_assertion_it_was_asked_to_simplify() {
+        let prompt = attacker_simplify_system_prompt();
         assert!(
-            !ATTACKER_SIMPLIFY_SYSTEM_PROMPT.contains("Use literal values. Keep the same intent."),
-            "the wording that let the assertion be reduced away must be gone"
+            !prompt.contains("Keep the same intent"),
+            "the wording that let the assertion be reduced to a bare call must be gone"
+        );
+        assert!(
+            prompt.contains("Use literal values."),
+            "the simplification advice itself must survive the rewording"
         );
         for present in [
             "KEEP THE ASSERTION",
@@ -2398,7 +2430,7 @@ mod tests {
             "it is then SCRAPPED and the failure stands",
         ] {
             assert!(
-                ATTACKER_SIMPLIFY_SYSTEM_PROMPT.contains(present),
+                prompt.contains(present),
                 "the simplify prompt must require the assertion survive: {present}"
             );
         }

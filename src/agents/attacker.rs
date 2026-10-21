@@ -309,6 +309,36 @@ pub async fn attacker_generate_tests(
 }
 
 // ============================================================================
+// ATTACKER_REVISE_SYSTEM_PROMPT — the BATE-revision prompt
+// ============================================================================
+//
+// [VANTA-WHY] Hoisted out of `attacker_revise_test` for the same reason
+// ATTACKER_SYSTEM_PROMPT was: a rule that lives only in a local `let` can be
+// dropped in a refactor with nothing to notice, and the audit fixed one of these
+// rules (plans/bugsinpy.md §14.10, A4), so the corrected text has to be pinned by
+// a test rather than by a comment.
+pub const ATTACKER_REVISE_SYSTEM_PROMPT: &str = r#"You are Vanta Attacker. A test you wrote failed BATE (Baseline-Aware Test Evaluation). The test's actual result on the ORIGINAL (unpatched) code did not match its declared intent. Revise the test so its baseline result matches its intent.
+
+YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
+
+Required JSON shape:
+{
+  "test_name":   string,
+  "test_source": string — MUST be a complete pytest function: `def test_name():` with assertions inside the function body. NO module-level statements. Import at top, then `def test_...():` with body.
+                   IMPORTANT: Do NOT import constants or symbols that only exist in the PATCHED code. Use literal values.
+  "intent":      "BugReproduction" | "FeatureAcceptance" | "BehaviorPreservation",
+  "reason":      string — why this revised test now matches its intent,
+  "issue_quote": string|null — for BugReproduction or FeatureAcceptance, quote the exact issue sentence that asks for this behaviour; for BehaviorPreservation use null
+}
+
+Intent rules (these predict the baseline result BATE will measure on the ORIGINAL code):
+- BugReproduction:      must FAIL on original code (the bug is present)
+- FeatureAcceptance:    must FAIL on original code (feature doesn't exist yet)
+- BehaviorPreservation: must PASS on original code (existing behavior)
+
+If the baseline still does not match the declared intent, fix the TEST first — the input it asserts, the expected value, or the label — and make the label the one the ISSUE supports for the input you assert. Relabel only when the LABEL was the mistake: the new intent must be honest for what the test actually asserts, and BugReproduction / FeatureAcceptance need an issue sentence that asks for that behaviour AT THAT INPUT. Relabelling is never a way to make a mismatch disappear; a test whose input or expected value is wrong stays wrong under any label."#;
+
+// ============================================================================
 // attacker_revise_test() — BATE feedback loop: revise a mismatched test
 // ============================================================================
 //
@@ -332,26 +362,7 @@ pub async fn attacker_revise_test(
 
     let client = build_reqwest_client(cfg)?;
 
-    let system_prompt = r#"You are Vanta Attacker. A test you wrote failed BATE (Baseline-Aware Test Evaluation). The test's actual result on the ORIGINAL (unpatched) code did not match its declared intent. Revise the test so its baseline result matches its intent.
-
-YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
-
-Required JSON shape:
-{
-  "test_name":   string,
-  "test_source": string — MUST be a complete pytest function: `def test_name():` with assertions inside the function body. NO module-level statements. Import at top, then `def test_...():` with body.
-                   IMPORTANT: Do NOT import constants or symbols that only exist in the PATCHED code. Use literal values.
-  "intent":      "BugReproduction" | "FeatureAcceptance" | "BehaviorPreservation",
-  "reason":      string — why this revised test now matches its intent,
-  "issue_quote": string|null — for BugReproduction or FeatureAcceptance, quote the exact issue sentence that asks for this behaviour; for BehaviorPreservation use null
-}
-
-Intent rules (CRITICAL — these determine the expected baseline result):
-- BugReproduction:      must FAIL on original code (the bug is present)
-- FeatureAcceptance:    must FAIL on original code (feature doesn't exist yet)
-- BehaviorPreservation: must PASS on original code (existing behavior)
-
-If you cannot make the test match its intent, change the intent to match the test's actual behavior."#;
+    let system_prompt = ATTACKER_REVISE_SYSTEM_PROMPT;
 
     let user_prompt = format!(
         "ISSUE:\n{issue_text}\n\n\
@@ -2030,6 +2041,31 @@ mod tests {
         assert!(
             ATTACKER_SYSTEM_PROMPT.contains("name what you left uncovered and why"),
             "an uncovered case must be named in the test's reason rather than dropped silently"
+        );
+    }
+
+    /// [VANTA-WHY] A4 (§14.10) — the revise prompt ended with "If you cannot make
+    /// the test match its intent, change the intent to match the test's actual
+    /// behavior". That is an unconditional licence to relabel: the label can be
+    /// moved to whatever the test happens to do, with no requirement that the
+    /// ISSUE supports the new label, so a test whose input or expected value is
+    /// wrong is laundered into a passing one. The label may still change — the
+    /// declared intent really is sometimes the mistake — but only when the label
+    /// is what is wrong.
+    #[test]
+    fn the_revise_prompt_does_not_license_relabelling_away_a_mismatch() {
+        assert!(
+            !ATTACKER_REVISE_SYSTEM_PROMPT
+                .contains("change the intent to match the test's actual behavior"),
+            "the unconditional relabel licence must be gone"
+        );
+        assert!(
+            ATTACKER_REVISE_SYSTEM_PROMPT.contains("fix the TEST first")
+                && ATTACKER_REVISE_SYSTEM_PROMPT.contains("Relabel only when the LABEL was the mistake")
+                && ATTACKER_REVISE_SYSTEM_PROMPT
+                    .contains("Relabelling is never a way to make a mismatch disappear"),
+            "a mismatch must be repaired in the test, and a relabel must be tied to the label \
+             being the mistake"
         );
     }
 

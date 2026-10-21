@@ -1977,6 +1977,12 @@ history is reproducible from the references.
 | A14 | generate prompt: the IMPORT RULES and INTENT-vs-API rules, written for a whole-repo read | review mode's narrowed context: "the ORIGINAL source" is an excerpt, so a symbol absent from it is read as evidence that the patch adds it | `832d60a` | `7e6a067` |
 | A17 | generate prompt: "Tests run with PYTHONPATH=src so `from heretic.modifier import X` works", and the `import heretic.system as sysmod` example | every non-Heretic target: BugsInPy sets no PYTHONPATH, has no `src/` layout and is not heretic, so the prompt describes an environment this harness never builds | `832d60a` | `b05e7e8` |
 | A18 | generate prompt, line 1: "Keep reasoning SHORT (under 100 words)" | a thinking model: its reasoning is emitted before the answer, against a budget the prompt does not set (Ornith reasoned ~30k tokens), so the rule can only be read as a limit on the answer | `832d60a` | `d8d6356` |
+| A19a | the four auditor prompts: question 1 on a `BehaviorPreservation` test — nothing said whether a "without changing X" clause counts as the issue ASKING for the original result at an input it does not ask to change | every preservation test (2 of the 3 in most rounds): a 17-word question re-argued instead of answered — "does the ISSUE ask for the result that test asserts, AT THE INPUT THE TEST ASSERTS?" 17×, "Preserving existing behaviour is always a valid answer" 23×, ") FORBIDS the change; it never authorises it" 18× | `28d4367` | `961e42f` |
+| A19b | the two grounded auditor prompts: question 3 (assertion grounding) is asked for every intent, though `route_intent` reads the answer only for a `BugReproduction` test | every `BehaviorPreservation`/`FeatureAcceptance` test: grounding reasoning the pipeline discards (A7 — only `BugReproduction + Some(false)` scraps) | `47e52e8` | `8e09513` |
+| A19c | all four auditor prompts: no rule scoped a "must not change" / "without changing X" clause | the issue's clause quoted 168× (pre-fix) / 57× (post-fix) while the model enumerates which inputs are "thresholds" (is 0 one? 999?), and "at the other thresholds" 180× | `28d4367` | `d75a60c` |
+| A19d | `INTENT_AUDIT_BATCH_TOKENS_PER_TEST` / `INTENT_AUDIT_BATCH_TOKENS_CEILING` (2048 / 16384) and the auditor's schedule cap | an audit that legitimately exceeds the cap: 21 truncations across 8 of 12 runs, the largest ending mid-reasoning ("Let me reconsider grounded once more…") with no JSON | `f10858d` | `698933e` |
+| A19e | `write_forensics_to`: the type name in the filename is not sanitised | the batched audit writes `IntentVerdict>_intent_audit_batch_round_1_attempt_1_raw_response.txt` — the `>` is `Vec<IntentVerdict>`'s closing bracket, and shell-hostile | `5f8af2f` | `60e2c08` |
+| A19f | prompt provenance: the version label had no content hash beside it | `3588728` (A3 follow-up) and `d4ea314` (A10 follow-up) reworded prompts after the `a2617b3` bump without bumping, so one tag covers two prompt texts and the log cannot tell them apart | `a2617b3` | `6c337eb` |
 
 **Evidence — the same contradictions, quoted by the models, across models, binaries and attempts.**
 A grep over `~/vanta-runs`, `runs/bugsinpy` and `vanta_sessions` for the rules' own words returns:
@@ -2017,9 +2023,59 @@ the model scavenges fillers. The fix makes the items explicitly non-exclusive (c
 the higher item), gives the leftover slot a first-found BehaviorPreservation default, and makes the plan
 final. The toy fixture's issue text is **not** touched — it is reference data.
 
+**Auditor-truncation follow-up — the batch that changes no verdict (`961e42f`, `8e09513`, `d75a60c`,
+`698933e`, `60e2c08`, `6c337eb`).** The post-fix coding run on the toy (Ornith-1.5, 12 runs, **every
+verdict correct, zero Attacker truncations**) left one symptom: **the intent auditor was cut off at its
+cap 21 times across 8 of the 12 runs** (batched at `6144 = 2048 × 3`, single-test at `2048`). The
+largest batched reply ends mid-reasoning — `"Let me reconsider grounded once more…"` then
+`===END_REASONING===` and **no JSON at all** — which is the whole point: this is not a contradiction
+loop (a grep of the 67 `IntentVerdict` raw replies finds **no contradiction phrases**), it is a
+deliberation that runs past the cap and never reaches the answer. The budget goes to two questions that
+do not change the outcome, for every `BehaviorPreservation` test (2 of the 3 in most rounds):
+
+| what the auditor re-chews | evidence (67 `IntentVerdict` replies) | count |
+|---|---|---|
+| Q1 on a preservation test — is `"without changing the existing behaviour at the other thresholds"` the issue ASKING for the original result at input 0/999/1002? | the clause quoted | 168 (pre-fix) + 57 (post-fix) |
+| | `"does the ISSUE ask for the result that test asserts, AT THE INPUT THE TEST ASSERTS?"` | 17 |
+| | `"Preserving existing behaviour is always a valid answer"` / `") FORBIDS the change; it never authorises it and never requires one."` — the same doubt re-checked against the two rules | 23 + 18 |
+| Q3 on a preservation test — `assertions_grounded` (`"Is 'light' at 0 a specific value the issue never states?"`), which `route_intent` reads only for `BugReproduction` (A7) | stated in the tail, then discarded by the pipeline | — |
+| second-guessing openers | `Actually` / `Hmm` | 225 / 204 |
+
+The six fixes, one commit each — (a)–(c) and (f) wording/provenance only, (d)–(e) code:
+
+- **(a)** `961e42f` — Q1 gets a **decided answer** for a preservation input the issue does not ask to
+  change: `issue_asks_for_behaviour = false`. The value is chosen to keep `route_intent` byte-for-byte:
+  it matches the rule already in the prompt (a "must not change" clause *forbids* a change; it never
+  *authorises* one) and matches `audit_unavailable_verdict`, and because with `issue_requires_change`
+  mis-answered `true` an `asks = false` **scraps** where `asks = true` **promotes** a relabel, `false`
+  is the answer that cannot manufacture a decision.
+- **(b)** `8e09513` — question 3 is asked **only for a `BugReproduction` test**; any other intent writes
+  `null`, and a missing/null answer parses to `None`, which never scraps
+  (`an_absent_or_positive_grounded_answer_never_scraps`).
+- **(c)** `d75a60c` — one line in all four auditor prompts: a "must not change" / "without changing X"
+  clause covers **every** input whose original result the issue does not ask to change, and the model
+  must not enumerate or debate which inputs are "thresholds".
+- **(d)** `698933e` — `INTENT_AUDIT_BATCH_TOKENS_PER_TEST` 2048 → **8192** and
+  `INTENT_AUDIT_BATCH_TOKENS_CEILING` 16384 → **32768**, so a long audit finishes; the single-test
+  transport inherits the same 8192 through the schedule, both caps stay recorded in `run.summary`, and
+  the truncation-retry behaviour is unchanged.
+- **(e)** `60e2c08` — `write_forensics_to` sanitises the type name too, so the batched reply is written
+  as `IntentVerdict__…` instead of `IntentVerdict>_…`.
+- **(f)** `6c337eb` — `session.start` and `run.summary` record `prompt_hash=` beside `prompt_version=`
+  (below), and the Attacker and auditor labels are bumped once at the end.
+
+**No decision moves.** (a)–(c) are wording-only, and
+`the_wording_fixes_never_move_a_routing_decision` walks the whole grid of intents, answers and relabel
+states to show each fix leaves `route_intent`'s decision identical to the answers it replaces;
+`the_prompt_scopes_a_must_not_change_clause_to_every_unchanged_input` pins the (c) clause in all four
+prompts; `forensics_type_name_is_sanitized` pins the (e) filename. The toy fixture's issue text is
+**not** touched.
+
 **Before/after check.** The same grep on runs made after `a2617b3` is the check that the audit moved
 them: `attacker=6.expected-on-a-correct-patch` and `intent_check=4.audit-questions-renamed` in
-`run.summary` separate the two sets.
+`run.summary` separate the two sets. Runs after this batch carry
+`attacker=7.priority-overlap-and-simplify-assertion` and `intent_check=5.preservation-q1-and-grounded-scope`
+and, crucially, a `prompt_hash=` that differs whenever the wording does.
 
 **Evidence and disclosure.** The finding was made on the **toy dev fixture** (§14.7), by reading the
 session debug artifact rather than by inspecting an evaluation result, and it is disclosed here as a
@@ -2034,6 +2090,23 @@ share the auditor's tag by construction (they are variants of one ask), and the 
 revise/simplify prompts are Attacker-family; the tags this audit moved are the Attacker's and the
 auditor's.
 
+**A version label is only as good as the bump discipline, so the row also carries a hash (`6c337eb`).**
+That discipline slipped twice: `3588728` (A3 follow-up) and `d4ea314` (A10 follow-up) reworded prompts
+after the `a2617b3` bump and left the label alone, so rows between those commits carry one tag
+(`6.expected-on-a-correct-patch`) for two different prompt texts. Both `session.start` and
+`run.summary` now also write `prompt_hash=` — the first 12 hex of the SHA-256 of each role's exact
+system-prompt text (`pipeline::prompt_hashes`), joined with `U+001F` so role boundaries are part of the
+input. Each role's ingredients are the prompts it can actually send: the Attacker's three
+(`attacker_system_prompts`), the auditor's four (`intent_auditor_system_prompts` — one per
+grounded/batched combination), the Creator's one, and the hash of an empty list for the Diagnostician.
+The hash cannot drift from the wire: `attacker.rs::attacker_prompt_hash_follows_the_call_sites` pins
+the Attacker slots against the call-site lines read out of the file itself, and
+`m3_session_log.rs::the_recorded_prompt_hash_is_the_hash_of_the_prompts_the_run_sends` recomputes both
+rows from the accessors rather than from the recorded string. The two labels this batch reworded are
+bumped once, at the end: `ATTACKER_PROMPT_VERSION = 7.priority-overlap-and-simplify-assertion` (the
+late bump for `3588728`/`d4ea314`) and
+`INTENT_AUDITOR_PROMPT_VERSION = 5.preservation-q1-and-grounded-scope`.
+
 ### 14.11 `VANTA_SAMPLING` — the sampling preset
 
 `VANTA_SAMPLING=pinned|coding`, default **`pinned`** — which is today's schedule (§4.3),
@@ -2047,12 +2120,13 @@ sites, **and the intent auditor**. The auditor was left out of the first cut, on
 is a judgement rather than a generation and that a noisier auditor is not a fix for a noisy Attacker;
 that left the audit pinned at 0.0 while the tests it audits were sampled at 0.6, so the preset did not
 describe the run it was recorded for. `max_tokens` is not part of the preset, so the auditor keeps its
-**2048** cap under both presets. Seeds are unchanged (§14.5 — the configured seed on attempt 1,
+**8192** cap under both presets (§14.10 A19d raised it from 2048 after the cap cut 21 audits off across
+a 12-run toy batch). Seeds are unchanged (§14.5 — the configured seed on attempt 1,
 `seed + (attempt - 1)` on retries above 0.0), and because the truncation rules read each call's own
 temperature, a cut-off audit at 0.6 takes the retry path with the seed advanced instead of failing
 fast the way a pinned one does.
 `m3_session_log.rs::the_coding_preset_covers_every_site_including_the_auditor` asserts both halves:
-under `coding` every site including the auditor carries 0.6/0.95/20/0.0/0.0 with the auditor's 2048
+under `coding` every site including the auditor carries 0.6/0.95/20/0.0/0.0 with the auditor's 8192
 cap, and under `pinned` the auditor bodies still carry temperature 0.0 and none of the extra sampler
 keys.
 

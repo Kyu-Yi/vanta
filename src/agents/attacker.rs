@@ -201,7 +201,7 @@ ONE INTENT PER TEST:
 - Each test declares exactly ONE intent. Do NOT mix a new-feature assertion with a preservation assertion in the same test. A test that both checks a NEW value (e.g. a new field defaults to None) AND asserts that some OTHER call is "unchanged as before" has no honest single label: split it into two tests — one FeatureAcceptance/BugReproduction for the new value, one BehaviorPreservation for the unchanged behaviour — or drop the part you cannot label.
 
 PRESERVATION SPECIFICITY:
-- A BehaviorPreservation test targets the EXACT behaviour the issue's "must stay the same" clause names — the result the ORIGINAL code returns for the asserted input. It must NOT pin the INTERNAL calls of a function the issue says to change: asserting that an inner function is called with the OLD arguments locks in internals the issue explicitly rewires, and such a test fails on a CORRECT patch.
+- A BehaviorPreservation test targets the EXACT behaviour the issue's "must stay the same" clause names — the result the ORIGINAL code returns for the asserted input — and reads that result through the observable behaviour, not through internal call arguments. It must NOT pin the INTERNAL calls of a function the issue says to change: asserting that an inner function is called with the OLD arguments locks in internals the issue explicitly rewires, and such a test fails on a CORRECT patch. If the only probe you can write for a "must stay the same" clause pins an internal call the issue rewires, there is no preservation probe to write: cover that comparison with a BugReproduction test instead, or drop it.
 
 TEST FIXTURES:
 - Do NOT instantiate application settings/config objects that read CLI arguments, environment variables or files (a Settings class built from the command line, for example). Under pytest they parse pytest's OWN argv and exit, so the test fails on ANY code, original or patched. Use unittest.mock.MagicMock, or build the model with model_construct()/copy-update and set only the attributes the code under test reads.
@@ -2159,6 +2159,32 @@ mod tests {
                 && ATTACKER_SYSTEM_PROMPT
                     .contains("A test that cannot be labelled honestly is not a test"),
             "the unlabelable probe must be dropped rather than mislabelled"
+        );
+    }
+
+    /// [VANTA-WHY] A13 (§14.10) — PRESERVATION SPECIFICITY banned pinning
+    /// internals only in the case "the issue says to change" the function, and
+    /// said nothing about how a preservation probe should read the behaviour it
+    /// preserves. The B v1 caching probe was written by pinning an internal call's
+    /// arguments, which is a preservation probe that cannot survive any rewire the
+    /// issue asks for; the rule has to say the probe reads the observable result
+    /// and, when only the internal call can be pinned, that there is no probe to
+    /// write. The hygiene test pins the internal-calls phrase, so that sentence
+    /// stays in the text verbatim.
+    #[test]
+    fn a_preservation_probe_reads_the_result_not_the_internal_calls() {
+        assert!(
+            !ATTACKER_SYSTEM_PROMPT.contains("the asserted input. It must NOT pin the INTERNAL calls"),
+            "the rule must say how the result is read, not only what may not be pinned"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("through the observable behaviour, not through internal call arguments")
+                && ATTACKER_SYSTEM_PROMPT.contains("there is no preservation probe to write"),
+            "the probe must read the observable result, and an unpinnable clause must not be probed"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("pin the INTERNAL calls of a function the issue says to change"),
+            "the sentence the test-hygiene test pins must survive this reword"
         );
     }
 

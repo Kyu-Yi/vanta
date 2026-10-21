@@ -42,6 +42,18 @@ undetermined       Rejected, but no signal could be evaluated (e.g. a legacy v0
                    separately so it is never silently folded into
                    spurious_reject.
 approved_unlabeled Approved with no ground-truth label, so nothing is claimed.
+needs_review_on_good
+                   The run refused to decide (`NeedsReview`, §14) on a patch the
+                   ground truth says is GOOD. [WHY] Its own bucket: it is neither
+                   a false_reject (Vanta never rejected) nor a true_approval
+                   (nothing was approved), and folding it into either would
+                   report a decision the run did not make.
+needs_review_on_bad
+                   The run refused to decide on a patch the ground truth says is
+                   BAD. Same reasoning: not a true_reject, not a false_approval.
+needs_review_unlabeled
+                   The run refused to decide and no ground truth was supplied, so
+                   nothing is claimed about whether the refusal was right.
 infra_failure      The run ended because an LLM call failed for every attempt
                    the retry loop was allowed (`final_decision=InfraFailure`).
                    No test ever judged the candidate, so this is neither an
@@ -69,6 +81,9 @@ TRUE_APPROVAL = "true_approval"
 UNRESOLVED = "unresolved"
 UNDETERMINED = "undetermined"
 APPROVED_UNLABELED = "approved_unlabeled"
+NEEDS_REVIEW_ON_GOOD = "needs_review_on_good"
+NEEDS_REVIEW_ON_BAD = "needs_review_on_bad"
+NEEDS_REVIEW_UNLABELED = "needs_review_unlabeled"
 INFRA_FAILURE = "infra_failure"
 
 # [WHY] `AllTestsPassed` alone. `MaxAttemptsReached` used to live here and was
@@ -76,6 +91,13 @@ INFRA_FAILURE = "infra_failure"
 # without an approved patch (see the `unresolved` bucket).
 APPROVED_DECISIONS = {"AllTestsPassed"}
 UNRESOLVED_DECISIONS = {"MaxAttemptsReached"}
+# [WHY] §14's refusal to decide. Kept in its own set, never merged into
+# APPROVED_DECISIONS, UNRESOLVED_DECISIONS or the `Rejected` arm: the run did not
+# reject the candidate and did not give up mid-patch, it declined to make the
+# claim at all because no rule corroborated a rejection. Its row's own label
+# (`needs_review_on_good`/`needs_review_on_bad`, runner.py) already carries the
+# ground truth, so this arm only has to keep it out of the other buckets.
+NEEDS_REVIEW_DECISIONS = {"NeedsReview"}
 # [WHY] An LLM call failed after its retries. Kept in its own set, never merged
 # into APPROVED_DECISIONS or UNRESOLVED_DECISIONS: the run produced no verdict
 # about the candidate at all.
@@ -434,6 +456,12 @@ class Verdict:
             return "approved on a patch labelled known-good"
         if self.bucket == UNRESOLVED:
             return "attempt budget exhausted with no approved patch (not an approval)"
+        if self.bucket == NEEDS_REVIEW_ON_GOOD:
+            return "refused to decide on a patch labelled known-good (not a rejection)"
+        if self.bucket == NEEDS_REVIEW_ON_BAD:
+            return "refused to decide on a patch labelled known-bad (not a rejection)"
+        if self.bucket == NEEDS_REVIEW_UNLABELED:
+            return "refused to decide; no ground-truth label, so nothing is claimed"
         if self.bucket == INFRA_FAILURE:
             return "LLM call failed after its retries (not a verdict about the candidate)"
         return "approved, no ground-truth label"
@@ -484,6 +512,19 @@ def classify(
         # about the model, so it must be neither approval, rejection, nor the
         # budget-exhausted `unresolved`. It goes in its own bucket.
         bucket = INFRA_FAILURE
+    elif decision in NEEDS_REVIEW_DECISIONS:
+        # [WHY] §14.6: the loop declined to decide because no rule corroborated a
+        # rejection. Checked BEFORE the labelled-approval and fallthrough arms —
+        # an unlabelled NeedsReview must not be filed as `approved_unlabeled`
+        # ("nothing is claimed") nor as `undetermined` (a broken rejection),
+        # because it states a fact of its own: the run refused. The ground-truth
+        # label, when there is one, only says which side the refusal fell on.
+        if known_bad is True:
+            bucket = NEEDS_REVIEW_ON_BAD
+        elif known_bad is False:
+            bucket = NEEDS_REVIEW_ON_GOOD
+        else:
+            bucket = NEEDS_REVIEW_UNLABELED
     elif decision in APPROVED_DECISIONS:
         if known_bad is True:
             bucket = FALSE_APPROVAL
@@ -516,16 +557,21 @@ def classify(
 
 
 def render_table(verdicts: list[Verdict]) -> str:
+    # [WHY] 22 is the width of the longest bucket name (`needs_review_unlabeled`).
+    # The three §14.6 refusals are longer than every bucket before them, and a
+    # narrower column would run the bucket into its own note.
+    bucket_width = 22
     header = (
         f"{'SESSION':<10} {'VERDICT':<12} {'SCHEMA':<12} {'SIGNALS':<13} "
-        f"{'BUCKET':<18} NOTE"
+        f"{'BUCKET':<{bucket_width}} NOTE"
     )
     lines = [header, "-" * len(header)]
     for verdict in verdicts:
         signals = f"{verdict.signals_deciding}/{verdict.signals_total}"
         lines.append(
             f"{verdict.session_id[:8]:<10} {verdict.decision:<12} "
-            f"{verdict.schema_label:<12} {signals:<13} {verdict.bucket:<18} "
+            f"{verdict.schema_label:<12} {signals:<13} "
+            f"{verdict.bucket:<{bucket_width}} "
             f"{verdict.explanation}"
         )
     lines.append("")
@@ -536,13 +582,20 @@ def render_table(verdicts: list[Verdict]) -> str:
         FALSE_REJECT,
         FALSE_APPROVAL,
         TRUE_APPROVAL,
+        # [WHY] The refusals sit next to the approvals and rejections they are
+        # neither of, so a reader comparing a wave against the previous one sees
+        # a refusal count next to the two counts it could otherwise have been
+        # mistaken for (§14.6).
+        NEEDS_REVIEW_ON_GOOD,
+        NEEDS_REVIEW_ON_BAD,
+        NEEDS_REVIEW_UNLABELED,
         UNRESOLVED,
         UNDETERMINED,
         APPROVED_UNLABELED,
         INFRA_FAILURE,
     ):
         count = sum(1 for verdict in verdicts if verdict.bucket == bucket)
-        lines.append(f"  {bucket:<18} {count}")
+        lines.append(f"  {bucket:<{bucket_width}} {count}")
     lines.append("")
     scored = sum(
         1

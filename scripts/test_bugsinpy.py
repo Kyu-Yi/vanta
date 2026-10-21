@@ -5278,11 +5278,17 @@ class TestLabelFor:
             ("Rejected", True, False, "true_reject"),
             ("MaxAttemptsReached", True, True, "unresolved_but_fixed"),
             ("MaxAttemptsReached", True, False, "unresolved"),
+            # §14.6: a refusal to decide is scored as itself, on both sides of the
+            # ground truth — never as the rejection it declined to issue and never
+            # as the approval it never made.
+            ("NeedsReview", True, True, "needs_review_on_good"),
+            ("NeedsReview", True, False, "needs_review_on_bad"),
             ("InfraFailure", False, False, "infra_failure"),
             ("InfraFailure", True, True, "infra_failure"),
             # The censor wins over the verdict: a patch that never applied told us
             # nothing, so it cannot become a `true_reject` for Vanta (§5.2 step 2).
             ("Rejected", False, True, "unobservable"),
+            ("NeedsReview", False, True, "unobservable"),
             ("PatchApplicationFailed", False, False, "unobservable"),
             ("HarnessFailure", False, False, "unobservable"),
             ("SomethingNobodyNamed", True, True, "unobservable"),
@@ -5291,6 +5297,28 @@ class TestLabelFor:
     def test_the_table(self, verdict, apply_ok, patch_good, expected):
         oracle = oracle_mod.OracleResult(apply_ok=apply_ok, patch_good=patch_good)
         assert runner_mod.label_for(verdict, oracle) == expected
+
+    def test_a_needs_review_label_is_not_a_rejection_label(self):
+        """§14.6: the two refusals must not collide with the four decisions.
+
+        [WHY] `false_reject` is a scored Vanta error and `true_reject` is a scored
+        Vanta catch. A refusal is neither, so the two families must be disjoint —
+        a shared name would put a row the loop never decided into a rate that
+        claims it did.
+        """
+        good = oracle_mod.OracleResult(apply_ok=True, patch_good=True)
+        bad = oracle_mod.OracleResult(apply_ok=True, patch_good=False)
+        refusal = {
+            runner_mod.label_for("NeedsReview", good),
+            runner_mod.label_for("NeedsReview", bad),
+        }
+        decided = {
+            runner_mod.label_for(verdict, oracle)
+            for verdict in ("AllTestsPassed", "Rejected", "MaxAttemptsReached")
+            for oracle in (good, bad)
+        }
+        assert refusal == {"needs_review_on_good", "needs_review_on_bad"}
+        assert refusal.isdisjoint(decided)
 
     def test_a_censored_oracle_states_its_reason(self):
         bug_prep = prep(fail_to_pass=["tests/test_a.py::test_b", "tests/test_a.py::test_a"])
@@ -5506,6 +5534,44 @@ class TestWaveGate:
         """There is no candidate to pair before the review passes run."""
         rows = [_gate_row(config=config, mode="repair") for config in ("baseline", "vanta")]
         assert runner_mod.wave_gate_failures(rows) == []
+
+    def test_a_needs_review_row_does_not_stop_the_wave(self):
+        """§14.6: a refusal to decide is the designed outcome, not a gate failure.
+
+        [WHY] The label is taken from `label_for` rather than typed in, so this
+        test fails if the label table and the gate ever disagree about what a
+        refusal is called — which is exactly how the row would otherwise come
+        back as a censored `unobservable` and stop the wave.
+        """
+        rows = _healthy_wave()
+        for row in rows:
+            if row["candidate"] and row["candidate"]["kind"] == runner_mod.DEV_FIX:
+                good = bool(row["candidate"]["oracle"]["patch_good"])
+                row["verdict"] = "NeedsReview"
+                row["label"] = runner_mod.label_for(
+                    "NeedsReview", oracle_mod.OracleResult(apply_ok=True, patch_good=good)
+                )
+        labels = {row["label"] for row in rows if row["verdict"] == "NeedsReview"}
+        assert labels == {"needs_review_on_good"}
+        assert runner_mod.wave_gate_failures(rows) == []
+
+    def test_a_needs_review_row_the_oracle_could_not_grade_is_still_gated(self):
+        """The censor is verdict-independent: it reports the plumbing, not the refusal.
+
+        [WHY] `no final.patch` means the candidate was never applied, so the row
+        says nothing about Vanta's decision-making and the wave's plumbing is
+        what needs looking at. Keeping this gate armed is what stops the
+        NeedsReview exemption above from becoming a blanket silence.
+        """
+        rows = _healthy_wave()
+        rows[0]["verdict"] = "NeedsReview"
+        rows[0]["label"] = "unobservable"
+        rows[0]["oracle"]["apply_ok"] = False
+        rows[0]["oracle"]["apply_detail"] = "no final.patch for verdict NeedsReview"
+        problems = runner_mod.wave_gate_failures(rows)
+        assert any(
+            "unobservable" in problem and "no final.patch" in problem for problem in problems
+        )
 
 
 class TestDigestAndLabels:

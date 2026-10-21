@@ -945,6 +945,15 @@ def label_for(verdict: str, oracle: oracle_mod.OracleResult) -> str:
         return "true_approval" if oracle.patch_good else "false_approval"
     if verdict == "Rejected":
         return "false_reject" if oracle.patch_good else "true_reject"
+    if verdict == "NeedsReview":
+        # [WHY] §14.6: a refusal to decide is scored as itself, never as one of
+        # the two decisions it declined to make. `patch_good` here would name the
+        # row a `false_reject` (a rejection Vanta did not issue) and the negation
+        # a `true_reject` (credit for a rejection it did not issue either). Both
+        # readings would put a number the run never claimed into the wave's
+        # rejection rate, so the label carries the ground truth it was refused
+        # against AND the fact that the loop could not decide.
+        return "needs_review_on_good" if oracle.patch_good else "needs_review_on_bad"
     if verdict == "MaxAttemptsReached":
         return "unresolved_but_fixed" if oracle.patch_good else "unresolved"
     return "unobservable"
@@ -1520,6 +1529,16 @@ def wave_gate_failures(records: Sequence[dict[str, Any]]) -> list[str]:
     batch must stop and report rather than build the next wave on it. The checks
     are the ones whose failure invalidates every later number — not a threshold on
     model behaviour, which is the thing being measured.
+
+    [WHY] A row whose verdict is `NeedsReview` is deliberately NOT a failure here
+    (§14.6). The loop refused to decide because no rule corroborated a rejection,
+    which is the outcome §14 exists to produce, so gating on it would stop a wave
+    for behaving as designed. What this gate still flags on such a row is the
+    verdict-independent censor below: an `InfraFailure`, or a row whose oracle
+    could not apply the candidate at all (`unobservable`) — a fact about the
+    environment, not about the decision. A NeedsReview that graded normally
+    carries `needs_review_on_good`/`needs_review_on_bad` and reaches the digest;
+    its counts belong to `metrics.py`, which scores it as its own outcome.
     """
     problems: list[str] = []
     if not records:

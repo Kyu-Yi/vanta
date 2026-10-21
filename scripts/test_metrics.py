@@ -523,20 +523,94 @@ def test_infra_failure_is_counted_on_its_own_line(tmp_path):
     assert re.search(r"scored rejections\s+0", table), table
 
 
+# ============================================================================
+# NeedsReview is a refusal to decide: its own buckets, never a decision
+# ============================================================================
+
+
+def test_needs_review_gets_its_own_bucket_on_both_sides_of_the_label(tmp_path):
+    """§14.6: a refusal is scored as itself, never as a reject or an approval.
+
+    [WHY] `false_reject` is a scored Vanta error and `true_reject` a scored
+    catch; a NeedsReview is neither, so folding it into either would report a
+    decision the run explicitly declined to make. The ground-truth label says
+    only which side the refusal fell on.
+    """
+    write_session(tmp_path, "refused", decision="NeedsReview", schema_version=1)
+    data = metrics.load_session(str(tmp_path), "refused")
+
+    assert metrics.classify(data, True).bucket == metrics.NEEDS_REVIEW_ON_BAD
+    assert metrics.classify(data, False).bucket == metrics.NEEDS_REVIEW_ON_GOOD
+    assert metrics.classify(data, None).bucket == metrics.NEEDS_REVIEW_UNLABELED
+
+    for label in (True, False, None):
+        bucket = metrics.classify(data, label).bucket
+        assert bucket not in (
+            metrics.FALSE_REJECT,
+            metrics.TRUE_CATCH,
+            metrics.SPURIOUS_REJECT,
+            metrics.UNDETERMINED,
+            metrics.FALSE_APPROVAL,
+            metrics.TRUE_APPROVAL,
+            metrics.APPROVED_UNLABELED,
+            metrics.UNRESOLVED,
+        ), label
+
+
+def test_an_unlabelled_refusal_is_not_an_approval_and_not_undetermined(tmp_path):
+    """A refusal states a fact even with no label: it is `needs_review_unlabeled`.
+
+    [WHY] The two tempting fallthroughs are both wrong. `approved_unlabeled` says
+    "approved, nothing claimed about the patch"; `undetermined` is the bucket for
+    a rejection whose signals could not be reconstructed. A run that refused to
+    decide neither approved nor rejected anything, and it owes no signal rerun.
+    """
+    write_session(tmp_path, "refused", decision="NeedsReview", schema_version=1)
+    verdict = metrics.classify(metrics.load_session(str(tmp_path), "refused"), None)
+
+    assert verdict.bucket == metrics.NEEDS_REVIEW_UNLABELED
+    assert verdict.bucket != metrics.APPROVED_UNLABELED
+    assert verdict.bucket != metrics.UNDETERMINED
+    assert "refused to decide" in verdict.explanation
+
+
+def test_the_refusal_counts_sit_next_to_the_decision_counts(tmp_path):
+    """The wave digest shows the refusals beside the approvals and rejections."""
+    write_session(tmp_path, "refused-good", decision="NeedsReview", schema_version=1)
+    write_session(tmp_path, "refused-bad", decision="NeedsReview", schema_version=1)
+    verdicts = [
+        metrics.classify(metrics.load_session(str(tmp_path), "refused-good"), False),
+        metrics.classify(metrics.load_session(str(tmp_path), "refused-bad"), True),
+    ]
+    table = metrics.render_table(verdicts)
+
+    assert re.search(r"needs_review_on_good\s+1", table), table
+    assert re.search(r"needs_review_on_bad\s+1", table), table
+    assert re.search(r"needs_review_unlabeled\s+0", table), table
+    assert re.search(r"false_reject\s+0", table), table
+    assert re.search(r"scored rejections\s+0", table), table
+    assert re.search(r"rejections seen\s+0", table), table
+
+
 def test_only_a_rejection_owes_a_signal_rerun(tmp_path):
     """An approval has nothing to re-run, so the absent probe file is not a warning.
 
     [WHY] Only a rejection produces rejecting signals worth re-running. Warning
-    on an approval would blame the session for a measurement nobody needed.
+    on an approval would blame the session for a measurement nobody needed. A
+    refusal is in the same position as an approval: it issued no rejecting
+    signal, so the absent file is not a missing measurement.
     """
     write_session(tmp_path, "approved", decision="AllTestsPassed", schema_version=1)
     write_session(tmp_path, "gave-up", decision="MaxAttemptsReached", schema_version=1)
+    write_session(tmp_path, "refused", decision="NeedsReview", schema_version=1)
 
     approved = metrics.load_session(str(tmp_path), "approved")
     gave_up = metrics.load_session(str(tmp_path), "gave-up")
+    refused = metrics.load_session(str(tmp_path), "refused")
 
     assert not any("signal_reruns" in w for w in approved.warnings), approved.warnings
     assert not any("signal_reruns" in w for w in gave_up.warnings), gave_up.warnings
+    assert not any("signal_reruns" in w for w in refused.warnings), refused.warnings
 
 
 def test_render_table_reports_the_buckets_separately(tmp_path):

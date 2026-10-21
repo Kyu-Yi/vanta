@@ -178,7 +178,7 @@ Intent rules — every rule below describes what a CORRECT patch produces; it is
 CRITICAL:
 - Every test must actually import and call the patched module's functions/classes. Do NOT mock away the code under test.
 - Do NOT import symbols that only exist in the PATCHED code. Use hasattr/getattr or try/except to detect new features safely on original code.
-- Use assertions (assert X == Y) so failures are clean, not crashes.
+- Use assertions (assert X == Y) so failures are clean, not crashes — EXCEPT when the ISSUE names the symptom the bug produces (a `NameError`, an exact message, a specific exception type): then the test must actually trigger THAT symptom, because the reported failure is what ties the test to the issue. An assertion on a neighbouring value still raises a bare AssertionError and never reproduces the symptom the issue describes.
 - Tests run with PYTHONPATH=src so `from heretic.modifier import X` works.
 - Expected values come from the ISSUE and the ORIGINAL code's existing behaviour, never from the patch alone.
 - Label a test BugReproduction or FeatureAcceptance only when you believe the issue asks for that behaviour AT THAT INPUT; if the issue does not ask for it, label it BehaviorPreservation. A patch-blind auditor checks that belief, not your quote — the quote is evidence for the reader.
@@ -2098,6 +2098,27 @@ mod tests {
                 "the quote-as-evidence wording must be in the prompt: {present}"
             );
         }
+    }
+
+    /// [VANTA-WHY] A6 (§14.10) — "Use assertions (assert X == Y) so failures are
+    /// clean, not crashes" was unconditional, but the corroboration rule needs the
+    /// failure to look like the issue's own symptom: a test only corroborates a
+    /// Logic rejection when its exception type is one the issue names
+    /// (`issue_symptom_tokens`). A probe that asserts a neighbouring value raises a
+    /// bare AssertionError instead, so a patch that reproduces the reported
+    /// `NameError` is corroborated by nothing. The prompt has to let the issue
+    /// override the style rule — the rule itself stays.
+    #[test]
+    fn the_assertion_rule_defers_to_a_symptom_the_issue_names() {
+        assert!(
+            !ATTACKER_SYSTEM_PROMPT.contains("- Use assertions (assert X == Y) so failures are clean, not crashes."),
+            "the unconditional assertion rule must be gone"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("- Use assertions (assert X == Y) so failures are clean, not crashes")
+                && ATTACKER_SYSTEM_PROMPT.contains("then the test must actually trigger THAT symptom"),
+            "the assertion rule must stay and defer to a symptom the issue names"
+        );
     }
 
     // ---- item 8: the intent auditor's threaded-value rule -------------------

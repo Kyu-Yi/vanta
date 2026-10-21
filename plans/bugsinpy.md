@@ -1928,10 +1928,76 @@ of a regression. "MUST PASS on BOTH" was never Vanta's semantics.
 `BehaviorPreservation` test asserts behaviour the issue does **not** ask to change; it MUST pass on
 the ORIGINAL code (BATE checks this); it is EXPECTED to pass on a correct patch, but if it fails on
 the PATCHED code that failure **is** the finding; never drop a boundary probe because you expect the
-patch to break it. The revise prompt already said "must PASS on original code", the simplify prompt
-does not repeat the rule, and none of the four auditor prompts do — **the contradiction was confined
-to the generate prompt**. Every other rule is kept. `ATTACKER_PROMPT_VERSION` is bumped so a session
-states which side of the fix it ran.
+patch to break it. The revise prompt already said "must PASS on original code" and the simplify
+prompt does not repeat the rule. `ATTACKER_PROMPT_VERSION` is bumped so a session states which side
+of the fix it ran.
+
+**Correction (prompt audit, 2026-10-21).** An earlier revision of this section claimed that "the
+contradiction was confined to the generate prompt" and that "every other rule is kept". Both claims
+are wrong, and the run logs say so. What the audit found:
+
+- **The "MUST" shape was not confined to the preservation rule.** The same requirement-shaped wording
+  carried the umbrella bullet ("each test MUST produce a DIFFERENT result") and the BugReproduction
+  and FeatureAcceptance bullets ("MUST FAIL on ORIGINAL and PASS on PATCHED"). A BugReproduction
+  probe that reproduces the issue's own symptom — the probe §9's corroboration rule needs — fails on
+  the patched code by definition, so the same reading that jammed the preservation rule jams these.
+  `A2` generalised `9a8356a`'s qualifier to them.
+- **It was not confined to the generate prompt.** The revise prompt licensed a relabel instead of a
+  repair (`A4`); the simplify prompt never said the assertion had to survive, and the Diagnostician
+  then read *any* passing simplified test as "Unknown resolved" (`A10`); the auditor's four prompts
+  each carried an ambiguity the models quoted back at it (`A7`–`A9`). One rule was missing entirely
+  (`A11`: nothing warned that the baseline is measured more than once) and two lines were another
+  project's (`A17`: `PYTHONPATH=src` and the `heretic.system` import example).
+- **Rules were not all kept.** `A13` and `A14` rewrote two rules, and `A18` deleted one outright (the
+  reasoning word count).
+
+#### 14.10.1 The audit — one row per finding
+
+Method: every rule in every system prompt was listed; each was checked against every other rule under
+each case it can meet, and against what the code actually does; and each rule's key phrase was traced
+with `git log -S`. `A15` was **rejected** — allowing zero tests on a no-op would let the model declare
+"no behaviour change" and skip testing the bug, and the no-op true reject is the core result. `A16` is
+**parked**. "introduced" and "fixed" are the `git log -S` hits for the rule's own phrase, so the
+history is reproducible from the references.
+
+| # | rule / where it lives | the case where it breaks | introduced | fixed |
+|---|---|---|---|---|
+| A2 | `ATTACKER_SYSTEM_PROMPT`, the "each test MUST produce a DIFFERENT result" umbrella and the BR/FA "MUST FAIL on ORIGINAL and PASS on PATCHED" bullets | a bad patch: the BR probe that reproduces the issue's symptom fails on the patched tree, which the bullet forbids | `832d60a` | `9a8356a` + `0457ac3` |
+| A3 | generate prompt: "Write exactly 3 tests. Label each one honestly" | no stated order, so the three slots can be spent on duplicates, and nothing says what was left uncovered | `832d60a` | `182aafa` |
+| A4 | `ATTACKER_REVISE_SYSTEM_PROMPT`: "If you cannot make the test match its intent, change the intent to match the test's actual behavior" | a test whose input or expected value is wrong: the label moves to whatever the test does, with no requirement that the issue support it | `832d60a` | `d75964f` |
+| A5 | the `issue_quote` MUSTs: "that sentence MUST name the same input the test asserts", and the label being allowed "ONLY if the quoted issue sentence explicitly asks for that behaviour" | any probe whose input the issue does not spell out; and a quote lifted from a "must not change" clause — "…without changing the existing behavior at the other thresholds." — used as the licence for the change it forbids | `1c44e64`, `9f31ebe` | `fe1d976` |
+| A6 | generate prompt: "Use assertions (assert X == Y) so failures are clean, not crashes" | an issue that names its own symptom (a `NameError`, an exact message): an assertion on a neighbouring value raises a bare `AssertionError`, so corroboration rule (b) matches nothing | `832d60a` | `29a53bb` |
+| A7 | the two grounded auditor prompts: the closing "answer for every test, whatever its intent" | it names no question and no test, so a two-test batch reads as "answer question 3 for both" | — | `47e52e8` |
+| A8 | all four auditor prompts: the heading "Answer two questions about the input the test asserts" | the grounded variant asks three questions and the batch variant asks about each test, so the heading promises a question the auditor may not ask | `28d4367`, `b715e1d` | `f79380e` |
+| A9 | both batch prompts: the rule closing on "the input THIS test asserts" | a batch of N tests: "THIS test" has no referent, so the issue-wide reading demotes probes it should keep | `28d4367`, `b715e1d`, `5f8af2f` | `0a590a0` |
+| A10 | the simplify prompt ("Use literal values. Keep the same intent.") and the Diagnostician's `Passed` branch in `pipeline/diagnostician.rs` | a simplification that deletes the failing assertion (`assert add(2, 3) == 5` → `add(2, 3)`) passes on the patched tree, and the Unknown is recorded as resolved with no check that the test still asserts anything | `832d60a` | `450fb1c` |
+| A11 | generate prompt: no rule at all about the baseline being measured more than once | a clock/seed/network/ordering-dependent test, written in good faith, is scrapped for flakiness with no rule it had broken | (missing) | `5da097c` |
+| A12 | generate prompt: the INTENT-vs-API rule, which stopped at the FeatureAcceptance redirect | a probe using a symbol the patch ADDS when the issue asks for no new behaviour either: every remaining label is dishonest and the audit scraps it anyway | `832d60a` | `5399e95` |
+| A13 | generate prompt: "targets the EXACT behaviour … must NOT pin the INTERNAL calls of a function the issue says to change" | read as an absolute ban on pinning internals, so a correct patch that legitimately calls an internal with the same arguments is failed | `d646d40`, `2eb5c36` | `8fb8270` |
+| A14 | generate prompt: the IMPORT RULES and INTENT-vs-API rules, written for a whole-repo read | review mode's narrowed context: "the ORIGINAL source" is an excerpt, so a symbol absent from it is read as evidence that the patch adds it | `832d60a` | `7e6a067` |
+| A17 | generate prompt: "Tests run with PYTHONPATH=src so `from heretic.modifier import X` works", and the `import heretic.system as sysmod` example | every non-Heretic target: BugsInPy sets no PYTHONPATH, has no `src/` layout and is not heretic, so the prompt describes an environment this harness never builds | `832d60a` | `b05e7e8` |
+| A18 | generate prompt, line 1: "Keep reasoning SHORT (under 100 words)" | a thinking model: its reasoning is emitted before the answer, against a budget the prompt does not set (Ornith reasoned ~30k tokens), so the rule can only be read as a limit on the answer | `832d60a` | `d8d6356` |
+
+**Evidence — the same contradictions, quoted by the models, across models, binaries and attempts.**
+A grep over `~/vanta-runs`, `runs/bugsinpy` and `vanta_sessions` for the rules' own words returns:
+
+| phrase the model quoted back | hits |
+|---|---|
+| `violates the intent rule` | 83 |
+| `violates the "MUST PASS on BOTH" rule` | 72 |
+| `instructions are poorly written` | 73 |
+| `instructions are contradictory` | 71 |
+| `violates the BehaviorPreservation rule` | 15 |
+| loop-drift variants in other languages (`contradictoire`, `contradictorio`, `contradictoriu`, …) | ~100 |
+
+At least 19 distinct raw-reply files contain them (the listing was cut at 20). They span runs at
+11:19, 11:31, 12:19, 13:17, 13:53, 15:36, 16:17 and 17:06 on 2026-10-21 — the model screen included —
+across the `vanta_m2` and `vanta_m3` binaries, in first attempts, retries and round 2. So this is not
+one model misreading one prompt: it is the shape of the rules.
+
+**Before/after check.** The same grep on runs made after `a2617b3` is the check that the audit moved
+them: `attacker=6.expected-on-a-correct-patch` and `intent_check=4.audit-questions-renamed` in
+`run.summary` separate the two sets.
 
 **Evidence and disclosure.** The finding was made on the **toy dev fixture** (§14.7), by reading the
 session debug artifact rather than by inspecting an evaluation result, and it is disclosed here as a
@@ -1943,7 +2009,8 @@ recorded in the summary (below).
 (`pipeline::prompt_versions`) — so a run's prompt identity is readable from the summary row alone and
 a run before the fix is distinguishable from one after it. The auditor's grounded/batched variants
 share the auditor's tag by construction (they are variants of one ask), and the Attacker's
-revise/simplify prompts are Attacker-family; the tag that this fix moved is the Attacker's.
+revise/simplify prompts are Attacker-family; the tags this audit moved are the Attacker's and the
+auditor's.
 
 ### 14.11 `VANTA_SAMPLING` — the sampling preset
 
@@ -1952,16 +2019,24 @@ byte-identical: Creator 0.1, Attacker generate 0.2, revise/simplify 0.3, intent 
 `max_tokens` at every site, and no other sampler key pinned, so every request body is what it was
 before the flag existed.
 
-`coding` replaces the sampler pins of the **generative** roles with temperature **0.6**, top_p
-**0.95**, top_k **20**, min_p **0**, presence_penalty **0** — the Creator and the Attacker's
-generate/revise/simplify sites. The **intent auditor keeps 0.0 and its 2048 cap under both presets**:
-it is a judgement, not a generation, and a noisier auditor is not a fix for a noisy Attacker.
-`max_tokens` is unchanged under both, and seeds are unchanged (§14.5 — the configured seed on attempt
-1, `seed + (attempt - 1)` on retries above 0.0).
+`coding` replaces the sampler pins of **every** site with temperature **0.6**, top_p **0.95**, top_k
+**20**, min_p **0**, presence_penalty **0** — the Creator, the Attacker's generate/revise/simplify
+sites, **and the intent auditor**. The auditor was left out of the first cut, on the argument that it
+is a judgement rather than a generation and that a noisier auditor is not a fix for a noisy Attacker;
+that left the audit pinned at 0.0 while the tests it audits were sampled at 0.6, so the preset did not
+describe the run it was recorded for. `max_tokens` is not part of the preset, so the auditor keeps its
+**2048** cap under both presets. Seeds are unchanged (§14.5 — the configured seed on attempt 1,
+`seed + (attempt - 1)` on retries above 0.0), and because the truncation rules read each call's own
+temperature, a cut-off audit at 0.6 takes the retry path with the seed advanced instead of failing
+fast the way a pinned one does.
+`m3_session_log.rs::the_coding_preset_covers_every_site_including_the_auditor` asserts both halves:
+under `coding` every site including the auditor carries 0.6/0.95/20/0.0/0.0 with the auditor's 2048
+cap, and under `pinned` the auditor bodies still carry temperature 0.0 and none of the extra sampler
+keys.
 
 Both the preset and the per-role values it produced are recorded in `run.summary`:
 `sampling_preset=` plus `temperature_<site>` / `max_tokens_<site>`, and, under `coding`, the extra
-sampler keys per generative site. The recorded schedule is the **effective** one — the same table the
+sampler keys per site. The recorded schedule is the **effective** one — the same table the
 request bodies carry — and `m3_session_log.rs::the_recorded_sampling_schedule_matches_the_request_bodies`
 compares the two.
 

@@ -478,12 +478,13 @@ pub async fn run(
         test_id: None,
         phase: "session.start".to_string(),
         summary: format!(
-            "model={} model_version={} prompt_version={} provider={} api_key={} \
+            "model={} model_version={} prompt_version={} prompt_hash={} provider={} api_key={} \
              vanta_version={} vanta_commit={} vanta_dirty={} tested_commit={} target_repo_dirty={} requested_backend={} actual_backend={} max_attempts={} \
              baseline_test_timeout_secs={} patched_test_timeout_secs={} deps_checkpoint={} deps_freeze={} test_cmd={} mode={} benchmark_instance={}",
             cfg.model_id,
             std::env::var("VANTA_MODEL_VERSION").unwrap_or_else(|_| "unknown".into()),
             prompt_versions,
+            crate::pipeline::prompt_hashes(),
             cfg.base_url,
             if cfg.api_key.is_some() { "set" } else { "none" },
             env!("CARGO_PKG_VERSION"),
@@ -2315,7 +2316,7 @@ pub async fn run(
              corroborate={} grounded_audit={} batch_audit={} \
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
-             commit={} dirty={} prompt_version={}",
+             commit={} dirty={} prompt_version={} prompt_hash={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -2357,6 +2358,13 @@ pub async fn run(
             // made before the Attacker prompt's preservation fix is otherwise
             // indistinguishable from one made after it.
             crate::pipeline::prompt_versions(),
+            // [VANTA-WHY] §14.10 f — the content hash beside the version label.
+            // A version tag is only as good as the discipline of bumping it, and
+            // that discipline slipped twice already (the A3 and A10 follow-ups
+            // reworded prompts without a bump). The hash is computed over the
+            // exact text each role sends, so a wording change shows up in the log
+            // whether or not anyone remembered the label.
+            crate::pipeline::prompt_hashes(),
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),

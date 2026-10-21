@@ -4495,6 +4495,61 @@ fn a_stalled_stream_is_cancelled_and_the_stub_sees_the_disconnect() {
     );
 }
 
+/// [VANTA-WHY] §14.10 f — the run identity is recorded TWICE: the hand-bumped
+/// version LABEL, and a content HASH of the system prompts the run sends. The
+/// label was forgotten twice (the A3 follow-up `3588728` and the A10 follow-up
+/// `d4ea314` reworded prompts after the `a2617b3` bump and left it alone), so the
+/// hash is the field a later log comparison can trust. That is only true if the
+/// recorded value really is the hash of the text sent, so this pins BOTH rows
+/// that carry it against a recomputation from the accessors the call sites use —
+/// never against the recorded string itself, which would pass however stale it
+/// had become.
+#[test]
+fn the_recorded_prompt_hash_is_the_hash_of_the_prompts_the_run_sends() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start_streaming(None, SINGLE_BEHAVIOR_TEST, StubBehaviour::Normal);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 3, &[]);
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "the run must reach a verdict before its identity can be read; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let expected = format!(
+        "attacker={};intent_check={};creator={};diagnostician={}",
+        vanta::core::prompt_content_hash(&vanta::agents::attacker::attacker_system_prompts()),
+        vanta::core::prompt_content_hash(&vanta::agents::attacker::intent_auditor_system_prompts()),
+        vanta::core::prompt_content_hash(&[vanta::agents::creator::creator_system_prompt()]),
+        vanta::core::prompt_content_hash(&[]),
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let start = records
+        .first()
+        .expect("the first record on disk is session.start");
+    assert_eq!(start.phase, "session.start");
+    assert!(
+        start.summary.contains(&format!("prompt_hash={expected}")),
+        "session.start must record the hash of the prompts this run sends; got {}",
+        start.summary
+    );
+
+    // The same value in the terminal row: a session's debug artifacts outlive the
+    // shell that produced them, so the run's prompt identity has to be readable
+    // from the summary alone.
+    let summary = run_summary(workspace.path());
+    assert!(
+        summary.summary.contains(&format!("prompt_hash={expected}")),
+        "run.summary must record the same prompt hash; got {}",
+        summary.summary
+    );
+}
+
 /// A prompt that cannot fit the window is refused ONCE, without retrying.
 #[test]
 fn the_context_precheck_fails_once_without_retrying() {

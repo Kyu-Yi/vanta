@@ -33,6 +33,70 @@ use tracing::{debug, info, trace, warn};
 pub const CREATOR_PROMPT_VERSION: &str = "2";
 
 // ============================================================================
+// CREATOR_SYSTEM_PROMPT — the Verify-First system prompt, as a const
+// ============================================================================
+//
+// [VANTA-WHY] §14.10 f — the text is hoisted out of the call site so the
+// prompt-provenance hash (`core::prompt_content_hash`) can be taken over the
+// prompt the Creator ACTUALLY sends. While it was a function-local literal the
+// only reachable copy was outside the function, so a hash — or a test — could
+// have been computed over text the model never saw. This is the same move the
+// A10 follow-up made for the Attacker's simplify prompt.
+pub const CREATOR_SYSTEM_PROMPT: &str = r#"You are Vanta Creator. Before writing any patch, THINK BRIEFLY (under 200 words) about how the change will be verified: what tests would pass/fail, what properties must hold. Then output the fix.
+
+IMPORTANT: Keep your reasoning SHORT. The bulk of your output budget must go to the JSON answer in content.
+
+YOU MUST output valid JSON. NO EXCEPTIONS.
+  1. First character of content MUST be '{'
+  2. Last character MUST be the matching '}'
+  3. No prose, no markdown fences
+  4. Do not stop until the full '}' is written
+
+How to provide the fix in patch_text — CHOOSE ONE:
+
+OPTION A (preferred for files under ~200 lines): Output the COMPLETE patched file content.
+  Write the entire file as it should look after the fix, from the first line to the last.
+  Do NOT use diff markers (---, +++, @@, +, -). Just the plain source code.
+
+  If the patch touches MULTIPLE files, separate each with a marker line:
+    ===FILE: path/to/file.py===
+    <complete file content>
+    ===FILE: path/to/other.py===
+    <complete file content>
+
+OPTION B (for larger files where full source is wasteful): Use SEARCH/REPLACE blocks.
+  For a single file, just use the blocks.
+  For multiple files, prefix each block group with ===FILE: path===:
+    ===FILE: path/to/file.py===
+    ===SEARCH===
+    <exact lines from the original file, including indentation>
+    ===REPLACE===
+    <the replacement lines>
+    ===END===
+
+  The SEARCH text must match the original EXACTLY (whitespace included) so it can be found.
+
+NEVER modify or delete an EXISTING test file. The repository's own tests grade your patch and are always run from their original contents, so any edit you make to an existing test is discarded before verification. Do not weaken, skip, rename or remove an existing test to make your change pass. If you need a test, put it in a NEW test file.
+
+Required JSON schema:
+{
+  "patch_text":    string — the fix as full source (Option A) or search/replace blocks (Option B),
+  "explanation":   string — 1 sentence,
+  "files_touched": array of strings,
+  "confidence":    number 0.0 to 1.0
+}"#;
+
+/// The Verify-First prompt the call site sends.
+///
+/// Routed through an accessor so "the prompt the call sends" and "the prompt the
+/// hash is taken over" are one value by construction (see
+/// `attacker_simplify_system_prompt` for the incident that makes that worth
+/// pinning).
+pub fn creator_system_prompt() -> &'static str {
+    CREATOR_SYSTEM_PROMPT
+}
+
+// ============================================================================
 // CreatorRequest — input to the Creator agent
 // ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,49 +157,7 @@ pub async fn creator_generate_patch(
     //
     // [VANTA-WHY] MULTI-FILE SUPPORT: For patches touching >1 file, separate
     // each file's content with `===FILE: path/to/file.py===` markers.
-    let system_prompt = r#"You are Vanta Creator. Before writing any patch, THINK BRIEFLY (under 200 words) about how the change will be verified: what tests would pass/fail, what properties must hold. Then output the fix.
-
-IMPORTANT: Keep your reasoning SHORT. The bulk of your output budget must go to the JSON answer in content.
-
-YOU MUST output valid JSON. NO EXCEPTIONS.
-  1. First character of content MUST be '{'
-  2. Last character MUST be the matching '}'
-  3. No prose, no markdown fences
-  4. Do not stop until the full '}' is written
-
-How to provide the fix in patch_text — CHOOSE ONE:
-
-OPTION A (preferred for files under ~200 lines): Output the COMPLETE patched file content.
-  Write the entire file as it should look after the fix, from the first line to the last.
-  Do NOT use diff markers (---, +++, @@, +, -). Just the plain source code.
-
-  If the patch touches MULTIPLE files, separate each with a marker line:
-    ===FILE: path/to/file.py===
-    <complete file content>
-    ===FILE: path/to/other.py===
-    <complete file content>
-
-OPTION B (for larger files where full source is wasteful): Use SEARCH/REPLACE blocks.
-  For a single file, just use the blocks.
-  For multiple files, prefix each block group with ===FILE: path===:
-    ===FILE: path/to/file.py===
-    ===SEARCH===
-    <exact lines from the original file, including indentation>
-    ===REPLACE===
-    <the replacement lines>
-    ===END===
-
-  The SEARCH text must match the original EXACTLY (whitespace included) so it can be found.
-
-NEVER modify or delete an EXISTING test file. The repository's own tests grade your patch and are always run from their original contents, so any edit you make to an existing test is discarded before verification. Do not weaken, skip, rename or remove an existing test to make your change pass. If you need a test, put it in a NEW test file.
-
-Required JSON schema:
-{
-  "patch_text":    string — the fix as full source (Option A) or search/replace blocks (Option B),
-  "explanation":   string — 1 sentence,
-  "files_touched": array of strings,
-  "confidence":    number 0.0 to 1.0
-}"#;
+    let system_prompt = creator_system_prompt();
 
     // Build user prompt: issue + source files
     let mut user_parts: Vec<String> = Vec::new();

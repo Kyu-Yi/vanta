@@ -17,6 +17,12 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.28.0", features = ["v4"] }
 libc = "0.2"
 octocrab = "0.54.5"
+# [VANTA-WHY] Only for the prompt-provenance hash (`core::prompt_content_hash`):
+# the first 12 hex characters of the SHA-256 of each role's system prompt, so a
+# wording change that forgot to bump a version label still shows in the logs.
+# Already in the lock file as a transitive dependency of `octocrab`, so this adds
+# no new download or version resolution.
+sha2 = "0.10"
 
 [dev-dependencies]
 # [VANTA-WHY] `test-util` (NOT part of tokio's `full`) provides

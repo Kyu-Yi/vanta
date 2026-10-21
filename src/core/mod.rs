@@ -202,6 +202,37 @@ fn fnv1a_hex(input: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// The first 12 hex characters of the SHA-256 of one role's system prompt
+/// text(s), taken over the parts joined by U+001F.
+///
+/// [VANTA-WHY] §14.10 f — prompt provenance. A version LABEL is only as good as
+/// the discipline of bumping it: `3588728` (the A3 follow-up) and `d4ea314` (the
+/// A10 follow-up) both changed prompt wording after the `a2617b3` bump and left
+/// the label alone, so two different prompts were logged under one tag and the
+/// logs said "no change" about a change that moves verdicts. A content hash
+/// cannot be forgotten: it is derived from the text that is sent.
+///
+/// [VANTA-WHY] Joined with U+001F (the ASCII unit separator, a character no
+/// prompt contains) so the parts' boundaries are unambiguous — without a
+/// separator, moving a word from the end of one prompt to the start of the next
+/// would leave the concatenation identical and the change invisible.
+///
+/// The digest is TRUNCATED to 12 hex characters (48 bits): this is a change
+/// detector for a handful of prompts, not an attack-resistant fingerprint, and a
+/// short tag keeps `run.summary` readable.
+pub fn prompt_content_hash(prompts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let joined = prompts.join("\u{1f}");
+    let digest = Sha256::digest(joined.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex.truncate(12);
+    hex
+}
+
 /// Canonical identity of a test's PROBE, independent of the name it was given.
 ///
 /// [VANTA-WHY] The shared test set exists so attempt N and attempt N+1 can be

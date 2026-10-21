@@ -49,7 +49,17 @@ use tracing::{debug, info, trace, warn};
 // on the PATCHED tree is an expectation about a correct patch, not a rule to be
 // satisfied, and that a failure there is the finding. A row logged before this
 // tag and a row after it come from different prompts.
-pub const ATTACKER_PROMPT_VERSION: &str = "6.expected-on-a-correct-patch";
+//
+// [VANTA-WHY] Bumped again for §14.10 f, which is a bump that is LATE rather
+// than new: `3588728` (the A3 follow-up — the three priority items overlap, and a
+// leftover slot defaults to the preserved behaviour) and `d4ea314` (the A10
+// follow-up — the simplify prompt stopped licensing "keep the label, drop the
+// assertion") both reworded Attacker prompts after the `a2617b3` bump and neither
+// bumped. Rows written between those two commits therefore carry the
+// `6.expected-on-a-correct-patch` tag for two different prompt texts. This tag
+// covers the current text; the content hash recorded beside it is what makes the
+// miss recoverable in the log rather than invisible.
+pub const ATTACKER_PROMPT_VERSION: &str = "7.priority-overlap-and-simplify-assertion";
 
 // ============================================================================
 // INTENT_AUDITOR_PROMPT_VERSION — the run-identity tag for the intent check
@@ -66,7 +76,15 @@ pub const ATTACKER_PROMPT_VERSION: &str = "6.expected-on-a-correct-patch";
 // the auditor's headings no longer promise a question it may not ask, its
 // grounding rule names the question and the test it closes, and the batch rule
 // points at the numbered test instead of an ambiguous "this".
-pub const INTENT_AUDITOR_PROMPT_VERSION: &str = "4.audit-questions-renamed";
+//
+// [VANTA-WHY] Bumped for the auditor-truncation batch (§14.10 a–c): the
+// preservation case of question 1 now has a decided answer instead of a debate,
+// question 3 is asked only for a BugReproduction test, and "without changing X"
+// is scoped to every input the issue does not ask to change. The wording changed
+// in all four auditor prompts, so the auditor's own tag has to move — the run's
+// budget behaviour changed with it (21 truncations in the 12-run Ornith-1.5 toy
+// run that motivated the batch).
+pub const INTENT_AUDITOR_PROMPT_VERSION: &str = "5.preservation-q1-and-grounded-scope";
 
 // ============================================================================
 // AttackerRequest — input to the Attacker agent
@@ -399,6 +417,44 @@ Do NOT import constants or symbols that only exist in the PATCHED code."#;
 /// not send.
 pub fn attacker_simplify_system_prompt() -> &'static str {
     ATTACKER_SIMPLIFY_SYSTEM_PROMPT
+}
+
+/// Every system prompt the Attacker's call sites can send, in a fixed order.
+///
+/// [VANTA-WHY] §14.10 f — the ingredient of the `attacker=` prompt-content hash.
+/// It is an accessor over the SAME literals the call sites assign to
+/// `system_prompt` (`ATTACKER_SYSTEM_PROMPT` for generate,
+/// `ATTACKER_REVISE_SYSTEM_PROMPT` for the BATE revision,
+/// `attacker_simplify_system_prompt()` for the Unknown path), so the hash is
+/// taken over the text that is sent and not over a copy of it. Order is part of
+/// the hash's meaning and must not be reshuffled: `attacker_prompt_hash_follows_the_call_sites`
+/// pins each slot against the accessor the call site actually uses.
+pub fn attacker_system_prompts() -> [&'static str; 3] {
+    [
+        ATTACKER_SYSTEM_PROMPT,
+        ATTACKER_REVISE_SYSTEM_PROMPT,
+        attacker_simplify_system_prompt(),
+    ]
+}
+
+/// Every system prompt the intent auditor can send, in a fixed order: the
+/// one-test prompt, its grounded variant, the batched prompt, and the batched
+/// grounded variant.
+///
+/// [VANTA-WHY] §14.10 f — all FOUR, because which one is sent depends on two
+/// independent flags (`VANTA_GROUNDED_AUDIT`, `VANTA_BATCH_AUDIT`), and the
+/// wording of each is part of the run's identity: a change to the grounded
+/// variant alone must show in the log of a grounded run. Taken through
+/// `intent_auditor_system_prompt`/`intent_auditor_batch_system_prompt`, the same
+/// selectors the call sites use, so a literal that is not the one sent cannot
+/// contribute to the hash.
+pub fn intent_auditor_system_prompts() -> [&'static str; 4] {
+    [
+        intent_auditor_system_prompt(false),
+        intent_auditor_system_prompt(true),
+        intent_auditor_batch_system_prompt(false),
+        intent_auditor_batch_system_prompt(true),
+    ]
 }
 
 // ============================================================================
@@ -3573,5 +3629,57 @@ mod tests {
         assert!(!quote_names_literal("shipping_band(1500) is heavy", "500"));
         assert!(quote_names_literal("add(2, 3)", "2"));
         assert!(!quote_names_literal("add(20, 3)", "2"));
+    }
+
+    /// [VANTA-WHY] A19f (§14.10) — the recorded prompt hash is only worth having
+    /// if it is the hash of the text the call sites SEND; otherwise it is another
+    /// hand-maintained copy that can go stale exactly like the version label did
+    /// (`3588728`, `d4ea314`). So the hash's ingredients are pinned against the
+    /// three call sites: each slot is the value a call site assigns, in the order
+    /// the accessor declares.
+    ///
+    /// [VANTA-WHY] The call-site lines are read out of this file's own source
+    /// because `let system_prompt = ATTACKER_SYSTEM_PROMPT;` is the only thing
+    /// that makes "the prompt the hash covers" and "the prompt the model
+    /// receives" one text. A duplicated literal elsewhere in the module would
+    /// satisfy every other assertion here and still let the two drift.
+    #[test]
+    fn attacker_prompt_hash_follows_the_call_sites() {
+        let prompts = attacker_system_prompts();
+        assert_eq!(
+            prompts[0], ATTACKER_SYSTEM_PROMPT,
+            "slot 0 must be the generate prompt"
+        );
+        assert_eq!(
+            prompts[1], ATTACKER_REVISE_SYSTEM_PROMPT,
+            "slot 1 must be the BATE-revision prompt"
+        );
+        assert_eq!(
+            prompts[2],
+            attacker_simplify_system_prompt(),
+            "slot 2 must be the Unknown-path prompt"
+        );
+
+        let source = include_str!("attacker.rs");
+        for call_site in [
+            "let system_prompt = ATTACKER_SYSTEM_PROMPT;",
+            "let system_prompt = ATTACKER_REVISE_SYSTEM_PROMPT;",
+            "let system_prompt = attacker_simplify_system_prompt();",
+        ] {
+            assert!(
+                source.contains(call_site),
+                "every hashed Attacker prompt must be the one a call site sends; \
+                 this file has no {call_site:?}"
+            );
+        }
+
+        assert_eq!(
+            crate::pipeline::prompt_hashes()
+                .split(';')
+                .find_map(|field| field.strip_prefix("attacker="))
+                .expect("prompt_hashes must carry the attacker slot"),
+            crate::core::prompt_content_hash(&prompts),
+            "the recorded attacker hash must be the hash of the prompts its call sites send"
+        );
     }
 }

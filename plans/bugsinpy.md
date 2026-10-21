@@ -1983,6 +1983,7 @@ history is reproducible from the references.
 | A19d | `INTENT_AUDIT_BATCH_TOKENS_PER_TEST` / `INTENT_AUDIT_BATCH_TOKENS_CEILING` (2048 / 16384) and the auditor's schedule cap | an audit that legitimately exceeds the cap: 21 truncations across 8 of 12 runs, the largest ending mid-reasoning ("Let me reconsider grounded once more…") with no JSON | `f10858d` | `698933e` |
 | A19e | `write_forensics_to`: the type name in the filename is not sanitised | the batched audit writes `IntentVerdict>_intent_audit_batch_round_1_attempt_1_raw_response.txt` — the `>` is `Vec<IntentVerdict>`'s closing bracket, and shell-hostile | `5f8af2f` | `60e2c08` |
 | A19f | prompt provenance: the version label had no content hash beside it | `3588728` (A3 follow-up) and `d4ea314` (A10 follow-up) reworded prompts after the `a2617b3` bump without bumping, so one tag covers two prompt texts and the log cannot tell them apart | `a2617b3` | `6c337eb` |
+| A21 | generate prompt: the A3 leftover-slot default — "an input where the ORIGINAL source returns a DIFFERENT result than at the inputs you have already tested" — has no terminal case | a late round where every meaningful input is already in the shared set: round 3 on the toy looped **45×** on `"Let me pick the three most valuable tests"` / `"Both are shared"` / `"-1 is shared"`, hunting for a novel input that does not exist, instead of spending the slots and finishing | `3588728` | `70fdc50` |
 
 **Evidence — the same contradictions, quoted by the models, across models, binaries and attempts.**
 A grep over `~/vanta-runs`, `runs/bugsinpy` and `vanta_sessions` for the rules' own words returns:
@@ -2022,6 +2023,27 @@ slot to be spent twice on one test, and once that happens the third slot has not
 the model scavenges fillers. The fix makes the items explicitly non-exclusive (counted once, against
 the higher item), gives the leftover slot a first-found BehaviorPreservation default, and makes the plan
 final. The toy fixture's issue text is **not** touched — it is reference data.
+
+**A21 follow-up — the leftover-slot default has no terminal case (`70fdc50`).** The A3 leftover-slot
+default names an input "where the ORIGINAL source returns a DIFFERENT result than at the inputs you have
+already tested". It has no answer once every meaningful input is already in the shared set, which is
+exactly the state a late round reaches: round 3 on the toy (the shared set already carrying the boundary
+and the band from rounds 1 and 2) looped **45×** on the same three phrases —
+
+| the loop | evidence (raw reply) | count |
+|---|---|---|
+| hunting for a novel input that does not exist | `"Let me pick the three most valuable tests"` / `"Both are shared"` / `"-1 is shared"`, re-argued instead of choosing | 45 |
+
+The reading: the default is a *search* ("returns a DIFFERENT result than at the inputs you have already
+tested") with no terminating branch, so when the search space is exhausted the model keeps searching
+rather than spending its slots. The fix adds a **terminal fallback** to the generate prompt — when every
+input the defaults point to is already covered, spend each remaining slot on **another input inside a
+band that is already covered** (a midpoint of the band, or the value on the other side of a boundary
+already probed), chosen on the spot without weighing alternatives. A repeat of an existing test is an
+**acceptable** answer there: the driver drops duplicates before BATE, so a round of three repeats still
+carries its three tests, while a round that keeps hunting loses all of them. Still exactly 3 tests; the
+toy fixture's issue text is **not** touched. The tag is
+`ATTACKER_PROMPT_VERSION = 8.shared-band-terminal-fallback`.
 
 **Auditor-truncation follow-up — the batch that changes no verdict (`961e42f`, `8e09513`, `d75a60c`,
 `698933e`, `60e2c08`, `6c337eb`).** The post-fix coding run on the toy (Ornith-1.5, 12 runs, **every
@@ -2075,7 +2097,9 @@ prompts; `forensics_type_name_is_sanitized` pins the (e) filename. The toy fixtu
 them: `attacker=6.expected-on-a-correct-patch` and `intent_check=4.audit-questions-renamed` in
 `run.summary` separate the two sets. Runs after this batch carry
 `attacker=7.priority-overlap-and-simplify-assertion` and `intent_check=5.preservation-q1-and-grounded-scope`
-and, crucially, a `prompt_hash=` that differs whenever the wording does.
+and, crucially, a `prompt_hash=` that differs whenever the wording does. The A21 follow-up then bumps the
+Attacker tag once more, to `8.shared-band-terminal-fallback`, so a run after it is separable from a run
+after this batch.
 
 **Evidence and disclosure.** The finding was made on the **toy dev fixture** (§14.7), by reading the
 session debug artifact rather than by inspecting an evaluation result, and it is disclosed here as a

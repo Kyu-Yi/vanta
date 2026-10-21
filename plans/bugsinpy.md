@@ -1963,7 +1963,7 @@ history is reproducible from the references.
 | # | rule / where it lives | the case where it breaks | introduced | fixed |
 |---|---|---|---|---|
 | A2 | `ATTACKER_SYSTEM_PROMPT`, the "each test MUST produce a DIFFERENT result" umbrella and the BR/FA "MUST FAIL on ORIGINAL and PASS on PATCHED" bullets | a bad patch: the BR probe that reproduces the issue's symptom fails on the patched tree, which the bullet forbids | `832d60a` | `9a8356a` + `0457ac3` |
-| A3 | generate prompt: "Write exactly 3 tests. Label each one honestly" | no stated order, so the three slots can be spent on duplicates, and nothing says what was left uncovered | `832d60a` | `182aafa` |
+| A3 | generate prompt: "Write exactly 3 tests. Label each one honestly"; follow-up: the "THIS order of priority" line | no stated order, so the three slots can be spent on duplicates, and nothing says what was left uncovered; and the three priority items read as exclusive (a slot re-covering item (1) as item (3)) with no default for a leftover slot, so the model hunts for a third thing to test | `832d60a` | `182aafa` + `3588728` |
 | A4 | `ATTACKER_REVISE_SYSTEM_PROMPT`: "If you cannot make the test match its intent, change the intent to match the test's actual behavior" | a test whose input or expected value is wrong: the label moves to whatever the test does, with no requirement that the issue support it | `832d60a` | `d75964f` |
 | A5 | the `issue_quote` MUSTs: "that sentence MUST name the same input the test asserts", and the label being allowed "ONLY if the quoted issue sentence explicitly asks for that behaviour" | any probe whose input the issue does not spell out; and a quote lifted from a "must not change" clause — "…without changing the existing behavior at the other thresholds." — used as the licence for the change it forbids | `1c44e64`, `9f31ebe` | `fe1d976` |
 | A6 | generate prompt: "Use assertions (assert X == Y) so failures are clean, not crashes" | an issue that names its own symptom (a `NameError`, an exact message): an assertion on a neighbouring value raises a bare `AssertionError`, so corroboration rule (b) matches nothing | `832d60a` | `29a53bb` |
@@ -1994,6 +1994,28 @@ At least 19 distinct raw-reply files contain them (the listing was cut at 20). T
 11:19, 11:31, 12:19, 13:17, 13:53, 15:36, 16:17 and 17:06 on 2026-10-21 — the model screen included —
 across the `vanta_m2` and `vanta_m3` binaries, in first attempts, retries and round 2. So this is not
 one model misreading one prompt: it is the shape of the rules.
+
+**A3 follow-up — the two loops the priority line left open (`3588728`).** After the audit commits, an
+Ornith-1.5 run (default sampling, toy, 3 runs, **all three rejected**, **zero contradiction phrases** —
+so the loops below are not the A2 contradiction; they are what the priority line does when it is obeyed)
+was read back from its five `AttackerResponse_*_raw_response.txt` files (49.8 KB–118.5 KB each). Two
+loops:
+
+| loop | evidence (raw reply) | count |
+|---|---|---|
+| priority overlap, read as exclusive | `"(1) the exact comparison the patch changes, at its boundary value"` repeated in one reply | 41 |
+| | `"(3) the code path the issue asks you to change"` repeated in one reply | 39 |
+| | `The code path the issue asks to change is the 1000 boundary. This is the same as test 1.` said outright, then the model keeps looking for a third test | 38 |
+| third-slot hunting — filler candidates after the two tests that matter (1000 BugReproduction, 500 BehaviorPreservation) | `1001` / `0` / `2000` / `999` / `-1` mentioned as candidate probes | 23 / 28 / 19 / 19 / 15 |
+| | the issue's `"without changing the existing behavior at the other thresholds."` quoted while looking for thresholds that do not exist | 180 |
+| | `"Hmm, I keep coming back to the same thing"` / second-guessing openers (`Actually`, `Hmm`, `Wait`, …) | 423 / 288 / 160 |
+
+The reading: on the toy, priority items (1) and (3) are the SAME test — the changed
+comparison is the code path the issue asks to change — so a line that lists them separately invites a
+slot to be spent twice on one test, and once that happens the third slot has nothing left to target and
+the model scavenges fillers. The fix makes the items explicitly non-exclusive (counted once, against
+the higher item), gives the leftover slot a first-found BehaviorPreservation default, and makes the plan
+final. The toy fixture's issue text is **not** touched — it is reference data.
 
 **Before/after check.** The same grep on runs made after `a2617b3` is the check that the audit moved
 them: `attacker=6.expected-on-a-correct-patch` and `intent_check=4.audit-questions-renamed` in

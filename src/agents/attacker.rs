@@ -806,17 +806,17 @@ Rules:
 - If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
 - For a BehaviorPreservation test, when the asserted input is one the issue does NOT ask to change, both answers are already fixed: "issue_requires_change": false (the issue requires no change there) and "issue_asks_for_behaviour": false (a clause that forbids a change never ASKS for the old result). Do not deliberate over whether a "must stay the same" clause counts as asking: it forbids, so both answers are false. Decide once and move on.
 
-3. "assertions_grounded": does this test assert ONLY behaviour the ISSUE describes, at the input the ISSUE names — or does it also pin a SPECIFIC VALUE the issue never states?
+3. "assertions_grounded": does this test assert ONLY behaviour the ISSUE describes, at the input the ISSUE names — or does it also pin a SPECIFIC VALUE the issue never states? Ask this question ONLY when the test's declared intent is BugReproduction.
 
 Rules for question 3:
 - Grounded: an assertion that follows from the issue's own words about the input it names ("it should not raise", "the file is written", "the boundary value returns the standard band").
 - Ungrounded: an assertion that pins wording, an exact output string, an exact message, a format or a number the issue never mentions ("the output CONTAINS 'Starting var'", "the repr is exactly ...", "the log line begins with a timestamp").
 - The issue is the only source of requirements. "It should not raise NameError" is grounded; "it should print exactly this string" is grounded only if the issue prints that string.
 - A test may assert more than the issue asks about ONLY when the extra assertion is a direct consequence of what the issue requires. Invented specifics are ungrounded.
-- Answer question 3 for the test you are given, whatever its declared intent.
+- Answer question 3 for the test you are given only when its declared intent is BugReproduction; for a FeatureAcceptance or BehaviorPreservation test write "assertions_grounded": null and do not reason about it — nothing acts on the answer for those intents, so deciding it spends budget that changes no outcome.
 
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
-{"issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "assertions_grounded": true|false, "reason": "one short sentence"}"#;
+{"issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "assertions_grounded": true|false|null, "reason": "one short sentence"}"#;
 
 /// [VANTA-WHY] §14.5 — the BATCHED form of the auditor prompt, used only with
 /// `VANTA_BATCH_AUDIT=on`.
@@ -871,17 +871,17 @@ Rules:
 - For a BehaviorPreservation test, when the asserted input is one the issue does NOT ask to change, both answers are already fixed: "issue_requires_change": false (the issue requires no change there) and "issue_asks_for_behaviour": false (a clause that forbids a change never ASKS for the old result). Do not deliberate over whether a "must stay the same" clause counts as asking: it forbids, so both answers are false. Decide once and move on.
 - Answer EVERY numbered test exactly once and no test that was not given to you. "index" is the number printed above that test.
 
-3. "assertions_grounded": does that test assert ONLY behaviour the ISSUE describes, at the input the ISSUE names — or does it also pin a SPECIFIC VALUE the issue never states?
+3. "assertions_grounded": does that test assert ONLY behaviour the ISSUE describes, at the input the ISSUE names — or does it also pin a SPECIFIC VALUE the issue never states? Ask this question ONLY for a numbered test whose declared intent is BugReproduction.
 
 Rules for question 3:
 - Grounded: an assertion that follows from the issue's own words about the input it names ("it should not raise", "the file is written", "the boundary value returns the standard band").
 - Ungrounded: an assertion that pins wording, an exact output string, an exact message, a format or a number the issue never mentions ("the output CONTAINS 'Starting var'", "the repr is exactly ...", "the log line begins with a timestamp").
 - The issue is the only source of requirements. "It should not raise NameError" is grounded; "it should print exactly this string" is grounded only if the issue prints that string.
 - A test may assert more than the issue asks about ONLY when the extra assertion is a direct consequence of what the issue requires. Invented specifics are ungrounded.
-- Answer question 3 for EACH numbered test, whatever its declared intent.
+- Answer question 3 for EACH numbered test only when its declared intent is BugReproduction; for a FeatureAcceptance or BehaviorPreservation test write "assertions_grounded": null and do not reason about it — nothing acts on the answer for those intents, so deciding it spends budget that changes no outcome.
 
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
-{"tests": [{"index": 1, "issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "assertions_grounded": true|false, "reason": "one short sentence"}]}"#;
+{"tests": [{"index": 1, "issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "assertions_grounded": true|false|null, "reason": "one short sentence"}]}"#;
 
 /// The system prompt for the requested audit variant.
 ///
@@ -950,7 +950,7 @@ pub async fn attacker_check_intent(
     let sys_owned = intent_auditor_system_prompt(grounded).to_string();
     let user_owned = user_prompt.clone();
     let reprompt = if grounded {
-        "REPROMPT: output ONLY {\"issue_asks_for_behaviour\": true|false, \"issue_requires_change\": true|false, \"assertions_grounded\": true|false, \"reason\": \"...\"}."
+        "REPROMPT: output ONLY {\"issue_asks_for_behaviour\": true|false, \"issue_requires_change\": true|false, \"assertions_grounded\": true|false|null, \"reason\": \"...\"}."
     } else {
         "REPROMPT: output ONLY {\"issue_asks_for_behaviour\": true|false, \"issue_requires_change\": true|false, \"reason\": \"...\"}."
     };
@@ -1504,7 +1504,7 @@ async fn attacker_check_intent_batch(
     let sys_owned = intent_auditor_batch_system_prompt(grounded).to_string();
     let user_owned = user_prompt;
     let reprompt = if grounded {
-        "REPROMPT: output ONLY {\"tests\": [{\"index\": 1, \"issue_asks_for_behaviour\": true|false, \"issue_requires_change\": true|false, \"assertions_grounded\": true|false, \"reason\": \"...\"}]} — one entry per numbered test, each index exactly once."
+        "REPROMPT: output ONLY {\"tests\": [{\"index\": 1, \"issue_asks_for_behaviour\": true|false, \"issue_requires_change\": true|false, \"assertions_grounded\": true|false|null, \"reason\": \"...\"}]} — one entry per numbered test, each index exactly once."
     } else {
         "REPROMPT: output ONLY {\"tests\": [{\"index\": 1, \"issue_asks_for_behaviour\": true|false, \"issue_requires_change\": true|false, \"reason\": \"...\"}]} — one entry per numbered test, each index exactly once."
     };
@@ -2867,6 +2867,52 @@ mod tests {
             INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED.contains("for EACH numbered test"),
             "the batch prompt must speak about each numbered test"
         );
+    }
+
+    /// [VANTA-WHY] A19b (§14.10) — the grounded question was asked "for the test
+    /// you are given, whatever its declared intent", but `route_intent` acts on
+    /// `assertions_grounded` for ONE declared intent only: a BugReproduction test
+    /// whose answer is `Some(false)`. The post-fix Ornith-1.5 run shows what that
+    /// mismatch costs — the auditor cut off at its 6,144-token batch cap 21 times
+    /// across 8 of 12 runs, and the tail of its replies is question 3 reasoned out
+    /// for BehaviorPreservation tests ("Is 'light' at 0 a specific value the issue
+    /// never states?") whose answer the pipeline then discards. Ask question 3
+    /// only for a BugReproduction test and write null otherwise: a missing or null
+    /// answer is `None`, which no route reads as ungrounded, so no decision moves.
+    #[test]
+    fn the_grounding_question_is_asked_only_for_a_bug_reproduction_test() {
+        for prompt in [
+            INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED,
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED,
+        ] {
+            assert!(
+                prompt.contains("only when its declared intent is BugReproduction"),
+                "a grounded prompt must scope question 3 to a BugReproduction test"
+            );
+            assert!(
+                prompt.contains(r#"write "assertions_grounded": null"#),
+                "a grounded prompt must say what to write for any other intent"
+            );
+            assert!(
+                prompt.contains(r#""assertions_grounded": true|false|null"#),
+                "the JSON contract must allow the null the other intents write"
+            );
+            assert!(
+                !prompt.contains("whatever its declared intent"),
+                "no grounded prompt may ask question 3 for every declared intent — the \
+                 answer is routed on for a BugReproduction test alone"
+            );
+        }
+
+        for prompt in [
+            INTENT_AUDITOR_SYSTEM_PROMPT,
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT,
+        ] {
+            assert!(
+                !prompt.contains("assertions_grounded"),
+                "the flag-off prompts may not gain the third question"
+            );
+        }
     }
 
     /// [VANTA-WHY] A8 (§14.10) — all four auditor prompts opened with "Answer two

@@ -195,6 +195,7 @@ NO-REIMPLEMENTATION RULE:
 
 INTENT-vs-API RULE:
 - BehaviorPreservation may ONLY exercise APIs that already exist in the ORIGINAL source. If the behaviour you want to check uses a symbol the patch ADDS, it is a FeatureAcceptance test, not BehaviorPreservation.
+- If the issue does not ask for that new behaviour either, DROP the probe. A test that cannot be labelled honestly is not a test: any label you could give it asserts something the issue never asked for, and the patch-blind audit scraps it anyway.
 
 ONE INTENT PER TEST:
 - Each test declares exactly ONE intent. Do NOT mix a new-feature assertion with a preservation assertion in the same test. A test that both checks a NEW value (e.g. a new field defaults to None) AND asserts that some OTHER call is "unchanged as before" has no honest single label: split it into two tests — one FeatureAcceptance/BugReproduction for the new value, one BehaviorPreservation for the unchanged behaviour — or drop the part you cannot label.
@@ -2137,6 +2138,27 @@ mod tests {
         assert!(
             ATTACKER_SYSTEM_PROMPT.contains("Keep every test deterministic"),
             "the flakiness warning must come with the rule that prevents it"
+        );
+    }
+
+    /// [VANTA-WHY] A12 (§14.10) — the INTENT-vs-API rule stopped at the
+    /// FeatureAcceptance redirect, so the case it does not cover had no answer:
+    /// a probe whose behaviour comes from a symbol the patch ADDS, when the issue
+    /// asks for no new behaviour either. The Attacker's remaining options were all
+    /// dishonest — a preservation label for new API, or an acceptance label with
+    /// no issue sentence — and each is then scrapped by the audit, so the probe
+    /// was written only to be thrown away. The rule needs its terminal clause.
+    #[test]
+    fn the_intent_vs_api_rule_ends_by_dropping_the_unlabelable_probe() {
+        assert!(
+            !ATTACKER_SYSTEM_PROMPT.contains("not BehaviorPreservation.\n\nONE INTENT PER TEST"),
+            "the rule may no longer end at the FeatureAcceptance redirect"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("DROP the probe")
+                && ATTACKER_SYSTEM_PROMPT
+                    .contains("A test that cannot be labelled honestly is not a test"),
+            "the unlabelable probe must be dropped rather than mislabelled"
         );
     }
 

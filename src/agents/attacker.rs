@@ -790,7 +790,7 @@ Rules:
 - The issue is the only source of requirements. The original source shows what the behaviour WAS; it is evidence of existing behaviour, never of a new requirement.
 - A test asserting `shipping_band(500) == "light"` is authorised only by an issue sentence that asks for that result at that input. A sentence about a DIFFERENT input does not authorise it.
 - A sentence that forbids changing behaviour ("without changing the existing behaviour at the other thresholds") FORBIDS the change; it never authorises it and never requires one.
-- An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THIS test asserts, not for the issue in general.
+- An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THAT numbered test asserts, not for the issue in general.
 - A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
 - If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
 - Answer EVERY numbered test exactly once and no test that was not given to you. "index" is the number printed above that test.
@@ -816,7 +816,7 @@ Rules:
 - The issue is the only source of requirements. The original source shows what the behaviour WAS; it is evidence of existing behaviour, never of a new requirement.
 - A test asserting `shipping_band(500) == "light"` is authorised only by an issue sentence that asks for that result at that input. A sentence about a DIFFERENT input does not authorise it.
 - A sentence that forbids changing behaviour ("without changing the existing behaviour at the other thresholds") FORBIDS the change; it never authorises it and never requires one.
-- An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THIS test asserts, not for the issue in general.
+- An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THAT numbered test asserts, not for the issue in general.
 - A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
 - If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
 - Answer EVERY numbered test exactly once and no test that was not given to you. "index" is the number printed above that test.
@@ -2483,6 +2483,36 @@ mod tests {
             assert!(
                 prompt.contains("Answer these questions about the input"),
                 "the heading must promise the questions it actually prints"
+            );
+        }
+    }
+
+    /// [VANTA-WHY] A9 (§14.10) — the batched prompts kept the single-test
+    /// wording "for the input THIS test asserts". A batch message holds several
+    /// numbered tests and no single "this" one, so the rule that stops a
+    /// one-input issue from being generalised to every input named a test the
+    /// auditor could not pick out — exactly the ambiguity the batching exists to
+    /// remove. Say "that numbered test"; the one-test prompts keep "THIS test",
+    /// where it is unambiguous.
+    #[test]
+    fn the_batch_rule_points_at_the_numbered_test_not_an_ambiguous_this() {
+        for prompt in [
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT,
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED,
+        ] {
+            assert!(
+                !prompt.contains("for the input THIS test asserts"),
+                "a batch prompt may not say 'THIS test' when several are numbered"
+            );
+            assert!(
+                prompt.contains("for the input THAT numbered test asserts"),
+                "the batch rule must name the numbered test it is about"
+            );
+        }
+        for prompt in [INTENT_AUDITOR_SYSTEM_PROMPT, INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED] {
+            assert!(
+                prompt.contains("for the input THIS test asserts"),
+                "the one-test prompts must keep the wording that is unambiguous there"
             );
         }
     }

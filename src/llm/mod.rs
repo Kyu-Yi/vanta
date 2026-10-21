@@ -181,6 +181,14 @@ fn write_forensics(type_name: &str, tag: &str, attempt: u32, suffix: &str, conte
 
 /// The one place a forensics filename is built. `round` is the pipeline round,
 /// `attempt` the structured-call retry index.
+///
+/// [VANTA-WHY] `type_name` is sanitized too, because it is NOT always a bare
+/// identifier: `structured_call_with_retry` derives it as the LAST `::`-segment
+/// of `std::any::type_name::<T>()`, and for a generic answer that segment keeps
+/// its angle bracket — `Vec<IntentVerdict>` yields `"IntentVerdict>"`, which the
+/// batched intent audit writes as
+/// `IntentVerdict>_intent_audit_batch_round_1_attempt_1_raw_response.txt`. A `>`
+/// in a filename is shell-hostile, so the same rule that cleans a tag cleans it.
 fn write_forensics_to(
     dir: &Path,
     type_name: &str,
@@ -195,7 +203,10 @@ fn write_forensics_to(
     } else {
         format!("_{}", sanitize_tag(tag))
     };
-    let filename = format!("{type_name}{label}_round_{round}_attempt_{attempt}_{suffix}");
+    let filename = format!(
+        "{}{label}_round_{round}_attempt_{attempt}_{suffix}",
+        sanitize_tag(type_name)
+    );
     let path = dir.join(filename);
     match std::fs::write(&path, content) {
         Ok(_) => debug!(path = %path.display(), "forensics written"),
@@ -204,7 +215,8 @@ fn write_forensics_to(
 }
 
 /// A test name can carry `/`, `[`, `]`, spaces — none of which belong in a
-/// filename.
+/// filename. The same rule cleans the type name in a forensics filename, where a
+/// `Vec<T>` answer contributes a trailing `>`.
 fn sanitize_tag(tag: &str) -> String {
     tag.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
@@ -1651,6 +1663,45 @@ mod _cleaning_tests {
     #[test]
     fn forensics_tag_is_sanitized() {
         assert_eq!(super::sanitize_tag("tests/x.py::test[1]"), "tests_x.py__test_1_");
+    }
+
+    /// [VANTA-WHY] e (§14.10) — the batched intent audit writes its raw replies
+    /// as
+    /// `IntentVerdict>_intent_audit_batch_round_1_attempt_1_raw_response.txt`. The
+    /// `>` is not in the tag; it is the last `::`-segment of
+    /// `std::any::type_name::<Vec<IntentVerdict>>()`, which keeps the closing
+    /// angle bracket of the generic. A `>` in a filename is shell-hostile (it
+    /// redirects), so the same rule that cleans a tag must clean the type name.
+    #[test]
+    fn forensics_type_name_is_sanitized() {
+        use super::write_forensics_to;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_forensics_to(
+            dir.path(),
+            "IntentVerdict>",
+            "intent_audit_batch",
+            1,
+            1,
+            "raw_response.txt",
+            "{}",
+        );
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names.len(), 1, "one file per call: {names:?}");
+        let name = &names[0];
+        assert!(
+            !name.contains('>'),
+            "a forensics filename may not carry a '>': {name}"
+        );
+        assert_eq!(
+            name,
+            "IntentVerdict__intent_audit_batch_round_1_attempt_1_raw_response.txt",
+            "the '>' must be replaced by '_', not dropped or left in place"
+        );
     }
 }
 

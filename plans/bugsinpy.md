@@ -1734,6 +1734,26 @@ Contract:
   and the per-test path takes over on the first attempt, asking the same questions one at a time,
   each well inside its own 2048. The round keeps its verdicts instead of losing every one of them to
   "audit unavailable";
+- **that fail-fast is scoped to calls pinned at `temperature = 0.0`, which is the auditor and no one
+  else** — batched and per-test, both 0.0. The argument above is an argument about a *deterministic*
+  call: same request, same seed, same cut-off. It does not hold for the creator (0.1) or the
+  attacker's three sites (0.2, 0.3), where a generator that spent its whole 32768-token window on
+  reasoning and emitted no content is a **sampling accident**, not a property of the request. So
+  above 0.0 a cut-off answer **keeps its retries within the existing budget**; failing the call on
+  the first attempt instead turned a re-runnable run into an `InfraFailure` row, which the wave gate
+  counts as a failure. The retry loop reads the call's pinned temperature out of its own extras —
+  where the schedule put it — and a caller that sends no `temperature` key at all (the bootstrap) is
+  read as 0.2, i.e. not deterministic, and keeps its retries too;
+- **on those calls a retry also moves the seed.** The harness pins `seeds: [0]` (§13), and a pinned
+  seed with an identical prompt reproduces the identical prefix, so at 0.2 the retry would be spent
+  re-reaching the same cut-off. Each attempt therefore sends `seed + (attempt - 1)`: attempt 1 sends
+  the configured seed byte-for-byte, so a one-attempt run is unchanged, and attempt 2 asks a question
+  the server can answer differently while the run stays reproducible. The seed an attempt actually
+  sent is recorded — every `call.usage` row carries `seed=<value|unset>`;
+- **truncations are counted per role in `run.summary`**: `truncated_calls_creator=`,
+  `truncated_calls_attacker=` and `truncated_calls_intent_audit=` (with the same fact on each
+  `call.usage` row as `truncated=`), because "how often a model runs away on the attacker" is a
+  number the paper reports for the dev split (§14.7), not an observation to reconstruct from a log;
 - a **malformed** answer that was *not* cut off keeps its retries: the model can answer that one
   differently, which is what the retry budget is for. Because a cut-off batch now makes one call and
   a malformed one makes the whole budget, the call count no longer says which happened, so the
@@ -1835,6 +1855,15 @@ One per rule and per new parse, plus the regression that matters most:
   with no record saying the audit was unavailable. Its mirror is the malformed batch, which is
   asserted to **still** spend the whole retry budget, and each of the two is asserted to write its own
   `transport=` value in the `intent.audit_batch` record;
+- the fail-fast's **scope**, on the make-or-break case: an **attacker** answer the server reports as
+  cut off is **retried** and the round succeeds on attempt 2, run twice — once with `VANTA_LLM_SEED`
+  unset (no `seed` key in either body) and once with it set, where attempt 1 sends the pinned seed and
+  attempt 2 sends `seed + 1`, the `call.usage` rows for `attacker_generate` record the seed each
+  attempt actually sent (and `truncated=true` then `false`), and `run.summary` reads
+  `truncated_calls_attacker=1`. Its mirror is the **per-test auditor**, whose cut-off answer still
+  fails the call on the first attempt — one `intent_audit` request, not the whole budget — with
+  `truncated_calls_intent_audit=1`. And with nothing truncated and the flags off, every request body
+  stays byte-identical: the pinned seed on every call, `seed + 1` on none, all three counters 0;
 - `metrics.py`'s two new buckets and `label_for`'s new branch, and that the wave gate ignores a
   `NeedsReview` row;
 - `plans/bugsinpy_dev_split.json` loads under `load_split`; the only bug it shares with the
@@ -1889,6 +1918,12 @@ to be made on the dev split (§14.7), not on these nine cases.
 `intent_audit` **2048** cap at Vanta's low sampling temperatures (§4.3 — 0.1 / 0.2 / 0.3 / 0.0),
 producing truncated answers rather than wrong ones. That is a sampling-pin problem, not a model
 verdict, and it is not a candidate for the waves until the pins can be overridden.
+
+**Ornith-1.0 shows the same pattern, more rarely.** One attacker call in nine in the screening spent
+the whole 32768-token window on reasoning and emitted no content — the same failure as 1.5's, just
+rarer — which is why §14.5 retries a cut-off answer above temperature 0.0 instead of failing the call,
+and counts truncations per role: `run.summary`'s `truncated_calls_attacker=` is the rate the paper
+reports for the dev split, rather than something recovered by grepping a batch log.
 
 Future work:
 

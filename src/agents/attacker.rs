@@ -43,7 +43,13 @@ use tracing::{debug, info, trace, warn};
 // "attacker.2.boundary-probe": `session.start` writes
 // `prompt_version=attacker=<tag>;intent_check=<tag>;...`, so the prompt NAME is
 // the key and repeating it inside the value would make the field ambiguous.
-pub const ATTACKER_PROMPT_VERSION: &str = "5.preservation-is-original-only";
+//
+// [VANTA-WHY] Bumped for the prompt audit (plans/bugsinpy.md §14.10, A2–A18):
+// every Attacker prompt — generate, revise, simplify — now states that a result
+// on the PATCHED tree is an expectation about a correct patch, not a rule to be
+// satisfied, and that a failure there is the finding. A row logged before this
+// tag and a row after it come from different prompts.
+pub const ATTACKER_PROMPT_VERSION: &str = "6.expected-on-a-correct-patch";
 
 // ============================================================================
 // INTENT_AUDITOR_PROMPT_VERSION — the run-identity tag for the intent check
@@ -55,7 +61,12 @@ pub const ATTACKER_PROMPT_VERSION: &str = "5.preservation-is-original-only";
 // requires to change. A change to THAT wording changes what a run accepts, so
 // it needs its own tag — otherwise editing the auditor would be logged as "no
 // change" because the Attacker's tag is untouched.
-pub const INTENT_AUDITOR_PROMPT_VERSION: &str = "3.threaded-value-rule";
+//
+// [VANTA-WHY] Bumped for the prompt audit (plans/bugsinpy.md §14.10, A7–A9):
+// the auditor's headings no longer promise a question it may not ask, its
+// grounding rule names the question and the test it closes, and the batch rule
+// points at the numbered test instead of an ambiguous "this".
+pub const INTENT_AUDITOR_PROMPT_VERSION: &str = "4.audit-questions-renamed";
 
 // ============================================================================
 // AttackerRequest — input to the Attacker agent

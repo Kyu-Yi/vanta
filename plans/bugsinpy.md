@@ -1679,6 +1679,15 @@ way. Routing: `assertions_grounded == Some(false)` on a `BugReproduction` test m
 current routing, and a missing field can never scrap anything. Scrapping a test can only ever remove
 a rejection signal, never create one.
 
+**Over-scrapping is the risk, so every ungrounded scrap is logged with the auditor's own reason** —
+the `intent.check[…]` record carries `assertions_grounded=` next to the other two answers and the
+full reason, and the driver prints one `⚖ UNGROUNDED: <test> scrapped — <reason>` line per scrap at
+both audit call sites (`attacker.generate`, `attacker.revise`). The failure mode being guarded is a
+legitimate reproduction test that happens to name a specific the issue states in prose: it is
+scrapped, the bug then has no probe of its own, and without a per-scrap line on the console that
+would only be visible by grepping a batch log thousands of lines long. Whether the flag over-scraps
+is therefore a measurement taken on the dev split (§14.7), not an assumption.
+
 ### 14.5 `VANTA_BATCH_AUDIT` — one audit call per round
 
 `intent_audit` was **60 of 88** LLM calls in the first wave-1 run. With the flag on, a round's tests
@@ -1770,7 +1779,14 @@ One per rule and per new parse, plus the regression that matters most:
 - symptom extraction and matching from issue text; `run.summary`'s `deciding_rule` /
   `needs_review_weak` fields;
 - the grounded-audit parse (`assertions_grounded` present, absent, and false) and the
-  `ScrapUngrounded` routing, including that a missing field never scraps;
+  `ScrapUngrounded` routing for a **`BugReproduction`** test, including that a missing field never
+  scraps and that the ungrounded answer is decided **before** the relabel arms (a demote-shaped
+  verdict must still come out `ScrapUngrounded`);
+- the mirror: an ungrounded answer must never scrap a `BehaviorPreservation` or a
+  `FeatureAcceptance` test — no combination of the other two answers may reach `ScrapUngrounded` —
+  and their routings are otherwise unchanged;
+- a grounded prompt keeps every shared rule of the ungrounded one, and the flag-off prompt does not
+  mention the third question at all;
 - the batched-audit schema: batched vs unbatched give the same per-test decisions and records; a
   missing/duplicate index fails the batch; a failed batch falls back to the unbatched failure shape;
 - `metrics.py`'s two new buckets and `label_for`'s new branch, and that the wave gate ignores a

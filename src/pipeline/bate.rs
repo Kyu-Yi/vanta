@@ -237,6 +237,11 @@ pub fn mislabeled_reproduction_decision(
 ///
 /// Returns the report (for discard-rate logging) and the surviving tests using
 /// their possibly-revised source.
+///
+/// [VANTA-WHY] `grounded_audit` is §14.4's flag, threaded to the two intent
+/// audits this phase performs (the relabel question and the audit of a revised
+/// test). It only selects the auditor's prompt variant; with it `false` both calls
+/// are byte-identical to v0.2's.
 pub async fn run_bate(
     cfg: &LlmConfig,
     issue_text: &str,
@@ -244,6 +249,7 @@ pub async fn run_bate(
     original_prompt_source: &str,
     tests: &[GeneratedTest],
     test_cmd: &TestCommand,
+    grounded_audit: bool,
 ) -> BateRun {
     let mut valid_tests: Vec<GeneratedTest> = Vec::new();
     let mut scrapped_tests: Vec<(String, String)> = Vec::new();
@@ -310,6 +316,7 @@ pub async fn run_bate(
                             issue_text,
                             original_prompt_source,
                             &current_test,
+                            grounded_audit,
                         )
                         .await;
                         intent_checks.push(record);
@@ -387,6 +394,7 @@ pub async fn run_bate(
                                         issue_text,
                                         original_prompt_source,
                                         &revised,
+                                        grounded_audit,
                                     )
                                         .await;
                                 if let Some(relabel) = relabel {

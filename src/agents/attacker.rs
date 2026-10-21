@@ -564,6 +564,13 @@ pub struct IntentVerdict {
     /// BATE relabel question, `Some(false)`.
     #[serde(default)]
     pub issue_requires_change: Option<bool>,
+    /// [VANTA-WHY] §14.4 — the grounded-assertions question, asked only with
+    /// `VANTA_GROUNDED_AUDIT=on`. `Option<bool>` for the same reason
+    /// `issue_requires_change` is: with the flag off the field is absent and
+    /// `None` says so, which must never be read as "ungrounded" — a field nobody
+    /// asked for must not be able to scrap a test that earlier waves accepted.
+    #[serde(default)]
+    pub assertions_grounded: Option<bool>,
     pub reason: String,
 }
 
@@ -593,6 +600,11 @@ pub struct IntentCheckRecord {
     /// lead to different decisions and a log that conflates them cannot explain
     /// the decision afterwards.
     pub issue_requires_change: Option<bool>,
+    /// [VANTA-WHY] §14.4 — the grounded-assertions answer, logged for the same
+    /// reason as the other two: a reader must be able to see WHY a test was
+    /// scrapped as ungrounded, and `None` (flag off, or the model omitted the
+    /// field) must be distinguishable from an explicit `false`.
+    pub assertions_grounded: Option<bool>,
     /// [VANTA-WHY] True when a BehaviorPreservation test asserts behaviour the
     /// issue requires to CHANGE. It contradicts the issue, so it is scrapped
     /// rather than demoted: there is no honest label left for it.
@@ -621,42 +633,120 @@ Rules:
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
 {"issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "reason": "one short sentence"}"#;
 
+/// [VANTA-WHY] §14.4 — the auditor's THIRD question, used only with
+/// `VANTA_GROUNDED_AUDIT=on`.
+///
+/// A SEPARATE literal rather than a string built up from the one above, because
+/// the flag-off prompt must stay byte-identical to the prompt earlier waves ran
+/// (`intent_audit` is one of §4.3's call sites, so its text is part of a run's
+/// identity — see `INTENT_AUDITOR_PROMPT_VERSION`). The shared rules are repeated
+/// verbatim; `the_grounded_prompt_keeps_the_shared_rules` pins that both prompts
+/// carry them, so an edit to one that is not mirrored in the other fails the
+/// tests rather than silently making the two asks disagree.
+///
+/// The question exists because PySnooper/3's false reject was a test that
+/// asserted output text — `'Starting var' in content` — that the issue never
+/// mentions. That is not a wrong *label*, which is all the other questions can
+/// see; it is an assertion invented on top of the issue. Asking about grounding
+/// lets the audit scrap it before it can reject a correct patch. Scrapping only
+/// ever REMOVES a rejection signal, so a model that answers `false` too eagerly
+/// can lose a reject but cannot manufacture one (and only a
+/// `BugReproduction` test is routed on the answer).
+const INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED: &str = r#"You are Vanta Intent Auditor. You are given an ISSUE, the ORIGINAL source of a repository, and ONE test. You are NOT given the patch and must not speculate about it.
+
+Answer two questions about the input the test asserts:
+1. "issue_asks_for_behaviour": does the ISSUE ask for the result this test asserts, AT THE INPUT THE TEST ASSERTS?
+2. "issue_requires_change": does the ISSUE require the behaviour at that input to CHANGE from what the ORIGINAL source does there — that is, does the issue ask for a DIFFERENT result than the original returns at that input?
+
+Rules:
+- The issue is the only source of requirements. The original source shows what the behaviour WAS; it is evidence of existing behaviour, never of a new requirement.
+- A test asserting `shipping_band(500) == "light"` is authorised only by an issue sentence that asks for that result at that input. A sentence about a DIFFERENT input does not authorise it.
+- A sentence that forbids changing behaviour ("without changing the existing behaviour at the other thresholds") FORBIDS the change; it never authorises it and never requires one.
+- An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THIS test asserts, not for the issue in general.
+- A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
+- If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
+
+3. "assertions_grounded": does this test assert ONLY behaviour the ISSUE describes, at the input the ISSUE names — or does it also pin a SPECIFIC VALUE the issue never states?
+
+Rules for question 3:
+- Grounded: an assertion that follows from the issue's own words about the input it names ("it should not raise", "the file is written", "the boundary value returns the standard band").
+- Ungrounded: an assertion that pins wording, an exact output string, an exact message, a format or a number the issue never mentions ("the output CONTAINS 'Starting var'", "the repr is exactly ...", "the log line begins with a timestamp").
+- The issue is the only source of requirements. "It should not raise NameError" is grounded; "it should print exactly this string" is grounded only if the issue prints that string.
+- A test may assert more than the issue asks about ONLY when the extra assertion is a direct consequence of what the issue requires. Invented specifics are ungrounded.
+- Answer this for every test you are given, whatever its declared intent.
+
+YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
+{"issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "assertions_grounded": true|false, "reason": "one short sentence"}"#;
+
+/// The system prompt for the requested audit variant.
+///
+/// [VANTA-WHY] The only place the two prompts are chosen between. Flag off
+/// returns the original literal unchanged — not a re-derivation of it — so
+/// "prompt is byte-identical when the flag is off" is a property of the code
+/// rather than of a test.
+fn intent_auditor_system_prompt(grounded: bool) -> &'static str {
+    if grounded {
+        INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED
+    } else {
+        INTENT_AUDITOR_SYSTEM_PROMPT
+    }
+}
+
 /// Audit one test's declared intent against the issue.
 ///
 /// Never sees the patch: `IntentCheckRequest` has no field for it.
+///
+/// [VANTA-WHY] `grounded` selects the §14.4 prompt VARIANT. With it `false` both
+/// messages are built exactly as before the variant existed — the closing
+/// question, the re-prompt line and the system prompt are the original strings,
+/// not re-derivations of them — so a flag-off run's request body is byte-identical
+/// to a v0.2 one. Run identity for the variant is the base
+/// `INTENT_AUDITOR_PROMPT_VERSION` plus the `grounded_audit=` field `run.summary`
+/// records, so a flag-off session's prompt tag is untouched.
 pub async fn attacker_check_intent(
     cfg: &LlmConfig,
     request: &IntentCheckRequest,
+    grounded: bool,
 ) -> Result<IntentVerdict, Box<dyn Error + Send + Sync>> {
     info!(
         test_name = %request.test_name,
         intent = ?request.declared_intent,
+        grounded,
         "intent auditor start"
     );
 
     let client = build_reqwest_client(cfg)?;
 
+    let closing_question = if grounded {
+        "Does the issue ask for this behaviour at the input this test asserts, does it require the behaviour at that input to change, and does the test assert only behaviour the issue describes? Answer with JSON."
+    } else {
+        "Does the issue ask for this behaviour at the input this test asserts, and does it require the behaviour at that input to change? Answer with JSON."
+    };
+
     let user_prompt = format!(
-        "ISSUE:\n{}\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nTEST UNDER AUDIT ({}):\n```\n{}\n```\n\nDeclared intent: {:?}\n\nDoes the issue ask for this behaviour at the input this test asserts, and does it require the behaviour at that input to change? Answer with JSON.",
+        "ISSUE:\n{}\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nTEST UNDER AUDIT ({}):\n```\n{}\n```\n\nDeclared intent: {:?}\n\n{}",
         request.issue_text,
         request.original_source,
         request.test_name,
         request.test_source,
-        request.declared_intent
+        request.declared_intent,
+        closing_question
     );
 
-    let sys_owned = INTENT_AUDITOR_SYSTEM_PROMPT.to_string();
+    let sys_owned = intent_auditor_system_prompt(grounded).to_string();
     let user_owned = user_prompt.clone();
+    let reprompt = if grounded {
+        "REPROMPT: output ONLY {\"issue_asks_for_behaviour\": true|false, \"issue_requires_change\": true|false, \"assertions_grounded\": true|false, \"reason\": \"...\"}."
+    } else {
+        "REPROMPT: output ONLY {\"issue_asks_for_behaviour\": true|false, \"issue_requires_change\": true|false, \"reason\": \"...\"}."
+    };
     let build_messages = move |attempt: u32| {
         let mut messages = vec![
             json!({"role": "system", "content": sys_owned.clone()}),
             json!({"role": "user", "content": user_owned.clone()}),
         ];
         if attempt >= 2 {
-            messages.push(json!({
-                "role": "user",
-                "content": "REPROMPT: output ONLY {\"issue_asks_for_behaviour\": true|false, \"issue_requires_change\": true|false, \"reason\": \"...\"}."
-            }));
+            messages.push(json!({"role": "user", "content": reprompt}));
         }
         messages
     };
@@ -752,6 +842,14 @@ pub(crate) enum IntentRouting {
     /// BehaviorPreservation + the issue REQUIRES the asserted behaviour to
     /// change. The test contradicts the issue and no honest label remains.
     ScrapRequiresChange,
+    /// [VANTA-WHY] §14.4 — a `BugReproduction` test whose assertions pin values
+    /// the issue never states. Only reachable with `VANTA_GROUNDED_AUDIT=on` and
+    /// only on an EXPLICIT `Some(false)`: with the flag off the field is absent,
+    /// so `None` falls through to the ordinary arms and a test earlier waves
+    /// accepted cannot be scrapped by a question nobody asked. Scrapping removes
+    /// a rejection signal and can never create one, which is why an over-eager
+    /// model here loses a reject rather than manufacturing one.
+    ScrapUngrounded,
     /// The test already carries one relabel, so this verdict would flip it back.
     ScrapRelabelCeiling,
 }
@@ -767,6 +865,17 @@ pub(crate) fn route_intent(
     verdict: &IntentVerdict,
     already_relabeled: bool,
 ) -> IntentRouting {
+    // [VANTA-WHY] §14.4 — an ungrounded BugReproduction test is scrapped before
+    // any other arm is consulted. A test that asserts an invented specific cannot
+    // be trusted to reject a patch whatever else the verdict says, so the answer
+    // is "no honest test here" (a scrap, i.e. back to the Attacker) rather than a
+    // relabel. Every other intent keeps its routing: an ungrounded
+    // BehaviorPreservation probe can only ever ASSERT a failure, and the ordinary
+    // arms already decide what an unasked-for presupposition means.
+    if *intent == TestIntent::BugReproduction && verdict.assertions_grounded == Some(false) {
+        return IntentRouting::ScrapUngrounded;
+    }
+
     let wanted = match intent {
         TestIntent::BehaviorPreservation => {
             if verdict.issue_requires_change == Some(true) {
@@ -819,6 +928,7 @@ pub async fn audit_test_intent(
     issue_text: &str,
     original_source: &str,
     test: &GeneratedTest,
+    grounded: bool,
 ) -> (Option<GeneratedTest>, Option<IntentRelabel>, Option<IntentCheckRecord>) {
     let evidence = observe_quote_evidence(test, issue_text);
 
@@ -830,7 +940,7 @@ pub async fn audit_test_intent(
         declared_intent: test.intent.clone(),
     };
 
-    let verdict = match attacker_check_intent(cfg, &request).await {
+    let verdict = match attacker_check_intent(cfg, &request, grounded).await {
         Ok(verdict) => verdict,
         Err(e) => {
             warn!(
@@ -841,6 +951,7 @@ pub async fn audit_test_intent(
             IntentVerdict {
                 issue_asks_for_behaviour: false,
                 issue_requires_change: None,
+                assertions_grounded: None,
                 reason: format!("intent audit unavailable ({e})"),
             }
         }
@@ -851,6 +962,7 @@ pub async fn audit_test_intent(
         declared_intent: test.intent.clone(),
         issue_asks_for_behaviour: verdict.issue_asks_for_behaviour,
         issue_requires_change: verdict.issue_requires_change,
+        assertions_grounded: verdict.assertions_grounded,
         scrapped,
         reason,
         evidence: evidence.clone(),
@@ -914,6 +1026,28 @@ pub async fn audit_test_intent(
             (None, None, Some(record(true, reason)))
         }
 
+        IntentRouting::ScrapUngrounded => {
+            // [VANTA-WHY] §14.4 — PySnooper/3's shape. The test reproduces the
+            // reported symptom, so every other arm is happy with it; what is
+            // wrong is an assertion laid on top that the issue never states
+            // (`'Starting var' in content`). Kept, it fails on a CORRECT patch and
+            // rejects it in round 4. Scrapped, it is dropped like a BATE mismatch,
+            // so the Attacker is asked for a test that asserts only what the issue
+            // describes — and the rejection signal it would have supplied is gone,
+            // which is the safe direction.
+            let reason = format!(
+                "the test's assertions are not grounded in the issue: it pins a specific value \
+                 the issue never states, so it cannot be trusted to judge a patch: {}",
+                verdict.reason
+            );
+            warn!(
+                test = %test.test_name,
+                auditor_reason = %verdict.reason,
+                "intent audit: ungrounded BugReproduction assertions — scrapping the test"
+            );
+            (None, None, Some(record(true, reason)))
+        }
+
         IntentRouting::ScrapRelabelCeiling => {
             let reason = format!(
                 "the test already carries one relabel; a second relabel would flip it back, so it \
@@ -945,6 +1079,7 @@ pub async fn audit_issue_requires_change(
     issue_text: &str,
     original_source: &str,
     test: &GeneratedTest,
+    grounded: bool,
 ) -> (Option<bool>, IntentCheckRecord) {
     let evidence = observe_quote_evidence(test, issue_text);
 
@@ -956,7 +1091,7 @@ pub async fn audit_issue_requires_change(
         declared_intent: test.intent.clone(),
     };
 
-    let verdict = match attacker_check_intent(cfg, &request).await {
+    let verdict = match attacker_check_intent(cfg, &request, grounded).await {
         Ok(verdict) => verdict,
         Err(e) => {
             warn!(
@@ -968,6 +1103,7 @@ pub async fn audit_issue_requires_change(
             IntentVerdict {
                 issue_asks_for_behaviour: false,
                 issue_requires_change: None,
+                assertions_grounded: None,
                 reason: format!("intent audit unavailable ({e})"),
             }
         }
@@ -978,6 +1114,7 @@ pub async fn audit_issue_requires_change(
         declared_intent: test.intent.clone(),
         issue_asks_for_behaviour: verdict.issue_asks_for_behaviour,
         issue_requires_change: verdict.issue_requires_change,
+        assertions_grounded: verdict.assertions_grounded,
         scrapped: false,
         reason: verdict.reason,
         evidence,
@@ -992,6 +1129,7 @@ pub async fn audit_tests_intent(
     issue_text: &str,
     original_source: &str,
     tests: &[GeneratedTest],
+    grounded: bool,
 ) -> (
     Vec<GeneratedTest>,
     Vec<IntentRelabel>,
@@ -1002,7 +1140,7 @@ pub async fn audit_tests_intent(
     let mut records = Vec::new();
     for test in tests {
         let (updated, relabel, record) =
-            audit_test_intent(cfg, issue_text, original_source, test).await;
+            audit_test_intent(cfg, issue_text, original_source, test, grounded).await;
         if let Some(updated) = updated {
             audited.push(updated);
         }
@@ -1162,6 +1300,19 @@ mod tests {
         IntentVerdict {
             issue_asks_for_behaviour: asks,
             issue_requires_change: requires_change,
+            assertions_grounded: None,
+            reason: "the issue says so".to_string(),
+        }
+    }
+
+    /// [VANTA-WHY] §14.4 — the only difference is the third answer, so the
+    /// grounded tests cannot accidentally pass by way of a change to the shared
+    /// helper's other two fields.
+    fn grounded_verdict(asks: bool, grounded: Option<bool>) -> IntentVerdict {
+        IntentVerdict {
+            issue_asks_for_behaviour: asks,
+            issue_requires_change: None,
+            assertions_grounded: grounded,
             reason: "the issue says so".to_string(),
         }
     }
@@ -1320,6 +1471,200 @@ mod tests {
                     .contains("answer \"issue_requires_change\": true for it"),
             "the auditor must answer issue_requires_change=true when a preservation probe pins an \
              internal call the issue threads a new value through"
+        );
+    }
+
+    // ---- §14.4: the grounded-assertions question ----------------------------
+
+    /// PySnooper/3's false reject was a `BugReproduction` test that reproduced
+    /// the reported `NameError` AND asserted output text — `'Starting var' in
+    /// content` — that the issue never mentions. Every other arm accepts it, so
+    /// without this routing it survives to round 4 and rejects a correct patch.
+    ///
+    /// The second half pins the PRECEDENCE: with `issue_asks_for_behaviour =
+    /// false` the ordinary arms would demote this test, so `ScrapUngrounded`
+    /// coming out at all proves it is checked before them.
+    #[test]
+    fn an_ungrounded_bug_reproduction_test_is_scrapped() {
+        assert_eq!(
+            route_intent(
+                &TestIntent::BugReproduction,
+                &grounded_verdict(true, Some(false)),
+                false
+            ),
+            IntentRouting::ScrapUngrounded
+        );
+
+        let demote_shaped = IntentVerdict {
+            issue_asks_for_behaviour: false,
+            issue_requires_change: Some(false),
+            assertions_grounded: Some(false),
+            reason: "pins an invented output string".to_string(),
+        };
+        assert_eq!(
+            route_intent(&TestIntent::BugReproduction, &demote_shaped, false),
+            IntentRouting::ScrapUngrounded,
+            "the ungrounded arm must be decided before the demotion the other \
+             answers would have selected"
+        );
+    }
+
+    /// The safety property that matters: a field NOBODY ASKED FOR must not be
+    /// able to scrap a test earlier waves accepted. With the flag off the model
+    /// never emits `assertions_grounded`, so `None` has to fall through to the
+    /// ordinary arms — as does an explicit `true`.
+    #[test]
+    fn an_absent_or_positive_grounded_answer_never_scraps() {
+        assert_eq!(
+            route_intent(
+                &TestIntent::BugReproduction,
+                &grounded_verdict(true, None),
+                false
+            ),
+            IntentRouting::Keep
+        );
+        assert_eq!(
+            route_intent(
+                &TestIntent::BugReproduction,
+                &grounded_verdict(true, Some(true)),
+                false
+            ),
+            IntentRouting::Keep
+        );
+        // The flag-off verdict has no opinion at all (see `verdict`).
+        assert_eq!(
+            route_intent(&TestIntent::BugReproduction, &verdict(true, None), false),
+            IntentRouting::Keep
+        );
+    }
+
+    /// Only `BugReproduction` is classified on the grounded answer. A
+    /// `BehaviorPreservation`/`FeatureAcceptance` test answering
+    /// `assertions_grounded = false` must NEVER reach `ScrapUngrounded` — its
+    /// routing is whatever it was before this question existed, because the
+    /// question is about a test that reproduces a bug and those two are the
+    /// labels that carry a calibration risk of their own.
+    #[test]
+    fn an_ungrounded_answer_never_scraps_a_preservation_or_acceptance_test() {
+        for grounded in [None, Some(false), Some(true)] {
+            for asks in [false, true] {
+                for intent in [TestIntent::BehaviorPreservation, TestIntent::FeatureAcceptance] {
+                    assert_ne!(
+                        route_intent(&intent, &grounded_verdict(asks, grounded), false),
+                        IntentRouting::ScrapUngrounded,
+                        "an ungrounded answer must not scrap a {intent:?} test \
+                         (asks={asks}, assertions_grounded={grounded:?})"
+                    );
+                }
+            }
+        }
+
+        // ...and the exact routings those two intents keep.
+        assert_eq!(
+            route_intent(
+                &TestIntent::BehaviorPreservation,
+                &grounded_verdict(true, Some(false)),
+                false
+            ),
+            IntentRouting::Keep
+        );
+        // The demotion direction is deliberately unchanged: demoting already
+        // makes a test harder to admit, so an ungrounded FeatureAcceptance test is
+        // demoted rather than scrapped.
+        assert_eq!(
+            route_intent(
+                &TestIntent::FeatureAcceptance,
+                &grounded_verdict(false, Some(false)),
+                false
+            ),
+            IntentRouting::DemoteToPreservation
+        );
+    }
+
+    /// For a `BugReproduction` test the ungrounded answer decides alone: every
+    /// combination of the other two answers still comes out `ScrapUngrounded`,
+    /// so the test can never be quietly relabelled into something that keeps
+    /// rejecting patches on an invented assertion.
+    #[test]
+    fn an_ungrounded_bug_reproduction_test_is_never_relabelled_instead_of_scrapped() {
+        for asks in [false, true] {
+            for requires_change in [None, Some(false), Some(true)] {
+                let v = IntentVerdict {
+                    issue_asks_for_behaviour: asks,
+                    issue_requires_change: requires_change,
+                    assertions_grounded: Some(false),
+                    reason: "pins an invented output string".to_string(),
+                };
+                assert_eq!(
+                    route_intent(&TestIntent::BugReproduction, &v, false),
+                    IntentRouting::ScrapUngrounded
+                );
+            }
+        }
+    }
+
+    /// The typed answer: the field is `Option<bool>`, so `Some(false)` (the
+    /// model said ungrounded) must be distinguishable from `None` (nobody asked,
+    /// or the model dropped the field) — the whole routing above keys on that
+    /// distinction.
+    #[test]
+    fn the_grounded_answer_parses_present_absent_and_false() {
+        let present = serde_json::from_str::<IntentVerdict>(
+            r#"{"issue_asks_for_behaviour": true, "issue_requires_change": false, "assertions_grounded": false, "reason": "pins an invented string"}"#,
+        )
+        .expect("a verdict carrying assertions_grounded parses");
+        assert_eq!(present.assertions_grounded, Some(false));
+
+        let positive = serde_json::from_str::<IntentVerdict>(
+            r#"{"issue_asks_for_behaviour": true, "issue_requires_change": false, "assertions_grounded": true, "reason": "only asserts no-raise"}"#,
+        )
+        .expect("a grounded verdict parses");
+        assert_eq!(positive.assertions_grounded, Some(true));
+
+        let absent = serde_json::from_str::<IntentVerdict>(
+            r#"{"issue_asks_for_behaviour": true, "issue_requires_change": false, "reason": "flag off"}"#,
+        )
+        .expect("the flag-off shape still parses");
+        assert_eq!(absent.assertions_grounded, None);
+    }
+
+    /// [VANTA-WHY] The grounded variant is a SEPARATE literal, so an edit to one
+    /// prompt that is not mirrored in the other would silently make the two asks
+    /// disagree about the rules they share. This fails on that edit.
+    #[test]
+    fn the_grounded_prompt_keeps_the_shared_rules() {
+        const SHARED: [&str; 4] = [
+            "The issue is the only source of requirements.",
+            "A sentence that forbids changing behaviour",
+            "THREADED THROUGH",
+            "Preserving existing behaviour is always a valid answer.",
+        ];
+        for rule in SHARED {
+            assert!(
+                INTENT_AUDITOR_SYSTEM_PROMPT.contains(rule),
+                "the base prompt must carry the shared rule: {rule}"
+            );
+            assert!(
+                INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED.contains(rule),
+                "the grounded prompt must carry the same shared rule verbatim: {rule}"
+            );
+        }
+
+        assert!(
+            INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED.contains("\"assertions_grounded\""),
+            "the grounded prompt must ask the third question and pin its JSON key"
+        );
+        assert!(
+            !INTENT_AUDITOR_SYSTEM_PROMPT.contains("assertions_grounded"),
+            "the flag-off prompt must be unchanged — it may not mention the third question"
+        );
+        assert_eq!(
+            intent_auditor_system_prompt(false),
+            INTENT_AUDITOR_SYSTEM_PROMPT
+        );
+        assert_eq!(
+            intent_auditor_system_prompt(true),
+            INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED
         );
     }
 

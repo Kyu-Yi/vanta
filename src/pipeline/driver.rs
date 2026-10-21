@@ -1029,6 +1029,7 @@ pub async fn run(
                 &repo.issue_text,
                 &review_prompt_concat,
                 &generated_tests,
+                grounded_audit_enabled,
             )
             .await;
             let intent_scrapped = initial_intent_checks.iter().filter(|c| c.scrapped).count();
@@ -1062,6 +1063,7 @@ pub async fn run(
                 benchmark_label: None,
             })?;
             log_intent_checks(&mut session_log, &session_id, &patch_attempt_id, &testing_iteration_id, "attacker.generate", &initial_intent_checks)?;
+            announce_ungrounded_scraps(&initial_intent_checks);
             for check in &initial_intent_checks {
                 issue_requires_change_by_test
                     .insert(check.test_name.clone(), check.issue_requires_change);
@@ -1122,6 +1124,7 @@ pub async fn run(
                 &review_prompt_concat,
                 &attacker_tests,
                 &test_cmd,
+                grounded_audit_enabled,
             )
             .await
         })
@@ -1160,6 +1163,7 @@ pub async fn run(
             benchmark_label: None,
         })?;
         log_intent_checks(&mut session_log, &session_id, &patch_attempt_id, &testing_iteration_id, "attacker.revise", &bate_intent_checks)?;
+        announce_ungrounded_scraps(&bate_intent_checks);
         // [VANTA-WHY] BATE's answers come AFTER a possible revision, so they
         // describe the test version that actually runs. They overwrite the
         // generation-time answers for the same name — the newer answer is the
@@ -3534,6 +3538,29 @@ fn tri_state_text(value: Option<bool>) -> &'static str {
     }
 }
 
+/// Print one line per §14.4 ungrounded scrap, with the auditor's reason.
+///
+/// [VANTA-WHY] A scrap removes a rejection signal, so the one thing that must be
+/// checkable on a real run is whether it removed the RIGHT one: a legitimate
+/// `BugReproduction` test that happens to name a specific the issue states in
+/// prose would be scrapped here and its bug would then have no probe at all. The
+/// session log proves it happened (`intent.check[…]` carries `scrapped=true` and
+/// the reason), but a batch run's log is thousands of lines; the console line is
+/// what makes over-scrapping visible while the dev split is still in front of
+/// you. A record whose `assertions_grounded` is `Some(false)` is the only shape
+/// this routing can produce, so the filter cannot drift from `route_intent`.
+fn announce_ungrounded_scraps(checks: &[IntentCheckRecord]) {
+    for check in checks
+        .iter()
+        .filter(|c| c.scrapped && c.assertions_grounded == Some(false))
+    {
+        println!(
+            "      ⚖ UNGROUNDED: {} scrapped — {}",
+            check.test_name, check.reason
+        );
+    }
+}
+
 /// Append one `intent.check[…]` record per audited test.
 ///
 /// [VANTA-WHY] The verdict is logged for EVERY test — kept, demoted or scrapped,
@@ -3557,10 +3584,11 @@ fn log_intent_checks(
             test_id: Some(fresh_test_id()),
             phase: format!("intent.check[{}]", check.test_name),
             summary: format!(
-                "source={source} declared={:?} issue_asks_for_behaviour={} issue_requires_change={} scrapped={} quote_present={} quote_in_issue={} quote_names_asserted_input={} asserted_inputs=[{}] reason={}",
+                "source={source} declared={:?} issue_asks_for_behaviour={} issue_requires_change={} assertions_grounded={} scrapped={} quote_present={} quote_in_issue={} quote_names_asserted_input={} asserted_inputs=[{}] reason={}",
                 check.declared_intent,
                 check.issue_asks_for_behaviour,
                 tri_state_text(check.issue_requires_change),
+                tri_state_text(check.assertions_grounded),
                 check.scrapped,
                 check.evidence.quote_present,
                 check.evidence.quote_in_issue,

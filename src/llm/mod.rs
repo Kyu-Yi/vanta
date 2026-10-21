@@ -425,7 +425,7 @@ pub const SAMPLING_SCHEDULE: &[(&str, f64, u32)] = &[
     ("attacker_generate", 0.2, 32768),
     ("attacker_revise", 0.3, 32768),
     ("attacker_simplify", 0.3, 32768),
-    ("intent_audit", 0.0, 2048),
+    ("intent_audit", 0.0, 8192),
 ];
 
 /// The `coding` preset's sampler pins, for EVERY site including the auditor (§14.11).
@@ -433,7 +433,7 @@ pub const SAMPLING_SCHEDULE: &[(&str, f64, u32)] = &[
 /// [VANTA-WHY] One temperature / top_p / top_k / min_p / presence_penalty set,
 /// not a second schedule: the preset changes HOW a site samples, not how many
 /// tokens it may emit (`max_tokens` stays the `pinned` row's, so the auditor keeps
-/// its 2048-token cap). The auditor is covered like every other site: under
+/// its 8192-token cap). The auditor is covered like every other site: under
 /// `coding` it samples at 0.6 alongside the Attacker whose tests it judges, which
 /// is the condition the preset exists for — a pinned-0.0 auditor grades a noisy
 /// Attacker's output as if that output were the only reading of the issue. A

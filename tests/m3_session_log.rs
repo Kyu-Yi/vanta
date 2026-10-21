@@ -2481,12 +2481,12 @@ fn a_batch_cut_off_at_the_cap_falls_back_to_per_test_audits_with_the_same_decisi
     assert!(summary_off.contains("batch_audit=off"), "got {summary_off}");
     assert!(summary_on.contains("batch_audit=on"), "got {summary_on}");
     assert!(
-        summary_on.contains("batch_audit_tokens_per_test=2048"),
+        summary_on.contains("batch_audit_tokens_per_test=8192"),
         "the per-test allowance must be recorded; got {summary_on}"
     );
     assert!(
-        summary_on.contains("batch_audit_max_tokens=6144"),
-        "three tests × one test's allowance is 6144, under the ceiling; got {summary_on}"
+        summary_on.contains("batch_audit_max_tokens=24576"),
+        "three tests × one test's allowance is 24576, under the ceiling; got {summary_on}"
     );
 }
 
@@ -4983,7 +4983,7 @@ fn the_recorded_sampling_schedule_matches_the_request_bodies() {
 /// which left it judging a 0.6-sampled Attacker's tests at 0.0 — the one site
 /// whose output is a judgement on the run's noisiest generation. It is now covered
 /// like the rest, while `max_tokens` is NOT part of the preset: the auditor keeps
-/// its 2048 cap, so a cut-off audit at 0.6 takes the retry path (temperature
+/// its 8192 cap, so a cut-off audit at 0.6 takes the retry path (temperature
 /// above 0.0) instead of the temperature-0.0 fail-fast. Both halves are asserted
 /// here, against the recorded schedule AND the bodies the server received.
 #[test]
@@ -5080,8 +5080,8 @@ fn the_coding_preset_covers_every_site_including_the_auditor() {
             "0.0"
         );
     }
-    // The preset moves samplers, not caps: the auditor keeps its 2048.
-    assert_eq!(summary_value(&summary, "max_tokens_intent_audit"), "2048");
+    // The preset moves samplers, not caps: the auditor keeps its 8192.
+    assert_eq!(summary_value(&summary, "max_tokens_intent_audit"), "8192");
     assert_eq!(summary_value(&summary, "max_tokens_attacker_generate"), "32768");
 
     // The recorded schedule must be the one the bodies carried — the auditor's
@@ -5112,7 +5112,7 @@ fn the_coding_preset_covers_every_site_including_the_auditor() {
         assert_eq!(value.get("min_p").and_then(|v| v.as_f64()), Some(0.0));
         assert_eq!(
             value.get("max_tokens").and_then(|v| v.as_u64()),
-            Some(2048),
+            Some(8192),
             "the coding preset must not move the auditor's cap: {body}"
         );
     }

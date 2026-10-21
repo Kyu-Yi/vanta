@@ -974,7 +974,7 @@ pub async fn attacker_check_intent(
     // 0.0 — the audit must not be a coin flip, and it never sees the patch, so
     // there is no patch-shaped variance to average over — while `coding` samples
     // it at that preset's temperature, alongside the Attacker whose output it
-    // judges. `max_tokens` comes from the schedule too, so the 2048 cap is the
+    // judges. `max_tokens` comes from the schedule too, so the 8192 cap is the
     // same under both presets. Because `structured_call_with_retry` reads the
     // temperature off the request itself, a truncated audit at 0.6 retries with
     // the seed advanced instead of taking the temperature-0.0 fail-fast.
@@ -1419,21 +1419,32 @@ impl BatchAuditTransport {
 
 /// Output allowance the batched audit is given PER TEST in the round (§14.5).
 ///
-/// [VANTA-WHY] The batch answers with one entry per test, so the 2048 the
+/// [VANTA-WHY] The batch answers with one entry per test, so the cap the
 /// single-test call pins is the wrong number for it: a three-test round asked
 /// for one entry's worth of output, the JSON was cut off mid-object, and the
 /// whole round's verdicts were lost to a parse failure. One entry per test is
 /// what the request is for, so the cap is one test's worth per test.
-pub const INTENT_AUDIT_BATCH_TOKENS_PER_TEST: u64 = 2_048;
+///
+/// [VANTA-WHY] 8192, raised from 2048 (§14.10 e-follow-up). The post-fix
+/// Ornith-1.5 run on the toy was cut off at the old 6144 batch cap 21 times
+/// across 8 of 12 runs, and the single-test pin (the schedule's own cap, the
+/// same number) is what the fallback then inherits — so the raise covers both
+/// transports. The biggest batched reply ends mid-sentence on the reasoning
+/// ("Let me reconsider grounded once more…") with no JSON at all: the audit does
+/// not stop deliberating at 2048 tokens, it stops writing.
+pub const INTENT_AUDIT_BATCH_TOKENS_PER_TEST: u64 = 8_192;
 
 /// Ceiling for the batched audit's output cap (§14.5).
 ///
-/// [VANTA-WHY] 16384 — half of the 32768-token window Vanta's local models are
-/// served at (§9), so the round's prompt plus the cap still fits that window
-/// instead of tripping the deterministic context pre-flight, and eight tests'
-/// worth of the per-test allowance, so a round larger than eight is exactly the
-/// case the per-test fallback below exists for.
-pub const INTENT_AUDIT_BATCH_TOKENS_CEILING: u64 = 16_384;
+/// [VANTA-WHY] 32768 — the full context window Vanta's local models are served
+/// at (§9), raised from 16384 alongside the per-test allowance. It is now four
+/// tests' worth of that allowance (8192 × 4), where under the old numbers it was
+/// eight: a round larger than four is the case the per-test fallback below
+/// exists for. The cap is deliberately allowed to reach the window rather than
+/// stop at half of it: the alternative to a large cap is a truncated audit that
+/// loses the whole round's verdicts, which is exactly the failure this raise is
+/// for.
+pub const INTENT_AUDIT_BATCH_TOKENS_CEILING: u64 = 32_768;
 
 /// The `max_tokens` a batched audit of `tests` tests is given.
 ///
@@ -1528,7 +1539,7 @@ async fn attacker_check_intent_batch(
     // changes how many times it is called, not how each call is sampled. The
     // OUTPUT cap is the one number that must scale, because the batch's answer is
     // one entry per test (§14.5), so it is written over the schedule's cap after
-    // the pins are applied — the batch keeps `2048 * tests` (ceilinged) and the
+    // the pins are applied — the batch keeps `8192 * tests` (ceilinged) and the
     // preset's temperature, which is what `run.summary` records separately.
     let mut extras = crate::llm::with_sampling(
         json!({
@@ -1612,7 +1623,7 @@ pub async fn audit_tests_intent(
                 // call is not retried at all (see `structured_call_with_retry`),
                 // and falling through to the per-test loop asks the same
                 // questions one at a time — each well inside the single call's
-                // own 2048 — so the round keeps its verdicts instead of losing
+                // own 8192 cap — so the round keeps its verdicts instead of losing
                 // all of them to a cap no retry of the batch can clear.
                 warn!(
                     tests = tests.len(),

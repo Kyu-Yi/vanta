@@ -257,7 +257,7 @@ fn truncation_counts(calls: &[crate::llm::CallUsage]) -> (u64, u64, u64) {
 /// [VANTA-WHY] §14.11 — the record is the EFFECTIVE schedule, not the static
 /// `pinned` table: under `VANTA_SAMPLING=coding` every site, the intent auditor
 /// included, samples at 0.6 with `top_p`/`top_k`/`min_p`/`presence_penalty`
-/// pinned (the auditor's 2048-token cap is not part of the preset), and a summary
+/// pinned (the auditor's 8192-token cap is not part of the preset), and a summary
 /// that still said 0.1 would describe a run nobody made. The preset names itself
 /// first, and the per-role keys come from `llm::sampling_pins_text`, the same
 /// table the request bodies are built from, so the record cannot drift from the
@@ -668,7 +668,7 @@ pub async fn run(
     // explicit `true`.
     let mut issue_requires_change_by_test: HashMap<String, Option<bool>> = HashMap::new();
     // [VANTA-WHY] §14.5 — the largest output cap the batched audit was given in
-    // this run, over every round. The cap scales with the round (`2048` per test,
+    // this run, over every round. The cap scales with the round (`8192` per test,
     // ceilinged), so it is a property of the run's rounds, not a constant, and a
     // reader of `run.summary` cannot recover it from the schedule: the schedule
     // records the SINGLE-call pin (`max_tokens_intent_audit`), which the batch

@@ -258,6 +258,48 @@ TERMINAL FALLBACK: when EVERY input the defaults above point to is already cover
 This order and these defaults are FINAL. Choose the three tests once, write them, and do not re-derive the plan or reconsider the priority while drafting: if you identified a case and did not spend a slot on it, name what you left uncovered and why at the end of its `reason`."#;
 
 // ============================================================================
+// already_probed_section() — the round >= 2 addendum to the Attacker's user prompt
+// ============================================================================
+//
+// [VANTA-WHY] A21 follow-up — the "do not repeat" rule and the system prompt's
+// TERMINAL FALLBACK are ONE rule and must not pull apart. An unqualified "DO NOT
+// REPEAT ANY OF THESE" is exactly wrong in the state the fallback exists for: a
+// late round whose shared set already covers every useful input, where the model
+// is told to find something new that does not exist. So the section asks for a
+// probe outside the set and then says what to do when there is none left — use
+// the TERMINAL FALLBACK, where a repeat is acceptable because the driver
+// discards duplicates automatically. The duplicate-is-not-an-attack sentence is
+// kept: it is what makes the repeat harmless rather than misleading.
+fn already_probed_section(existing_tests: &[SharedProbe]) -> String {
+    if existing_tests.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from(
+        "\n\nALREADY IN THE SHARED TEST SET — AIM FOR A PROBE THAT IS NOT ONE OF THESE:\n",
+    );
+    for probe in existing_tests {
+        let inputs = asserted_input_literals(&probe.test_source);
+        section.push_str(&format!(
+            "- {} (asserted inputs: [{}]):\n```\n{}\n```\n",
+            probe.test_name,
+            inputs.join(", "),
+            probe.test_source
+        ));
+    }
+    section.push_str(
+        "Each test above already runs on every attempt. A new test that asserts the SAME input \
+         with the SAME expected value is a duplicate, is discarded before it runs, and does not \
+         count as an attack — so spend your slots on a probe that is NOT already in this set: a \
+         DIFFERENT boundary, threshold, branch or input the patch touches. When every useful input \
+         is already covered and nothing new is left, do NOT keep hunting for a novel input: use \
+         the TERMINAL FALLBACK and spend the slot on another input inside a band that is already \
+         covered. A repeat is acceptable there, because duplicates are discarded automatically \
+         and the round still carries its three tests.\n",
+    );
+    section
+}
+
+// ============================================================================
 // attacker_generate_tests() — call LLM, get typed AttackerResponse
 // ============================================================================
 pub async fn attacker_generate_tests(
@@ -271,33 +313,13 @@ pub async fn attacker_generate_tests(
     let system_prompt = ATTACKER_SYSTEM_PROMPT;
 
     // [VANTA-WHY] Round >= 2: show the probes already in the shared set, with
-    // the input literals each one pins, and forbid repeating them. A duplicate
-    // probe adds no coverage but does consume a BATE slot and a patched run, so
-    // the driver also drops exact duplicates before BATE; this section is what
-    // makes the Attacker aim somewhere new instead of being silently discarded.
-    let already_probed = if request.existing_tests.is_empty() {
-        String::new()
-    } else {
-        let mut section = String::from(
-            "\n\nALREADY IN THE SHARED TEST SET — DO NOT REPEAT ANY OF THESE:\n",
-        );
-        for probe in &request.existing_tests {
-            let inputs = asserted_input_literals(&probe.test_source);
-            section.push_str(&format!(
-                "- {} (asserted inputs: [{}]):\n```\n{}\n```\n",
-                probe.test_name,
-                inputs.join(", "),
-                probe.test_source
-            ));
-        }
-        section.push_str(
-            "Each test above already runs on every attempt. A new test that asserts the SAME input \
-             with the SAME expected value is a duplicate, is discarded before it runs, and does not \
-             count as an attack. Probe a DIFFERENT boundary, threshold, branch or input the patch \
-             touches.\n",
-        );
-        section
-    };
+    // the input literals each one pins, and aim the Attacker somewhere new. A
+    // duplicate probe adds no coverage but does consume a BATE slot and a
+    // patched run, so the driver also drops exact duplicates before BATE; this
+    // section is what makes the Attacker aim somewhere new instead of being
+    // silently discarded. `already_probed_section` is where the "do not repeat"
+    // rule is qualified against the system prompt's TERMINAL FALLBACK.
+    let already_probed = already_probed_section(&request.existing_tests);
 
     let user_prompt = format!(
         "PATCH:\n```diff\n{}\n```\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nISSUE:\n{}{}\n\nWrite AttackerResponse JSON.",
@@ -2323,6 +2345,46 @@ mod tests {
                     .contains("A repeat of an existing test is an ACCEPTABLE answer here"),
             "when every defaulted input is already covered the search must terminate on a \
              repeated input inside a covered band, because duplicates are dropped"
+        );
+    }
+
+    /// [VANTA-WHY] A21 follow-up (§14.10) — the round >= 2 section and the system
+    /// prompt's TERMINAL FALLBACK are one rule about the same late-round state and
+    /// must not pull apart. A bare "DO NOT REPEAT ANY OF THESE" is unqualified in
+    /// exactly the state the fallback exists for: a round whose shared set already
+    /// covers every useful input, where the section told the model to find
+    /// something new that does not exist. The section must keep the
+    /// duplicate-is-not-an-attack fact (it is what makes a repeat harmless) and
+    /// must send the exhausted case to the fallback rather than leaving the
+    /// prohibition as the last word.
+    #[test]
+    fn the_round_two_section_points_at_the_terminal_fallback_instead_of_forbidding_repeats() {
+        let section = already_probed_section(&[SharedProbe {
+            test_name: "test_preserve_add_pair".to_string(),
+            test_source: "from calc import add\n\ndef test_preserve_add_pair():\n    assert add(2, 3) == 5\n"
+                .to_string(),
+        }]);
+        assert!(
+            !section.contains("DO NOT REPEAT"),
+            "an unqualified DO NOT REPEAT contradicts the terminal fallback in the very \
+             state the fallback exists for"
+        );
+        assert!(
+            section.contains("does not count as an attack")
+                && section.contains("NOT already in this set"),
+            "the section must keep the duplicate-is-not-an-attack fact and aim the probe \
+             outside the shared set"
+        );
+        assert!(
+            section.contains("TERMINAL FALLBACK") && section.contains("A repeat is acceptable there"),
+            "the section must send the exhausted case to the terminal fallback the system \
+             prompt defines"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("TERMINAL FALLBACK:")
+                && ATTACKER_SYSTEM_PROMPT
+                    .contains("A repeat of an existing test is an ACCEPTABLE answer here"),
+            "the system prompt must still carry the terminal fallback the section points at"
         );
     }
 

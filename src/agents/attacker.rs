@@ -212,7 +212,7 @@ BOUNDARY-PROBING RULE:
 - Example: a patch changing `if w < 500` to `if w <= 500` moves the ORIGINAL result at 500 from `"standard"` (because `< 500` is false at 500) to `"light"`. The preservation probe must therefore assert `shipping_band(500) == "standard"` — the original result AT 500 — and never assert `shipping_band(499)`, which returns the same band on both versions and proves nothing.
 - Read the ORIGINAL result at the boundary out of the ORIGINAL SOURCE you were given. Never copy the patched value back as the expectation.
 
-Write exactly 3 tests. Label each one honestly: use BugReproduction or FeatureAcceptance only when the issue asks for that behaviour at the input you assert, otherwise use BehaviorPreservation. Three BehaviorPreservation tests are a correct answer when the issue only describes one boundary."#;
+Write exactly 3 tests, spending them in THIS order of priority: (1) the exact comparison the patch changes, at its boundary value; (2) the behaviour the issue's "must stay the same" clause names; (3) the code path the issue asks you to change. Label each one honestly: use BugReproduction or FeatureAcceptance only when the issue asks for that behaviour at the input you assert, otherwise use BehaviorPreservation. Three BehaviorPreservation tests are a correct answer when the issue only describes one boundary. If you identified a case and chose not to cover it with these 3 tests, name what you left uncovered and why at the end of its `reason`."#;
 
 // ============================================================================
 // attacker_generate_tests() — call LLM, get typed AttackerResponse
@@ -2003,6 +2003,33 @@ mod tests {
             3,
             "all three intent bullets must carry the same qualifier the preservation \
              bullet already had"
+        );
+    }
+
+    /// [VANTA-WHY] A3 (§14.10) — the closing line fixed the test COUNT but said
+    /// nothing about what to spend the three tests on, and nothing about the cases
+    /// the Attacker decided not to cover. A budget rule with no priority lets a
+    /// round spend all three probes on the easy interior values and leave the
+    /// boundary the patch actually changed untested, and a dropped case then
+    /// leaves no trace in the run at all.
+    #[test]
+    fn the_prompt_orders_what_the_three_tests_are_spent_on() {
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("Write exactly 3 tests"),
+            "the budget must stay exactly three tests"
+        );
+        assert!(
+            !ATTACKER_SYSTEM_PROMPT.contains("Write exactly 3 tests. Label each one honestly"),
+            "the priority order must come between the budget and the labelling rule"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("THIS order of priority")
+                && ATTACKER_SYSTEM_PROMPT.contains("the exact comparison the patch changes"),
+            "the prompt must spend the three tests on the changed comparison first"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("name what you left uncovered and why"),
+            "an uncovered case must be named in the test's reason rather than dropped silently"
         );
     }
 

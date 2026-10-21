@@ -496,6 +496,11 @@ struct StreamedCompletion {
     /// prompt tokens it processed and `predicted_n` the number it generated.
     timings_prompt_tokens: Option<u64>,
     timings_completion_tokens: Option<u64>,
+    /// The server's own `finish_reason`, when it published one. Only `length`
+    /// changes what Vanta does with the reply: it means the answer was CUT OFF at
+    /// `max_tokens`, which is a different fact from "the answer was malformed"
+    /// and has a different fix.
+    finish_reason: Option<String>,
 }
 
 /// Fold ONE `\n\n`-delimited SSE event into the accumulator.
@@ -552,6 +557,15 @@ fn consume_sse_event(event: &str, out: &mut StreamedCompletion) -> Result<bool, 
                 if let Some(s) = message["reasoning_content"].as_str() {
                     out.reasoning.push_str(s);
                 }
+            }
+            // [VANTA-WHY] Why the server stopped, when it says. `length` is the
+            // one value the caller acts on: the answer was CUT OFF at
+            // `max_tokens`, which is a different fact from "the answer was
+            // malformed" — the fix is a smaller question or a bigger cap, not
+            // another attempt at the same request. Recorded rather than acted on
+            // here, so nothing about a completed call changes.
+            if let Some(reason) = choice["finish_reason"].as_str() {
+                out.finish_reason = Some(reason.to_string());
             }
         }
         if let Some(usage) = value.get("usage").filter(|u| u.is_object()) {
@@ -760,6 +774,28 @@ pub async fn post_chat(
     extra_fields: Value,
     site: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    post_chat_meta(client, cfg, messages, extra_fields, site)
+        .await
+        .map(|(content, _finish_reason)| content)
+}
+
+/// As `post_chat`, but the server's own `finish_reason` comes back beside the
+/// content.
+///
+/// [VANTA-WHY] §14.5 — the retry loop needs to tell a TRUNCATED answer from a
+/// malformed one, and only the server knows which it was. Returning it beside
+/// the content (rather than in an error) keeps every existing caller's behaviour
+/// identical: a truncated answer still comes back as content, still fails to
+/// parse, and is still retried; what changes is that the FINAL failure can say
+/// why, and the one caller that can act on it — the batched audit, which can ask
+/// the same round's questions one at a time — does.
+async fn post_chat_meta(
+    client: &reqwest::Client,
+    cfg: &LlmConfig,
+    messages: Vec<Value>,
+    extra_fields: Value,
+    site: &str,
+) -> Result<(String, Option<String>), Box<dyn Error + Send + Sync>> {
     let url = cfg.chat_completions_url();
 
     let body: Value = json!({
@@ -998,10 +1034,11 @@ pub async fn post_chat(
         status = status.as_u16(),
         elapsed_ms = ms,
         total_tokens = streamed.total_tokens.unwrap_or(0),
+        finish_reason = streamed.finish_reason.as_deref().unwrap_or("unset"),
         "streamed chat completion complete"
     );
 
-    Ok(combined)
+    Ok((combined, streamed.finish_reason))
 }
 
 // ============================================================================
@@ -1011,6 +1048,17 @@ pub async fn post_chat(
 /// producer (`post_chat`) and the consumer (the retry loop below) must agree on
 /// it exactly.
 const DETERMINISTIC_CONTEXT_PREFIX: &str = "Prompt would exceed model context";
+
+/// Prefix of the failure a response cut off at `max_tokens` produces.
+///
+/// [VANTA-WHY] §14.5 — a truncated answer is a DIFFERENT fact from a malformed
+/// one: the model was still producing when the output cap stopped it, so the
+/// remedy is a smaller question or a bigger cap, and re-sending the same request
+/// cannot fix it. The retry loop marks the final failure with this prefix and
+/// the one consumer that can act on it — the batched audit, which can ask the
+/// same round's questions one test at a time — matches it. Public so that
+/// consumer does not have to re-spell the string.
+pub const TRUNCATED_OUTPUT_PREFIX: &str = "LLM response truncated at max_tokens";
 
 /// Backoff before retry `attempt` (1-based): 500ms, 1s, 2s, 4s, 8s, 8s…
 ///
@@ -1050,6 +1098,13 @@ where
     T: std::fmt::Debug + serde::Serialize,
 {
     let mut last_err: Option<String> = None;
+    // [VANTA-WHY] §14.5 — whether the most recent completed attempt was cut off
+    // at `max_tokens`. Kept so the FINAL failure can say so: every attempt that
+    // ends this way parses as nothing and looks, from the parse error alone,
+    // exactly like an answer the model got wrong. Only the server's own
+    // `finish_reason` separates the two, and only the last attempt describes the
+    // failure this function reports.
+    let mut last_was_truncated = false;
 
     for attempt in 1..=max_attempts {
         let messages = build_messages(attempt);
@@ -1057,33 +1112,44 @@ where
             warn!(attempt, max_attempts, "retrying structured call");
         }
 
-        let raw = match post_chat(client, cfg, messages, extras_for_attempt.clone(), site).await {
-            Ok(r) => r,
-            Err(http_e) => {
-                let http_e = http_e.to_string();
-                // [VANTA-WHY] A prompt that cannot fit the context window fails
-                // IDENTICALLY on every attempt — it is decided by arithmetic
-                // before a byte leaves the process. Retrying it three times
-                // cannot change the outcome; it only pretended the failure was
-                // transient and delayed the run. Fail once, loudly, with what to
-                // change.
-                if http_e.contains(DETERMINISTIC_CONTEXT_PREFIX) {
-                    return Err(format!(
-                        "{http_e}\nThis is a deterministic local failure — the prompt does not fit \
-                         the model's context window — so it is NOT retried. Raise the server's n_ctx \
-                         (or VANTA_LLM_CONTEXT_TOKENS to match it), or shrink the prompt."
-                    )
-                    .into());
+        let (raw, finish_reason) =
+            match post_chat_meta(client, cfg, messages, extras_for_attempt.clone(), site).await {
+                Ok(pair) => pair,
+                Err(http_e) => {
+                    let http_e = http_e.to_string();
+                    // [VANTA-WHY] A prompt that cannot fit the context window fails
+                    // IDENTICALLY on every attempt — it is decided by arithmetic
+                    // before a byte leaves the process. Retrying it three times
+                    // cannot change the outcome; it only pretended the failure was
+                    // transient and delayed the run. Fail once, loudly, with what to
+                    // change.
+                    if http_e.contains(DETERMINISTIC_CONTEXT_PREFIX) {
+                        return Err(format!(
+                            "{http_e}\nThis is a deterministic local failure — the prompt does not fit \
+                             the model's context window — so it is NOT retried. Raise the server's n_ctx \
+                             (or VANTA_LLM_CONTEXT_TOKENS to match it), or shrink the prompt."
+                        )
+                        .into());
+                    }
+                    let msg = format!("attempt {attempt} HTTP err: {http_e}");
+                    warn!(%msg);
+                    last_err = Some(msg);
+                    last_was_truncated = false;
+                    if attempt < max_attempts {
+                        back_off(attempt).await;
+                    }
+                    continue;
                 }
-                let msg = format!("attempt {attempt} HTTP err: {http_e}");
-                warn!(%msg);
-                last_err = Some(msg);
-                if attempt < max_attempts {
-                    back_off(attempt).await;
-                }
-                continue;
-            }
-        };
+            };
+        // The stream completed, so it has an answer to judge: `length` here means
+        // the answer was CUT OFF, not that it was wrong.
+        last_was_truncated = finish_reason.as_deref() == Some("length");
+        if last_was_truncated {
+            warn!(
+                attempt,
+                "the server cut this answer off at max_tokens — it cannot be parsed as written"
+            );
+        }
 
         let type_name = std::any::type_name::<T>().split("::").last().unwrap_or("T");
 
@@ -1113,11 +1179,24 @@ where
         }
     }
 
-    Err(format!(
+    let mut message = format!(
         "structured_call_with_retry all {} attempts FAILED. Last:\n{}",
         max_attempts,
         last_err.as_deref().unwrap_or("(no details)")
-    ).into())
+    );
+    // [VANTA-WHY] §14.5 — say WHY the last attempt failed, when the server said.
+    // Without this a truncated answer is indistinguishable from an answer the
+    // model got wrong, and the two have opposite remedies: this one is fixed by
+    // asking a smaller question, which is exactly what the batched audit can do
+    // (one test per call) and must do, instead of losing the whole round.
+    if last_was_truncated {
+        message.push_str(&format!(
+            "\n{TRUNCATED_OUTPUT_PREFIX}: the server stopped this answer at the request's \
+             `max_tokens` cap, so the reply is a prefix of the intended one and could not be \
+             parsed. Re-sending the same request cannot fix that — ask for less, or raise the cap."
+        ));
+    }
+    Err(message.into())
 }
 
 #[cfg(test)]

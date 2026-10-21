@@ -1717,6 +1717,21 @@ Contract:
   same record shape on the same input;
 - round order is preserved (the records come out in the order the tests went in), so the session log
   is a permutation-free view of the unbatched one;
+- the batch's answer is **one entry per test**, so its output cap is **2048 tokens per test in the
+  round** (`batch_audit_tokens_per_test`), clamped to a **16384** ceiling — half the 32768-token
+  window Vanta's local models are served at (§9), and eight tests' worth of the per-test allowance.
+  The 2048 the single-test call pins is *one entry's* worth and truncates a multi-test round
+  mid-object, which is a lost round for no reason. The cap is part of a run's identity alongside the
+  schedule, so both numbers are recorded in `run.summary`: `batch_audit_tokens_per_test=` and
+  `batch_audit_max_tokens=` (the largest cap any round of the run was given; `unset` when the flag is
+  off);
+- a reply the server itself reports as **cut off at the cap** (`finish_reason: "length"`) falls back
+  to **one audit call per test for that round**. The truncation is a fact about the *request* — N
+  answers in one capped generation — so re-sending the same batch cannot clear it, while the per-test
+  path asks the same questions one at a time, each well inside its own 2048, and the round keeps its
+  verdicts instead of losing every one of them to "audit unavailable". Only the **final** attempt's
+  `finish_reason` decides this; the retry budget is unchanged, so a truncation and a malformed answer
+  stay distinguishable in the log;
 - the flag is **off** by default precisely because the call schedule is part of a run's identity
   (§13), so a re-batched auditor is a different run, not a faster one.
 
@@ -1804,6 +1819,10 @@ One per rule and per new parse, plus the regression that matters most:
   mention the third question at all;
 - the batched-audit schema: batched vs unbatched give the same per-test decisions and records; a
   missing/duplicate index fails the batch; a failed batch falls back to the unbatched failure shape;
+- the batched audit's **output cap** — one test's allowance per test in the round, clamped to the
+  ceiling, recorded in `run.summary` — and the **truncation fallback**: a batch the server reports as
+  cut off at that cap (`finish_reason: "length"`) is re-audited one test per call, and that round's
+  verdicts and records are the unbatched run's, with no record saying the audit was unavailable;
 - `metrics.py`'s two new buckets and `label_for`'s new branch, and that the wave gate ignores a
   `NeedsReview` row;
 - `plans/bugsinpy_dev_split.json` loads under `load_split`; the only bug it shares with the

@@ -87,6 +87,14 @@ struct StubLlmServer {
     /// Number of stalled chat connections the client closed on us. It is how a
     /// test proves the cancel reached the SERVER (not just the client's future).
     disconnects: Arc<AtomicUsize>,
+    /// When set, a BATCHED intent-audit request is answered with a JSON answer
+    /// CUT OFF mid-string and a tail frame carrying `finish_reason: "length"` —
+    /// the shape a server publishes when the generation hit `max_tokens`. Set
+    /// after `start` (the answer depends on the request, which does not exist
+    /// yet at construction time) and read per request, so it can be flipped
+    /// between rounds. Per-test audit requests are answered normally, which is
+    /// what lets a test prove the per-test fallback RECOVERS the round (§14.5).
+    truncate_batch_audit: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
@@ -252,12 +260,14 @@ impl StubLlmServer {
         let request_kinds = Arc::new(Mutex::new(Vec::new()));
         let request_bodies = Arc::new(Mutex::new(Vec::new()));
         let disconnects = Arc::new(AtomicUsize::new(0));
+        let truncate_batch_audit = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
 
         let request_count_clone = Arc::clone(&request_count);
         let request_kinds_clone = Arc::clone(&request_kinds);
         let request_bodies_clone = Arc::clone(&request_bodies);
         let disconnects_clone = Arc::clone(&disconnects);
+        let truncate_batch_audit_clone = Arc::clone(&truncate_batch_audit);
         let stop_clone = Arc::clone(&stop);
         // The Attacker has two call sites with different response shapes: a
         // generation call expects `{"tests":[...]}` (AttackerResponse), while a
@@ -451,7 +461,24 @@ impl StubLlmServer {
                         // carry exactly the payload the old JSON envelope did —
                         // the answer in `choices[0].delta.content` — so a parser
                         // on top of `post_chat` cannot tell the difference.
-                        let content_text = content.to_string();
+                        //
+                        // [VANTA-WHY] §14.5 — a batched intent audit can be
+                        // answered with a reply CUT OFF at the cap. The batch
+                        // request is the one carrying "TESTS TO AUDIT"; a
+                        // per-test request carries "TEST UNDER AUDIT" and is
+                        // never truncated, so the fallback has something to
+                        // succeed against.
+                        let cut_off_batch = request_kind == "intent_audit"
+                            && body.contains("TESTS TO AUDIT")
+                            && truncate_batch_audit_clone.load(Ordering::SeqCst);
+                        let (content_text, finish_reason) = if cut_off_batch {
+                            (
+                                TRUNCATED_BATCH_AUDIT_ANSWER.to_string(),
+                                Some("length"),
+                            )
+                        } else {
+                            (content.to_string(), None)
+                        };
 
                         if matches!(behaviour, StubBehaviour::Fail) {
                             let response = "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
@@ -481,10 +508,18 @@ impl StubLlmServer {
                             continue;
                         }
 
+                        // [VANTA-WHY] §14.5 — `finish_reason` rides on the same
+                        // tail frame a real server publishes it on, and only for
+                        // a truncated reply: the field is absent otherwise, so a
+                        // test that forgets to truncate cannot pass by accident.
+                        let mut choice = serde_json::json!({"delta": {}});
+                        if let Some(reason) = finish_reason {
+                            choice["finish_reason"] = serde_json::json!(reason);
+                        }
                         let tail = format!(
                             "data: {}\n\ndata: [DONE]\n\n",
                             serde_json::json!({
-                                "choices": [{"delta": {}}],
+                                "choices": [choice],
                                 // [VANTA-WHY] 777/123/900, not 1/1/2. A token
                                 // count a local estimate could plausibly have
                                 // produced would let a test that reads the
@@ -517,9 +552,17 @@ impl StubLlmServer {
             request_kinds,
             request_bodies,
             disconnects,
+            truncate_batch_audit,
             stop,
             join: Some(join),
         }
+    }
+
+    /// Answer every BATCHED intent-audit request with a reply CUT OFF at the
+    /// output cap (`finish_reason: "length"`), leaving per-test audit requests
+    /// alone (§14.5). Called after `start*`.
+    fn truncate_batch_audit(&self) {
+        self.truncate_batch_audit.store(true, Ordering::SeqCst);
     }
 
     fn request_count(&self) -> usize {
@@ -654,6 +697,17 @@ const THREE_PRESERVATION_TESTS: &str = r#"{"tests":[
 /// so this can never be read as "the other two answered false".
 const SHELL_BATCH_AUDIT_ANSWER: &str =
     r#"{"tests":[{"index":1,"issue_asks_for_behaviour":true,"reason":"only one of three"}]}"#;
+
+/// A batched answer CUT OFF mid-string, which is what a server's reply looks
+/// like when the generation hit `max_tokens`: the JSON never closes, so no
+/// parser can read it, and the tail frame says `finish_reason: "length"`.
+///
+/// [VANTA-WHY] §14.5 — the truncation is a fact about the REQUEST (N answers in
+/// one capped generation), not about the round, so re-sending the same batch
+/// cannot clear it. The per-test path can: it asks the same questions one at a
+/// time, each well inside the single call's own output allowance.
+const TRUNCATED_BATCH_AUDIT_ANSWER: &str =
+    r#"{"tests":[{"index":1,"issue_asks_for_behaviour":true,"reason":"stub: this answer was cut off at the cap"#;
 
 /// A single BugReproduction test whose baseline CONTRADICTS its intent:
 /// `calc.add(2, 3)` is 5 on the original tree, so the asserted `== 5` passes,
@@ -2200,6 +2254,114 @@ fn a_batch_the_auditor_cannot_answer_falls_back_to_the_single_call_failure_shape
     ] {
         assert!(!status.success(), "the bad patch must not be approved: {summary}");
     }
+}
+
+/// [VANTA-WHY] §14.5 — a batched answer the server CUT OFF at `max_tokens`
+/// (`finish_reason: "length"`) is the one batch failure the per-test path FIXES:
+/// the truncation is caused by asking for N answers in one capped generation, so
+/// re-asking the same batch cannot clear it, while one test per call is answered
+/// easily. The round must therefore keep the verdicts the flag-off run gets, and
+/// no record may say the audit was unavailable. The truncation is forced on the
+/// BATCH request only, so what the test measures is the fallback rather than an
+/// unanswerable round (the shape `a_batch_the_auditor_cannot_answer…` covers).
+#[test]
+fn a_batch_cut_off_at_the_cap_falls_back_to_per_test_audits_with_the_same_decisions() {
+    let _serial = serial_run();
+
+    let run = |extra_env: &'static [(&'static str, &'static str)], truncate: bool| {
+        let workspace = TempDir::new().unwrap();
+        let (_repo_dir, _issue_path, patch_path) =
+            write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+        let server = StubLlmServer::start_with_intent_audit(
+            THREE_PRESERVATION_TESTS,
+            SINGLE_AUDIT_KEEP_ANSWER,
+        );
+        if truncate {
+            server.truncate_batch_audit();
+        }
+        let _ = run_patch_mode_with(workspace.path(), &patch_path, &server, 1, extra_env);
+
+        let records = read_session_records(&find_session_log(workspace.path()));
+        let decisions: Vec<(String, String)> = records
+            .iter()
+            .filter(|r| r.phase.starts_with("intent.check["))
+            .map(|r| (r.phase.clone(), r.summary.clone()))
+            .collect();
+        (
+            server.request_kinds(),
+            server.request_bodies(),
+            decisions,
+            run_summary(workspace.path()).summary,
+            workspace,
+        )
+    };
+
+    let (kinds_off, _bodies_off, decisions_off, summary_off, _off_workspace) = run(&[], false);
+    let (kinds_on, bodies_on, decisions_on, summary_on, _on_workspace) =
+        run(&[("VANTA_BATCH_AUDIT", "on")], true);
+
+    assert_eq!(
+        kinds_off,
+        vec!["generate", "intent_audit", "intent_audit", "intent_audit"],
+        "with the flag off each test is audited in its own call — the v0.2 schedule"
+    );
+    assert_eq!(
+        kinds_on,
+        vec![
+            "generate",
+            // the batch, retried whole, cut off every time
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            // then the fallback: one call per test, which is answered
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+        ],
+        "a batch cut off at the cap must be followed by one audit call PER TEST, not by an \
+         unavailable verdict for the whole round"
+    );
+
+    // Which call was which is the point: the retries carried the round, the
+    // fallback carried one test each.
+    for body in &bodies_on[1..4] {
+        assert!(
+            body.contains("TESTS TO AUDIT"),
+            "the first three audit calls are the batch, re-sent whole; got {body}"
+        );
+    }
+    for body in &bodies_on[4..] {
+        assert!(
+            body.contains("TEST UNDER AUDIT") && !body.contains("TESTS TO AUDIT"),
+            "the fallback audits one test per call; got {body}"
+        );
+    }
+
+    assert_eq!(decisions_off.len(), 3);
+    assert_eq!(
+        decisions_off, decisions_on,
+        "the per-test fallback must recover the same verdicts and records as the flag-off run"
+    );
+    for (phase, summary) in &decisions_on {
+        assert!(
+            !summary.contains("intent audit unavailable"),
+            "every test was answered by the fallback, so no record may say the audit was \
+             unavailable; got {phase}: {summary:?}"
+        );
+    }
+
+    // The output cap is a recorded property of the run: one test's allowance per
+    // test in the round, under the ceiling.
+    assert!(summary_off.contains("batch_audit=off"), "got {summary_off}");
+    assert!(summary_on.contains("batch_audit=on"), "got {summary_on}");
+    assert!(
+        summary_on.contains("batch_audit_tokens_per_test=2048"),
+        "the per-test allowance must be recorded; got {summary_on}"
+    );
+    assert!(
+        summary_on.contains("batch_audit_max_tokens=6144"),
+        "three tests × one test's allowance is 6144, under the ceiling; got {summary_on}"
+    );
 }
 
 /// The repo's OWN test suite is a gate the generated tests cannot substitute for.

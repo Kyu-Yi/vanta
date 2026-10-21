@@ -18,7 +18,10 @@
 
 use crate::config::LlmConfig;
 use crate::core::TestIntent;
-use crate::llm::{build_reqwest_client, extract_json_candidate, structured_call_with_retry};
+use crate::llm::{
+    build_reqwest_client, extract_json_candidate, structured_call_with_retry,
+    TRUNCATED_OUTPUT_PREFIX,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error;
@@ -1295,6 +1298,34 @@ pub async fn audit_issue_requires_change(
     (verdict.issue_requires_change, record)
 }
 
+/// Output allowance the batched audit is given PER TEST in the round (§14.5).
+///
+/// [VANTA-WHY] The batch answers with one entry per test, so the 2048 the
+/// single-test call pins is the wrong number for it: a three-test round asked
+/// for one entry's worth of output, the JSON was cut off mid-object, and the
+/// whole round's verdicts were lost to a parse failure. One entry per test is
+/// what the request is for, so the cap is one test's worth per test.
+pub const INTENT_AUDIT_BATCH_TOKENS_PER_TEST: u64 = 2_048;
+
+/// Ceiling for the batched audit's output cap (§14.5).
+///
+/// [VANTA-WHY] 16384 — half of the 32768-token window Vanta's local models are
+/// served at (§9), so the round's prompt plus the cap still fits that window
+/// instead of tripping the deterministic context pre-flight, and eight tests'
+/// worth of the per-test allowance, so a round larger than eight is exactly the
+/// case the per-test fallback below exists for.
+pub const INTENT_AUDIT_BATCH_TOKENS_CEILING: u64 = 16_384;
+
+/// The `max_tokens` a batched audit of `tests` tests is given.
+///
+/// Never below one test's allowance: an empty round still asks a well-formed
+/// question rather than for zero tokens, which no server can answer.
+pub fn intent_audit_batch_max_tokens(tests: usize) -> u64 {
+    INTENT_AUDIT_BATCH_TOKENS_PER_TEST
+        .saturating_mul(tests as u64)
+        .clamp(INTENT_AUDIT_BATCH_TOKENS_PER_TEST, INTENT_AUDIT_BATCH_TOKENS_CEILING)
+}
+
 /// One call for the whole round, to the batched auditor prompt (§14.5).
 ///
 /// [VANTA-WHY] The batch is a TRANSPORT change, so the answer is turned into one
@@ -1375,11 +1406,12 @@ async fn attacker_check_intent_batch(
 
     // The same sampler pins as the single-test call: `intent_audit` is one call
     // site in §4.3's schedule, and batching changes how many times it is called,
-    // not how each call is sampled.
+    // not how each call is sampled. The OUTPUT cap is the one number that must
+    // scale, because the batch's answer is one entry per test (§14.5).
     let extras = json!({
         "response_format": {"type": "json_object"},
         "temperature": 0.0,
-        "max_tokens": 2048,
+        "max_tokens": intent_audit_batch_max_tokens(tests.len()),
         "reasoning_effort": "low",
     });
 
@@ -1435,28 +1467,36 @@ pub async fn audit_tests_intent(
     // [VANTA-WHY] §14.5 — with the flag off this is the v0.2 path unchanged: the
     // same per-test call, through the same function, in the same order.
     if !batch {
-        let mut audited = Vec::with_capacity(tests.len());
-        let mut relabels = Vec::new();
-        let mut records = Vec::new();
-        for test in tests {
-            let (updated, relabel, record) =
-                audit_test_intent(cfg, issue_text, original_source, test, grounded).await;
-            if let Some(updated) = updated {
-                audited.push(updated);
-            }
-            if let Some(relabel) = relabel {
-                relabels.push(relabel);
-            }
-            if let Some(record) = record {
-                records.push(record);
-            }
-        }
-        return (audited, relabels, records);
+        return audit_tests_intent_per_test(cfg, issue_text, original_source, tests, grounded).await;
     }
 
     let verdicts: Vec<IntentVerdict> =
         match attacker_check_intent_batch(cfg, issue_text, original_source, tests, grounded).await {
             Ok(verdicts) => verdicts,
+            Err(e) if e.to_string().contains(TRUNCATED_OUTPUT_PREFIX) => {
+                // [VANTA-WHY] §14.5 — a truncated batch is the one batch failure
+                // the per-test path FIXES, because it is caused by the request
+                // asking for N answers in one capped generation. Falling through
+                // to the per-test loop asks the same questions one at a time —
+                // each well inside the single call's own 2048 — so the round keeps
+                // its verdicts instead of losing all of them to a cap no retry of
+                // the batch can clear. This is also why the truncation flag is
+                // carried out of the retry loop at all.
+                warn!(
+                    tests = tests.len(),
+                    error = %e,
+                    "batched intent audit was CUT OFF at max_tokens — re-auditing the round one \
+                     test per call"
+                );
+                return audit_tests_intent_per_test(
+                    cfg,
+                    issue_text,
+                    original_source,
+                    tests,
+                    grounded,
+                )
+                .await;
+            }
             Err(e) => {
                 // [VANTA-WHY] §14.5 — one failed batch call must not be one
                 // verdict for the whole round. Every test falls back to exactly
@@ -1481,6 +1521,42 @@ pub async fn audit_tests_intent(
     let mut records = Vec::new();
     for (test, verdict) in tests.iter().zip(verdicts) {
         let (updated, relabel, record) = apply_intent_verdict(test, issue_text, verdict);
+        if let Some(updated) = updated {
+            audited.push(updated);
+        }
+        if let Some(relabel) = relabel {
+            relabels.push(relabel);
+        }
+        if let Some(record) = record {
+            records.push(record);
+        }
+    }
+    (audited, relabels, records)
+}
+
+/// Audit a round one test per call — the unbatched path.
+///
+/// [VANTA-WHY] Factored out of `audit_tests_intent` rather than duplicated: the
+/// flag-off path and the truncated-batch fallback below must produce the SAME
+/// per-test records, and two copies of this loop would be two definitions of
+/// "what a per-test audit does".
+async fn audit_tests_intent_per_test(
+    cfg: &LlmConfig,
+    issue_text: &str,
+    original_source: &str,
+    tests: &[GeneratedTest],
+    grounded: bool,
+) -> (
+    Vec<GeneratedTest>,
+    Vec<IntentRelabel>,
+    Vec<IntentCheckRecord>,
+) {
+    let mut audited = Vec::with_capacity(tests.len());
+    let mut relabels = Vec::new();
+    let mut records = Vec::new();
+    for test in tests {
+        let (updated, relabel, record) =
+            audit_test_intent(cfg, issue_text, original_source, test, grounded).await;
         if let Some(updated) = updated {
             audited.push(updated);
         }

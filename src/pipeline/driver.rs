@@ -629,6 +629,15 @@ pub async fn run(
     // actually ran. Absent means UNKNOWN, and rule (d) only downgrades on an
     // explicit `true`.
     let mut issue_requires_change_by_test: HashMap<String, Option<bool>> = HashMap::new();
+    // [VANTA-WHY] §14.5 — the largest output cap the batched audit was given in
+    // this run, over every round. The cap scales with the round (`2048` per test,
+    // ceilinged), so it is a property of the run's rounds, not a constant, and a
+    // reader of `run.summary` cannot recover it from the schedule: the schedule
+    // records the SINGLE-call pin (`max_tokens_intent_audit`), which the batch
+    // deliberately does not use. `None` means no batched call was made — the flag
+    // was off, or no round reached the audit — and is recorded as `none`, the
+    // same word the sampling provenance uses for "the server showed nothing".
+    let mut batch_audit_max_tokens: Option<u64> = None;
 
     // [VANTA-WHY] `max_attempts` means two different things and the Governor now
     // has to be told which. With `--patch` the candidate is FIXED, so an attempt
@@ -1024,6 +1033,17 @@ pub async fn run(
             // the patch could always label the patch's own side effect
             // "FeatureAcceptance" and then pass its own acceptance test. The
             // quote-substring evidence is recorded, but the audit decides.
+            //
+            // [VANTA-WHY] §14.5 — the cap the batched call is about to be given,
+            // recorded here rather than read back from the audit, because the
+            // audit's answer is exactly what a truncated batch fails to produce.
+            // The value is the one `attacker_check_intent_batch` will send.
+            if batch_audit_enabled {
+                let cap = crate::agents::attacker::intent_audit_batch_max_tokens(
+                    generated_tests.len(),
+                );
+                batch_audit_max_tokens = Some(batch_audit_max_tokens.map_or(cap, |m| m.max(cap)));
+            }
             let (attacker_tests, initial_relabels, initial_intent_checks) = audit_tests_intent(
                 &cfg,
                 &repo.issue_text,
@@ -2206,6 +2226,7 @@ pub async fn run(
              config={} mode={} seed={} model={} top_p={} {} \
              llm_calls={} llm_calls_measured={} llm_prompt_tokens={} llm_completion_tokens={} \
              corroborate={} grounded_audit={} batch_audit={} \
+             batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
              commit={} dirty={}",
             attempts_run,
@@ -2230,6 +2251,8 @@ pub async fn run(
             flag_text(corroborate_enabled),
             flag_text(grounded_audit_enabled),
             flag_text(batch_audit_enabled),
+            crate::agents::attacker::INTENT_AUDIT_BATCH_TOKENS_PER_TEST,
+            token_value(batch_audit_max_tokens),
             deciding_rule.as_deref().unwrap_or("none"),
             deciding_evidence.join(","),
             needs_review_weak.join(","),

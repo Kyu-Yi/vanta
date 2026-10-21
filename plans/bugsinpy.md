@@ -1864,6 +1864,14 @@ One per rule and per new parse, plus the regression that matters most:
   fails the call on the first attempt — one `intent_audit` request, not the whole budget — with
   `truncated_calls_intent_audit=1`. And with nothing truncated and the flags off, every request body
   stays byte-identical: the pinned seed on every call, `seed + 1` on none, all three counters 0;
+- **the Attacker generate prompt no longer forbids the test that catches a bad patch** (§14.10): the
+  both-trees preservation wording is gone, and every other rule the prompt carried is still in it —
+  the same test that pins the hygiene rules (ONE INTENT PER TEST, TEST FIXTURES, PRESERVATION
+  SPECIFICITY, the fake-attribute rule) must keep passing;
+- **`VANTA_SAMPLING`** (§14.11): a `coding` run sends the coding sampler pins on the Creator and the
+  three Attacker generative sites and leaves the auditor at 0.0/2048, a default run's bodies are
+  unchanged, and `run.summary` records the preset and the effective per-role values — the recorded
+  schedule is the effective one, which the request-body comparison above already enforces;
 - `metrics.py`'s two new buckets and `label_for`'s new branch, and that the wave gate ignores a
   `NeedsReview` row;
 - `plans/bugsinpy_dev_split.json` loads under `load_split`; the only bug it shares with the
@@ -1892,6 +1900,76 @@ python3 scripts/bugsinpy_run.py run     --split plans/bugsinpy_dev_split.json --
 with `prepare` + `run` repeated once with the three flags in the environment of the `vanta_m3`
 child. The evaluation waves are not touched: no `plans/bugsinpy_split.json` entry, no wave-1 batch
 and no evaluation number changes.
+
+### 14.10 The Attacker prompt's preservation contradiction
+
+**The runaway had a cause, and the cause was the prompt.** Ornith-1.0's Attacker truncations (§15)
+were read as a sampling-pin problem until the raw reply of the capped call was read:
+`vanta_sessions/<id>/debug/AttackerResponse_round_1_attempt_1_raw_response.txt` is a **repetition
+loop** — the same paragraphs emitted on the order of seventy times — not a model that had run out of
+things to say. The loop is a **contradiction inside `ATTACKER_SYSTEM_PROMPT`**
+(`src/agents/attacker.rs`), and the model's own reply quotes both halves of it:
+
+- the intent rule said a `BehaviorPreservation` test *"MUST PASS on BOTH original and patched code"*;
+- the BOUNDARY-PROBING RULE orders a `BehaviorPreservation` probe at the exact boundary the patch
+  changes.
+
+On a **bad** patch the two cannot both hold: the preservation probe at the boundary the patch broke
+is precisely the test that catches it, and it fails on the patched code by definition. Read
+literally, the prompt forbids writing the test that catches a bad patch — so the model, unable to
+satisfy both rules, repeated itself until the 32768-token cap.
+
+**The prompt is wrong, not the model.** BATE checks a preservation test on the **ORIGINAL** tree
+only (`pipeline/bate.rs` — a `BehaviorPreservation` test is expected to pass on the baseline), and
+corroboration rule (d) treats a validated preservation failure on the **PATCHED** tree as evidence
+of a regression. "MUST PASS on BOTH" was never Vanta's semantics.
+
+**Fix — always on, a bug fix, not a flag.** The generate prompt's preservation rule now reads: a
+`BehaviorPreservation` test asserts behaviour the issue does **not** ask to change; it MUST pass on
+the ORIGINAL code (BATE checks this); it is EXPECTED to pass on a correct patch, but if it fails on
+the PATCHED code that failure **is** the finding; never drop a boundary probe because you expect the
+patch to break it. The revise prompt already said "must PASS on original code", the simplify prompt
+does not repeat the rule, and none of the four auditor prompts do — **the contradiction was confined
+to the generate prompt**. Every other rule is kept. `ATTACKER_PROMPT_VERSION` is bumped so a session
+states which side of the fix it ran.
+
+**Evidence and disclosure.** The finding was made on the **toy dev fixture** (§14.7), by reading the
+session debug artifact rather than by inspecting an evaluation result, and it is disclosed here as a
+fix: runs made before it ran a different Attacker prompt, which is why the prompt version is now
+recorded in the summary (below).
+
+**Prompt provenance in `run.summary`.** Every terminal run now writes `prompt_version=` — the same
+`attacker=…;intent_check=…;creator=…;diagnostician=…` string `session.start` carries
+(`pipeline::prompt_versions`) — so a run's prompt identity is readable from the summary row alone and
+a run before the fix is distinguishable from one after it. The auditor's grounded/batched variants
+share the auditor's tag by construction (they are variants of one ask), and the Attacker's
+revise/simplify prompts are Attacker-family; the tag that this fix moved is the Attacker's.
+
+### 14.11 `VANTA_SAMPLING` — the sampling preset
+
+`VANTA_SAMPLING=pinned|coding`, default **`pinned`** — which is today's schedule (§4.3),
+byte-identical: Creator 0.1, Attacker generate 0.2, revise/simplify 0.3, intent audit 0.0, the same
+`max_tokens` at every site, and no other sampler key pinned, so every request body is what it was
+before the flag existed.
+
+`coding` replaces the sampler pins of the **generative** roles with temperature **0.6**, top_p
+**0.95**, top_k **20**, min_p **0**, presence_penalty **0** — the Creator and the Attacker's
+generate/revise/simplify sites. The **intent auditor keeps 0.0 and its 2048 cap under both presets**:
+it is a judgement, not a generation, and a noisier auditor is not a fix for a noisy Attacker.
+`max_tokens` is unchanged under both, and seeds are unchanged (§14.5 — the configured seed on attempt
+1, `seed + (attempt - 1)` on retries above 0.0).
+
+Both the preset and the per-role values it produced are recorded in `run.summary`:
+`sampling_preset=` plus `temperature_<site>` / `max_tokens_<site>`, and, under `coding`, the extra
+sampler keys per generative site. The recorded schedule is the **effective** one — the same table the
+request bodies carry — and `m3_session_log.rs::the_recorded_sampling_schedule_matches_the_request_bodies`
+compares the two.
+
+**Chosen on the dev split and frozen before evaluation.** The preset is part of a run's identity
+(§13), so every row of a comparison must run under one preset. The preset is chosen on the dev split
+(§14.7) and then **frozen** for the evaluation waves, and each baseline row is run under the **same**
+preset as the Vanta rows — a baseline at `pinned` measured against a Vanta at `coding` would
+attribute the sampling change to the pipeline.
 
 ---
 
@@ -1924,6 +2002,14 @@ the whole 32768-token window on reasoning and emitted no content — the same fa
 rarer — which is why §14.5 retries a cut-off answer above temperature 0.0 instead of failing the call,
 and counts truncations per role: `run.summary`'s `truncated_calls_attacker=` is the rate the paper
 reports for the dev split, rather than something recovered by grepping a batch log.
+
+**That at least one of those cut-off Attacker calls was the prompt, not the sampler.** Reading the
+raw reply of a capped call (`vanta_sessions/<id>/debug/AttackerResponse_round_1_attempt_1_raw_response.txt`)
+showed a repetition loop of one paragraph rather than a model still reasoning, triggered by the
+contradiction between the prompt's both-trees `BehaviorPreservation` rule and its BOUNDARY-PROBING
+RULE. The prompt was fixed and its version bumped (§14.10), so part of the "Ornith runs away" signal
+this screen recorded was a Vanta bug that applies to every model; the retry (§14.5) still covers the
+truncations that are genuinely sampling accidents.
 
 Future work:
 

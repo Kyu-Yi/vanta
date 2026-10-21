@@ -414,9 +414,9 @@ async fn probe_server_context_window(client: &reqwest::Client, cfg: &LlmConfig) 
 /// sampling the collected baseline ran under — and it is the DEFAULT:
 /// `VANTA_SAMPLING` unset (or `pinned`) gives exactly these values at every call
 /// site, byte for byte. `VANTA_SAMPLING=coding` (§14.11) overrides the sampler
-/// pins of the four GENERATIVE sites only; the auditor's row is never overridden,
-/// because the audit is a judgement rather than a generation. The values reach the
-/// request bodies through [`with_sampling`], and
+/// pins of EVERY site, the auditor's row included: the audit judges the
+/// Attacker's output, so it samples the way that output was sampled. The values
+/// reach the request bodies through [`with_sampling`], and
 /// `tests/m3_session_log.rs::the_recorded_sampling_schedule_matches_the_request_bodies`
 /// compares the EFFECTIVE schedule against the bodies actually sent, which is the
 /// guard against a call site and this table drifting apart.
@@ -567,7 +567,8 @@ pub fn sampling_pins_text(preset: SamplingPreset, site: &str) -> Vec<(&'static s
 /// cannot drift between sites. Under `pinned` (the default) this inserts exactly
 /// the `temperature` / `max_tokens` the call site used to hard-code, so a default
 /// run's request bodies are unchanged. A `coding` run additionally pins `top_p` /
-/// `top_k` / `min_p` / `presence_penalty` on the generative sites.
+/// `top_k` / `min_p` / `presence_penalty` on every site, the auditor included —
+/// only `max_tokens` is left to the call site, and only the batch audit scales it.
 pub fn with_sampling(mut extras: Value, site: &str) -> Value {
     let pins = sampling_pins_json(sampling_preset(), site);
     let object = extras
@@ -594,11 +595,12 @@ pub fn with_sampling(mut extras: Value, site: &str) -> Value {
 /// the provenance block is precisely the kind of claim this project exists to
 /// avoid.
 ///
-/// [VANTA-WHY] §14.11 — under `VANTA_SAMPLING=coding` the GENERATIVE sites pin
-/// `top_p` themselves, so this server value describes only what the intent
-/// auditor (which never pins `top_p`) inherits. The generative sites' pinned
-/// values are recorded per role as `top_p_<site>`, so both facts are in the
-/// record and neither is a claim about a call it does not describe.
+/// [VANTA-WHY] §14.11 — `top_p` is the server's default only under the `pinned`
+/// preset: under `VANTA_SAMPLING=coding` every site, the intent auditor included,
+/// pins `top_p` itself, so this server value then describes no call in the run.
+/// The pinned values are recorded per role as `top_p_<site>`, which is what keeps
+/// the two facts separable in the record and neither a claim about a call it does
+/// not describe.
 pub async fn server_top_p_default(client: &reqwest::Client, cfg: &LlmConfig) -> Option<f64> {
     let body = fetch_props(client, cfg).await?;
     body["default_generation_settings"]["top_p"].as_f64()

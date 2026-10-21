@@ -959,14 +959,22 @@ pub async fn attacker_check_intent(
         messages
     };
 
-    // temperature 0: the audit must not be a coin flip. It also never sees the
-    // patch, so there is no patch-shaped variance to average over.
-    let extras = json!({
-        "response_format": {"type": "json_object"},
-        "temperature": 0.0,
-        "max_tokens": 2048,
-        "reasoning_effort": "low",
-    });
+    // [VANTA-WHY] The audit's sampler pins come from the SAME table the
+    // generative sites use (§14.11), so `pinned` still samples it at temperature
+    // 0.0 — the audit must not be a coin flip, and it never sees the patch, so
+    // there is no patch-shaped variance to average over — while `coding` samples
+    // it at that preset's temperature, alongside the Attacker whose output it
+    // judges. `max_tokens` comes from the schedule too, so the 2048 cap is the
+    // same under both presets. Because `structured_call_with_retry` reads the
+    // temperature off the request itself, a truncated audit at 0.6 retries with
+    // the seed advanced instead of taking the temperature-0.0 fail-fast.
+    let extras = crate::llm::with_sampling(
+        json!({
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": "low",
+        }),
+        "intent_audit",
+    );
 
     let parse_closure = |raw: &str| -> Result<IntentVerdict, String> {
         let cleaned = extract_json_candidate(raw).map_err(|e| format!("{e}"))?;
@@ -1505,16 +1513,21 @@ async fn attacker_check_intent_batch(
         messages
     };
 
-    // The same sampler pins as the single-test call: `intent_audit` is one call
-    // site in §4.3's schedule, and batching changes how many times it is called,
-    // not how each call is sampled. The OUTPUT cap is the one number that must
-    // scale, because the batch's answer is one entry per test (§14.5).
-    let extras = json!({
-        "response_format": {"type": "json_object"},
-        "temperature": 0.0,
-        "max_tokens": intent_audit_batch_max_tokens(tests.len()),
-        "reasoning_effort": "low",
-    });
+    // The same sampler pins as the single-test call, through the same table
+    // (§14.11): `intent_audit` is one call site in §4.3's schedule, and batching
+    // changes how many times it is called, not how each call is sampled. The
+    // OUTPUT cap is the one number that must scale, because the batch's answer is
+    // one entry per test (§14.5), so it is written over the schedule's cap after
+    // the pins are applied — the batch keeps `2048 * tests` (ceilinged) and the
+    // preset's temperature, which is what `run.summary` records separately.
+    let mut extras = crate::llm::with_sampling(
+        json!({
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": "low",
+        }),
+        "intent_audit",
+    );
+    extras["max_tokens"] = json!(intent_audit_batch_max_tokens(tests.len()));
 
     let count = tests.len();
     let parse_closure = |raw: &str| -> Result<Vec<IntentVerdict>, String> {

@@ -1537,7 +1537,6 @@ pub async fn run(
                     &cfg,
                     &review_prompt_concat,
                     &test_cmd,
-                    &touched_paths,
                 )
                 .await;
                 println!(

@@ -65,47 +65,188 @@ pub fn truncate_output(s: &str, limit: usize) -> String {
     )
 }
 
-/// Locate a pytest failure's innermost frame.
+// ---------------------------------------------------------------------------
+// Reading the failure's own traceback out of a pytest run
+// ---------------------------------------------------------------------------
+//
+// [VANTA-WHY] A pytest run is a SEQUENCE of titled sections — `FAILURES`,
+// `short test summary info`, `warnings summary`, `--- Captured stdout ---`
+// blocks — and only the FAILURES/ERRORS sections carry the traceback of the
+// exception that was actually raised. Scanning the raw output bottom-up (as
+// this file first did) reads whichever section pytest printed LAST: in the
+// py3.8 BugsInPy images `future` emits a `DeprecationWarning` for every imported
+// module, so a failing test ends with
+// `…/future/standard_library/__init__.py:65: DeprecationWarning` in its warnings
+// summary, and that warning — never the `NameError` the test hit — was taken as
+// the failure site (PySnooper/3, ff241462); every failing test in that image
+// was affected.
+
+/// The title between the runs of `ch` that bookend `line`, when `line` is a
+/// pytest marker (`===== FAILURES =====`, `--- Captured stdout call ---`,
+/// `______ test_x ______`). Runs shorter than 3 characters are rejected so that
+/// ordinary prose (`- one - two -`) is not read as a marker.
+fn marker_title(line: &str, ch: char) -> Option<&str> {
+    let t = line.trim();
+    if !t.starts_with(ch) || !t.ends_with(ch) {
+        return None;
+    }
+    let start = t.find(|c| c != ch).unwrap_or(t.len());
+    let end = t.rfind(|c| c != ch).map_or(start, |i| i + 1);
+    if start < 3 || t.len() - end < 3 {
+        return None;
+    }
+    Some(t[start..end].trim())
+}
+
+/// Is `line` a bare run of `ch` (a titleless pytest rule)?
+fn is_rule(line: &str, ch: char) -> bool {
+    let t = line.trim();
+    t.len() >= 4 && t.chars().all(|c| c == ch)
+}
+
+/// Is `line` a pytest marker of kind `ch`, titled or bare?
+fn is_marker(line: &str, ch: char) -> bool {
+    is_rule(line, ch) || marker_title(line, ch).is_some()
+}
+
+/// Parse a bare `path.py:LINE: ExceptionType` traceback line.
 ///
-/// [VANTA-WHY] pytest ends a traceback with a bare `path.py:LINE: ExceptionType`
-/// line — the frame where the exception was actually raised. That triple is what
-/// lets a later step tell a failure in the CODE UNDER TEST ("the patch has a
-/// bug") from one raised in the TEST's own objects ("the test is broken"):
-/// `'FakeTensor' object has no attribute 'shape'` is the test's fake, not the
-/// patch. Parsing it from the saved output keeps the classification auditable.
+/// The exception type is Capitalised, which also rejects the `test_x.py:14: `
+/// lines pytest prints for a traceback's intermediate frames: those carry no
+/// exception type, so only the last such line is the frame where the exception
+/// was raised.
+fn parse_frame_line(line: &str) -> Option<(String, u32, String)> {
+    let mut parts = line.splitn(3, ':');
+    let (file, lineno, rest) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(f), Some(l), Some(r)) => (f.trim(), l.trim(), r.trim()),
+        _ => return None,
+    };
+    if !file.ends_with(".py") {
+        return None;
+    }
+    let line_no = lineno.parse::<u32>().ok()?;
+    let exc = rest
+        .split(|c: char| c == ':' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    if !exc.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        return None;
+    }
+    Some((file.to_string(), line_no, exc.to_string()))
+}
+
+/// The innermost frame of the exception raised within `lines`.
 ///
-/// Returns `(file, line, exception_type)`, each `None` when the output has no
-/// recognisable frame (e.g. the test never got that far).
-pub fn parse_failure_site(output: &str) -> (Option<String>, Option<u32>, Option<String>) {
-    for raw in output.lines().rev() {
+/// Scans forward, remembering every frame line, and stops where the traceback
+/// ends: a section boundary, a `--- Captured stdout ---` block, or the next
+/// failing test's `______ test_name ______` header. The last frame seen before
+/// that is the innermost one.
+fn innermost_frame(lines: &[&str]) -> Option<(String, u32, String)> {
+    let mut found = None;
+    for raw in lines {
         let line = raw.trim();
         if line.is_empty() {
             continue;
         }
-        let mut parts = line.splitn(3, ':');
-        let (file, lineno, rest) = match (parts.next(), parts.next(), parts.next()) {
-            (Some(f), Some(l), Some(r)) => (f.trim(), l.trim(), r.trim()),
-            _ => continue,
-        };
-        if !file.ends_with(".py") {
-            continue;
+        if is_marker(line, '=') || is_marker(line, '-') {
+            break;
         }
-        let Ok(line_no) = lineno.parse::<u32>() else {
-            continue;
-        };
-        // Exception types are Capitalised; this also rejects the `in helper`
-        // frames pytest interleaves into a traceback.
-        let exc = rest
-            .split(|c: char| c == ':' || c.is_whitespace())
-            .next()
-            .unwrap_or("");
-        let capitalised = exc.chars().next().is_some_and(|c| c.is_ascii_uppercase());
-        if !capitalised {
-            continue;
+        // A `______ test_name ______` header opens the NEXT failing test; a bare
+        // `_ _ _ _` run only separates the frames of the current traceback.
+        if is_marker(line, '_') && found.is_some() {
+            break;
         }
-        return (Some(file.to_string()), Some(line_no), Some(exc.to_string()));
+        if let Some(frame) = parse_frame_line(line) {
+            found = Some(frame);
+        }
     }
-    (None, None, None)
+    found
+}
+
+/// Every `FAILURES` / `ERRORS` section of a pytest run, and whether the run had
+/// one at all (a run that died before testing prints none).
+fn failure_sections(output: &str) -> (bool, Vec<Vec<&str>>) {
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    let mut open: Option<Vec<&str>> = None;
+    for raw in output.lines() {
+        if is_marker(raw, '=') {
+            if let Some(block) = open.take() {
+                blocks.push(block);
+            }
+            // A FAILURES/ERRORS boundary opens a section; every other boundary
+            // (short test summary, warnings summary, the final "N failed" line)
+            // closes the one that is open.
+            let opens = marker_title(raw, '=')
+                .is_some_and(|t| t.eq_ignore_ascii_case("failures") || t.eq_ignore_ascii_case("errors"));
+            if opens {
+                open = Some(Vec::new());
+            }
+            continue;
+        }
+        if let Some(block) = open.as_mut() {
+            block.push(raw);
+        }
+    }
+    if let Some(block) = open {
+        blocks.push(block);
+    }
+    (!blocks.is_empty(), blocks)
+}
+
+/// The innermost frame in an output that has NO FAILURES/ERRORS section (a
+/// fragment of a run, or a runner that prints only the traceback line), skipping
+/// the sections that can never hold the failure's own frame.
+fn innermost_frame_anywhere(output: &str) -> Option<(String, u32, String)> {
+    let mut found = None;
+    let mut skipped = false;
+    for raw in output.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if is_marker(line, '=') {
+            skipped = marker_title(line, '=').is_some_and(|t| {
+                let t = t.to_ascii_lowercase();
+                t.contains("warnings summary")
+                    || t.contains("short test summary")
+                    || t.contains("test session starts")
+            });
+            continue;
+        }
+        if is_marker(line, '-') {
+            skipped = true;
+        }
+        if skipped {
+            continue;
+        }
+        if let Some(frame) = parse_frame_line(line) {
+            found = Some(frame);
+        }
+    }
+    found
+}
+
+/// Locate a pytest failure's innermost frame: the frame of the exception that
+/// was actually raised, never a warning or a captured-output line that merely
+/// follows it in the log.
+///
+/// The triple is what lets a later step tell a failure in the CODE UNDER TEST
+/// ("the patch has a bug") from one raised in the TEST's own file ("the test is
+/// broken"), so what it points at has to be the failure itself.
+///
+/// Returns `(file, line, exception_type)`, each `None` when the output has no
+/// recognisable frame (e.g. the test never got that far).
+pub fn parse_failure_site(output: &str) -> (Option<String>, Option<u32>, Option<String>) {
+    let (has_sections, blocks) = failure_sections(output);
+    let frame = if has_sections {
+        blocks.iter().find_map(|block| innermost_frame(block))
+    } else {
+        innermost_frame_anywhere(output)
+    };
+    match frame {
+        Some((file, line, exc)) => (Some(file), Some(line), Some(exc)),
+        None => (None, None, None),
+    }
 }
 
 /// The signature of a failure: `(exception_type, file, line)` from its output.
@@ -134,50 +275,14 @@ fn is_patch_insensitive(patched: &TestExecutionDetails, original: &TestExecution
 }
 
 /// Is this path one of the test runner's own generated test files?
+///
+/// [VANTA-WHY] The harness writes each generated test to a fixed name in the
+/// sandbox (`test_run.py` for a review round, `test_bate.py` for validation), so
+/// a frame in a `test_*` / `*_test` / `conftest` file is the generated test's own
+/// code — not the code under test.
 fn is_test_file(path: &str) -> bool {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     name.starts_with("test_") || name.ends_with("_test.py") || name == "conftest.py"
-}
-
-fn is_identifier(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Does `source` declare `class <name>`?
-fn declares_class(source: &str, name: &str) -> bool {
-    let needle = format!("class {name}");
-    source.match_indices(&needle).any(|(i, _)| {
-        source[i + needle.len()..]
-            .chars()
-            .next()
-            .map_or(true, |c| !(c.is_ascii_alphanumeric() || c == '_'))
-    })
-}
-
-/// Does the failure name an object of a type the TEST itself declares?
-///
-/// [VANTA-WHY] Item 3 of the heretic fix list. `'FakeTensor' object has no
-/// attribute 'shape'` is the TESTS's fake (56eb4fd3 round 2), not the patch:
-/// the test stubbed the model incompletely, so the crash is a property of the
-/// test. Recognizing the `'X' object` shape and finding `class X` in the test's
-/// own source is what tells that apart from the patch throwing on real input.
-fn names_test_defined_type(output: &str, test_source: &str) -> bool {
-    for (idx, _) in output.match_indices("' object") {
-        let before = &output[..idx];
-        let Some(open) = before.rfind('\'') else {
-            continue;
-        };
-        let name = &before[open + 1..];
-        if is_identifier(name) && declares_class(test_source, name) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Is an `AssertionError` the TEST's own `assert` / mock `assert_*`?
@@ -208,25 +313,28 @@ fn assertion_is_the_tests_own(output: &str, frame_file: Option<&str>) -> bool {
 
 /// Locate the fault: is this failure about the PATCH or about the TEST?
 ///
-/// [VANTA-WHY] Item 3 of the heretic fix list. `Logic` means "the patch is
-/// wrong", so before blaming the patch we must find WHERE the exception was
-/// raised. `Logic` is only fair when:
-///   (a) an `AssertionError` comes from the test's own `assert`/mock `assert_*`
-///       — the test asserted and the behaviour was wrong; or
-///   (b) the exception is raised in a file the PATCH TOUCHED, on an object the
-///       test did not define itself — the patch's code threw on real input.
-/// Everything else — a `SystemExit` from a test that instantiated a CLI-reading
-/// settings object, an argparse/CLI error, an error in test setup before the
-/// code under test is called, or an exception on a test-defined fake — says
-/// nothing about the candidate. Returns the TestDefect reason + payload, or
-/// `None` when the patch is a fair target.
+/// [VANTA-WHY] `Logic` claims "the patch is wrong", so before blaming the patch
+/// we must find WHERE the exception was raised. BATE has already proved how the
+/// test behaves on the original tree, so a validated test that fails on the
+/// patched tree is evidence about the patch: an exception raised inside the code
+/// under test counts, whether or not the patch touched the file the traceback
+/// ends in. A no-op patch leaves the bug exactly where it was, and "the patch
+/// did not touch this file" is a reason to REJECT it, not to excuse it — the
+/// earlier rule demoted exactly those failures to TestDefect and so threw away
+/// the BugReproduction counterexamples that argued for rejection (PySnooper/3,
+/// 3ef3ac33).
 ///
-/// Returns `None` (do not reclassify) when no fault can be located at all: an
-/// unreadable failure must not be quietly turned into a test defect.
+/// The one real test defect is the generated test's OWN code breaking: the
+/// innermost frame of a non-assertion exception is inside the test file itself,
+/// so the code under test never had a fair chance to run — a test that
+/// instantiated a CLI-reading settings object and got `SystemExit`, or a fake
+/// that is missing the attribute the test then uses.
+///
+/// Returns the TestDefect reason + payload, or `None` when the patch is a fair
+/// target. Also `None` when no fault can be located at all: an unreadable
+/// failure must not be quietly turned into a test defect.
 pub fn locate_fault(
     execution: &TestExecutionDetails,
-    test_source: &str,
-    touched_paths: &[String],
 ) -> Option<(String, serde_json::Value)> {
     let output = format!("{}\n{}", execution.stdout, execution.stderr);
     let (frame_file, frame_line, exception_type) = parse_failure_site(&output);
@@ -235,15 +343,15 @@ pub fn locate_fault(
         return None;
     }
 
+    // An assertion the test itself made is a verdict on the patch, not a defect
+    // in the test.
     if exception == "AssertionError" && assertion_is_the_tests_own(&output, frame_file.as_deref()) {
         return None;
     }
-    if let Some(file) = frame_file.as_deref() {
-        if harness::path_touched(file, touched_paths)
-            && !names_test_defined_type(&output, test_source)
-        {
-            return None;
-        }
+    // Anything raised outside the generated test's own file was raised by the
+    // code under test, so it is the patch's business.
+    if !frame_file.as_deref().is_some_and(is_test_file) {
+        return None;
     }
 
     let site = format!(
@@ -252,14 +360,14 @@ pub fn locate_fault(
         frame_line.map(|l| l.to_string()).unwrap_or_else(|| "?".into()),
     );
     let reason = format!(
-        "Failure located in the TEST ({exception} at {site}), not in an assertion of the test nor \
-         in a file the patch touched — a property of the test, not the patch. Sent back to the \
-         Attacker for revision."
+        "Failure located in the TEST's own code ({exception} at {site}) — the generated test raised \
+         it before the code under test could run, so the failure is a property of the test, not the \
+         patch. Sent back to the Attacker for revision."
     );
     Some((
         reason,
         json!({
-            "signal": "test_defect_fault_not_in_patch",
+            "signal": "test_defect_exception_in_test_file",
             "exception_type": exception_type,
             "frame_file": frame_file,
             "frame_line": frame_line,
@@ -469,7 +577,6 @@ pub async fn diagnose_failure(
     cfg: &LlmConfig,
     original_source: &str,
     test_cmd: &TestCommand,
-    touched_paths: &[String],
 ) -> DiagnosticResult {
     let force_unknown = std::env::var("VANTA_TEST_FORCE_UNKNOWN").ok().as_deref() == Some("1");
     // [VANTA-WHY] The FIRST classification sees the real execution: whether the
@@ -531,18 +638,16 @@ pub async fn diagnose_failure(
 
     let diag = classify(execution);
 
-    // [VANTA-WHY] Item 3 of the heretic fix list — locate the fault BEFORE
-    // blaming the patch. A `Logic` verdict asserts "the patch is wrong", so the
-    // failure has to be attributable to the patch: an assertion the test made,
-    // or an exception in a file the patch touched. A `SystemExit` from a test
-    // that built a CLI-reading settings object, a crash inside the test's own
-    // fake (`'FakeTensor' object has no attribute 'shape'`, 56eb4fd3 round 2),
-    // or an error in test setup is a property of the TEST. This runs before the
-    // (expensive) patch-insensitivity probe below because it needs no rerun.
+    // [VANTA-WHY] Locate the fault BEFORE blaming the patch. A `Logic` verdict
+    // asserts "the patch is wrong", so the failure has to be attributable to the
+    // patch: an assertion the test made, or an exception raised in the code
+    // under test. Only a crash inside the generated test's own code is a defect
+    // of the test — a `SystemExit` from a test that built a CLI-reading settings
+    // object, or a fake that lacks the attribute the test uses next. This runs
+    // before the (expensive) patch-insensitivity probe below because it needs no
+    // rerun.
     if diag.failure_class == Some(FailureClass::Logic) {
-        if let Some((reason, payload)) =
-            locate_fault(execution, &test.test_source, touched_paths)
-        {
+        if let Some((reason, payload)) = locate_fault(execution) {
             tracing::info!(
                 test = %test.test_name,
                 "fault located in the TEST, not the patch → TestDefect"
@@ -935,55 +1040,147 @@ mod tests {
         );
     }
 
-    /// Item 3 of the heretic fix list: the fault must be located before the
-    /// patch is blamed. 56eb4fd3 round 2's fake (`class FakeTensor`) has no
-    /// `.shape`, so the crash is the TEST's, not the patch's.
+    /// A real py3.8 pytest run (the wave-1 PySnooper/3 shape): the FAILURES
+    /// section ends with the `NameError` the test hit, and `future`'s
+    /// `DeprecationWarning` — which the old bottom-up scan mistook for the
+    /// failure site — follows in the warnings summary.
+    const PYSNOOPER_NOOP_OUTPUT: &str = concat!(
+        "============================= test session starts ==============================\n",
+        "platform linux -- Python 3.8.20, pytest-8.0.2, pluggy-1.5.0\n",
+        "rootdir: /tmp/sandbox\n",
+        "plugins: json-report-1.5.0, metadata-3.1.1\n",
+        "collected 1 item\n\n",
+        "test_run.py::test_snoop_file_output_contains_starting_var                   [100%]\n\n",
+        "=================================== FAILURES ===================================\n",
+        "_____________ test_snoop_file_output_contains_starting_var _____________\n\n",
+        "    def test_snoop_file_output_contains_starting_var():\n",
+        "        with pysnooper.snoop(trace_file):\n",
+        ">           assert 'Starting var' in trace_file.read()\n",
+        "E           NameError: name 'output_path' is not defined\n\n",
+        "pysnooper/pysnooper.py:26: NameError\n",
+        "=========================== short test summary info ============================\n",
+        "FAILED test_run.py::test_snoop_file_output_contains_starting_var - NameError\n",
+        "=============================== warnings summary ===============================\n",
+        "/opt/venv38/lib/python3.8/site-packages/future/standard_library/__init__.py:65\n",
+        "  /opt/venv38/lib/python3.8/site-packages/future/standard_library/__init__.py:65: DeprecationWarning: the imp module is deprecated\n",
+        "    __import__('future_builtins')\n\n",
+        "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n",
+        "============================== 1 failed in 0.31s ==============================\n",
+    );
+
+    /// The failure site is the frame of the exception that was actually raised —
+    /// never the warning pytest prints after it (PySnooper/3, 3ef3ac33).
     #[test]
-    fn a_failure_inside_the_tests_own_fake_is_a_test_defect() {
+    fn the_failure_site_ignores_a_later_warning_summary() {
+        let (file, line, exc) = parse_failure_site(PYSNOOPER_NOOP_OUTPUT);
+        assert_eq!(file.as_deref(), Some("pysnooper/pysnooper.py"));
+        assert_eq!(line, Some(26));
+        assert_eq!(exc.as_deref(), Some("NameError"));
+    }
+
+    /// A `NameError` raised in the code under test is the patch's fault even
+    /// though the no-op patch touched only another file — the PySnooper/3 no-op
+    /// appends a newline to `pysnooper/__init__.py` and leaves `pysnooper.py` as
+    /// buggy as it was. BATE proved the test's behaviour on the original tree,
+    /// so a validated test that still hits the bug is evidence AGAINST the patch.
+    #[test]
+    fn a_failure_in_the_code_under_test_is_blamed_on_the_patch() {
+        let execution = exec_at(TestResult::Failed, PYSNOOPER_NOOP_OUTPUT);
+        assert!(
+            locate_fault(&execution).is_none(),
+            "the patched tree still raises the bug's NameError, so the patch must be rejected"
+        );
+    }
+
+    /// Captured output inside the FAILURES section can mention any file and
+    /// line; it is not the failure site.
+    #[test]
+    fn captured_output_is_not_read_as_a_failure_site() {
+        let output = concat!(
+            "=================================== FAILURES ===================================\n",
+            "___________________________________ test_x ____________________________________\n\n",
+            "    def test_x():\n",
+            ">       raise RuntimeError('real')\n",
+            "E       RuntimeError: real\n\n",
+            "pkg/mod.py:12: RuntimeError\n",
+            "----------------------------- Captured stdout call -----------------------------\n",
+            "log line mentioning other/thing.py:99: ValueError: not the failure\n",
+            "=========================== short test summary info ============================\n",
+            "FAILED test_x.py::test_x - RuntimeError: real\n",
+        );
+        let (file, line, exc) = parse_failure_site(output);
+        assert_eq!(file.as_deref(), Some("pkg/mod.py"));
+        assert_eq!(line, Some(12));
+        assert_eq!(exc.as_deref(), Some("RuntimeError"));
+    }
+
+    /// An exception raised by the generated test's own body is a test defect:
+    /// the code under test never ran.
+    #[test]
+    fn a_failure_in_the_generated_tests_own_body_is_a_test_defect() {
+        let output = concat!(
+            "=================================== FAILURES ===================================\n",
+            "___________________________________ test_run ___________________________________\n\n",
+            "    def test_x():\n",
+            ">       raise RuntimeError('the test itself is broken')\n",
+            "E       RuntimeError: the test itself is broken\n\n",
+            "test_run.py:5: RuntimeError\n",
+        );
+        let located = locate_fault(&exec_at(TestResult::Failed, output))
+            .expect("a crash in the test's own file says nothing about the patch");
+        assert_eq!(
+            located.1["signal"],
+            json!("test_defect_exception_in_test_file")
+        );
+        assert_eq!(located.1["frame_file"], json!("test_run.py"));
+        assert_eq!(located.1["exception_type"], json!("RuntimeError"));
+        assert!(located.0.contains("Attacker"), "the reason must say it goes back: {}", located.0);
+    }
+
+    /// The 56eb4fd3 shape, when the crash lands in the test's own file: the fake
+    /// the TEST defined lacks an attribute, so the test is at fault.
+    #[test]
+    fn a_failure_inside_the_tests_own_file_is_a_test_defect() {
         let execution = exec_at(
             TestResult::Failed,
             "test_run.py:9: AttributeError: 'FakeTensor' object has no attribute 'shape'\n",
         );
-        let test_source = "class FakeTensor:\n    def __init__(self, ids):\n        self.ids = ids\n";
-        let touched = vec!["src/heretic/modifiers/abliteration.py".to_string()];
-
-        let located = locate_fault(&execution, test_source, &touched)
-            .expect("a fault in the test's own fake must not be blamed on the patch");
-        assert_eq!(located.1["signal"], json!("test_defect_fault_not_in_patch"));
+        let located = locate_fault(&execution)
+            .expect("a fault in the test's own file must not be blamed on the patch");
+        assert_eq!(
+            located.1["signal"],
+            json!("test_defect_exception_in_test_file")
+        );
         assert_eq!(located.1["exception_type"], json!("AttributeError"));
         assert!(located.0.contains("Attacker"), "the reason must say it goes back: {}", located.0);
     }
 
-    /// The same shape, but raised from a file the patch TOUCHED — the patch's
-    /// code threw on an object the test itself defined, so the test is still at
-    /// fault (rule (b)'s exclusion).
+    /// The same exception on a TEST-defined object, but raised inside the code
+    /// under test, is the patch's fault: the patch's code threw on an object the
+    /// validated test had used successfully on the original tree. This is the
+    /// case the old "not in a file the patch touched" rule got backwards.
     #[test]
-    fn a_patch_file_raising_on_a_test_defined_object_is_still_a_test_defect() {
+    fn a_crash_in_the_patchs_own_file_is_the_patchs_fault() {
         let execution = exec_at(
             TestResult::Failed,
             "src/heretic/modifiers/abliteration.py:88: AttributeError: 'FakeTensor' object has no attribute 'shape'\n",
         );
-        let test_source = "class FakeTensor:\n    pass\n";
-        let touched = vec!["src/heretic/modifiers/abliteration.py".to_string()];
-
         assert!(
-            locate_fault(&execution, test_source, &touched).is_some(),
-            "an exception on a type the TEST declares is the test's fault even inside the patch"
+            locate_fault(&execution).is_none(),
+            "the exception was raised by the patch's own file, so the patch is the suspect"
         );
     }
 
-    /// An exception raised in a file the patch touched, on a real object, is a
-    /// fair verdict on the patch — the patch's code threw.
+    /// An exception raised in the code under test on real input is the patch's
+    /// fault.
     #[test]
-    fn an_exception_in_a_file_the_patch_touched_is_blamed_on_the_patch() {
+    fn an_exception_in_the_code_under_test_is_blamed_on_the_patch() {
         let execution = exec_at(
             TestResult::Failed,
             "src/heretic/modifiers/abliteration.py:88: TypeError: unsupported operand type(s)\n",
         );
-        let touched = vec!["src/heretic/modifiers/abliteration.py".to_string()];
-
         assert!(
-            locate_fault(&execution, "def test_x():\n    pass\n", &touched).is_none(),
+            locate_fault(&execution).is_none(),
             "the patch's own file throwing on real input is the patch's fault"
         );
     }
@@ -992,27 +1189,18 @@ mod tests {
     /// object (B v2's `HereticSettings`) is the test's setup, not the patch.
     #[test]
     fn a_cli_system_exit_in_test_setup_is_a_test_defect() {
-        let execution = exec_at(
-            TestResult::Failed,
-            "test_run.py:5: SystemExit: 2\n",
-        );
-        let test_source = "class Settings:\n    pass\n";
-        let touched = vec!["src/heretic/modifiers/abliteration.py".to_string()];
-
-        let located = locate_fault(&execution, test_source, &touched)
-            .expect("a CLI/argparse SystemExit is a test defect");
+        let execution = exec_at(TestResult::Failed, "test_run.py:5: SystemExit: 2\n");
+        let located =
+            locate_fault(&execution).expect("a CLI/argparse SystemExit is a test defect");
         assert_eq!(located.1["exception_type"], json!("SystemExit"));
     }
 
     /// The test's own `assert` failing IS a verdict on the patch.
     #[test]
     fn the_tests_own_assertion_is_blamed_on_the_patch() {
-        let execution = exec_at(
-            TestResult::Failed,
-            "test_x.py:2: AssertionError\n",
-        );
+        let execution = exec_at(TestResult::Failed, "test_x.py:2: AssertionError\n");
         assert!(
-            locate_fault(&execution, "def test_x():\n    assert f() == 5\n", &[]).is_none(),
+            locate_fault(&execution).is_none(),
             "an assertion the test made is a fair verdict on the patch"
         );
     }
@@ -1025,8 +1213,7 @@ mod tests {
             "test_x.py:6: AssertionError: Expected 'get_responses' to have been called once. Called 0 times.\n",
         );
         assert!(
-            locate_fault(&execution, "def test_x():\n    m.assert_called_once()\n", &[])
-                .is_none(),
+            locate_fault(&execution).is_none(),
             "a mock assertion failure is a fair verdict on the patch"
         );
     }
@@ -1037,7 +1224,7 @@ mod tests {
     fn an_unlocatable_failure_is_not_reclassified() {
         let execution = exec_at(TestResult::Failed, "no frames here\n");
         assert!(
-            locate_fault(&execution, "def test_x():\n    pass\n", &[]).is_none(),
+            locate_fault(&execution).is_none(),
             "with no fault located, the patch keeps its Logic class"
         );
     }

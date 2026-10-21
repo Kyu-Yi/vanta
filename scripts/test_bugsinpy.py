@@ -1320,16 +1320,18 @@ class TestContextConstants:
     def test_the_estimator_and_the_output_reserve_match_the_run_time_guard(self):
         """The precheck's boundary must be the guard's boundary, not near it.
 
-        The same three numbers appear in three files: the token estimator and the
-        chat overhead in ``src/llm/mod.rs`` (where ``context_budget_exceeded``
-        compares ``prompt + output + overhead > n_ctx``), and the output reserve in
-        ``src/agents/creator.rs``. If the Creator's ``max_tokens`` grows and this
-        module keeps subtracting 32768, the precheck silently starts accepting
-        prompts the guard rejects — and the run dies at attempt 1 after a checkpoint
-        and a wave have been spent. So the duplication is asserted, not trusted.
+        ``context_budget_exceeded`` (in ``src/llm/mod.rs``) compares ``prompt +
+        output + overhead > n_ctx``, and its ``output`` is the request body's
+        ``"max_tokens"``. Every M3 call site gets that number from
+        ``SAMPLING_SCHEDULE`` through ``with_sampling`` — eb7cab9 moved the
+        Creator's literal out of ``src/agents/creator.rs`` and into the table, so
+        the table is what this test reads, not a copy of the number. If the
+        Creator's ``max_tokens`` grew and this module kept subtracting 32768, the
+        precheck would silently accept prompts the guard rejects, and the run
+        would die at attempt 1 after a checkpoint and a wave had been spent. So
+        the value is asserted against the table the request bodies are built from.
         """
         llm = (REPO_ROOT / "src" / "llm" / "mod.rs").read_text(encoding="utf-8")
-        creator = (REPO_ROOT / "src" / "agents" / "creator.rs").read_text(encoding="utf-8")
 
         bytes_per_token = re.search(
             r"const TOKEN_ESTIMATE_BYTES_PER_TOKEN: u32 = (\d+);", llm
@@ -1340,9 +1342,23 @@ class TestContextConstants:
         assert int(bytes_per_token.group(1)) == ctx.BYTES_PER_TOKEN_ESTIMATE
         assert int(overhead.group(1)) == ctx.CHAT_OVERHEAD_TOKENS
 
-        max_tokens = re.search(r'"max_tokens":\s*(\d+)', creator)
-        assert max_tokens, '"max_tokens" not found in src/agents/creator.rs'
-        assert int(max_tokens.group(1)) == ctx.OUTPUT_RESERVE_TOKENS
+        block = llm.split("pub const SAMPLING_SCHEDULE", 1)[1].split("];", 1)[0]
+        pinned = {
+            site: int(max_tokens)
+            for site, _temperature, max_tokens in re.findall(
+                r'\("([a-z_]+)",\s*([0-9.]+),\s*(\d+)\)', block
+            )
+        }
+        assert pinned, "could not read SAMPLING_SCHEDULE out of src/llm/mod.rs"
+
+        # The Creator asks for this many, and the gate reserves exactly it.
+        assert pinned["creator"] == ctx.OUTPUT_RESERVE_TOKENS
+
+        # The gate reserves one number for every site, so it must be at least the
+        # largest cap: a site above it could still die at attempt 1 on a tree the
+        # gate had passed. The auditor's 8192 (698933e) is below the reserve and
+        # so needs no term of its own.
+        assert max(pinned.values()) == ctx.OUTPUT_RESERVE_TOKENS, pinned
 
     def test_estimate_tokens_rounds_up_like_the_rust_does(self):
         """``conservative_token_estimate`` ceils; a truncated mirror under-counts."""

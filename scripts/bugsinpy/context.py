@@ -20,8 +20,9 @@ The budget is not "some fraction of the window":
     budget = n_ctx − output reserve − chat overhead − margin       (§1.6.2)
 
 The first two terms are what Vanta's own run-time guard subtracts
-(``context_budget_exceeded`` in ``src/llm/mod.rs``, and ``max_tokens: 32768`` in
-``src/agents/creator.rs``), so the precheck's boundary sits on the guard's
+(``context_budget_exceeded`` in ``src/llm/mod.rs``, whose ``max_tokens`` is the
+request body's — the ``"creator"`` row of ``SAMPLING_SCHEDULE`` there, put into
+the body by ``with_sampling``), so the precheck's boundary sits on the guard's
 boundary; the margin is the harness's addition, reserved for feedback growth
 across attempts. Both the token estimator and these constants are mirrors, not
 independent choices — a precheck that disagrees with the guard either discards
@@ -101,8 +102,9 @@ PROMPT_FRAME_TOKENS = 3000
 present regardless of the source size."""
 
 OUTPUT_RESERVE_TOKENS = 32_768
-"""What the Creator asks the server to generate (``"max_tokens": 32768`` in
-``src/agents/creator.rs``). The window is shared: prompt and completion come out of
+"""What the Creator asks the server to generate (the ``"creator"`` row of
+``SAMPLING_SCHEDULE`` in ``src/llm/mod.rs``, which is what ``with_sampling`` puts
+in the request body). The window is shared: prompt and completion come out of
 the same ``n_ctx``, so this is subtracted before the margin is taken. Without it
 the precheck would pass prompts that the guard below rejects — the exact
 disagreement this module exists to prevent."""
@@ -486,8 +488,8 @@ def render_markdown(rows: list[tuple[str, str, ContextVerdict]]) -> str:
         f"− {int(CONTEXT_MARGIN_FRACTION * 100)} % of n_ctx",
         "```",
         "",
-        f"- **output reserve {OUTPUT_RESERVE_TOKENS} tok** — `\"max_tokens\": 32768` in "
-        "`src/agents/creator.rs`. Prompt and completion share `n_ctx`.",
+        f"- **output reserve {OUTPUT_RESERVE_TOKENS} tok** — the `\"creator\"` row of "
+        "`SAMPLING_SCHEDULE` in `src/llm/mod.rs`. Prompt and completion share `n_ctx`.",
         f"- **chat overhead {CHAT_OVERHEAD_TOKENS} tok** — `CHAT_OVERHEAD_TOKENS` in "
         "`src/llm/mod.rs`.",
         f"- **margin {int(CONTEXT_MARGIN_FRACTION * 100)} %** — §1.6.2. The Creator's "

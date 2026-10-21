@@ -165,7 +165,7 @@ Required JSON shape:
                        IMPORTANT: Do NOT import constants or symbols that only exist in the PATCHED code (e.g. MAX_TOTAL). Use literal values instead so the test can run on BOTH original and patched code.
       "intent":      "BugReproduction" | "FeatureAcceptance" | "BehaviorPreservation",
       "reason":      string — why this test targets the patch,
-      "issue_quote": string|null — for BugReproduction or FeatureAcceptance, quote the exact issue sentence that asks for this behaviour, and that sentence MUST name the same input the test asserts (a test asserting `shipping_band(500)` needs a quote about 500). For BehaviorPreservation use null
+      "issue_quote": string|null — for BugReproduction or FeatureAcceptance, quote the issue sentence you believe asks for this behaviour at the input you assert (a test asserting `shipping_band(500)` needs a quote about 500). The quote is RECORDED as evidence for the reader; it does not authorise the label — a patch-blind auditor, not your quote, decides whether the issue asks for that behaviour. For BehaviorPreservation use null
     }
   ]
 }
@@ -181,8 +181,8 @@ CRITICAL:
 - Use assertions (assert X == Y) so failures are clean, not crashes.
 - Tests run with PYTHONPATH=src so `from heretic.modifier import X` works.
 - Expected values come from the ISSUE and the ORIGINAL code's existing behaviour, never from the patch alone.
-- A test may be BugReproduction or FeatureAcceptance ONLY if the quoted issue sentence explicitly asks for that behaviour AT THAT INPUT. If the issue does not ask for it, label it BehaviorPreservation.
-- Quoting an issue sentence that does not mention your test's input does NOT authorise a non-preservation intent. A patch changing behaviour is NOT evidence the issue wanted the change — "the patch does X" is never a reason to label a test FeatureAcceptance.
+- Label a test BugReproduction or FeatureAcceptance only when you believe the issue asks for that behaviour AT THAT INPUT; if the issue does not ask for it, label it BehaviorPreservation. A patch-blind auditor checks that belief, not your quote — the quote is evidence for the reader.
+- A patch that changes behaviour is NOT evidence the issue wanted the change — "the patch does X" is never a reason to label a test FeatureAcceptance.
 
 IMPORT RULES (violating these makes the test ERROR on collection — worse than failing):
 - Only import a name you can LITERALLY SEE defined in the ORIGINAL SOURCE above, and import it from the file where it is defined. Do NOT guess that a symbol lives in a module.
@@ -2067,6 +2067,37 @@ mod tests {
             "a mismatch must be repaired in the test, and a relabel must be tied to the label \
              being the mistake"
         );
+    }
+
+    /// [VANTA-WHY] A5 (§14.10) — the generate prompt made the `issue_quote` a
+    /// REQUIREMENT ("that sentence MUST name the same input the test asserts")
+    /// and then made the quote the licence for the label ("A test may be
+    /// BugReproduction or FeatureAcceptance ONLY if the quoted issue sentence
+    /// explicitly asks for that behaviour"). The quote is a recorded field, not a
+    /// verdict: the label is decided by the patch-blind intent audit, and a
+    /// requirement the prompt cannot check is a rule the model can only be
+    /// punished for breaking. Say that the quote is evidence for the reader.
+    #[test]
+    fn the_issue_quote_is_recorded_evidence_not_the_licence_for_a_label() {
+        for gone in [
+            "and that sentence MUST name the same input the test asserts",
+            "- A test may be BugReproduction or FeatureAcceptance ONLY if the quoted issue sentence explicitly asks for that behaviour AT THAT INPUT.",
+        ] {
+            assert!(
+                !ATTACKER_SYSTEM_PROMPT.contains(gone),
+                "the quote-as-requirement wording must be gone: {gone}"
+            );
+        }
+        for present in [
+            "The quote is RECORDED as evidence for the reader",
+            "a patch-blind auditor, not your quote, decides whether the issue asks for that behaviour",
+            "A patch-blind auditor checks that belief, not your quote",
+        ] {
+            assert!(
+                ATTACKER_SYSTEM_PROMPT.contains(present),
+                "the quote-as-evidence wording must be in the prompt: {present}"
+            );
+        }
     }
 
     // ---- item 8: the intent auditor's threaded-value rule -------------------

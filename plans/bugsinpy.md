@@ -1868,10 +1868,10 @@ One per rule and per new parse, plus the regression that matters most:
   both-trees preservation wording is gone, and every other rule the prompt carried is still in it —
   the same test that pins the hygiene rules (ONE INTENT PER TEST, TEST FIXTURES, PRESERVATION
   SPECIFICITY, the fake-attribute rule) must keep passing;
-- **`VANTA_SAMPLING`** (§14.11): a `coding` run sends the coding sampler pins on the Creator and the
-  three Attacker generative sites and leaves the auditor at 0.0/2048, a default run's bodies are
-  unchanged, and `run.summary` records the preset and the effective per-role values — the recorded
-  schedule is the effective one, which the request-body comparison above already enforces;
+- **`VANTA_SAMPLING`** (§14.11): a `coding` run sends the coding sampler pins on the Creator, the
+  three Attacker generative sites **and the intent auditor** (which keeps its 2048 cap), a default run's
+  bodies are unchanged, and `run.summary` records the preset and the effective per-role values — the
+  recorded schedule is the effective one, which the request-body comparison above already enforces;
 - `metrics.py`'s two new buckets and `label_for`'s new branch, and that the wave gate ignores a
   `NeedsReview` row;
 - `plans/bugsinpy_dev_split.json` loads under `load_split`; the only bug it shares with the
@@ -2033,6 +2033,17 @@ fast the way a pinned one does.
 under `coding` every site including the auditor carries 0.6/0.95/20/0.0/0.0 with the auditor's 2048
 cap, and under `pinned` the auditor bodies still carry temperature 0.0 and none of the extra sampler
 keys.
+
+The first cut of the auditor change (`ee9fef2`) reached the **recorded** schedule but not the wire: it
+moved `intent_audit`'s row into the coding table and wrote `temperature_intent_audit = 0.6` into
+`run.summary`, while the two functions that build the audit's request body still hard-coded
+`"temperature": 0.0`. `the_coding_preset_covers_every_site_including_the_auditor` caught the
+disagreement — the body read back at 0.0 against the schedule's 0.6. Follow-up `413bdd7` routes both
+auditor builders (`attacker_check_intent`, the single-test audit reached from `audit_test_intent`,
+BATE's `audit_issue_requires_change`, and the per-test fallback after a truncated batch;
+`attacker_check_intent_batch`, the batched round audit) through the same `with_sampling(_, "intent_audit")`
+call the generative sites use, so the grounded and ungrounded variants are one code path and the
+batch's scaled `max_tokens` is written over the schedule's cap after the pins are applied.
 
 Both the preset and the per-role values it produced are recorded in `run.summary`:
 `sampling_preset=` plus `temperature_<site>` / `max_tokens_<site>`, and, under `coding`, the extra

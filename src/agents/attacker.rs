@@ -181,6 +181,7 @@ CRITICAL:
 - Use assertions (assert X == Y) so failures are clean, not crashes — EXCEPT when the ISSUE names the symptom the bug produces (a `NameError`, an exact message, a specific exception type): then the test must actually trigger THAT symptom, because the reported failure is what ties the test to the issue. An assertion on a neighbouring value still raises a bare AssertionError and never reproduces the symptom the issue describes.
 - Tests run with PYTHONPATH=src so `from heretic.modifier import X` works.
 - Expected values come from the ISSUE and the ORIGINAL code's existing behaviour, never from the patch alone.
+- BATE may run your test more than once against the ORIGINAL code. A test whose result changes between those runs — time.sleep, a timeout, randomness, network, iteration order, shared state — is flaky and will be scrapped. Keep every test deterministic.
 - Label a test BugReproduction or FeatureAcceptance only when you believe the issue asks for that behaviour AT THAT INPUT; if the issue does not ask for it, label it BehaviorPreservation. A patch-blind auditor checks that belief, not your quote — the quote is evidence for the reader.
 - A patch that changes behaviour is NOT evidence the issue wanted the change — "the patch does X" is never a reason to label a test FeatureAcceptance.
 
@@ -2118,6 +2119,24 @@ mod tests {
             ATTACKER_SYSTEM_PROMPT.contains("- Use assertions (assert X == Y) so failures are clean, not crashes")
                 && ATTACKER_SYSTEM_PROMPT.contains("then the test must actually trigger THAT symptom"),
             "the assertion rule must stay and defer to a symptom the issue names"
+        );
+    }
+
+    /// [VANTA-WHY] A11 (§14.10) — the prompt never said that the baseline may be
+    /// measured more than once, so a test that depends on a clock, a random seed,
+    /// the network or ordering could be written in good faith and then scrapped
+    /// for flakiness with no rule it had broken. The remediation path (fresh
+    /// sandbox, then simplify) exists precisely because this happens.
+    #[test]
+    fn the_prompt_warns_that_a_flaky_test_is_scrapped() {
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("BATE may run your test more than once")
+                && ATTACKER_SYSTEM_PROMPT.contains("is flaky and will be scrapped"),
+            "the prompt must say a non-deterministic test is scrapped, not blamed on the patch"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("Keep every test deterministic"),
+            "the flakiness warning must come with the rule that prevents it"
         );
     }
 

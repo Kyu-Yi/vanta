@@ -1170,7 +1170,7 @@ Chosen for light, pure-Python, low-dependency projects, staged into waves by Pyt
 
 | Project | bugs | Python versions seen | chosen | wave | context (design estimate) |
 |---|---|---|---|---|---|
-| PySnooper | 3 | 3.8.1 | 1, 2, 3 | 1 | tiny, ~40 k tok |
+| PySnooper | 3 | 3.8.1 | 3 | 1 | tiny, ~40 k tok |
 | thefuck | 20 | 3.7.0 | 1, 2, 3 | 2 | small, **borderline** — measure |
 | httpie | 5 | 3.7.3 | 1, 2, 3 | 2 | small |
 | cookiecutter | 4 | 3.6.9 | 1 | 3 | small, needs `setup.py build` |
@@ -1181,7 +1181,7 @@ Chosen for light, pure-Python, low-dependency projects, staged into waves by Pyt
 **The `youtube-dl` decision (review point).** youtube-dl is hundreds of extractor files — the source
 concat is orders of magnitude past any window we run. Rather than silently dropping it, it stays in
 the split with `context_ok: false` so the precheck's verdict is **auditable in the committed record**,
-and it consumes **zero runs**. Its slot in the 10-bug pilot is taken by a reserve. The
+and it consumes **zero runs**. Its slot in the pilot is taken by a reserve. The
 `context_sizes.md` dump (§1.6) reports sizes for **all** candidates, reserves included, so the
 choice is data, not assertion.
 
@@ -1193,18 +1193,20 @@ build is the only step that can invalidate a whole batch:
 
 | Wave | Python | Bugs | Seeds | Purpose |
 |---|---|---|---|---|
-| 1 | 3.8.1 | PySnooper 2, 3 | `[0]` | **go/no-go gate** — checkpoint, `import ssl`+pip gate, oracle, leak gate, runner |
+| 1 | 3.8.1 | PySnooper 3 | `[0]` | **go/no-go gate** — checkpoint, `import ssl`+pip gate, oracle, leak gate, runner |
 | 2 | 3.7.0 / 3.7.3 | thefuck 1–3, httpie 1–3 | `[0]` | the pilot proper |
 | 3 | 3.6.9 | cookiecutter 1 | `[0]` | the last pilot slot; the two-repo `setup.py build` case |
 
-Pilot = waves 1 + 2 + 3 = **9 bugs** (`PySnooper/1` is excluded — a Python-2-only encoding bug that
-passes on both commits under 3.8; see the split's `reviewed_changes`).
+Pilot = waves 1 + 2 + 3 = **8 bugs** (`PySnooper/1` and `PySnooper/2` are excluded —
+PySnooper/1 is a Python-2-only encoding bug that passes on both commits under 3.8, and PySnooper/2's
+BugsInPy `bug_patch.txt` is an incomplete developer fix whose oracle no patch can pass; see the
+split's `reviewed_changes`).
 
 Per-bug environment notes that shape the estimates:
 
 | Bug | py | Checkpoint | Notes |
 |---|---|---|---|
-| PySnooper/2..3 | 3.8.1 | `vanta-bugsinpy-py3.8` | clean, no `pythonpath`, no build step — cheapest, standalone Python |
+| PySnooper/3 | 3.8.1 | `vanta-bugsinpy-py3.8` | clean, no `pythonpath`, no build step — cheapest, standalone Python |
 | thefuck/1..3 | 3.7.0 | `vanta-bugsinpy-py3.7` | pytest-native suite, no build step; **context borderline** |
 | httpie/1..3 | 3.7.3 | `vanta-bugsinpy-py3.7` | pytest-native, `requests`-like deps |
 | cookiecutter/1 | 3.6.9 | `vanta-bugsinpy-py3.6` | **`pythonpath=cookiecutter/build/lib/` → needs `setup.py build`** |
@@ -1231,10 +1233,10 @@ are 4–8 of them.
 
 | Wave | Bugs | Seeds | Runs | Checkpoint bake | Estimated wall clock |
 |---|---|---|---|---|---|
-| 1 (gate) | 3 | `[0]` | 18–30 | 20–40 min (py3.8, standalone) | 3–6 h |
+| 1 (gate) | 1 | `[0]` | 6–10 | 20–40 min (py3.8, standalone) | 3–6 h |
 | 2 (pilot) | 6 | `[0]` | 36–60 | 30–70 min (py3.7 + OpenSSL 1.1.1) | 6–12 h |
 | 3 (last slot) | 1 | `[0]` | 6–10 | 30–70 min (py3.6 + OpenSSL 1.1.1) | 1–2 h |
-| **total** | **10** | `[0]` | **60–100** | ~1.5–3 h | **~12–22 h → 2 overnight batches** |
+| **total** | **8** | `[0]` | **48–80** | ~1.5–3 h | **~12–22 h → 2 overnight batches** |
 
 Runs are strictly sequential (one LLM slot), so wall clock is the **sum**, not the max. At
 `seeds=[0]` the whole pilot fits comfortably; the previous `seeds=[0,1,2]` plan (98 runs in wave 2
@@ -1243,8 +1245,9 @@ alone) did not fit and is dropped (§8.3). Adding `vanta_planner` later multipli
 
 **Wave 1 is the go/no-go gate (decided).** If the checkpoint build, the `import ssl` + pip assertion,
 the oracle, or the leak gate misbehaves on wave 1, `run` **stops and reports** before any wave-2 work
-is scheduled. Wave 1 is deliberately cheap — 18–30 runs, `seeds=[0]`, one interpreter — so a bad
-assumption costs hours, not days.
+is scheduled. Wave 1 is deliberately cheap — 6–10 runs, `seeds=[0]`, one interpreter — so a bad
+assumption costs hours, not days. It is now a single bug (PySnooper/3): the wave's other original bug
+was excluded rather than replaced.
 
 **Calibration step (mandatory).** Before wave 2, replace this table with measured wave-1 timings.
 The estimates above are not data.
@@ -1255,10 +1258,11 @@ Explicitly, wave 1 must demonstrate all of:
 
 1. `vanta-bugsinpy-py3.8` passes `import ssl`, a real `pip install`, and `pytest --version` (§3.2).
 2. The per-bug layers bake and `pytest --collect-only -q` succeeds inside them.
-3. `prepare` derives a non-empty `FAIL_TO_PASS` for both PySnooper bugs (the declared intersection of
-   §1.3), with no flaky escapes. PySnooper/2 additionally records `f2p_undeclared` — the fix adds a
-   test for a helper it also adds — and that test must be absent from `vanta_tree`.
-4. The leak gate produces a clean text for both, and `issue_texts_all.md` reads as actionable.
+3. `prepare` derives a non-empty `FAIL_TO_PASS` for PySnooper/3 (the declared intersection of §1.3),
+   with no flaky escapes. PySnooper/2 used to cover the `f2p_undeclared` case here, and it is now
+   excluded — its BugsInPy `bug_patch.txt` is an incomplete developer fix whose oracle no patch can
+   pass, so it was removed from the split before its slot was spent (see `reviewed_changes`).
+4. The leak gate produces a clean text for it, and `issue_texts_all.md` reads as actionable.
 5. The oracle returns `patch_good = true` for the developer fix and `false` for the no-op patch, and
    the pooled candidate set for a bug is reproducible from the manifest alone.
 6. Baseline review (Attacker off) drives all its runs to completion with a consistent manifest, and
@@ -1413,7 +1417,7 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
 | D7 | Metrics location | Additive section in `scripts/metrics.py`. |
 | D8 | Test trees | **SWE-bench split** (§1.2–§1.3): Vanta's tree = buggy source + **fixed** test files − the declared `FAIL_TO_PASS` − the undeclared flippers (`f2p_undeclared`, recorded with a reason). `PASS_TO_PASS` is the native suite. Fixed-tree gate relaxed to "no fixed-only failures"; pre-existing failures recorded; every suite run twice to flag flaky nodeids. |
 | D9 | Oracle & labels | `final.patch` built for **every** terminal verdict (§5.1). The oracle applies **only non-test hunks**; test files are always the fixed version's. `patch_good = hidden_pass ∧ suite_regressions == 0`, and the label table keys off `patch_good` (§5.3). |
-| D10 | Waves & budget | Wave 1 = PySnooper (py3.8, `[0]`) as a **go/no-go gate**; wave 2 = thefuck + httpie (py3.7, `[0]`); wave 3 = cookiecutter (py3.6, `[0]`). 10 bugs, 60–100 runs, ~12–22 h. Budgets in §8.1. |
+| D10 | Waves & budget | Wave 1 = PySnooper/3 (py3.8, `[0]`) as a **go/no-go gate**; wave 2 = thefuck + httpie (py3.7, `[0]`); wave 3 = cookiecutter (py3.6, `[0]`). 8 bugs, 48–80 runs, ~12–22 h. Budgets in §8.1. |
 | D11 | Context precheck | `prepare` estimates each bug's source-concat tokens and **rejects** over-budget bugs with a documented 25 % margin, writing `context_sizes.md` **and** `context_report.json` for **all** candidates and printing the table. The split is an input and is never rewritten by a stage. Substitutions wait for wave 1's real `usage.prompt_tokens` — the estimate runs ~1.5× high. Narrowing files to fit is v2. |
 | D12 | Review coverage | Review mode on **every** bug over a **symmetric** per-bug candidate set — developer fix (`dev`, known-good) + no-op floor (`noop`) + up to 2 pooled failed Creator patches (`repair:<config>:<session>`, known-bad). `InfraFailure` / `apply_ok = false` skipped; deduplicated by **normalized diff**; each candidate records its source and oracle label. Baseline and vanta review the same set at the same seed (paired). Applied with test hunks dropped. |
 | D13 | Run order | baseline repair → vanta repair → baseline review (no LLM) → vanta review. Repair first, so failed patches exist before any review; reviews last, so both configs see the same set. |

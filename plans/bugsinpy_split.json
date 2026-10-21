@@ -238,38 +238,15 @@
       "reason": "black/22's BugsInPy `requirements.txt` is a pip freeze of the corpus author's own environment, not black's dependency list, and the environment it names cannot be built in the sandbox. Decoded (the file is UTF-16 LE with a BOM; see the reader change of 2043f64) it is 71 requirement lines, all 71 exact `==` pins, carrying black's whole dev toolchain and an unrelated application stack with it — sphinx, mypy, flake8, coverage, aiohttp plus its 12 transitive packages, typed-ast, PyYAML. Its buggy commit is dated 2018-03-29 and 65 of the 71 pins were released after that date (newest tqdm==4.44.1, 2020-03-29), so the file is a freeze taken about two years after the commit it is attached to. Mechanically, 10 of the 71 pins have no cp38 aarch64 wheel and would have to build from source inside the sandbox: accessify==0.3.1 and distlib==3.0.0 (sdist only), typed-ast==1.4.0 (its wheels are x86_64-only), pyyaml==5.1 (no aarch64 wheel at any version), cffi==1.14.0, coverage==5.0.4, multidict==4.7.5, regex==2020.2.20 and yarl==1.4.2 (wheels exist, none for this platform), and cryptography==2.8 (needs Rust and OpenSSL headers in the layer). The sandbox has a C toolchain, so a few of these would compile; typed-ast 1.4.0 and PyYAML 5.1 are the ones that do not build against this interpreter, and a 90-minute bake is the wrong place to discover it. The exclusion is therefore a property of the benchmark's own metadata — the reference environment is a snapshot of somebody's laptop from 2020 — and not a judgement about the bug, its difficulty or its context size, all of which are fine (it is the only candidate the §1.6 gate accepted: ~58497 estimated prompt tokens against a 65280 budget, no file skipped). The resolver no longer refuses this bug, so nothing here is left of the dependency-conflict stop that prompted this review: with the pin-intersects-bound rule the `attrs==19.3.0` / `attrs>=17.4.0` disagreement is one requirement, and with the reference-pin exemption all 71 pins resolve and all 71 would be installed. The two rules are recorded in the design (§3.3) and are general for the later waves; this entry is only the black/22 consequence.",
       "decided_by": "user review, 2026-10-20",
       "rule": "A candidate whose resolved dependency set cannot be built in the sandbox's own environment is excluded before a slot is spent on it, by the same principle as the §1.6 context gate. The check is per pin and mechanical: for every resolved pin, does PyPI list a wheel whose platform tag is `any` or `aarch64` and whose Python tag matches the bug's interpreter? A pin with no such wheel is a source build. A single pin that has no aarch64 wheel at all makes the layer unbuildable rather than merely slow, and its count is the measurement, not a judgement. Measured for black/22 on 2026-10-20: 71 pins, 65 released after the buggy commit, 10 with no cp38/aarch64 wheel. The same check is what the wave-2/3 freeze-file rule has to be applied with, and it is recorded here because a later wave must not re-derive it by hand."
+    },
+    {
+      "change": "PySnooper/2 is removed from `bugs`. It was wave 1, role pilot; wave 1 is now PySnooper/3 alone, and the slot was not refilled — no substitute was searched for in the candidate pool. Wave 1 therefore runs one pilot bug rather than two. This supersedes the wave-1 composition stated at the end of the change above (\"the two remaining PySnooper bugs\").",
+      "reason": "BugsInPy's `bug_patch.txt` for PySnooper/2 is an INCOMPLETE developer fix, which makes the oracle unpassable by construction rather than merely hard. `bug_patch.txt` touches exactly one file (`pysnooper/tracer.py`, 143 lines), while the fix commit it is cut from (buggy e21a31162f4c54be693d8ca8260e42393b39abd3 -> fixed 814abc34a098c1b98cb327105ac396f985d2413e) changes 18 paths, including `pysnooper/pycompat.py`, `pysnooper/utils.py`, `pysnooper/variables.py`, `pysnooper/__init__.py`, `setup.py`, `tox.ini` and `tests/`. The tracer.py hunks it does apply call code added by those other files and never installed by it: `pycompat.PY2` (patch line 17, `if pycompat.PY2:`), `pycompat.collections_abc.Iterable` (line 84), and `utils.get_shortish_repr(value, custom_repr=...)` (lines 30 and 140). None of those exist in the buggy tree, where `pycompat.py` defines only `PY3 = (sys.version_info[0] == 3)` and `utils.get_shortish_repr` takes a single argument with no `custom_repr`. The patched `pysnooper` therefore cannot be imported at all. Measured, from batch runs/bugsinpy/prepare-wave1-3: the oracle grades the DEVELOPER FIX ITSELF `apply_ok=true, hidden_pass=false, patch_good=false`, with all three derived FAIL_TO_PASS nodeids — `tests/test_pysnooper.py::test_custom_repr`, `::test_custom_repr_single`, `::test_disable` — recorded as `\"absent\"` rather than failed, because pytest cannot collect them; and both review configs report `Native: original ran=true (29 tests), patched ran=true (0 tests), 29 regression(s) [SUITE COLLAPSED]`. No patch of any kind can pass this oracle, so every grade this bug produces is uninformative about the model: the baseline review of the developer fix is `Rejected` on `[SUITE COLLAPSED]`, and the Diagnostician classifies that collapse as Infrastructure (import/collect error), not as a property of the candidate. The general mechanism that catches this class is prepare's developer-fix self-check (`oracle.grade_dev_fix`, wired into `prepare.prepare_one`): it grades a bug's developer fix with the real oracle and refuses the bug when its own fix does not grade `patch_good`. With that check in place PySnooper/2 would be refused before any GPU time is spent; this entry removes it from the split first, so its wave-1 slot is not spent producing a refusal. A separate, thinner reason not to rely on it: the issue text Vanta was given (\"Support single tuple to , fix #144\" plus one generic sentence) is too thin for the Attacker to write a reproduction test at all, so the no-op was approved with zero BugReproduction evidence. Fetching the real linked GitHub issue text behind `fix #144`, leak-gated, is recorded as future work in the design (§13); it is not the reason for this exclusion.",
+      "decided_by": "user review, 2026-10-21",
+      "rule": "A bug whose own developer fix does not grade `patch_good` under the hidden oracle is excluded before a wave runs on it: the oracle is unpassable, so the bug cannot produce a label that means anything, whatever the model does. `prepare` enforces this per bug (`prepare.selfcheck_dev_fix`) and refuses rather than skips, so a bug that fails the check while still present in `bugs` stops prepare with the grader's evidence in hand. The exclusion is recorded here because removing a bug changes the wave-1 gate's membership, and §8.2 is a committed protocol rather than a note."
     }
   ],
   "bugs": [
-    {
-      "project": "PySnooper",
-      "bug_id": 2,
-      "python_version": "3.8.1",
-      "buggy_commit": "e21a31162f4c54be693d8ca8260e42393b39abd3",
-      "fixed_commit": "814abc34a098c1b98cb327105ac396f985d2413e",
-      "test_file": "tests/test_pysnooper.py",
-      "pythonpath": null,
-      "needs_build": false,
-      "native_test_paths": [
-        "tests"
-      ],
-      "test_cmd": [
-        "python",
-        "-m",
-        "pytest",
-        "tests",
-        "-p",
-        "no:cacheprovider",
-        "--json-report",
-        "--json-report-file={report}"
-      ],
-      "pytest_version": "8.0.2",
-      "json_report_version": "1.5.0",
-      "checkpoint": "vanta-bi-PySnooper-2",
-      "wave": 1,
-      "role": "pilot",
-      "notes": "Shares buggy_commit with PySnooper/1. Wave-1 go/no-go gate (§8.2)."
-    },
     {
       "project": "PySnooper",
       "bug_id": 3,

@@ -67,7 +67,14 @@ use tracing::{debug, info, trace, warn};
 // round-3 reply on the toy looped 45 times on "Let me pick the three most valuable
 // tests" / "Both are shared" / "-1 is shared". The reworded line is part of the
 // prompt text, so the tag moves with it.
-pub const ATTACKER_PROMPT_VERSION: &str = "8.shared-band-terminal-fallback";
+//
+// [VANTA-WHY] Bumped again for the rest of A21, whose prompt edits land together
+// under this one tag. `745cafb` reworded the round >= 2 user-prompt section so
+// "DO NOT REPEAT" and the terminal fallback read as ONE rule (a bare prohibition
+// pulled against the fallback in exactly the late-round state the fallback exists
+// for), and the ONE PASS line bounds the plan to a single pass over the
+// candidates so the 45x re-listing loop has no work to do.
+pub const ATTACKER_PROMPT_VERSION: &str = "9.one-pass-plan-and-qualified-repeat";
 
 // ============================================================================
 // INTENT_AUDITOR_PROMPT_VERSION — the run-identity tag for the intent check
@@ -255,6 +262,7 @@ BOUNDARY-PROBING RULE:
 Write exactly 3 tests, spending them in THIS order of priority: (1) the exact comparison the patch changes, at its boundary value; (2) the behaviour the issue's "must stay the same" clause names; (3) the code path the issue asks you to change. The three items are NOT exclusive: one test may satisfy several of them at once, and you count it once, against the highest item it satisfies — when a single boundary is both the comparison the patch changes and the code path the issue asks you to change, items (1) and (3) are the SAME test, not two, and there is no third thing to find for it. Label each one honestly: use BugReproduction or FeatureAcceptance only when the issue asks for that behaviour at the input you assert, otherwise use BehaviorPreservation.
 Once every comparison the patch changes and every behaviour the issue's "must stay the same" clause names are covered, spend each remaining slot on one more BehaviorPreservation probe: an input where the ORIGINAL source returns a DIFFERENT result than at the inputs you have already tested — the other side of an unchanged boundary, or the far end of a band. Take the FIRST such input you find and do not compare alternatives; when the issue names only one boundary, three BehaviorPreservation probes at three such inputs are a correct answer and you do not need a third kind of test.
 TERMINAL FALLBACK: when EVERY input the defaults above point to is already covered by an existing test, so nothing new is left to find, do NOT keep searching or comparing candidates — spend each remaining slot on one more input inside a band that is already covered (a midpoint of the band, or the value on the other side of a boundary you already probed), chosen on the spot without weighing alternatives. A repeat of an existing test is an ACCEPTABLE answer here: it is discarded automatically, so the round still has its three tests, while a round that keeps hunting for a novel input loses all of them.
+ONE PASS: list candidate tests at most once. Do not re-list, re-rank or re-check a candidate you have already considered; once you have three, write them.
 This order and these defaults are FINAL. Choose the three tests once, write them, and do not re-derive the plan or reconsider the priority while drafting: if you identified a case and did not spend a slot on it, name what you left uncovered and why at the end of its `reason`."#;
 
 // ============================================================================
@@ -2385,6 +2393,27 @@ mod tests {
                 && ATTACKER_SYSTEM_PROMPT
                     .contains("A repeat of an existing test is an ACCEPTABLE answer here"),
             "the system prompt must still carry the terminal fallback the section points at"
+        );
+    }
+
+    /// [VANTA-WHY] A21 follow-up (§14.10) — the 45x round-3 loop was the model
+    /// re-listing and re-ranking candidate tests instead of writing what it had.
+    /// The one-pass rule is what bounds that deliberation: candidates are listed
+    /// once, a candidate already considered is not revisited, and three is the
+    /// stop condition.
+    #[test]
+    fn the_prompt_limits_the_plan_to_one_pass() {
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("ONE PASS:")
+                && ATTACKER_SYSTEM_PROMPT.contains("list candidate tests at most once")
+                && ATTACKER_SYSTEM_PROMPT
+                    .contains("Do not re-list, re-rank or re-check a candidate you have already considered")
+                && ATTACKER_SYSTEM_PROMPT.contains("once you have three, write them"),
+            "the plan must be one pass: no re-listing, no re-ranking, no re-checking"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("This order and these defaults are FINAL"),
+            "the one-pass rule sits with the finality rule, not apart from it"
         );
     }
 

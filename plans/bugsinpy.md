@@ -1465,17 +1465,35 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
   reported alongside (§9.3).
 - Seeds do not guarantee reproducibility (§4.3), and the pilot runs a single seed (§8.3), so every
   pilot rate is one sample per (bug, config).
-- **Two harness bugs were found while gating wave 1 and were fixed before the reported runs; every
+- **Harness defects were found while gating wave 1 and were fixed before the reported runs; every
   reported result uses the fixed harness.** One was in how a candidate's reproduction tests are
-  graded (the BATE path); the other was in the Diagnostician's failure-location step, which read
+  graded (the BATE path); the other two were in the Diagnostician's failure-location step, which read
   pytest's warnings summary as the failure site and demoted any failure whose innermost frame was not
   in a file the patch touched to a test defect — so the BugReproduction counterexamples that argued
-  for rejection were discarded, and PySnooper/3's no-op was approved. Repairing a scorer mid-study is
-  legitimate provided the before/after is disclosed and the affected rows are re-run on the fixed
-  harness, which is what the wave-1 re-run and §11 step 9 are for; the rows a broken grader produced
-  are not reported. Neither fix touches the verdict rule, ECR/EIR or sampling. Recording the two
-  graders as defects is also the honest reading of the gate: finding them is what the gate is for
-  (§8.2), and both were found by running on BugsInPy rather than by inspection.
+  for rejection were discarded, and PySnooper/3's no-op was approved. A second defect in the same step
+  compounded it: the patch-insensitivity probe demoted any failure that reproduced *identically* on
+  the original tree, which is what a no-op patch produces by construction, so no no-op could be
+  rejected even once its failure was located correctly. The probe is now gated on BATE's baseline — a
+  validated test is never demoted, since for a `BugReproduction` test an identical failure on both
+  trees is the evidence that the patch did not fix the bug — and BATE's baseline is what makes that
+  boundary checkable rather than a matter of taste. Repairing a scorer mid-study is legitimate
+  provided the before/after is disclosed and the affected rows are re-run on the fixed harness, which
+  is what the wave-1 re-run and §11 step 9 are for; the rows a broken grader produced are not
+  reported. None of the fixes touches the verdict rule, ECR/EIR or sampling. Recording the graders as
+  defects is also the honest reading of the gate: finding them is what the gate is for (§8.2), and
+  all three were found by running on BugsInPy rather than by inspection.
+- **A false reject of PySnooper/3's developer fix (measured on the pre-fix run; to be re-measured on
+  the fixed harness).** In the first wave-1 run the Attacker's round-4 reproduction test asserted
+  `'Starting var' in <snoop file>` for a **zero-argument** function, but `tracer.py:170` emits
+  `'Starting var:.. '` only at a `call` event **for variables already in scope**, so that string is
+  never written on any tree. The assertion cannot distinguish a fixed tree from a buggy one. On the
+  *fixed* harness this is a plain `AssertionError` in the generated test's own file, which is a
+  verdict on the patch (§12.3's failure-location rule), so Vanta will **reject the upstream fix** —
+  a false reject. It is recorded rather than tuned away: the Attacker and BATE were not modified for
+  it. A false reject caused by the model's own test is an EIR-type error, not evidence about the
+  fix, and it is reported as such, with the `tracer.py:170` evidence. The principled fix is a
+  BATE-side gate (§13), to be developed on heretic/toy — never on a BugsInPy row, which would be
+  tuning on the benchmark being measured.
 
 ---
 
@@ -1497,3 +1515,12 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
   realistic bug reports, which is the SWE-bench convention. It is future work rather than part of this
   pilot because it changes what the model is given: the pilot's issue text has to stay the derived one
   for its numbers to be comparable to the §8.2 gate.
+- **A BATE gate on the reproduction test's symptom.** BATE checks that a `BugReproduction` test
+  *fails* on the original tree, which accepts a test that fails for an unrelated reason — PySnooper/3's
+  round-4 test asserted a string `tracer.py:170` never emits, so it failed everywhere and still
+  matched the expected baseline (§12.3). Requiring a reproduction test to fail on the original tree
+  **with the symptom the issue names** (the exception type / message the issue reports) would refuse
+  that test instead of letting it reject a good fix. This is a change to BATE's gate, so it changes
+  what the pilot measures and it is future work; it is to be developed and validated on heretic and
+  the toy fixtures — **not** on a BugsInPy row, since tuning the pipeline on the benchmark it is
+  measured against would invalidate the measurement.

@@ -764,6 +764,7 @@ Rules:
 - The issue is the only source of requirements. The original source shows what the behaviour WAS; it is evidence of existing behaviour, never of a new requirement.
 - A test asserting `shipping_band(500) == "light"` is authorised only by an issue sentence that asks for that result at that input. A sentence about a DIFFERENT input does not authorise it.
 - A sentence that forbids changing behaviour ("without changing the existing behaviour at the other thresholds") FORBIDS the change; it never authorises it and never requires one.
+- A "must not change" / "without changing X" clause covers EVERY input whose original result the issue does not ask to change. Do not enumerate those inputs and do not debate which of them count as "thresholds": the only input the clause does NOT cover is one the issue asks you to change.
 - An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THIS test asserts, not for the issue in general.
 - A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
 - If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
@@ -801,6 +802,7 @@ Rules:
 - The issue is the only source of requirements. The original source shows what the behaviour WAS; it is evidence of existing behaviour, never of a new requirement.
 - A test asserting `shipping_band(500) == "light"` is authorised only by an issue sentence that asks for that result at that input. A sentence about a DIFFERENT input does not authorise it.
 - A sentence that forbids changing behaviour ("without changing the existing behaviour at the other thresholds") FORBIDS the change; it never authorises it and never requires one.
+- A "must not change" / "without changing X" clause covers EVERY input whose original result the issue does not ask to change. Do not enumerate those inputs and do not debate which of them count as "thresholds": the only input the clause does NOT cover is one the issue asks you to change.
 - An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THIS test asserts, not for the issue in general.
 - A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
 - If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
@@ -838,6 +840,7 @@ Rules:
 - The issue is the only source of requirements. The original source shows what the behaviour WAS; it is evidence of existing behaviour, never of a new requirement.
 - A test asserting `shipping_band(500) == "light"` is authorised only by an issue sentence that asks for that result at that input. A sentence about a DIFFERENT input does not authorise it.
 - A sentence that forbids changing behaviour ("without changing the existing behaviour at the other thresholds") FORBIDS the change; it never authorises it and never requires one.
+- A "must not change" / "without changing X" clause covers EVERY input whose original result the issue does not ask to change. Do not enumerate those inputs and do not debate which of them count as "thresholds": the only input the clause does NOT cover is one the issue asks you to change.
 - An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THAT numbered test asserts, not for the issue in general.
 - A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
 - If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
@@ -865,6 +868,7 @@ Rules:
 - The issue is the only source of requirements. The original source shows what the behaviour WAS; it is evidence of existing behaviour, never of a new requirement.
 - A test asserting `shipping_band(500) == "light"` is authorised only by an issue sentence that asks for that result at that input. A sentence about a DIFFERENT input does not authorise it.
 - A sentence that forbids changing behaviour ("without changing the existing behaviour at the other thresholds") FORBIDS the change; it never authorises it and never requires one.
+- A "must not change" / "without changing X" clause covers EVERY input whose original result the issue does not ask to change. Do not enumerate those inputs and do not debate which of them count as "thresholds": the only input the clause does NOT cover is one the issue asks you to change.
 - An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THAT numbered test asserts, not for the issue in general.
 - A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
 - If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
@@ -2913,6 +2917,110 @@ mod tests {
                 "the flag-off prompts may not gain the third question"
             );
         }
+    }
+
+    /// [VANTA-WHY] A19c (§14.10) — "without changing the existing behaviour at the
+    /// other thresholds" is the single most-quoted sentence in the auditor's
+    /// replies: the Q1 quote 168x, the follow-up run's 57x, "at the other
+    /// thresholds" 180x. The model spends its budget deciding WHICH inputs count as
+    /// "other thresholds" — is 0 one? 999? — a question the issue never frames. All
+    /// four prompts now state the scope once, so there is nothing to enumerate.
+    #[test]
+    fn the_prompt_scopes_a_must_not_change_clause_to_every_unchanged_input() {
+        for prompt in [
+            INTENT_AUDITOR_SYSTEM_PROMPT,
+            INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED,
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT,
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED,
+        ] {
+            assert!(
+                prompt.contains(
+                    r#""must not change" / "without changing X" clause covers EVERY input"#
+                ),
+                "every auditor prompt must state what a must-not-change clause covers"
+            );
+            assert!(
+                prompt.contains(r#"do not debate which of them count as "thresholds""#),
+                "the scope rule must forbid the threshold enumeration the replies show"
+            );
+        }
+    }
+
+    /// [VANTA-WHY] A19 (§14.10) — a)–c) are wording-only: they change which answers
+    /// the auditor is TOLD to give, never which answer `route_intent` reads. This is
+    /// the routing evidence for that claim, over the whole grid of intents, answers
+    /// and relabel state.
+    ///
+    /// (b) makes every non-BugReproduction test answer question 3 "null" (`None`);
+    /// (a) and (c) make a preservation input the issue does not ask to change answer
+    /// `asks = false, requires_change = false`. Each fix is checked against the
+    /// answers it replaces, so no fixture decision can move. BugReproduction is
+    /// excluded from the (b) equivalence for the reason the fix keeps asking it
+    /// there: `ScrapUngrounded` fires on `Some(false)` for that intent alone.
+    #[test]
+    fn the_wording_fixes_never_move_a_routing_decision() {
+        let of = |asks: bool, rc: Option<bool>, grounded: Option<bool>| IntentVerdict {
+            issue_asks_for_behaviour: asks,
+            issue_requires_change: rc,
+            assertions_grounded: grounded,
+            reason: "the issue says so".to_string(),
+        };
+
+        for intent in [
+            TestIntent::BehaviorPreservation,
+            TestIntent::FeatureAcceptance,
+        ] {
+            for asks in [false, true] {
+                for rc in [None, Some(false), Some(true)] {
+                    for relabeled in [false, true] {
+                        let null = route_intent(&intent, &of(asks, rc, None), relabeled);
+                        for grounded in [Some(false), Some(true)] {
+                            assert_eq!(
+                                null,
+                                route_intent(&intent, &of(asks, rc, grounded), relabeled),
+                                "a null question-3 answer must route exactly where \
+                                 {grounded:?} did for {intent:?} (asks={asks}, \
+                                 requires_change={rc:?}, relabeled={relabeled})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // (a)+(c): a preservation test at an input the issue does not ask to change.
+        // The rule fixes asks = false, requires_change = false; all four answers the
+        // model might otherwise have given route to the same place.
+        for asks in [false, true] {
+            for rc in [None, Some(false)] {
+                assert_eq!(
+                    route_intent(&TestIntent::BehaviorPreservation, &of(asks, rc, None), false),
+                    IntentRouting::Keep,
+                    "a preservation test at an input the issue does not ask to change must \
+                     keep (asks={asks}, requires_change={rc:?})"
+                );
+            }
+        }
+
+        // The two answers the rule forbids, and why (a) fixes asks = false: with
+        // requires_change mis-answered `true`, asks = false SCAPS and asks = true
+        // PROMOTES — and a promotion is a relabel.
+        assert_eq!(
+            route_intent(
+                &TestIntent::BehaviorPreservation,
+                &of(false, Some(true), None),
+                false
+            ),
+            IntentRouting::ScrapRequiresChange
+        );
+        assert_eq!(
+            route_intent(
+                &TestIntent::BehaviorPreservation,
+                &of(true, Some(true), None),
+                false
+            ),
+            IntentRouting::PromoteToFeature
+        );
     }
 
     /// [VANTA-WHY] A8 (§14.10) — all four auditor prompts opened with "Answer two

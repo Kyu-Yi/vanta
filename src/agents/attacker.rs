@@ -342,6 +342,33 @@ Intent rules (these predict the baseline result BATE will measure on the ORIGINA
 If the baseline still does not match the declared intent, fix the TEST first — the input it asserts, the expected value, or the label — and make the label the one the ISSUE supports for the input you assert. Relabel only when the LABEL was the mistake: the new intent must be honest for what the test actually asserts, and BugReproduction / FeatureAcceptance need an issue sentence that asks for that behaviour AT THAT INPUT. Relabelling is never a way to make a mismatch disappear; a test whose input or expected value is wrong stays wrong under any label."#;
 
 // ============================================================================
+// ATTACKER_SIMPLIFY_SYSTEM_PROMPT — the Unknown-simplification prompt
+// ============================================================================
+//
+// [VANTA-WHY] Hoisted out of `attacker_simplify_test` for the same reason the
+// revise prompt was. The audit fixed this rule too (plans/bugsinpy.md §14.10,
+// A10): the prompt told the Attacker to simplify a test that produced an UNKNOWN
+// but never said the ASSERTION had to survive, and the Diagnostician then read a
+// passing simplified test as "Unknown resolved" — including a body whose
+// assertion had been deleted. The corrected text is pinned by a test.
+pub const ATTACKER_SIMPLIFY_SYSTEM_PROMPT: &str = r#"You are Vanta Attacker. A test you wrote produced an UNKNOWN result (could not be classified as Pass/Fail/Infrastructure/Static). The test may be too complex, non-deterministic, or have side effects. Simplify it so it produces a clear PASS or FAIL.
+
+YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
+
+Required JSON shape:
+{
+  "test_name":   string,
+  "test_source": string — MUST be a complete pytest function: `def test_name():` with assertions inside the function body.
+                   SIMPLIFY: remove network calls, time.sleep, randomness, complex setup. Use literal values. Keep the same intent.
+                   KEEP THE ASSERTION: the simplified test MUST still assert the SAME input and the SAME expected value as the test you were given. Dropping the assertion — or replacing it with `assert True`, an `is not None` check, or a bare call — makes the test pass without testing anything, and it is then SCRAPPED and the failure stands. Simplify the SETUP, never the claim.
+  "intent":      "BugReproduction" | "FeatureAcceptance" | "BehaviorPreservation",
+  "reason":      string — what you simplified and why,
+  "issue_quote": string|null — preserve the prior issue quote for BugReproduction/FeatureAcceptance; use null for BehaviorPreservation
+}
+
+Do NOT import constants or symbols that only exist in the PATCHED code."#;
+
+// ============================================================================
 // attacker_revise_test() — BATE feedback loop: revise a mismatched test
 // ============================================================================
 //
@@ -440,21 +467,7 @@ pub async fn attacker_simplify_test(
 
     let client = build_reqwest_client(cfg)?;
 
-    let system_prompt = r#"You are Vanta Attacker. A test you wrote produced an UNKNOWN result (could not be classified as Pass/Fail/Infrastructure/Static). The test may be too complex, non-deterministic, or have side effects. Simplify it so it produces a clear PASS or FAIL.
-
-YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
-
-Required JSON shape:
-{
-  "test_name":   string,
-  "test_source": string — MUST be a complete pytest function: `def test_name():` with assertions inside the function body.
-                   SIMPLIFY: remove network calls, time.sleep, randomness, complex setup. Use literal values. Keep the same intent.
-  "intent":      "BugReproduction" | "FeatureAcceptance" | "BehaviorPreservation",
-  "reason":      string — what you simplified and why,
-  "issue_quote": string|null — preserve the prior issue quote for BugReproduction/FeatureAcceptance; use null for BehaviorPreservation
-}
-
-Do NOT import constants or symbols that only exist in the PATCHED code."#;
+    let system_prompt = ATTACKER_SIMPLIFY_SYSTEM_PROMPT;
 
     let user_prompt = format!(
         "ORIGINAL SOURCE:\n```\n{original_source}\n```\n\n\
@@ -1728,6 +1741,80 @@ fn asserted_input_literals(test_source: &str) -> Vec<String> {
     literals
 }
 
+/// The literals an ASSERT statement pins — its inputs AND its expected value.
+///
+/// [VANTA-WHY] A10 — a "simplification" may delete the failing assertion
+/// outright (`assert add(2, 3) == 5` → `add(2, 3)`, or `assert add(2, 3) is not
+/// None`). Both still mention the same inputs, so `asserted_input_literals`
+/// (call arguments only, which is all the duplicate-probe check needs) cannot
+/// see the deletion: the body passes, and the Unknown looks resolved. The
+/// contract a test owes is what its assert statements compare, so it is read off
+/// THOSE lines: every string and number literal on a line that asserts.
+fn asserted_contract_literals(test_source: &str) -> Vec<String> {
+    let mut literals: Vec<String> = Vec::new();
+    for line in test_source.lines() {
+        if !line.trim_start().starts_with("assert") {
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0usize;
+        while i < chars.len() {
+            match chars[i] {
+                '"' | '\'' => {
+                    let quote = chars[i];
+                    let start = i + 1;
+                    let mut j = start;
+                    while j < chars.len() && chars[j] != quote {
+                        j += 1;
+                    }
+                    let literal: String = chars[start..j.min(chars.len())].iter().collect();
+                    let literal = literal.trim().to_string();
+                    if literal.chars().count() >= 2 && !literals.contains(&literal) {
+                        literals.push(literal);
+                    }
+                    i = j + 1;
+                }
+                c if c.is_ascii_digit() => {
+                    let starts_token = chars
+                        .get(i.wrapping_sub(1))
+                        .map_or(true, |p| !(p.is_ascii_alphanumeric() || *p == '_' || *p == '.'));
+                    if starts_token {
+                        let mut j = i;
+                        while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+                            j += 1;
+                        }
+                        let literal: String = chars[i..j].iter().collect();
+                        if !literals.contains(&literal) {
+                            literals.push(literal);
+                        }
+                        i = j;
+                    } else {
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+    }
+    literals
+}
+
+/// A10 — did the simplified test keep the contract the original test asserted?
+///
+/// True only when the simplified body still contains an assert and pins exactly
+/// the literals — inputs and expected values — the original test's asserts did.
+/// A body with no assert at all (`add(2, 3)`), or one that weakened the claim
+/// (`assert add(2, 3) is not None`), answers false and must be SCRAPPED rather
+/// than reported as a resolved Unknown.
+pub fn simplification_keeps_the_asserted_contract(
+    original_source: &str,
+    simplified_source: &str,
+) -> bool {
+    let asserted = asserted_contract_literals(original_source);
+    let simplified = asserted_contract_literals(simplified_source);
+    !simplified.is_empty() && simplified == asserted
+}
+
 /// Does `quote` name `literal` as a standalone token?
 ///
 /// Guards `500` against matching inside `1500`, and `2` against `20`.
@@ -2279,6 +2366,83 @@ mod tests {
         assert!(
             ATTACKER_SYSTEM_PROMPT.contains("Save output budget for the JSON answer"),
             "the budget advice must survive the removal of the count"
+        );
+    }
+
+    /// [VANTA-WHY] A10 (§14.10) — the simplify prompt asked only for a clear
+    /// PASS or FAIL and told the Attacker to "Keep the same intent", never that
+    /// the ASSERTION had to survive the simplification. The Diagnostician then
+    /// read a passing simplified test as "Unknown resolved", so a body reduced to
+    /// `add(2, 3)` — the same inputs, no assertion — retired a real failure. The
+    /// rule must now say the assertion and its expected value are kept.
+    #[test]
+    fn the_simplify_prompt_keeps_the_assertion_it_was_asked_to_simplify() {
+        assert!(
+            !ATTACKER_SIMPLIFY_SYSTEM_PROMPT.contains("Use literal values. Keep the same intent."),
+            "the wording that let the assertion be reduced away must be gone"
+        );
+        for present in [
+            "KEEP THE ASSERTION",
+            "assert the SAME input and the SAME expected value",
+            "it is then SCRAPPED and the failure stands",
+        ] {
+            assert!(
+                ATTACKER_SIMPLIFY_SYSTEM_PROMPT.contains(present),
+                "the simplify prompt must require the assertion survive: {present}"
+            );
+        }
+    }
+
+    /// [VANTA-WHY] A10 (§14.10) — the deterministic half of the fix. A simplified
+    /// test is allowed to pass only if it still asserts the SAME input and
+    /// expected value; the integration test covers the routing, this pins the
+    /// predicate it routes on.
+    #[test]
+    fn a_simplification_must_keep_the_input_and_expected_value_it_asserted() {
+        let original = "from calc import add\n\ndef test_x():\n    assert add(2, 3) == 5\n";
+
+        assert!(
+            simplification_keeps_the_asserted_contract(
+                original,
+                "from calc import add\n\ndef test_x():\n    assert add(2, 3) == 5\n",
+            ),
+            "a simplification that keeps the assertion is allowed through"
+        );
+        assert!(
+            !simplification_keeps_the_asserted_contract(
+                original,
+                "from calc import add\n\ndef test_x():\n    add(2, 3)\n",
+            ),
+            "dropping the assertion must be a scrap: the same inputs still appear, but nothing \
+             is claimed about them"
+        );
+        assert!(
+            !simplification_keeps_the_asserted_contract(
+                original,
+                "from calc import add\n\ndef test_x():\n    assert add(2, 3) is not None\n",
+            ),
+            "weakening the assertion loses the expected value, so it is not the same test"
+        );
+        assert!(
+            !simplification_keeps_the_asserted_contract(
+                original,
+                "from calc import add\n\ndef test_x():\n    assert add(2, 4) == 5\n",
+            ),
+            "a different input is a different claim, not a simplification"
+        );
+        assert!(
+            !simplification_keeps_the_asserted_contract(
+                original,
+                "from calc import add\n\ndef test_x():\n    assert True\n",
+            ),
+            "an assertion that pins nothing is not the same test"
+        );
+        assert!(
+            simplification_keeps_the_asserted_contract(
+                "def test_y():\n    assert shipping_band(500) == \"light\"\n",
+                "def test_y():\n    assert shipping_band(500) == \"light\"\n",
+            ),
+            "a string expected value is part of the contract too"
         );
     }
 

@@ -22,9 +22,12 @@
 // patch also carried a lint/type finding (session e8d393be).
 // ============================================================================
 
-use crate::agents::attacker::{GeneratedTest, attacker_simplify_test};
+use crate::agents::attacker::{
+    GeneratedTest, attacker_simplify_test, simplification_keeps_the_asserted_contract,
+};
 use crate::config::LlmConfig;
 use crate::core::{FailureClass, TestResult};
+use crate::pipeline::bate::{BateOutcome, validate_test_against_baseline};
 use crate::pipeline::candidate::TestCommand;
 use crate::pipeline::harness::{self, TestExecutionDetails};
 use serde::{Deserialize, Serialize};
@@ -875,6 +878,10 @@ pub async fn diagnose_failure(
             }
 
             // Step 2: ask the Attacker to simplify the test.
+            // `scrap_note` records WHY a passing simplification was refused, so
+            // the quarantine below names the reason instead of reporting a
+            // generic persistent Unknown.
+            let mut scrap_note: Option<String> = None;
             tracing::info!(test = %test.test_name, "Unknown → asking Attacker to simplify");
             match attacker_simplify_test(cfg, original_source, test).await {
                 Ok(simplified) => {
@@ -886,16 +893,79 @@ pub async fn diagnose_failure(
                         harness::patched_test_timeout_secs(),
                     )
                     .await;
+                    // [VANTA-WHY] A10 — a passing simplified test does NOT by
+                    // itself retire the Unknown. Simplification is free to delete
+                    // the assertion that was failing: `assert add(2, 3) == 5`
+                    // becomes `add(2, 3)`, which passes and still mentions the
+                    // same inputs, so the run used to record "Unknown resolved"
+                    // over a probe that tests nothing. The pass is believed only
+                    // when BOTH hold:
+                    //   (a) the simplified body still asserts the SAME input and
+                    //       expected value as the test it replaces, and
+                    //   (b) BATE finds that test's baseline on the ORIGINAL tree
+                    //       consistent with its declared intent — a reproduction
+                    //       probe that no longer fails on the original tree
+                    //       reproduced nothing.
+                    // Otherwise the simplified test is SCRAPPED and the failure
+                    // stands: it is the finding, not a fix.
                     if simp_result.result == TestResult::Passed {
-                        return enrich_with_sandbox_roots(
-                            DiagnosticResult {
-                                failure_class: None,
-                                reason: "Unknown resolved after Attacker simplification".into(),
-                                structured_payload: None,
-                            },
-                            execution.sandbox_root.clone(),
-                            simp_result.sandbox_root.clone(),
-                        );
+                        if !simplification_keeps_the_asserted_contract(
+                            &test.test_source,
+                            &simplified.test_source,
+                        ) {
+                            tracing::info!(
+                                test = %simplified.test_name,
+                                "simplified test passes but no longer asserts the original's input \
+                                 and expected value → SCRAPPED, Unknown stands"
+                            );
+                            scrap_note = Some(
+                                "the simplified test dropped the assertion it should have kept \
+                                 (the same input and expected value must still be asserted)"
+                                    .to_string(),
+                            );
+                        } else {
+                            let original_run = harness::run_single_test_with_timeout(
+                                original_source,
+                                &simplified.test_source,
+                                test_cmd,
+                                harness::patched_test_timeout_secs(),
+                            )
+                            .await;
+                            match validate_test_against_baseline(
+                                &simplified.test_name,
+                                &simplified.intent,
+                                original_run.result.clone(),
+                            ) {
+                                BateOutcome::Valid => {
+                                    return enrich_with_sandbox_roots(
+                                        DiagnosticResult {
+                                            failure_class: None,
+                                            reason: "Unknown resolved after Attacker simplification (BATE re-validated the simplified test against the original tree)".into(),
+                                            structured_payload: Some(json!({
+                                                "signal": "simplification_revalidated",
+                                                "simplified_test": simplified.test_name,
+                                                "original_sandbox_root": original_run.sandbox_root.clone(),
+                                            })),
+                                        },
+                                        execution.sandbox_root.clone(),
+                                        simp_result.sandbox_root.clone(),
+                                    );
+                                }
+                                BateOutcome::Mismatch(reason) => {
+                                    tracing::info!(
+                                        test = %simplified.test_name,
+                                        "simplified test passes on the patched tree but its ORIGINAL \
+                                         baseline contradicts its intent → SCRAPPED, Unknown stands: {reason}"
+                                    );
+                                    scrap_note = Some(
+                                        "the simplified test passes on the patched tree but its \
+                                         baseline on the ORIGINAL tree contradicts its declared \
+                                         intent, so it no longer asserts what the issue requires"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
                     }
                     let simp_diag = classify(&simp_result);
                     if !matches!(simp_diag.failure_class, Some(FailureClass::Unknown)) {
@@ -913,9 +983,19 @@ pub async fn diagnose_failure(
 
             // Step 4: still Unknown → quarantine (Attacker-generated tests).
             // Repository/benchmark tests would escalate to human review instead.
+            // [VANTA-WHY] A10 — a simplification whose PASS was refused leaves the
+            // Unknown exactly as it was; the scrap reason is named so the record
+            // shows the failure was not erased by a test that stopped asserting.
             DiagnosticResult {
                 failure_class: Some(FailureClass::Unknown),
-                reason: "Unknown persisted after rerun + simplification → QUARANTINED (Attacker-generated test). For repo/benchmark tests this would escalate to human review.".into(),
+                reason: match scrap_note {
+                    Some(note) => format!(
+                        "Unknown persisted after simplification: {note} → QUARANTINED \
+                         (Attacker-generated test). For repo/benchmark tests this would escalate to \
+                         human review."
+                    ),
+                    None => "Unknown persisted after rerun + simplification → QUARANTINED (Attacker-generated test). For repo/benchmark tests this would escalate to human review.".into(),
+                },
                 structured_payload: Some(serde_json::json!({
                     "action": "quarantine",
                     "evidence_source": "AttackerGenerated",

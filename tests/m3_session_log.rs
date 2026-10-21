@@ -186,6 +186,22 @@ impl StubLlmServer {
         )
     }
 
+    /// As `start`, but the Attacker's simplify call — the one the Unknown path
+    /// makes — is answered with a scripted body instead of the first element of
+    /// the generation script. A test that wants the diagnosed behaviour of a
+    /// particular substitute test needs to say what that substitute is.
+    fn start_with_simplify(attacker_response_json: &str, simplify_response_json: &str) -> Self {
+        Self::start_scripted(
+            None,
+            attacker_response_json,
+            None,
+            Some(simplify_response_json),
+            None,
+            None,
+            None,
+        )
+    }
+
     /// `on_request` runs with the 0-based index of each request, before the
     /// response is written. It lets a test change the world between rounds —
     /// e.g. replace the --patch file so the next attempt verifies a different
@@ -2965,6 +2981,84 @@ fn an_unknown_failure_is_rerun_then_simplified_then_quarantined() {
             .contains("QUARANTINED"),
         "persistent Unknowns must quarantine, not count as a model bug; got {:?}",
         diagnostic["reason"]
+    );
+    let payload = diagnostic["structured_payload"]
+        .as_object()
+        .expect("quarantined Unknowns must write a structured payload");
+    assert_eq!(
+        payload.get("action"),
+        Some(&serde_json::Value::String("quarantine".into()))
+    );
+}
+
+/// [VANTA-WHY] A10 (§14.10) — the Unknown path read ANY passing simplified test
+/// as proof that the Unknown was resolved, and nothing checked that the
+/// simplification still asserted anything. A body reduced to `add(2, 3)` keeps
+/// the same inputs, drops the assertion, and therefore PASSES on a patched tree
+/// the original probe failed on — so a real failure was erased by a test that
+/// had stopped testing. The pass may retire the failure only when the same input
+/// and expected value are still asserted; otherwise the simplified test is
+/// SCRAPPED and the Unknown stands.
+#[test]
+fn a_simplified_test_that_dropped_its_assertion_does_not_erase_the_failure() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    // The generated probe asserts `add(2, 3) == 5`, which passes on the original
+    // tree and fails on this patch (`a - b`). The simplification keeps the call
+    // and the inputs but drops the assertion, so it passes on the patched tree.
+    const SIMPLIFIED_WITHOUT_ASSERTION: &str = r#"{
+        "test_name":"test_behavior_preservation_only",
+        "test_source":"from calc import add\n\ndef test_behavior_preservation_only():\n    add(2, 3)\n",
+        "intent":"BehaviorPreservation",
+        "reason":"simplified: reduced the body to the call under test",
+        "issue_quote":null
+    }"#;
+    let server =
+        StubLlmServer::start_with_simplify(SINGLE_BEHAVIOR_TEST, SIMPLIFIED_WITHOUT_ASSERTION);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[("VANTA_TEST_FORCE_UNKNOWN", "1")],
+    );
+    assert!(
+        !output.status.success(),
+        "a failure that was not erased must not approve the patch"
+    );
+    assert_eq!(
+        server.request_kinds(),
+        vec!["generate", "intent_audit", "simplify"],
+        "the Unknown path still asks for exactly one simplification"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let debug_dir = workspace
+        .path()
+        .join("vanta_sessions")
+        .join(records[0].session_id.as_str())
+        .join("debug");
+    let diagnostic =
+        read_json(&debug_dir.join("attempt_1_diagnostic_test_behavior_preservation_only.json"));
+    assert!(
+        diagnostic["failure_class"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unknown"),
+        "a simplification that no longer asserts anything must not resolve the Unknown; got {}",
+        diagnostic["failure_class"]
+    );
+    let reason = diagnostic["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("QUARANTINED"),
+        "the failure must still be quarantined, not erased; got {reason:?}"
+    );
+    assert!(
+        reason.contains("dropped the assertion"),
+        "the record must name WHY the passing simplification was refused; got {reason:?}"
     );
     let payload = diagnostic["structured_payload"]
         .as_object()

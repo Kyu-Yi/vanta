@@ -1461,6 +1461,130 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
     );
 }
 
+/// [VANTA-WHY] A21 follow-up item 3 — the dedup arm of the terminal fallback.
+///
+/// The fallback tells a late round that a repeat is an ACCEPTABLE answer BECAUSE
+/// duplicates are discarded automatically. This pins the other half of that
+/// promise: a round whose three Attacker tests are ALL duplicates of the shared
+/// set ends NORMALLY. Every duplicate is dropped before it is audited, the round
+/// still runs the shared set, and the run advances to the approval — no audit
+/// call is made for a round with nothing to audit, and nothing is an error.
+///
+/// The fixture repeats the SAME three preservation probes every round, so from
+/// round 2 the shared set IS those three and every generated test is a duplicate.
+#[test]
+fn a_round_of_all_duplicates_is_dropped_and_the_run_advances() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(THREE_PRESERVATION_TESTS);
+
+    let status = run_patch_mode(workspace.path(), &patch_path, &server);
+
+    assert!(
+        status.success(),
+        "a round that only repeats the shared set is not an error: the candidate still passes"
+    );
+
+    // One generate call per round (3). The intent audit runs ONLY for round 1's
+    // freshly generated probes: rounds 2 and 3 have nothing left after the dedup,
+    // so there is nothing to audit and no further call may be made.
+    assert_eq!(
+        server.request_kinds(),
+        vec![
+            "generate",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "generate",
+            "generate"
+        ],
+        "rounds 2 and 3 drop all three probes, so they must make no audit call"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+
+    let dedup_rows: Vec<&SessionRecord> = records
+        .iter()
+        .filter(|r| r.phase == "attacker.dedup")
+        .collect();
+    assert_eq!(dedup_rows.len(), 3, "one dedup row per round");
+
+    // Round 1 has no shared set yet, so it drops nothing.
+    assert!(
+        dedup_rows[0].summary.contains("shared_set_size=0")
+            && dedup_rows[0].summary.contains("generated=3")
+            && dedup_rows[0].summary.contains("dropped_duplicates=0")
+            && dedup_rows[0].summary.contains("remaining=3"),
+        "round 1 has no shared set yet, so it drops nothing; got {}",
+        dedup_rows[0].summary
+    );
+    // Rounds 2 and 3 repeat the whole shared set: all three dropped, none left.
+    for row in &dedup_rows[1..] {
+        assert!(
+            row.summary.contains("shared_set_size=3")
+                && row.summary.contains("generated=3")
+                && row.summary.contains("dropped_duplicates=3")
+                && row.summary.contains("remaining=0"),
+            "a fully repeated round must drop all three and keep none; got {}",
+            row.summary
+        );
+    }
+
+    // Nothing to audit means no audit: the three intent.check records all belong
+    // to round 1, the round that actually generated the probes.
+    let audit_rows: Vec<&SessionRecord> = records
+        .iter()
+        .filter(|r| r.phase.starts_with("intent.check["))
+        .collect();
+    assert_eq!(
+        audit_rows.len(),
+        3,
+        "exactly round 1's three probes are audited; a dropped round is never audited"
+    );
+    assert!(
+        audit_rows
+            .iter()
+            .all(|r| r.summary.contains("source=attacker.generate")),
+        "every audit must be a generate-side audit, not a BATE revision"
+    );
+    let round_one_iteration = dedup_rows[0].testing_iteration_id.as_ref();
+    assert!(
+        audit_rows
+            .iter()
+            .all(|r| r.testing_iteration_id.as_ref() == round_one_iteration),
+        "every audit record must belong to the round that generated its probes"
+    );
+
+    // The run advances: three rounds ran, and the candidate is approved at the
+    // end of the attack depth rather than erroring out on a duplicate-only round.
+    let attempt_summaries: Vec<&SessionRecord> = records
+        .iter()
+        .filter(|r| r.phase == "attempt.summary")
+        .collect();
+    assert_eq!(attempt_summaries.len(), 3, "all three rounds ran");
+    assert!(
+        attempt_summaries
+            .last()
+            .unwrap()
+            .summary
+            .contains("decision=AllTestsPassed"),
+        "the candidate must be approved at the end of the attack depth; got {}",
+        attempt_summaries.last().unwrap().summary
+    );
+    assert!(
+        !records.iter().any(|r| r.phase == "run.infra_failure"),
+        "a duplicate-only round is normal, not an infrastructure failure"
+    );
+    assert!(
+        run_summary(workspace.path())
+            .summary
+            .contains("final_decision=AllTestsPassed"),
+        "the run's terminal decision must be the approval"
+    );
+}
+
 /// The mirror of the import bug.
 ///
 /// The Infrastructure reroute exists so a harness that fails to build a tree is

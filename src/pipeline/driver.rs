@@ -1537,6 +1537,14 @@ pub async fn run(
                     &cfg,
                     &review_prompt_concat,
                     &test_cmd,
+                    // [VANTA-WHY] Every test in `tests_to_run` has a BATE baseline:
+                    // `valid_tests` were validated this attempt and `shared_tests`
+                    // were validated when they were first generated (replayed from
+                    // disk). The Diagnostician must not demote a validated test's
+                    // failure to a test defect — for a BugReproduction test,
+                    // failing identically on the original and the patched tree is
+                    // the evidence that the patch did not fix the bug.
+                    true,
                 )
                 .await;
                 println!(

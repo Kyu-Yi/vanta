@@ -196,6 +196,13 @@ fn failure_sections(output: &str) -> (bool, Vec<Vec<&str>>) {
 /// The innermost frame in an output that has NO FAILURES/ERRORS section (a
 /// fragment of a run, or a runner that prints only the traceback line), skipping
 /// the sections that can never hold the failure's own frame.
+///
+/// [VANTA-WHY] Only the SUMMARY sections are skipped, and each of them is the
+/// LAST thing a pytest run prints. The session-start banner is deliberately NOT
+/// one of them: its lines (`rootdir:`, `plugins:`, `collected 1 item`) cannot be
+/// mistaken for frames, and skipping it swallowed every fragment that begins
+/// with the banner — `an_assertion_failure_saves_the_test_source_and_the_failure_site`
+/// lost its exception type that way (e432d2c).
 fn innermost_frame_anywhere(output: &str) -> Option<(String, u32, String)> {
     let mut found = None;
     let mut skipped = false;
@@ -207,9 +214,7 @@ fn innermost_frame_anywhere(output: &str) -> Option<(String, u32, String)> {
         if is_marker(line, '=') {
             skipped = marker_title(line, '=').is_some_and(|t| {
                 let t = t.to_ascii_lowercase();
-                t.contains("warnings summary")
-                    || t.contains("short test summary")
-                    || t.contains("test session starts")
+                t.contains("warnings summary") || t.contains("short test summary")
             });
             continue;
         }
@@ -285,6 +290,49 @@ fn is_test_file(path: &str) -> bool {
     name.starts_with("test_") || name.ends_with("_test.py") || name == "conftest.py"
 }
 
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Does `source` declare `class <name>`?
+fn declares_class(source: &str, name: &str) -> bool {
+    let needle = format!("class {name}");
+    source.match_indices(&needle).any(|(i, _)| {
+        source[i + needle.len()..]
+            .chars()
+            .next()
+            .map_or(true, |c| !(c.is_ascii_alphanumeric() || c == '_'))
+    })
+}
+
+/// Does the failure name an object of a type the TEST itself declares?
+///
+/// [VANTA-WHY] `'FakeTensor' object has no attribute 'shape'` is the TEST's fake
+/// (56eb4fd3 round 2), not the patch: the test stubbed the model incompletely,
+/// so wherever the crash lands — in the test's file or inside the code under
+/// test that was handed the fake — the crash is a property of the test. This is
+/// the one signal that reaches a crash landing in the code under test, which the
+/// test-file check below cannot see. Re-instated with its original signal after
+/// the e432d2c rewrite dropped it.
+fn names_test_defined_type(output: &str, test_source: &str) -> bool {
+    for (idx, _) in output.match_indices("' object") {
+        let before = &output[..idx];
+        let Some(open) = before.rfind('\'') else {
+            continue;
+        };
+        let name = &before[open + 1..];
+        if is_identifier(name) && declares_class(test_source, name) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Is an `AssertionError` the TEST's own `assert` / mock `assert_*`?
 ///
 /// [VANTA-WHY] An assertion failure IS a verdict on the patch: the test checked
@@ -325,16 +373,18 @@ fn assertion_is_the_tests_own(output: &str, frame_file: Option<&str>) -> bool {
 /// 3ef3ac33).
 ///
 /// The one real test defect is the generated test's OWN code breaking: the
-/// innermost frame of a non-assertion exception is inside the test file itself,
-/// so the code under test never had a fair chance to run — a test that
-/// instantiated a CLI-reading settings object and got `SystemExit`, or a fake
-/// that is missing the attribute the test then uses.
+/// innermost frame of a non-assertion exception is inside the test file itself
+/// — a test that instantiated a CLI-reading settings object and got `SystemExit`
+/// — or the exception names an object of a class the test itself declared, so
+/// the crash is on the test's incomplete fake wherever it landed (56eb4fd3's
+/// `'FakeTensor' object has no attribute 'shape'`).
 ///
 /// Returns the TestDefect reason + payload, or `None` when the patch is a fair
 /// target. Also `None` when no fault can be located at all: an unreadable
 /// failure must not be quietly turned into a test defect.
 pub fn locate_fault(
     execution: &TestExecutionDetails,
+    test_source: &str,
 ) -> Option<(String, serde_json::Value)> {
     let output = format!("{}\n{}", execution.stdout, execution.stderr);
     let (frame_file, frame_line, exception_type) = parse_failure_site(&output);
@@ -348,17 +398,36 @@ pub fn locate_fault(
     if exception == "AssertionError" && assertion_is_the_tests_own(&output, frame_file.as_deref()) {
         return None;
     }
+    let site = format!(
+        "{}:{}",
+        frame_file.clone().unwrap_or_else(|| "?".into()),
+        frame_line.map(|l| l.to_string()).unwrap_or_else(|| "?".into()),
+    );
+
+    // A crash on an object of a type the TEST declared is the test's incomplete
+    // fake, even when the frame is in the code under test.
+    if names_test_defined_type(&output, test_source) {
+        let reason = format!(
+            "Failure located in the TEST's own object ({exception} at {site}) — the generated test \
+             defined the type that broke, so the failure is a property of the test, not the patch. \
+             Sent back to the Attacker for revision."
+        );
+        return Some((
+            reason,
+            json!({
+                "signal": "test_defect_test_defined_type",
+                "exception_type": exception_type,
+                "frame_file": frame_file,
+                "frame_line": frame_line,
+            }),
+        ));
+    }
     // Anything raised outside the generated test's own file was raised by the
     // code under test, so it is the patch's business.
     if !frame_file.as_deref().is_some_and(is_test_file) {
         return None;
     }
 
-    let site = format!(
-        "{}:{}",
-        frame_file.clone().unwrap_or_else(|| "?".into()),
-        frame_line.map(|l| l.to_string()).unwrap_or_else(|| "?".into()),
-    );
     let reason = format!(
         "Failure located in the TEST's own code ({exception} at {site}) — the generated test raised \
          it before the code under test could run, so the failure is a property of the test, not the \
@@ -565,6 +634,10 @@ pub fn diagnose(inputs: &DiagnosticInputs) -> DiagnosticResult {
 //     Attacker-generated test QUARANTINED (excluded from EIR/ECR, reason logged)
 //     rather than silently counted as a model error.
 //   Static / Logic → no remediation here (M3 feeds them back to the Creator).
+//
+// `bate_validated` says whether BATE holds a baseline for this test (it ran it
+// on the original tree and accepted it). It gates the patch-insensitivity probe;
+// see the probe's comment for why a validated test must never be demoted by it.
 pub async fn diagnose_failure(
     test: &GeneratedTest,
     execution: &TestExecutionDetails,
@@ -577,6 +650,7 @@ pub async fn diagnose_failure(
     cfg: &LlmConfig,
     original_source: &str,
     test_cmd: &TestCommand,
+    bate_validated: bool,
 ) -> DiagnosticResult {
     let force_unknown = std::env::var("VANTA_TEST_FORCE_UNKNOWN").ok().as_deref() == Some("1");
     // [VANTA-WHY] The FIRST classification sees the real execution: whether the
@@ -647,7 +721,7 @@ pub async fn diagnose_failure(
     // before the (expensive) patch-insensitivity probe below because it needs no
     // rerun.
     if diag.failure_class == Some(FailureClass::Logic) {
-        if let Some((reason, payload)) = locate_fault(execution) {
+        if let Some((reason, payload)) = locate_fault(execution, &test.test_source) {
             tracing::info!(
                 test = %test.test_name,
                 "fault located in the TEST, not the patch → TestDefect"
@@ -664,53 +738,71 @@ pub async fn diagnose_failure(
         }
     }
 
-    // [VANTA-WHY] Item 2 of the heretic fix list. A failure that reproduces
-    // IDENTICALLY on the ORIGINAL tree says nothing about the patch. B v2's
-    // generated test built `HereticSettings(model=...)`, whose CLI settings
-    // source parses pytest's own argv and raises `SystemExit` — on the unpatched
-    // tree exactly as on the patch. Blaming the patch there is a false finding
-    // about the model. When the failing test raises the same exception at the
-    // same file:line on the original tree, the TEST is defective, not the
-    // candidate: classify it TestDefect, never Logic.
-    if diag.failure_class == Some(FailureClass::Logic) {
-        if let Some(patched_sig) = failure_signature(execution) {
-            let original = harness::run_single_test_with_timeout(
-                original_source,
-                &test.test_source,
-                test_cmd,
-                harness::patched_test_timeout_secs(),
-            )
-            .await;
-            if is_patch_insensitive(execution, &original) {
-                let (exception, file, line) = &patched_sig;
-                let site = format!(
-                    "{}:{}",
-                    file.clone().unwrap_or_else(|| "?".into()),
-                    line.map(|l| l.to_string()).unwrap_or_else(|| "?".into()),
-                );
-                tracing::info!(
-                    test = %test.test_name,
-                    "failure reproduces on the ORIGINAL tree → TestDefect (patch-insensitive)"
-                );
-                return enrich_with_sandbox_roots(
-                    DiagnosticResult {
-                        failure_class: Some(FailureClass::TestDefect),
-                        reason: format!(
-                            "Test fails identically on the unpatched tree ({exception} at {site}) — \
-                             patch-insensitive, so the failure is a property of the test, not the \
-                             patch. Sent back to the Attacker for revision."
-                        ),
-                        structured_payload: Some(json!({
-                            "signal": "patch_insensitive_failure",
-                            "exception_type": exception,
-                            "frame_file": file,
-                            "frame_line": line,
-                            "original_sandbox_root": original.sandbox_root.clone(),
-                        })),
-                    },
-                    execution.sandbox_root.clone(),
-                    original.sandbox_root.clone(),
-                );
+    // [VANTA-WHY] The patch-insensitivity probe (b7325c9) may NOT demote a test
+    // that BATE has a baseline for, which is why it is gated on `bate_validated`.
+    // BATE has already run the test on the ORIGINAL tree and accepted it, so
+    // "fails identically on both trees" is not new information about the test:
+    //   - BugReproduction: BATE accepted it because it FAILS on the original, so
+    //     failing identically on the patched tree is exactly the evidence that
+    //     the patch did not fix the bug → Logic, which rejects. A no-op patch is
+    //     byte-identical to the original, so it would otherwise intercept EVERY
+    //     no-op by construction (PySnooper/3, 5cc225fc).
+    //   - FeatureAcceptance / BehaviorPreservation: BATE proved they PASS on the
+    //     original, so a failure on the patched tree is patch-caused by
+    //     construction and the probe has no job there either.
+    // It is kept for a failure that carries no BATE baseline — a test the
+    // Diagnostician is asked about without one, e.g. a native pre-existing
+    // failure. No such failure reaches here today: every test in `tests_to_run`
+    // is `shared ∪ valid`, i.e. BATE-validated at generation and replayed
+    // thereafter. The gate is what makes that boundary explicit and testable.
+    // A test's OWN assertion is never a test defect (§B3): the test checked
+    // behaviour and the behaviour was wrong.
+    if !bate_validated && diag.failure_class == Some(FailureClass::Logic) {
+        let output = format!("{}\n{}", execution.stdout, execution.stderr);
+        let (frame_file, _, exception_type) = parse_failure_site(&output);
+        let exception = exception_type.clone().unwrap_or_default();
+        let tests_own_assertion = exception == "AssertionError"
+            && assertion_is_the_tests_own(&output, frame_file.as_deref());
+        if !exception.is_empty() && !tests_own_assertion {
+            if let Some(patched_sig) = failure_signature(execution) {
+                let original = harness::run_single_test_with_timeout(
+                    original_source,
+                    &test.test_source,
+                    test_cmd,
+                    harness::patched_test_timeout_secs(),
+                )
+                .await;
+                if is_patch_insensitive(execution, &original) {
+                    let (exception, file, line) = &patched_sig;
+                    let site = format!(
+                        "{}:{}",
+                        file.clone().unwrap_or_else(|| "?".into()),
+                        line.map(|l| l.to_string()).unwrap_or_else(|| "?".into()),
+                    );
+                    tracing::info!(
+                        test = %test.test_name,
+                        "failure reproduces on the ORIGINAL tree → TestDefect (patch-insensitive)"
+                    );
+                    return enrich_with_sandbox_roots(
+                        DiagnosticResult {
+                            failure_class: Some(FailureClass::TestDefect),
+                            reason: format!(
+                                "Test fails identically on the unpatched tree ({exception} at \
+                                 {site}) — patch-insensitive, so the failure is a property of the \
+                                 test, not the patch. Sent back to the Attacker for revision."
+                            ),
+                            structured_payload: Some(json!({
+                                "signal": "patch_insensitive_failure",
+                                "exception_type": exception,
+                                "frame_file": file,
+                                "frame_line": line,
+                                "original_sandbox_root": original.sandbox_root.clone(),
+                            })),
+                        },
+                        execution.sandbox_root.clone(),
+                        original.sandbox_root.clone(),
+                    );
+                }
             }
         }
     }
@@ -1087,7 +1179,7 @@ mod tests {
     fn a_failure_in_the_code_under_test_is_blamed_on_the_patch() {
         let execution = exec_at(TestResult::Failed, PYSNOOPER_NOOP_OUTPUT);
         assert!(
-            locate_fault(&execution).is_none(),
+            locate_fault(&execution, "").is_none(),
             "the patched tree still raises the bug's NameError, so the patch must be rejected"
         );
     }
@@ -1126,7 +1218,7 @@ mod tests {
             "E       RuntimeError: the test itself is broken\n\n",
             "test_run.py:5: RuntimeError\n",
         );
-        let located = locate_fault(&exec_at(TestResult::Failed, output))
+        let located = locate_fault(&exec_at(TestResult::Failed, output), "")
             .expect("a crash in the test's own file says nothing about the patch");
         assert_eq!(
             located.1["signal"],
@@ -1145,7 +1237,7 @@ mod tests {
             TestResult::Failed,
             "test_run.py:9: AttributeError: 'FakeTensor' object has no attribute 'shape'\n",
         );
-        let located = locate_fault(&execution)
+        let located = locate_fault(&execution, "")
             .expect("a fault in the test's own file must not be blamed on the patch");
         assert_eq!(
             located.1["signal"],
@@ -1155,10 +1247,26 @@ mod tests {
         assert!(located.0.contains("Attacker"), "the reason must say it goes back: {}", located.0);
     }
 
-    /// The same exception on a TEST-defined object, but raised inside the code
-    /// under test, is the patch's fault: the patch's code threw on an object the
-    /// validated test had used successfully on the original tree. This is the
-    /// case the old "not in a file the patch touched" rule got backwards.
+    /// The same 56eb4fd3 shape when the crash lands in the code under test: the
+    /// frame file is the patch's, but the object it choked on is the fake the
+    /// TEST declared — the test stubbed its dependency incompletely, so the
+    /// failure is the test's. This is the signal the e432d2c rewrite dropped.
+    #[test]
+    fn a_crash_on_a_test_defined_type_is_a_test_defect() {
+        let execution = exec_at(
+            TestResult::Failed,
+            "src/heretic/modifiers/abliteration.py:88: AttributeError: 'FakeTensor' object has no attribute 'shape'\n",
+        );
+        let test_source = "class FakeTensor:\n    def __init__(self, ids):\n        self.ids = ids\n";
+        let located = locate_fault(&execution, test_source)
+            .expect("the test's own fake lacks the attribute, so the test is at fault");
+        assert_eq!(located.1["signal"], json!("test_defect_test_defined_type"));
+        assert_eq!(located.1["exception_type"], json!("AttributeError"));
+        assert_eq!(located.1["frame_file"], json!("src/heretic/modifiers/abliteration.py"));
+    }
+
+    /// ...and a crash in the patch's own file on an object the test did NOT
+    /// define is the patch's fault.
     #[test]
     fn a_crash_in_the_patchs_own_file_is_the_patchs_fault() {
         let execution = exec_at(
@@ -1166,8 +1274,8 @@ mod tests {
             "src/heretic/modifiers/abliteration.py:88: AttributeError: 'FakeTensor' object has no attribute 'shape'\n",
         );
         assert!(
-            locate_fault(&execution).is_none(),
-            "the exception was raised by the patch's own file, so the patch is the suspect"
+            locate_fault(&execution, "def test_x():\n    pass\n").is_none(),
+            "the test declared no such type, so the exception was raised by the patch's own file"
         );
     }
 
@@ -1180,7 +1288,7 @@ mod tests {
             "src/heretic/modifiers/abliteration.py:88: TypeError: unsupported operand type(s)\n",
         );
         assert!(
-            locate_fault(&execution).is_none(),
+            locate_fault(&execution, "").is_none(),
             "the patch's own file throwing on real input is the patch's fault"
         );
     }
@@ -1190,8 +1298,8 @@ mod tests {
     #[test]
     fn a_cli_system_exit_in_test_setup_is_a_test_defect() {
         let execution = exec_at(TestResult::Failed, "test_run.py:5: SystemExit: 2\n");
-        let located =
-            locate_fault(&execution).expect("a CLI/argparse SystemExit is a test defect");
+        let located = locate_fault(&execution, "")
+            .expect("a CLI/argparse SystemExit is a test defect");
         assert_eq!(located.1["exception_type"], json!("SystemExit"));
     }
 
@@ -1200,7 +1308,7 @@ mod tests {
     fn the_tests_own_assertion_is_blamed_on_the_patch() {
         let execution = exec_at(TestResult::Failed, "test_x.py:2: AssertionError\n");
         assert!(
-            locate_fault(&execution).is_none(),
+            locate_fault(&execution, "").is_none(),
             "an assertion the test made is a fair verdict on the patch"
         );
     }
@@ -1213,7 +1321,7 @@ mod tests {
             "test_x.py:6: AssertionError: Expected 'get_responses' to have been called once. Called 0 times.\n",
         );
         assert!(
-            locate_fault(&execution).is_none(),
+            locate_fault(&execution, "").is_none(),
             "a mock assertion failure is a fair verdict on the patch"
         );
     }
@@ -1224,8 +1332,98 @@ mod tests {
     fn an_unlocatable_failure_is_not_reclassified() {
         let execution = exec_at(TestResult::Failed, "no frames here\n");
         assert!(
-            locate_fault(&execution).is_none(),
+            locate_fault(&execution, "").is_none(),
             "with no fault located, the patch keeps its Logic class"
+        );
+    }
+
+    fn generated_test(test_source: &str) -> GeneratedTest {
+        GeneratedTest {
+            test_name: "test_snoop_file_output_contains_starting_var".to_string(),
+            test_source: test_source.to_string(),
+            intent: crate::core::TestIntent::BugReproduction,
+            reason: "reproduce the reported NameError".to_string(),
+            issue_quote: None,
+            relabeled: false,
+        }
+    }
+
+    /// The BATE gate on the patch-insensitivity probe. BATE accepted this
+    /// BugReproduction test because it FAILS on the original tree, so the
+    /// Diagnostician must not demote the identical failure on the no-op tree:
+    /// the no-op is byte-identical to the original, so the probe would otherwise
+    /// intercept every no-op by construction and the bug would be approved
+    /// (PySnooper/3, 5cc225fc). If the gate is removed, this test fails.
+    #[tokio::test]
+    async fn a_bate_validated_no_op_failure_stays_logic() {
+        let test = generated_test("def test_snoop_file_output_contains_starting_var():\n    pass\n");
+        let execution = exec_at(TestResult::Failed, PYSNOOPER_NOOP_OUTPUT);
+        let diag = diagnose_failure(
+            &test,
+            &execution,
+            false,
+            false,
+            "",
+            "",
+            false,
+            "",
+            &LlmConfig::default(),
+            "",
+            &TestCommand::default(),
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            diag.failure_class,
+            Some(FailureClass::Logic),
+            "a no-op patch must be rejected, not excused: {:?}",
+            diag.reason
+        );
+        assert_ne!(diag.failure_class, Some(FailureClass::TestDefect));
+    }
+
+    /// ...and the dev fix's own bogus test (3ef3ac33 round 4 asserted
+    /// `'Starting var'`, which `tracer.py:170` never emits for a zero-argument
+    /// function) is still the test's assertion, so it stays Logic too. That
+    /// false reject is recorded, not tuned away (plans/bugsinpy.md §13).
+    #[tokio::test]
+    async fn a_bate_validated_tests_own_assertion_stays_logic() {
+        let test = generated_test(
+            "def test_snoop_file_output_contains_starting_var():\n    assert 'Starting var' in content\n",
+        );
+        let output = concat!(
+            "=================================== FAILURES ===================================\n",
+            "_____________ test_snoop_file_output_contains_starting_var _____________\n\n",
+            "    def test_snoop_file_output_contains_starting_var():\n",
+            ">       assert 'Starting var' in content\n",
+            "E       AssertionError: assert 'Starting var' in ''\n\n",
+            "test_run.py:17: AssertionError\n",
+            "=========================== short test summary info ============================\n",
+            "FAILED test_run.py::test_snoop_file_output_contains_starting_var - AssertionError\n",
+        );
+        let execution = exec_at(TestResult::Failed, output);
+        let diag = diagnose_failure(
+            &test,
+            &execution,
+            false,
+            false,
+            "",
+            "",
+            false,
+            "",
+            &LlmConfig::default(),
+            "",
+            &TestCommand::default(),
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            diag.failure_class,
+            Some(FailureClass::Logic),
+            "the test's own assertion is a verdict on the patch: {:?}",
+            diag.reason
         );
     }
 

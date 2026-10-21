@@ -2277,7 +2277,7 @@ class TestPrepareInvariants:
             bug_entry(pythonpath="demo/build/lib/", needs_build=True), bug
         ) == []
 
-    def test_require_checkpoints_names_every_missing_layer(self, monkeypatch):
+    def test_missing_checkpoints_names_every_missing_layer(self, monkeypatch):
         # Patched on ``bake``, not on ``prepare``: prepare has to reach the layer
         # through the same function the bake decides skip-vs-rebuild with, and this
         # is what makes that shared. A patch on prepare's own module namespace would
@@ -2285,14 +2285,12 @@ class TestPrepareInvariants:
         monkeypatch.setattr(
             bake_mod, "layer_exists", lambda name: name == "vanta-bugsinpy-py3.8"
         )
-        with pytest.raises(prepare_mod.PrepareError) as excinfo:
-            prepare_mod.require_checkpoints(
-                ["vanta-bugsinpy-py3.8", "vanta-bi-thefuck-1", "vanta-bi-httpie-1"]
-            )
-        message = str(excinfo.value)
-        assert "vanta-bi-httpie-1" in message
-        assert "vanta-bi-thefuck-1" in message
-        assert "vanta-bugsinpy-py3.8" not in message
+        # Reported, not raised on: a missing layer is one bug's problem and prepare
+        # flags that bug and prepares the rest (§3.2).
+        missing = prepare_mod.missing_checkpoints(
+            ["vanta-bugsinpy-py3.8", "vanta-bi-thefuck-1", "vanta-bi-httpie-1"]
+        )
+        assert missing == ["vanta-bi-httpie-1", "vanta-bi-thefuck-1"]
 
     def test_prepare_and_bake_ask_the_same_question_about_a_layer(self, monkeypatch):
         """``require_checkpoint`` and ``bake.frozen`` must not be two opinions."""
@@ -4282,14 +4280,15 @@ class TestDependencyProvenance:
         path = bake_mod.write_deps(deps_dir, item)
         assert path.name == "vanta-bi-Demo-3.json"
         assert bake_mod.load_deps(deps_dir, "vanta-bi-Demo-3")["import_name"] == "demo"
-        bake_mod.require_deps(deps_dir, ["vanta-bi-Demo-3"])
+        assert bake_mod.missing_deps(deps_dir, ["vanta-bi-Demo-3"]) == []
 
     def test_a_layer_with_no_recorded_provenance_must_be_rebaked(self, tmp_path):
         deps_dir = tmp_path / "deps"
         with pytest.raises(bake_mod.BakeError, match="re-run bake"):
             bake_mod.load_deps(deps_dir, "vanta-bi-Demo-3")
-        with pytest.raises(bake_mod.BakeError, match="vanta-bi-Demo-3"):
-            bake_mod.require_deps(deps_dir, ["vanta-bi-Demo-3"])
+        # A missing record is reported, not raised on: it is one bug's problem and
+        # prepare flags that bug rather than stopping the split (§3.2).
+        assert bake_mod.missing_deps(deps_dir, ["vanta-bi-Demo-3"]) == ["vanta-bi-Demo-3"]
 
     def test_a_file_that_is_not_provenance_is_an_error_not_an_empty_provenance(self, tmp_path):
         deps_dir = tmp_path / "deps"
@@ -4354,9 +4353,14 @@ class TestRealPySnooperDependencies:
             fetch=lambda name: self.RELEASE_DATES[name],
         )
 
+    def _layers(self, entries):
+        layers, flagged = self._resolve(entries)
+        assert flagged == [], f"PySnooper/2 and /3 must both resolve, got {flagged}"
+        return layers
+
     def test_bug_three_installs_every_declared_dependency_and_not_the_project(self):
         _, entries = self._entries()
-        item = next(d for d in self._resolve(entries) if d.checkpoint.endswith("-3"))
+        item = next(d for d in self._layers(entries) if d.checkpoint.endswith("-3"))
         assert set(item.installs) == {
             "decorator==4.4.0",
             "future==0.17.1",
@@ -4367,7 +4371,7 @@ class TestRealPySnooperDependencies:
     def test_the_project_is_never_among_the_installs(self):
         """A copy of ``pysnooper`` in site-packages would make every patch grade the same."""
         _, entries = self._entries()
-        for item in self._resolve(entries):
+        for item in self._layers(entries):
             assert not any(spec.startswith("pysnooper") for spec in item.installs)
 
     def test_the_harness_pytest_is_recorded_but_never_installed_by_the_layer(self):
@@ -4379,7 +4383,7 @@ class TestRealPySnooperDependencies:
         either — a record that disagrees with the recipe is worse than no record.
         """
         _, entries = self._entries()
-        item = next(d for d in self._resolve(entries) if d.checkpoint.endswith("-3"))
+        item = next(d for d in self._layers(entries) if d.checkpoint.endswith("-3"))
         assert not any(spec.startswith("pytest==") for spec in item.installs)
         pytest_dep = next(
             dep for dep in item.provenance["dependencies"] if dep["name"] == "pytest"
@@ -4394,7 +4398,7 @@ class TestRealPySnooperDependencies:
         _, entries = self._entries()
         got = {
             item.checkpoint: set(item.installs)
-            for item in self._resolve(entries)
+            for item in self._layers(entries)
             if not item.checkpoint.endswith("-3")
         }
         assert got == {
@@ -4409,7 +4413,7 @@ class TestRealPySnooperDependencies:
         have allowed the same release, but the record has to say which declaration
         decided it."""
         _, entries = self._entries()
-        item = next(d for d in self._resolve(entries) if d.checkpoint.endswith("-2"))
+        item = next(d for d in self._layers(entries) if d.checkpoint.endswith("-2"))
         six = next(d for d in item.provenance["dependencies"] if d["name"] == "six")
         assert six["pin"] == "six==1.12.0"
         assert six["commit"] == "814abc34a098c1b98cb327105ac396f985d2413e"
@@ -4420,7 +4424,7 @@ class TestRealPySnooperDependencies:
 
     def test_the_setup_py_install_line_is_recorded_as_skipped_on_every_bug(self):
         _, entries = self._entries()
-        for item in self._resolve(entries):
+        for item in self._layers(entries):
             skipped = item.provenance["skipped"]
             assert any(
                 line["source"] == "setup.sh"
@@ -4431,8 +4435,122 @@ class TestRealPySnooperDependencies:
 
     def test_the_import_name_is_read_from_the_projects_own_setup_py(self):
         _, entries = self._entries()
-        for item in self._resolve(entries):
+        for item in self._layers(entries):
             assert item.provenance["import_name"] == "pysnooper"
+
+
+class TestOneBugDoesNotStopTheBatch:
+    """A bug whose dependencies cannot be read is flagged, never fatal (§3.2).
+
+    [VANTA-WHY] ``fastapi/1``'s refusal stopped a whole dev-split ``bake`` at the
+    first bug — which hides every later bug behind it and produces nothing to look
+    at. ``resolve_bug_deps`` therefore returns ``(layers, flagged)``: the resolvable
+    bugs are baked, the flagged checkpoints are kept out of the recipes, and the
+    flagged list is printed *separately* from the §14.7 gate results, because
+    flagged-unreadable is not one of those two gates and must not promote a reserve.
+    """
+
+    UNREADABLE = (
+        "Demo/1: neither setup.py nor pyproject.toml at " + "b" * 40 + ", so the "
+        "declared dependencies and test requirements cannot be read. Flag this bug "
+        "rather than guessing at its dependencies (design §3.2)."
+    )
+
+    def _split(self) -> split_mod.Split:
+        return split_mod.Split(
+            split_data(
+                bugs=[
+                    bug_entry(checkpoint="vanta-bi-Demo-1"),
+                    bug_entry(bug_id=2, checkpoint="vanta-bi-Demo-2"),
+                ]
+            )
+        )
+
+    def _resolve(self, monkeypatch, *, refusing=("Demo/1",)):
+        def fake_sources(entry, *, bugsinpy_root, repo, module_distributions=None):
+            if f"{entry['project']}/{entry['bug_id']}" in refusing:
+                raise bake_mod.BakeError(self.UNREADABLE)
+            return bake_mod.DepSources(
+                project="Demo",
+                bug_id=2,
+                checkpoint="vanta-bi-Demo-2",
+                buggy_commit="b" * 40,
+                commit_date="2019-04-22",
+                fixed_commit="f" * 40,
+                fixed_commit_date="2019-07-30",
+                import_name="demo",
+                refs=(
+                    replace(
+                        bake_mod.dep_ref(
+                            "decorator>=4.3.0", "install_requires (setup.py) line 1"
+                        ),
+                        commit="b" * 40,
+                        commit_date="2019-04-22",
+                    ),
+                ),
+            )
+
+        monkeypatch.setattr(bake_mod, "bug_sources", fake_sources)
+        split = self._split()
+        return bake_mod.resolve_bug_deps(
+            split,
+            split.bugs,
+            bugsinpy_root=Path("/nonexistent"),
+            repo_for=lambda project: Path("/nonexistent"),
+            fetch=lambda name: TestResolvePinsByDate.RELEASES[name],
+        )
+
+    def test_the_bug_after_the_unreadable_one_is_still_resolved(self, monkeypatch):
+        layers, _ = self._resolve(monkeypatch)
+        assert [item.checkpoint for item in layers] == ["vanta-bi-Demo-2"]
+        assert layers[0].installs == ("decorator==4.4.0",)
+
+    def test_the_unreadable_bug_is_flagged_with_its_reason(self, monkeypatch):
+        layers, flagged = self._resolve(monkeypatch)
+        assert layers, "the batch carried on"
+        assert [(flag.key, flag.reason) for flag in flagged] == [
+            ("Demo/1", f"BakeError: {self.UNREADABLE}")
+        ]
+
+    def test_a_split_where_every_bug_is_unreadable_still_returns_flags(self, monkeypatch):
+        """Nothing resolvable is not an exception: it is two flags and no layers."""
+        layers, flagged = self._resolve(monkeypatch, refusing=("Demo/1", "Demo/2"))
+        assert layers == []
+        assert [flag.key for flag in flagged] == ["Demo/1", "Demo/2"]
+
+    def test_a_flagged_bug_is_kept_out_of_the_recipes(self, monkeypatch):
+        """The exclusion ``cmd_bake`` performs — without it the flag would stop the bake."""
+        layers, flagged = self._resolve(monkeypatch)
+        split = self._split()
+        with pytest.raises(bake_mod.BakeError, match="no resolved dependencies"):
+            bake_mod.layer_recipes(
+                split, pythons=["3.8"], entries=list(split.bugs), deps=layers
+            )
+        flagged_keys = {flag.key for flag in flagged}
+        baked = [
+            entry
+            for entry in split.bugs
+            if f"{entry['project']}/{entry['bug_id']}" not in flagged_keys
+        ]
+        names = [
+            name
+            for name, _, _ in bake_mod.layer_recipes(
+                split, pythons=["3.8"], entries=baked, deps=layers
+            )
+        ]
+        assert names == ["vanta-bugsinpy-py3.8", "vanta-bi-Demo-2"]
+
+    def test_the_flagged_list_is_printed_apart_from_the_gate_results(self):
+        text = run_mod.render_flagged(
+            [("Demo/1", "BakeError: no setup.py ..."), ("FastAPI/1", "BakeError: b")]
+        )
+        assert "flagged bugs (2)" in text
+        assert "not gate failures" in text, "a flag is not a §14.7 gate"
+        assert "no reserve was promoted" in text, (
+            "promoting a reserve for an unreadable bug is a hand decision"
+        )
+        assert "  - Demo/1: BakeError: no setup.py ..." in text
+        assert "  - FastAPI/1: BakeError: b" in text
 
 
 class TestDepGate:

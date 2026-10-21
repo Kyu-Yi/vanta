@@ -2050,6 +2050,24 @@ class BugDeps:
     provenance: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class FlaggedBug:
+    """One bug whose dependencies could not be read, and why (§3.2).
+
+    [VANTA-WHY] A bug whose metadata cannot be read is one bug's problem, never the
+    batch's. ``bake`` used to stop at the first one — ``fastapi/1``'s ``no setup.py``
+    refusal took a whole dev-split bake down with it — which hides every later bug
+    behind it and produces nothing to look at. The bug is recorded here with the
+    reason it was refused, the rest of the split is resolved and baked, and the
+    flagged list is printed separately from the §14.7 gate results: a flagged bug is
+    not a gate failure, so it never silently promotes a reserve, and replacing it is
+    a decision taken by hand (amend the split, §8).
+    """
+
+    key: str
+    reason: str
+
+
 def resolve_bug_deps(
     split: Split,
     entries: Sequence[dict[str, Any]],
@@ -2057,28 +2075,43 @@ def resolve_bug_deps(
     bugsinpy_root: Path,
     repo_for: Callable[[str], Path],
     fetch: Callable[[str], Mapping[str, str]] = pypi_releases,
-) -> list[BugDeps]:
+) -> tuple[list[BugDeps], list[FlaggedBug]]:
     """Resolve every selected bug's layer, pinning by date from PyPI.
+
+    Returns ``(layers, flagged)``. A bug whose sources cannot be read — no
+    ``setup.py`` and no ``pyproject.toml`` at the buggy commit, an unparseable file,
+    two sources that disagree, a release the interpreter layer cannot accept, a
+    requirement with no release on or before its declaration's date — is **flagged**
+    with the reason and skipped, rather than stopping the bake: one unreadable bug
+    must not take the whole split down with it (§3.2). ``flagged`` is returned rather
+    than printed so the caller can exclude those checkpoints from the recipes and
+    print the list next to the §14.7 gate results, where it belongs.
 
     ``fetch`` is injected so the entire chain — union, conflict, cutoff, harness
     exception — is testable without the network.
     """
     out: list[BugDeps] = []
+    flagged: list[FlaggedBug] = []
     distributions = split.module_distributions()
     for entry in entries:
-        sources = bug_sources(
-            entry,
-            bugsinpy_root=bugsinpy_root,
-            repo=repo_for(str(entry["project"])),
-            module_distributions=distributions,
-        )
-        pin = pins_for_python(split, minor_version(str(entry["python_version"])))
-        harness_pins = {"pytest": pin.pytest, "pytest-json-report": pin.json_report}
-        needed = sorted(
-            {ref.name for ref in sources.refs if ref.name not in HARNESS_PACKAGES}
-        )
-        releases = {name: fetch(name) for name in needed}
-        resolved = resolve_deps(sources, releases=releases, harness_pins=harness_pins)
+        key = f"{entry['project']}/{entry['bug_id']}"
+        try:
+            sources = bug_sources(
+                entry,
+                bugsinpy_root=bugsinpy_root,
+                repo=repo_for(str(entry["project"])),
+                module_distributions=distributions,
+            )
+            pin = pins_for_python(split, minor_version(str(entry["python_version"])))
+            harness_pins = {"pytest": pin.pytest, "pytest-json-report": pin.json_report}
+            needed = sorted(
+                {ref.name for ref in sources.refs if ref.name not in HARNESS_PACKAGES}
+            )
+            releases = {name: fetch(name) for name in needed}
+            resolved = resolve_deps(sources, releases=releases, harness_pins=harness_pins)
+        except BakeError as exc:
+            flagged.append(FlaggedBug(key=key, reason=f"{type(exc).__name__}: {exc}"))
+            continue
         out.append(
             BugDeps(
                 entry=dict(entry),
@@ -2087,7 +2120,7 @@ def resolve_bug_deps(
                 provenance=deps_provenance(sources, resolved, harness_pins=harness_pins),
             )
         )
-    return out
+    return out, flagged
 
 
 def deps_path(deps_dir: Path, checkpoint: str) -> Path:
@@ -2126,16 +2159,18 @@ def load_deps(deps_dir: Path, checkpoint: str) -> dict[str, Any]:
     return data
 
 
-def require_deps(deps_dir: Path, checkpoints: Sequence[str]) -> None:
-    """Preflight every selected bug's provenance, before any checkout."""
-    missing = sorted(name for name in checkpoints if not deps_path(deps_dir, name).is_file())
-    if missing:
-        raise BakeError(
-            "no dependency provenance for "
-            + ", ".join(missing)
-            + f" under {deps_dir}. Re-run bake for these bugs — prepare reads the "
-            "recorded pins rather than trusting a layer baked without one."
-        )
+def missing_deps(deps_dir: Path, checkpoints: Sequence[str]) -> list[str]:
+    """The checkpoints under ``deps_dir`` with no provenance record, sorted.
+
+    [VANTA-WHY] Returns the missing names instead of raising: a layer baked without
+    a record is *one bug's* problem, not the batch's (§3.2), and ``prepare`` has to
+    be able to flag that bug and prepare the rest. A bug whose dependencies could
+    not be read at bake time has no layer and no record, so this is also where
+    ``prepare`` sees bake's refusal — per bug, never as a stopped run.
+    """
+    return sorted(
+        name for name in checkpoints if not deps_path(deps_dir, name).is_file()
+    )
 
 
 # ---------------------------------------------------------------------------

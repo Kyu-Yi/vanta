@@ -42,7 +42,7 @@ import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent
@@ -106,6 +106,24 @@ def utc_stamp() -> str:
 # ---------------------------------------------------------------------------
 def bug_key(entry: dict[str, Any]) -> str:
     return f"{entry['project']}/{entry['bug_id']}"
+
+
+def render_flagged(flagged: Sequence[tuple[str, str]]) -> str:
+    """The end-of-run list of bugs that failed for their own reason (§3.2).
+
+    [VANTA-WHY] Printed **separately** from the gate results on purpose: a flagged
+    bug — one whose dependencies could not be read at bake time, or that a stage
+    could not finish — is not a §14.7 gate failure, so the harness does not promote
+    a reserve to replace it. The split is unchanged, the reason is here in full, and
+    the decision is the reader's.
+    """
+    lines = [
+        f"flagged bugs ({len(flagged)}) — not gate failures; no reserve was promoted "
+        "and the split is unchanged:",
+    ]
+    for key, reason in flagged:
+        lines.append(f"  - {key}: {reason}")
+    return "\n".join(lines)
 
 
 def select(
@@ -211,17 +229,22 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         flush=True,
     )
 
-    # Preflight the checkpoints for everything that will run a suite, before the
-    # first checkout: a missing layer is a batch-level mistake (§3.3).
-    prepare_mod.require_checkpoints(
-        [entry["checkpoint"] for entry, full in selected if full]
+    # Preflight the checkpoints for everything that will run a suite, and the
+    # dependency provenance the bake recorded, before the first checkout: a missing
+    # layer is a batch-level mistake (§3.3) and a layer baked without a record is
+    # one prepare must not trust. Both sets are computed here — so the expensive
+    # part of prepare is never spent on a bug that cannot finish — but the
+    # *response* is per bug inside the loop below (§3.2): a bug whose dependencies
+    # could not be read at bake time has no layer and no record, and stopping the
+    # whole split for it is what the flag exists to avoid.
+    selected_full = [entry for entry, full in selected if full]
+    missing_layers = set(
+        prepare_mod.missing_checkpoints([entry["checkpoint"] for entry in selected_full])
     )
-    # And the dependency provenance the bake recorded. prepare installs nothing; it
-    # reads back what the layer was built from, so a layer baked without a record —
-    # or by a harness that did not record one — is a batch-level mistake too, not a
-    # per-bug surprise three suite runs later.
     deps_dir = RUNS_DIR / "deps"
-    bake_mod.require_deps(deps_dir, [entry["checkpoint"] for entry, full in selected if full])
+    missing_provenance = set(
+        bake_mod.missing_deps(deps_dir, [entry["checkpoint"] for entry in selected_full])
+    )
 
     batch_dir: Path = (args.batch or (RUNS_DIR / f"prepare-{utc_stamp()}")).resolve()
     batch_dir.mkdir(parents=True, exist_ok=True)
@@ -234,6 +257,23 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         key = bug_key(entry)
         project = entry["project"]
         print(f"[{key}] {'full' if full else 'context-only'} ...", flush=True)
+        checkpoint = entry["checkpoint"]
+        if full and checkpoint in missing_layers:
+            detail = (
+                f"PrepareError: checkpoint {checkpoint} does not exist. Bake it first "
+                "(design §11 step 3 for py3.8, §3.2 for the older interpreters)."
+            )
+            broken.append((key, detail))
+            print(f"[{key}] FAILED — {detail}", flush=True)
+            continue
+        if full and checkpoint in missing_provenance:
+            detail = (
+                f"BakeError: no dependency provenance for {checkpoint} under {deps_dir}. "
+                "Its dependencies could not be read at bake time; re-run bake for it."
+            )
+            broken.append((key, detail))
+            print(f"[{key}] FAILED — {detail}", flush=True)
+            continue
         try:
             url = meta_mod.project_github_url(bugsinpy_root, project)
             if not url:
@@ -304,6 +344,9 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     print(summary)
     print()
     print(prepare_mod.render_context_table(preps))
+    if broken:
+        print()
+        print(render_flagged(broken))
     print()
     print(f"batch dir : {batch_dir}")
     print(f"split     : {split_path} (read-only; {split_sha_after[:12]} unchanged)")
@@ -365,11 +408,15 @@ def cmd_bake(args: argparse.Namespace) -> int:
         )
 
     # Dependencies are resolved (and their provenance written) before anything is
-    # baked, so a bug whose four declared sources contradict each other, or that
-    # names a release which did not exist yet at its commit date, fails the whole
-    # bake here rather than producing a layer nobody can defend. This is the only
-    # place the harness talks to PyPI; every decision it makes is taken from the
-    # dates that call returns.
+    # baked, so a bug whose declared sources contradict each other, or that names a
+    # release which did not exist yet at its commit date, is caught here rather than
+    # producing a layer nobody can defend. This is the only place the harness talks
+    # to PyPI; every decision it makes is taken from the dates that call returns.
+    #
+    # A bug that cannot be read is *flagged*, not fatal (§3.2): stopping the whole
+    # bake at the first one hides every later bug behind it and produces nothing.
+    # The resolvable bugs are baked, the flagged list is printed at the end, and the
+    # exit code says a bug did not bake.
     repo_cache = RUNS_DIR / "repos"
     deps_dir = RUNS_DIR / "deps"
 
@@ -379,7 +426,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             raise SplitError(f"no github_url for {project} in project.info")
         return tree_cache(repo_cache, project, url)
 
-    bug_deps = bake_mod.resolve_bug_deps(
+    bug_deps, flagged = bake_mod.resolve_bug_deps(
         split, entries, bugsinpy_root=bugsinpy_root, repo_for=repo_for
     )
     for item in bug_deps:
@@ -387,8 +434,13 @@ def cmd_bake(args: argparse.Namespace) -> int:
         print(f"[{item.checkpoint}] installs: {', '.join(item.installs) or '—'}")
         print(f"[{item.checkpoint}] provenance: {path}", flush=True)
 
+    # A flagged bug has no resolved deps, so it must not reach the recipes — they
+    # would refuse a checkpoint with nothing resolved for it, which is exactly the
+    # stop the flag exists to avoid.
+    flagged_keys = {flag.key for flag in flagged}
+    baked_entries = [entry for entry in entries if bug_key(entry) not in flagged_keys]
     layers = bake_mod.layer_recipes(
-        split, pythons=minors, entries=entries, deps=bug_deps
+        split, pythons=minors, entries=baked_entries, deps=bug_deps
     )
 
     # --force means "replace", which for shuru means delete-then-create, and a
@@ -409,8 +461,11 @@ def cmd_bake(args: argparse.Namespace) -> int:
         ),
     )
     print(summary, flush=True)
+    if flagged:
+        print()
+        print(render_flagged([(flag.key, flag.reason) for flag in flagged]))
     print("bake complete", flush=True)
-    return EXIT_OK
+    return EXIT_BUG_FAILED if flagged else EXIT_OK
 
 
 def tree_cache(repo_cache: Path, project: str, url: str) -> Path:

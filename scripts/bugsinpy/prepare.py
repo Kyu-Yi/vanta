@@ -860,28 +860,22 @@ def require_checkpoint(name: str) -> None:
         )
 
 
-def require_checkpoints(names: list[str]) -> None:
-    """Preflight the whole selected set, so a missing layer stops the batch up front.
+def missing_checkpoints(names: list[str]) -> list[str]:
+    """The selected checkpoints that do not exist, sorted.
 
-    Checked before any checkout is made, not per bug: a missing checkpoint is a
-    configuration error about the batch (the bake step has not been run for that
-    wave), not a property of a bug, and discovering it after three full oracle
-    derivations would waste the expensive part of ``prepare`` on work that cannot
-    be completed.
+    [VANTA-WHY] Returns the missing names instead of raising. A missing layer is
+    still checked *before* any checkout, so the expensive part of ``prepare`` is
+    never spent on a bug that cannot finish — but the *response* is per bug: the
+    bug is flagged and the rest of the split is prepared (§3.2). A bug whose
+    dependencies could not be read at bake time has no layer, and stopping the
+    whole batch for it is what left a split with one unusable bug and no results
+    for the others.
 
     The check is ``bake.layer_exists`` — the same function ``bake`` decides
     skip-vs-rebuild with. Two opinions about whether a layer exists is how this
     stage came to report "does not exist" about a layer the bake had just named.
     """
-    missing = sorted({name for name in names if not bake_mod.layer_exists(name)})
-    if missing:
-        raise PrepareError(
-            "these checkpoints do not exist: "
-            + ", ".join(missing)
-            + ". Bake them first (design §11 step 3 for py3.8, §3.2 for the older "
-            "interpreters). prepare runs every suite inside Shuru and will not run "
-            "one on the host."
-        )
+    return sorted({name for name in names if not bake_mod.layer_exists(name)})
 
 
 # ---------------------------------------------------------------------------

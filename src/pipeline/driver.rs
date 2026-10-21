@@ -216,6 +216,34 @@ fn token_totals(calls: &[crate::llm::CallUsage]) -> (usize, usize, u64, Option<u
     (calls.len(), measured.len(), prompt, completion)
 }
 
+/// Count the calls the server cut off at `max_tokens`, per role (§14.5).
+///
+/// [VANTA-WHY] A truncated call is one whose generation hit the output cap —
+/// the shape a model "runs away" in. The role comes from the call SITE via
+/// `llm::truncation_role`, because the Attacker has four call sites and a
+/// run-away on any of them is the same fact about the same agent.
+/// `(creator, attacker, intent_audit)`.
+fn truncation_counts(calls: &[crate::llm::CallUsage]) -> (u64, u64, u64) {
+    let mut counts = (0_u64, 0_u64, 0_u64);
+    for site in calls.iter().filter(|c| c.truncated).map(|c| c.site.as_str()) {
+        match crate::llm::truncation_role(site) {
+            "creator" => counts.0 += 1,
+            "attacker" => counts.1 += 1,
+            "intent_audit" => counts.2 += 1,
+            // [VANTA-WHY] A site outside the schedule (the M0 spike names its
+            // own) has no role to report under. Said out loud rather than
+            // silently dropped, because a run-away that vanishes from every
+            // count would make the split's rate a lower bound nobody labelled.
+            other => tracing::warn!(
+                site,
+                role = other,
+                "a truncated call's site maps to no reported role, so it is not counted"
+            ),
+        }
+    }
+    counts
+}
+
 /// Render the pinned per-call-site sampling schedule as `run.summary` keys.
 ///
 /// [VANTA-WHY] Underscores, not dots. `rerun.rs::summary_field` and
@@ -2181,13 +2209,19 @@ pub async fn run(
             test_id: None,
             phase: "call.usage".to_string(),
             summary: format!(
-                "seq={} site={} prompt_tokens={} completion_tokens={} total_tokens={} source={}",
+                "seq={} site={} prompt_tokens={} completion_tokens={} total_tokens={} source={} \
+                 seed={} truncated={}",
                 usage.seq,
                 usage.site,
                 token_value(usage.prompt_tokens),
                 token_value(usage.completion_tokens),
                 token_value(usage.total_tokens),
                 usage.source,
+                // [VANTA-WHY] §14.5 — the seed THIS attempt sent, which is not
+                // `VANTA_LLM_SEED` when a retry advanced it. Written per call so
+                // a truncated-and-retried call is reproducible after the fact.
+                token_value(usage.seed),
+                usage.truncated,
             ),
             timestamp: now_iso(),
             benchmark_instance: None,
@@ -2196,6 +2230,17 @@ pub async fn run(
     }
     let (llm_calls, llm_calls_measured, llm_prompt_tokens, llm_completion_tokens) =
         token_totals(&call_usages);
+
+    // ---- Run-away (truncated) calls, per role (plans/bugsinpy.md §14.5) ----
+    // [VANTA-WHY] A model that spends its whole output cap on reasoning and
+    // returns nothing parseable is a fact about the MODEL, not about the bug it
+    // was pointed at, and the paper has to be able to say how often it happens
+    // (Ornith-1.0 does this roughly 1 run in 9 on the Attacker). Counting from
+    // the calls the run already recorded means the count cannot disagree with
+    // the run it describes; counting per ROLE means the number is reportable
+    // beside the split's results rather than buried per call site.
+    let (truncated_creator, truncated_attacker, truncated_intent_audit) =
+        truncation_counts(&call_usages);
 
     // ---- Provenance (plans/bugsinpy.md §4.4) ----
     // [VANTA-WHY] A session directory copied out of a batch has to be
@@ -2252,6 +2297,8 @@ pub async fn run(
             "attempts_run={} fixed_at_attempt_1={} final_decision={:?} \
              config={} mode={} seed={} model={} top_p={} {} \
              llm_calls={} llm_calls_measured={} llm_prompt_tokens={} llm_completion_tokens={} \
+             truncated_calls_creator={} truncated_calls_attacker={} \
+             truncated_calls_intent_audit={} \
              corroborate={} grounded_audit={} batch_audit={} \
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
@@ -2269,6 +2316,11 @@ pub async fn run(
             llm_calls_measured,
             llm_prompt_tokens,
             token_value(llm_completion_tokens),
+            // [VANTA-WHY] §14.5 — how often a model ran away on each role in THIS
+            // run. A count, not a rate: the split's report pools it over runs.
+            truncated_creator,
+            truncated_attacker,
+            truncated_intent_audit,
             // [VANTA-WHY] §14.2/§14.4/§14.5 — the switches this run actually ran
             // under, and the corroboration that produced its verdict. A reader
             // must be able to tell a `Rejected` decided by rule (a) from one

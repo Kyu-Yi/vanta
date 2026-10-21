@@ -95,6 +95,17 @@ struct StubLlmServer {
     /// between rounds. Per-test audit requests are answered normally, which is
     /// what lets a test prove the per-test fallback RECOVERS the round (§14.5).
     truncate_batch_audit: Arc<AtomicBool>,
+    /// Request kinds still to be answered with a reply CUT OFF at the output cap
+    /// (`finish_reason: "length"`), consumed one per matching request.
+    ///
+    /// [VANTA-WHY] §14.5 — a ONE-SHOT cut-off is what lets a test tell "the
+    /// caller retried and recovered" from "the caller gave up after one try":
+    /// the first matching request is answered with a reply no parser can read,
+    /// and the retry is answered normally. The `truncate_batch_audit` flag above
+    /// cannot express this — it truncates EVERY batch call, which is right for
+    /// the temp-0.0 auditor (whose retries are deterministic) and wrong for a
+    /// call site that is supposed to recover on the retry.
+    truncate_next: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
@@ -261,6 +272,7 @@ impl StubLlmServer {
         let request_bodies = Arc::new(Mutex::new(Vec::new()));
         let disconnects = Arc::new(AtomicUsize::new(0));
         let truncate_batch_audit = Arc::new(AtomicBool::new(false));
+        let truncate_next = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let request_count_clone = Arc::clone(&request_count);
@@ -268,6 +280,7 @@ impl StubLlmServer {
         let request_bodies_clone = Arc::clone(&request_bodies);
         let disconnects_clone = Arc::clone(&disconnects);
         let truncate_batch_audit_clone = Arc::clone(&truncate_batch_audit);
+        let truncate_next_clone = Arc::clone(&truncate_next);
         let stop_clone = Arc::clone(&stop);
         // The Attacker has two call sites with different response shapes: a
         // generation call expects `{"tests":[...]}` (AttackerResponse), while a
@@ -468,14 +481,34 @@ impl StubLlmServer {
                         // per-test request carries "TEST UNDER AUDIT" and is
                         // never truncated, so the fallback has something to
                         // succeed against.
+                        // [VANTA-WHY] §14.5 — a ONE-SHOT cut-off: the first
+                        // request of each queued kind is answered with a reply
+                        // that never closes, and every later request of that
+                        // kind is answered normally. `truncate_next_calls` is
+                        // the only way to script it — the parse fails, and
+                        // whether the caller comes back is the thing under test.
                         let cut_off_batch = request_kind == "intent_audit"
                             && body.contains("TESTS TO AUDIT")
                             && truncate_batch_audit_clone.load(Ordering::SeqCst);
+                        let cut_off_once = {
+                            let mut queued = truncate_next_clone
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            match queued.iter().position(|kind| kind == request_kind) {
+                                Some(position) => {
+                                    queued.remove(position);
+                                    true
+                                }
+                                None => false,
+                            }
+                        };
                         let (content_text, finish_reason) = if cut_off_batch {
                             (
                                 TRUNCATED_BATCH_AUDIT_ANSWER.to_string(),
                                 Some("length"),
                             )
+                        } else if cut_off_once {
+                            (TRUNCATED_REPLY.to_string(), Some("length"))
                         } else {
                             (content.to_string(), None)
                         };
@@ -553,6 +586,7 @@ impl StubLlmServer {
             request_bodies,
             disconnects,
             truncate_batch_audit,
+            truncate_next,
             stop,
             join: Some(join),
         }
@@ -563,6 +597,18 @@ impl StubLlmServer {
     /// alone (§14.5). Called after `start*`.
     fn truncate_batch_audit(&self) {
         self.truncate_batch_audit.store(true, Ordering::SeqCst);
+    }
+
+    /// Cut off the next request of each named kind (stub kind labels: `creator`,
+    /// `generate`, `revise`, `simplify`, `intent_audit`), one cut-off per entry,
+    /// and answer every later request normally (§14.5). Called after `start*`.
+    fn truncate_next_calls(&self, kinds: &[&str]) {
+        let mut queued = self
+            .truncate_next
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queued.clear();
+        queued.extend(kinds.iter().map(|kind| kind.to_string()));
     }
 
     fn request_count(&self) -> usize {
@@ -708,6 +754,18 @@ const SHELL_BATCH_AUDIT_ANSWER: &str =
 /// time, each well inside the single call's own output allowance.
 const TRUNCATED_BATCH_AUDIT_ANSWER: &str =
     r#"{"tests":[{"index":1,"issue_asks_for_behaviour":true,"reason":"stub: this answer was cut off at the cap"#;
+
+/// A reply CUT OFF mid-string in the shape the caller expected, for a ONE-SHOT
+/// cut-off on any call kind (§14.5).
+///
+/// [VANTA-WHY] It has to be unparseable for the kind it is served to — an
+/// unterminated JSON string is — so the retry is reached through the ordinary
+/// parse-failure path rather than a special one, and the tail frame's
+/// `finish_reason: "length"` is what tells the retry loop the answer was CUT
+/// OFF rather than wrong. That distinction is the whole point: a cut-off answer
+/// is retried only where the call site samples above temperature 0.0.
+const TRUNCATED_REPLY: &str =
+    r#"{"tests":[{"test_name":"test_cut_off_at_the_output_cap","test_source":"from calc import add\n\ndef test_cut_off"#;
 
 /// A single BugReproduction test whose baseline CONTRADICTS its intent:
 /// `calc.add(2, 3)` is 5 on the original tree, so the asserted `== 5` passes,
@@ -2414,6 +2472,261 @@ fn a_batch_cut_off_at_the_cap_falls_back_to_per_test_audits_with_the_same_decisi
         summary_on.contains("batch_audit_max_tokens=6144"),
         "three tests × one test's allowance is 6144, under the ceiling; got {summary_on}"
     );
+}
+
+/// [VANTA-WHY] §14.5 — a CUT-OFF answer at a call site that samples ABOVE
+/// temperature 0.0 must be RETRIED, not failed fast.
+///
+/// A model can spend its whole output cap on reasoning and return no content at
+/// all — Ornith does exactly this on the Attacker — and at temperature 0.2 the
+/// next attempt is a different sample, which is precisely the remedy a retry is
+/// for. A fail-fast scoped to "any truncation" turns one model run-away into a
+/// dead run: `InfraFailure`, which in the BugsInPy harness BLOCKS the wave gate
+/// (§14.7). Hence the scope: fail fast only where a retry is provably
+/// deterministic.
+///
+/// [VANTA-WHY] The harness pins ONE seed per run, and the same seed with the
+/// same prompt can reproduce the identical cut-off prefix, so each retry
+/// advances the seed by its attempt index. The record has to say which seed each
+/// attempt ACTUALLY sent — `VANTA_LLM_SEED` alone no longer answers that — or a
+/// run with a retry cannot be reproduced after the fact.
+#[test]
+fn a_cut_off_attacker_answer_is_retried_and_recovers_on_the_next_attempt() {
+    let _serial = serial_run();
+
+    let run = |extra_env: &'static [(&'static str, &'static str)]| {
+        let workspace = TempDir::new().unwrap();
+        let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), PRESERVING_PATCH);
+        let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+        // The FIRST generation is cut off at the cap; the retry is answered
+        // normally, so "retried and recovered" is distinguishable from "gave up".
+        server.truncate_next_calls(&["generate"]);
+        let output =
+            run_patch_mode_with_output(workspace.path(), &patch_path, &server, 3, extra_env);
+
+        let records = read_session_records(&find_session_log(workspace.path()));
+        // One `call.usage` row per CHAT CALL, written in call order, so the first
+        // two rows are this generation's two attempts — which is what makes the
+        // seed each attempt sent checkable.
+        let usage: Vec<(String, String, String)> = records
+            .iter()
+            .filter(|r| r.phase == "call.usage")
+            .map(|r| {
+                (
+                    summary_value(&r.summary, "site"),
+                    summary_value(&r.summary, "seed"),
+                    summary_value(&r.summary, "truncated"),
+                )
+            })
+            .collect();
+        (
+            output,
+            server.request_kinds(),
+            server.request_bodies(),
+            usage,
+            run_summary(workspace.path()).summary,
+        )
+    };
+
+    let (output_plain, kinds_plain, bodies_plain, usage_plain, summary_plain) = run(&[]);
+    let (output_seeded, kinds_seeded, bodies_seeded, usage_seeded, summary_seeded) =
+        run(&[("VANTA_LLM_SEED", "4242")]);
+
+    // The regression guard: the run RECOVERS instead of dying. Before the
+    // retry was restored this ended as an infrastructure failure (exit 2).
+    for (label, output) in [("unseeded", &output_plain), ("seeded", &output_seeded)] {
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "a cut-off Attacker answer above temperature 0.0 must be retried, and the run must \
+             still reach the reference approval ({label}); stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    // One cut-off, one retry: the second generation is answered, so the run
+    // makes exactly two generation calls rather than spending its budget.
+    let expected_kinds = vec!["generate", "generate", "intent_audit"];
+    assert_eq!(
+        kinds_plain, expected_kinds,
+        "a cut-off generation must be retried exactly once here, and the recovered answer must \
+         carry the round on to its audit"
+    );
+    assert_eq!(
+        kinds_seeded, expected_kinds,
+        "the pinned seed must not change how many attempts the retry costs"
+    );
+
+    // Unseeded: no attempt may add a seed key — the byte-identity rule is not
+    // suspended for retries.
+    for body in &bodies_plain {
+        assert!(
+            !body.contains("\"seed\""),
+            "an unset VANTA_LLM_SEED must add NO seed key, retry or not; got: {body}"
+        );
+    }
+
+    // Seeded: attempt 1 sends the pinned seed, attempt 2 sends pinned + 1.
+    assert!(
+        bodies_seeded[0].contains("\"seed\":4242") && bodies_seeded[1].contains("\"seed\":4243"),
+        "the retry must advance the seed by its attempt index, or the same seed reproduces the \
+         same cut-off prefix; got attempt 1: {} attempt 2: {}",
+        bodies_seeded[0],
+        bodies_seeded[1]
+    );
+    for body in &bodies_seeded[2..] {
+        assert!(
+            body.contains("\"seed\":4242"),
+            "a call that never retried must send the pinned seed unchanged; got: {body}"
+        );
+    }
+
+    // The record of what each attempt actually sent.
+    let generate_rows = |usage: &[(String, String, String)]| -> Vec<(String, String)> {
+        usage
+            .iter()
+            .filter(|(site, _, _)| site == "attacker_generate")
+            .map(|(_, seed, truncated)| (seed.clone(), truncated.clone()))
+            .collect()
+    };
+    assert_eq!(
+        generate_rows(&usage_plain),
+        vec![
+            ("unset".to_string(), "true".to_string()),
+            ("unset".to_string(), "false".to_string()),
+        ],
+        "the session log must show the first attempt cut off with no seed and the second answered"
+    );
+    assert_eq!(
+        generate_rows(&usage_seeded),
+        vec![
+            ("4242".to_string(), "true".to_string()),
+            ("4243".to_string(), "false".to_string()),
+        ],
+        "the session log must record the seed EACH attempt sent, not the configured one"
+    );
+
+    // §14.5's reportable number: how often the model ran away, per role.
+    for summary in [&summary_plain, &summary_seeded] {
+        assert!(
+            summary.contains("truncated_calls_attacker=1"),
+            "the run-away must be counted against the Attacker's role; got {summary}"
+        );
+        assert!(
+            summary.contains("truncated_calls_creator=0")
+                && summary.contains("truncated_calls_intent_audit=0"),
+            "only the Attacker ran away in this run; got {summary}"
+        );
+    }
+}
+
+/// [VANTA-WHY] §14.5 — the fail-fast stays where a retry is provably
+/// deterministic: a call PINNED at temperature 0.0. The per-test intent auditor
+/// is one, so a cut-off answer there must NOT be retried — re-sending the same
+/// question is another full generation that stops at the identical point. The
+/// retries that DO remain are for an answer the auditor got WRONG without being
+/// cut off, which is a different fact with a different remedy.
+///
+/// [VANTA-WHY] Failing fast must not turn the round into an infrastructure
+/// failure: the auditor's unavailable verdict is the ordinary safe shape
+/// (`issue_asks_for_behaviour = false`, the two `Option` fields UNKNOWN), which
+/// can demote or keep a test but can never manufacture a rejection.
+#[test]
+fn a_cut_off_per_test_audit_answer_is_not_retried() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    // The one per-test audit of this single-test round is cut off; no other kind
+    // is touched, so the count below measures the retry loop and nothing else.
+    server.truncate_next_calls(&["intent_audit"]);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 3, &[]);
+
+    let kinds = server.request_kinds();
+    assert_eq!(
+        kinds.iter().filter(|kind| *kind == "intent_audit").count(),
+        1,
+        "a cut-off answer on a call pinned at temperature 0.0 must fail fast — ONE call, not the \
+         retry budget; kinds={kinds:?}"
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the auditor's unavailable verdict must leave the run at its ordinary verdict rather than \
+         ending it; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert!(
+        summary.contains("truncated_calls_intent_audit=1"),
+        "the run-away must be counted against the auditor's role; got {summary}"
+    );
+    assert!(
+        summary.contains("truncated_calls_attacker=0") && summary.contains("truncated_calls_creator=0"),
+        "only the auditor ran away in this run; got {summary}"
+    );
+}
+
+/// [VANTA-WHY] §14.5 — the seed offsetting exists for RETRIES only, so a run
+/// with the §14 flags OFF and nothing truncated must be inert: attempt 1 of
+/// every call sends the pinned seed and nothing else. That is what keeps such a
+/// run byte-comparable with the v0.2 baseline the pilot is measured against, and
+/// what makes `truncated_calls_*` a proof that no offset ever applied.
+#[test]
+fn a_flag_off_run_without_truncation_never_moves_the_seed() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        3,
+        &[("VANTA_LLM_SEED", "4242")],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the reference run must be the approval; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let bodies = server.request_bodies();
+    assert!(!bodies.is_empty(), "the run must have called the LLM");
+    for body in &bodies {
+        assert!(
+            body.contains("\"seed\":4242"),
+            "with nothing truncated every call is attempt 1, which sends the PINNED seed; got: \
+             {body}"
+        );
+        assert!(
+            !body.contains("\"seed\":4243"),
+            "no call may carry the first offset when no retry happened; got: {body}"
+        );
+    }
+
+    let summary = run_summary(workspace.path()).summary;
+    for flag in ["corroborate=off", "grounded_audit=off", "batch_audit=off"] {
+        assert!(
+            summary.contains(flag),
+            "this guard is about the flag-off configuration; got {summary}"
+        );
+    }
+    for key in [
+        "truncated_calls_creator=0",
+        "truncated_calls_attacker=0",
+        "truncated_calls_intent_audit=0",
+    ] {
+        assert!(
+            summary.contains(key),
+            "no call was cut off, so `{key}` must be recorded as zero; got {summary}"
+        );
+    }
 }
 
 /// The repo's OWN test suite is a gate the generated tests cannot substitute for.

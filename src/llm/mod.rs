@@ -105,6 +105,25 @@ pub struct CallUsage {
     /// count). A cost table must be able to exclude `estimate` rows instead of
     /// silently averaging a measurement with a guess.
     pub source: String,
+    /// The `seed` THIS call actually sent, `None` when the body carried no
+    /// `seed` key at all.
+    ///
+    /// [VANTA-WHY] §14.5 — a truncated answer above temperature 0.0 is retried
+    /// with the seed advanced (see `seed_for_attempt`), so "which seed did
+    /// attempt 2 send?" is not answerable from `VANTA_LLM_SEED` alone. Carrying
+    /// it on the per-call row is what makes the retry reproducible AFTER the
+    /// fact: the sequence is a function of the pinned seed and the attempt
+    /// index, and both are in the record.
+    pub seed: Option<u64>,
+    /// Whether the server stopped this call at `max_tokens` (`finish_reason:
+    /// "length"`).
+    ///
+    /// [VANTA-WHY] §14.5 — a model that "runs away" spends the whole output cap
+    /// on reasoning and returns nothing parseable. Counting those per role is
+    /// how the paper reports how often it happens, and a counter derived from
+    /// the calls the run already records cannot disagree with the run it
+    /// describes.
+    pub truncated: bool,
 }
 
 static CALL_USAGES: Mutex<Vec<CallUsage>> = Mutex::new(Vec::new());
@@ -774,13 +793,20 @@ pub async fn post_chat(
     extra_fields: Value,
     site: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    post_chat_meta(client, cfg, messages, extra_fields, site)
-        .await
-        .map(|(content, _finish_reason)| content)
+    post_chat_meta(
+        client,
+        cfg,
+        messages,
+        extra_fields,
+        site,
+        cfg.seed,
+    )
+    .await
+    .map(|(content, _finish_reason)| content)
 }
 
 /// As `post_chat`, but the server's own `finish_reason` comes back beside the
-/// content.
+/// content, and the `seed` this attempt sends can be overridden.
 ///
 /// [VANTA-WHY] §14.5 — the retry loop needs to tell a TRUNCATED answer from a
 /// malformed one, and only the server knows which it was. Returning it beside
@@ -789,12 +815,22 @@ pub async fn post_chat(
 /// parse, and is still retried; what changes is that the FINAL failure can say
 /// why, and the one caller that can act on it — the batched audit, which can ask
 /// the same round's questions one at a time — does.
+///
+/// [VANTA-WHY] `seed` is the value THIS attempt sends, not necessarily
+/// `cfg.seed`: a retry of a call sampled above temperature 0.0 advances it, so
+/// that the harness's single pinned seed does not reproduce the identical
+/// cut-off prefix (see `seed_for_attempt`). `post_chat` passes `cfg.seed`
+/// untouched, so attempt 1 of every call — and every call that never retries —
+/// is byte-identical to what it was before this parameter existed. `None` means
+/// "send no `seed` key at all", which is what keeps an unseeded run's bodies
+/// byte-for-byte unchanged.
 async fn post_chat_meta(
     client: &reqwest::Client,
     cfg: &LlmConfig,
     messages: Vec<Value>,
     extra_fields: Value,
     site: &str,
+    seed: Option<u64>,
 ) -> Result<(String, Option<String>), Box<dyn Error + Send + Sync>> {
     let url = cfg.chat_completions_url();
 
@@ -838,7 +874,11 @@ async fn post_chat_meta(
     //
     // Placed after the `extra_fields` merge so a caller cannot smuggle one in
     // that disagrees with the configuration the run records as its provenance.
-    if let Some(seed) = cfg.seed {
+    //
+    // [VANTA-WHY] §14.5 — `seed` is the ATTEMPT's seed, which the retry loop may
+    // have advanced past the pinned one; `post_chat` passes `cfg.seed` as-is, so
+    // the first attempt of every call sends exactly what it always did.
+    if let Some(seed) = seed {
         full_body.insert("seed".to_string(), json!(seed));
     }
     let full_body = Value::Object(full_body);
@@ -1002,12 +1042,16 @@ async fn post_chat_meta(
         completion_tokens: measured_completion,
         total_tokens: measured_total,
         source: usage_source.to_string(),
+        seed,
+        truncated: streamed.finish_reason.as_deref() == Some("length"),
     };
     debug!(
         site,
         prompt_tokens = prompt_tokens_recorded,
         completion_tokens = ?measured_completion,
         token_source = usage_source,
+        seed = ?seed,
+        truncated = usage.truncated,
         "llm call token usage recorded"
     );
     record_call_usage(usage);
@@ -1072,6 +1116,54 @@ pub const TRUNCATED_OUTPUT_PREFIX: &str = "LLM response truncated at max_tokens"
 /// consumer does not have to re-spell the string.
 pub const PARSE_FAILURE_PREFIX: &str = "PARSE ERR";
 
+/// The role a call site's truncations are counted under (§14.5).
+///
+/// [VANTA-WHY] The three roles the paper reports are `creator`, `attacker` and
+/// `intent_audit`; the Attacker alone has four call sites
+/// (`attacker_generate` / `_revise` / `_simplify`), and a run-away is a fact
+/// about the AGENT, not about which of its calls it happened on. A site outside
+/// the schedule (the M0 spike names its own) is counted as `other` rather than
+/// folded into a role it does not belong to.
+pub fn truncation_role(site: &str) -> &'static str {
+    match site {
+        "creator" => "creator",
+        "attacker_generate" | "attacker_revise" | "attacker_simplify" => "attacker",
+        "intent_audit" => "intent_audit",
+        _ => "other",
+    }
+}
+
+/// The `seed` one attempt sends (§14.5).
+///
+/// [VANTA-WHY] Attempt 1 always sends the configured seed unchanged, so a call
+/// that never retries is byte-identical to one from before this offsetting
+/// existed.
+///
+/// [VANTA-WHY] A RETRY advances it by the attempt index, because the harness
+/// pins ONE seed per run: with the same seed and the same prompt, even a
+/// temperature-0.2 retry can come back identical — and be cut off at the
+/// identical point — so the retry budget would be spent reproducing the same
+/// prefix. Advancing the seed keeps the run reproducible (the sequence is a
+/// function of the pinned seed and the attempt number, and both are recorded)
+/// while letting the retry actually differ.
+///
+/// [VANTA-WHY] A call PINNED at temperature 0.0 is greedy: its retries are
+/// deterministic whatever the seed says, so the seed is deliberately left alone
+/// there. That is also the only place a truncated answer fails fast (see the
+/// retry loop), so nothing depends on the seed moving for it.
+fn seed_for_attempt(
+    configured: Option<u64>,
+    attempt: u32,
+    deterministic_temperature: bool,
+) -> Option<u64> {
+    match configured {
+        Some(seed) if attempt > 1 && !deterministic_temperature => {
+            Some(seed.wrapping_add(u64::from(attempt - 1)))
+        }
+        other => other,
+    }
+}
+
 /// Backoff before retry `attempt` (1-based): 500ms, 1s, 2s, 4s, 8s, 8s…
 ///
 /// [VANTA-WHY] A retry that starts the instant the previous connection dropped
@@ -1114,13 +1206,36 @@ where
     // at `max_tokens`. Kept so the FINAL failure can say so: every attempt that
     // ends this way parses as nothing and looks, from the parse error alone,
     // exactly like an answer the model got wrong. Only the server's own
-    // `finish_reason` separates the two, and the two have opposite remedies —
-    // which is why a cut-off answer is not retried at all (below).
+    // `finish_reason` separates the two, and the two have opposite remedies.
     let mut last_was_truncated = false;
+    // Whether the loop stopped ON a truncation (rather than exhausting its
+    // budget), so the final failure can say which of the two happened.
+    let mut stopped_on_truncation = false;
     // Attempts that actually reached the parse step, so the failure can report
     // how many were spent rather than how many were allowed: a call that stops
-    // early (a cut-off answer) did not fail `max_attempts` times.
+    // early (a cut-off answer at temperature 0.0) did not fail `max_attempts`
+    // times.
     let mut attempts_made = 0_u32;
+
+    // [VANTA-WHY] §14.5 — whether this call is PINNED at temperature 0.0, and
+    // therefore answers identically on every attempt. It is read from the
+    // request's own `temperature`, because that is what the server samples with:
+    // every M3 agent passes its pin through `extra_fields`, which wins over
+    // `post_chat`'s own body default, so a caller that sends no extras samples at
+    // that default (0.2) and is NOT deterministic.
+    //
+    // [VANTA-WHY] This is the scope of the fail-fast below. The "same request is
+    // cut off at the same point" argument holds only at temperature 0.0: the
+    // Creator and the Attacker run at 0.1-0.3, where a cut-off answer CAN come
+    // back different — and a model that spends the whole output cap on reasoning
+    // returns nothing parseable however many times it is asked, which is exactly
+    // the case a retry exists for. Applying the fail-fast to them turned one
+    // model run-away into a dead run.
+    let deterministic_temperature = extras_for_attempt
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.2)
+        <= 0.0;
 
     for attempt in 1..=max_attempts {
         let messages = build_messages(attempt);
@@ -1128,36 +1243,45 @@ where
         if attempt > 1 {
             warn!(attempt, max_attempts, "retrying structured call");
         }
+        let attempt_seed = seed_for_attempt(cfg.seed, attempt, deterministic_temperature);
 
-        let (raw, finish_reason) =
-            match post_chat_meta(client, cfg, messages, extras_for_attempt.clone(), site).await {
-                Ok(pair) => pair,
-                Err(http_e) => {
-                    let http_e = http_e.to_string();
-                    // [VANTA-WHY] A prompt that cannot fit the context window fails
-                    // IDENTICALLY on every attempt — it is decided by arithmetic
-                    // before a byte leaves the process. Retrying it three times
-                    // cannot change the outcome; it only pretended the failure was
-                    // transient and delayed the run. Fail once, loudly, with what to
-                    // change.
-                    if http_e.contains(DETERMINISTIC_CONTEXT_PREFIX) {
-                        return Err(format!(
-                            "{http_e}\nThis is a deterministic local failure — the prompt does not fit \
-                             the model's context window — so it is NOT retried. Raise the server's n_ctx \
-                             (or VANTA_LLM_CONTEXT_TOKENS to match it), or shrink the prompt."
-                        )
-                        .into());
-                    }
-                    let msg = format!("attempt {attempt} HTTP err: {http_e}");
-                    warn!(%msg);
-                    last_err = Some(msg);
-                    last_was_truncated = false;
-                    if attempt < max_attempts {
-                        back_off(attempt).await;
-                    }
-                    continue;
+        let (raw, finish_reason) = match post_chat_meta(
+            client,
+            cfg,
+            messages,
+            extras_for_attempt.clone(),
+            site,
+            attempt_seed,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(http_e) => {
+                let http_e = http_e.to_string();
+                // [VANTA-WHY] A prompt that cannot fit the context window fails
+                // IDENTICALLY on every attempt — it is decided by arithmetic
+                // before a byte leaves the process. Retrying it three times
+                // cannot change the outcome; it only pretended the failure was
+                // transient and delayed the run. Fail once, loudly, with what to
+                // change.
+                if http_e.contains(DETERMINISTIC_CONTEXT_PREFIX) {
+                    return Err(format!(
+                        "{http_e}\nThis is a deterministic local failure — the prompt does not fit \
+                         the model's context window — so it is NOT retried. Raise the server's n_ctx \
+                         (or VANTA_LLM_CONTEXT_TOKENS to match it), or shrink the prompt."
+                    )
+                    .into());
                 }
-            };
+                let msg = format!("attempt {attempt} HTTP err: {http_e}");
+                warn!(%msg);
+                last_err = Some(msg);
+                last_was_truncated = false;
+                if attempt < max_attempts {
+                    back_off(attempt).await;
+                }
+                continue;
+            }
+        };
         // The stream completed, so it has an answer to judge: `length` here means
         // the answer was CUT OFF, not that it was wrong.
         last_was_truncated = finish_reason.as_deref() == Some("length");
@@ -1189,17 +1313,28 @@ where
                     "attempt {attempt} PARSE ERR: {}\n  model-preview: {preview}",
                     parse_err
                 ));
-                // [VANTA-WHY] §14.5 — a CUT-OFF answer is NOT retried. The cap
-                // that cut it off is a property of the request, and `max_tokens`
-                // is pinned per call site, so the same request is cut off at the
-                // same point: the retries are deterministic, and on local
-                // hardware each one is a full-length generation spent to reach
-                // the identical prefix. Failing here is what lets the callers
-                // that can ask a SMALLER question (the batched audit, one test
-                // per call) do it on the first attempt instead of the fourth.
-                // A malformed answer that was NOT cut off is a different fact —
-                // the model can answer it differently — so it keeps its retries.
-                if last_was_truncated {
+                // [VANTA-WHY] §14.5 — a CUT-OFF answer fails fast ONLY where a
+                // retry is provably deterministic: a call PINNED at temperature
+                // 0.0 samples greedily, so `max_tokens` being pinned per call
+                // site means the same request is cut off at the same point every
+                // time, and each retry is a full-length generation spent to
+                // reach the identical prefix. Failing here is what lets the
+                // callers that can ask a SMALLER question (the batched audit,
+                // one test per call) do it on the first attempt instead of the
+                // fourth.
+                //
+                // [VANTA-WHY] Above temperature 0.0 the same request CAN come
+                // back different — that is the whole reason the pipeline samples
+                // the Creator and Attacker at 0.1-0.3 — so a cut-off answer keeps
+                // its retries, with the seed advanced each time (see
+                // `seed_for_attempt`). A model that spends the entire output cap
+                // on reasoning and returns no content is precisely the transient
+                // failure a retry exists for; refusing to retry it turned one
+                // run-away into a dead run. A malformed answer that was NOT cut
+                // off is a different fact again — the model answered, and the
+                // answer was wrong — so it keeps its retries too.
+                if last_was_truncated && deterministic_temperature {
+                    stopped_on_truncation = true;
                     break;
                 }
                 if attempt < max_attempts {
@@ -1221,11 +1356,28 @@ where
     // asking a smaller question, which is exactly what the batched audit can do
     // (one test per call) and must do, instead of losing the whole round.
     if last_was_truncated {
+        let tail = if stopped_on_truncation {
+            "The call was NOT retried: `max_tokens` is pinned for this call site AND this call is \
+             pinned at temperature 0.0, so the same request is cut off at the same point every \
+             time. Ask for less, or raise the cap."
+                .to_string()
+        } else if attempts_made > 1 {
+            format!(
+                "This call site samples above temperature 0.0, so a retry can come back \
+                 different: each attempt advanced the seed by its attempt index, and both are \
+                 recorded with the call. {} retries were spent and the last attempt was cut off \
+                 as well. Ask for less, or raise the cap.",
+                attempts_made - 1
+            )
+        } else {
+            "This call site samples above temperature 0.0, so a retry could come back different, \
+             but no retry was made: the attempt budget is one. Ask for less, or raise the cap."
+                .to_string()
+        };
         message.push_str(&format!(
             "\n{TRUNCATED_OUTPUT_PREFIX}: the server stopped this answer at the request's \
              `max_tokens` cap, so the reply is a prefix of the intended one and could not be \
-             parsed. The call was NOT retried: `max_tokens` is pinned for this call site, so the \
-             same request is cut off at the same point every time. Ask for less, or raise the cap."
+             parsed. {tail}"
         ));
     }
     Err(message.into())

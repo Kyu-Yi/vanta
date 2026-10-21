@@ -187,6 +187,7 @@ CRITICAL:
 
 IMPORT RULES (violating these makes the test ERROR on collection — worse than failing):
 - Only import a name you can LITERALLY SEE defined in the ORIGINAL SOURCE above, and import it from the file where it is defined. Do NOT guess that a symbol lives in a module.
+- The ORIGINAL SOURCE may be a NARROWED excerpt of the repository (review mode shows the code the fix touches, not the whole tree). A name the excerpt does not show is UNKNOWN to you, not absent from the runtime: fetch it from the module object with getattr instead of concluding it does not exist or inventing the module it lives in.
 - When unsure, import the MODULE and access the attribute defensively, e.g. `import heretic.system as sysmod; fn = getattr(sysmod, "is_mps_available", None); assert fn is not None`. Never write `from m import name` for a name you have not seen defined.
 - A test whose import raises is treated as an infra ERROR, not a clean failure — it is scrapped.
 
@@ -194,7 +195,7 @@ NO-REIMPLEMENTATION RULE:
 - Never re-implement the patch's logic inside the test body (e.g. re-setting an env var yourself and asserting it is set). Such a test always passes on BOTH versions and proves nothing. Call the repo's real code instead.
 
 INTENT-vs-API RULE:
-- BehaviorPreservation may ONLY exercise APIs that already exist in the ORIGINAL source. If the behaviour you want to check uses a symbol the patch ADDS, it is a FeatureAcceptance test, not BehaviorPreservation.
+- BehaviorPreservation may ONLY exercise APIs that already exist in the ORIGINAL source. That source may be an excerpt (see IMPORT RULES): a name it does not show may still exist at runtime, so reach it with getattr rather than assuming the patch adds it. If the behaviour you want to check uses a symbol the patch ADDS, it is a FeatureAcceptance test, not BehaviorPreservation.
 - If the issue does not ask for that new behaviour either, DROP the probe. A test that cannot be labelled honestly is not a test: any label you could give it asserts something the issue never asked for, and the patch-blind audit scraps it anyway.
 
 ONE INTENT PER TEST:
@@ -2185,6 +2186,30 @@ mod tests {
         assert!(
             ATTACKER_SYSTEM_PROMPT.contains("pin the INTERNAL calls of a function the issue says to change"),
             "the sentence the test-hygiene test pins must survive this reword"
+        );
+    }
+
+    /// [VANTA-WHY] A14 (§14.10) — both import-facing rules read as if the
+    /// Attacker can see the whole repository. In review mode the ORIGINAL SOURCE
+    /// is a narrowed excerpt of the files the fix touched, so "only import what
+    /// you can see" and "may only exercise APIs that already exist in the ORIGINAL
+    /// source" told the model to treat everything it cannot see as absent — and a
+    /// symbol the excerpt merely omits then looks like one the patch adds, which
+    /// relabels a preservation probe as FeatureAcceptance for no reason. Say the
+    /// excerpt is partial and an unseen name is unknown, not absent.
+    #[test]
+    fn the_import_rules_allow_for_a_narrowed_excerpt_of_the_repo() {
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("The ORIGINAL SOURCE may be a NARROWED excerpt of the repository")
+                && ATTACKER_SYSTEM_PROMPT
+                    .contains("A name the excerpt does not show is UNKNOWN to you, not absent from the runtime"),
+            "the import rules must say the source may be an excerpt and an unseen name is unknown"
+        );
+        assert!(
+            !ATTACKER_SYSTEM_PROMPT
+                .contains("ORIGINAL source. If the behaviour you want to check uses a symbol the patch ADDS")
+                && ATTACKER_SYSTEM_PROMPT.contains("That source may be an excerpt (see IMPORT RULES)"),
+            "the INTENT-vs-API rule must read the excerpt as unknown rather than absent"
         );
     }
 

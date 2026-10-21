@@ -613,6 +613,78 @@ pub struct IntentCheckRecord {
     pub evidence: QuoteEvidence,
 }
 
+/// [VANTA-WHY] §14.5 — one entry of the batched auditor's answer. The field set
+/// is the single-test contract plus the number the prompt printed for the test,
+/// so the per-test decision is computed from the same three answers either way.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntentAuditEntry {
+    /// The 1-based number the prompt printed above the test.
+    pub index: usize,
+    pub issue_asks_for_behaviour: bool,
+    #[serde(default)]
+    pub issue_requires_change: Option<bool>,
+    #[serde(default)]
+    pub assertions_grounded: Option<bool>,
+    pub reason: String,
+}
+
+impl IntentAuditEntry {
+    fn verdict(&self) -> IntentVerdict {
+        IntentVerdict {
+            issue_asks_for_behaviour: self.issue_asks_for_behaviour,
+            issue_requires_change: self.issue_requires_change,
+            assertions_grounded: self.assertions_grounded,
+            reason: self.reason.clone(),
+        }
+    }
+}
+
+/// [VANTA-WHY] §14.5 — the batched auditor's whole answer: one entry per test
+/// the prompt numbered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntentBatchVerdict {
+    pub tests: Vec<IntentAuditEntry>,
+}
+
+impl IntentBatchVerdict {
+    /// Map the batch back onto the round, in the order the tests went in.
+    ///
+    /// [VANTA-WHY] Every index must appear exactly once: an unknown index, a
+    /// duplicate or a missing one is a parse failure of the WHOLE response, not
+    /// a shrug about one test. The alternative — filling the gap with "no
+    /// answer" — would silently demote whichever test the model forgot, and a
+    /// demotion that nobody decided is the failure mode this project exists to
+    /// prevent. A count that does not match the round is a failure for the same
+    /// reason.
+    fn by_index(&self, count: usize) -> Result<Vec<IntentVerdict>, String> {
+        if self.tests.len() != count {
+            return Err(format!(
+                "batch answered {} test(s) but {count} were sent",
+                self.tests.len()
+            ));
+        }
+        let mut slots: Vec<Option<IntentVerdict>> = vec![None; count];
+        for entry in &self.tests {
+            if entry.index == 0 || entry.index > count {
+                return Err(format!(
+                    "batch entry index {} is not one of 1..={count}",
+                    entry.index
+                ));
+            }
+            let slot = &mut slots[entry.index - 1];
+            if slot.is_some() {
+                return Err(format!("batch entry index {} appears twice", entry.index));
+            }
+            *slot = Some(entry.verdict());
+        }
+        slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, slot)| slot.ok_or_else(|| format!("batch entry index {} is missing", i + 1)))
+            .collect()
+    }
+}
+
 /// [VANTA-WHY] The first line is the stub server's dispatch marker for this call
 /// kind; an integration test uses it to find the audit requests and prove their
 /// bodies carry no patch.
@@ -678,6 +750,69 @@ Rules for question 3:
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
 {"issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "assertions_grounded": true|false, "reason": "one short sentence"}"#;
 
+/// [VANTA-WHY] §14.5 — the BATCHED form of the auditor prompt, used only with
+/// `VANTA_BATCH_AUDIT=on`.
+///
+/// The same ask with the frame changed from "ONE test" to "SEVERAL tests, each
+/// numbered": the rules are repeated verbatim from
+/// [`INTENT_AUDITOR_SYSTEM_PROMPT`] and the output contract gains one entry per
+/// test. `the_batch_prompt_keeps_the_shared_rules` pins that repetition, so an
+/// edit to one prompt that is not mirrored in the other fails the tests rather
+/// than silently making the two asks disagree. The first line is unchanged
+/// because the stub server dispatches this call kind on it.
+const INTENT_AUDITOR_BATCH_SYSTEM_PROMPT: &str = r#"You are Vanta Intent Auditor. You are given an ISSUE, the ORIGINAL source of a repository, and SEVERAL tests, each numbered from 1. You are NOT given the patch and must not speculate about it.
+
+Answer these two questions about the input EACH test asserts:
+1. "issue_asks_for_behaviour": does the ISSUE ask for the result that test asserts, AT THE INPUT THE TEST ASSERTS?
+2. "issue_requires_change": does the ISSUE require the behaviour at that input to CHANGE from what the ORIGINAL source does there — that is, does the issue ask for a DIFFERENT result than the original returns at that input?
+
+Rules:
+- The issue is the only source of requirements. The original source shows what the behaviour WAS; it is evidence of existing behaviour, never of a new requirement.
+- A test asserting `shipping_band(500) == "light"` is authorised only by an issue sentence that asks for that result at that input. A sentence about a DIFFERENT input does not authorise it.
+- A sentence that forbids changing behaviour ("without changing the existing behaviour at the other thresholds") FORBIDS the change; it never authorises it and never requires one.
+- An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THIS test asserts, not for the issue in general.
+- A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
+- If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
+- Answer EVERY numbered test exactly once and no test that was not given to you. "index" is the number printed above that test.
+
+YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
+{"tests": [{"index": 1, "issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "reason": "one short sentence"}]}"#;
+
+/// [VANTA-WHY] §14.5 — the batched form of the grounded auditor prompt, used
+/// when `VANTA_BATCH_AUDIT=on` and `VANTA_GROUNDED_AUDIT=on`.
+///
+/// A SEPARATE literal for the same reason §14.4's variant is one: the two flags
+/// are independent, and a batch run without the grounded question must not be
+/// able to scrap anything on an answer nobody asked for. The two questions and
+/// the shared rules are repeated verbatim again; the batch rule and question 3
+/// are added.
+const INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED: &str = r#"You are Vanta Intent Auditor. You are given an ISSUE, the ORIGINAL source of a repository, and SEVERAL tests, each numbered from 1. You are NOT given the patch and must not speculate about it.
+
+Answer these two questions about the input EACH test asserts:
+1. "issue_asks_for_behaviour": does the ISSUE ask for the result that test asserts, AT THE INPUT THE TEST ASSERTS?
+2. "issue_requires_change": does the ISSUE require the behaviour at that input to CHANGE from what the ORIGINAL source does there — that is, does the issue ask for a DIFFERENT result than the original returns at that input?
+
+Rules:
+- The issue is the only source of requirements. The original source shows what the behaviour WAS; it is evidence of existing behaviour, never of a new requirement.
+- A test asserting `shipping_band(500) == "light"` is authorised only by an issue sentence that asks for that result at that input. A sentence about a DIFFERENT input does not authorise it.
+- A sentence that forbids changing behaviour ("without changing the existing behaviour at the other thresholds") FORBIDS the change; it never authorises it and never requires one.
+- An issue that asks for a change at ONE input does not require a change at any other input: answer "issue_requires_change" for the input THIS test asserts, not for the issue in general.
+- A preservation test that asserts a function's INTERNAL downstream call is unchanged (for example, that an inner helper is still called with the OLD arguments) contradicts an issue that says a new value is THREADED THROUGH that function: the internal call is exactly what the issue asks to change, so answer "issue_requires_change": true for it. Do not accept "the function is called exactly as before" as a preservation of behaviour the issue rewires.
+- If the issue does not ask for the asserted behaviour at the asserted input, answer "issue_asks_for_behaviour": false. Preserving existing behaviour is always a valid answer.
+- Answer EVERY numbered test exactly once and no test that was not given to you. "index" is the number printed above that test.
+
+3. "assertions_grounded": does that test assert ONLY behaviour the ISSUE describes, at the input the ISSUE names — or does it also pin a SPECIFIC VALUE the issue never states?
+
+Rules for question 3:
+- Grounded: an assertion that follows from the issue's own words about the input it names ("it should not raise", "the file is written", "the boundary value returns the standard band").
+- Ungrounded: an assertion that pins wording, an exact output string, an exact message, a format or a number the issue never mentions ("the output CONTAINS 'Starting var'", "the repr is exactly ...", "the log line begins with a timestamp").
+- The issue is the only source of requirements. "It should not raise NameError" is grounded; "it should print exactly this string" is grounded only if the issue prints that string.
+- A test may assert more than the issue asks about ONLY when the extra assertion is a direct consequence of what the issue requires. Invented specifics are ungrounded.
+- Answer this for every test you are given, whatever its declared intent.
+
+YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
+{"tests": [{"index": 1, "issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "assertions_grounded": true|false, "reason": "one short sentence"}]}"#;
+
 /// The system prompt for the requested audit variant.
 ///
 /// [VANTA-WHY] The only place the two prompts are chosen between. Flag off
@@ -689,6 +824,15 @@ fn intent_auditor_system_prompt(grounded: bool) -> &'static str {
         INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED
     } else {
         INTENT_AUDITOR_SYSTEM_PROMPT
+    }
+}
+
+/// §14.5 — the batched method's system prompt, selected the same way.
+fn intent_auditor_batch_system_prompt(grounded: bool) -> &'static str {
+    if grounded {
+        INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED
+    } else {
+        INTENT_AUDITOR_BATCH_SYSTEM_PROMPT
     }
 }
 
@@ -909,53 +1053,39 @@ pub(crate) fn route_intent(
     }
 }
 
-/// Audit one test against the issue.
+/// The verdict an unavailable auditor produces, in BOTH transports.
 ///
-/// Returns the surviving test (`None` = scrapped), the relabel event if the test
-/// was relabelled, and the audit record. A record is returned for EVERY test,
-/// preservation included, so the session log shows the check ran and what it
-/// decided — the demote-only asymmetry is what made a preservation test the one
-/// label nobody re-checked.
+/// [VANTA-WHY] §14.5 — one definition, because the batched path's failure
+/// behaviour is defined as "what the single-call path does when its call
+/// fails": `issue_asks_for_behaviour = false` (so a non-preservation label is
+/// demoted rather than admitted), `issue_requires_change = None` (UNKNOWN, so
+/// nothing is relabelled) and `assertions_grounded = None` (so nothing is
+/// scrapped as ungrounded). A broken auditor therefore cannot manufacture a
+/// rejection, and it cannot manufacture a scrap either.
+fn audit_unavailable_verdict(error: &dyn std::fmt::Display) -> IntentVerdict {
+    IntentVerdict {
+        issue_asks_for_behaviour: false,
+        issue_requires_change: None,
+        assertions_grounded: None,
+        reason: format!("intent audit unavailable ({error})"),
+    }
+}
+
+/// Apply one auditor verdict to one test: route it, relabel or scrap it, and
+/// build its record.
 ///
-/// Four outcomes, one per way the declared intent can relate to the issue (see
-/// `route_intent`): keep; promote a preservation probe to FeatureAcceptance when
-/// the issue ASKS for the asserted behaviour and requires it to change (the B v2
-/// shape: a probe asserting the NEW field's default, labelled as preservation);
-/// demote an unasked-for non-preservation label; scrap when no honest label
-/// remains.
-pub async fn audit_test_intent(
-    cfg: &LlmConfig,
-    issue_text: &str,
-    original_source: &str,
+/// [VANTA-WHY] §14.5 — the single-call and batched paths differ ONLY in how the
+/// verdict was obtained, so the decision itself lives here, shared by both. That
+/// is what makes "the batched path decides the same way" a property of the code
+/// rather than of a test: the same `route_intent` call, the same record
+/// construction, the same `[VANTA-WHY]` arms. The evidence is computed from this
+/// test and the issue, so it does not depend on the transport either.
+fn apply_intent_verdict(
     test: &GeneratedTest,
-    grounded: bool,
+    issue_text: &str,
+    verdict: IntentVerdict,
 ) -> (Option<GeneratedTest>, Option<IntentRelabel>, Option<IntentCheckRecord>) {
     let evidence = observe_quote_evidence(test, issue_text);
-
-    let request = IntentCheckRequest {
-        issue_text: issue_text.to_string(),
-        original_source: original_source.to_string(),
-        test_name: test.test_name.clone(),
-        test_source: test.test_source.clone(),
-        declared_intent: test.intent.clone(),
-    };
-
-    let verdict = match attacker_check_intent(cfg, &request, grounded).await {
-        Ok(verdict) => verdict,
-        Err(e) => {
-            warn!(
-                test = %test.test_name,
-                error = %e,
-                "intent audit unavailable — demoting to BehaviorPreservation"
-            );
-            IntentVerdict {
-                issue_asks_for_behaviour: false,
-                issue_requires_change: None,
-                assertions_grounded: None,
-                reason: format!("intent audit unavailable ({e})"),
-            }
-        }
-    };
 
     let record = |scrapped: bool, reason: String| IntentCheckRecord {
         test_name: test.test_name.clone(),
@@ -1059,6 +1189,54 @@ pub async fn audit_test_intent(
     }
 }
 
+/// Audit one test against the issue.
+///
+/// Returns the surviving test (`None` = scrapped), the relabel event if the test
+/// was relabelled, and the audit record. A record is returned for EVERY test,
+/// preservation included, so the session log shows the check ran and what it
+/// decided — the demote-only asymmetry is what made a preservation test the one
+/// label nobody re-checked.
+///
+/// Four outcomes, one per way the declared intent can relate to the issue (see
+/// `route_intent`): keep; promote a preservation probe to FeatureAcceptance when
+/// the issue ASKS for the asserted behaviour and requires it to change (the B v2
+/// shape: a probe asserting the NEW field's default, labelled as preservation);
+/// demote an unasked-for non-preservation label; scrap when no honest label
+/// remains.
+///
+/// [VANTA-WHY] §14.5 — this is the ONE-test transport. The decision is
+/// [`apply_intent_verdict`]'s, shared with the batched transport, so the two
+/// differ only in the number of calls they make.
+pub async fn audit_test_intent(
+    cfg: &LlmConfig,
+    issue_text: &str,
+    original_source: &str,
+    test: &GeneratedTest,
+    grounded: bool,
+) -> (Option<GeneratedTest>, Option<IntentRelabel>, Option<IntentCheckRecord>) {
+    let request = IntentCheckRequest {
+        issue_text: issue_text.to_string(),
+        original_source: original_source.to_string(),
+        test_name: test.test_name.clone(),
+        test_source: test.test_source.clone(),
+        declared_intent: test.intent.clone(),
+    };
+
+    let verdict = match attacker_check_intent(cfg, &request, grounded).await {
+        Ok(verdict) => verdict,
+        Err(e) => {
+            warn!(
+                test = %test.test_name,
+                error = %e,
+                "intent audit unavailable — demoting to BehaviorPreservation"
+            );
+            audit_unavailable_verdict(&e)
+        }
+    };
+
+    apply_intent_verdict(test, issue_text, verdict)
+}
+
 /// Ask ONLY whether the issue requires the asserted behaviour to change.
 ///
 /// [VANTA-WHY] Fix 6 — BATE's relabel-before-revise question. A BugReproduction
@@ -1100,12 +1278,7 @@ pub async fn audit_issue_requires_change(
                 "relabel question unavailable — answer is unknown, so the test takes the \
                  ordinary revision path"
             );
-            IntentVerdict {
-                issue_asks_for_behaviour: false,
-                issue_requires_change: None,
-                assertions_grounded: None,
-                reason: format!("intent audit unavailable ({e})"),
-            }
+            audit_unavailable_verdict(&e)
         }
     };
 
@@ -1122,25 +1295,192 @@ pub async fn audit_issue_requires_change(
     (verdict.issue_requires_change, record)
 }
 
-/// Audit a whole batch. Scrapped tests are dropped from the returned list; their
-/// audit records (with `scrapped = true`) are still returned for logging.
+/// One call for the whole round, to the batched auditor prompt (§14.5).
+///
+/// [VANTA-WHY] The batch is a TRANSPORT change, so the answer is turned into one
+/// [`IntentVerdict`] per test, in the round's own order, and handed to the same
+/// [`apply_intent_verdict`] the single-call path uses. An index that is unknown,
+/// duplicated or missing fails the parse of the whole response (see
+/// [`IntentBatchVerdict::by_index`]), which is what makes it retried like any
+/// other malformed structured output instead of quietly demoting one test.
+async fn attacker_check_intent_batch(
+    cfg: &LlmConfig,
+    issue_text: &str,
+    original_source: &str,
+    tests: &[GeneratedTest],
+    grounded: bool,
+) -> Result<Vec<IntentVerdict>, Box<dyn std::error::Error + Send + Sync>> {
+    info!(
+        tests = tests.len(),
+        grounded,
+        "batched intent auditor start"
+    );
+
+    let client = build_reqwest_client(cfg)?;
+
+    let mut body = String::new();
+    for (i, test) in tests.iter().enumerate() {
+        body.push_str(&format!(
+            "TEST {} — {}\nDeclared intent: {:?}\n```\n{}\n```\n\n",
+            i + 1,
+            test.test_name,
+            test.intent,
+            test.test_source
+        ));
+    }
+
+    let closing_question = if grounded {
+        format!(
+            "Does the issue ask for the behaviour each of the {} tests asserts at the input it \
+             asserts, does it require the behaviour at that input to change, and does each test \
+             assert only behaviour the issue describes? Answer with one JSON entry per test.",
+            tests.len()
+        )
+    } else {
+        format!(
+            "Does the issue ask for the behaviour each of the {} tests asserts at the input it \
+             asserts, and does it require the behaviour at that input to change? Answer with one \
+             JSON entry per test.",
+            tests.len()
+        )
+    };
+
+    let user_prompt = format!(
+        "ISSUE:\n{}\n\nORIGINAL SOURCE:\n```\n{}\n```\n\n{} {} TESTS TO AUDIT:\n\n{}\n{}",
+        issue_text,
+        original_source,
+        tests.len(),
+        if tests.len() == 1 { "TEST IS" } else { "TESTS ARE" },
+        body,
+        closing_question
+    );
+
+    let sys_owned = intent_auditor_batch_system_prompt(grounded).to_string();
+    let user_owned = user_prompt;
+    let reprompt = if grounded {
+        "REPROMPT: output ONLY {\"tests\": [{\"index\": 1, \"issue_asks_for_behaviour\": true|false, \"issue_requires_change\": true|false, \"assertions_grounded\": true|false, \"reason\": \"...\"}]} — one entry per numbered test, each index exactly once."
+    } else {
+        "REPROMPT: output ONLY {\"tests\": [{\"index\": 1, \"issue_asks_for_behaviour\": true|false, \"issue_requires_change\": true|false, \"reason\": \"...\"}]} — one entry per numbered test, each index exactly once."
+    };
+    let build_messages = move |attempt: u32| {
+        let mut messages = vec![
+            json!({"role": "system", "content": sys_owned.clone()}),
+            json!({"role": "user", "content": user_owned.clone()}),
+        ];
+        if attempt >= 2 {
+            messages.push(json!({"role": "user", "content": reprompt}));
+        }
+        messages
+    };
+
+    // The same sampler pins as the single-test call: `intent_audit` is one call
+    // site in §4.3's schedule, and batching changes how many times it is called,
+    // not how each call is sampled.
+    let extras = json!({
+        "response_format": {"type": "json_object"},
+        "temperature": 0.0,
+        "max_tokens": 2048,
+        "reasoning_effort": "low",
+    });
+
+    let count = tests.len();
+    let parse_closure = |raw: &str| -> Result<Vec<IntentVerdict>, String> {
+        let cleaned = extract_json_candidate(raw).map_err(|e| format!("{e}"))?;
+        let batch = serde_json::from_str::<IntentBatchVerdict>(cleaned).map_err(|e| {
+            format!(
+                "INTENT AUDIT BATCH PARSE FAIL (line {} col {}): {}",
+                e.line(),
+                e.column(),
+                e
+            )
+        })?;
+        batch.by_index(count)
+    };
+
+    let verdicts = structured_call_with_retry(
+        &client,
+        cfg,
+        cfg.retry_attempts,
+        "intent_audit_batch",
+        "intent_audit",
+        build_messages,
+        extras,
+        parse_closure,
+    )
+    .await?;
+
+    info!(tests = verdicts.len(), "batched intent auditor done");
+    Ok(verdicts)
+}
+
+/// Audit a whole round, in ONE call when `batch` is set (§14.5) and one call per
+/// test otherwise.
+///
+/// Scrapped tests are dropped from the returned list; their audit records (with
+/// `scrapped = true`) are still returned for logging. Either way the records
+/// come out in the order the tests went in, so a session log cannot be a
+/// permutation of another run's.
 pub async fn audit_tests_intent(
     cfg: &LlmConfig,
     issue_text: &str,
     original_source: &str,
     tests: &[GeneratedTest],
     grounded: bool,
+    batch: bool,
 ) -> (
     Vec<GeneratedTest>,
     Vec<IntentRelabel>,
     Vec<IntentCheckRecord>,
 ) {
+    // [VANTA-WHY] §14.5 — with the flag off this is the v0.2 path unchanged: the
+    // same per-test call, through the same function, in the same order.
+    if !batch {
+        let mut audited = Vec::with_capacity(tests.len());
+        let mut relabels = Vec::new();
+        let mut records = Vec::new();
+        for test in tests {
+            let (updated, relabel, record) =
+                audit_test_intent(cfg, issue_text, original_source, test, grounded).await;
+            if let Some(updated) = updated {
+                audited.push(updated);
+            }
+            if let Some(relabel) = relabel {
+                relabels.push(relabel);
+            }
+            if let Some(record) = record {
+                records.push(record);
+            }
+        }
+        return (audited, relabels, records);
+    }
+
+    let verdicts: Vec<IntentVerdict> =
+        match attacker_check_intent_batch(cfg, issue_text, original_source, tests, grounded).await {
+            Ok(verdicts) => verdicts,
+            Err(e) => {
+                // [VANTA-WHY] §14.5 — one failed batch call must not be one
+                // verdict for the whole round. Every test falls back to exactly
+                // what a failed single call produces (see
+                // `audit_unavailable_verdict`), so a broken auditor demotes the
+                // round instead of scrapping it and cannot manufacture a reject.
+                warn!(
+                    tests = tests.len(),
+                    error = %e,
+                    "batched intent audit unavailable — every test in the round takes the \
+                     single-call failure path"
+                );
+                tests
+                    .iter()
+                    .map(|_| audit_unavailable_verdict(&e))
+                    .collect()
+            }
+        };
+
     let mut audited = Vec::with_capacity(tests.len());
     let mut relabels = Vec::new();
     let mut records = Vec::new();
-    for test in tests {
-        let (updated, relabel, record) =
-            audit_test_intent(cfg, issue_text, original_source, test, grounded).await;
+    for (test, verdict) in tests.iter().zip(verdicts) {
+        let (updated, relabel, record) = apply_intent_verdict(test, issue_text, verdict);
         if let Some(updated) = updated {
             audited.push(updated);
         }
@@ -1665,6 +2005,353 @@ mod tests {
         assert_eq!(
             intent_auditor_system_prompt(true),
             INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED
+        );
+    }
+
+    // ---- §14.5 batched audit (schema, transport-neutral decision) -----------
+
+    fn batch_entry(index: usize, asks: bool) -> IntentAuditEntry {
+        IntentAuditEntry {
+            index,
+            issue_asks_for_behaviour: asks,
+            issue_requires_change: None,
+            assertions_grounded: None,
+            reason: "the issue says so".to_string(),
+        }
+    }
+
+    /// The batched answer is the single-test contract plus an index, so an entry
+    /// is turned into exactly the verdict the single-test call would have parsed.
+    #[test]
+    fn the_batch_entry_carries_the_single_test_answers() {
+        let entry = IntentAuditEntry {
+            index: 3,
+            issue_asks_for_behaviour: true,
+            issue_requires_change: Some(false),
+            assertions_grounded: Some(true),
+            reason: "the issue names the input".to_string(),
+        };
+        assert_eq!(
+            entry.verdict(),
+            IntentVerdict {
+                issue_asks_for_behaviour: true,
+                issue_requires_change: Some(false),
+                assertions_grounded: Some(true),
+                reason: "the issue names the input".to_string(),
+            }
+        );
+    }
+
+    /// A model that numbers the tests in a different order (or lists them out of
+    /// order) must still produce the round's own order: the index is what binds
+    /// an answer to a test, not the position in the array.
+    #[test]
+    fn the_batch_maps_entries_back_onto_the_round_in_the_round_s_order() {
+        let batch = IntentBatchVerdict {
+            tests: vec![
+                IntentAuditEntry {
+                    index: 2,
+                    ..batch_entry(2, false)
+                },
+                IntentAuditEntry {
+                    index: 3,
+                    ..batch_entry(3, true)
+                },
+                IntentAuditEntry {
+                    index: 1,
+                    ..batch_entry(1, true)
+                },
+            ],
+        };
+        let verdicts = batch.by_index(3).expect("every index appears once");
+        assert_eq!(
+            verdicts
+                .iter()
+                .map(|v| (v.issue_asks_for_behaviour, v.reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (true, "the issue says so"),
+                (false, "the issue says so"),
+                (true, "the issue says so"),
+            ]
+        );
+    }
+
+    /// One forgotten test would otherwise be silently demoted, which is exactly
+    /// the "a decision nobody made" failure this project exists to prevent. The
+    /// whole response is a parse failure, so the call is retried instead.
+    ///
+    /// [VANTA-WHY] An answer that OMITS a test cannot reach the `is missing` arm
+    /// on its own: the round's size is checked first, and with the size enforced
+    /// a gap in the numbering can only be filled by a duplicate or by an index
+    /// outside `1..=count`. So the omission is asserted in the three shapes it can
+    /// actually take — all of them a parse failure of the whole response, none of
+    /// them a shrug about one test.
+    #[test]
+    fn an_answer_that_omits_a_test_fails_the_whole_batch() {
+        let cases = [
+            (
+                vec![batch_entry(1, true), batch_entry(2, true)],
+                "answered 2 test(s) but 3 were sent",
+            ),
+            (
+                vec![
+                    batch_entry(1, true),
+                    batch_entry(2, true),
+                    batch_entry(2, false),
+                ],
+                "index 2 appears twice",
+            ),
+            (
+                vec![
+                    batch_entry(1, true),
+                    batch_entry(2, true),
+                    batch_entry(4, true),
+                ],
+                "is not one of 1..=3",
+            ),
+        ];
+        for (entries, expected) in cases {
+            let batch = IntentBatchVerdict { tests: entries };
+            let error = batch
+                .by_index(3)
+                .expect_err("a round of three tests needs three answers");
+            assert!(error.contains(expected), "expected {expected:?}; got {error}");
+        }
+    }
+
+    #[test]
+    fn a_duplicate_index_fails_the_whole_batch() {
+        let batch = IntentBatchVerdict {
+            tests: vec![
+                batch_entry(1, true),
+                batch_entry(2, true),
+                batch_entry(2, false),
+            ],
+        };
+        let error = batch.by_index(3).expect_err("index 2 was answered twice");
+        assert!(error.contains("index 2 appears twice"), "{error}");
+    }
+
+    /// Both ends of the range, because the prompt is 1-based: index 0 is off by
+    /// one and `count + 1` is a test that was not sent.
+    #[test]
+    fn an_unknown_index_fails_the_whole_batch() {
+        for index in [0_usize, 4] {
+            let batch = IntentBatchVerdict {
+                tests: vec![
+                    batch_entry(1, true),
+                    batch_entry(2, true),
+                    batch_entry(index, true),
+                ],
+            };
+            let error = batch
+                .by_index(3)
+                .expect_err("an index outside 1..=3 cannot be an answer");
+            assert!(error.contains("is not one of 1..=3"), "{error}");
+        }
+    }
+
+    /// The documented batch JSON parses, and an omitted `issue_requires_change`
+    /// or `assertions_grounded` is UNKNOWN — never `false`. Reading a missing
+    /// answer as a negative one is what would let a truncated response scrap a
+    /// test or demote it.
+    #[test]
+    fn an_omitted_change_or_grounded_field_is_unknown_not_an_answer() {
+        let raw = r#"{"tests": [
+            {"index": 1, "issue_asks_for_behaviour": true, "reason": "a"},
+            {"index": 2, "issue_asks_for_behaviour": false, "issue_requires_change": true,
+             "assertions_grounded": false, "reason": "b"}
+        ]}"#;
+        let batch: IntentBatchVerdict = serde_json::from_str(raw).expect("the documented schema");
+        let verdicts = batch.by_index(2).expect("every index appears once");
+        assert_eq!(verdicts[0].issue_requires_change, None);
+        assert_eq!(verdicts[0].assertions_grounded, None);
+        assert_eq!(verdicts[1].issue_requires_change, Some(true));
+        assert_eq!(verdicts[1].assertions_grounded, Some(false));
+    }
+
+    /// §14.8 — batched vs unbatched give the same per-test decisions and the same
+    /// records. Both transports parse the SAME three answers into an
+    /// [`IntentVerdict`] (the single call deserializes it directly, the batch maps
+    /// its entries onto the round) and hand it to [`apply_intent_verdict`], so the
+    /// equivalence is asserted over the decisions that come out of each shape.
+    #[test]
+    fn the_batched_and_single_test_answers_decide_the_same_way() {
+        let round = vec![
+            generated(
+                TestIntent::BugReproduction,
+                "def test_boundary():\n    assert shipping_band(1000) == \"standard\"\n",
+                Some("`shipping_band(1000)` should return `\"standard\"`"),
+            ),
+            generated(
+                TestIntent::FeatureAcceptance,
+                "def test_boundary():\n    assert shipping_band(500) == \"light\"\n",
+                None,
+            ),
+            generated(
+                TestIntent::BehaviorPreservation,
+                "def test_boundary():\n    assert shipping_band(1000) == \"standard\"\n",
+                None,
+            ),
+        ];
+        // One answer per test, in the single-test JSON shape and the batched one.
+        let answers = [
+            (true, None, None),
+            (false, None, None),
+            (true, Some(true), None),
+        ];
+        let singles: Vec<IntentVerdict> = answers
+            .iter()
+            .map(|(asks, change, grounded)| IntentVerdict {
+                issue_asks_for_behaviour: *asks,
+                issue_requires_change: *change,
+                assertions_grounded: *grounded,
+                reason: "the issue says so".to_string(),
+            })
+            .collect();
+        let batch_json = format!(
+            "{{\"tests\": [{}]}}",
+            answers
+                .iter()
+                .enumerate()
+                .map(|(i, (asks, change, grounded))| format!(
+                    "{{\"index\": {}, \"issue_asks_for_behaviour\": {}, ",
+                    i + 1,
+                    asks
+                ) + &match (change, grounded) {
+                    (Some(c), _) => format!("\"issue_requires_change\": {c}, "),
+                    (None, Some(g)) => format!("\"assertions_grounded\": {g}, "),
+                    (None, None) => String::new(),
+                } + "\"reason\": \"the issue says so\"}")
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let batched: IntentBatchVerdict =
+            serde_json::from_str(&batch_json).expect("the batch JSON is the documented schema");
+        let batched_verdicts = batched.by_index(round.len()).expect("one entry per test");
+
+        for ((test, single), batched) in round.iter().zip(&singles).zip(batched_verdicts) {
+            assert_eq!(
+                single, &batched,
+                "the same three answers must parse to the same verdict either way"
+            );
+            assert_eq!(
+                apply_intent_verdict(test, FIXTURE_ISSUE, single.clone()),
+                apply_intent_verdict(test, FIXTURE_ISSUE, batched),
+                "the decision and the record may not depend on the transport"
+            );
+        }
+    }
+
+    /// A failed call must produce the same verdict in both transports, and that
+    /// verdict is the SAFE one: nothing is scrapped, and a non-preservation label
+    /// that nobody verified does not stand — it is demoted, never admitted.
+    #[test]
+    fn an_unavailable_auditor_answers_unknown_in_the_batch_s_shape_too() {
+        let unavailable = audit_unavailable_verdict(&"connection reset");
+        assert!(!unavailable.issue_asks_for_behaviour);
+        assert_eq!(unavailable.issue_requires_change, None);
+        assert_eq!(unavailable.assertions_grounded, None);
+        assert!(
+            unavailable.reason.contains("connection reset"),
+            "{}",
+            unavailable.reason
+        );
+
+        // A probe that already declares preservation is untouched: there is
+        // nothing an absent auditor could safely revise.
+        let (kept, relabel, record) = apply_intent_verdict(
+            &generated(
+                TestIntent::BehaviorPreservation,
+                "def test_boundary():\n    assert True\n",
+                None,
+            ),
+            FIXTURE_ISSUE,
+            audit_unavailable_verdict(&"connection reset"),
+        );
+        assert!(relabel.is_none());
+        assert_eq!(
+            kept.expect("the probe survives").intent,
+            TestIntent::BehaviorPreservation
+        );
+        assert!(!record.expect("a record is always written").scrapped);
+
+        // An unverified non-preservation label is demoted to preservation — the
+        // BATE requirement that follows (baseline must PASS) is the one that
+        // cannot admit a patch-introduced behaviour as if the issue asked for it.
+        for intent in [TestIntent::BugReproduction, TestIntent::FeatureAcceptance] {
+            let declared = format!("{intent:?}");
+            let (updated, relabel, record) = apply_intent_verdict(
+                &generated(intent, "def test_boundary():\n    assert True\n", None),
+                FIXTURE_ISSUE,
+                audit_unavailable_verdict(&"connection reset"),
+            );
+            assert_eq!(
+                updated.expect("the test survives").intent,
+                TestIntent::BehaviorPreservation,
+                "{declared} may not keep an unverified label"
+            );
+            let relabel = relabel.expect("the demotion is a relabel and must be logged");
+            assert_eq!(relabel.to_intent, TestIntent::BehaviorPreservation);
+            assert!(!record.expect("a record is always written").scrapped);
+        }
+    }
+
+    /// [VANTA-WHY] The batch prompts are SEPARATE literals, so an edit to one
+    /// that is not mirrored in the others would silently make the asks disagree.
+    #[test]
+    fn the_batch_prompt_keeps_the_shared_rules() {
+        const SHARED: [&str; 5] = [
+            "The issue is the only source of requirements.",
+            "A sentence that forbids changing behaviour",
+            "THREADED THROUGH",
+            "Preserving existing behaviour is always a valid answer.",
+            "YOU MUST output valid JSON. First char '{', last char '}'.",
+        ];
+        for rule in SHARED {
+            for prompt in [
+                INTENT_AUDITOR_SYSTEM_PROMPT,
+                INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED,
+                INTENT_AUDITOR_BATCH_SYSTEM_PROMPT,
+                INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED,
+            ] {
+                assert!(
+                    prompt.contains(rule),
+                    "every auditor prompt must carry the shared rule {rule}"
+                );
+            }
+        }
+
+        for prompt in [
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT,
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED,
+        ] {
+            assert!(
+                prompt.contains("- Answer EVERY numbered test exactly once"),
+                "a batch prompt must say that each numbered test is answered once"
+            );
+            assert!(
+                prompt.contains(r#"{"tests": [{"index": 1"#),
+                "a batch prompt must pin the batched JSON contract"
+            );
+        }
+        assert!(
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED.contains("\"assertions_grounded\""),
+            "the grounded batch prompt must ask the third question"
+        );
+        assert!(
+            !INTENT_AUDITOR_BATCH_SYSTEM_PROMPT.contains("assertions_grounded"),
+            "a batch run without the grounded flag may not scrap on an answer nobody asked for"
+        );
+
+        assert_eq!(
+            intent_auditor_batch_system_prompt(false),
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT
+        );
+        assert_eq!(
+            intent_auditor_batch_system_prompt(true),
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED
         );
     }
 

@@ -608,6 +608,53 @@ const THREE_SIGNAL_TESTS: &str = r#"{"tests":[
         }
     ]}"#;
 
+/// The single-test form of the stub's keep-the-label answer.
+const SINGLE_AUDIT_KEEP_ANSWER: &str =
+    r#"{"issue_asks_for_behaviour":true,"reason":"stub: keep the label"}"#;
+
+/// [VANTA-WHY] §14.5 — the BATCHED form of the same answer: one entry per
+/// numbered test, which is what makes it a transport change and not a decision
+/// change. The batched auditor must reach the same verdicts for
+/// `THREE_SIGNAL_TESTS` as three single-test calls carrying one entry each.
+const THREE_SIGNAL_BATCH_AUDIT_ANSWER: &str = r#"{"tests":[
+        {"index":1,"issue_asks_for_behaviour":true,"reason":"stub: keep the label"},
+        {"index":2,"issue_asks_for_behaviour":true,"reason":"stub: keep the label"},
+        {"index":3,"issue_asks_for_behaviour":true,"reason":"stub: keep the label"}
+    ]}"#;
+
+/// Three BehaviourPreservation probes that all PASS on the original tree.
+///
+/// [VANTA-WHY] §14.5 — demoting a probe the audit could not answer is a no-op for
+/// these, so a run whose audit fails has an arithmetic that is the audit retries
+/// and nothing else: no BATE revision, no relabel gate. That is what makes the
+/// call counts below a measurement of the transport rather than of the fixture.
+const THREE_PRESERVATION_TESTS: &str = r#"{"tests":[
+        {
+            "test_name":"test_preserve_add_pair",
+            "test_source":"from calc import add\n\ndef test_preserve_add_pair():\n    assert add(2, 3) == 5\n",
+            "intent":"BehaviorPreservation",
+            "reason":"The original tree returns 5 for this input."
+        },
+        {
+            "test_name":"test_preserve_add_pair_reversed",
+            "test_source":"from calc import add\n\ndef test_preserve_add_pair_reversed():\n    assert add(3, 2) == 5\n",
+            "intent":"BehaviorPreservation",
+            "reason":"The original tree returns 5 for this input too."
+        },
+        {
+            "test_name":"test_preserve_add_identity",
+            "test_source":"from calc import add\n\ndef test_preserve_add_identity():\n    assert add(0, 0) == 0\n",
+            "intent":"BehaviorPreservation",
+            "reason":"Adding zero is unchanged behaviour."
+        }
+    ]}"#;
+
+/// A batched answer that answers ONE of the round's three tests. An unknown,
+/// duplicated or missing index is a parse failure of the WHOLE response (§14.5),
+/// so this can never be read as "the other two answered false".
+const SHELL_BATCH_AUDIT_ANSWER: &str =
+    r#"{"tests":[{"index":1,"issue_asks_for_behaviour":true,"reason":"only one of three"}]}"#;
+
 /// A single BugReproduction test whose baseline CONTRADICTS its intent:
 /// `calc.add(2, 3)` is 5 on the original tree, so the asserted `== 5` passes,
 /// while a BugReproduction test is only admissible if it FAILS there. The stub
@@ -1918,6 +1965,201 @@ fn a_preservation_probe_the_issue_asks_for_is_promoted_not_scrapped() {
             .map(|r| r.summary.as_str())
             .collect::<Vec<_>>()
     );
+}
+
+/// [VANTA-WHY] §14.5 — the batched audit is a TRANSPORT change. The same round,
+/// the same three answers, must produce the same per-test decisions and records
+/// whether they arrived in one call or three; the only observable difference
+/// allowed is the number of calls.
+#[test]
+fn the_batched_audit_is_one_call_per_round_with_the_same_decisions() {
+    let _serial = serial_run();
+
+    // One run of `THREE_SIGNAL_TESTS` against the bad patch, with the audit
+    // answered in the given shape. Returns the call kinds, the audit bodies, the
+    // per-test decisions the run logged and the terminal decision.
+    let run = |audit_answer: &str, extra_env: &'static [(&'static str, &'static str)]| {
+        let workspace = TempDir::new().unwrap();
+        let (_repo_dir, _issue_path, patch_path) =
+            write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+        let server = StubLlmServer::start_with_intent_audit(THREE_SIGNAL_TESTS, audit_answer);
+        let _ = run_patch_mode_with(workspace.path(), &patch_path, &server, 1, extra_env);
+
+        let records = read_session_records(&find_session_log(workspace.path()));
+        let decisions: Vec<(String, String)> = records
+            .iter()
+            .filter(|r| r.phase.starts_with("intent.check["))
+            .map(|r| (r.phase.clone(), r.summary.clone()))
+            .collect();
+        let terminal = records
+            .iter()
+            .find(|r| r.phase == "M3_repair_loop")
+            .map(|r| r.summary.clone())
+            .unwrap_or_default();
+        let batch_flag = summary_value(&run_summary(workspace.path()).summary, "batch_audit");
+        (
+            server.request_kinds(),
+            server.request_bodies(),
+            decisions,
+            terminal,
+            batch_flag,
+            workspace,
+        )
+    };
+
+    let (kinds_off, _bodies_off, decisions_off, terminal_off, flag_off, _off_workspace) =
+        run(SINGLE_AUDIT_KEEP_ANSWER, &[]);
+    let (kinds_on, bodies_on, decisions_on, terminal_on, flag_on, _on_workspace) = run(
+        THREE_SIGNAL_BATCH_AUDIT_ANSWER,
+        &[("VANTA_BATCH_AUDIT", "on")],
+    );
+
+    assert_eq!(
+        kinds_off,
+        vec!["generate", "intent_audit", "intent_audit", "intent_audit"],
+        "with the flag off each test is audited in its own call — the v0.2 schedule"
+    );
+    assert_eq!(
+        kinds_on,
+        vec!["generate", "intent_audit"],
+        "with the flag on the round's three tests are audited in ONE call"
+    );
+    assert_eq!(flag_off, "off");
+    assert_eq!(flag_on, "on");
+
+    // The one batched call must carry the WHOLE round, each test numbered — that
+    // numbering is what binds an answer to a test.
+    let batch_body = &bodies_on[1];
+    for numbered in [
+        "TEST 1 — test_bug_regression_signal",
+        "TEST 2 — test_feature_acceptance_signal",
+        "TEST 3 — test_behavior_preservation_signal",
+    ] {
+        assert!(
+            batch_body.contains(numbered),
+            "the batched audit request must carry every numbered test; missing {numbered:?} \
+             from {batch_body}"
+        );
+    }
+
+    assert_eq!(
+        decisions_off.len(),
+        3,
+        "every test gets a verdict, preservation included; got {decisions_off:?}"
+    );
+    assert_eq!(
+        decisions_off, decisions_on,
+        "the same three answers must produce the same verdicts and the same records \
+         whichever transport carried them"
+    );
+    assert_eq!(
+        terminal_off, terminal_on,
+        "a transport change may not move the run's decision"
+    );
+    assert!(
+        terminal_on.contains("Rejected"),
+        "three failing generated tests are still a rejection; got {terminal_on}"
+    );
+}
+
+/// [VANTA-WHY] §14.5 — an answer that does not cover the round is a parse failure
+/// of the whole response, so it is retried like any other malformed structured
+/// output; and when it finally fails, every test falls back to EXACTLY the
+/// single-call failure shape. Both halves are asserted against the flag-off run
+/// of the same fixture, whose calls fail the same way at the same place.
+#[test]
+fn a_batch_the_auditor_cannot_answer_falls_back_to_the_single_call_failure_shape() {
+    let _serial = serial_run();
+
+    let run = |extra_env: &'static [(&'static str, &'static str)]| {
+        let workspace = TempDir::new().unwrap();
+        let (_repo_dir, _issue_path, patch_path) =
+            write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+        // The SAME unparseable answer in both transports: one entry for a
+        // three-test round.
+        let server =
+            StubLlmServer::start_with_intent_audit(THREE_PRESERVATION_TESTS, SHELL_BATCH_AUDIT_ANSWER);
+        let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, extra_env);
+
+        let records = read_session_records(&find_session_log(workspace.path()));
+        let decisions: Vec<String> = records
+            .iter()
+            .filter(|r| r.phase.starts_with("intent.check["))
+            .map(|r| r.summary.clone())
+            .collect();
+        (server.request_kinds(), server.request_bodies(), decisions, output)
+    };
+
+    let (kinds_off, bodies_off, decisions_off, output_off) = run(&[]);
+    let (kinds_on, bodies_on, decisions_on, output_on) = run(&[("VANTA_BATCH_AUDIT", "on")]);
+
+    // Off: three tests, each call retried the full budget = 1 + 3x3.
+    assert_eq!(
+        kinds_off,
+        vec![
+            "generate",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+            "intent_audit",
+        ],
+        "with the flag off an unparseable audit is retried per test"
+    );
+    // On: ONE logical call, retried three times.
+    assert_eq!(
+        kinds_on,
+        vec!["generate", "intent_audit", "intent_audit", "intent_audit"],
+        "an incomplete batch must be retried as ONE call, not split into three"
+    );
+    for body in &bodies_on[1..] {
+        assert!(
+            body.contains("TEST 3 — test_preserve_add_identity"),
+            "every retry must carry the whole round, not the tests answered so far; got {body}"
+        );
+    }
+    assert!(
+        bodies_off[1..].iter().all(|body| !body.contains("TEST 2 —")),
+        "with the flag off a request carries exactly one test"
+    );
+
+    assert_eq!(decisions_off.len(), 3);
+    assert_eq!(decisions_on.len(), 3);
+    for (summary_off, summary_on) in decisions_off.iter().zip(&decisions_on) {
+        // The DECISION is what must not depend on the transport: the same fields,
+        // the same values. The reason quotes the parse error, which necessarily
+        // names a different failure, so it is checked for the shared marker only.
+        for field in [
+            "issue_asks_for_behaviour=false",
+            "issue_requires_change=unknown",
+            "assertions_grounded=unknown",
+            "scrapped=false",
+        ] {
+            assert!(
+                summary_off.contains(field) && summary_on.contains(field),
+                "a failed audit must take the same safe shape in both transports: {field} \
+                 is missing from {summary_off:?} or {summary_on:?}"
+            );
+        }
+        assert!(
+            summary_off.contains("intent audit unavailable")
+                && summary_on.contains("intent audit unavailable"),
+            "the record must say the audit was unavailable; got {summary_off:?} and {summary_on:?}"
+        );
+    }
+
+    // A failed auditor demotes the round; it may not end the run as an
+    // infrastructure failure, and it may not approve the bad patch.
+    for (status, summary) in [
+        (output_off.status, &decisions_off[0]),
+        (output_on.status, &decisions_on[0]),
+    ] {
+        assert!(!status.success(), "the bad patch must not be approved: {summary}");
+    }
 }
 
 /// The repo's OWN test suite is a gate the generated tests cannot substitute for.

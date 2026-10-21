@@ -1030,6 +1030,7 @@ pub async fn run(
                 &review_prompt_concat,
                 &generated_tests,
                 grounded_audit_enabled,
+                batch_audit_enabled,
             )
             .await;
             let intent_scrapped = initial_intent_checks.iter().filter(|c| c.scrapped).count();
@@ -2226,9 +2227,9 @@ pub async fn run(
             // decided by rule (c), and a `NeedsReview` must name the weak
             // failures that triggered it — otherwise "needs a human" names
             // nothing to look at.
-            corroborate_enabled,
-            grounded_audit_enabled,
-            batch_audit_enabled,
+            flag_text(corroborate_enabled),
+            flag_text(grounded_audit_enabled),
+            flag_text(batch_audit_enabled),
             deciding_rule.as_deref().unwrap_or("none"),
             deciding_evidence.join(","),
             needs_review_weak.join(","),
@@ -3536,6 +3537,16 @@ fn tri_state_text(value: Option<bool>) -> &'static str {
         Some(false) => "false",
         None => "unknown",
     }
+}
+
+/// Render one of §14.3's three robustness switches the way the operator set it.
+///
+/// [VANTA-WHY] §14.3 records them as `on|off`, the spelling
+/// `VANTA_CORROBORATE=on` uses, so `run.summary` and the command that produced
+/// the run can be read against each other without translating `true` back into a
+/// flag name.
+fn flag_text(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "off" }
 }
 
 /// Print one line per §14.4 ungrounded scrap, with the auditor's reason.

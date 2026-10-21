@@ -2302,7 +2302,7 @@ pub async fn run(
              corroborate={} grounded_audit={} batch_audit={} \
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
-             commit={} dirty={}",
+             commit={} dirty={} prompt_version={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -2337,6 +2337,13 @@ pub async fn run(
             needs_review_weak.join(","),
             vanta_commit,
             vanta_dirty,
+            // [VANTA-WHY] §14.10 — the prompt identity of the run, the same
+            // string `session.start` carries (`pipeline::prompt_versions`). A
+            // session's debug artifacts outlive the shell that produced them, so
+            // "which prompts wrote this row" must be readable from the row: a run
+            // made before the Attacker prompt's preservation fix is otherwise
+            // indistinguishable from one made after it.
+            crate::pipeline::prompt_versions(),
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),

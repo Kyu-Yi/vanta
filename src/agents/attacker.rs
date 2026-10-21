@@ -43,7 +43,7 @@ use tracing::{debug, info, trace, warn};
 // "attacker.2.boundary-probe": `session.start` writes
 // `prompt_version=attacker=<tag>;intent_check=<tag>;...`, so the prompt NAME is
 // the key and repeating it inside the value would make the field ambiguous.
-pub const ATTACKER_PROMPT_VERSION: &str = "4.intent-and-fixture-rules";
+pub const ATTACKER_PROMPT_VERSION: &str = "5.preservation-is-original-only";
 
 // ============================================================================
 // INTENT_AUDITOR_PROMPT_VERSION — the run-identity tag for the intent check
@@ -173,7 +173,7 @@ Required JSON shape:
 Intent rules — each test MUST produce a DIFFERENT result on original vs patched (except BehaviorPreservation):
 - BugReproduction: reproduces a bug that the patch fixes. The test MUST FAIL on the ORIGINAL code and PASS on the PATCHED code. It exercises the exact code path the patch changes.
 - FeatureAcceptance: checks a NEW capability added by the patch. The test MUST FAIL on the ORIGINAL code (feature absent) and PASS on the PATCHED code (feature present).
-- BehaviorPreservation: checks EXISTING behavior that should not change. The test MUST PASS on BOTH original and patched code. Test only functionality that existed before the patch.
+- BehaviorPreservation: checks EXISTING behavior the issue does NOT ask to change. The test MUST PASS on the ORIGINAL code (BATE checks this). It is EXPECTED to pass on a correct patch — but that is not a requirement you may test the patch against: if it FAILS on the PATCHED code, that failure IS the finding, because a bad patch breaking existing behavior is exactly what this test exists to catch. NEVER drop a boundary probe because you expect the patch to break it. Test only functionality that existed before the patch.
 
 CRITICAL:
 - Every test must actually import and call the patched module's functions/classes. Do NOT mock away the code under test.
@@ -1923,6 +1923,41 @@ mod tests {
         assert!(
             ATTACKER_SYSTEM_PROMPT.contains("implement EVERY attribute the code under test touches"),
             "fakes must be told to implement every attribute the code under test reads"
+        );
+    }
+
+    /// [VANTA-WHY] §14.10 — the prompt used to say a BehaviorPreservation test
+    /// "MUST PASS on BOTH original and patched code", while the BOUNDARY-PROBING
+    /// RULE ordered a preservation probe at the exact boundary the patch changes.
+    /// On a bad patch the two cannot both hold — the probe at the broken boundary
+    /// IS the test that catches it, and it fails on the patched code by definition
+    /// — and Ornith-1.0 answered the contradiction with a repetition loop that ran
+    /// to the 32768-token cap. BATE checks a preservation test on the ORIGINAL
+    /// tree only (`pipeline::bate`), so the both-trees wording was the bug, not the
+    /// model. This pins the corrected semantics so the contradiction cannot return.
+    #[test]
+    fn the_attacker_prompt_does_not_forbid_the_test_that_catches_a_bad_patch() {
+        assert!(
+            !ATTACKER_SYSTEM_PROMPT.contains("MUST PASS on BOTH"),
+            "the both-trees preservation rule is the contradiction that caused the runaways"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("MUST PASS on the ORIGINAL code"),
+            "a preservation test must be told BATE only checks it on the original tree"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("FAILS on the PATCHED code")
+                && ATTACKER_SYSTEM_PROMPT.contains("that failure IS the finding"),
+            "a preservation failure on the patched tree is the finding, not a reason to drop the test"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT
+                .contains("NEVER drop a boundary probe because you expect the patch to break it"),
+            "the boundary probe must survive the patch it catches"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("BOUNDARY-PROBING RULE"),
+            "the boundary-probing rule must still be in the prompt"
         );
     }
 

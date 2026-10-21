@@ -2490,6 +2490,19 @@ fn a_batch_cut_off_at_the_cap_falls_back_to_per_test_audits_with_the_same_decisi
 /// advances the seed by its attempt index. The record has to say which seed each
 /// attempt ACTUALLY sent — `VANTA_LLM_SEED` alone no longer answers that — or a
 /// run with a retry cannot be reproduced after the fact.
+///
+/// [VANTA-WHY] ONE round (`--max-attempts 1`), because the retry under test
+/// happens inside a round. In patch mode the Governor treats the cap as attack
+/// DEPTH and keeps attacking a candidate that PASSES — a clean round is a
+/// sample, not a finding (`governor.rs`) — so at depth 3 this run continues past
+/// the round the assertion is about. Every later round re-asks the same stub for
+/// the same probe, the dedup drops it as already shared, and the round makes one
+/// generation call and NO audit (an empty test list audits nothing). That is 5
+/// calls — `generate, generate, intent_audit` then `generate` twice — so the
+/// exact-sequence assertion below would be measuring the Governor's depth policy
+/// rather than the retry. The `truncated_calls_attacker=1` assertion is what keeps
+/// that honest from the other side: a second cut-off anywhere in the run, in any
+/// round, would read 2 and fail.
 #[test]
 fn a_cut_off_attacker_answer_is_retried_and_recovers_on_the_next_attempt() {
     let _serial = serial_run();
@@ -2502,7 +2515,7 @@ fn a_cut_off_attacker_answer_is_retried_and_recovers_on_the_next_attempt() {
         // normally, so "retried and recovered" is distinguishable from "gave up".
         server.truncate_next_calls(&["generate"]);
         let output =
-            run_patch_mode_with_output(workspace.path(), &patch_path, &server, 3, extra_env);
+            run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, extra_env);
 
         let records = read_session_records(&find_session_log(workspace.path()));
         // One `call.usage` row per CHAT CALL, written in call order, so the first

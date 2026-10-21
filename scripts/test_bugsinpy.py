@@ -58,6 +58,7 @@ from bugsinpy.split import SplitError, load_split  # noqa: E402
 import bugsinpy_run as run_mod  # noqa: E402
 
 SPLIT_PATH = REPO_ROOT / "plans" / "bugsinpy_split.json"
+DEV_SPLIT_PATH = REPO_ROOT / "plans" / "bugsinpy_dev_split.json"
 BUGSINPY_CLONE = REPO_ROOT / "runs" / "bugsinpy" / "bugsinpy"
 
 needs_clone = pytest.mark.skipif(
@@ -192,7 +193,8 @@ class TestSplit:
             if e.get("role") == "reserve"
         }
         assert pilot_keys == {
-            "PySnooper/2",
+            # PySnooper/2 is deliberately absent: it was dropped for a
+            # `bug_patch.txt` that cannot pass the oracle (reviewed_changes[3]).
             "PySnooper/3",
             "thefuck/1",
             "thefuck/2",
@@ -220,8 +222,8 @@ class TestSplit:
         """
         split = load_split(SPLIT_PATH)
         changes = split.data["reviewed_changes"]
-        assert len(changes) == 3
-        excluded, promoted, removed = changes
+        assert len(changes) == 5
+        excluded, promoted, removed, dropped, development = changes
         assert "PySnooper/1" in excluded["change"]
         assert "Python-2-only" in excluded["reason"]
 
@@ -242,6 +244,24 @@ class TestSplit:
         assert "pip freeze" in removed["reason"]
         assert "aarch64" in removed["rule"]
         assert "measurements" not in removed
+
+        # The fourth drops PySnooper/2, which is what makes wave 1 a single pilot
+        # bug. Its evidence is the oracle's own grading of the developer fix (the
+        # bug's `bug_patch.txt` cannot be imported), quoted from the batch it was
+        # measured in.
+        assert "PySnooper/2 is removed from `bugs`" in dropped["change"]
+        assert "prepare-wave1-3" in dropped["reason"]
+        assert "measurements" not in dropped
+
+        # The fifth is not a protocol change but a reporting one: PySnooper/3 stays
+        # in `bugs` and its wave still runs, and the record is what keeps its rows
+        # out of the pooled results (§14.7 — §14's items 1 and 2 were designed from
+        # its false reject, so it is development data).
+        assert "PySnooper/3 is development data" in development["change"]
+        assert "seen during development" in development["change"]
+        assert "no config, seed, sampling or gate field is touched" in development["change"]
+        assert "development case" in development["reason"]
+        assert "measurements" not in development
 
     def test_reviewed_change_validates(self):
         data = split_data(
@@ -326,7 +346,47 @@ class TestSplit:
     def test_waves_group_the_pilot(self):
         split = load_split(SPLIT_PATH)
         assert split.waves() == [1, 2, 3]
-        assert len(split.bugs_in_wave(1)) == 2
+        # Wave 1 is PySnooper/3 alone: PySnooper/2 was dropped and no substitute
+        # was searched for (reviewed_changes[3]).
+        assert len(split.bugs_in_wave(1)) == 1
+
+    def test_dev_split_is_disjoint_from_the_evaluation_waves(self):
+        """§14.7: items 1-3 are developed on bugs no evaluation number comes from.
+
+        The development split is a second file precisely so that the choice of
+        development data does not rewrite the evaluation split's bugs, waves or
+        sampling. What has to hold is that the two sets meet at one bug only: the
+        one §14 was designed from — PySnooper/3 — which the dev split carries as
+        "seen during development" and the evaluation split excludes at reporting
+        time through ``reviewed_changes``.
+        """
+        dev = load_split(DEV_SPLIT_PATH)
+        evaluation = load_split(SPLIT_PATH)
+
+        dev_keys = {f"{e['project']}/{e['bug_id']}" for e in dev.bugs}
+        evaluation_keys = {f"{e['project']}/{e['bug_id']}" for e in evaluation.bugs}
+        assert dev_keys & evaluation_keys == {"PySnooper/3"}
+        assert len(dev.bugs) == 11, "5 pilots, 5 reserves and PySnooper/3"
+        assert len(split_mod.pilot_bugs(dev)) == 6
+        assert len([e for e in dev.bugs if e["role"] == "reserve"]) == 5
+
+        # Project level: every other development project is in no evaluation wave
+        # at all, pilot or reserve, so no item can be tuned on a project the paper
+        # reports a number for.
+        dev_projects = {e["project"] for e in dev.bugs}
+        evaluation_projects = {e["project"] for e in evaluation.bugs}
+        assert dev_projects & evaluation_projects == {"PySnooper"}
+
+        seen = dev.bug("PySnooper", 3)
+        assert seen["role"] == "pilot"
+        assert "seen during development" in seen["notes"].lower()
+
+        # The rule that chose the list is in the file, recorded before any gate ran
+        # and before any Vanta result was looked at.
+        rule = dev.data["reviewed_changes"][0]["rule"]
+        assert "Round-robin across projects" in rule
+        assert "until 5" in rule
+        assert "skip it and continue" in rule
 
     def test_module_distributions_is_optional(self):
         """The split is valid without it: only a divergent module name needs a mapping."""
@@ -2733,30 +2793,30 @@ class TestBake:
             "decorator"
         ]
 
-    def test_wave_1_layers_are_one_interpreter_and_two_bug_layers(self):
+    def test_wave_1_layers_are_one_interpreter_and_one_bug_layer(self):
         split = load_split(SPLIT_PATH)
         minors, entries = bake_mod.select_layers(
             split, pythons=["3.8"], only=[], roles={"pilot"}
         )
         assert minors == ["3.8"]
-        # Wave 1 is the two PySnooper bugs: black/22's promotion was retired (see
-        # the third reviewed_change), so the interpreter carries two bug layers.
-        assert [entry["project"] for entry in entries] == ["PySnooper", "PySnooper"]
+        # Wave 1 is PySnooper/3 alone: black/22's promotion was retired (the third
+        # reviewed_change) and PySnooper/2 was dropped (the fourth), so the
+        # interpreter carries one bug layer.
+        assert [entry["project"] for entry in entries] == ["PySnooper"]
         layers = bake_mod.layer_recipes(
             split,
             pythons=minors,
             entries=entries,
-            deps=_bug_deps(entries, {"vanta-bi-PySnooper-2": ("python-toolbox==0.9.3",)}),
+            deps=_bug_deps(entries, {"vanta-bi-PySnooper-3": ("decorator==4.4.0",)}),
         )
         assert [name for name, _, _ in layers] == [
             "vanta-bugsinpy-py3.8",
-            "vanta-bi-PySnooper-2",
             "vanta-bi-PySnooper-3",
         ]
         assert layers[0][1] == bake_mod.DEFAULT_BASE
         assert all(base == "vanta-bugsinpy-py3.8" for _, base, _ in layers[1:])
         recipe_by_name = {name: script for name, _, script in layers}
-        assert "python-toolbox==0.9.3" in recipe_by_name["vanta-bi-PySnooper-2"]
+        assert "decorator==4.4.0" in recipe_by_name["vanta-bi-PySnooper-3"]
 
     def test_a_bug_without_resolved_dependencies_is_refused_not_baked_dependency_free(self):
         """``layer_recipes`` must not silently build a layer that installs nothing.
@@ -3947,8 +4007,26 @@ class TestRealPySnooperDependencies:
 
     def _entries(self) -> tuple[split_mod.Split, list[dict]]:
         split = load_split(SPLIT_PATH)
-        entries = [split.bug("PySnooper", bug_id) for bug_id in (2, 3)]
-        return split, entries
+        three = split.bug("PySnooper", 3)
+        # PySnooper/2 is no longer scheduled — it was dropped for a
+        # `bug_patch.txt` that cannot pass the oracle (reviewed_changes[3]) — but
+        # BugsInPy still ships it and bake's resolution for it is what these tests
+        # measure, the vendored `import six` in particular. Its entry is rebuilt
+        # from the clone's own `bug.info` so no commit is retyped, and it inherits
+        # PySnooper/3's pins so the interpreter stays the one pin the split
+        # declares.
+        info = meta_mod.load_bug_info(BUGSINPY_CLONE, "PySnooper", 2)
+        two = dict(three)
+        two.update(
+            bug_id=2,
+            python_version=info.python_version,
+            buggy_commit=info.buggy_commit,
+            fixed_commit=info.fixed_commit,
+            test_file=info.test_file,
+            pythonpath=info.pythonpath,
+            checkpoint="vanta-bi-PySnooper-2",
+        )
+        return split, [two, three]
 
     def _resolve(self, entries):
         return bake_mod.resolve_bug_deps(

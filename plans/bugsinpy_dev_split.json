@@ -1,0 +1,347 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-10-21T04:57:36Z",
+  "bugsinpy_commit": "11c5f1eea954a42132cfd06bf257766a7963e0fd",
+  "bugsinpy_root": "runs/bugsinpy/bugsinpy",
+  "configs": [
+    "baseline",
+    "vanta"
+  ],
+  "seeds": [
+    0
+  ],
+  "review_mode": true,
+  "sampling": {
+    "policy": "pinned_per_call_plus_server_top_p",
+    "note": "temperature/max_tokens come from the pipeline's per-call pins (design §4.3); top_p is the one value read from the server's /props. The harness adds no run-level value."
+  },
+  "reviewed_changes": [
+    {
+      "change": "This is the development split of §14.7: five py3.8 bugs, one per project, from projects that appear in no evaluation wave, plus PySnooper/3 labelled 'seen during development'. It is a separate file so the evaluation split's bugs, waves and sampling are not rewritten by the choice of development data.",
+      "reason": "Items 1-3 of §14 are developed on bugs no evaluation number will be computed from, so no number is produced by a pipeline tuned on the bug it measures. Flat directory order was rejected: it makes the first ten candidates ten fastapi bugs, so every item would be developed against one codebase's idioms. Round-robin gives one bug per project.",
+      "decided_by": "user review, 2026-10-21",
+      "rule": "Round-robin across projects in clone order (fastapi, luigi, matplotlib, pandas, sanic, scrapy, spacy): take the first bug in each project that passes both gates, until 5. If a project has no bug that passes, skip it and continue. One pass over the projects gives their next py3.8 bug in ascending id and the pass repeats until 10 candidates are listed; the first 5 are pilots, the rest the substitution pool. The two gates are the existing ones -- the §1.6 context gate and the §8.2 dev-fix self-check -- neither is loosened and no cap is raised. Recorded before any gate was run and before any Vanta result was looked at."
+    }
+  ],
+  "bugs": [
+    {
+      "project": "fastapi",
+      "bug_id": 1,
+      "python_version": "3.8.3",
+      "buggy_commit": "766157bfb4e7dfccba09ab398e8ec444d14e947c",
+      "fixed_commit": "3397d4d69a9c2d64c1219fcbf291ea5697a4abb8",
+      "test_file": "tests/test_jsonable_encoder.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-fastapi-1",
+      "wave": 1,
+      "role": "pilot",
+      "notes": "Round-robin pass 1, fastapi. First py3.8 bug in the project."
+    },
+    {
+      "project": "luigi",
+      "bug_id": 1,
+      "python_version": "3.8.3",
+      "buggy_commit": "1164eb6b85b8a70f596dbb99452bec513e72c12e",
+      "fixed_commit": "aec5dc2ed8db53fc282a0bd24aabe59031b6d1ba",
+      "test_file": "test/server_test.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "test"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "test",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-luigi-1",
+      "wave": 1,
+      "role": "pilot",
+      "notes": "Round-robin pass 1, luigi. First py3.8 bug in the project."
+    },
+    {
+      "project": "matplotlib",
+      "bug_id": 1,
+      "python_version": "3.8.1",
+      "buggy_commit": "c404d1f716e8aaefd4d7371ff49673e9c1f7f07c",
+      "fixed_commit": "5324adaec6a7fd3d78dea7b28451d5f6e95392a6",
+      "test_file": "lib/matplotlib/tests/test_bbox_tight.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "lib/matplotlib/tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "lib/matplotlib/tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-matplotlib-1",
+      "wave": 1,
+      "role": "pilot",
+      "notes": "Round-robin pass 1, matplotlib. First py3.8 bug in the project."
+    },
+    {
+      "project": "pandas",
+      "bug_id": 1,
+      "python_version": "3.8.3",
+      "buggy_commit": "3fd150c",
+      "fixed_commit": "e41ee47a90bb1d8a1fa28fcefcd45ed8ef5cb946",
+      "test_file": "pandas/tests/dtypes/test_dtypes.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "pandas/tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "pandas/tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-pandas-1",
+      "wave": 1,
+      "role": "pilot",
+      "notes": "Round-robin pass 1, pandas. First py3.8 bug in the project."
+    },
+    {
+      "project": "sanic",
+      "bug_id": 1,
+      "python_version": "3.8.3",
+      "buggy_commit": "e7001b00747b659f7042b0534802b936ee8a53e0",
+      "fixed_commit": "44973125c15304b4262c51c78b5a86bd1daafa86",
+      "test_file": "tests/test_blueprints.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-sanic-1",
+      "wave": 1,
+      "role": "pilot",
+      "notes": "Round-robin pass 1, sanic. First py3.8 bug in the project. Pilot #5, the last of the one-per-project pass."
+    },
+    {
+      "project": "scrapy",
+      "bug_id": 1,
+      "python_version": "3.8.3",
+      "buggy_commit": "c57512fa669e6f6b1b766a7639206a380f0d10ce",
+      "fixed_commit": "9d9dea0d69709ef0f7aef67ddba1bd7bda25d273",
+      "test_file": "tests/test_spidermiddleware_offsite.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-scrapy-1",
+      "wave": 1,
+      "role": "reserve",
+      "notes": "Round-robin pass 1, scrapy. Reserve #1: the substitution pool starts with another project's first bug, so promoting it keeps the dev set at five distinct projects."
+    },
+    {
+      "project": "spacy",
+      "bug_id": 4,
+      "python_version": "3.8.3",
+      "buggy_commit": "abd5c06374eab5db0cf897b73543b1f3eb007e12",
+      "fixed_commit": "9fa9d7f2cb52ce6a70c264d4e57c7f190d7686bf",
+      "test_file": "spacy/tests/regression/test_issue4665.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "spacy/tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "spacy/tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-spacy-4",
+      "wave": 1,
+      "role": "reserve",
+      "notes": "Round-robin pass 1, spacy. Reserve #2. spacy has exactly one py3.8 bug in the corpus, so this project cannot supply a second candidate."
+    },
+    {
+      "project": "fastapi",
+      "bug_id": 2,
+      "python_version": "3.8.3",
+      "buggy_commit": "210af1fd3dc0f612a08fa02a0cb3f5adb81e5bfb",
+      "fixed_commit": "02441ff0313d5b471b662293244c53e712f1243f",
+      "test_file": "tests/test_ws_router.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-fastapi-2",
+      "wave": 1,
+      "role": "reserve",
+      "notes": "Round-robin pass 2, fastapi. Reserve #3, the first second-bug depth: used if fastapi/1 fails a gate."
+    },
+    {
+      "project": "luigi",
+      "bug_id": 2,
+      "python_version": "3.8.3",
+      "buggy_commit": "baa54c9f4f809692d62d4c3e4497161717c76550",
+      "fixed_commit": "24e85945ae39e5975491527e00c3f0f64b42ea6e",
+      "test_file": "test/contrib/beam_dataflow_test.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "test"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "test",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-luigi-2",
+      "wave": 1,
+      "role": "reserve",
+      "notes": "Round-robin pass 2, luigi. Reserve #4. The test root is the project's ``test``, not the file's own ``test/contrib``."
+    },
+    {
+      "project": "matplotlib",
+      "bug_id": 2,
+      "python_version": "3.8.1",
+      "buggy_commit": "2a3707d9c3472b1a010492322b6946388d4989ae",
+      "fixed_commit": "d86cc2bab8183fd3288ed474e4dfd33e0f018908",
+      "test_file": "lib/matplotlib/tests/test_axes.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "lib/matplotlib/tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "lib/matplotlib/tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-matplotlib-2",
+      "wave": 1,
+      "role": "reserve",
+      "notes": "Round-robin pass 2, matplotlib. Reserve #5, the tenth candidate."
+    },
+    {
+      "project": "PySnooper",
+      "bug_id": 3,
+      "python_version": "3.8.1",
+      "buggy_commit": "6e3d797be3fa0a746fb5b1b7c7fea78eb926c208",
+      "fixed_commit": "15555ed760000b049aff8fecc79d29339c1224c3",
+      "test_file": "tests/test_pysnooper.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-PySnooper-3",
+      "wave": 1,
+      "role": "pilot",
+      "notes": "Seen during development. Items 1 and 2 of §14 were designed from this bug's round-4 false reject, so it is development data, not an evaluation bug: it is run here to check that a no-op still rejects via rule (b) and that the developer fix no longer false-rejects, and it is never reported as an evaluation result. The evaluation split records the same exclusion in its ``reviewed_changes``."
+    }
+  ]
+}

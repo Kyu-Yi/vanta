@@ -1746,24 +1746,39 @@ produced by a pipeline tuned on the bug it is measuring. The selection rule, rec
    is — in projects that appear in **no** wave of `plans/bugsinpy_split.json`, i.e. not
    `PySnooper`, `thefuck`, `httpie`, `cookiecutter`, `black`, `tqdm`, `youtube-dl`. Measured now:
    `fastapi` 16, `luigi` 33, `matplotlib` 30, `pandas` 169, `sanic` 5, `scrapy` 40, `spacy` 1 — 294 bugs.
-2. **Order.** The clone's own order: `runs/bugsinpy/bugsinpy/projects/` in directory order
-   (`ansible`, `keras`, `tornado` have no py3.8 bug and are skipped), then `bugs/<id>` ascending.
-   The first candidates are therefore `fastapi/1`, `fastapi/2`, …
-3. **Take the first 5** that pass (i) the §1.6 context gate and (ii) the §8.2 dev-fix self-check
-   (`bug_patch.txt`, test hunks dropped, grading `patch_good` against the oracle `prepare` just
-   derived). Both gates are the existing ones; neither is loosened, and no cap is raised.
-4. **If fewer than 5 pass**, the list extends mechanically to the next candidates in the same order.
+2. **Order — round-robin across projects, not down one project.** The projects are taken in the
+   clone's own order: `runs/bugsinpy/bugsinpy/projects/` in directory order, keeping only those with
+   a py3.8 bug, which gives `fastapi`, `luigi`, `matplotlib`, `pandas`, `sanic`, `scrapy`, `spacy`
+   (`ansible`, `keras` and `tornado` have no py3.8 bug; `PySnooper` and `black` are evaluation
+   projects). **One pass takes each project's next py3.8 bug in ascending id** —
+   `fastapi/1`, `luigi/1`, `matplotlib/1`, `pandas/1`, `sanic/1`, `scrapy/1`, `spacy/4` — and passes
+   repeat until the list is full. Flat directory order was rejected on inspection: it makes the
+   first ten candidates ten `fastapi` bugs, so the dev set would have been a single project and every
+   item would have been developed against one codebase's idioms.
+3. **Take the first bug in each project that passes both gates, until 5.** The gates are the existing
+   ones: (i) the §1.6 context gate and (ii) the §8.2 dev-fix self-check (`bug_patch.txt`, test hunks
+   dropped, grading `patch_good` against the oracle `prepare` just derived). Neither is loosened and
+   no cap is raised. **If a project has no bug that passes, it is skipped and the round-robin
+   continues** with the next project in order.
+4. **If fewer than 5 pass** after the authored list is exhausted, the list extends mechanically to the
+   next candidates in the same round-robin order.
 
 The file is `plans/bugsinpy_dev_split.json`: the same closed schema, a separate file, so the
 evaluation split is not rewritten (its `reviewed_changes` carries this rule and the per-candidate
-gate measurements, exactly as §8 records a substitution). The first **10** candidates in order are
-authored as entries, and the dev set is the first 5 of them that come out runnable; the others are
-recorded as measured-but-unused. Authoring 10 rather than exactly 5 is the one judgement here: the
-gates can only be evaluated by running them, and a shorter list risks a second prepare round.
+gate measurements, exactly as §8 records a substitution). The first **10** candidates in round-robin
+order are authored as entries — the first five as `pilot`, the rest as `reserve`. The pilots are one
+bug per project, so the authored pass already satisfies "one per project" before any gate is run; if a
+pilot fails a gate, the next reserve in file order is promoted (change its `role`, re-run `prepare`,
+§8), and that reserve is another project's first bug, so the dev set stays five distinct projects.
+The tenth entry buys the fallback depth: authoring 10 rather than exactly 5 is the one judgement here,
+because the gates can only be evaluated by running them and a shorter list risks a second prepare
+round.
 
 `PySnooper/3` also joins the dev set, labelled **"seen during development"**: items 1 and 2 were
-designed from its false reject, so it is development data now. It is never reported as an evaluation
-result, and the paper reports it as a development case.
+designed from its false reject, so it is development data now. It is entered in the dev split as an
+extra `pilot` carrying that label, and it is never reported as an evaluation result — the evaluation
+split records the exclusion in its own `reviewed_changes`, so a reader of either file sees the same
+decision. The paper reports it as a development case.
 
 ### 14.8 Tests
 
@@ -1791,8 +1806,9 @@ One per rule and per new parse, plus the regression that matters most:
   missing/duplicate index fails the batch; a failed batch falls back to the unbatched failure shape;
 - `metrics.py`'s two new buckets and `label_for`'s new branch, and that the wave gate ignores a
   `NeedsReview` row;
-- `plans/bugsinpy_dev_split.json` loads under `load_split` and shares no bug with the evaluation
-  split;
+- `plans/bugsinpy_dev_split.json` loads under `load_split`; the only bug it shares with the
+  evaluation split is `PySnooper/3`, and that entry says "seen during development" — every other dev
+  project is in no evaluation wave;
 - **the toy fixture, with all three flags on, still rejects the bad patch and approves the good one**
   (bad via rule (d), 6/6; good 3/3), which is the end-to-end guard that the corroboration rule did
   not go soft.

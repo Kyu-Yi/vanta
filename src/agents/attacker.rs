@@ -179,7 +179,7 @@ CRITICAL:
 - Every test must actually import and call the patched module's functions/classes. Do NOT mock away the code under test.
 - Do NOT import symbols that only exist in the PATCHED code. Use hasattr/getattr or try/except to detect new features safely on original code.
 - Use assertions (assert X == Y) so failures are clean, not crashes — EXCEPT when the ISSUE names the symptom the bug produces (a `NameError`, an exact message, a specific exception type): then the test must actually trigger THAT symptom, because the reported failure is what ties the test to the issue. An assertion on a neighbouring value still raises a bare AssertionError and never reproduces the symptom the issue describes.
-- Tests run with PYTHONPATH=src so `from heretic.modifier import X` works.
+- Tests run from the REPOSITORY ROOT, with the repo root and its `src/` directory already on `sys.path` (the harness writes a root `conftest.py` that inserts both). Import the package by its own top-level name; the `[IMPORT PATH HINT]` line in the ISSUE, when present, IS this repo's import path. Never assume an environment variable such as PYTHONPATH is set — it is not.
 - Expected values come from the ISSUE and the ORIGINAL code's existing behaviour, never from the patch alone.
 - BATE may run your test more than once against the ORIGINAL code. A test whose result changes between those runs — time.sleep, a timeout, randomness, network, iteration order, shared state — is flaky and will be scrapped. Keep every test deterministic.
 - Label a test BugReproduction or FeatureAcceptance only when you believe the issue asks for that behaviour AT THAT INPUT; if the issue does not ask for it, label it BehaviorPreservation. A patch-blind auditor checks that belief, not your quote — the quote is evidence for the reader.
@@ -188,7 +188,7 @@ CRITICAL:
 IMPORT RULES (violating these makes the test ERROR on collection — worse than failing):
 - Only import a name you can LITERALLY SEE defined in the ORIGINAL SOURCE above, and import it from the file where it is defined. Do NOT guess that a symbol lives in a module.
 - The ORIGINAL SOURCE may be a NARROWED excerpt of the repository (review mode shows the code the fix touches, not the whole tree). A name the excerpt does not show is UNKNOWN to you, not absent from the runtime: fetch it from the module object with getattr instead of concluding it does not exist or inventing the module it lives in.
-- When unsure, import the MODULE and access the attribute defensively, e.g. `import heretic.system as sysmod; fn = getattr(sysmod, "is_mps_available", None); assert fn is not None`. Never write `from m import name` for a name you have not seen defined.
+- When unsure, import the MODULE and access the attribute defensively, e.g. `import pkg.module as mod; fn = getattr(mod, "name", None); assert fn is not None`. Never write `from m import name` for a name you have not seen defined.
 - A test whose import raises is treated as an infra ERROR, not a clean failure — it is scrapped.
 
 NO-REIMPLEMENTATION RULE:
@@ -2211,6 +2211,53 @@ mod tests {
                 && ATTACKER_SYSTEM_PROMPT.contains("That source may be an excerpt (see IMPORT RULES)"),
             "the INTENT-vs-API rule must read the excerpt as unknown rather than absent"
         );
+    }
+
+    /// [VANTA-WHY] A17 (§14.10) — the Attacker prompt was written against one
+    /// repository. It stated "Tests run with PYTHONPATH=src so `from
+    /// heretic.modifier import X` works", and gave the defensive-import example
+    /// as `import heretic.system as sysmod; fn = getattr(sysmod,
+    /// "is_mps_available", None)`. Neither holds for a BugsInPy target: vanta sets
+    /// no PYTHONPATH at all — it writes a root `conftest.py` that puts the repo
+    /// root and `src/` on `sys.path`, and passes the real import path in the
+    /// issue's `[IMPORT PATH HINT]` — and `heretic` / `is_mps_available` exist
+    /// only in the repo the prompt was first written against. A model that trusts
+    /// the PYTHONPATH line writes imports that hold in exactly one repository; the
+    /// example invites the same. State the mechanism that actually runs the tests,
+    /// and keep the example neutral.
+    #[test]
+    fn the_import_path_rules_describe_this_harness_not_one_repository() {
+        assert!(
+            !ATTACKER_SYSTEM_PROMPT.contains("PYTHONPATH=src")
+                && !ATTACKER_SYSTEM_PROMPT.contains("Tests run with PYTHONPATH"),
+            "vanta sets no PYTHONPATH, so the claim is false on every target and would \
+             send the Attacker writing imports that hold in one repository only"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("Tests run from the REPOSITORY ROOT")
+                && ATTACKER_SYSTEM_PROMPT.contains("conftest.py")
+                && ATTACKER_SYSTEM_PROMPT
+                    .contains("Never assume an environment variable such as PYTHONPATH is set"),
+            "the rule must describe what the harness does instead"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT
+                .contains(r#"import pkg.module as mod; fn = getattr(mod, "name", None)"#),
+            "the defensive-import example must be project-neutral"
+        );
+        for prompt in [
+            ATTACKER_SYSTEM_PROMPT,
+            ATTACKER_REVISE_SYSTEM_PROMPT,
+            INTENT_AUDITOR_SYSTEM_PROMPT,
+            INTENT_AUDITOR_SYSTEM_PROMPT_GROUNDED,
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT,
+            INTENT_AUDITOR_BATCH_SYSTEM_PROMPT_GROUNDED,
+        ] {
+            assert!(
+                !prompt.contains("heretic") && !prompt.contains("is_mps_available"),
+                "no prompt may name a repository the run is not against"
+            );
+        }
     }
 
     /// [VANTA-WHY] A18 (§14.10) — the prompt opened by telling the Attacker to

@@ -59,7 +59,15 @@ use tracing::{debug, info, trace, warn};
 // `6.expected-on-a-correct-patch` tag for two different prompt texts. This tag
 // covers the current text; the content hash recorded beside it is what makes the
 // miss recoverable in the log rather than invisible.
-pub const ATTACKER_PROMPT_VERSION: &str = "7.priority-overlap-and-simplify-assertion";
+//
+// [VANTA-WHY] Bumped for §14.10 A21: the generate prompt gained a TERMINAL
+// FALLBACK after the leftover-slot default. That default ("an input where the
+// ORIGINAL source returns a DIFFERENT result than at the inputs you have already
+// tested") has no answer once every meaningful input is in the shared set, and a
+// round-3 reply on the toy looped 45 times on "Let me pick the three most valuable
+// tests" / "Both are shared" / "-1 is shared". The reworded line is part of the
+// prompt text, so the tag moves with it.
+pub const ATTACKER_PROMPT_VERSION: &str = "8.shared-band-terminal-fallback";
 
 // ============================================================================
 // INTENT_AUDITOR_PROMPT_VERSION — the run-identity tag for the intent check
@@ -246,6 +254,7 @@ BOUNDARY-PROBING RULE:
 
 Write exactly 3 tests, spending them in THIS order of priority: (1) the exact comparison the patch changes, at its boundary value; (2) the behaviour the issue's "must stay the same" clause names; (3) the code path the issue asks you to change. The three items are NOT exclusive: one test may satisfy several of them at once, and you count it once, against the highest item it satisfies — when a single boundary is both the comparison the patch changes and the code path the issue asks you to change, items (1) and (3) are the SAME test, not two, and there is no third thing to find for it. Label each one honestly: use BugReproduction or FeatureAcceptance only when the issue asks for that behaviour at the input you assert, otherwise use BehaviorPreservation.
 Once every comparison the patch changes and every behaviour the issue's "must stay the same" clause names are covered, spend each remaining slot on one more BehaviorPreservation probe: an input where the ORIGINAL source returns a DIFFERENT result than at the inputs you have already tested — the other side of an unchanged boundary, or the far end of a band. Take the FIRST such input you find and do not compare alternatives; when the issue names only one boundary, three BehaviorPreservation probes at three such inputs are a correct answer and you do not need a third kind of test.
+TERMINAL FALLBACK: when EVERY input the defaults above point to is already covered by an existing test, so nothing new is left to find, do NOT keep searching or comparing candidates — spend each remaining slot on one more input inside a band that is already covered (a midpoint of the band, or the value on the other side of a boundary you already probed), chosen on the spot without weighing alternatives. A repeat of an existing test is an ACCEPTABLE answer here: it is discarded automatically, so the round still has its three tests, while a round that keeps hunting for a novel input loses all of them.
 This order and these defaults are FINAL. Choose the three tests once, write them, and do not re-derive the plan or reconsider the priority while drafting: if you identified a case and did not spend a slot on it, name what you left uncovered and why at the end of its `reason`."#;
 
 // ============================================================================
@@ -2275,6 +2284,17 @@ mod tests {
     /// I keep coming back to the same thing". The default must name a concrete way to
     /// fill the slot (a BehaviorPreservation probe at an input the ORIGINAL source
     /// answers differently) and pick the first one, not weigh alternatives.
+    ///
+    /// [VANTA-WHY] A21 follow-up (§14.10) — that leftover-slot default is not
+    /// terminal. On the toy, a round-3 reply looped 45 times on the literal phrases
+    /// "Let me pick the three most valuable tests", "Both are shared" and "-1 is
+    /// shared": every meaningful input was already in the shared set from rounds 1
+    /// and 2, so "an input where the ORIGINAL source returns a DIFFERENT result than
+    /// at the inputs you have already tested" had no answer left, and the model kept
+    /// hunting for a novel input it could not find. The fallback must terminate the
+    /// search: an input inside a band that is ALREADY covered (a midpoint), chosen on
+    /// the spot, and a repeat of an existing test is an ACCEPTABLE answer because the
+    /// driver drops duplicates before BATE.
     #[test]
     fn the_prompt_says_the_priority_items_overlap_and_fills_a_leftover_slot() {
         assert!(
@@ -2295,6 +2315,14 @@ mod tests {
             ATTACKER_SYSTEM_PROMPT.contains("are FINAL")
                 && ATTACKER_SYSTEM_PROMPT.contains("do not re-derive the plan"),
             "the plan must be chosen once and not re-derived while drafting"
+        );
+        assert!(
+            ATTACKER_SYSTEM_PROMPT.contains("TERMINAL FALLBACK:")
+                && ATTACKER_SYSTEM_PROMPT.contains("already covered by an existing test")
+                && ATTACKER_SYSTEM_PROMPT
+                    .contains("A repeat of an existing test is an ACCEPTABLE answer here"),
+            "when every defaulted input is already covered the search must terminate on a \
+             repeated input inside a covered band, because duplicates are dropped"
         );
     }
 

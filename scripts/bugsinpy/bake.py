@@ -47,6 +47,7 @@ import ast
 import json
 import re
 import shlex
+import tomllib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
@@ -723,6 +724,272 @@ def import_name_of(setup_py: str) -> str:
         "setup.py declares neither name= nor a packages=[...] literal, so the "
         "import-path check cannot name the project's package; flag this bug "
         "(design §3.2)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# pyproject.toml, read statically — never executed (§3.2)
+# ---------------------------------------------------------------------------
+PYPROJECT_TEST_EXTRAS = ("test", "testing", "dev", "all")
+"""Extra names whose requirements count as declared test requirements (§3.2).
+
+[VANTA-WHY] ``setup.py``'s convention is a single ``tests`` extra; a
+``pyproject.toml`` project's is plural and inconsistent — flit projects write
+``test`` (fastapi's shape), poetry projects ``dev``, and many write ``all`` as the
+union. All four are read. Which ones were taken is recorded in the ref's ``source``
+and in a note, so "there are no test requirements" is never indistinguishable from
+"there was no extra by that name".
+"""
+
+
+def _pyproject_data(pyproject: str) -> dict[str, Any]:
+    """``pyproject.toml`` parsed as TOML — never executed (design C3).
+
+    [VANTA-WHY] TOML is data, not code, so a parser is safe here in a way ``ast`` is
+    for ``setup.py`` — the reason ``setup.py`` is walked rather than run does not
+    apply. Unparseable TOML is still a refusal rather than an empty read: a
+    half-read metadata file is how a missing dependency becomes a mystery.
+    """
+    try:
+        return tomllib.loads(pyproject)
+    except tomllib.TOMLDecodeError as exc:
+        raise BakeError(f"pyproject.toml does not parse as TOML: {exc}") from exc
+
+
+def _table(data: Mapping[str, Any], *path: str) -> Optional[dict[str, Any]]:
+    """The TOML table at ``path``, or ``None`` when any segment is absent/not one."""
+    node: Any = data
+    for segment in path:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(segment)
+    return node if isinstance(node, dict) else None
+
+
+def _toml_requirement_array(
+    value: Any, *, source: str, notes: list[str]
+) -> list[DepRef]:
+    """A PEP 621 / flit array of requirement strings → refs, exactly as written.
+
+    A non-string entry is recorded rather than dropped: a metadata shape this
+    harness does not read is a fact about the file, and silently skipping it would
+    read as a project that declares less than it does.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        notes.append(
+            f"{source}: expected an array of requirement strings, found "
+            f"{type(value).__name__}"
+        )
+        return []
+    refs: list[DepRef] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            notes.append(f"{source}: {entry!r} is not a requirement string; not read")
+            continue
+        text = entry.strip()
+        if not text or text.startswith("#"):
+            continue
+        refs.append(dep_ref(text, source))
+    return refs
+
+
+def _extras_of(
+    table: Mapping[str, Any], *, key: str, label: str, notes: list[str]
+) -> list[tuple[str, Any]]:
+    """``(extra name, its requirement array)`` from ``table[key]``, in file order."""
+    extras = table.get(key)
+    if extras is None:
+        return []
+    if not isinstance(extras, dict):
+        notes.append(
+            f"{label}: expected a table of extras, found {type(extras).__name__}"
+        )
+        return []
+    return [(str(name), value) for name, value in extras.items()]
+
+
+PEP440_OPERATORS = ("==", "!=", "<=", ">=", "<", ">", "~=")
+"""The spellings that mean the same thing in poetry as in PEP 440."""
+
+
+def _poetry_ref(
+    name: str, value: Any, *, source: str, notes: list[str]
+) -> Optional[DepRef]:
+    """One ``[tool.poetry.dependencies]`` entry → a ref, or ``None`` (noted).
+
+    [VANTA-WHY] Poetry's constraint syntax is not PEP 440: ``^2.22`` is a caret
+    range, ``~1.4`` a tilde range, ``1.4.*`` a wildcard. Translating a caret range
+    into bounds would mean reimplementing poetry's resolver in this harness, so only
+    the spellings that can be read *exactly* are taken — a bare version (whose poetry
+    meaning is ``==``), a PEP 440 specifier written as such, and ``*`` (no
+    constraint) — and everything else is recorded and skipped. A guessed bound is
+    worse than a recorded gap (§3.2), and the recorded gap names the entry.
+
+    A bare version is turned into ``==`` *after* the operator check, never before:
+    ``six1.12.0`` is a syntactically valid requirement name, so trying
+    ``f"{name}{text}"`` first would silently declare a package called ``six1.12.0``
+    instead of pinning ``six``.
+    """
+    if isinstance(value, dict):
+        value = value.get("version")
+    if value is None:
+        notes.append(f"{source}: names no version this harness can read; not read")
+        return None
+    if not isinstance(value, str):
+        notes.append(f"{source}: {value!r} is not a version string; not read")
+        return None
+    text = value.strip()
+    if text in ("", "*"):
+        return dep_ref(name, source)
+    if text.startswith(PEP440_OPERATORS):
+        return dep_ref(f"{name}{text}", source)
+    try:
+        Version(text)
+    except InvalidVersion:
+        notes.append(
+            f"{source}: {value!r} is a poetry constraint this harness does not "
+            "translate to PEP 440; not read"
+        )
+        return None
+    return dep_ref(f"{name}=={text}", source)
+
+
+def pyproject_refs(
+    pyproject: str,
+    notes: list[str],
+    *,
+    commit: Optional[str] = None,
+    commit_date: Optional[str] = None,
+    commit_label: str = "the buggy commit",
+) -> list[DepRef]:
+    """``pyproject.toml`` → the project's runtime deps plus its test requirements.
+
+    Sources 3 and 4 (§3.2) for a commit packaged with ``pyproject.toml`` instead of
+    ``setup.py`` — which is what ``fastapi/1`` is: a flit project with no
+    ``setup.py`` at ``766157bf``, so reading ``setup.py`` alone refused the bug.
+    Three spellings are read, all parsed and none executed:
+
+    * **PEP 621** — ``[project] dependencies`` and ``[project.optional-dependencies]``;
+    * **flit** — ``[tool.flit.metadata] requires`` and
+      ``[tool.flit.metadata]["requires-extra"]``;
+    * **poetry** — ``[tool.poetry.dependencies]``, when present (``python`` is
+      skipped: it names the interpreter, not a distribution).
+
+    A test extra (:data:`PYPROJECT_TEST_EXTRAS`) counts as a declared test
+    requirement the way ``setup.py``'s ``tests`` extra does, and the extra a
+    requirement came from is named in its ``source``. ``commit``/``commit_date``
+    stamp the refs with where they were read from, and ``commit_label`` says so in
+    the notes — the same contract as :func:`setup_py_refs`, because these refs go
+    through the same both-commits union and the same per-declaration date rule.
+    """
+    data = _pyproject_data(pyproject)
+    refs: list[DepRef] = []
+    extras_taken: list[str] = []
+
+    project = _table(data, "project")
+    if project is not None:
+        refs += _toml_requirement_array(
+            project.get("dependencies"),
+            source="project.dependencies (pyproject.toml)",
+            notes=notes,
+        )
+        for extra, entries in _extras_of(
+            project,
+            key="optional-dependencies",
+            label="project.optional-dependencies (pyproject.toml)",
+            notes=notes,
+        ):
+            source = f"project.optional-dependencies['{extra}'] (pyproject.toml)"
+            part = _toml_requirement_array(entries, source=source, notes=notes)
+            if extra in PYPROJECT_TEST_EXTRAS:
+                extras_taken.append(f"{extra} (PEP 621)")
+                if not part:
+                    notes.append(f"{source}: declares no requirements")
+            refs += part
+
+    flit = _table(data, "tool", "flit", "metadata")
+    if flit is not None:
+        refs += _toml_requirement_array(
+            flit.get("requires"),
+            source="tool.flit.metadata.requires (pyproject.toml)",
+            notes=notes,
+        )
+        for extra, entries in _extras_of(
+            flit,
+            key="requires-extra",
+            label="tool.flit.metadata.requires-extra (pyproject.toml)",
+            notes=notes,
+        ):
+            source = f"tool.flit.metadata.requires-extra['{extra}'] (pyproject.toml)"
+            part = _toml_requirement_array(entries, source=source, notes=notes)
+            if extra in PYPROJECT_TEST_EXTRAS:
+                extras_taken.append(f"{extra} (flit)")
+                if not part:
+                    notes.append(f"{source}: declares no requirements")
+            refs += part
+
+    poetry = _table(data, "tool", "poetry", "dependencies")
+    if poetry is not None:
+        for name in poetry:
+            if name == "python":
+                continue
+            ref = _poetry_ref(
+                str(name),
+                poetry[name],
+                source=f"tool.poetry.dependencies['{name}'] (pyproject.toml)",
+                notes=notes,
+            )
+            if ref is not None:
+                refs.append(ref)
+
+    if project is None and flit is None and poetry is None:
+        notes.append(
+            "pyproject.toml: none of [project], [tool.flit.metadata] or "
+            f"[tool.poetry.dependencies] is present at {commit_label}, so no "
+            "dependency is declared here"
+        )
+    if extras_taken:
+        notes.append("pyproject.toml: test extras taken: " + ", ".join(extras_taken))
+
+    return _stamped(refs, commit=commit, commit_date=commit_date)
+
+
+def import_name_of_pyproject(pyproject: str) -> str:
+    """The module the import-path check must load, named by ``pyproject.toml``.
+
+    The counterpart of :func:`import_name_of` for a commit with no ``setup.py``:
+    ``[project].name`` first (PEP 621's own field), then flit's
+    ``[tool.flit.metadata].module`` — the module flit actually builds, which is what
+    an import loads — then flit's ``.name``, then poetry's ``[tool.poetry].name``.
+    When none is there the bug is flagged rather than guessed at, for the same
+    reason a wrong ``setup.py`` name would be: the check would pass against the
+    wrong module.
+    """
+    data = _pyproject_data(pyproject)
+    project = _table(data, "project")
+    if project is not None:
+        name = project.get("name")
+        if isinstance(name, str) and name.strip():
+            return canonicalize_name(name.strip()).replace("-", "_")
+    flit = _table(data, "tool", "flit", "metadata")
+    if flit is not None:
+        module = flit.get("module")
+        if isinstance(module, str) and module.strip():
+            return module.strip().split(".")[0]
+        name = flit.get("name")
+        if isinstance(name, str) and name.strip():
+            return canonicalize_name(name.strip()).replace("-", "_")
+    poetry = _table(data, "tool", "poetry")
+    if poetry is not None:
+        name = poetry.get("name")
+        if isinstance(name, str) and name.strip():
+            return canonicalize_name(name.strip()).replace("-", "_")
+    raise BakeError(
+        "pyproject.toml declares no [project].name, no [tool.flit.metadata].module "
+        "and no [tool.poetry].name, so the import-path check cannot name the "
+        "project's package; flag this bug (design §3.2)"
     )
 
 
@@ -1612,34 +1879,58 @@ def bug_sources(
     if not setup_sh.strip():
         notes.append("setup.sh (BugsInPy): empty for this bug")
 
-    # The import name comes from the *buggy* ``setup.py``: that is the package under
-    # test, and the closure needs it to exclude the project's own modules.
-    buggy_setup = tree_mod.read_file_at(repo, buggy, "setup.py")
-    if buggy_setup is None:
+    # The import name comes from the *buggy* commit's own metadata — ``setup.py``
+    # or ``pyproject.toml``, whichever it carries: that is the package under test,
+    # and the closure needs it to exclude the project's own modules. A commit with
+    # neither is refused rather than guessed at (§3.2): the deps could be anywhere
+    # and the module name would be a guess.
+    read_buggy = partial(tree_mod.read_file_at, repo, buggy)
+    buggy_setup = read_buggy("setup.py")
+    buggy_pyproject = read_buggy("pyproject.toml")
+    if buggy_setup is None and buggy_pyproject is None:
         raise BakeError(
-            f"{project}/{bug_id}: no setup.py at {buggy}, so install_requires and the "
-            "declared test requirements cannot be read. Flag this bug rather than "
-            "guessing at its dependencies (design §3.2)."
+            f"{project}/{bug_id}: neither setup.py nor pyproject.toml at {buggy}, so "
+            "the declared dependencies and test requirements cannot be read. Flag "
+            "this bug rather than guessing at its dependencies (design §3.2)."
         )
-    import_name = import_name_of(buggy_setup)
+    import_name = (
+        import_name_of(buggy_setup)
+        if buggy_setup is not None
+        else import_name_of_pyproject(buggy_pyproject)
+    )
 
-    # 3 + 4. The project's own declarations, once per commit.
+    # 3 + 4. The project's own declarations, once per commit — from ``setup.py``,
+    # from ``pyproject.toml``, or from both if a commit carries both (a project
+    # mid-migration does, and reading only one would under-provision).
     for label, sha, date in (("buggy", buggy, buggy_date), ("fixed", fixed, fixed_date)):
         read_at = partial(tree_mod.read_file_at, repo, sha)
         setup_py = read_at("setup.py")
-        if setup_py is None:
-            notes.append(f"setup.py: not at the {label} commit ({sha[:12]})")
+        pyproject = read_at("pyproject.toml")
+        if setup_py is None and pyproject is None:
+            notes.append(
+                f"setup.py and pyproject.toml: neither at the {label} commit "
+                f"({sha[:12]})"
+            )
             continue
-        part, part_skipped = setup_py_refs(
-            setup_py,
-            read_at,
-            notes,
-            commit=sha,
-            commit_date=date,
-            commit_label=f"the {label} commit",
-        )
-        refs += part
-        skipped += part_skipped
+        if setup_py is not None:
+            part, part_skipped = setup_py_refs(
+                setup_py,
+                read_at,
+                notes,
+                commit=sha,
+                commit_date=date,
+                commit_label=f"the {label} commit",
+            )
+            refs += part
+            skipped += part_skipped
+        if pyproject is not None:
+            refs += pyproject_refs(
+                pyproject,
+                notes,
+                commit=sha,
+                commit_date=date,
+                commit_label=f"the {label} commit",
+            )
 
     # 5. The test side's own imports, at the fixed commit.
     closure_refs, optional, closure_notes = test_import_closure(

@@ -3294,6 +3294,176 @@ def setup_py_refs(setup_py: str, files: dict, notes: list) -> tuple:
     return bake_mod.setup_py_refs(setup_py, files.get, notes)
 
 
+class TestPyprojectStaticReader:
+    """``pyproject.toml`` is parsed as TOML and never executed (§3.2, C3).
+
+    ``fastapi/1`` is the measured case: at ``766157bf`` there is no ``setup.py`` at
+    all — it is a flit project — so a reader that only knew ``setup.py`` refused the
+    bug at ``bake`` before ``prepare`` ever ran. Each spelling below is one that
+    exists in the wild, and the test extras are the part of them that decides whether
+    a bug's own tests can run at all.
+    """
+
+    def test_pep621_project_dependencies_are_read_as_written(self):
+        refs = pyproject_refs(
+            "[project]\n"
+            'name = "demo"\n'
+            'dependencies = ["starlette >=0.13.2,<0.14.0", "pydantic >=1.0,<2.0.0"]\n',
+            [],
+        )
+        assert [ref.spec for ref in refs] == [
+            "starlette >=0.13.2,<0.14.0",
+            "pydantic >=1.0,<2.0.0",
+        ]
+        assert refs[0].source == "project.dependencies (pyproject.toml)"
+        assert refs[0].name == "starlette"
+
+    def test_a_pep621_test_extra_is_a_declared_test_requirement(self):
+        notes: list[str] = []
+        refs = pyproject_refs(
+            "[project]\n"
+            'name = "demo"\n'
+            'dependencies = ["six"]\n'
+            "[project.optional-dependencies]\n"
+            'test = ["python_toolbox>=0.9.3", "pytest>=4.4.1"]\n'
+            'doc = ["mkdocs"]\n',
+            notes,
+        )
+        assert {ref.name for ref in refs} == {"six", "python-toolbox", "pytest", "mkdocs"}
+        assert next(ref for ref in refs if ref.name == "python-toolbox").source == (
+            "project.optional-dependencies['test'] (pyproject.toml)"
+        )
+        assert "pyproject.toml: test extras taken: test (PEP 621)" in notes
+
+    def test_flit_requires_and_requires_extra_are_read(self):
+        """fastapi's own shape at ``766157bf``, quoted from that commit."""
+        notes: list[str] = []
+        refs = pyproject_refs(
+            "[tool.flit.metadata]\n"
+            'module = "fastapi"\n'
+            'requires = ["starlette ==0.13.2", "pydantic >=0.32.2,<2.0.0"]\n'
+            "[tool.flit.metadata.requires-extra]\n"
+            'test = ["requests", "pytest"]\n'
+            'doc = ["mkdocs"]\n',
+            notes,
+        )
+        assert [ref.spec for ref in refs] == [
+            "starlette ==0.13.2",
+            "pydantic >=0.32.2,<2.0.0",
+            "requests",
+            "pytest",
+            "mkdocs",
+        ]
+        assert refs[2].source == "tool.flit.metadata.requires-extra['test'] (pyproject.toml)"
+        assert "pyproject.toml: test extras taken: test (flit)" in notes
+
+    def test_every_test_extra_name_is_taken_and_the_ones_taken_are_recorded(self):
+        """``test``/``testing``/``dev``/``all`` are the conventions; ``doc`` is not one."""
+        notes: list[str] = []
+        refs = pyproject_refs(
+            "[project]\n"
+            'name = "demo"\n'
+            "[project.optional-dependencies]\n"
+            'test = ["six>=1.12.0"]\n'
+            'testing = ["decorator>=4.3.0"]\n'
+            'dev = ["future>=0.15.0"]\n'
+            'all = ["requests>=2.0"]\n'
+            'doc = ["mkdocs>=1.0"]\n',
+            notes,
+        )
+        assert [ref.source for ref in refs] == [
+            f"project.optional-dependencies['{extra}'] (pyproject.toml)"
+            for extra in ("test", "testing", "dev", "all", "doc")
+        ]
+        assert notes == [
+            "pyproject.toml: test extras taken: test (PEP 621), testing (PEP 621), "
+            "dev (PEP 621), all (PEP 621)"
+        ], "every extra that counts as a test requirement is named in the record"
+
+    def test_poetry_dependencies_are_read_where_the_spelling_is_pep440(self):
+        notes: list[str] = []
+        refs = pyproject_refs(
+            "[tool.poetry.dependencies]\n"
+            'python = "^3.8"\n'
+            'six = "1.12.0"\n'
+            'attrs = ">=19.3.0"\n'
+            'anything = "*"\n',
+            notes,
+        )
+        assert [ref.spec for ref in refs] == ["six==1.12.0", "attrs>=19.3.0", "anything"]
+        assert not any(ref.name == "python" for ref in refs), (
+            "``python`` names the interpreter, not a distribution"
+        )
+        assert refs[0].source == "tool.poetry.dependencies['six'] (pyproject.toml)"
+        assert notes == []
+
+    def test_a_bare_poetry_version_is_a_pin_not_a_package_named_after_itself(self):
+        """``six1.12.0`` parses as a requirement name, so the operator check comes first."""
+        refs = pyproject_refs('[tool.poetry.dependencies]\nsix = "1.12.0"\n', [])
+        assert [ref.name for ref in refs] == ["six"]
+        assert refs[0].spec == "six==1.12.0"
+
+    def test_a_poetry_constraint_this_harness_cannot_read_is_recorded_not_guessed(self):
+        """``^2.22`` is a caret range: translating it would be guessing at bounds."""
+        notes: list[str] = []
+        refs = pyproject_refs('[tool.poetry.dependencies]\nrequests = "^2.22"\n', notes)
+        assert refs == []
+        assert notes == [
+            "tool.poetry.dependencies['requests'] (pyproject.toml): '^2.22' is a "
+            "poetry constraint this harness does not translate to PEP 440; not read"
+        ]
+
+    def test_a_pyproject_with_none_of_the_three_tables_declares_nothing_and_says_so(self):
+        notes: list[str] = []
+        refs = pyproject_refs('[build-system]\nrequires = ["flit_core"]\n', notes)
+        assert refs == [], "``flit_core`` is the build backend, not a runtime dependency"
+        assert notes == [
+            "pyproject.toml: none of [project], [tool.flit.metadata] or "
+            "[tool.poetry.dependencies] is present at the buggy commit, so no "
+            "dependency is declared here"
+        ]
+
+    def test_a_pyproject_that_is_not_toml_is_a_refusal_never_an_empty_read(self):
+        with pytest.raises(bake_mod.BakeError, match="does not parse as TOML"):
+            bake_mod.pyproject_refs("[project\nname = 'demo'\n", [])
+
+    def test_refs_are_stamped_with_the_commit_they_were_read_from(self):
+        refs = bake_mod.pyproject_refs(
+            '[project]\nname = "demo"\ndependencies = ["six"]\n',
+            [],
+            commit="f" * 40,
+            commit_date="2019-07-30",
+            commit_label="the fixed commit",
+        )
+        assert refs[0].commit == "f" * 40
+        assert refs[0].commit_date == "2019-07-30"
+
+    def test_import_name_comes_from_the_project_name_first(self):
+        assert bake_mod.import_name_of_pyproject('[project]\nname = "FastAPI"\n') == "fastapi"
+
+    def test_import_name_falls_back_to_flit_module_then_flit_name_then_poetry(self):
+        assert (
+            bake_mod.import_name_of_pyproject('[tool.flit.metadata]\nmodule = "fastapi"\n')
+            == "fastapi"
+        )
+        assert (
+            bake_mod.import_name_of_pyproject(
+                '[tool.flit.metadata]\nname = "python-toolbox"\n'
+            )
+            == "python_toolbox"
+        )
+        assert bake_mod.import_name_of_pyproject('[tool.poetry]\nname = "fastapi"\n') == "fastapi"
+
+    def test_import_name_that_cannot_be_read_is_flagged_not_guessed(self):
+        with pytest.raises(bake_mod.BakeError, match=r"no \[project\]\.name"):
+            bake_mod.import_name_of_pyproject('[build-system]\nrequires = ["flit_core"]\n')
+
+
+def pyproject_refs(pyproject: str, notes: list) -> list:
+    """``bake_mod.pyproject_refs`` with no commit stamping — a pure parse."""
+    return bake_mod.pyproject_refs(pyproject, notes)
+
+
 class TestResolvePinsByDate:
     """Pin by release date, with the dates passed in — no network in a test."""
 
@@ -3707,6 +3877,153 @@ class TestUnionAcrossCommits:
         )
         assert dep.pin == "decorator==4.4.1"
         assert dep.fixed is True
+
+
+def fake_clone(monkeypatch, *, files: dict, dates: dict, requirements="", setup_sh="") -> None:
+    """Point ``bug_sources`` at a dict-backed clone: ``(commit, path) -> text``.
+
+    A real clone lives under ``runs/``, which is not committed, and what these tests
+    measure is the *wiring* — which commit's file is read, and that both are — not
+    git. Nothing is executed: handing back the text is the whole of the clone.
+    """
+    monkeypatch.setattr(
+        bake_mod.tree_mod,
+        "read_file_at",
+        lambda repo, commit, path: files.get((commit, path)),
+    )
+    monkeypatch.setattr(
+        bake_mod.tree_mod, "commit_date", lambda repo, commit: dates[commit]
+    )
+    monkeypatch.setattr(
+        bake_mod, "requirements_for", lambda root, project, bug_id: requirements
+    )
+    monkeypatch.setattr(bake_mod, "setup_sh_for", lambda root, project, bug_id: setup_sh)
+    monkeypatch.setattr(bake_mod, "test_side_paths", lambda repo, commit: [])
+    monkeypatch.setattr(bake_mod, "test_import_closure", lambda **kwargs: ([], [], []))
+
+
+class TestPyprojectAcrossCommits:
+    """A ``pyproject.toml`` bug is read at both commits and unioned like any other.
+
+    [VANTA-WHY] ``fastapi/1``'s refusal was not a missing file but a missing reader:
+    the file was there, at both commits, and §3.2's union rule applies to it exactly
+    as it does to ``setup.py``. A pyproject-only reader that stopped at the buggy
+    commit would under-provision the graded tree, which is a mixture of the two
+    (§1.2) — and the *fix* is where a requirement the bug's own tests need tends to
+    be declared.
+    """
+
+    BUGGY = "b" * 40
+    FIXED = "f" * 40
+    BUGGY_DATE = "2019-04-22"
+    FIXED_DATE = "2019-07-30"
+
+    BUGGY_TOML = (
+        "[tool.flit.metadata]\n"
+        'module = "demo"\n'
+        'requires = ["decorator >=4.3.0"]\n'
+        "[tool.flit.metadata.requires-extra]\n"
+        'test = ["requests"]\n'
+    )
+    FIXED_TOML = (
+        "[tool.flit.metadata]\n"
+        'module = "demo"\n'
+        'requires = ["decorator >=4.3.0", "six >=1.12.0"]\n'
+        "[tool.flit.metadata.requires-extra]\n"
+        'test = ["responses"]\n'
+    )
+    RELEASES = {
+        "decorator": {"4.3.0": "2018-02-03", "4.4.0": "2019-03-16", "4.4.1": "2019-06-01"},
+        "six": {"1.12.0": "2018-12-10"},
+        "requests": {"2.21.0": "2019-01-01"},
+        "responses": {"0.10.6": "2019-05-21"},
+    }
+
+    def _sources(self, monkeypatch, *, buggy_toml=None, fixed_toml=None, setup=None):
+        files = {}
+        if buggy_toml is not None:
+            files[(self.BUGGY, "pyproject.toml")] = buggy_toml
+        if fixed_toml is not None:
+            files[(self.FIXED, "pyproject.toml")] = fixed_toml
+        if setup is not None:
+            files[(self.BUGGY, "setup.py")] = setup
+        fake_clone(
+            monkeypatch,
+            files=files,
+            dates={self.BUGGY: self.BUGGY_DATE, self.FIXED: self.FIXED_DATE},
+        )
+        return bake_mod.bug_sources(
+            bug_entry(checkpoint="vanta-bi-Demo-1"),
+            bugsinpy_root=Path("/nonexistent"),
+            repo=Path("/nonexistent"),
+        )
+
+    def _resolved(self, sources) -> dict:
+        resolved = bake_mod.resolve_deps(
+            sources, releases=self.RELEASES, harness_pins={}
+        )
+        return {dep.name: dep for dep in resolved}
+
+    def test_a_pyproject_only_bug_is_read_rather_than_refused(self, monkeypatch):
+        sources = self._sources(
+            monkeypatch, buggy_toml=self.BUGGY_TOML, fixed_toml=self.FIXED_TOML
+        )
+        assert sources.import_name == "demo"
+        assert {ref.name for ref in sources.refs} == {
+            "decorator",
+            "six",
+            "requests",
+            "responses",
+        }
+
+    def test_both_commits_are_read_and_each_ref_carries_its_own_commit(self, monkeypatch):
+        sources = self._sources(
+            monkeypatch, buggy_toml=self.BUGGY_TOML, fixed_toml=self.FIXED_TOML
+        )
+        by_name = {ref.name: ref for ref in sources.refs}
+        assert by_name["requests"].commit == self.BUGGY
+        assert by_name["requests"].commit_date == self.BUGGY_DATE
+        assert by_name["responses"].commit == self.FIXED
+        assert by_name["responses"].commit_date == self.FIXED_DATE
+
+    def test_each_ref_is_pinned_by_the_date_of_the_commit_that_declared_it(self, monkeypatch):
+        """One resolve, two cutoffs — and the fix's own declaration is reachable."""
+        sources = self._sources(
+            monkeypatch, buggy_toml=self.BUGGY_TOML, fixed_toml=self.FIXED_TOML
+        )
+        by_name = self._resolved(sources)
+        assert by_name["decorator"].pin == "decorator==4.4.0"
+        assert by_name["decorator"].pin_rule == (
+            "the newest release on or before the buggy commit's date"
+        )
+        assert by_name["six"].pin == "six==1.12.0"
+        assert by_name["six"].pin_rule == (
+            "the newest release on or before the fixed commit's date"
+        )
+        assert by_name["responses"].pin == "responses==0.10.6", (
+            "declared only by the fix, and released after the buggy commit's date: "
+            "reading the fix is what makes it reachable at all"
+        )
+
+    def test_a_commit_with_neither_file_keeps_todays_refusal(self, monkeypatch):
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._sources(monkeypatch)
+        message = str(excinfo.value)
+        assert "neither setup.py nor pyproject.toml" in message
+        assert "Flag this bug rather than guessing" in message
+
+    def test_a_commit_carrying_both_files_has_both_read(self, monkeypatch):
+        """A project mid-migration declares in both; reading one would under-provision."""
+        sources = self._sources(
+            monkeypatch,
+            buggy_toml='[project]\nname = "demo"\ndependencies = ["future"]\n',
+            fixed_toml='[project]\nname = "demo"\ndependencies = ["future"]\n',
+            setup="setup(name='Demo', install_requires=['six>=1.12.0'])\n",
+        )
+        by_name = {ref.name: ref for ref in sources.refs}
+        assert by_name["six"].source == "install_requires (setup.py) line 1"
+        assert by_name["future"].source == "project.dependencies (pyproject.toml)"
+        assert sources.import_name == "demo"
 
 
 class TestTestImportClosure:

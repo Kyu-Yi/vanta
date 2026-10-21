@@ -1499,13 +1499,14 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
 
 ## 13. Future work (not in this pilot)
 
-- **Batch the intent audits.** In the first full wave-1 run `intent_audit` was **60 of 88** LLM calls
-  (the rest: `creator` 6, `attacker_generate` 19, `attacker_revise` 3), so auditing each generated
-  test on its own dominates the cost of a round. Auditing a round's intents in one call — one prompt
-  carrying every generated test and its claimed intent, one decision returned per test — keeps the
-  per-test decision while cutting the call count, and is the next speed item. It is not done here
-  because it changes the auditor's call schedule, and the schedule is part of the run identity
-  (§4.3): a re-batched auditor is a different run, not a faster one.
+- **Batch the intent audits** — now scheduled behind `VANTA_BATCH_AUDIT` (§14.5). In the first full
+  wave-1 run `intent_audit` was **60 of 88** LLM calls (the rest: `creator` 6, `attacker_generate`
+  19, `attacker_revise` 3), so auditing each generated test on its own dominates the cost of a
+  round. Auditing a round's intents in one call — one prompt carrying every generated test and its
+  claimed intent, one decision returned per test — keeps the per-test decision while cutting the
+  call count. It stays off by default because it changes the auditor's call schedule, and the
+  schedule is part of the run identity (§4.3): a re-batched auditor is a different run, not a
+  faster one.
 - **Real issue text from the upstream issue a bug cites.** Vanta's issue text is *derived from the fix
   commit* (§2.3), and for PySnooper/2 the derived text was `Support single tuple to , fix #144` plus a
   single generic sentence — too thin for the Attacker to write even one reproduction test, which is
@@ -1524,3 +1525,278 @@ Reordered after review: `final.patch` is now **step 1**, because the oracle is u
   what the pilot measures and it is future work; it is to be developed and validated on heretic and
   the toy fixtures — **not** on a BugsInPy row, since tuning the pipeline on the benchmark it is
   measured against would invalidate the measurement.
+
+---
+
+## 14. Corroborated rejection, grounded assertions, batched audits, and the development split
+
+§12.3 recorded that the first wave-1 run false-rejected PySnooper/3's developer fix. After the two
+grader defects of §12.3 were fixed, wave 1 was re-run on the fixed harness
+(`runs/bugsinpy/prepare-wave1-4/run_digest.md`), and the rows that matter are now:
+
+```
+baseline  review  false_approval=1 true_approval=1
+vanta     review  false_reject=1  true_reject=1
+```
+
+The no-op is rejected for the right reason — its `BugReproduction` test fails with the `NameError`
+the issue names — and the developer fix is **still** rejected, by one Attacker-authored test that
+asserts `'Starting var' in <snoop file>`, a string `tracer.py:170` never emits on any tree, so the
+assertion cannot distinguish a fixed tree from a buggy one. That is the case this section exists
+for. No prompt can guarantee an LLM writes a correct test; what can be made robust is the verdict
+built on top of it.
+
+The idea is **corroboration**: a rejection is a claim about the *patch*, so it needs evidence that
+survives the possibility that the test itself is wrong. A single uncorroborated failure stops being
+a rejection and becomes "a human should look at this".
+
+### 14.1 Shape of the change
+
+Three env flags, **all default off**, so every run reported above — and every evaluation wave —
+keeps v0.2's behaviour until they are flipped:
+
+| Flag | Stage | Effect |
+|---|---|---|
+| `VANTA_CORROBORATE=on` | review mode only | a rejection requires a rule from §14.2; otherwise a failing-but-uncorroborated candidate ends in the new `NeedsReview` (§14.3) |
+| `VANTA_GROUNDED_AUDIT=on` | intent auditor | the auditor also asks whether a test's assertions are grounded in the issue text (§14.4) |
+| `VANTA_BATCH_AUDIT=on` | intent auditor | one audit call per round instead of one call per test (§14.5) |
+
+Nothing in ECR/EIR, the Gatekeeper, the sampling schedule (§4.3) or the exit-code meanings of 0/1/2
+changes. The three flags are recorded in `run.summary` (§14.3) because a flagged run is a different
+run and the rows have to be attributable.
+
+### 14.2 What corroborates a rejection
+
+In **review** mode a candidate is `Rejected` only if at least one rule holds. Every rule is a pure
+function of evidence the run already has (`TestEvidence`: `test_name`, `outcome`, `failure_class`,
+`intent`, the Diagnostician's `structured_payload`), so it is unit-testable without an LLM, next to
+`route_intent`:
+
+| Rule | Evidence | Why it is strong |
+|---|---|---|
+| **(a)** native-suite regression | the native suite fails on the patched tree where it passed on the original | the project's own tests, not a Vanta-authored one |
+| **(b)** symptom match | a BATE-validated `BugReproduction` failure on the patched tree whose `exception_type` is one the **issue text names** | the issue's own symptom, reproduced; the failure discriminates *and* says the right thing |
+| **(c)** two distinct corroborating tests | ≥2 BATE-validated generated tests that fail as `Logic` on the patched tree, distinct by (attempt, test_name), counting different rounds and different intents | one wrong test cannot manufacture two independent ones |
+| **(d)** a validated `BugReproduction`/`FeatureAcceptance` failure | one BATE-validated BR/FA test failing as `Logic`, **provided the auditor did not answer `issue_requires_change = true` for it** | a BR/FA test passes on the original and fails on the patch, so the patch is what moved it — the opposite of a wrong test |
+| **(e)** a new static finding | ruff/mypy findings in a file the patch touched (review mode only) | deterministic tool output, not model-authored — see the deviation note below |
+
+**Rule (b) is mechanical, not semantic.** The issue's named symptoms are the exception-class tokens
+in the issue text, extracted with the harness's own expression
+(`\b([A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning))\b`, §2.2's `failure_kinds_from_report`), and
+compared for equality with the failing evidence's `exception_type`. Vanta's issue text already
+carries them: the behavioural line is built from the failure kind, so PySnooper/3's text says
+`(NameError)`. If the issue names no such token, rule (b) **cannot** fire — an issue with no named
+symptom cannot corroborate an exception, which is the honest direction.
+
+**The (d) caveat is a downgrade, not a second gate.** A `BehaviorPreservation` probe that asserts
+the behaviour the issue says must *change* is broken by a correct fix, so its failure is not
+evidence against the patch. The intent auditor already answers that question
+(`issue_requires_change`), so rule (d) reads the auditor's answer: `true` downgrades that failure to
+weak. This is the toy fixture's shape — its bad patch breaks exactly one probe,
+`test_shipping_band_500_stays_standard`, whose audit says
+`{"issue_asks_for_behaviour": false, "issue_requires_change": false, "reason": "…the original
+already returns 'standard' for 500, so no change is required at this input."}` — so (d) fires there
+and the toy still rejects bad.
+
+**A weak failure** is any `Logic` failure no rule covers: a validated BP/FA failure the auditor
+flagged `issue_requires_change = true`, or any other non-infrastructure failure. `Infrastructure`
+is never a finding (unchanged), so an all-infrastructure round stays `Inconclusive`.
+
+**Deviation to confirm:** rule (e) is not in the enumeration this section was written from (which
+named a/b/c/d). It is kept because corroboration is about *model-authored* evidence — a ruff/mypy
+finding in a line the patch touched is deterministic — and dropping it would turn today's
+static-only rejections into `NeedsReview`, i.e. quietly loosen a signal nobody asked to loosen.
+Say the word and static findings move into the weak bucket instead.
+
+### 14.3 `NeedsReview`
+
+New `GovernorDecision::NeedsReview`, reachable only in review mode with `VANTA_CORROBORATE=on`:
+
+- it is **not** an approval. The Gatekeeper still approves only on `AllTestsPassed`, so nothing in
+  this path can ever produce an approval. `metrics.py`'s approval buckets cannot be inflated by it;
+- it is a **terminal** decision, taken when the attempt budget is exhausted, no rule fired, and at
+  least one weak failure exists. While attempts remain the run keeps attacking (so rule (c)'s
+  "different rounds" is reachable rather than tautological);
+- it gets **exit code 3** in `vanta_m3` (`0` approved, `1` any other negative verdict, `2`
+  infrastructure failure). A harness driving the binary must be able to tell "a human should look"
+  from "no";
+- `run.summary` gains, in the existing key=value form:
+
+```
+corroborate=on|off grounded_audit=on|off batch_audit=on|off
+deciding_rule=<a|b|c|d|e|none> deciding_evidence=<test_name>@<attempt>[,<test_name>@<attempt>…]
+needs_review_weak=<test_name>=<FailureClass>/<Intent>[@<attempt>][,…]
+```
+
+  `deciding_rule` is the first rule that fired in a/b/c/d/e order and `deciding_evidence` the
+  evidence that fired it, so a rejected row says *why*; `needs_review_weak` lists the weak failures
+  that triggered a `NeedsReview`. Both are empty/`none` when the flag is off, which keeps every
+  pre-existing row byte-comparable.
+
+**Repair mode is unchanged, deliberately.** Should the same rule apply to feedback? In repair the
+corroboration rule belongs on the *message*, not on the decision: telling the Creator "your patch is
+wrong because a single uncorroborated test failed" is the repair-mode version of the same mistake,
+and the honest fix would be to qualify that feedback. It is not implemented here — repair's
+feedback text is the Attacker's prompt surface, and this section is not allowed to touch it. It is
+recorded as the next step if repair ever false-rejects a good patch on one bad test.
+
+### 14.4 `VANTA_GROUNDED_AUDIT` — the auditor's third question
+
+The auditor already reads the issue, the original source and one test, patch-blind. With the flag on
+it answers one more question, and a `BugReproduction` test whose assertions are **not** grounded in
+the issue text is scrapped exactly as a BATE mismatch is: dropped from the round, logged with
+`scrapped = true` and its reason, and — when no test survives — the Attacker is asked to revise.
+This is the change that would have stopped PySnooper/3's `'Starting var' in content` test at the
+audit instead of letting it reject the fix.
+
+The change is a *variant* of the existing prompt, not a replacement: with the flag off the system
+prompt, the user prompt and the request body are byte-identical to today, because prompt identity is
+part of run identity (`intent_audit` is one of the §4.3 call sites).
+
+System prompt, appended after the existing rules (flag on):
+
+```
+3. "assertions_grounded": does this test assert ONLY behaviour the ISSUE describes, at the input the ISSUE names — or does it also pin a SPECIFIC VALUE the issue never states?
+
+Rules for question 3:
+- Grounded: an assertion that follows from the issue's own words about the input it names ("it should not raise", "the file is written", "the boundary value returns the standard band").
+- Ungrounded: an assertion that pins wording, an exact output string, an exact message, a format or a number the issue never mentions ("the output CONTAINS 'Starting var'", "the repr is exactly ...", "the log line begins with a timestamp").
+- The issue is the only source of requirements. "It should not raise NameError" is grounded; "it should print exactly this string" is grounded only if the issue prints that string.
+- A test may assert more than the issue asks about ONLY when the extra assertion is a direct consequence of what the issue requires. Invented specifics are ungrounded.
+- Answer this for every test you are given, whatever its declared intent.
+```
+
+The JSON contract becomes:
+
+```
+{"issue_asks_for_behaviour": true|false, "issue_requires_change": true|false, "assertions_grounded": true|false, "reason": "one short sentence"}
+```
+
+and the typed answer gains `assertions_grounded: Option<bool>` (`None` = the flag was off, or the
+model omitted it). The user prompt's closing question and the re-prompt line are extended the same
+way. Routing: `assertions_grounded == Some(false)` on a `BugReproduction` test maps to a new
+`IntentRouting::ScrapUngrounded`, checked **before** the existing arms; every other intent keeps its
+current routing, and a missing field can never scrap anything. Scrapping a test can only ever remove
+a rejection signal, never create one.
+
+### 14.5 `VANTA_BATCH_AUDIT` — one audit call per round
+
+`intent_audit` was **60 of 88** LLM calls in the first wave-1 run. With the flag on, a round's tests
+are audited in **one** call: one prompt carrying the issue, the original source and the round's
+tests, each numbered, whose structured answer carries one entry per test with the same per-test
+schema as §14.4:
+
+```
+{"tests": [
+  {"index": 1, "issue_asks_for_behaviour": true|false, "issue_requires_change": true|false,
+   "assertions_grounded": true|false, "reason": "one short sentence"},
+  …
+]}
+```
+
+Contract:
+
+- `index` is the 1-based number the prompt printed for the test. Every index must appear exactly
+  once; an unknown index, a duplicate or a missing one is a **parse failure of the whole batch
+  response** (retried like any other malformed structured output);
+- if the call finally fails, every test in the round falls back to the single-call path's failure
+  behaviour — `issue_asks_for_behaviour = false`, `issue_requires_change = None`, audit record with
+  the error in its reason. So a broken auditor still cannot manufacture a rejection;
+- the per-test decision, the relabel, the scrap and the `IntentCheckRecord` are computed by the same
+  `route_intent` and the same record construction as the unbatched path; only the transport changes.
+  A test asserts that the batched and unbatched paths produce the same per-test decisions and the
+  same record shape on the same input;
+- round order is preserved (the records come out in the order the tests went in), so the session log
+  is a permutation-free view of the unbatched one;
+- the flag is **off** by default precisely because the call schedule is part of a run's identity
+  (§13), so a re-batched auditor is a different run, not a faster one.
+
+### 14.6 Metrics and labels for `NeedsReview`
+
+The harness has to be able to score the new outcome without inventing an approval or a rejection:
+
+- `runner.py`'s `label_for`: `NeedsReview` with `apply_ok = false` → `unobservable` (unchanged
+  rule), otherwise `needs_review_on_good` when the oracle says the candidate was `patch_good`, and
+  `needs_review_on_bad` otherwise. The oracle is derived in `prepare`, so a review row always has
+  its label;
+- `runner.py`'s `wave_gate_failures` must **not** count a `NeedsReview` row as a failure: it is a
+  refusal to decide, not a wrong decision, and a wave gate that failed on it would stop a wave for
+  behaving exactly as designed;
+- `metrics.py` gains two buckets, `needs_review_on_good` and `needs_review_on_bad`, plus
+  `needs_review_unlabeled` for the case where no label was supplied, so the outcome is never folded
+  into an approval, a rejection, `unresolved` or `undetermined`. The wave digest prints them next to
+  the approval/rejection counts.
+
+### 14.7 The development split
+
+Items 1–3 are developed on bugs that are **not** in any evaluation wave, so no evaluation number is
+produced by a pipeline tuned on the bug it is measuring. The selection rule, recorded here and in
+`plans/bugsinpy_dev_split.json` **before** any Vanta result is looked at:
+
+1. **Pool.** BugsInPy bugs whose `python_version` is 3.8 — the version the py3.8 checkpoint actually
+   is — in projects that appear in **no** wave of `plans/bugsinpy_split.json`, i.e. not
+   `PySnooper`, `thefuck`, `httpie`, `cookiecutter`, `black`, `tqdm`, `youtube-dl`. Measured now:
+   `fastapi` 16, `luigi` 33, `matplotlib` 30, `pandas` 169, `sanic` 5, `scrapy` 40, `spacy` 1 — 294 bugs.
+2. **Order.** The clone's own order: `runs/bugsinpy/bugsinpy/projects/` in directory order
+   (`ansible`, `keras`, `tornado` have no py3.8 bug and are skipped), then `bugs/<id>` ascending.
+   The first candidates are therefore `fastapi/1`, `fastapi/2`, …
+3. **Take the first 5** that pass (i) the §1.6 context gate and (ii) the §8.2 dev-fix self-check
+   (`bug_patch.txt`, test hunks dropped, grading `patch_good` against the oracle `prepare` just
+   derived). Both gates are the existing ones; neither is loosened, and no cap is raised.
+4. **If fewer than 5 pass**, the list extends mechanically to the next candidates in the same order.
+
+The file is `plans/bugsinpy_dev_split.json`: the same closed schema, a separate file, so the
+evaluation split is not rewritten (its `reviewed_changes` carries this rule and the per-candidate
+gate measurements, exactly as §8 records a substitution). The first **10** candidates in order are
+authored as entries, and the dev set is the first 5 of them that come out runnable; the others are
+recorded as measured-but-unused. Authoring 10 rather than exactly 5 is the one judgement here: the
+gates can only be evaluated by running them, and a shorter list risks a second prepare round.
+
+`PySnooper/3` also joins the dev set, labelled **"seen during development"**: items 1 and 2 were
+designed from its false reject, so it is development data now. It is never reported as an evaluation
+result, and the paper reports it as a development case.
+
+### 14.8 Tests
+
+One per rule and per new parse, plus the regression that matters most:
+
+- rules (a), (b), (c), (d) and (e) each fire on their own evidence — including (b) *not* firing when
+  the issue names no symptom, and (b) not firing on a mismatch
+  (`NameError` in the issue vs `AssertionError` in the evidence, which is the PySnooper/3 shape);
+- the (d) downgrade: a validated BP failure with `issue_requires_change = true` is weak, and the same
+  failure with `false` is strong (the toy's two shapes);
+- `NeedsReview` is terminal, is not an approval, and carries exit code 3; with the flag off none of
+  the above can be reached;
+- symptom extraction and matching from issue text; `run.summary`'s `deciding_rule` /
+  `needs_review_weak` fields;
+- the grounded-audit parse (`assertions_grounded` present, absent, and false) and the
+  `ScrapUngrounded` routing, including that a missing field never scraps;
+- the batched-audit schema: batched vs unbatched give the same per-test decisions and records; a
+  missing/duplicate index fails the batch; a failed batch falls back to the unbatched failure shape;
+- `metrics.py`'s two new buckets and `label_for`'s new branch, and that the wave gate ignores a
+  `NeedsReview` row;
+- `plans/bugsinpy_dev_split.json` loads under `load_split` and shares no bug with the evaluation
+  split;
+- **the toy fixture, with all three flags on, still rejects the bad patch and approves the good one**
+  (bad via rule (d), 6/6; good 3/3), which is the end-to-end guard that the corroboration rule did
+  not go soft.
+
+### 14.9 Commands
+
+Build, test and the two comparisons (the user runs everything that boots Shuru or the GPU):
+
+```bash
+cargo build --release
+cargo test --lib -- --skip harness
+zsh fixtures/toy_calc/run_matrix.sh all --repeat 3            # flags OFF
+VANTA_CORROBORATE=on VANTA_GROUNDED_AUDIT=on VANTA_BATCH_AUDIT=on \
+  zsh fixtures/toy_calc/run_matrix.sh all --repeat 3          # flags ON
+
+python3 scripts/bugsinpy_run.py bake    --split plans/bugsinpy_dev_split.json --pythons 3.8 --yes
+python3 scripts/bugsinpy_run.py prepare --split plans/bugsinpy_dev_split.json
+python3 scripts/bugsinpy_run.py run     --split plans/bugsinpy_dev_split.json --batch runs/bugsinpy/<dev-batch>
+```
+
+with `prepare` + `run` repeated once with the three flags in the environment of the `vanta_m3`
+child. The evaluation waves are not touched: no `plans/bugsinpy_split.json` entry, no wave-1 batch
+and no evaluation number changes.

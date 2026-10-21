@@ -4,6 +4,7 @@
 // ============================================================================
 pub mod bate;
 pub mod candidate;
+pub mod corroborate;
 pub mod diagnostician;
 pub mod driver;
 pub mod harness;

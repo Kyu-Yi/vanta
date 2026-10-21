@@ -266,15 +266,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })
     .await?;
 
-    // Exit codes: 0 = approved, 2 = infrastructure failure, 1 = any other
-    // negative verdict. [VANTA-WHY] An InfraFailure is not a verdict about the
-    // candidate at all — no Attacker test ever judged the patch — so it must be
-    // distinguishable from a plain rejection by whatever script drives this
-    // binary. It also gets its own exit code so a harness can retry the target
-    // without mistaking it for a clean "no".
+    // Exit codes: 0 = approved, 2 = infrastructure failure, 3 = needs review,
+    // 1 = any other negative verdict. [VANTA-WHY] An InfraFailure is not a
+    // verdict about the candidate at all — no Attacker test ever judged the
+    // patch — so it must be distinguishable from a plain rejection by whatever
+    // script drives this binary. It also gets its own exit code so a harness can
+    // retry the target without mistaking it for a clean "no".
+    //
+    // [VANTA-WHY] §14.3. `NeedsReview` gets code 3 for the same reason: it is
+    // neither the approval (0) nor a rejection (1). A harness that treated it as
+    // a rejection would count an uncorroborated failure as a false reject, which
+    // is exactly the mislabel this change exists to remove — so it must be its
+    // own outcome on the process boundary too, not folded into `_`.
     match decision {
         GovernorDecision::AllTestsPassed => Ok(()),
         GovernorDecision::InfraFailure => std::process::exit(2),
+        GovernorDecision::NeedsReview => std::process::exit(3),
         _ => std::process::exit(1),
     }
 }

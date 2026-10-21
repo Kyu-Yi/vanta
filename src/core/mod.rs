@@ -852,6 +852,19 @@ pub enum GovernorDecision {
     // the run's own `--max-attempts` (the driver logs `attempts_run`); it is NOT
     // a fixed 4.
     MaxAttemptsReached,
+    // [VANTA-WHY] §14.3. Review mode spent its whole attack depth on failures
+    // that no corroborating rule covers: the candidate is not approved, and it
+    // is not rejected either, because the only evidence against it might be a
+    // wrong test. Reachable ONLY in review mode with `VANTA_CORROBORATE=on`, and
+    // only once the budget is exhausted — a human has to look.
+    //
+    // Deliberately NOT an approval: the Gatekeeper still approves only on
+    // `AllTestsPassed`, so this variant cannot inflate an approval count, and
+    // the harness scores it as its own outcome (`needs_review_on_good` /
+    // `needs_review_on_bad`) rather than as an approval, a rejection or an
+    // unresolved run. It has its own exit code (3) so a caller can tell "a
+    // human should look" from "no".
+    NeedsReview,
     // [VANTA-WHY] An LLM call failed for every attempt the retry loop was
     // allowed. This says NOTHING about the candidate: the model never produced an
     // answer, so there is no evidence for or against the patch. It exists so the

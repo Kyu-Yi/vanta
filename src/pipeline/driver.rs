@@ -45,6 +45,7 @@ use crate::core::{
 use crate::llm::{build_reqwest_client, drain_call_usages, reset_call_usages, server_top_p_default};
 use crate::pipeline::bate::run_bate;
 use crate::pipeline::candidate::{CandidatePair, TestCommand};
+use crate::pipeline::corroborate::{self, CorroborationInput, FailureEvidence};
 use crate::pipeline::diagnostician::diagnose_failure;
 use crate::pipeline::gatekeeper::{Gatekeeper, GatekeeperVerdict};
 use crate::pipeline::governor::{
@@ -281,6 +282,15 @@ pub async fn run(
     // to the configuration.
     let attacker_enabled = env_flag("VANTA_ATTACKER", true)?;
     let planner_enabled = env_flag("VANTA_PLANNER", false)?;
+    // [VANTA-WHY] §14.2/§14.4/§14.5 — the three robustness switches. All
+    // default OFF so v0.2 behaves exactly as before until they are flipped, and
+    // the values are written into `run.summary` so a session's artifacts state
+    // which rules produced its verdict. Read once here for the same reason the
+    // two above are: a later reader must not be able to disagree with the code
+    // path that actually ran.
+    let corroborate_enabled = env_flag("VANTA_CORROBORATE", false)?;
+    let grounded_audit_enabled = env_flag("VANTA_GROUNDED_AUDIT", false)?;
+    let batch_audit_enabled = env_flag("VANTA_BATCH_AUDIT", false)?;
     if !attacker_enabled {
         println!(
             "▌ Config: {} — Attacker off (VANTA_ATTACKER=off): the repo's own suite and static \
@@ -600,6 +610,25 @@ pub async fn run(
     let mut removed_existing_tests: Vec<String> = Vec::new();
     let mut added_test_files: Vec<String> = Vec::new();
     let mut modified_test_config: Vec<serde_json::Value> = Vec::new();
+
+    // [VANTA-WHY] §14.2/§14.3 — the corroboration hand-over out of the loop.
+    // `deciding_rule` / `deciding_evidence` name the rule (a–e) that decided the
+    // rejection, so a finished run's artifacts can say WHY it was a rejection and
+    // not just that one happened. `needs_review_weak` lists the uncorroborated
+    // failures behind a `NeedsReview`, because "needs a human" is useless without
+    // naming what the human should look at. All three stay empty when the flag is
+    // off, so v0.2's `run.summary` is unchanged.
+    let mut deciding_rule: Option<String> = None;
+    let mut deciding_evidence: Vec<String> = Vec::new();
+    let mut needs_review_weak: Vec<String> = Vec::new();
+    // [VANTA-WHY] The intent auditor's answer to "does the issue require the
+    // behaviour at this test's input to change?", keyed by test name. Rule (d)
+    // needs it to downgrade a preservation/acceptance failure the issue overrides.
+    // The audit runs per round and re-runs after a BATE revision, so the LAST
+    // answer for a name wins — it is the one that describes the test version that
+    // actually ran. Absent means UNKNOWN, and rule (d) only downgrades on an
+    // explicit `true`.
+    let mut issue_requires_change_by_test: HashMap<String, Option<bool>> = HashMap::new();
 
     // [VANTA-WHY] `max_attempts` means two different things and the Governor now
     // has to be told which. With `--patch` the candidate is FIXED, so an attempt
@@ -1033,6 +1062,10 @@ pub async fn run(
                 benchmark_label: None,
             })?;
             log_intent_checks(&mut session_log, &session_id, &patch_attempt_id, &testing_iteration_id, "attacker.generate", &initial_intent_checks)?;
+            for check in &initial_intent_checks {
+                issue_requires_change_by_test
+                    .insert(check.test_name.clone(), check.issue_requires_change);
+            }
             for relabel in &initial_relabels {
                 session_log.append(SessionRecord {
                     session_id: session_id.clone(),
@@ -1127,6 +1160,14 @@ pub async fn run(
             benchmark_label: None,
         })?;
         log_intent_checks(&mut session_log, &session_id, &patch_attempt_id, &testing_iteration_id, "attacker.revise", &bate_intent_checks)?;
+        // [VANTA-WHY] BATE's answers come AFTER a possible revision, so they
+        // describe the test version that actually runs. They overwrite the
+        // generation-time answers for the same name — the newer answer is the
+        // one about the test on the tree.
+        for check in &bate_intent_checks {
+            issue_requires_change_by_test
+                .insert(check.test_name.clone(), check.issue_requires_change);
+        }
         for relabel in &bate_relabels {
             session_log.append(SessionRecord {
                 session_id: session_id.clone(),
@@ -1689,13 +1730,78 @@ pub async fn run(
         // [VANTA-WHY] The Governor needs three-way evidence, not a bool. In review
         // mode a Logic failure is a REJECTION; an Infrastructure-only round is
         // not a finding at all and must never be reported as one.
-        let verdict = attempt_verdict(
+        let mut verdict = attempt_verdict(
             all_passed,
             &patched_classes,
             native_regression,
             new_static_in_touched_files,
             governor_mode,
         );
+
+        // ---- 9. Corroboration overlay (§14.2, `VANTA_CORROBORATE=on`) ----
+        // [VANTA-WHY] This is the whole point of §14: a rejection is a claim
+        // about the PATCH, so it must survive the possibility that the failing
+        // test is wrong. `attempt_verdict` above is v0.2's rule and is left
+        // untouched; with the flag off this block does not run and the verdict is
+        // byte-for-byte what it always was. With it on, only a review-mode
+        // rejection is re-examined, and it is downgraded to `WeaklyRejected`
+        // (never a stop, and `NeedsReview` at budget exhaustion) when no rule
+        // covers the failure. Rules (a) and (e) are deterministic — a native
+        // regression or a static error cannot be an LLM's bad test — so they
+        // always stand.
+        if corroborate_enabled
+            && governor_mode == GovernorMode::Review
+            && verdict == AttemptVerdict::Rejected
+        {
+            let failures = failure_evidence_for(
+                &attempt_evidence,
+                attempt + 1,
+                &issue_requires_change_by_test,
+            );
+            let assessment = corroborate::assess(&CorroborationInput {
+                failures: &failures,
+                native_regressions: &native_regressions,
+                new_static_in_touched_files: &blocking_static,
+                issue_text: &repo.issue_text,
+            });
+            match assessment.rule {
+                Some(rule) => {
+                    println!(
+                        "  ⚖ CORROBORATED by rule ({}) — {}",
+                        rule.code(),
+                        assessment.evidence.join(", ")
+                    );
+                    deciding_rule = Some(rule.code().to_string());
+                    deciding_evidence = assessment.evidence.clone();
+                    // The rejection is corroborated, so no weak-failure list
+                    // belongs in the summary: the reason is the rule, not a
+                    // "human should look".
+                    needs_review_weak.clear();
+                }
+                // No rule fired, and there IS at least one uncorroborated Logic
+                // failure: the only evidence against the candidate might be a
+                // wrong test, so this is not a rejection.
+                None if !assessment.weak.is_empty() => {
+                    println!(
+                        "  ⚖ UNCORROBORATED failure(s) — not a rejection on this evidence: {}",
+                        assessment.weak.join(", ")
+                    );
+                    verdict = AttemptVerdict::WeaklyRejected;
+                    // Accumulate across rounds: a run that ends `NeedsReview`
+                    // should name EVERY weak failure it saw, not just the last
+                    // round's, so the human knows the full set to look at.
+                    for weak in &assessment.weak {
+                        if !needs_review_weak.contains(weak) {
+                            needs_review_weak.push(weak.clone());
+                        }
+                    }
+                }
+                // Fail CLOSED: a rejection whose evidence this module could not
+                // enumerate stays a rejection rather than becoming an approval.
+                None => {}
+            }
+        }
+
         let governor_decision = governor.decide(governor_mode, verdict, true);
         let decision = if harness_collapsed {
             let next = collapse_decision(
@@ -1762,6 +1868,22 @@ pub async fn run(
                         &failing_names,
                         &modified_existing_tests
                     )
+                );
+            }
+            // [VANTA-WHY] §14.3. A `NeedsReview` must name the evidence, or a
+            // human has nothing to look at. The failing tests are printed for
+            // context; `needs_review_weak` (recorded in `run.summary`) says which
+            // of them no §14.2 rule covered.
+            if decision == GovernorDecision::NeedsReview {
+                println!(
+                    "  ⚠ NEEDS REVIEW — no corroboration rule covers the failure(s) after {} \
+                     round(s): {}",
+                    attempt + 1,
+                    if needs_review_weak.is_empty() {
+                        "inspect the attempt's diagnostic payloads".to_string()
+                    } else {
+                        needs_review_weak.join(", ")
+                    }
                 );
             }
         } else {
@@ -1857,6 +1979,17 @@ pub async fn run(
                 // the candidate attached so the failing tests can be read back
                 // from the evidence, and it never reaches the Gatekeeper — there
                 // is nothing to approve.
+                final_patched_files = Some(patched_files);
+                break decision;
+            }
+            GovernorDecision::NeedsReview => {
+                // [VANTA-WHY] §14.3. Not an approval and not a rejection: the
+                // candidate spent the whole attack depth on failures no §14.2
+                // rule corroborates, so a human must judge it. The candidate is
+                // attached exactly as for `Rejected` — the reader needs the
+                // patch, and `final.patch` is written for every terminal verdict
+                // — but it never reaches the Gatekeeper, because "needs review"
+                // is not the Gatekeeper's `Approved`.
                 final_patched_files = Some(patched_files);
                 break decision;
             }
@@ -2067,6 +2200,8 @@ pub async fn run(
             "attempts_run={} fixed_at_attempt_1={} final_decision={:?} \
              config={} mode={} seed={} model={} top_p={} {} \
              llm_calls={} llm_calls_measured={} llm_prompt_tokens={} llm_completion_tokens={} \
+             corroborate={} grounded_audit={} batch_audit={} \
+             deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
              commit={} dirty={}",
             attempts_run,
             fixed_at_attempt_1,
@@ -2081,6 +2216,18 @@ pub async fn run(
             llm_calls_measured,
             llm_prompt_tokens,
             token_value(llm_completion_tokens),
+            // [VANTA-WHY] §14.2/§14.4/§14.5 — the switches this run actually ran
+            // under, and the corroboration that produced its verdict. A reader
+            // must be able to tell a `Rejected` decided by rule (a) from one
+            // decided by rule (c), and a `NeedsReview` must name the weak
+            // failures that triggered it — otherwise "needs a human" names
+            // nothing to look at.
+            corroborate_enabled,
+            grounded_audit_enabled,
+            batch_audit_enabled,
+            deciding_rule.as_deref().unwrap_or("none"),
+            deciding_evidence.join(","),
+            needs_review_weak.join(","),
             vanta_commit,
             vanta_dirty,
         ),
@@ -3124,6 +3271,44 @@ fn attempt_verdict(
     } else {
         AttemptVerdict::Inconclusive
     }
+}
+
+/// Build the §14.2 corroboration evidence for one round (§14.2, item 1).
+///
+/// [VANTA-WHY] The two facts a `FailureEvidence` needs that are NOT on
+/// `TestEvidence` are supplied here and nowhere else: the exception the failure
+/// actually raised (nested inside the Diagnostician's `structured_payload`, at
+/// `structured_payload["exception_type"]`) and the auditor's answer about the
+/// issue (`issue_requires_change_by_test`). `bate_validated` is `true` for every
+/// failure by construction — `attempt_evidence` is built from `tests_to_run`,
+/// and every entry there has a BATE baseline (validated this attempt, or
+/// replayed from disk having been validated when first generated).
+fn failure_evidence_for(
+    evidence: &[TestEvidence],
+    attempt: u32,
+    issue_requires_change_by_test: &HashMap<String, Option<bool>>,
+) -> Vec<FailureEvidence> {
+    evidence
+        .iter()
+        .filter(|e| e.failure_class.is_some())
+        .map(|e| FailureEvidence {
+            test_name: e.test_name.clone(),
+            attempt,
+            intent: e.intent.clone(),
+            failure_class: e.failure_class.clone(),
+            exception_type: e
+                .structured_payload
+                .as_ref()
+                .and_then(|payload| payload.get("exception_type"))
+                .and_then(|value| value.as_str())
+                .map(|s| s.to_string()),
+            bate_validated: true,
+            issue_requires_change: issue_requires_change_by_test
+                .get(&e.test_name)
+                .copied()
+                .flatten(),
+        })
+        .collect()
 }
 
 /// Name the REAL signal behind a review-mode rejection.

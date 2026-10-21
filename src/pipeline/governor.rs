@@ -72,6 +72,17 @@ pub enum AttemptVerdict {
     /// The candidate demonstrably fails: at least one Logic-class failure, or a
     /// repo-native test that passed on the original and fails on the candidate.
     Rejected,
+    /// [VANTA-WHY] §14.2/§14.3. The round HAS failures that v0.2 would have
+    /// rejected on, but not one of them is corroborated: the only evidence
+    /// against the candidate might be a wrong test. Produced only in review mode
+    /// with `VANTA_CORROBORATE=on`, by the driver's corroboration overlay — never
+    /// by `attempt_verdict` alone, so with the flag off this value cannot occur
+    /// and v0.2's behaviour is unchanged.
+    ///
+    /// In review mode this spends the attempt and keeps attacking (a second,
+    /// independent test may corroborate the first); once the budget is
+    /// exhausted the decision is `NeedsReview`, not a rejection.
+    WeaklyRejected,
     /// Failures exist but none is attributable to the candidate (Infrastructure,
     /// Unknown or Static only). Not enough evidence to reject, and nothing
     /// passed. The loop keeps going if it has budget.
@@ -140,6 +151,14 @@ pub struct Governor {
     last_observed_attempt: Option<u32>,
     // [VANTA-WHY] All transitions recorded so far. Logged to session for M4.
     transitions: Vec<AttemptTransition>,
+    // [VANTA-WHY] §14.3. The attempts whose verdict was `WeaklyRejected`: rounds
+    // that failed, but only on evidence no corroboration rule (§14.2) covers.
+    // Kept because "no rule fired in the LAST round" is not the same fact as "no
+    // rule fired in ANY round": a final round that produced only Infrastructure
+    // failures would otherwise end as `MaxAttemptsReached` and quietly lose the
+    // weak failure the run had already seen. Empty unless the corroboration flag
+    // is on, so v0.2 never reaches the branch that reads it.
+    weak_rounds: Vec<u32>,
 }
 
 impl Governor {
@@ -154,6 +173,7 @@ impl Governor {
             s0_hashes: HashSet::new(),
             last_observed_attempt: None,
             transitions: Vec::new(),
+            weak_rounds: Vec::new(),
         }
     }
 
@@ -364,6 +384,18 @@ impl Governor {
         }
     }
 
+    /// The attempts whose verdict was `WeaklyRejected` (§14.3). Non-empty means
+    /// the run saw failures it could not corroborate, which is what a
+    /// `NeedsReview` reports.
+    ///
+    /// [VANTA-WHY] Indices are in the Governor's OWN attempt space — the same
+    /// 0-based index `record_shared_results` writes as a row's `to_attempt` — so
+    /// a weak round can be cross-referenced against the transition rows without
+    /// an off-by-one translation. The console's "round N" is this index + 1.
+    pub fn weak_rounds(&self) -> &[u32] {
+        &self.weak_rounds
+    }
+
     /// Decide whether to continue the loop.
     ///
     /// [VANTA-WHY] The stop rule is MODE-DEPENDENT, and getting that wrong is how
@@ -417,6 +449,20 @@ impl Governor {
                         "Governor: candidate demonstrably failed — stopping (Rejected)");
                     return GovernorDecision::Rejected;
                 }
+                // [VANTA-WHY] §14.3. A weak rejection is NOT a stopping
+                // condition, even though v0.2 treated the same evidence as one.
+                // The round's batch is a sample of attacks and a corroborating
+                // second test may be one round away, so the honest move is to
+                // keep attacking to the depth that was asked for and let the
+                // budget decide. The round is RECORDED, because the decision at
+                // the end depends on whether any round was ever weak — not on
+                // what the last round happened to be.
+                if verdict == AttemptVerdict::WeaklyRejected {
+                    self.weak_rounds.push(self.current_attempt);
+                    info!(attempt = self.current_attempt, weak_rounds = self.weak_rounds.len(),
+                        "Governor: failures are uncorroborated — keeping the attack depth \
+                         (NeedsReview if the budget runs out)");
+                }
             }
         }
 
@@ -432,6 +478,19 @@ impl Governor {
                     "Governor: attack depth exhausted with no rejection — candidate passed \
                      all rounds (AllTestsPassed)");
                 return GovernorDecision::AllTestsPassed;
+            }
+            // [VANTA-WHY] §14.3, checked AFTER the pass above so a final round that
+            // passed everything keeps approving: the shared set is re-run every
+            // round, so a failure that does not reproduce on the last round is not
+            // the last round's evidence. Otherwise, a run that ever saw an
+            // uncorroborated failure ends as NeedsReview rather than
+            // MaxAttemptsReached — "a human should look", not "gave up".
+            if mode == GovernorMode::Review && !self.weak_rounds.is_empty() {
+                info!(attempt = self.current_attempt, max = self.max_attempts,
+                    weak_rounds = self.weak_rounds.len(),
+                    "Governor: budget exhausted on uncorroborated failures — stopping \
+                     (NeedsReview)");
+                return GovernorDecision::NeedsReview;
             }
             info!(attempt = self.current_attempt, max = self.max_attempts,
                 "Governor: reached max attempts — stopping (MaxAttemptsReached)");
@@ -614,6 +673,122 @@ mod tests {
         assert_eq!(
             g.decide(GovernorMode::Review, AttemptVerdict::Inconclusive, true),
             GovernorDecision::MaxAttemptsReached
+        );
+    }
+
+    // ---- review mode: uncorroborated failures are NEEDS REVIEW ------------
+    //
+    // [VANTA-WHY] §14.3. `WeaklyRejected` is the driver's corroboration overlay
+    // saying "this round failed, but only on evidence no §14.2 rule covers".
+    // It must NOT stop the loop (a second independent test may corroborate the
+    // first one next round) and it must NOT end as `MaxAttemptsReached` (that
+    // reads "gave up", when what happened is "there is a failure a human should
+    // judge").
+
+    #[test]
+    fn review_mode_keeps_attacking_after_a_weak_rejection() {
+        let mut g = Governor::new(3);
+        let src = "def test_t1():\n    assert out == 'the exact text'\n";
+        g.record_shared_results(vec![failed("t1", src, FailureClass::Logic)]);
+        assert_eq!(
+            g.decide(GovernorMode::Review, AttemptVerdict::WeaklyRejected, true),
+            GovernorDecision::Continue,
+            "a single uncorroborated test must not end the review — the next batch may \
+             corroborate it"
+        );
+        assert_eq!(
+            g.weak_rounds(),
+            &[0],
+            "the weak round must be RECORDED, because the final decision depends on whether \
+             any round was ever weak (indexed in the governor's own 0-based attempt space)"
+        );
+    }
+
+    #[test]
+    fn review_mode_reports_needs_review_when_the_budget_runs_out_on_uncorroborated_failures() {
+        let mut g = Governor::new(2);
+        let src = "def test_t1():\n    assert out == 'the exact text'\n";
+        g.record_shared_results(vec![failed("t1", src, FailureClass::Logic)]);
+        assert_eq!(
+            g.decide(GovernorMode::Review, AttemptVerdict::WeaklyRejected, true),
+            GovernorDecision::Continue
+        );
+        g.record_shared_results(vec![failed("t1", src, FailureClass::Logic)]);
+        assert_eq!(
+            g.decide(GovernorMode::Review, AttemptVerdict::WeaklyRejected, true),
+            GovernorDecision::NeedsReview,
+            "an exhausted budget over uncorroborated failures is 'a human should look', \
+             not 'gave up'"
+        );
+    }
+
+    #[test]
+    fn a_final_passing_round_still_approves_after_a_weak_round() {
+        // [VANTA-WHY] The shared set is re-run every round, so a failure that does
+        // not reproduce on the LAST round is not the last round's evidence. The
+        // pass check must come BEFORE the weak-round check, or this run would end
+        // NeedsReview on a candidate that survived every round.
+        let mut g = Governor::new(2);
+        let src = "def test_t1():\n    assert out == 'the exact text'\n";
+        g.record_shared_results(vec![failed("t1", src, FailureClass::Logic)]);
+        assert_eq!(
+            g.decide(GovernorMode::Review, AttemptVerdict::WeaklyRejected, true),
+            GovernorDecision::Continue
+        );
+        g.record_shared_results(vec![passed("t1", src)]);
+        assert_eq!(
+            g.decide(GovernorMode::Review, AttemptVerdict::Passed, true),
+            GovernorDecision::AllTestsPassed,
+            "the failure did not reproduce on the final round, so the approval stands"
+        );
+    }
+
+    #[test]
+    fn a_later_infrastructure_round_does_not_erase_a_weak_round() {
+        // [VANTA-WHY] "No rule fired in the LAST round" is not the same fact as
+        // "no rule fired in ANY round": a final round that produced only
+        // Infrastructure failures would otherwise end as MaxAttemptsReached and
+        // quietly lose the weak failure the run had already seen.
+        let mut g = Governor::new(2);
+        let src = "def test_t1():\n    assert out == 'the exact text'\n";
+        g.record_shared_results(vec![failed("t1", src, FailureClass::Logic)]);
+        assert_eq!(
+            g.decide(GovernorMode::Review, AttemptVerdict::WeaklyRejected, true),
+            GovernorDecision::Continue
+        );
+        g.record_shared_results(vec![failed("t1", src, FailureClass::Infrastructure)]);
+        assert_eq!(
+            g.decide(GovernorMode::Review, AttemptVerdict::Inconclusive, true),
+            GovernorDecision::NeedsReview,
+            "the weak round from earlier in the run must still force a review"
+        );
+    }
+
+    #[test]
+    fn repair_mode_has_no_needs_review_path() {
+        // [VANTA-WHY] `WeaklyRejected` is produced only by the review-mode
+        // corroboration overlay, so repair mode must be unaffected: a weak
+        // verdict there is an ordinary non-passing attempt that spends budget
+        // and ends as MaxAttemptsReached, exactly as v0.2 did.
+        let mut g = Governor::new(2);
+        g.record_shared_results(vec![failed(
+            "t1",
+            "def test_t1():\n    assert False\n",
+            FailureClass::Logic,
+        )]);
+        assert_eq!(
+            g.decide(GovernorMode::Repair, AttemptVerdict::WeaklyRejected, true),
+            GovernorDecision::Continue
+        );
+        g.record_shared_results(vec![failed(
+            "t1",
+            "def test_t1():\n    assert False\n",
+            FailureClass::Logic,
+        )]);
+        assert_eq!(
+            g.decide(GovernorMode::Repair, AttemptVerdict::WeaklyRejected, true),
+            GovernorDecision::MaxAttemptsReached,
+            "repair mode keeps its v0.2 stop rule; NeedsReview is a review-mode outcome"
         );
     }
 

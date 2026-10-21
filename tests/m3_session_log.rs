@@ -721,6 +721,46 @@ const SINGLE_BEHAVIOR_TEST: &str = r#"{"tests":[
         }
     ]}"#;
 
+/// ONE `BugReproduction` probe, and nothing else in the round.
+///
+/// [VANTA-WHY] §14.2 — this is the shape whose failures NO rule covers: `(b)`
+/// needs the issue to name the raised exception and `TEST_ISSUE_TEXT` names none,
+/// `(c)` needs two distinct tests, and `(d)` covers preservation/acceptance
+/// failures only. It is also PySnooper/3's dev-fix shape: the only evidence
+/// against the patch is a test nothing corroborates, which must reach a human
+/// instead of being reported as a rejection.
+const SINGLE_BUG_REPRODUCTION_TEST: &str = r#"{"tests":[
+        {
+            "test_name":"test_bug_reproduction_only",
+            "test_source":"from calc import add\n\ndef test_bug_reproduction_only():\n    assert add(2, 3) == 6\n",
+            "intent":"BugReproduction",
+            "reason":"Fails on the original baseline, so BATE admits it.",
+            "issue_quote":"The issue expects a bug-reproduction probe asserting add(2, 3) == 6."
+        }
+    ]}"#;
+
+/// A round of two tests: a reproduction probe that pins a string the issue never
+/// states, and a preservation probe that passes on the original tree.
+///
+/// [VANTA-WHY] §14.4 — one answer is served to both tests, so this is what proves
+/// the mirror: the third question may scrap the REPRODUCTION probe, and it may
+/// never scrap the preservation probe, whatever the answer says.
+const UNGROUNDED_AND_PRESERVING_TESTS: &str = r#"{"tests":[
+        {
+            "test_name":"test_bug_reproduction_pins_invented_text",
+            "test_source":"from calc import add\n\ndef test_bug_reproduction_pins_invented_text():\n    assert add(2, 3) == 6\n    assert \"Starting var\" in str(add(2, 3))\n",
+            "intent":"BugReproduction",
+            "reason":"Fails on the original baseline, so BATE admits it.",
+            "issue_quote":"The issue expects a bug-reproduction probe asserting add(2, 3) == 6."
+        },
+        {
+            "test_name":"test_preserve_add_pair",
+            "test_source":"from calc import add\n\ndef test_preserve_add_pair():\n    assert add(2, 3) == 5\n",
+            "intent":"BehaviorPreservation",
+            "reason":"Passes on the original baseline."
+        }
+    ]}"#;
+
 /// A BehaviourPreservation probe asserting the ORIGINAL result at an input the
 /// issue requires to CHANGE. This is exactly the probe the boundary rule tells
 /// the Attacker to write — correct when the issue preserves that boundary, wrong
@@ -4389,3 +4429,387 @@ fn token_accounting_records_the_servers_counts_per_call_and_a_run_total() {
     );
 }
 
+// ============================================================================
+// §14.8 — corroboration, grounded audits and needs-review, END TO END
+// ============================================================================
+//
+// [VANTA-WHY] `corroborate.rs` and `attacker.rs` unit-test the RULES. What only
+// the binary can prove is that the switch reaches the driver, that a downgraded
+// rejection keeps the loop alive instead of stopping it, that the terminal
+// decision and the process exit code follow (§14.3), and that `run.summary`
+// names the rule that decided and the weak failures that did not — the record a
+// human needs in order to know WHAT to review. With the flag off none of it may
+// be reachable: the v0.2 verdict is unchanged, which is the compat half of the
+// contract.
+
+/// §14.2 rule (d): the ONLY evidence against the candidate is a
+/// `BehaviorPreservation` probe pinning behaviour the issue says to preserve, so
+/// the issue itself authorises the rejection. This is the toy fixture's bad-patch
+/// shape, and it is the guard that corroboration did not go soft.
+#[test]
+fn a_validated_preservation_failure_is_corroborated_by_rule_d() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    // One preservation probe: it passes on the original tree and fails on the bad
+    // patch, and it is the whole of the evidence against the patch.
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[("VANTA_CORROBORATE", "on")],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a corroborated rejection is a rejection, not a needs-review: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("CORROBORATED by rule (d)"),
+        "the console must name the rule that decided; got {stdout}"
+    );
+    assert!(
+        stdout.contains("test_behavior_preservation_only@1"),
+        "the corroboration line must name the evidence that decided; got {stdout}"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let final_row = records
+        .iter()
+        .find(|r| r.phase == "M3_repair_loop")
+        .expect("a final decision row must exist");
+    assert!(
+        final_row.summary.contains("final_decision=Rejected"),
+        "got {}",
+        final_row.summary
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(summary_value(&summary, "corroborate"), "on");
+    assert_eq!(summary_value(&summary, "deciding_rule"), "d");
+    assert_eq!(
+        summary_value(&summary, "deciding_evidence"),
+        "[test_behavior_preservation_only@1]"
+    );
+    assert_eq!(
+        summary_value(&summary, "needs_review_weak"),
+        "[]",
+        "a corroborated rejection has nothing weak to review; got {summary}"
+    );
+}
+
+/// §14.3/§14.8: failures NO rule covers must reach a human, and "a human should
+/// look" has to be visible on the process boundary (exit code 3) and in
+/// `run.summary` — a harness that read it as a rejection would count an
+/// uncorroborated failure as a false reject, which is the mislabel this change
+/// exists to remove.
+#[test]
+fn a_lone_uncorroborated_failure_ends_as_needs_review_with_exit_code_3() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    // ONE BugReproduction probe, which fails on the patched tree as Logic. Nothing
+    // corroborates it: `TEST_ISSUE_TEXT` names no exception class, so rule (b)
+    // cannot fire; a single test can never satisfy rule (c); and (d)/(e) do not
+    // apply. This is PySnooper/3's dev-fix shape, the false reject §14 removed.
+    let server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[("VANTA_CORROBORATE", "on")],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "an uncorroborated failure is neither an approval nor a rejection: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("UNCORROBORATED failure(s)"),
+        "the console must say the failure was uncorroborated; got {stdout}"
+    );
+    assert!(
+        !stdout.contains("CORROBORATED by rule"),
+        "no rule may fire on this evidence, so nothing may be reported as \
+         corroborated; got {stdout}"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let final_row = records
+        .iter()
+        .find(|r| r.phase == "M3_repair_loop")
+        .expect("a final decision row must exist");
+    assert!(
+        final_row.summary.contains("final_decision=NeedsReview"),
+        "the budget ran out on an uncorroborated failure, so the honest terminal \
+         decision is NeedsReview, not Rejected or MaxAttemptsReached; got {}",
+        final_row.summary
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(summary_value(&summary, "corroborate"), "on");
+    assert_eq!(summary_value(&summary, "deciding_rule"), "none");
+    assert_eq!(summary_value(&summary, "deciding_evidence"), "[]");
+    assert_eq!(
+        summary_value(&summary, "needs_review_weak"),
+        "[test_bug_reproduction_only=Logic/BugReproduction@1]",
+        "the summary must name the weak failures, or `NeedsReview` tells the human \
+         nothing to look at; got {summary}"
+    );
+
+    // §14.3 — NeedsReview attaches the candidate exactly as a rejection does, so
+    // the patch the reviewer has to look at is on disk.
+    let debug_dir = workspace
+        .path()
+        .join("vanta_sessions")
+        .join(records[0].session_id.as_str())
+        .join("debug");
+    assert!(
+        debug_dir.join("final.patch").exists(),
+        "a NeedsReview must leave the candidate patch for the reviewer; missing under {}",
+        debug_dir.display()
+    );
+}
+
+/// §14.2/§14.8 byte-compat: with the flag off the SAME fixture takes v0.2's path
+/// untouched — the rejection stands, nothing weak is recorded and no rule is
+/// named, because no rule ran.
+#[test]
+fn with_the_corroboration_flag_off_an_uncorroborated_failure_is_still_a_rejection() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "with the switch off there is no needs-review path at all: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let final_row = records
+        .iter()
+        .find(|r| r.phase == "M3_repair_loop")
+        .expect("a final decision row must exist");
+    assert!(
+        final_row.summary.contains("final_decision=Rejected"),
+        "the v0.2 verdict is a rejection; got {}",
+        final_row.summary
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(summary_value(&summary, "corroborate"), "off");
+    assert_eq!(summary_value(&summary, "deciding_rule"), "none");
+    assert_eq!(summary_value(&summary, "needs_review_weak"), "[]");
+}
+
+/// §14.2 rule (a) is deterministic — the repository's OWN suite cannot be an
+/// LLM's bad test — so it must stand with corroboration on, and it must win over
+/// every weaker signal.
+#[test]
+fn a_native_suite_regression_is_corroborated_by_rule_a() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    // The generated probe only asserts on `add`; the patch only breaks `scale`.
+    // So the repository's own test is the only evidence against this patch.
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        NATIVE_BREAKING_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[("VANTA_CORROBORATE", "on")],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a regression in the project's own suite must still be rejected: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("CORROBORATED by rule (a)"),
+        "got {stdout}"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let final_row = records
+        .iter()
+        .find(|r| r.phase == "M3_repair_loop")
+        .expect("a final decision row must exist");
+    assert!(
+        final_row.summary.contains("final_decision=Rejected"),
+        "got {}",
+        final_row.summary
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(summary_value(&summary, "deciding_rule"), "a");
+    assert!(
+        summary_value(&summary, "deciding_evidence").contains("test_scale_doubles"),
+        "the rule's evidence must name the broken repo test; got {summary}"
+    );
+    assert_eq!(summary_value(&summary, "needs_review_weak"), "[]");
+}
+
+/// §14.4 end to end: an ungrounded answer scraps the `BugReproduction` probe it
+/// was asked about, is logged with the auditor's own reason on the console (the
+/// line that makes over-scrapping visible while the dev split is still in front
+/// of you), and NEVER scraps the `BehaviorPreservation` probe that received the
+/// very same answer.
+#[test]
+fn the_grounded_audit_scraps_an_ungrounded_reproduction_probe_and_never_a_preservation_one() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    // ONE answer, served to BOTH tests: the second record is what makes this the
+    // mirror rather than just a scrap test.
+    let server = StubLlmServer::start_with_intent_audit(
+        UNGROUNDED_AND_PRESERVING_TESTS,
+        r#"{"issue_asks_for_behaviour":true,"assertions_grounded":false,"reason":"stub: pins a value the issue never states"}"#,
+    );
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[("VANTA_GROUNDED_AUDIT", "on")],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("UNGROUNDED: test_bug_reproduction_pins_invented_text scrapped"),
+        "every ungrounded scrap must be visible on the console; got {stdout}"
+    );
+    assert!(
+        stdout.contains("pins a value the issue never states"),
+        "the console line must carry the auditor's reason, not a generic one; got {stdout}"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+
+    let reproduction = records
+        .iter()
+        .find(|r| r.phase == "intent.check[test_bug_reproduction_pins_invented_text]")
+        .expect("the reproduction probe must have an intent.check row");
+    assert!(
+        reproduction.summary.contains("assertions_grounded=false")
+            && reproduction.summary.contains("scrapped=true")
+            && reproduction.summary.contains("source=attacker.generate"),
+        "the reproduction probe must be scrapped on the ungrounded answer; got {}",
+        reproduction.summary
+    );
+
+    let preservation = records
+        .iter()
+        .find(|r| r.phase == "intent.check[test_preserve_add_pair]")
+        .expect("the preservation probe must be audited too, not skipped by its label");
+    assert!(
+        preservation.summary.contains("assertions_grounded=false"),
+        "the same answer must reach the preservation probe, or the mirror below is \
+         vacuous; got {}",
+        preservation.summary
+    );
+    assert!(
+        preservation.summary.contains("scrapped=false"),
+        "an ungrounded answer may never scrap a BehaviorPreservation probe; got {}",
+        preservation.summary
+    );
+
+    let attacker_summary = records
+        .iter()
+        .find(|r| r.phase == "attacker.summary")
+        .expect("the Attacker summary row must exist");
+    assert!(
+        attacker_summary.summary.contains("intent_scrapped=1")
+            && attacker_summary.summary.contains("valid_tests=1"),
+        "exactly one test is scrapped and the round keeps the other; got {}",
+        attacker_summary.summary
+    );
+}
+
+/// §14.8's positive guard: with all three flags on, a correct patch is still
+/// APPROVED. Corroboration exists to remove false rejects, so the failure it
+/// must not introduce is a false `NeedsReview` — an approval turned into
+/// "a human should look" would be the same wrong label, one step safer.
+#[test]
+fn the_three_flags_on_do_not_turn_an_approval_into_a_needs_review() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    // The batched transport needs a batched answer; the single-test shape would
+    // fail the whole batch and take the unavailable-audit path instead.
+    let server = StubLlmServer::start_with_intent_audit(
+        SINGLE_BEHAVIOR_TEST,
+        r#"{"tests":[{"index":1,"issue_asks_for_behaviour":true,"assertions_grounded":true,"reason":"stub: keep the label"}]}"#,
+    );
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[
+            ("VANTA_CORROBORATE", "on"),
+            ("VANTA_GROUNDED_AUDIT", "on"),
+            ("VANTA_BATCH_AUDIT", "on"),
+        ],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a correct patch must still be approved with every switch on: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let final_row = records
+        .iter()
+        .find(|r| r.phase == "M3_repair_loop")
+        .expect("a final decision row must exist");
+    assert!(
+        final_row.summary.contains("final_decision=AllTestsPassed"),
+        "got {}",
+        final_row.summary
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(summary_value(&summary, "corroborate"), "on");
+    assert_eq!(summary_value(&summary, "grounded_audit"), "on");
+    assert_eq!(summary_value(&summary, "batch_audit"), "on");
+    assert_eq!(summary_value(&summary, "deciding_rule"), "none");
+    assert_eq!(
+        summary_value(&summary, "needs_review_weak"),
+        "[]",
+        "an approval carries no weak failures; got {summary}"
+    );
+}

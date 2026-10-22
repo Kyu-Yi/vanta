@@ -2954,14 +2954,106 @@ class TestBake:
     def test_a_minor_without_system_packages_is_unchanged(self):
         """3.6/3.7 were baked without them, so their recipe must not move.
 
-        Their layers are neither rebuilt nor re-downloaded by this decision.
+        Their layers are neither rebuilt nor re-downloaded by this decision — and
+        that includes the compiler environment and the smoke check below, which are
+        keyed on the same fact (there is no compiler on 3.6/3.7 to point them at).
         """
         recipe = bake_mod.python_recipe("3.6", bake_mod.PytestPin("6.2.5", "1.4.1"))
         assert "apt-get" not in recipe
         assert recipe.splitlines()[:2] == ["set -eux", 'export HOME="${HOME:-/root}"']
+        assert "export CC" not in recipe
+        assert "build_ext" not in recipe
 
     def test_the_system_package_lines_are_empty_for_a_minor_without_them(self):
         assert bake_mod.system_package_lines(()) == []
+
+    # ---- the compiler the source builds run ------------------------------
+    #
+    # [VANTA-WHY] Measured on matplotlib/1: ``numpy==1.18.5`` has no wheel for the
+    # sandbox (linux/aarch64, py3.8), so the layer builds it from source, and that
+    # build ended in ``error: [Errno 2] No such file or directory`` — *after*
+    # configure had read the tree, i.e. the compiler *invocation* failed. uv's
+    # interpreter is a python-build-standalone build whose ``sysconfig`` records the
+    # compiler its own build machine used, and an old-style ``distutils`` build runs
+    # that string. ``gcc``/``g++`` are installed by the system packages above and were
+    # never being called; ``CC``/``CXX``/``LDSHARED``/``LDCXXSHARED`` are distutils'
+    # documented override.
+
+    COMPILER_ENV = {
+        "CC": "gcc",
+        "CXX": "g++",
+        "LDSHARED": "gcc -pthread -shared",
+        "LDCXXSHARED": "g++ -pthread -shared",
+    }
+
+    def test_the_compiler_environment_is_the_distutils_override_for_this_toolchain(self):
+        """One list, so the recipe and this expectation cannot drift apart."""
+        assert bake_mod.COMPILER_ENV == self.COMPILER_ENV
+
+    def test_the_interpreter_recipe_exports_the_compiler_for_source_builds(self):
+        """Quoted as shell, because a linker line is more than one word."""
+        recipe = self._recipe()
+        assert "export CC=gcc" in recipe
+        assert "export CXX=g++" in recipe
+        assert "export LDSHARED='gcc -pthread -shared'" in recipe
+        assert "export LDCXXSHARED='g++ -pthread -shared'" in recipe
+
+    def test_the_recipe_prints_what_the_standalone_recorded(self):
+        """The evidence for the override: sysconfig's own CC/CXX, not ``$CC``.
+
+        Printed rather than only overridden, so a source build that dies on
+        ``[Errno 2]`` is not a mystery until someone boots the layer and looks.
+        """
+        recipe = self._recipe()
+        assert "sysconfig.get_config_var('CC')" in recipe
+        assert "sysconfig.get_config_var('CXX')" in recipe
+
+    def test_a_layer_fails_when_the_compiler_environment_did_not_reach_it(self):
+        """By name, rather than reproducing the ``[Errno 2]`` this exists to prevent."""
+        recipe = self._recipe()
+        assert "did not reach this layer" in recipe
+        for name in self.COMPILER_ENV:
+            assert f'[ -n "${name}" ]' in recipe
+
+    def test_the_compiler_environment_is_recorded_in_the_layer(self):
+        """The layer's provenance for its compiler, beside its system packages.
+
+        Beside ``/opt/vanta-system-packages.txt``: written by the recipe that sets
+        it, so it describes the layer rather than a host-side intention.
+        """
+        recipe = self._recipe()
+        assert bake_mod.BUILD_ENV_RECORD in recipe
+        assert "env | grep -E" in recipe
+
+    def test_a_source_build_runs_after_the_compiler_is_exported(self):
+        """The export is what the build reads; before it, the recorded compiler runs."""
+        recipe = self._recipe()
+        assert recipe.index("export CC=gcc") < recipe.index("build_ext")
+        assert recipe.index("export CC=gcc") < recipe.index(f"touch {bake_mod.MARKER}")
+
+    def test_the_interpreter_recipe_smokes_the_toolchain_before_the_marker(self):
+        """A broken toolchain fails the base layer, not twenty minutes into numpy."""
+        recipe = self._recipe()
+        assert "build_ext" in recipe
+        assert "vanta_smoke_c" in recipe
+        assert "vanta_smoke_cpp" in recipe
+        assert recipe.index("build_ext") < recipe.index(f"touch {bake_mod.MARKER}")
+
+    def test_the_smoke_check_builds_both_c_and_cpp(self):
+        """``CC`` and ``CXX`` are two variables; a C-only smoke check passes a broken C++.
+
+        The measured trees compile C++ extensions (matplotlib's ``ft2font``, pandas'
+        ``_libs``), so the smoke check declares a ``language="c++"`` extension too.
+        """
+        assert 'language="c++"' in self._recipe()
+
+    def test_the_compiler_environment_is_empty_for_a_minor_without_a_toolchain(self):
+        """Keyed on ``SYSTEM_PACKAGES``, so a 3.6/3.7 layer gets neither lines."""
+        assert bake_mod.build_env_for("3.8") == bake_mod.COMPILER_ENV
+        assert bake_mod.build_env_for("3.6") == {}
+        assert bake_mod.build_env_for(None) == {}
+        assert bake_mod.build_env_lines({}) == []
+        assert bake_mod.toolchain_smoke_lines({}) == []
 
     # ---- the per-bug recipe ----------------------------------------------
     def test_declared_deps_reads_setup_sh_and_drops_the_self_install(self):
@@ -3103,6 +3195,43 @@ class TestBake:
         assert "VANTA_BUILD_TOOLS" in recipe
         assert "VANTA_REQUIREMENTS" not in recipe
         assert recipe.strip().splitlines()[-1] == f"touch {bake_mod.MARKER}"
+
+    def test_the_per_bug_layer_sets_the_compiler_in_its_own_recipe(self):
+        """The interpreter layer's ``export`` does not survive ``--from``.
+
+        A checkpoint is a filesystem: the exported ``CC``/``CXX`` are shell state and
+        a layer baked ``--from`` its interpreter layer starts a fresh shell without
+        them. Without this the per-bug layer's source builds (matplotlib's and pandas'
+        numpy) run the compiler the standalone recorded for its own build machine.
+        """
+        recipe = bake_mod.requirements_recipe(["numpy==1.18.5"], minor="3.8")
+        assert "export CC=gcc" in recipe
+        assert "export CXX=g++" in recipe
+        assert recipe.index("export CC=gcc") < recipe.index("--no-build-isolation")
+
+    def test_a_per_bug_recipe_without_a_toolchain_minor_is_unchanged(self):
+        """The default is no environment, so every existing caller keeps its recipe."""
+        assert "export CC" not in bake_mod.requirements_recipe(["decorator==4.4.0"])
+        assert (
+            "export CC"
+            not in bake_mod.requirements_recipe(["decorator==4.4.0"], minor="3.6")
+        )
+
+    def test_layer_recipes_wires_the_minor_into_the_bug_recipe(self):
+        """The minor comes from the bug's own entry, not from the interpreter layer."""
+        split = split_mod.Split(split_data(bugs=[bug_entry(checkpoint="vanta-bi-Demo-1")]))
+        entry = split.bug("Demo", 1)
+        deps = [
+            bake_mod.BugDeps(
+                entry=entry,
+                checkpoint="vanta-bi-Demo-1",
+                installs=("decorator==4.4.0",),
+                provenance={},
+            )
+        ]
+        layers = bake_mod.layer_recipes(split, pythons=["3.8"], entries=[entry], deps=deps)
+        recipe = {name: script for name, _, script in layers}["vanta-bi-Demo-1"]
+        assert "export CC=gcc" in recipe
 
     def test_a_bug_layer_recipe_carries_its_own_build_pins(self):
         """``layer_recipes`` is what wires the resolution into the layer's script."""
@@ -4370,6 +4499,96 @@ class TestTheReportPluginFollowsTheBugsPytest:
         )
         assert "| vanta-bugsinpy-py3.8 | vanta-python | 3.8 | 8.0.2 | 1.5.0 |" in plan
         assert "| vanta-bi-Demo-1 | vanta-bugsinpy-py3.8 | 3.8.1 | 5.4.3 | at bake |" in plan
+
+
+class TestTheFetchIncludesTheBugsOwnPytest:
+    """A bug's exact ``pytest==X`` needs pytest's own release dates fetched.
+
+    [VANTA-WHY] Measured on fastapi/1, luigi/1, pandas/1 and sanic/1: the bake failed
+    with ``no release dates for 'pytest' were fetched; the bake cannot pin it``. The
+    new rule is that the bug's own exact ``==`` pytest pin wins over the interpreter
+    layer's, and that pin is a BugsInPy reference pin — exempt from the date rule, so
+    :func:`resolve_pins` installs it as written. It still reads ``releases["pytest"]``,
+    though: the exemption *records* the date the release landed and refuses a pin whose
+    release does not exist. The fetch set excluded every :data:`HARNESS_PACKAGES` name
+    and pytest is one, so the exemption and the fetch contradicted each other.
+    """
+
+    def _releases(self) -> dict:
+        releases = dict(TestResolvePinsByDate.RELEASES)
+        releases.update(TestTheReportPluginFollowsTheBugsPytest.RELEASES)
+        return releases
+
+    def _resolve(self, monkeypatch, *, refs):
+        fetched: list[str] = []
+
+        def fake_sources(entry, *, bugsinpy_root, repo, module_distributions=None):
+            return bake_mod.DepSources(
+                project="Demo",
+                bug_id=1,
+                checkpoint="vanta-bi-Demo-1",
+                buggy_commit="b" * 40,
+                commit_date="2019-04-22",
+                fixed_commit="f" * 40,
+                fixed_commit_date="2019-07-30",
+                import_name="demo",
+                refs=tuple(refs),
+            )
+
+        def fetch(name):
+            fetched.append(name)
+            return self._releases()[name]
+
+        monkeypatch.setattr(bake_mod, "bug_sources", fake_sources)
+        split = split_mod.Split(split_data(bugs=[bug_entry(checkpoint="vanta-bi-Demo-1")]))
+        layers, flagged = bake_mod.resolve_bug_deps(
+            split,
+            split.bugs,
+            bugsinpy_root=Path("/nonexistent"),
+            repo_for=lambda project: Path("/nonexistent"),
+            fetch=fetch,
+            metadata_of=TestTheReportPluginFollowsTheBugsPytest._metadata_of,
+        )
+        return fetched, layers, flagged
+
+    def test_the_bugs_own_pytest_is_fetched_so_its_pin_can_be_dated(self, monkeypatch):
+        """The whole chain, with the fetch recorded rather than assumed."""
+        fetched, layers, flagged = self._resolve(
+            monkeypatch,
+            refs=[
+                bake_mod.dep_ref(
+                    "decorator>=4.3.0", "install_requires (setup.py) line 1"
+                ),
+                bake_mod.dep_ref("pytest==5.4.3", "requirements.txt line 7"),
+            ],
+        )
+        assert flagged == []
+        assert "pytest" in fetched
+        # The plugin releases follow from the same pin, so they are fetched too.
+        assert "pytest-json-report" in fetched
+        assert "pytest-metadata" in fetched
+        assert layers[0].installs == (
+            "decorator==4.4.0",
+            "pytest==5.4.3",
+            "pytest-json-report==1.5.0",
+            "pytest-metadata==2.0.4",
+        )
+
+    def test_a_bug_without_its_own_pin_fetches_none_of_the_three(self, monkeypatch):
+        """PySnooper/3, matplotlib/1-2 and the rest keep the interpreter layer's pair."""
+        fetched, layers, flagged = self._resolve(
+            monkeypatch,
+            refs=[
+                bake_mod.dep_ref(
+                    "decorator>=4.3.0", "install_requires (setup.py) line 1"
+                )
+            ],
+        )
+        assert flagged == []
+        assert "pytest" not in fetched
+        assert "pytest-json-report" not in fetched
+        assert "pytest-metadata" not in fetched
+        assert layers[0].installs == ("decorator==4.4.0",)
 
 
 class TestMergeRefs:

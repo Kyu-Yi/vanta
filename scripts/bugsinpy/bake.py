@@ -311,9 +311,216 @@ def system_package_lines(packages: Sequence[str]) -> list[str]:
     ]
 
 
+COMPILER_ENV: Mapping[str, str] = {
+    "CC": "gcc",
+    "CXX": "g++",
+    "LDSHARED": "gcc -pthread -shared",
+    "LDCXXSHARED": "g++ -pthread -shared",
+}
+"""The compiler a source build in these layers runs, and the linker that follows it.
+
+[VANTA-WHY] Measured on matplotlib/1: ``numpy==1.18.5`` has no wheel for the sandbox,
+so the layer builds it from source, and that build ended in
+``error: [Errno 2] No such file or directory`` — *after* the normal BLAS/LAPACK
+fallback warnings and ``Unknown distribution option: 'define_macros'``, i.e. the
+configure step had already read the tree and what failed was the compiler
+*invocation*. uv's interpreter is a python-build-standalone build whose ``sysconfig``
+records the compiler its own build machine used (a path that does not exist here),
+and an old-style ``distutils`` build runs exactly that string — ``gcc`` and ``g++``
+are installed by :data:`SYSTEM_PACKAGES` and were never being called. These four are
+``distutils``' documented override (``customize_compiler`` reads ``CC``/``CXX``/
+``LDSHARED`` from the environment before the recorded value), and
+``g++ -pthread -shared`` is CPython's own Linux default for ``LDCXXSHARED``, so
+nothing about the link line is invented here.
+"""
+
+BUILD_ENV_RECORD = "/opt/vanta-build-env.txt"
+"""Where a layer records the compiler environment its own builds run under.
+
+Written by the same script that exports it, beside the interpreter layer's
+``/opt/vanta-system-packages.txt`` and every layer's ``/opt/vanta-deps-freeze.txt``,
+and printed into the bake log: the override above is what makes a source build work,
+so what it actually was has to be a fact about the layer rather than a line in a
+recipe nobody can read after the fact.
+"""
+
+_SYSCONFIG_COMPILER_KEYS = ("CC", "CXX", "LDSHARED", "LDCXXSHARED")
+
+
+def build_env_for(minor: Optional[str]) -> Mapping[str, str]:
+    """The compiler environment a ``py<minor>`` layer's builds run with, or ``{}``.
+
+    Keyed on the same fact as the toolchain itself: :func:`system_package_lines`
+    installs ``g++`` (and ``gcc`` with it) only for the minors in
+    :data:`SYSTEM_PACKAGES`, so a minor without them has no compiler to point these
+    at and its recipe stays exactly as it was baked.
+    """
+    return COMPILER_ENV if minor in SYSTEM_PACKAGES else {}
+
+
+def _sysconfig_probe() -> str:
+    """A ``python -c`` that prints the interpreter's *own* recorded compiler settings.
+
+    [VANTA-WHY] Printed rather than only overridden, because this is the evidence for
+    why the overrides exist: a source build that dies on ``[Errno 2]`` is otherwise a
+    mystery until someone boots the layer and looks. ``sysconfig`` reports what the
+    interpreter was *built* with, not ``$CC``, so the line still answers "what did the
+    standalone record" after the exports below.
+    """
+    prints = "; ".join(
+        f"print('recorded {key}:', sysconfig.get_config_var({key!r}))"
+        for key in _SYSCONFIG_COMPILER_KEYS
+    )
+    return f'python -c "import sysconfig; {prints}"'
+
+
+def _build_env_assert(env: Mapping[str, str]) -> str:
+    """A shell check that every variable was really set in the layer's shell.
+
+    [VANTA-WHY] ``export`` in a recipe is not the same fact as the variable being set
+    in the shell that runs the build, and getting it wrong reproduces the failure this
+    environment exists to prevent — so it fails here, by name, rather than twenty
+    minutes into a source build with an ``[Errno 2]`` that names no variable.
+    """
+    tests = " && ".join(f'[ -n "${name}" ]' for name in env)
+    return (
+        tests
+        + " || { echo 'the compiler environment ("
+        + ", ".join(env)
+        + ") did not reach this layer; a source build would run the compiler the "
+        "interpreter recorded for the machine it was built on' >&2; exit 1; }"
+    )
+
+
+def build_env_lines(env: Mapping[str, str]) -> list[str]:
+    """Probe, export, check and record one layer's compiler environment.
+
+    Empty when ``env`` is empty, so a layer whose minor has no toolchain keeps its
+    recipe line for line (:func:`build_env_for`).
+    """
+    if not env:
+        return []
+    pattern = "|".join(env)
+    return [
+        _sysconfig_probe(),
+        *[f"export {name}={shlex.quote(value)}" for name, value in env.items()],
+        _build_env_assert(env),
+        # `set -e` sees the last command in a pipeline, so this is the record rather
+        # than the check — the check is the line above it.
+        f"env | grep -E '^({pattern})=' | sort > {BUILD_ENV_RECORD}",
+        f"cat {BUILD_ENV_RECORD}",
+    ]
+
+
+_TOOLCHAIN_SMOKE_DIR = "/tmp/vanta-toolchain-smoke"
+"""A scratch directory the interpreter layer builds a throwaway extension in."""
+
+_TOOLCHAIN_SMOKE_C_SOURCE = """\
+#include <Python.h>
+
+static PyObject *vanta_value(PyObject *self, PyObject *args) {
+    return PyLong_FromLong(1);
+}
+
+static PyMethodDef vanta_methods[] = {
+    {"value", vanta_value, METH_NOARGS, NULL},
+    {NULL, NULL, 0, NULL},
+};
+
+static struct PyModuleDef vanta_module = {
+    PyModuleDef_HEAD_INIT, "vanta_smoke_c", NULL, -1, vanta_methods,
+};
+
+PyMODINIT_FUNC PyInit_vanta_smoke_c(void) {
+    return PyModule_Create(&vanta_module);
+}
+"""
+
+_TOOLCHAIN_SMOKE_CPP_SOURCE = """\
+#include <Python.h>
+
+static PyObject *vanta_value(PyObject *self, PyObject *args) {
+    return PyLong_FromLong(2);
+}
+
+static PyMethodDef vanta_methods[] = {
+    {"value", vanta_value, METH_NOARGS, NULL},
+    {NULL, NULL, 0, NULL},
+};
+
+static struct PyModuleDef vanta_module = {
+    PyModuleDef_HEAD_INIT, "vanta_smoke_cpp", NULL, -1, vanta_methods,
+};
+
+PyMODINIT_FUNC PyInit_vanta_smoke_cpp(void) {
+    return PyModule_Create(&vanta_module);
+}
+"""
+
+_TOOLCHAIN_SMOKE_SETUP = """\
+from setuptools import Extension, setup
+
+setup(
+    name="vanta-toolchain-smoke",
+    version="0",
+    ext_modules=[
+        Extension("vanta_smoke_c", ["vanta_smoke_c.c"]),
+        Extension("vanta_smoke_cpp", ["vanta_smoke_cpp.cpp"], language="c++"),
+    ],
+)
+"""
+
+
+def toolchain_smoke_lines(env: Mapping[str, str]) -> list[str]:
+    """Build and import a tiny C **and** C++ extension in the interpreter layer.
+
+    [VANTA-WHY] The failure the compiler environment prevents surfaces twenty minutes
+    into a dependency's source build (numpy, then pandas). This is that build in
+    miniature, on the layer where the toolchain is installed: ``setup.py build_ext``
+    is the same ``distutils`` path that ran the recorded compiler, and the extension
+    is imported afterwards so a build that produced an unloadable object file fails
+    too. A broken toolchain therefore fails *this* layer's bake, before any per-bug
+    layer is attempted, and one line of the log says so.
+
+    The C++ half is not redundant: the measured trees compile C++ extensions
+    (matplotlib's ``ft2font``, pandas' ``_libs``), and ``CC`` and ``CXX`` are two
+    variables with two answers — a layer that can compile C and not C++ would pass a
+    C-only smoke check.
+
+    It runs under the interpreter layer's own **seeded** setuptools rather than a
+    pinned toolchain: this layer's job is the interpreter and the compiler, and the
+    toolchain is pinned per bug (§3.2) because it is the tree's build that has a date.
+
+    Empty when ``env`` is empty, i.e. for a minor with no toolchain to smoke-test: it
+    is keyed on the same fact as the packages that install the compiler
+    (:func:`build_env_for`), so a 3.6/3.7 layer keeps the recipe it was baked with
+    rather than being rebuilt to fail on a compiler it never had.
+    """
+    if not env:
+        return []
+    directory = _TOOLCHAIN_SMOKE_DIR
+    return [
+        f"mkdir -p {directory}",
+        f"cat > {directory}/vanta_smoke_c.c <<'VANTA_SMOKE_C'",
+        _TOOLCHAIN_SMOKE_C_SOURCE.rstrip("\n"),
+        "VANTA_SMOKE_C",
+        f"cat > {directory}/vanta_smoke_cpp.cpp <<'VANTA_SMOKE_CPP'",
+        _TOOLCHAIN_SMOKE_CPP_SOURCE.rstrip("\n"),
+        "VANTA_SMOKE_CPP",
+        f"cat > {directory}/setup.py <<'VANTA_SMOKE_SETUP'",
+        _TOOLCHAIN_SMOKE_SETUP.rstrip("\n"),
+        "VANTA_SMOKE_SETUP",
+        f'cd {directory} && python setup.py build_ext --inplace && python -c "import '
+        "vanta_smoke_c, vanta_smoke_cpp; assert vanta_smoke_c.value() == 1 and "
+        "vanta_smoke_cpp.value() == 2; print('toolchain smoke ok: C and C++ "
+        'extensions build and import\')"',
+    ]
+
+
 def python_recipe(minor: str, pin: PytestPin) -> str:
     """Install a standalone CPython and the pinned pytest, then assert both work."""
     venv = f"/opt/venv{minor.replace('.', '')}"
+    build_env = build_env_for(minor)
     return "\n".join(
         [
             "set -eux",
@@ -373,6 +580,13 @@ def python_recipe(minor: str, pin: PytestPin) -> str:
             # context. (Measured: the 3.8.20 standalone carries OpenSSL 3.0.14 and
             # builds a context fine, so `ssl` does not depend on the base image.)
             'python -c "import ssl; assert ssl.OPENSSL_VERSION; ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)"',
+            # The compiler environment, set on the interpreter layer because that is
+            # where the toolchain is installed and because every source build *above*
+            # this layer (the smoke check below, then numpy, then pandas) inherits the
+            # standalone's recorded compiler otherwise (COMPILER_ENV). Placed after the
+            # wrapper exists, so the sysconfig probe reports *this* interpreter's
+            # settings rather than the base image's 3.13.
+            *build_env_lines(build_env),
             # pip is not upgraded: `uv venv --seed` already installs the newest pip
             # that supports the target (25.0.1 on 3.8), so an upgrade is one more
             # network round trip for no change — and against a bare interpreter it
@@ -383,6 +597,11 @@ def python_recipe(minor: str, pin: PytestPin) -> str:
             # A real import of the plugin, so a wheel that installed but cannot be
             # imported fails here rather than inside a wave.
             'python -c "import pytest_jsonreport; print(\'json-report ok\')"',
+            # The toolchain, exercised: a layer whose compiler is installed but whose
+            # environment is wrong fails here, by name, instead of twenty minutes into
+            # numpy (toolchain_smoke_lines). Before the marker, so a smoke failure makes
+            # `checkpoint_create` delete the layer rather than cache it.
+            *toolchain_smoke_lines(build_env),
             "python -m pip freeze > /opt/vanta-deps-freeze.txt",
             f"touch {MARKER}",
         ]
@@ -1730,7 +1949,10 @@ def test_import_closure(
 
 
 def requirements_recipe(
-    install_specs: Sequence[str], *, build_pins: Sequence[str] = ()
+    install_specs: Sequence[str],
+    *,
+    build_pins: Sequence[str] = (),
+    minor: Optional[str] = None,
 ) -> str:
     """Install one bug's *resolved* dependencies on top of the interpreter layer.
 
@@ -1772,6 +1994,16 @@ def requirements_recipe(
     (:func:`_no_isolated_build_env`), and every pin's version is asserted with
     ``importlib.metadata`` once both installs have run.
 
+    ``minor`` is the interpreter minor this layer is built on, and it decides the
+    **compiler environment** the installs below run under (:func:`build_env_for`). It
+    is passed explicitly rather than inherited from the interpreter layer because a
+    checkpoint is a filesystem: the ``export``ed ``CC``/``CXX`` the interpreter layer
+    set are shell state and do not survive into a layer baked ``--from`` it. Without
+    them the per-bug layer's source builds (matplotlib's and pandas' numpy) run the
+    compiler the standalone recorded for its own build machine, which is the
+    ``[Errno 2]`` this environment exists to prevent. A minor with no toolchain gets
+    no exports, so such a layer's recipe is unchanged.
+
     ``build_pins`` is keyword-only and empty by default so that a caller with nothing
     to build — and every test of the dependency half — still gets a recipe, and the
     recipe says so rather than pretending to a toolchain it was not given.
@@ -1789,6 +2021,7 @@ def requirements_recipe(
         # as `ModuleNotFoundError` inside a wave.
         'python -c "import ssl, sys; assert sys.prefix != sys.base_prefix, sys.prefix; '
         'print(sys.version.split()[0], ssl.OPENSSL_VERSION, sys.prefix)"',
+        *build_env_lines(build_env_for(minor)),
     ]
     if toolchain:
         lines += [
@@ -3201,16 +3434,37 @@ def resolve_bug_deps(
                 }
                 - HARNESS_PACKAGES
             )
-            # A bug that pins pytest itself needs the *plugin's* release dates as well:
-            # which pytest-json-report/pytest-metadata release the layer can carry is a
-            # question about a bug's own pin, so it is asked here, before the fetch
-            # (:func:`own_pytest_pin`). A bug without such a pin keeps the interpreter
-            # layer's pair and needs neither.
+            # A bug that pins pytest itself needs pytest's **and** the *plugin's*
+            # release dates, and both are asked here, before the fetch
+            # (:func:`own_pytest_pin`), because both follow from the same fact: a pin
+            # that is not the interpreter layer's own version.
+            #
+            # pytest itself, even though it is a :data:`HARNESS_PACKAGES` name the
+            # interpreter layer already carries: the bug's ``pytest==X`` is a reference
+            # pin (:func:`reference_pin`), so :func:`resolve_pins` exempts it from the
+            # date rule and installs it as written — but it still reads
+            # ``releases["pytest"]`` to check the release exists and to record the date
+            # it was released. The harness-provides branch is gated on
+            # ``not reference_pin(ref)``, so an exact pin does not take it, and
+            # excluding the name here is what made fastapi/1, luigi/1, pandas/1 and
+            # sanic/1 fail with "no release dates for 'pytest' were fetched".
+            #
+            # The plugin packages: which pytest-json-report/pytest-metadata release the
+            # layer can carry is a question about that same pin. A bug without such a
+            # pin keeps the interpreter layer's pair and needs none of the three — and
+            # neither does one whose pin is exactly the harness's, which
+            # :func:`own_pytest_pin` reads as no pin at all. No bug in either split
+            # pins pytest at the layer's own version; if one did, it would need
+            # pytest's dates for the reason above and this condition would have to be
+            # ``own_pytest is not None or any(reference pin on pytest)``.
             own_pytest = own_pytest_pin(sources.refs, harness_pytest=pin.pytest)
+            pytest_dates = (
+                {"pytest", *PLUGIN_PACKAGES} if own_pytest is not None else set()
+            )
             needed = sorted(
                 {ref.name for ref in sources.refs if ref.name not in HARNESS_PACKAGES}
                 | set(build_names)
-                | (set(PLUGIN_PACKAGES) if own_pytest is not None else set())
+                | pytest_dates
             )
             releases = {name: fetch(name) for name in needed}
             resolved = resolve_deps(
@@ -3420,11 +3674,14 @@ def layer_recipes(
                 f"no resolved dependencies for {name}: resolve_bug_deps has to run "
                 "before the recipes are built (design §3.2)"
             )
+        minor = minor_version(entry["python_version"])
         layers.append(
             (
                 name,
-                python_checkpoint_name(minor_version(entry["python_version"])),
-                requirements_recipe(item.installs, build_pins=item.build_pins),
+                python_checkpoint_name(minor),
+                requirements_recipe(
+                    item.installs, build_pins=item.build_pins, minor=minor
+                ),
             )
         )
     return layers

@@ -3913,6 +3913,7 @@ def fake_clone(monkeypatch, *, files: dict, dates: dict, requirements="", setup_
     )
     monkeypatch.setattr(bake_mod, "setup_sh_for", lambda root, project, bug_id: setup_sh)
     monkeypatch.setattr(bake_mod, "test_side_paths", lambda repo, commit: [])
+    monkeypatch.setattr(bake_mod, "tree_provided_modules", lambda repo, commit: set())
     monkeypatch.setattr(bake_mod, "test_import_closure", lambda **kwargs: ([], [], []))
 
 
@@ -4063,6 +4064,7 @@ class TestTestImportClosure:
         import_name: str = "pysnooper",
         distributions: dict | None = None,
         stdlib=None,
+        tree_files: dict | None = None,
     ) -> tuple:
         return bake_mod.test_import_closure(
             files=sorted(files),
@@ -4070,7 +4072,43 @@ class TestTestImportClosure:
             import_name=import_name,
             distributions=distributions,
             stdlib=bake_mod.PY38_STDLIB if stdlib is None else stdlib,
+            tree_modules=bake_mod._tree_local_modules(sorted(tree_files or {})),
         )
+
+    def test_a_module_the_tree_ships_outside_the_test_side_is_not_a_distribution(self):
+        """fastapi/1's measured case: ``docs_src`` goes on ``sys.path`` by hand.
+
+        ``scripts/test.sh`` does ``export PYTHONPATH=./docs_src``, so a tutorial test's
+        ``from additional_responses.tutorial001 import app`` is the repo's own
+        directory. Nothing there is a declaration, so the closure emitted
+        ``additional-responses`` and the bake died asking PyPI for it (404).
+        """
+        refs, optional, _ = self._closure(
+            {
+                "tests/test_tutorial/test_additional_responses/test_tutorial001.py": (
+                    "from additional_responses.tutorial001 import app\n"
+                )
+            },
+            tree_files={
+                "docs_src/additional_responses/tutorial001.py": "",
+                "tests/test_tutorial/test_additional_responses/test_tutorial001.py": "",
+            },
+        )
+        assert refs == []
+        assert optional == []
+
+    def test_a_file_inside_a_package_does_not_make_its_stem_a_module(self):
+        """``fastapi/requests.py`` is ``fastapi.requests``, never a top-level ``requests``.
+
+        Only directories that ship ``.py`` are modules the tree provides, so the real
+        distribution is still provisioned — the whole reason the rule is not
+        "any name the tree mentions".
+        """
+        refs, _, _ = self._closure(
+            {"tests/test_demo.py": "import requests\n"},
+            tree_files={"fastapi/requests.py": ""},
+        )
+        assert [ref.spec for ref in refs] == ["requests"]
 
     def test_a_third_party_import_no_declaration_names_is_a_dependency(self):
         refs, optional, notes = self._closure(
@@ -4453,6 +4491,101 @@ class TestRealPySnooperDependencies:
         _, entries = self._entries()
         for item in self._layers(entries):
             assert item.provenance["import_name"] == "pysnooper"
+
+
+needs_fastapi_repo = pytest.mark.skipif(
+    not (REPO_ROOT / "runs" / "bugsinpy" / "repos" / "fastapi.git").is_dir(),
+    reason="fastapi's bare clone is not present (runs/ is not committed)",
+)
+
+
+@needs_fastapi_repo
+@needs_clone
+class TestRealFastapiTutorialModules:
+    """fastapi/1's flag, reproduced and fixed against the real files.
+
+    [VANTA-WHY] The flag read "cannot read release dates for 'additional-responses'
+    from PyPI: 404", which names the *consequence*: ``additional-responses`` is not a
+    package anybody publishes, so something emitted a module that is not a
+    distribution. The cause was the fifth source, not the reader — at the fixed commit
+    ``tests/test_tutorial/test_additional_responses/test_tutorial001.py`` opens with
+    ``from additional_responses.tutorial001 import app``, which is ``docs_src/``'s own
+    directory (the repo's ``scripts/test.sh`` exports ``PYTHONPATH=./docs_src``), and
+    the closure's local-module set only knew the test side. Both halves are asserted
+    here so the diagnosis cannot drift back to "the reader picked up a TOML key".
+    """
+
+    BUGGY = "766157bfb4e7dfccba09ab398e8ec444d14e947c"
+    FIXED = "3397d4d69a9c2d64c1219fcbf291ea5697a4abb8"
+    REPO = REPO_ROOT / "runs" / "bugsinpy" / "repos" / "fastapi.git"
+    TUTORIAL = "tests/test_tutorial/test_additional_responses/test_tutorial001.py"
+
+    def _test_files(self) -> list[str]:
+        files = tree_mod.list_files_at(self.REPO, self.FIXED)
+        return [p for p in files if p.endswith(".py") and tree_mod.is_test_path(p)]
+
+    def test_the_pyproject_reader_names_no_tutorial_directory_at_either_commit(self):
+        """The file the flag pointed at: read at both commits and checked by name."""
+        for commit in (self.BUGGY, self.FIXED):
+            text = tree_mod.read_file_at(self.REPO, commit, "pyproject.toml")
+            assert text is not None, commit
+            names = {
+                ref.name
+                for ref in bake_mod.pyproject_refs(
+                    text, [], commit=commit, commit_label="the commit"
+                )
+            }
+            assert "additional-responses" not in names, commit
+            assert {"starlette", "pydantic"} <= names, commit
+
+    def test_the_tutorial_import_is_the_trees_own_directory_not_a_distribution(self):
+        """Where ``additional-responses`` came from, and the one change that removes it."""
+        test_files = self._test_files()
+        naive, _, _ = bake_mod.test_import_closure(
+            files=test_files,
+            read_file=lambda path: tree_mod.read_file_at(self.REPO, self.FIXED, path),
+            import_name="fastapi",
+        )
+        assert "additional_responses" in {
+            ref.spec for ref in naive if ref.source.startswith(f"import closure: {self.TUTORIAL} ")
+        }, "the tutorial import is what the closure used to emit"
+
+        provided = bake_mod.tree_provided_modules(self.REPO, self.FIXED)
+        assert "additional_responses" in provided
+        refs, _, _ = bake_mod.test_import_closure(
+            files=test_files,
+            read_file=lambda path: tree_mod.read_file_at(self.REPO, self.FIXED, path),
+            import_name="fastapi",
+            tree_modules=provided,
+        )
+        names = {ref.spec for ref in refs}
+        assert names == {
+            "orjson",
+            "pydantic",
+            "pytest",
+            "requests",
+            "sqlalchemy",
+            "starlette",
+        }, sorted(names)
+        assert "requests" in names, "fastapi/requests.py must not hide the distribution"
+
+    def test_bug_sources_for_fastapi_one_has_no_tutorial_directory(self):
+        """End to end through the wiring, not just the closure in isolation."""
+        split = load_split(DEV_SPLIT_PATH)
+        sources = bake_mod.bug_sources(
+            split.bug("fastapi", 1),
+            bugsinpy_root=BUGSINPY_CLONE,
+            repo=self.REPO,
+            module_distributions=split.module_distributions(),
+        )
+        names = {ref.name for ref in sources.refs}
+        assert "additional-responses" not in names
+        assert {
+            ref.name
+            for ref in sources.refs
+            if ref.source.startswith("import closure:")
+        } == {"orjson", "pydantic", "pytest", "requests", "sqlalchemy", "starlette"}
+        assert {"requests", "starlette"} <= names
 
 
 class TestOneBugDoesNotStopTheBatch:

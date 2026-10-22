@@ -1232,6 +1232,35 @@ def _test_local_modules(files: Sequence[str]) -> set[str]:
     return names
 
 
+def _tree_local_modules(files: Sequence[str]) -> set[str]:
+    """Module names the tree provides for itself by shipping Python source.
+
+    [VANTA-WHY] The test side is not the only place the tree can put a module on
+    ``sys.path``. fastapi's ``scripts/test.sh`` does ``export PYTHONPATH=./docs_src``
+    before running pytest, so ``tests/test_tutorial/test_additional_responses/
+    test_tutorial001.py`` opens with ``from additional_responses.tutorial001 import
+    app`` — a directory of the repo's *own* tutorial sources, not a distribution
+    (measured: the test-side-only exclusion set misses it, the bake then asks PyPI
+    for ``additional-responses`` and dies on the 404).
+
+    A directory that contains ``.py`` files is such a root wherever it sits, because
+    both pytest's rootdir insertion and the project's own runner put directories on
+    ``sys.path``. A ``.py`` file is deliberately *not* counted: ``fastapi/requests.py``
+    is importable as ``fastapi.requests`` and never as a top-level ``requests``, and
+    counting file stems would swallow the real distribution of that name.
+    """
+    names: set[str] = set()
+    for path in files:
+        if path.endswith(".py"):
+            names.update(path.split("/")[:-1])
+    return names
+
+
+def tree_provided_modules(repo: Path, commit: str) -> set[str]:
+    """The tree at ``commit``'s own modules, for :func:`test_import_closure`."""
+    return _tree_local_modules(tree_mod.list_files_at(repo, commit))
+
+
 def test_import_closure(
     *,
     files: Sequence[str],
@@ -1239,6 +1268,7 @@ def test_import_closure(
     import_name: str,
     distributions: Optional[Mapping[str, str]] = None,
     stdlib: Iterable[str] = PY38_STDLIB,
+    tree_modules: Iterable[str] = (),
 ) -> tuple[list[DepRef], list[OptionalImport], list[str]]:
     """The third-party modules the *test side* imports, and no source declares.
 
@@ -1257,11 +1287,13 @@ def test_import_closure(
 
     ``stdlib`` is a parameter so the walk is testable without a 3.8 interpreter and
     without the 280-name literal (design §3.2 pins the closure by module name, not by
-    running anything).
+    running anything). ``tree_modules`` is the rest of the tree's own modules
+    (:func:`tree_provided_modules`) — a name the tree ships is not a distribution,
+    wherever in the tree the sources that put it on ``sys.path`` live.
     """
     reviewed = distributions or {}
     stdlib_names = set(stdlib)
-    local = _test_local_modules(files)
+    local = _test_local_modules(files) | set(tree_modules)
     refs: list[DepRef] = []
     optional: list[OptionalImport] = []
     notes: list[str] = []
@@ -1932,12 +1964,16 @@ def bug_sources(
                 commit_label=f"the {label} commit",
             )
 
-    # 5. The test side's own imports, at the fixed commit.
+    # 5. The test side's own imports, at the fixed commit. The tree's own modules
+    # are excluded too: the test side is not the only thing that can put a name on
+    # ``sys.path`` (fastapi's own ``scripts/test.sh`` adds ``docs_src``), and a name
+    # the tree ships is a module it provides, never a distribution to install.
     closure_refs, optional, closure_notes = test_import_closure(
         files=test_side_paths(repo, fixed),
         read_file=partial(tree_mod.read_file_at, repo, fixed),
         import_name=import_name,
         distributions=module_distributions,
+        tree_modules=tree_provided_modules(repo, fixed),
     )
     refs += _stamped(closure_refs, commit=fixed, commit_date=fixed_date)
     notes += closure_notes

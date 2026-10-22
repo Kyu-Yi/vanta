@@ -2081,6 +2081,29 @@ def _never_runs(test: ast.AST, type_checking: frozenset[str] = _TYPE_CHECKING_NA
     return isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
 
 
+def _scope_only_reason(reason: Optional[str]) -> bool:
+    """Whether an optional reason answers the *audit's* question and not the layer's.
+
+    [VANTA-WHY] ``type-checking only`` (:data:`TYPE_CHECKING_ONLY`) and
+    ``lazy: inside <qualname>`` (:data:`_LAZY_PREFIX`) say "this import does not run when
+    the module is imported". That is the question §3.2's unresolvable-pin rule asks — it is
+    why a pin nothing on this image can install may be *dropped*
+    (:func:`decide_unresolvable`) — and it is **not** a reason to leave an *installable*
+    package out of a layer. Read as one it shrank the benchmark environment around the bug:
+    measured on pandas/1, ``beautifulsoup4``, ``scikit-learn`` and ``psycopg2-binary``
+    reach the layer through exactly such sites, so classifying them out of
+    :func:`test_import_closure` stopped installing three packages the graded suite asked
+    for, and the tests that skipped without them were the blind spot that hid it.
+
+    So the two reasons are consulted by the audit walk (:func:`tree_import_sites` →
+    :func:`import_auditor`) and by nothing else: :func:`test_import_closure` installs them
+    like any other import, exactly as it did before the reasons existed.
+    """
+    return reason is not None and (
+        reason == TYPE_CHECKING_ONLY or reason.startswith(_LAZY_PREFIX)
+    )
+
+
 def _collect_imports(
     node: ast.AST,
     *,
@@ -2345,6 +2368,13 @@ def test_import_closure(
     running anything). ``tree_modules`` is the rest of the tree's own modules
     (:func:`tree_provided_modules`) — a name the tree ships is not a distribution,
     wherever in the tree the sources that put it on ``sys.path`` live.
+
+    This walk is the **install set** and nothing else decides it: the two reasons that
+    only answer the audit's question — ``type-checking only`` and ``lazy: inside
+    <qualname>`` — are not reasons to leave a package out of a layer
+    (:func:`_scope_only_reason`), so a site carrying one is installed like any other
+    import. Only a *guard* (an ``except ImportError``, a version check, an
+    ``importorskip``) keeps a module in ``optional`` and out of the layer.
     """
     reviewed = distributions or {}
     stdlib_names = set(stdlib)
@@ -2380,7 +2410,13 @@ def test_import_closure(
                 )
                 continue
             source = f"import closure: {path} line {site.line}"
-            if site.optional is not None:
+            # ``type-checking only`` and ``lazy: inside <qualname>`` are the audit's
+            # reasons, not this walk's: §3.2 consults them to decide whether a pin
+            # nothing here can install may be dropped (:func:`decide_unresolvable`), and
+            # they must not change which *installable* packages a layer carries — see
+            # :func:`_scope_only_reason`. A guard (``except ImportError``, a version
+            # check, ``importorskip``) is still this walk's reason, as it always was.
+            if site.optional is not None and not _scope_only_reason(site.optional):
                 if (top, source) not in seen_optional:
                     seen_optional.add((top, source))
                     optional.append(

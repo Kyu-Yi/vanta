@@ -540,26 +540,39 @@ function `outer.inner`. `bake._never_runs` matches the guard in its **exact** fo
 `typing.TYPE_CHECKING` attribute, the literal `False` — because `if not TYPE_CHECKING:` and
 `if x or TYPE_CHECKING:` *do* run, and a rule with a false positive drops a pin a graded test needs,
 which is the failure mode this rule exists to avoid. A **module-level unguarded import is unchanged**: it
-is still an unconditional site, and still what makes the pin required. Measured, this was the last flag
-the dev-split preflight carried — `pandas/core/arrays/boolean.py` at `3fd150c` is
+is still an unconditional site, and still what makes the pin required.
+
+**Both reasons are the audit's, and neither one touches the install set.** `bake._scope_only_reason`
+marks exactly these two as reasons that answer the *audit's* question — "may a pin nothing here can
+install be left out of the layer?" — and never the closure's question — "which packages does a layer
+carry?". `bake.test_import_closure` installs them like any other import, exactly as it did before the
+reasons existed; they are read only by `bake.tree_import_sites` → `bake.import_auditor` →
+`bake.decide_unresolvable`, and only for a pin that is class (c) unavailable or
+`UNBUILDABLE_ON_PLATFORM`. The distinction is not cosmetic: read as closure reasons they shrank
+`pandas/1`'s layer by three packages, and the tests that ask for them then *skipped* — which no failure
+set can see (measured below). What the audit reads on `pandas/1` starts at
+`pandas/core/arrays/boolean.py` at `3fd150c`:
 
     if TYPE_CHECKING:
         import pyarrow  # noqa: F401
 
-and `pandas/1`'s failing test (`pandas/tests/dtypes/test_dtypes.py`) never reaches a runtime
-`import pyarrow`, so the block was the only thing keeping a pin this image cannot build.
+so the block is one of `pyarrow`'s recorded sites — beside `pandas/core/arrays/_arrow_utils.py:5`, the
+only *unconditional* one, and the in-method sites below — and it is why `pyarrow` may be dropped from a
+layer this image cannot build it into. The install set carries the pin until that drop removes it.
 
-The lazy reason is a prediction like a drop, and it is safe for the same reason: `prepare`'s gate — the
-buggy tree must fail and the fixed tree must pass — is the measurement, and a bug whose gate fails names
-the pins the layer went without (`prepare.dropped_pin_note`, at every gate exit). Measured on the test
-side the rule also changes three of `pandas/1`'s names: `import bs4` inside `test_bs4_version_fails`
-(`pandas/tests/io/test_html.py`), `from sklearn import svm, datasets` inside `test_scikit_learn`
-(`pandas/tests/test_downstream.py`), and `import psycopg2` inside
-`TestToDatetime.test_to_datetime_tz_psycopg2` (`pandas/tests/tools/test_to_datetime.py`) — none of the
-three is installed for the layer now, and each is in `optional_imports` with its qualname so the drop is
-checkable rather than silent. Two of those three are `@td.skip_if_no(...)`-decorated, which is worth
-saying plainly: without the distribution such a test **skips** instead of failing, so the gate is blind
-to that one and the record is the only place the decision can be read.
+The drop is a prediction like any other, and it is safe for the same reason: `prepare`'s gate — the buggy
+tree must fail and the fixed tree must pass — is the measurement, and a bug whose gate fails names the
+pins the layer went without (`prepare.dropped_pin_note`, at every gate exit). **Three of `pandas/1`'s
+names are on the test side and are installed anyway**, and that measurement is what corrected the scope:
+`import bs4` inside `test_bs4_version_fails` (`pandas/tests/io/test_html.py`), `from sklearn import svm,
+datasets` inside `test_scikit_learn` (`pandas/tests/test_downstream.py`), and `import psycopg2` inside
+`TestToDatetime.test_to_datetime_tz_psycopg2` (`pandas/tests/tools/test_to_datetime.py`) are `lazy:
+inside <qualname>` sites, and those reasons are the *audit's*. Read as closure reasons — which is what
+the reasons were first wired into — they took `beautifulsoup4`, `scikit-learn` and `psycopg2-binary` out
+of the layer, and the tests that ask for them then **skipped**. Two of the three are
+`@td.skip_if_no(...)`-decorated, which is what hid the loss: a skip is not a failure, so nothing in the
+gate moved and the layer that had lost three packages looked exactly like the layer that had them. The
+reason is still recorded on each site and still read by the audit; the closure installs the three.
 
 The distinction is measured, and it is where the rule was wrong before. **`pandas/1` is not flagged, it
 drops.** `import pyarrow` does appear in **18** `.py` files at the fix's commit, but the only
@@ -800,12 +813,15 @@ Source 5's scope, since "the test side's imports" can be read several ways:
   counted: `fastapi/requests.py` is importable as `fastapi.requests` and never as a top-level
   `requests`, so counting those would silently drop the real distribution of that name. This applies
   to every wave, not only the dev split.
-- **An optional import is recorded, never installed.** An import inside `try/except ImportError`, behind
-  a version check (`sys.version_info`, `PY2`, `six.PY3`), inside a `TYPE_CHECKING` block
-  (`type-checking only`) or inside a function body (`lazy: inside <qualname>`) is a fallback: it goes in
-  `optional_imports` and not into `installs`, because installing a Python-2-only fallback on 3.8 would
-  fail the bake over a branch that can never be taken — and a type-checking block or a function body is
-  the same statement about *when* the import runs, which is the only thing the layer has to answer.
+- **An optional import is recorded, never installed — except the two reasons that are the audit's.** An
+  import inside `try/except ImportError` or behind a version check (`sys.version_info`, `PY2`, `six.PY3`)
+  is a fallback: it goes in `optional_imports` and not into `installs`, because installing a
+  Python-2-only fallback on 3.8 would fail the bake over a branch that can never be taken. An import
+  inside a `TYPE_CHECKING` block (`type-checking only`) or inside a function body
+  (`lazy: inside <qualname>`) is **not** a reason to leave an installable package out of a layer: those
+  two are read only by the audit of a pin nothing here can install (`bake._scope_only_reason`), and
+  `bake.test_import_closure` installs them like any other import — measured above as the three
+  `pandas/1` names that left the layer and made their tests skip.
 - **An ambiguous module name stops the bake.** `import yaml` is PyYAML and `import bs4` is
   beautifulsoup4; no canonicalisation recovers that. The closure names the module and refuses, and the
   fix is a reviewed `module_distributions` entry in the split — a decision recorded in the protocol,
@@ -823,11 +839,11 @@ Source 5's scope, since "the test side's imports" can be read several ways:
   into the table with its reason and its rule in `reviewed_changes` rather than into the harness:
   `psycopg2` → `psycopg2-binary`, because the bug's tests only need the module to import (the SQL tests
   skip without a database server, so no connection is exercised) while the source distribution builds
-  against libpq and needs a `pg_config` the sandbox does not have. On `pandas/1` the entry is read by
-  the **audit** rather than by the closure now: the tree's only site, `import psycopg2` in
-  `pandas/tests/tools/test_to_datetime.py`, is inside `TestToDatetime.test_to_datetime_tz_psycopg2`, so
-  it is a `lazy` optional import (above) and nothing is installed for it — the mapping is what
-  `import_auditor` reads when a pin of that name has to be judged. Nothing about it is otherwise
+  against libpq and needs a `pg_config` the sandbox does not have. On `pandas/1` both walks read that
+  entry — the closure installs `psycopg2-binary`, and the audit reads the same mapping when a pin of that
+  name has to be judged — because the tree's only site, `import psycopg2` in
+  `pandas/tests/tools/test_to_datetime.py`, sits inside `TestToDatetime.test_to_datetime_tz_psycopg2` and
+  carries a `lazy` reason, which is the audit's and never the closure's. Nothing about it is otherwise
   special: a mapped distribution that *is* installed is pinned by the same date rule as every other
   dependency, and a pin with no wheel for the sandbox's platform fails the bake as an ordinary build
   failure for that bug — flagged, not worked around, and never answered by falling back to the source

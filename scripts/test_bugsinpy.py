@@ -6589,6 +6589,18 @@ class TestTestImportClosure:
             tree_modules=bake_mod._tree_local_modules(sorted(tree_files or {})),
         )
 
+    def _sites(self, files: dict) -> dict:
+        """The *audit* walk over the same files: ``{module as imported: every site}``.
+
+        The closure above is the install set; this is the walk §3.2's unresolvable-pin
+        rule reads (``bake.tree_import_sites``). A test that asserts a ``type-checking
+        only`` / ``lazy: inside <qualname>`` reason has to read it here, because those
+        reasons are the audit's and never the closure's (``bake._scope_only_reason``).
+        """
+        return bake_mod.tree_import_sites(
+            sorted(files), read_file=files.get, stdlib=bake_mod.PY38_STDLIB
+        )
+
     def test_a_module_the_tree_ships_outside_the_test_side_is_not_a_distribution(self):
         """fastapi/1's measured case: ``docs_src`` goes on ``sys.path`` by hand.
 
@@ -6699,35 +6711,40 @@ class TestTestImportClosure:
     def test_a_type_checking_or_if_false_block_never_runs_its_imports(self):
         """``pandas/1``'s last flag: ``if TYPE_CHECKING: import pyarrow  # noqa: F401``.
 
-        ``TYPE_CHECKING`` is ``False`` at run time, so the block is a type checker's
-        input and not an import the module makes: the layer can be short and the module
-        still imports. ``if False:`` is the same statement written without the import
-        from ``typing``, and both are recorded as ``type-checking only`` rather than as
-        evidence the distribution is required.
+        ``TYPE_CHECKING`` is ``False`` at run time, so the block is a type checker's input
+        and not an import the module makes: §3.2's audit can read the distribution as
+        droppable. ``if False:`` is the same statement written without the import from
+        ``typing``. Both are recorded as ``type-checking only`` on the *site*, which is the
+        walk the audit reads — and the closure, which is the install set, still installs
+        them: a reason about *when* an import runs must not shrink a layer around a package
+        the tests name (``bake._scope_only_reason``).
         """
-        refs, optional, _ = self._closure(
-            {
-                "tests/test_demo.py": (
-                    "from typing import TYPE_CHECKING\n"
-                    "if TYPE_CHECKING:\n"
-                    "    import pyarrow  # noqa: F401\n"
-                    "if False:\n"
-                    "    import six\n"
-                )
-            }
-        )
-        assert refs == []
-        assert [(item.module, item.reason) for item in optional] == [
-            ("pyarrow", "type-checking only"),
-            ("six", "type-checking only"),
+        files = {
+            "tests/test_demo.py": (
+                "from typing import TYPE_CHECKING\n"
+                "if TYPE_CHECKING:\n"
+                "    import pyarrow  # noqa: F401\n"
+                "if False:\n"
+                "    import six\n"
+            )
+        }
+        refs, optional, _ = self._closure(files)
+        assert [ref.spec for ref in refs] == ["pyarrow", "six"]
+        assert optional == [], "the audit's reason is not the closure's"
+        sites = self._sites(files)
+        assert [(site.module, site.optional) for site in sites["pyarrow"]] == [
+            ("pyarrow", "type-checking only")
+        ]
+        assert [(site.module, site.optional) for site in sites["six"]] == [
+            ("six", "type-checking only")
         ]
 
     def test_a_dotted_type_checking_block_is_the_same_guard(self):
-        refs, optional, _ = self._closure(
-            {"tests/test_demo.py": "import typing\nif typing.TYPE_CHECKING:\n    import six\n"}
-        )
-        assert refs == []
-        assert [(item.module, item.reason) for item in optional] == [
+        files = {"tests/test_demo.py": "import typing\nif typing.TYPE_CHECKING:\n    import six\n"}
+        refs, optional, _ = self._closure(files)
+        assert [ref.spec for ref in refs] == ["six"]
+        assert optional == []
+        assert [(site.module, site.optional) for site in self._sites(files)["six"]] == [
             ("six", "type-checking only")
         ]
 
@@ -6738,53 +6755,58 @@ class TestTestImportClosure:
         from the name the checker uses, which is the one spelling the bare-name check
         cannot see.
         """
-        refs, optional, _ = self._closure(
-            {
-                "tests/test_demo.py": (
-                    "from typing import TYPE_CHECKING as TC\n"
-                    "if TC:\n"
-                    "    import six\n"
-                )
-            }
-        )
-        assert refs == []
-        assert [(item.module, item.reason) for item in optional] == [
+        files = {
+            "tests/test_demo.py": (
+                "from typing import TYPE_CHECKING as TC\n"
+                "if TC:\n"
+                "    import six\n"
+            )
+        }
+        refs, optional, _ = self._closure(files)
+        assert [ref.spec for ref in refs] == ["six"]
+        assert optional == []
+        assert [(site.module, site.optional) for site in self._sites(files)["six"]] == [
             ("six", "type-checking only")
         ]
 
     def test_an_import_inside_a_method_is_lazy_not_module_scope(self):
         """Importing the module does not define the method's import, calling it does."""
-        refs, optional, _ = self._closure(
-            {
-                "tests/test_demo.py": (
-                    "class Dtype:\n"
-                    "    def _arrow(self):\n"
-                    "        import pyarrow\n"
-                )
-            }
-        )
-        assert refs == []
-        assert [(item.module, item.reason) for item in optional] == [
+        files = {
+            "tests/test_demo.py": (
+                "class Dtype:\n"
+                "    def _arrow(self):\n"
+                "        import pyarrow\n"
+            )
+        }
+        refs, optional, _ = self._closure(files)
+        assert [ref.spec for ref in refs] == ["pyarrow"]
+        assert optional == []
+        assert [(site.module, site.optional) for site in self._sites(files)["pyarrow"]] == [
             ("pyarrow", "lazy: inside Dtype._arrow")
         ]
 
     def test_an_import_inside_a_nested_function_names_the_whole_path(self):
-        refs, optional, _ = self._closure(
-            {
-                "tests/test_demo.py": (
-                    "def outer():\n"
-                    "    def inner():\n"
-                    "        import pyarrow\n"
-                )
-            }
-        )
-        assert refs == []
-        assert [(item.module, item.reason) for item in optional] == [
+        files = {
+            "tests/test_demo.py": (
+                "def outer():\n"
+                "    def inner():\n"
+                "        import pyarrow\n"
+            )
+        }
+        refs, optional, _ = self._closure(files)
+        assert [ref.spec for ref in refs] == ["pyarrow"]
+        assert optional == []
+        assert [(site.module, site.optional) for site in self._sites(files)["pyarrow"]] == [
             ("pyarrow", "lazy: inside outer.inner")
         ]
 
     def test_a_module_level_import_beside_a_type_checking_block_still_counts(self):
-        """The new guards are narrow: an ordinary import in the same file is still a pin."""
+        """The guards are narrow: an ordinary import in the same file is still a pin.
+
+        And a guarded one is still a *guard*: the closure's ``optional`` keeps the imports
+        it declines to install, so the two reasons did not displace the pre-existing rule
+        either.
+        """
         refs, optional, _ = self._closure(
             {
                 "tests/test_demo.py": (
@@ -6792,11 +6814,17 @@ class TestTestImportClosure:
                     "import six\n"
                     "if TYPE_CHECKING:\n"
                     "    import pyarrow\n"
+                    "try:\n"
+                    "    import decorator\n"
+                    "except ImportError:\n"
+                    "    pass\n"
                 )
             }
         )
-        assert [ref.spec for ref in refs] == ["six"]
-        assert [item.module for item in optional] == ["pyarrow"]
+        assert [ref.spec for ref in refs] == ["six", "pyarrow"]
+        assert [(item.module, item.reason) for item in optional] == [
+            ("decorator", "behind an ImportError guard")
+        ]
 
     def test_a_relative_import_is_the_trees_own_file(self):
         refs, optional, _ = self._closure({"tests/test_demo.py": "from . import helper\n"})
@@ -7796,9 +7824,7 @@ class TestRealMatplotlibAndPandasClosure:
     decision for the evaluation waves — not a per-bug exception. pandas' ``psycopg2``
     entry is the same table used for a different reason: two distributions provide that
     module, so the entry is the reviewer's pick (the reason is in ``reviewed_changes``)
-    and the harness still never guesses; its only import site is inside a test method,
-    so it is now a lazy optional import rather than a closure ref, and what the table
-    answers for it is an audit question rather than an install. The same two bugs
+    and the harness still never guesses. The same two bugs
     exercise the other half of the source: matplotlib's ``lib/pylab.py`` and pandas'
     ``scripts/validate_docstrings.py`` live in directories with no ``__init__.py``, so
     pytest puts them on ``sys.path`` as modules the tree provides, and pandas'
@@ -7808,6 +7834,25 @@ class TestRealMatplotlibAndPandasClosure:
 
     MATPLOTLIB_REPO = REPO_ROOT / "runs" / "bugsinpy" / "repos" / "matplotlib.git"
     PANDAS_REPO = REPO_ROOT / "runs" / "bugsinpy" / "repos" / "pandas.git"
+
+    # The closure's contribution to pandas/1's install set, measured at the fix's commit.
+    # `f095789` classified `bs4`, `sklearn` and `psycopg2` out of it — every site of the
+    # three is `lazy: inside <qualname>` — so this is both the list the layer had *before*
+    # that commit and the list the scope fix restores. Written down whole because nothing
+    # else in the harness notices a package quietly leaving a layer: the tests that need
+    # one then skip, and `skipped` is not a failure.
+    PANDAS_ONE_CLOSURE = (
+        "IPython", "botocore", "bs4", "cftime", "cycler", "dask", "dateutil",
+        "fastparquet", "hypothesis", "jedi", "matplotlib", "numba", "numexpr",
+        "openpyxl", "pkg_resources", "psycopg2", "py", "pyarrow", "pymysql",
+        "pytest", "pytz", "s3fs", "scipy", "sklearn", "sqlalchemy", "statsmodels",
+        "xarray", "xlrd",
+    )
+    # The only pins in that list nothing on this image can build; §3.2's rule may take
+    # them out of the layer and nothing else. ``llvmlite`` is the third entry of
+    # ``bake.UNBUILDABLE_ON_PLATFORM`` and is *not* here: nothing in either tree imports
+    # it, so it never enters the install set to be dropped.
+    PANDAS_ONE_UNUSABLE = ("numba", "pyarrow")
 
     def _sources(self, project: str, bug_id: int, repo: Path):
         split = load_split(DEV_SPLIT_PATH)
@@ -7857,37 +7902,22 @@ class TestRealMatplotlibAndPandasClosure:
             )
 
     @needs_pandas_repo
-    def test_pandas_resolves_the_divergent_names_its_tests_import_at_module_scope(self):
-        """The table decides ``dateutil`` and ``pkg_resources``; nothing canonicalises them.
+    def test_pandas_resolves_the_five_divergent_modules(self):
+        """``psycopg2`` included: the reviewer's pick is in the table, not the harness.
 
-        [VANTA-WHY] Measured against the fixed commit: ``import dateutil`` is at module
-        scope in ``pandas/tests/frame/test_missing.py`` and ``import pkg_resources`` in
-        ``pandas/tests/plotting/test_backend.py``, and no canonicalisation turns the
-        first into ``python-dateutil`` or the second into ``setuptools``, so the closure
-        refuses to guess and the split's reviewed ``module_distributions`` answers
-        instead. The other three names this test used to see are gone for a reason that
-        is the fix, not a loss: every site of ``bs4``, ``sklearn`` and ``psycopg2`` is
-        inside a test *function* body (``test_bs4_version_fails``,
-        ``test_scikit_learn``, ``TestToDatetime.test_to_datetime_tz_psycopg2``), so the
-        import is lazy and importing the suite does not need the distribution. Each is
-        recorded as an optional import with that reason, which is what makes the drop
-        checkable rather than silent. The reviewer's ``psycopg2`` pick is still asserted
-        where it belongs — on the table itself, in the dev split's own test.
+        [VANTA-WHY] Unlike the other four, ``psycopg2`` was never resolvable by
+        canonicalisation *or* by preference: two distributions provide that module, so
+        the closure refuses until a reviewer records which one — and it is now recorded
+        (``psycopg2-binary``), with the reason in the split's ``reviewed_changes``. The
+        table still decides it, so removing the entry puts the refusal back.
         """
         _, sources = self._sources("pandas", 1, self.PANDAS_REPO)
         by_spec = self._by_spec(sources.refs)
         assert by_spec["dateutil"] == "python-dateutil"
+        assert by_spec["bs4"] == "beautifulsoup4"
+        assert by_spec["sklearn"] == "scikit-learn"
         assert by_spec["pkg_resources"] == "setuptools"
-        assert {"bs4", "sklearn", "psycopg2"} & set(by_spec) == set(), (
-            "every site of these three is inside a function body, so none of them "
-            "reaches the module-scope closure"
-        )
-        lazy = {item.module: item.reason for item in sources.optional_imports}
-        assert lazy["bs4"] == "lazy: inside test_bs4_version_fails"
-        assert lazy["sklearn"] == "lazy: inside test_scikit_learn"
-        assert lazy["psycopg2"] == (
-            "lazy: inside TestToDatetime.test_to_datetime_tz_psycopg2"
-        )
+        assert by_spec["psycopg2"] == "psycopg2-binary", "the reviewed pick, not a guess"
 
     @needs_pandas_repo
     def test_pandas_merges_without_a_conflict_and_csv_is_the_interpreters(self):
@@ -7895,14 +7925,8 @@ class TestRealMatplotlibAndPandasClosure:
         merged, conflicts = bake_mod.merge_refs(sources.refs)
         assert conflicts == []
         names = {ref.name for ref in merged}
-        assert {"python-dateutil", "setuptools"} <= names
-        assert {"beautifulsoup4", "scikit-learn"} & names == set(), (
-            "bs4 and sklearn are imported only inside test function bodies, so the "
-            "closure records them as lazy optional imports rather than as pins"
-        )
-        assert "psycopg2-binary" not in names, (
-            "the closure's only psycopg2 site is inside a method body as well"
-        )
+        assert {"beautifulsoup4", "python-dateutil", "scikit-learn", "setuptools"} <= names
+        assert "psycopg2-binary" in names, "mapped by the split; the source build needs libpq"
         assert "psycopg2" not in names, "the unmapped distribution is never installed"
         assert "-csv" not in names
         refs, _, notes = bake_mod.test_import_closure(
@@ -7918,6 +7942,94 @@ class TestRealMatplotlibAndPandasClosure:
         )
         assert "_csv" not in {ref.spec for ref in refs}
         assert any("'_csv' cannot name a distribution" in note for note in notes)
+
+    @needs_pandas_repo
+    def test_pandas_one_keeps_the_install_set_it_had_before_the_scope_fix(self):
+        """The install set is the pre-``f095789`` one, and only the unusable pins leave it.
+
+        [VANTA-WHY] ``f095789`` read ``type-checking only`` and ``lazy: inside <qualname>``
+        as reasons to leave a package *out of a layer*. On pandas/1 that took
+        ``beautifulsoup4``, ``scikit-learn`` and ``psycopg2-binary`` out of the install
+        set — the tests that ask for them then *skip*, and ``skipped`` is not a failure, so
+        the gate could not see it. The closure's list is written down whole for that
+        reason: it is the difference a scope bug makes, and nothing else in the harness
+        would notice it. The three the fix restored are asserted by name, the two pins
+        nothing here can install are asserted *out* with the audit that let them go
+        (``llvmlite`` is not in the list at all — nothing in either tree imports it), and
+        the install set after the drop is the baseline minus exactly those two.
+        """
+        split, sources = self._sources("pandas", 1, self.PANDAS_REPO)
+        closure = sorted(
+            {ref.spec for ref in sources.refs if ref.source.startswith("import closure:")}
+        )
+        assert closure == sorted(self.PANDAS_ONE_CLOSURE), (
+            "the install set is the one before the scope fix: a `lazy` / `type-checking "
+            "only` site answers the audit's question, never the closure's "
+            "(`bake._scope_only_reason`)"
+        )
+        assert {"bs4", "sklearn", "psycopg2"} <= set(closure), (
+            "`beautifulsoup4`, `scikit-learn` and `psycopg2-binary` are installed again; "
+            "the split's table names them"
+        )
+
+        audit = bake_mod.import_auditor(
+            self.PANDAS_REPO,
+            (sources.buggy_commit, sources.fixed_commit),
+            distributions=split.module_distributions(),
+            test_files=(str(split.bug("pandas", 1)["test_file"]),),
+        )
+        source_of = {
+            ref.spec: ref.source
+            for ref in sources.refs
+            if ref.source.startswith("import closure:")
+        }
+        dropped = {
+            name: bake_mod.decide_unresolvable(
+                name,
+                version=None,
+                spec=name,
+                sources=(source_of[name],),
+                outcome=bake_mod.UNBUILDABLE,
+                reason=bake_mod.UNBUILDABLE_ON_PLATFORM[name],
+                audit=audit(name),
+            )
+            for name in self.PANDAS_ONE_UNUSABLE
+        }
+        for name, record in dropped.items():
+            assert record.audit is not None and record.audit.required_by is None, (
+                "the audit is what lets it drop; a required one raises instead"
+            )
+            assert record.audit.sites, "a drop records every site it was measured on"
+            assert record.pin == name, "a closure ref carries no version of its own"
+
+        assert "llvmlite" not in closure, (
+            "nothing in either tree imports it, so it never enters the install set"
+        )
+        assert audit("llvmlite").reason == "nothing in either tree imports it"
+
+        arrow = {
+            (site.path, site.line, site.optional)
+            for site in dropped["pyarrow"].audit.sites
+        }
+        assert ("pandas/core/arrays/boolean.py", 32, "type-checking only") in arrow, (
+            "the block the fix reads: `if TYPE_CHECKING: import pyarrow  # noqa: F401`"
+        )
+        assert ("pandas/core/arrays/_arrow_utils.py", 5, None) in arrow, (
+            "the one unconditional site in the tree, and it is outside the failing "
+            "tests' import closure"
+        )
+        assert dropped["pyarrow"].audit.reason == (
+            "no unconditional import of it is in the failing tests' import closure"
+        )
+        assert dropped["numba"].audit.reason.startswith("every one of its"), (
+            "every numba site is `lazy: inside <qualname>` or an import_optional_dependency"
+        )
+
+        installs = sorted(spec for spec in closure if spec not in dropped)
+        assert installs == sorted(set(self.PANDAS_ONE_CLOSURE) - set(dropped)), (
+            "the install set after the rule is the baseline minus only the unusable pins"
+        )
+        assert sorted(dropped) == sorted(self.PANDAS_ONE_UNUSABLE)
 
 
 needs_sanic_repo = pytest.mark.skipif(

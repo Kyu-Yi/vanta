@@ -242,18 +242,43 @@ def pins_for_python(split: Split, minor: str) -> PytestPin:
 # the interpreter layer
 # ---------------------------------------------------------------------------
 SDIST_SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
+    # The evidence comment on each line is the review: the pinned sdist's own
+    # ``setup.py``/``setup.cfg`` read (never executed) for ``libraries=``,
+    # ``library_dirs``, a pkg-config/``find_library``/``ctypes.util`` call, or an
+    # include of a header the archive does not carry.
+    "asyncpg": (),  # Cython pgproto only; no libpq, no external header
     "bcrypt": ("libffi-dev",),
+    "brotli": (),  # vendored c/; <vector> is libstdc++, which g++ brings
     "cffi": ("libffi-dev",),
+    "coverage": (),  # coverage/ctracer/* only, all in the sdist
     "cryptography": ("libssl-dev",),
+    "cython": (),  # its own setup.py names no library; Demos/ and docs/ do
+    "distlib": (),  # PC/launcher.c is the Windows launcher, never built here
+    "httptools": (),  # vendor/http-parser/ is inside the sdist
     "lxml": ("libxml2-dev", "libxslt1-dev"),
+    "multidict": (),  # multidict/_multidict.c + _multilib/*.h only
+    "numpy": (),  # bundled f2c lapack_lite; get_info('lapack_opt', 0) falls back
+    "peewee": ("libsqlite3-dev",),  # setup.py libraries=['sqlite3'] (optional ext)
     "pillow": ("libjpeg-dev",),
+    "psutil": (),  # its libraries= are devstat/kvm/kstat/perfstat — all non-Linux
     "psycopg2": ("libpq-dev",),
     "psycopg2-binary": ("libpq-dev",),
     "pynacl": ("libffi-dev",),
+    "pyyaml": ("libyaml-dev",),  # setup.py libraries=['yaml'] for ext/_yaml.pyx
+    "regex": (),  # regex_2/ and regex_3/ are in the sdist
+    "ruamel-yaml-clib": (),  # libs come from its own ext_modules; it lists none
     "scikit-learn": ("gfortran", "libopenblas-dev", "liblapack-dev"),
     "scipy": ("gfortran", "libopenblas-dev", "liblapack-dev"),
+    "sqlalchemy": (),  # cextension/{processors,resultproxy,utils}.c only
     "statsmodels": ("gfortran", "libopenblas-dev", "liblapack-dev"),
+    "tornado": (),  # tornado/speedups.c only
+    "ujson": (),  # vendored double-conversion; -lstdc++/-lm are the toolchain's
+    "urwid": (),  # source/str_util.c only
     "uvloop": ("make", "autoconf", "automake", "libtool"),
+    "websockets": (),  # src/websockets/speedups.c only
+    "yarl": (),  # yarl/_quoting.c only
+    "zope-interface": (),  # src/zope/interface/_zope_interface_coptimizations.c
+    "zstandard": (),  # vendored c-ext/ only
 }
 """Reviewed table: a package that compiles from sdist → the Debian trixie packages it needs.
 
@@ -286,6 +311,18 @@ what :func:`preflight_pin` classifies with. Three entries need a word:
 An entry with an empty tuple is a legitimate review result — "this package compiles,
 and against nothing but libc and the compiler already in the layer" — and is how a
 :func:`_review_of` gap gets closed without pretending a package needs something.
+
+[VANTA-WHY] Every entry above was decided by reading the *pinned sdist*, not by
+knowing the package: ``python3 scripts/bugsinpy_run.py bake --preflight-only`` names
+the pins that compile and no entry covered, and each of those was re-read at its exact
+pinned version for ``libraries=``, ``library_dirs``, a pkg-config/``find_library``/
+``ctypes.util`` call, or an include of a header the archive does not carry. The one
+finding that did not go to plan is worth keeping: the *raw* compiled-source count that
+:func:`compiled_sources` produces is not evidence of a build. ``distlib`` 0.3.0's is
+``PC/launcher.c`` — the Windows launcher, which nothing on Linux compiles — and
+``cffi``'s includes ``demo/*.c``, which are examples. Both packages' entries are empty
+for that reason, and the count stays in the record as a raw fact rather than as the
+reason a build is said to need a library (:func:`_sdist_reason`).
 """
 
 UNBUILDABLE_ON_PLATFORM: Mapping[str, str] = {

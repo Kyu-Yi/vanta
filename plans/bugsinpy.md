@@ -375,7 +375,19 @@ from a package that compiles from its sdist to the Debian trixie packages that b
 on), unioned with the five the layer started with — `g++`, `pkg-config`, `libfreetype-dev`,
 `libpng-dev`, `zlib1g-dev`. **One table, two readers**, and that is the point: the preflight's
 unreviewed-build check looks a pin up in the same map, so an entry added for a preflight `gap` is
-simultaneously in the install list the next bake runs. The interpreter recipe installs the union (§3.2's
+simultaneously in the install list the next bake runs. An **empty** entry is a review result and not a
+missing one — it says "this package compiles, against nothing but libc and the compiler the layer
+already carries" — and it *clears* the `gap`; only a package with no entry at all is reported. Every
+entry was decided by reading the **pinned sdist's own `setup.py`/`setup.cfg`** (from the cached
+archive, never executing it) for `libraries=`, `library_dirs`, a pkg-config / `find_library` /
+`ctypes.util` call, or an include of a header the archive does not carry, and the finding is recorded
+as the comment on the entry, so a reader argues with the evidence rather than with the verdict. The
+measures that review settled (`coverage`, `multidict`, `yarl`, `websockets`, `tornado`, `urwid`,
+`zope-interface`, `regex`, `sqlalchemy`, `psutil`, `ruamel-yaml-clib`, `httptools`, `ujson`, `brotli`,
+`zstandard`, `asyncpg`, `numpy`, `cython`, `distlib` → toolchain only; `pyyaml` → `libyaml-dev`;
+`peewee` → `libsqlite3-dev`) are in the map itself, each with its evidence.
+
+The interpreter recipe installs the union (§3.2's
 build-toolchain rule for the *system* half: the pinned `setuptools`/`wheel`/`Cython` are the Python
 half), and a package that is not in dpkg's own `installed` state afterwards fails **that layer's** bake.
 The check is on the status field and not on `dpkg-query -W`'s exit code, because a package dpkg knows

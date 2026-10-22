@@ -433,8 +433,15 @@ def cmd_bake(args: argparse.Namespace) -> int:
             raise SplitError(f"no github_url for {project} in project.info")
         return tree_cache(repo_cache, project, url)
 
+    # One classifier for the whole run, shared by the two places that ask the same
+    # question about the same pins: §3.2's unresolvable-pin rule (does this release
+    # install here at all, which decides whether a pin is dropped or the bug flagged)
+    # and the preflight table below. A second classifier would pay PyPI a second time
+    # for every answer, and the splits share their pins heavily — numpy alone is in six
+    # of the eleven dev-split bugs.
+    classify = bake_mod.preflight_classifier()
     bug_deps, flagged = bake_mod.resolve_bug_deps(
-        split, entries, bugsinpy_root=bugsinpy_root, repo_for=repo_for
+        split, entries, bugsinpy_root=bugsinpy_root, repo_for=repo_for, classify=classify
     )
 
     # Every run ends with this list, empty or not: a reader of a run that stopped at a
@@ -455,13 +462,23 @@ def cmd_bake(args: argparse.Namespace) -> int:
             flush=True,
         )
         print(f"[{item.checkpoint}] provenance: {path}", flush=True)
+        # A dropped pin is the one thing about a layer that a reader cannot see from the
+        # install list alone — the declaration is gone and the layer is shorter than the
+        # bug's own files say. So it is printed here, one line per pin, with the reason:
+        # the JSON next to it has the same record, and neither is a summary of the other.
+        for record in item.provenance.get("dropped") or []:
+            print(
+                f"[{item.checkpoint}] dropped {record['pin']} "
+                f"({record['outcome']}) — {record['reason']}",
+                flush=True,
+            )
 
     # The preflight, before the first layer is built (§3.2): what every pin installs
     # as on this image — cp38/linux-aarch64. A pin with no wheel here is built from
     # its sdist, and every system library that build needs is a whole bake cycle to
     # discover, so the answer is computed, printed and recorded next to the
     # provenance before anything is built.
-    preflight = bake_mod.preflight_layers(bug_deps)
+    preflight = bake_mod.preflight_layers(bug_deps, classify=classify)
     for report in preflight:
         path = bake_mod.write_preflight(deps_dir, report)
         print(f"[{report.checkpoint}] preflight: {path}", flush=True)

@@ -2950,6 +2950,15 @@ NO_DISTRIBUTION = "unavailable"
 """Class (c): nothing pip can install here — PyPI has no such release, or the release
 ships only Windows/macOS wheels and no sdist."""
 
+UNBUILDABLE = "unbuildable"
+"""A §3.2 finding that is not one of the three classes: a build no reviewed table entry
+could make work on this image (:data:`UNBUILDABLE_ON_PLATFORM`).
+
+The pin *is* sdist-only, so its class letter stays (b) — that is what pip will try — and
+this is the separate word for the fact that the attempt cannot succeed. It is a recorded
+outcome like :data:`NO_DISTRIBUTION`, not a class of its own.
+"""
+
 PREFLIGHT_CLASS_LETTERS: Mapping[str, str] = {
     INSTALLABLE_WHEEL: "a",
     SDIST_ONLY: "b",
@@ -3392,37 +3401,54 @@ class PreflightBug:
         }
 
 
-def preflight_layers(
-    layers: Sequence[BugDeps],
+def preflight_classifier(
     *,
     files_of: Callable[[str, str], Optional[tuple[PyPIFile, ...]]] = pypi_release_files,
     sdist_of: Callable[[PyPIFile], tuple[tuple[str, ...], bool]] = sdist_file_list,
-) -> list[PreflightBug]:
-    """Classify every pin of every layer, with one cache for the whole run.
+) -> Callable[[str, str, str], PreflightPin]:
+    """``(name, version, python_minor) -> PreflightPin``, each pin fetched once per run.
 
-    [VANTA-WHY] Cached across layers rather than per bug: the splits share their pins
-    (numpy alone is in six of the eleven dev-split bugs), so a preflight that refetched
-    per bug would spend most of its time asking PyPI the same question. The cache is
-    keyed ``(name, version)`` for the release's files and by filename for the sdist
-    listing, so a package two bugs pin at the same version is fetched once — the same
-    shape as the per-run ``releases`` mapping :func:`resolve_bug_deps` fetches.
+    [VANTA-WHY] One instance per run, shared by §3.2's unresolvable-pin rule
+    (:func:`drop_unresolvable_refs`) and by the table the bake prints
+    (:func:`preflight_layers`). Both ask the same question about the same pins, and a
+    second cache would pay PyPI twice for every answer. Cached across bugs rather than
+    per bug, because the splits share their pins (numpy alone is in six of the eleven
+    dev-split bugs), keyed ``(name, version, python_minor)`` so a package two bugs pin
+    at the same version is fetched once — the same shape as the per-run ``releases``
+    mapping :func:`resolve_bug_deps` keeps for the date fetches.
 
     ``files_of``/``sdist_of`` are injected so the whole classification is a structural
     test: the default pair is the network, and no test should need it.
     """
-    files_cache: dict[tuple[str, str], Optional[tuple[PyPIFile, ...]]] = {}
-    sdist_cache: dict[str, tuple[tuple[str, ...], bool]] = {}
+    cache: dict[tuple[str, str, str], PreflightPin] = {}
 
-    def cached_files(name: str, version: str) -> Optional[tuple[PyPIFile, ...]]:
-        key = (name, version)
-        if key not in files_cache:
-            files_cache[key] = files_of(name, version)
-        return files_cache[key]
+    def classify(name: str, version: str, python_minor: str) -> PreflightPin:
+        key = (name, version, python_minor)
+        if key not in cache:
+            cache[key] = preflight_pin(
+                name,
+                version,
+                python_minor=python_minor,
+                files_of=files_of,
+                sdist_of=sdist_of,
+            )
+        return cache[key]
 
-    def cached_sdist(file: PyPIFile) -> tuple[tuple[str, ...], bool]:
-        if file.filename not in sdist_cache:
-            sdist_cache[file.filename] = sdist_of(file)
-        return sdist_cache[file.filename]
+    return classify
+
+
+def preflight_layers(
+    layers: Sequence[BugDeps],
+    *,
+    classify: Optional[Callable[[str, str, str], PreflightPin]] = None,
+) -> list[PreflightBug]:
+    """Classify every pin of every layer, through one shared classifier.
+
+    ``classify`` is the run's own :func:`preflight_classifier` when the caller has one —
+    ``bake`` builds it once and hands the same instance to the drop decision and to this
+    report — and a fresh one otherwise, so the cache still covers a whole call.
+    """
+    classifier = classify or preflight_classifier()
 
     out: list[PreflightBug] = []
     for layer in layers:
@@ -3433,13 +3459,7 @@ def preflight_layers(
                 checkpoint=layer.checkpoint,
                 python_minor=minor,
                 pins=tuple(
-                    preflight_pin(
-                        name,
-                        version,
-                        python_minor=minor,
-                        files_of=cached_files,
-                        sdist_of=cached_sdist,
-                    )
+                    classifier(name, version, minor)
                     for name, version in layer_pins(layer)
                 ),
             )
@@ -3499,6 +3519,372 @@ def write_preflight(deps_dir: Path, report: PreflightBug) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+# ---------------------------------------------------------------------------
+# §3.2's unresolvable-pin rule: drop a pin nothing can install, or flag the bug
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class DroppedPin:
+    """A pin nothing on this image can install, and nothing in the bug imports.
+
+    [VANTA-WHY] Dropped *with a record*, never silently. A dependency the layer cannot
+    install would otherwise be one bug's build error, and it is the same class of
+    problem as a missing system package (§3.2): knowable before the layer is built, and
+    the answer is a decision rather than a fallback. The record carries the declaration,
+    why nothing can install it, and which finding it was — so that the "nothing imports
+    it" half of the rule is a claim about the tree that can be re-checked rather than
+    taken on trust.
+    """
+
+    name: str
+    spec: str
+    """The declaration as written, e.g. ``requests-async==0.5.0``."""
+    sources: tuple[str, ...]
+    """Every place it was declared."""
+    version: Optional[str]
+    """The version the pin names, when it names one."""
+    outcome: str
+    """Which finding: :data:`NO_DISTRIBUTION` or :data:`UNBUILDABLE`."""
+    reason: str
+
+    @property
+    def pin(self) -> str:
+        return f"{self.name}=={self.version}" if self.version else self.name
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "spec": self.spec,
+            "pin": self.pin,
+            "sources": list(self.sources),
+            "outcome": self.outcome,
+            "reason": self.reason,
+        }
+
+
+def decide_unresolvable(
+    name: str,
+    *,
+    version: Optional[str],
+    spec: str,
+    sources: Sequence[str],
+    outcome: str,
+    reason: str,
+    imported_by: Optional[str],
+) -> DroppedPin:
+    """§3.2's one rule, for every pin nothing on this image can install.
+
+    Two findings reach here and they are one rule rather than two:
+
+    * a class (c) pin — ``luigi/1``'s ``requests-async==0.5.0``, a release PyPI never
+      uploaded, and ``sanic/1``'s ``pywin32==227``, whose files are all foreign wheels
+      and which ships no sdist;
+    * a class (b) pin preflight marks :data:`UNBUILDABLE` — an sdist whose build no
+      entry in the reviewed table could make work here (``pyarrow``'s Arrow C++,
+      ``llvmlite``'s LLVM).
+
+    Both are settled by the same question, asked of the bug itself: **does anything in
+    its source tree or test files import the module this distribution provides?**
+    ``imported_by`` is that answer — the file that imports it, or ``None``.
+
+    Nothing imports it → the pin is dropped and this returns the record that goes into
+    the provenance, the bake output and the plan's §3.2. Something does →
+    :class:`BakeError`, and :func:`resolve_bug_deps` flags the bug: a layer missing a
+    module the tree under test imports cannot run the suite, so baking it anyway would
+    trade a named flag now for an unreadable failure later.
+    """
+    if imported_by is not None:
+        raise BakeError(
+            f"{name} cannot be installed on this image ({reason}), and {imported_by} "
+            "imports it, so the bug cannot be baked without it. Amend the split or flag "
+            "the bug: §3.2's unresolvable-pin rule only drops a pin nothing imports."
+        )
+    return DroppedPin(
+        name=name,
+        spec=spec,
+        sources=tuple(sources),
+        version=version,
+        outcome=outcome,
+        reason=reason,
+    )
+
+
+def exact_version(spec: str, source: str) -> Optional[str]:
+    """The version an exact ``==`` pin names, or ``None`` for anything else.
+
+    Only an exact pin can be judged *before* the date rule runs: a range or a bare name
+    has no version until :func:`resolve_pins` picks one, and that half of the rule is
+    applied to the resolved list instead (:func:`drop_unresolvable_deps`). ``==1.0.*``
+    names a set of releases and not one, so it is not one of these either.
+    """
+    for clause in _requirement(spec, source).specifier:
+        if clause.operator == "==" and not clause.version.endswith(".*"):
+            return clause.version
+    return None
+
+
+def distribution_module_names(
+    distribution: str, *, distributions: Mapping[str, str]
+) -> tuple[str, ...]:
+    """The import spellings ``distribution`` is normally known by.
+
+    The split's reviewed ``module_distributions`` table inverted — ``Pillow`` → ``PIL``,
+    ``PyYAML`` → ``yaml`` — plus PEP 503's own ``-`` → ``_`` spelling, which is what
+    nearly every package is (``requests-async`` → ``requests_async``). The table is
+    keyed by the import spelling, so inverting it is what recovers the name the tree
+    would have written.
+
+    Used only to ask "does anything import this", and there the extra spellings are the
+    safe direction: a name that matches too much is a false *flag*, not a false drop.
+    """
+    canonical = canonicalize_name(distribution)
+    names = {
+        module
+        for module, dist in distributions.items()
+        if canonicalize_name(dist) == canonical
+    }
+    names.add(canonical.replace("-", "_"))
+    return tuple(sorted(names))
+
+
+def tree_import_sites(
+    files: Sequence[str],
+    *,
+    read_file: Callable[[str], Optional[str]],
+    stdlib: Iterable[str] = PY38_STDLIB,
+) -> dict[str, str]:
+    """``{module as imported: first file that imports it}`` over ``files``.
+
+    [VANTA-WHY] The mirror image of :func:`test_import_closure`: that walk asks which
+    distributions the test side needs, this asks whether *one* distribution is needed at
+    all — the question §3.2's unresolvable-pin rule turns on. Read with ``ast`` for the
+    same reason (nothing third-party runs on the host, design C3), and a file that does
+    not parse is passed over rather than reported, exactly as the closure passes it
+    over: the target interpreter could not collect it either.
+
+    Both spellings are filed — ``google.protobuf`` and its top-level ``google`` — because
+    a distribution provides a module and the tree may name either.
+    """
+    stdlib_names = set(stdlib)
+    sites: dict[str, str] = {}
+    for path in sorted(files):
+        if not path.endswith(".py"):
+            continue
+        text = read_file(path)
+        if text is None:
+            continue
+        try:
+            parsed = ast.parse(text)
+        except SyntaxError:
+            continue
+        found: list[_ImportSite] = []
+        _collect_imports(parsed, optional=None, out=found)
+        for site in found:
+            top = site.module.split(".")[0]
+            if not top or top == "__future__" or top in stdlib_names:
+                continue
+            sites.setdefault(site.module, path)
+            sites.setdefault(top, path)
+    return sites
+
+
+def uninstallable_reason(
+    name: str,
+    version: str,
+    *,
+    releases: Mapping[str, Mapping[str, str]],
+    classify: Callable[[str, str, str], PreflightPin],
+    python_minor: str,
+) -> Optional[tuple[str, str]]:
+    """``(outcome, reason)`` when nothing on this image can install ``name==version``.
+
+    Three answers, one shape, because the road from here on is the same:
+
+    * the pin names a release PyPI does not list at all — decided from the ``releases``
+      mapping the bake already has (``requests-async==0.5.0``), so it costs no fetch;
+    * the release's files say its format cannot work here — a class (c) release whose
+      wheels are all foreign and which ships no sdist (``pywin32==227``);
+    * the release is an sdist this image cannot build, named by
+      :data:`UNBUILDABLE_ON_PLATFORM` (``pyarrow``, :data:`UNBUILDABLE`).
+
+    ``None`` means "this pin is ordinary", which is the answer for a wheel, for an sdist
+    the reviewed table covers, and for an sdist that compiles nothing.
+
+    [VANTA-WHY] ``releases`` in and not one package's dates out of it: the rule is one
+    callable for the whole bug, so it is bound once —
+    ``partial(uninstallable_reason, releases=…, classify=…, python_minor=…)`` — and
+    handed to both drop passes. The mapping answers the first finding for free; only a
+    release that *does* exist costs a fetch, and that fetch is the run's shared
+    preflight answer (:func:`preflight_classifier`), not a second one of its own.
+    """
+    known = releases.get(name)
+    if known is not None and version not in known:
+        newest, released = _newest_release(known)
+        return NO_DISTRIBUTION, (
+            f"PyPI lists no release {version} of {name}, so nothing can install it "
+            f"(the newest {name} is {newest}, released {released[:10]})"
+        )
+    report = classify(name, version, python_minor)
+    if report.unbuildable is not None:
+        return UNBUILDABLE, report.unbuildable
+    if report.kind == NO_DISTRIBUTION:
+        return NO_DISTRIBUTION, report.reason
+    return None
+
+
+def _unresolvable_pin(
+    name: str,
+    version: str,
+    *,
+    spec: str,
+    sources: Sequence[str],
+    reason_of: Callable[[str, str], Optional[tuple[str, str]]],
+    imported_by: Callable[[str], Optional[str]],
+) -> Optional[DroppedPin]:
+    """The record for one pin, or ``None`` when it is ordinary.
+
+    Raises :class:`BakeError` through :func:`decide_unresolvable` when something in the
+    bug's own tree imports it — that raise is what flags the bug, and it is deliberate
+    that it happens here rather than being returned as a value a caller could ignore.
+    """
+    finding = reason_of(name, version)
+    if finding is None:
+        return None
+    outcome, reason = finding
+    return decide_unresolvable(
+        name,
+        version=version,
+        spec=spec,
+        sources=sources,
+        outcome=outcome,
+        reason=reason,
+        imported_by=imported_by(name),
+    )
+
+
+def importer_of(
+    repo: Path,
+    commits: Sequence[str],
+    *,
+    distributions: Mapping[str, str],
+    read_file: Callable[[str, Optional[str]], Optional[str]] = None,
+    list_files: Optional[Callable[[str], Sequence[str]]] = None,
+) -> Callable[[str], Optional[str]]:
+    """A lazy ``distribution -> the file that imports it`` for one bug.
+
+    Lazy on purpose: the walk reads every ``.py`` of the tree at both commits through
+    ``git show``, one fork per file, and it is only ever asked about a pin preflight
+    could not install — a handful at most. Building the answer for every bug would cost
+    a full tree read per bug to answer a question most bugs never ask.
+
+    [VANTA-WHY] Both commits, because the graded tree is a mixture (§1.2): the buggy
+    source with the fix's test files. A file only the buggy commit carries can be the
+    importer (a fix that removed an import), and a test file only the fix carries can
+    be too, so either side alone would drop a pin the tree needs. The file is named
+    with its commit, so the claim is checkable rather than a summary.
+    """
+    walk = list_files or (lambda commit: tree_mod.list_files_at(repo, commit))
+    read = read_file or (lambda commit, path: tree_mod.read_file_at(repo, commit, path))
+    sites: Optional[dict[str, str]] = None
+
+    def find(distribution: str) -> Optional[str]:
+        nonlocal sites
+        if sites is None:
+            sites = {}
+            for commit in dict.fromkeys(commits):
+                if not commit:
+                    continue
+                found = tree_import_sites(
+                    walk(commit), read_file=partial(read, commit)
+                )
+                for module, path in found.items():
+                    sites.setdefault(module, f"{path} at {commit[:12]}")
+        for name in distribution_module_names(distribution, distributions=distributions):
+            if name in sites:
+                return sites[name]
+        return None
+
+    return find
+
+
+def drop_unresolvable_refs(
+    refs: Sequence[DepRef],
+    *,
+    reason_of: Callable[[str, str], Optional[tuple[str, str]]],
+    imported_by: Callable[[str], Optional[str]],
+) -> tuple[tuple[DepRef, ...], list[DroppedPin]]:
+    """Drop every declared pin whose own version nothing can install here.
+
+    This runs **before** :func:`resolve_pins`, and that is the point of it: a BugsInPy
+    reference pin naming a release PyPI never uploaded is a class (c) pin, and
+    :func:`resolve_pins` refuses the whole bug on it before any later pass could look at
+    it (``luigi/1``'s ``requests-async==0.5.0``). Only an exact pin can be judged here —
+    the declaration itself has to name the version — so this is half the pass, and
+    :func:`drop_unresolvable_deps` is the other half.
+    """
+    kept: list[DepRef] = []
+    dropped: list[DroppedPin] = []
+    for ref in refs:
+        version = exact_version(ref.spec, ref.source)
+        record = (
+            None
+            if version is None
+            else _unresolvable_pin(
+                ref.name,
+                version,
+                spec=ref.spec,
+                sources=(ref.source,),
+                reason_of=reason_of,
+                imported_by=imported_by,
+            )
+        )
+        if record is not None:
+            dropped.append(record)
+            continue
+        kept.append(ref)
+    return tuple(kept), dropped
+
+
+def drop_unresolvable_deps(
+    resolved: Sequence[ResolvedDep],
+    *,
+    reason_of: Callable[[str, str], Optional[tuple[str, str]]],
+    imported_by: Callable[[str], Optional[str]],
+) -> tuple[list[ResolvedDep], list[DroppedPin]]:
+    """The same rule over what the date rule picked.
+
+    The second half of the pass, and not redundant with
+    :func:`drop_unresolvable_refs`: a dependency declared as a bare name or as a range —
+    ``numpy``, which six bugs in the dev split declare that way — has no version until
+    :func:`resolve_pins` chooses one, and only then can the release it picked be asked
+    whether it installs here. Measured, that is pandas/1's ``pyarrow``, which comes from
+    the import closure with no version at all and resolves to 0.17.1.
+
+    A package the interpreter layer carries is never asked: this layer does not install
+    it, so there is nothing to drop.
+    """
+    kept: list[ResolvedDep] = []
+    dropped: list[DroppedPin] = []
+    for dep in resolved:
+        version = None if dep.harness else _pin_version(dep.pin)
+        record = (
+            None
+            if version is None
+            else _unresolvable_pin(
+                dep.name,
+                version,
+                spec=dep.spec,
+                sources=dep.sources,
+                reason_of=reason_of,
+                imported_by=imported_by,
+            )
+        )
+        if record is not None:
+            dropped.append(record)
+            continue
+        kept.append(dep)
+    return kept, dropped
 
 
 def _declared_requirement(
@@ -3697,6 +4083,9 @@ def resolve_deps(
     metadata_of: Optional[
         Callable[[str, str], tuple[tuple[str, ...], Optional[str]]]
     ] = None,
+    reason_of: Optional[Callable[[str, str], Optional[tuple[str, str]]]] = None,
+    imported_by: Optional[Callable[[str], Optional[str]]] = None,
+    dropped: Optional[list[DroppedPin]] = None,
 ) -> list[ResolvedDep]:
     """Union → conflict check → date pin → the report plugin, for one bug.
 
@@ -3705,6 +4094,17 @@ def resolve_deps(
     plugin release to choose. Whatever it returns is *in addition to* the harness's
     own pins, which stay in the list as ``harness=True`` — the interpreter layer still
     carries them, and ``installs`` still excludes them (:func:`installs_of`).
+
+    ``reason_of``, ``imported_by`` and ``dropped`` are §3.2's unresolvable-pin rule,
+    and they come as a triple or not at all: ``dropped`` is the list the records are
+    appended to, ``reason_of`` says whether one pin can be installed here at all, and
+    ``imported_by`` says whether the bug's own tree imports it. The rule is applied
+    **around** the date rule, in two passes, because only one of them can run before it
+    (:func:`drop_unresolvable_refs`, :func:`drop_unresolvable_deps`) — and *not* inside
+    :func:`resolve_pins`, which stays pure and keeps refusing a pin it cannot date.
+    Passing the triple is what a caller does when it wants the rule; a caller that
+    passes none of it — every test that is about the date rule itself — gets the pins
+    the declarations and the dates decide, with nothing dropped and nothing raised.
     """
     merged, conflicts = merge_refs(sources.refs)
     if conflicts:
@@ -3714,6 +4114,11 @@ def resolve_deps(
             + " — name the source that should win and the split will be amended rather "
             "than guessed at"
         )
+    if dropped is not None:
+        merged, dropped_refs = drop_unresolvable_refs(
+            merged, reason_of=reason_of, imported_by=imported_by
+        )
+        dropped.extend(dropped_refs)
     resolved = resolve_pins(
         merged,
         releases=releases,
@@ -3722,15 +4127,20 @@ def resolve_deps(
         buggy_commit=sources.buggy_commit,
     )
     own = own_pytest_pin(sources.refs, harness_pytest=harness_pins.get("pytest"))
-    if own is None:
-        return resolved
-    return resolved + plugin_pins(
-        pytest_version=own,
-        python_minor=python_minor or "",
-        releases=releases,
-        metadata_of=metadata_of or pypi_release_metadata,
-        taken={dep.name: _pin_version(dep.pin) for dep in resolved},
-    )
+    if own is not None:
+        resolved = resolved + plugin_pins(
+            pytest_version=own,
+            python_minor=python_minor or "",
+            releases=releases,
+            metadata_of=metadata_of or pypi_release_metadata,
+            taken={dep.name: _pin_version(dep.pin) for dep in resolved},
+        )
+    if dropped is not None:
+        resolved, dropped_deps = drop_unresolvable_deps(
+            resolved, reason_of=reason_of, imported_by=imported_by
+        )
+        dropped.extend(dropped_deps)
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -4074,6 +4484,7 @@ def deps_provenance(
     *,
     harness_pins: Mapping[str, str],
     build_pins: Sequence[BuildPin] = (),
+    dropped: Sequence[DroppedPin] = (),
 ) -> dict[str, Any]:
     """What the bake decided for one bug, as data a later stage can read.
 
@@ -4112,6 +4523,14 @@ def deps_provenance(
     (§3.2). It is a separate key rather than a flag on ``dependencies`` because it
     answers a different question: a reader asking "which Cython compiled
     ``pandas/_libs``" is not asking what pandas imports.
+
+    ``dropped`` is the other thing that is not in ``installs``, and it is the one
+    exception to "a declared dependency is installed": a pin nothing on this image can
+    install, which §3.2's unresolvable-pin rule drops *only* when no file in the bug's
+    own tree imports the module it provides (:func:`decide_unresolvable`). The key is
+    always present, empty when nothing was dropped, because "nothing was dropped" and
+    "this file predates the rule" have to be distinguishable by a reader — and a layer
+    whose install list is shorter than its declarations needs the record of why.
     """
     return {
         "schema_version": 1,
@@ -4125,6 +4544,7 @@ def deps_provenance(
         "import_name": sources.import_name,
         "harness_pins": dict(harness_pins),
         "installs": list(installs_of(resolved)),
+        "dropped": [pin.as_dict() for pin in dropped],
         "build_pins": [pin.as_dict() for pin in build_pins],
         "dependencies": [dep.as_dict() for dep in resolved],
         "pins_after_commit_date": [
@@ -4193,6 +4613,7 @@ def resolve_bug_deps(
     metadata_of: Callable[
         [str, str], tuple[tuple[str, ...], Optional[str]]
     ] = pypi_release_metadata,
+    classify: Optional[Callable[[str, str, str], PreflightPin]] = None,
 ) -> tuple[list[BugDeps], list[FlaggedBug]]:
     """Resolve every selected bug's layer, pinning by date from PyPI.
 
@@ -4205,24 +4626,38 @@ def resolve_bug_deps(
     than printed so the caller can exclude those checkpoints from the recipes and
     print the list next to the §14.7 gate results, where it belongs.
 
+    A bug that declares a pin *nothing on this image can install* is the same kind of
+    answer and reaches the same place, by §3.2's unresolvable-pin rule: dropped with a
+    record when nothing in its tree imports it, flagged when something does
+    (:func:`decide_unresolvable`). The rule's two callables are built here, per bug —
+    ``reason_of`` from the ``releases`` this bug just fetched and the run's shared
+    preflight classifier, ``imported_by`` from the bug's own repo — and
+    :func:`resolve_deps` applies them around the date rule.
+
     ``fetch`` and ``metadata_of`` are injected so the entire chain — union, conflict,
     cutoff, harness exception, the report plugin's own pin — is testable without the
     network: the first answers "which releases exist, and when", the second "what does
-    one release declare".
+    one release declare". ``classify`` answers "what does this release install as
+    here"; ``bake`` builds one per run and shares it with the preflight table, so a pin
+    is classified once however many times it is asked about. Injecting it — or a stub
+    of it — is what keeps these tests offline.
     """
     out: list[BugDeps] = []
     flagged: list[FlaggedBug] = []
     distributions = split.module_distributions()
+    classifier = classify or preflight_classifier()
     for entry in entries:
         key = f"{entry['project']}/{entry['bug_id']}"
         try:
+            repo = repo_for(str(entry["project"]))
             sources = bug_sources(
                 entry,
                 bugsinpy_root=bugsinpy_root,
-                repo=repo_for(str(entry["project"])),
+                repo=repo,
                 module_distributions=distributions,
             )
-            pin = pins_for_python(split, minor_version(str(entry["python_version"])))
+            minor = minor_version(str(entry["python_version"]))
+            pin = pins_for_python(split, minor)
             harness_pins = {"pytest": pin.pytest, "pytest-json-report": pin.json_report}
             # The build toolchain's names are fetched from PyPI too: they are pinned
             # by date like everything else, and a name the harness provides is left
@@ -4267,12 +4702,30 @@ def resolve_bug_deps(
                 | pytest_dates
             )
             releases = {name: fetch(name) for name in needed}
+            # §3.2's unresolvable-pin rule, ready for whichever pass finds something:
+            # the date rule's own mapping answers "does this release exist", the run's
+            # shared classifier answers "what does it install as", and the bug's own
+            # two trees answer "does anything here import it" — lazily, because the
+            # walk is a file read per ``.py`` and most bugs never ask.
+            dropped: list[DroppedPin] = []
             resolved = resolve_deps(
                 sources,
                 releases=releases,
                 harness_pins=harness_pins,
-                python_minor=minor_version(str(entry["python_version"])),
+                python_minor=minor,
                 metadata_of=metadata_of,
+                reason_of=partial(
+                    uninstallable_reason,
+                    releases=releases,
+                    classify=classifier,
+                    python_minor=minor,
+                ),
+                imported_by=importer_of(
+                    repo,
+                    (sources.buggy_commit, sources.fixed_commit or ""),
+                    distributions=distributions,
+                ),
+                dropped=dropped,
             )
             built = resolve_build_pins(
                 sources.build_refs,
@@ -4289,7 +4742,11 @@ def resolve_bug_deps(
                 checkpoint=sources.checkpoint,
                 installs=installs_of(resolved),
                 provenance=deps_provenance(
-                    sources, resolved, harness_pins=harness_pins, build_pins=built
+                    sources,
+                    resolved,
+                    harness_pins=harness_pins,
+                    build_pins=built,
+                    dropped=dropped,
                 ),
                 build_pins=build_installs(built),
             )

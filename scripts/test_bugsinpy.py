@@ -178,6 +178,28 @@ def _heredoc(recipe: str, tag: str) -> str:
     return recipe.split(f"<<'{tag}'\n", 1)[1].split(f"\n{tag}\n", 1)[0]
 
 
+def _wheel_classifier():
+    """A preflight classifier that says every release installs from a wheel.
+
+    The real one (:func:`bake.preflight_classifier`) is a PyPI fetch per pin, and it is
+    the answer §3.2's unresolvable-pin rule is built on: a pin it calls a wheel is
+    ordinary, so nothing is dropped and nothing is flagged. That is exactly what a test
+    that is about the *date* rule — or about a drop the release's own dates decide —
+    needs from the classifier it has to inject, without a network.
+    """
+
+    def classify(name, version, python_minor):
+        return bake_mod.PreflightPin(
+            name=name,
+            version=version,
+            kind=bake_mod.INSTALLABLE_WHEEL,
+            reason=f"installs from {name}-{version}-py3-none-any.whl (py3-none-any)",
+            matched_tag="py3-none-any",
+        )
+
+    return classify
+
+
 # ============================================================================
 # split.py — the committed protocol
 # ============================================================================
@@ -3910,7 +3932,9 @@ class TestPinPreflight:
             listings.append(file.filename)
             return ("numpy-1.18.5/numpy/core/src/multiarray/arrayobject.c",), False
 
-        reports = bake_mod.preflight_layers(deps, files_of=files_of, sdist_of=sdist_of)
+        reports = bake_mod.preflight_layers(
+            deps, classify=bake_mod.preflight_classifier(files_of=files_of, sdist_of=sdist_of)
+        )
         assert fetched == [("numpy", "1.18.5")]
         assert listings == ["numpy-1.18.5.tar.gz"]
         assert [report.checkpoint for report in reports] == [
@@ -4002,13 +4026,14 @@ class TestPinPreflight:
         assert data["pins"][1]["class"] == "b"
         assert "compiled_sources" not in data["pins"][0]
 
-    def _cli(self, tmp_path, monkeypatch, *, argv=(), flagged=()):
+    def _cli(self, tmp_path, monkeypatch, *, argv=(), flagged=(), deps=None):
         """Drive ``bake`` with resolution, preflight and the build all injected."""
         root = tmp_path / "bugsinpy"
         root.mkdir()
         entry = bug_entry(checkpoint="vanta-bi-Demo-1")
         split = split_mod.Split(split_data(bugs=[entry], bugsinpy_root=str(root)))
-        deps = _bug_deps([entry], {"vanta-bi-Demo-1": ("decorator==4.4.0",)})
+        if deps is None:
+            deps = _bug_deps([entry], {"vanta-bi-Demo-1": ("decorator==4.4.0",)})
         written: list[str] = []
         monkeypatch.setattr(run_mod, "load_split", lambda path: split)
         monkeypatch.setattr(
@@ -4073,6 +4098,504 @@ class TestPinPreflight:
         assert "preflight: 1 layer(s)" in captured.out
         assert "bake complete" in captured.out
         assert code == run_mod.EXIT_OK
+
+
+# ============================================================================
+# §3.2's unresolvable-pin rule — drop it with a record, or flag the bug
+# ============================================================================
+class TestUnresolvablePins:
+    """One rule for both findings, and the same question settles both.
+
+    ``luigi/1`` declares ``requests-async==0.5.0``, a release PyPI never uploaded;
+    ``sanic/1`` declares ``pywin32==227``, whose twelve files are all foreign wheels and
+    which ships no sdist; ``pandas/1`` pulls in ``pyarrow==0.17.1``, an sdist whose Arrow
+    C++ build this image cannot do. All three are pins nothing here can install.
+
+    The rule is not "drop it" and not "stop": it is *does anything in the bug's own tree
+    import the module this distribution provides?* Measured against the two commits:
+    nothing in luigi's or sanic's tree imports ``requests_async`` or ``win32`` at all
+    (so those pins drop, with a record), while ``pyarrow`` is imported by 18 ``.py``
+    files at pandas' fixed commit (so that bug is flagged rather than baked without a
+    module its own tests import).
+    """
+
+    def _reason_of(self, *, unavailable=(), unbuildable=(), calls=None):
+        """A ``reason_of`` that answers from two findings, and can be watched."""
+
+        def reason_of(name, version):
+            if calls is not None:
+                calls.append((name, version))
+            if (name, version) in unavailable:
+                return (
+                    bake_mod.NO_DISTRIBUTION,
+                    f"nothing pip can install on cp38/linux-aarch64: {name}=={version}",
+                )
+            if name in unbuildable:
+                return bake_mod.UNBUILDABLE, unbuildable[name]
+            return None
+
+        return reason_of
+
+    def _imported_by(self, sites=None, *, asked=None):
+        """An ``imported_by`` that answers from a dict, and can be watched."""
+
+        def imported_by(distribution):
+            if asked is not None:
+                asked.append(distribution)
+            return (sites or {}).get(distribution)
+
+        return imported_by
+
+    def _sources(self, *refs) -> bake_mod.DepSources:
+        return bake_mod.DepSources(
+            project="Demo",
+            bug_id=1,
+            checkpoint="vanta-bi-Demo-1",
+            buggy_commit="b" * 40,
+            commit_date="2019-06-01",
+            fixed_commit="f" * 40,
+            fixed_commit_date="2019-07-30",
+            import_name="demo",
+            refs=tuple(refs),
+        )
+
+    # ---- the drop half -----------------------------------------------------
+    def test_a_release_pypi_never_uploaded_is_dropped_with_its_reason(self):
+        """``luigi/1``'s ``requests-async==0.5.0``: class (c), nothing imports it."""
+        ref = bake_mod.dep_ref("requests-async==0.5.0", "requirements.txt line 30")
+        kept, dropped = bake_mod.drop_unresolvable_refs(
+            (ref,),
+            reason_of=self._reason_of(unavailable={("requests-async", "0.5.0")}),
+            imported_by=self._imported_by(),
+        )
+        assert kept == ()
+        assert [record.pin for record in dropped] == ["requests-async==0.5.0"]
+        record = dropped[0]
+        assert record.sources == ("requirements.txt line 30",)
+        assert record.outcome == bake_mod.NO_DISTRIBUTION
+        assert "nothing pip can install" in record.reason
+        assert record.as_dict() == {
+            "name": "requests-async",
+            "spec": "requests-async==0.5.0",
+            "pin": "requests-async==0.5.0",
+            "sources": ["requirements.txt line 30"],
+            "outcome": bake_mod.NO_DISTRIBUTION,
+            "reason": record.reason,
+        }
+
+    def test_a_pin_the_tree_imports_is_not_dropped_and_flags_the_bug(self):
+        """``pandas/1``'s ``pyarrow``: unbuildable here, and 18 files import it."""
+        ref = bake_mod.dep_ref("pyarrow==0.17.1", "import closure: pandas/io/parquet.py")
+        with pytest.raises(bake_mod.BakeError) as caught:
+            bake_mod.drop_unresolvable_refs(
+                (ref,),
+                reason_of=self._reason_of(unbuildable={"pyarrow": "needs Arrow C++"}),
+                imported_by=self._imported_by(
+                    {"pyarrow": "pandas/io/parquet.py at e41ee47a90bb"}
+                ),
+            )
+        message = str(caught.value)
+        assert "pyarrow cannot be installed on this image (needs Arrow C++)" in message
+        assert "pandas/io/parquet.py at e41ee47a90bb imports it" in message
+        assert "only drops a pin nothing imports" in message
+
+    def test_a_pin_that_installs_is_never_asked_who_imports_it(self):
+        """The walk is a file read per ``.py``, so it is not paid for an ordinary pin."""
+        ref = bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1")
+        asked: list[str] = []
+        kept, dropped = bake_mod.drop_unresolvable_refs(
+            (ref,),
+            reason_of=self._reason_of(),
+            imported_by=self._imported_by(asked=asked),
+        )
+        assert kept == (ref,)
+        assert dropped == []
+        assert asked == [], "no candidate, no tree walk"
+
+    def test_a_bare_or_range_declaration_is_not_judged_before_the_date_rule(self):
+        """Only an exact ``==`` pin names a version, so only one can be judged here."""
+        bare = bake_mod.dep_ref("numpy", "install_requires (setup.py) line 2")
+        ranged = bake_mod.dep_ref("tornado>=4.0,<5", "requirements.txt line 31")
+        calls: list[tuple[str, str]] = []
+        kept, dropped = bake_mod.drop_unresolvable_refs(
+            (bare, ranged),
+            reason_of=self._reason_of(calls=calls),
+            imported_by=self._imported_by(),
+        )
+        assert kept == (bare, ranged), "they stay for the second pass to judge"
+        assert dropped == []
+        assert calls == [], "no version to ask about yet"
+
+    # ---- the second pass, over what the dates picked -----------------------
+    def test_the_version_the_date_rule_picked_is_what_the_second_pass_judges(self):
+        """``pandas/1`` declares ``pyarrow`` bare; 0.17.1 is the date rule's choice."""
+        harness = bake_mod.ResolvedDep(
+            name="pytest",
+            spec="pytest",
+            sources=("requirements.txt line 7",),
+            pin="pytest==5.4.3",
+            harness=True,
+        )
+        closure = bake_mod.ResolvedDep(
+            name="pyarrow",
+            spec="pyarrow",
+            sources=("import closure: pandas/io/parquet.py line 12",),
+            pin="pyarrow==0.17.1",
+            harness=False,
+        )
+        calls: list[tuple[str, str]] = []
+        kept, dropped = bake_mod.drop_unresolvable_deps(
+            (harness, closure),
+            reason_of=self._reason_of(
+                unbuildable={"pyarrow": bake_mod.UNBUILDABLE_ON_PLATFORM["pyarrow"]},
+                calls=calls,
+            ),
+            imported_by=self._imported_by(),
+        )
+        assert kept == [harness], "the interpreter layer's own pin is not this layer's"
+        assert [record.name for record in dropped] == ["pyarrow"]
+        assert dropped[0].outcome == bake_mod.UNBUILDABLE
+        assert dropped[0].spec == "pyarrow", "the record carries the declaration"
+        assert calls == [("pyarrow", "0.17.1")]
+
+    # ---- the three answers uninstallable_reason gives -----------------------
+    def test_a_missing_release_is_settled_without_a_fetch(self):
+        """The ``releases`` the bake already has answers it: no file is downloaded."""
+        asked: list[tuple[str, str]] = []
+
+        def classify(name, version, python_minor):
+            asked.append((name, version))
+            return bake_mod.PreflightPin(
+                name, version, bake_mod.INSTALLABLE_WHEEL, "w", matched_tag="py3-none-any"
+            )
+
+        finding = bake_mod.uninstallable_reason(
+            "requests-async",
+            "0.5.0",
+            releases={"requests-async": {"0.1.0": "2018-01-01", "0.2.4": "2019-03-04"}},
+            classify=classify,
+            python_minor="3.8",
+        )
+        assert finding is not None
+        outcome, reason = finding
+        assert outcome == bake_mod.NO_DISTRIBUTION
+        assert "PyPI lists no release 0.5.0 of requests-async" in reason
+        assert "the newest requests-async is 0.2.4, released 2019-03-04" in reason
+        assert asked == [], "nothing to classify: the release does not exist"
+
+    def test_a_release_that_exists_is_classified_once_for_both_callers(self):
+        """The preflight table and the drop rule ask the same question of one cache."""
+        fetched: list[tuple[str, str]] = []
+        classifier = bake_mod.preflight_classifier(
+            files_of=lambda name, version: (
+                fetched.append((name, version)),
+                (_sdist(f"{name}-{version}.tar.gz"),),
+            )[1],
+            sdist_of=lambda file: (("pyarrow-0.17.1/pyarrow/src/arrow/python.cc",), False),
+        )
+        releases = {"pyarrow": {"0.17.1": "2020-05-04"}}
+        first = bake_mod.uninstallable_reason(
+            "pyarrow", "0.17.1", releases=releases, classify=classifier, python_minor="3.8"
+        )
+        second = bake_mod.uninstallable_reason(
+            "pyarrow", "0.17.1", releases=releases, classify=classifier, python_minor="3.8"
+        )
+        expected = (bake_mod.UNBUILDABLE, bake_mod.UNBUILDABLE_ON_PLATFORM["pyarrow"])
+        assert first == second == expected
+        assert fetched == [("pyarrow", "0.17.1")], "one fetch, two questions"
+
+    def test_a_wheel_is_not_a_drop_candidate(self):
+        finding = bake_mod.uninstallable_reason(
+            "six",
+            "1.15.0",
+            releases={"six": {"1.15.0": "2020-05-21"}},
+            classify=_wheel_classifier(),
+            python_minor="3.8",
+        )
+        assert finding is None
+
+    # ---- the record, and the two passes inside resolve_deps ----------------
+    def test_the_provenance_carries_what_was_dropped_and_is_never_missing(self):
+        sources = self._sources()
+        assert bake_mod.deps_provenance(sources, [], harness_pins={})["dropped"] == []
+        record = bake_mod.DroppedPin(
+            name="pywin32",
+            spec="pywin32==227",
+            sources=("requirements.txt line 9",),
+            version="227",
+            outcome=bake_mod.NO_DISTRIBUTION,
+            reason="nothing pip can install on cp38/linux-aarch64: 12 wheel(s) and none "
+            "of them installable here, and no source distribution to build instead",
+        )
+        data = bake_mod.deps_provenance(sources, [], harness_pins={}, dropped=(record,))
+        assert data["dropped"] == [record.as_dict()]
+        assert data["installs"] == []
+
+    def test_resolve_deps_drops_it_before_the_date_rule_ever_sees_it(self):
+        """The whole point of the first pass: ``resolve_pins`` refuses that pin."""
+        refs = (
+            bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1"),
+            bake_mod.dep_ref("requests-async==0.5.0", "requirements.txt line 30"),
+        )
+        dropped: list[bake_mod.DroppedPin] = []
+        resolved = bake_mod.resolve_deps(
+            self._sources(*refs),
+            releases={
+                "decorator": {"4.4.0": "2019-01-15"},
+                "requests-async": {"0.2.4": "2019-03-04"},
+            },
+            harness_pins={},
+            reason_of=self._reason_of(unavailable={("requests-async", "0.5.0")}),
+            imported_by=self._imported_by(),
+            dropped=dropped,
+        )
+        assert [dep.pin for dep in resolved] == ["decorator==4.4.0"]
+        assert [record.pin for record in dropped] == ["requests-async==0.5.0"]
+
+    def test_resolve_deps_without_the_rule_drops_nothing(self):
+        """A caller that passes no triple gets the declarations and the dates, as before."""
+        refs = (bake_mod.dep_ref("requests-async==0.2.4", "requirements.txt line 30"),)
+        resolved = bake_mod.resolve_deps(
+            self._sources(*refs),
+            releases={"requests-async": {"0.2.4": "2019-03-04"}},
+            harness_pins={},
+        )
+        assert [dep.pin for dep in resolved] == ["requests-async==0.2.4"]
+
+    def test_resolve_deps_flags_by_raising_when_the_tree_imports_the_pin(self):
+        refs = (bake_mod.dep_ref("pyarrow==0.17.1", "requirements.txt line 12"),)
+        with pytest.raises(bake_mod.BakeError, match="imports it"):
+            bake_mod.resolve_deps(
+                self._sources(*refs),
+                releases={"pyarrow": {"0.17.1": "2020-05-04"}},
+                harness_pins={},
+                reason_of=self._reason_of(unbuildable={"pyarrow": "needs Arrow C++"}),
+                imported_by=self._imported_by({"pyarrow": "pandas/io/parquet.py at e41ee"}),
+                dropped=[],
+            )
+
+    # ---- the two halves of the rule that are about a real tree -------------
+    def test_a_tree_walk_files_both_spellings_of_a_module_and_skips_the_stdlib(self):
+        files = {
+            "demo/core.py": "import pyarrow, json\nfrom google.protobuf import text_format\n",
+            "demo/other.py": "import pyarrow\n",
+            "demo/broken.py": "def (:\n",
+        }
+        sites = bake_mod.tree_import_sites(
+            list(files), read_file=lambda path: files.get(path)
+        )
+        assert sites["pyarrow"] == "demo/core.py", "the first file wins"
+        assert sites["google.protobuf"] == "demo/core.py"
+        assert sites["google"] == "demo/core.py"
+        assert "json" not in sites, "the stdlib is not a distribution"
+        assert "demo/broken.py" not in sites.values(), "a file that cannot parse is passed over"
+
+    def test_the_import_spellings_come_from_the_splits_reviewed_table(self):
+        distributions = {"PIL": "Pillow", "yaml": "PyYAML"}
+        assert bake_mod.distribution_module_names(
+            "pillow", distributions=distributions
+        ) == ("PIL", "pillow")
+        assert bake_mod.distribution_module_names(
+            "requests-async", distributions=distributions
+        ) == ("requests_async",)
+        # The table answers ``yaml``; PEP 503's spelling answers ``pyyaml``. Both are
+        # returned because the tree may have written either, and over-matching here is
+        # a false flag rather than a false drop.
+        assert bake_mod.distribution_module_names(
+            "PyYAML", distributions=distributions
+        ) == ("pyyaml", "yaml")
+
+    def test_importer_of_names_the_file_and_its_commit_at_either_commit(self):
+        """The graded tree is the buggy source with the fix's tests, so both are read."""
+        walk = {
+            "b" * 40: ["demo/core.py"],
+            "f" * 40: ["tests/test_demo.py"],
+        }
+        text = {
+            ("b" * 40, "demo/core.py"): "import pyarrow\n",
+            ("f" * 40, "tests/test_demo.py"): "import pyarrow\n",
+        }
+        importer = bake_mod.importer_of(
+            Path("/nonexistent"),
+            ("b" * 40, "f" * 40),
+            distributions={},
+            read_file=lambda commit, path: text.get((commit, path)),
+            list_files=lambda commit: walk[commit],
+        )
+        assert importer("pyarrow") == f"demo/core.py at {'b' * 12}"
+        assert importer("decorator") is None
+
+    def test_importer_of_asks_a_tree_once_for_every_candidate_it_is_asked_about(self):
+        walks: list[str] = []
+
+        def list_files(commit):
+            walks.append(commit)
+            return ["demo/core.py"]
+
+        importer = bake_mod.importer_of(
+            Path("/nonexistent"),
+            ("b" * 40, "f" * 40),
+            distributions={},
+            read_file=lambda commit, path: "import pyarrow\nimport luigi\n",
+            list_files=list_files,
+        )
+        assert importer("pyarrow") is not None
+        assert importer("luigi") is not None
+        assert walks == ["b" * 40, "f" * 40], "two commits, once each"
+
+    # ---- wired into the bake's own resolution ------------------------------
+    def test_resolve_bug_deps_records_the_drop_in_the_provenance(
+        self, monkeypatch, tmp_path
+    ):
+        """``six==9.9.9``: the release does not exist, and nothing imports ``six`` here."""
+        monkeypatch.setattr(
+            bake_mod,
+            "importer_of",
+            lambda repo, commits, *, distributions: lambda name: None,
+        )
+        fetched, layers, flagged = _resolve_with_drops(
+            monkeypatch, refs=(bake_mod.dep_ref("six==9.9.9", "requirements.txt line 4"),)
+        )
+        assert flagged == []
+        assert layers[0].installs == ()
+        record = layers[0].provenance["dropped"][0]
+        assert record["pin"] == "six==9.9.9"
+        assert "PyPI lists no release 9.9.9 of six" in record["reason"]
+        assert record["outcome"] == bake_mod.NO_DISTRIBUTION
+        assert record["sources"] == ["requirements.txt line 4"]
+        written = bake_mod.write_deps(tmp_path, layers[0])
+        assert json.loads(written.read_text(encoding="utf-8"))["dropped"] == [record], (
+            "the deps JSON and the returned layer say the same thing"
+        )
+        assert "six" in fetched, "its dates were still fetched: the ruling needed them"
+
+    def test_resolve_bug_deps_flags_the_bug_when_something_imports_the_pin(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            bake_mod,
+            "importer_of",
+            lambda repo, commits, *, distributions: lambda name: (
+                f"demo/core.py at {'b' * 12}"
+            ),
+        )
+        _, layers, flagged = _resolve_with_drops(
+            monkeypatch, refs=(bake_mod.dep_ref("six==9.9.9", "requirements.txt line 4"),)
+        )
+        assert layers == []
+        assert [flag.key for flag in flagged] == ["Demo/1"]
+        assert "imports it" in flagged[0].reason
+        assert flagged[0].reason.startswith("BakeError: ")
+
+    def test_one_classifier_is_shared_by_the_drop_rule_and_the_preflight_table(
+        self, tmp_path, monkeypatch
+    ):
+        """``bake`` builds it once; both askers get the same object, so PyPI is paid once."""
+        seen: dict[str, object] = {}
+        sentinel = object()
+        monkeypatch.setattr(bake_mod, "preflight_classifier", lambda **kwargs: sentinel)
+        entry = bug_entry(checkpoint="vanta-bi-Demo-1")
+        split = split_mod.Split(split_data(bugs=[entry], bugsinpy_root=str(tmp_path)))
+        (tmp_path / "bugsinpy").mkdir()
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split)
+        monkeypatch.setattr(run_mod, "tree_cache", lambda *a, **k: tmp_path)
+        monkeypatch.setattr(meta_mod, "project_github_url", lambda *a, **k: "https://x/y")
+
+        def fake_resolve(*args, **kwargs):
+            seen["resolve"] = kwargs["classify"]
+            return [], []
+
+        monkeypatch.setattr(bake_mod, "resolve_bug_deps", fake_resolve)
+        monkeypatch.setattr(
+            bake_mod,
+            "preflight_layers",
+            lambda deps, *, classify: seen.update(preflight=classify) or [],
+        )
+        code = run_mod.main(
+            [
+                "bake",
+                "--pythons",
+                "3.8",
+                "--split",
+                str(tmp_path / "s.json"),
+                "--preflight-only",
+            ]
+        )
+        assert code == run_mod.EXIT_OK
+        assert seen["resolve"] is sentinel
+        assert seen["preflight"] is sentinel
+
+    def test_a_dropped_pin_is_printed_in_the_bake_output(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Nothing silent: the line names the pin, the finding and the reason."""
+        record = bake_mod.DroppedPin(
+            name="pywin32",
+            spec="pywin32==227",
+            sources=("requirements.txt line 9",),
+            version="227",
+            outcome=bake_mod.NO_DISTRIBUTION,
+            reason="nothing pip can install on cp38/linux-aarch64: 12 wheel(s) and none "
+            "of them installable here, and no source distribution to build instead",
+        )
+        deps = [
+            bake_mod.BugDeps(
+                entry=bug_entry(checkpoint="vanta-bi-Demo-1"),
+                checkpoint="vanta-bi-Demo-1",
+                installs=(),
+                provenance={"dropped": [record.as_dict()]},
+            )
+        ]
+        TestPinPreflight()._cli(
+            tmp_path, monkeypatch, argv=["--preflight-only"], deps=deps
+        )
+        out = capsys.readouterr().out
+        assert (
+            "[vanta-bi-Demo-1] dropped pywin32==227 (unavailable) — nothing pip can "
+            "install on cp38/linux-aarch64: 12 wheel(s)" in out
+        )
+        assert "[vanta-bi-Demo-1] installs: —" in out
+
+
+def _resolve_with_drops(monkeypatch, *, refs):
+    """``resolve_bug_deps`` over one fake source set, with the network taken out.
+
+    The pins are the caller's; the release dates are the fixture the date-rule tests
+    use (so a version the fixture does not list is a version PyPI does not list); and
+    the classifier is the wheel stub — these tests are about the rule *around* the
+    pins, and the drop they measure comes from the dates, not from what PyPI ships.
+    """
+    fetched: list[str] = []
+
+    def fake_sources(entry, *, bugsinpy_root, repo, module_distributions=None):
+        return bake_mod.DepSources(
+            project="Demo",
+            bug_id=1,
+            checkpoint="vanta-bi-Demo-1",
+            buggy_commit="b" * 40,
+            commit_date="2019-04-22",
+            fixed_commit="f" * 40,
+            fixed_commit_date="2019-07-30",
+            import_name="demo",
+            refs=tuple(refs),
+        )
+
+    def fetch(name):
+        fetched.append(name)
+        return TestResolvePinsByDate.RELEASES[name]
+
+    monkeypatch.setattr(bake_mod, "bug_sources", fake_sources)
+    split = split_mod.Split(split_data(bugs=[bug_entry(checkpoint="vanta-bi-Demo-1")]))
+    layers, flagged = bake_mod.resolve_bug_deps(
+        split,
+        split.bugs,
+        bugsinpy_root=Path("/nonexistent"),
+        repo_for=lambda project: Path("/nonexistent"),
+        fetch=fetch,
+        metadata_of=TestTheReportPluginFollowsTheBugsPytest._metadata_of,
+        classify=_wheel_classifier(),
+    )
+    return fetched, layers, flagged
 
 
 # ============================================================================

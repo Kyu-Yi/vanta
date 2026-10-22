@@ -444,7 +444,9 @@ provenance, with `--preflight-only` to do that and stop:
   `cryptography`, `numpy`, `regex`, `sqlalchemy`, `yarl` and the rest are silent about it.
 - **(c) `unavailable`** — nothing pip can install here: the release does not exist on PyPI
   (`luigi/1`'s `requests-async==0.5.0`) or the release has no Linux distribution at all
-  (`sanic/1`'s `pywin32==227`: twelve wheels, every one `win_amd64`, no sdist).
+  (`sanic/1`'s `pywin32==227`: twelve wheels, every one `win_amd64`, no sdist). What the bake then
+  does with such a pin — and with a class (b) pin the reviewed table cannot build — is decided by the
+  unresolvable-pin rule below.
 
 The tag has to be *read*, and as a **compressed set**: PEP 425 makes a dot in a tag field the set of
 tags the wheel also claims, so `six-1.15.0-py2.py3-none-any.whl` is `py3-none-any` as well as
@@ -461,6 +463,48 @@ because the sdists that do are exactly the ones whose read is skipped for size �
 BLAS half — and "compiles nothing" would be the wrong answer for the two packages most likely to need
 `gfortran`. It is reported, not enforced: the bake still installs what the recipe says, and the record
 is what makes the claim checkable afterwards.
+
+**One rule for a pin nothing here can install, and it is the import closure that decides.** The
+preflight produces three answers a *bake* cannot act on: a release PyPI does not have at all
+(`luigi/1`'s `requests-async==0.5.0`), a release with no distribution this interpreter can install
+(`sanic/1`'s `pywin32==227`, twelve wheels and every one `win_amd64`, no sdist), and a pin
+`bake.UNBUILDABLE_ON_PLATFORM` reviews as impossible on this image (`pandas/1`'s `pyarrow`). All three
+are the same situation — the pin is in the bug's own files and cannot become a fact about the layer —
+so they get one rule rather than three: the pin is **dropped with a record only if no module it
+provides is imported anywhere in the bug's tree** (its buggy source or the fixed commit's test files),
+and **otherwise the bug is flagged** and not baked at all. The import test reuses the two things
+already here — the split's reviewed `module_distributions` table inverted
+(`bake.distribution_module_names`) and the AST walk `bake.tree_import_sites` — and it reads both
+commits because the graded tree is the buggy source carrying the fix's tests.
+
+The condition is not decoration. A dropped pin makes the layer *shorter than the bug's own files
+declare*, and if the tree really imports it, the suite then fails at `import` — a native regression
+invented by the harness and attributed to the patch under test, which is the one failure mode §1.2/§1.3
+exist to avoid. Dropping a pin nothing imports is the opposite: `luigi/1` and `sanic/1` lose a Windows
+pipe wrapper and a version of `requests-async` that was never uploaded. Measured by `git grep` over
+`*.py` at both commits: **zero** import sites for `requests_async`, `win32` and `pydivert` in either
+repo, so those two pins drop with a record and both bugs still bake. `pydivert` is not even a drop
+candidate — it ships a `py3-none-any` wheel, i.e. class (a). `pandas/1` is the other outcome: nothing
+before this ever looked at `pyarrow`, and the same walk finds it imported in **18** `.py` files at the
+fix's commit, so `pandas/1` moves from "baked" to **flagged**.
+
+The drop has to run on both sides of the date rule, which is why `bake.resolve_deps` applies it in two
+passes rather than inside `bake.resolve_pins`. `luigi/1`'s `requests-async==0.5.0` is a BugsInPy
+reference pin (`requirements.txt`/`setup.sh`), so the date rule refuses the whole bug on it and the pin
+must be judged **before**; `pandas/1`'s `pyarrow` comes from the test side's import closure with no
+version attached, so only the *resolved* pin (0.17.1) can be judged at all, and that is **after**.
+`resolve_pins` itself stays pure and keeps raising on a pin it cannot date — the passes around it are
+what turn "cannot resolve" into either a record or a flag.
+
+The decision itself (`bake.decide_unresolvable`) raises `BakeError` when something imports the pin, so
+flagging needs no new control flow: `resolve_bug_deps` already catches that and files the bug with its
+reason. **Nothing is silent.** A dropped pin is written to `runs/bugsinpy/deps/<checkpoint>.json` under
+`dropped` — a key that is always present, `[]` when nothing was dropped, each entry
+`{name, spec, pin, sources, outcome, reason}` — and printed once per pin as
+`[<checkpoint>] dropped <pin> (<outcome>) — <reason>` in the bake output, with the outcome naming which
+of the three situations it was (`unavailable` / `unbuildable`). The JSON next to the log line is the
+same record and neither is a summary of the other: the log line is what a reader watching the bake
+sees, and the JSON is what survives it.
 
 **Rebuild semantics — `--force` means replace, and a rebuilt base invalidates its children.** A layer
 is deleted *before* it is created, never merely created over (shuru refuses a duplicate name with

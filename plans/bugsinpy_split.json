@@ -15,6 +15,28 @@
     "policy": "pinned_per_call_plus_server_top_p",
     "note": "temperature/max_tokens come from the pipeline's per-call pins (design §4.3); top_p is the one value read from the server's /props. The harness adds no run-level value."
   },
+  "module_distributions": {
+    "PIL": "Pillow",
+    "dateutil": "python-dateutil",
+    "yaml": "PyYAML",
+    "sklearn": "scikit-learn",
+    "bs4": "beautifulsoup4",
+    "cv2": "opencv-python",
+    "attr": "attrs",
+    "jwt": "PyJWT",
+    "dns": "dnspython",
+    "Crypto": "pycryptodome",
+    "google.protobuf": "protobuf",
+    "OpenSSL": "pyOpenSSL",
+    "magic": "python-magic",
+    "serial": "pyserial",
+    "usb": "pyusb",
+    "zmq": "pyzmq",
+    "MySQLdb": "mysqlclient",
+    "pylab": "matplotlib",
+    "mpl_toolkits": "matplotlib",
+    "pkg_resources": "setuptools"
+  },
   "reviewed_changes": [
     {
       "change": "PySnooper/1 is removed from `bugs`. It was wave 1, role pilot, and its slot in the wave-1 go/no-go gate is taken by black/22 (`bugs[2]`, promoted from the py3.8 candidate pool).",

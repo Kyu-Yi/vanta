@@ -1089,18 +1089,44 @@ def module_distribution(module: str, *, distributions: Mapping[str, str]) -> str
     ``python-toolbox``), which is what nearly every package does. The exceptions are
     the reviewed mappings in the split and the known-divergent names, which fail
     loudly rather than being guessed at.
+
+    ``module`` is the import spelling and may be dotted; the reviewed table is keyed by
+    that spelling, so ``google.protobuf`` is matched before its top-level ``google`` —
+    which is a distribution of its own on PyPI, and would otherwise be installed in
+    protobuf's place. The fallback is always the *top-level* word, because
+    ``import foo.bar`` is provided by distribution ``foo``, never by ``foo-bar``.
     """
-    reviewed = distributions.get(module)
-    if reviewed:
-        return canonicalize_name(reviewed)
-    if module in AMBIGUOUS_MODULE_DISTRIBUTIONS:
+    top = module.split(".")[0]
+    for spelling in (module, top):
+        reviewed = distributions.get(spelling)
+        if reviewed:
+            return canonicalize_name(reviewed)
+    if top in AMBIGUOUS_MODULE_DISTRIBUTIONS:
         raise BakeError(
             f"the test side imports {module!r}, whose distribution is not named by its "
             "module, so the harness will not guess at it. Record the reviewed mapping "
             f"in the split's module_distributions ({module!r}: <distribution>) and bake "
             "again (design §3.2)."
         )
-    return canonicalize_name(module)
+    return canonicalize_name(top)
+
+
+def _can_name_a_distribution(module: str) -> bool:
+    """Whether ``module`` could name a PyPI distribution at all.
+
+    [VANTA-WHY] A PEP 508 name begins with a letter or a digit, so a module whose
+    canonicalised spelling is not a valid one cannot be published under *any* name a
+    merge could resolve: ``_csv`` canonicalises to ``-csv``. Those names are CPython's
+    own private modules — ``_csv`` is the ``csv`` accelerator, which ships with every
+    3.8 build — and they are the interpreter's, not the layer's. Measured: pandas/1's
+    ``from _csv import Error`` reached the merge as ``-csv`` and stopped that bug over a
+    name no one can install, rather than being recognised as the interpreter's.
+    """
+    try:
+        Requirement(canonicalize_name(module))
+    except InvalidRequirement:
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -1257,14 +1283,33 @@ def _tree_local_modules(files: Sequence[str]) -> set[str]:
 
     A directory that contains ``.py`` files is such a root wherever it sits, because
     both pytest's rootdir insertion and the project's own runner put directories on
-    ``sys.path``. A ``.py`` file is deliberately *not* counted: ``fastapi/requests.py``
+    ``sys.path`` — and so are the ``.py`` files *directly* in a directory that is not a
+    package, for the same reason: pytest inserts ``lib/`` for
+    ``lib/matplotlib/tests/test_basic.py``, which is how matplotlib's own
+    ``lib/pylab.py`` is imported as ``pylab`` (measured: the closure otherwise emits a
+    distribution named ``pylab``, which PyPI does not publish — a 404 — and the bug
+    stops), and ``scripts/`` for pandas'
+    ``scripts/tests/test_validate_docstrings.py``, which is how
+    ``scripts/validate_docstrings.py`` is imported as ``validate_docstrings``.
+
+    A ``.py`` file *inside a package* is deliberately not counted: ``fastapi/requests.py``
     is importable as ``fastapi.requests`` and never as a top-level ``requests``, and
-    counting file stems would swallow the real distribution of that name.
+    counting those stems would swallow the real distribution of that name.
     """
+    paths = list(files)
+    packages = {
+        path.rsplit("/", 1)[0] if "/" in path else "" for path in paths if path.endswith("__init__.py")
+    }
     names: set[str] = set()
-    for path in files:
-        if path.endswith(".py"):
-            names.update(path.split("/")[:-1])
+    for path in paths:
+        if not path.endswith(".py"):
+            continue
+        parts = path.split("/")
+        names.update(parts[:-1])
+        stem = parts[-1][:-3]
+        directory = "/".join(parts[:-1])
+        if stem != "__init__" and directory not in packages:
+            names.add(stem)
     return names
 
 
@@ -1329,6 +1374,13 @@ def test_import_closure(
                 continue
             if top in stdlib_names or top == import_name or top in local:
                 continue
+            if not _can_name_a_distribution(top):
+                notes.append(
+                    f"import closure: {path} line {site.line}: {top!r} cannot name a "
+                    "distribution, so it is the interpreter's own module and nothing "
+                    "is installed for it"
+                )
+                continue
             source = f"import closure: {path} line {site.line}"
             if site.optional is not None:
                 if (top, source) not in seen_optional:
@@ -1337,7 +1389,7 @@ def test_import_closure(
                         OptionalImport(module=top, source=source, reason=site.optional)
                     )
                 continue
-            distribution = module_distribution(top, distributions=reviewed)
+            distribution = module_distribution(site.module, distributions=reviewed)
             if (distribution, path) in seen:
                 continue
             seen.add((distribution, path))

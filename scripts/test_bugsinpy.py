@@ -409,6 +409,53 @@ class TestSplit:
         with pytest.raises(SplitError, match="non-empty distribution name"):
             split_mod.validate(split_data(module_distributions={"yaml": "  "}))
 
+    def test_the_reviewed_module_table_is_pinned_in_both_splits(self):
+        """The divergent module names, as a reviewed decision, in the protocol.
+
+        [VANTA-WHY] ``PIL`` (matplotlib/1) and ``dateutil`` (pandas/1) are the
+        measured flags: the test side imports the module, the distribution is a
+        different word, and no canonicalisation recovers it — so §3.2's closure
+        refuses to guess and the answer goes in ``module_distributions`` where a
+        reviewer sees it. ``pylab``, ``mpl_toolkits`` and ``pkg_resources`` are the
+        other three names the closures reach that PyPI does not publish (measured:
+        both 404). Pinned exactly, and identically in the development and evaluation
+        splits, because a table that decides every layer's contents is the protocol,
+        not a detail a later edit should move quietly.
+
+        ``psycopg2`` is deliberately **absent**: ``import psycopg2`` is provided by
+        two distributions that both exist on PyPI (``psycopg2`` and
+        ``psycopg2-binary``, same module), and picking one is a reviewed choice the
+        harness must not make for the user. Until it is recorded the closure stops
+        that bug, which is the intended behaviour.
+        """
+        required = {
+            "PIL": "Pillow",
+            "dateutil": "python-dateutil",
+            "yaml": "PyYAML",
+            "sklearn": "scikit-learn",
+            "bs4": "beautifulsoup4",
+            "cv2": "opencv-python",
+            "attr": "attrs",
+            "jwt": "PyJWT",
+            "dns": "dnspython",
+            "Crypto": "pycryptodome",
+            "google.protobuf": "protobuf",
+            "OpenSSL": "pyOpenSSL",
+            "magic": "python-magic",
+            "serial": "pyserial",
+            "usb": "pyusb",
+            "zmq": "pyzmq",
+            "MySQLdb": "mysqlclient",
+            "pylab": "matplotlib",
+            "mpl_toolkits": "matplotlib",
+            "pkg_resources": "setuptools",
+        }
+        dev = load_split(DEV_SPLIT_PATH).module_distributions()
+        evaluation = load_split(SPLIT_PATH).module_distributions()
+        assert dev == required
+        assert evaluation == required
+        assert "psycopg2" not in dev, "psycopg2 names two distributions; the user decides"
+
     def test_unknown_top_level_key_is_an_error(self):
         with pytest.raises(SplitError, match="unknown top-level keys"):
             split_mod.validate(split_data(seed=0))  # typo for `seeds`
@@ -4233,6 +4280,78 @@ class TestTestImportClosure:
         assert refs[0].name == "pyyaml"
         assert refs[0].spec == "yaml"
 
+    def test_a_dotted_reviewed_mapping_is_matched_before_its_top_level(self):
+        """``google.protobuf`` is protobuf; ``google`` alone is a distribution too.
+
+        [VANTA-WHY] The reviewed table is keyed by the import spelling, so the
+        longest match has to win: a dotted import that fell through to its top-level
+        word would install ``google`` — a real but unrelated release — in protobuf's
+        place, and the layer would be wrong in a way no later stage can see.
+        """
+        assert (
+            bake_mod.module_distribution("google.protobuf", distributions={"google.protobuf": "protobuf"})
+            == "protobuf"
+        )
+        # The fallback is the top-level word, and only for names the table does not key.
+        assert bake_mod.module_distribution("google.protobuf", distributions={}) == "google"
+        assert bake_mod.module_distribution("six.moves", distributions={}) == "six"
+
+    def test_a_reviewed_mapping_wins_over_the_ambiguous_refusal(self):
+        """The table is consulted first, so a mapped ambiguous name never stops the bake."""
+        assert (
+            bake_mod.module_distribution("PIL", distributions={"PIL": "Pillow"}) == "pillow"
+        )
+        with pytest.raises(bake_mod.BakeError, match="module_distributions"):
+            bake_mod.module_distribution("PIL", distributions={})
+
+    def test_a_module_whose_name_cannot_be_a_distribution_is_its_interpreters(self):
+        """``_csv`` is CPython's own module, so nothing is installed for it.
+
+        [VANTA-WHY] pandas/1's ``from _csv import Error`` reached the merge as
+        ``-csv`` (the canonicalised spelling) and stopped the bug over a name no one
+        can publish — a PEP 508 name starts with a letter or a digit. It is the
+        interpreter's accelerator for ``csv``, present in every 3.8 build, so the
+        closure notes it and emits no reference rather than failing the bake.
+        """
+        assert bake_mod._can_name_a_distribution("_csv") is False
+        assert bake_mod._can_name_a_distribution("csv") is True
+        refs, optional, notes = self._closure(
+            {"tests/test_demo.py": "from _csv import Error\n"}
+        )
+        assert refs == []
+        assert optional == []
+        assert any(
+            "'_csv' cannot name a distribution" in note
+            and "tests/test_demo.py line 1" in note
+            for note in notes
+        )
+
+    def test_a_non_package_directory_ships_its_py_stems_as_modules(self):
+        """matplotlib's ``lib/pylab.py`` imports as ``pylab`` (pytest inserts ``lib/``).
+
+        [VANTA-WHY] PyPI publishes no ``pylab``, so counting the stem as a distribution
+        stops matplotlib/1 with a 404 — the flag this rule removes. A ``.py`` directly
+        in a directory that has no ``__init__.py`` is on ``sys.path`` as its own module;
+        one *inside* a package is not, so ``fastapi/requests.py`` stays
+        ``fastapi.requests`` and the real ``requests`` is still provisioned.
+        """
+        names = bake_mod._tree_local_modules(
+            sorted(
+                {
+                    "lib/pylab.py": "",
+                    "lib/matplotlib/__init__.py": "",
+                    "fastapi/__init__.py": "",
+                    "fastapi/requests.py": "",
+                    "scripts/tests/test_validate_docstrings.py": "",
+                    "scripts/validate_docstrings.py": "",
+                }
+            )
+        )
+        assert "pylab" in names, "a non-package directory's .py stem is a module"
+        assert "validate_docstrings" in names
+        assert "requests" not in names, "a .py inside a package is not a top-level module"
+        assert "__init__" not in names
+
     def test_a_file_that_does_not_parse_is_noted_and_skipped(self):
         """The target interpreter could not collect it either, so its imports are not ours."""
         refs, _, notes = self._closure(
@@ -4739,6 +4858,115 @@ class TestRealLuigiTornadoPin:
         assert resolved[0].as_dict()["overridden"] == [
             {"spec": "tornado>=4.0,<5", "source": "install_requires (setup.py) line 41"}
         ]
+
+
+needs_matplotlib_repo = pytest.mark.skipif(
+    not (REPO_ROOT / "runs" / "bugsinpy" / "repos" / "matplotlib.git").is_dir(),
+    reason="matplotlib's bare clone is not present (runs/ is not committed)",
+)
+
+needs_pandas_repo = pytest.mark.skipif(
+    not (REPO_ROOT / "runs" / "bugsinpy" / "repos" / "pandas.git").is_dir(),
+    reason="pandas' bare clone is not present (runs/ is not committed)",
+)
+
+
+class TestRealMatplotlibAndPandasClosure:
+    """matplotlib/1's ``PIL`` and pandas/1's ``dateutil``, against the real files.
+
+    [VANTA-WHY] Both flags are the fifth source: the test side imports a module whose
+    distribution is a different word (``PIL`` is Pillow, ``dateutil`` is
+    python-dateutil), and no canonicalisation recovers it, so the closure refuses to
+    guess. The resolution is the split's reviewed ``module_distributions`` — the same
+    decision for the evaluation waves — not a per-bug exception. The same two bugs
+    exercise the other half of the source: matplotlib's ``lib/pylab.py`` and pandas'
+    ``scripts/validate_docstrings.py`` live in directories with no ``__init__.py``, so
+    pytest puts them on ``sys.path`` as modules the tree provides, and pandas'
+    ``from _csv import Error`` is CPython's own. Every fact is asserted against the
+    fixed commits the bake actually reads.
+    """
+
+    MATPLOTLIB_REPO = REPO_ROOT / "runs" / "bugsinpy" / "repos" / "matplotlib.git"
+    PANDAS_REPO = REPO_ROOT / "runs" / "bugsinpy" / "repos" / "pandas.git"
+
+    def _sources(self, project: str, bug_id: int, repo: Path):
+        split = load_split(DEV_SPLIT_PATH)
+        return split, bake_mod.bug_sources(
+            split.bug(project, bug_id),
+            bugsinpy_root=BUGSINPY_CLONE,
+            repo=repo,
+            module_distributions=split.module_distributions(),
+        )
+
+    @staticmethod
+    def _by_spec(refs) -> dict:
+        return {
+            ref.spec: ref.name
+            for ref in refs
+            if ref.source.startswith("import closure:")
+        }
+
+    @needs_matplotlib_repo
+    def test_matplotlib_resolves_pil_to_pillow_and_dateutil_to_python_dateutil(self):
+        _, sources = self._sources("matplotlib", 1, self.MATPLOTLIB_REPO)
+        by_spec = self._by_spec(sources.refs)
+        assert by_spec["PIL"] == "pillow"
+        assert by_spec["dateutil"] == "python-dateutil"
+        assert "pylab" not in by_spec, "lib/pylab.py is the tree's own module"
+        assert "mpl_toolkits" not in by_spec, "it ships as a package in matplotlib"
+
+    @needs_matplotlib_repo
+    def test_matplotlib_merges_without_a_conflict(self):
+        _, sources = self._sources("matplotlib", 1, self.MATPLOTLIB_REPO)
+        merged, conflicts = bake_mod.merge_refs(sources.refs)
+        assert conflicts == []
+        names = {ref.name for ref in merged}
+        assert {"pillow", "python-dateutil", "numpy", "cycler"} <= names
+        assert "pylab" not in names
+
+    @needs_matplotlib_repo
+    def test_without_the_reviewed_table_matplotlib_1_still_flags(self):
+        """The mapping is what fixes it; unrecorded, the closure refuses (as today)."""
+        split = load_split(DEV_SPLIT_PATH)
+        with pytest.raises(bake_mod.BakeError, match="module_distributions"):
+            bake_mod.bug_sources(
+                split.bug("matplotlib", 1),
+                bugsinpy_root=BUGSINPY_CLONE,
+                repo=self.MATPLOTLIB_REPO,
+                module_distributions={},
+            )
+
+    @needs_pandas_repo
+    def test_pandas_resolves_the_four_divergent_modules(self):
+        _, sources = self._sources("pandas", 1, self.PANDAS_REPO)
+        by_spec = self._by_spec(sources.refs)
+        assert by_spec["dateutil"] == "python-dateutil"
+        assert by_spec["bs4"] == "beautifulsoup4"
+        assert by_spec["sklearn"] == "scikit-learn"
+        assert by_spec["pkg_resources"] == "setuptools"
+        assert by_spec["psycopg2"] == "psycopg2", "unmapped: canonicalised, not guessed"
+
+    @needs_pandas_repo
+    def test_pandas_merges_without_a_conflict_and_csv_is_the_interpreters(self):
+        split, sources = self._sources("pandas", 1, self.PANDAS_REPO)
+        merged, conflicts = bake_mod.merge_refs(sources.refs)
+        assert conflicts == []
+        names = {ref.name for ref in merged}
+        assert {"beautifulsoup4", "python-dateutil", "scikit-learn", "setuptools"} <= names
+        assert "-csv" not in names
+        refs, _, notes = bake_mod.test_import_closure(
+            files=bake_mod.test_side_paths(self.PANDAS_REPO, sources.fixed_commit),
+            read_file=lambda path: tree_mod.read_file_at(
+                self.PANDAS_REPO, sources.fixed_commit, path
+            ),
+            import_name=sources.import_name,
+            distributions=split.module_distributions(),
+            tree_modules=bake_mod.tree_provided_modules(
+                self.PANDAS_REPO, sources.fixed_commit
+            ),
+        )
+        assert "_csv" not in {ref.spec for ref in refs}
+        assert any("'_csv' cannot name a distribution" in note for note in notes)
 
 
 class TestOneBugDoesNotStopTheBatch:

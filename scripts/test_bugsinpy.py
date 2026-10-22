@@ -5240,6 +5240,61 @@ class TestOneBugDoesNotStopTheBatch:
         assert "  - Demo/1: BakeError: no setup.py ..." in text
         assert "  - FastAPI/1: BakeError: b" in text
 
+    def _bake_cli(self, tmp_path, monkeypatch, *, flagged, failure=None):
+        """Drive ``bake --yes`` with the resolution and the build injected."""
+        root = tmp_path / "bugsinpy"
+        root.mkdir()
+        split = split_mod.Split(
+            split_data(
+                bugs=[bug_entry(checkpoint="vanta-bi-Demo-1")],
+                bugsinpy_root=str(root),
+            )
+        )
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split)
+        monkeypatch.setattr(
+            bake_mod, "resolve_bug_deps", lambda *a, **k: ([], list(flagged))
+        )
+        monkeypatch.setattr(bake_mod, "plan_layers", lambda *a, **k: [])
+
+        def build(*args, **kwargs):
+            if failure is not None:
+                raise failure
+            return "summary line"
+
+        monkeypatch.setattr(bake_mod, "run_bake_actions", build)
+        return run_mod.main(
+            ["bake", "--pythons", "3.8", "--yes", "--split", str(tmp_path / "s.json")]
+        )
+
+    def test_a_bake_that_fails_at_a_build_still_ends_with_the_flagged_list(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """[VANTA-WHY] ``run_bake_actions`` raises on the first failed build.
+
+        That is exactly the run whose reader has to know which bugs were flagged
+        before it: the failure message names the layer that failed, and the flagged
+        list is the other half of "what did this run not do".
+        """
+        code = self._bake_cli(
+            tmp_path,
+            monkeypatch,
+            flagged=[bake_mod.FlaggedBug("Demo/1", "BakeError: unreadable")],
+            failure=bake_mod.BakeError("baking vanta-bi-Demo-1 failed (exit 1)"),
+        )
+        captured = capsys.readouterr()
+        assert "flagged bugs (1)" in captured.out
+        assert "  - Demo/1: BakeError: unreadable" in captured.out
+        assert "error: baking vanta-bi-Demo-1 failed" in captured.err
+        assert code == run_mod.EXIT_HARNESS_FAILED
+
+    def test_a_bake_that_flags_nothing_says_so(self, tmp_path, monkeypatch, capsys):
+        """An empty list is a fact about the run, not a line to leave out."""
+        code = self._bake_cli(tmp_path, monkeypatch, flagged=[])
+        captured = capsys.readouterr()
+        assert "flagged bugs (0)" in captured.out
+        assert captured.out.rstrip().splitlines()[-1] == "bake complete"
+        assert code == run_mod.EXIT_OK
+
 
 class TestDepGate:
     """The dependency gate runs before the derivation, with its own messages (§3.3).

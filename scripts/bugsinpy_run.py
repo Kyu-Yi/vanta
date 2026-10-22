@@ -453,17 +453,30 @@ def cmd_bake(args: argparse.Namespace) -> int:
     for action in actions:
         print(f"  {action.describe()}", flush=True)
 
-    summary = bake_mod.run_bake_actions(
-        actions,
-        children=children,
-        build=lambda name, script, base: bake_mod.bake(
-            name, script, base=base, disk_mb=args.disk_mb
-        ),
-    )
+    # Every run ends with this list, empty or not, and the run that stopped at a
+    # failed build ends with it too: `run_bake_actions` raises on the first failure,
+    # so a reader of that run saw the plan and the layer that failed but had no way
+    # to tell whether other bugs had been flagged before the build started. The `(0)`
+    # line is the same statement made about a run where nothing was flagged.
+    flagged_pairs = [(flag.key, flag.reason) for flag in flagged]
+
+    def report_flagged() -> None:
+        print(flush=True)
+        print(render_flagged(flagged_pairs), flush=True)
+
+    try:
+        summary = bake_mod.run_bake_actions(
+            actions,
+            children=children,
+            build=lambda name, script, base: bake_mod.bake(
+                name, script, base=base, disk_mb=args.disk_mb
+            ),
+        )
+    except BaseException:
+        report_flagged()
+        raise
     print(summary, flush=True)
-    if flagged:
-        print()
-        print(render_flagged([(flag.key, flag.reason) for flag in flagged]))
+    report_flagged()
     print("bake complete", flush=True)
     return EXIT_BUG_FAILED if flagged else EXIT_OK
 

@@ -480,7 +480,12 @@ refusal, per bug; an unparseable `pyproject.toml` is a refusal too, never a sile
 **A refusal is one bug's, never the batch's.** `bake` and `prepare` both read the metadata per bug, so
 a bug whose dependencies cannot be read is recorded as **flagged** with the reason, the rest of the
 split carries on, and the flagged bugs are printed as a list at the end of the run — the same shape
-`prepare` already uses for a bug whose `prepare_one` raised (`prepare.json`'s `breaks`). The one bug
+`prepare` already uses for a bug whose `prepare_one` raised (`prepare.json`'s `breaks`). That list is
+printed by **every** `bake` run and not only by the ones that finish: the layer build raises on its
+first failure, so a run that dies at `matplotlib/1` never reached the old end-of-command print, and a
+reader of that run could not tell a flagged bug from a bug that never got there. When nothing was
+flagged the line says `flagged bugs (0)` — the same statement about the run, not a line to leave out.
+The one bug
 that stops everything is one the *harness* cannot proceed on at all (a missing checkpoint, a moved
 BugsInPy clone), and that is exit code 2. A flagged-unreadable bug is **not** either of the two §14.7
 gates — the §1.6 context gate and the §8.2 dev-fix self-check — so it never silently promotes a

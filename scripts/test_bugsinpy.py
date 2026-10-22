@@ -7987,8 +7987,30 @@ class TestRealMatplotlibAndPandasClosure:
         "pytest", "pytz", "s3fs", "scipy", "sklearn", "sqlalchemy", "statsmodels",
         "xarray", "xlrd",
     )
+    # The **full** pandas/1 install set — the closure *and* every declared dependency, as
+    # `merge_refs` unions them before the date rule resolves them. Measured at `39063e5`
+    # (the commit before `f095789`), as distribution names, and it is the same 41 the
+    # scope fix produces because the scope fix is exactly a return to that behaviour:
+    # `f095789` read `type-checking only` / `lazy: inside <qualname>` as reasons to leave a
+    # package out of a *layer*, and on pandas/1 that took the refs down to the **22** of
+    # `4615f27` — nineteen names, which the preflight prints as 24 pins once the two plugin
+    # pins are added. The nineteen are `beautifulsoup4`, `botocore`, `cftime`, `dask`,
+    # `fastparquet`, `ipython`, `jedi`, `numba`, `numexpr`, `openpyxl`, `psycopg2-binary`,
+    # `pymysql`, `s3fs`, `scikit-learn`, `scipy`, `sqlalchemy`, `statsmodels`, `xarray` and
+    # `xlrd`. `numba`/`llvmlite` are *not* the story: `llvmlite` was never a ref (nothing in
+    # either tree imports it), and `numba` is in this list on both sides — it leaves the
+    # *installs* by §3.2's unresolvable rule, not by the closure.
+    PANDAS_ONE_INSTALLS = (
+        "atomicwrites", "attrs", "beautifulsoup4", "botocore", "cftime", "colorama",
+        "cycler", "cython", "dask", "fastparquet", "hypothesis", "ipython", "jedi",
+        "kiwisolver", "matplotlib", "more-itertools", "numba", "numexpr", "numpy",
+        "openpyxl", "packaging", "pluggy", "psycopg2-binary", "py", "pyarrow", "pymysql",
+        "pyparsing", "pytest", "python-dateutil", "pytz", "s3fs", "scikit-learn", "scipy",
+        "setuptools", "six", "sortedcontainers", "sqlalchemy", "statsmodels", "wcwidth",
+        "xarray", "xlrd",
+    )
     # The only pins in that list nothing on this image can build; §3.2's rule may take
-    # them out of the layer and nothing else. ``llvmlite`` is the third entry of
+    # them out of the installs and nothing else. ``llvmlite`` is the third entry of
     # ``bake.UNBUILDABLE_ON_PLATFORM`` and is *not* here: nothing in either tree imports
     # it, so it never enters the install set to be dropped.
     PANDAS_ONE_UNUSABLE = ("numba", "pyarrow")
@@ -8083,28 +8105,46 @@ class TestRealMatplotlibAndPandasClosure:
         assert any("'_csv' cannot name a distribution" in note for note in notes)
 
     @needs_pandas_repo
-    def test_pandas_one_keeps_the_install_set_it_had_before_the_scope_fix(self):
-        """The install set is the pre-``f095789`` one, and only the unusable pins leave it.
+    def test_pandas_one_keeps_the_full_pin_list_it_had_before_the_scope_fix(self):
+        """The **full** pin list is the pre-``f095789`` one, and only the unusable pins leave it.
 
         [VANTA-WHY] ``f095789`` read ``type-checking only`` and ``lazy: inside <qualname>``
-        as reasons to leave a package *out of a layer*. On pandas/1 that took
-        ``beautifulsoup4``, ``scikit-learn`` and ``psycopg2-binary`` out of the install
-        set — the tests that ask for them then *skip*, and ``skipped`` is not a failure, so
-        the gate could not see it. The closure's list is written down whole for that
-        reason: it is the difference a scope bug makes, and nothing else in the harness
-        would notice it. The three the fix restored are asserted by name, the two pins
-        nothing here can install are asserted *out* with the audit that let them go
-        (``llvmlite`` is not in the list at all — nothing in either tree imports it), and
-        the install set after the drop is the baseline minus exactly those two.
+        as reasons to leave a package *out of a layer*. On pandas/1 that cut the pin list the
+        preflight counts to 24 from the 41 it is without the misread — nineteen names, of
+        which the tests ask for ``beautifulsoup4``, ``scikit-learn`` and ``psycopg2-binary``
+        by name — and the tests that ask for a missing package then *skip*, and ``skipped``
+        is not a failure, so the gate could not see it. The list is written down **whole**,
+        because the closure is only one contributor to it: ``merge_refs`` unions the closure
+        with every declared requirement, and it is the merged list — not the closure — the
+        preflight counts, so a regression in either contributor has to show up here.
+        ``llvmlite`` is not the story either: it
+        was never a ref, so it never entered the list to be dropped. What may leave the list
+        afterwards is §3.2's unresolvable rule, on the two pins nothing on this image can
+        build — ``numba`` and ``pyarrow``, each with the audit that let it go.
         """
         split, sources = self._sources("pandas", 1, self.PANDAS_REPO)
+
+        # The full pin list, before §3.2's drop: `merge_refs` unions the closure with the
+        # declared requirements, so this is the baseline whole and not just the closure's
+        # slice of it — and it is the same 41 `39063e5` (before `f095789`) produced, which
+        # is what the scope fix restores.
+        merged, conflicts = bake_mod.merge_refs(sources.refs)
+        assert conflicts == [], "pandas/1's declarations do not disagree with each other"
+        names = sorted({ref.name for ref in merged})
+        assert names == sorted(self.PANDAS_ONE_INSTALLS), (
+            "the full install set is the one before the scope fix: a `lazy` / "
+            "`type-checking only` site answers the audit's question, never the closure's "
+            "or the merge's (`bake._scope_only_reason`)"
+        )
+
+        # The closure's own contribution, kept apart: it is the walk `f095789` misread,
+        # and the names it took out of the *closure* are the spellings that walk uses.
         closure = sorted(
             {ref.spec for ref in sources.refs if ref.source.startswith("import closure:")}
         )
         assert closure == sorted(self.PANDAS_ONE_CLOSURE), (
-            "the install set is the one before the scope fix: a `lazy` / `type-checking "
-            "only` site answers the audit's question, never the closure's "
-            "(`bake._scope_only_reason`)"
+            "the closure is the pre-``f095789`` one: a `lazy` / `type-checking only` site "
+            "answers the audit's question, never the closure's (`bake._scope_only_reason`)"
         )
         assert {"bs4", "sklearn", "psycopg2"} <= set(closure), (
             "`beautifulsoup4`, `scikit-learn` and `psycopg2-binary` are installed again; "
@@ -8117,11 +8157,7 @@ class TestRealMatplotlibAndPandasClosure:
             distributions=split.module_distributions(),
             test_files=(str(split.bug("pandas", 1)["test_file"]),),
         )
-        source_of = {
-            ref.spec: ref.source
-            for ref in sources.refs
-            if ref.source.startswith("import closure:")
-        }
+        source_of = {ref.name: ref.source for ref in merged}
         dropped = {
             name: bake_mod.decide_unresolvable(
                 name,
@@ -8141,8 +8177,8 @@ class TestRealMatplotlibAndPandasClosure:
             assert record.audit.sites, "a drop records every site it was measured on"
             assert record.pin == name, "a closure ref carries no version of its own"
 
-        assert "llvmlite" not in closure, (
-            "nothing in either tree imports it, so it never enters the install set"
+        assert "llvmlite" not in names, (
+            "nothing in either tree imports it, so it never enters the pin list"
         )
         assert audit("llvmlite").reason == "nothing in either tree imports it"
 
@@ -8164,11 +8200,12 @@ class TestRealMatplotlibAndPandasClosure:
             "every numba site is `lazy: inside <qualname>` or an import_optional_dependency"
         )
 
-        installs = sorted(spec for spec in closure if spec not in dropped)
-        assert installs == sorted(set(self.PANDAS_ONE_CLOSURE) - set(dropped)), (
-            "the install set after the rule is the baseline minus only the unusable pins"
-        )
         assert sorted(dropped) == sorted(self.PANDAS_ONE_UNUSABLE)
+        installs = sorted(set(names) - set(dropped))
+        assert installs == sorted(set(self.PANDAS_ONE_INSTALLS) - set(dropped)), (
+            "§3.2's rule leaves the baseline minus exactly the unusable pins, and nothing "
+            "else may leave it — the only difference is those two, each with its audit"
+        )
 
 
 needs_sanic_repo = pytest.mark.skipif(

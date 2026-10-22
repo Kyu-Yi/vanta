@@ -1315,8 +1315,18 @@ class TestDeclaredFailToPass:
         assert bug_prep.f2p_undeclared == sorted(flipping)
         assert any("empty FAIL_TO_PASS" in f for f in bug_prep.gate_failures)
 
-    def test_strip_and_baseline_hides_the_undeclared_test_too(self, tmp_path, monkeypatch):
-        """Hidden from the tree, and therefore from the P2P suite as well."""
+    @pytest.mark.parametrize("schema", ["mapping_0_3", "flat_list_0_2"])
+    def test_strip_and_baseline_hides_the_undeclared_test_too(
+        self, tmp_path, monkeypatch, schema
+    ):
+        """Hidden from the tree, and therefore from the P2P suite as well.
+
+        Both plugin schemas: the collected nodeids come from the oracle's report
+        whether that file is the 0.3+ mapping or the flat list 0.1/0.2 write, which is
+        what a bug whose own pytest pin caps the plugin at 0.2 gets (§3.2). Reading
+        only `["tests"]` left the collected set empty for that bug, so nothing was
+        hidden from the Creator and nothing was stripped from the P2P suite.
+        """
         root = tmp_path / "batch" / "worktrees" / "Demo_1"
         declared_file = "tests/test_pysnooper.py"
         undeclared_file = "tests/test_utils/test_ensure_tuple.py"
@@ -1328,17 +1338,13 @@ class TestDeclaredFailToPass:
             root / "oracle_tree" / undeclared_file,
             "def test_ensure_tuple():\n    assert 1\n",
         )
-        monkeypatch.setattr(
-            prepare_mod,
-            "_read_report",
-            lambda batch_dir, stem: {
-                "tests": [
-                    {"nodeid": f"{declared_file}::test_custom_repr"},
-                    {"nodeid": f"{declared_file}::test_disable"},
-                    {"nodeid": f"{undeclared_file}::test_ensure_tuple"},
-                ]
-            },
-        )
+        entries = [
+            {"nodeid": f"{declared_file}::test_custom_repr"},
+            {"nodeid": f"{declared_file}::test_disable"},
+            {"nodeid": f"{undeclared_file}::test_ensure_tuple"},
+        ]
+        report = {"tests": entries} if schema == "mapping_0_3" else entries
+        monkeypatch.setattr(prepare_mod, "_read_report", lambda batch_dir, stem: report)
         seen: dict = {}
 
         def fake_suite(*args, **kwargs):
@@ -2101,6 +2107,21 @@ class TestBehaviouralLine:
         }
         assert issue_mod.failure_kinds_from_report(report) == ["ImportError"]
 
+    @pytest.mark.parametrize("schema", ["mapping_0_3", "flat_list_0_2"])
+    def test_failure_kinds_read_both_plugin_schemas(self, schema):
+        """The 0.2 flat list carries the same `longrepr` blocks; it must be read."""
+        entries = [
+            {
+                "nodeid": "t.py::test_a",
+                "call": {"longrepr": "E   ValueError: bad flag"},
+            }
+        ]
+        report = {"tests": entries} if schema == "mapping_0_3" else entries
+        assert issue_mod.failure_kinds_from_report(report) == ["ValueError"]
+
+    def test_failure_kinds_of_an_absent_report_are_empty_not_an_error(self):
+        assert issue_mod.failure_kinds_from_report({}) == []
+
 
 class TestBuildIssueText:
     def test_assembles_and_gates(self, tmp_path):
@@ -2264,6 +2285,28 @@ class TestSuiteReport:
             "tests/test_a.py": {"tests/test_a.py::test_b", "tests/test_a.py::test_c"},
             "t.py": {"t.py::test_d"},
         }
+
+    # ---- the shared entry reader, which prepare and issue also go through -----
+    #
+    # [VANTA-WHY] `parse_report` is not the only reader of the file. The stripper
+    # (prepare) reads the collected nodeids out of the oracle's report and the issue
+    # text (issue) reads exception classes out of it, and both used to look only under
+    # `["tests"]`. On a bug whose own pin caps the plugin at 0.2 (httpie/1; §3.2) they
+    # therefore saw ZERO collected tests and ZERO exception classes — a silently wrong
+    # answer, not an error. One helper now knows both schemas and all three read it.
+
+    def test_report_tests_reads_both_schemas(self):
+        assert suite_mod.report_tests(self.TESTS) == self.TESTS
+        assert suite_mod.report_tests({"tests": self.TESTS}) == self.TESTS
+
+    def test_report_tests_an_absent_key_is_an_empty_report_not_an_error(self):
+        assert suite_mod.report_tests({}) == []
+
+    def test_report_tests_a_top_level_that_is_neither_schema_is_an_error(self):
+        with pytest.raises(suite_mod.SuiteError, match="top level"):
+            suite_mod.report_tests("passed")
+        with pytest.raises(suite_mod.SuiteError, match="`tests` is a str"):
+            suite_mod.report_tests({"tests": "nope"})
 
 
 class TestSuitePair:

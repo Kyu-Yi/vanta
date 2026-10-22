@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
+from . import suite
 from .records import RecordError, field_of, strings_of
 from .trees import nodeid_chain, nodeid_file
 
@@ -150,9 +151,13 @@ def failure_kinds_from_report(report: dict) -> list[str]:
 
     Only the class name is read out of ``longrepr``; the message — which for an
     assertion contains the expected value — is never extracted.
+
+    The entries come from :func:`suite.report_tests`, so the report of a bug whose own
+    pytest pin caps pytest-json-report at 0.2 (a flat list, §3.2) names its exceptions
+    instead of silently contributing none.
     """
     kinds: list[str] = []
-    for test in report.get("tests") or []:
+    for test in suite.report_tests(report):
         for phase in ("call", "setup", "teardown"):
             block = test.get(phase) or {}
             longrepr = block.get("longrepr")

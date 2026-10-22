@@ -336,33 +336,38 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
     };
     let mut tests = Vec::new();
     let mut failure_outputs: HashMap<String, String> = HashMap::new();
-    if let Some(arr) = report["tests"].as_array() {
-        for t in arr {
-            let nodeid = t["nodeid"].as_str().unwrap_or_default().to_string();
-            let Some(result) = native_outcome(t["outcome"].as_str().unwrap_or_default()) else {
-                continue;
-            };
-            if nodeid.is_empty() {
-                continue;
-            }
-            if result != TestResult::Passed {
-                // [VANTA-WHY] pytest attaches the traceback to whichever phase
-                // produced it: `call` for an assertion, `setup`/`teardown` for a
-                // fixture or import error. Reading all three is what makes a
-                // collection-time failure explain itself instead of arriving as
-                // a bare nodeid.
-                for phase in ["call", "setup", "teardown"] {
-                    let repr = t[phase]["longrepr"]
-                        .as_str()
-                        .or_else(|| t[phase]["crash"]["message"].as_str());
-                    if let Some(repr) = repr {
-                        failure_outputs.insert(nodeid.clone(), one_line(repr));
-                        break;
-                    }
+    // The shape is the plugin version's business, not this reader's (§3.2), so
+    // the entries come from the one helper that knows both schemas. A report of
+    // neither shape is a FAILED run: `ran: true` with zero tests is the reading
+    // that made a 0.2-pinned bug look like a tree with no tests.
+    let Ok(entries) = report_tests(&report) else {
+        return NativeSuiteReport::failed_run(exec.exit_code, tail);
+    };
+    for t in entries {
+        let nodeid = t["nodeid"].as_str().unwrap_or_default().to_string();
+        let Some(result) = native_outcome(t["outcome"].as_str().unwrap_or_default()) else {
+            continue;
+        };
+        if nodeid.is_empty() {
+            continue;
+        }
+        if result != TestResult::Passed {
+            // [VANTA-WHY] pytest attaches the traceback to whichever phase
+            // produced it: `call` for an assertion, `setup`/`teardown` for a
+            // fixture or import error. Reading all three is what makes a
+            // collection-time failure explain itself instead of arriving as
+            // a bare nodeid.
+            for phase in ["call", "setup", "teardown"] {
+                let repr = t[phase]["longrepr"]
+                    .as_str()
+                    .or_else(|| t[phase]["crash"]["message"].as_str());
+                if let Some(repr) = repr {
+                    failure_outputs.insert(nodeid.clone(), one_line(repr));
+                    break;
                 }
             }
-            tests.push((nodeid, result));
         }
+        tests.push((nodeid, result));
     }
     NativeSuiteReport {
         tests,
@@ -735,6 +740,33 @@ for _p in (os.path.join(_here, 'src'), _here):
 // pytest report parsing
 // ============================================================================
 
+/// The `tests` array of a pytest-json-report file, whichever schema wrote it.
+///
+/// [VANTA-WHY] Which schema the plugin writes is a function of its *version*,
+/// and its version is a function of the bug's own pytest pin
+/// (plans/bugsinpy.md §3.2): `pytest-json-report` 0.1/0.2 write a bare JSON
+/// list, 0.3 and later write `{"tests": [...]}`. `httpie/1` pins
+/// `pytest==3.2.1`, which caps the plugin at 0.2, so that bug's layer writes the
+/// flat list. Every reader here looked only under `["tests"]`, so on that layer
+/// the native suite reported `ran: true` with ZERO tests and every generated
+/// test graded `Error` — an InfraFailure that has nothing to do with the model.
+///
+/// `Err` is "neither schema", and a caller must not read it as an empty report:
+/// a report of the wrong top-level type is a reason to fail closed (no verdict
+/// was reached), never a reason to conclude the tree has no tests.
+pub fn report_tests(report: &serde_json::Value) -> Result<&[serde_json::Value], &'static str> {
+    if let Some(entries) = report.as_array() {
+        return Ok(entries);
+    }
+    if let Some(entries) = report.get("tests").and_then(serde_json::Value::as_array) {
+        return Ok(entries);
+    }
+    Err(
+        "the report is neither the flat list pytest-json-report 0.1/0.2 write nor the \
+         {\"tests\": [...]} mapping 0.3 and later write",
+    )
+}
+
 /// Parse pytest's JSON report into the outcome of a specific generated test
 /// file.
 ///
@@ -813,12 +845,16 @@ pub fn parse_pytest_report_detailed(
 /// the sandbox as one fixed name (`test_run.py` / `test_bate.py`), so its nodeid
 /// is identified by that FILE. A nodeid that is absent from the report yields
 /// `None` — the caller fails closed rather than reading someone else's result.
+///
+/// The entries come from :func:`report_tests`, so the plugin's schema (0.1/0.2
+/// flat list or 0.3+ mapping) is not this function's business; `None` covers an
+/// unreadable shape as well as an absent nodeid, and both fail closed.
 fn generated_test_outcome(
     report: &serde_json::Value,
     generated_test_file: &str,
 ) -> Option<TestResult> {
     let wanted = nodeid_file(generated_test_file);
-    for t in report["tests"].as_array()? {
+    for t in report_tests(report).ok()? {
         let nodeid = t["nodeid"].as_str().unwrap_or_default();
         if nodeid_file(nodeid) == wanted {
             let result = match t["outcome"].as_str().unwrap_or_default() {
@@ -1512,7 +1548,7 @@ mod tests {
         copy_static_configs, interpreter_for, is_native_test_path, native_outcome,
         native_regressions, native_suite_collapsed, native_tree_with_original_tests,
         new_diagnostics, parse_mypy_line, parse_native_report, parse_pytest_report_detailed,
-        parse_ruff_line, ruff_is_error_class, run_single_test, run_tests_parallel,
+        parse_ruff_line, report_tests, ruff_is_error_class, run_single_test, run_tests_parallel,
         static_tool_runner, write_source_files,
     };
     use crate::agents::attacker::GeneratedTest;
@@ -2135,6 +2171,122 @@ mod tests {
             TestResult::Passed,
             "rootdir-relative nodeids may carry a `./` prefix and must still match"
         );
+    }
+
+    // ---- both report schemas, in both readers --------------------------------
+    //
+    // [VANTA-WHY] Which schema pytest-json-report writes is a function of its
+    // version, and the version follows the bug's own pytest pin
+    // (plans/bugsinpy.md §3.2): 0.1/0.2 write a bare JSON list, 0.3 and later
+    // write {"tests": [...]}. `httpie/1` pins `pytest==3.2.1`, which caps the
+    // plugin at 0.2 — so the BugSinPy layer for that one bug writes the flat
+    // list, and both readers here (the native suite and the generated test)
+    // would have seen "no tests" rather than a verdict: an InfraFailure at
+    // evaluation time for a reason that has nothing to do with the model.
+    // Three cases are pinned: each schema, and a top level that is neither.
+
+    fn written_flat_report(tests_json: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.json");
+        fs::write(&path, format!("[{tests_json}]")).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn a_flat_list_report_is_read_by_both_readers() {
+        let entries = concat!(
+            r#"{"nodeid":"tests/test_core.py::test_a","outcome":"passed"},"#,
+            r#"{"nodeid":"test_bate.py::test_reproduces_bug","outcome":"failed"}"#
+        );
+        let (_dir, path) = written_flat_report(entries);
+
+        let native = parse_native_report(&path, &buggy_exec());
+        assert!(native.ran, "a flat-list report is a report the suite produced");
+        assert_eq!(
+            native.tests.len(),
+            2,
+            "the 0.2 plugin's flat list carries the same per-test entries"
+        );
+        assert_eq!(
+            native
+                .tests
+                .iter()
+                .find(|(name, _)| name.ends_with("test_a"))
+                .map(|(_, result)| result.clone()),
+            Some(TestResult::Passed)
+        );
+
+        let details = parse_pytest_report_detailed(path, &buggy_exec(), None, "test_bate.py");
+        assert_eq!(
+            details.result,
+            TestResult::Failed,
+            "the generated test still fails on the buggy original under the 0.2 schema"
+        );
+        assert!(
+            details.report_path_exists,
+            "a graded test reached a verdict, so the shape was read"
+        );
+    }
+
+    #[test]
+    fn a_mapping_report_is_read_by_both_readers() {
+        let entries = concat!(
+            r#"{"nodeid":"tests/test_core.py::test_a","outcome":"passed"},"#,
+            r#"{"nodeid":"test_bate.py::test_reproduces_bug","outcome":"failed"}"#
+        );
+        let (_dir, path) = written_report(entries);
+
+        let native = parse_native_report(&path, &buggy_exec());
+        assert!(native.ran);
+        assert_eq!(native.tests.len(), 2, "0.3+ puts the same entries under `tests`");
+
+        let details = parse_pytest_report_detailed(path, &buggy_exec(), None, "test_bate.py");
+        assert_eq!(details.result, TestResult::Failed);
+        assert!(details.report_path_exists);
+    }
+
+    #[test]
+    fn a_report_of_an_unexpected_shape_is_not_an_empty_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let string_report = dir.path().join("string.json");
+        fs::write(&string_report, r#""passed""#).unwrap();
+        let keyless_mapping = dir.path().join("keyless.json");
+        fs::write(&keyless_mapping, r#"{"created":0.0}"#).unwrap();
+
+        for path in [&string_report, &keyless_mapping] {
+            let native = parse_native_report(path, &buggy_exec());
+            assert!(
+                !native.ran,
+                "a report of neither schema is a run that produced no usable \
+                 report, not a tree with zero tests: {path:?}"
+            );
+
+            let details = parse_pytest_report_detailed(
+                path.clone(),
+                &buggy_exec(),
+                None,
+                "test_bate.py",
+            );
+            assert_eq!(
+                details.result,
+                TestResult::Error,
+                "an unreadable report can never grade a generated test: {path:?}"
+            );
+            assert!(!details.report_path_exists);
+        }
+    }
+
+    #[test]
+    fn report_tests_rejects_a_shape_neither_plugin_writes() {
+        assert!(report_tests(&serde_json::json!([])).unwrap().is_empty());
+        assert_eq!(
+            report_tests(&serde_json::json!({"tests": [{"nodeid": "a"}]}))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(report_tests(&serde_json::json!("passed")).is_err());
+        assert!(report_tests(&serde_json::json!({"created": 0.0})).is_err());
     }
 
     #[test]

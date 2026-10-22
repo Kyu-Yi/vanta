@@ -652,14 +652,22 @@ pytest 5.2.1. Three things follow, and each is recorded rather than assumed:
    `pin_rule` ("the newest release whose declared pytest requirement accepts pytest==<v>"), so a reader
    can tell the plugin's pin from a date pin. A bug with **no** `pytest` pin of its own keeps the
    interpreter layer's pair — `8.0.2`/`1.5.0` on 3.8 — and needs no plugin resolution at all.
-3. **The report reader handles both schemas.** Which schema the plugin writes is a function of the
-   version this rule picks, so `suite.parse_report` reads **both**: 0.1/0.2 write a flat list, 0.3 and
-   later write `{"tests": [...]}` — and 0.2 is exactly what httpie/1 lands on. Both carry `nodeid` and
-   `outcome`, so both are read. One limitation of 0.2 that cannot be repaired: it builds its list from
-   the terminal reporter's `passed`/`failed` stats, so a test that *errors* is absent from the file
-   rather than recorded as `"error"` — an absent nodeid is excluded from the stable comparison, which
-   is the right treatment of a test the report says nothing about. The Rust side
-   (`src/pipeline/harness.rs`) reads the 0.3+ mapping, which is what every bug except httpie/1 gets.
+3. **Every reader of the report handles both schemas, through one helper per language.** Which schema
+   the plugin writes is a function of the version this rule picks, and 0.2 is exactly what httpie/1
+   lands on: 0.1/0.2 write a **flat list**, 0.3 and later write `{"tests": [...]}`. Both carry `nodeid`,
+   `outcome` and the `call`/`setup`/`teardown` blocks, so one entry reader knows both and every reader
+   calls it — Python's `suite.report_tests` (feeding `parse_report`, `prepare.strip_and_baseline`'s
+   collected-nodeid set, and `issue.failure_kinds_from_report`) and Rust's `harness.report_tests`
+   (feeding the native-suite reader, the generated-test reader, and `bin/checkpoint_e.rs`). A reader
+   that looked only under `["tests"]` did not fail loudly on that bug: it saw **zero** tests, so the
+   native suite came back `ran: true` with an empty suite, every generated test graded `Error`
+   (InfraFailure at evaluation time), the stripper hid nothing, and the issue text named no exception
+   class. For the same reason a top level that is **neither** schema is an error (Python) and a failed
+   run (Rust), never "no tests": silently empty is how a real report turns into a wrong answer. One
+   limitation of 0.2 that no reader can repair: it builds its list from the terminal reporter's
+   `passed`/`failed` stats, so a test that *errors* is absent from the file rather than recorded as
+   `"error"` — an absent nodeid is excluded from the stable comparison, which is the right treatment of
+   a test the report says nothing about.
 
 A layer whose `pytest` changes has to be **rebuilt**, because the interpreter layer and everything
 stacked on it were baked against the old pair; the checkpoints are the previous bake's, and
@@ -872,7 +880,7 @@ and **rejects the bug from the split** if it does not collect. The resolved `tes
 in the split, alongside the *interpreter* layer's pinned `pytest` / `pytest-json-report`; the pair the
 bug's own layer actually carries is a property of that layer and lives in its provenance (§3.2), which
 is also where the report format is decided — a bug whose own pin caps the plugin at 0.2 writes the
-older schema, and `suite.parse_report` reads both.
+older schema, and **every** reader reads both, Python and Rust alike (§3.2 point 3).
 `run_test.sh` is still read, but used as the *cross-check* on which nodeid is the hidden test
 (§1.3), not as the executor.
 

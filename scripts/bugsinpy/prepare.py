@@ -447,9 +447,13 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> No
     vanta = prep.root / "vanta_tree"
 
     report = _read_report(batch_dir, f"{prep.slug}-oracle")
+    # Through the shared reader: the oracle report of a bug whose own pytest pin caps
+    # pytest-json-report at 0.2 is a flat list (§3.2), and reading only `["tests"]`
+    # would make every file look uncollected — the hidden set would come out empty for
+    # that bug and the stripper would not strip.
     collected_nodeids = [
         test["nodeid"]
-        for test in report.get("tests") or []
+        for test in suite_mod.report_tests(report, source=f"{prep.slug}-oracle report")
         if isinstance(test.get("nodeid"), str)
     ]
     collected_by_file = suite_mod.collect_by_file(collected_nodeids)

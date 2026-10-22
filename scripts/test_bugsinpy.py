@@ -2906,6 +2906,63 @@ class TestBake:
         for recipe in (self._recipe(), bake_mod.requirements_recipe(["decorator"])):
             assert recipe.strip().splitlines()[-1] == f"touch {bake_mod.MARKER}"
 
+    # ---- the interpreter layer's system packages -------------------------
+    #
+    # [VANTA-WHY] The measured trees that compile extensions (matplotlib/1,2,
+    # pandas/1, spacy/4) need a C++ compiler and the `-dev` headers they link
+    # against, and every py3.8 bug shares one interpreter layer, so the packages go
+    # there rather than into each bug's layer. The layer records their versions in
+    # itself, and a package that is missing fails this layer's bake — not a bug's
+    # build an hour later.
+
+    SYSTEM_PACKAGES = ("g++", "pkg-config", "libfreetype-dev", "libpng-dev", "zlib1g-dev")
+
+    def test_the_interpreter_recipe_installs_the_system_packages(self):
+        recipe = self._recipe()
+        assert (
+            "apt-get install -y --no-install-recommends "
+            + " ".join(self.SYSTEM_PACKAGES) in recipe
+        )
+
+    def test_the_system_packages_are_those_the_split_compiles_against(self):
+        """One list, so the recipe and this expectation cannot drift apart."""
+        assert bake_mod.SYSTEM_PACKAGES["3.8"] == self.SYSTEM_PACKAGES
+
+    def test_the_layer_records_the_installed_versions_in_itself(self):
+        """The interpreter layer's provenance for its non-pip half.
+
+        Beside ``/opt/vanta-deps-freeze.txt``: written by the recipe that installs
+        them, so it describes the layer rather than a host-side intention.
+        """
+        recipe = self._recipe()
+        assert "dpkg-query -W" in recipe
+        assert "/opt/vanta-system-packages.txt" in recipe
+
+    def test_a_missing_system_package_fails_the_bake(self):
+        """A layer without the compiler must not be cached under a valid name.
+
+        The check is on dpkg's own status field: a package dpkg knows but has not
+        installed still prints a version, so a version-only check would pass.
+        """
+        recipe = self._recipe()
+        assert " installed$" in recipe
+        assert "exit 1" in recipe
+        assert "missing from the layer after apt-get:$missing" in recipe
+        # Before the marker, or the layer is saved as built anyway.
+        assert recipe.index("exit 1") < recipe.index(f"touch {bake_mod.MARKER}")
+
+    def test_a_minor_without_system_packages_is_unchanged(self):
+        """3.6/3.7 were baked without them, so their recipe must not move.
+
+        Their layers are neither rebuilt nor re-downloaded by this decision.
+        """
+        recipe = bake_mod.python_recipe("3.6", bake_mod.PytestPin("6.2.5", "1.4.1"))
+        assert "apt-get" not in recipe
+        assert recipe.splitlines()[:2] == ["set -eux", 'export HOME="${HOME:-/root}"']
+
+    def test_the_system_package_lines_are_empty_for_a_minor_without_them(self):
+        assert bake_mod.system_package_lines(()) == []
+
     # ---- the per-bug recipe ----------------------------------------------
     def test_declared_deps_reads_setup_sh_and_drops_the_self_install(self):
         setup = "python setup.py install\npip install python_toolbox\n"

@@ -238,12 +238,86 @@ def pins_for_python(split: Split, minor: str) -> PytestPin:
 # ---------------------------------------------------------------------------
 # the interpreter layer
 # ---------------------------------------------------------------------------
+SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
+    "3.8": ("g++", "pkg-config", "libfreetype-dev", "libpng-dev", "zlib1g-dev"),
+}
+"""Build-time system packages, per Python minor, installed into the interpreter layer.
+
+[VANTA-WHY] These are the *system* half of §3.2's build toolchain: the pinned
+``setuptools``/``wheel``/``Cython`` are Python packages, but the extensions the
+measured trees compile (matplotlib's ``_png``/``ft2font``, pandas' ``_libs``,
+spacy's Cython modules) want a C++ compiler and the ``-dev`` headers they link
+against. They go in the **interpreter** layer, not in a per-bug layer, because all
+bugs on one minor share it — one environment, so a bug's layer is only ever what
+its own metadata added.
+
+All eleven dev-split bugs are 3.8, which is why 3.8 is the minor that has them.
+The keys are a decision per minor and not a switch: a minor that is absent gets no
+system packages, so the 3.6/3.7 layers keep the recipe they were baked with and are
+neither rebuilt nor re-downloaded by this. Extending the list is a base-image change
+and needs the same approval as adding to it the first time.
+
+A compiler being present does not change a pure-Python bug's tests: ``needs_build``
+(§3.2) decides per bug whether anything is compiled, and a bug that compiles nothing
+never invokes the toolchain, so its verdict is the same as on a layer without one.
+"""
+
+_DPKG_QUERY_STATUS = "dpkg-query -W -f='${Package} ${Version} ${db:Status-Status}\\n'"
+"""One line per package: name, version, and dpkg's own ``status:status`` field.
+
+Not ``dpkg-query -W`` bare: for a package dpkg knows but has not installed that
+prints an entry with a version and exits 0, which would read as present. The third
+field is what distinguishes "installed" from "known".
+"""
+
+
+def system_package_lines(packages: Sequence[str]) -> list[str]:
+    """Install, verify, and record the interpreter layer's system packages.
+
+    [VANTA-WHY] Verified rather than trusted, for the same reason the pip and ssl
+    checks below are: a layer that boots without a compiler looks baked, and the
+    failure then surfaces mid-bake on a *bug's* layer as a build error whose text is
+    ``g++: not found`` — i.e. as that bug's problem, on every wave, when the cause is
+    the interpreter layer. A missing package therefore fails **this** layer's bake,
+    which is what makes ``checkpoint_create`` delete it instead of caching it.
+
+    The versions go to ``/opt/vanta-system-packages.txt`` inside the layer — the
+    interpreter layer's provenance for its system half, beside the ``/opt/vanta-deps-freeze.txt``
+    every layer already carries for its pip half. Like the freeze file it is part of
+    the layer, because that is what makes it true of the layer: the record is written
+    by the same script that does the install, and read back by booting the checkpoint
+    (§3.2's ``python -m pip freeze`` pattern).
+
+    Empty for a minor not in :data:`SYSTEM_PACKAGES`, so the recipe of a layer without
+    them is unchanged, line for line.
+    """
+    if not packages:
+        return []
+    names = " ".join(packages)
+    return [
+        # The base image's apt lists are empty, so an install without this resolves
+        # nothing. Network is allowed at bake time and only here (§3.2).
+        "apt-get update",
+        f"DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {names}",
+        f"{_DPKG_QUERY_STATUS} {names} > /opt/vanta-system-packages.txt",
+        "cat /opt/vanta-system-packages.txt",
+        # `set -e` would stop at the first miss, so the misses are collected first and
+        # the message names all of them: one bake tells you the whole list.
+        f"missing=''; for pkg in {names}; do "
+        f"{_DPKG_QUERY_STATUS} \"$pkg\" 2>/dev/null | grep -q ' installed$' "
+        '|| missing="$missing $pkg"; done',
+        '[ -z "$missing" ] || { echo "system packages missing from the layer after '
+        f'apt-get:$missing" >&2; exit 1; }}',
+    ]
+
+
 def python_recipe(minor: str, pin: PytestPin) -> str:
     """Install a standalone CPython and the pinned pytest, then assert both work."""
     venv = f"/opt/venv{minor.replace('.', '')}"
     return "\n".join(
         [
             "set -eux",
+            *system_package_lines(SYSTEM_PACKAGES.get(minor, ())),
             # [VANTA-WHY] Measured on the base image: `sh -c` inside a fresh VM gets
             # HOME=/ (set, but to the root directory), so the uv installer's default
             # target became `//.local/bin` and the next line failed with

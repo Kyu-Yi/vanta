@@ -367,6 +367,35 @@ All bugs on one minor share a layer, and `pytest`/`pytest-json-report` pins must
 within a minor version — `bake.pins_for_python` fails the bake if they do not, because a shared layer
 cannot carry two pins.
 
+**The py3.8 layer carries the five system packages its extensions build against.** `g++`, `pkg-config`,
+`libfreetype-dev`, `libpng-dev` and `zlib1g-dev` are installed by the interpreter recipe itself
+(`bake.SYSTEM_PACKAGES`, §3.2's build-toolchain rule for the *system* half: the pinned
+`setuptools`/`wheel`/`Cython` are the Python half), and a package that is not in dpkg's own `installed`
+state afterwards fails **that layer's** bake. The check is on the status field and not on
+`dpkg-query -W`'s exit code, because a package dpkg knows but has not installed still prints a version.
+Verified at the layer, not at the bug, on purpose: the failure belongs to the environment, and left
+alone it surfaces mid-bake on the first bug that compiles anything — as `g++: not found`, i.e. as that
+bug's problem, on every wave. Their versions are recorded *inside* the layer, at
+`/opt/vanta-system-packages.txt`: the system half of the layer's provenance, written by the same script
+that does the install, beside the pip half `/opt/vanta-deps-freeze.txt` every layer already carries.
+
+**One environment for every py3.8 bug is the point, and a compiler does not change a pure-Python bug's
+tests.** The layer is shared, so a compiler added for `matplotlib/1` is present for `luigi/1` as well.
+That is safe because `needs_build` (§3.2) decides per bug whether anything is compiled at all: a bug
+that compiles nothing never invokes the toolchain, so its collected tests, its verdicts and its report
+are the same as on a layer without one. The measured set that does compile is dev `matplotlib/1`,
+`matplotlib/2`, `pandas/1`, `spacy/4` and eval `cookiecutter/1`, `tqdm/1` — and the last two are
+**3.6**, whose layer this leaves alone.
+
+**Rebuild set.** The list is keyed on the minor, so only `vanta-bugsinpy-py3.8`'s recipe changes. The
+next bake therefore rebuilds that layer and, because a rebuilt interpreter layer makes everything
+stacked on it stale (`bake.plan_layers`), every layer beneath it: the whole dev split (11 bugs, all
+3.8) and, in the evaluation split, `PySnooper/3`, `black/1` and `black/2`. `vanta-bugsinpy-py3.6` and
+`vanta-bugsinpy-py3.7` are untouched — for a minor absent from `SYSTEM_PACKAGES` the recipe is
+unchanged line for line — so `cookiecutter/1`, `tqdm/1`, `thefuck/1`–`3`, `httpie/1`–`3` and
+`youtube-dl/1` are not rebuilt. The 3.6 layer is the one that will need the same decision before its
+two compiler-using bugs can be baked.
+
 then a thin per-bug layer on top:
 
 ```
@@ -806,6 +835,7 @@ list rather than a missing key.
 ```
 python -c "import ssl, sys; print(sys.version, ssl.OPENSSL_VERSION)"   # must not fail
 python -c "import ssl; ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)"        # functional, not a string
+dpkg-query -W -f='${Package} ${Version} ${db:Status-Status}\n' <pkg>    # each one `installed`, 3.8
 python -m pip install "pytest==<pin>" "pytest-json-report==<pin>"      # must reach PyPI and install
 python -m pytest --version                                             # pinned version, must import
 python -c "import pytest_jsonreport"                                   # the plugin, not just the wheel

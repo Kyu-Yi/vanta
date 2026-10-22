@@ -334,6 +334,17 @@ class DepRef:
     """
     commit_date: Optional[str] = None
     """``commit``'s own date — the cutoff :func:`resolve_pins` applies to this ref."""
+    overridden: tuple[tuple[str, str], ...] = ()
+    """The claims a BugsInPy reference pin won over, as ``(spec, source)`` pairs.
+
+    [VANTA-WHY] Only :func:`merge_refs` sets this, and only when the group's exact
+    ``==`` pin came from BugsInPy's own files and a project declaration asked for
+    something the pin does not satisfy (luigi/1: ``tornado==5.0`` in BugsInPy's
+    ``requirements.txt`` against ``tornado>=4.0,<5`` in ``setup.py``). The pin is
+    the benchmark's validated environment and is installed anyway, so the claim it
+    beat is not a conflict to raise — but it is a *decision*, and a decision that
+    is not in the record is indistinguishable from a harness that never noticed.
+    """
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -343,6 +354,7 @@ class DepRef:
             "pin_source": self.pin_source,
             "commit": self.commit,
             "commit_date": self.commit_date,
+            "overridden": [{"spec": spec, "source": source} for spec, source in self.overridden],
         }
 
 
@@ -1477,6 +1489,15 @@ class ResolvedDep:
     """``commit``'s date — the cutoff that was applied."""
     fixed: bool = False
     """Whether this declaration came from the fix's commit rather than the buggy one."""
+    overridden: tuple[tuple[str, str], ...] = ()
+    """The claims this pin beat, as ``(spec, source)`` pairs — normally none.
+
+    [VANTA-WHY] Carried from :attr:`DepRef.overridden`, and recorded for the same
+    reason ``exempt`` is: it is a departure from "the declarations decide", so the
+    provenance has to say it out loud rather than leave a reader to notice that a
+    ``>=4.0,<5`` bound is nowhere in the install set. It is empty for every ordinary
+    pin, including a reference pin that agrees with the project.
+    """
 
     @property
     def pin_rule(self) -> str:
@@ -1503,6 +1524,10 @@ class ResolvedDep:
         }
         if self.pin_source:
             data["pinned_by"] = self.pin_source
+        if self.overridden:
+            data["overridden"] = [
+                {"spec": spec, "source": source} for spec, source in self.overridden
+            ]
         return data
 
 
@@ -1581,13 +1606,24 @@ def merge_refs(refs: Sequence[DepRef]) -> tuple[list[DepRef], list[DepConflict]]
       the requirement *is* the pin. Which source wrote the pin travels with the merged
       ref in :attr:`DepRef.pin_source`, because that is what decides whether §3.2's
       date rule applies to it.
+    * A pin that violates a bound is a conflict, **unless the pin is BugsInPy's own**
+      (design §3.3). luigi/1 pins ``tornado==5.0`` in BugsInPy's ``requirements.txt``
+      while the project's ``install_requires`` says ``tornado>=4.0,<5``; the ranges
+      are jointly unsatisfiable, so one of them has to lose, and the rule is decided
+      once rather than per bug: BugsInPy's pin is the environment its own
+      ``run_test.sh`` was validated fail-before/pass-after in, and the dev-fix
+      self-check re-verifies that claim afterwards. So the pin is installed as
+      written — the same exemption :func:`reference_pin` already grants it — and the
+      claim it beat travels in :attr:`DepRef.overridden` so the merge is not silent.
+      A *project* pin that violates a bound is still a conflict: the project's own
+      declarations disagree with each other and nothing in the harness can say which
+      one the buggy tree was built with.
     * Anything else is a conflict and is never picked between (design §3.3). Two
-      different ``==`` pins for one package are jointly unsatisfiable, and so is a pin
-      that violates another source's bound — the bug is then not reproducible from its
-      declared sources, which is a decision for the split, not for the harness. Two
-      *different bounds* are a conflict too: their intersection is a constraint no
-      source wrote, and a layer must install what was declared rather than a range the
-      harness computed.
+      different ``==`` pins for one package are jointly unsatisfiable, whether or not
+      one of them is BugsInPy's: a pin that never existed cannot be installed, so
+      there is nothing to prefer. Two *different bounds* are a conflict too: their
+      intersection is a constraint no source wrote, and a layer must install what was
+      declared rather than a range the harness computed.
     """
     grouped: dict[str, list[DepRef]] = {}
     order: list[str] = []
@@ -1611,11 +1647,24 @@ def merge_refs(refs: Sequence[DepRef]) -> tuple[list[DepRef], list[DepConflict]]
             continue
         if pins:
             pinned, version = pins[0]
-            if any(
-                _specifier_text(ref) and version not in _specifier_of(ref)
-                for ref in group
-                if ref is not pinned
-            ):
+            # Every pin in the group has the same version (checked above). When one of
+            # them is BugsInPy's own, that is the one the merged ref speaks for: it is
+            # what makes the pin exempt from §3.2's date rule, and it is the pin a
+            # project declaration may not override.
+            pinned = next((ref for ref, _ in pins if reference_pin(ref)), pinned)
+            violated = tuple(
+                # Collapsed to one entry per claim: the same declaration read at both
+                # commits carries the same label, and a record that lists one claim
+                # twice reads like a bug in the reader rather than a fact about luigi.
+                dict.fromkeys(
+                    (ref.spec, ref.source)
+                    for ref in group
+                    if ref is not pinned
+                    and _specifier_text(ref)
+                    and version not in _specifier_of(ref)
+                )
+            )
+            if violated and not reference_pin(pinned):
                 conflicts.append(DepConflict(name=name, claims=_claims(group)))
                 continue
             merged.append(
@@ -1626,6 +1675,7 @@ def merge_refs(refs: Sequence[DepRef]) -> tuple[list[DepRef], list[DepConflict]]
                     pin_source=pinned.source,
                     commit=pinned.commit,
                     commit_date=pinned.commit_date,
+                    overridden=violated,
                 )
             )
             continue
@@ -1698,7 +1748,9 @@ def resolve_pins(
       and it is the wrong rule for the benchmark's *own* frozen environment, which is
       what ``requirements.txt`` in a pip-freeze-style bug is. Such a pin is installed
       as written, and its release date is recorded in the provenance so a late pin is
-      visible rather than silent.
+      visible rather than silent. When the pin also had to win over a project
+      declaration the merge could not satisfy (:attr:`DepRef.overridden`), that
+      decision is recorded with it rather than left implicit in the install list.
 
     For everything else the rule is unchanged, and it takes precedence over
     convenience: if the constraint has no release on or before the declaration's date,
@@ -1785,6 +1837,7 @@ def resolve_pins(
                 commit=ref.commit,
                 commit_date=ref.commit_date,
                 fixed=fixed,
+                overridden=ref.overridden,
             )
         )
     return resolved

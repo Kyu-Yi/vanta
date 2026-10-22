@@ -3664,18 +3664,53 @@ class TestMergeRefs:
         assert merged[0].pin_source == "requirements.txt line 7"
         assert bake_mod.reference_pin(merged[0]) is True
 
-    def test_a_pin_that_violates_another_sources_bound_is_a_conflict(self):
-        """``attrs==17.1.0`` cannot satisfy ``attrs>=17.4.0``: not reproducible."""
+    def test_a_bugsinpys_pin_that_a_project_bound_excludes_wins_and_is_recorded(self):
+        """luigi/1: ``tornado==5.0`` in BugsInPy's ``requirements.txt``, ``>=4.0,<5`` in setup.py.
+
+        The two are jointly unsatisfiable, so one of them has to lose. The pin wins —
+        it is the environment BugsInPy's own ``run_test.sh`` was validated
+        fail-before/pass-after in — and the bound it beat is *recorded* rather than
+        raised, so the override is visible in the provenance instead of looking like a
+        harness that never read ``setup.py``.
+        """
         merged, conflicts = bake_mod.merge_refs(
             [
-                bake_mod.dep_ref("attrs==17.1.0", "requirements.txt line 7"),
-                bake_mod.dep_ref("attrs>=17.4.0", "install_requires (setup.py) line 43"),
+                bake_mod.dep_ref("tornado==5.0", "requirements.txt line 137"),
+                bake_mod.dep_ref("tornado>=4.0,<5", "install_requires (setup.py) line 41"),
+                # The test side imports it bare, which is how luigi/1 reaches tornado
+                # even without the two declarations. A bare name decides nothing.
+                bake_mod.dep_ref("tornado", "import closure: test/server_test.py line 34"),
+            ]
+        )
+        assert conflicts == []
+        assert [ref.spec for ref in merged] == ["tornado==5.0"]
+        assert merged[0].pin_source == "requirements.txt line 137"
+        assert bake_mod.reference_pin(merged[0]) is True
+        assert merged[0].overridden == (
+            ("tornado>=4.0,<5", "install_requires (setup.py) line 41"),
+        )
+        # Both sources are still named: the override beats the claim, not the record.
+        assert "install_requires (setup.py) line 41" in merged[0].source
+
+    def test_a_project_pin_that_violates_another_sources_bound_is_still_a_conflict(self):
+        """The licence is BugsInPy's, not "whoever pinned first".
+
+        A pin the *project* wrote is subject to §3.2's date rule like any other
+        requirement, and when it contradicts another of the project's own
+        declarations nothing in the harness can say which one the buggy tree was built
+        with — so it stays a conflict.
+        """
+        merged, conflicts = bake_mod.merge_refs(
+            [
+                bake_mod.dep_ref("attrs==17.1.0", "install_requires (setup.py) line 43"),
+                bake_mod.dep_ref("attrs>=17.4.0", "tests_require (setup.py) line 7"),
             ]
         )
         assert merged == []
+        assert conflicts[0].name == "attrs"
         assert conflicts[0].claims == (
-            ("attrs==17.1.0", "requirements.txt line 7"),
-            ("attrs>=17.4.0", "install_requires (setup.py) line 43"),
+            ("attrs==17.1.0", "install_requires (setup.py) line 43"),
+            ("attrs>=17.4.0", "tests_require (setup.py) line 7"),
         )
 
     def test_two_different_pins_are_a_conflict(self):
@@ -4294,6 +4329,40 @@ class TestDependencyProvenance:
         ]
         assert provenance["dependencies"][0]["pinned_by"] == "requirements.txt line 12"
 
+    def test_a_reference_pin_that_beat_a_project_bound_records_what_it_beat(self):
+        """The override is data in the record, not a sentence in a docstring.
+
+        The layer installs one pin and the provenance says both where the pin came
+        from and which declaration it contradicts — otherwise a reader comparing the
+        record against ``setup.py`` finds a bound that was silently dropped.
+        """
+        sources = bake_mod.DepSources(
+            project="Demo",
+            bug_id=5,
+            checkpoint="vanta-bi-Demo-5",
+            buggy_commit="b" * 40,
+            commit_date="2019-04-22",
+            import_name="demo",
+            refs=(
+                bake_mod.dep_ref("six==1.13.0", "requirements.txt line 12"),
+                bake_mod.dep_ref("six<1.12", "install_requires (setup.py) line 9"),
+            ),
+        )
+        resolved = bake_mod.resolve_deps(
+            sources, releases=TestResolvePinsByDate.RELEASES, harness_pins={}
+        )
+        provenance = bake_mod.deps_provenance(sources, resolved, harness_pins={})
+        assert provenance["installs"] == ["six==1.13.0"]
+        dep = provenance["dependencies"][0]
+        assert dep["sources"] == [
+            "requirements.txt line 12; install_requires (setup.py) line 9"
+        ]
+        assert dep["pinned_by"] == "requirements.txt line 12"
+        assert dep["pin_rule"] == "BugsInPy's own exact pin, installed as written"
+        assert dep["overridden"] == [
+            {"spec": "six<1.12", "source": "install_requires (setup.py) line 9"}
+        ]
+
     def test_a_pin_inside_the_window_is_not_recorded_as_late(self):
         sources = self._sources()
         resolved = bake_mod.resolve_deps(
@@ -4586,6 +4655,90 @@ class TestRealFastapiTutorialModules:
             if ref.source.startswith("import closure:")
         } == {"orjson", "pydantic", "pytest", "requests", "sqlalchemy", "starlette"}
         assert {"requests", "starlette"} <= names
+
+
+needs_luigi_repo = pytest.mark.skipif(
+    not (REPO_ROOT / "runs" / "bugsinpy" / "repos" / "luigi.git").is_dir(),
+    reason="luigi's bare clone is not present (runs/ is not committed)",
+)
+
+
+@needs_luigi_repo
+@needs_clone
+class TestRealLuigiTornadoPin:
+    """luigi/1's flag, reproduced and settled against the real files.
+
+    [VANTA-WHY] The flag read ``tornado: the declared sources disagree —
+    'tornado==5.0' from requirements.txt line 137; 'tornado>=4.0,<5' from
+    install_requires (setup.py) line 41``. Both claims are real and neither is a
+    reader bug: BugsInPy's own ``requirements.txt`` pins exactly what the project's
+    ``install_requires`` excludes, and the test side imports ``tornado`` bare besides.
+    The resolution is therefore not a per-bug exception — it is §3.3's rule about
+    BugsInPy's own pins — and it has to be checkable against the two files that
+    produced it rather than against a fixture that paraphrases them.
+    """
+
+    BUGGY = "1164eb6b85b8a70f596dbb99452bec513e72c12e"
+    FIXED = "aec5dc2ed8db53fc282a0bd24aabe59031b6d1ba"
+    REPO = REPO_ROOT / "runs" / "bugsinpy" / "repos" / "luigi.git"
+    # tornado's real release dates (the bake fetches these from PyPI).
+    TORNADO = {
+        "4.0.2": "2014-09-11",
+        "4.2.1": "2015-07-17",
+        "4.5.3": "2018-01-06",
+        "5.0": "2018-03-05",
+        "5.1": "2018-07-11",
+    }
+
+    def _merged(self):
+        split = load_split(DEV_SPLIT_PATH)
+        sources = bake_mod.bug_sources(
+            split.bug("luigi", 1),
+            bugsinpy_root=BUGSINPY_CLONE,
+            repo=self.REPO,
+            module_distributions=split.module_distributions(),
+        )
+        return bake_mod.merge_refs(sources.refs)
+
+    def _tornado(self):
+        merged, conflicts = self._merged()
+        return next(ref for ref in merged if ref.name == "tornado"), conflicts
+
+    def test_all_three_declarations_are_really_there(self):
+        """The pin, the bound it contradicts, and the bare closure import."""
+        tornado, conflicts = self._tornado()
+        assert conflicts == []
+        assert tornado.spec == "tornado==5.0"
+        assert tornado.pin_source == "requirements.txt line 137"
+        assert "install_requires (setup.py) line 41" in tornado.source
+        assert "import closure: test/server_test.py line 34" in tornado.source
+
+    def test_the_bugsinpy_pin_settles_it_instead_of_flagging_the_bug(self):
+        tornado, _ = self._tornado()
+        assert tornado.overridden == (
+            ("tornado>=4.0,<5", "install_requires (setup.py) line 41"),
+        )
+
+    def test_the_pin_is_installed_as_written_and_the_override_travels_with_it(self):
+        """End of the chain: what the layer installs, and what the record says.
+
+        The merge is not allowed to settle a disagreement and then forget it, so the
+        claim that lost is checkable in the provenance a later stage reads back.
+        """
+        tornado, _ = self._tornado()
+        resolved = bake_mod.resolve_pins(
+            [tornado],
+            releases={"tornado": self.TORNADO},
+            commit_date=tree_mod.commit_date(self.REPO, self.BUGGY),
+            harness_pins={},
+            buggy_commit=self.BUGGY,
+        )
+        assert resolved[0].pin == "tornado==5.0"
+        assert resolved[0].exempt is True
+        assert resolved[0].released_at == "2018-03-05"
+        assert resolved[0].as_dict()["overridden"] == [
+            {"spec": "tornado>=4.0,<5", "source": "install_requires (setup.py) line 41"}
+        ]
 
 
 class TestOneBugDoesNotStopTheBatch:

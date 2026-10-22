@@ -482,6 +482,22 @@ BLAS half — and "compiles nothing" would be the wrong answer for the two packa
 `gfortran`. It is recorded, not enforced: the bake still installs what the recipe says, and the record
 is what makes the claim checkable afterwards.
 
+**The terminal prints one line per layer and each finding once, and ends on a verdict.**
+`bake.preflight_lines` prints exactly **one** line per layer —
+`[<checkpoint>] <key> (<target>): N pin(s), a wheel, b sdist-only, c unavailable, d gap, e unbuildable,
+f dropped` — so a bug with nothing to report still appears (a table with the quiet bugs missing cannot
+say whether they were checked), and a bug's pure-Python sdists are **not** listed: a noticed
+disposition is a decision nobody has to take, and those live in `<checkpoint>.preflight.json` alone.
+Then each **finding** is printed once for the *whole split* rather than once per bug that carries it —
+a deduplicated `unreviewed sdist build(s) (N)`, `unbuildable pin(s) (N)` and `pin(s) nothing can
+install (N)` block, each line `<LABEL> <pin> — <bug keys>` — because the pins the split shares are why
+a reader is there (numpy alone is in six of the eleven dev-split bugs) and one decision printed six
+times is six times the reading. A pin the unresolvable-pin rule dropped is not repeated as a finding;
+it appears once in the drops block below, with the audit that settled it. `--preflight-only` then ends
+on a single line — `bake.preflight_verdict` — `ready to bake` when there are 0 gaps and 0 flags,
+otherwise `not ready to bake: N unreviewed sdist build(s) across M bug(s), F flagged bug(s)`; the
+counts are in it because "not ready" without them says nothing a reader can act on.
+
 **One rule for a pin nothing here can install, and it is the import closure that decides.** The
 preflight produces three answers a *bake* cannot act on: a release PyPI does not have at all
 (`luigi/1`'s `requests-async==0.5.0`), a release with no distribution this interpreter can install

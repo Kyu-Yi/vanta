@@ -4136,16 +4136,22 @@ class TestPinPreflight:
             ),
         )
 
-    def test_the_table_lists_every_sdist_and_unavailable_entry(self):
+    def test_the_printed_table_is_one_line_per_layer_plus_the_open_findings(self):
+        """A reviewed sdist is not a finding: the layer's line counts it, the JSON keeps it."""
         lines = bake_mod.preflight_lines([self._report()])
-        assert "preflight: 1 layer(s)" in lines[0]
+        assert lines[0] == "preflight: 1 layer(s)"
         assert (
             "[vanta-bi-Demo-1] Demo/1 (cp38/linux-aarch64): 3 pin(s), 1 wheel, "
-            "1 sdist-only, 1 unavailable" in lines[1]
+            "1 sdist-only, 1 unavailable, 0 gap, 0 unbuildable, 0 dropped" in lines[1]
         )
-        assert "(b) cffi==1.14.0 — no cp38 aarch64 wheel" in lines[2]
-        assert "(c) pywin32==227 — nothing pip can install" in lines[3]
-        assert "(a)" not in "\n".join(lines), "a usable wheel is not a finding"
+        assert not any("cffi" in line for line in lines), (
+            "an sdist a reviewed-table entry covers is a decision already taken"
+        )
+        assert "pin(s) nothing can install (1):" in lines
+        assert "  UNAVAILABLE pywin32==227 — Demo/1" in lines
+        assert not any("(a)" in line or "(b)" in line for line in lines), (
+            "the class letters are in the record; the terminal prints findings"
+        )
 
     def test_a_layer_with_nothing_to_report_still_gets_its_line(self):
         quiet = bake_mod.PreflightBug(
@@ -4226,7 +4232,8 @@ class TestPinPreflight:
         )
         captured = capsys.readouterr()
         assert written == ["vanta-bi-Demo-1"], "the record is written for every layer"
-        assert "(b) cffi==1.14.0" in captured.out
+        assert "3 pin(s), 1 wheel, 1 sdist-only, 1 unavailable" in captured.out
+        assert "ready to bake" in captured.out, "0 gaps and 0 flags is the whole verdict"
         assert "preflight only: nothing was baked" in captured.out
         assert "bake plan" not in captured.out, "no plan: no layer is touched"
         assert "bake complete" not in captured.out
@@ -4849,11 +4856,83 @@ class TestUnresolvablePins:
             tmp_path, monkeypatch, argv=["--preflight-only"], deps=deps
         )
         out = capsys.readouterr().out
+        assert "0 dropped" not in out, "the layer line counts it"
+        assert "1 dropped" in out
+        assert "dropped pin(s) (1) — §3.2's rule, with the audit that settled it:" in out
         assert (
-            "[vanta-bi-Demo-1] dropped pywin32==227 (unavailable) — nothing pip can "
-            "install on cp38/linux-aarch64: 12 wheel(s)" in out
+            "  pywin32==227 (unavailable) — nothing pip can install on "
+            "cp38/linux-aarch64: 12 wheel(s)" in out
         )
+        assert "Demo/1 — nothing in either tree imports it" in out
         assert "[vanta-bi-Demo-1] installs: —" in out
+
+    def test_the_verdict_names_the_counts_when_something_is_open(self, monkeypatch):
+        """A finding is one printed section, and the verdict is what a reader acts on."""
+        gap = bake_mod.PreflightPin(
+            "numpy",
+            "1.18.5",
+            bake_mod.SDIST_ONLY,
+            "no cp38 aarch64 wheel; pip builds numpy-1.18.5.tar.gz from source, and no "
+            "reviewed-table entry says what that build needs",
+            compiled=("numpy-1.18.5/numpy/linalg/lapack_lite/f2c_src/lapack_lite.c",),
+            gap="unreviewed: numpy compiles from its sdist and SDIST_SYSTEM_PACKAGES "
+            "has no entry for it",
+        )
+        reports = [
+            bake_mod.PreflightBug(
+                key="Demo/1", checkpoint="vanta-bi-Demo-1", python_minor="3.8",
+                pins=(gap,),
+            ),
+            bake_mod.PreflightBug(
+                key="Demo/2", checkpoint="vanta-bi-Demo-2", python_minor="3.8",
+                pins=(gap,),
+            ),
+        ]
+        lines = bake_mod.preflight_lines(reports)
+        assert lines.count("  GAP numpy==1.18.5 — Demo/1, Demo/2") == 1, (
+            "one finding is printed once for the whole split, naming every bug it stops"
+        )
+        assert bake_mod.preflight_verdict(reports) == (
+            "not ready to bake: 1 unreviewed sdist build(s) across 2 bug(s)"
+        )
+        assert bake_mod.preflight_verdict(reports, flags=1).endswith("1 flagged bug(s)")
+        assert bake_mod.preflight_verdict([]) == "ready to bake"
+
+    def test_a_dropped_pin_is_not_an_open_finding(self):
+        """Dropping is a decision already taken, so it is listed once, in the drops."""
+        report = bake_mod.PreflightBug(
+            key="Demo/1",
+            checkpoint="vanta-bi-Demo-1",
+            python_minor="3.8",
+            pins=(
+                bake_mod.PreflightPin(
+                    "pyarrow", "0.17.1", bake_mod.SDIST_ONLY, "unbuildable here",
+                    unbuildable="needs Arrow C++", gap=None,
+                ),
+            ),
+        )
+        drops = {
+            "vanta-bi-Demo-1": [
+                {
+                    "pin": "pyarrow==0.17.1",
+                    "outcome": bake_mod.UNBUILDABLE,
+                    "reason": "needs Arrow C++",
+                    "imports": {"reason": "every one of its 3 import site(s) is behind an "
+                                          "optional guard", "required_by": None, "sites": []},
+                }
+            ]
+        }
+        lines = bake_mod.preflight_lines([report], dropped=drops)
+        assert not any(line.startswith("  UNBUILDABLE") for line in lines), (
+            "it is in the drops block; printing it twice inflates the problem count"
+        )
+        assert lines[1].endswith("1 unbuildable, 1 dropped")
+        assert "  pyarrow==0.17.1 (unbuildable) — needs Arrow C++" in lines
+        assert (
+            "    Demo/1 — every one of its 3 import site(s) is behind an optional guard"
+            in lines
+        )
+        assert bake_mod.preflight_verdict([report], dropped=drops) == "ready to bake"
 
     # ---- the gate that can refute the prediction (§11 step 2) --------------
     def test_the_gate_reason_names_the_pins_the_bake_dropped(self):

@@ -454,6 +454,13 @@ def cmd_bake(args: argparse.Namespace) -> int:
         print(flush=True)
         print(render_flagged(flagged_pairs), flush=True)
 
+    # A dropped pin is the one thing about a layer that a reader cannot see from the
+    # install list alone — the declaration is gone and the layer is shorter than the
+    # bug's own files say. It is not printed here per bug: the same pin is usually
+    # dropped from several bugs, and the preflight below prints each drop once for the
+    # whole split with the audit that settled it. The records are collected here, from
+    # the provenance just written, so the two views are the same data.
+    drops = {item.checkpoint: item.provenance.get("dropped") or [] for item in bug_deps}
     for item in bug_deps:
         path = bake_mod.write_deps(deps_dir, item)
         print(f"[{item.checkpoint}] installs: {', '.join(item.installs) or '—'}")
@@ -462,16 +469,6 @@ def cmd_bake(args: argparse.Namespace) -> int:
             flush=True,
         )
         print(f"[{item.checkpoint}] provenance: {path}", flush=True)
-        # A dropped pin is the one thing about a layer that a reader cannot see from the
-        # install list alone — the declaration is gone and the layer is shorter than the
-        # bug's own files say. So it is printed here, one line per pin, with the reason:
-        # the JSON next to it has the same record, and neither is a summary of the other.
-        for record in item.provenance.get("dropped") or []:
-            print(
-                f"[{item.checkpoint}] dropped {record['pin']} "
-                f"({record['outcome']}) — {record['reason']}",
-                flush=True,
-            )
 
     # The preflight, before the first layer is built (§3.2): what every pin installs
     # as on this image — cp38/linux-aarch64. A pin with no wheel here is built from
@@ -483,9 +480,13 @@ def cmd_bake(args: argparse.Namespace) -> int:
         path = bake_mod.write_preflight(deps_dir, report)
         print(f"[{report.checkpoint}] preflight: {path}", flush=True)
     if preflight:
-        print("\n".join(bake_mod.preflight_lines(preflight)), flush=True)
+        print("\n".join(bake_mod.preflight_lines(preflight, dropped=drops)), flush=True)
 
     if args.preflight_only:
+        print(
+            bake_mod.preflight_verdict(preflight, dropped=drops, flags=len(flagged)),
+            flush=True,
+        )
         print("preflight only: nothing was baked", flush=True)
         report_flagged()
         return EXIT_BUG_FAILED if flagged else EXIT_OK

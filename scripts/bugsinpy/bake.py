@@ -56,7 +56,7 @@ import zipfile
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Container, Iterable, Mapping, Optional, Sequence
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -3691,19 +3691,85 @@ def preflight_layers(
     return out
 
 
-def preflight_lines(reports: Sequence[PreflightBug]) -> list[str]:
-    """The per-bug table: every class (b) and (c) entry, and the count for each bug.
+def _dropped_pins(
+    drops: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> set[str]:
+    """The ``name==version`` spellings the unresolvable-pin rule took out of the split."""
+    return {str(record.get("pin")) for records in drops.values() for record in records}
 
-    One line per bug even when it has nothing to report — "this layer is all wheels" is
-    the answer to the question the table is asked, and a table with the quiet bugs
-    missing cannot say whether a bug was checked.
 
-    A class (b) entry that needs a decision gets a second line for it, ``GAP`` or
-    ``UNBUILDABLE``, labelled rather than folded into the reason: the run's output is
-    read to find these, and a clause inside a sentence is not something a reader can
-    search for. Nothing else in either split reports an empty tuple as a gap, so a layer
-    whose list of GAP lines is empty is a layer whose builds are all reviewed.
+def _unavailable_pins(
+    reports: Sequence[PreflightBug], *, dropped: Container[str]
+) -> dict[str, list[str]]:
+    """``{pin: the bug keys it stops}`` for the pins nothing on this image can install."""
+    findings: dict[str, list[str]] = {}
+    for report in reports:
+        for pin in report.unavailable:
+            spelling = f"{pin.name}=={pin.version}"
+            if spelling in dropped:
+                continue
+            findings.setdefault(spelling, []).append(report.key)
+    return findings
+
+
+def _finding_pins(
+    reports: Sequence[PreflightBug], *, dropped: Container[str], finding: str
+) -> dict[str, list[str]]:
+    """``{pin: the bug keys it stops}`` for the pins carrying ``finding``.
+
+    ``finding`` is the :class:`PreflightPin` attribute that holds the reason — ``gap``
+    for a compiling sdist the reviewed table does not cover, ``unbuildable`` for one no
+    entry could make work. They are separate questions and a pin answers exactly one of
+    them, which is why this is asked once per finding rather than once for both.
+
+    ``dropped`` is the set of ``pin`` strings the rule dropped — a pin that was dropped is
+    *not* an open finding, so it is skipped: it is in the drops section with the audit that
+    settled it, and printing it twice would make the run look like it has more problems
+    than it has.
     """
+    findings: dict[str, list[str]] = {}
+    for report in reports:
+        for pin in report.pins:
+            if getattr(pin, finding) is None:
+                continue
+            spelling = f"{pin.name}=={pin.version}"
+            if spelling in dropped:
+                continue
+            findings.setdefault(spelling, []).append(report.key)
+    return findings
+
+
+def preflight_lines(
+    reports: Sequence[PreflightBug],
+    *,
+    dropped: Optional[Mapping[str, Sequence[Mapping[str, Any]]]] = None,
+) -> list[str]:
+    """One line per layer, then each finding once for the whole split.
+
+    Per layer, **one** line: how many pins it installs and how each one is classified,
+    plus what the unresolvable-pin rule took out of it. A bug with nothing to report
+    gets that line too — "this layer is all wheels" is the answer to the question the
+    table is asked, and a table with the quiet bugs missing cannot say whether a bug was
+    checked.
+
+    Then the findings, each printed once for the whole split rather than once per bug
+    that has it: the pins the split shares are why a reader is here (numpy alone is in
+    six of the eleven dev-split bugs), and the same GAP on six lines is six times the
+    reading for one decision. ``<pin> — <bug keys>`` is the shape, so "which bugs does
+    this unreviewed build stop" is answerable from the line.
+
+    A layer's sdist-only pins are deliberately **not** listed: a pure-Python sdist needs
+    no compiler and a noticed-disposition is a decision nobody has to take, so both live
+    in the layer's ``.preflight.json`` and not on the terminal (§3.2). What is printed is
+    what is still open — an unreviewed GAP, an UNBUILDABLE, an UNAVAILABLE pin the rule
+    did not take, and what it did take — and the pins' own reasons are in that JSON,
+    next to the provenance.
+
+    ``dropped`` is ``{checkpoint: that layer's dropped records}``, read from the
+    provenance the run just wrote; the records are the dicts, so the audit's sites are
+    in the JSON and the reason is repeated here.
+    """
+    drops = dropped or {}
     lines = [f"preflight: {len(reports)} layer(s)"]
     for report in reports:
         counts = report.counts()
@@ -3711,17 +3777,74 @@ def preflight_lines(reports: Sequence[PreflightBug]) -> list[str]:
             f"[{report.checkpoint}] {report.key} ({report.target}): "
             f"{len(report.pins)} pin(s), {counts[INSTALLABLE_WHEEL]} wheel, "
             f"{counts[SDIST_ONLY]} sdist-only, {counts[NO_DISTRIBUTION]} unavailable, "
-            f"{counts['gap']} gap, {counts['unbuildable']} unbuildable"
+            f"{counts['gap']} gap, {counts['unbuildable']} unbuildable, "
+            f"{len(drops.get(report.checkpoint, ()))} dropped"
         )
-        for pin in (*report.to_build, *report.unavailable):
-            lines.append(f"  ({pin.letter}) {pin.name}=={pin.version} — {pin.reason}")
-            if pin.unbuildable is not None:
+
+    dropped_pins = _dropped_pins(drops)
+    gaps = _finding_pins(reports, dropped=dropped_pins, finding="gap")
+    blocked = _finding_pins(reports, dropped=dropped_pins, finding="unbuildable")
+    unavailable = _unavailable_pins(reports, dropped=dropped_pins)
+
+    keys = {report.checkpoint: report.key for report in reports}
+    lines += _section("unreviewed sdist build(s)", "GAP", gaps)
+    lines += _section("unbuildable pin(s)", "UNBUILDABLE", blocked)
+    lines += _section("pin(s) nothing can install", "UNAVAILABLE", unavailable)
+    if dropped_pins:
+        lines += ["", f"dropped pin(s) ({len(dropped_pins)}) — §3.2's rule, with the "
+                      "audit that settled it:"]
+        for checkpoint, records in drops.items():
+            for record in records:
+                imports = record.get("imports") or {}
                 lines.append(
-                    f"  UNBUILDABLE {pin.name}=={pin.version} — {pin.unbuildable}"
+                    f"  {record.get('pin')} ({record.get('outcome')}) — "
+                    f"{record.get('reason')}"
                 )
-            elif pin.gap is not None:
-                lines.append(f"  GAP {pin.name}=={pin.version} — {pin.gap}")
+                lines.append(
+                    f"    {keys.get(checkpoint, checkpoint)} — "
+                    f"{imports.get('reason') or 'no import audit recorded'}"
+                )
     return lines
+
+
+def _section(title: str, label: str, findings: Mapping[str, Sequence[str]]) -> list[str]:
+    """One printed block for one finding, or nothing when there is no such finding."""
+    if not findings:
+        return []
+    lines = ["", f"{title} ({len(findings)}):"]
+    for pin, keys in findings.items():
+        lines.append(f"  {label} {pin} — {', '.join(keys)}")
+    return lines
+
+
+def preflight_verdict(
+    reports: Sequence[PreflightBug],
+    *,
+    dropped: Optional[Mapping[str, Sequence[Mapping[str, Any]]]] = None,
+    flags: int = 0,
+) -> str:
+    """One line: whether this split is ready to bake.
+
+    Ready means there is nothing left for a human to decide *before* the first layer is
+    built: no unreviewed sdist build (§3.2's table) and no flagged bug (a bug whose
+    dependencies could not be resolved). A dropped pin is a decision already recorded and
+    not a blocker; if dropping one broke a bug, that shows up as a **flagged** bug — or
+    at ``prepare``, which measures the buggy/fixed flip for real and names the drops when
+    the gate fails. Either way the counts are printed, because "not ready" without them
+    says nothing a reader can act on.
+    """
+    gaps = _finding_pins(
+        reports, dropped=_dropped_pins(dropped or {}), finding="gap"
+    )
+    if not gaps and not flags:
+        return "ready to bake"
+    counts: list[str] = []
+    if gaps:
+        bugs = {key for keys in gaps.values() for key in keys}
+        counts.append(f"{len(gaps)} unreviewed sdist build(s) across {len(bugs)} bug(s)")
+    if flags:
+        counts.append(f"{flags} flagged bug(s)")
+    return "not ready to bake: " + ", ".join(counts)
 
 
 def preflight_path(deps_dir: Path, checkpoint: str) -> Path:

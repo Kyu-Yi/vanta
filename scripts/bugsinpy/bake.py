@@ -1102,6 +1102,101 @@ def build_refs(
     return refs
 
 
+COMPILED_SOURCE_SUFFIXES = (".pyx", ".c", ".cpp", ".cc", ".cxx")
+"""What a tree has of its own to compile: Cython sources and C/C++ sources.
+
+Suffixes and never directories: matplotlib's extension sources sit in ``extern/`` (the
+vendored Agg, 63 files) and ``src/`` (17) alike, and both are compiled into the
+package. A directory rule would have to guess which vendored directories count.
+``.pxd`` is deliberately absent — a Cython *declaration* is not compiled.
+"""
+
+
+def needs_build(
+    files: Sequence[str], setup_py: Optional[str], *, pythonpath: Optional[str] = None
+) -> tuple[bool, str]:
+    """Whether this tree must be built before its tests can import it, and **why**.
+
+    [VANTA-WHY] Measured, not assumed. The dev split declared ``needs_build: false``
+    for matplotlib/1 and pandas/1, whose tests import a package the tree itself has to
+    compile — ``pandas/tests/dtypes/test_dtypes.py`` reaches ``pandas._libs``, and
+    matplotlib's tests reach ``matplotlib._path`` — so the first thing that would have
+    happened is the dependency gate's import probe failing with "does not import from
+    the tree". That reads like a missing dependency and is not one, which is exactly
+    the confusion §3.3 exists to prevent, in the other direction.
+
+    The rule has two independent triggers, and both are properties of the tree rather
+    than judgements about it:
+
+    1. **BugsInPy says the import lives in a build directory** — it sets ``pythonpath``
+       *inside* the tree (``tqdm/build/lib/``, ``cookiecutter/build/lib/``). The
+       package its own ``run_test.sh`` imports only exists after a build, so this
+       settles it whatever the tree ships.
+    2. **The tree compiles extensions of its own.** ``setup(...)`` declares
+       ``ext_modules`` *and* the tree carries sources to compile
+       (:data:`COMPILED_SOURCE_SUFFIXES`). Both halves are load-bearing, and each
+       excludes a measured shape: black declares ``ext_modules`` and has nothing to
+       compile — its extension is the opt-in ``mypyc`` build of its own Python, off
+       unless ``BLACK_USE_MYPYC`` is set, so its tests import pure Python; tornado
+       ships ``tornado/speedups.c`` and declares no ``ext_modules``, because since 5.0
+       that file is a stub kept for old compiled installs and is not built.
+
+    The *reason* comes back with the answer, in both directions: the split carries a
+    lone boolean, and a boolean that disagrees with its tree has to be able to say
+    which half of the rule it disagrees with. ``prepare`` compares the two both ways
+    and flags the bug rather than building a tree the split did not declare.
+    """
+    if pythonpath:
+        return (
+            True,
+            f"BugsInPy sets pythonpath={pythonpath!r}: the suite imports the package "
+            "from inside a build directory, so the tree has to be built first",
+        )
+    sources = sorted(path for path in files if path.endswith(COMPILED_SOURCE_SUFFIXES))
+    declared = setup_py is not None and "ext_modules" in _setup_kwargs(setup_py)
+    if declared and sources:
+        sample = ", ".join(sources[:3]) + (", …" if len(sources) > 3 else "")
+        return (
+            True,
+            f"setup.py declares ext_modules and the tree carries {len(sources)} "
+            f"extension source(s) of its own ({sample}) for the tests to import",
+        )
+    if declared:
+        return (
+            False,
+            "setup.py declares ext_modules but the tree carries no extension sources of "
+            "its own, so nothing is compiled in-tree (black's mypyc extension is opt-in "
+            "and compiles Python, not C)",
+        )
+    if sources:
+        return (
+            False,
+            f"the tree carries {len(sources)} extension source(s) but setup.py declares "
+            "no ext_modules, so nothing builds them (tornado's speedups.c is a stub)",
+        )
+    return (
+        False,
+        "setup.py declares no ext_modules and the tree carries no extension sources",
+    )
+
+
+def needs_build_at(
+    repo: Path, commit: str, *, pythonpath: Optional[str] = None
+) -> tuple[bool, str]:
+    """:func:`needs_build` for a project's tree at ``commit``, read out of the clone.
+
+    [VANTA-WHY] Read through ``git`` rather than from a checked-out tree, for the
+    reason :func:`trees.read_file_at` exists: both callers need the answer *before*
+    any tree is materialised — ``prepare`` as an early gate, the authoring script that
+    writes the split before anything is materialised at all — and a checkout would be
+    a second materialisation of the same commit that could disagree with the one the
+    suites run.
+    """
+    files = tree_mod.list_files_at(repo, commit)
+    setup_py = tree_mod.read_file_at(repo, commit, "setup.py")
+    return needs_build(files, setup_py, pythonpath=pythonpath)
+
+
 def import_name_of_pyproject(pyproject: str) -> str:
     """The module the import-path check must load, named by ``pyproject.toml``.
 

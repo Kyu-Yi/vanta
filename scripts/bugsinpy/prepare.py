@@ -901,11 +901,43 @@ def check_declared(entry: dict[str, Any], bug: BugInfo) -> list[str]:
             mismatches.append(
                 f"split declares {key}={entry.get(key)!r}, BugsInPy metadata says {actual!r}"
             )
-    if bug.pythonpath and not entry.get("needs_build"):
-        mismatches.append(
-            f"BugsInPy sets pythonpath={bug.pythonpath!r} but the split says needs_build=false"
-        )
     return mismatches
+
+
+def check_build_declared(entry: dict[str, Any], bug: BugInfo, *, repo: Path) -> list[str]:
+    """``needs_build`` has to agree with the tree it is about, **in both directions**.
+
+    [VANTA-WHY] This replaced a one-way check: "BugsInPy sets ``pythonpath``, so the
+    split must say ``needs_build``". That direction was never the one that mattered —
+    it only ever caught tqdm and cookiecutter, where BugsInPy's own metadata already
+    said the package was imported out of a build directory. It said nothing about the
+    trees that compile their own extensions, which is how the dev split came to
+    declare ``needs_build: false`` for matplotlib/1, pandas/1 and spacy/4: their tests
+    import a package that does not exist until the tree has been built, so the
+    dependency gate's import probe would have failed with a message about a package
+    that is not missing.
+
+    The rule is :func:`bake.needs_build` — ``pythonpath`` pointing into the tree, or
+    ``ext_modules`` *and* extension sources of the tree's own — and it is read from
+    the **buggy commit**, because that is the tree the suite runs against
+    (``oracle_tree`` is the buggy source with the fixed commit's test files). A wrong
+    flag is fatal here and nowhere earlier: the split is the protocol, and every run's
+    provenance carries this value. Flagged, not raised on (§3.2), so one mis-declared
+    bug does not stop the rest of the batch.
+    """
+    declared = bool(entry.get("needs_build"))
+    try:
+        needed, why = bake_mod.needs_build_at(
+            repo, bug.buggy_commit, pythonpath=bug.pythonpath
+        )
+    except (tree_mod.TreeError, bake_mod.BakeError) as exc:
+        return [f"needs_build: the buggy tree could not be read: {exc}"]
+    if declared == needed:
+        return []
+    return [
+        f"split declares needs_build={declared!r} but the tree at {bug.buggy_commit[:12]} "
+        f"says {needed!r}: {why}"
+    ]
 
 
 def prepare_one(
@@ -939,6 +971,11 @@ def prepare_one(
     )
 
     mismatches = check_declared(entry, bug)
+    # `needs_build` is checked against the buggy commit's own tree and not against the
+    # metadata: it is a property of the files (§3.2), and the split is the protocol, so
+    # a flag that disagrees with the tree is a mismatch like any other. Read through the
+    # clone, so it runs before any tree is materialised.
+    mismatches += check_build_declared(entry, bug, repo=repo_cache)
     if mismatches:
         prep.gate_failures.extend(mismatches)
         return prep

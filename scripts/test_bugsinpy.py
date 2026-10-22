@@ -66,6 +66,12 @@ needs_clone = pytest.mark.skipif(
     reason="the BugsInPy clone is not present (runs/ is not committed)",
 )
 
+PROJECT_CLONES = REPO_ROOT / "runs" / "bugsinpy" / "repos"
+needs_project_clones = pytest.mark.skipif(
+    not (PROJECT_CLONES / "matplotlib.git").is_dir(),
+    reason="the project clones are not present (runs/ is not committed)",
+)
+
 
 # ============================================================================
 # fixture helpers
@@ -4700,6 +4706,151 @@ class TestBuildPinsByDate:
             "wheel==0.33.1",
             "cython==0.29.6",
         )
+
+
+class TestNeedsBuildIsARule:
+    """``needs_build`` is read off the tree, in both directions (§3.2).
+
+    [VANTA-WHY] Measured, and the reason this rule exists: the dev split declared
+    ``needs_build: false`` for matplotlib/1 and pandas/1, whose tests import a package
+    the tree compiles itself. The first thing that would have happened is the
+    dependency gate's import probe failing with "does not import from the tree" — a
+    dependency problem that is not a dependency problem, which is what §3.3 exists to
+    keep apart. The old rule was ``info.pythonpath is not None``, which could only ever
+    see tqdm and cookiecutter, where BugsInPy's metadata already said "build".
+    """
+
+    EXTENSION_SETUP = (
+        "from setuptools import setup, Extension\n"
+        "setup(name='demo', ext_modules=[Extension('demo._lib', [])])\n"
+    )
+    PLAIN_SETUP = "from setuptools import setup\nsetup(name='demo', packages=['demo'])\n"
+
+    def test_a_pythonpath_into_the_tree_is_a_build_on_its_own(self):
+        needs, why = bake_mod.needs_build([], None, pythonpath="demo/build/lib/")
+        assert needs is True
+        assert "pythonpath='demo/build/lib/'" in why
+
+    def test_declared_extensions_plus_sources_in_the_tree_is_a_build(self):
+        needs, why = bake_mod.needs_build(
+            ["setup.py", "pandas/__init__.py", "pandas/_libs/algos.pyx"],
+            self.EXTENSION_SETUP,
+        )
+        assert needs is True
+        assert "1 extension source" in why and "pandas/_libs/algos.pyx" in why
+
+    def test_the_sources_count_wherever_they_sit(self):
+        """matplotlib's are in ``extern/`` (the vendored Agg) and ``src/``, both built."""
+        needs, _ = bake_mod.needs_build(
+            ["setup.py", "extern/agg24-svn/src/agg_arc.cpp", "src/_path_wrapper.cpp"],
+            self.EXTENSION_SETUP,
+        )
+        assert needs is True
+
+    def test_declared_extensions_with_no_sources_is_not_a_build(self):
+        """black declares ``ext_modules``: the opt-in mypyc build of its own Python."""
+        needs, why = bake_mod.needs_build(
+            ["setup.py", "black/__init__.py"], self.EXTENSION_SETUP
+        )
+        assert needs is False
+        assert "no extension sources" in why and "mypyc" in why
+
+    def test_sources_with_no_declared_extensions_is_not_a_build(self):
+        """tornado ships ``tornado/speedups.c`` and builds nothing: a stub since 5.0."""
+        needs, why = bake_mod.needs_build(
+            ["setup.py", "tornado/speedups.c"], self.PLAIN_SETUP
+        )
+        assert needs is False
+        assert "no ext_modules" in why and "speedups.c" in why
+
+    def test_a_pure_python_tree_is_not_a_build(self):
+        needs, why = bake_mod.needs_build(
+            ["setup.py", "demo/__init__.py"], self.PLAIN_SETUP
+        )
+        assert needs is False
+        assert "no ext_modules" in why and "no extension sources" in why
+
+    def test_a_cython_declaration_is_not_a_source(self):
+        """``.pxd`` declares types for a compiler; it is not compiled itself."""
+        needs, _ = bake_mod.needs_build(
+            ["setup.py", "demo/attrs.pxd"], self.EXTENSION_SETUP
+        )
+        assert needs is False
+
+    def test_a_tree_with_no_setup_py_is_read_rather_than_refused(self):
+        """fastapi has no ``setup.py`` at all (flit): nothing is compiled, so no build."""
+        needs, why = bake_mod.needs_build(["fastapi/__init__.py"], None)
+        assert needs is False
+        assert "no ext_modules" in why
+
+    def test_the_reader_asks_the_clone_for_that_commit(self, monkeypatch):
+        seen: dict = {}
+
+        def fake_list(repo, commit):
+            seen["list"] = (repo, commit)
+            return ["setup.py", "demo/_lib.c"]
+
+        def fake_read(repo, commit, path):
+            seen["read"] = (repo, commit, path)
+            return self.EXTENSION_SETUP
+
+        monkeypatch.setattr(bake_mod.tree_mod, "list_files_at", fake_list)
+        monkeypatch.setattr(bake_mod.tree_mod, "read_file_at", fake_read)
+        needs, _ = bake_mod.needs_build_at(Path("/clones/demo.git"), "a" * 40)
+        assert needs is True
+        assert seen["list"] == (Path("/clones/demo.git"), "a" * 40)
+        assert seen["read"] == (Path("/clones/demo.git"), "a" * 40, "setup.py")
+
+    def test_an_unparseable_setup_py_is_an_error_not_a_silent_no(self):
+        with pytest.raises(bake_mod.BakeError, match="does not parse"):
+            bake_mod.needs_build(["setup.py"], "setup(name='demo'\n")
+
+
+@needs_project_clones
+class TestTheSplitsAgreeWithTheirTrees:
+    """Both committed splits, checked against the trees they name (§3.2).
+
+    [VANTA-WHY] This is the regression for the flag being hand-set: ``needs_build`` was
+    ``info.pythonpath is not None``, so the four dev-split bugs whose trees compile C
+    extensions of their own — matplotlib/1, matplotlib/2, pandas/1, spacy/4 — were
+    declared ``false`` and nothing could disagree. Read through the clone, and every bug
+    whose clone is present has to agree, so a *stale split* is a test failure rather
+    than a prepare gate failure hours later.
+    """
+
+    def test_every_bug_in_both_splits_has_the_flag_its_tree_implies(self):
+        checked = 0
+        for path in (SPLIT_PATH, DEV_SPLIT_PATH):
+            split = load_split(path)
+            for entry in split.data["bugs"]:
+                repo = PROJECT_CLONES / f"{entry['project']}.git"
+                if not repo.is_dir():
+                    continue
+                bug = prepare_mod.load_bug(
+                    path,
+                    REPO_ROOT / split.data["bugsinpy_root"],
+                    entry["project"],
+                    int(entry["bug_id"]),
+                )
+                mismatches = prepare_mod.check_build_declared(entry, bug, repo=repo)
+                assert mismatches == [], f"{path.name}: {entry['project']}/{entry['bug_id']}"
+                checked += 1
+        # A missing clone must not shrink this to nothing and still pass.
+        assert checked >= 20, f"only {checked} bugs were checked"
+
+    def test_the_four_trees_that_compile_extensions_are_declared(self):
+        """The measured set, named: a rule that drifts must break these lines."""
+        for path, expected in (
+            (SPLIT_PATH, {}),
+            (DEV_SPLIT_PATH, {"matplotlib/1", "matplotlib/2", "pandas/1", "spacy/4"}),
+        ):
+            split = load_split(path)
+            found = {
+                f"{entry['project']}/{entry['bug_id']}"
+                for entry in split.data["bugs"]
+                if entry["needs_build"]
+            }
+            assert found == expected, f"{path.name}: {sorted(found)}"
 
 
 class TestDependencyProvenance:

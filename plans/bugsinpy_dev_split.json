@@ -124,7 +124,7 @@
       "fixed_commit": "5324adaec6a7fd3d78dea7b28451d5f6e95392a6",
       "test_file": "lib/matplotlib/tests/test_bbox_tight.py",
       "pythonpath": null,
-      "needs_build": false,
+      "needs_build": true,
       "native_test_paths": [
         "lib/matplotlib/tests"
       ],
@@ -153,7 +153,7 @@
       "fixed_commit": "e41ee47a90bb1d8a1fa28fcefcd45ed8ef5cb946",
       "test_file": "pandas/tests/dtypes/test_dtypes.py",
       "pythonpath": null,
-      "needs_build": false,
+      "needs_build": true,
       "native_test_paths": [
         "pandas/tests"
       ],
@@ -240,7 +240,7 @@
       "fixed_commit": "9fa9d7f2cb52ce6a70c264d4e57c7f190d7686bf",
       "test_file": "spacy/tests/regression/test_issue4665.py",
       "pythonpath": null,
-      "needs_build": false,
+      "needs_build": true,
       "native_test_paths": [
         "spacy/tests"
       ],
@@ -327,7 +327,7 @@
       "fixed_commit": "d86cc2bab8183fd3288ed474e4dfd33e0f018908",
       "test_file": "lib/matplotlib/tests/test_axes.py",
       "pythonpath": null,
-      "needs_build": false,
+      "needs_build": true,
       "native_test_paths": [
         "lib/matplotlib/tests"
       ],

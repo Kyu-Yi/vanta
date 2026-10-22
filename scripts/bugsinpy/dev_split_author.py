@@ -26,9 +26,14 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR.parent))
 
+from bugsinpy import bake as bake_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta  # noqa: E402
 
 SPLIT_PATH = REPO_ROOT / "plans" / "bugsinpy_dev_split.json"
+REPO_CACHE = REPO_ROOT / "runs" / "bugsinpy" / "repos"
+"""Where ``bake``/``prepare`` clone the projects. ``needs_build`` is read from the
+*buggy commit's* tree here, so the clone has to exist — it is not committed (it is
+under ``runs/``), and a hand-authored ``needs_build`` is what this replaced."""
 
 # The evaluation split's pin, which the dev split must share: same BugsInPy
 # commit, same interpreter layer, same pytest pins (§3.2).
@@ -120,6 +125,24 @@ PYSNOOPER_NOTE = (
 )
 
 
+def needs_build(project: str, commit: str, pythonpath: str | None) -> tuple[bool, str]:
+    """``needs_build`` for one bug, from the buggy commit's own tree (§3.2).
+
+    Derived rather than hand-set: the flag was ``info.pythonpath is not None``, which
+    said "no" for matplotlib/1, pandas/1 and spacy/4 — trees whose tests import a
+    package that only exists after the tree compiles its own C extensions. The rule
+    lives in :func:`bake.needs_build`; this reads the tree it needs.
+    """
+    repo = REPO_CACHE / f"{project}.git"
+    if not repo.is_dir():
+        raise SystemExit(
+            f"{project}: no clone at {repo}, and needs_build is read from the buggy "
+            "commit's tree. bake clones the projects first "
+            "(scripts/bugsinpy_run.py bake)."
+        )
+    return bake_mod.needs_build_at(repo, commit, pythonpath=pythonpath)
+
+
 def main() -> int:
     root = REPO_ROOT / BUGSINPY_ROOT
     bugs: list[dict] = []
@@ -131,6 +154,8 @@ def main() -> int:
                 f"{project}/{bug_id}: the clone declares test_file "
                 f"{info.test_file!r}, this table says {test_file!r}"
             )
+        needs, why = needs_build(project, info.buggy_commit, info.pythonpath)
+        print(f"{project}/{bug_id}: needs_build={needs} — {why}")
         bugs.append(
             {
                 "project": project,
@@ -140,7 +165,7 @@ def main() -> int:
                 "fixed_commit": info.fixed_commit,
                 "test_file": info.test_file,
                 "pythonpath": info.pythonpath,
-                "needs_build": info.pythonpath is not None,
+                "needs_build": needs,
                 "native_test_paths": [test_root],
                 "test_cmd": [
                     "python",
@@ -192,6 +217,19 @@ def main() -> int:
     extra["wave"] = 1
     extra["role"] = "pilot"
     extra["notes"] = PYSNOOPER_NOTE
+    # The mirror copies the evaluation split's value, so it is checked against the
+    # rule rather than trusted: the mirror's own comment promises the two files
+    # cannot drift, and a stale ``needs_build`` in either is exactly that drift.
+    mirrored_needs, mirrored_why = needs_build(
+        "PySnooper", extra["buggy_commit"], extra["pythonpath"]
+    )
+    if mirrored_needs != extra["needs_build"]:
+        raise SystemExit(
+            f"PySnooper/3: the evaluation split says needs_build="
+            f"{extra['needs_build']!r}, its buggy tree says {mirrored_needs!r} "
+            f"({mirrored_why}). Fix plans/bugsinpy_split.json, then re-run this."
+        )
+    print(f"PySnooper/3: needs_build={mirrored_needs} — {mirrored_why}")
     bugs.append(extra)
 
     data = {

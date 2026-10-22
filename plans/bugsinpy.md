@@ -642,9 +642,40 @@ reasons:
 2. **An editable install cannot work.** `pip install -e .` bakes the *bake-time* path, and each run
    gets its own tree path; the layer would point at a directory that no longer exists.
 
-Projects that genuinely need building (`pythonpath="<pkg>/build/lib/"` on tqdm and cookiecutter) are
-built **per tree, at prepare time, inside Shuru** — the same place, and for the same reason, that
-their suites run.
+**`needs_build` is read from the tree, not judged.** A build, when a tree needs one, happens **per
+tree, at prepare time, inside Shuru** — the same place, and for the same reason, that the suites run.
+Which trees those are is the split's `needs_build` flag, and the flag has to be derived from the tree
+it is about rather than hand-set: the dev split shipped `needs_build: false` for matplotlib/1 and
+pandas/1, whose tests import a package the tree itself has to compile (`pandas/tests/dtypes/test_dtypes.py`
+reaches `pandas._libs`; matplotlib's tests reach `matplotlib._path`), so the first thing that would
+have happened is the dependency gate's import probe failing with "does not import from the tree" —
+which reads like a missing dependency and is not one, the exact confusion §3.3 exists to prevent, in
+the other direction. The rule is `bake.needs_build(files, setup_py, pythonpath=…)` and it has two
+independent triggers, each a property of the tree rather than a judgement about it:
+
+1. **BugsInPy says the import lives in a build directory.** It sets `pythonpath` *inside* the tree
+   (`tqdm/build/lib/`, `cookiecutter/build/lib/`), so the package its own `run_test.sh` imports only
+   exists after the tree is built. This settles it whatever the tree ships.
+2. **The tree compiles extensions of its own.** `setup.py` declares `ext_modules` **and** the tree
+   carries sources to compile (`bake.COMPILED_SOURCE_SUFFIXES`: `.pyx`, `.c`, `.cpp`, `.cc`, `.cxx`).
+   Both halves are load-bearing, and each excludes a measured shape: **black** declares `ext_modules`
+   and has nothing to compile — its extension is the opt-in `mypyc` build of its own Python, off
+   unless `BLACK_USE_MYPYC` is set, so its tests import pure Python; **tornado** ships
+   `tornado/speedups.c` and declares no `ext_modules`, because since 5.0 that file is a stub kept for
+   old compiled installs and is not built. Suffixes and never directories, because matplotlib's
+   extension sources sit in the vendored `extern/` (63 files) and in `src/` (17) alike and both are
+   compiled into the package; `.pxd` is deliberately absent, a Cython *declaration* not being
+   compiled.
+
+Read from the **buggy commit**, because that is the tree the suite runs against (`oracle_tree` is the
+buggy source with the fixed commit's test files). The reason comes back with the answer in both
+directions, so a boolean that disagrees with its tree can say which half of the rule it disagrees
+with: `dev_split_author.py` derives the flag from the clone (and cross-checks the mirrored
+PySnooper/3 entry against the evaluation split's value rather than trusting it), and
+`prepare.check_build_declared` compares split and tree **both ways** before any tree is materialised,
+flagging rather than raising (§3.2) so one mis-declared bug does not stop the rest of the batch. The
+measured dev split is `matplotlib/1, matplotlib/2, pandas/1, spacy/4`; the measured evaluation split
+is `cookiecutter/1, tqdm/1`.
 
 **Build-time tools are pinned by date too.** A build-time tool is as much a part of "the environment
 this tree was built in" as a dependency is, so the date rule above binds it as well — measured, not
@@ -1125,7 +1156,10 @@ Committed **before any run**; `plans/` is not gitignored (verified), so this tra
 It is both the plan and the frozen record of the experimental design, and it is **hand-authored**:
 no stage rewrites it (§1.6.4), so every value in it is a decision that was reviewed. Measurements a
 run makes — sizes, verdicts, `FAIL_TO_PASS`, flakiness — live under `runs/bugsinpy/<batch>/` and only
-enter this file through a deliberate edit:
+enter this file through a deliberate edit. (`needs_build` is the one value the authoring step derives
+rather than a human setting it: it is read from the buggy commit's own tree by `bake.needs_build`, per
+§3.2, and `prepare` re-checks the written file against that tree both ways — so what is reviewed here
+is the rule, and the value is its output.)
 
 ```json
 {
@@ -1988,7 +2022,10 @@ pilot fails a gate, the next reserve in file order is promoted (change its `role
 §8), and that reserve is another project's first bug, so the dev set stays five distinct projects.
 The tenth entry buys the fallback depth: authoring 10 rather than exactly 5 is the one judgement here,
 because the gates can only be evaluated by running them and a shorter list risks a second prepare
-round.
+round. Each entry's `needs_build` is not authored but derived from the buggy commit's own tree by
+`bake.needs_build` (§3.2) as the file is written — measured, that flags `matplotlib/1`, `matplotlib/2`,
+`pandas/1` and `spacy/4`, whose tests import a package the tree has to compile — and `prepare` re-checks
+the written file against the tree both ways.
 
 `PySnooper/3` also joins the dev set, labelled **"seen during development"**: items 1 and 2 were
 designed from its false reject, so it is development data now. It is entered in the dev split as an

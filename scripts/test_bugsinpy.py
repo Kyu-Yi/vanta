@@ -456,6 +456,21 @@ class TestSplit:
         assert evaluation == required
         assert "psycopg2" not in dev, "psycopg2 names two distributions; the user decides"
 
+    def test_import_package_is_an_optional_declared_key(self):
+        """The last-resort import name, carried only by a bug that needs it (§3.2).
+
+        [VANTA-WHY] The normal route is the bug's own ``setup.py``/``pyproject.toml``;
+        requiring ``import_package`` of every bug would put a redundant guess next to a
+        fact. It is validated when present, and unknown keys are still an error, so the
+        shape stays closed.
+        """
+        assert split_mod.validate(split_data()) is None
+        assert split_mod.validate(split_data(bugs=[bug_entry(import_package="sanic")])) is None
+        with pytest.raises(SplitError, match="import_package"):
+            split_mod.validate(split_data(bugs=[bug_entry(import_package="  ")]))
+        with pytest.raises(SplitError, match="import_package"):
+            split_mod.validate(split_data(bugs=[bug_entry(import_package=1)]))
+
     def test_unknown_top_level_key_is_an_error(self):
         with pytest.raises(SplitError, match="unknown top-level keys"):
             split_mod.validate(split_data(seed=0))  # typo for `seeds`
@@ -3345,6 +3360,43 @@ class TestSetupPyStaticReader:
         with pytest.raises(bake_mod.BakeError, match="neither name= nor a packages="):
             bake_mod.import_name_of("setup(version='1.0')\n")
 
+    def test_a_setup_kwargs_dict_passed_as_a_splat_is_read(self):
+        """sanic/1's shape, quoted from that commit's ``setup.py``.
+
+        [VANTA-WHY] Sanic assembles its metadata in a module-level dict literal,
+        appends the requirement keys by subscript, and calls
+        ``setup(**setup_kwargs)``. Measured: a reader that dropped the splat saw
+        neither ``name=`` nor a ``packages=[...]`` literal and flagged the bug,
+        although every value is written down statically.
+        """
+        setup = (
+            "requirements = ['httptools>=0.0.10', 'uvloop>=0.5.1']\n"
+            "setup_kwargs = {\n"
+            "    'name': 'sanic',\n"
+            "    'packages': ['sanic'],\n"
+            "    'version': '19.12.0',\n"
+            "}\n"
+            "setup_kwargs['install_requires'] = requirements\n"
+            "setup(**setup_kwargs)\n"
+        )
+        assert bake_mod.import_name_of(setup) == "sanic"
+
+    def test_the_kwargs_dicts_subscripted_install_requires_is_a_declaration(self):
+        """The four keys sanic adds by subscript are dependencies like any other."""
+        setup = (
+            "requirements = ['httptools>=0.0.10']\n"
+            "setup_kwargs = {'name': 'sanic'}\n"
+            "setup_kwargs['install_requires'] = requirements\n"
+            "setup(**setup_kwargs)\n"
+        )
+        refs, _ = setup_py_refs(setup, {}, [])
+        assert [ref.spec for ref in refs] == ["httptools>=0.0.10"]
+
+    def test_a_splat_that_is_not_a_dict_literal_contributes_nothing(self):
+        """A computed ``**kwargs`` is not guessed at; the bug is flagged as before."""
+        with pytest.raises(bake_mod.BakeError, match="neither name= nor a packages="):
+            bake_mod.import_name_of("setup(**make_kwargs())\n")
+
     def test_setup_py_that_is_not_python_is_an_error(self):
         with pytest.raises(bake_mod.BakeError, match="does not parse as Python"):
             bake_mod.setup_py_refs("setup(name=\n", {}, [])
@@ -4121,6 +4173,45 @@ class TestPyprojectAcrossCommits:
         assert by_name["six"].source == "install_requires (setup.py) line 1"
         assert by_name["future"].source == "project.dependencies (pyproject.toml)"
         assert sources.import_name == "demo"
+
+
+class TestImportPackageOverride:
+    """``import_package`` is the last resort when the metadata cannot name the package.
+
+    [VANTA-WHY] Sanic's ``setup.py`` is read by the ast reader (§3.2's fourth source),
+    and in sanic/1's real file the reader now resolves ``name``/``packages`` from the
+    module-level dict. The override exists for the shape the reader still cannot follow
+    — a metadata dict built by a function — and only then: a bug whose ``setup.py``
+    names its package is never overridden, and the note says the metadata was not what
+    named it, so the value is never mistaken for a fact the file stated.
+    """
+
+    BUGGY = "b" * 40
+    FIXED = "f" * 40
+    UNREADABLE_SETUP = "setup(**make_kwargs())\n"
+
+    def _sources(self, monkeypatch, entry):
+        fake_clone(
+            monkeypatch,
+            files={(self.BUGGY, "setup.py"): self.UNREADABLE_SETUP},
+            dates={self.BUGGY: "2019-04-22", self.FIXED: "2019-07-30"},
+        )
+        return bake_mod.bug_sources(
+            entry, bugsinpy_root=Path("/nonexistent"), repo=Path("/nonexistent")
+        )
+
+    def test_the_override_is_used_when_the_metadata_cannot_name_the_package(self, monkeypatch):
+        sources = self._sources(monkeypatch, bug_entry(import_package="sanic"))
+        assert sources.import_name == "sanic"
+        assert any("import_package='sanic'" in note for note in sources.notes)
+
+    def test_without_the_override_the_bug_is_still_flagged(self, monkeypatch):
+        with pytest.raises(bake_mod.BakeError, match="neither name= nor a packages="):
+            self._sources(monkeypatch, bug_entry())
+
+    def test_the_override_is_normalised_the_way_a_name_literal_is(self, monkeypatch):
+        sources = self._sources(monkeypatch, bug_entry(import_package="PySnooper"))
+        assert sources.import_name == "pysnooper"
 
 
 class TestTestImportClosure:
@@ -4967,6 +5058,48 @@ class TestRealMatplotlibAndPandasClosure:
         )
         assert "_csv" not in {ref.spec for ref in refs}
         assert any("'_csv' cannot name a distribution" in note for note in notes)
+
+
+needs_sanic_repo = pytest.mark.skipif(
+    not (REPO_ROOT / "runs" / "bugsinpy" / "repos" / "sanic.git").is_dir(),
+    reason="sanic's bare clone is not present (runs/ is not committed)",
+)
+
+
+@needs_sanic_repo
+class TestRealSanicSetupKwargs:
+    """sanic/1's flag, reproduced and fixed against the real ``setup.py``.
+
+    [VANTA-WHY] The flag read ``setup.py declares neither name= nor a packages=[...]
+    literal`` — true of the AST as the reader walked it, false as a fact about the bug,
+    since sanic's ``setup.py`` opens ``setup_kwargs = {"name": "sanic", …}``, appends
+    the requirement keys by subscript, and ends with ``setup(**setup_kwargs)``. The
+    resolution is source 4's rule about a splatted dict literal, not a per-bug
+    exception, so it is asserted against the file that produced it rather than against
+    a fixture that paraphrases it.
+    """
+
+    BUGGY = "e7001b00747b659f7042b0534802b936ee8a53e0"
+    FIXED = "44973125c15304b4262c51c78b5a86bd1daafa86"
+    REPO = REPO_ROOT / "runs" / "bugsinpy" / "repos" / "sanic.git"
+
+    def test_the_setup_py_names_its_package_through_the_kwargs_dict(self):
+        setup_py = tree_mod.read_file_at(self.REPO, self.BUGGY, "setup.py")
+        assert setup_py is not None
+        assert "setup(**setup_kwargs)" in setup_py
+        assert bake_mod.import_name_of(setup_py) == "sanic"
+
+    def test_bug_sources_names_the_project_and_merges_without_a_conflict(self):
+        split = load_split(DEV_SPLIT_PATH)
+        sources = bake_mod.bug_sources(
+            split.bug("sanic", 1),
+            bugsinpy_root=BUGSINPY_CLONE,
+            repo=self.REPO,
+            module_distributions=split.module_distributions(),
+        )
+        assert sources.import_name == "sanic"
+        _, conflicts = bake_mod.merge_refs(sources.refs)
+        assert conflicts == []
 
 
 class TestOneBugDoesNotStopTheBatch:

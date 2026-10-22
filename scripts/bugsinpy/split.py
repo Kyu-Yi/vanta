@@ -97,6 +97,18 @@ DECLARED_BUG_KEYS = frozenset(
     }
 )
 
+OPTIONAL_DECLARED_BUG_KEYS = frozenset({"import_package"})
+"""Declared keys a bug may carry but need not.
+
+[VANTA-WHY] ``import_package`` is the last-resort override for the import name the
+import-path check loads, used only when the bug's own ``setup.py``/``pyproject.toml``
+cannot name the package statically (design §3.2). It is optional because the normal
+route is the metadata itself: requiring it of every bug would put a redundant guess
+next to a fact for all of them. A bug that sets it records the reason in the split's
+``reviewed_changes``, the same way every other departure from the first-authored
+protocol is recorded.
+"""
+
 # Written back by ``prepare``. Nothing here may be hand-edited into the file
 # without ``prepare`` re-deriving it, which is why the reader checks the hash.
 DERIVED_BUG_KEYS = frozenset(
@@ -126,7 +138,7 @@ DERIVED_BUG_KEYS = frozenset(
     }
 )
 
-BUG_KEYS = DECLARED_BUG_KEYS | DERIVED_BUG_KEYS
+BUG_KEYS = DECLARED_BUG_KEYS | OPTIONAL_DECLARED_BUG_KEYS | DERIVED_BUG_KEYS
 
 CONFIGS = ("baseline", "vanta")  # `vanta_planner` is addressable but not implemented (§4.2)
 ROLES = ("pilot", "reserve")
@@ -422,6 +434,13 @@ def _validate_bug(entry: Any, where: str, index: int, seen: set[str]) -> None:
         raise SplitError(
             f"{tag}: pytest_version and json_report_version are pinned per Python "
             "version and must be recorded (design §3.2)"
+        )
+
+    override = entry.get("import_package")
+    if override is not None and (not isinstance(override, str) or not override.strip()):
+        raise SplitError(
+            f"{tag}: import_package must be a non-empty string — it is the module the "
+            "import-path check loads, and an empty one would be a guess"
         )
 
     # Derived fields, when present, must be self-consistent.

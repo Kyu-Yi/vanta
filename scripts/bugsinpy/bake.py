@@ -499,6 +499,21 @@ def requirements_refs(text: str, *, source: str) -> tuple[list[DepRef], list[Ski
 # ---------------------------------------------------------------------------
 # setup.py, read statically — never executed
 # ---------------------------------------------------------------------------
+def _dict_literal_items(node: ast.expr) -> Optional[dict[str, ast.expr]]:
+    """A dict literal's ``{str: value}`` items, or ``None`` if it is not a dict.
+
+    Only constant string keys are read: a computed key (``"install_" + "requires"``)
+    would have to be evaluated, and nothing here executes the project's code.
+    """
+    if not isinstance(node, ast.Dict):
+        return None
+    out: dict[str, ast.expr] = {}
+    for key, value in zip(node.keys, node.values):
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            out[key.value] = value
+    return out
+
+
 def _setup_kwargs(setup_py: str) -> dict[str, ast.expr]:
     """``setup(...)``'s keyword arguments, as AST nodes.
 
@@ -506,8 +521,18 @@ def _setup_kwargs(setup_py: str) -> dict[str, ast.expr]:
     (design C3: nothing third-party executes outside Shuru, and "just asking
     setuptools what it wants" is executing it). It is Python; it can do anything.
     Reading it with ``ast`` is the only safe way to learn what it declares, and what
-    ``ast`` cannot see — a ``**kwargs`` splat, a computed keyword name — is recorded
-    as a note instead of guessed at.
+    ``ast`` cannot see — a computed keyword name, a dict built by a function — is
+    recorded as a note instead of guessed at.
+
+    A ``**kwargs`` splat is resolved too, because a project that assembles its
+    metadata in a module-level dict has still written it down statically: sanic's
+    ``setup.py`` opens ``setup_kwargs = {"name": "sanic", "packages": ["sanic"], …}``,
+    appends ``setup_kwargs["install_requires"] = requirements`` and friends by
+    subscript, and ends with ``setup(**setup_kwargs)``. Measured: without this the
+    reader saw no ``name=`` and no ``packages=[...]`` and flagged sanic/1, whose
+    metadata is all present. The literal's own keys and the subscript assignments are
+    merged in source order, still by reading the AST — a splat whose name does not
+    resolve to a dict literal contributes nothing, exactly as before.
     """
     try:
         tree = ast.parse(setup_py)
@@ -515,11 +540,35 @@ def _setup_kwargs(setup_py: str) -> dict[str, ast.expr]:
         raise BakeError(f"setup.py does not parse as Python: {exc}") from exc
 
     assigned: dict[str, ast.expr] = {}
+    subscripted: dict[str, dict[str, ast.expr]] = {}
     for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    assigned[target.id] = node.value
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                assigned[target.id] = node.value
+            elif (
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and isinstance(target.slice, ast.Constant)
+                and isinstance(target.slice.value, str)
+            ):
+                subscripted.setdefault(target.value.id, {})[target.slice.value] = node.value
+
+    def deref(node: ast.expr) -> ast.expr:
+        if isinstance(node, ast.Name) and node.id in assigned:
+            return assigned[node.id]
+        return node
+
+    def splat_items(name: str) -> dict[str, ast.expr]:
+        items: dict[str, ast.expr] = {}
+        literal = assigned.get(name)
+        if literal is not None:
+            parsed = _dict_literal_items(literal)
+            if parsed is not None:
+                items.update(parsed)
+        items.update(subscripted.get(name, {}))
+        return {key: deref(value) for key, value in items.items()}
 
     kwargs: dict[str, ast.expr] = {}
     for node in ast.walk(tree):
@@ -533,11 +582,10 @@ def _setup_kwargs(setup_py: str) -> dict[str, ast.expr]:
             continue
         for keyword in node.keywords:
             if keyword.arg is None:
+                if isinstance(keyword.value, ast.Name):
+                    kwargs.update(splat_items(keyword.value.id))
                 continue
-            value = keyword.value
-            if isinstance(value, ast.Name) and value.id in assigned:
-                value = assigned[value.id]
-            kwargs[keyword.arg] = value
+            kwargs[keyword.arg] = deref(keyword.value)
     return kwargs
 
 
@@ -2030,11 +2078,27 @@ def bug_sources(
             "the declared dependencies and test requirements cannot be read. Flag "
             "this bug rather than guessing at its dependencies (design §3.2)."
         )
-    import_name = (
-        import_name_of(buggy_setup)
-        if buggy_setup is not None
-        else import_name_of_pyproject(buggy_pyproject)
-    )
+    try:
+        import_name = (
+            import_name_of(buggy_setup)
+            if buggy_setup is not None
+            else import_name_of_pyproject(buggy_pyproject)
+        )
+    except BakeError:
+        # Last resort, and only when the metadata itself cannot be read: the split may
+        # carry a reviewed ``import_package`` for this bug (recorded in its
+        # ``reviewed_changes``). Read exactly as a ``name=`` literal is, and the note
+        # says the metadata was not what named it, so the override never looks like a
+        # fact the file stated.
+        override = entry.get("import_package")
+        if override is None:
+            raise
+        import_name = canonicalize_name(str(override).strip()).replace("-", "_")
+        notes.append(
+            f"{project}/{bug_id}: the metadata at {buggy} did not name the import "
+            f"package, so the reviewed split override import_package={override!r} was "
+            "used; it is recorded in the split's reviewed_changes (design §3.2)."
+        )
 
     # 3 + 4. The project's own declarations, once per commit — from ``setup.py``,
     # from ``pyproject.toml``, or from both if a commit carries both (a project

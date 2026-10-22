@@ -124,6 +124,8 @@ DERIVED_BUG_KEYS = frozenset(
         "preexisting_failures",
         "native_failure_baseline",
         "native_green_on_vanta_tree",
+        "native_skips_buggy",
+        "native_skips_fixed",
         "hidden_files_deleted",
         "partially_hidden_functions",
         "gate_failures",

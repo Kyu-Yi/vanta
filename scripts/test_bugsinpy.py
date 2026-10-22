@@ -1337,6 +1337,141 @@ class TestDeclaredFailToPass:
         assert bug_prep.f2p_undeclared == sorted(flipping)
         assert any("empty FAIL_TO_PASS" in f for f in bug_prep.gate_failures)
 
+    # ---- a skip is never the pass half of the flip (§3.2) -----------------
+    def test_a_graded_test_that_skips_on_the_fixed_commit_fails_the_gate(
+        self, tmp_path, monkeypatch
+    ):
+        """F2P is ``F_before \\ F_after``, and ``skipped`` is not a failure.
+
+        The blind spot the scope fix exposed: measured on pandas/1, three packages left
+        the layer and the tests that ask for them *skipped* instead of failing — no
+        failure anywhere, so the run that had lost them looked exactly like the run that
+        had them. A graded test skipping on the fixed commit is the same shape and worse:
+        it is absent from ``F_after``, so the derivation declares it a test the fix makes
+        pass, while grading reads the same skip as a hidden test that never passed.
+        """
+        bug = bug_info(test_file="tests/test_demo.py")
+        buggy_side = {"tests/test_demo.py::test_a": "failed"}
+        fixed_side = {"tests/test_demo.py::test_a": "skipped"}
+        self._patched_suites(
+            monkeypatch,
+            {
+                "src_buggy": self._pair(buggy_side),
+                "oracle_tree": self._pair(buggy_side),
+                "src_fixed": self._pair(fixed_side),
+            },
+        )
+        bug_prep = prep(bug=bug, root=tmp_path / "batch" / "worktrees" / "Demo_1")
+
+        prepare_mod.derive_hidden(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", collected=set()
+        )
+
+        assert bug_prep.fail_to_pass == ["tests/test_demo.py::test_a"], (
+            "the derivation itself cannot see the skip — that is the blindness this gate "
+            "closes, not a derivation bug"
+        )
+        reason = next(f for f in bug_prep.gate_failures if "skipped" in f)
+        assert "tests/test_demo.py::test_a skipped on the fixed commit" in reason
+        assert "oracle.score" in reason, "the reason says why skipped is not a pass"
+
+    def test_a_graded_test_that_skips_on_the_buggy_commit_fails_the_gate(
+        self, tmp_path, monkeypatch
+    ):
+        """The commit *itself*, not the derived buggy side, which is a failure by rule.
+
+        ``oracle_tree`` is the buggy source with the fixed commit's tests, and every
+        declared F2P nodeid is one of its stable failures — checking that tree for a skip
+        asks a question the declaration has already answered. So the buggy side here is
+        the buggy commit's own suite: a graded test that skips there does not run on that
+        commit at all, and the flip the gate is meant to measure is not happening.
+        """
+        bug = bug_info(test_file="tests/test_demo.py")
+        bug_prep = prep(bug=bug, root=tmp_path / "batch" / "worktrees" / "Demo_1")
+        self._patched_suites(
+            monkeypatch,
+            {
+                "src_buggy": self._pair({"tests/test_demo.py::test_a": "skipped"}),
+                "oracle_tree": self._pair({"tests/test_demo.py::test_a": "failed"}),
+                "src_fixed": self._pair({"tests/test_demo.py::test_a": "passed"}),
+            },
+        )
+
+        prepare_mod.derive_hidden(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", collected=set()
+        )
+
+        reason = next(f for f in bug_prep.gate_failures if "skipped" in f)
+        assert "tests/test_demo.py::test_a skipped on the buggy commit" in reason
+
+    def test_a_skip_in_the_non_graded_suite_is_recorded_per_commit_not_gated(
+        self, tmp_path, monkeypatch
+    ):
+        """Two numbers per bug, and no reason: nothing grades the rest of the suite.
+
+        A skip is a legitimate outcome there, but it is also the only signal that a layer
+        lost a dependency — so it is counted per commit, where the difference between the
+        two trees is readable, rather than gated.
+        """
+        bug = bug_info(test_file="tests/test_demo.py")
+        bug_prep = prep(bug=bug, root=tmp_path / "batch" / "worktrees" / "Demo_1")
+        self._patched_suites(
+            monkeypatch,
+            {
+                "src_buggy": self._pair(
+                    {
+                        "tests/test_demo.py::test_a": "failed",
+                        "tests/test_io.py::test_needs_bs4": "skipped",
+                        "tests/test_io.py::test_needs_sklearn": "skipped",
+                    }
+                ),
+                "oracle_tree": self._pair({"tests/test_demo.py::test_a": "failed"}),
+                "src_fixed": self._pair(
+                    {
+                        "tests/test_demo.py::test_a": "passed",
+                        "tests/test_io.py::test_needs_bs4": "skipped",
+                    }
+                ),
+            },
+        )
+
+        prepare_mod.derive_hidden(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", collected=set()
+        )
+
+        assert bug_prep.fail_to_pass == ["tests/test_demo.py::test_a"]
+        assert bug_prep.gate_failures == [], "a skip here is not a gate failure"
+        assert bug_prep.native_skips_buggy == 2
+        assert bug_prep.native_skips_fixed == 1
+
+    def test_a_run_that_skips_nothing_records_zero_and_no_reason(
+        self, tmp_path, monkeypatch
+    ):
+        bug = bug_info(test_file="tests/test_demo.py")
+        bug_prep = prep(bug=bug, root=tmp_path / "batch" / "worktrees" / "Demo_1")
+        self._patched_suites(
+            monkeypatch,
+            {
+                "src_buggy": self._pair({"tests/test_demo.py::test_a": "failed"}),
+                "oracle_tree": self._pair({"tests/test_demo.py::test_a": "failed"}),
+                "src_fixed": self._pair({"tests/test_demo.py::test_a": "passed"}),
+            },
+        )
+
+        prepare_mod.derive_hidden(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", collected=set()
+        )
+
+        assert bug_prep.gate_failures == []
+        assert bug_prep.native_skips_buggy == 0
+        assert bug_prep.native_skips_fixed == 0
+        assert (
+            prepare_mod.graded_skip_failure(
+                ["tests/test_demo.py::test_a"], runs=(("the fixed commit", self._pair({})),)
+            )
+            == ""
+        )
+
     @pytest.mark.parametrize("schema", ["mapping_0_3", "flat_list_0_2"])
     def test_strip_and_baseline_hides_the_undeclared_test_too(
         self, tmp_path, monkeypatch, schema
@@ -2614,6 +2749,8 @@ class TestPrepareRunRecordContract:
             preexisting_failures=["tests/test_demo.py::test_pre"],
             native_failure_baseline=["tests/test_demo.py::test_native"],
             native_green_on_vanta_tree=True,
+            native_skips_buggy=3,
+            native_skips_fixed=1,
             hidden_files_deleted=["tests/test_hidden.py"],
             partially_hidden_functions=["hidden_fn"],
             gate_failures=[],
@@ -2649,6 +2786,8 @@ class TestPrepareRunRecordContract:
         assert loaded.preexisting_failures == sorted(original.preexisting_failures)
         assert loaded.native_failure_baseline == sorted(original.native_failure_baseline)
         assert loaded.native_green_on_vanta_tree is True
+        assert loaded.native_skips_buggy == 3
+        assert loaded.native_skips_fixed == 1
         assert loaded.hidden_files_deleted == original.hidden_files_deleted
         assert loaded.partially_hidden_functions == original.partially_hidden_functions
         assert loaded.gate_failures == original.gate_failures

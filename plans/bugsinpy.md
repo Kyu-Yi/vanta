@@ -574,6 +574,26 @@ of the layer, and the tests that ask for them then **skipped**. Two of the three
 gate moved and the layer that had lost three packages looked exactly like the layer that had them. The
 reason is still recorded on each site and still read by the audit; the closure installs the three.
 
+**A skipped graded test is a gate failure; a skip anywhere else is a number.** `suite.FAILURE_OUTCOMES`
+is `{"failed", "error"}`, so a graded test that *skips* on the fixed commit is in neither `F_before` nor
+`F_after`: the flip `F_before \ F_after` reads it as one the fix makes pass, `FAIL_TO_PASS` declares it,
+and `oracle.score` — reading the same report — counts it as *not* passing. A hidden test that can never
+pass fails every candidate for a reason that is not the bug, and reconciling the two readings after the
+batch is baked is too late — the bug is in the run and its oracle is unsatisfiable. So
+`prepare.graded_skip_failure` checks every `FAIL_TO_PASS` nodeid against `suite.SuitePair.stable_outcomes`
+on **both** the buggy commit (`src_buggy`) and the fixed commit (`src_fixed`) and appends a gate failure
+naming the nodeid and the commit; `oracle_tree` is deliberately not consulted, because it is the buggy
+source carrying the fix's tests, where every declared F2P is by construction a stable failure. A graded
+test skips almost always because the layer is missing something it needs (`@td.skip_if_no`,
+`pytest.importorskip`, `pytest.mark.skipif`), so the reason is one the `dropped_pin_note` clause extends
+with the pins the bake dropped — the skip gate is how the `pandas/1` loss would have been caught at
+prepare time rather than looked at as a pass. **Never treated as a pass.** The non-graded native suite is
+*not* gated — a skip in it is a legitimate outcome — but `prepare` records it per commit as
+`BugPrep.native_skips_buggy` / `BugPrep.native_skips_fixed` (each derived by `prepare.skip_count`, both
+in the derived `split.DERIVED_BUG_KEYS` and in the record's round-trip), because it is the only signal
+that a layer lost a dependency: no failure appears in any failure set, so the run that dropped three
+packages and the run that had them look identical except for the skip counts.
+
 The distinction is measured, and it is where the rule was wrong before. **`pandas/1` is not flagged, it
 drops.** `import pyarrow` does appear in **18** `.py` files at the fix's commit, but the only
 *unconditional* site is `pandas/core/arrays/_arrow_utils.py:5`, every importer of `_arrow_utils` is a

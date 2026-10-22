@@ -113,6 +113,19 @@ class BugPrep:
     preexisting_failures: list[str] = field(default_factory=list)
     native_failure_baseline: list[str] = field(default_factory=list)
     native_green_on_vanta_tree: bool = False
+    native_skips_buggy: int = 0
+    native_skips_fixed: int = 0
+    """Stable ``skipped`` outcomes in the non-graded suite, one count per commit.
+
+    [VANTA-WHY] Nothing grades that suite, so a skip there is fine — but it is the
+    observation that shows a dependency the layer no longer has. On ``pandas/1``,
+    dropping ``beautifulsoup4``, ``scikit-learn`` and ``psycopg2-binary`` turned the
+    tests that ask for them into skips: no failure appeared anywhere, and a skip is not
+    in :data:`suite.FAILURE_OUTCOMES`, so the run that lost three packages looked
+    identical to the run that had them. Recorded per commit rather than merged, because
+    the number that carries the information is the *difference* between the two trees —
+    a fixed commit does not skip the tests its own fix adds.
+    """
     hidden_files_deleted: list[str] = field(default_factory=list)
     partially_hidden_functions: list[str] = field(default_factory=list)
     gate_failures: list[str] = field(default_factory=list)
@@ -162,6 +175,8 @@ class BugPrep:
             "preexisting_failures": sorted(self.preexisting_failures),
             "native_failure_baseline": sorted(self.native_failure_baseline),
             "native_green_on_vanta_tree": self.native_green_on_vanta_tree,
+            "native_skips_buggy": self.native_skips_buggy,
+            "native_skips_fixed": self.native_skips_fixed,
             "hidden_files_deleted": self.hidden_files_deleted,
             "partially_hidden_functions": self.partially_hidden_functions,
             "gate_failures": self.gate_failures,
@@ -217,6 +232,12 @@ class BugPrep:
             ),
             native_green_on_vanta_tree=bool(
                 field_of(payload, "native_green_on_vanta_tree", owner=owner, where=where)
+            ),
+            native_skips_buggy=int(
+                field_of(payload, "native_skips_buggy", owner=owner, where=where)
+            ),
+            native_skips_fixed=int(
+                field_of(payload, "native_skips_fixed", owner=owner, where=where)
             ),
             hidden_files_deleted=strings_of(
                 payload, "hidden_files_deleted", owner=owner, where=where
@@ -326,6 +347,68 @@ def check_deps(
 # ---------------------------------------------------------------------------
 # FAIL_TO_PASS / PASS_TO_PASS derivation (§1.3)
 # ---------------------------------------------------------------------------
+GRADED_SKIP_REASON = (
+    "a FAIL_TO_PASS test is recorded as skipped, which is neither the failure the buggy "
+    "commit has to show nor the pass the fixed commit has to show: skipped is not in "
+    "suite.FAILURE_OUTCOMES, so FAIL_TO_PASS (= F_before \\ F_after) reads a test that "
+    "skips on the fixed commit as one the fix makes pass, while oracle.score reads the "
+    "same report and counts a skipped hidden test as *not* passing — a hidden test that "
+    "can never pass, so every candidate would be failed for a reason that is not the bug. "
+    "A graded test skips almost always because something it needs is missing from the "
+    "layer (skip_if_no / importorskip / pytest.mark.skipif), so the pins the bake dropped "
+    "are named here when it dropped any"
+)
+"""Why a graded skip is a gate failure and not a pass — see :func:`graded_skip_failure`."""
+
+
+def graded_skip_failure(
+    graded: Sequence[str],
+    *,
+    runs: Sequence[tuple[str, suite_mod.SuitePair]],
+) -> str:
+    """The gate reason for graded nodeids recorded as ``skipped``, or ``""``.
+
+    [VANTA-WHY] ``skipped`` is the one outcome the two halves of the derivation disagree
+    about, and both readings come from the same report: :data:`suite.FAILURE_OUTCOMES`
+    cannot see it, so the flip the gate measures treats it as the pass half, and
+    ``oracle.score`` treats it as not-passing. Reconciling that after the batch is baked
+    is too late — the bug is in the run, and its oracle is unsatisfiable — so a graded
+    test that skips on *either* commit refuses the bug here. Never as a pass, and never
+    silently: the reason names the nodeid and the commit, and ``prepare``'s
+    :func:`dropped_pin_note` adds the pins the bake dropped from the layer, which is the
+    cause such a skip almost always has (§3.2).
+
+    Reads :attr:`suite.SuitePair.stable_outcomes`, so a test that skips in only one of
+    the two runs is flaky and is reported as flaky by :func:`derive_hidden` instead.
+    """
+    measured: list[str] = []
+    for nodeid in graded:
+        on = [
+            label
+            for label, pair in runs
+            if pair.stable_outcomes.get(nodeid) == suite_mod.SKIPPED_OUTCOME
+        ]
+        if on:
+            measured.append(f"{nodeid} skipped on {', '.join(on)}")
+    if not measured:
+        return ""
+    return f"{GRADED_SKIP_REASON} Measured: {'; '.join(measured)}"
+
+
+def skip_count(pair: suite_mod.SuitePair) -> int:
+    """How many nodeids this run stably recorded as ``skipped``.
+
+    Recorded, never gated: nothing grades the suite this counts, and a skip in it is a
+    legitimate outcome. It is written down per commit because it is the only signal that
+    a layer lost a dependency — see :attr:`BugPrep.native_skips_buggy`.
+    """
+    return sum(
+        1
+        for outcome in pair.stable_outcomes.values()
+        if outcome == suite_mod.SKIPPED_OUTCOME
+    )
+
+
 def derive_hidden(
     prep: BugPrep,
     *,
@@ -379,6 +462,22 @@ def derive_hidden(
             "the fixed tree fails tests the buggy tree does not — the relaxed fixed-tree "
             f"gate (F_after \\ F_buggy_pre == empty) is violated: {fixed_only}"
         )
+
+    # A skip is neither the failure nor the pass the flip is made of, and by the time
+    # grading reads the report it is too late to say so (§3.2). Both commits, because a
+    # graded test that skips on the buggy source is not a FAIL_TO_PASS either.
+    skip_failure = graded_skip_failure(
+        prep.fail_to_pass,
+        runs=(("the buggy commit", buggy), ("the fixed commit", after)),
+    )
+    if skip_failure:
+        prep.gate_failures.append(skip_failure)
+
+    # The non-graded suite is not gated: a skip in it is a legitimate outcome. It is
+    # recorded per commit, because a layer that lost a dependency shows up here and
+    # nowhere else — no failure appears, and a skip is invisible to every failure set.
+    prep.native_skips_buggy = skip_count(buggy)
+    prep.native_skips_fixed = skip_count(after)
 
 
 DROPPED_PIN_NOTE = (
@@ -1118,6 +1217,8 @@ def derive_verdict(prep: BugPrep) -> dict[str, Any]:
         "preexisting_failures": sorted(prep.preexisting_failures),
         "native_failure_baseline": sorted(prep.native_failure_baseline),
         "native_green_on_vanta_tree": prep.native_green_on_vanta_tree,
+        "native_skips_buggy": prep.native_skips_buggy,
+        "native_skips_fixed": prep.native_skips_fixed,
         "hidden_files_deleted": prep.hidden_files_deleted,
         "partially_hidden_functions": prep.partially_hidden_functions,
         "gate_failures": prep.gate_failures,

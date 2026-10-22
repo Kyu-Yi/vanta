@@ -30,6 +30,16 @@ from . import shuru
 
 FAILURE_OUTCOMES = frozenset({"failed", "error"})
 
+SKIPPED_OUTCOME = "skipped"
+"""The outcome that is neither a failure nor a pass.
+
+[VANTA-WHY] ``prepare``'s gate is built on :data:`FAILURE_OUTCOMES`, so a graded test
+that *skips* is absent from both ``F_before`` and ``F_after`` and the flip the gate
+measures cannot see it (:data:`prepare.GRADED_SKIP_REASON`); ``oracle.score``, reading
+the same report, counts it as not passing. Named once here so the two readers cannot
+disagree about which string they mean.
+"""
+
 
 class SuiteError(RuntimeError):
     """The suite could not be run or its report could not be read."""

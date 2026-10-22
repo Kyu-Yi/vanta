@@ -420,6 +420,32 @@ and `decorator` exist only in `setup.sh` at bug 3. One source alone under-provis
 5. the test side's **import closure** — the third-party top-level modules the test-side files
    themselves import (`bake.test_import_closure`).
 
+**A `setup(**kwargs)` splat is resolved from the AST, never by running it.** Source 4 reads the
+`setup()` call's keyword arguments, and a project may pass them as a splat of a module-level dict
+rather than inline. `sanic/1` (`e7001b00`) is the measured case: its `setup.py` ends with
+`setup(**setup_kwargs)`, and `setup_kwargs` a few lines above is a module-level dict literal carrying
+`name`, `packages`, `install_requires`, `tests_require`, `extras_require` and `cmdclass`, with some
+keys assigned by subscript afterwards (`setup_kwargs["extras_require"] = …`). Read inline-only, that
+bug's `install_requires` is invisible and `import_name` cannot be read at all — the bake refused it
+with "declares neither `name=` nor a `packages=[…]` literal" over a file that declares both. The
+reader therefore dereferences a splatted name to its module-level assignment, takes the dict
+literal's **string keys in source order**, overlays the name's subscript assignments, and reads the
+same keys (`name`, `packages`, `install_requires`, `tests_require`, a `tests` extra) from the result.
+A splat whose value is not a dict literal — a call, an import, a comprehension — contributes nothing
+and the commit keeps today's refusal: the reader will not execute `setup.py` to find out what
+`**kwargs` holds, because that is third-party code outside Shuru (C3). This is source 4, and it
+applies to every wave.
+
+**A bug the metadata cannot name may carry a reviewed `import_package` — last, and only last.** One
+bug's `import_package` names the module its import-path check loads, as an **optional** declared key
+(`DECLARED_BUG_KEYS` stays the *required* set, so no other bug's entry changes), and the decision is
+recorded in that bug's `reviewed_changes`. It is used only when the metadata itself cannot name the
+import package — `import_name_of`/`import_name_of_pyproject` raising, after the splat resolution
+above has had its turn — so it is a fallback and never a preference: metadata that names the package
+always wins, and the fallback is noted in the bug's provenance when it fires. It names the import
+path only; the bug's dependencies still come from the five sources above. This applies to every
+wave, not only the dev split.
+
 **`setup.py` or `pyproject.toml` — whichever the commit actually carries.** Packaging moved, and a
 bug's dependencies are wherever its own metadata put them, so sources 3 and 4 are read from
 `setup.py` *or* `pyproject.toml` at each commit, never assumed from one file. `fastapi/1`
@@ -487,9 +513,29 @@ Source 5's scope, since "the test side's imports" can be read several ways:
 - **Parsed with `ast`, never imported or executed.** Nothing third-party runs on the host (C3). A file
   that does not parse as Python 3 is recorded and skipped: the target interpreter could not collect it
   either, so its imports cannot be imports the suite makes.
-- **Third-party top-level modules only.** The interpreter's stdlib, the project's own package, and the
-  test side's own local modules are excluded. `bake.PY38_STDLIB` is a committed literal because 3.8
-  predates `sys.stdlib_module_names`, so the harness's own Python cannot be asked what is standard.
+- **Third-party top-level modules only.** The interpreter's stdlib, the project's own package, the
+  test side's own local modules, and **every module the tree itself ships** are excluded.
+  `bake.PY38_STDLIB` is a committed literal because 3.8 predates `sys.stdlib_module_names`, so the
+  harness's own Python cannot be asked what is standard.
+- **A name the tree ships is never a distribution, wherever in the tree it lives.** The test side is
+  not the only thing that can put a name on `sys.path`: fastapi's own `scripts/test.sh` exports
+  `PYTHONPATH=./docs_src`, so
+  `tests/test_tutorial/test_additional_responses/test_tutorial001.py` opens with
+  `from additional_responses.tutorial001 import app` — a directory of the repository's *own* tutorial
+  sources, not a package. Measured: the test-side-only exclusion set missed it and the bake died
+  asking PyPI for `additional-responses` (404), which is the *consequence* and not the cause. The rule
+  is therefore **the directory name of any directory that contains a `.py` file**, at any depth —
+  both pytest's rootdir insertion and the project's own runner put directories on `sys.path`
+  (`bake.tree_provided_modules`) — **and the stem of a `.py` file that sits directly in a directory
+  that is not a package** (that directory has no `__init__.py`), because pytest puts that directory on
+  `sys.path` too: matplotlib's `lib/pylab.py` imports as `pylab` for
+  `lib/matplotlib/tests/test_basic.py` (measured: the closure otherwise emits a distribution named
+  `pylab`, which PyPI does not publish — a 404 — and the bug stops), and pandas'
+  `scripts/validate_docstrings.py` as `validate_docstrings` for
+  `scripts/tests/test_validate_docstrings.py`. A stem *inside* a package is still deliberately **not**
+  counted: `fastapi/requests.py` is importable as `fastapi.requests` and never as a top-level
+  `requests`, so counting those would silently drop the real distribution of that name. This applies
+  to every wave, not only the dev split.
 - **An optional import is recorded, never installed.** An import inside `try/except ImportError`, or
   behind a version check (`sys.version_info`, `PY2`, `six.PY3`), is a fallback: it goes in
   `optional_imports` and not into `installs`, because installing a Python-2-only fallback on 3.8 would
@@ -497,7 +543,18 @@ Source 5's scope, since "the test side's imports" can be read several ways:
 - **An ambiguous module name stops the bake.** `import yaml` is PyYAML and `import bs4` is
   beautifulsoup4; no canonicalisation recovers that. The closure names the module and refuses, and the
   fix is a reviewed `module_distributions` entry in the split — a decision recorded in the protocol,
-  never a guess in the harness.
+  never a guess in the harness. The table is keyed by the **import spelling as written**, so a dotted
+  import needs its full key (`google.protobuf` → `protobuf`, since `google` alone is a distribution of
+  its own on PyPI and would otherwise be installed in protobuf's place); a name the table does not key
+  falls back to its **top-level word** (`import foo.bar` is provided by distribution `foo`, never
+  `foo-bar`). Two names are deliberately *not* in the table. A module whose canonicalised spelling
+  cannot be a PEP 508 name at all — `_csv` canonicalises to `-csv` — is the interpreter's own, not the
+  layer's (measured: pandas/1's `from _csv import Error` reached the merge as `-csv` and stopped that
+  bug over a name nobody can publish), so the closure **notes** it and installs nothing. And
+  `psycopg2`, which two distributions both provide (`psycopg2` and `psycopg2-binary`, same module), so
+  the harness refuses to choose and the bug stays flagged until a reviewer records the pick. This
+  applies to every wave: the table is carried by *both* split files, so a name mapped for the dev split
+  is mapped for the evaluation run too.
 
 Nothing is taken from anywhere else, and no package is ever chosen by hand. The union is **merged to
 one entry per package**, and every claim in that group must agree on one version, or `bake.DepConflict`
@@ -508,9 +565,20 @@ fails that bug and names every claim rather than picking one:
   (`install_requires`) is one requirement, because the reference pin is a legitimate narrowing of the
   project's range. `==1.2.*` is **not** a pin: it matches a range of releases, so it is a bound like
   any other and never the claim a merge settles on.
-- a pin that **violates** another source's bound (`attrs==17.1.0` against `attrs>=17.4.0`), two
-  different `==` pins, or two different bounds, are real conflicts and fail loudly. Not being able to
-  reproduce the environment is the failure this check exists to surface.
+- a pin that **violates** another source's bound is a conflict — **unless the pin is BugsInPy's own**.
+  Two different `==` pins, and two different bounds, are real conflicts and fail loudly: their
+  intersection is a version no source wrote, and not being able to reproduce the environment is the
+  failure this check exists to surface. But when the only unsatisfiable claim is a *project*
+  declaration against BugsInPy's own exact pin — luigi/1 pins `tornado==5.0` in BugsInPy's
+  `requirements.txt` while the project's `install_requires` says `tornado>=4.0,<5` — the **pin wins**,
+  by the reasoning of the date-rule exception below: it is the environment BugsInPy's own `run_test.sh`
+  was validated fail-before/pass-after in, and the §8.2 dev-fix self-check re-verifies that claim on
+  that same bug afterwards. The pin is installed as written, and the claim it beat is **recorded** —
+  `overridden`, as `{spec, source}` pairs, next to the pin's own source in the provenance — so an
+  override is never silent and the record can be read against `setup.py` instead of looking like a
+  harness that never read it. A *project* pin that violates a bound gets no such licence: the project's
+  own declarations contradict each other and nothing in the harness can say which one the buggy tree
+  was built with. This applies to every wave, not only the dev split.
 
 **Pinning.** Every third-party dep is pinned to the newest release published on or before **its own
 declaration's** commit date — the buggy commit's date for a reference the buggy commit declared, or for
@@ -603,7 +671,10 @@ by `bake.resolve_bug_deps`, with two rules that were learned the hard way:
 1. **Read `setup.py`, never execute it.** At the buggy commit, `setup.py` is how these projects
    declare their deps (`install_requires`, `tests_require`, a `tests` extra, or a file they read from
    `install_requires`), so it is source 4 in §3.2 — parsed with `ast`, never run on the host. Running
-   it would mean executing third-party code outside Shuru (C3). If a future project's deps genuinely
+   it would mean executing third-party code outside Shuru (C3). Reading it statically includes
+   following a `setup(**kwargs)` splat back to its module-level dict literal (§3.2, the sanic/1
+   case); and a bug whose metadata even that cannot name may carry a reviewed `import_package` in its
+   split entry, used last and only for the import-path check. If a future project's deps genuinely
    cannot be read statically, that bug is flagged, not improvised around.
 2. **Install the deps, never the project.** `python setup.py install` is deliberately *not* run: it
    writes the buggy package into `site-packages`, where it would shadow the patched tree under test

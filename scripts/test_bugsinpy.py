@@ -422,11 +422,13 @@ class TestSplit:
         splits, because a table that decides every layer's contents is the protocol,
         not a detail a later edit should move quietly.
 
-        ``psycopg2`` is deliberately **absent**: ``import psycopg2`` is provided by
-        two distributions that both exist on PyPI (``psycopg2`` and
-        ``psycopg2-binary``, same module), and picking one is a reviewed choice the
-        harness must not make for the user. Until it is recorded the closure stops
-        that bug, which is the intended behaviour.
+        ``psycopg2`` is the reviewed exception to that "don't guess" rule being *refused*:
+        ``import psycopg2`` is provided by two distributions that both exist on PyPI
+        (``psycopg2`` and ``psycopg2-binary``, same module), so the harness refuses to
+        pick one. The pick is the reviewer's, and it is recorded in the split — the
+        table maps it to ``psycopg2-binary``, with the reason and the pin rule in
+        ``reviewed_changes``. Until that was recorded the closure stopped the bug that
+        reaches the module, which was the intended behaviour.
         """
         required = {
             "PIL": "Pillow",
@@ -449,12 +451,13 @@ class TestSplit:
             "pylab": "matplotlib",
             "mpl_toolkits": "matplotlib",
             "pkg_resources": "setuptools",
+            "psycopg2": "psycopg2-binary",
         }
         dev = load_split(DEV_SPLIT_PATH).module_distributions()
         evaluation = load_split(SPLIT_PATH).module_distributions()
         assert dev == required
         assert evaluation == required
-        assert "psycopg2" not in dev, "psycopg2 names two distributions; the user decides"
+        assert dev["psycopg2"] == "psycopg2-binary", "the reviewer's pick, not a guess"
 
     def test_import_package_is_an_optional_declared_key(self):
         """The last-resort import name, carried only by a bug that needs it (§3.2).
@@ -4969,7 +4972,10 @@ class TestRealMatplotlibAndPandasClosure:
     distribution is a different word (``PIL`` is Pillow, ``dateutil`` is
     python-dateutil), and no canonicalisation recovers it, so the closure refuses to
     guess. The resolution is the split's reviewed ``module_distributions`` — the same
-    decision for the evaluation waves — not a per-bug exception. The same two bugs
+    decision for the evaluation waves — not a per-bug exception. pandas' ``psycopg2``
+    is the same table used for a different reason: two distributions provide that
+    module, so the entry is the reviewer's pick (the reason is in ``reviewed_changes``)
+    and the harness still never guesses. The same two bugs
     exercise the other half of the source: matplotlib's ``lib/pylab.py`` and pandas'
     ``scripts/validate_docstrings.py`` live in directories with no ``__init__.py``, so
     pytest puts them on ``sys.path`` as modules the tree provides, and pandas'
@@ -5028,14 +5034,22 @@ class TestRealMatplotlibAndPandasClosure:
             )
 
     @needs_pandas_repo
-    def test_pandas_resolves_the_four_divergent_modules(self):
+    def test_pandas_resolves_the_five_divergent_modules(self):
+        """``psycopg2`` included: the reviewer's pick is in the table, not the harness.
+
+        [VANTA-WHY] Unlike the other four, ``psycopg2`` was never resolvable by
+        canonicalisation *or* by preference: two distributions provide that module, so
+        the closure refuses until a reviewer records which one — and it is now recorded
+        (``psycopg2-binary``), with the reason in the split's ``reviewed_changes``. The
+        table still decides it, so removing the entry puts the refusal back.
+        """
         _, sources = self._sources("pandas", 1, self.PANDAS_REPO)
         by_spec = self._by_spec(sources.refs)
         assert by_spec["dateutil"] == "python-dateutil"
         assert by_spec["bs4"] == "beautifulsoup4"
         assert by_spec["sklearn"] == "scikit-learn"
         assert by_spec["pkg_resources"] == "setuptools"
-        assert by_spec["psycopg2"] == "psycopg2", "unmapped: canonicalised, not guessed"
+        assert by_spec["psycopg2"] == "psycopg2-binary", "the reviewed pick, not a guess"
 
     @needs_pandas_repo
     def test_pandas_merges_without_a_conflict_and_csv_is_the_interpreters(self):
@@ -5044,6 +5058,8 @@ class TestRealMatplotlibAndPandasClosure:
         assert conflicts == []
         names = {ref.name for ref in merged}
         assert {"beautifulsoup4", "python-dateutil", "scikit-learn", "setuptools"} <= names
+        assert "psycopg2-binary" in names, "mapped by the split; the source build needs libpq"
+        assert "psycopg2" not in names, "the unmapped distribution is never installed"
         assert "-csv" not in names
         refs, _, notes = bake_mod.test_import_closure(
             files=bake_mod.test_side_paths(self.PANDAS_REPO, sources.fixed_commit),

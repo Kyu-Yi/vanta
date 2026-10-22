@@ -35,7 +35,8 @@
     "MySQLdb": "mysqlclient",
     "pylab": "matplotlib",
     "mpl_toolkits": "matplotlib",
-    "pkg_resources": "setuptools"
+    "pkg_resources": "setuptools",
+    "psycopg2": "psycopg2-binary"
   },
   "reviewed_changes": [
     {
@@ -271,6 +272,12 @@
       "change": "PySnooper/3 is development data: its rows are excluded from every reported evaluation result. The exclusion is at the reporting step only. The entry stays in `bugs` with the same wave, role and notes, wave 1 still runs it, and no config, seed, sampling or gate field is touched. The manifest keeps its rows unfiltered — the manifest is raw evidence — so the exclusion is applied where the rates are computed, by dropping this bug's sessions from the labels file `metrics.py --labels` reads; nothing in the harness filters rows by itself, and this record is what tells a reader which sessions are not poolable. The same bug appears in `plans/bugsinpy_dev_split.json` labelled \"seen during development\".",
       "reason": "§14 item 1 replaces a hard reject with a corroborated one after this bug's round-4 bogus generated test asserted output text the issue never mentions, and §14 item 2 scraps exactly that shape of assertion: both were designed with PySnooper/3's transcript in front of them. Any rate computed from its rows would therefore be a number produced by a pipeline tuned on the bug it measures, which §14.7 forbids. The paper reports it as a development case — the mechanism and its before/after behaviour (the no-op still rejects via rule (b); the developer fix stops false-rejecting) — and reports evaluation numbers only from bugs the work was not tuned on. Excluding the row from the report is the minimum change that keeps a tuned-on number out of the pooled results; excluding it from the wave would instead change what wave 1 is, and the wave-1 gate is left counting exactly the rows it counted before.",
       "decided_by": "user review, 2026-10-21"
+    },
+    {
+      "change": "`module_distributions` maps `psycopg2` -> `psycopg2-binary`. `import psycopg2` is provided by two distributions, so the closure refused to choose and stopped the bug that reaches it.",
+      "reason": "The tests only need the module to import: they skip without a database server, so nothing opens a connection and the binary wheel is enough. The source `psycopg2` builds against libpq and needs pg_config, which the sandbox does not have, so choosing it would turn a dependency into a build failure the test never asked for. Recorded here as well as in the development split because the table is the protocol for every wave, not a dev-only detail.",
+      "decided_by": "user review, 2026-10-22",
+      "rule": "The choice is the distribution's, not the harness's, and is pinned by the same date rule as every other dependency (the newest release on or before the declaration's commit date; the closure's own stamp is the fixed commit's). If the pinned psycopg2-binary has no wheel for the sandbox's platform and the bake fails, that is a normal build failure for the bug that needed it, recorded as such -- not special-cased, and not worked around by installing the source distribution."
     }
   ],
   "bugs": [

@@ -35,7 +35,8 @@
     "MySQLdb": "mysqlclient",
     "pylab": "matplotlib",
     "mpl_toolkits": "matplotlib",
-    "pkg_resources": "setuptools"
+    "pkg_resources": "setuptools",
+    "psycopg2": "psycopg2-binary"
   },
   "reviewed_changes": [
     {
@@ -48,6 +49,12 @@
       "change": "Excluded from the candidate pool: ansible, keras and tornado. No bug of theirs in the pinned clone declares ``python_version`` 3.8 (0 of 18, 0 of 45, 0 of 16), so the §1.6 context gate can never pass for them and §14.7's round-robin has nothing to take from these projects.",
       "reason": "Recorded so the skip reads as a decision rather than an omission: a reader comparing the clone's projects with the seven in the round-robin would otherwise have to re-derive it from the corpus. They are not evaluation-wave projects either, and the same fact is noted in the plan doc (§14.7).",
       "decided_by": "user review, 2026-10-21"
+    },
+    {
+      "change": "`module_distributions` maps `psycopg2` -> `psycopg2-binary`. The closure reaches `import psycopg2` from pandas/1's test side, and that module is provided by two distributions, so the harness refused to choose.",
+      "reason": "The bug's tests only need the module to import: the SQL tests skip without a database server, so no live connection is exercised and the binary wheel is enough. The source `psycopg2` builds against libpq and needs pg_config, which the sandbox does not have, so choosing it would turn a dependency into a build failure the test never asked for.",
+      "decided_by": "user review, 2026-10-22",
+      "rule": "The choice is the distribution's, not the harness's, and is pinned by the same date rule as every other dependency (the newest release on or before the declaration's commit date; the closure's own stamp is the fixed commit's). If the pinned psycopg2-binary has no wheel for the sandbox's platform and the bake fails, that is a normal build failure for pandas/1, recorded as such -- not special-cased, and not worked around by installing the source distribution."
     }
   ],
   "bugs": [

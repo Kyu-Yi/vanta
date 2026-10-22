@@ -547,14 +547,22 @@ Source 5's scope, since "the test side's imports" can be read several ways:
   import needs its full key (`google.protobuf` → `protobuf`, since `google` alone is a distribution of
   its own on PyPI and would otherwise be installed in protobuf's place); a name the table does not key
   falls back to its **top-level word** (`import foo.bar` is provided by distribution `foo`, never
-  `foo-bar`). Two names are deliberately *not* in the table. A module whose canonicalised spelling
+  `foo-bar`). One name is deliberately *not* in the table: a module whose canonicalised spelling
   cannot be a PEP 508 name at all — `_csv` canonicalises to `-csv` — is the interpreter's own, not the
   layer's (measured: pandas/1's `from _csv import Error` reached the merge as `-csv` and stopped that
-  bug over a name nobody can publish), so the closure **notes** it and installs nothing. And
-  `psycopg2`, which two distributions both provide (`psycopg2` and `psycopg2-binary`, same module), so
-  the harness refuses to choose and the bug stays flagged until a reviewer records the pick. This
-  applies to every wave: the table is carried by *both* split files, so a name mapped for the dev split
-  is mapped for the evaluation run too.
+  bug over a name nobody can publish), so the closure **notes** it and installs nothing. `psycopg2` is
+  the case the refusal exists for — two distributions both provide it (`psycopg2` and
+  `psycopg2-binary`, same module), so the harness will not choose and the bug stays flagged until a
+  reviewer records the pick. The pick is therefore the reviewer's, written into the table with its
+  reason and its rule in `reviewed_changes` rather than into the harness: `psycopg2` →
+  `psycopg2-binary`, because the bug's tests only need the module to import (the SQL tests skip without
+  a database server, so no connection is exercised) while the source distribution builds against libpq
+  and needs a `pg_config` the sandbox does not have. Nothing about it is otherwise special: the mapped
+  distribution is pinned by the same date rule as every other dependency, and a pin with no wheel for
+  the sandbox's platform fails the bake as an ordinary build failure for that bug — flagged, not
+  worked around, and never answered by falling back to the source distribution. This applies to every
+  wave: the table is carried by *both* split files, so a name mapped for the dev split is mapped for
+  the evaluation run too.
 
 Nothing is taken from anywhere else, and no package is ever chosen by hand. The union is **merged to
 one entry per package**, and every claim in that group must agree on one version, or `bake.DepConflict`

@@ -385,7 +385,13 @@ as the comment on the entry, so a reader argues with the evidence rather than wi
 measures that review settled (`coverage`, `multidict`, `yarl`, `websockets`, `tornado`, `urwid`,
 `zope-interface`, `regex`, `sqlalchemy`, `psutil`, `ruamel-yaml-clib`, `httptools`, `ujson`, `brotli`,
 `zstandard`, `asyncpg`, `numpy`, `cython`, `distlib` → toolchain only; `pyyaml` → `libyaml-dev`;
-`peewee` → `libsqlite3-dev`) are in the map itself, each with its evidence.
+`peewee` → `libsqlite3-dev`; `matplotlib` → `libfreetype-dev` + `libpng-dev` + `zlib1g-dev` +
+`pkg-config`) are in the map itself, each with its evidence. The matplotlib entry is the case that shows
+the two readers are one design and not two lists: its four packages are already in
+`_PY38_BASE_PACKAGES`, so the interpreter's install list is unchanged — but a `pandas/1` pin of
+`matplotlib==3.2.1` still reaches the preflight's `gap`, and this entry is what clears it, from
+`setupext.py`'s own `pkg_config_setup_extension` calls (`'freetype2'`, `'libpng'`, `deplib('z')`) and
+`get_pkg_config`, which is the `pkg-config` it needs to find them.
 
 The interpreter recipe installs the union (§3.2's
 build-toolchain rule for the *system* half: the pinned `setuptools`/`wheel`/`Cython` are the Python
@@ -548,9 +554,18 @@ install be left out of the layer?" — and never the closure's question — "whi
 carry?". `bake.test_import_closure` installs them like any other import, exactly as it did before the
 reasons existed; they are read only by `bake.tree_import_sites` → `bake.import_auditor` →
 `bake.decide_unresolvable`, and only for a pin that is class (c) unavailable or
-`UNBUILDABLE_ON_PLATFORM`. The distinction is not cosmetic: read as closure reasons they shrank
-`pandas/1`'s layer by three packages, and the tests that ask for them then *skipped* — which no failure
-set can see (measured below). What the audit reads on `pandas/1` starts at
+`UNBUILDABLE_ON_PLATFORM`. The distinction is not cosmetic, and it is **measurably larger than the three
+the tests ask for by name**: read as closure reasons they took `pandas/1`'s merged pin list from the **41**
+names it is at `39063e5` to the **22** at `4615f27` — nineteen names gone, printed as **24 pins** once the
+two plugin pins are added, because `bs4`/`sklearn`/`psycopg2` are only the visible edge. The nineteen are
+`beautifulsoup4`, `botocore`, `cftime`, `dask`, `fastparquet`, `ipython`, `jedi`, `numba`, `numexpr`,
+`openpyxl`, `psycopg2-binary`, `pymysql`, `s3fs`, `scikit-learn`, `scipy`, `sqlalchemy`, `statsmodels`,
+`xarray` and `xlrd`; `llvmlite` is in neither commit's refs at all, because nothing in either tree imports
+it. The fix restores the list name for name, and the regression test asserts that **whole** list — the
+merged list and not the closure, since it is the merged list the preflight counts — so the only difference
+left is §3.2's drop of the two pins this image cannot build, `numba` and `pyarrow`, each with its audit
+(`41` refs → `39` installs). The bug is exactly this: the tests that ask for a missing package *skip*, and
+no failure set can see a skip (measured below). What the audit reads on `pandas/1` starts at
 `pandas/core/arrays/boolean.py` at `3fd150c`:
 
     if TYPE_CHECKING:

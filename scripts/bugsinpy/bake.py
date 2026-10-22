@@ -256,6 +256,13 @@ SDIST_SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
     "distlib": (),  # PC/launcher.c is the Windows launcher, never built here
     "httptools": (),  # vendor/http-parser/ is inside the sdist
     "lxml": ("libxml2-dev", "libxslt1-dev"),
+    "matplotlib": (
+        "libfreetype-dev",
+        "libpng-dev",
+        "zlib1g-dev",
+        "pkg-config",
+    ),  # setupext.py: FreeType via pkg-config 'freetype2' and Png via 'libpng', both
+    # default_libraries=[..., deplib('z')] — and get_pkg_config() is what locates them
     "multidict": (),  # multidict/_multidict.c + _multilib/*.h only
     "numpy": (),  # bundled f2c lapack_lite; get_info('lapack_opt', 0) falls back
     "peewee": ("libsqlite3-dev",),  # setup.py libraries=['sqlite3'] (optional ext)

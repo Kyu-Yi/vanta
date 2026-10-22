@@ -882,9 +882,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         return args.func(args)
     except EXPECTED_ERRORS as exc:
-        # A bake that failed still owes the reader the summary of what it rebuilt,
-        # skipped and failed, and every other expected error owes the reader its own
-        # message; both are printed, not traced (see EXPECTED_ERRORS).
+        # A bake that failed still owes the reader the summary of what it built,
+        # deleted, skipped and failed — including the layers a failed interpreter
+        # layer left unstarted — and every other expected error owes the reader its
+        # own message; both are printed, not traced (see EXPECTED_ERRORS).
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_HARNESS_FAILED
     except KeyboardInterrupt:

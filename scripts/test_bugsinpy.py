@@ -3074,6 +3074,18 @@ class TestBake:
         assert bake_mod.BUILD_ENV_RECORD in recipe
         assert "env | grep -E" in recipe
 
+    def test_the_record_is_echoed_between_its_sentinels(self):
+        """What the bake log re-prints has to be framed in the build's own output."""
+        recipe = self._recipe()
+        assert recipe.index(bake_mod.BUILD_ENV_HEADER) < recipe.index(
+            f"cat {bake_mod.BUILD_ENV_RECORD}"
+        )
+        assert recipe.index(f"cat {bake_mod.BUILD_ENV_RECORD}") < recipe.index(
+            bake_mod.BUILD_ENV_FOOTER
+        )
+        # The smoke line and the reader of it agree on the words, by construction.
+        assert f"print('{bake_mod._SMOKE_PREFIX}" in recipe
+
     def test_a_source_build_runs_after_the_compiler_is_exported(self):
         """The export is what the build reads; before it, the recorded compiler runs."""
         recipe = self._recipe()
@@ -3600,37 +3612,72 @@ class TestRunBakeActions:
             PY38,
         ]
 
-    def test_a_failed_build_stops_the_run_and_leaves_nothing_behind(self):
+    def test_a_failed_per_bug_layer_does_not_stop_the_others(self):
+        """The layers are independent: one bug's failure says nothing about the next."""
         recorder = self.Recorder(
             present={PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"},
             failing={"vanta-bi-Demo-1"},
         )
         with pytest.raises(bake_mod.BakeError) as excinfo:
             self._run(_layers(PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"), recorder, force=True)
-        message = str(excinfo.value)
-        # Fail fast: the layer after the failure is not attempted.
-        assert [name for verb, name in recorder.calls if verb == "build"] == [PY38, "vanta-bi-Demo-1"]
+        # Both per-bug layers are attempted, in plan order, whatever the first did.
+        assert [name for verb, name in recorder.calls if verb == "build"] == [
+            PY38,
+            "vanta-bi-Demo-1",
+            "vanta-bi-Demo-2",
+        ]
         # And the half-baked name is gone, so prepare cannot accept it.
         assert not recorder.exists("vanta-bi-Demo-1")
-        assert "FAILED" in message and "vanta-bi-Demo-1" in message
-        assert "bake summary:" in message
+        assert recorder.exists("vanta-bi-Demo-2")
+        message = str(excinfo.value)
+        assert "1 layer(s) failed to bake:" in message
+        # The last *meaningful* line of that layer's output, not a truncated tail.
+        assert "vanta-bi-Demo-1: exit 1 — shuru: refusing to build vanta-bi-Demo-1" in message
+        assert "[FAILED] vanta-bi-Demo-1" in message
+        assert "[done] vanta-bi-Demo-2" in message
+        assert "nothing was left behind" in message
+
+    def test_a_failed_interpreter_layer_leaves_everything_above_it_not_started(self):
+        """The one failure that stops the run: every other layer is baked from it.
+
+        The labels are the point. The old summary called the layers after a failure
+        ``[done]`` — four names a reader would take for layers that exist, which is
+        the one thing ``prepare`` acts on.
+        """
+        recorder = self.Recorder(present={PY38, "vanta-bi-Demo-1"}, failing={PY38})
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._run(_layers(PY38, "vanta-bi-Demo-1"), recorder, force=True)
+        assert [name for verb, name in recorder.calls if verb == "build"] == [PY38]
+        message = str(excinfo.value)
+        assert "[FAILED] vanta-bugsinpy-py3.8" in message
+        assert "[not started] vanta-bi-Demo-1" in message
+        assert "[done]" not in message
 
     def test_a_layer_that_survives_its_own_failure_is_reported_not_hidden(self):
         """If the cleanup delete does not take, say so instead of leaving it live."""
         recorder = self.Recorder(
-            present={PY38, "vanta-bi-Demo-1"},
+            present={PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"},
             failing={"vanta-bi-Demo-1"},
             sticky={"vanta-bi-Demo-1"},
         )
-        with pytest.raises(bake_mod.BakeError, match="could not be removed"):
-            self._run(_layers(PY38, "vanta-bi-Demo-1"), recorder, force=True)
+        with pytest.raises(bake_mod.BakeError, match="could not be removed") as excinfo:
+            self._run(_layers(PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"), recorder, force=True)
         assert recorder.exists("vanta-bi-Demo-1"), "the test's own premise"
+        message = str(excinfo.value)
+        # The survivor is named as surviving, and the claim about the rest is not made.
+        assert "still exist: vanta-bi-Demo-1" in message
+        assert "nothing was left behind" not in message
+        # A sticky delete is not a reason to throw away the rest of the run.
+        assert [name for verb, name in recorder.calls if verb == "build"][-1] == (
+            "vanta-bi-Demo-2"
+        )
 
     def test_the_summary_names_what_was_rebuilt_skipped_and_failed(self):
         recorder = self.Recorder(present={PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"})
         summary = self._run(_layers(PY38, "vanta-bi-Demo-1"), recorder, force=True)
         assert "[done] vanta-bi-Demo-1: delete+rebuild" in summary
-        assert "[skipped] vanta-bi-Demo-2: delete" in summary
+        # A stale child is *deleted*, which is not the same statement as "skipped".
+        assert "[deleted] vanta-bi-Demo-2: delete" in summary
         assert "[done] vanta-bugsinpy-py3.8" in summary
 
     def test_without_force_a_baked_layer_is_not_touched(self):
@@ -3638,6 +3685,99 @@ class TestRunBakeActions:
         summary = self._run(_layers(PY38, "vanta-bi-Demo-1"), recorder, force=False)
         assert recorder.calls == []
         assert summary.count("[skipped]") == 2
+
+    def test_the_run_logs_each_built_layers_own_build_environment(self):
+        logged: list[str] = []
+
+        def build(name, script, base):
+            return bake_mod.ExecResult(
+                stdout=(
+                    f"{bake_mod.BUILD_ENV_HEADER}\nCC=gcc\nCXX=g++\n"
+                    f"{bake_mod.BUILD_ENV_FOOTER}\n"
+                    f"{bake_mod._SMOKE_PREFIX}: C and C++ extensions build and import\n"
+                ),
+                stderr="",
+                exit_code=0,
+                timed_out=False,
+            )
+
+        summary = bake_mod.run_bake_actions(
+            bake_mod.plan_layers(
+                _layers(PY38), force=True, children=self.CHILDREN, exists=lambda name: False
+            ),
+            children=self.CHILDREN,
+            exists=lambda name: True,
+            remove=lambda name: None,
+            build=build,
+            log=logged.append,
+        )
+        assert "[vanta-bugsinpy-py3.8] CC=gcc" in logged
+        assert f"[vanta-bugsinpy-py3.8] {bake_mod.BUILD_ENV_HEADER}" in logged
+        assert (
+            f"[vanta-bugsinpy-py3.8] {bake_mod._SMOKE_PREFIX}: C and C++ extensions "
+            "build and import"
+        ) in logged
+        assert "[done] vanta-bugsinpy-py3.8" in summary
+
+
+class TestBakeLogProvenance:
+    """What the bake's own log says about a layer, without booting anything."""
+
+    def test_the_record_between_the_sentinels_is_what_comes_back(self):
+        """Including the ``set -x`` traces, which are the reason for exact sentinels."""
+        output = "\n".join(
+            [
+                "+ echo 'vanta build env (/opt/vanta-build-env.txt):'",
+                "vanta build env (/opt/vanta-build-env.txt):",
+                "+ cat /opt/vanta-build-env.txt",
+                "CC=gcc",
+                "CXX=g++",
+                "LDCXXSHARED=g++ -pthread -shared",
+                "LDSHARED=gcc -pthread -shared",
+                "vanta build env end",
+                "+ python -c \"import sys; print('toolchain smoke ok: C and C++')\"",
+                "toolchain smoke ok: C and C++ extensions build and import",
+                "Successfully installed decorator-4.4.0",
+            ]
+        )
+        assert bake_mod.layer_provenance_lines(output) == [
+            "vanta build env (/opt/vanta-build-env.txt):",
+            "CC=gcc",
+            "CXX=g++",
+            "LDCXXSHARED=g++ -pthread -shared",
+            "LDSHARED=gcc -pthread -shared",
+            "vanta build env end",
+            "toolchain smoke ok: C and C++ extensions build and import",
+        ]
+
+    def test_a_layer_with_no_record_and_no_smoke_prints_nothing(self):
+        """A 3.6/3.7 layer has no toolchain, so it has nothing to say here."""
+        assert bake_mod.layer_provenance_lines("pip install ok\n") == []
+
+    def test_the_error_line_is_the_last_line_that_says_something(self):
+        # The measured fragment: the merged log ended mid-write, in one character.
+        assert bake_mod.last_error_line("Collecting numpy\ni") == "Collecting numpy"
+        # A `set -x` trace is the shell echoing a command, not the error.
+        assert bake_mod.last_error_line("FAILED: cffi\n+ exit 1\n") == "FAILED: cffi"
+        # pip's progress output overwrites its own line in place.
+        assert bake_mod.last_error_line("x\rInstalling collected packages: numpy") == (
+            "Installing collected packages: numpy"
+        )
+        assert bake_mod.last_error_line("") == "(no output)"
+        assert bake_mod.last_error_line("a\n\n  \n") == "(no output)"
+
+    def test_a_layer_not_reached_is_not_called_done(self):
+        actions = bake_mod.plan_layers(
+            _layers(PY38, "vanta-bi-Demo-1"),
+            force=True,
+            children={"vanta-bi-Demo-1": PY38},
+            exists=lambda name: False,
+        )
+        summary = bake_mod.summarise(
+            actions, failed=[PY38], attempted=[PY38], survived=[]
+        )
+        assert "[FAILED] vanta-bugsinpy-py3.8" in summary
+        assert "[not started] vanta-bi-Demo-1" in summary
 
 
 def _wheel(filename: str) -> bake_mod.PyPIFile:
@@ -7538,10 +7678,10 @@ class TestOneBugDoesNotStopTheBatch:
     def test_a_bake_that_fails_at_a_build_still_ends_with_the_flagged_list(
         self, tmp_path, monkeypatch, capsys
     ):
-        """[VANTA-WHY] ``run_bake_actions`` raises on the first failed build.
+        """[VANTA-WHY] ``run_bake_actions`` raises at the end, with every failure.
 
         That is exactly the run whose reader has to know which bugs were flagged
-        before it: the failure message names the layer that failed, and the flagged
+        before it: the failure message names the layers that failed, and the flagged
         list is the other half of "what did this run not do".
         """
         code = self._bake_cli(

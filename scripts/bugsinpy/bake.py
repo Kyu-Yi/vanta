@@ -444,6 +444,20 @@ so what it actually was has to be a fact about the layer rather than a line in a
 recipe nobody can read after the fact.
 """
 
+BUILD_ENV_HEADER = f"vanta build env ({BUILD_ENV_RECORD}):"
+BUILD_ENV_FOOTER = "vanta build env end"
+"""The two lines that frame the record in the layer's own build log.
+
+[VANTA-WHY] The record is echoed *inside* the build and framed, rather than read
+back later with a probe that boots the layer again: the interpreter layer already
+boots twice to verify its marker, and a third boot per layer would be paid twelve
+times for a file the build itself just wrote. The frame is what makes the echo a
+fact rather than a filter: ``run_bake_actions`` re-prints exactly the lines between
+these two sentinels, so what appears in the bake log is the layer's own record —
+not a guess assembled out of whatever the build happened to print. Exact match, not
+a substring, because ``set -x`` echoes the ``echo`` that prints them.
+"""
+
 _SYSCONFIG_COMPILER_KEYS = ("CC", "CXX", "LDSHARED", "LDCXXSHARED")
 
 
@@ -508,8 +522,55 @@ def build_env_lines(env: Mapping[str, str]) -> list[str]:
         # `set -e` sees the last command in a pipeline, so this is the record rather
         # than the check — the check is the line above it.
         f"env | grep -E '^({pattern})=' | sort > {BUILD_ENV_RECORD}",
+        # Echoed between the two sentinels so the layer's own record reaches the bake
+        # log (BUILD_ENV_HEADER): what the exports actually were is the one fact a
+        # reader of a failed source build cannot recover from the recipe.
+        f"echo {shlex.quote(BUILD_ENV_HEADER)}",
         f"cat {BUILD_ENV_RECORD}",
+        f"echo {shlex.quote(BUILD_ENV_FOOTER)}",
     ]
+
+
+_ENV_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+"""One ``NAME=value`` line of a build-environment record."""
+
+_SMOKE_PREFIX = "toolchain smoke ok"
+"""What the interpreter layer prints when both smoke extensions built and imported."""
+
+
+def layer_provenance_lines(output: str) -> list[str]:
+    """The compiler-environment record and the toolchain smoke result in one log.
+
+    ``output`` is a layer's own build output, so these are facts about *that* layer:
+    the record is the file the build wrote inside it (:data:`BUILD_ENV_RECORD`), and
+    the smoke line is the interpreter layer's C/C++ extension check having passed.
+
+    Three rules keep this from turning noise into provenance. The block is read only
+    between the exact sentinels, because ``set -x`` echoes the commands that print
+    them. Inside the block only ``NAME=value`` lines are kept, because the trace of
+    the ``cat`` itself is a line in the same stream. The smoke line is matched at the
+    *start* of the stripped line, because the shell's trace of the ``python -c`` that
+    prints it contains the same words — measured shape of a log where the trace and
+    the output are interleaved.
+    """
+    inside = False
+    out: list[str] = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if line == BUILD_ENV_HEADER:
+            inside = True
+            out.append(line)
+            continue
+        if line == BUILD_ENV_FOOTER:
+            out.append(line)
+            inside = False
+            continue
+        if inside:
+            if _ENV_LINE_RE.match(line):
+                out.append(line)
+        elif line.startswith(_SMOKE_PREFIX):
+            out.append(line)
+    return out
 
 
 _TOOLCHAIN_SMOKE_DIR = "/tmp/vanta-toolchain-smoke"
@@ -612,7 +673,7 @@ def toolchain_smoke_lines(env: Mapping[str, str]) -> list[str]:
         "VANTA_SMOKE_SETUP",
         f'cd {directory} && python setup.py build_ext --inplace && python -c "import '
         "vanta_smoke_c, vanta_smoke_cpp; assert vanta_smoke_c.value() == 1 and "
-        "vanta_smoke_cpp.value() == 2; print('toolchain smoke ok: C and C++ "
+        f"vanta_smoke_cpp.value() == 2; print('{_SMOKE_PREFIX}: C and C++ "
         'extensions build and import\')"',
     ]
 
@@ -5150,18 +5211,93 @@ def build_order(actions: Sequence[LayerAction]) -> list[LayerAction]:
     return [action for action in actions if action.build]
 
 
-def summarise(actions: Sequence[LayerAction], *, failed: Sequence[str] = ()) -> str:
-    """The bake's one-line-per-layer record, for the log and for the failure path."""
+def summarise(
+    actions: Sequence[LayerAction],
+    *,
+    failed: Sequence[str] = (),
+    attempted: Optional[Sequence[str]] = None,
+    survived: Sequence[str] = (),
+) -> str:
+    """The bake's one-line-per-layer record, for the log and for the failure path.
+
+    [VANTA-WHY] Every label is a statement about what happened, and the earlier
+    version's ``[done]`` was not: it was printed for any action whose plan said
+    "build", including the four layers *after* the one that failed, none of which
+    was ever attempted. A reader took that summary for a list of layers that exist —
+    which is the one thing ``prepare`` acts on. So ``done`` now requires the build to
+    have been attempted and to have returned, ``not started`` is its own label, and a
+    delete-only action says ``deleted`` instead of hiding behind ``skipped``.
+
+    ``attempted`` is *which* build actions were reached, in order. ``None`` means
+    "not recorded — treat every planned build as attempted", which is what a caller
+    summarising a plan rather than a run is asking for.
+    """
+    reached = None if attempted is None else set(attempted)
+    failed_set = set(failed)
     lines = ["bake summary:"]
     for action in actions:
-        state = "FAILED" if action.name in failed else "done" if action.build else "skipped"
+        if action.name in failed_set:
+            state = "FAILED"
+        elif action.build:
+            state = "done" if reached is None or action.name in reached else "not started"
+        elif action.delete:
+            state = "deleted"
+        else:
+            state = "skipped"
         lines.append(f"  [{state}] {action.describe()}")
     if failed:
-        lines.append(
-            f"  {len(failed)} layer(s) failed: {', '.join(failed)} — nothing was "
-            "left behind for prepare to treat as valid"
-        )
+        lines.append(_failed_footer(failed, survived))
     return "\n".join(lines)
+
+
+def _failed_footer(failed: Sequence[str], survived: Sequence[str]) -> str:
+    """What the run left behind, said exactly — including when the answer is "a name".
+
+    A failed build's checkpoint is deleted and the deletion *verified*
+    (:func:`run_bake_actions`), because ``shuru checkpoint create`` saves the
+    checkpoint before it reports the inner command's failure. That is the normal
+    case, and it is the one that lets the summary claim nothing was left behind. When
+    the delete does not take, the claim is not softened but replaced: the name is
+    listed, and the reader is told that this one name *would* be accepted.
+    """
+    names = ", ".join(failed)
+    if not survived:
+        return (
+            f"  {len(failed)} layer(s) failed: {names} — each was deleted again and "
+            "its absence verified, so nothing was left behind for prepare to treat "
+            "as valid"
+        )
+    return (
+        f"  {len(failed)} layer(s) failed: {names}. These could not be removed and "
+        f"still exist: {', '.join(survived)} — under those names a half-baked layer "
+        "would be treated as valid by prepare (the marker is absent, but the name is "
+        "not); delete them by hand before running anything else"
+    )
+
+
+_MIN_ERROR_LINE_CHARS = 4
+"""Shorter than this, a line is not an error message.
+
+Measured: a failed bake's message ended in ``failed (exit 1): i`` — the last thing
+in the merged build output was a one-character fragment, so the tail of the log is
+not the same thing as the error. The last line that has anything in it is.
+"""
+
+
+def last_error_line(output: str) -> str:
+    """The last line of a failed build that says something, or a placeholder.
+
+    Lines are read from the end, so the *first* one that is not blank, not a ``set
+    -x`` trace (``+ …``), and not a fragment is the answer. ``\\r`` is treated as a
+    line break because pip's progress output overwrites a line in place: without it
+    the "line" is the whole carousel concatenated.
+    """
+    for raw in reversed(output.replace("\r", "\n").splitlines()):
+        line = raw.strip()
+        if len(line) < _MIN_ERROR_LINE_CHARS or line.startswith("+ "):
+            continue
+        return line
+    return "(no output)"
 
 
 def _bake_layer(name: str, script: str, base: str) -> ExecResult:
@@ -5183,18 +5319,36 @@ def run_bake_actions(
     build: Callable[[str, str, str], ExecResult] = _bake_layer,
     log: Callable[[str], None] = print,
 ) -> str:
-    """Delete, then build, and stop at the first failure with a full summary.
+    """Delete, then build every layer the plan asks for, and report what happened.
 
     Takes the plan :func:`plan_layers` produced rather than re-deriving it: what is
     logged before the run has to be the same list that is executed, or the log is
     describing a different bake.
 
-    [VANTA-WHY] Fail fast, and fail *clean*: a layer that failed to build must not
-    survive under a name ``prepare`` will accept. ``checkpoint_create`` deletes on
-    a failed inner command, but a failed ``delete`` of its own would leave the name
-    in place, so the absence is verified here rather than assumed — this is the one
-    post-condition where "probably" is not good enough, because a surviving
-    half-baked layer is invisible to every later stage.
+    [VANTA-WHY] One failed *per-bug* layer does not stop the others. They are
+    independent by construction — each is baked ``--from`` the interpreter layer and
+    none is baked from another — so a bug that cannot resolve its dependencies says
+    nothing about the next one, and stopping at the first turns a nine-bug run into
+    nine runs to learn nine facts. Every failure is collected and reported together at
+    the end. The interpreter layer is the exception and stops
+    everything: it is the base of every layer stacked on it, so a layer that failed
+    there would fail its children too, and each of those names would burn a bake
+    cycle to learn the same thing.
+
+    [VANTA-WHY] Fail *clean*: a layer that failed to build must not survive under a
+    name ``prepare`` will accept. ``checkpoint_create`` deletes on a failed inner
+    command, but a failed ``delete`` of its own would leave the name in place, so the
+    absence is verified here rather than assumed — this is the one post-condition
+    where "probably" is not good enough, because a surviving half-baked layer is
+    invisible to every later stage. When the verification fails, that fact is carried
+    into the summary by name (:func:`_failed_footer`) instead of the run claiming
+    nothing was left behind.
+
+    A built layer's own build-environment record and toolchain smoke result are
+    re-printed here (:func:`layer_provenance_lines`), so the log of a run carries the
+    layer's provenance rather than only the recipe that was supposed to produce it.
+    There is nothing to print for a layer that was skipped: it was not built in this
+    run, and what is being reported is this run.
 
     Injected ``exists``/``remove``/``build``/``log`` so the whole sequence is a
     structural test rather than something only a real bake can exercise.
@@ -5204,26 +5358,62 @@ def run_bake_actions(
         remove(action.name)
 
     failed: list[str] = []
+    results: dict[str, ExecResult] = {}
+    attempted: list[str] = []
+    survived: list[str] = []
     for action in build_order(actions):
         log(f"[{action.name}] building from {action.base} — {action.reason}")
+        attempted.append(action.name)
         result = build(action.name, action.script, action.base)
         if not result.ok:
             failed.append(action.name)
+            results[action.name] = result
             if exists(action.name):
                 remove(action.name)
             if exists(action.name):
-                raise BakeError(
-                    f"baking {action.name} failed and the layer could not be removed, "
-                    "so it would be treated as valid by prepare; delete it by hand "
-                    f"before running anything.\n\n{summarise(actions, failed=failed)}\n"
-                    f"--- build log (tail) ---\n"
-                    f"{(result.stdout + result.stderr).strip()[-2000:]}"
-                )
-            raise BakeError(
-                f"baking {action.name} failed (exit {result.exit_code}): "
-                f"{(result.stdout + result.stderr).strip()[-2000:]}\n\n"
-                f"{summarise(actions, failed=failed)}"
-            )
+                survived.append(action.name)
+            if action.base == DEFAULT_BASE:
+                # An interpreter layer is the base of every layer stacked on it, so
+                # nothing after this point is worth attempting. The layers that were
+                # not reached are labelled ``not started`` in the summary.
+                break
+            continue
         log(f"[{action.name}] ok — marker {MARKER} verified")
+        for line in layer_provenance_lines(result.stdout + result.stderr):
+            log(f"[{action.name}] {line}")
 
-    return summarise(actions)
+    summary = summarise(
+        actions, failed=failed, attempted=attempted, survived=survived
+    )
+    if failed:
+        raise BakeError(_failure_report(failed, results, summary))
+    return summary
+
+
+def _failure_report(
+    failed: Sequence[str], results: Mapping[str, ExecResult], summary: str
+) -> str:
+    """Every failed layer, one line each, then the summary and the last build log.
+
+    The one-line entry carries the **last meaningful line** of that layer's output
+    (:func:`last_error_line`) rather than a tail: the measured message ended
+    ``failed (exit 1): i``, which names no failure at all. The tail is still there for
+    the last failure, below, because the one-line summary is a pointer and the log is
+    the evidence.
+    """
+    lines = [f"{len(failed)} layer(s) failed to bake:"]
+    for name in failed:
+        result = results[name]
+        state = (
+            "timed out" if result.timed_out else f"exit {result.exit_code}"
+        )
+        lines.append(
+            f"  {name}: {state} — {last_error_line(result.stdout + result.stderr)}"
+        )
+    lines.append("")
+    lines.append(summary)
+    last = results[failed[-1]]
+    lines.append("")
+    lines.append("--- build log of the last failure (tail) ---")
+    lines.append((last.stdout + last.stderr).strip()[-2000:])
+    return "\n".join(lines)

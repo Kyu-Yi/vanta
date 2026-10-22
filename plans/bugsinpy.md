@@ -520,12 +520,41 @@ decides the whole run before touching anything, in this order:
    removed and listed with its reason rather than left for `prepare` to run a suite in;
 3. **build** base before child (`layer_recipes` order).
 
-A layer outside the selection is never touched except as a stale child in step 2. The bake then stops
-at the first failed build, deletes whatever the failure left behind (`shuru checkpoint create` saves a
-checkpoint *before* reporting the inner command failed), and prints a one-line-per-layer summary
-(`rebuilt` / `skipped` / `FAILED`) so a half-finished run cannot leave a name that `prepare` would
-treat as valid. `bake` exits non-zero on any failure, and the commands are chained with `&&` so
-`prepare` never runs against a broken set.
+A layer outside the selection is never touched except as a stale child in step 2.
+
+**One failed per-bug layer does not stop the others; a failed interpreter layer stops everything above
+it.** The per-bug layers are independent by construction — each is baked `--from` the interpreter layer
+and none is baked from another — so a bug that cannot resolve its dependencies says nothing about the
+next one, and stopping at the first turns an eleven-bug run into eleven runs to learn eleven facts.
+Every per-bug failure is therefore collected and reported **together at the end**, once the rest have
+been built. The interpreter layer is the one exception: every layer in the run is stacked on it, so a
+failure there would fail each child too, and each of those names would burn a bake cycle to learn the
+same thing. The run stops there, and the layers after it are labelled `[not started]`.
+
+**The summary labels what happened, and the log carries the layer's own provenance.** A failed build's
+checkpoint is deleted and the deletion *verified*, because `shuru checkpoint create` saves a checkpoint
+*before* reporting the inner command failed — so the one-line-per-layer summary can say that nothing was
+left behind and mean it, naming the survivors instead when a delete does not take (a name that survived
+is a name `prepare` would accept, which is why it is named rather than the claim being softened). Each
+layer is labelled from what actually happened: `[done]` only for a layer that was built and whose marker
+was verified, `[FAILED]`, `[not started]` for one a failed interpreter layer stopped the run short of,
+`[deleted]` for a stale child removed, `[skipped]` for one this run did not touch. `[done]` was
+previously printed for every layer the *plan* said to build, including the four after a failure that
+were never attempted — a list of names a reader, and `prepare`, would take for layers that exist. Each
+failure's line in the error carries the **last meaningful line** of that layer's own build output rather
+than a tail (`failed (exit 1): i` is what a tail produced), followed by the summary and the tail of the
+last failure's log.
+
+A built layer also echoes its own `/opt/vanta-build-env.txt` — the `CC`/`CXX`/`LDSHARED`/`LDCXXSHARED`
+the build actually exported, not the ones the recipe intended — and the interpreter layer's toolchain
+smoke result into the bake log, so the log of a run is the provenance of the layers it built. The echo is
+produced *inside* the build between two sentinel lines (`vanta build env (…)` / `vanta build env end`)
+and re-printed by `bake.run_bake_actions`, rather than read back with a probe that boots each layer a
+third time: the interpreter layer already boots twice to verify its marker, and a boot per layer would be
+paid twelve times for a file the build itself just wrote.
+
+`bake` exits non-zero on any failure, and the commands are chained with `&&` so `prepare` never runs
+against a broken set.
 
 **One existence check, shared.** `bake.layer_exists` (→ `shuru.checkpoint list`, matching the first
 token of each line) is the only function that answers "does this layer exist". `prepare`'s preflight

@@ -2220,22 +2220,38 @@ class TestSuiteCommand:
 
 
 class TestSuiteReport:
-    def test_parse_report(self, tmp_path):
-        path = write(
-            tmp_path / "r.json",
-            json.dumps(
-                {
-                    "tests": [
-                        {"nodeid": "tests/test_a.py::test_b", "outcome": "failed"},
-                        {"nodeid": "tests/test_a.py::test_c", "outcome": "passed"},
-                    ]
-                }
-            ),
-        )
-        assert suite_mod.parse_report(path) == {
-            "tests/test_a.py::test_b": "failed",
-            "tests/test_a.py::test_c": "passed",
-        }
+    """The reader must handle both plugin schemas, because which one is written
+    depends on the bug's own pytest pin (§3.2): 0.1/0.2 write a flat list, 0.3+
+    write ``{"tests": [...]}``. Both versions are actually in use — httpie/1's
+    ``pytest==3.2.1`` caps the plugin at 0.2 — so both get a test.
+    """
+
+    TESTS = [
+        {"nodeid": "tests/test_a.py::test_b", "outcome": "failed"},
+        {"nodeid": "tests/test_a.py::test_c", "outcome": "passed"},
+    ]
+    EXPECTED = {
+        "tests/test_a.py::test_b": "failed",
+        "tests/test_a.py::test_c": "passed",
+    }
+
+    def test_parse_report_reads_the_mapping_schema_0_3_and_later_write(self, tmp_path):
+        path = write(tmp_path / "r.json", json.dumps({"tests": self.TESTS}))
+        assert suite_mod.parse_report(path) == self.EXPECTED
+
+    def test_parse_report_reads_the_flat_list_schema_0_1_and_0_2_write(self, tmp_path):
+        """The newest plugin that accepts httpie/1's pytest==3.2.1 is 0.2."""
+        path = write(tmp_path / "r.json", json.dumps(self.TESTS))
+        assert suite_mod.parse_report(path) == self.EXPECTED
+
+    def test_a_missing_mapping_key_is_an_empty_report_not_an_error(self, tmp_path):
+        path = write(tmp_path / "r.json", json.dumps({"created": 0.0}))
+        assert suite_mod.parse_report(path) == {}
+
+    def test_a_top_level_that_is_neither_schema_is_an_error(self, tmp_path):
+        path = write(tmp_path / "r.json", json.dumps("passed"))
+        with pytest.raises(suite_mod.SuiteError, match="top level"):
+            suite_mod.parse_report(path)
 
     def test_parse_report_missing_file(self, tmp_path):
         with pytest.raises(suite_mod.SuiteError, match="cannot read"):
@@ -2368,14 +2384,30 @@ class TestPrepareInvariants:
         assert len(mismatches) == 1
         assert "fixed_commit" in mismatches[0]
 
-    def test_check_declared_requires_needs_build_when_pythonpath_is_set(self):
+    def test_a_pythonpath_into_the_tree_needs_build_in_the_split(self, monkeypatch):
+        """The clause lives in ``check_build_declared``, which reads the tree (§3.2).
+
+        ``check_declared`` is metadata-only now: ``needs_build`` is a property of the
+        cloned tree, not of BugsInPy's ``bug.info``, so it is checked against the
+        clone in both directions rather than inferred from ``pythonpath``.
+        """
+        monkeypatch.setattr(
+            bake_mod,
+            "needs_build_at",
+            lambda repo, commit, *, pythonpath=None: (
+                True,
+                "pythonpath points into the tree",
+            ),
+        )
         entry = bug_entry(pythonpath="demo/build/lib/")
         bug = bug_info(pythonpath="demo/build/lib/")
-        mismatches = prepare_mod.check_declared(entry, bug)
+        assert prepare_mod.check_declared(entry, bug) == []
+        repo = Path("/clones/demo.git")
+        mismatches = prepare_mod.check_build_declared(entry, bug, repo=repo)
         assert len(mismatches) == 1
         assert "needs_build" in mismatches[0]
-        assert prepare_mod.check_declared(
-            bug_entry(pythonpath="demo/build/lib/", needs_build=True), bug
+        assert prepare_mod.check_build_declared(
+            bug_entry(pythonpath="demo/build/lib/", needs_build=True), bug, repo=repo
         ) == []
 
     def test_missing_checkpoints_names_every_missing_layer(self, monkeypatch):
@@ -2501,7 +2533,7 @@ class TestPrepareRunRecordContract:
         issue = self._issue()
         verdict = ctx.precheck(tree, issue.text, n_ctx=131_072, n_ctx_source="--n-ctx")
         deps = {
-            "checkpoint": "vanta-bi-demo-1",
+            "checkpoint": "vanta-bi-Demo-1",
             "installs": ["pytest==8.0.2", "pytest-json-report==1.5.0"],
             "dependencies": [{"name": "pytest", "version": "8.0.2"}],
         }
@@ -2562,7 +2594,7 @@ class TestPrepareRunRecordContract:
         assert loaded.context == verdict
         assert loaded.deps == deps
         assert loaded.runnable == original.runnable
-        assert batch.entries["Demo/1"]["checkpoint"] == "vanta-bi-demo-1"
+        assert batch.entries["Demo/1"]["checkpoint"] == "vanta-bi-Demo-1"
 
     @pytest.mark.parametrize(
         "drop",
@@ -3724,6 +3756,15 @@ class TestResolvePinsByDate:
         "future": {"0.17.1": "2018-10-31"},
         "six": {"1.12.0": "2018-12-10", "1.13.0": "2020-05-31"},
         "python-toolbox": {"0.9.3": "2016-06-07"},
+        # The build toolchain is date-pinned for every bug (§3.2), so any test that
+        # runs the whole resolution path needs dates for it. The values are PyPI's
+        # (TestBuildPins uses the same three), and both PySnooper trees — 2019-05-20
+        # for bug 2, 2019-04-22 for bug 3 — have a release of each inside its window.
+        "setuptools": {"40.8.0": "2019-02-04", "41.0.0": "2019-06-01"},
+        "wheel": {"0.32.3": "2018-10-21", "0.33.1": "2019-04-06"},
+        "cython": {"0.29.6": "2019-03-10", "0.29.13": "2019-08-30"},
+        # The interpreter layer's own pair, for the harness-provides branch.
+        "pytest": {"5.4.3": "2020-04-09", "8.0.2": "2023-12-30"},
     }
 
     def _resolve(self, refs, *, commit_date="2019-04-22", harness_pins=None):
@@ -3774,16 +3815,67 @@ class TestResolvePinsByDate:
     # ---- the harness exception -------------------------------------------
     def test_a_harness_provided_package_keeps_the_harness_version(self):
         """pytest is what ``pytest-json-report`` is installed against and what the
-        oracle is read from; re-pinning it is a silent downgrade of the report."""
+        oracle is read from; re-pinning it is a silent downgrade of the report.
+
+        A **range** is the case this covers: it names no release, so the layer has
+        nothing to install and the harness version is the only answer. Its constraint
+        is checked against that version rather than ignored.
+        """
         refs = [bake_mod.dep_ref("pytest>=4.4.1", "test_requirements.txt line 2")]
         resolved = self._resolve(refs, harness_pins={"pytest": "8.0.2"})
         assert resolved[0].pin == "pytest==8.0.2"
         assert resolved[0].harness is True
         assert resolved[0].as_dict()["provisioned_by"] == "interpreter layer"
 
+    def test_a_bugsinpys_own_pytest_pin_wins_over_the_harness_version(self):
+        """The decision the four dev-pilot flags were about (§3.2).
+
+        fastapi/1 and luigi/1 pin ``pytest==5.4.3``, pandas/1 ``5.4.2``, sanic/1
+        ``5.2.1`` — all from BugsInPy's own ``requirements.txt``, so all reference
+        pins — while the interpreter layer carries 8.0.2. Installing the harness pair
+        over them asked the bug to run under a pytest it was never validated with,
+        and the run flagged rather than pretending: pytest 8 refuses these suites.
+        BugsInPy's exact ``==`` pin wins, exactly as it does for every other package,
+        and the layer installs it *on top of* the interpreter layer's default. The
+        report plugin then has to follow (:class:`TestTheReportPluginFollowsTheBugsPytest`),
+        which is why this pin cannot be resolved in isolation from it.
+        """
+        refs = [bake_mod.dep_ref("pytest==5.4.3", "requirements.txt line 7")]
+        resolved = self._resolve(refs, harness_pins={"pytest": "8.0.2"})
+        assert resolved[0].pin == "pytest==5.4.3"
+        assert resolved[0].harness is False
+        assert resolved[0].exempt is True
+        # Released 2020-04-09, a year after the 2019-04-22 commit the test pins to:
+        # the exemption is what lets it through, as it is for any late reference pin.
+        assert resolved[0].released_at == "2020-04-09"
+        assert resolved[0].pin_rule == "BugsInPy's own exact pin, installed as written"
+
+    def test_a_project_pin_on_a_harness_package_is_not_a_reference_pin(self):
+        """Only BugsInPy's own files are the reference environment (§3.2).
+
+        A project that pins the version the harness already provides is satisfied by
+        it and recorded as provisioned by the interpreter layer; one that pins a
+        different version is refused rather than installed over it, because a project
+        declaration is not the benchmark's validated environment.
+        """
+        agreeing = self._resolve(
+            [bake_mod.dep_ref("pytest==8.0.2", "install_requires (setup.py) line 4")],
+            harness_pins={"pytest": "8.0.2"},
+        )
+        assert agreeing[0].pin == "pytest==8.0.2"
+        assert agreeing[0].harness is True
+        with pytest.raises(bake_mod.BakeError, match="needs a decision"):
+            self._resolve(
+                [bake_mod.dep_ref("pytest==5.4.3", "install_requires (setup.py) line 4")],
+                harness_pins={"pytest": "8.0.2"},
+            )
+
     def test_a_constraint_that_excludes_the_harness_version_needs_a_decision(self):
+        """A range names no release, so a range that excludes the harness is fatal."""
         refs = [bake_mod.dep_ref("pytest<5", "test_requirements.txt line 2")]
-        with pytest.raises(bake_mod.BakeError, match="will not downgrade pytest"):
+        with pytest.raises(
+            bake_mod.BakeError, match="will not re-pin a package it provides"
+        ):
             self._resolve(refs, harness_pins={"pytest": "8.0.2"})
 
     def test_a_harness_package_the_layer_does_not_provide_is_an_error(self):
@@ -3843,6 +3935,341 @@ class TestResolvePinsByDate:
         resolved = self._resolve(refs)
         assert resolved[0].pin == "decorator==4.4.0"
         assert resolved[0].released_at == "2019-03-16"
+
+
+class TestTheReportPluginFollowsTheBugsPytest:
+    """A bug's own pytest decides which report plugin its layer can carry (§3.2).
+
+    [VANTA-WHY] ``pytest-json-report`` declares a *floor* on pytest, and from 0.5.0 on
+    it declares ``pytest-metadata``, whose own floor moves with the years: installed
+    without a bound pip takes 3.1.1, which requires pytest 7. A layer that installs
+    the bug's own ``pytest==5.4.3`` over the interpreter layer's pair (fastapi/1,
+    luigi/1, pandas/1, sanic/1) would therefore end up with a plugin that refuses its
+    own pytest, and the report the oracle is read from would never be written — the
+    ``pip check`` signal was ``pytest-metadata 3.1.1 has requirement pytest>=7.0.0,
+    but you have pytest 5.4.3``.
+
+    So the plugin's release is chosen from the releases' **own** metadata, newest
+    first, against the bug's pytest and the layer's interpreter; the choice is
+    recorded (``chosen_for_pytest``); and ``pytest-metadata`` is pinned only when the
+    chosen plugin release actually asks for it. Every value in ``METADATA`` below is
+    what PyPI's per-release ``info`` says, so the rule is tested against the packages
+    rather than against a table this file made up.
+    """
+
+    RELEASES = {
+        "pytest-json-report": {
+            "0.2": "2018-01-18",
+            "0.3": "2018-01-19",
+            "0.4": "2018-01-21",
+            "1.5.0": "2022-03-15",
+        },
+        "pytest-metadata": {
+            "1.11.0": "2020-11-27",
+            "2.0.4": "2022-10-30",
+            "3.1.1": "2024-02-12",
+        },
+    }
+
+    METADATA = {
+        # ``(requires_dist, requires_python)`` per release, measured from PyPI.
+        ("pytest-json-report", "0.2"): ((), None),
+        ("pytest-json-report", "0.3"): (("pytest (>=3.3.2)",), None),
+        ("pytest-json-report", "0.4"): (("pytest (>=3.3.2)",), None),
+        ("pytest-json-report", "1.5.0"): (("pytest (>=3.8.0)", "pytest-metadata"), None),
+        ("pytest-metadata", "1.11.0"): (
+            ("pytest (>=2.9.0)",),
+            ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*",
+        ),
+        ("pytest-metadata", "2.0.4"): (("pytest (>=3.0.0,<8.0.0)",), ">=3.7,<4.0"),
+        ("pytest-metadata", "3.1.1"): (("pytest>=7.0.0",), ">=3.8"),
+    }
+
+    @staticmethod
+    def _metadata_of(name: str, version: str):
+        return TestTheReportPluginFollowsTheBugsPytest.METADATA[(name, version)]
+
+    def _plugins(self, pytest_version: str, *, python_minor: str, taken=None):
+        return bake_mod.plugin_pins(
+            pytest_version=pytest_version,
+            python_minor=python_minor,
+            releases=self.RELEASES,
+            metadata_of=self._metadata_of,
+            taken=taken,
+        )
+
+    def test_a_pytest_five_bug_gets_the_newest_plugin_that_still_accepts_it(self):
+        """pytest 5.4.3 on 3.8: the plugin 1.5.0, and metadata 2.0.4 rather than 3.1.1.
+
+        3.1.1 declares ``pytest>=7.0.0`` and is what an unbounded ``pytest-metadata``
+        resolves to; 2.0.4 declares ``pytest>=3.0.0,<8.0.0`` with ``Requires-Python``
+        ``>=3.7,<4.0``, so it is the newest release that can coexist with the layer.
+        """
+        pins = self._plugins("5.4.3", python_minor="3.8")
+        assert [pin.pin for pin in pins] == [
+            "pytest-json-report==1.5.0",
+            "pytest-metadata==2.0.4",
+        ]
+        for pin in pins:
+            assert pin.chosen_for_pytest == "5.4.3"
+            assert pin.harness is False
+        assert pins[0].released_at == "2022-03-15"
+        assert pins[0].pin_rule == (
+            "the newest release whose declared pytest requirement accepts pytest==5.4.3"
+        )
+        assert pins[0].as_dict()["chosen_for_pytest"] == "5.4.3"
+        assert pins[1].as_dict()["provisioned_by"] == "pinned at bake time"
+
+    def test_pytest_metadata_is_skipped_when_the_chosen_plugin_does_not_ask_for_it(self):
+        """httpie/1: ``pytest==3.2.1`` caps the plugin at 0.2, which declares nothing.
+
+        0.3 and later all require pytest 3.3.2 or newer, so 0.2 is the only release
+        that accepts this bug's pytest — and its own metadata names no
+        ``pytest-metadata``, so none is installed. Left to pip, an unbounded metadata
+        would arrive anyway and refuse pytest 3.2.1.
+        """
+        pins = self._plugins("3.2.1", python_minor="3.7")
+        assert [pin.pin for pin in pins] == ["pytest-json-report==0.2"]
+        assert pins[0].pin_rule == (
+            "the newest release whose declared pytest requirement accepts pytest==3.2.1"
+        )
+
+    def test_a_python_36_layer_gets_the_metadata_release_that_supports_it(self):
+        """tqdm/1: 2.0.4's ``Requires-Python`` excludes 3.6, so the answer is older.
+
+        This is the half of the rule that is not about pytest at all: pip would refuse
+        the release outright, and the layer would have no metadata plugin.
+        """
+        pins = self._plugins("5.4.3", python_minor="3.6")
+        assert [pin.pin for pin in pins] == [
+            "pytest-json-report==1.5.0",
+            "pytest-metadata==1.11.0",
+        ]
+
+    def test_a_plugin_the_bugs_own_files_pinned_is_not_chosen_twice(self):
+        """``taken`` is every name the bug's own files already decided.
+
+        A bug whose ``requirements.txt`` carries ``pytest-json-report==1.5.0`` gets
+        that version installed by its own pin, so choosing one here would be a second
+        claim about the same package — but the release's declared requirements still
+        have to be read, or ``pytest-metadata`` would be left to pip.
+        """
+        assert self._plugins("5.4.3", python_minor="3.8", taken={"pytest-json-report": "1.5.0"}) == [
+            pin
+            for pin in self._plugins("5.4.3", python_minor="3.8")
+            if pin.name == "pytest-metadata"
+        ]
+        # 0.4 declares only pytest, so nothing is pulled in and nothing is chosen.
+        assert self._plugins("5.4.3", python_minor="3.8", taken={"pytest-json-report": "0.4"}) == []
+
+    def test_no_plugin_release_accepting_the_bugs_pytest_is_an_error(self):
+        """A guess here would be a layer whose report the oracle cannot read."""
+        with pytest.raises(bake_mod.BakeError, match="declares a pytest requirement that accepts"):
+            bake_mod.plugin_pins(
+                pytest_version="3.2.1",
+                python_minor="3.7",
+                releases={"pytest-json-report": self.RELEASES["pytest-json-report"] | {"0.2": "2018-01-18"}},
+                metadata_of=lambda name, version: (
+                    ("pytest (>=3.3.2)",),
+                    None,
+                ),
+            )
+
+    def test_a_plugin_with_no_fetched_releases_is_an_error(self):
+        with pytest.raises(bake_mod.BakeError, match="no release dates for 'pytest-json-report'"):
+            bake_mod.plugin_pins(
+                pytest_version="5.4.3",
+                python_minor="3.8",
+                releases={},
+                metadata_of=self._metadata_of,
+            )
+
+    # ---- which pytest does the bug declare itself? ------------------------
+    def test_own_pytest_pin_reads_an_exact_pin_from_bugsinpys_own_files(self):
+        refs = [
+            bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1"),
+            bake_mod.dep_ref("pytest==5.4.3", "requirements.txt line 7"),
+        ]
+        assert bake_mod.own_pytest_pin(refs, harness_pytest="8.0.2") == "5.4.3"
+
+    def test_own_pytest_pin_ignores_a_range(self):
+        """spacy/4's ``pytest>=4.6.5`` names no release for the layer to install."""
+        refs = [bake_mod.dep_ref("pytest>=4.6.5", "test_requirements.txt line 3")]
+        assert bake_mod.own_pytest_pin(refs, harness_pytest="8.0.2") is None
+
+    def test_own_pytest_pin_ignores_a_pin_equal_to_the_harness_version(self):
+        """PySnooper/3's ``requirements.txt`` names the harness version, and that is a no-op."""
+        refs = [bake_mod.dep_ref("pytest==8.0.2", "requirements.txt line 7")]
+        assert bake_mod.own_pytest_pin(refs, harness_pytest="8.0.2") is None
+
+    def test_own_pytest_pin_ignores_a_project_pin_on_pytest(self):
+        """Only BugsInPy's own files are the reference environment (§3.2)."""
+        refs = [bake_mod.dep_ref("pytest==5.4.3", "tests_require (setup.py) line 20")]
+        assert bake_mod.own_pytest_pin(refs, harness_pytest="8.0.2") is None
+
+    # ---- the whole chain, one bug ----------------------------------------
+    @staticmethod
+    def _sources(*refs: bake_mod.DepRef) -> bake_mod.DepSources:
+        return bake_mod.DepSources(
+            project="Demo",
+            bug_id=1,
+            checkpoint="vanta-bi-Demo-1",
+            buggy_commit="b" * 40,
+            commit_date="2019-04-22",
+            fixed_commit="f" * 40,
+            fixed_commit_date="2019-07-30",
+            import_name="demo",
+            refs=tuple(refs),
+        )
+
+    def _resolve(self, *refs: bake_mod.DepRef, python_minor: str = "3.8"):
+        releases = dict(TestResolvePinsByDate.RELEASES)
+        releases.update(self.RELEASES)
+        return bake_mod.resolve_deps(
+            self._sources(*refs),
+            releases=releases,
+            harness_pins={"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
+            python_minor=python_minor,
+            metadata_of=self._metadata_of,
+        )
+
+    def test_resolve_deps_adds_the_plugin_pins_to_the_bugs_own_pytest(self):
+        """Both halves in one list: the bug's pytest *and* the plugin that accepts it."""
+        resolved = self._resolve(
+            bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1"),
+            bake_mod.dep_ref("pytest==5.4.3", "requirements.txt line 7"),
+        )
+        assert [dep.pin for dep in resolved] == [
+            "decorator==4.4.0",
+            "pytest==5.4.3",
+            "pytest-json-report==1.5.0",
+            "pytest-metadata==2.0.4",
+        ]
+        assert bake_mod.installs_of(resolved) == (
+            "decorator==4.4.0",
+            "pytest==5.4.3",
+            "pytest-json-report==1.5.0",
+            "pytest-metadata==2.0.4",
+        )
+
+    def test_resolve_deps_leaves_a_bug_without_its_own_pin_alone(self):
+        """PySnooper/3, black/1-2, matplotlib/1-2, cookiecutter/1, youtube-dl/1.
+
+        No pin of their own, so the interpreter layer's pair stands and there is no
+        plugin release to choose — the harness's own pin is the layer's.
+        """
+        resolved = self._resolve(
+            bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1")
+        )
+        assert [dep.pin for dep in resolved] == ["decorator==4.4.0"]
+
+    def test_resolve_deps_does_not_re_choose_a_plugin_the_bug_pinned_itself(self):
+        resolved = self._resolve(
+            bake_mod.dep_ref("pytest==5.4.3", "requirements.txt line 7"),
+            bake_mod.dep_ref("pytest-json-report==0.4", "requirements.txt line 20"),
+        )
+        assert [dep.pin for dep in resolved] == [
+            "pytest==5.4.3",
+            "pytest-json-report==0.4",
+        ]
+
+    # ---- what the layers record and the plan shows ------------------------
+    def test_layer_pin_reads_the_version_the_layer_actually_installs(self):
+        """The split's entry declares the *interpreter* layer's pair, not the bug's.
+
+        ``runner.build_record`` reads the run's row back through this, so a row that
+        named the split's ``pytest_version`` would name a version the suite never ran
+        under.
+        """
+        sources = self._sources(bake_mod.dep_ref("pytest==5.4.3", "requirements.txt line 7"))
+        resolved = self._resolve(bake_mod.dep_ref("pytest==5.4.3", "requirements.txt line 7"))
+        provenance = bake_mod.deps_provenance(
+            sources,
+            resolved,
+            harness_pins={"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
+        )
+        assert bake_mod.layer_pin(provenance, "pytest") == "5.4.3"
+        assert bake_mod.layer_pin(provenance, "pytest-json-report") == "1.5.0"
+        assert bake_mod.layer_pin(provenance, "pytest-metadata") == "2.0.4"
+        assert bake_mod.layer_pin(provenance, "decorator") is None
+
+    def test_layer_pin_reads_the_interpreter_layers_pair_when_the_bug_has_none(self):
+        """A bug with no pin of its own: the interpreter layer's pair stands.
+
+        Neither package is in ``dependencies`` here — the bug's sources never named
+        them — so the answer comes from ``harness_pins``, which is the pair the
+        interpreter layer was built with. Reporting ``None`` instead would drop the
+        version from every such run's row.
+        """
+        sources = self._sources(bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1"))
+        resolved = self._resolve(
+            bake_mod.dep_ref("decorator>=4.3.0", "install_requires (setup.py) line 1")
+        )
+        provenance = bake_mod.deps_provenance(
+            sources,
+            resolved,
+            harness_pins={"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
+        )
+        assert bake_mod.layer_pin(provenance, "pytest") == "8.0.2"
+        assert bake_mod.layer_pin(provenance, "pytest-json-report") == "1.5.0"
+        assert bake_mod.layer_pin(provenance, "six") is None
+
+    def test_layer_pin_reads_a_range_that_resolved_to_the_interpreter_layer(self):
+        """spacy/4's ``pytest>=4.6.5`` is named, and §3.2 left it to the harness."""
+        sources = self._sources(bake_mod.dep_ref("pytest>=4.6.5", "test_requirements.txt line 3"))
+        resolved = self._resolve(
+            bake_mod.dep_ref("pytest>=4.6.5", "test_requirements.txt line 3")
+        )
+        provenance = bake_mod.deps_provenance(
+            sources,
+            resolved,
+            harness_pins={"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
+        )
+        by_name = {dep["name"]: dep for dep in provenance["dependencies"]}
+        assert by_name["pytest"]["provisioned_by"] == "interpreter layer"
+        assert bake_mod.layer_pin(provenance, "pytest") == "8.0.2"
+
+    @staticmethod
+    def _clone(tmp_path: Path, requirements: str, setup_sh: str = "") -> Path:
+        """One bug's two BugsInPy files, UTF-16 with a BOM as the real ones are."""
+        bug_dir = tmp_path / "projects" / "Demo" / "bugs" / "1"
+        bug_dir.mkdir(parents=True, exist_ok=True)
+        (bug_dir / "requirements.txt").write_bytes(requirements.encode("utf-16"))
+        (bug_dir / "setup.sh").write_bytes(setup_sh.encode("utf-16"))
+        return tmp_path
+
+    def test_bugsinpy_refs_reads_both_of_bugsinpys_files_without_a_repo(self, tmp_path):
+        """The plan path has no clone and no network, so it reads these two alone."""
+        root = self._clone(
+            tmp_path,
+            "decorator==4.4.1\npytest==5.4.3\n",
+            "pip install six==1.12.0\npython setup.py install\n",
+        )
+        refs = bake_mod.bugsinpy_refs(bug_entry(), bugsinpy_root=root)
+        assert [ref.spec for ref in refs] == [
+            "decorator==4.4.1",
+            "pytest==5.4.3",
+            "six==1.12.0",
+        ]
+        assert bake_mod.own_pytest_pin(refs, harness_pytest="8.0.2") == "5.4.3"
+
+    def test_the_plan_shows_the_bugs_own_pytest_and_defers_the_plugin(self, tmp_path):
+        """A dry run has to name the pytest the layer will carry (§3.2).
+
+        The ``json-report`` cell reads ``at bake``: which release the plugin can be is
+        PyPI's answer, taken when the layer is built, and printing a guess would be a
+        second, unrecorded decision about the same question.
+        """
+        root = self._clone(tmp_path, "pytest==5.4.3\n")
+        split = split_mod.Split(split_data(bugs=[bug_entry(checkpoint="vanta-bi-Demo-1")]))
+        plan = bake_mod.render_plan(
+            split,
+            pythons=["3.8"],
+            entries=[split.bug("Demo", 1)],
+            bugsinpy_root=root,
+        )
+        assert "| vanta-bugsinpy-py3.8 | vanta-python | 3.8 | 8.0.2 | 1.5.0 |" in plan
+        assert "| vanta-bi-Demo-1 | vanta-bugsinpy-py3.8 | 3.8.1 | 5.4.3 | at bake |" in plan
 
 
 class TestMergeRefs:
@@ -4901,10 +5328,16 @@ class TestTheSplitsAgreeWithTheirTrees:
         # A missing clone must not shrink this to nothing and still pass.
         assert checked >= 20, f"only {checked} bugs were checked"
 
-    def test_the_four_trees_that_compile_extensions_are_declared(self):
-        """The measured set, named: a rule that drifts must break these lines."""
+    def test_the_trees_that_compile_extensions_are_declared(self):
+        """The measured set, named: a rule that drifts must break these lines.
+
+        ``bake.needs_build`` reads ``ext_modules`` at the buggy commit *and* a
+        compiled extension source of the tree's own, so the dev split's three C
+        trees are joined by the eval split's two, which BugsInPy itself builds out
+        of a ``build/lib`` directory (``pythonpath``) before their tests can import.
+        """
         for path, expected in (
-            (SPLIT_PATH, {}),
+            (SPLIT_PATH, {"cookiecutter/1", "tqdm/1"}),
             (DEV_SPLIT_PATH, {"matplotlib/1", "matplotlib/2", "pandas/1", "spacy/4"}),
         ):
             split = load_split(path)
@@ -5743,19 +6176,27 @@ class TestOneBugDoesNotStopTheBatch:
         assert "  - FastAPI/1: BakeError: b" in text
 
     def _bake_cli(self, tmp_path, monkeypatch, *, flagged, failure=None):
-        """Drive ``bake --yes`` with the resolution and the build injected."""
+        """Drive ``bake --yes`` with the resolution and the build injected.
+
+        The resolution is injected with a *resolvable* deps record, because a
+        non-flagged entry always has one: ``layer_recipes`` refuses a checkpoint
+        with nothing resolved (§3.2), and that refusal is its own test. A fake that
+        returned no deps for a non-flagged bug would model a state the code
+        deliberately cannot reach. ``write_deps`` is injected because the real one
+        writes under ``runs/``.
+        """
         root = tmp_path / "bugsinpy"
         root.mkdir()
+        entry = bug_entry(checkpoint="vanta-bi-Demo-1")
         split = split_mod.Split(
-            split_data(
-                bugs=[bug_entry(checkpoint="vanta-bi-Demo-1")],
-                bugsinpy_root=str(root),
-            )
+            split_data(bugs=[entry], bugsinpy_root=str(root))
         )
+        deps = _bug_deps([entry], {"vanta-bi-Demo-1": ("decorator==4.4.0",)})
         monkeypatch.setattr(run_mod, "load_split", lambda path: split)
         monkeypatch.setattr(
-            bake_mod, "resolve_bug_deps", lambda *a, **k: ([], list(flagged))
+            bake_mod, "resolve_bug_deps", lambda *a, **k: (deps, list(flagged))
         )
+        monkeypatch.setattr(bake_mod, "write_deps", lambda *a, **k: tmp_path / "d.json")
         monkeypatch.setattr(bake_mod, "plan_layers", lambda *a, **k: [])
 
         def build(*args, **kwargs):

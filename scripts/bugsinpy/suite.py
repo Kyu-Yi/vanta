@@ -361,12 +361,41 @@ def import_probe(
 # report parsing
 # ---------------------------------------------------------------------------
 def parse_report(path: Path) -> dict[str, str]:
+    """``{nodeid: outcome}`` from a ``pytest-json-report`` file, in either schema.
+
+    [VANTA-WHY] Two schemas are in play, because the plugin's release follows the
+    bug's own pytest pin (§3.2): 0.1/0.2 write a **flat list**, one entry per test,
+    while 0.3 and later write ``{"tests": [...]}``. Both carry ``nodeid`` and
+    ``outcome``, so both are read: a bug whose own pin caps the plugin at 0.2 — the
+    newest release that accepts httpie/1's ``pytest==3.2.1`` — would otherwise have an
+    unreadable oracle, and an unreadable report is a silently empty result rather
+    than an error someone notices.
+
+    One limitation of the 0.2 schema this reader cannot repair: it builds its list
+    from the terminal reporter's ``passed`` and ``failed`` stats only, so a test that
+    *errors* (the terminal reporter's ``error`` stat) is absent from the file rather
+    than recorded as ``"error"``. An absent nodeid is excluded from the stable
+    comparison (:func:`compare_runs`), which is the right treatment of a test the
+    report says nothing about.
+    """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SuiteError(f"cannot read pytest report {path}: {exc}") from exc
+    if isinstance(data, dict):
+        tests = data.get("tests") or []
+    elif isinstance(data, list):
+        tests = data
+    else:
+        raise SuiteError(
+            f"cannot read pytest report {path}: its top level is a "
+            f"{type(data).__name__}, not the mapping 0.3+ writes or the list 0.1/0.2 "
+            "writes"
+        )
     outcomes: dict[str, str] = {}
-    for test in data.get("tests") or []:
+    for test in tests:
+        if not isinstance(test, dict):
+            continue
         nodeid = test.get("nodeid")
         outcome = test.get("outcome")
         if isinstance(nodeid, str) and isinstance(outcome, str):

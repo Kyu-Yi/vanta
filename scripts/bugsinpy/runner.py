@@ -61,6 +61,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
+from . import bake as bake_mod
 from . import compact as compact_mod
 from . import context as ctx_mod
 from . import manifest as manifest_mod
@@ -963,7 +964,6 @@ def build_record(
     *,
     job: "Job",
     prep: prepare_mod.BugPrep,
-    entry: dict[str, Any],
     outcome: SessionOutcome,
     oracle: oracle_mod.OracleResult,
     issue_sha256: str,
@@ -1008,8 +1008,19 @@ def build_record(
         # by writing the actual number into a field that claims to be the pin.
         "python_version": python_version or "unknown",
         "python_version_pinned": job.python_version_pinned,
-        "pytest_version": entry.get("pytest_version"),
-        "json_report_version": entry.get("json_report_version"),
+        # The pins the layer ACTUALLY carries, read back from its provenance rather
+        # than from the split's entry (§3.2): an entry declares the *interpreter*
+        # layer's pair, one pair per Python minor, while a bug whose own files pin
+        # pytest is installed with that version on top of it. A bug with no pin of its
+        # own carries the interpreter layer's pair, which its provenance records under
+        # `harness_pins` — not the split's number by convention but the one this bug
+        # was resolved against. `None` only when there is no provenance to read.
+        "pytest_version": (
+            bake_mod.layer_pin(prep.deps, "pytest") if prep.deps else None
+        ),
+        "json_report_version": (
+            bake_mod.layer_pin(prep.deps, "pytest-json-report") if prep.deps else None
+        ),
         "candidate": job.candidate.as_dict() if job.candidate else None,
         "verdict": outcome.decision or None,
         "exit_code": outcome.exit_code,
@@ -1249,7 +1260,6 @@ def run_job(
     record = build_record(
         job=job,
         prep=prep,
-        entry=job.entry,
         outcome=outcome,
         oracle=oracle,
         issue_sha256=issue_sha256,

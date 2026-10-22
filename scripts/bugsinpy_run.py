@@ -391,7 +391,9 @@ def cmd_bake(args: argparse.Namespace) -> int:
 
     if not args.yes:
         sys.stdout.write(
-            bake_mod.render_plan(split, pythons=minors, entries=entries)
+            bake_mod.render_plan(
+                split, pythons=minors, entries=entries, bugsinpy_root=bugsinpy_root
+            )
         )
         if not args.plan:
             print(

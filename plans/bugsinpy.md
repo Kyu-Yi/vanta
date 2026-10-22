@@ -603,8 +603,9 @@ read the other way, a requirement the buggy tree already declared is stamped wit
 cannot be upgraded past it. Two exceptions:
 
 - A package the harness already provides (`pytest`, `pytest-json-report`) is left at the harness
-  version and recorded as such — in particular `pytest` is never downgraded, which would break the
-  json-report plugin.
+  version and recorded as such **when the bug only bounds it** — a range names no release for the layer
+  to install, so `pytest>=4.6.5` (spacy/4) leaves the interpreter layer's pinned pair standing. An exact
+  `==` pin is the next exception instead, and it wins.
 - An exact `==` pin **written in BugsInPy's own two per-bug files** (`requirements.txt`, `setup.sh`) is
   the benchmark's **reference environment**: it is installed as written and exempt from the date rule,
   because that pin is what `run_test.sh` was validated against. Whatever its release date, it is
@@ -612,7 +613,59 @@ cannot be upgraded past it. Two exceptions:
   chose it), so "this pin is newer than the bug" is a recorded fact rather than an invisible one. A
   bug whose `requirements.txt` is a corpus-era **pip freeze** (black/22's is: 71 pins, 65 of them
   released after its 2018-03-29 commit) therefore resolves instead of refusing — see the split's
-  `reviewed_changes` for what then has to be checked about the sandbox's ability to build it.
+  `reviewed_changes` for what then has to be checked about the sandbox's ability to build it. This
+  exception applies to `pytest` like any other name: an exact `==` pin on `pytest` in those two files
+  wins over the harness's version, for the same reason and with the same record (see the next
+  paragraph). A `pytest` pin from the *project's* own files (`tests_require`, `install_requires`) gets
+  no such licence: it is not the environment `run_test.sh` was validated in, so it cannot decide the
+  harness's own version — a project pin that agrees with the harness version is simply that version,
+  and one that does not is a decision the harness refuses to make rather than a silent downgrade of the
+  plugin's host.
+
+**The bug's own `pytest` pin wins, and the report plugin follows it.** Measured, and the reason this
+rule exists: all four dev-pilot bugs flagged on the same thing — fastapi/1 and luigi/1 pin
+`pytest==5.4.3`, pandas/1 `5.4.2`, sanic/1 `5.2.1`, in BugsInPy's own `requirements.txt` — while the
+harness installed `pytest==8.0.2` plus `pytest-json-report`. The bug's pin is the reference environment,
+so it is what the layer carries; and then the plugin has to follow it, because `pytest-json-report` 0.3
+and later declare `pytest>=3.3.2` (1.5.0 declares `pytest>=3.8.0`) and simply cannot live next to
+pytest 5.2.1. Three things follow, and each is recorded rather than assumed:
+
+1. **The pin lands on the bug's own layer, not on the interpreter layer.** Every bug's layer is
+   `vanta-bi-<project>-<N>`, stacked on `vanta-bugsinpy-py<X.Y>`; the bug's `pytest==5.4.3` is one more
+   install line in that layer's recipe. The interpreter layer stays one pair per Python minor
+   (`bake.pins_for_python`, unchanged, still refusing two bugs that disagree about one interpreter), so
+   **no split entry changes** — an entry's `pytest_version`/`json_report_version` continue to declare
+   the *interpreter* layer's pair. What the bug's own layer actually carries is in its provenance, and
+   `bake.layer_pin` reads it back: a run's row names the pytest the suite ran under, not the one the
+   split's entry happens to match.
+2. **The plugin is chosen from PyPI's per-release metadata, not guessed.** For a bug with its own
+   `pytest` pin, `bake.plugin_pins` walks `pytest-json-report`'s releases newest-first and takes the
+   first whose declared `Requires-Dist` on `pytest` accepts that version, skipping a release whose
+   `Requires-Python` excludes the layer's interpreter — and pins `pytest-metadata` only when the chosen
+   plugin declares it, at the newest release that both its own requirement and the interpreter's
+   `Requires-Python` allow. Measured outcome: pytest 5.x on 3.8 → `pytest-json-report==1.5.0` +
+   `pytest-metadata==2.0.4` (3.1.1 declares `pytest>=7.0.0`); tqdm/1's pytest 5.4.3 on 3.6 →
+   `1.5.0` + `1.11.0` (2.0.4 is `>=3.7`); httpie/1's pytest 3.2.1 → `pytest-json-report==0.2` and no
+   metadata, 0.3 being the first release with a pytest floor. `pytest-json-report` and
+   `pytest-metadata` are therefore in the fetch set only for a bug that has its own pin; a bug with
+   none needs neither. The choice is recorded next to the pin as `chosen_for_pytest` and its own
+   `pin_rule` ("the newest release whose declared pytest requirement accepts pytest==<v>"), so a reader
+   can tell the plugin's pin from a date pin. A bug with **no** `pytest` pin of its own keeps the
+   interpreter layer's pair — `8.0.2`/`1.5.0` on 3.8 — and needs no plugin resolution at all.
+3. **The report reader handles both schemas.** Which schema the plugin writes is a function of the
+   version this rule picks, so `suite.parse_report` reads **both**: 0.1/0.2 write a flat list, 0.3 and
+   later write `{"tests": [...]}` — and 0.2 is exactly what httpie/1 lands on. Both carry `nodeid` and
+   `outcome`, so both are read. One limitation of 0.2 that cannot be repaired: it builds its list from
+   the terminal reporter's `passed`/`failed` stats, so a test that *errors* is absent from the file
+   rather than recorded as `"error"` — an absent nodeid is excluded from the stable comparison, which
+   is the right treatment of a test the report says nothing about. The Rust side
+   (`src/pipeline/harness.rs`) reads the 0.3+ mapping, which is what every bug except httpie/1 gets.
+
+A layer whose `pytest` changes has to be **rebuilt**, because the interpreter layer and everything
+stacked on it were baked against the old pair; the checkpoints are the previous bake's, and
+`pins_for_python` cannot notice that a *bug's* pin moved. PySnooper/3 is the one bug in both splits
+with no `pytest` pin of its own, so it is unaffected: it keeps the interpreter layer's `8.0.2`/`1.5.0`,
+its mirrored entry in the evaluation split stays valid, and nothing about its layers changes.
 
 `pins_after_commit_date` therefore has **two** expected reasons, and `pin_rule` distinguishes them: a
 BugsInPy reference pin installed as written, and a requirement only the fix declared, held to the fix's
@@ -626,10 +679,12 @@ resolved set, each dep's source (file + line), the pin, the pin rule, the releas
 its declaration came from, the optional imports the closure found, and the
 skipped `setup.sh` lines all go into `runs/bugsinpy/deps/<checkpoint>.json` and, as derived data, into
 the split's `deps` key. That file's `installs` list is **exactly** what the layer's recipe passes to
-pip (`bake.installs_of`, the one function both the recipe and the record use): a harness package
-appears in `dependencies` with its `provisioned_by` but is **not** in `installs`, because the
-interpreter layer already provides it and the recipe never re-pins it. A record that disagrees with
-the recipe is worse than no record.
+pip (`bake.installs_of`, the one function both the recipe and the record use): a harness package the
+interpreter layer already provides appears in `dependencies` with `provisioned_by: "interpreter layer"`
+and is **not** in `installs`, because the bug's own layer never re-pins it — but a harness package the
+bug's own files pin exactly **is** in `installs`, on top of the interpreter layer, because that is what
+the recipe does. `installs` is the difference between the two, and a record that disagrees with the
+recipe is worse than no record.
 
 **What the layer deliberately does not install.** The project's own install line is dropped, for two
 reasons:
@@ -759,6 +814,20 @@ interpreter — 3.6 caps at pytest 6.x, 3.7 at 7.4.x, 3.8 at 8.0.x — written i
 and recorded per bug in the split (`pytest_version`, `json_report_version`) so a report can be read
 back years later.
 
+Those two fields are the **interpreter** layer's pair, and the split is the protocol for that layer
+alone: one pair per Python minor, `bake.pins_for_python` refuses a split where two bugs of one minor
+disagree, and nothing about them changed when the bug's own `pytest` pin was given precedence above. A
+bug's own layer stacks *on top* of it, so what a bug's layer actually carries is a property of that
+bug, not of the split: an exact `==` pin on `pytest` in BugsInPy's own `requirements.txt`/`setup.sh`
+wins, and the `pytest-json-report` (and `pytest-metadata`) release is then chosen from PyPI's
+per-release metadata to accept it. That choice, and the pytest it was chosen for, are in the layer's
+`runs/bugsinpy/deps/<checkpoint>.json` under `dependencies` — each plugin pin carrying
+`chosen_for_pytest` and its own `pin_rule` — and `bake.layer_pin` reads the pair back out of that file,
+so a run's row and a report years later name the versions the suite really ran under. The split files
+therefore needed **no edit** for this rule: `bugsinpy_dev_split.json` and `bugsinpy_split.json` still
+carry each entry's interpreter-layer pair, and the per-bug reality lives in the provenance beside the
+layer it describes.
+
 ### 3.3 BLOCKER 2 — dependency detection under-provisions
 
 [`deps::detect()`](file:///Users/kyu-yi/vanta/src/sandbox/deps.rs) reads `requirements.txt` and
@@ -799,8 +868,11 @@ projects run `python -m unittest` (e.g. `youtube-dl/1/run_test.sh` →
 
 **Design:** normalise every bug to a pytest command, since pytest collects `unittest.TestCase`
 subclasses. `prepare` validates collectability with `pytest --collect-only -q` inside the checkpoint
-and **rejects the bug from the split** if it does not collect. The resolved `test_cmd`, plus the
-pinned `pytest` / `pytest-json-report` versions (§3.2), are stored per bug in the split.
+and **rejects the bug from the split** if it does not collect. The resolved `test_cmd` is stored per bug
+in the split, alongside the *interpreter* layer's pinned `pytest` / `pytest-json-report`; the pair the
+bug's own layer actually carries is a property of that layer and lives in its provenance (§3.2), which
+is also where the report format is decided — a bug whose own pin caps the plugin at 0.2 writes the
+older schema, and `suite.parse_report` reads both.
 `run_test.sh` is still read, but used as the *cross-check* on which nodeid is the hidden test
 (§1.3), not as the executor.
 
@@ -1332,6 +1404,13 @@ publishes nothing). The manifest never *implies* the harness picked them.
 Note `python_version`: that is the interpreter the checkpoint **actually** contains, not the version
 BugsInPy's `bug.info` pins. The two differ (§12.3) and both are recorded, so the gap is auditable
 rather than hidden by writing the actual number into a field that claims to be the pinned one.
+
+Note `pytest_version` / `json_report_version`: the pair the layer **actually** carries, read out of
+that checkpoint's provenance with `bake.layer_pin` (§3.2), not copied from the split's entry. The
+example above is PySnooper/2, which has no `pytest` pin of its own, so its layer carries the interpreter
+layer's pair and the two agree; a bug that pins `pytest` exactly in BugsInPy's own files records that
+version here, together with the `pytest-json-report` release chosen to accept it. `null` when the
+checkpoint has no provenance to read at all.
 
 Note `artifacts.compact_state`: `full` (snapshots still on disk), `compacted` (replaced by a diff +
 hashes), or `none` (the session wrote no snapshot at all — an `InfraFailure`, or a patch that never

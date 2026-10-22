@@ -78,16 +78,45 @@ BAKE_TIMEOUT_SECS = 5400
 """90 min. py3.6/3.7 may compile OpenSSL 1.1.1 and CPython from source here."""
 
 HARNESS_PACKAGES = frozenset({"pytest", "pytest-json-report"})
-"""Installed by the *interpreter* layer and never touched by a per-bug layer.
+"""Provisioned by the *interpreter* layer, for every bug on that Python minor.
 
-[VANTA-WHY] A project's own ``pytest>=4.4.1`` (PySnooper's
-``test_requirements.txt``) is a constraint on a package the harness already
-provides. Installing the project's choice would downgrade pytest under
-``pytest-json-report``, whose plugin is what produces the reports the oracle is
-read from. The constraint is therefore *checked* against the harness pin and
-recorded; a project that pins an incompatible pytest fails the bug loudly instead
-of silently re-pinning the interpreter every wave.
+A bug that declares one of these as a **range** — PySnooper's
+``test_requirements.txt`` says ``pytest>=4.4.1`` — is a constraint on a package the
+interpreter layer already carries, so it is *checked* against the harness pin and
+recorded rather than installed: a range names no release, and the layer already has
+a concrete one. A project that asks for a range the harness pin does not satisfy
+fails the bug loudly instead of silently re-pinning the interpreter every wave.
+
+[VANTA-WHY] An exact ``==`` pin is a different claim, and it wins. ``fastapi/1``'s
+``requirements.txt`` says ``pytest==5.4.3``: that is the environment its own
+``run_test.sh`` was validated fail-before/pass-after in, the same claim that makes
+:func:`reference_pin` install any other BugsInPy pin as written. So the pin is
+installed by the *per-bug* layer, on top of the interpreter layer's default, and the
+two packages that declare a pytest requirement of their own are re-chosen to accept
+it (:func:`plugin_pins`). The interpreter layer keeps the default
+(:func:`pins_for_python`) — four bugs on Python 3.8 pin four different pytest
+versions, which one shared interpreter layer cannot carry — and a bug with no pin of
+its own runs under exactly that default.
 """
+
+PLUGIN_PACKAGES = ("pytest-json-report", "pytest-metadata")
+"""The two packages whose own requirements decide which release the layer can carry.
+
+[VANTA-WHY] ``pytest-json-report`` is the plugin that writes the report the oracle
+is read from, and every release from 0.3 on declares ``pytest>=3.3.2`` or higher.
+``pytest-metadata`` it requires with **no** bound at all, so pip installs the newest
+one — measured: 3.1.1, which declares ``pytest>=7.0.0``. Against a bug whose own pin
+is pytest 5.4.3 that is not a warning but a broken layer (``pip check``: ``pytest-metadata
+3.1.1 has requirement pytest>=7.0.0, but you have pytest 5.4.3``). Both are therefore
+resolved against the bug's own pytest pin rather than left to pip, and both go into
+the layer's install list and into its provenance.
+"""
+
+PLUGIN_SOURCES = {
+    "pytest-json-report": "the report plugin (every bug)",
+    "pytest-metadata": "the report plugin's metadata dependency",
+}
+"""What is recorded as having asked for a plugin pin — nothing *declared* it."""
 
 DEPS_DIRNAME = "deps"
 """Where ``bake`` leaves each per-bug layer's dependency provenance.
@@ -1930,12 +1959,27 @@ class ResolvedDep:
     ``>=4.0,<5`` bound is nowhere in the install set. It is empty for every ordinary
     pin, including a reference pin that agrees with the project.
     """
+    chosen_for_pytest: Optional[str] = None
+    """The pytest pin this release was chosen to accept, when that is why it is here.
+
+    [VANTA-WHY] ``pytest-json-report`` and ``pytest-metadata`` declare a *floor* on
+    pytest, so a bug whose own pin is pytest 5.4.3 cannot carry the release the
+    interpreter layer has. Which release was chosen is not a date rule, so it has to
+    be recorded next to the pin: it is "the newest release whose declared pytest
+    requirement accepts this pytest" (:func:`plugin_pins`), and without the pytest it
+    accepts, the same pin would look arbitrary.
+    """
 
     @property
     def pin_rule(self) -> str:
         """How the pinned version was chosen, in one phrase, for the provenance."""
         if self.harness:
             return "provisioned by the interpreter layer"
+        if self.chosen_for_pytest:
+            return (
+                "the newest release whose declared pytest requirement accepts "
+                f"pytest=={self.chosen_for_pytest}"
+            )
         if self.exempt:
             return "BugsInPy's own exact pin, installed as written"
         if self.fixed:
@@ -1956,6 +2000,8 @@ class ResolvedDep:
         }
         if self.pin_source:
             data["pinned_by"] = self.pin_source
+        if self.chosen_for_pytest:
+            data["chosen_for_pytest"] = self.chosen_for_pytest
         if self.overridden:
             data["overridden"] = [
                 {"spec": spec, "source": source} for spec, source in self.overridden
@@ -2170,19 +2216,22 @@ def resolve_pins(
 
     Two exceptions, and both are checks rather than decisions:
 
-    * A package the interpreter layer already provides. Its constraint is *checked*
-      against the harness version and recorded; it is never installed over it,
-      because the json-report plugin is what produces the report the oracle is read
-      from and a project asking for ``pytest>=4.4.1`` would otherwise silently
-      downgrade it.
-    * A BugsInPy reference pin (:func:`reference_pin`). The date rule is what stops a
-      layer from installing a release the buggy tree could not have been built with,
-      and it is the wrong rule for the benchmark's *own* frozen environment, which is
-      what ``requirements.txt`` in a pip-freeze-style bug is. Such a pin is installed
-      as written, and its release date is recorded in the provenance so a late pin is
-      visible rather than silent. When the pin also had to win over a project
-      declaration the merge could not satisfy (:attr:`DepRef.overridden`), that
-      decision is recorded with it rather than left implicit in the install list.
+    * A package the interpreter layer already provides, declared as a **range**. Its
+      constraint is *checked* against the harness version and recorded; it is never
+      installed over it, because a range names no release and the layer already
+      carries one.
+    * A BugsInPy reference pin (:func:`reference_pin`) — including one on a package
+      the harness provides. The date rule is what stops a layer from installing a
+      release the buggy tree could not have been built with, and it is the wrong rule
+      for the benchmark's *own* frozen environment, which is what a pip-freeze-style
+      ``requirements.txt`` is. Such a pin is installed as written, and its release
+      date is recorded in the provenance so a late pin is visible rather than silent.
+      ``pytest==5.4.3`` in fastapi/1's ``requirements.txt`` is this case: it is the
+      environment that bug's ``run_test.sh`` was validated in, so it is installed by
+      the per-bug layer rather than checked against the interpreter layer's default.
+      When the pin also had to win over a project declaration the merge could not
+      satisfy (:attr:`DepRef.overridden`), that decision is recorded with it rather
+      than left implicit in the install list.
 
     For everything else the rule is unchanged, and it takes precedence over
     convenience: if the constraint has no release on or before the declaration's date,
@@ -2194,7 +2243,7 @@ def resolve_pins(
         requirement = _requirement(ref.spec, ref.source)
         cutoff = ref.commit_date or commit_date
         fixed = ref.commit is not None and ref.commit != buggy_commit
-        if ref.name in HARNESS_PACKAGES:
+        if ref.name in HARNESS_PACKAGES and not reference_pin(ref):
             provided = harness_pins.get(ref.name)
             if provided is None:
                 raise BakeError(
@@ -2206,8 +2255,7 @@ def resolve_pins(
                     f"{ref.source}: {ref.spec} excludes the harness's "
                     f"{ref.name}=={provided}, which the interpreter layer installs and "
                     "pytest-json-report needs. The harness will not re-pin a package it "
-                    "provides, and it will not downgrade pytest underneath the plugin — "
-                    "this bug needs a decision."
+                    "provides for a *range* — this bug needs a decision."
                 )
             resolved.append(
                 ResolvedDep(
@@ -2310,13 +2358,247 @@ def pypi_releases(name: str) -> dict[str, str]:
     return dates
 
 
+PYPI_VERSION_JSON = "https://pypi.org/pypi/{name}/{version}/json"
+
+
+def pypi_release_metadata(name: str, version: str) -> tuple[tuple[str, ...], Optional[str]]:
+    """``(requires_dist, requires_python)`` for one release, from PyPI's JSON API.
+
+    [VANTA-WHY] ``info.requires_dist`` is what the release itself declares, so "which
+    release of pytest-json-report accepts this pytest" is answered by the packages
+    rather than by a table in this file that would be stale the next time either of
+    them ships. Measured against PyPI: 1.5.0 declares ``pytest>=3.8.0``, 1.2.4
+    ``pytest>=4.2.0``, 0.3 ``pytest>=3.3.2``, and 0.1/0.2 declare no pytest
+    requirement at all — which is why httpie/1's ``pytest==3.2.1`` lands on 0.2.
+    Called only by the bake, like :func:`pypi_releases`.
+    """
+    url = PYPI_VERSION_JSON.format(name=name, version=version)
+    try:
+        with urllib.request.urlopen(url, timeout=PYPI_TIMEOUT_SECS) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise BakeError(
+            f"cannot read metadata for {name}=={version} from {url}: {exc}"
+        ) from exc
+
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        raise BakeError(f"{url} returned no 'info' mapping")
+    requires = info.get("requires_dist") or ()
+    if isinstance(requires, str):
+        requires = (requires,)
+    requires_python = info.get("requires_python")
+    return (
+        tuple(str(item) for item in requires),
+        str(requires_python) if requires_python else None,
+    )
+
+
+def _declared_requirement(
+    requires: Sequence[str], name: str
+) -> Optional[SpecifierSet]:
+    """The constraint a release's own metadata puts on ``name``, or ``None`` for none.
+
+    ``None`` means the release does not mention ``name`` at all; an **empty**
+    specifier set means it names ``name`` with no bound (``pytest-metadata`` is
+    declared that way from ``pytest-json-report`` 0.5.0 on), which is a different
+    claim and is why this returns ``Optional`` rather than a set that could be empty.
+    """
+    for raw in requires:
+        try:
+            requirement = Requirement(raw)
+        except InvalidRequirement:
+            continue
+        if canonicalize_name(requirement.name) == canonicalize_name(name):
+            return requirement.specifier
+    return None
+
+
+def newest_accepting_pytest(
+    name: str,
+    versions: Mapping[str, str],
+    *,
+    pytest_version: str,
+    python_minor: Optional[str],
+    metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
+) -> str:
+    """The newest release of ``name`` whose declared requirement accepts ``pytest_version``.
+
+    Newest first, so the answer is the one the packages' own metadata allows rather
+    than the one a date rule would have picked. A release that declares no pytest
+    requirement accepts any pytest; a release whose ``Requires-Python`` excludes the
+    layer's interpreter is skipped, because pip would refuse it — measured:
+    ``pytest-metadata`` 2.0.4 declares ``pytest>=3.0.0,<8.0.0`` and ``>=3.7,<4.0``, so
+    on the Python 3.6 bugs (tqdm/1) the newest acceptable release is 1.11.0, not 2.0.4.
+    """
+    wanted = Version(pytest_version)
+    for version in sorted(
+        (item for item in versions if _parseable(item)), key=Version, reverse=True
+    ):
+        requires, requires_python = metadata_of(name, version)
+        if requires_python and python_minor is not None:
+            try:
+                allowed = Version(f"{python_minor}.0") in SpecifierSet(requires_python)
+            except (InvalidSpecifier, InvalidVersion):
+                allowed = True
+            if not allowed:
+                continue
+        specifier = _declared_requirement(requires, "pytest")
+        if specifier is None or wanted in specifier:
+            return version
+    raise BakeError(
+        f"no release of {name!r} declares a pytest requirement that accepts "
+        f"pytest=={pytest_version}"
+        + (f" on Python {python_minor}" if python_minor else "")
+        + f" (newest {name} is {_newest_release(versions)[0]}). The layer cannot carry "
+        "both, and the reporter the oracle is read from has to match the bug's pytest."
+    )
+
+
+def plugin_pins(
+    *,
+    pytest_version: str,
+    python_minor: str,
+    releases: Mapping[str, Mapping[str, str]],
+    metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
+    taken: Optional[Mapping[str, str]] = None,
+) -> list[ResolvedDep]:
+    """The report plugin's own pins, for a bug whose pytest is not the harness's.
+
+    [VANTA-WHY] A bug that pins pytest itself changes what the plugin *can* be: every
+    release of ``pytest-json-report`` from 0.3 on requires pytest 3.3.2 or newer — so
+    httpie/1's ``pytest==3.2.1`` caps it at 0.2 — and from 0.5.0 on it declares a bare
+    ``pytest-metadata``, which pip would resolve to 3.1.1, which requires pytest 7.
+    Nothing declared either package for this bug, so the choice is recorded as
+    :attr:`ResolvedDep.chosen_for_pytest` rather than left to pip, and the pins go
+    into the layer's install list like any other dependency.
+
+    Read in order, and each package is only chosen because a previous one declares it:
+    the plugin itself is always installed (it is what the oracle's report is read
+    from), while ``pytest-metadata`` is pinned only when the chosen plugin release
+    actually asks for it — httpie/1's ``pytest-json-report==0.2`` declares no
+    ``requires_dist`` at all, so nothing pulls metadata in and none is installed.
+
+    ``taken`` maps every name this bug's own files already decided to the version they
+    decided, so a plugin one of them pinned is not chosen twice — but its declared
+    requirements are still read, so what *it* pulls in is still decided here.
+    """
+    decided: dict[str, str] = dict(taken or {})
+    pulled_by: list[tuple[str, tuple[str, ...]]] = []
+    out: list[ResolvedDep] = []
+    for position, name in enumerate(PLUGIN_PACKAGES):
+        version = decided.get(name)
+        if version is None:
+            if position and not any(
+                _declared_requirement(requires, name) is not None
+                for _, requires in pulled_by
+            ):
+                continue
+            versions = releases.get(name)
+            if not versions:
+                raise BakeError(
+                    f"no release dates for {name!r} were fetched; the layer's pytest is "
+                    f"pytest=={pytest_version}, so the plugin cannot be chosen for it"
+                )
+            version = newest_accepting_pytest(
+                name,
+                versions,
+                pytest_version=pytest_version,
+                python_minor=python_minor,
+                metadata_of=metadata_of,
+            )
+            decided[name] = version
+            out.append(
+                ResolvedDep(
+                    name=name,
+                    spec=f"{name}=={version}",
+                    sources=(PLUGIN_SOURCES[name],),
+                    pin=f"{name}=={version}",
+                    harness=False,
+                    released_at=versions[version][:10],
+                    chosen_for_pytest=pytest_version,
+                )
+            )
+        requires, _ = metadata_of(name, version)
+        pulled_by.append((name, requires))
+    return out
+
+
+def _pin_version(pin: str) -> str:
+    """The version half of a ``name==version`` pin."""
+    return pin.partition("==")[2]
+
+
+def own_pytest_pin(
+    refs: Sequence[DepRef], *, harness_pytest: Optional[str] = None
+) -> Optional[str]:
+    """The pytest version this bug's own files pin **exactly**, or ``None``.
+
+    [VANTA-WHY] Read off the *sources* rather than off the resolved dependencies, so
+    ``bake`` can ask the question while it still has a chance to fetch what the answer
+    needs: whether the report plugin has to be re-chosen decides whether its release
+    dates are fetched at all. A reference pin always resolves to its own version —
+    :func:`resolve_pins` exempts it from the date rule and installs it as written — so
+    reading the file's text and reading the pin agree.
+
+    A **range** is not a pin and yields ``None``: spacy/4's ``pytest>=4.6.5`` states a
+    constraint on a package the interpreter layer already carries, and a range names
+    no release for the layer to install. A pin equal to the harness's own version is
+    also ``None``: the interpreter layer already has exactly that, so there is no
+    plugin to re-choose and re-pinning it would be a no-op on the command line.
+    """
+    for ref in refs:
+        if ref.name != "pytest" or not reference_pin(ref):
+            continue
+        version = _exact_version(_specifier_of(ref))
+        if version is None:
+            continue
+        if harness_pytest is not None and version == Version(harness_pytest):
+            continue
+        return str(version)
+    return None
+
+
+def bugsinpy_refs(
+    entry: Mapping[str, Any], *, bugsinpy_root: Path
+) -> tuple[DepRef, ...]:
+    """Every dependency BugsInPy's two per-bug files declare, without the repo.
+
+    [VANTA-WHY] :func:`bug_sources` is the full reader — five sources, two commits,
+    a repo clone — and it is what ``bake`` uses. This is the *plan* path's subset: the
+    per-bug layer's pytest is decided by BugsInPy's own ``requirements.txt`` /
+    ``setup.sh`` alone (:func:`own_pytest_pin`), and the plan has to be able to say so
+    before anything is cloned or fetched. Reading the whole set of sources here rather
+    than only the ``pytest`` lines keeps one parser per file, and the predicate that
+    filters to pytest is the same one ``bake`` uses.
+    """
+    project = str(entry["project"])
+    bug_id = int(entry["bug_id"])
+    declared, _ = requirements_refs(
+        requirements_for(bugsinpy_root, project, bug_id), source="requirements.txt"
+    )
+    installed, _ = parse_setup_sh(setup_sh_for(bugsinpy_root, project, bug_id))
+    return tuple(declared) + tuple(installed)
+
+
 def resolve_deps(
     sources: DepSources,
     *,
     releases: Mapping[str, Mapping[str, str]],
     harness_pins: Mapping[str, str],
+    python_minor: Optional[str] = None,
+    metadata_of: Optional[
+        Callable[[str, str], tuple[tuple[str, ...], Optional[str]]]
+    ] = None,
 ) -> list[ResolvedDep]:
-    """Union → conflict check → date pin, for one bug."""
+    """Union → conflict check → date pin → the report plugin, for one bug.
+
+    The plugin step runs only when this bug's own files pin pytest exactly and that
+    pin is not the interpreter layer's (:func:`own_pytest_pin`): only then is there a
+    plugin release to choose. Whatever it returns is *in addition to* the harness's
+    own pins, which stay in the list as ``harness=True`` — the interpreter layer still
+    carries them, and ``installs`` still excludes them (:func:`installs_of`).
+    """
     merged, conflicts = merge_refs(sources.refs)
     if conflicts:
         raise BakeError(
@@ -2325,12 +2607,22 @@ def resolve_deps(
             + " — name the source that should win and the split will be amended rather "
             "than guessed at"
         )
-    return resolve_pins(
+    resolved = resolve_pins(
         merged,
         releases=releases,
         commit_date=sources.commit_date,
         harness_pins=harness_pins,
         buggy_commit=sources.buggy_commit,
+    )
+    own = own_pytest_pin(sources.refs, harness_pytest=harness_pins.get("pytest"))
+    if own is None:
+        return resolved
+    return resolved + plugin_pins(
+        pytest_version=own,
+        python_minor=python_minor or "",
+        releases=releases,
+        metadata_of=metadata_of or pypi_release_metadata,
+        taken={dep.name: _pin_version(dep.pin) for dep in resolved},
     )
 
 
@@ -2791,6 +3083,9 @@ def resolve_bug_deps(
     bugsinpy_root: Path,
     repo_for: Callable[[str], Path],
     fetch: Callable[[str], Mapping[str, str]] = pypi_releases,
+    metadata_of: Callable[
+        [str, str], tuple[tuple[str, ...], Optional[str]]
+    ] = pypi_release_metadata,
 ) -> tuple[list[BugDeps], list[FlaggedBug]]:
     """Resolve every selected bug's layer, pinning by date from PyPI.
 
@@ -2803,8 +3098,10 @@ def resolve_bug_deps(
     than printed so the caller can exclude those checkpoints from the recipes and
     print the list next to the §14.7 gate results, where it belongs.
 
-    ``fetch`` is injected so the entire chain — union, conflict, cutoff, harness
-    exception — is testable without the network.
+    ``fetch`` and ``metadata_of`` are injected so the entire chain — union, conflict,
+    cutoff, harness exception, the report plugin's own pin — is testable without the
+    network: the first answers "which releases exist, and when", the second "what does
+    one release declare".
     """
     out: list[BugDeps] = []
     flagged: list[FlaggedBug] = []
@@ -2830,12 +3127,25 @@ def resolve_bug_deps(
                 }
                 - HARNESS_PACKAGES
             )
+            # A bug that pins pytest itself needs the *plugin's* release dates as well:
+            # which pytest-json-report/pytest-metadata release the layer can carry is a
+            # question about a bug's own pin, so it is asked here, before the fetch
+            # (:func:`own_pytest_pin`). A bug without such a pin keeps the interpreter
+            # layer's pair and needs neither.
+            own_pytest = own_pytest_pin(sources.refs, harness_pytest=pin.pytest)
             needed = sorted(
                 {ref.name for ref in sources.refs if ref.name not in HARNESS_PACKAGES}
                 | set(build_names)
+                | (set(PLUGIN_PACKAGES) if own_pytest is not None else set())
             )
             releases = {name: fetch(name) for name in needed}
-            resolved = resolve_deps(sources, releases=releases, harness_pins=harness_pins)
+            resolved = resolve_deps(
+                sources,
+                releases=releases,
+                harness_pins=harness_pins,
+                python_minor=minor_version(str(entry["python_version"])),
+                metadata_of=metadata_of,
+            )
             built = resolve_build_pins(
                 sources.build_refs,
                 resolved,
@@ -2893,6 +3203,38 @@ def load_deps(deps_dir: Path, checkpoint: str) -> dict[str, Any]:
     if not isinstance(data, dict) or "installs" not in data:
         raise BakeError(f"{path} is not dependency provenance")
     return data
+
+
+def layer_pin(deps: Mapping[str, Any], name: str) -> Optional[str]:
+    """The version of ``name`` the layer's recipe installs, from its provenance.
+
+    [VANTA-WHY] A bug whose own files pin a harness package is installed with *that*
+    version, on top of the interpreter layer's default (§3.2), so the split's entry —
+    which declares the interpreter layer's pair, one pair per Python minor — no longer
+    says what the layer carries. The provenance does: it is written from the same
+    resolved list :func:`installs_of` reads, so a run summary reporting the layer's
+    pytest takes it from here rather than from the split.
+
+    Three answers, in order of what the record actually says:
+
+    * a dependency the bug's own sources named — its pin, or the interpreter layer's
+      when §3.2 left it there;
+    * a package no source named but the interpreter layer provides — recorded in
+      ``harness_pins``, which is the pair that layer was *built* with, so it is what
+      the bug's layer carries. Falling back to it is not borrowing the split's value:
+      the split's entry is per Python minor and the same number only by convention,
+      while this is the pin this bug was resolved against;
+    * ``None`` when neither names it — a row that claims a version the layer never
+      carried is worse than one that says it does not know.
+    """
+    harness_pins = deps.get("harness_pins") or {}
+    for dep in deps.get("dependencies") or []:
+        if dep.get("name") != name:
+            continue
+        if dep.get("provisioned_by") == "interpreter layer":
+            return harness_pins.get(name)
+        return _pin_version(str(dep.get("pin") or "")) or None
+    return harness_pins.get(name)
 
 
 def missing_deps(deps_dir: Path, checkpoints: Sequence[str]) -> list[str]:
@@ -3014,8 +3356,29 @@ def layer_recipes(
     return layers
 
 
-def render_plan(split: Split, *, pythons: list[str], entries: Sequence[dict[str, Any]]) -> str:
-    """What the bake would create, and from which pins. No side effects."""
+def render_plan(
+    split: Split,
+    *,
+    pythons: list[str],
+    entries: Sequence[dict[str, Any]],
+    bugsinpy_root: Optional[Path] = None,
+) -> str:
+    """What the bake would create, and from which pins. No side effects.
+
+    A bug's ``pytest`` cell is the version its layer will carry: its **own** pin when
+    BugsInPy's files write one, read here from those two files alone — no repo, no
+    network — because that is what ``bake`` installs on top of the interpreter layer
+    (§3.2), and the interpreter layer's default otherwise. The split's entry declares
+    the *interpreter* layer's pair (one pair per Python minor, checked by
+    :func:`pins_for_python`), so printing it as the bug's own would name a pytest the
+    layer will not have.
+
+    The ``json-report`` cell of such a bug reads ``at bake``: which release the plugin
+    can be is PyPI's answer, taken when this bug's layer is baked, and a plan that
+    guessed it would be a second, unrecorded decision about the same question.
+    ``bugsinpy_root`` is optional so the plan still renders where the clone is not
+    there yet; the cell then falls back to the inherited pin.
+    """
     lines = ["| layer | base | python | pytest | json-report |", "|---|---|---|---|---|"]
     for minor in pythons:
         pin = pins_for_python(split, minor)
@@ -3024,11 +3387,19 @@ def render_plan(split: Split, *, pythons: list[str], entries: Sequence[dict[str,
             f"{pin.pytest} | {pin.json_report} |"
         )
     for entry in entries:
+        inherited = str(entry["pytest_version"])
+        own = None
+        if bugsinpy_root is not None:
+            own = own_pytest_pin(
+                bugsinpy_refs(entry, bugsinpy_root=bugsinpy_root),
+                harness_pytest=inherited,
+            )
+        pytest_cell = own or inherited
+        plugin_cell = "at bake" if own else str(entry["json_report_version"])
         lines.append(
             f"| {bug_checkpoint_name(entry)} | "
             f"{python_checkpoint_name(minor_version(entry['python_version']))} | "
-            f"{entry['python_version']} | {entry['pytest_version']} | "
-            f"{entry['json_report_version']} |"
+            f"{entry['python_version']} | {pytest_cell} | {plugin_cell} |"
         )
     return "\n".join(lines) + "\n"
 

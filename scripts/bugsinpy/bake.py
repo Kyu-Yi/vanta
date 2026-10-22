@@ -99,6 +99,45 @@ it. It is the record of what the bake decided — sources, pins, skipped lines �
 ``prepare`` never has to re-derive a decision that needed the network.
 """
 
+BUILD_TOOLS = ("setuptools", "wheel", "cython")
+"""The build-time toolchain, pinned by date for every layer, installed first (§3.2).
+
+[VANTA-WHY] Measured on matplotlib/1: the pinned ``numpy==1.18.5`` has no wheel for
+the sandbox (linux/aarch64, py3.8), so pip built it from source in an **isolated**
+build environment — which takes *today's* setuptools, and setuptools has not carried
+``distutils.msvccompiler`` for years, so numpy's own
+``numpy/distutils/mingw32ccompiler.py`` died with ``ModuleNotFoundError``. A build-time
+tool is as much a part of "the environment this tree was built in" as a dependency is,
+so it is pinned by the same date rule: the newest release on or before the bug's commit
+date, installed into the per-bug layer *before* its dependencies, and every dependency
+install then runs with ``--no-build-isolation`` so a source build uses these pins
+rather than a build environment that did not exist when the tree did.
+
+Names are canonicalised the way every other name in this module is
+(:func:`packaging.utils.canonicalize_name`), so ``cython`` is PyPI's ``Cython``.
+"""
+
+BUILD_REQUIRES_SOURCES = ("setup_requires (setup.py)", "build-system.requires (pyproject.toml)")
+"""The two places a project declares **build** requirements (PEP 518 / setuptools).
+
+These are not dependencies: nothing here is installed for the suite to import. They
+say which tools the tree's own build needs (pandas needs Cython and numpy to compile
+``pandas/_libs``), and that is what turns "pin setuptools, wheel and Cython" into a
+per-project answer for ``numpy when it is a build requirement``.
+"""
+
+BUILD_TOOL_SOURCE = "the build toolchain (every bug)"
+"""The ``source`` recorded for :data:`BUILD_TOOLS`' own three pins in the provenance.
+
+A toolchain pin has no declaring line to name — it is the harness's own answer to
+"what was this tree built with" — and the record has to distinguish it from a pin the
+project asked for by name (``setup_requires=["numpy>=1.15"]``), which carries the line
+that declared it.
+"""
+
+BUILD_PIN_RULE = "the newest release on or before the bug's commit date"
+"""One phrase for the provenance, shared with §3.2's rule for dependencies."""
+
 
 class BakeError(RuntimeError):
     """A layer could not be baked or did not verify."""
@@ -1016,6 +1055,53 @@ def pyproject_refs(
     return _stamped(refs, commit=commit, commit_date=commit_date)
 
 
+def build_refs(
+    setup_py: Optional[str],
+    pyproject: Optional[str],
+    notes: list[str],
+) -> list[DepRef]:
+    """The project's **build** requirements → refs, read statically, never installed as deps.
+
+    PEP 518's ``[build-system].requires`` and setuptools' ``setup_requires`` (:data:`BUILD_REQUIRES_SOURCES`).
+    Read for one reason: :func:`build_pins` has to know *which* tools to pin, and
+    "numpy when it is a build requirement" is a question only the project's own
+    metadata answers — pandas builds ``pandas/_libs`` against numpy and says so in
+    both places, matplotlib says ``setup_requires=["numpy>=1.15"]``.
+
+    Nothing here goes into the dependency install: these are the tools the tree is
+    *built* with, and a build requirement that is also a runtime dependency is
+    already pinned by the dependency set. Nothing here is executed either —
+    ``setup.py`` is read with ``ast`` like every other source (§3.2) and the
+    ``pyproject.toml`` is parsed as TOML.
+
+    The declared constraint is not carried into the pin; only the *name* is read.
+    The version comes from :data:`BUILD_PIN_RULE`, which is the point of the rule:
+    pandas' build declares ``numpy==1.15.4`` because that is what *its own CI* used,
+    and installing that in the layer would be a second source build of a numpy the
+    dependency set then replaces.
+    """
+    refs: list[DepRef] = []
+    if setup_py is not None:
+        node = _setup_kwargs(setup_py).get("setup_requires")
+        if node is not None:
+            for literal in _literal_nodes(node):
+                text = literal.value.strip()
+                if not text or text.startswith("#"):
+                    continue
+                refs.append(
+                    dep_ref(text, f"setup_requires (setup.py) line {literal.lineno}")
+                )
+    if pyproject is not None:
+        build_system = _table(_pyproject_data(pyproject), "build-system")
+        if build_system is not None:
+            refs += _toml_requirement_array(
+                build_system.get("requires"),
+                source="build-system.requires (pyproject.toml)",
+                notes=notes,
+            )
+    return refs
+
+
 def import_name_of_pyproject(pyproject: str) -> str:
     """The module the import-path check must load, named by ``pyproject.toml``.
 
@@ -1445,7 +1531,9 @@ def test_import_closure(
     return refs, optional, notes
 
 
-def requirements_recipe(install_specs: Sequence[str]) -> str:
+def requirements_recipe(
+    install_specs: Sequence[str], *, build_pins: Sequence[str] = ()
+) -> str:
     """Install one bug's *resolved* dependencies on top of the interpreter layer.
 
     Takes pins (:func:`resolve_deps`) rather than the project's own requirement
@@ -1455,8 +1543,29 @@ def requirements_recipe(install_specs: Sequence[str]) -> str:
     was named by one of the five approved sources and pinned to the newest release on
     or before the date of the commit that declared it (a fix-only requirement is held
     to the *fix's* date, everything else to the buggy commit's).
+
+    ``build_pins`` goes in **first**, and is what makes the dependency install below
+    run against a *dated* toolchain rather than today's:
+
+    * the pins are installed in one pip call before anything else, with pip's own
+      build isolation — these three are the tools the isolation would otherwise
+      supply, so they are the one install that cannot be made to depend on itself;
+    * their versions are then asserted with ``importlib.metadata``, because a pin
+      that silently did not land is worse than no pin: the build below would use the
+      interpreter layer's seeded setuptools and look identical in the log;
+    * and the dependency install runs with ``--no-build-isolation``, pip's supported
+      way to say "build against what is already in this environment" — which is
+      exactly the pins just installed. Measured on matplotlib/1: without it, the
+      pinned ``numpy==1.18.5`` built in a fresh isolated environment, took setuptools
+      released years after the tree, and died in ``numpy/distutils/mingw32ccompiler``
+      on a ``distutils`` module that setuptools no longer carries.
+
+    ``build_pins`` is keyword-only and empty by default so that a caller with nothing
+    to build — and every test of the dependency half — still gets a recipe, and the
+    recipe says so rather than pretending to a toolchain it was not given.
     """
     body = "\n".join(spec.strip() for spec in install_specs if spec.strip()).strip()
+    build_body = "\n".join(spec.strip() for spec in build_pins if spec.strip()).strip()
 
     lines = [
         "set -eux",
@@ -1469,14 +1578,32 @@ def requirements_recipe(install_specs: Sequence[str]) -> str:
         'python -c "import ssl, sys; assert sys.prefix != sys.base_prefix, sys.prefix; '
         'print(sys.version.split()[0], ssl.OPENSSL_VERSION, sys.prefix)"',
     ]
+    if build_body:
+        lines += [
+            "cat > /tmp/build-req.txt <<'VANTA_BUILD_TOOLS'",
+            build_body,
+            "VANTA_BUILD_TOOLS",
+            # The toolchain itself, and the only install here that keeps isolation:
+            # pip has to be able to *build* a pinned tool that has no wheel for the
+            # platform, and at this point there is nothing in the layer to build it
+            # against. Everything built after this line is built without isolation.
+            "python -m pip install --no-cache-dir -r /tmp/build-req.txt",
+        ]
+        check = _build_pin_check(build_pins)
+        if check:
+            lines.append(check)
     if body:
         lines += [
             "cat > /tmp/req.txt <<'VANTA_REQUIREMENTS'",
             body,
             "VANTA_REQUIREMENTS",
             # No `|| true`: a bug whose dependencies do not install is a bug that
-            # cannot be measured, and it must fail here rather than mid-wave.
-            "python -m pip install --no-cache-dir -r /tmp/req.txt",
+            # cannot be measured, and it must fail here rather than mid-wave. The
+            # `--no-build-isolation` is the other half of it: a source build here
+            # uses the dated toolchain installed above, and pip refuses to build
+            # when a build requirement is missing from the environment rather than
+            # quietly isolating, so the flag either applies or this line fails.
+            "python -m pip install --no-cache-dir --no-build-isolation -r /tmp/req.txt",
         ]
     lines += [
         "python -m pytest --version",
@@ -1484,6 +1611,33 @@ def requirements_recipe(install_specs: Sequence[str]) -> str:
         f"touch {MARKER}",
     ]
     return "\n".join(lines)
+
+
+def _build_pin_check(build_pins: Sequence[str]) -> str:
+    """One line asserting that each build pin's version is the installed one.
+
+    [VANTA-WHY] The failure this guards is not a wrong pin but an *absent* one: a
+    toolchain that did not install (a yanked release, a name pip resolved elsewhere)
+    leaves the dependency install to fall back on the interpreter layer's seeded
+    setuptools, which is the exact environment the pins exist to replace — and pip
+    reports nothing, because ``--no-build-isolation`` was satisfied. Read with
+    ``importlib.metadata`` rather than ``import``: the pin names a *distribution*, and
+    the module it provides is not always the same word (``cython`` → ``Cython``).
+    """
+    expected = []
+    for pin in build_pins:
+        name, _, version = pin.partition("==")
+        if version:
+            expected.append(f"({name!r}, {version!r})")
+    if not expected:
+        return ""
+    return (
+        'python -c "import importlib.metadata as md; '
+        f"build_pins = [{', '.join(expected)}]; "
+        "wrong = [(n, md.version(n), v) for n, v in build_pins if md.version(n) != v]; "
+        "assert not wrong, wrong; "
+        "print('build pins', build_pins)\""
+    )
 
 
 def requirements_for(bugsinpy_root: Path, project: str, bug_id: int) -> str:
@@ -1537,6 +1691,15 @@ class DepSources:
     """Third-party imports on an optional path: recorded, never installed."""
     skipped: tuple[SkippedLine, ...] = ()
     notes: tuple[str, ...] = ()
+    build_refs: tuple[DepRef, ...] = ()
+    """The project's declared **build** requirements, from both commits (:func:`build_refs`).
+
+    Not dependencies and never installed as ones: they name the tools the tree is
+    *built* with, which is what :func:`resolve_build_pins` turns into the layer's
+    build pins. Read at the same two commits as the declarations, and stamped the
+    same way, because a build requirement only the fix declares is held to the fix's
+    date for the same reason a dependency is.
+    """
 
 
 @dataclass(frozen=True)
@@ -2002,6 +2165,161 @@ def resolve_deps(
     )
 
 
+@dataclass(frozen=True)
+class BuildPin:
+    """One build-time tool, pinned by date and installed before the dependencies (§3.2).
+
+    [VANTA-WHY] The environment a tree was built in is not only its dependencies: pip
+    builds a source distribution in a *fresh* environment unless told otherwise, and
+    that environment is today's. Measured on matplotlib/1: the pinned
+    ``numpy==1.18.5`` has no wheel for the sandbox (linux/aarch64, py3.8), so pip built
+    it with a setuptools released years after matplotlib's own build, and numpy's
+    ``numpy/distutils/mingw32ccompiler.py`` died on a ``distutils`` submodule that
+    setuptools no longer carries. So the toolchain is pinned by the same rule as a
+    dependency — the newest release on or before the bug's commit date — installed into
+    the layer first, and the dependency install runs with ``--no-build-isolation``
+    against it.
+    """
+
+    name: str
+    pin: str
+    source: str
+    """What asked for this pin: :data:`BUILD_TOOL_SOURCE`, or the line that declared it."""
+    released_at: Optional[str] = None
+    dependency_pin: Optional[str] = None
+    """The dependency pin this one copies, when both name the same package.
+
+    [VANTA-WHY] pandas' ``setup_requires`` and its own dependency list both name numpy,
+    and the layer can only hold one: pinning the build requirement by its own date and
+    then installing the dependency's numpy over it would compile ``pandas/_libs``
+    against a version that is immediately replaced. A build pin for a package the
+    dependency set already pins *is* that pin, installed early — the record says which
+    one it followed, so "why is numpy at this version" has one answer and not two.
+    """
+
+    @property
+    def pin_rule(self) -> str:
+        """How the pinned version was chosen, in one phrase, for the provenance."""
+        if self.dependency_pin is not None:
+            return "the dependency set's pin for the same package"
+        return BUILD_PIN_RULE
+
+    def as_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "name": self.name,
+            "pin": self.pin,
+            "source": self.source,
+            "pin_rule": self.pin_rule,
+            "released_at": self.released_at,
+        }
+        if self.dependency_pin is not None:
+            data["dependency_pin"] = self.dependency_pin
+        return data
+
+
+def resolve_build_pins(
+    refs: Sequence[DepRef],
+    resolved: Sequence[ResolvedDep],
+    *,
+    releases: Mapping[str, Mapping[str, str]],
+    commit_date: str,
+) -> list[BuildPin]:
+    """The build-time tools this layer installs first, each pinned by date.
+
+    Two kinds of name, one rule each:
+
+    * :data:`BUILD_TOOLS` — setuptools, wheel and Cython, the toolchain every bug's
+      layer gets, held to the **bug's** commit date. There is no declaration to read
+      a date from: the question is "what was available when this tree was built".
+    * every name the project declares as a build requirement (:func:`build_refs`),
+      held to the date of the commit that declared it, exactly as a dependency is. A
+      build requirement only the fix declares was not there for the buggy tree, so
+      the buggy date would refuse the very tool the fix's own build used.
+
+    Pure, and takes ``releases`` as an argument for the same reason
+    :func:`resolve_pins` does: the cutoff rule is exercised by a test that never
+    touches the network.
+
+    A name the dependency set already pins follows that pin (:attr:`BuildPin.dependency_pin`)
+    rather than being dated twice — including the case the user's rule singles out,
+    "numpy when it is a build requirement": pandas and matplotlib both declare numpy
+    as a build requirement, both also depend on it, and the layer ends with the one
+    numpy the dependency set resolved, installed early. A name the interpreter layer
+    provides is skipped entirely: the harness's pytest is not something a tree's build
+    gets to re-pin (§3.2), and :func:`resolve_pins` is where that constraint is
+    checked.
+
+    A build tool with no release on or before its cutoff is a ``BakeError`` and flags
+    the bug, like every other date-rule refusal: a tree cannot have been built with a
+    tool that did not exist yet, and installing today's is the failure this rule
+    exists to prevent.
+    """
+    by_name = {dep.name: dep for dep in resolved}
+    declared: dict[str, list[DepRef]] = {}
+    for ref in refs:
+        declared.setdefault(canonicalize_name(ref.name), []).append(ref)
+    ordered: list[str] = [canonicalize_name(name) for name in BUILD_TOOLS]
+    for ref in refs:
+        name = canonicalize_name(ref.name)
+        if name not in ordered:
+            ordered.append(name)
+
+    pins: list[BuildPin] = []
+    for name in ordered:
+        if name in HARNESS_PACKAGES:
+            continue
+        from_refs = declared.get(name, [])
+        source = from_refs[0].source if from_refs else BUILD_TOOL_SOURCE
+        dependency = by_name.get(name)
+        if dependency is not None:
+            pins.append(
+                BuildPin(
+                    name=name,
+                    pin=dependency.pin,
+                    source=source,
+                    released_at=dependency.released_at,
+                    dependency_pin=dependency.pin,
+                )
+            )
+            continue
+        cutoff = max(
+            (ref.commit_date or commit_date for ref in from_refs), default=commit_date
+        )
+        available = releases.get(name)
+        if not available:
+            raise BakeError(
+                f"{source}: no release dates for {name!r} were fetched, so the build "
+                "toolchain cannot be pinned (design §3.2 pins by date, not by guess)"
+            )
+        matching = [
+            (version, date)
+            for version, date in available.items()
+            if _parseable(version) and date[:10] <= cutoff
+        ]
+        if not matching:
+            newest = _newest_release(available)
+            raise BakeError(
+                f"{source}: {name!r} has no release on or before {cutoff} (newest is "
+                f"{newest[0]}, released {newest[1][:10]}). A tree could not have been "
+                "built with a tool that did not exist yet."
+            )
+        version, released_at = max(matching, key=lambda item: Version(item[0]))
+        pins.append(
+            BuildPin(
+                name=name,
+                pin=f"{name}=={version}",
+                source=source,
+                released_at=released_at[:10],
+            )
+        )
+    return pins
+
+
+def build_installs(pins: Sequence[BuildPin]) -> tuple[str, ...]:
+    """The build pins' install specs, in the order the recipe installs them."""
+    return tuple(pin.pin for pin in pins)
+
+
 def bug_sources(
     entry: Mapping[str, Any],
     *,
@@ -2046,6 +2364,7 @@ def bug_sources(
     notes: list[str] = []
     refs: list[DepRef] = []
     skipped: list[SkippedLine] = []
+    build_declared: list[DepRef] = []
 
     # 1. BugsInPy's per-bug requirements.txt. Measured: 0 bytes for PySnooper 1-3,
     # which is exactly why the other sources exist.
@@ -2132,6 +2451,14 @@ def bug_sources(
                 commit_date=date,
                 commit_label=f"the {label} commit",
             )
+        # The same two files' **build** requirements, read here so they are read at
+        # the same two commits and stamped the same way. They are not dependencies and
+        # never enter ``refs``: they name the tools the tree is built with, which is
+        # §3.2's separate question and gets its own resolution
+        # (:func:`resolve_build_pins`).
+        build_declared += _stamped(
+            build_refs(setup_py, pyproject, notes), commit=sha, commit_date=date
+        )
 
     # 5. The test side's own imports, at the fixed commit. The tree's own modules
     # are excluded too: the test side is not the only thing that can put a name on
@@ -2160,6 +2487,7 @@ def bug_sources(
         optional_imports=tuple(optional),
         skipped=tuple(skipped),
         notes=tuple(notes),
+        build_refs=tuple(build_declared),
     )
 
 
@@ -2177,6 +2505,7 @@ def deps_provenance(
     resolved: Sequence[ResolvedDep],
     *,
     harness_pins: Mapping[str, str],
+    build_pins: Sequence[BuildPin] = (),
 ) -> dict[str, Any]:
     """What the bake decided for one bug, as data a later stage can read.
 
@@ -2208,6 +2537,13 @@ def deps_provenance(
     side imports only on a Python-2 or platform-specific branch. They are recorded and
     deliberately **not** installed — installing a py2-only fallback on 3.8 would fail
     the bake over a branch that can never be taken.
+
+    ``build_pins`` is the layer's other environment: not what the suite imports, but
+    what the tree's own builds run *under* — the toolchain plus every build requirement
+    the project declares, each pinned by date and installed before the dependencies
+    (§3.2). It is a separate key rather than a flag on ``dependencies`` because it
+    answers a different question: a reader asking "which Cython compiled
+    ``pandas/_libs``" is not asking what pandas imports.
     """
     return {
         "schema_version": 1,
@@ -2221,6 +2557,7 @@ def deps_provenance(
         "import_name": sources.import_name,
         "harness_pins": dict(harness_pins),
         "installs": list(installs_of(resolved)),
+        "build_pins": [pin.as_dict() for pin in build_pins],
         "dependencies": [dep.as_dict() for dep in resolved],
         "pins_after_commit_date": [
             {
@@ -2247,12 +2584,17 @@ class BugDeps:
     pytest would either be a no-op that re-downloads it or a silent downgrade
     underneath ``pytest-json-report``, which is the plugin the oracle is read from.
     The full set — including what was left to the harness — is in ``provenance``.
+
+    ``build_pins`` is installed *before* ``installs`` and is in the record for the
+    same reason: ``requirements_recipe`` runs the two in that order and
+    ``--no-build-isolation`` is what makes the order mean anything (§3.2).
     """
 
     entry: dict[str, Any]
     checkpoint: str
     installs: tuple[str, ...]
     provenance: dict[str, Any]
+    build_pins: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2309,11 +2651,28 @@ def resolve_bug_deps(
             )
             pin = pins_for_python(split, minor_version(str(entry["python_version"])))
             harness_pins = {"pytest": pin.pytest, "pytest-json-report": pin.json_report}
+            # The build toolchain's names are fetched from PyPI too: they are pinned
+            # by date like everything else, and a name the harness provides is left
+            # alone (:func:`resolve_build_pins`).
+            build_names = sorted(
+                {
+                    canonicalize_name(name)
+                    for name in (*BUILD_TOOLS, *(ref.name for ref in sources.build_refs))
+                }
+                - HARNESS_PACKAGES
+            )
             needed = sorted(
                 {ref.name for ref in sources.refs if ref.name not in HARNESS_PACKAGES}
+                | set(build_names)
             )
             releases = {name: fetch(name) for name in needed}
             resolved = resolve_deps(sources, releases=releases, harness_pins=harness_pins)
+            built = resolve_build_pins(
+                sources.build_refs,
+                resolved,
+                releases=releases,
+                commit_date=sources.commit_date,
+            )
         except BakeError as exc:
             flagged.append(FlaggedBug(key=key, reason=f"{type(exc).__name__}: {exc}"))
             continue
@@ -2322,7 +2681,10 @@ def resolve_bug_deps(
                 entry=dict(entry),
                 checkpoint=sources.checkpoint,
                 installs=installs_of(resolved),
-                provenance=deps_provenance(sources, resolved, harness_pins=harness_pins),
+                provenance=deps_provenance(
+                    sources, resolved, harness_pins=harness_pins, build_pins=built
+                ),
+                build_pins=build_installs(built),
             )
         )
     return out, flagged
@@ -2477,7 +2839,7 @@ def layer_recipes(
             (
                 name,
                 python_checkpoint_name(minor_version(entry["python_version"])),
-                requirements_recipe(item.installs),
+                requirements_recipe(item.installs, build_pins=item.build_pins),
             )
         )
     return layers

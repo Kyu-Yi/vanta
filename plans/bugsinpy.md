@@ -646,6 +646,50 @@ Projects that genuinely need building (`pythonpath="<pkg>/build/lib/"` on tqdm a
 built **per tree, at prepare time, inside Shuru** — the same place, and for the same reason, that
 their suites run.
 
+**Build-time tools are pinned by date too.** A build-time tool is as much a part of "the environment
+this tree was built in" as a dependency is, so the date rule above binds it as well — measured, not
+hypothesised: on matplotlib/1 the pinned `numpy==1.18.5` has no wheel for the sandbox
+(linux/aarch64, py3.8), so pip built it **from source**, in an *isolated* build environment, and that
+environment supplies *today's* setuptools. Setuptools has not carried `distutils.msvccompiler` for
+years, so numpy's own `numpy/distutils/mingw32ccompiler.py` died with `ModuleNotFoundError` — a
+failure with nothing to do with matplotlib or the bug. Every wave therefore resolves and installs, per
+layer and before anything else, a **build pin** set:
+
+- **The toolchain, for every bug**: `setuptools`, `wheel`, `cython`, each pinned to the newest release
+  on or before the **bug's** commit date. These are the tools pip's isolation would otherwise supply
+  at their current versions, and one of them is the package that just failed.
+- **Every name the project declares as a build requirement**, held to the declaring commit's date like
+  any other reference: `setup_requires` in `setup.py` and `[build-system].requires` in
+  `pyproject.toml` (`bake.build_refs`, `bake.resolve_build_pins`). This is what turns "and numpy when
+  it is a build requirement" into a per-project answer — pandas declares Cython and numpy to compile
+  `pandas/_libs`, matplotlib's `setup.py` says `setup_requires=["numpy>=1.15"]`, and a project that
+  declares nothing gets exactly the three. These are **not** dependencies and never enter the
+  dependency set; they are read at the same two commits and stamped the same way, because a build
+  requirement only the fix declares is held to the fix's date for the same reason a dependency is.
+- **A name the dependency set already pins follows that pin** (`dependency_pin` in the record):
+  pandas needs one numpy to run and to build, and installing two versions of it in one layer would
+  make the layer describe neither. A harness package (`pytest`, `pytest-json-report`) is never a
+  build pin.
+- A build tool with **no release on or before its cutoff** flags the bug rather than being guessed at:
+  a tree cannot have been built with a tool that did not exist yet.
+
+The order is what makes the pins mean anything, and `--no-build-isolation` is what makes the order
+apply: the pins are installed in one pip call **first** (keeping pip's own isolation — these three are
+the tools the isolation would otherwise supply, so this is the one install that cannot be made to
+depend on itself), their versions are then asserted with `importlib.metadata` (a pin that silently did
+not land is worse than no pin: the build below would fall back to the interpreter layer's seeded
+setuptools and look identical in the log), and the dependency install runs with
+`--no-build-isolation` — pip's supported way to say "build against what is already in this
+environment". With the flag, a missing build requirement fails the line instead of quietly isolating,
+so the flag either applies or the run stops.
+
+The pins go into the layer's provenance under its own **`build_pins`** key — next to `installs`, not
+inside `dependencies` — because it answers a different question: a reader asking which Cython compiled
+`pandas/_libs` is not asking what pandas imports. Each entry carries the name, the pin, what asked for
+it (the toolchain, or the `setup_requires`/`[build-system].requires` line that declared it), the
+`pin_rule`, and the release date. `bake` prints them per layer, and a layer with none records an empty
+list rather than a missing key.
+
 **Mandatory bake-time gate (part of the wave-1 gate, §8.1).** For each version checkpoint, assert
 *inside the checkpoint*:
 

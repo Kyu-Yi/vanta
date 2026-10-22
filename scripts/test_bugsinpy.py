@@ -2864,6 +2864,64 @@ class TestBake:
         assert "python -m pytest --version" in recipe
         assert "cat >" not in recipe, "an empty heredoc would install nothing useful"
 
+    def test_the_toolchain_is_installed_first_and_the_builds_are_not_isolated(self):
+        """The two halves of the build-pin rule, as they appear in the layer (§3.2).
+
+        Order is the whole point: pip builds a source distribution in a *fresh*
+        environment unless told otherwise, so the dated toolchain has to be in the
+        venv before the dependency install runs — and that install has to run with
+        ``--no-build-isolation`` for the pins to be what the build uses.
+        """
+        recipe = bake_mod.requirements_recipe(
+            ["numpy==1.18.5"],
+            build_pins=["setuptools==40.8.0", "wheel==0.33.1", "cython==0.29.6"],
+        )
+        pip_lines = [
+            line for line in recipe.splitlines() if line.startswith("python -m pip install")
+        ]
+        assert pip_lines == [
+            "python -m pip install --no-cache-dir -r /tmp/build-req.txt",
+            "python -m pip install --no-cache-dir --no-build-isolation -r /tmp/req.txt",
+        ]
+        assert "VANTA_BUILD_TOOLS" in recipe
+        assert recipe.index("setuptools==40.8.0") < recipe.index("--no-build-isolation")
+        # The pinned versions are asserted, not assumed: a toolchain that did not land
+        # would leave the build to the interpreter layer's seeded setuptools and look
+        # identical in the log.
+        assert "importlib.metadata" in recipe
+        assert "('setuptools', '40.8.0')" in recipe
+        assert "('cython', '0.29.6')" in recipe
+
+    def test_a_recipe_without_build_pins_asks_for_no_toolchain(self):
+        recipe = bake_mod.requirements_recipe(["decorator==4.4.0"])
+        assert "/tmp/build-req.txt" not in recipe
+        assert "--no-build-isolation" not in recipe
+
+    def test_build_pins_without_dependencies_still_install_the_toolchain(self):
+        recipe = bake_mod.requirements_recipe([], build_pins=["setuptools==40.8.0"])
+        assert "VANTA_BUILD_TOOLS" in recipe
+        assert "VANTA_REQUIREMENTS" not in recipe
+        assert recipe.strip().splitlines()[-1] == f"touch {bake_mod.MARKER}"
+
+    def test_a_bug_layer_recipe_carries_its_own_build_pins(self):
+        """``layer_recipes`` is what wires the resolution into the layer's script."""
+        split = split_mod.Split(split_data(bugs=[bug_entry(checkpoint="vanta-bi-Demo-1")]))
+        entry = split.bug("Demo", 1)
+        deps = [
+            bake_mod.BugDeps(
+                entry=entry,
+                checkpoint="vanta-bi-Demo-1",
+                installs=("decorator==4.4.0",),
+                provenance={},
+                build_pins=("setuptools==40.8.0", "wheel==0.33.1", "cython==0.29.6"),
+            )
+        ]
+        layers = bake_mod.layer_recipes(split, pythons=["3.8"], entries=[entry], deps=deps)
+        recipe = {name: script for name, _, script in layers}["vanta-bi-Demo-1"]
+        assert "setuptools==40.8.0" in recipe
+        assert recipe.index("setuptools==40.8.0") < recipe.index("decorator==4.4.0")
+        assert "--no-build-isolation" in recipe
+
     @needs_clone
     def test_real_pysnooper_layers_are_the_interpreter_plus_one_thin_layer(self):
         """PySnooper's deps live in ``setup.sh``; ``requirements.txt`` is empty.
@@ -4477,6 +4535,173 @@ class TestTestImportClosure:
         assert refs == []
 
 
+class TestBuildPinsByDate:
+    """The build-time toolchain is pinned by date like a dependency (§3.2).
+
+    [VANTA-WHY] Measured on matplotlib/1: the pinned ``numpy==1.18.5`` has no wheel
+    for the sandbox (linux/aarch64, py3.8), so pip built it in an *isolated* build
+    environment that took setuptools released years after the tree — and numpy's
+    ``numpy/distutils/mingw32ccompiler.py`` died on a ``distutils`` submodule that
+    setuptools no longer carries. The rule these tests pin down: the toolchain is
+    dated to the bug's commit, installed first, and the builds run against it.
+    """
+
+    TOOLCHAIN = {
+        "setuptools": {"40.8.0": "2019-02-04", "41.0.0": "2019-06-01", "50.0.0": "2020-08-09"},
+        "wheel": {"0.32.3": "2018-10-21", "0.33.1": "2019-04-06", "0.35.1": "2019-07-25"},
+        "cython": {"0.29.6": "2019-03-10", "0.29.7": "2019-05-02"},
+    }
+
+    def _pins(self, refs=(), resolved=(), *, releases=None, commit_date="2019-04-22"):
+        return bake_mod.resolve_build_pins(
+            list(refs),
+            list(resolved),
+            releases=releases if releases is not None else dict(self.TOOLCHAIN),
+            commit_date=commit_date,
+        )
+
+    def test_the_toolchain_gets_a_pin_for_every_bug_even_with_nothing_declared(self):
+        """No project has to ask for setuptools, wheel and Cython: they are the answer
+        to "what was this tree built with", and every layer gets them."""
+        pins = self._pins()
+        assert [pin.pin for pin in pins] == [
+            "setuptools==40.8.0",
+            "wheel==0.33.1",
+            "cython==0.29.6",
+        ]
+        assert [pin.released_at for pin in pins] == [
+            "2019-02-04",
+            "2019-04-06",
+            "2019-03-10",
+        ]
+        assert {pin.source for pin in pins} == {bake_mod.BUILD_TOOL_SOURCE}
+        assert all(pin.pin_rule == bake_mod.BUILD_PIN_RULE for pin in pins)
+
+    def test_a_release_newer_than_the_commit_is_excluded_even_when_it_is_newest(self):
+        """setuptools 41.0.0 exists and the buggy tree could not have been built with it."""
+        pins = {pin.name: pin for pin in self._pins()}
+        assert pins["setuptools"].pin == "setuptools==40.8.0"
+
+    def test_a_declared_build_requirement_is_held_to_the_commit_that_declared_it(self):
+        """pandas' ``_libs`` are compiled against numpy, and ``pyproject.toml`` says so.
+
+        The cutoff is the declaring commit's, exactly as for a dependency: a build
+        requirement only the *fix* declares was not there for the buggy tree, and the
+        buggy date would refuse the very numpy the fix's own build used.
+        """
+        releases = dict(self.TOOLCHAIN)
+        releases["numpy"] = {
+            "1.16.4": "2019-04-01",
+            "1.17.0": "2019-07-26",
+            "1.18.0": "2019-12-22",
+        }
+        at_buggy = bake_mod.DepRef(
+            name="numpy", spec="numpy>=1.15", source="setup_requires (setup.py) line 275"
+        )
+        at_fixed = bake_mod.DepRef(
+            name="numpy",
+            spec="numpy>=1.15",
+            source="build-system.requires (pyproject.toml)",
+            commit="f" * 40,
+            commit_date="2019-08-01",
+        )
+        buggy_view = {pin.name: pin for pin in self._pins([at_buggy], releases=releases)}
+        fixed_view = {pin.name: pin for pin in self._pins([at_fixed], releases=releases)}
+        assert buggy_view["numpy"].pin == "numpy==1.16.4"
+        assert fixed_view["numpy"].pin == "numpy==1.17.0"
+        assert fixed_view["numpy"].source == "build-system.requires (pyproject.toml)"
+        assert fixed_view["numpy"].released_at == "2019-07-26"
+
+    def test_a_build_requirement_the_dependencies_already_pin_follows_that_pin(self):
+        """One numpy in the layer, or ``pandas/_libs`` is built against a version that
+        is immediately replaced. The record says which pin it followed."""
+        resolved = [
+            bake_mod.ResolvedDep(
+                name="numpy",
+                spec="numpy==1.15.4",
+                sources=("requirements.txt line 3",),
+                pin="numpy==1.15.4",
+                harness=False,
+                released_at="2018-08-30",
+                exempt=True,
+            )
+        ]
+        ref = bake_mod.DepRef(
+            name="numpy", spec="numpy>=1.15", source="setup_requires (setup.py) line 275"
+        )
+        # Only the toolchain's releases are passed, and numpy is absent from them on
+        # purpose: a followed pin needs no date of its own, so if this path dated
+        # numpy the call would fail with "no release dates for 'numpy'" instead of
+        # pinning it. Two versions of one package in one layer is the failure.
+        numpy_pin = {
+            pin.name: pin for pin in self._pins([ref], resolved, releases=self.TOOLCHAIN)
+        }["numpy"]
+        assert numpy_pin.pin == "numpy==1.15.4"
+        assert numpy_pin.dependency_pin == "numpy==1.15.4"
+        assert numpy_pin.source == "setup_requires (setup.py) line 275"
+        assert numpy_pin.pin_rule == "the dependency set's pin for the same package"
+
+    def test_a_build_tool_with_no_release_before_the_commit_date_flags_the_bug(self):
+        """A tree cannot have been built with a tool that did not exist yet, and
+        installing today's is the failure this rule exists to prevent."""
+        releases = dict(self.TOOLCHAIN)
+        releases["wheel"] = {"0.33.1": "2019-06-01"}
+        with pytest.raises(
+            bake_mod.BakeError, match="'wheel' has no release on or before 2019-04-22"
+        ):
+            self._pins(releases=releases)
+
+    def test_a_build_tool_with_no_release_dates_at_all_is_not_guessed_at(self):
+        with pytest.raises(bake_mod.BakeError, match="no release dates for 'setuptools'"):
+            self._pins(releases={"setuptools": {}})
+
+    def test_a_package_the_interpreter_layer_provides_is_not_a_build_pin(self):
+        """pytest is the harness's, and a tree's build does not get to re-pin it."""
+        ref = bake_mod.DepRef(
+            name="pytest", spec="pytest>=4.4.1", source="test_requirements.txt line 2"
+        )
+        # The releases mapping has no pytest in it at all: if the name were not skipped
+        # this would raise, which is the assertion.
+        assert [pin.name for pin in self._pins([ref])] == [
+            "setuptools",
+            "wheel",
+            "cython",
+        ]
+
+    def test_the_declared_build_requirements_are_pinned_after_the_toolchain(self):
+        """Order is the install order, so the toolchain comes first on the command line."""
+        refs = [
+            bake_mod.DepRef(
+                name="numpy",
+                spec="numpy>=1.15",
+                source="build-system.requires (pyproject.toml)",
+            ),
+            bake_mod.DepRef(
+                name="cython",
+                spec="cython>=0.28",
+                source="setup_requires (setup.py) line 271",
+            ),
+        ]
+        releases = dict(self.TOOLCHAIN)
+        releases["numpy"] = {"1.16.4": "2019-04-01"}
+        pins = self._pins(refs, releases=releases)
+        assert [pin.name for pin in pins] == ["setuptools", "wheel", "cython", "numpy"]
+        # A toolchain name the project also declares records the declaration as its
+        # source: "cython is here because this setup.py names it" says more than
+        # "cython is here for every bug", and the toolchain rule still applied to the
+        # pin's version — one pin, two reasons, and the more specific one recorded.
+        assert pins[2].source == "setup_requires (setup.py) line 271"
+        assert pins[2].pin == "cython==0.29.6"
+        assert pins[3].source == "build-system.requires (pyproject.toml)"
+
+    def test_build_installs_is_the_pins_in_install_order(self):
+        assert bake_mod.build_installs(self._pins()) == (
+            "setuptools==40.8.0",
+            "wheel==0.33.1",
+            "cython==0.29.6",
+        )
+
+
 class TestDependencyProvenance:
     """What the bake decided is data a later stage reads back, not a re-derivation."""
 
@@ -4613,6 +4838,69 @@ class TestDependencyProvenance:
             }
         ]
         assert provenance["notes"] == ["requirements.txt (BugsInPy): empty for this bug"]
+
+    def test_the_build_pins_are_recorded_with_what_asked_for_them(self):
+        """The layer's *other* environment, and the numpy case the rule names.
+
+        matplotlib declares ``setup_requires=["numpy>=1.15"]`` and depends on numpy;
+        the layer can only hold one numpy, so the build pin is the dependency's pin —
+        recorded as such, with the line that declared it.
+        """
+        sources = bake_mod.DepSources(
+            project="Demo",
+            bug_id=6,
+            checkpoint="vanta-bi-Demo-6",
+            buggy_commit="b" * 40,
+            commit_date="2019-04-22",
+            import_name="demo",
+            refs=(bake_mod.dep_ref("numpy==1.15.4", "requirements.txt line 3"),),
+            build_refs=(
+                bake_mod.DepRef(
+                    name="numpy",
+                    spec="numpy>=1.15",
+                    source="setup_requires (setup.py) line 275",
+                ),
+            ),
+        )
+        releases = {
+            "numpy": {"1.15.4": "2018-08-30"},
+            "setuptools": {"40.8.0": "2019-02-04"},
+            "wheel": {"0.33.1": "2019-04-06"},
+            "cython": {"0.29.6": "2019-03-10"},
+        }
+        resolved = bake_mod.resolve_deps(sources, releases=releases, harness_pins={})
+        built = bake_mod.resolve_build_pins(
+            sources.build_refs,
+            resolved,
+            releases=releases,
+            commit_date=sources.commit_date,
+        )
+        provenance = bake_mod.deps_provenance(
+            sources, resolved, harness_pins={}, build_pins=built
+        )
+        assert [pin["pin"] for pin in provenance["build_pins"]] == [
+            "setuptools==40.8.0",
+            "wheel==0.33.1",
+            "cython==0.29.6",
+            "numpy==1.15.4",
+        ]
+        by_name = {pin["name"]: pin for pin in provenance["build_pins"]}
+        assert by_name["numpy"] == {
+            "name": "numpy",
+            "pin": "numpy==1.15.4",
+            "source": "setup_requires (setup.py) line 275",
+            "pin_rule": "the dependency set's pin for the same package",
+            "released_at": "2018-08-30",
+            "dependency_pin": "numpy==1.15.4",
+        }
+        assert by_name["setuptools"]["source"] == bake_mod.BUILD_TOOL_SOURCE
+        assert by_name["setuptools"]["pin_rule"] == bake_mod.BUILD_PIN_RULE
+        # And the dependency half is unchanged: numpy is installed once, as it was.
+        assert provenance["installs"] == ["numpy==1.15.4"]
+
+    def test_a_layer_with_no_build_pins_records_an_empty_list_not_a_missing_key(self):
+        provenance = bake_mod.deps_provenance(self._sources(), [], harness_pins={})
+        assert provenance["build_pins"] == []
 
     def test_write_load_and_preflight_round_trip(self, tmp_path):
         deps_dir = tmp_path / "deps"

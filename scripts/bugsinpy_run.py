@@ -432,6 +432,10 @@ def cmd_bake(args: argparse.Namespace) -> int:
     for item in bug_deps:
         path = bake_mod.write_deps(deps_dir, item)
         print(f"[{item.checkpoint}] installs: {', '.join(item.installs) or '—'}")
+        print(
+            f"[{item.checkpoint}] build pins: {', '.join(item.build_pins) or '—'}",
+            flush=True,
+        )
         print(f"[{item.checkpoint}] provenance: {path}", flush=True)
 
     # A flagged bug has no resolved deps, so it must not reach the recipes — they

@@ -241,9 +241,106 @@ def pins_for_python(split: Split, minor: str) -> PytestPin:
 # ---------------------------------------------------------------------------
 # the interpreter layer
 # ---------------------------------------------------------------------------
-SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
-    "3.8": ("g++", "pkg-config", "libfreetype-dev", "libpng-dev", "zlib1g-dev"),
+SDIST_SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
+    "bcrypt": ("libffi-dev",),
+    "cffi": ("libffi-dev",),
+    "cryptography": ("libssl-dev",),
+    "lxml": ("libxml2-dev", "libxslt1-dev"),
+    "pillow": ("libjpeg-dev",),
+    "psycopg2": ("libpq-dev",),
+    "psycopg2-binary": ("libpq-dev",),
+    "pynacl": ("libffi-dev",),
+    "scikit-learn": ("gfortran", "libopenblas-dev", "liblapack-dev"),
+    "scipy": ("gfortran", "libopenblas-dev", "liblapack-dev"),
+    "statsmodels": ("gfortran", "libopenblas-dev", "liblapack-dev"),
+    "uvloop": ("make", "autoconf", "automake", "libtool"),
 }
+"""Reviewed table: a package that compiles from sdist → the Debian trixie packages it needs.
+
+[VANTA-WHY] The VM is ``linux/aarch64`` and most of these pins predate aarch64 wheels,
+so pip builds them from source — and each missing ``-dev`` header costs a *whole bake
+cycle* to discover, because the failure surfaces as that one bug's build error
+(measured: ``cffi``'s wheel build died on ``c/_cffi_backend.c:15:10: fatal error:
+ffi.h: No such file or directory``, i.e. on a package nothing in the split's metadata
+mentions). The mapping is a *review*, in the same shape as the split's
+``module_distributions``: it is the decision of which system library a measured sdist
+builds against. Two things read it — :func:`_system_packages_for_py38` (the 3.8
+interpreter layer's install list) and :func:`_review_of` (the preflight's gap check, so
+a measured build that no entry covers is reported by name instead of discovered at
+build time).
+
+The names are canonical distribution names, because that is what the resolver pins and
+what :func:`preflight_pin` classifies with. Three entries need a word:
+
+* ``cryptography`` is ``libssl-dev`` **only before 3.4** — from 3.4 on its sdist builds
+  the Rust binding, which needs a Rust toolchain this image does not carry at all. The
+  entry is a name and cannot carry that boundary, so it stands for the build the split
+  actually pins (``2.9.2``, the cffi/OpenSSL one); a wave that pins 3.4 or later has to
+  revisit it, and the pin's own ``reason`` in the preflight is where that would show.
+* ``pillow`` joins ``libjpeg-dev`` to the ``libpng-dev``/``libfreetype-dev``/``zlib1g-dev``
+  the base list already carries: those three are for matplotlib's ``_png``/``ft2font``,
+  and pillow needs the fourth for JPEG.
+* ``uvloop`` vendors libuv and builds it with its own ``autogen.sh``, so it needs the
+  autotools *and* ``make`` rather than a ``-dev`` header.
+
+An entry with an empty tuple is a legitimate review result — "this package compiles,
+and against nothing but libc and the compiler already in the layer" — and is how a
+:func:`_review_of` gap gets closed without pretending a package needs something.
+"""
+
+UNBUILDABLE_ON_PLATFORM: Mapping[str, str] = {
+    "llvmlite": (
+        "its sdist builds against a specific LLVM release's C API; this image carries "
+        "no LLVM, and the version it wants is not the one any current trixie package "
+        "ships"
+    ),
+    "numba": (
+        "it is built against llvmlite, which needs a specific LLVM release this image "
+        "does not carry, so its own C extension cannot be built either"
+    ),
+    "pyarrow": (
+        "its sdist needs the Arrow C++ toolchain (a full C++17 build plus its vendored "
+        "third-party sources), which this image does not carry"
+    ),
+}
+"""Packages whose *sdist* also cannot be built here, and why, as a review.
+
+[VANTA-WHY] Different from a missing ``-dev`` header: no entry in
+:data:`SDIST_SYSTEM_PACKAGES` would help, so a pin here is not a gap to close but a
+fact to report. Preflight says so by name instead of letting the bake spend a cycle
+building Arrow C++ to find out (measured: pandas/1's ``pyarrow==0.17.1``), and
+:func:`decide_unresolvable` treats such a pin exactly like one with no Linux
+distribution at all (§3.2): dropped when nothing imports it, and the bug flagged when
+something does.
+"""
+
+
+def _system_packages_for_py38() -> tuple[str, ...]:
+    """The 3.8 interpreter layer's list: the base plus every entry of the table.
+
+    Computed rather than written out twice, so "the layer carries what the reviewed
+    table says it needs" is a property of the code and not of someone remembering to
+    edit two lists. A table entry that is not in this union would be a gap that no
+    preflight could close.
+    """
+    return tuple(
+        sorted(
+            set(_PY38_BASE_PACKAGES)
+            | {package for packages in SDIST_SYSTEM_PACKAGES.values() for package in packages}
+        )
+    )
+
+
+_PY38_BASE_PACKAGES = (
+    # g++ brings gcc with it, which is also the driver LDSHARED names (§ COMPILER_ENV).
+    "g++",
+    "pkg-config",
+    "libfreetype-dev",
+    "libpng-dev",
+    "zlib1g-dev",
+)
+
+SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {"3.8": _system_packages_for_py38()}
 """Build-time system packages, per Python minor, installed into the interpreter layer.
 
 [VANTA-WHY] These are the *system* half of §3.2's build toolchain: the pinned
@@ -3040,6 +3137,16 @@ class PreflightPin:
     """The sdist members that look like sources a build compiles (class (b))."""
     sdist_truncated: bool = False
     """Whether the sdist was not read whole, so :attr:`compiled` may be incomplete."""
+    gap: Optional[str] = None
+    """Why this build is unreviewed, when it compiles and no table entry covers it."""
+    unbuildable: Optional[str] = None
+    """Why this sdist cannot be built on this image, when it cannot (a review, not a gap).
+
+    A different answer from :attr:`gap` and they are mutually exclusive: a gap is a
+    review someone has not done yet, and this is a build no entry in the reviewed table
+    could make work. Both are recorded rather than passed over, because both are things
+    the bake would otherwise discover as one bug's build error (§3.2).
+    """
 
     @property
     def letter(self) -> str:
@@ -3069,6 +3176,10 @@ class PreflightPin:
         if self.kind == SDIST_ONLY:
             data["compiled_sources"] = list(self.compiled)
             data["sdist_truncated"] = self.sdist_truncated
+        if self.gap is not None:
+            data["gap"] = self.gap
+        if self.unbuildable is not None:
+            data["unbuildable"] = self.unbuildable
         return data
 
 
@@ -3154,7 +3265,50 @@ def preflight_pin(
         reason=rest,
         compiled=compiled,
         sdist_truncated=truncated,
+        **_review_of(name, compiled=compiled, truncated=truncated),
     )
+
+
+def _review_of(
+    name: str, *, compiled: Sequence[str], truncated: bool
+) -> dict[str, Optional[str]]:
+    """The reviewed table's verdict on one sdist build, as :class:`PreflightPin` fields.
+
+    Three answers and each is a decision rather than a fallback:
+
+    * a :data:`UNBUILDABLE_ON_PLATFORM` entry — the reason, because no system package
+      would make this build work. Checked first: it is a fact about the package, and a
+      gap line on top of it would read as if a review could close it;
+    * a :data:`SDIST_SYSTEM_PACKAGES` entry — nothing to report. The entry may be an
+      empty tuple ("this compiles, against nothing but libc and the layer's compiler"),
+      which is a review result and not a missing entry;
+    * neither, **and the build compiles something** — a named gap. A package whose sdist
+      compiles nothing needs no entry: there is no library to name. ``truncated`` is not
+      part of this test for the same reason it does not clear the count: a listing that
+      was cut short *and* already showed compiled sources is a build that compiles, and
+      that is the case the table most needs an entry for (``scipy`` and numpy's BLAS half
+      are read no other way). A truncated read that showed **no** compiled source is the
+      one case left alone — "unreviewed" cannot be said of a listing nobody finished.
+
+    Looked up by :func:`packaging.utils.canonicalize_name`, so a pin spelled
+    ``Zope.Interface`` finds the table's ``zope-interface``: the names on both sides are
+    distribution names, and PEP 503 makes those one name.
+    """
+    canonical = canonicalize_name(name)
+    reason = UNBUILDABLE_ON_PLATFORM.get(canonical)
+    if reason is not None:
+        return {"gap": None, "unbuildable": reason}
+    if canonical in SDIST_SYSTEM_PACKAGES or not compiled:
+        return {"gap": None, "unbuildable": None}
+    return {
+        "gap": (
+            f"unreviewed: {name} compiles from its sdist and SDIST_SYSTEM_PACKAGES has "
+            "no entry for it, so which system library that build needs is unknown — add "
+            "it to the table (the py3.8 layer's list is computed from the table) before "
+            "baking, or the bake discovers it as this bug's build error"
+        ),
+        "unbuildable": None,
+    }
 
 
 def _pinned_parts(pin: str) -> Optional[tuple[str, str]]:
@@ -3214,9 +3368,17 @@ class PreflightBug:
         return tuple(pin for pin in self.pins if pin.kind == NO_DISTRIBUTION)
 
     def counts(self) -> dict[str, int]:
+        """The three class counts, plus the two findings that are not a class.
+
+        ``gap`` and ``unbuildable`` are counted separately because neither replaces the
+        class: an unbuildable pin *is* sdist-only (that is what pip will try), and the
+        extra word is what says the attempt cannot succeed.
+        """
         counts = {kind: 0 for kind in PREFLIGHT_CLASS_LETTERS}
         for pin in self.pins:
             counts[pin.kind] = counts.get(pin.kind, 0) + 1
+        counts["gap"] = sum(1 for pin in self.pins if pin.gap is not None)
+        counts["unbuildable"] = sum(1 for pin in self.pins if pin.unbuildable is not None)
         return counts
 
     def as_dict(self) -> dict[str, Any]:
@@ -3291,6 +3453,12 @@ def preflight_lines(reports: Sequence[PreflightBug]) -> list[str]:
     One line per bug even when it has nothing to report — "this layer is all wheels" is
     the answer to the question the table is asked, and a table with the quiet bugs
     missing cannot say whether a bug was checked.
+
+    A class (b) entry that needs a decision gets a second line for it, ``GAP`` or
+    ``UNBUILDABLE``, labelled rather than folded into the reason: the run's output is
+    read to find these, and a clause inside a sentence is not something a reader can
+    search for. Nothing else in either split reports an empty tuple as a gap, so a layer
+    whose list of GAP lines is empty is a layer whose builds are all reviewed.
     """
     lines = [f"preflight: {len(reports)} layer(s)"]
     for report in reports:
@@ -3298,10 +3466,17 @@ def preflight_lines(reports: Sequence[PreflightBug]) -> list[str]:
         lines.append(
             f"[{report.checkpoint}] {report.key} ({report.target}): "
             f"{len(report.pins)} pin(s), {counts[INSTALLABLE_WHEEL]} wheel, "
-            f"{counts[SDIST_ONLY]} sdist-only, {counts[NO_DISTRIBUTION]} unavailable"
+            f"{counts[SDIST_ONLY]} sdist-only, {counts[NO_DISTRIBUTION]} unavailable, "
+            f"{counts['gap']} gap, {counts['unbuildable']} unbuildable"
         )
         for pin in (*report.to_build, *report.unavailable):
             lines.append(f"  ({pin.letter}) {pin.name}=={pin.version} — {pin.reason}")
+            if pin.unbuildable is not None:
+                lines.append(
+                    f"  UNBUILDABLE {pin.name}=={pin.version} — {pin.unbuildable}"
+                )
+            elif pin.gap is not None:
+                lines.append(f"  GAP {pin.name}=={pin.version} — {pin.gap}")
     return lines
 
 

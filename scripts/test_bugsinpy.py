@@ -2915,18 +2915,45 @@ class TestBake:
     # itself, and a package that is missing fails this layer's bake — not a bug's
     # build an hour later.
 
-    SYSTEM_PACKAGES = ("g++", "pkg-config", "libfreetype-dev", "libpng-dev", "zlib1g-dev")
+    BASE_PACKAGES = ("g++", "pkg-config", "libfreetype-dev", "libpng-dev", "zlib1g-dev")
+    """The packages the layer carried before the sdist review (matplotlib/pandas/spacy)."""
 
     def test_the_interpreter_recipe_installs_the_system_packages(self):
         recipe = self._recipe()
         assert (
             "apt-get install -y --no-install-recommends "
-            + " ".join(self.SYSTEM_PACKAGES) in recipe
+            + " ".join(bake_mod.SYSTEM_PACKAGES["3.8"]) in recipe
         )
 
-    def test_the_system_packages_are_those_the_split_compiles_against(self):
-        """One list, so the recipe and this expectation cannot drift apart."""
-        assert bake_mod.SYSTEM_PACKAGES["3.8"] == self.SYSTEM_PACKAGES
+    def test_the_system_packages_are_the_base_plus_every_reviewed_sdist_entry(self):
+        """One list, computed from the table, so the three cannot drift apart.
+
+        The recipe installs ``SYSTEM_PACKAGES``, which is the base list unioned with
+        every value in ``SDIST_SYSTEM_PACKAGES`` — so a reviewed entry whose package is
+        missing from the layer is a property this test would catch rather than a gap the
+        preflight could only report after a bake cycle.
+        """
+        expected = set(self.BASE_PACKAGES)
+        for packages in bake_mod.SDIST_SYSTEM_PACKAGES.values():
+            expected |= set(packages)
+        assert bake_mod.SYSTEM_PACKAGES["3.8"] == tuple(sorted(expected))
+
+    def test_the_reviewed_sdist_table_names_canonical_distributions(self):
+        """The table is read by name from the resolver's pins, so both sides are PEP 503."""
+        for name, packages in bake_mod.SDIST_SYSTEM_PACKAGES.items():
+            assert name == bake_mod.canonicalize_name(name), name
+            for package in packages:
+                assert package and " " not in package, (name, package)
+
+    def test_the_seed_entries_of_the_table_are_the_measured_cffi_ones(self):
+        """The entry the cffi failure asked for, and the ones the review measured with it."""
+        table = bake_mod.SDIST_SYSTEM_PACKAGES
+        assert table["cffi"] == ("libffi-dev",)
+        assert table["lxml"] == ("libxml2-dev", "libxslt1-dev")
+        assert table["psycopg2-binary"] == ("libpq-dev",)
+        assert "gfortran" in table["scipy"]
+        assert table["pillow"] == ("libjpeg-dev",)
+        assert bake_mod.UNBUILDABLE_ON_PLATFORM["pyarrow"]
 
     def test_the_layer_records_the_installed_versions_in_itself(self):
         """The interpreter layer's provenance for its non-pip half.
@@ -3745,6 +3772,118 @@ class TestPinPreflight:
         assert "2 wheel(s)" in pin.reason
         assert "no source distribution" in pin.reason
 
+    def test_an_sdist_the_reviewed_table_covers_is_not_reported(self, monkeypatch):
+        """The measured cffi failure, with the table that answers it in place."""
+        monkeypatch.setattr(
+            bake_mod, "SDIST_SYSTEM_PACKAGES", {"cffi": ("libffi-dev",)}
+        )
+        pin = self._classify(
+            [_sdist("cffi-1.14.0.tar.gz")],
+            members=("cffi-1.14.0/c/_cffi_backend.c",),
+            pin="cffi==1.14.0",
+        )
+        assert pin.compiles
+        assert pin.gap is None
+        assert pin.unbuildable is None
+
+    def test_an_sdist_that_compiles_and_no_entry_covers_is_a_named_gap(self, monkeypatch):
+        """The point of the table: a build nobody reviewed is said so, by name."""
+        monkeypatch.setattr(bake_mod, "SDIST_SYSTEM_PACKAGES", {})
+        pin = self._classify(
+            [_sdist("numpy-1.18.5.tar.gz")],
+            members=("numpy-1.18.5/numpy/linalg/lapack_lite/f2c_src/lapack_lite.c",),
+            pin="numpy==1.18.5",
+        )
+        assert pin.gap is not None
+        assert "SDIST_SYSTEM_PACKAGES has no entry" in pin.gap
+        assert pin.unbuildable is None
+
+    def test_an_sdist_that_compiles_nothing_is_never_a_gap(self, monkeypatch):
+        """There is no library to name, so "unreviewed" would be noise in a table to read."""
+        monkeypatch.setattr(bake_mod, "SDIST_SYSTEM_PACKAGES", {})
+        pin = self._classify(
+            [_sdist("pager-3.3.tar.gz")], members=("pager-3.3/pager.py",)
+        )
+        assert not pin.compiles
+        assert pin.gap is None
+
+    def test_a_truncated_read_that_already_compiled_something_is_still_a_gap(
+        self, monkeypatch
+    ):
+        """scipy and numpy's BLAS half are read no other way, so the cut cannot excuse it."""
+        monkeypatch.setattr(bake_mod, "SDIST_SYSTEM_PACKAGES", {})
+        pin = self._classify(
+            [_sdist("scipy-1.4.1.tar.gz")],
+            members=("scipy-1.4.1/scipy/linalg/src/x.f90",),
+            truncated=True,
+            pin="scipy==1.4.1",
+        )
+        assert pin.gap is not None
+
+    def test_a_truncated_read_that_compiled_nothing_claims_nothing(self, monkeypatch):
+        """"Unreviewed" cannot be said of a listing nobody finished reading."""
+        monkeypatch.setattr(bake_mod, "SDIST_SYSTEM_PACKAGES", {})
+        pin = self._classify([_sdist("huge-1.0.tar.gz")], truncated=True)
+        assert pin.gap is None
+
+    def test_the_gap_lookup_is_pep_503_so_a_dotted_pin_still_matches(self, monkeypatch):
+        monkeypatch.setattr(
+            bake_mod, "SDIST_SYSTEM_PACKAGES", {"zope-interface": ()}
+        )
+        pin = self._classify(
+            [_sdist("zope.interface-5.1.0.tar.gz")],
+            members=("zope.interface-5.1.0/src/zope/interface/_zope_interface_coptimizations.c",),
+            pin="Zope.Interface==5.1.0",
+        )
+        assert pin.gap is None, "an empty tuple is a review result, not a missing entry"
+
+    def test_a_package_the_platform_cannot_build_says_so_instead_of_passing_as_a_gap(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(bake_mod, "SDIST_SYSTEM_PACKAGES", {})
+        monkeypatch.setattr(
+            bake_mod, "UNBUILDABLE_ON_PLATFORM", {"pyarrow": "needs Arrow C++"}
+        )
+        pin = self._classify(
+            [_sdist("pyarrow-0.17.1.tar.gz")],
+            members=("pyarrow-0.17.1/pyarrow/_compute.cc",),
+            pin="pyarrow==0.17.1",
+        )
+        assert pin.unbuildable == "needs Arrow C++"
+        assert pin.gap is None, "no table entry would help, so it is not a gap to close"
+
+    def test_the_unreviewed_and_unbuildable_findings_reach_the_record(self, monkeypatch):
+        monkeypatch.setattr(bake_mod, "SDIST_SYSTEM_PACKAGES", {})
+        monkeypatch.setattr(
+            bake_mod, "UNBUILDABLE_ON_PLATFORM", {"pyarrow": "needs Arrow C++"}
+        )
+        records = [
+            self._classify(
+                [_sdist("numpy-1.18.5.tar.gz")],
+                members=("numpy-1.18.5/x.c",),
+                pin="numpy==1.18.5",
+            ),
+            self._classify(
+                [_sdist("pyarrow-0.17.1.tar.gz")],
+                members=("pyarrow-0.17.1/_compute.cc",),
+                pin="pyarrow==0.17.1",
+            ),
+        ]
+        lines = bake_mod.preflight_lines(
+            [
+                bake_mod.PreflightBug(
+                    key="Demo/1", checkpoint="vanta-bi-Demo-1", python_minor="3.8",
+                    pins=tuple(records),
+                )
+            ]
+        )
+        assert "2 pin(s), 0 wheel, 2 sdist-only, 0 unavailable, 1 gap, 1 unbuildable" in lines[1]
+        assert any(line.startswith("  GAP numpy==1.18.5 — ") for line in lines)
+        assert any(line.startswith("  UNBUILDABLE pyarrow==0.17.1 — ") for line in lines)
+        assert records[0].as_dict()["gap"].startswith("unreviewed:")
+        assert records[1].as_dict()["unbuildable"] == "needs Arrow C++"
+        assert "gap" not in records[1].as_dict()
+
     def test_the_files_and_the_listing_of_a_shared_pin_are_fetched_once(self):
         """The cache is what makes a 232-pin preflight cheap; numpy is in six bugs."""
         entries = [
@@ -3847,7 +3986,13 @@ class TestPinPreflight:
         assert data["schema_version"] == bake_mod.PREFLIGHT_SCHEMA_VERSION
         assert data["checkpoint"] == "vanta-bi-Demo-1"
         assert data["target"] == "cp38/linux-aarch64"
-        assert data["counts"] == {"wheel": 1, "sdist": 1, "unavailable": 1}
+        assert data["counts"] == {
+            "wheel": 1,
+            "sdist": 1,
+            "unavailable": 1,
+            "gap": 0,
+            "unbuildable": 0,
+        }
         assert [pin["pin"] for pin in data["pins"]] == [
             "decorator==4.4.0",
             "cffi==1.14.0",

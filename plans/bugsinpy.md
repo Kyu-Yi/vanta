@@ -367,17 +367,31 @@ All bugs on one minor share a layer, and `pytest`/`pytest-json-report` pins must
 within a minor version — `bake.pins_for_python` fails the bake if they do not, because a shared layer
 cannot carry two pins.
 
-**The py3.8 layer carries the five system packages its extensions build against.** `g++`, `pkg-config`,
-`libfreetype-dev`, `libpng-dev` and `zlib1g-dev` are installed by the interpreter recipe itself
-(`bake.SYSTEM_PACKAGES`, §3.2's build-toolchain rule for the *system* half: the pinned
-`setuptools`/`wheel`/`Cython` are the Python half), and a package that is not in dpkg's own `installed`
-state afterwards fails **that layer's** bake. The check is on the status field and not on
-`dpkg-query -W`'s exit code, because a package dpkg knows but has not installed still prints a version.
-Verified at the layer, not at the bug, on purpose: the failure belongs to the environment, and left
-alone it surfaces mid-bake on the first bug that compiles anything — as `g++: not found`, i.e. as that
-bug's problem, on every wave. Their versions are recorded *inside* the layer, at
-`/opt/vanta-system-packages.txt`: the system half of the layer's provenance, written by the same script
-that does the install, beside the pip half `/opt/vanta-deps-freeze.txt` every layer already carries.
+**The py3.8 layer carries the system packages the reviewed sdist table names.** `bake.SYSTEM_PACKAGES`
+is no longer a hand-written list: it is *computed* from `bake.SDIST_SYSTEM_PACKAGES`, the reviewed map
+from a package that compiles from its sdist to the Debian trixie packages that build needs
+(`cffi` → `libffi-dev`, `lxml` → `libxml2-dev` + `libxslt1-dev`, `scipy` → `gfortran` +
+`libopenblas-dev` + `liblapack-dev`, `uvloop` → `make` + `autoconf` + `automake` + `libtool`, and so
+on), unioned with the five the layer started with — `g++`, `pkg-config`, `libfreetype-dev`,
+`libpng-dev`, `zlib1g-dev`. **One table, two readers**, and that is the point: the preflight's
+unreviewed-build check looks a pin up in the same map, so an entry added for a preflight `gap` is
+simultaneously in the install list the next bake runs. The interpreter recipe installs the union (§3.2's
+build-toolchain rule for the *system* half: the pinned `setuptools`/`wheel`/`Cython` are the Python
+half), and a package that is not in dpkg's own `installed` state afterwards fails **that layer's** bake.
+The check is on the status field and not on `dpkg-query -W`'s exit code, because a package dpkg knows
+but has not installed still prints a version. Verified at the layer, not at the bug, on purpose: the
+failure belongs to the environment, and left alone it surfaces mid-bake on the first bug that compiles
+anything — as `g++: not found`, i.e. as that bug's problem, on every wave. Their versions are recorded
+*inside* the layer, at `/opt/vanta-system-packages.txt`: the system half of the layer's provenance,
+written by the same script that does the install, beside the pip half `/opt/vanta-deps-freeze.txt` every
+layer already carries.
+
+**A package the platform cannot build says so, rather than arriving as a build error.**
+`bake.UNBUILDABLE_ON_PLATFORM` is the third answer the preflight can give about an sdist-only pin and it
+is a review, not a gap: `pyarrow` needs the Arrow C++ toolchain and `llvmlite`/`numba` a specific LLVM
+release, so no entry in the system-package table could make those builds work on this image. Reported as
+`UNBUILDABLE <pin> — <reason>` and recorded as such, because the alternative is discovering it as one
+bug's compile error (§3.2's unresolvable-pin rule then decides whether that bug bakes or is flagged).
 
 **One environment for every py3.8 bug is the point, and a compiler does not change a pure-Python bug's
 tests.** The layer is shared, so a compiler added for `matplotlib/1` is present for `luigi/1` as well.

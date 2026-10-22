@@ -44,12 +44,15 @@ The disk requirement is a measured fact, not a tuning knob: the base image is
 from __future__ import annotations
 
 import ast
+import io
 import json
 import re
 import shlex
+import tarfile
 import tomllib
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -2699,6 +2702,628 @@ def pypi_release_metadata(name: str, version: str) -> tuple[tuple[str, ...], Opt
         tuple(str(item) for item in requires),
         str(requires_python) if requires_python else None,
     )
+
+
+@dataclass(frozen=True)
+class PyPIFile:
+    """One file a release is distributed as: the unit ``preflight`` classifies."""
+
+    filename: str
+    packagetype: str
+    url: str = ""
+    size: int = 0
+
+    @property
+    def is_wheel(self) -> bool:
+        return self.filename.endswith(".whl")
+
+    @property
+    def is_sdist(self) -> bool:
+        # ``packagetype`` is the field that means it; the suffix is the fallback,
+        # because the same JSON is read for releases old enough to predate the field.
+        return self.packagetype == "sdist" or self.filename.endswith((".tar.gz", ".zip"))
+
+
+def pypi_release_files(name: str, version: str) -> Optional[tuple[PyPIFile, ...]]:
+    """Every file PyPI lists for one release, out of the same JSON as the metadata.
+
+    ``None`` when PyPI has no such release — an HTTP 404, which is an *answer* ("this
+    release does not exist") and not a fetch that failed. The distinction is the whole
+    reason this returns rather than raises for it: ``luigi/1``'s
+    ``requests-async==0.5.0`` and ``sanic/1``'s ``pywin32==227`` are both class (c)
+    (§3.2) for the same reason — nothing pip can install — and the preflight has to be
+    able to say which of the two it found rather than stopping on the first. A release
+    that **does** exist and lists no file is a non-``None`` empty tuple, which is a
+    third thing again.
+
+    ``urls`` and not ``info``: :func:`pypi_release_metadata` reads what the release
+    *declares*, this reads what it can be **installed as** — the wheels, their tags,
+    and the sdist. Called only by the bake, like :func:`pypi_releases`.
+    """
+    url = PYPI_VERSION_JSON.format(name=name, version=version)
+    try:
+        with urllib.request.urlopen(url, timeout=PYPI_TIMEOUT_SECS) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise BakeError(
+            f"cannot read the files of {name}=={version} from {url}: {exc}"
+        ) from exc
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise BakeError(
+            f"cannot read the files of {name}=={version} from {url}: {exc}"
+        ) from exc
+
+    listed = payload.get("urls")
+    if not isinstance(listed, list):
+        raise BakeError(f"{url} returned no 'urls' list")
+    return tuple(
+        PyPIFile(
+            filename=str(item.get("filename") or ""),
+            packagetype=str(item.get("packagetype") or ""),
+            url=str(item.get("url") or ""),
+            size=int(item.get("size") or 0),
+        )
+        for item in listed
+        if isinstance(item, dict)
+    )
+
+
+SDIST_MAX_BYTES = 64 * 1024 * 1024
+"""How much of an sdist preflight is willing to download in order to look inside it.
+
+[VANTA-WHY] The sdist has to be read for real, because nothing cheaper answers the
+question. PyPI's classifiers were measured useless for it: ``asyncpg``, ``cffi``,
+``cryptography``, ``numpy``, ``regex``, ``sqlalchemy``, ``yarl`` and fourteen more of
+the dev split's sdists that compile an extension carry no ``Programming Language ::
+C`` classifier at all, and ``info``/``urls`` name the *files* without ever listing what
+is inside the archive. The cap is a fuse and not a judgement about size: 64 MB is
+above every sdist either split pins, and a release past it is reported as not
+inspected rather than guessed at.
+"""
+
+
+def _read_capped(response: Any, max_bytes: int) -> tuple[bytes, bool]:
+    """The body, or the first ``max_bytes`` of it, and whether it was cut."""
+    chunks: list[bytes] = []
+    read = 0
+    while True:
+        chunk = response.read(65536)
+        if not chunk:
+            return b"".join(chunks), False
+        if read + len(chunk) > max_bytes:
+            return b"".join([*chunks, chunk[: max_bytes - read]]), True
+        chunks.append(chunk)
+        read += len(chunk)
+
+
+def _archive_names(data: bytes) -> tuple[str, ...]:
+    """The member names of a tar or zip archive held in memory.
+
+    Streaming (``r|*``) on purpose: a truncated tar still yields the members it did
+    contain, which is the difference between "these are this sdist's compiled
+    sources" and "nothing was read at all".
+    """
+    names: list[str] = []
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r|*") as archive:
+            for member in archive:
+                names.append(member.name)
+        return tuple(names)
+    except (tarfile.TarError, EOFError, ValueError):
+        pass
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            return tuple(archive.namelist())
+    except (zipfile.BadZipFile, OSError):
+        return ()
+
+
+def sdist_file_list(
+    file: PyPIFile, *, max_bytes: int = SDIST_MAX_BYTES
+) -> tuple[tuple[str, ...], bool]:
+    """``(member names, truncated)`` for one sdist.
+
+    An sdist always has members, so "no names read" is reported as truncated: the
+    listing is not the whole archive either way, and the caller must not read an
+    empty list as "this sdist compiles nothing".
+    """
+    try:
+        with urllib.request.urlopen(file.url, timeout=PYPI_TIMEOUT_SECS) as response:
+            data, cut = _read_capped(response, max_bytes)
+    except (urllib.error.URLError, OSError) as exc:
+        raise BakeError(f"cannot download {file.filename}: {exc}") from exc
+    names = _archive_names(data)
+    return names, cut or not names
+
+
+# ---------------------------------------------------------------------------
+# preflight: what each pin installs as, before any layer is built
+# ---------------------------------------------------------------------------
+PREFLIGHT_SCHEMA_VERSION = 1
+
+INSTALLABLE_WHEEL = "wheel"
+"""Class (a): a wheel that installs on this image's interpreter without compiling."""
+
+SDIST_ONLY = "sdist"
+"""Class (b): no usable wheel, but a source distribution pip will build."""
+
+NO_DISTRIBUTION = "unavailable"
+"""Class (c): nothing pip can install here — PyPI has no such release, or the release
+ships only Windows/macOS wheels and no sdist."""
+
+PREFLIGHT_CLASS_LETTERS: Mapping[str, str] = {
+    INSTALLABLE_WHEEL: "a",
+    SDIST_ONLY: "b",
+    NO_DISTRIBUTION: "c",
+}
+"""The §3.2 class letters, so the printed table and the JSON agree on the vocabulary."""
+
+TARGET_ARCHITECTURES = ("aarch64", "arm64")
+"""The platform tags' architecture suffix that this image's ``linux-aarch64`` is.
+
+Both spellings, because wheels are on PyPI under both and they mean the same machine.
+"""
+
+
+def _cpython_tag(python_minor: str) -> str:
+    """``"3.8"`` → ``"cp38"``, the Python tag that interpreter's wheels carry."""
+    major, _, minor = python_minor.partition(".")
+    return f"cp{major}{minor or '0'}"
+
+
+def _wheel_tag_parts(filename: str) -> Optional[tuple[str, str, str]]:
+    """``(python, abi, platform)`` from a wheel filename, or ``None`` for not a wheel.
+
+    PEP 427's ``{name}-{version}(-{build})?-{python}-{abi}-{platform}.whl``: the
+    distribution name and the version may not contain a dash, so the last three
+    dash-separated fields are the tags whether or not a build tag is present.
+    """
+    if not filename.endswith(".whl"):
+        return None
+    parts = filename[: -len(".whl")].split("-")
+    if len(parts) < 5:
+        return None
+    return parts[-3], parts[-2], parts[-1]
+
+
+def _aarch64_platform(platform: str) -> bool:
+    """Whether a wheel's platform tag names this image's architecture.
+
+    ``manylinux2014_aarch64`` and its PEP 600 spelling ``manylinux_2_17_aarch64`` are
+    one tag written two ways and both count; so do ``manylinux1``/``manylinux2010``,
+    ``musllinux_*_aarch64`` and the bare ``linux_aarch64``.
+
+    The matched tag is recorded per pin rather than collapsed into a boolean — those
+    are not all the same claim about this image, which is glibc and would not take a
+    musl libc build. Nothing in either split is affected (musllinux postdates every
+    pin in both) and the record is what keeps that from being an assumption.
+    """
+    parts = platform.split("_")
+    if len(parts) < 2 or parts[-1] not in TARGET_ARCHITECTURES:
+        return False
+    return parts[0] in (
+        "manylinux",
+        "manylinux1",
+        "manylinux2010",
+        "manylinux2014",
+        "musllinux",
+        "linux",
+    )
+
+
+def _tag_set(field: str) -> tuple[str, ...]:
+    """The alternatives one wheel tag field names: ``py2.py3`` → ``py2``, ``py3``.
+
+    [VANTA-WHY] A dot in a wheel's python/abi/platform field is not part of the tag:
+    PEP 425 makes it the *compressed set* of tags the wheel also claims, so
+    ``py2.py3-none-any`` is ``py2-none-any`` **and** ``py3-none-any``. Reading the
+    field as one literal tag — or requiring every alternative to be acceptable —
+    puts ``six``'s own wheel outside ``six``'s own interpreter, which is how this
+    was caught: ``six-1.15.0-py2.py3-none-any.whl`` came back ``unavailable``.
+    """
+    return tuple(field.split("."))
+
+
+def wheel_install_tag(file: PyPIFile, *, python_minor: str) -> Optional[str]:
+    """The ``python-abi-platform`` triple that makes this wheel installable, or ``None``.
+
+    A reason and not a boolean: the record has to say **which** of a release's files
+    answered, because "some wheel was fine" is not checkable against PyPI afterwards.
+    The triple returned is the expanded one — the alternative that actually matched,
+    not the field it was spelled in — so the answer can be compared with pip's own
+    tag listing rather than translated by hand.
+
+    [VANTA-WHY] The tag has to be read. Measured: a classifier that accepted any
+    non-``none-any`` wheel put ``numpy 1.18.5``, ``scipy 1.4.1`` and ``cffi 1.14.0`` in
+    class (a) although none of the three ships a ``cp38`` ``aarch64`` wheel — and the
+    ``cffi`` bake then failed on ``ffi.h``, which is precisely the discovery preflight
+    exists to move forward. The three accepted shapes, and why each is one:
+
+    * ``cp38``/``cp38m`` with an aarch64 platform tag — this interpreter's own build;
+    * ``abi3`` from ``cp30`` to ``cp38`` on an aarch64 platform tag — the stable ABI is
+      forward-compatible, so a wheel built for 3.7 installs on 3.8 and one built for
+      3.9 does not;
+    * ``py3``/``py2.py3``/``py3N`` (N ≤ the minor) with ``none`` and ``any``, or with
+      an aarch64 platform tag — pure Python, which compiles nothing either way.
+
+    A ``py2``-only wheel is **not** installable here and falls through to the sdist:
+    ``py2-none-any`` expands to itself alone, and there is no ``py2`` in the set this
+    interpreter answers to. That is the same rule that takes ``py2.py3``, and it is
+    why the alternatives are enumerated instead of the field string being compared.
+    """
+    parts = _wheel_tag_parts(file.filename)
+    if parts is None:
+        return None
+    major, _, minor = python_minor.partition(".")
+    limit = int(minor) if minor.isdigit() else 0
+    expected = f"cp{major}{minor}"
+    concrete = (expected, f"{expected}m")
+    stable = {f"cp{major}{n}" for n in range(limit + 1)}
+    pure = {f"py{major}"} | {f"py{major}{n}" for n in range(limit + 1)}
+    for python in _tag_set(parts[0]):
+        for abi in _tag_set(parts[1]):
+            for platform in _tag_set(parts[2]):
+                on_arch = platform != "any" and _aarch64_platform(platform)
+                if platform != "any" and not on_arch:
+                    continue
+                if abi == "none":
+                    if python in pure:
+                        return f"{python}-{abi}-{platform}"
+                elif abi == "abi3":
+                    if on_arch and python in stable:
+                        return f"{python}-{abi}-{platform}"
+                elif platform != "any" and python == expected and abi in concrete:
+                    return f"{python}-{abi}-{platform}"
+    return None
+
+
+SDIST_COMPILED_SUFFIXES = COMPILED_SOURCE_SUFFIXES + (".f", ".f77", ".f90", ".f95")
+"""Compiled-source suffixes, plus Fortran.
+
+[VANTA-WHY] Fortran is on the list although no tree in either split compiles any: the
+sdists that do are exactly the ones whose read is skipped for size (``scipy``, and
+numpy's BLAS half), and a rule that silently omitted Fortran would report "compiles
+nothing" for the two packages most likely to need ``gfortran`` — the wrong direction,
+because it would let a missing compiler be discovered at build time.
+"""
+
+SDIST_DATA_DIRS = frozenset(
+    {
+        "test",
+        "tests",
+        "test_data",
+        "testdata",
+        "testing",
+        "doc",
+        "docs",
+        "example",
+        "examples",
+    }
+)
+"""Path components that mean an sdist shipped the file as data, not as source to build.
+
+[VANTA-WHY] Measured on ``protego`` 0.1.16: its sdist carries four ``.cc`` files and
+every one is under ``tests/test_data/`` — renamed corpora, not C++. Counting them puts
+a pure-Python package on the "needs a C compiler" list, and a review table is only
+worth reading if every entry on it is real.
+"""
+
+
+def compiled_sources(members: Sequence[str]) -> tuple[str, ...]:
+    """The sdist members whose suffix says the build compiles them.
+
+    Suffix-matched on the basename and filtered by :data:`SDIST_DATA_DIRS`. PyPI's own
+    classifiers cannot answer this (see :data:`SDIST_MAX_BYTES`), so the archive's own
+    file list is what does: it is cheap, and it is the release's own claim about itself.
+    """
+    return tuple(
+        name
+        for name in members
+        if name.endswith(SDIST_COMPILED_SUFFIXES)
+        and not SDIST_DATA_DIRS.intersection(name.split("/")[:-1])
+    )
+
+
+@dataclass(frozen=True)
+class PreflightPin:
+    """One ``name==version`` pin and what PyPI says it can be installed as."""
+
+    name: str
+    version: str
+    kind: str
+    reason: str
+    matched_tag: Optional[str] = None
+    """The wheel tag that put this pin in class (a), when one did."""
+    compiled: tuple[str, ...] = ()
+    """The sdist members that look like sources a build compiles (class (b))."""
+    sdist_truncated: bool = False
+    """Whether the sdist was not read whole, so :attr:`compiled` may be incomplete."""
+
+    @property
+    def letter(self) -> str:
+        """The §3.2 class letter, for a line a human reads."""
+        return PREFLIGHT_CLASS_LETTERS.get(self.kind, "?")
+
+    @property
+    def compiles(self) -> bool:
+        """Whether this sdist carries sources a build would compile.
+
+        The one predicate the review table and the gap report both key off, so "needs a
+        system library" cannot mean two different things in two places.
+        """
+        return self.kind == SDIST_ONLY and bool(self.compiled)
+
+    def as_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "name": self.name,
+            "version": self.version,
+            "pin": f"{self.name}=={self.version}",
+            "class": self.letter,
+            "kind": self.kind,
+            "reason": self.reason,
+        }
+        if self.matched_tag is not None:
+            data["matched_tag"] = self.matched_tag
+        if self.kind == SDIST_ONLY:
+            data["compiled_sources"] = list(self.compiled)
+            data["sdist_truncated"] = self.sdist_truncated
+        return data
+
+
+def preflight_pin(
+    name: str,
+    version: str,
+    *,
+    python_minor: str,
+    files_of: Callable[[str, str], Optional[tuple[PyPIFile, ...]]] = pypi_release_files,
+    sdist_of: Callable[[PyPIFile], tuple[tuple[str, ...], bool]] = sdist_file_list,
+) -> PreflightPin:
+    """Classify one pin as §3.2 class (a), (b) or (c).
+
+    A wheel wins over an sdist when both are listed, because that is what pip picks.
+    ``files_of`` returning ``None`` (PyPI has no such release) and a release that lists
+    no file at all are both class (c) and get different reasons: the first is a pin
+    that names a version nobody ever uploaded, the second a release that was uploaded
+    without anything in it, and the remedy for a reader is different.
+    """
+    files = files_of(name, version)
+    if files is None:
+        return PreflightPin(
+            name=name,
+            version=version,
+            kind=NO_DISTRIBUTION,
+            reason=(
+                "PyPI has no such release: the pin names a version that was never "
+                "uploaded, so nothing can install it"
+            ),
+        )
+    for file in files:
+        tag = wheel_install_tag(file, python_minor=python_minor)
+        if tag is not None:
+            return PreflightPin(
+                name=name,
+                version=version,
+                kind=INSTALLABLE_WHEEL,
+                reason=f"installs from {file.filename} ({tag})",
+                matched_tag=tag,
+            )
+
+    sdists = [file for file in files if file.is_sdist]
+    if not sdists:
+        wheels = [file for file in files if file.is_wheel]
+        detail = (
+            f"{len(wheels)} wheel(s) and none of them installable here"
+            if wheels
+            else "no files listed for it at all"
+        )
+        return PreflightPin(
+            name=name,
+            version=version,
+            kind=NO_DISTRIBUTION,
+            reason=(
+                f"nothing pip can install on {_cpython_tag(python_minor)}/linux-aarch64: "
+                f"{detail}, and no source distribution to build instead"
+            ),
+        )
+
+    sdist = sdists[0]
+    members, truncated = sdist_of(sdist)
+    compiled = compiled_sources(members)
+    if compiled:
+        sample = ", ".join(compiled[:3]) + (", …" if len(compiled) > 3 else "")
+        rest = (
+            f"no {_cpython_tag(python_minor)} aarch64 wheel; {sdist.filename} builds "
+            f"{len(compiled)} compiled source(s) ({sample})"
+        )
+    elif truncated:
+        rest = (
+            f"no {_cpython_tag(python_minor)} aarch64 wheel; {sdist.filename} was not "
+            "read whole, so what it compiles is unknown"
+        )
+    else:
+        rest = (
+            f"no {_cpython_tag(python_minor)} aarch64 wheel; {sdist.filename} carries "
+            "no compiled sources, so it needs no compiler"
+        )
+    return PreflightPin(
+        name=name,
+        version=version,
+        kind=SDIST_ONLY,
+        reason=rest,
+        compiled=compiled,
+        sdist_truncated=truncated,
+    )
+
+
+def _pinned_parts(pin: str) -> Optional[tuple[str, str]]:
+    """``(name, version)`` from an install spec, or ``None`` when it is not one.
+
+    Every pin the layers carry is written by :func:`resolve_pins` or
+    :func:`resolve_build_pins` as ``name==version``. Anything else is a shape this
+    preflight does not recognise and must not guess about.
+    """
+    name, sep, version = pin.partition("==")
+    if not sep or not name or not version:
+        return None
+    return name, version
+
+
+def layer_pins(layer: BugDeps) -> tuple[tuple[str, str], ...]:
+    """The layer's ``(name, version)`` pins, build pins first and with no repeats.
+
+    Build pins first because that is the order the recipe installs them (§3.2), and a
+    package in both lists appears once: a build requirement the dependency set also
+    pins *is* that pin (:attr:`BuildPin.dependency_pin`), so counting it twice would
+    report one package as two.
+    """
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for pin in (*layer.build_pins, *layer.installs):
+        parts = _pinned_parts(pin)
+        if parts is None or parts in seen:
+            continue
+        seen.add(parts)
+        out.append(parts)
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class PreflightBug:
+    """One layer's preflight, over every pin it will install."""
+
+    key: str
+    checkpoint: str
+    python_minor: str
+    pins: tuple[PreflightPin, ...]
+
+    @property
+    def target(self) -> str:
+        """The interpreter and platform the classification was made for."""
+        return f"{_cpython_tag(self.python_minor)}/linux-aarch64"
+
+    @property
+    def to_build(self) -> tuple[PreflightPin, ...]:
+        """The class (b) pins: pip will compile them from their sdist."""
+        return tuple(pin for pin in self.pins if pin.kind == SDIST_ONLY)
+
+    @property
+    def unavailable(self) -> tuple[PreflightPin, ...]:
+        """The class (c) pins: nothing pip can install here, so the layer cannot."""
+        return tuple(pin for pin in self.pins if pin.kind == NO_DISTRIBUTION)
+
+    def counts(self) -> dict[str, int]:
+        counts = {kind: 0 for kind in PREFLIGHT_CLASS_LETTERS}
+        for pin in self.pins:
+            counts[pin.kind] = counts.get(pin.kind, 0) + 1
+        return counts
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": PREFLIGHT_SCHEMA_VERSION,
+            "key": self.key,
+            "checkpoint": self.checkpoint,
+            "target": self.target,
+            "counts": self.counts(),
+            "pins": [pin.as_dict() for pin in self.pins],
+        }
+
+
+def preflight_layers(
+    layers: Sequence[BugDeps],
+    *,
+    files_of: Callable[[str, str], Optional[tuple[PyPIFile, ...]]] = pypi_release_files,
+    sdist_of: Callable[[PyPIFile], tuple[tuple[str, ...], bool]] = sdist_file_list,
+) -> list[PreflightBug]:
+    """Classify every pin of every layer, with one cache for the whole run.
+
+    [VANTA-WHY] Cached across layers rather than per bug: the splits share their pins
+    (numpy alone is in six of the eleven dev-split bugs), so a preflight that refetched
+    per bug would spend most of its time asking PyPI the same question. The cache is
+    keyed ``(name, version)`` for the release's files and by filename for the sdist
+    listing, so a package two bugs pin at the same version is fetched once — the same
+    shape as the per-run ``releases`` mapping :func:`resolve_bug_deps` fetches.
+
+    ``files_of``/``sdist_of`` are injected so the whole classification is a structural
+    test: the default pair is the network, and no test should need it.
+    """
+    files_cache: dict[tuple[str, str], Optional[tuple[PyPIFile, ...]]] = {}
+    sdist_cache: dict[str, tuple[tuple[str, ...], bool]] = {}
+
+    def cached_files(name: str, version: str) -> Optional[tuple[PyPIFile, ...]]:
+        key = (name, version)
+        if key not in files_cache:
+            files_cache[key] = files_of(name, version)
+        return files_cache[key]
+
+    def cached_sdist(file: PyPIFile) -> tuple[tuple[str, ...], bool]:
+        if file.filename not in sdist_cache:
+            sdist_cache[file.filename] = sdist_of(file)
+        return sdist_cache[file.filename]
+
+    out: list[PreflightBug] = []
+    for layer in layers:
+        minor = minor_version(str(layer.entry["python_version"]))
+        out.append(
+            PreflightBug(
+                key=f"{layer.entry['project']}/{layer.entry['bug_id']}",
+                checkpoint=layer.checkpoint,
+                python_minor=minor,
+                pins=tuple(
+                    preflight_pin(
+                        name,
+                        version,
+                        python_minor=minor,
+                        files_of=cached_files,
+                        sdist_of=cached_sdist,
+                    )
+                    for name, version in layer_pins(layer)
+                ),
+            )
+        )
+    return out
+
+
+def preflight_lines(reports: Sequence[PreflightBug]) -> list[str]:
+    """The per-bug table: every class (b) and (c) entry, and the count for each bug.
+
+    One line per bug even when it has nothing to report — "this layer is all wheels" is
+    the answer to the question the table is asked, and a table with the quiet bugs
+    missing cannot say whether a bug was checked.
+    """
+    lines = [f"preflight: {len(reports)} layer(s)"]
+    for report in reports:
+        counts = report.counts()
+        lines.append(
+            f"[{report.checkpoint}] {report.key} ({report.target}): "
+            f"{len(report.pins)} pin(s), {counts[INSTALLABLE_WHEEL]} wheel, "
+            f"{counts[SDIST_ONLY]} sdist-only, {counts[NO_DISTRIBUTION]} unavailable"
+        )
+        for pin in (*report.to_build, *report.unavailable):
+            lines.append(f"  ({pin.letter}) {pin.name}=={pin.version} — {pin.reason}")
+    return lines
+
+
+def preflight_path(deps_dir: Path, checkpoint: str) -> Path:
+    return deps_dir / f"{checkpoint}.preflight.json"
+
+
+def write_preflight(deps_dir: Path, report: PreflightBug) -> Path:
+    """Record one layer's preflight next to its provenance, in the same directory.
+
+    A sibling of ``<checkpoint>.json`` and not that file: ``prepare`` reads the
+    provenance to find what the layer installs, and this is what the *bake* learned on
+    the way there. Nothing globs ``*.json`` in ``deps/``, and the ``.preflight.json``
+    suffix keeps it that way.
+    """
+    deps_dir.mkdir(parents=True, exist_ok=True)
+    path = preflight_path(deps_dir, report.checkpoint)
+    path.write_text(
+        json.dumps(report.as_dict(), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def _declared_requirement(

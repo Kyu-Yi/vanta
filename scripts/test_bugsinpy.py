@@ -3591,6 +3591,345 @@ class TestRunBakeActions:
         assert summary.count("[skipped]") == 2
 
 
+def _wheel(filename: str) -> bake_mod.PyPIFile:
+    return bake_mod.PyPIFile(
+        filename=filename, packagetype="bdist_wheel", url=f"https://files.test/{filename}"
+    )
+
+
+def _sdist(filename: str) -> bake_mod.PyPIFile:
+    return bake_mod.PyPIFile(
+        filename=filename, packagetype="sdist", url=f"https://files.test/{filename}"
+    )
+
+
+class TestPinPreflight:
+    """What every pin installs as, decided before anything is built (§3.2).
+
+    Not ``TestPreflight``: that name is already taken by the runner's own preflight
+    (CWD, the binary) further down this file, and a second class of the same name
+    would shadow this one in the module namespace — collected as nothing.
+
+    Every test injects ``files_of``/``sdist_of``: the defaults are PyPI and the
+    network, and a preflight that can only be tested by reaching the network is a
+    preflight nobody tests.
+    """
+
+    def _classify(
+        self, files, *, members=(), truncated=False, pin="demo==1.0", minor="3.8"
+    ):
+        name, version = pin.split("==")
+        return bake_mod.preflight_pin(
+            name,
+            version,
+            python_minor=minor,
+            files_of=lambda n, v: None if files is None else tuple(files),
+            sdist_of=lambda file: (tuple(members), truncated),
+        )
+
+    def test_a_pure_python_wheel_installs_on_this_interpreter(self):
+        """``py2.py3`` is a compressed tag set: the ``py3`` half is the one that answers."""
+        pin = self._classify([_wheel("six-1.15.0-py2.py3-none-any.whl")])
+        assert pin.kind == bake_mod.INSTALLABLE_WHEEL
+        assert pin.matched_tag == "py3-none-any"
+        assert pin.letter == "a"
+
+    def test_a_compressed_platform_field_is_expanded_not_compared_literally(self):
+        """``manylinux1_x86_64.manylinux2014_aarch64`` — one wheel, two platforms."""
+        pin = self._classify(
+            [_wheel("numpy-1.18.5-cp38-cp38-manylinux1_x86_64.manylinux2014_aarch64.whl")],
+            pin="numpy==1.18.5",
+        )
+        assert pin.kind == bake_mod.INSTALLABLE_WHEEL
+        assert pin.matched_tag == "cp38-cp38-manylinux2014_aarch64"
+
+    def test_a_wheel_marked_for_another_cpython_does_not_install(self):
+        for filename in (
+            "numpy-1.18.5-cp39-cp39-manylinux2014_aarch64.whl",
+            "numpy-1.18.5-cp36-cp36m-manylinux2014_aarch64.whl",
+            "numpy-1.18.5-cp39-abi3-manylinux2014_aarch64.whl",
+            "numpy-1.18.5-cp27-cp27m-manylinux2014_aarch64.whl",
+            "numpy-1.18.5-py2-none-any.whl",
+        ):
+            pin = self._classify([_wheel(filename), _sdist("numpy-1.18.5.tar.gz")])
+            assert pin.kind == bake_mod.SDIST_ONLY, filename
+            assert pin.letter == "b"
+
+    def test_a_wheel_for_another_architecture_does_not_install(self):
+        pin = self._classify(
+            [
+                _wheel("numpy-1.18.5-cp38-cp38-manylinux2014_x86_64.whl"),
+                _wheel("numpy-1.18.5-cp38-cp38-win_amd64.whl"),
+                _sdist("numpy-1.18.5.tar.gz"),
+            ]
+        )
+        assert pin.kind == bake_mod.SDIST_ONLY
+
+    def test_an_abi3_wheel_installs_up_to_its_own_minor(self):
+        pin = self._classify([_wheel("cryptography-3.0-cp37-abi3-manylinux2014_aarch64.whl")])
+        assert pin.kind == bake_mod.INSTALLABLE_WHEEL
+
+    def test_a_build_tag_on_the_filename_does_not_confuse_the_tag_read(self):
+        pin = self._classify([_wheel("demo-1.0-1-cp38-cp38m-manylinux_2_17_aarch64.whl")])
+        assert pin.matched_tag == "cp38-cp38m-manylinux_2_17_aarch64"
+
+    def test_a_wheel_is_preferred_over_the_sdist_of_the_same_release(self):
+        pin = self._classify(
+            [
+                _sdist("cffi-1.14.0.tar.gz"),
+                _wheel("cffi-1.14.0-cp38-cp38-manylinux2014_aarch64.whl"),
+            ],
+            members=("cffi-1.14.0/c/_cffi_backend.c",),
+        )
+        assert pin.kind == bake_mod.INSTALLABLE_WHEEL
+
+    def test_an_sdist_that_compiles_says_what_it_will_compile(self):
+        pin = self._classify(
+            [_sdist("cffi-1.14.0.tar.gz")],
+            members=(
+                "cffi-1.14.0/c/_cffi_backend.c",
+                "cffi-1.14.0/setup.py",
+                "cffi-1.14.0/doc/index.rst",
+            ),
+        )
+        assert pin.kind == bake_mod.SDIST_ONLY
+        assert pin.compiles
+        assert pin.compiled == ("cffi-1.14.0/c/_cffi_backend.c",)
+        assert "_cffi_backend.c" in pin.reason
+
+    def test_an_sdist_that_compiles_nothing_needs_no_system_package(self):
+        pin = self._classify(
+            [_sdist("pager-3.3.tar.gz")], members=("pager-3.3/pager.py", "pager-3.3/setup.py")
+        )
+        assert pin.kind == bake_mod.SDIST_ONLY
+        assert not pin.compiles
+        assert "no compiled sources" in pin.reason
+
+    def test_a_test_data_file_named_like_c_is_not_a_compiled_source(self):
+        """Measured on protego 0.1.16: four ``.cc`` files, all renamed corpora."""
+        pin = self._classify(
+            [_sdist("protego-0.1.16.tar.gz")],
+            members=(
+                "protego-0.1.16/tests/test_data/neurips.cc",
+                "protego-0.1.16/protego.py",
+            ),
+        )
+        assert not pin.compiles
+
+    def test_fortran_is_something_to_compile(self):
+        pin = self._classify(
+            [_sdist("scipy-1.4.1.tar.gz")], members=("scipy-1.4.1/scipy/linalg/src/x.f90",)
+        )
+        assert pin.compiles
+
+    def test_an_sdist_that_was_not_read_whole_does_not_claim_to_compile_nothing(self):
+        pin = self._classify([_sdist("matplotlib-3.2.1.tar.gz")], truncated=True)
+        assert pin.sdist_truncated
+        assert "not read whole" in pin.reason
+
+    def test_a_pin_pypi_never_released_is_unavailable_and_says_so(self):
+        pin = self._classify(None, pin="requests-async==0.5.0")
+        assert pin.kind == bake_mod.NO_DISTRIBUTION
+        assert pin.letter == "c"
+        assert "no such release" in pin.reason
+
+    def test_a_release_with_only_foreign_wheels_and_no_sdist_is_unavailable(self):
+        pin = self._classify(
+            [
+                _wheel("pywin32-227-cp27-cp27m-win_amd64.whl"),
+                _wheel("pywin32-227-cp38-cp38-win_amd64.whl"),
+            ],
+            pin="pywin32==227",
+        )
+        assert pin.kind == bake_mod.NO_DISTRIBUTION
+        assert "2 wheel(s)" in pin.reason
+        assert "no source distribution" in pin.reason
+
+    def test_the_files_and_the_listing_of_a_shared_pin_are_fetched_once(self):
+        """The cache is what makes a 232-pin preflight cheap; numpy is in six bugs."""
+        entries = [
+            bug_entry(checkpoint="vanta-bi-Demo-1"),
+            bug_entry(bug_id=2, checkpoint="vanta-bi-Demo-2"),
+        ]
+        deps = [
+            bake_mod.BugDeps(
+                entry=dict(entry),
+                checkpoint=bake_mod.bug_checkpoint_name(entry),
+                installs=("numpy==1.18.5",),
+                provenance={},
+            )
+            for entry in entries
+        ]
+        fetched: list[tuple[str, str]] = []
+        listings: list[str] = []
+
+        def files_of(name, version):
+            fetched.append((name, version))
+            return (_sdist(f"{name}-{version}.tar.gz"),)
+
+        def sdist_of(file):
+            listings.append(file.filename)
+            return ("numpy-1.18.5/numpy/core/src/multiarray/arrayobject.c",), False
+
+        reports = bake_mod.preflight_layers(deps, files_of=files_of, sdist_of=sdist_of)
+        assert fetched == [("numpy", "1.18.5")]
+        assert listings == ["numpy-1.18.5.tar.gz"]
+        assert [report.checkpoint for report in reports] == [
+            "vanta-bi-Demo-1",
+            "vanta-bi-Demo-2",
+        ]
+        assert all(report.pins[0].compiles for report in reports)
+
+    def test_the_layers_pins_keep_the_build_pins_first_and_drop_repeats(self):
+        """A build requirement the dependency set also pins is that one pin, once."""
+        layer = bake_mod.BugDeps(
+            entry=bug_entry(),
+            checkpoint="vanta-bi-Demo-1",
+            installs=("numpy==1.18.5", "pytest==8.0.2"),
+            provenance={},
+            build_pins=("setuptools==44.1.0", "numpy==1.18.5"),
+        )
+        assert bake_mod.layer_pins(layer) == (
+            ("setuptools", "44.1.0"),
+            ("numpy", "1.18.5"),
+            ("pytest", "8.0.2"),
+        )
+
+    def _report(self):
+        return bake_mod.PreflightBug(
+            key="Demo/1",
+            checkpoint="vanta-bi-Demo-1",
+            python_minor="3.8",
+            pins=(
+                bake_mod.PreflightPin("decorator", "4.4.0", bake_mod.INSTALLABLE_WHEEL, "w"),
+                bake_mod.PreflightPin(
+                    "cffi",
+                    "1.14.0",
+                    bake_mod.SDIST_ONLY,
+                    "no cp38 aarch64 wheel; cffi-1.14.0.tar.gz builds 24 compiled source(s)",
+                    compiled=("cffi-1.14.0/c/_cffi_backend.c",),
+                ),
+                bake_mod.PreflightPin(
+                    "pywin32", "227", bake_mod.NO_DISTRIBUTION, "nothing pip can install"
+                ),
+            ),
+        )
+
+    def test_the_table_lists_every_sdist_and_unavailable_entry(self):
+        lines = bake_mod.preflight_lines([self._report()])
+        assert "preflight: 1 layer(s)" in lines[0]
+        assert (
+            "[vanta-bi-Demo-1] Demo/1 (cp38/linux-aarch64): 3 pin(s), 1 wheel, "
+            "1 sdist-only, 1 unavailable" in lines[1]
+        )
+        assert "(b) cffi==1.14.0 — no cp38 aarch64 wheel" in lines[2]
+        assert "(c) pywin32==227 — nothing pip can install" in lines[3]
+        assert "(a)" not in "\n".join(lines), "a usable wheel is not a finding"
+
+    def test_a_layer_with_nothing_to_report_still_gets_its_line(self):
+        quiet = bake_mod.PreflightBug(
+            key="Demo/1",
+            checkpoint="vanta-bi-Demo-1",
+            python_minor="3.8",
+            pins=(
+                bake_mod.PreflightPin("six", "1.15.0", bake_mod.INSTALLABLE_WHEEL, "w"),
+            ),
+        )
+        lines = bake_mod.preflight_lines([quiet])
+        assert len(lines) == 2, "one header and one line per layer, finding or not"
+        assert "1 wheel, 0 sdist-only, 0 unavailable" in lines[1]
+
+    def test_the_record_is_written_beside_the_provenance(self, tmp_path):
+        path = bake_mod.write_preflight(tmp_path, self._report())
+        assert path.name == "vanta-bi-Demo-1.preflight.json"
+        assert tmp_path / "vanta-bi-Demo-1.preflight.json" == path
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["schema_version"] == bake_mod.PREFLIGHT_SCHEMA_VERSION
+        assert data["checkpoint"] == "vanta-bi-Demo-1"
+        assert data["target"] == "cp38/linux-aarch64"
+        assert data["counts"] == {"wheel": 1, "sdist": 1, "unavailable": 1}
+        assert [pin["pin"] for pin in data["pins"]] == [
+            "decorator==4.4.0",
+            "cffi==1.14.0",
+            "pywin32==227",
+        ]
+        assert data["pins"][1]["compiled_sources"] == ["cffi-1.14.0/c/_cffi_backend.c"]
+        assert data["pins"][1]["class"] == "b"
+        assert "compiled_sources" not in data["pins"][0]
+
+    def _cli(self, tmp_path, monkeypatch, *, argv=(), flagged=()):
+        """Drive ``bake`` with resolution, preflight and the build all injected."""
+        root = tmp_path / "bugsinpy"
+        root.mkdir()
+        entry = bug_entry(checkpoint="vanta-bi-Demo-1")
+        split = split_mod.Split(split_data(bugs=[entry], bugsinpy_root=str(root)))
+        deps = _bug_deps([entry], {"vanta-bi-Demo-1": ("decorator==4.4.0",)})
+        written: list[str] = []
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split)
+        monkeypatch.setattr(
+            bake_mod, "resolve_bug_deps", lambda *a, **k: (deps, list(flagged))
+        )
+        monkeypatch.setattr(bake_mod, "write_deps", lambda *a, **k: tmp_path / "d.json")
+        monkeypatch.setattr(
+            bake_mod, "preflight_layers", lambda *a, **k: [self._report()]
+        )
+        monkeypatch.setattr(
+            bake_mod,
+            "write_preflight",
+            lambda deps_dir, report: written.append(report.checkpoint) or (tmp_path / "p.json"),
+        )
+        monkeypatch.setattr(bake_mod, "plan_layers", lambda *a, **k: [])
+        monkeypatch.setattr(bake_mod, "run_bake_actions", lambda *a, **k: "summary line")
+        code = run_mod.main(
+            [
+                "bake",
+                "--pythons",
+                "3.8",
+                "--split",
+                str(tmp_path / "s.json"),
+                *argv,
+            ]
+        )
+        return code, written
+
+    def test_preflight_only_classifies_and_builds_nothing(self, tmp_path, monkeypatch, capsys):
+        code, written = self._cli(
+            tmp_path, monkeypatch, argv=["--preflight-only"], flagged=[]
+        )
+        captured = capsys.readouterr()
+        assert written == ["vanta-bi-Demo-1"], "the record is written for every layer"
+        assert "(b) cffi==1.14.0" in captured.out
+        assert "preflight only: nothing was baked" in captured.out
+        assert "bake plan" not in captured.out, "no plan: no layer is touched"
+        assert "bake complete" not in captured.out
+        assert code == run_mod.EXIT_OK
+
+    def test_preflight_only_needs_no_yes_and_still_reports_flagged_bugs(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The preflight builds nothing, so the ``--yes`` gate does not apply to it."""
+        code, _ = self._cli(
+            tmp_path,
+            monkeypatch,
+            argv=["--preflight-only"],
+            flagged=[bake_mod.FlaggedBug("Demo/1", "BakeError: unreadable")],
+        )
+        captured = capsys.readouterr()
+        assert "flagged bugs (1)" in captured.out
+        assert "dry run: nothing was baked" not in captured.err
+        assert code == run_mod.EXIT_BUG_FAILED
+
+    def test_a_bake_writes_the_preflight_before_it_builds_anything(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        code, written = self._cli(tmp_path, monkeypatch, argv=["--yes"])
+        captured = capsys.readouterr()
+        assert written == ["vanta-bi-Demo-1"]
+        assert "preflight: 1 layer(s)" in captured.out
+        assert "bake complete" in captured.out
+        assert code == run_mod.EXIT_OK
+
+
 # ============================================================================
 # the four dependency sources (§3.2, §3.3) — the fix for the wave-1 failure
 # ============================================================================

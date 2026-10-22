@@ -380,6 +380,11 @@ def cmd_bake(args: argparse.Namespace) -> int:
     one that runs before ``prepare``. Without ``--yes`` it prints the plan and
     stops: a bake downloads interpreters and installs packages for minutes, and a
     typo should not start one.
+
+    Every ``--yes`` run starts with the preflight (§3.2): what each pin installs as
+    on this image, written next to the provenance and printed before the first layer
+    is built. ``--preflight-only`` stops after it, and does not need ``--yes`` — the
+    preflight builds nothing, and the pins it classifies are the same ones either way.
     """
     split = load_split(args.split.resolve())
     pythons = parse_pythons(args.pythons, split)
@@ -389,7 +394,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
     )
     bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
 
-    if not args.yes:
+    if not args.yes and not args.preflight_only:
         sys.stdout.write(
             bake_mod.render_plan(
                 split, pythons=minors, entries=entries, bugsinpy_root=bugsinpy_root
@@ -431,6 +436,17 @@ def cmd_bake(args: argparse.Namespace) -> int:
     bug_deps, flagged = bake_mod.resolve_bug_deps(
         split, entries, bugsinpy_root=bugsinpy_root, repo_for=repo_for
     )
+
+    # Every run ends with this list, empty or not: a reader of a run that stopped at a
+    # failed build saw the plan and the layer that failed but had no way to tell
+    # whether other bugs had been flagged before the build started. The `(0)` line is
+    # the same statement made about a run where nothing was flagged.
+    flagged_pairs = [(flag.key, flag.reason) for flag in flagged]
+
+    def report_flagged() -> None:
+        print(flush=True)
+        print(render_flagged(flagged_pairs), flush=True)
+
     for item in bug_deps:
         path = bake_mod.write_deps(deps_dir, item)
         print(f"[{item.checkpoint}] installs: {', '.join(item.installs) or '—'}")
@@ -439,6 +455,23 @@ def cmd_bake(args: argparse.Namespace) -> int:
             flush=True,
         )
         print(f"[{item.checkpoint}] provenance: {path}", flush=True)
+
+    # The preflight, before the first layer is built (§3.2): what every pin installs
+    # as on this image — cp38/linux-aarch64. A pin with no wheel here is built from
+    # its sdist, and every system library that build needs is a whole bake cycle to
+    # discover, so the answer is computed, printed and recorded next to the
+    # provenance before anything is built.
+    preflight = bake_mod.preflight_layers(bug_deps)
+    for report in preflight:
+        path = bake_mod.write_preflight(deps_dir, report)
+        print(f"[{report.checkpoint}] preflight: {path}", flush=True)
+    if preflight:
+        print("\n".join(bake_mod.preflight_lines(preflight)), flush=True)
+
+    if args.preflight_only:
+        print("preflight only: nothing was baked", flush=True)
+        report_flagged()
+        return EXIT_BUG_FAILED if flagged else EXIT_OK
 
     # A flagged bug has no resolved deps, so it must not reach the recipes — they
     # would refuse a checkpoint with nothing resolved for it, which is exactly the
@@ -458,17 +491,6 @@ def cmd_bake(args: argparse.Namespace) -> int:
     print(f"bake plan ({len(actions)} layers):", flush=True)
     for action in actions:
         print(f"  {action.describe()}", flush=True)
-
-    # Every run ends with this list, empty or not, and the run that stopped at a
-    # failed build ends with it too: `run_bake_actions` raises on the first failure,
-    # so a reader of that run saw the plan and the layer that failed but had no way
-    # to tell whether other bugs had been flagged before the build started. The `(0)`
-    # line is the same statement made about a run where nothing was flagged.
-    flagged_pairs = [(flag.key, flag.reason) for flag in flagged]
-
-    def report_flagged() -> None:
-        print(flush=True)
-        print(render_flagged(flagged_pairs), flush=True)
 
     try:
         summary = bake_mod.run_bake_actions(
@@ -762,6 +784,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="rebuild layers that already exist",
+    )
+    bake.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help=(
+            "resolve and classify every pin against PyPI, write the preflight records "
+            "and exit without building anything (§3.2); does not need --yes"
+        ),
     )
     bake.set_defaults(func=cmd_bake)
 

@@ -407,6 +407,47 @@ shuru checkpoint create vanta-bi-<project>-<N> --from vanta-bugsinpy-py3.<v> --a
 This mirrors the existing `vanta-deps-<fingerprint>` + `/opt/vanta-deps-ok` marker + freeze-file
 pattern exactly, so nothing new has to be invented for verification.
 
+**Preflight — what every pin installs as, decided before the first layer is built.** The VM is
+`linux-aarch64` and most of these 2020-era pins have no `aarch64` wheel, so they are compiled from
+their sdist and every missing system library behind that build costs a whole bake cycle to discover:
+the measured `cffi` failure was `c/_cffi_backend.c:15:10: fatal error: ffi.h: No such file or
+directory`, and it was found by *baking*, which is exactly what the preflight exists to prevent.
+`bake.preflight_layers` therefore classifies every pin of every selected layer against PyPI's own
+per-release file list (`bake.pypi_release_files`, reading the release payload's `urls` key — the same
+URL the date fetcher reads `info` from, and the half it deliberately ignored until now) **before**
+`layer_recipes` is called, and writes `runs/bugsinpy/deps/<checkpoint>.preflight.json` beside the
+provenance, with `--preflight-only` to do that and stop:
+
+- **(a) `wheel`** — a wheel that installs on `cp38 linux-aarch64`: `py3`/`py2.py3`/`py3N` (N ≤ 8) with
+  `none`/`any`, or a `cp38`/`cp38m` wheel, or an `abi3` wheel from `cp30` to `cp38`, each with a
+  `manylinux*`/`musllinux*`/`linux` `aarch64` platform tag. A wheel wins over the sdist of the same
+  release, because that is what pip picks.
+- **(b) `sdist`** — no usable wheel and an sdist: pip will compile it. The sdist's own file list is
+  read (`bake.sdist_file_list`, capped at `SDIST_MAX_BYTES` and streamed so a truncated read still
+  yields what it contained) and the members whose suffix says "compiled" are recorded and reported.
+  PyPI's classifiers cannot answer this and were measured: only **7 of 51** packages carry a
+  `Programming Language :: C` classifier, and 24 of the 61 class (b) pins do not — `asyncpg`, `cffi`,
+  `cryptography`, `numpy`, `regex`, `sqlalchemy`, `yarl` and the rest are silent about it.
+- **(c) `unavailable`** — nothing pip can install here: the release does not exist on PyPI
+  (`luigi/1`'s `requests-async==0.5.0`) or the release has no Linux distribution at all
+  (`sanic/1`'s `pywin32==227`: twelve wheels, every one `win_amd64`, no sdist).
+
+The tag has to be *read*, and as a **compressed set**: PEP 425 makes a dot in a tag field the set of
+tags the wheel also claims, so `six-1.15.0-py2.py3-none-any.whl` is `py3-none-any` as well as
+`py2-none-any` — read as one literal tag, or with every alternative required at once, `six`'s own
+wheel comes back unavailable (which is how that was caught). `py2-none-any` alone really is not
+installable on this interpreter and falls through to the sdist. Measured over both splits' provenance:
+**232 distinct pins → 170 wheel, 61 sdist, 1 unavailable**, cached per run by `(name, version)` for the
+file list and by filename for the sdist listing (`numpy==1.18.5` alone is in six of the eleven dev-split
+bugs), the same shape as the per-run `releases` mapping `resolve_bug_deps` fetches dates with. Two
+measured corrections are in the code for the same reason: an sdist's `tests/test_data/*.cc` is a renamed
+corpus and not C++ (`protego 0.1.16`), so those directories are excluded from the compiled count; and
+Fortran (`.f`, `.f77`, `.f90`, `.f95`) **is** counted although nothing in either split compiles any,
+because the sdists that do are exactly the ones whose read is skipped for size — `scipy` and numpy's
+BLAS half — and "compiles nothing" would be the wrong answer for the two packages most likely to need
+`gfortran`. It is reported, not enforced: the bake still installs what the recipe says, and the record
+is what makes the claim checkable afterwards.
+
 **Rebuild semantics — `--force` means replace, and a rebuilt base invalidates its children.** A layer
 is deleted *before* it is created, never merely created over (shuru refuses a duplicate name with
 `checkpoint '<name>' already exists, delete it first`; `checkpoint_create` treats any non-zero result

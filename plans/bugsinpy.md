@@ -705,14 +705,30 @@ layer and before anything else, a **build pin** set:
   a tree cannot have been built with a tool that did not exist yet.
 
 The order is what makes the pins mean anything, and `--no-build-isolation` is what makes the order
-apply: the pins are installed in one pip call **first** (keeping pip's own isolation — these three are
-the tools the isolation would otherwise supply, so this is the one install that cannot be made to
-depend on itself), their versions are then asserted with `importlib.metadata` (a pin that silently did
-not land is worse than no pin: the build below would fall back to the interpreter layer's seeded
-setuptools and look identical in the log), and the dependency install runs with
-`--no-build-isolation` — pip's supported way to say "build against what is already in this
-environment". With the flag, a missing build requirement fails the line instead of quietly isolating,
-so the flag either applies or the run stops.
+apply. The pins go into the layer in **two** pip calls, and the split between them is the fix for a
+*second* measured failure of the first implementation. With the pins in one call, that call had to keep
+pip's own isolation — the toolchain is the one install that cannot be made to depend on itself — and
+that put matplotlib's `setup_requires=["numpy>=1.15"]`, a **build pin**, on the *isolated* side. The log
+printed `build pins: setuptools==47.1.1 …` and pip built `numpy==1.18.5` in
+`/tmp/pip-build-env-*/overlay` with *today's* setuptools: straight back into the failure the pins exist
+to prevent, one line above the assertion that said the pin had landed. So:
+
+1. **the toolchain alone**, in one pip call, keeping pip's own isolation — `setuptools`, `wheel`,
+   `cython` are what the isolation would otherwise supply, so this is the one install that cannot be
+   made to depend on itself;
+2. **everything else, with `--no-build-isolation`**: the project's declared build requirements first
+   (a name that is one of the three is claimed by call 1 whichever list it arrived in), then the
+   dependency set. The flag is pip's supported way to say "build against what is already in this
+   environment"; with it, a missing build requirement fails the line instead of quietly isolating, so
+   the flag either applies or the run stops.
+
+Their versions are asserted once, with `importlib.metadata`, after **both** calls — a pin that silently
+did not land is worse than no pin: the build would fall back to the interpreter layer's seeded
+setuptools and look identical in the log. And every non-isolated call is followed by a check that pip
+left **no** `/tmp/pip-build-env-*` directory behind: that path is the isolated build environment made
+visible, pip removes it on a normal exit, so its presence means an isolated build ran anyway (failed or
+aborted) and the layer must not be recorded as built. The check is a `for` loop over the glob, not
+`compgen -G`, because the recipe runs under the image's `/bin/sh` (dash).
 
 The pins go into the layer's provenance under its own **`build_pins`** key — next to `installs`, not
 inside `dependencies` — because it answers a different question: a reader asking which Cython compiled

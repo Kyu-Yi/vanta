@@ -173,6 +173,11 @@ def _bug_deps(
     ]
 
 
+def _heredoc(recipe: str, tag: str) -> str:
+    """The body of one ``cat > … <<'TAG' … TAG`` block in a layer recipe."""
+    return recipe.split(f"<<'{tag}'\n", 1)[1].split(f"\n{tag}\n", 1)[0]
+
+
 # ============================================================================
 # split.py — the committed protocol
 # ============================================================================
@@ -2871,12 +2876,14 @@ class TestBake:
         assert "cat >" not in recipe, "an empty heredoc would install nothing useful"
 
     def test_the_toolchain_is_installed_first_and_the_builds_are_not_isolated(self):
-        """The two halves of the build-pin rule, as they appear in the layer (§3.2).
+        """The installs, in order, and which of them keeps pip's own isolation.
 
         Order is the whole point: pip builds a source distribution in a *fresh*
         environment unless told otherwise, so the dated toolchain has to be in the
         venv before the dependency install runs — and that install has to run with
-        ``--no-build-isolation`` for the pins to be what the build uses.
+        ``--no-build-isolation`` for the pins to be what the build uses. The
+        toolchain call is the one install that keeps isolation, because at that point
+        there is nothing in the layer for pip to build a pinned tool against.
         """
         recipe = bake_mod.requirements_recipe(
             ["numpy==1.18.5"],
@@ -2886,7 +2893,7 @@ class TestBake:
             line for line in recipe.splitlines() if line.startswith("python -m pip install")
         ]
         assert pip_lines == [
-            "python -m pip install --no-cache-dir -r /tmp/build-req.txt",
+            "python -m pip install --no-cache-dir -r /tmp/build-tools.txt",
             "python -m pip install --no-cache-dir --no-build-isolation -r /tmp/req.txt",
         ]
         assert "VANTA_BUILD_TOOLS" in recipe
@@ -2898,10 +2905,66 @@ class TestBake:
         assert "('setuptools', '40.8.0')" in recipe
         assert "('cython', '0.29.6')" in recipe
 
+    def test_a_declared_build_requirement_is_never_built_in_an_isolated_env(self):
+        """The measured matplotlib failure, as a property of the recipe.
+
+        ``setup.py`` says ``setup_requires=["numpy>=1.15"]``, so numpy is a *build*
+        pin. Shared with the toolchain in one build install that kept pip's
+        isolation, pip built ``numpy==1.18.5`` in ``/tmp/pip-build-env-*/overlay``
+        with *today's* setuptools — which is why the log printed
+        ``build pins: setuptools==47.1.1 …`` and numpy still died in
+        ``numpy/distutils/mingw32ccompiler``, one line above the assertion that said
+        the pin had landed.
+        """
+        recipe = bake_mod.requirements_recipe(
+            ["decorator==4.4.0"],
+            build_pins=[
+                "setuptools==47.1.1",
+                "wheel==0.33.1",
+                "cython==0.29.6",
+                "numpy==1.18.5",
+            ],
+        )
+        pip_lines = [
+            line for line in recipe.splitlines() if line.startswith("python -m pip install")
+        ]
+        assert pip_lines == [
+            "python -m pip install --no-cache-dir -r /tmp/build-tools.txt",
+            "python -m pip install --no-cache-dir --no-build-isolation -r /tmp/build-req.txt",
+            "python -m pip install --no-cache-dir --no-build-isolation -r /tmp/req.txt",
+        ]
+        tools = _heredoc(recipe, "VANTA_BUILD_TOOLS")
+        build_req = _heredoc(recipe, "VANTA_BUILD_REQUIRES")
+        assert "setuptools==47.1.1" in tools
+        assert "numpy==1.18.5" in build_req
+        assert "numpy" not in tools
+        assert recipe.index("VANTA_BUILD_REQUIRES") < recipe.index("--no-build-isolation")
+
+    def test_every_non_isolated_install_checks_for_a_leftover_build_env(self):
+        """``/tmp/pip-build-env-*`` is the isolated build env made visible (§3.2).
+
+        pip removes it on a normal exit, so the guard catches the run that created
+        one anyway — an isolated build that failed or was aborted — and fails the
+        layer rather than recording one built with today's toolchain.
+        """
+        bare = bake_mod.requirements_recipe(["decorator==4.4.0"])
+        assert bare.count("--no-build-isolation") == 1
+        assert bare.count("/tmp/pip-build-env-*") == 1
+        built = bake_mod.requirements_recipe(
+            ["decorator==4.4.0"], build_pins=["setuptools==47.1.1", "numpy==1.18.5"]
+        )
+        assert built.count("--no-build-isolation") == 2
+        assert built.count("/tmp/pip-build-env-*") == 2
+        assert "exit 1" in built
+
     def test_a_recipe_without_build_pins_asks_for_no_toolchain(self):
         recipe = bake_mod.requirements_recipe(["decorator==4.4.0"])
+        assert "/tmp/build-tools.txt" not in recipe
         assert "/tmp/build-req.txt" not in recipe
-        assert "--no-build-isolation" not in recipe
+        # The dependency install stays non-isolated even with no build pins: the
+        # interpreter layer is `uv venv --seed`, so it carries a setuptools and a
+        # wheel, and a dependency pulled transitively can itself be a source build.
+        assert "--no-build-isolation" in recipe
 
     def test_build_pins_without_dependencies_still_install_the_toolchain(self):
         recipe = bake_mod.requirements_recipe([], build_pins=["setuptools==40.8.0"])

@@ -1639,28 +1639,42 @@ def requirements_recipe(
     or before the date of the commit that declared it (a fix-only requirement is held
     to the *fix's* date, everything else to the buggy commit's).
 
-    ``build_pins`` goes in **first**, and is what makes the dependency install below
-    run against a *dated* toolchain rather than today's:
+    ``build_pins`` goes in **first**, in **two** installs, and the split between them
+    is what makes the dependency install below run against a *dated* toolchain rather
+    than today's:
 
-    * the pins are installed in one pip call before anything else, with pip's own
+    * the **toolchain** (:data:`BUILD_TOOLS`) alone, in one pip call, with pip's own
       build isolation — these three are the tools the isolation would otherwise
       supply, so they are the one install that cannot be made to depend on itself;
-    * their versions are then asserted with ``importlib.metadata``, because a pin
-      that silently did not land is worse than no pin: the build below would use the
-      interpreter layer's seeded setuptools and look identical in the log;
-    * and the dependency install runs with ``--no-build-isolation``, pip's supported
-      way to say "build against what is already in this environment" — which is
-      exactly the pins just installed. Measured on matplotlib/1: without it, the
-      pinned ``numpy==1.18.5`` built in a fresh isolated environment, took setuptools
-      released years after the tree, and died in ``numpy/distutils/mingw32ccompiler``
-      on a ``distutils`` module that setuptools no longer carries.
+    * then **everything else** with ``--no-build-isolation``: the build requirements
+      the project declares (numpy for matplotlib, Cython and numpy for pandas) and
+      the dependency set.
+
+    [VANTA-WHY] The two-install split is the fix for a *measured* failure, and the
+    single install it replaces looked correct in the log. matplotlib's ``setup.py``
+    says ``setup_requires=["numpy>=1.15"]``, so numpy is a build pin and was written
+    into the one pip call that keeps isolation: the log printed
+    ``build pins: setuptools==47.1.1 …`` while pip built ``numpy==1.18.5`` in
+    ``/tmp/pip-build-env-*/overlay`` with *today's* setuptools, and numpy died in
+    ``numpy/distutils/mingw32ccompiler`` on a ``distutils`` module setuptools no
+    longer carries — the exact failure the pins exist to prevent, one line above the
+    assertion that said the pin had landed.
+
+    ``--no-build-isolation`` is pip's supported way to say "build against what is
+    already in this environment", which is exactly the pins just installed; pip
+    refuses to build when a build requirement is missing from the environment rather
+    than quietly isolating, so the flag either applies or the line fails. The recipe
+    does not take that on trust either: after every non-isolated install it asserts
+    that pip left **no** ``/tmp/pip-build-env-*`` directory behind
+    (:func:`_no_isolated_build_env`), and every pin's version is asserted with
+    ``importlib.metadata`` once both installs have run.
 
     ``build_pins`` is keyword-only and empty by default so that a caller with nothing
     to build — and every test of the dependency half — still gets a recipe, and the
     recipe says so rather than pretending to a toolchain it was not given.
     """
     body = "\n".join(spec.strip() for spec in install_specs if spec.strip()).strip()
-    build_body = "\n".join(spec.strip() for spec in build_pins if spec.strip()).strip()
+    toolchain, build_requires = _split_build_pins(build_pins)
 
     lines = [
         "set -eux",
@@ -1673,17 +1687,34 @@ def requirements_recipe(
         'python -c "import ssl, sys; assert sys.prefix != sys.base_prefix, sys.prefix; '
         'print(sys.version.split()[0], ssl.OPENSSL_VERSION, sys.prefix)"',
     ]
-    if build_body:
+    if toolchain:
         lines += [
-            "cat > /tmp/build-req.txt <<'VANTA_BUILD_TOOLS'",
-            build_body,
+            "cat > /tmp/build-tools.txt <<'VANTA_BUILD_TOOLS'",
+            "\n".join(toolchain),
             "VANTA_BUILD_TOOLS",
             # The toolchain itself, and the only install here that keeps isolation:
             # pip has to be able to *build* a pinned tool that has no wheel for the
             # platform, and at this point there is nothing in the layer to build it
             # against. Everything built after this line is built without isolation.
-            "python -m pip install --no-cache-dir -r /tmp/build-req.txt",
+            "python -m pip install --no-cache-dir -r /tmp/build-tools.txt",
         ]
+    if build_requires:
+        lines += [
+            "cat > /tmp/build-req.txt <<'VANTA_BUILD_REQUIRES'",
+            "\n".join(build_requires),
+            "VANTA_BUILD_REQUIRES",
+            # The project's own build requirements, and *not* part of the isolated
+            # call above: numpy is what failed there. Built against the toolchain
+            # instead, so a source build sees the setuptools this tree was built
+            # with rather than the one pip would fetch today.
+            "python -m pip install --no-cache-dir --no-build-isolation -r /tmp/build-req.txt",
+            _no_isolated_build_env("the build requirements"),
+        ]
+    if toolchain or build_requires:
+        # After both installs, because it asserts every pin — including the ones the
+        # second install puts there. A pin that silently did not land is worse than
+        # no pin: the build below would fall back on the interpreter layer's seeded
+        # setuptools and look identical in the log.
         check = _build_pin_check(build_pins)
         if check:
             lines.append(check)
@@ -1693,12 +1724,11 @@ def requirements_recipe(
             body,
             "VANTA_REQUIREMENTS",
             # No `|| true`: a bug whose dependencies do not install is a bug that
-            # cannot be measured, and it must fail here rather than mid-wave. The
-            # `--no-build-isolation` is the other half of it: a source build here
-            # uses the dated toolchain installed above, and pip refuses to build
-            # when a build requirement is missing from the environment rather than
-            # quietly isolating, so the flag either applies or this line fails.
+            # cannot be measured, and it must fail here rather than mid-wave. A
+            # dependency pulled transitively can itself be a source build, which is
+            # why this install carries the flag too.
             "python -m pip install --no-cache-dir --no-build-isolation -r /tmp/req.txt",
+            _no_isolated_build_env("the dependency install"),
         ]
     lines += [
         "python -m pytest --version",
@@ -1706,6 +1736,50 @@ def requirements_recipe(
         f"touch {MARKER}",
     ]
     return "\n".join(lines)
+
+
+_BUILD_TOOL_NAMES = frozenset(canonicalize_name(name) for name in BUILD_TOOLS)
+
+
+def _split_build_pins(build_pins: Sequence[str]) -> tuple[list[str], list[str]]:
+    """``(toolchain, declared build requirements)`` — the recipe's two installs.
+
+    Split by **name** rather than by position, and the name wins whichever group it
+    arrived in: a build requirement that is one of :data:`BUILD_TOOLS` (pandas
+    declares Cython, matplotlib Cython and numpy) is installed by the toolchain call,
+    because the second call is the one that has to run *against* the toolchain rather
+    than fetch it. :func:`resolve_build_pins` already orders the toolchain first, so
+    this only has to survive a caller that did not.
+    """
+    toolchain: list[str] = []
+    build_requires: list[str] = []
+    for spec in build_pins:
+        stripped = spec.strip()
+        if not stripped:
+            continue
+        name = canonicalize_name(stripped.partition("==")[0].strip())
+        (toolchain if name in _BUILD_TOOL_NAMES else build_requires).append(stripped)
+    return toolchain, build_requires
+
+
+def _no_isolated_build_env(step: str) -> str:
+    """One shell line that fails the recipe if pip left an isolated build env behind.
+
+    [VANTA-WHY] ``/tmp/pip-build-env-*`` is pip's isolated build environment *made
+    visible*, and ``--no-build-isolation`` is what stops one being created for
+    ``step``. pip removes the directory on a normal exit, so this is a guard against
+    the run that created one anyway — a failed or aborted isolated build — and not
+    the main enforcement; but such a layer would be recorded as built, which is worse
+    than a bake that stops. Written as a glob loop and not ``compgen -G``: the script
+    runs under the image's ``/bin/sh`` (dash), where ``compgen`` does not exist.
+    """
+    return (
+        "for d in /tmp/pip-build-env-*; do "
+        '[ -e "$d" ] || continue; '
+        f'echo "VANTA: {step} left an isolated build environment behind: $d"; '
+        'ls -d "$d"; exit 1; '
+        "done"
+    )
 
 
 def _build_pin_check(build_pins: Sequence[str]) -> str:

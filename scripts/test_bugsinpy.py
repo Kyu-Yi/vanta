@@ -115,7 +115,7 @@ def bug_entry(**over) -> dict:
         test_cmd=["python", "-m", "pytest", "tests", "--json-report-file={report}"],
         pytest_version="8.0.2",
         json_report_version="1.5.0",
-        checkpoint="vanta-bi-demo-1",
+        checkpoint="vanta-bi-Demo-1",
         wave=1,
         role="pilot",
         notes="",
@@ -222,8 +222,8 @@ class TestSplit:
         """
         split = load_split(SPLIT_PATH)
         changes = split.data["reviewed_changes"]
-        assert len(changes) == 5
-        excluded, promoted, removed, dropped, development = changes
+        assert len(changes) == 6
+        excluded, promoted, removed, dropped, development, mapped = changes
         assert "PySnooper/1" in excluded["change"]
         assert "Python-2-only" in excluded["reason"]
 
@@ -262,6 +262,15 @@ class TestSplit:
         assert "no config, seed, sampling or gate field is touched" in development["change"]
         assert "development case" in development["reason"]
         assert "measurements" not in development
+
+        # The sixth is the reviewed module mapping: `psycopg2` is provided by two
+        # distributions, so the closure refuses to choose and the pick is recorded
+        # rather than guessed. Its evidence is the rule, not a per-candidate table.
+        assert "psycopg2" in mapped["change"]
+        assert "psycopg2-binary" in mapped["change"]
+        assert "skip without a database server" in mapped["reason"]
+        assert "date rule" in mapped["rule"]
+        assert "measurements" not in mapped
 
     def test_reviewed_change_validates(self):
         data = split_data(
@@ -4282,7 +4291,7 @@ class TestTestImportClosure:
         """
         refs, _, _ = self._closure(
             {"tests/test_demo.py": "import requests\n"},
-            tree_files={"fastapi/requests.py": ""},
+            tree_files={"fastapi/__init__.py": "", "fastapi/requests.py": ""},
         )
         assert [ref.spec for ref in refs] == ["requests"]
 

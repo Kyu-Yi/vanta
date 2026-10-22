@@ -509,8 +509,10 @@ not about "is this module mentioned somewhere". `bake.decide_unresolvable` drops
 when
 
 * every import site in the tree is **optional** — inside a `try`/`except ImportError`, behind
-  `pytest.importorskip(...)`, or reached through `import_optional_dependency("name")` by string
-  (`ImportSite.optional`, from `_collect_imports`' existing reasons plus those two call forms) — **or**
+  `pytest.importorskip(...)`, reached through `import_optional_dependency("name")` by string, inside a
+  `TYPE_CHECKING` block (`type-checking only`), or inside a function or method body
+  (`lazy: inside <qualname>`) — each recorded on the site as `ImportSite.optional` by
+  `_collect_imports`, so the audit prints the reason it did not count — **or**
 * no site at all is in the **import closure** of the bug's failing test files — the split's declared
   `test_file`, the same declaration `prepare._declared_by_bugsinpy` filters `FAIL_TO_PASS` by — and
   that closure;
@@ -520,6 +522,39 @@ closure is walked by `bake.import_closure` over `bake.module_import_graph`, root
 file; `bake.import_auditor` reads both commits' trees, because the graded tree is the buggy source
 carrying the fix's tests. A file that is not in the graph makes the audit conservative — the whole
 graph is treated as the closure.
+
+**Two structures that read like imports are not imports the module makes.** An import inside
+`if TYPE_CHECKING:` — the bare name, `typing.TYPE_CHECKING`, an alias (`from typing import TYPE_CHECKING
+as TC`), or the `if False:` that says the same thing without the import from `typing` — never executes:
+`TYPE_CHECKING` is `False` at run time, so the block is read by a type checker, the distribution can be
+missing, and the module still imports. That is the whole point of writing it that way. It is recorded as
+**`type-checking only`**. An import inside a function or method body runs when *that function* is
+called, not when the module is imported, so importing the suite does not need the distribution either;
+it is recorded as **`lazy: inside <qualname>`**, dotted so a method reads `Dtype._arrow` and a nested
+function `outer.inner`. `bake._never_runs` matches the guard in its **exact** form — the name, the
+`typing.TYPE_CHECKING` attribute, the literal `False` — because `if not TYPE_CHECKING:` and
+`if x or TYPE_CHECKING:` *do* run, and a rule with a false positive drops a pin a graded test needs,
+which is the failure mode this rule exists to avoid. A **module-level unguarded import is unchanged**: it
+is still an unconditional site, and still what makes the pin required. Measured, this was the last flag
+the dev-split preflight carried — `pandas/core/arrays/boolean.py` at `3fd150c` is
+
+    if TYPE_CHECKING:
+        import pyarrow  # noqa: F401
+
+and `pandas/1`'s failing test (`pandas/tests/dtypes/test_dtypes.py`) never reaches a runtime
+`import pyarrow`, so the block was the only thing keeping a pin this image cannot build.
+
+The lazy reason is a prediction like a drop, and it is safe for the same reason: `prepare`'s gate — the
+buggy tree must fail and the fixed tree must pass — is the measurement, and a bug whose gate fails names
+the pins the layer went without (`prepare.dropped_pin_note`, at every gate exit). Measured on the test
+side the rule also changes three of `pandas/1`'s names: `import bs4` inside `test_bs4_version_fails`
+(`pandas/tests/io/test_html.py`), `from sklearn import svm, datasets` inside `test_scikit_learn`
+(`pandas/tests/test_downstream.py`), and `import psycopg2` inside
+`TestToDatetime.test_to_datetime_tz_psycopg2` (`pandas/tests/tools/test_to_datetime.py`) — none of the
+three is installed for the layer now, and each is in `optional_imports` with its qualname so the drop is
+checkable rather than silent. Two of those three are `@td.skip_if_no(...)`-decorated, which is worth
+saying plainly: without the distribution such a test **skips** instead of failing, so the gate is blind
+to that one and the record is the only place the decision can be read.
 
 The distinction is measured, and it is where the rule was wrong before. **`pandas/1` is not flagged, it
 drops.** `import pyarrow` does appear in **18** `.py` files at the fix's commit, but the only
@@ -760,10 +795,12 @@ Source 5's scope, since "the test side's imports" can be read several ways:
   counted: `fastapi/requests.py` is importable as `fastapi.requests` and never as a top-level
   `requests`, so counting those would silently drop the real distribution of that name. This applies
   to every wave, not only the dev split.
-- **An optional import is recorded, never installed.** An import inside `try/except ImportError`, or
-  behind a version check (`sys.version_info`, `PY2`, `six.PY3`), is a fallback: it goes in
+- **An optional import is recorded, never installed.** An import inside `try/except ImportError`, behind
+  a version check (`sys.version_info`, `PY2`, `six.PY3`), inside a `TYPE_CHECKING` block
+  (`type-checking only`) or inside a function body (`lazy: inside <qualname>`) is a fallback: it goes in
   `optional_imports` and not into `installs`, because installing a Python-2-only fallback on 3.8 would
-  fail the bake over a branch that can never be taken.
+  fail the bake over a branch that can never be taken — and a type-checking block or a function body is
+  the same statement about *when* the import runs, which is the only thing the layer has to answer.
 - **An ambiguous module name stops the bake.** `import yaml` is PyYAML and `import bs4` is
   beautifulsoup4; no canonicalisation recovers that. The closure names the module and refuses, and the
   fix is a reviewed `module_distributions` entry in the split — a decision recorded in the protocol,
@@ -776,15 +813,20 @@ Source 5's scope, since "the test side's imports" can be read several ways:
   layer's (measured: pandas/1's `from _csv import Error` reached the merge as `-csv` and stopped that
   bug over a name nobody can publish), so the closure **notes** it and installs nothing. `psycopg2` is
   the case the refusal exists for — two distributions both provide it (`psycopg2` and
-  `psycopg2-binary`, same module), so the harness will not choose and the bug stays flagged until a
-  reviewer records the pick. The pick is therefore the reviewer's, written into the table with its
-  reason and its rule in `reviewed_changes` rather than into the harness: `psycopg2` →
-  `psycopg2-binary`, because the bug's tests only need the module to import (the SQL tests skip without
-  a database server, so no connection is exercised) while the source distribution builds against libpq
-  and needs a `pg_config` the sandbox does not have. Nothing about it is otherwise special: the mapped
-  distribution is pinned by the same date rule as every other dependency, and a pin with no wheel for
-  the sandbox's platform fails the bake as an ordinary build failure for that bug — flagged, not
-  worked around, and never answered by falling back to the source distribution. This applies to every
+  `psycopg2-binary`, same module), so the harness will not choose and a module-level site of it would
+  keep the bug flagged until a reviewer records the pick. The pick is therefore the reviewer's, written
+  into the table with its reason and its rule in `reviewed_changes` rather than into the harness:
+  `psycopg2` → `psycopg2-binary`, because the bug's tests only need the module to import (the SQL tests
+  skip without a database server, so no connection is exercised) while the source distribution builds
+  against libpq and needs a `pg_config` the sandbox does not have. On `pandas/1` the entry is read by
+  the **audit** rather than by the closure now: the tree's only site, `import psycopg2` in
+  `pandas/tests/tools/test_to_datetime.py`, is inside `TestToDatetime.test_to_datetime_tz_psycopg2`, so
+  it is a `lazy` optional import (above) and nothing is installed for it — the mapping is what
+  `import_auditor` reads when a pin of that name has to be judged. Nothing about it is otherwise
+  special: a mapped distribution that *is* installed is pinned by the same date rule as every other
+  dependency, and a pin with no wheel for the sandbox's platform fails the bake as an ordinary build
+  failure for that bug — flagged, not worked around, and never answered by falling back to the source
+  distribution. This applies to every
   wave: the table is carried by *both* split files, so a name mapped for the dev split is mapped for
   the evaluation run too.
 

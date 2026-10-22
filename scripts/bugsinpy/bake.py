@@ -1921,6 +1921,33 @@ _VERSION_GUARDS = frozenset(
 """Names that make an ``if`` a version check: ``sys.version_info[:2] >= (3, 6)``,
 ``if PY2:``, ``six.PY3``. Either branch is then the other branch's fallback."""
 
+TYPE_CHECKING_ONLY = "type-checking only"
+"""Why an import cannot count as a runtime import: the block around it never runs.
+
+[VANTA-WHY] An import inside ``if TYPE_CHECKING:`` is not an import the module makes.
+``TYPE_CHECKING`` is ``False`` at run time, so the block is read by a type checker and
+never executed — the distribution can be missing and the module still imports, which is
+the whole point of writing it that way. Measured on pandas/1, this is the flag that
+survived every other rule: ``pandas/core/arrays/boolean.py:31-32`` is
+``if TYPE_CHECKING:`` / ``import pyarrow  # noqa: F401``, and the failing test
+(``pandas/tests/dtypes/test_dtypes.py``) never reaches a runtime ``import pyarrow``, so
+counting the block as evidence that the layer needs ``pyarrow`` refused a bug whose
+graded tests pass without it. ``if False:`` is the same statement written without the
+import from ``typing``."""
+
+_LAZY_PREFIX = "lazy: inside "
+"""The reason a function-scope import is recorded with, prefixed to its qualname.
+
+[VANTA-WHY] An import inside a function or method body runs when that function is
+called, not when the module is imported, so importing the module does not need the
+distribution. That is not a leap of faith: ``prepare``'s gate is the empirical check —
+if a graded test does call the function, the gate fails and the bug is reported with the
+dropped pins named (:func:`prepare.dropped_pin_note`), which is a stop rather than a
+silently short layer."""
+
+_TYPE_CHECKING_NAMES = frozenset({"TYPE_CHECKING"})
+"""The spellings :func:`_never_runs` treats as ``typing.TYPE_CHECKING`` by default."""
+
 
 @dataclass(frozen=True)
 class ImportSite:
@@ -2015,8 +2042,53 @@ def _guard_reason(node: ast.Try) -> Optional[str]:
     return None
 
 
+def _type_checking_names(node: ast.AST) -> frozenset[str]:
+    """The spellings of ``typing.TYPE_CHECKING`` the module under ``node`` binds.
+
+    ``import typing`` and ``from typing import TYPE_CHECKING`` are both read by the
+    ``TYPE_CHECKING`` name or attribute itself, so the only spelling this has to find is
+    an **alias**: ``from typing import TYPE_CHECKING as TC`` leaves nothing called
+    ``TYPE_CHECKING`` in the file, and the ``if TC:`` that follows is the same guard.
+    The set is collected from the whole tree under ``node`` — the alias may be declared
+    anywhere in the file — and always contains the bare name.
+    """
+    names = set(_TYPE_CHECKING_NAMES)
+    for item in ast.walk(node):
+        if isinstance(item, ast.ImportFrom) and not item.level and item.module == "typing":
+            for alias in item.names:
+                if alias.name == "TYPE_CHECKING":
+                    names.add(alias.asname or alias.name)
+    return frozenset(names)
+
+
+def _never_runs(test: ast.AST, type_checking: frozenset[str] = _TYPE_CHECKING_NAMES) -> bool:
+    """Whether an ``if`` with this test never runs its body, so its imports never run.
+
+    The forms read here are the ones decidable from the test alone: a name bound to
+    ``typing.TYPE_CHECKING`` (the bare name, an alias, the ``typing.TYPE_CHECKING``
+    attribute) and the literal ``False``.
+
+    [VANTA-WHY] The test is matched in its *exact* form, not as "any test that mentions
+    the name". ``if not TYPE_CHECKING:`` and ``if x or TYPE_CHECKING:`` do run, so
+    treating a mention as the guard would drop a pin a graded test actually needs.
+    Anything else is left unguarded — the direction that keeps a pin rather than
+    dropping one.
+    """
+    if isinstance(test, ast.Constant):
+        return test.value is False
+    if isinstance(test, ast.Name):
+        return test.id in type_checking
+    return isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+
+
 def _collect_imports(
-    node: ast.AST, *, optional: Optional[str], out: list[ImportSite], path: str = ""
+    node: ast.AST,
+    *,
+    optional: Optional[str],
+    out: list[ImportSite],
+    path: str = "",
+    qualname: str = "",
+    type_checking: Optional[frozenset[str]] = None,
 ) -> None:
     """Record every import reachable from ``node``, and whether it is optional.
 
@@ -2027,11 +2099,21 @@ def _collect_imports(
     spelling of the same thing (``import tests``) is excluded by name instead, in
     :func:`test_import_closure`.
 
+    Two structures make an import optional with no guard at all, and each is recorded
+    with its own reason rather than as an unconditional site: a ``TYPE_CHECKING`` block
+    (:data:`TYPE_CHECKING_ONLY`) and a function or method body (:data:`_LAZY_PREFIX`).
+    Neither runs when the module is imported, which is the question this walk answers.
+
     ``path`` is the file being walked, recorded on every site so the rule that reads
     them (§3.2's, in :func:`tree_import_sites` and :func:`import_auditor`) can say
     *where* a module was named. It defaults to ``""`` so a caller that only wants the
-    module names does not have to invent a filename.
+    module names does not have to invent a filename. ``qualname`` is the enclosing
+    ``Class.method``/``outer.inner`` the lazy reason is built from, and ``type_checking``
+    is the file's spellings of ``TYPE_CHECKING``: both are derived from the module handed
+    in on the first call and threaded down, because neither is a fact about one branch.
     """
+    if type_checking is None:
+        type_checking = _type_checking_names(node)
     if isinstance(node, ast.Import):
         for alias in node.names:
             out.append(ImportSite(path=path, line=node.lineno, module=alias.name, optional=optional))
@@ -2048,19 +2130,109 @@ def _collect_imports(
             out.append(replace(site, path=path))
         # Not a return: the arguments are walked as usual, and a guarded call is not
         # the only thing a line can be.
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        qual = f"{qualname}.{node.name}" if qualname else node.name
+        body = {id(statement) for statement in node.body}
+        for child in ast.iter_child_nodes(node):
+            if id(child) not in body:
+                # Only the body is lazy: a decorator and a default argument are
+                # evaluated when the ``def`` runs, which is import time for a function
+                # at module scope.
+                _collect_imports(
+                    child,
+                    optional=optional,
+                    out=out,
+                    path=path,
+                    qualname=qualname,
+                    type_checking=type_checking,
+                )
+                continue
+            # A reason that is already set is the nearer one (a guard, a version check,
+            # a ``TYPE_CHECKING`` block) and stays; a nested function's own qualname is
+            # the more specific answer to "where is this lazy".
+            reason = optional
+            if reason is None or reason.startswith(_LAZY_PREFIX):
+                reason = f"{_LAZY_PREFIX}{qual}"
+            _collect_imports(
+                child,
+                optional=reason,
+                out=out,
+                path=path,
+                qualname=qual,
+                type_checking=type_checking,
+            )
+        return
+    if isinstance(node, ast.ClassDef):
+        # A class body *does* run at import time, so nothing becomes optional on the
+        # class's account; the name is carried only so a method's reason reads
+        # ``Class.method`` rather than ``method``.
+        qual = f"{qualname}.{node.name}" if qualname else node.name
+        for child in ast.iter_child_nodes(node):
+            _collect_imports(
+                child,
+                optional=optional,
+                out=out,
+                path=path,
+                qualname=qual,
+                type_checking=type_checking,
+            )
+        return
     if isinstance(node, ast.Try):
         inner = _guard_reason(node) or optional
         for branch in (*node.body, *node.handlers, *node.orelse, *node.finalbody):
-            _collect_imports(branch, optional=inner, out=out, path=path)
+            _collect_imports(
+                branch,
+                optional=inner,
+                out=out,
+                path=path,
+                qualname=qualname,
+                type_checking=type_checking,
+            )
         return
     if isinstance(node, ast.If):
+        if _never_runs(node.test, type_checking):
+            for branch in node.body:
+                _collect_imports(
+                    branch,
+                    optional=TYPE_CHECKING_ONLY,
+                    out=out,
+                    path=path,
+                    qualname=qualname,
+                    type_checking=type_checking,
+                )
+            # The ``else`` of a ``TYPE_CHECKING`` ``if`` is the branch that *does* run
+            # (``pyarrow = None``), so it keeps the reason the ``if`` came in with.
+            for branch in node.orelse:
+                _collect_imports(
+                    branch,
+                    optional=optional,
+                    out=out,
+                    path=path,
+                    qualname=qualname,
+                    type_checking=type_checking,
+                )
+            return
         guard = _names_in(node.test) & _VERSION_GUARDS
         inner = "behind a version check" if guard else optional
         for branch in (*node.body, *node.orelse):
-            _collect_imports(branch, optional=inner, out=out, path=path)
+            _collect_imports(
+                branch,
+                optional=inner,
+                out=out,
+                path=path,
+                qualname=qualname,
+                type_checking=type_checking,
+            )
         return
     for child in ast.iter_child_nodes(node):
-        _collect_imports(child, optional=optional, out=out, path=path)
+        _collect_imports(
+            child,
+            optional=optional,
+            out=out,
+            path=path,
+            qualname=qualname,
+            type_checking=type_checking,
+        )
 
 
 def test_side_paths(repo: Path, commit: str) -> list[str]:
@@ -4112,7 +4284,12 @@ def _absolute_module(path: str, level: int, module: str) -> Optional[str]:
     return ".".join([*package, module] if module else package)
 
 
-def _module_scope_imports(node: ast.AST, out: list[tuple[int, str, str]]) -> None:
+def _module_scope_imports(
+    node: ast.AST,
+    out: list[tuple[int, str, str]],
+    *,
+    type_checking: Optional[frozenset[str]] = None,
+) -> None:
     """``(level, module, imported name)`` for every import a *module body* runs.
 
     [VANTA-WHY] A function body is not module scope, and that distinction is the whole
@@ -4121,14 +4298,18 @@ def _module_scope_imports(node: ast.AST, out: list[tuple[int, str, str]]) -> Non
     runs when that method is called — and ``_arrow_utils`` is where pandas' one
     unconditional ``import pyarrow`` lives. A graph that followed function bodies would
     put pyarrow in the import closure of every pandas test that reaches any array, which
-    is exactly the false flag the rule exists to remove. ``TYPE_CHECKING`` blocks are
-    skipped for the same reason: they never run.
+    is exactly the false flag the rule exists to remove. A ``TYPE_CHECKING`` block — in
+    any of its spellings, an alias included — and an ``if False:`` are skipped for the
+    same reason: they never run, so a file only one of them names is not a file this one
+    reaches.
 
     Relative imports are kept as ``(level, module)`` rather than dropped the way
     :func:`_collect_imports` drops them: inside a package the relative spelling is how
     most of its own modules are named, so a closure that ignored it would see only the
     handful of absolute imports at the top.
     """
+    if type_checking is None:
+        type_checking = _type_checking_names(node)
     if isinstance(node, ast.Import):
         for alias in node.names:
             out.append((0, alias.name, ""))
@@ -4139,14 +4320,14 @@ def _module_scope_imports(node: ast.AST, out: list[tuple[int, str, str]]) -> Non
         return
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
         return
-    if isinstance(node, ast.If) and "TYPE_CHECKING" in _names_in(node.test):
+    if isinstance(node, ast.If) and _never_runs(node.test, type_checking):
         return
     if isinstance(node, ast.Try):
         for branch in (*node.body, *node.handlers, *node.orelse, *node.finalbody):
-            _module_scope_imports(branch, out)
+            _module_scope_imports(branch, out, type_checking=type_checking)
         return
     for child in ast.iter_child_nodes(node):
-        _module_scope_imports(child, out)
+        _module_scope_imports(child, out, type_checking=type_checking)
 
 
 def module_import_graph(
@@ -4265,8 +4446,12 @@ def import_auditor(
 
     1. an unconditional import that is inside the failing test files' *module-scope*
        import closure → required, and the bug is flagged (:func:`decide_unresolvable`);
-    2. every site behind a guard (:data:`_OPTIONAL_CALLS`, an ``except ImportError``, a
-       version check) → not required, whatever the tree looks like;
+    2. every site optional — behind a guard (:data:`_OPTIONAL_CALLS`, an
+       ``except ImportError``, a version check), inside a ``TYPE_CHECKING`` block
+       (:data:`TYPE_CHECKING_ONLY`), or inside a function body
+       (:data:`_LAZY_PREFIX`) → not required, whatever the tree looks like. None of
+       those runs when the module is imported, so none is evidence the layer needs the
+       distribution, and the record keeps every site and its reason;
     3. sites exist but none of the unconditional ones is in that closure → not required,
        because the tests this bug is graded on never reach it.
 

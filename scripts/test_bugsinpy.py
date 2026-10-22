@@ -4262,6 +4262,11 @@ class TestPinPreflight:
         assert written == ["vanta-bi-Demo-1"]
         assert "preflight: 1 layer(s)" in captured.out
         assert "bake complete" in captured.out
+        # A real bake still logs what each layer installs, what it builds with and where
+        # its provenance went; only a preflight-only run drops those three lines.
+        assert "[vanta-bi-Demo-1] installs: decorator==4.4.0" in captured.out
+        assert "[vanta-bi-Demo-1] build pins: —" in captured.out
+        assert "[vanta-bi-Demo-1] provenance:" in captured.out
         assert code == run_mod.EXIT_OK
 
 
@@ -4902,7 +4907,12 @@ class TestUnresolvablePins:
             "cp38/linux-aarch64: 12 wheel(s)" in out
         )
         assert "Demo/1 — nothing in either tree imports it" in out
-        assert "[vanta-bi-Demo-1] installs: —" in out
+        # The layer's own build log is not repeated here: a preflight-only run read it to
+        # answer, and what the run is for is the findings above. The lines stay in the
+        # deps JSON, so nothing is lost by not printing them.
+        assert "[vanta-bi-Demo-1] installs:" not in out
+        assert "[vanta-bi-Demo-1] build pins:" not in out
+        assert "[vanta-bi-Demo-1] provenance:" not in out
 
     def test_the_verdict_names_the_counts_when_something_is_open(self, monkeypatch):
         """A finding is one printed section, and the verdict is what a reader acts on."""

@@ -493,7 +493,12 @@ a deduplicated `unreviewed sdist build(s) (N)`, `unbuildable pin(s) (N)` and `pi
 install (N)` block, each line `<LABEL> <pin> — <bug keys>` — because the pins the split shares are why
 a reader is there (numpy alone is in six of the eleven dev-split bugs) and one decision printed six
 times is six times the reading. A pin the unresolvable-pin rule dropped is not repeated as a finding;
-it appears once in the drops block below, with the audit that settled it. `--preflight-only` then ends
+it appears once in the drops block below, with the audit that settled it. A `--preflight-only` run also
+leaves out the three **per-layer build lines** — `[<checkpoint>] installs:`, `[<checkpoint>] build
+pins:`, `[<checkpoint>] provenance:` — because they are the build's own log and that run is not
+building; they are written into `runs/bugsinpy/deps/<checkpoint>.json` either way, so the record is
+unchanged and only the terminal is quieter, which is the point of a run whose product is the findings
+below. A real bake still prints them, one per layer. `--preflight-only` then ends
 on a single line — `bake.preflight_verdict` — `ready to bake` when there are 0 gaps and 0 flags,
 otherwise `not ready to bake: N unreviewed sdist build(s) across M bug(s), F flagged bug(s)`; the
 counts are in it because "not ready" without them says nothing a reader can act on.

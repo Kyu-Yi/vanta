@@ -463,12 +463,17 @@ def cmd_bake(args: argparse.Namespace) -> int:
     drops = {item.checkpoint: item.provenance.get("dropped") or [] for item in bug_deps}
     for item in bug_deps:
         path = bake_mod.write_deps(deps_dir, item)
-        print(f"[{item.checkpoint}] installs: {', '.join(item.installs) or '—'}")
-        print(
-            f"[{item.checkpoint}] build pins: {', '.join(item.build_pins) or '—'}",
-            flush=True,
-        )
-        print(f"[{item.checkpoint}] provenance: {path}", flush=True)
+        # The three per-layer lines are the build's own log, so a preflight-only run does
+        # not print them: it read them to answer, and what it is for is the findings
+        # below. They stay in the deps JSON either way, so nothing is lost by not
+        # repeating the layer's install list once per bug before the run has started.
+        if not args.preflight_only:
+            print(f"[{item.checkpoint}] installs: {', '.join(item.installs) or '—'}")
+            print(
+                f"[{item.checkpoint}] build pins: {', '.join(item.build_pins) or '—'}",
+                flush=True,
+            )
+            print(f"[{item.checkpoint}] provenance: {path}", flush=True)
 
     # The preflight, before the first layer is built (§3.2): what every pin installs
     # as on this image — cp38/linux-aarch64. A pin with no wheel here is built from

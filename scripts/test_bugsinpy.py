@@ -3880,11 +3880,17 @@ class TestPinPreflight:
                 "cffi-1.14.0/setup.py",
                 "cffi-1.14.0/doc/index.rst",
             ),
+            pin="cffi==1.14.0",
         )
         assert pin.kind == bake_mod.SDIST_ONLY
         assert pin.compiles
         assert pin.compiled == ("cffi-1.14.0/c/_cffi_backend.c",)
-        assert "_cffi_backend.c" in pin.reason
+        # The reviewed table is the authority for what the build needs; the archive
+        # listing is the raw count and the record keeps it (`compiled_sources`).
+        assert "reviewed: needs libffi-dev" in pin.reason
+        assert "_cffi_backend.c" not in pin.reason, (
+            "a path is not a reason: files an archive carries are not what a build needs"
+        )
 
     def test_an_sdist_that_compiles_nothing_needs_no_system_package(self):
         pin = self._classify(
@@ -3914,7 +3920,18 @@ class TestPinPreflight:
     def test_an_sdist_that_was_not_read_whole_does_not_claim_to_compile_nothing(self):
         pin = self._classify([_sdist("matplotlib-3.2.1.tar.gz")], truncated=True)
         assert pin.sdist_truncated
-        assert "not read whole" in pin.reason
+        assert "read only in part" in pin.reason
+        assert "no compiled sources" not in pin.reason
+
+    def test_a_reviewed_package_with_no_libraries_says_the_toolchain_is_the_answer(self):
+        """An empty entry is a review result, and it must not read like a missing entry."""
+        pin = self._classify(
+            [_sdist("numpy-1.18.5.tar.gz")],
+            members=("numpy-1.18.5/numpy/linalg/lapack_lite/f2c_src/lapack_lite.c",),
+            pin="numpy==1.18.5",
+        )
+        assert pin.gap is None
+        assert "reviewed: the toolchain alone" in pin.reason
 
     def test_a_pin_pypi_never_released_is_unavailable_and_says_so(self):
         pin = self._classify(None, pin="requests-async==0.5.0")
@@ -4109,7 +4126,8 @@ class TestPinPreflight:
                     "cffi",
                     "1.14.0",
                     bake_mod.SDIST_ONLY,
-                    "no cp38 aarch64 wheel; cffi-1.14.0.tar.gz builds 24 compiled source(s)",
+                    "no cp38 aarch64 wheel; pip builds cffi-1.14.0.tar.gz from source "
+                    "— reviewed: needs libffi-dev",
                     compiled=("cffi-1.14.0/c/_cffi_backend.c",),
                 ),
                 bake_mod.PreflightPin(

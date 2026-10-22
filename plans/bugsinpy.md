@@ -450,8 +450,14 @@ provenance, with `--preflight-only` to do that and stop:
   release, because that is what pip picks.
 - **(b) `sdist`** — no usable wheel and an sdist: pip will compile it. The sdist's own file list is
   read (`bake.sdist_file_list`, capped at `SDIST_MAX_BYTES` and streamed so a truncated read still
-  yields what it contained) and the members whose suffix says "compiled" are recorded and reported.
-  PyPI's classifiers cannot answer this and were measured: only **7 of 51** packages carry a
+  yields what it contained) and the members whose suffix says "compiled" are recorded in the pin's
+  `compiled_sources`. That count is a **raw archive fact and nothing more**: it is a suffix match over
+  the whole tar, so it sees `distlib` 0.3.0's `PC/launcher.c` (the Windows launcher) and `cffi`'s
+  `demo/*.c` — files no Linux build compiles. It stays in the `.preflight.json` as the fact it is; it
+  is never the reason a build is said to need a library and no line is printed from it. What a build
+  needs is the reviewed table's answer (§3.2's table), which is the one authority for that question,
+  and no path heuristic over the file list is invented to second-guess it.
+  PyPI's classifiers cannot answer it either and were measured: only **7 of 51** packages carry a
   `Programming Language :: C` classifier, and 24 of the 61 class (b) pins do not — `asyncpg`, `cffi`,
   `cryptography`, `numpy`, `regex`, `sqlalchemy`, `yarl` and the rest are silent about it.
 - **(c) `unavailable`** — nothing pip can install here: the release does not exist on PyPI
@@ -473,7 +479,7 @@ corpus and not C++ (`protego 0.1.16`), so those directories are excluded from th
 Fortran (`.f`, `.f77`, `.f90`, `.f95`) **is** counted although nothing in either split compiles any,
 because the sdists that do are exactly the ones whose read is skipped for size — `scipy` and numpy's
 BLAS half — and "compiles nothing" would be the wrong answer for the two packages most likely to need
-`gfortran`. It is reported, not enforced: the bake still installs what the recipe says, and the record
+`gfortran`. It is recorded, not enforced: the bake still installs what the recipe says, and the record
 is what makes the claim checkable afterwards.
 
 **One rule for a pin nothing here can install, and it is the import closure that decides.** The

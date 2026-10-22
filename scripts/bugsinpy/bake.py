@@ -3349,31 +3349,74 @@ def preflight_pin(
     sdist = sdists[0]
     members, truncated = sdist_of(sdist)
     compiled = compiled_sources(members)
-    if compiled:
-        sample = ", ".join(compiled[:3]) + (", …" if len(compiled) > 3 else "")
-        rest = (
-            f"no {_cpython_tag(python_minor)} aarch64 wheel; {sdist.filename} builds "
-            f"{len(compiled)} compiled source(s) ({sample})"
-        )
-    elif truncated:
-        rest = (
-            f"no {_cpython_tag(python_minor)} aarch64 wheel; {sdist.filename} was not "
-            "read whole, so what it compiles is unknown"
-        )
-    else:
-        rest = (
-            f"no {_cpython_tag(python_minor)} aarch64 wheel; {sdist.filename} carries "
-            "no compiled sources, so it needs no compiler"
-        )
+    review = _review_of(name, compiled=compiled, truncated=truncated)
     return PreflightPin(
         name=name,
         version=version,
         kind=SDIST_ONLY,
-        reason=rest,
+        reason=_sdist_reason(
+            name,
+            sdist=sdist,
+            python_minor=python_minor,
+            compiled=compiled,
+            truncated=truncated,
+            review=review,
+        ),
         compiled=compiled,
         sdist_truncated=truncated,
-        **_review_of(name, compiled=compiled, truncated=truncated),
+        **review,
     )
+
+
+def _review_note(name: str) -> str:
+    """What the reviewed table says this build needs, as a clause a reader can search.
+
+    ``reviewed: the toolchain alone`` is the empty tuple's clause and says the review
+    happened — "no entry" and "an empty entry" must not read the same, because only the
+    second one closes a gap (:func:`_review_of`).
+    """
+    packages = SDIST_SYSTEM_PACKAGES.get(canonicalize_name(name))
+    if not packages:
+        return "reviewed: the toolchain alone"
+    return "reviewed: needs " + ", ".join(packages)
+
+
+def _sdist_reason(
+    name: str,
+    *,
+    sdist: PyPIFile,
+    python_minor: str,
+    compiled: Sequence[str],
+    truncated: bool,
+    review: Mapping[str, Optional[str]],
+) -> str:
+    """Why this pin is class (b), and what the reviewed table says about its build.
+
+    [VANTA-WHY] The reason quotes the *review*, not the file list. ``compiled_sources``
+    is a raw archive listing and it counts files no Linux build touches — ``distlib``
+    0.3.0's only entry is ``PC/launcher.c`` (the Windows launcher) and ``cffi``'s
+    include ``demo/*.c`` — so printing its sample made a Windows-only file read as the
+    reason a build needs a system library. The count is still recorded per pin
+    (``compiled_sources`` in the record); the authority for "what does this build need"
+    is :data:`SDIST_SYSTEM_PACKAGES`, and a reader who wants to disagree with a line
+    here argues with the table, not with a filename heuristic nothing could maintain.
+    """
+    head = (
+        f"no {_cpython_tag(python_minor)} aarch64 wheel; pip builds "
+        f"{sdist.filename} from source"
+    )
+    if review.get("unbuildable") is not None:
+        return head
+    if review.get("gap") is not None:
+        return head + ", and no reviewed-table entry says what that build needs"
+    if not compiled:
+        detail = (
+            "its file list was read only in part, so what it compiles is unknown"
+            if truncated
+            else "it carries no compiled sources, so it needs no compiler"
+        )
+        return f"{head}, and {detail}"
+    return f"{head} — {_review_note(name)}"
 
 
 def _review_of(
@@ -3396,6 +3439,12 @@ def _review_of(
       that is the case the table most needs an entry for (``scipy`` and numpy's BLAS half
       are read no other way). A truncated read that showed **no** compiled source is the
       one case left alone — "unreviewed" cannot be said of a listing nobody finished.
+
+    ``compiled`` only decides *whether to ask*; the table decides the answer, and the
+    reason text never quotes the file list (:func:`_sdist_reason`). The list over-counts
+    by construction — it is a suffix match over the whole archive, so it sees
+    ``distlib``'s ``PC/launcher.c`` and ``cffi``'s ``demo/*.c`` — and the fix for that is
+    an entry recording what the build really needs, which is what the table is.
 
     Looked up by :func:`packaging.utils.canonicalize_name`, so a pin spelled
     ``Zope.Interface`` finds the table's ``zope-interface``: the names on both sides are

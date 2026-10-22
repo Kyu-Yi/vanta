@@ -4294,15 +4294,46 @@ class TestUnresolvablePins:
 
         return reason_of
 
-    def _imported_by(self, sites=None, *, asked=None):
-        """An ``imported_by`` that answers from a dict, and can be watched."""
+    def _audit(self, audits=None, *, asked=None):
+        """An ``audit`` that answers from ``{distribution: ImportAudit}``, and can be watched.
 
-        def imported_by(distribution):
+        The default is the audit's own answer for a distribution nothing imports —
+        ``ImportAudit((), None, "nothing in either tree imports it")`` — so a test that
+        does not name a distribution does not have to spell one out.
+        """
+        table = audits or {}
+
+        def audit(distribution):
             if asked is not None:
                 asked.append(distribution)
-            return (sites or {}).get(distribution)
+            return table.get(
+                distribution,
+                bake_mod.ImportAudit((), None, "nothing in either tree imports it"),
+            )
 
-        return imported_by
+        return audit
+
+    def _audit_imported(self, *sites, reason="", commit="c" * 40):
+        """An ``audit`` whose one site makes the distribution required."""
+        records = tuple(
+            bake_mod.ImportSite(
+                path=path, line=line, module="pyarrow", optional=None, commit=commit
+            )
+            for path, line in sites
+        )
+        return self._audit(
+            {
+                "pyarrow": bake_mod.ImportAudit(
+                    records,
+                    records[0].spelling,
+                    reason
+                    or (
+                        f"{records[0].spelling} imports it unconditionally, inside the "
+                        "failing tests' import closure"
+                    ),
+                )
+            }
+        )
 
     def _sources(self, *refs) -> bake_mod.DepSources:
         return bake_mod.DepSources(
@@ -4324,7 +4355,7 @@ class TestUnresolvablePins:
         kept, dropped = bake_mod.drop_unresolvable_refs(
             (ref,),
             reason_of=self._reason_of(unavailable={("requests-async", "0.5.0")}),
-            imported_by=self._imported_by(),
+            audit=self._audit(),
         )
         assert kept == ()
         assert [record.pin for record in dropped] == ["requests-async==0.5.0"]
@@ -4332,6 +4363,7 @@ class TestUnresolvablePins:
         assert record.sources == ("requirements.txt line 30",)
         assert record.outcome == bake_mod.NO_DISTRIBUTION
         assert "nothing pip can install" in record.reason
+        assert record.import_note == "nothing in either tree imports it"
         assert record.as_dict() == {
             "name": "requests-async",
             "spec": "requests-async==0.5.0",
@@ -4339,23 +4371,71 @@ class TestUnresolvablePins:
             "sources": ["requirements.txt line 30"],
             "outcome": bake_mod.NO_DISTRIBUTION,
             "reason": record.reason,
+            "imports": {
+                "required_by": None,
+                "reason": "nothing in either tree imports it",
+                "sites": [],
+            },
         }
 
-    def test_a_pin_the_tree_imports_is_not_dropped_and_flags_the_bug(self):
-        """``pandas/1``'s ``pyarrow``: unbuildable here, and 18 files import it."""
-        ref = bake_mod.dep_ref("pyarrow==0.17.1", "import closure: pandas/io/parquet.py")
+    def test_a_pin_the_graded_tests_import_unconditionally_flags_the_bug(self):
+        """The flag answer, and the only one: an unguarded site the graded tests reach."""
+        ref = bake_mod.dep_ref("pyarrow==0.17.1", "requirements.txt line 12")
         with pytest.raises(bake_mod.BakeError) as caught:
             bake_mod.drop_unresolvable_refs(
                 (ref,),
                 reason_of=self._reason_of(unbuildable={"pyarrow": "needs Arrow C++"}),
-                imported_by=self._imported_by(
-                    {"pyarrow": "pandas/io/parquet.py at e41ee47a90bb"}
-                ),
+                audit=self._audit_imported(("pandas/io/parquet.py", 12)),
             )
         message = str(caught.value)
         assert "pyarrow cannot be installed on this image (needs Arrow C++)" in message
-        assert "pandas/io/parquet.py at e41ee47a90bb imports it" in message
-        assert "only drops a pin nothing imports" in message
+        assert "pandas/io/parquet.py:12 at cccccccccccc imports it" in message
+        assert "only drops a pin every site imports optionally" in message
+
+    def test_eighteen_optional_mentions_are_not_a_required_pin(self):
+        """``pandas/1``'s ``pyarrow``: measured, all 18 sites are optional or lazy.
+
+        This is the false flag the rule was changed for. The sites are still *in* the
+        record — the drop says which sites were found and why none of them counts — so
+        the claim is checkable rather than an assertion that nothing looked.
+        """
+        ref = bake_mod.dep_ref("pyarrow==0.17.1", "requirements.txt line 12")
+        sites = (
+            bake_mod.ImportSite(
+                "pandas/compat/pyarrow.py", 3, "pyarrow",
+                "behind an ImportError guard", "f" * 40,
+            ),
+            bake_mod.ImportSite(
+                "pandas/tests/dtypes/test_dtypes.py", 7, "pyarrow",
+                "behind pytest.importorskip", "f" * 40,
+            ),
+            bake_mod.ImportSite(
+                "pandas/core/arrays/_arrow_utils.py", 5, "pyarrow", None, "f" * 40,
+            ),
+        )
+        audit = self._audit(
+            {
+                "pyarrow": bake_mod.ImportAudit(
+                    sites,
+                    None,
+                    "no unconditional import of it is in the failing tests' import closure",
+                )
+            }
+        )
+        kept, dropped = bake_mod.drop_unresolvable_refs(
+            (ref,),
+            reason_of=self._reason_of(unbuildable={"pyarrow": "needs Arrow C++"}),
+            audit=audit,
+        )
+        assert kept == ()
+        assert [record.pin for record in dropped] == ["pyarrow==0.17.1"]
+        assert "no unconditional import of it" in dropped[0].import_note
+        assert [site["path"] for site in dropped[0].as_dict()["imports"]["sites"]] == [
+            "pandas/compat/pyarrow.py",
+            "pandas/tests/dtypes/test_dtypes.py",
+            "pandas/core/arrays/_arrow_utils.py",
+        ]
+        assert dropped[0].as_dict()["imports"]["required_by"] is None
 
     def test_a_pin_that_installs_is_never_asked_who_imports_it(self):
         """The walk is a file read per ``.py``, so it is not paid for an ordinary pin."""
@@ -4364,7 +4444,7 @@ class TestUnresolvablePins:
         kept, dropped = bake_mod.drop_unresolvable_refs(
             (ref,),
             reason_of=self._reason_of(),
-            imported_by=self._imported_by(asked=asked),
+            audit=self._audit(asked=asked),
         )
         assert kept == (ref,)
         assert dropped == []
@@ -4378,7 +4458,7 @@ class TestUnresolvablePins:
         kept, dropped = bake_mod.drop_unresolvable_refs(
             (bare, ranged),
             reason_of=self._reason_of(calls=calls),
-            imported_by=self._imported_by(),
+            audit=self._audit(),
         )
         assert kept == (bare, ranged), "they stay for the second pass to judge"
         assert dropped == []
@@ -4408,7 +4488,7 @@ class TestUnresolvablePins:
                 unbuildable={"pyarrow": bake_mod.UNBUILDABLE_ON_PLATFORM["pyarrow"]},
                 calls=calls,
             ),
-            imported_by=self._imported_by(),
+            audit=self._audit(),
         )
         assert kept == [harness], "the interpreter layer's own pin is not this layer's"
         assert [record.name for record in dropped] == ["pyarrow"]
@@ -4504,7 +4584,7 @@ class TestUnresolvablePins:
             },
             harness_pins={},
             reason_of=self._reason_of(unavailable={("requests-async", "0.5.0")}),
-            imported_by=self._imported_by(),
+            audit=self._audit(),
             dropped=dropped,
         )
         assert [dep.pin for dep in resolved] == ["decorator==4.4.0"]
@@ -4520,7 +4600,7 @@ class TestUnresolvablePins:
         )
         assert [dep.pin for dep in resolved] == ["requests-async==0.2.4"]
 
-    def test_resolve_deps_flags_by_raising_when_the_tree_imports_the_pin(self):
+    def test_resolve_deps_flags_by_raising_when_the_graded_tests_import_the_pin(self):
         refs = (bake_mod.dep_ref("pyarrow==0.17.1", "requirements.txt line 12"),)
         with pytest.raises(bake_mod.BakeError, match="imports it"):
             bake_mod.resolve_deps(
@@ -4528,7 +4608,7 @@ class TestUnresolvablePins:
                 releases={"pyarrow": {"0.17.1": "2020-05-04"}},
                 harness_pins={},
                 reason_of=self._reason_of(unbuildable={"pyarrow": "needs Arrow C++"}),
-                imported_by=self._imported_by({"pyarrow": "pandas/io/parquet.py at e41ee"}),
+                audit=self._audit_imported(("pandas/io/parquet.py", 12)),
                 dropped=[],
             )
 
@@ -4542,11 +4622,15 @@ class TestUnresolvablePins:
         sites = bake_mod.tree_import_sites(
             list(files), read_file=lambda path: files.get(path)
         )
-        assert sites["pyarrow"] == "demo/core.py", "the first file wins"
-        assert sites["google.protobuf"] == "demo/core.py"
-        assert sites["google"] == "demo/core.py"
+        assert [site.path for site in sites["pyarrow"]] == ["demo/core.py", "demo/other.py"], (
+            "every site is kept, not the first one: the record has to list them all"
+        )
+        assert sites["google.protobuf"][0].path == "demo/core.py"
+        assert sites["google"][0].path == "demo/core.py"
         assert "json" not in sites, "the stdlib is not a distribution"
-        assert "demo/broken.py" not in sites.values(), "a file that cannot parse is passed over"
+        assert "demo/broken.py" not in {site.path for site in sites["pyarrow"]}, (
+            "a file that cannot parse is passed over"
+        )
 
     def test_the_import_spellings_come_from_the_splits_reviewed_table(self):
         distributions = {"PIL": "Pillow", "yaml": "PyYAML"}
@@ -4563,7 +4647,7 @@ class TestUnresolvablePins:
             "PyYAML", distributions=distributions
         ) == ("pyyaml", "yaml")
 
-    def test_importer_of_names_the_file_and_its_commit_at_either_commit(self):
+    def test_the_audit_names_the_site_and_its_commit_at_either_commit(self):
         """The graded tree is the buggy source with the fix's tests, so both are read."""
         walk = {
             "b" * 40: ["demo/core.py"],
@@ -4573,32 +4657,75 @@ class TestUnresolvablePins:
             ("b" * 40, "demo/core.py"): "import pyarrow\n",
             ("f" * 40, "tests/test_demo.py"): "import pyarrow\n",
         }
-        importer = bake_mod.importer_of(
+        audit = bake_mod.import_auditor(
             Path("/nonexistent"),
             ("b" * 40, "f" * 40),
             distributions={},
+            test_files=["demo/core.py"],
             read_file=lambda commit, path: text.get((commit, path)),
             list_files=lambda commit: walk[commit],
         )
-        assert importer("pyarrow") == f"demo/core.py at {'b' * 12}"
-        assert importer("decorator") is None
+        found = audit("pyarrow")
+        assert found.required_by == f"demo/core.py:1 at {'b' * 12}"
+        assert [site.commit for site in found.sites] == ["b" * 40, "f" * 40]
+        assert "inside the failing tests' import closure" in found.reason
+        assert "nothing in either tree imports it" in audit("decorator").reason
 
-    def test_importer_of_asks_a_tree_once_for_every_candidate_it_is_asked_about(self):
+    def test_a_guarded_site_is_not_a_required_pin(self):
+        """``pytest.importorskip("pyarrow")`` is the test saying it can work without it."""
+        audit = bake_mod.import_auditor(
+            Path("/nonexistent"),
+            ("b" * 40,),
+            distributions={},
+            test_files=["tests/test_demo.py"],
+            read_file=lambda commit, path: (
+                "import pytest\n"
+                "pyarrow = pytest.importorskip('pyarrow')\n"
+                if path == "tests/test_demo.py"
+                else None
+            ),
+            list_files=lambda commit: ["tests/test_demo.py"],
+        )
+        found = audit("pyarrow")
+        assert found.required_by is None
+        assert found.sites[0].optional == "behind pytest.importorskip"
+        assert "behind an optional guard" in found.reason
+
+    def test_an_unconditional_site_outside_the_closure_is_not_required(self):
+        """Lazy, in-method imports are not module scope: nothing the tests reach runs them."""
+        files = {
+            "demo/arrow_utils.py": "import pyarrow\n",
+            "demo/api.py": "def use():\n    import arrow_utils\n",
+            "tests/test_demo.py": "import api\n",
+        }
+        audit = bake_mod.import_auditor(
+            Path("/nonexistent"),
+            ("b" * 40,),
+            distributions={},
+            test_files=["tests/test_demo.py"],
+            read_file=lambda commit, path: files.get(path),
+            list_files=lambda commit: list(files),
+        )
+        found = audit("pyarrow")
+        assert found.required_by is None, "the closure reaches api, not arrow_utils"
+        assert "no unconditional import of it is in" in found.reason
+
+    def test_the_audit_reads_each_commit_once_however_many_pins_ask(self):
         walks: list[str] = []
 
         def list_files(commit):
             walks.append(commit)
             return ["demo/core.py"]
 
-        importer = bake_mod.importer_of(
+        audit = bake_mod.import_auditor(
             Path("/nonexistent"),
             ("b" * 40, "f" * 40),
             distributions={},
             read_file=lambda commit, path: "import pyarrow\nimport luigi\n",
             list_files=list_files,
         )
-        assert importer("pyarrow") is not None
-        assert importer("luigi") is not None
+        assert audit("pyarrow").required_by is not None
+        assert audit("luigi").required_by is not None
         assert walks == ["b" * 40, "f" * 40], "two commits, once each"
 
     # ---- wired into the bake's own resolution ------------------------------
@@ -4608,8 +4735,10 @@ class TestUnresolvablePins:
         """``six==9.9.9``: the release does not exist, and nothing imports ``six`` here."""
         monkeypatch.setattr(
             bake_mod,
-            "importer_of",
-            lambda repo, commits, *, distributions: lambda name: None,
+            "import_auditor",
+            lambda repo, commits, **kwargs: lambda name: bake_mod.ImportAudit(
+                (), None, "nothing in either tree imports it"
+            ),
         )
         fetched, layers, flagged = _resolve_with_drops(
             monkeypatch, refs=(bake_mod.dep_ref("six==9.9.9", "requirements.txt line 4"),)
@@ -4627,14 +4756,21 @@ class TestUnresolvablePins:
         )
         assert "six" in fetched, "its dates were still fetched: the ruling needed them"
 
-    def test_resolve_bug_deps_flags_the_bug_when_something_imports_the_pin(
+    def test_resolve_bug_deps_flags_the_bug_when_the_graded_tests_import_the_pin(
         self, monkeypatch
     ):
         monkeypatch.setattr(
             bake_mod,
-            "importer_of",
-            lambda repo, commits, *, distributions: lambda name: (
-                f"demo/core.py at {'b' * 12}"
+            "import_auditor",
+            lambda repo, commits, **kwargs: lambda name: bake_mod.ImportAudit(
+                (
+                    bake_mod.ImportSite(
+                        "demo/core.py", 1, name, None, "b" * 40
+                    ),
+                ),
+                f"demo/core.py:1 at {'b' * 12}",
+                f"demo/core.py:1 at {'b' * 12} imports it unconditionally, inside the "
+                "failing tests' import closure",
             ),
         )
         _, layers, flagged = _resolve_with_drops(
@@ -4686,7 +4822,7 @@ class TestUnresolvablePins:
     def test_a_dropped_pin_is_printed_in_the_bake_output(
         self, tmp_path, monkeypatch, capsys
     ):
-        """Nothing silent: the line names the pin, the finding and the reason."""
+        """Nothing silent: the pin, the finding, the reason, and the audit behind it."""
         record = bake_mod.DroppedPin(
             name="pywin32",
             spec="pywin32==227",
@@ -4695,6 +4831,11 @@ class TestUnresolvablePins:
             outcome=bake_mod.NO_DISTRIBUTION,
             reason="nothing pip can install on cp38/linux-aarch64: 12 wheel(s) and none "
             "of them installable here, and no source distribution to build instead",
+            audit=bake_mod.ImportAudit(
+                (),
+                None,
+                "nothing in either tree imports it",
+            ),
         )
         deps = [
             bake_mod.BugDeps(
@@ -4713,6 +4854,29 @@ class TestUnresolvablePins:
             "install on cp38/linux-aarch64: 12 wheel(s)" in out
         )
         assert "[vanta-bi-Demo-1] installs: —" in out
+
+    # ---- the gate that can refute the prediction (§11 step 2) --------------
+    def test_the_gate_reason_names_the_pins_the_bake_dropped(self):
+        """A dropped pin is a prediction; ``prepare``'s gate is what refutes it."""
+        note = prepare_mod.dropped_pin_note(
+            {"dropped": [{"pin": "pyarrow==0.17.1"}, {"pin": "six==9.9.9"}]}
+        )
+        assert "pyarrow==0.17.1, six==9.9.9" in note
+        assert "§3.2's unresolvable-pin rule" in note
+        assert "the drop is why" in note
+
+    def test_a_bug_that_dropped_nothing_gets_no_clause(self):
+        assert prepare_mod.dropped_pin_note({"dropped": []}) == ""
+        assert prepare_mod.dropped_pin_note({"installs": ["decorator==4.4.0"]}) == ""
+        assert prepare_mod.dropped_pin_note(None) == ""
+
+    def test_prepare_one_names_the_drops_at_every_gate_exit(self):
+        """Wiring: the clause is added where the gate fails, not where a reason is made."""
+        source = inspect.getsource(prepare_mod.prepare_one)
+        assert source.count("note_drops()") >= 7, (
+            "one call per exit path: the steps that record their own reasons deep inside "
+            "themselves cannot be reached by annotating at the `append`"
+        )
 
 
 def _resolve_with_drops(monkeypatch, *, refs):

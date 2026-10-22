@@ -488,23 +488,48 @@ preflight produces three answers a *bake* cannot act on: a release PyPI does not
 (`sanic/1`'s `pywin32==227`, twelve wheels and every one `win_amd64`, no sdist), and a pin
 `bake.UNBUILDABLE_ON_PLATFORM` reviews as impossible on this image (`pandas/1`'s `pyarrow`). All three
 are the same situation — the pin is in the bug's own files and cannot become a fact about the layer —
-so they get one rule rather than three: the pin is **dropped with a record only if no module it
-provides is imported anywhere in the bug's tree** (its buggy source or the fixed commit's test files),
-and **otherwise the bug is flagged** and not baked at all. The import test reuses the two things
-already here — the split's reviewed `module_distributions` table inverted
-(`bake.distribution_module_names`) and the AST walk `bake.tree_import_sites` — and it reads both
-commits because the graded tree is the buggy source carrying the fix's tests.
+so they get one rule rather than three — and the rule is about the **graded tests' import closure**,
+not about "is this module mentioned somewhere". `bake.decide_unresolvable` drops the pin with a record
+when
+
+* every import site in the tree is **optional** — inside a `try`/`except ImportError`, behind
+  `pytest.importorskip(...)`, or reached through `import_optional_dependency("name")` by string
+  (`ImportSite.optional`, from `_collect_imports`' existing reasons plus those two call forms) — **or**
+* no site at all is in the **import closure** of the bug's failing test files — the split's declared
+  `test_file`, the same declaration `prepare._declared_by_bugsinpy` filters `FAIL_TO_PASS` by — and
+  that closure;
+
+and **flags** the bug only when the failing tests or their closure import it **unconditionally**. The
+closure is walked by `bake.import_closure` over `bake.module_import_graph`, rooted at the declared test
+file; `bake.import_auditor` reads both commits' trees, because the graded tree is the buggy source
+carrying the fix's tests. A file that is not in the graph makes the audit conservative — the whole
+graph is treated as the closure.
+
+The distinction is measured, and it is where the rule was wrong before. **`pandas/1` is not flagged, it
+drops.** `import pyarrow` does appear in **18** `.py` files at the fix's commit, but the only
+*unconditional* site is `pandas/core/arrays/_arrow_utils.py:5`, every importer of `_arrow_utils` is a
+lazy in-method import (`integer.py:113`, `interval.py:1102`, `period.py:301`, `dtypes.py:1024`,
+`io/parquet.py:86`), and `pandas/1`'s failing test is `pandas/tests/dtypes/test_dtypes.py` — nowhere
+near parquet. Counting mentions made a pin required that pandas works without; the closure is what the
+suite actually reaches. `numba`/`llvmlite` follow the same rule on the same reasoning, as does every
+other pin the preflight reports as uninstallable.
 
 The condition is not decoration. A dropped pin makes the layer *shorter than the bug's own files
-declare*, and if the tree really imports it, the suite then fails at `import` — a native regression
-invented by the harness and attributed to the patch under test, which is the one failure mode §1.2/§1.3
-exist to avoid. Dropping a pin nothing imports is the opposite: `luigi/1` and `sanic/1` lose a Windows
-pipe wrapper and a version of `requests-async` that was never uploaded. Measured by `git grep` over
-`*.py` at both commits: **zero** import sites for `requests_async`, `win32` and `pydivert` in either
-repo, so those two pins drop with a record and both bugs still bake. `pydivert` is not even a drop
-candidate — it ships a `py3-none-any` wheel, i.e. class (a). `pandas/1` is the other outcome: nothing
-before this ever looked at `pyarrow`, and the same walk finds it imported in **18** `.py` files at the
-fix's commit, so `pandas/1` moves from "baked" to **flagged**.
+declare*, and if the graded tests really import it, the suite then fails at `import` — a native
+regression invented by the harness and attributed to the patch under test, which is the one failure
+mode §1.2/§1.3 exist to avoid. Dropping a pin nothing the tests reach imports is the opposite:
+`luigi/1` and `sanic/1` lose a Windows pipe wrapper and a version of `requests-async` that was never
+uploaded. Measured by `git grep` over `*.py` at both commits: **zero** import sites for
+`requests_async`, `win32` and `pydivert` in either repo, so those two pins drop with a record and both
+bugs still bake. `pydivert` is not even a drop candidate — it ships a `py3-none-any` wheel, i.e. class
+(a).
+
+The drop is a **prediction**, and `prepare`'s gate is the measurement that can refute it. So a bug that
+had a pin dropped names the drops in **every** reason its gate produces — `prepare.dropped_pin_note`,
+applied at each gate exit because `check_deps` and `strip_and_baseline` record their own reasons deep
+inside themselves. If the buggy source then fails to import a module the bake took out, the failure says
+which pins were dropped and that the drop is why, so the reader can tell a broken bug from a wrong
+prediction — the two call for opposite responses, fix the bug or put the pin back.
 
 The drop has to run on both sides of the date rule, which is why `bake.resolve_deps` applies it in two
 passes rather than inside `bake.resolve_pins`. `luigi/1`'s `requests-async==0.5.0` is a BugsInPy
@@ -514,15 +539,18 @@ version attached, so only the *resolved* pin (0.17.1) can be judged at all, and 
 `resolve_pins` itself stays pure and keeps raising on a pin it cannot date — the passes around it are
 what turn "cannot resolve" into either a record or a flag.
 
-The decision itself (`bake.decide_unresolvable`) raises `BakeError` when something imports the pin, so
-flagging needs no new control flow: `resolve_bug_deps` already catches that and files the bug with its
-reason. **Nothing is silent.** A dropped pin is written to `runs/bugsinpy/deps/<checkpoint>.json` under
+The decision itself (`bake.decide_unresolvable`) raises `BakeError` when something the graded tests
+reach imports the pin, so flagging needs no new control flow: `resolve_bug_deps` already catches that
+and files the bug with its reason, which names the sites the audit found — each with its file, line and
+commit. **Nothing is silent.** A dropped pin is written to `runs/bugsinpy/deps/<checkpoint>.json` under
 `dropped` — a key that is always present, `[]` when nothing was dropped, each entry
-`{name, spec, pin, sources, outcome, reason}` — and printed once per pin as
-`[<checkpoint>] dropped <pin> (<outcome>) — <reason>` in the bake output, with the outcome naming which
-of the three situations it was (`unavailable` / `unbuildable`). The JSON next to the log line is the
-same record and neither is a summary of the other: the log line is what a reader watching the bake
-sees, and the JSON is what survives it.
+`{name, spec, pin, sources, outcome, reason, imports}`, where `imports` is the audit
+(`{required_by, reason, sites}`: the sites found and *why each counts as optional*, or why the closure
+never reaches one). A dropped pin is **not** printed per bug either: the same pin is usually dropped
+from several bugs, so `bake.preflight_lines` prints the whole split's drops once, as
+`<pin> (<outcome>) — <reason>` followed by the bug key and the audit's reason. The JSON and that block
+are the same records and neither summarises the other: the block is what a reader watching the bake
+sees, and the JSON is what survives it — including the per-site audit, which the block does not repeat.
 
 **Rebuild semantics — `--force` means replace, and a rebuilt base invalidates its children.** A layer
 is deleted *before* it is created, never merely created over (shuru refuses a duplicate name with

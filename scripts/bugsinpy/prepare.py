@@ -23,7 +23,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from . import bake as bake_mod
 from . import context as ctx
@@ -379,6 +379,29 @@ def derive_hidden(
             "the fixed tree fails tests the buggy tree does not — the relaxed fixed-tree "
             f"gate (F_after \\ F_buggy_pre == empty) is violated: {fixed_only}"
         )
+
+
+DROPPED_PIN_NOTE = (
+    " — the bake dropped {pins} from this layer under §3.2's unresolvable-pin rule "
+    "(nothing on this image installs it, and no site the graded tests reach imports "
+    "it unconditionally), so if this failure is that module missing, the drop is why"
+)
+
+
+def dropped_pin_note(deps: Optional[Mapping[str, Any]]) -> str:
+    """The clause that names the pins the bake dropped, for a gate-failure reason.
+
+    [VANTA-WHY] Dropping a pin is a *prediction* — the import audit says nothing the
+    graded tests reach imports it unconditionally — and ``prepare``'s gate is the
+    measurement that can refute it. A gate failure whose reason does not name the
+    drops leaves a reader to guess whether the bug is broken or the prediction was,
+    and the two call for opposite responses: fix the bug, or put the pin back. So a
+    bug that had a pin dropped says so in every reason the gate produces, and the
+    reason already lists the sites the audit found in the layer's provenance.
+    """
+    dropped = (deps or {}).get("dropped") or []
+    pins = [str(record.get("pin")) for record in dropped if record.get("pin")]
+    return DROPPED_PIN_NOTE.format(pins=", ".join(pins)) if pins else ""
 
 
 def split_declared_f2p(
@@ -1012,12 +1035,28 @@ def prepare_one(
         prep.gate_failures.append(f"deps: {exc}")
         return prep
 
+    # Every reason the gate produces from here on names the pins this layer dropped,
+    # when it dropped any (§3.2, ``dropped_pin_note``): the gate is what refutes the
+    # prediction that the pin was not needed, and a reason that does not say which pins
+    # were taken out leaves a reader unable to tell a broken bug from a wrong prediction.
+    # Applied at every exit rather than at each `append`, because two of the steps below
+    # record their own reasons deep inside themselves.
+    def note_drops() -> None:
+        suffix = dropped_pin_note(deps)
+        if not suffix:
+            return
+        prep.gate_failures = [
+            reason if reason.endswith(suffix) else reason + suffix
+            for reason in prep.gate_failures
+        ]
+
     try:
         collected = check_deps(
             prep, checkpoint=checkpoint, batch_dir=batch_dir, deps=deps
         )
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(str(exc))
+        note_drops()
         return prep
 
     try:
@@ -1026,13 +1065,17 @@ def prepare_one(
         )
     except (suite_mod.SuiteError, tree_mod.TreeError) as exc:
         prep.gate_failures.append(f"hidden-oracle derivation failed: {exc}")
+        note_drops()
         return prep
+    note_drops()
 
     try:
         strip_and_baseline(prep, checkpoint=checkpoint, batch_dir=batch_dir)
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(f"post-strip suite run failed: {exc}")
+        note_drops()
         return prep
+    note_drops()
 
     # The oracle's own validity check (§11 step 2). It runs before the issue text and
     # the authoritative context measurement because a bug refused here must not be
@@ -1040,9 +1083,11 @@ def prepare_one(
     # ever use.
     try:
         if not selfcheck_dev_fix(prep, batch_dir=batch_dir, checkpoint=checkpoint):
+            note_drops()
             return prep
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(f"developer-fix self-check failed to run: {exc}")
+        note_drops()
         return prep
 
     build_issue(prep, repo_cache=repo_cache, batch_dir=batch_dir)

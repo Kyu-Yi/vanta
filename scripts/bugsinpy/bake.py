@@ -1923,11 +1923,75 @@ _VERSION_GUARDS = frozenset(
 
 
 @dataclass(frozen=True)
-class _ImportSite:
-    module: str
+class ImportSite:
+    """One place in the bug's trees that names a module, and how it names it."""
+
+    path: str
     line: int
+    module: str
     optional: Optional[str]
-    """Why this import is optional, or ``None`` when the module is always loaded."""
+    """Why reaching this import is not required, or ``None`` when it always runs."""
+    commit: str = ""
+    """The commit the file was read at, when the walk that found it knew one.
+
+    Defaulted, because a caller that only wants the module names
+    (:func:`test_import_closure`) reads one tree and has no second commit to name.
+    """
+
+    @property
+    def spelling(self) -> str:
+        """``path:line``, and the commit — where a reader goes to check the claim."""
+        where = f"{self.path}:{self.line}"
+        return f"{where} at {self.commit[:12]}" if self.commit else where
+
+    @property
+    def rendering(self) -> str:
+        return f"{self.spelling} imports {self.module} — {self.optional or 'unconditional'}"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "line": self.line,
+            "module": self.module,
+            "optional": self.optional,
+            "commit": self.commit or None,
+        }
+
+
+_OPTIONAL_CALLS: Mapping[str, str] = {
+    "importorskip": "behind pytest.importorskip",
+    "import_optional_dependency": "through import_optional_dependency",
+}
+"""Calls that name a module and mean "only if it is there".
+
+[VANTA-WHY] A module a test only asks for through ``pytest.importorskip("x")`` is not
+a module the layer has to carry: the test is written to be skipped without it. Measured,
+this is most of pandas' 18 ``pyarrow`` mentions — the rest are ``try``/``except
+ImportError`` guards, ``TYPE_CHECKING`` blocks and calls to pandas' own
+``import_optional_dependency("pyarrow")`` — and reading any of them as "the tree
+requires pyarrow" flags a bug whose failing test never goes near parquet.
+``import_optional_dependency`` is the same statement in pandas' own vocabulary, and it
+takes the module name as a string, so the call form has to be read rather than the
+import statement.
+"""
+
+
+def _call_site(node: ast.Call) -> Optional[ImportSite]:
+    """The site a guarded optional-import *call* names, or ``None`` for any other call."""
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        callee = func.attr
+    elif isinstance(func, ast.Name):
+        callee = func.id
+    else:
+        return None
+    reason = _OPTIONAL_CALLS.get(callee)
+    if reason is None or not node.args:
+        return None
+    first = node.args[0]
+    if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
+        return None
+    return ImportSite(path="", line=node.lineno, module=first.value, optional=reason)
 
 
 def _names_in(node: ast.AST) -> set[str]:
@@ -1952,7 +2016,7 @@ def _guard_reason(node: ast.Try) -> Optional[str]:
 
 
 def _collect_imports(
-    node: ast.AST, *, optional: Optional[str], out: list[_ImportSite]
+    node: ast.AST, *, optional: Optional[str], out: list[ImportSite], path: str = ""
 ) -> None:
     """Record every import reachable from ``node``, and whether it is optional.
 
@@ -1962,28 +2026,41 @@ def _collect_imports(
     the tree's own file rather than a distribution, and is skipped — the absolute
     spelling of the same thing (``import tests``) is excluded by name instead, in
     :func:`test_import_closure`.
+
+    ``path`` is the file being walked, recorded on every site so the rule that reads
+    them (§3.2's, in :func:`tree_import_sites` and :func:`import_auditor`) can say
+    *where* a module was named. It defaults to ``""`` so a caller that only wants the
+    module names does not have to invent a filename.
     """
     if isinstance(node, ast.Import):
         for alias in node.names:
-            out.append(_ImportSite(alias.name, node.lineno, optional))
+            out.append(ImportSite(path=path, line=node.lineno, module=alias.name, optional=optional))
         return
     if isinstance(node, ast.ImportFrom):
         if node.level == 0 and node.module:
-            out.append(_ImportSite(node.module, node.lineno, optional))
+            out.append(
+                ImportSite(path=path, line=node.lineno, module=node.module, optional=optional)
+            )
         return
+    if isinstance(node, ast.Call):
+        site = _call_site(node)
+        if site is not None:
+            out.append(replace(site, path=path))
+        # Not a return: the arguments are walked as usual, and a guarded call is not
+        # the only thing a line can be.
     if isinstance(node, ast.Try):
         inner = _guard_reason(node) or optional
         for branch in (*node.body, *node.handlers, *node.orelse, *node.finalbody):
-            _collect_imports(branch, optional=inner, out=out)
+            _collect_imports(branch, optional=inner, out=out, path=path)
         return
     if isinstance(node, ast.If):
         guard = _names_in(node.test) & _VERSION_GUARDS
         inner = "behind a version check" if guard else optional
         for branch in (*node.body, *node.orelse):
-            _collect_imports(branch, optional=inner, out=out)
+            _collect_imports(branch, optional=inner, out=out, path=path)
         return
     for child in ast.iter_child_nodes(node):
-        _collect_imports(child, optional=optional, out=out)
+        _collect_imports(child, optional=optional, out=out, path=path)
 
 
 def test_side_paths(repo: Path, commit: str) -> list[str]:
@@ -2115,8 +2192,8 @@ def test_import_closure(
         except SyntaxError as exc:
             notes.append(f"import closure: {path} does not parse as Python 3 ({exc.msg})")
             continue
-        sites: list[_ImportSite] = []
-        _collect_imports(parsed, optional=None, out=sites)
+        sites: list[ImportSite] = []
+        _collect_imports(parsed, optional=None, out=sites, path=path)
         for site in sites:
             top = site.module.split(".")[0]
             if not top or top == "__future__":
@@ -3673,15 +3750,16 @@ def write_preflight(deps_dir: Path, report: PreflightBug) -> Path:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class DroppedPin:
-    """A pin nothing on this image can install, and nothing in the bug imports.
+    """A pin nothing on this image can install, and nothing the graded tests reach.
 
     [VANTA-WHY] Dropped *with a record*, never silently. A dependency the layer cannot
     install would otherwise be one bug's build error, and it is the same class of
     problem as a missing system package (§3.2): knowable before the layer is built, and
     the answer is a decision rather than a fallback. The record carries the declaration,
-    why nothing can install it, and which finding it was — so that the "nothing imports
-    it" half of the rule is a claim about the tree that can be re-checked rather than
-    taken on trust.
+    why nothing can install it, and the audit that settles the other half of the rule —
+    every import site the tree has for that module, and why each one counts as optional
+    — so that "nothing the graded tests reach imports it" is a claim about the tree that
+    can be re-checked rather than taken on trust.
     """
 
     name: str
@@ -3694,13 +3772,24 @@ class DroppedPin:
     outcome: str
     """Which finding: :data:`NO_DISTRIBUTION` or :data:`UNBUILDABLE`."""
     reason: str
+    audit: Optional[ImportAudit] = None
+    """What the bug's own trees say about the module this distribution provides.
+
+    ``None`` only for a record built by hand — every record :func:`decide_unresolvable`
+    makes carries one, and :meth:`as_dict` omits the key rather than inventing an audit.
+    """
 
     @property
     def pin(self) -> str:
         return f"{self.name}=={self.version}" if self.version else self.name
 
+    @property
+    def import_note(self) -> str:
+        """Why the sites found do not make this pin required, in one clause."""
+        return self.audit.reason if self.audit is not None else ""
+
     def as_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "name": self.name,
             "spec": self.spec,
             "pin": self.pin,
@@ -3708,6 +3797,9 @@ class DroppedPin:
             "outcome": self.outcome,
             "reason": self.reason,
         }
+        if self.audit is not None:
+            data["imports"] = self.audit.as_dict()
+        return data
 
 
 def decide_unresolvable(
@@ -3718,7 +3810,7 @@ def decide_unresolvable(
     sources: Sequence[str],
     outcome: str,
     reason: str,
-    imported_by: Optional[str],
+    audit: ImportAudit,
 ) -> DroppedPin:
     """§3.2's one rule, for every pin nothing on this image can install.
 
@@ -3731,21 +3823,36 @@ def decide_unresolvable(
       entry in the reviewed table could make work here (``pyarrow``'s Arrow C++,
       ``llvmlite``'s LLVM).
 
-    Both are settled by the same question, asked of the bug itself: **does anything in
-    its source tree or test files import the module this distribution provides?**
-    ``imported_by`` is that answer — the file that imports it, or ``None``.
+    Both are settled by the same question, asked of the bug itself: **does anything the
+    graded tests reach import the module this distribution provides?** ``audit`` is that
+    answer, and it is three answers rather than one, because "somewhere in the tree" is
+    not the same claim as "somewhere in this bug's tests":
 
-    Nothing imports it → the pin is dropped and this returns the record that goes into
-    the provenance, the bake output and the plan's §3.2. Something does →
-    :class:`BakeError`, and :func:`resolve_bug_deps` flags the bug: a layer missing a
-    module the tree under test imports cannot run the suite, so baking it anyway would
-    trade a named flag now for an unreadable failure later.
+    * nothing imports it at all → dropped;
+    * every site is behind a guard (:data:`_OPTIONAL_CALLS`, an ``except ImportError``, a
+      version check) → dropped, and the record lists the sites so the claim is checkable;
+    * sites exist but no unconditional one is in the failing test files' module-scope
+      import closure → dropped: the tests this bug is graded on never reach it;
+    * an unconditional site *is* in that closure → :class:`BakeError`, and
+      :func:`resolve_bug_deps` flags the bug. A layer missing a module the graded tests
+      import cannot run the suite, so baking it anyway would trade a named flag now for
+      an unreadable failure later.
+
+    [VANTA-WHY] The last answer is the whole point of the change from "does any file
+    import it": measured on pandas/1, ``import pyarrow`` appears in 18 files, and every
+    one of them is optional or lazy — pandas works without pyarrow, and the failing test
+    is ``pandas/tests/dtypes/test_dtypes.py``, nowhere near parquet. Calling that a
+    required pin flags a bug that would bake and grade perfectly well, and the fix is
+    the *prepare* gate, which measures the buggy/fixed flip for real: if a dropped pin
+    is what breaks the bug, the gate catches it and names the drops (§11 step 2).
     """
-    if imported_by is not None:
+    if audit.required_by is not None:
         raise BakeError(
-            f"{name} cannot be installed on this image ({reason}), and {imported_by} "
-            "imports it, so the bug cannot be baked without it. Amend the split or flag "
-            "the bug: §3.2's unresolvable-pin rule only drops a pin nothing imports."
+            f"{name} cannot be installed on this image ({reason}), and "
+            f"{audit.required_by} imports it, so the bug cannot be baked without it. "
+            "Amend the split or flag the bug: §3.2's unresolvable-pin rule only drops a "
+            "pin every site imports optionally, or one no site in the failing tests' "
+            "import closure reaches."
         )
     return DroppedPin(
         name=name,
@@ -3754,6 +3861,7 @@ def decide_unresolvable(
         version=version,
         outcome=outcome,
         reason=reason,
+        audit=audit,
     )
 
 
@@ -3800,8 +3908,8 @@ def tree_import_sites(
     *,
     read_file: Callable[[str], Optional[str]],
     stdlib: Iterable[str] = PY38_STDLIB,
-) -> dict[str, str]:
-    """``{module as imported: first file that imports it}`` over ``files``.
+) -> dict[str, tuple[ImportSite, ...]]:
+    """``{module as imported: every site that imports it}`` over ``files``.
 
     [VANTA-WHY] The mirror image of :func:`test_import_closure`: that walk asks which
     distributions the test side needs, this asks whether *one* distribution is needed at
@@ -3811,10 +3919,12 @@ def tree_import_sites(
     over: the target interpreter could not collect it either.
 
     Both spellings are filed — ``google.protobuf`` and its top-level ``google`` — because
-    a distribution provides a module and the tree may name either.
+    a distribution provides a module and the tree may name either. Every site is kept and
+    not just the first file, because the rule's answer is "every site of this module is
+    optional", which one filename cannot settle and a reader cannot check.
     """
     stdlib_names = set(stdlib)
-    sites: dict[str, str] = {}
+    sites: dict[str, list[ImportSite]] = {}
     for path in sorted(files):
         if not path.endswith(".py"):
             continue
@@ -3825,15 +3935,288 @@ def tree_import_sites(
             parsed = ast.parse(text)
         except SyntaxError:
             continue
-        found: list[_ImportSite] = []
-        _collect_imports(parsed, optional=None, out=found)
+        found: list[ImportSite] = []
+        _collect_imports(parsed, optional=None, out=found, path=path)
         for site in found:
             top = site.module.split(".")[0]
             if not top or top == "__future__" or top in stdlib_names:
                 continue
-            sites.setdefault(site.module, path)
-            sites.setdefault(top, path)
-    return sites
+            # The set, because the two spellings are the same name for a top-level
+            # module (``import pyarrow``) and one site must not be filed twice.
+            for name in {site.module, top}:
+                sites.setdefault(name, []).append(site)
+    return {module: tuple(records) for module, records in sites.items()}
+
+
+def _module_of(path: str) -> Optional[str]:
+    """The dotted name a tree file provides, or ``None`` when it is not importable.
+
+    ``pandas/core/frame.py`` → ``pandas.core.frame``; ``pandas/core/__init__.py`` →
+    ``pandas.core``.
+    """
+    if not path.endswith(".py"):
+        return None
+    parts = path[: -len(".py")].split("/")
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    if not parts or not all(part.isidentifier() for part in parts):
+        return None
+    return ".".join(parts)
+
+
+def _resolve_module(dotted: str, index: Mapping[str, str]) -> Optional[str]:
+    """The file ``dotted`` names, or the file of its nearest importable parent."""
+    parts = dotted.split(".")
+    while parts:
+        found = index.get(".".join(parts))
+        if found is not None:
+            return found
+        parts.pop()
+    return None
+
+
+def _absolute_module(path: str, level: int, module: str) -> Optional[str]:
+    """The absolute dotted name a relative import at ``path`` resolves to."""
+    if not level:
+        return module or None
+    parts = path[: -len(".py")].split("/")
+    if parts and parts[-1] != "__init__":
+        parts = parts[:-1]
+    keep = len(parts) - (level - 1)
+    if keep <= 0:
+        return None
+    package = parts[:keep]
+    return ".".join([*package, module] if module else package)
+
+
+def _module_scope_imports(node: ast.AST, out: list[tuple[int, str, str]]) -> None:
+    """``(level, module, imported name)`` for every import a *module body* runs.
+
+    [VANTA-WHY] A function body is not module scope, and that distinction is the whole
+    of §3.2's rule for a lazily imported pin. ``import pandas`` runs when pandas is
+    imported; the ``from pandas.core.arrays._arrow_utils import …`` inside a method body
+    runs when that method is called — and ``_arrow_utils`` is where pandas' one
+    unconditional ``import pyarrow`` lives. A graph that followed function bodies would
+    put pyarrow in the import closure of every pandas test that reaches any array, which
+    is exactly the false flag the rule exists to remove. ``TYPE_CHECKING`` blocks are
+    skipped for the same reason: they never run.
+
+    Relative imports are kept as ``(level, module)`` rather than dropped the way
+    :func:`_collect_imports` drops them: inside a package the relative spelling is how
+    most of its own modules are named, so a closure that ignored it would see only the
+    handful of absolute imports at the top.
+    """
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            out.append((0, alias.name, ""))
+        return
+    if isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            out.append((node.level, node.module or "", alias.name))
+        return
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return
+    if isinstance(node, ast.If) and "TYPE_CHECKING" in _names_in(node.test):
+        return
+    if isinstance(node, ast.Try):
+        for branch in (*node.body, *node.handlers, *node.orelse, *node.finalbody):
+            _module_scope_imports(branch, out)
+        return
+    for child in ast.iter_child_nodes(node):
+        _module_scope_imports(child, out)
+
+
+def module_import_graph(
+    files: Sequence[str],
+    *,
+    read_file: Callable[[str], Optional[str]],
+) -> dict[str, tuple[str, ...]]:
+    """``{path: the tree files its module body imports}`` for one tree.
+
+    Only the tree's own files are edges: a distribution is a leaf, and which
+    distribution a module names is the other question (:func:`tree_import_sites`).
+    """
+    index: dict[str, str] = {}
+    for path in files:
+        name = _module_of(path)
+        if name is not None:
+            index.setdefault(name, path)
+    graph: dict[str, tuple[str, ...]] = {}
+    for path in files:
+        if not path.endswith(".py"):
+            continue
+        text = read_file(path)
+        refs: list[tuple[int, str, str]] = []
+        if text is not None:
+            try:
+                _module_scope_imports(ast.parse(text), refs)
+            except SyntaxError:
+                refs = []
+        targets: list[str] = []
+        for level, module, name in refs:
+            base = _absolute_module(path, level, module)
+            if base is None:
+                continue
+            # ``from a.b import c`` may name a submodule of ``a.b`` or an attribute of
+            # it; both are tried, so ``from pandas.core import arrays`` reaches
+            # ``pandas/core/arrays/__init__.py``.
+            candidates = [f"{base}.{name}", base] if name else [base]
+            for candidate in candidates:
+                target = _resolve_module(candidate, index)
+                if target is not None and target != path:
+                    targets.append(target)
+        graph[path] = tuple(dict.fromkeys(targets))
+    return graph
+
+
+def import_closure(
+    roots: Iterable[str], graph: Mapping[str, Sequence[str]]
+) -> frozenset[str]:
+    """Every tree file the module-scope imports of ``roots`` reach, roots included."""
+    seen: set[str] = set()
+    queue = [root for root in roots if root in graph]
+    while queue:
+        path = queue.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        queue.extend(graph.get(path, ()))
+    return frozenset(seen)
+
+
+@dataclass(frozen=True)
+class ImportAudit:
+    """What a bug's own trees say about one pin nothing on this image can install."""
+
+    sites: tuple[ImportSite, ...]
+    """Every place in either tree that names the module this distribution provides."""
+    required_by: Optional[str]
+    """The site that makes it required — file, line and commit — or ``None``."""
+    reason: str
+    """Why it is required, or why it is not, in one clause for the record."""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "required_by": self.required_by,
+            "reason": self.reason,
+            "sites": [site.as_dict() for site in self.sites],
+        }
+
+
+def import_sites_of(
+    distribution: str,
+    *,
+    sites: Mapping[str, Sequence[ImportSite]],
+    distributions: Mapping[str, str],
+) -> tuple[ImportSite, ...]:
+    """Every site of every spelling ``distribution`` is named by, once each."""
+    out: list[ImportSite] = []
+    seen: set[tuple[str, str, int, str]] = set()
+    for name in distribution_module_names(distribution, distributions=distributions):
+        for site in sites.get(name, ()):
+            key = (site.commit, site.path, site.line, site.module)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(site)
+    return tuple(sorted(out, key=lambda site: (site.commit, site.path, site.line)))
+
+
+def import_auditor(
+    repo: Path,
+    commits: Sequence[str],
+    *,
+    distributions: Mapping[str, str],
+    test_files: Sequence[str] = (),
+    read_file: Optional[Callable[[str, Optional[str]], Optional[str]]] = None,
+    list_files: Optional[Callable[[str], Sequence[str]]] = None,
+) -> Callable[[str], ImportAudit]:
+    """A lazy ``distribution -> ImportAudit`` for one bug.
+
+    Lazy on purpose: the walk reads every ``.py`` of the tree at both commits through
+    ``git show``, one fork per file, and it is only ever asked about a pin preflight
+    could not install — a handful at most. Building the answer for every bug would cost
+    a full tree read per bug to answer a question most bugs never ask.
+
+    The rule, in the order the answers are decided:
+
+    1. an unconditional import that is inside the failing test files' *module-scope*
+       import closure → required, and the bug is flagged (:func:`decide_unresolvable`);
+    2. every site behind a guard (:data:`_OPTIONAL_CALLS`, an ``except ImportError``, a
+       version check) → not required, whatever the tree looks like;
+    3. sites exist but none of the unconditional ones is in that closure → not required,
+       because the tests this bug is graded on never reach it.
+
+    [VANTA-WHY] Both commits, because the graded tree is a mixture (§1.2): the buggy
+    source with the fix's test files. A file only the buggy commit carries can be the
+    importer (a fix that removed an import), and a test file only the fix carries can
+    be too, so either side alone would drop a pin the tree needs. The site keeps the
+    commit it was read at, so the claim is checkable rather than a summary.
+    """
+    walk = list_files or (lambda commit: tree_mod.list_files_at(repo, commit))
+    read = read_file or (lambda commit, path: tree_mod.read_file_at(repo, commit, path))
+    state: Optional[tuple[dict[str, tuple[ImportSite, ...]], frozenset[str]]] = None
+
+    def build() -> tuple[dict[str, tuple[ImportSite, ...]], frozenset[str]]:
+        sites: dict[str, tuple[ImportSite, ...]] = {}
+        seen: dict[str, list[ImportSite]] = {}
+        closure: set[str] = set()
+        for commit in dict.fromkeys(commits):
+            if not commit:
+                continue
+            files = list(walk(commit))
+            for module, records in tree_import_sites(
+                files, read_file=partial(read, commit)
+            ).items():
+                seen.setdefault(module, []).extend(
+                    replace(record, commit=commit) for record in records
+                )
+            graph = module_import_graph(files, read_file=partial(read, commit))
+            roots = [path for path in test_files if path in graph]
+            if roots:
+                closure.update(import_closure(roots, graph))
+            else:
+                # Neither tree carries the failing test file, so the closure question
+                # has no roots to answer from. An empty closure would drop every pin
+                # nothing can install, so the whole tree counts as reachable instead:
+                # the conservative direction, and the one that cannot bake a bug
+                # without a module its own tests reach.
+                closure.update(graph)
+        sites = {module: tuple(records) for module, records in seen.items()}
+        return sites, frozenset(closure)
+
+    def audit(distribution: str) -> ImportAudit:
+        nonlocal state
+        if state is None:
+            state = build()
+        sites, closure = state
+        found = import_sites_of(
+            distribution, sites=sites, distributions=distributions
+        )
+        if not found:
+            return ImportAudit((), None, "nothing in either tree imports it")
+        for site in found:
+            if site.optional is None and site.path in closure:
+                return ImportAudit(
+                    found,
+                    site.spelling,
+                    f"{site.spelling} imports it unconditionally, inside the failing "
+                    "tests' import closure",
+                )
+        if all(site.optional is not None for site in found):
+            return ImportAudit(
+                found,
+                None,
+                f"every one of its {len(found)} import site(s) is behind an optional "
+                "guard",
+            )
+        return ImportAudit(
+            found,
+            None,
+            "no unconditional import of it is in the failing tests' import closure",
+        )
+
+    return audit
 
 
 def uninstallable_reason(
@@ -3887,13 +4270,15 @@ def _unresolvable_pin(
     spec: str,
     sources: Sequence[str],
     reason_of: Callable[[str, str], Optional[tuple[str, str]]],
-    imported_by: Callable[[str], Optional[str]],
+    audit: Callable[[str], ImportAudit],
 ) -> Optional[DroppedPin]:
     """The record for one pin, or ``None`` when it is ordinary.
 
-    Raises :class:`BakeError` through :func:`decide_unresolvable` when something in the
-    bug's own tree imports it — that raise is what flags the bug, and it is deliberate
-    that it happens here rather than being returned as a value a caller could ignore.
+    Raises :class:`BakeError` through :func:`decide_unresolvable` when the graded tests
+    reach an unconditional import of it — that raise is what flags the bug, and it is
+    deliberate that it happens here rather than being returned as a value a caller could
+    ignore. The audit is asked *after* ``reason_of`` says the pin cannot be installed, so
+    an ordinary pin never pays for the tree walk.
     """
     finding = reason_of(name, version)
     if finding is None:
@@ -3906,60 +4291,15 @@ def _unresolvable_pin(
         sources=sources,
         outcome=outcome,
         reason=reason,
-        imported_by=imported_by(name),
+        audit=audit(name),
     )
-
-
-def importer_of(
-    repo: Path,
-    commits: Sequence[str],
-    *,
-    distributions: Mapping[str, str],
-    read_file: Callable[[str, Optional[str]], Optional[str]] = None,
-    list_files: Optional[Callable[[str], Sequence[str]]] = None,
-) -> Callable[[str], Optional[str]]:
-    """A lazy ``distribution -> the file that imports it`` for one bug.
-
-    Lazy on purpose: the walk reads every ``.py`` of the tree at both commits through
-    ``git show``, one fork per file, and it is only ever asked about a pin preflight
-    could not install — a handful at most. Building the answer for every bug would cost
-    a full tree read per bug to answer a question most bugs never ask.
-
-    [VANTA-WHY] Both commits, because the graded tree is a mixture (§1.2): the buggy
-    source with the fix's test files. A file only the buggy commit carries can be the
-    importer (a fix that removed an import), and a test file only the fix carries can
-    be too, so either side alone would drop a pin the tree needs. The file is named
-    with its commit, so the claim is checkable rather than a summary.
-    """
-    walk = list_files or (lambda commit: tree_mod.list_files_at(repo, commit))
-    read = read_file or (lambda commit, path: tree_mod.read_file_at(repo, commit, path))
-    sites: Optional[dict[str, str]] = None
-
-    def find(distribution: str) -> Optional[str]:
-        nonlocal sites
-        if sites is None:
-            sites = {}
-            for commit in dict.fromkeys(commits):
-                if not commit:
-                    continue
-                found = tree_import_sites(
-                    walk(commit), read_file=partial(read, commit)
-                )
-                for module, path in found.items():
-                    sites.setdefault(module, f"{path} at {commit[:12]}")
-        for name in distribution_module_names(distribution, distributions=distributions):
-            if name in sites:
-                return sites[name]
-        return None
-
-    return find
 
 
 def drop_unresolvable_refs(
     refs: Sequence[DepRef],
     *,
     reason_of: Callable[[str, str], Optional[tuple[str, str]]],
-    imported_by: Callable[[str], Optional[str]],
+    audit: Callable[[str], ImportAudit],
 ) -> tuple[tuple[DepRef, ...], list[DroppedPin]]:
     """Drop every declared pin whose own version nothing can install here.
 
@@ -3983,7 +4323,7 @@ def drop_unresolvable_refs(
                 spec=ref.spec,
                 sources=(ref.source,),
                 reason_of=reason_of,
-                imported_by=imported_by,
+                audit=audit,
             )
         )
         if record is not None:
@@ -3997,7 +4337,7 @@ def drop_unresolvable_deps(
     resolved: Sequence[ResolvedDep],
     *,
     reason_of: Callable[[str, str], Optional[tuple[str, str]]],
-    imported_by: Callable[[str], Optional[str]],
+    audit: Callable[[str], ImportAudit],
 ) -> tuple[list[ResolvedDep], list[DroppedPin]]:
     """The same rule over what the date rule picked.
 
@@ -4024,7 +4364,7 @@ def drop_unresolvable_deps(
                 spec=dep.spec,
                 sources=dep.sources,
                 reason_of=reason_of,
-                imported_by=imported_by,
+                audit=audit,
             )
         )
         if record is not None:
@@ -4231,7 +4571,7 @@ def resolve_deps(
         Callable[[str, str], tuple[tuple[str, ...], Optional[str]]]
     ] = None,
     reason_of: Optional[Callable[[str, str], Optional[tuple[str, str]]]] = None,
-    imported_by: Optional[Callable[[str], Optional[str]]] = None,
+    audit: Optional[Callable[[str], ImportAudit]] = None,
     dropped: Optional[list[DroppedPin]] = None,
 ) -> list[ResolvedDep]:
     """Union → conflict check → date pin → the report plugin, for one bug.
@@ -4242,16 +4582,17 @@ def resolve_deps(
     own pins, which stay in the list as ``harness=True`` — the interpreter layer still
     carries them, and ``installs`` still excludes them (:func:`installs_of`).
 
-    ``reason_of``, ``imported_by`` and ``dropped`` are §3.2's unresolvable-pin rule,
-    and they come as a triple or not at all: ``dropped`` is the list the records are
-    appended to, ``reason_of`` says whether one pin can be installed here at all, and
-    ``imported_by`` says whether the bug's own tree imports it. The rule is applied
-    **around** the date rule, in two passes, because only one of them can run before it
-    (:func:`drop_unresolvable_refs`, :func:`drop_unresolvable_deps`) — and *not* inside
-    :func:`resolve_pins`, which stays pure and keeps refusing a pin it cannot date.
-    Passing the triple is what a caller does when it wants the rule; a caller that
-    passes none of it — every test that is about the date rule itself — gets the pins
-    the declarations and the dates decide, with nothing dropped and nothing raised.
+    ``reason_of``, ``audit`` and ``dropped`` are §3.2's unresolvable-pin rule, and they
+    come as a triple or not at all: ``dropped`` is the list the records are appended to,
+    ``reason_of`` says whether one pin can be installed here at all, and ``audit`` says
+    whether anything the graded tests reach imports it (:func:`import_auditor`). The
+    rule is applied **around** the date rule, in two passes, because only one of them can
+    run before it (:func:`drop_unresolvable_refs`, :func:`drop_unresolvable_deps`) — and
+    *not* inside :func:`resolve_pins`, which stays pure and keeps refusing a pin it
+    cannot date. Passing the triple is what a caller does when it wants the rule; a
+    caller that passes none of it — every test that is about the date rule itself — gets
+    the pins the declarations and the dates decide, with nothing dropped and nothing
+    raised.
     """
     merged, conflicts = merge_refs(sources.refs)
     if conflicts:
@@ -4263,7 +4604,7 @@ def resolve_deps(
         )
     if dropped is not None:
         merged, dropped_refs = drop_unresolvable_refs(
-            merged, reason_of=reason_of, imported_by=imported_by
+            merged, reason_of=reason_of, audit=audit
         )
         dropped.extend(dropped_refs)
     resolved = resolve_pins(
@@ -4284,7 +4625,7 @@ def resolve_deps(
         )
     if dropped is not None:
         resolved, dropped_deps = drop_unresolvable_deps(
-            resolved, reason_of=reason_of, imported_by=imported_by
+            resolved, reason_of=reason_of, audit=audit
         )
         dropped.extend(dropped_deps)
     return resolved
@@ -4775,11 +5116,11 @@ def resolve_bug_deps(
 
     A bug that declares a pin *nothing on this image can install* is the same kind of
     answer and reaches the same place, by §3.2's unresolvable-pin rule: dropped with a
-    record when nothing in its tree imports it, flagged when something does
-    (:func:`decide_unresolvable`). The rule's two callables are built here, per bug —
+    record when nothing the graded tests reach imports it, flagged when something does
+    (:func:`decide_unresolvable`). The rule's callables are built here, per bug —
     ``reason_of`` from the ``releases`` this bug just fetched and the run's shared
-    preflight classifier, ``imported_by`` from the bug's own repo — and
-    :func:`resolve_deps` applies them around the date rule.
+    preflight classifier, ``audit`` from the bug's own two trees and the test file the
+    split declares — and :func:`resolve_deps` applies them around the date rule.
 
     ``fetch`` and ``metadata_of`` are injected so the entire chain — union, conflict,
     cutoff, harness exception, the report plugin's own pin — is testable without the
@@ -4795,6 +5136,12 @@ def resolve_bug_deps(
     classifier = classify or preflight_classifier()
     for entry in entries:
         key = f"{entry['project']}/{entry['bug_id']}"
+        # The failing test files, which is what :func:`import_auditor` roots its closure
+        # at: the split's ``test_file`` is BugsInPy's own statement of where the
+        # bug-revealing test lives — the same declaration the oracle's FAIL_TO_PASS is
+        # filtered by in ``prepare`` — so "the tests this bug is graded on" and this
+        # list are one thing and not two.
+        test_files = [str(entry["test_file"])] if entry.get("test_file") else []
         try:
             repo = repo_for(str(entry["project"]))
             sources = bug_sources(
@@ -4852,8 +5199,9 @@ def resolve_bug_deps(
             # §3.2's unresolvable-pin rule, ready for whichever pass finds something:
             # the date rule's own mapping answers "does this release exist", the run's
             # shared classifier answers "what does it install as", and the bug's own
-            # two trees answer "does anything here import it" — lazily, because the
-            # walk is a file read per ``.py`` and most bugs never ask.
+            # two trees answer "is anything the graded tests reach importing it" —
+            # lazily, because the walk is a file read per ``.py`` and most bugs never
+            # ask.
             dropped: list[DroppedPin] = []
             resolved = resolve_deps(
                 sources,
@@ -4867,10 +5215,11 @@ def resolve_bug_deps(
                     classify=classifier,
                     python_minor=minor,
                 ),
-                imported_by=importer_of(
+                audit=import_auditor(
                     repo,
                     (sources.buggy_commit, sources.fixed_commit or ""),
                     distributions=distributions,
+                    test_files=test_files,
                 ),
                 dropped=dropped,
             )

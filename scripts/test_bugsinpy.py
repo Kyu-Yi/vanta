@@ -6237,7 +6237,7 @@ class TestTheClosureWalk:
         except KeyError as exc:
             raise bake_mod.BakeError(f"no release dates for {name}") from exc
 
-    def _walk(self, pins, *, harness_pins=None, cutoffs=None):
+    def _walk(self, pins, *, harness_pins=None, cutoffs=None, tree_satisfied=None):
         return bake_mod.transitive_pins(
             pins,
             harness_pins=harness_pins or {},
@@ -6247,10 +6247,11 @@ class TestTheClosureWalk:
             fetch=self._fetch,
             metadata_of=self._metadata_of,
             cutoffs=cutoffs,
+            tree_satisfied=tree_satisfied,
         )
 
     def test_a_releases_own_declarations_are_pinned_by_the_date_rule(self):
-        pins, provided, orphans = self._walk(
+        pins, provided, orphans, tree = self._walk(
             (("pytest", "5.4.3"),), cutoffs={"pytest": "2020-04-09"}
         )
         assert [dep.pin for dep in pins] == [
@@ -6263,10 +6264,11 @@ class TestTheClosureWalk:
         ]
         assert provided == (), "with no harness pins there is nothing inherited"
         assert orphans == (), "and nothing the layer replaced, so nothing to remove"
+        assert tree == (), "and nothing the tree answered, so nothing left to it"
 
     def test_the_declarations_the_layer_cannot_have_are_not_pinned(self):
         """Markers are evaluated for the layer: Windows-only and py<3.8 are not read."""
-        pins, _provided, _orphans = self._walk(
+        pins, _provided, _orphans, _tree = self._walk(
             (("pytest", "5.4.3"),), cutoffs={"pytest": "2020-04-09"}
         )
         names = {dep.name for dep in pins}
@@ -6279,7 +6281,7 @@ class TestTheClosureWalk:
         assert names.isdisjoint({"mypy", "requests", "nose", "hypothesis"})
 
     def test_every_pick_names_the_pin_that_required_it(self):
-        pins, _provided, _orphans = self._walk(
+        pins, _provided, _orphans, _tree = self._walk(
             (("pytest", "5.4.3"),), cutoffs={"pytest": "2020-04-09"}
         )
         for dep in pins:
@@ -6313,7 +6315,7 @@ class TestTheClosureWalk:
         both, so they are pins and not provisions. What is left is the pair the layer
         keeps, and the three old-``pytest`` names that are the next test's subject.
         """
-        pins, provided, orphans = self._walk(
+        pins, provided, orphans, _tree = self._walk(
             (("pytest", "5.4.3"),),
             harness_pins={"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
             cutoffs={"pytest": "2020-04-09"},
@@ -6347,7 +6349,7 @@ class TestTheClosureWalk:
         *also* an inherited name no pin of this layer contains, and it is **not** an
         orphan, because the harness pin it comes from is one this layer keeps.
         """
-        _pins, provided, orphans = self._walk(
+        _pins, provided, orphans, _tree = self._walk(
             (("pytest", "5.4.3"),),
             harness_pins={"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
             cutoffs={"pytest": "2020-04-09"},
@@ -6383,7 +6385,7 @@ class TestTheClosureWalk:
         ``pytest-metadata`` stays — uninstalling it would break the plugin the oracle is
         read from.
         """
-        _pins, provided, orphans = self._walk(
+        _pins, provided, orphans, _tree = self._walk(
             (("pytest", "5.4.3"),),
             harness_pins={"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
             cutoffs={"pytest": "2020-04-09"},
@@ -6398,12 +6400,183 @@ class TestTheClosureWalk:
         harness pair whole — ``pytest 8.0.2`` is still the pytest it has — and every name
         its release declared is a name the interpreter layer provides it with.
         """
-        _pins, provided, orphans = self._walk(
+        _pins, provided, orphans, _tree = self._walk(
             (("httpcore", "0.3.0"),),
             harness_pins={"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
         )
         assert orphans == ()
         assert set(provided) >= {"exceptiongroup", "iniconfig", "tomli"}
+
+
+class TestTheBugUnderTestIsNeverATransitivePin:
+    """§3.2: a name the tree under test provides is never a pin of the layer.
+
+    Measured on ``pandas/1``: ``statsmodels==0.11.1`` and ``xarray==0.15.1`` each declare
+    ``pandas``, so the closure walk pinned ``pandas==1.0.3`` for it — and the layer would
+    have installed a released pandas **over the tree the suite imports**, grading every
+    patch against the wrong source. The exemption is the import closure's own
+    (:func:`bake_mod.tree_provided_modules`) applied to the other half of the layer, and
+    what the walk returns instead of a pin is a :class:`bake_mod.TreeSatisfied` record.
+    """
+
+    RELEASES = {
+        "statsmodels": {"0.11.1": "2020-02-19"},
+        "xarray": {"0.15.1": "2020-03-28"},
+        "pandas": {"1.0.3": "2020-03-18", "1.1.0": "2020-07-28"},
+        "demo": {"1.0": "2019-04-01"},
+        "helper": {"1.0": "2019-01-01"},
+    }
+    """The ``pandas/1`` shape: two requirers, and the tree's own name between them."""
+
+    DECLARATIONS = {
+        ("statsmodels", "0.11.1"): ("pandas (>=0.25)",),
+        ("xarray", "0.15.1"): ("pandas (>=0.25)",),
+        ("demo", "1.0"): ("pylab",),
+        ("helper", "1.0"): ("pylab",),
+    }
+    """``demo`` and ``helper`` stand in for the *other* half of the exemption: a
+    top-level module the tree ships (``pylab`` is matplotlib's own ``lib/pylab.py``),
+    which is a name the tree provides just as its distribution name is."""
+
+    def _metadata_of(self, name, version):
+        try:
+            return self.DECLARATIONS[(name, version)], None
+        except KeyError as exc:
+            raise bake_mod.BakeError(f"nothing is known about {name} {version}") from exc
+
+    def _fetch(self, name):
+        try:
+            return self.RELEASES[name]
+        except KeyError as exc:
+            raise bake_mod.BakeError(f"no release dates for {name}") from exc
+
+    def _walk(self, pins, *, harness_pins=None, tree_satisfied=None):
+        return bake_mod.transitive_pins(
+            pins,
+            harness_pins=harness_pins or {},
+            commit_date="2020-06-09",
+            python_minor="3.8",
+            releases=dict(self.RELEASES),
+            fetch=self._fetch,
+            metadata_of=self._metadata_of,
+            tree_satisfied=tree_satisfied,
+        )
+
+    def test_a_dependency_that_declares_the_tree_is_left_to_the_tree(self):
+        pins, provided, orphans, tree = self._walk(
+            (("statsmodels", "0.11.1"), ("xarray", "0.15.1")),
+            tree_satisfied={"demo": "demo", "pandas": "pandas"},
+        )
+        assert pins == (), (
+            "pandas is the tree's, so the layer installs nothing for it — leaving the "
+            "pinned 1.0.3 out is the whole point: it would sit over the graded tree"
+        )
+        assert provided == () and orphans == (), (
+            "and it is in neither of the other two answers: not this layer's pin, and "
+            "not something the interpreter layer provides it with"
+        )
+        assert [record.name for record in tree] == ["pandas"]
+        assert tree[0].shipped == ("pandas",)
+        assert tree[0].rule == bake_mod.TREE_SATISFIED_RULE
+
+    def test_without_the_exemption_the_tree_own_release_is_pinned_over_it(self):
+        """The measurement the exemption exists for, and the reason it is a record."""
+        pins, _provided, _orphans, tree = self._walk(
+            (("statsmodels", "0.11.1"), ("xarray", "0.15.1"))
+        )
+        assert [dep.pin for dep in pins] == ["pandas==1.0.3"]
+        assert tree == ()
+
+    def test_a_top_level_module_the_tree_ships_is_left_to_the_tree_too(self):
+        pins, _provided, _orphans, tree = self._walk(
+            (("demo", "1.0"),), tree_satisfied={"demo": "demo", "pylab": "pylab"}
+        )
+        assert pins == ()
+        assert [(record.name, record.shipped) for record in tree] == [("pylab", ("pylab",))]
+
+    def test_a_tree_name_is_neither_pinned_nor_counted_as_provided(self):
+        """The exemption holds in **both** walks, and neither is where it comes from.
+
+        A name the tree provides is not a pin of this layer, and it is not a name the
+        interpreter layer hands the layer either — so it may not appear in ``provided``,
+        which is what :func:`bake_mod.unpinned_freeze` exempts.
+        """
+        pins, provided, orphans, tree = self._walk(
+            (), harness_pins={"helper": "1.0"}, tree_satisfied={"pylab": "pylab"}
+        )
+        assert pins == ()
+        assert provided == ("helper",), "the harness pin itself, and not the tree's module"
+        assert orphans == ()
+        assert [record.name for record in tree] == ["pylab"]
+
+    def test_the_record_says_what_asked_for_the_tree_and_how(self):
+        _pins, _provided, _orphans, tree = self._walk(
+            (("statsmodels", "0.11.1"), ("xarray", "0.15.1")),
+            tree_satisfied={"pandas": "pandas"},
+        )
+        record = tree[0]
+        assert record.required_by == ("statsmodels==0.11.1", "xarray==0.15.1")
+        assert record.declared == ("pandas (>=0.25)",)
+        assert record.as_dict() == {
+            "name": "pandas",
+            "rule": bake_mod.TREE_SATISFIED_RULE,
+            "shipped_by_the_tree": ["pandas"],
+            "required_by": ["statsmodels==0.11.1", "xarray==0.15.1"],
+            "declared": ["pandas (>=0.25)"],
+        }
+        assert "statsmodels==0.11.1" in record.describe()
+        assert "provided by the tree" in record.describe()
+
+    def test_the_key_is_always_present_even_when_the_tree_answered_nothing(self):
+        """Like ``dropped`` and ``orphans``: absence and "this file predates it" differ."""
+        sources = bake_mod.DepSources(
+            project="Demo",
+            bug_id=1,
+            checkpoint="vanta-bi-Demo-1",
+            buggy_commit="b" * 40,
+            commit_date="2019-04-22",
+            import_name="demo",
+        )
+        assert bake_mod.deps_provenance(sources, [], harness_pins={})["tree_satisfied"] == []
+
+    def test_resolve_bug_deps_hands_the_walk_the_trees_own_names(self, monkeypatch):
+        """``pandas/1`` end to end: the seam is ``DepSources.tree_modules``."""
+        monkeypatch.setattr(
+            bake_mod,
+            "import_auditor",
+            lambda repo, commits, **kwargs: lambda name: bake_mod.ImportAudit(
+                (), None, "nothing in either tree imports it"
+            ),
+        )
+        releases = dict(_fixture_releases())
+        releases["statsmodels"] = {"0.11.1": "2020-02-19"}
+        releases["pandas"] = {"1.0.3": "2020-03-18"}
+
+        def metadata_of(name, version):
+            if (name, version) == ("statsmodels", "0.11.1"):
+                return (("pandas (>=0.25)",), None)
+            return TestTheReportPluginFollowsTheBugsPytest._metadata_of(name, version)
+
+        _, layers, flagged = _resolve_with_drops(
+            monkeypatch,
+            refs=(bake_mod.dep_ref("statsmodels==0.11.1", "requirements.txt line 3"),),
+            metadata_of=metadata_of,
+            releases=releases,
+            tree_modules=("pandas",),
+        )
+        assert flagged == []
+        assert layers[0].installs == ("statsmodels==0.11.1",), (
+            "the tree's own pandas is not installed over the tree"
+        )
+        assert layers[0].provenance["tree_satisfied"] == [
+            {
+                "name": "pandas",
+                "rule": bake_mod.TREE_SATISFIED_RULE,
+                "shipped_by_the_tree": ["pandas"],
+                "required_by": ["statsmodels==0.11.1"],
+                "declared": ["pandas (>=0.25)"],
+            }
+        ]
 
 
 class TestPinCutoff:
@@ -7523,7 +7696,7 @@ def _fixture_releases() -> dict:
 
 
 def _resolve_with_drops(
-    monkeypatch, *, refs, classify=None, metadata_of=None, releases=None
+    monkeypatch, *, refs, classify=None, metadata_of=None, releases=None, tree_modules=()
 ):
     """``resolve_bug_deps`` over one fake source set, with the network taken out.
 
@@ -7535,7 +7708,10 @@ def _resolve_with_drops(
     ``classify``, ``metadata_of`` and ``releases`` are the seams a test needs when the
     finding is about what a *release* declares rather than about a pin's own dates:
     §3.2's closure walk reads both, so an unbuildable pick has to be reachable through
-    a requirer's metadata before it can be dropped.
+    a requirer's metadata before it can be dropped. ``tree_modules`` is the other seam
+    the walk reads (:attr:`bake_mod.DepSources.tree_modules`) — the names the tree
+    under test provides for itself, which it must never pin
+    (:data:`bake_mod.TREE_SATISFIED_RULE`).
     """
     fetched: list[str] = []
     table = _fixture_releases() if releases is None else releases
@@ -7556,6 +7732,7 @@ def _resolve_with_drops(
             fixed_commit_date="2019-07-30",
             import_name="demo",
             refs=tuple(refs),
+            tree_modules=tuple(tree_modules),
         )
 
     def fetch(name):

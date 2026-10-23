@@ -321,6 +321,23 @@ happened (:func:`unpinned_freeze`). Which names those are is the walk's third an
 them (:class:`OrphanedPin`).
 """
 
+TREE_SATISFIED_RULE = (
+    "the tree under test provides it, so the layer installs nothing for it"
+)
+"""Why a requirement a release declared is left to the tree rather than pinned (§3.2).
+
+[VANTA-WHY] The tree under test ships its own distribution, and the suite imports *that*
+one — the layer installs beside it, never over it. So a release that declares the
+project's own name is asking for something the layer already has: measured, ``pandas/1``'s
+closure walk pinned ``pandas==1.0.3`` because ``statsmodels==0.11.1`` and
+``xarray==0.15.1`` each declare ``pandas``, and the recipe would have installed a released
+pandas over the very tree the bug is graded on. The exemption is the one the import
+closure already makes (:func:`tree_provided_modules`): the project's own distribution name
+and every top-level module the tree ships are names the tree provides, whoever asks for
+them. What the walk returns instead is the record (:class:`TreeSatisfied`), which is how
+the provenance says the requirement *was* satisfied rather than quietly missing a pin.
+"""
+
 ORPHAN_PREFIX = "VANTA-ORPHAN"
 """The marker the recipe's uninstall step prints into the build log (§3.2).
 
@@ -3243,6 +3260,16 @@ class DepSources:
     date for the same reason a dependency is.
     """
 
+    tree_modules: tuple[str, ...] = ()
+    """The top-level modules the tree ships at the fixed commit (:func:`tree_provided_modules`).
+
+    Read once, here, because two readers want the same answer and it is a walk of every
+    file in the tree: the test side's own import closure, which must not resolve the
+    tree's modules against PyPI, and §3.2's closure walk, which must not pin the tree's
+    own distribution (:data:`TREE_SATISFIED_RULE`). Carrying it also means this record's
+    consumers — the walk included — never touch the filesystem for it.
+    """
+
 
 @dataclass(frozen=True)
 class DepConflict:
@@ -4267,6 +4294,59 @@ class OrphanedPin:
         return f"{self.name} — installed for {because}{instead}"
 
 
+@dataclass(frozen=True)
+class TreeSatisfied:
+    """One requirement a release declared that the **tree under test** satisfies (§3.2).
+
+    [VANTA-WHY] The exception to the closure walk, and it is the one name a layer must
+    never pin: measured on ``pandas/1``, ``statsmodels==0.11.1`` and ``xarray==0.15.1``
+    each declare ``pandas``, the walk pinned ``pandas==1.0.3`` for it, and the recipe
+    would have installed a released pandas over the tree the bug is graded on — an
+    environment where the suite imports the wrong source. The exemption is the one the
+    import closure already makes (:func:`tree_provided_modules`): the bug's own
+    distribution name and every top-level module the tree ships are the tree's, whoever
+    asks for them. :data:`TREE_SATISFIED_RULE` is the fact; this record is what the walk
+    returns instead of a pin, so a reader can check the claim rather than take it.
+
+    ``required_by`` and ``declared`` are the half a reader cannot recover from the
+    layer — which releases asked for the tree's own name, and how they asked — and they
+    are the same two fields :class:`OrphanedPin` carries for the same reason.
+
+    ``shipped`` is the tree's own spelling of the name: ``pandas`` for the distribution,
+    or the directory a module lives in (``pylab``, ``docs_src``). It is what matched, and
+    it is the one thing that says *which* half of the exemption applied.
+    """
+
+    name: str
+    """The canonical name the requirement asked for, as the walk reads it."""
+    shipped: tuple[str, ...] = ()
+    """What the tree ships that answered it, sorted."""
+    required_by: tuple[str, ...] = ()
+    """The pins whose releases declared this name, sorted."""
+    declared: tuple[str, ...] = ()
+    """The declaration that asked for it, as the releasing metadata wrote it, sorted."""
+
+    @property
+    def rule(self) -> str:
+        """Why nothing is installed for this name, in one phrase, for the provenance."""
+        return TREE_SATISFIED_RULE
+
+    def as_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"name": self.name, "rule": self.rule}
+        if self.shipped:
+            data["shipped_by_the_tree"] = list(self.shipped)
+        if self.required_by:
+            data["required_by"] = list(self.required_by)
+        if self.declared:
+            data["declared"] = list(self.declared)
+        return data
+
+    def describe(self) -> str:
+        """One line for a build log or the preflight: the name and who asked for it."""
+        asked = ", ".join(self.required_by) or "no pin this layer installs"
+        return f"{self.name} — declared by {asked}, provided by the tree ({', '.join(self.shipped) or self.name})"
+
+
 def transitive_pins(
     pins: Sequence[tuple[str, str]],
     *,
@@ -4277,8 +4357,14 @@ def transitive_pins(
     fetch: Callable[[str], Mapping[str, str]],
     metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
     cutoffs: Optional[Mapping[str, str]] = None,
-) -> tuple[tuple[ResolvedDep, ...], tuple[str, ...], tuple[OrphanedPin, ...]]:
-    """``(transitive pins, names provided, names orphaned)``.
+    tree_satisfied: Optional[Mapping[str, str]] = None,
+) -> tuple[
+    tuple[ResolvedDep, ...],
+    tuple[str, ...],
+    tuple[OrphanedPin, ...],
+    tuple[TreeSatisfied, ...],
+]:
+    """``(transitive pins, names provided, names orphaned, names the tree satisfies)``.
 
     [VANTA-WHY] Everything else in this file pins what a *file* declared. This walks what
     a *release* declares, because that is the half of a layer's environment the pin list
@@ -4341,6 +4427,19 @@ def transitive_pins(
     one's own, so holding it to the earlier date would refuse the release that
     declaration's environment had.
 
+    ``tree_satisfied`` is the fourth answer, and the one name the walk must **not** pin:
+    the bug's own distribution name and every top-level module the tree ships, mapped to
+    the tree's own spelling of it. The tree under test is never a transitive pin
+    (:data:`TREE_SATISFIED_RULE`) — measured, ``pandas/1`` pinned ``pandas==1.0.3``
+    because ``statsmodels==0.11.1`` and ``xarray==0.15.1`` declare ``pandas``, which
+    would have installed a released pandas *over the tree the suite imports*. The
+    exemption is the import closure's own (:func:`tree_provided_modules`), applied to
+    the other half of the layer, and it holds in both walks: such a name is neither
+    pinned here nor counted as something the interpreter layer provides, because neither
+    is where it comes from. Each one is returned as a :class:`TreeSatisfied` record
+    naming the releases that asked for it, so "satisfied by the tree" is a statement in
+    the provenance rather than a name that quietly went missing.
+
     Pure apart from ``fetch``, which is called only for a name whose release dates are
     not already in ``releases``: the transitive picks, and the names the interpreter
     layer's provision walk has to descend through. A test that passes everything it
@@ -4348,6 +4447,23 @@ def transitive_pins(
     """
     dates: dict[str, Mapping[str, str]] = dict(releases)
     cutoffs = cutoffs or {}
+    tree = {canonicalize_name(name): name for name in (tree_satisfied or {})}
+    # The tree's own names, and the two halves of the record each one leaves behind
+    # (:class:`TreeSatisfied`): which releases asked for it, and how they asked. Both
+    # walks below feed this, and neither descends through a name it holds.
+    tree_asked_by: dict[str, set[str]] = {}
+    tree_declared: dict[str, set[str]] = {}
+
+    def note_tree(name: str, declared_by: str, version: str, raw: str) -> None:
+        """Record one requirement the tree under test answers (:data:`TREE_SATISFIED_RULE`).
+
+        ``name`` is the tree's own name the walk refused to pin, ``declared_by``/``version``
+        the release whose metadata asked for it, and ``raw`` that declaration as written —
+        the two halves a reader cannot recover from the layer.
+        """
+        tree_asked_by.setdefault(name, set()).add(f"{declared_by}=={version}")
+        tree_declared.setdefault(name, set()).add(raw)
+
     settled: dict[str, tuple[str, str]] = {
         canonicalize_name(name): (f"{name}=={version}", version)
         for name, version in harness_pins.items()
@@ -4428,6 +4544,13 @@ def transitive_pins(
                 # reached from is itself, so what it declares is its own closure and not
                 # the reaching pin's. Left as the seed recorded it.
                 continue
+            if required in tree:
+                # The tree's own name, whoever asks for it: neither something this layer
+                # pins nor something the interpreter layer provides it *with* — the suite
+                # imports it from the tree (:data:`TREE_SATISFIED_RULE`). Not descended,
+                # because there is no release of it this layer is entitled to resolve.
+                note_tree(required, name, version, raw)
+                continue
             bringers.setdefault(required, set()).add(source)
             declared_raw.setdefault(required, set()).add(raw)
             inherited.add(required)
@@ -4466,8 +4589,17 @@ def transitive_pins(
         if (name, version) in read:
             continue
         read.add((name, version))
-        for required, specifier, _ in declarations(name, version):
+        for required, specifier, raw in declarations(name, version):
             if required in pinned:
+                continue
+            if required in tree:
+                # The project under test is never a transitive pin (:data:`TREE_SATISFIED_RULE`):
+                # ``pandas/1``'s own closure walk pinned ``pandas==1.0.3`` because
+                # ``statsmodels==0.11.1`` and ``xarray==0.15.1`` declare it, which would have
+                # installed a released pandas over the tree the suite imports. Recorded as
+                # satisfied by the tree rather than pinned, and not descended for the same
+                # reason as above.
+                note_tree(required, name, version, raw)
                 continue
             node_cutoffs.setdefault(required, set()).add(cutoff)
             wanted = (f"{name}=={version}", specifier)
@@ -4521,10 +4653,24 @@ def transitive_pins(
         if bringers[name] <= replaced
     )
     removed = {pin.name for pin in orphans}
+    # The fourth answer, and the one the layer installs nothing for: a requirement a
+    # release declared that the tree under test itself satisfies (:data:`TREE_SATISFIED_RULE`).
+    # It is in neither of the other two — it is not a pin, and it is not a name the
+    # interpreter layer provides — because there is a third place it comes from.
+    satisfied = tuple(
+        TreeSatisfied(
+            name=name,
+            shipped=(tree[name],),
+            required_by=tuple(sorted(tree_asked_by[name])),
+            declared=tuple(sorted(tree_declared[name])),
+        )
+        for name in sorted(tree_asked_by)
+    )
     return (
         tuple(records[name] for name in sorted(records)),
         tuple(sorted(supplied - removed)),
         orphans,
+        satisfied,
     )
 
 PYPI_TIMEOUT_SECS = 60
@@ -7966,12 +8112,13 @@ def bug_sources(
     # are excluded too: the test side is not the only thing that can put a name on
     # ``sys.path`` (fastapi's own ``scripts/test.sh`` adds ``docs_src``), and a name
     # the tree ships is a module it provides, never a distribution to install.
+    tree_modules = sorted(tree_provided_modules(repo, fixed))
     closure_refs, optional, closure_notes = test_import_closure(
         files=test_side_paths(repo, fixed),
         read_file=partial(tree_mod.read_file_at, repo, fixed),
         import_name=import_name,
         distributions=module_distributions,
-        tree_modules=tree_provided_modules(repo, fixed),
+        tree_modules=tree_modules,
     )
     refs += _stamped(closure_refs, commit=fixed, commit_date=fixed_date)
     notes += closure_notes
@@ -7990,6 +8137,7 @@ def bug_sources(
         skipped=tuple(skipped),
         notes=tuple(notes),
         build_refs=tuple(build_declared),
+        tree_modules=tuple(tree_modules),
     )
 
 
@@ -8012,6 +8160,7 @@ def deps_provenance(
     dropped: Sequence[DroppedPin] = (),
     provisioned: Sequence[str] = (),
     orphans: Sequence[OrphanedPin] = (),
+    tree_satisfied: Sequence[TreeSatisfied] = (),
 ) -> dict[str, Any]:
     """What the bake decided for one bug, as data a later stage can read.
 
@@ -8097,6 +8246,17 @@ def deps_provenance(
     installed over it — because that is the half a reader cannot recover from the layer.
     Like ``dropped``, the key is always present and empty when nothing was removed, so
     "nothing was orphaned" and "this file predates the rule" are distinguishable.
+
+    ``tree_satisfied`` is the third place a name can come from, and the only one that is
+    neither installed nor inherited (:data:`TREE_SATISFIED_RULE`): a requirement a release
+    declared that the **tree under test** provides for itself, which the closure walk
+    therefore leaves unpinned. Measured, ``pandas/1`` is the case — ``statsmodels==0.11.1``
+    and ``xarray==0.15.1`` each declare ``pandas``, and a released pandas installed over
+    the tree would have been the wrong source for the suite that grades the bug. Each
+    record is a :class:`TreeSatisfied` naming what asked for it and how it asked, because
+    that is the half a reader cannot recover from the layer. Like ``dropped``, the key is
+    always present and empty when the tree answered nothing, so "the tree provided
+    nothing" and "this file predates the rule" are distinguishable.
     """
     return {
         "schema_version": 1,
@@ -8113,6 +8273,7 @@ def deps_provenance(
         "installs": list(installs_of(resolved)),
         "dropped": [pin.as_dict() for pin in dropped],
         "orphans": [pin.as_dict() for pin in orphans],
+        "tree_satisfied": [item.as_dict() for item in tree_satisfied],
         "build_pins": [pin.as_dict() for pin in build_pins],
         "early_pins": [item.as_dict() for item in early],
         "dependencies": [dep.as_dict() for dep in resolved],
@@ -8363,7 +8524,7 @@ def resolve_bug_deps(
             # window they are held to is that release's — which for a reference pin
             # installed as written is later than the buggy commit, and for a build pin is
             # its own release date (:func:`pin_cutoff`).
-            transitive, provisioned, orphaned = transitive_pins(
+            transitive, provisioned, orphaned, tree_satisfied_pins = transitive_pins(
                 own_pins,
                 harness_pins=harness_pins,
                 commit_date=sources.commit_date,
@@ -8371,6 +8532,18 @@ def resolve_bug_deps(
                 releases=releases,
                 fetch=fetch,
                 metadata_of=metadata_of,
+                # The names the tree under test provides for itself, so the closure walk
+                # never pins one (:data:`TREE_SATISFIED_RULE`): the project's own import
+                # name, and every top-level module the tree ships — the same exemption
+                # ``bug_sources`` already makes for the test side's import closure
+                # (:func:`tree_provided_modules`), applied to the other half of the layer.
+                # Measured, this is what ``pandas/1``'s ``pandas==1.0.3`` was: a
+                # transitive pick for the very distribution the bug is graded on, since
+                # ``statsmodels==0.11.1`` and ``xarray==0.15.1`` each declare ``pandas``.
+                tree_satisfied={
+                    name: name
+                    for name in (sources.import_name, *sources.tree_modules)
+                },
                 cutoffs={
                     **{
                         canonicalize_name(tool.name): tool.released_at
@@ -8435,6 +8608,7 @@ def resolve_bug_deps(
                     dropped=dropped,
                     provisioned=provisioned,
                     orphans=orphaned,
+                    tree_satisfied=tree_satisfied_pins,
                 ),
                 build_pins=build_specs,
                 # Spec strings, not ``pinned_parts``' ``(name, version)`` pairs: the

@@ -1284,6 +1284,26 @@ six layers, **one bug changes**: `matplotlib/1` moves `pyparsing` 3.0.0a1 → **
 `early_pins` holds a pre-release — none of `setuptools`, `wheel`, `cython` has one anywhere near these
 commits — so no build pin and no early install moves.
 
+**The project under test is never a transitive pin, and neither is anything else the tree ships.**
+`pandas/1`'s closure walk pinned `pandas==1.0.3` because `statsmodels==0.11.1` and `xarray==0.15.1` each
+declare `pandas` — a released pandas installed **over the very tree the bug is graded on**, so every
+patch would have been graded against the wrong source while the recipe looked correct. The exemption is
+the one the import closure already makes (`bake.tree_provided_modules`): the bug's own distribution name
+and every top-level module the tree ships are names the tree provides, whoever asks for them.
+`bake.transitive_pins` takes those names as `tree_satisfied` and holds them in **both** its walks — the
+interpreter layer's provision walk neither descends through one nor reports it as a name the base layer
+hands the layer (there is a third place it comes from), and the layer's own closure walk never pins one.
+Neither is silent: each is a `bake.TreeSatisfied` record naming the releases that asked for it and how
+they asked, carried in the deps JSON under `tree_satisfied` beside `dropped` and `orphans` (always
+present, empty when the tree answered nothing), because "the requirement was satisfied" has to be a
+statement a reader can check rather than a name that quietly went missing. The names are read once, in
+`bake.bug_sources`, and carried on `DepSources.tree_modules`, so the test side's import closure and this
+walk cannot disagree about what the tree ships. Measured across the six layers, **exactly one pick
+disappears**: `pandas/1` no longer installs `pandas==1.0.3`
+(`required_by ['statsmodels==0.11.1', 'xarray==0.15.1']`); `fastapi/1`, `luigi/1`, `matplotlib/1`,
+`sanic/1` and `PySnooper/1` have neither the project's own name nor a tree-shipped module spelling in
+their transitive lists.
+
 **The window is the requiring pin's own release, not the bug's date.** `bake.pin_cutoff` is the later of
 a pin's declaration date and the date its release landed. For a date-rule pin those agree. For a BugsInPy
 reference pin they do not, and the difference is load-bearing: `pytest==5.4.3` (2020-04-09) installed as

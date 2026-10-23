@@ -8330,6 +8330,166 @@ class TestResolvePinsByDate:
         assert resolved[0].released_at == "2019-03-16"
 
 
+class TestTheDateRuleNeverPicksAPreRelease:
+    """§3.2's date rule picks a *release* — the one thing pip would have installed.
+
+    [VANTA-WHY] Measured on matplotlib/1, three pins at once. ``pyparsing>=2.0.3,
+    !=2.0.4,!=2.1.2,!=2.1.6`` (``install_requires (setup.py) line 283``) is a range, and
+    the newest listing on or before the 2020-06-09 commit is ``3.0.0a1`` — uploaded the
+    same day as ``2.4.7`` and sorting *above* it. The layer installed the ``a1``, and the
+    same shape put ``jinja2==3.0.0a1`` in (``sphinx==3.1.0`` declares ``Jinja2>=2.3``)
+    and, out of that entry's own metadata, ``markupsafe==2.0.0a1``. pip's own rule is what
+    those picks broke: a pre-release or dev release is skipped unless the requirement
+    *names* one, which is why the rule is over the requirement and not over the version
+    (:func:`bake._names_a_pre_release`).
+
+    The carve-out is not decoration. ``black==19.10b0`` is BugsInPy's own pin in fastapi/1,
+    luigi/1 and sanic/1, it is a pre-release, and it is installed **as written** — a rule
+    that dropped every pre-release would make the benchmark's own frozen environment
+    unbakeable. Every date and declaration below is PyPI's, read back from the JSON API.
+    """
+
+    COMMIT = "2020-06-09"
+
+    RELEASES = {
+        "pyparsing": {
+            "2.4.2": "2019-07-30",
+            "2.4.6": "2019-12-25",
+            "2.4.7": "2020-04-05",
+            "3.0.0a1": "2020-04-05",
+            "3.0.0a2": "2020-06-28",
+        },
+        "jinja2": {"2.10.3": "2019-10-04", "2.11.2": "2020-04-13", "3.0.0a1": "2020-02-05"},
+        "markupsafe": {"1.1.1": "2019-02-24", "2.0.0a1": "2020-04-10"},
+        # The release whose ``requires_dist`` is the claim the walk reads, and its date is
+        # what that pick is held to (:func:`bake.pin_cutoff`).
+        "sphinx": {"3.1.0": "2020-06-08"},
+        # BugsInPy's own pin, and the only reason the carve-out exists.
+        "black": {"19.10b0": "2019-10-28"},
+        # The toolchain. The ``50.0.0a1`` row is this test's own — none of the three has a
+        # pre-release near these commits on PyPI, which is why this leg changes no current
+        # build pin — but the rule has to hold for a listing that does carry one.
+        "setuptools": {"40.8.0": "2019-02-04", "50.0.0a1": "2019-04-01"},
+        "wheel": {"0.32.3": "2018-10-21", "0.33.1": "2019-04-06"},
+        "cython": {"0.29.6": "2019-03-10"},
+    }
+
+    PYPROJECT = "install_requires (setup.py) line 283"
+
+    def _resolve(self, refs, *, metadata_of=None, harness_pins=None):
+        return bake_mod.resolve_pins(
+            refs,
+            releases=self.RELEASES,
+            commit_date=self.COMMIT,
+            harness_pins=harness_pins or {},
+            metadata_of=metadata_of,
+        )
+
+    def _pyparsing(self):
+        return bake_mod.dep_ref(
+            "pyparsing>=2.0.3,!=2.0.4,!=2.1.2,!=2.1.6", self.PYPROJECT
+        )
+
+    # ---- the rule ----------------------------------------------------------
+    def test_a_range_declaration_does_not_get_the_pre_release_above_it(self):
+        """3.0.0a1 is inside the window *and* newer than 2.4.7; it is not the answer."""
+        assert bake_mod.Version("3.0.0a1") > bake_mod.Version("2.4.7")
+        resolved = self._resolve([self._pyparsing()])
+        assert resolved[0].pin == "pyparsing==2.4.7"
+        assert resolved[0].released_at == "2020-04-05"
+
+    def test_a_pre_release_that_postdates_the_window_is_out_too(self):
+        """3.0.0a2 is refused for the date, and 3.0.0a1 for being a pre-release: a rule
+        that only had the first would still have picked the ``a1``."""
+        refs = [bake_mod.dep_ref("pyparsing", self.PYPROJECT)]
+        assert self._resolve(refs)[0].pin == "pyparsing==2.4.7"
+
+    def test_a_requirement_that_names_a_pre_release_is_allowed_one(self):
+        """The carve-out, read off the requirement and not off the version."""
+        refs = [bake_mod.dep_ref("pyparsing>=3.0.0a1", self.PYPROJECT)]
+        assert self._resolve(refs)[0].pin == "pyparsing==3.0.0a1"
+
+    def test_a_bugsinpys_own_pre_release_pin_is_still_installed_as_written(self):
+        """``black==19.10b0`` — the pin the rule would otherwise make unbakeable."""
+        refs = [bake_mod.dep_ref("black==19.10b0", "requirements.txt line 16")]
+        resolved = self._resolve(refs)
+        assert resolved[0].pin == "black==19.10b0"
+        assert resolved[0].exempt is True
+        assert resolved[0].pin_rule == "BugsInPy's own exact pin, installed as written"
+
+    def test_a_narrowing_pin_that_names_a_pre_release_admits_one(self):
+        """A narrowing claim is a requirement on the name like any other.
+
+        ``sphinx==3.1.0``'s ``requires_dist`` asking for ``pyparsing>=3.0.0a1`` is what
+        makes a pre-release installable for the bare ``pyparsing`` the tree declared,
+        and the narrowing filter then takes every version the claim excludes away. Read
+        as the declaration's requirement alone, the pool holds no pre-release at all and
+        the layer cannot be built — which is the wrong answer: pip unions the two.
+        """
+        refs = [
+            bake_mod.dep_ref("pyparsing", self.PYPROJECT),
+            bake_mod.dep_ref("sphinx==3.1.0", "install_requires (setup.py) line 284"),
+        ]
+
+        def metadata_of(name, version):
+            if (name, version) == ("sphinx", "3.1.0"):
+                return (("pyparsing>=3.0.0a1",), None)
+            return ((), None)
+
+        resolved = self._resolve(refs, metadata_of=metadata_of)
+        pyparsing = resolved[0]
+        assert pyparsing.pin == "pyparsing==3.0.0a1"
+        assert pyparsing.narrowed_by == (("sphinx==3.1.0", ">=3.0.0a1"),)
+
+    # ---- the transitive leg ------------------------------------------------
+    def test_a_transitive_pick_never_lands_on_a_pre_release(self):
+        """``jinja2`` under ``sphinx==3.1.0``'s ``Jinja2>=2.3``: 2.11.2, not 3.0.0a1."""
+        dep = bake_mod._transitive_pin(
+            "jinja2",
+            [("sphinx==3.1.0", ">=2.3")],
+            "2020-06-08",
+            releases=self.RELEASES["jinja2"],
+            settled={},
+            metadata_of=lambda name, version: ((), None),
+        )
+        assert dep.pin == "jinja2==2.11.2"
+        assert dep.pin_rule == bake_mod.TRANSITIVE_PIN_RULE
+        assert dep.required_by == ("sphinx==3.1.0",)
+
+    def test_a_transitive_claim_that_names_a_pre_release_keeps_one(self):
+        """The same carve-out, on the half of the layer no file declared."""
+        dep = bake_mod._transitive_pin(
+            "jinja2",
+            [("sphinx==3.1.0", ">=3.0.0a1")],
+            "2020-06-08",
+            releases=self.RELEASES["jinja2"],
+            settled={},
+            metadata_of=lambda name, version: ((), None),
+        )
+        assert dep.pin == "jinja2==3.0.0a1"
+
+    # ---- the build leg -----------------------------------------------------
+    def test_a_pre_release_of_a_build_tool_is_not_the_answer(self):
+        """Nothing declared it, so no requirement names one and none is admissible.
+
+        The 50.0.0a1 row is this test's own (PyPI has no such release near 2019-04):
+        the rule has to hold for a listing that carries one, and a toolchain that moved
+        on a pre-release is the silent failure this leg exists to stop.
+        """
+        pins = {
+            pin.name: pin
+            for pin in bake_mod.resolve_build_pins(
+                [],
+                [],
+                releases=self.RELEASES,
+                commit_date="2019-04-22",
+            )
+        }
+        assert pins["setuptools"].pin == "setuptools==40.8.0"
+        assert pins["wheel"].pin == "wheel==0.33.1"
+        assert pins["cython"].pin == "cython==0.29.6"
+
+
 class TestTheDateRuleObeysTheLayersOwnPins:
     """``luigi/1``: the newest dated release is one the layer's own pins refuse.
 

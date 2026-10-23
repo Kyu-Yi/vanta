@@ -1253,6 +1253,37 @@ cannot be read describes nothing and is not evidence it requires nothing (the la
 the backstop), and the layer's own settled pins still get the last word (`bake._chosen_release`), so a
 transitive pick cannot install a release one of them refuses.
 
+**The date rule picks a *release*, and a pre-release is not one.** `pip` skips pre-releases and dev
+releases unless the requirement itself names one — the one rule of pip's the date rule carries over,
+because everything else here is deliberately *not* pip's. PyPI's listing is full of them and they sort
+above the release that was current, so a pool built as "everything on or before the date" gets one:
+measured on `matplotlib/1`, `pyparsing>=2.0.3,!=2.0.4,!=2.1.2,!=2.1.6` (`install_requires (setup.py)
+line 283`, the 2020-06-09 commit) took `3.0.0a1` — uploaded 2020-04-05, the same day as the `2.4.7` pip
+would have installed, and above it — and the picks that release's own declarations produced followed it
+in: `sphinx==3.1.0` declares `Jinja2>=2.3` and the layer took `jinja2==3.0.0a1`, whose metadata then
+declared the `markupsafe==2.0.0a1`. Three pins in one layer, each a version the requirement never asked
+for. `bake._names_a_pre_release` is the carve-out, read off the requirement's own clauses (a `>=3.0.0a1`
+bound names one; a wildcard `==1.0.*` does not, and that direction only ever *denies*), and
+`bake._date_rule_candidate` is the rule. The carve-out is not decoration: `black==19.10b0` is BugsInPy's
+own pin in `fastapi/1`, `luigi/1` and `sanic/1`, it *is* a pre-release, and it is installed as written
+(`bake.reference_pin`) — a rule that dropped every pre-release would make three of the eleven bugs
+unbakeable.
+
+The rule is applied where a version is *picked*, and that is three call sites, all of them the date
+rule: `resolve_pins`' own pool — which is the list `_chosen_release` chooses from *and* the list the
+narrowing filter below filters, so a narrowing claim can only ever take candidates away and can never
+re-admit a pre-release — `bake._transitive_pin`'s pool, and `bake.resolve_build_pins`' pool. Narrowing
+is not a fourth site but it is a fourth *reader*: a narrowing claim is a requirement on the name like
+any other, so its clauses are read by the same carve-out as the declaration's, because
+`sphinx==3.1.0` declaring `pyparsing>=3.0.0a1` is what makes a pre-release installable at all and
+reading the carve-out off the declaration alone would refuse a layer pip builds. Measured across the
+six layers, **one bug changes**: `matplotlib/1` moves `pyparsing` 3.0.0a1 → **2.4.7**, `jinja2` 3.0.0a1
+→ **2.11.2**, `markupsafe` 2.0.0a1 → **1.1.1** (and that last one's `required_by` follows,
+`jinja2==3.0.0a1` → `jinja2==2.11.2`). Every other `pyparsing`/`jinja2`/`markupsafe` in the run is a
+`requirements.txt` reference pin already at 2.4.7/2.11.2/1.1.1, and no layer's `build_pins` or
+`early_pins` holds a pre-release — none of `setuptools`, `wheel`, `cython` has one anywhere near these
+commits — so no build pin and no early install moves.
+
 **The window is the requiring pin's own release, not the bug's date.** `bake.pin_cutoff` is the later of
 a pin's declaration date and the date its release landed. For a date-rule pin those agree. For a BugsInPy
 reference pin they do not, and the difference is load-bearing: `pytest==5.4.3` (2020-04-09) installed as

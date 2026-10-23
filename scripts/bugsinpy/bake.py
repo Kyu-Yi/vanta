@@ -3605,6 +3605,49 @@ def _parseable(version: str) -> bool:
     return True
 
 
+def _names_a_pre_release(specifier: SpecifierSet) -> bool:
+    """Whether this requirement asks for a pre-release, which is what re-admits them.
+
+    pip's own carve-out and the only one §3.2's date rule takes from it: a pre-release or
+    a dev release is skipped unless the requirement *names* one — ``black==19.10b0`` does
+    (a BugsInPy reference pin, installed as written), and so does a ``>=3.0.0a1`` bound,
+    while ``pyparsing>=2.0.2`` does not. The direction matters: without the rule a range
+    declaration gets the newest *listing*, and PyPI's listing holds pre-releases that sort
+    above the release that was current — measured, ``matplotlib/1``'s ``pyparsing`` and
+    ``jinja2`` and ``markupsafe`` all landed on an ``a1`` that pip would never have
+    installed for those requirements; without the carve-out the benchmark's own
+    pre-release pin could not be installed at all.
+
+    A wildcard clause (``==1.0.*``) names no single version and is passed over, which is
+    the conservative direction for a carve-out: it can only ever *deny* pre-releases.
+    """
+    for clause in specifier:
+        try:
+            if Version(clause.version).is_prerelease:
+                return True
+        except InvalidVersion:
+            continue
+    return False
+
+
+def _date_rule_candidate(version: str, *specifiers: SpecifierSet) -> bool:
+    """Whether the date rule may pick ``version`` for a requirement.
+
+    ``specifiers`` are every requirement this layer holds for that name: the declaration's
+    own (:func:`resolve_pins`), the union of the pins that declared it
+    (:func:`_transitive_pin`), the refs that asked for a build tool
+    (:func:`resolve_build_pins`) and, where this layer's own pinned releases constrain the
+    same name, **theirs** — the ``requires_dist`` clause that narrows the choice is a
+    requirement too, and a ``foo>=2.0a1`` in it is what makes a pre-release installable.
+    A pre-release or dev release is refused unless one of them names one
+    (:func:`_names_a_pre_release`); everything else is the caller's to filter, and the
+    caller has already run :func:`_parseable`.
+    """
+    return not Version(version).is_prerelease or any(
+        _names_a_pre_release(specifier) for specifier in specifiers
+    )
+
+
 def _newest_release(available: Mapping[str, str]) -> tuple[str, str]:
     """``(version, date)`` of the newest parseable release PyPI lists."""
     return max(
@@ -3835,6 +3878,16 @@ def resolve_pins(
     the bug cannot be rebuilt and the bake stops rather than installing today's
     version.
 
+    "The newest release on or before the date" means the newest **release**, and a
+    pre-release is not one: ``pip`` skips pre-releases and dev releases unless the
+    requirement names one itself, and PyPI's listing is full of them sorting above the
+    release that was current — measured, ``matplotlib/1``'s ``pyparsing>=2.0.2`` declaration
+    took ``3.0.0a1``. So a candidate with a pre or dev segment is refused unless the
+    requirement names one (:func:`_names_a_pre_release`), which is pip's own carve-out
+    and is what keeps a BugsInPy reference pin like ``black==19.10b0`` installable. The
+    narrowing below reads the same list this filter produced, so a narrowing claim can
+    only ever take candidates away and never re-admit a pre-release (§3.2).
+
     One qualification on "the newest release on or before the date", and it is §3.2's
     case (a): when an **exact** pin elsewhere in this layer declares its own requirement
     on this name, the newest release the *date* allows is not the answer if it is one
@@ -3897,11 +3950,24 @@ def resolve_pins(
                 f"{ref.source}: no release dates for {ref.name!r} were fetched; the "
                 "bake cannot pin it (design §3.2 pins by date, not by guess)"
             )
+        claims = narrowed.get(canonicalize_name(ref.name), [])
+        # Read here rather than at the narrowing filter below, because the carve-out has
+        # to be known while the *pool* is built: a narrowing claim is a requirement on
+        # this name like any other, and a ``foo>=2.0a1`` in one of them is what makes a
+        # pre-release installable (§3.2). The pool itself is still the declaration's —
+        # the claims only ever take candidates away, below.
+        claim_specifiers = tuple(SpecifierSet(spec) for _, spec in claims if spec)
         matching = [
             (version, date)
             for version, date in available.items()
             if _parseable(version)
             and (not requirement.specifier or Version(version) in requirement.specifier)
+            # ``pip`` would never take a pre-release for a requirement that does not
+            # name one, and neither does the date rule: the newest listing is not the
+            # newest release (§3.2). A requirement that names one keeps it.
+            and _date_rule_candidate(
+                version, requirement.specifier, *claim_specifiers
+            )
         ]
         exempt = reference_pin(ref)
         narrowed_by: tuple[tuple[str, str], ...] = ()
@@ -3931,7 +3997,6 @@ def resolve_pins(
                     "The tree this requirement was declared in could not have been "
                     "built with it."
                 )
-            claims = narrowed.get(canonicalize_name(ref.name), [])
             if claims:
                 wanted = [
                     item
@@ -4066,13 +4131,21 @@ def _transitive_pin(
     some pin declared — and no release satisfying the claims raises :class:`BakeError`
     rather than falling back to a newer one: the fallback is exactly what pip would have
     done on its own, and it is what put a 2025 ``exceptiongroup`` in a 2020 layer.
+
+    The claims stand in for the declaration, so the pre-release rule is read off them:
+    the newest release here has to be a *release* unless the claims name a pre-release
+    (:func:`_date_rule_candidate`), which is what took ``matplotlib/1`` off
+    ``jinja2==3.0.0a1`` (from ``sphinx==3.1.0``'s ``jinja2>=2.3``) and off the
+    ``markupsafe==2.0.0a1`` that entry in turn required.
     """
     spec = " ".join(sorted({specifier for _, specifier in claims if specifier}))
+    claimed = SpecifierSet(spec)
     matching = [
         (version, date)
         for version, date in releases.items()
         if _parseable(version)
         and date[:10] <= cutoff
+        and _date_rule_candidate(version, claimed)
         and all(
             not specifier or Version(version) in SpecifierSet(specifier)
             for _, specifier in claims
@@ -7655,6 +7728,13 @@ def resolve_build_pins(
     the bug, like every other date-rule refusal: a tree cannot have been built with a
     tool that did not exist yet, and installing today's is the failure this rule
     exists to prevent.
+
+    "Release" is meant literally here too (§3.2): a pre-release or dev release is
+    refused unless the refs that declared this name name one
+    (:func:`_date_rule_candidate`), so a tree that declared ``cython>=3.0a1`` keeps its
+    pre-release and :data:`BUILD_TOOLS` — which nothing declared — never gets one. What
+    the toolchain installs is what the tree's own build ran against, and pip would not
+    have taken a pre-release of ``setuptools`` for a bare field either.
     """
     by_name = {dep.name: dep for dep in resolved}
     declared: dict[str, list[DepRef]] = {}
@@ -7708,10 +7788,15 @@ def resolve_build_pins(
                 f"{source}: no release dates for {name!r} were fetched, so the build "
                 "toolchain cannot be pinned (design §3.2 pins by date, not by guess)"
             )
+        declared_specifiers = SpecifierSet(
+            " ".join(sorted({text for text in map(_specifier_text, from_refs) if text}))
+        )
         matching = [
             (version, date)
             for version, date in available.items()
-            if _parseable(version) and date[:10] <= cutoff
+            if _parseable(version)
+            and date[:10] <= cutoff
+            and _date_rule_candidate(version, declared_specifiers)
         ]
         if not matching:
             newest = _newest_release(available)

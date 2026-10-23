@@ -8645,6 +8645,30 @@ class TestTheDateRuleNeverPicksAPreRelease:
         )
         assert dep.pin == "jinja2==3.0.0a1"
 
+    def test_two_pins_claiming_one_name_join_into_a_specifier_set_that_exists(self):
+        """``luigi/1``: ``sanic==20.3.0`` wants ``uvloop>=0.14.0``, ``uvicorn==0.11.5``
+        wants ``uvloop>=0.5.3``, and both claims are handed to one
+        :class:`SpecifierSet`. Comma-joined, because ``packaging`` reads clauses
+        separated by commas: the space-joined pair ``">=0.14.0 >=0.5.3"`` is not a
+        specifier set at all — it raised ``InvalidSpecifier`` and took the whole
+        preflight run down with it, which is why this is asserted by name.
+        """
+        dep = bake_mod._transitive_pin(
+            "uvloop",
+            [("sanic==20.3.0", ">=0.14.0"), ("uvicorn==0.11.5", ">=0.5.3")],
+            "2020-06-13",
+            releases={
+                "0.12.2": "2019-03-20",
+                "0.13.0": "2019-08-14",
+                "0.14.0": "2019-11-05",
+            },
+            settled={},
+            metadata_of=lambda name, version: ((), None),
+        )
+        assert dep.pin == "uvloop==0.14.0"
+        assert dep.spec == ">=0.14.0,>=0.5.3"
+        assert dep.required_by == ("sanic==20.3.0", "uvicorn==0.11.5")
+
     # ---- the build leg -----------------------------------------------------
     def test_a_pre_release_of_a_build_tool_is_not_the_answer(self):
         """Nothing declared it, so no requirement names one and none is admissible.

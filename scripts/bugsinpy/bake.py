@@ -4177,7 +4177,11 @@ def _transitive_pin(
     ``jinja2==3.0.0a1`` (from ``sphinx==3.1.0``'s ``jinja2>=2.3``) and off the
     ``markupsafe==2.0.0a1`` that entry in turn required.
     """
-    spec = " ".join(sorted({specifier for _, specifier in claims if specifier}))
+    # Comma-joined, because this string is handed to :class:`SpecifierSet` below and
+    # ``packaging`` reads clauses separated by commas: a space-joined pair of claims
+    # (``>=0.14.0`` from one pin and ``>=0.5.3`` from another) is not a specifier set at
+    # all and raises ``InvalidSpecifier``.
+    spec = ",".join(sorted({specifier for _, specifier in claims if specifier}))
     claimed = SpecifierSet(spec)
     matching = [
         (version, date)
@@ -7947,7 +7951,7 @@ def resolve_build_pins(
                 "toolchain cannot be pinned (design §3.2 pins by date, not by guess)"
             )
         declared_specifiers = SpecifierSet(
-            " ".join(sorted({text for text in map(_specifier_text, from_refs) if text}))
+            ",".join(sorted({text for text in map(_specifier_text, from_refs) if text}))
         )
         matching = [
             (version, date)

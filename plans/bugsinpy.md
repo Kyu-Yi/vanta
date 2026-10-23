@@ -1318,6 +1318,71 @@ disappears**: `pandas/1` no longer installs `pandas==1.0.3`
 `sanic/1` and `PySnooper/1` have neither the project's own name nor a tree-shipped module spelling in
 their transitive lists.
 
+**A requirement whose marker is false for *this* layer is not a requirement, and every reader that
+sees one says so.** A marker is a conditional, and reading it as decoration installs what pip would
+not: measured, the preflight printed `EARLY scikit-learn==0.23.1's build needs
+numpy==1.13.3; python_version=='3.6' and platform_system!='AIX' and platform_python_implementation ==
+'CPython' → numpy==1.18.4` for `pandas/1` — a `py3.6`-only clause in a `py3.8` layer, read as if it
+applied. `bake.marker_applies(requirement, *, python_minor, extra="")` is the single answer, and it
+evaluates `packaging.markers` against the **layer's** environment and never the host's, which is the
+same distinction the closure walk already draws for the same reason:
+`packaging.markers.default_environment()` answers for the Mac running the bake — `sys_platform` is
+`darwin` there — and would drop every `sys_platform`-conditional requirement the layer really installs.
+Every variable this layer has is supplied (`python_version` `3.8`, `python_full_version` `3.8.0`,
+`implementation_name` `cpython`, `os_name` `posix`, `sys_platform` `linux`, `platform_machine`
+`aarch64`, `platform_python_implementation` `CPython`, `platform_system` `Linux`), so what the layer
+does not carry is a variable *no* layer carries: `dependency_groups`, which PEP 735 added and a bug
+layer is not a project with groups, parses and fails to evaluate, and that is read as *not applying*
+— pip cannot evaluate it either, and the freeze gate (:func:`unpinned_freeze`) is what names the
+distribution if pip installed it anyway. A **misspelt** variable is not that branch, and the difference
+is a measurement rather than a hope: on `packaging 26.3`, `Requirement('foo; python_versoin == "3.8"')`
+raises `InvalidRequirement` at *parse*, so `bake._requirement` raises and the ref is kept as
+unparseable instead of being read as a conditional that does not hold.
+
+The rule is applied **once, to the collected refs**, and not per reader — which is why nothing had to
+be threaded through the parsers: `bake.DepRef.spec` is the requirement verbatim and still carries its
+marker. `bake.marker_skips(refs, *, python_minor)` returns the refs to keep and a `bake.SkippedLine`
+for each one dropped, and it is called where the refs come together: twice in `bake.bug_sources` (the
+deps refs and the build refs, covering `install_requires`, `requires_dist`, `setup_requires` and
+`[build-system].requires` alike) and once per pinned release inside `bake.early_install_pins`. `extra`
+is empty by default — `requires_dist`'s `; extra == "test"` entries and the whole `extras_require`
+surface are not installed — and set from the requirement's **own** marker clause
+(`bake._EXTRA_CLAUSE_RE`), so a declaration read out of `extras_require["tests"]` that says
+`extra == "tests"` is judged on the rest of its marker rather than dropped for saying it. The record is
+a `SkippedLine(source, line, text, reason)`, its `reason` naming the marker that dropped it, and
+`bake._SOURCE_LINE_RE` recovers the file and line number from the reader-written source
+(`requirements.txt line 3` → `requirements.txt`, `3`; a source that names no line is recorded as line
+`0`). Nothing about it is printed: the drops fold into `DepSources.skipped` and land in the layer's
+`runs/bugsinpy/deps/<checkpoint>.json` under **`skipped`** through `bake.deps_provenance`, and into
+`bake.PreflightBug.skipped` — the key `skipped` of the preflight JSON, beside `early_pins` — because a
+`--preflight-only` run *is* the measurement and has to leave it somewhere the reader can check rather
+than on the terminal, which is for the findings a reader has to decide on.
+
+Measured across the six layers, **one bug changes and nothing else does**. `pandas/1`'s two
+sdist-only pins whose build wants `numpy` — `scipy==1.4.1` and `scikit-learn==0.23.1` — each write a
+family of `numpy` clauses into their `build-system.requires`, selected by `python_version` and
+`platform_system` (and, for `scikit-learn`, also by `platform_python_implementation`), and exactly one
+clause of the family holds in this layer: `numpy==1.17.3; python_version>='3.8' and
+platform_system!='AIX'`. The other **thirteen** are dropped and recorded; the two `EARLY` lines that
+used to name a false clause now name the one that holds — `scipy==1.4.1` used to print its
+`python_version=='3.5'` clause and now prints the `>= '3.8'` one, and `scikit-learn==0.23.1` its
+`'3.6' and platform_python_implementation == 'CPython'` one, likewise. The clause **count** does not
+move — `pandas/1` still installs `numpy==1.18.4` early and still counts `18 early` — and every other
+layer's preflight line is byte-identical, with the other five recording an empty `skipped` list, so the
+verdict stays `ready to bake` with no bug flagged. On disk the reading is one key:
+`runs/bugsinpy/deps/vanta-bi-pandas-1.preflight.json` carries `"skipped": [ … thirteen entries … ]`,
+each naming the clause verbatim and the marker that dropped it — and nothing about them reaches the
+terminal, which is the point of recording a measurement a reader can check rather than a line they have
+to notice. The two checks that the rule is narrow rather than sweeping: `luigi/1`'s and `sanic/1`'s
+`cffi>=1.8,!=1.11.3; platform_python_implementation != 'PyPy'` is **true** for CPython and is kept (the
+measured difference between judging the layer's platform and the host's — `platform_python_implementation`
+answers `CPython` on both, but a `sys_platform` clause is the case where the two disagree and the host
+would win if its environment were read), and the dev split holds exactly **two** marker-bearing tree
+declarations in total — both `pandas/1`'s `numpy==1.15.4; python_version>='3.7' and
+platform_system!='AIX'`, kept — with none at all among the releases the layers' own pins name. The
+`EARLY` line above is also the narrower reading of that block's promise: the preflight now names what
+the build will *want*, not the first clause the reader happened to write.
+
 **The window is the requiring pin's own release, not the bug's date.** `bake.pin_cutoff` is the later of
 a pin's declaration date and the date its release landed. For a date-rule pin those agree. For a BugsInPy
 reference pin they do not, and the difference is load-bearing: `pytest==5.4.3` (2020-04-09) installed as
@@ -1630,7 +1695,9 @@ not tolerated the way a case (b) conflict is: the layer that results is not the 
 describes, and left alone it bakes green. The preflight computes the same `early_install_pins` for each
 layer and prints the ordering decision (`EARLY <pin>'s build needs <requirement> → <pin>`, counted as
 `N early` on the line), so what the bake will install early is on screen before the first byte is
-installed; a pin the preflight dropped is skipped there, because the bake will not install it either.
+installed; a pin the preflight dropped is skipped there, because the bake will not install it either,
+and a requirement whose marker is false in this layer is not named at all (§3.2), so the line shows
+what the build will want rather than the first clause the declaration happened to write.
 Each finding is recorded in the provenance under **`early_pins`**, beside `build_pins`, with the pin,
 the requirement, its source, and the pin that satisfies it. Measured on the two existing bake logs:
 neither carries an `easy_install` line at all, and `bcrypt==3.1.7` shows no `Preparing metadata` step —

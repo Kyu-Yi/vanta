@@ -5085,6 +5085,7 @@ class TestEarlyInstallPins:
             build_requires_of=lambda name, version: (
                 self.CRYPTO_REFS if (name, version) == ("cryptography", "2.9.2") else ()
             ),
+            python_minor="3.8",
         )
         assert len(early) == 1
         item = early[0]
@@ -5110,6 +5111,7 @@ class TestEarlyInstallPins:
             [("cryptography", "2.9.2")],
             [("cryptography", "2.9.2")],
             build_requires_of=lambda name, version: self.CRYPTO_REFS,
+            python_minor="3.8",
         )
         assert early == ()
 
@@ -5121,6 +5123,7 @@ class TestEarlyInstallPins:
             build_requires_of=lambda name, version: (
                 bake_mod.DepRef("cffi", "cffi>=1.8", "setup_requires (setup.py) line 1"),
             ),
+            python_minor="3.8",
         )
         assert early == ()
 
@@ -5142,6 +5145,7 @@ class TestEarlyInstallPins:
             [("cryptography", "2.9.2")],
             [("cryptography", "2.9.2"), ("bcrypt", "3.1.7"), ("cffi", "1.14.0")],
             build_requires_of=build_requires_of,
+            python_minor="3.8",
         )
         assert asked == [("cryptography", "2.9.2")], "a wheel is never asked about"
         assert [item.pin for item in early] == ["cryptography==2.9.2"]
@@ -5159,6 +5163,7 @@ class TestEarlyInstallPins:
             [("cryptography", "2.9.2")],
             [("cryptography", "2.9.2"), ("cffi", "1.14.0")],
             build_requires_of=build_requires_of,
+            python_minor="3.8",
         ) == ()
 
     def _report(self, *, early: tuple = ()) -> bake_mod.PreflightBug:
@@ -5202,6 +5207,210 @@ class TestEarlyInstallPins:
             dropped={"vanta-bi-Demo-1": [{"pin": "cryptography==2.9.2"}]},
         )
         assert not any("EARLY" in line for line in lines)
+
+
+# ============================================================================
+# §3.2's marker rule — a requirement whose marker is false here is not installed
+# ============================================================================
+class TestMarkerSkips:
+    """``marker_skips``: §3.2's marker rule over the *collected* refs, applied once.
+
+    [VANTA-WHY] ``pandas/1``'s preflight printed ``EARLY scikit-learn==0.23.1's build
+    needs numpy==1.13.3; python_version=='3.6' …`` — a requirement whose marker is false
+    for every layer this harness bakes, read as something to install. pip skips what does
+    not apply, so the reading is :func:`bake_mod.marker_applies` against the layer's own
+    environment. Applied to the refs their readers wrote — :attr:`bake_mod.DepRef.spec`
+    is the requirement verbatim and still carries its marker, which is why the rule has
+    one home instead of one per parser — and a drop is recorded as a
+    :class:`bake_mod.SkippedLine`, never printed.
+
+    The two measured requirements are the pair this is built on: ``luigi/1``'s and
+    ``sanic/1``'s ``cffi`` marker is the CPython one and *is* true, and ``pandas/1``'s
+    numpy marker is the 3.6 one and is not.
+    """
+
+    PY36_ONLY = bake_mod.DepRef(
+        "numpy",
+        'numpy==1.13.3; python_version == "3.6"',
+        "build-system.requires (pyproject.toml) line 4",
+    )
+    """``scikit-learn==0.23.1``'s build declaration, measured off ``pandas/1``."""
+
+    CPYTHON_ONLY = bake_mod.DepRef(
+        "cffi",
+        "cffi>=1.8,!=1.11.3; platform_python_implementation != 'PyPy'",
+        "build-system.requires (pyproject.toml)",
+    )
+    """``luigi/1``'s and ``sanic/1``'s, which the layer really does install."""
+
+    def test_a_marker_false_for_this_layer_is_dropped_and_recorded(self):
+        """The measured pandas/1 requirement, and the record it leaves behind."""
+        kept, dropped = bake_mod.marker_skips([self.PY36_ONLY], python_minor="3.8")
+        assert kept == []
+        assert [line.as_dict() for line in dropped] == [
+            {
+                "source": "build-system.requires (pyproject.toml)",
+                "line": 4,
+                "text": 'numpy==1.13.3; python_version == "3.6"',
+                "reason": (
+                    "its environment marker does not hold in this layer: "
+                    'python_version == "3.6"'
+                ),
+            }
+        ]
+
+    def test_a_marker_that_holds_in_this_layer_is_kept(self):
+        """The CPython marker, which is true here — so the rule may not drop it."""
+        kept, dropped = bake_mod.marker_skips([self.CPYTHON_ONLY], python_minor="3.8")
+        assert kept == [self.CPYTHON_ONLY]
+        assert dropped == []
+
+    def test_each_ref_is_judged_against_the_layers_platform_and_not_the_hosts(self):
+        """A bake runs on a Mac, and ``sys_platform`` is the variable that notices.
+
+        Evaluating :func:`packaging.markers.default_environment` would answer "darwin"
+        and drop the ``uvloop`` a Linux layer installs — the other direction of the same
+        mistake.
+        """
+        windows = bake_mod.DepRef(
+            "colorama", 'colorama; sys_platform == "win32"', "requirements.txt line 1"
+        )
+        linux = bake_mod.DepRef(
+            "uvloop", 'uvloop; sys_platform != "win32"', "requirements.txt line 2"
+        )
+        kept, dropped = bake_mod.marker_skips([windows, linux], python_minor="3.8")
+        assert kept == [linux]
+        assert [line.as_dict() for line in dropped] == [
+            {
+                "source": "requirements.txt",
+                "line": 1,
+                "text": 'colorama; sys_platform == "win32"',
+                "reason": (
+                    "its environment marker does not hold in this layer: "
+                    'sys_platform == "win32"'
+                ),
+            }
+        ]
+
+    def test_a_requirement_whose_own_marker_names_its_extra_is_not_dropped(self):
+        """One read out of an extra says so about itself, so the extra it asks for is it.
+
+        The direction is deliberately narrow: the extra is taken from the
+        *requirement's own* marker clause and from nothing else, so a declaration whose
+        condition has nothing to do with the extra still has to hold here.
+        """
+        ref = bake_mod.DepRef(
+            "pytest", 'pytest>=5; extra == "tests"', "extras_require (setup.py) line 3"
+        )
+        kept, dropped = bake_mod.marker_skips([ref], python_minor="3.8")
+        assert kept == [ref]
+        assert dropped == []
+
+    def test_a_marker_on_a_variable_this_environment_lacks_is_read_as_not_applying(self):
+        """``dependency_groups``: a variable ``packaging`` knows and the layer does not.
+
+        Read as *not applying* rather than as *applying* because the freeze gate
+        (:func:`bake_mod.unpinned_freeze`) is what names the distribution if pip
+        installed it anyway — the two readings are not silent in the same direction. A
+        misspelt variable is not this branch: ``packaging`` refuses it at parse
+        (measured on ``packaging 26.3``), so it lands in the unparseable case below.
+        """
+        ref = bake_mod.DepRef(
+            "foo", 'foo; dependency_groups == "dev"', "requirements.txt line 7"
+        )
+        kept, dropped = bake_mod.marker_skips([ref], python_minor="3.8")
+        assert kept == []
+        assert [(line.source, line.line) for line in dropped] == [("requirements.txt", 7)]
+
+    def test_a_spec_that_does_not_parse_is_kept_rather_than_dropped(self):
+        """Every ref here was built by :func:`bake_mod.dep_ref`, which already refused
+        an unparseable requirement, so a refusal at this point is not a fact about the
+        requirement and dropping one would be a silent loss of a declaration."""
+        ref = bake_mod.DepRef("foo", "foo >>> 3", "requirements.txt line 1")
+        kept, dropped = bake_mod.marker_skips([ref], python_minor="3.8")
+        assert kept == [ref]
+        assert dropped == []
+
+    def test_a_ref_that_names_no_file_line_is_recorded_with_line_zero(self):
+        """Not every reader writes a number — ``build-system.requires`` has no lines."""
+        kept, dropped = bake_mod.marker_skips([self.PY36_ONLY], python_minor="3.8")
+        assert dropped[0].line == 4, "the number the pyproject reader did write is kept"
+
+        ref = bake_mod.DepRef(
+            "numpy",
+            'numpy==1.13.3; python_version == "3.6"',
+            "build-system.requires (pyproject.toml)",
+        )
+        _kept, dropped = bake_mod.marker_skips([ref], python_minor="3.8")
+        assert (dropped[0].source, dropped[0].line) == (
+            "build-system.requires (pyproject.toml)",
+            0,
+        )
+
+    SCOPED_TO_35 = bake_mod.DepRef(
+        "numpy",
+        "numpy==1.13.3; python_version=='3.5' and platform_system!='AIX'",
+        "build-system.requires (pyproject.toml)",
+    )
+    SCOPED_TO_38 = bake_mod.DepRef(
+        "numpy",
+        "numpy==1.17.3; python_version>='3.8' and platform_system!='AIX'",
+        "build-system.requires (pyproject.toml)",
+    )
+    """``scipy==1.4.1``'s ``pyproject.toml``, measured: it names numpy once per interp.
+
+    All three clauses are in the file and ``build-system.requires`` carries no line
+    numbers, which is why the record's ``line`` is 0 (:data:`bake._SOURCE_LINE_RE`).
+    """
+
+    def test_the_preflight_records_the_drops_in_the_json_and_not_on_the_terminal(self):
+        """The whole measured case, through :func:`bake_mod.preflight_layers`.
+
+        Before the rule the ``EARLY`` line read the ``3.5`` clause, which is false for
+        every layer this harness bakes; with it, the clause that holds is the one read,
+        and the two that do not are recorded on the report — which is what a
+        ``--preflight-only`` run writes, since it writes no other file.
+        """
+        layer = bake_mod.BugDeps(
+            entry=bug_entry(),
+            checkpoint="vanta-bi-Demo-1",
+            installs=("numpy==1.18.4", "scipy==1.4.1"),
+            provenance={},
+        )
+
+        def build_requires_of(name, version):
+            if (name, version) != ("scipy", "1.4.1"):
+                return ()
+            return (self.SCOPED_TO_35, self.SCOPED_TO_38)
+
+        reports = bake_mod.preflight_layers(
+            [layer],
+            classify=bake_mod.preflight_classifier(
+                files_of=lambda name, version: (_sdist(f"{name}-{version}.tar.gz"),),
+                sdist_of=lambda file: (("scipy-1.4.1/scipy/_lib/_ccallback_c.c",), False),
+            ),
+            metadata_of=bake_mod.cached_release_metadata(fetch=lambda name, version: ((), None)),
+            build_requires_of=build_requires_of,
+        )
+        report = reports[0]
+        assert [item.requirement.spec for item in report.early] == [
+            "numpy==1.17.3; python_version>='3.8' and platform_system!='AIX'"
+        ], "the clause that holds in this layer is the one the ordering reads"
+        assert [line.as_dict() for line in report.skipped] == [
+            {
+                "source": "build-system.requires (pyproject.toml)",
+                "line": 0,
+                "text": "numpy==1.13.3; python_version=='3.5' and platform_system!='AIX'",
+                "reason": (
+                    "its environment marker does not hold in this layer: "
+                    'python_version == "3.5" and platform_system != "AIX"'
+                ),
+            }
+        ]
+        assert report.as_dict()["skipped"] == [line.as_dict() for line in report.skipped]
+        assert not any("3.5" in line for line in bake_mod.preflight_lines(reports)), (
+            "the record is the JSON's; the terminal says nothing about it"
+        )
 
 
 # ============================================================================

@@ -4105,25 +4105,40 @@ bug's tree wrote the requirement.
 """
 
 
-def marker_applies(requirement: Requirement, *, python_minor: str) -> bool:
+def marker_applies(requirement: Requirement, *, python_minor: str, extra: str = "") -> bool:
     """Whether ``requirement``'s own marker holds **inside** the layer (§3.2).
 
-    [VANTA-WHY] :func:`_narrowing_requirements` skips every marker, and for its question
-    that is right: a conditional requirement is not something to move a settled pin's
-    version on. The closure asks the other way round — what will pip put in the
-    environment — and there a marker *is* the question. ``exceptiongroup`` reaches a
-    py3.8 environment through ``pytest``'s ``python_version < "3.11"`` and through
-    nothing else, so a walk that skipped markers would describe an environment it cannot
-    see.
+    [VANTA-WHY] The three readers that move a settled version on a declaration
+    (:func:`_chosen_release`, :func:`_narrowing_requirements`, :func:`metadata_conflicts`)
+    skip every marker, and for their question that is right: a conditional requirement is
+    not something to move a settled pin's, or to refuse a layer's, on — the conservative
+    direction there is to leave the declaration unread and let the layer's own ``pip
+    check`` report it. Everywhere a requirement is read *as an install* the question is
+    the other way round — what will pip put in the environment — and there a marker is
+    the question, because pip skips what does not apply. Measured, that is what
+    ``pandas/1``'s early pass got wrong: ``scikit-learn==0.23.1``'s build declares
+    ``numpy==1.13.3`` under ``python_version == "3.6"``, which is false for every layer
+    this harness bakes, and the ordering finding named it anyway.
+
+    ``extra`` is the extra the requirement was read *from*, and it is empty unless the
+    requirement's own marker asks for one (:func:`marker_skips`): a declaration inside an
+    extra is installed because that extra was requested, while PyPI's ``requires_dist``
+    carries ``; extra == "test"`` entries that pip does not install unless the extra is
+    asked for — so the default is the empty string and the closure walk
+    (:func:`transitive_pins`) leaves it that way.
 
     Evaluated against the layer's own platform and never the host's:
     :func:`packaging.markers.default_environment` answers for the machine running the
     bake, which is a Mac, and would silently drop every ``sys_platform``-conditional
-    requirement the layer really installs. Every standard variable is supplied, so the
-    only marker this cannot evaluate is one naming a variable that does not exist — a
-    package's own typo — and that is read as *not applying*: pip cannot evaluate it
-    either, and the freeze gate (:func:`unpinned_freeze`) is what names the distribution
-    if pip installed it anyway.
+    requirement the layer really installs. Every variable for this layer's platform is
+    supplied, so :class:`UndefinedEnvironmentName` reaches here in exactly one measured
+    way: a marker on a variable ``packaging`` knows but this environment does not carry —
+    ``dependency_groups``, which PEP 735 added and a layer is not a project with groups —
+    and that is read as *not applying*, because pip cannot evaluate it either and the
+    freeze gate (:func:`unpinned_freeze`) is what names the distribution if pip installed
+    it anyway. A misspelt variable is not this branch: ``packaging`` refuses it at parse,
+    so :func:`_requirement` raises and the ref is kept as unparseable rather than read as
+    conditional (measured on ``packaging 26.3``).
     """
     if requirement.marker is None:
         return True
@@ -4139,12 +4154,96 @@ def marker_applies(requirement: Requirement, *, python_minor: str) -> bool:
         "platform_release": "",
         "platform_system": "Linux",
         "platform_version": "",
-        "extra": "",
+        "extra": extra,
     }
     try:
         return bool(requirement.marker.evaluate(environment))
     except UndefinedEnvironmentName:
         return False
+
+
+_SOURCE_LINE_RE = re.compile(r"\s+line\s+(\d+)$")
+"""The trailing ``line N`` the file-backed readers write into a ref's ``source``.
+
+Read back out here so a skipped requirement is recorded in the same shape as every other
+:class:`SkippedLine` — the file in ``source`` and the number in ``line`` — rather than as
+one string that no reader of the provenance can compare against the others.
+"""
+
+_EXTRA_CLAUSE_RE = re.compile(r"""extra\s*==\s*['"]([^'"]*)['"]""")
+"""The extra a requirement's own marker asks for (``; extra == "test"``), if any."""
+
+
+def marker_skips(
+    refs: Sequence[DepRef], *, python_minor: str
+) -> tuple[list[DepRef], list[SkippedLine]]:
+    """``(refs whose markers hold in this layer, the ones dropped for not holding)``.
+
+    §3.2's rule for every requirement that is read as something to **install**:
+    ``setup.sh``'s lines, BugsInPy's ``requirements.txt``, ``install_requires``,
+    ``tests_require``, the ``tests`` extra, a root ``test_requirements.txt``, a
+    ``pyproject.toml``'s dependency arrays, ``setup_requires`` and
+    ``[build-system].requires`` — the tree's own and, through
+    :func:`early_install_pins`, a pinned release's. Applied to the *collected* refs, once,
+    so the rule has one home instead of one per reader, and the refs are read here exactly
+    as their readers wrote them: :attr:`DepRef.spec` is the requirement verbatim and
+    therefore still carries the marker, which is why nothing had to be threaded down
+    through the parsers to say so.
+
+    A requirement whose marker is false for this layer is not something pip would
+    install, and reading it as one describes an environment the layer never has: measured,
+    ``pandas/1``'s early pass named ``scikit-learn==0.23.1``'s build requirement
+    ``numpy==1.13.3`` under ``python_version == "3.6"``, and ``luigi/1``/``sanic/1`` each
+    carry ``cffi>=1.8,!=1.11.3; platform_python_implementation != 'PyPy'``, which *is* true
+    for CPython and stays.
+
+    The extra: empty unless the requirement's own marker names one, which is the case that
+    exists — ``extras_require["tests"]`` entries are read as declarations of an extra this
+    harness does install, so an entry that says so about itself is not dropped for saying
+    it. The direction is deliberately narrow: a *conditional* requirement whose condition
+    is unrelated to its own extra still has to hold on this platform to be installed.
+
+    A ref whose spec does not parse is kept rather than dropped: every ref here was built
+    by :func:`dep_ref`, which already refused an unparseable requirement, so a refusal at
+    this point is not a fact about the requirement and dropping one would be a silent loss
+    of a declaration.
+    """
+    kept: list[DepRef] = []
+    dropped: list[SkippedLine] = []
+    for ref in refs:
+        try:
+            requirement = _requirement(ref.spec, ref.source)
+        except BakeError:
+            kept.append(ref)
+            continue
+        named = (
+            _EXTRA_CLAUSE_RE.search(str(requirement.marker))
+            if requirement.marker is not None
+            else None
+        )
+        if marker_applies(
+            requirement,
+            python_minor=python_minor,
+            extra=named.group(1) if named else "",
+        ):
+            kept.append(ref)
+            continue
+        source, line = ref.source, 0
+        written = _SOURCE_LINE_RE.search(source)
+        if written is not None:
+            source, line = source[: written.start()], int(written.group(1))
+        dropped.append(
+            SkippedLine(
+                source=source,
+                line=line,
+                text=ref.spec,
+                reason=(
+                    "its environment marker does not hold in this layer: "
+                    f"{requirement.marker}"
+                ),
+            )
+        )
+    return kept, dropped
 
 
 def _transitive_pin(
@@ -6224,6 +6323,8 @@ def early_install_pins(
     pinned: Sequence[tuple[str, str]],
     *,
     build_requires_of: Callable[[str, str], Sequence[DepRef]],
+    python_minor: str,
+    marker_skipped: Optional[list[SkippedLine]] = None,
 ) -> tuple[EarlyInstall, ...]:
     """The pins a source build in this layer needs installed **before** it runs.
 
@@ -6250,6 +6351,18 @@ def early_install_pins(
     the whole decision is a structural test. A :class:`BakeError` from it is answered
     as "nothing known" — a release whose metadata could not be read is not a reason to
     fail a layer before it is built, and the layer's own build is the backstop.
+
+    ``python_minor`` is the layer's interpreter and it is read here, on each release's own
+    declarations, because this is the **early pass**'s half of §3.2's marker rule
+    (:func:`marker_skips`): a build requirement that does not apply on this image is not
+    something a build of it fetches. Measured, ``scikit-learn==0.23.1`` declares
+    ``numpy==1.13.3`` under ``python_version == "3.6"``, and reading that as applying is
+    what made ``pandas/1``'s ``early_pins`` name a numpy ordering for a python the layer is
+    not — while ``cffi>=1.8,!=1.11.3; platform_python_implementation != 'PyPy'`` is true
+    for CPython and stays. ``marker_skipped`` is the caller's list to record them in —
+    the same "one out-parameter" shape :func:`build_refs` and :func:`pyproject_refs` use
+    for ``notes`` — and it is optional because the preflight calls this too and the record
+    belongs to the deps JSON the bake writes.
     """
     held = {
         canonicalize_name(name): f"{name}=={version}" for name, version in pinned
@@ -6263,6 +6376,9 @@ def early_install_pins(
             refs = tuple(build_requires_of(name, version))
         except BakeError:
             continue
+        refs, dropped = marker_skips(refs, python_minor=python_minor)
+        if marker_skipped is not None:
+            marker_skipped += dropped
         for ref in refs:
             required = canonicalize_name(ref.name)
             satisfied_by = held.get(required)
@@ -6316,6 +6432,19 @@ class PreflightBug:
     first one's build finds it (§3.2, :func:`early_install_pins`). A reader of the pin
     list cannot tell ``cffi`` apart from any other dependency; a reader of this key can
     tell that ``cryptography==2.9.2``'s build is the reason it is where it is.
+    """
+
+    skipped: tuple[SkippedLine, ...] = ()
+    """The requirements §3.2's marker rule dropped, with the marker that dropped them.
+
+    [VANTA-WHY] The preflight's half of the record :func:`deps_provenance` writes under
+    the same key, and the reason it is here rather than on the terminal: what a build
+    declaration says is measured, not read, so a `--preflight-only` run has to leave it
+    somewhere. Measured, ``scipy==1.4.1``'s and ``scikit-learn==0.23.1``'s declarations
+    each name ``numpy`` three times — once for ``python_version == '3.5'``, once for
+    ``'3.6'`` and once for ``>= '3.8'`` — and only the last of the three applies to a
+    py3.8 layer; the other two are dropped here, and the ``EARLY`` line the reader sees
+    names the clause that holds instead of the first one written.
     """
 
     @property
@@ -6379,6 +6508,7 @@ class PreflightBug:
                 {"pin": pin, "reason": reason} for pin, reason in self.narrowings
             ],
             "early_pins": [item.as_dict() for item in self.early],
+            "skipped": [line.as_dict() for line in self.skipped],
         }
 
 
@@ -6518,6 +6648,11 @@ def preflight_layers(
         minor = minor_version(str(layer.entry["python_version"]))
         pins = layer_pins(layer)
         classified = tuple(classifier(name, version, minor) for name, version in pins)
+        # §3.2's marker rule over the pinned releases' own build declarations. The drops
+        # are collected here and recorded on the report rather than printed, because the
+        # reading is what a ``--preflight-only`` run measures and the terminal is for
+        # the findings a reader has to decide on (:attr:`PreflightBug.skipped`).
+        marker_skipped: list[SkippedLine] = []
         out.append(
             PreflightBug(
                 key=f"{layer.entry['project']}/{layer.entry['bug_id']}",
@@ -6538,7 +6673,13 @@ def preflight_layers(
                     ),
                     pins,
                     build_requires_of=build_requires_of,
+                    # The same reading the bake makes, from the pins the layer recorded:
+                    # §3.2's marker rule is applied here too, so the preflight's EARLY
+                    # lines name what the build will actually want (:func:`marker_skips`).
+                    python_minor=minor,
+                    marker_skipped=marker_skipped,
                 ),
+                skipped=tuple(marker_skipped),
             )
         )
     return out
@@ -8025,6 +8166,7 @@ def bug_sources(
     fixed = str(entry["fixed_commit"])
     buggy_date = tree_mod.commit_date(repo, buggy)
     fixed_date = tree_mod.commit_date(repo, fixed)
+    minor = minor_version(str(entry["python_version"]))
     notes: list[str] = []
     refs: list[DepRef] = []
     skipped: list[SkippedLine] = []
@@ -8138,6 +8280,18 @@ def bug_sources(
     )
     refs += _stamped(closure_refs, commit=fixed, commit_date=fixed_date)
     notes += closure_notes
+
+    # §3.2's marker rule, applied once over everything the five sources declared — the
+    # tree's own and its build requirements alike, because a ``setup_requires`` entry is
+    # read as something to *install* just as an ``install_requires`` one is
+    # (:func:`marker_skips`). Read here rather than in each parser so the rule has one
+    # home; the refs still carry their markers verbatim, and the dropped ones are
+    # recorded, not printed.
+    refs, marker_skipped = marker_skips(refs, python_minor=minor)
+    build_declared, build_marker_skipped = marker_skips(
+        build_declared, python_minor=minor
+    )
+    skipped += marker_skipped + build_marker_skipped
 
     return DepSources(
         project=project,
@@ -8601,6 +8755,13 @@ def resolve_bug_deps(
         deps = (*resolved, *transitive)
         installs = installs_of(deps)
         pins = pinned_parts(*build_specs, *installs)
+        # §3.2's marker rule over the pinned releases' own build declarations, which is
+        # this rule's early-pass half: a ``[build-system].requires`` entry that does not
+        # hold on this image is not something the build orders anything for. The dropped
+        # requirements are folded into the same ``skipped`` record the tree's declarations
+        # write to, because a reader asking "what was read and not installed" is asking
+        # one question of the whole layer.
+        early_skipped: list[SkippedLine] = []
         early = early_install_pins(
             tuple(
                 (name, version)
@@ -8609,7 +8770,11 @@ def resolve_bug_deps(
             ),
             pins,
             build_requires_of=build_requires_of,
+            python_minor=minor,
+            marker_skipped=early_skipped,
         )
+        if early_skipped:
+            sources = replace(sources, skipped=(*sources.skipped, *early_skipped))
         out.append(
             BugDeps(
                 entry=dict(entry),

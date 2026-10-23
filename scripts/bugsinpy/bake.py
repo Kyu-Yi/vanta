@@ -4628,6 +4628,7 @@ def transitive_pins(
     metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
     cutoffs: Optional[Mapping[str, str]] = None,
     tree_satisfied: Optional[Mapping[str, str]] = None,
+    installable_dropped: Sequence[str] = (),
 ) -> tuple[
     tuple[ResolvedDep, ...],
     tuple[str, ...],
@@ -4687,6 +4688,33 @@ def transitive_pins(
     is reported rather than passed. Only a name *every* one of whose paths starts at a
     replaced harness pin is one of these: a name a kept harness pin also needs is that
     pin's dependency and stays (:func:`OrphanedPin`'s own note on ``replaced_by``).
+
+    ``installable_dropped`` is the fourth input and the one the rule above gets wrong on
+    its own: the names this layer's pin list **drops** for a reason that does not stop pip
+    from installing them. A drop removes a name from the list; it does not remove the
+    requirement another pin wrote for that name, so pip resolves it at install time and
+    the layer holds a release the harness never chose. Measured on ``sanic/1``:
+    ``pyopenssl==19.1.0`` declares ``cryptography (>=2.8)``, the date rule's
+    ``cryptography==2.8`` is unbuildable here and is dropped, and pip installed
+    ``cryptography 47.0.0`` — whose own ``requires_dist`` names ``typing-extensions``,
+    a name only the replaced ``pytest 8.0.2`` brought in and which the layer therefore
+    removed. The removal was a ``pip check`` failure in the layer's own log
+    (``cryptography 47.0.0 requires typing-extensions, which is not installed``). So the
+    closure of each of these names is walked too, and a name it reaches is **not** an
+    orphan: nothing in this layer requires it is a claim the walk can only make from the
+    release pip is about to install.
+
+    The walk is at the *newest* release and not by date, for phase (A)'s reason: nothing
+    pins these names, so pip is free to resolve them at today's, and what this pass needs
+    from that release is the **names** it declares — the same prediction phase (A) makes
+    of the interpreter layer, with the same blind spot (a name that appears or disappears
+    with a release is the one thing this cannot see). Such a name is left exactly as the
+    interpreter layer provides it and not pinned: :func:`_transitive_pin` chooses by the
+    date rule, and no release it could choose both satisfies a release pip resolved years
+    after this layer's pins and holds on this image — the era's ``typing-extensions
+    3.7.4.2`` is the one ``pip check`` above refuses, and the release that does satisfy it
+    requires Python 3.9. The interpreter layer's own version is the one that satisfies
+    both, and it is already installed; that is what "the base layer brought it in" means.
 
     ``cutoffs`` maps a canonical pin name to the date that pin's **own** requirements are
     held to (:func:`pin_cutoff` — for a date-rule pin that is the date it was pinned
@@ -4910,6 +4938,44 @@ def transitive_pins(
         if settled[canonicalize_name(source)][1] != version
     }
     supplied = inherited - pinned - set(records)
+    # (D) The names pip's own resolution adds for a pin this layer drops, and the reason
+    # the filter below may not remove them (:data:`ORPHAN_RULE`'s measured exception,
+    # ``sanic/1``'s ``typing-extensions``). The roots are the releases pip is free to
+    # install for a dropped name — the *newest* one, the rule phase (A) walks the
+    # interpreter layer's provision by — and what is collected is the **names** they
+    # declare: a name the layer ends up holding may not be uninstalled, whoever required
+    # it. Descended like phase (A) rather than one level deep, because pip's resolution is
+    # a closure too; a name this layer pins, a name its own closure reaches, a harness pin
+    # and the tree's own names are all decided elsewhere and stop the walk.
+    pip_resolved: set[str] = set()
+    if installable_dropped:
+        pending: list[tuple[str, str]] = []
+        for source in installable_dropped:
+            canonical = canonicalize_name(source)
+            try:
+                available = releases_of(canonical)
+            except BakeError:
+                continue
+            if available:
+                pending.append((canonical, _newest_release(available)[0]))
+        walked: set[tuple[str, str]] = set()
+        while pending:
+            name, version = pending.pop()
+            if (name, version) in walked:
+                continue
+            walked.add((name, version))
+            for required, _, _raw in declarations(name, version):
+                if required in pinned or required in records or required in roots:
+                    continue
+                if required in tree:
+                    continue
+                pip_resolved.add(required)
+                try:
+                    available = releases_of(required)
+                except BakeError:
+                    continue
+                if available:
+                    pending.append((required, _newest_release(available)[0]))
     orphans = tuple(
         OrphanedPin(
             name=name,
@@ -4920,7 +4986,7 @@ def transitive_pins(
             ),
         )
         for name in sorted(supplied)
-        if bringers[name] <= replaced
+        if bringers[name] <= replaced and name not in pip_resolved
     )
     removed = {pin.name for pin in orphans}
     # The fourth answer, and the one the layer installs nothing for: a requirement a
@@ -9099,6 +9165,23 @@ def resolve_bug_deps(
                         if (date := pin_cutoff(dep)) is not None
                     },
                 },
+                # The dropped names pip will install anyway, which is what the orphan
+                # rule needs to answer "does anything in this layer still require it"
+                # (:func:`transitive_pins`). ``unbuildable`` and not ``unavailable``: the
+                # first is a name whose *pinned* release nothing here can build and whose
+                # requirement another pin still carries, so pip resolves a release of it
+                # at install time — ``sanic/1``'s ``cryptography``. The second is a name
+                # with no file that works on this image at all (``pywin32``), which pip
+                # cannot install under any version.
+                installable_dropped=tuple(
+                    sorted(
+                        {
+                            record.name
+                            for record in dropped
+                            if record.outcome == UNBUILDABLE
+                        }
+                    )
+                ),
             )
             # The closure walk's own picks get the same audit, and they are the half of
             # the layer it was measured on: ``luigi/1`` and ``sanic/1`` both install

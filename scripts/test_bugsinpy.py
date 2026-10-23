@@ -6675,24 +6675,46 @@ class TestTheClosureWalk:
             return TestTheClosureWalk.PYTEST_802, ">=3.8"
         return TestTheReportPluginFollowsTheBugsPytest._metadata_of(name, version)
 
-    @staticmethod
-    def _fetch(name: str) -> dict:
-        try:
-            return _fixture_releases()[name]
-        except KeyError as exc:
-            raise bake_mod.BakeError(f"no release dates for {name}") from exc
+    def _walk(
+        self,
+        pins,
+        *,
+        harness_pins=None,
+        cutoffs=None,
+        tree_satisfied=None,
+        installable_dropped=(),
+        releases=None,
+        metadata_of=None,
+    ):
+        """The walk over one fake layer.
 
-    def _walk(self, pins, *, harness_pins=None, cutoffs=None, tree_satisfied=None):
+        ``releases`` and ``metadata_of`` are the two seams a test needs when the finding
+        is about a release this class's fixtures do not describe — the dropped-name
+        closure below reads both, and a test that needs its own table should not have to
+        widen the shared one for every other test in the file.
+        """
+        table = _fixture_releases() if releases is None else releases
+        reader = self._metadata_of if metadata_of is None else metadata_of
+
+        def fetch(name):
+            try:
+                return table[name]
+            except KeyError as exc:
+                # The real reader's contract: a name the table does not list is a name
+                # PyPI has no dates for, which the walk catches as an unreadable release.
+                raise bake_mod.BakeError(f"no release dates for {name}") from exc
+
         return bake_mod.transitive_pins(
             pins,
             harness_pins=harness_pins or {},
             commit_date="2019-04-22",
             python_minor="3.8",
-            releases=_fixture_releases(),
-            fetch=self._fetch,
-            metadata_of=self._metadata_of,
+            releases=table,
+            fetch=fetch,
+            metadata_of=reader,
             cutoffs=cutoffs,
             tree_satisfied=tree_satisfied,
+            installable_dropped=installable_dropped,
         )
 
     def test_a_releases_own_declarations_are_pinned_by_the_date_rule(self):
@@ -6851,6 +6873,101 @@ class TestTheClosureWalk:
         )
         assert orphans == ()
         assert set(provided) >= {"exceptiongroup", "iniconfig", "tomli"}
+
+    DROPPED_RELEASES = {
+        # The ``sanic/1`` shape: the release pip is free to install for a name this
+        # layer dropped, and the name it requires, which only the *replaced* pytest
+        # brought in. ``cryptography 2.8`` is the unbuildable pick the drop removes and
+        # ``47.0.0`` the wheel pip installed in its place (log line 570).
+        "cryptography": {"2.8": "2019-03-01", "47.0.0": "2026-01-05"},
+        "typing-extensions": {"3.7.4.2": "2020-04-01", "4.13.2": "2025-04-10"},
+        "exceptiongroup": {"1.3.1": "2025-06-19"},
+        "exotic-helper": {"2.0": "2026-01-04", "2.1": "2026-02-01"},
+        "exotic-middle": {"1.0": "2026-01-05"},
+    }
+    """The releases the shared fixture does not carry, measured where they can be.
+
+    ``typing-extensions`` is the name the layer removed and ``exceptiongroup 1.3.1`` is
+    how it entered the interpreter layer — its ``typing-extensions >=4.6.0 ; python_version
+    < "3.13"`` is pytest 8.0.2's own dependency path to it, which is what makes it an
+    orphan of the replaced pytest rather than a name a kept harness pin needs.
+    """
+
+    def _dropped(self, *, installable_dropped=("cryptography",)):
+        """The walk with the dropped-name table above, and its two seams."""
+        table = {**_fixture_releases(), **self.DROPPED_RELEASES}
+
+        def metadata_of(name, version):
+            if (name, version) == ("cryptography", "47.0.0"):
+                return (("typing-extensions >=4.13.2",), ">=3.8")
+            if (name, version) == ("exceptiongroup", "1.3.1"):
+                return (
+                    ('typing-extensions >=4.6.0 ; python_version < "3.13"',),
+                    ">=3.7",
+                )
+            if (name, version) == ("exotic-helper", "2.1"):
+                return (("exotic-middle",), ">=3.8")
+            if (name, version) == ("exotic-middle", "1.0"):
+                return (("tomli >=1.0.0",), ">=3.8")
+            return self._metadata_of(name, version)
+
+        return self._walk(
+            (("pytest", "5.4.3"),),
+            harness_pins={"pytest": "8.0.2"},
+            cutoffs={"pytest": "2020-04-09"},
+            installable_dropped=installable_dropped,
+            releases=table,
+            metadata_of=metadata_of,
+        )
+
+    def test_a_name_a_dropped_pins_own_resolution_needs_is_not_an_orphan(self):
+        """``sanic/1``: the ``pip check`` failure was ``typing-extensions`` removed.
+
+        The layer replaces ``pytest 8.0.2`` with ``5.4.3`` and removes what only 8.0.2
+        declared — but ``pyopenssl==19.1.0``'s unbuildable-and-dropped ``cryptography``
+        is still required by that pin, so pip installs today's ``cryptography 47.0.0``,
+        which requires ``typing-extensions``. A name this layer ends up holding may not
+        be uninstalled, whoever declared it.
+        """
+        _pins, provided, orphans, _tree = self._dropped()
+        assert "typing-extensions" in provided, "kept as the base layer provides it"
+        assert "typing-extensions" not in {pin.name for pin in orphans}
+        assert [pin.name for pin in orphans] == [
+            "exceptiongroup",
+            "iniconfig",
+            "tomli",
+        ], "and only the names nothing in the layer requires are removed"
+
+    def test_the_dropped_closure_is_walked_and_not_just_its_first_level(self):
+        """A name the dropped release reaches *through* another unpinned one stays too.
+
+        ``exotic-helper``'s newest release declares ``exotic-middle``, which nothing pins
+        and nothing else requires, and ``exotic-middle 1.0`` re-declares ``tomli`` — a name
+        only the *replaced* ``pytest 8.0.2`` brought in, so one this layer would otherwise
+        remove. A rule that read only the dropped release's own declarations would stop at
+        ``exotic-middle`` and leave ``tomli`` to be uninstalled while the release pip
+        installs still requires it.
+        """
+        _pins, provided, orphans, _tree = self._dropped(
+            installable_dropped=("exotic-helper",)
+        )
+        assert "tomli" in provided, "kept as the base layer provides it"
+        assert "tomli" not in {pin.name for pin in orphans}
+        assert [pin.name for pin in orphans] == [
+            "exceptiongroup",
+            "iniconfig",
+            "typing-extensions",
+        ], "cryptography is not in this run, so nothing requires typing-extensions"
+
+    def test_a_layer_with_nothing_dropped_orphans_exactly_as_before(self):
+        """The rule's own denominator: no dropped name, no exception to the orphan rule."""
+        _pins, _provided, orphans, _tree = self._dropped(installable_dropped=())
+        assert [pin.name for pin in orphans] == [
+            "exceptiongroup",
+            "iniconfig",
+            "tomli",
+            "typing-extensions",
+        ]
 
 
 class TestTheBugUnderTestIsNeverATransitivePin:

@@ -1523,6 +1523,32 @@ so anything else fails the layer. No orphans is the ordinary case and the recipe
 whose bug does not re-pin a harness package removes nothing. Every removal is written into the deps JSON
 under `orphans` with its reason, and the names are deliberately **not** in `provisioned`.
 
+**A name a pin this layer *drops* still requires is not an orphan either, and this is the fourth input
+to the walk.** Measured, and it is what `sanic/1` failed on. Its `pip check` read
+`cryptography 47.0.0 requires typing-extensions, which is not installed`, and the removal that preceded it
+was the orphan rule firing on `typing-extensions` — a name only the replaced `pytest 8.0.2` brought in, so
+by the paragraph above a name this layer may not keep. The rule above is right about *why* the name is
+there and wrong about whether it may go, because a drop removes a name from the **pin list** and does not
+remove the requirement another pin wrote for it: `pyopenssl==19.1.0` declares `cryptography (>=2.8)`, the
+date rule's `cryptography==2.8` has no wheel this image can build and is dropped, and pip resolves a
+release of its own for the name at install time — today's `cryptography 47.0.0`, whose own `requires_dist`
+names `typing-extensions`. Nothing pinned it, nothing this layer's closure reached it, and yet the layer
+ends up holding it, so it may not be uninstalled. `bake.transitive_pins` takes a fourth input,
+`installable_dropped` — the dropped names whose *reason* still lets pip install a release of them
+(`record.outcome == bake.UNBUILDABLE`; a name with no file that works here at all, `pywin32`, is
+`NO_DISTRIBUTION` and cannot be installed under any version, so it is not one) — and walks the closure of
+each name's **newest** release, the rule phase (A) already walks the interpreter layer's provision by: the
+walk wants the **names** that release declares, and pip is free to resolve today's. A name it reaches is
+excluded from the orphan set, and it is left exactly as the interpreter layer provides it and **not**
+re-pinned: `bake._transitive_pin` chooses by the date rule, and no release it could choose both satisfies a
+release pip resolved years after this layer's pins and holds on this image — the era's `typing-extensions
+3.7.4.2` is the one the `pip check` above refuses, and the release that does satisfy `cryptography 47.0.0`
+requires Python 3.9. The closure is descended and not read one level deep, for phase (A)'s reason: pip's
+own resolution is a closure too, and a name the dropped release reaches *through* another unpinned one
+would otherwise be removed while the release pip installs requires it. The measured effect is the whole of
+`sanic/1`: `typing-extensions` stays, `pip check` is clean of it, and only `exceptiongroup`, `iniconfig`
+and `tomli` — the names nothing in the layer requires — are removed.
+
 **Every distribution the layer ends up holding has to be one its pin list names or the interpreter layer
 supplies.** The closure walk above is a prediction; the layer's own `pip freeze` is the reading, and it
 is the only place a name pip resolved for itself is written down, because

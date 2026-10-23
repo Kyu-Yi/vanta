@@ -1388,10 +1388,12 @@ to prevent, one line above the assertion that said the pin had landed. So:
    `cython` are what the isolation would otherwise supply, so this is the one install that cannot be
    made to depend on itself;
 2. **everything else, with `--no-build-isolation`**: the project's declared build requirements first
-   (a name that is one of the three is claimed by call 1 whichever list it arrived in), then the
-   dependency set. The flag is pip's supported way to say "build against what is already in this
-   environment"; with it, a missing build requirement fails the line instead of quietly isolating, so
-   the flag either applies or the run stops.
+   (a name that is one of the three is claimed by call 1 whichever list it arrived in), then — as a
+   separate call, before the dependency set — the dependency pins another pin's build needs
+   (`bake.early_install_pins`, see the build-requirement block below), then the dependency set. The
+   flag is pip's supported way to say "build against what is already in this environment"; with it, a
+   missing build requirement fails the line instead of quietly isolating, so the flag either applies
+   or the run stops.
 
 Their versions are asserted once, with `importlib.metadata`, after **both** calls — a pin that silently
 did not land is worse than no pin: the build would fall back to the interpreter layer's seeded
@@ -1407,6 +1409,52 @@ inside `dependencies` — because it answers a different question: a reader aski
 it (the toolchain, or the `setup_requires`/`[build-system].requires` line that declared it), the
 `pin_rule`, and the release date. `bake` prints them per layer, and a layer with none records an empty
 list rather than a missing key.
+
+**A *dependency's* build requirement is read from that dependency's sdist, never from its metadata.**
+`bake.build_refs` reads the declarations in the **bug's own tree**, which is the right answer for the
+project's own `setup.py`/`pyproject.toml`. A dependency makes the same declaration in its own source
+release, and none of the three places the pin metadata is read from carries it: measured on
+`cryptography==2.9.2`, `info.requires_dist`, the PEP 658 sidecar and the wheel's `dist-info/METADATA`
+each answer with *runtime* requirements only, and its `cffi` build requirement lives solely in the
+sdist's `pyproject.toml`. `bake.pypi_build_requirements` therefore opens the release's sdist — the same
+cached archive `bake.sdist_file_list` already reads, capped and streamed — and reads its **top-level**
+`<name>-<version>/pyproject.toml` and `.../setup.py` (`bake._archive_texts` over
+`SDIST_METADATA_MEMBERS`, tar then zip, and nothing the release vendored under a subdirectory), through
+the *same* two readers the tree's declaration goes through: `[build-system].requires` through the TOML
+table reader and `setup_requires` through the splat-aware AST reader. The archive is never executed. A
+release pip installs from a wheel declares nothing this can read and is left alone, and a release whose
+metadata cannot be read is not a failed layer — it is "nothing known", which the guard below still
+covers. One reading per `(name, version)` per run (`bake.cached_build_requirements`), because the same
+release is pinned in more than one bug's layer.
+
+**A build requirement another pin satisfies is installed before the build wants it; a fetch that gets
+past that fails the layer.** With `--no-build-isolation`, a `setup_requires`/`[build-system].requires`
+nothing satisfies is resolved by setuptools itself, through `easy_install`, which reaches PyPI and
+installs *today's* release: measured on `fastapi/1`, the layer pinned `cffi==1.14.0` and baked with
+`cffi 2.1.1` beside it, and `Installing cffi-2.1.1` was the only line that gave it away. Two measures
+answer it, one before the build and one after. **Before** — `bake.early_install_pins` takes each
+sdist-only pin's read build requirements and, where **another pin in the same layer satisfies one**,
+installs that pin in an **earlier pass**: the recipe's third non-isolated call, written to
+`/tmp/early-req.txt` and run before `/tmp/req.txt`, so the build finds the pinned version already in the
+environment. `EarlyInstall.satisfied_by` records which of the layer's pins it was, and a requirement no
+pin satisfies is deliberately **not** invented here — pinning a version the layer never chose is exactly
+what the date rule exists to prevent, so that case is left to the guard. **After** — *every* built
+layer's output is read for the two lines only `easy_install` writes (`bake.easy_install_fetches`:
+`Searching for ` and `Best match: `; the second names the release it settled on, and pip writes neither),
+and a layer where one appears fails through `bake.easy_install_failure`, which names the fetched
+package. That guard is kept apart from §3.2's own-pin gate because it answers a different question —
+not a conflict between pins but a package that entered from **outside** the pin list, which no pin list
+can be checked against — so it runs first and for **every** built layer, own pins or not, and a fetch is
+not tolerated the way a case (b) conflict is: the layer that results is not the one its provenance
+describes, and left alone it bakes green. The preflight computes the same `early_install_pins` for each
+layer and prints the ordering decision (`EARLY <pin>'s build needs <requirement> → <pin>`, counted as
+`N early` on the line), so what the bake will install early is on screen before the first byte is
+installed; a pin the preflight dropped is skipped there, because the bake will not install it either.
+Each finding is recorded in the provenance under **`early_pins`**, beside `build_pins`, with the pin,
+the requirement, its source, and the pin that satisfies it. Measured on the two existing bake logs:
+neither carries an `easy_install` line at all, and `bcrypt==3.1.7` shows no `Preparing metadata` step —
+it installs from an `aarch64` `abi3` wheel and is never a source build — so the fetch this guards
+against is a `cryptography==2.9.2`-shaped sdist-only pin and not every such pin.
 
 **Mandatory bake-time gate (part of the wave-1 gate, §8.1).** For each version checkpoint, assert
 *inside the checkpoint*:

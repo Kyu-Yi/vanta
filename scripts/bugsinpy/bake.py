@@ -1837,6 +1837,8 @@ def build_refs(
     setup_py: Optional[str],
     pyproject: Optional[str],
     notes: list[str],
+    *,
+    strict: bool = True,
 ) -> list[DepRef]:
     """The project's **build** requirements → refs, read statically, never installed as deps.
 
@@ -1857,10 +1859,28 @@ def build_refs(
     pandas' build declares ``numpy==1.15.4`` because that is what *its own CI* used,
     and installing that in the layer would be a second source build of a numpy the
     dependency set then replaces.
+
+    ``strict`` is what the two callers differ on, and the difference is whose file is
+    being read. For the *tree* it is ``True``: an unparseable ``setup.py`` is this
+    bug's own metadata and a :class:`BakeError` is the flag it deserves. For a
+    **pinned release** (:func:`pypi_build_requirements`) it is ``False``: a 2020 sdist
+    can carry Python 2 syntax that ``ast`` refuses, and that is not this bug's fault or
+    a fact about the bug — the refusal is recorded as a note and the ``pyproject.toml``
+    half is still read.
     """
     refs: list[DepRef] = []
     if setup_py is not None:
-        node = _setup_kwargs(setup_py).get("setup_requires")
+        try:
+            kwargs = _setup_kwargs(setup_py)
+        except BakeError:
+            if strict:
+                raise
+            notes.append(
+                "setup.py does not parse as Python, so its setup_requires could not "
+                "be read; this is a reading, not a fact about the release"
+            )
+            kwargs = {}
+        node = kwargs.get("setup_requires")
         if node is not None:
             for literal in _literal_nodes(node):
                 text = literal.value.strip()
@@ -2693,6 +2713,7 @@ def requirements_recipe(
     install_specs: Sequence[str],
     *,
     build_pins: Sequence[str] = (),
+    early_pins: Sequence[str] = (),
     minor: Optional[str] = None,
 ) -> str:
     """Install one bug's *resolved* dependencies on top of the interpreter layer.
@@ -2714,7 +2735,20 @@ def requirements_recipe(
       supply, so they are the one install that cannot be made to depend on itself;
     * then **everything else** with ``--no-build-isolation``: the build requirements
       the project declares (numpy for matplotlib, Cython and numpy for pandas) and
-      the dependency set.
+      the dependency set;
+    * and, between the two and the dependency set's own call, ``early_pins`` — the
+      dependency pins that some pin in this layer declares as a *build* requirement
+      (:func:`early_install_pins`), installed before the main list so the build that
+      wants them finds them already there.
+
+    [VANTA-WHY] ``early_pins`` is the third install because ``--no-build-isolation``
+    makes setuptools resolve ``setup_requires`` itself, and with nothing installed that
+    satisfies it ``easy_install`` reaches PyPI and installs **today's** release of it
+    — which is the ``[VANTA-WHY]`` of :func:`pypi_build_requirements` seen from the
+    build side, and the reason :func:`run_bake_actions` fails a layer that does it
+    anyway. The pins are already in ``install_specs``; installing them first is what
+    makes the difference, and pip installing an already-satisfied pin is a no-op, so
+    they stay in the main list where the layer's record of what it installs is.
 
     [VANTA-WHY] The two-install split is the fix for a *measured* failure, and the
     single install it replaces looked correct in the log. matplotlib's ``setup.py``
@@ -2806,6 +2840,22 @@ def requirements_recipe(
         check = _build_pin_check(build_pins)
         if check:
             lines.append(check)
+    early = [spec.strip() for spec in early_pins if spec.strip()]
+    if early:
+        lines += [
+            "cat > /tmp/early-req.txt <<'VANTA_EARLY_REQUIRES'",
+            "\n".join(early),
+            "VANTA_EARLY_REQUIRES",
+            # The dependency pins that another pin in this layer builds against,
+            # installed before the main list so the build finds them: with
+            # `--no-build-isolation` an unsatisfied setup_requires is fetched by
+            # easy_install at today's version rather than the pinned one (§3.2). It
+            # carries the flag for the same reason the main install does — it is a
+            # dependency install and a dependency can itself be a source build.
+            "python -m pip install --no-cache-dir --no-build-isolation "
+            f"{LEGACY_RESOLVER_FLAG} -r /tmp/early-req.txt",
+            _no_isolated_build_env("the early build-requirement install"),
+        ]
     if body:
         lines += [
             "cat > /tmp/req.txt <<'VANTA_REQUIREMENTS'",
@@ -4121,6 +4171,122 @@ def sdist_file_list(
     return names, cut or not names
 
 
+SDIST_METADATA_MEMBERS = ("pyproject.toml", "setup.py")
+"""The two files a release declares its **build** requirements in (PEP 518 + setuptools)."""
+
+
+def _top_level_member(name: str, wanted: Sequence[str]) -> Optional[str]:
+    """``name`` as one of ``wanted``, when it is an sdist's own top-level copy of it.
+
+    Top-level only (``<name>-<version>/<member>``), because that is where an sdist puts
+    its own metadata: a nested copy is a vendored one, and reading it would attribute
+    another project's build requirements to this release.
+    """
+    parts = name.split("/")
+    if len(parts) != 2:
+        return None
+    return parts[1] if parts[1] in wanted else None
+
+
+def _archive_texts(data: bytes, wanted: Sequence[str]) -> dict[str, str]:
+    """``{member: text}`` for the top-level members of a tar or zip archive in memory.
+
+    The counterpart of :func:`_archive_names`, which keeps the *names* because the
+    question it answers is "does this build compile anything". This one keeps the
+    *contents*, because "what does this build need" is written inside two files and
+    nowhere in the listing.
+    """
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
+            texts: dict[str, str] = {}
+            for member in archive.getmembers():
+                base = _top_level_member(member.name, wanted)
+                if base is None or not member.isfile():
+                    continue
+                handle = archive.extractfile(member)
+                if handle is None:
+                    continue
+                texts[base] = handle.read().decode("utf-8", errors="replace")
+            return texts
+    except (tarfile.TarError, EOFError, ValueError):
+        pass
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            texts = {}
+            for name in archive.namelist():
+                base = _top_level_member(name, wanted)
+                if base is None or base in texts:
+                    continue
+                texts[base] = archive.read(name).decode("utf-8", errors="replace")
+            return texts
+    except (zipfile.BadZipFile, OSError, KeyError):
+        return {}
+
+
+def sdist_metadata_texts(
+    file: PyPIFile, *, max_bytes: int = SDIST_MAX_BYTES
+) -> dict[str, str]:
+    """An sdist's own ``pyproject.toml`` and ``setup.py``, as text.
+
+    Downloaded and read, never executed (design C3): both files are parsed as data —
+    ``tomllib`` for the first, ``ast`` for the second — by the same
+    :func:`build_refs` :func:`bug_sources` hands the tree's two files to.
+    """
+    try:
+        with urllib.request.urlopen(file.url, timeout=PYPI_TIMEOUT_SECS) as response:
+            data, _ = _read_capped(response, max_bytes)
+    except (urllib.error.URLError, OSError) as exc:
+        raise BakeError(f"cannot download {file.filename}: {exc}") from exc
+    return _archive_texts(data, SDIST_METADATA_MEMBERS)
+
+
+def pypi_build_requirements(
+    name: str,
+    version: str,
+    *,
+    files_of: Callable[[str, str], Optional[tuple[PyPIFile, ...]]] = pypi_release_files,
+    texts_of: Callable[[PyPIFile], dict[str, str]] = sdist_metadata_texts,
+) -> tuple[DepRef, ...]:
+    """What one release declares it needs in order to be **built**, from its sdist.
+
+    [VANTA-WHY] A second reading of the same two files :func:`build_refs` reads for the
+    *tree* — PEP 518's ``[build-system].requires`` and setuptools' ``setup_requires`` —
+    asked of the release instead of the project, because it is the only reading that
+    answers it. PyPI's ``requires_dist`` (and therefore the sidecar and the wheel
+    ``METADATA`` that :func:`declared_requires` falls back to) carries *runtime*
+    requirements and never says "this needs cffi to build". Measured on the split's own
+    pins: ``cryptography==2.9.2``'s ``pyproject.toml`` declares
+    ``cffi>=1.8,!=1.11.3; platform_python_implementation != 'PyPy'`` and
+    ``bcrypt==3.1.7``'s declares ``cffi>=1.1; python_implementation != 'PyPy'``, and
+    neither release's ``METADATA`` mentions cffi as a build requirement anywhere.
+
+    An empty tuple for a release with no sdist: a release pip installs from a wheel is
+    never built here, so its build requirements are never exercised and nothing can
+    fetch them. ``setup_py`` is read with ``strict=False`` (:func:`build_refs`) — a
+    dependency's Python-2-era ``setup.py`` is a reading that failed, not this bug's
+    fault.
+
+    ``files_of``/``texts_of`` are injected so the whole reading is structural, the same
+    way :func:`preflight_pin`'s pair is. Called only by the bake, like the other PyPI
+    readers.
+    """
+    files = files_of(name, version)
+    if files is None:
+        return ()
+    sdists = [file for file in files if file.is_sdist]
+    if not sdists:
+        return ()
+    texts = texts_of(sdists[0])
+    return tuple(
+        build_refs(
+            texts.get("setup.py"),
+            texts.get("pyproject.toml"),
+            notes=[],
+            strict=False,
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # preflight: what each pin installs as, before any layer is built
 # ---------------------------------------------------------------------------
@@ -4663,6 +4829,71 @@ def pip_check_failure(conflicts: Sequence[PinConflict]) -> ExecResult:
     )
 
 
+EASY_INSTALL_MARKERS = ("Searching for ", "Best match: ")
+"""What setuptools' ``easy_install`` prints when it goes looking for a distribution.
+
+Both, and not one: ``Searching for cffi`` is the first line it writes and ``Best
+match: cffi 2.1.1`` is the one that names the version it settled on, so a single
+marker would either miss a fetch that failed between the two or report a search whose
+result is not in the log. They are also the two lines that cannot be anything else —
+pip does not write either, and the recipe writes neither, so a match is a fetch.
+
+Measured, and the reason the pair is spelled out rather than grepped loosely: on
+``fastapi/1`` the layer installed ``cffi==1.14.0`` and ``cryptography==2.9.2`` declared
+cffi in ``[build-system].requires``; with ``--no-build-isolation`` setuptools resolved
+that declaration itself through ``easy_install``, which reached PyPI and installed
+**today's** cffi 2.1.1 beside the pin. ``Installing cffi-2.1.1`` was the line that gave
+it away and it is deliberately not a marker: pip's own ``Installing collected
+packages:`` shares that prefix, and a marker that also matches pip's success line
+would fail every layer.
+"""
+
+
+def easy_install_fetches(output: str) -> tuple[str, ...]:
+    """The lines that say ``easy_install`` fetched a distribution during this build.
+
+    Empty is the pass, and it is the answer a correct layer gives: every build
+    requirement this layer's pins declare is either already installed — the early pass
+    :func:`early_install_pins` orders, or a pin pip put there — or pip refuses to build
+    at all. A match means something was fetched from outside the pin list, and which
+    release it was is the point: ``cffi 2.1.1`` installed under a layer that pins
+    ``cffi==1.14.0`` is a layer whose environment is not the one its provenance
+    describes.
+    """
+    markers = EASY_INSTALL_MARKERS
+    return tuple(
+        line
+        for raw in output.replace("\r", "\n").splitlines()
+        if (line := raw.strip()).startswith(markers)
+    )
+
+
+def easy_install_failure(lines: Sequence[str]) -> ExecResult:
+    """A failed build's result, synthesised from an ``easy_install`` fetch (§3.2).
+
+    Through the same path :func:`pip_check_failure` uses and for the same reason: the
+    install itself succeeded — the layer installed and its marker is there — so what
+    failed is the gate after it, and reporting it as a build failure keeps one kind of
+    failure in the summary instead of two. The leading ``ERROR:`` is the prefix
+    :func:`last_error_line` picks out, so the one-line entry names this rather than the
+    last line of pip's output.
+    """
+    body = "\n".join(lines)
+    return ExecResult(
+        stdout="",
+        stderr=(
+            "ERROR: setuptools' easy_install fetched a distribution while this layer "
+            "was being built, so the layer is not the one its pin list describes "
+            "(§3.2). Either the fetched package is a build requirement a pin in this "
+            "layer satisfies — and it must be installed before the build that wants it "
+            "(:func:`early_install_pins`) — or nothing here pins it and the layer "
+            "cannot be built from its own pins:\n" + body
+        ),
+        exit_code=1,
+        timed_out=False,
+    )
+
+
 @dataclass(frozen=True)
 class PreflightPin:
     """One ``name==version`` pin and what PyPI says it can be installed as."""
@@ -4918,22 +5149,118 @@ def _pinned_parts(pin: str) -> Optional[tuple[str, str]]:
     return name, version
 
 
-def layer_pins(layer: BugDeps) -> tuple[tuple[str, str], ...]:
-    """The layer's ``(name, version)`` pins, build pins first and with no repeats.
+def pinned_parts(*specs: str) -> tuple[tuple[str, str], ...]:
+    """``(name, version)`` for each ``name==version`` spec, de-duplicated, in order.
 
-    Build pins first because that is the order the recipe installs them (§3.2), and a
-    package in both lists appears once: a build requirement the dependency set also
-    pins *is* that pin (:attr:`BuildPin.dependency_pin`), so counting it twice would
-    report one package as two.
+    [VANTA-WHY] A spec that is not an exact pin is dropped rather than guessed at
+    (:func:`_pinned_parts`), and a repeated one is dropped because a build requirement
+    the dependency set also pins *is* that pin (:attr:`BuildPin.dependency_pin`) —
+    counting it twice would report one package as two.
     """
     seen: set[tuple[str, str]] = set()
     out: list[tuple[str, str]] = []
-    for pin in (*layer.build_pins, *layer.installs):
+    for pin in specs:
         parts = _pinned_parts(pin)
         if parts is None or parts in seen:
             continue
         seen.add(parts)
         out.append(parts)
+    return tuple(out)
+
+
+def layer_pins(layer: BugDeps) -> tuple[tuple[str, str], ...]:
+    """The layer's ``(name, version)`` pins, build pins first and with no repeats.
+
+    Build pins first because that is the order the recipe installs them (§3.2).
+    """
+    return pinned_parts(*layer.build_pins, *layer.installs)
+
+
+@dataclass(frozen=True)
+class EarlyInstall:
+    """A build requirement of one pin that another pin in the same layer satisfies.
+
+    [VANTA-WHY] The record of one D1 finding, and it is a *pair* of pins rather than a
+    fact about one: ``cryptography==2.9.2``'s ``[build-system].requires`` names cffi,
+    and whether that name is a problem depends entirely on whether the same layer also
+    holds a cffi pin — if it does, ``--no-build-isolation`` needs it installed
+    *before* the build that wants it, and if it does not, setuptools' ``easy_install``
+    fetches today's cffi instead (§3.2). So the finding names both sides, and the
+    declaration itself, because "cffi" alone would not say which release asked for it
+    or in what range.
+    """
+
+    pin: str
+    """The pin whose *build* needs it, as ``name==version``."""
+    requirement: DepRef
+    """The declaration as the release's own metadata wrote it, with its source."""
+    satisfied_by: str
+    """The pin in the same layer that satisfies it, as ``name==version``."""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "pin": self.pin,
+            "requires": self.requirement.spec,
+            "source": self.requirement.source,
+            "satisfied_by": self.satisfied_by,
+        }
+
+
+def early_install_pins(
+    built: Sequence[tuple[str, str]],
+    pinned: Sequence[tuple[str, str]],
+    *,
+    build_requires_of: Callable[[str, str], Sequence[DepRef]],
+) -> tuple[EarlyInstall, ...]:
+    """The pins a source build in this layer needs installed **before** it runs.
+
+    ``built`` is the pins pip will compile here and ``pinned`` every pin the layer
+    holds (:func:`pinned_parts`) — two arguments and not one, because the two halves
+    of the finding come from different places: what a pin's build *needs* is a fact
+    about that release's sdist, and which version of it the layer *has* is the pin
+    list. ``built`` is the caller's answer to "will pip build this here", because only
+    a build runs ``setup.py`` at all: ``bcrypt==3.1.7`` declares cffi in
+    ``[build-system].requires`` and installs from an aarch64 ``abi3`` wheel, so its
+    declaration is never exercised and there is nothing to install early for it
+    (measured on ``fastapi/1``'s log).
+
+    A requirement the layer does **not** pin is not this function's business and is
+    left to :func:`run_bake_actions`'s ``easy_install`` guard, which fails the layer
+    that fetches one: what this returns is an ordering decision about pins the layer
+    already holds, and it cannot invent a version for a name nothing pinned.
+
+    A pin whose own build requires itself is skipped: installing it early would mean
+    building it to build it, which is the circularity the toolchain install exists to
+    avoid, and no measured pin does it.
+
+    ``build_requires_of`` is the reading (:func:`pypi_build_requirements`), injected so
+    the whole decision is a structural test. A :class:`BakeError` from it is answered
+    as "nothing known" — a release whose metadata could not be read is not a reason to
+    fail a layer before it is built, and the layer's own build is the backstop.
+    """
+    held = {
+        canonicalize_name(name): f"{name}=={version}" for name, version in pinned
+    }
+    out: list[EarlyInstall] = []
+    seen: set[tuple[str, str]] = set()
+    for name, version in built:
+        own = canonicalize_name(name)
+        spelling = f"{name}=={version}"
+        try:
+            refs = tuple(build_requires_of(name, version))
+        except BakeError:
+            continue
+        for ref in refs:
+            required = canonicalize_name(ref.name)
+            satisfied_by = held.get(required)
+            if required == own or satisfied_by is None:
+                continue
+            if (spelling, satisfied_by) in seen:
+                continue
+            seen.add((spelling, satisfied_by))
+            out.append(
+                EarlyInstall(pin=spelling, requirement=ref, satisfied_by=satisfied_by)
+            )
     return tuple(out)
 
 
@@ -4967,6 +5294,17 @@ class PreflightBug:
     (:func:`pin_narrowings`). Printed by :func:`preflight_lines` before any build.
     """
 
+    early: tuple[EarlyInstall, ...] = ()
+    """The build requirements a pin in this layer needs and another pin here satisfies.
+
+    [VANTA-WHY] Recorded because it is an *ordering* decision and nothing else in the
+    report shows it: the two pins are both in the layer either way, and the only
+    difference is that the bake installs the second one before the main list so the
+    first one's build finds it (§3.2, :func:`early_install_pins`). A reader of the pin
+    list cannot tell ``cffi`` apart from any other dependency; a reader of this key can
+    tell that ``cryptography==2.9.2``'s build is the reason it is where it is.
+    """
+
     @property
     def refused(self) -> tuple[PinConflict, ...]:
         """The conflicts §3.2 does not tolerate: at least one side is a harness choice.
@@ -4996,17 +5334,23 @@ class PreflightBug:
         return tuple(pin for pin in self.pins if pin.kind == NO_DISTRIBUTION)
 
     def counts(self) -> dict[str, int]:
-        """The three class counts, plus the two findings that are not a class.
+        """The three class counts, plus the three findings that are not a class.
 
         ``gap`` and ``unbuildable`` are counted separately because neither replaces the
         class: an unbuildable pin *is* sdist-only (that is what pip will try), and the
         extra word is what says the attempt cannot succeed.
+
+        ``early`` is the third and counts :attr:`early` — the build requirements the
+        layer satisfies from its own pins. It is a count of *findings* rather than of
+        pins: the two pins it names are already counted in their own classes, and what
+        the number says is how many ordering decisions the bake is about to take.
         """
         counts = {kind: 0 for kind in PREFLIGHT_CLASS_LETTERS}
         for pin in self.pins:
             counts[pin.kind] = counts.get(pin.kind, 0) + 1
         counts["gap"] = sum(1 for pin in self.pins if pin.gap is not None)
         counts["unbuildable"] = sum(1 for pin in self.pins if pin.unbuildable is not None)
+        counts["early"] = len(self.early)
         return counts
 
     def as_dict(self) -> dict[str, Any]:
@@ -5021,6 +5365,7 @@ class PreflightBug:
             "narrowings": [
                 {"pin": pin, "reason": reason} for pin, reason in self.narrowings
             ],
+            "early_pins": [item.as_dict() for item in self.early],
         }
 
 
@@ -5092,6 +5437,34 @@ def cached_release_metadata(
     return read
 
 
+def cached_build_requirements(
+    *,
+    fetch: Callable[[str, str], Sequence[DepRef]] = pypi_build_requirements,
+) -> Callable[[str, str], tuple[DepRef, ...]]:
+    """``(name, version) -> what its sdist needs to be built``, read once per run.
+
+    [VANTA-WHY] The third reader with this shape, and the one that pays the most: this
+    one downloads a whole sdist (up to :data:`SDIST_MAX_BYTES`), while the other two ask
+    for JSON, so a pin two layers hold being read twice is the difference between one
+    400 KB download and two. ``bake`` builds one per run and hands it to both places
+    that ask (:func:`early_install_pins` for the report and for the layer's own
+    ``early_pins``).
+
+    Keyed ``(name, version)`` like :func:`cached_release_metadata` and unlike the
+    classifier: what an sdist declares it needs to build does not depend on the
+    interpreter reading it. ``fetch`` is injected so a test can hand it a dict.
+    """
+    cache: dict[tuple[str, str], tuple[DepRef, ...]] = {}
+
+    def read(name: str, version: str) -> tuple[DepRef, ...]:
+        key = (name, version)
+        if key not in cache:
+            cache[key] = tuple(fetch(name, version))
+        return cache[key]
+
+    return read
+
+
 def preflight_layers(
     layers: Sequence[BugDeps],
     *,
@@ -5099,6 +5472,7 @@ def preflight_layers(
     metadata_of: Callable[
         [str, str], tuple[tuple[str, ...], Optional[str]]
     ] = pypi_release_metadata,
+    build_requires_of: Callable[[str, str], Sequence[DepRef]] = pypi_build_requirements,
 ) -> list[PreflightBug]:
     """Classify every pin of every layer, through one shared classifier.
 
@@ -5114,6 +5488,15 @@ def preflight_layers(
     which is also the one it gave :func:`resolve_bug_deps`, so a pin two layers hold is
     fetched once for both readings. It is the uncached network by default, and every
     test that calls this passes a stub.
+
+    ``build_requires_of`` is the third reading, and it answers the question the other
+    two cannot: what each pin's **build** needs (:func:`pypi_build_requirements`), which
+    is in its sdist's ``pyproject.toml``/``setup.py`` and in none of the metadata forms
+    the other two read. Its one use here is :func:`early_install_pins` — reporting the
+    build requirements some *other* pin of the same layer satisfies, which the bake then
+    installs before the main list (§3.2). It is the run's
+    :func:`cached_build_requirements` instance when ``bake`` has one, because each answer
+    costs a whole sdist download, and every test that calls this passes a stub.
     """
     classifier = classify or preflight_classifier()
 
@@ -5121,18 +5504,28 @@ def preflight_layers(
     for layer in layers:
         minor = minor_version(str(layer.entry["python_version"]))
         pins = layer_pins(layer)
+        classified = tuple(classifier(name, version, minor) for name, version in pins)
         out.append(
             PreflightBug(
                 key=f"{layer.entry['project']}/{layer.entry['bug_id']}",
                 checkpoint=layer.checkpoint,
                 python_minor=minor,
-                pins=tuple(classifier(name, version, minor) for name, version in pins),
+                pins=classified,
                 conflicts=metadata_conflicts(
                     pins,
                     own=own_pin_names(layer.provenance),
                     metadata_of=metadata_of,
                 ),
                 narrowings=pin_narrowings(layer.provenance),
+                early=early_install_pins(
+                    tuple(
+                        (pin.name, pin.version)
+                        for pin in classified
+                        if pin.kind == SDIST_ONLY
+                    ),
+                    pins,
+                    build_requires_of=build_requires_of,
+                ),
             )
         )
     return out
@@ -5211,7 +5604,8 @@ def preflight_lines(
     what is still open — an unreviewed GAP, an UNBUILDABLE, an UNAVAILABLE pin the rule
     did not take, the pins whose own declarations contradict each other
     (:func:`_conflict_sections`), the pins the date rule moved for the layer's own pins
-    (:func:`_narrowing_section`), and what the rule did take — and the pins' own reasons
+    (:func:`_narrowing_section`), the build requirements the layer installs early
+    (:func:`_early_section`), and what the rule did take — and the pins' own reasons
     are in that JSON, next to the provenance.
 
     ``dropped`` is ``{checkpoint: that layer's dropped records}``, read from the
@@ -5227,6 +5621,7 @@ def preflight_lines(
             f"{len(report.pins)} pin(s), {counts[INSTALLABLE_WHEEL]} wheel, "
             f"{counts[SDIST_ONLY]} sdist-only, {counts[NO_DISTRIBUTION]} unavailable, "
             f"{counts['gap']} gap, {counts['unbuildable']} unbuildable, "
+            f"{counts['early']} early, "
             f"{len(drops.get(report.checkpoint, ()))} dropped"
         )
 
@@ -5241,6 +5636,7 @@ def preflight_lines(
     lines += _section("pin(s) nothing can install", "UNAVAILABLE", unavailable)
     lines += _conflict_sections(reports, dropped=dropped_pins)
     lines += _narrowing_section(reports)
+    lines += _early_section(reports, dropped=dropped_pins)
     if dropped_pins:
         lines += ["", f"dropped pin(s) ({len(dropped_pins)}) — §3.2's rule, with the "
                       "audit that settled it:"]
@@ -5342,6 +5738,38 @@ def _narrowing_section(reports: Sequence[PreflightBug]) -> list[str]:
     for pin, (reason, keys) in grouped.items():
         lines.append(f"  NARROWED {pin} — {reason} ({', '.join(keys)})")
     return lines
+
+
+def _early_section(
+    reports: Sequence[PreflightBug], *, dropped: Container[str]
+) -> list[str]:
+    """One printed block for the build requirements the layer installs early.
+
+    [VANTA-WHY] Printed rather than left to the layer's ``.preflight.json`` because it
+    is the one finding in this report that changes what the *recipe* does: every other
+    line is about whether a pin can go in, and this one is about the order two pins go
+    in. A reader comparing the pin list to the recipe sees a pin installed twice and
+    needs a line that says why (§3.2, :func:`early_install_pins`).
+
+    The line names both sides and the declaration, in the direction of the decision —
+    *this* pin's build needs *that* pin — because "cffi" alone would not say which
+    release asked for it; the source it came from is in the layer's JSON. A finding
+    with a **dropped** pin on either side is skipped, like the other blocks: a dropped
+    pin is not installed at all, so there is nothing to order it before.
+    """
+    grouped: dict[str, list[str]] = {}
+    for report in reports:
+        for item in report.early:
+            if item.pin in dropped or item.satisfied_by in dropped:
+                continue
+            grouped.setdefault(
+                f"{item.pin}'s build needs {item.requirement.spec} → "
+                f"{item.satisfied_by}",
+                [],
+            ).append(report.key)
+    return _section(
+        "build requirement(s) the layer installs early", "EARLY", grouped
+    )
 
 
 def preflight_verdict(
@@ -6703,6 +7131,7 @@ def deps_provenance(
     *,
     harness_pins: Mapping[str, str],
     build_pins: Sequence[BuildPin] = (),
+    early: Sequence[EarlyInstall] = (),
     dropped: Sequence[DroppedPin] = (),
 ) -> dict[str, Any]:
     """What the bake decided for one bug, as data a later stage can read.
@@ -6743,6 +7172,15 @@ def deps_provenance(
     answers a different question: a reader asking "which Cython compiled
     ``pandas/_libs``" is not asking what pandas imports.
 
+    ``early_pins`` is the ordering half of the same story and the one thing the other
+    keys cannot show: a subset of ``installs`` that the recipe installs **first**,
+    because a pin in this layer's own build declares it (``cryptography==2.9.2`` wants
+    cffi, the layer holds ``cffi==1.14.0``) and under ``--no-build-isolation`` an
+    unsatisfied declaration is fetched by ``easy_install`` at today's version instead
+    (§3.2, :func:`early_install_pins`). Each entry names the pin that wants it, what it
+    declared, and the pin that answers it — the same record the preflight prints, kept
+    next to the pins it reorders.
+
     ``dropped`` is the other thing that is not in ``installs``, and it is the one
     exception to "a declared dependency is installed": a pin nothing on this image can
     install, which §3.2's unresolvable-pin rule drops *only* when no file in the bug's
@@ -6772,6 +7210,7 @@ def deps_provenance(
         "installs": list(installs_of(resolved)),
         "dropped": [pin.as_dict() for pin in dropped],
         "build_pins": [pin.as_dict() for pin in build_pins],
+        "early_pins": [item.as_dict() for item in early],
         "dependencies": [dep.as_dict() for dep in resolved],
         "pins_after_commit_date": [
             {
@@ -6803,6 +7242,13 @@ class BugDeps:
     ``build_pins`` is installed *before* ``installs`` and is in the record for the
     same reason: ``requirements_recipe`` runs the two in that order and
     ``--no-build-isolation`` is what makes the order mean anything (§3.2).
+
+    ``early_pins`` is a subset of ``installs`` the recipe installs *before* the main
+    list (:func:`early_install_pins`): a pin this layer's own build declares, which has
+    to be there when that build runs rather than beside it. It is carried rather than
+    recomputed by :func:`layer_recipes`, for the reason ``installs`` is: the record
+    next to the layer is the resolution's own answer, and a second reader of the sdists
+    would be a second chance to install an order nobody recorded.
     """
 
     entry: dict[str, Any]
@@ -6810,6 +7256,7 @@ class BugDeps:
     installs: tuple[str, ...]
     provenance: dict[str, Any]
     build_pins: tuple[str, ...] = ()
+    early_pins: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -6840,6 +7287,9 @@ def resolve_bug_deps(
     metadata_of: Callable[
         [str, str], tuple[tuple[str, ...], Optional[str]]
     ] = pypi_release_metadata,
+    build_requires_of: Callable[
+        [str, str], Sequence[DepRef]
+    ] = pypi_build_requirements,
     classify: Optional[Callable[[str, str, str], PreflightPin]] = None,
 ) -> tuple[list[BugDeps], list[FlaggedBug]]:
     """Resolve every selected bug's layer, pinning by date from PyPI.
@@ -6868,6 +7318,13 @@ def resolve_bug_deps(
     here"; ``bake`` builds one per run and shares it with the preflight table, so a pin
     is classified once however many times it is asked about. Injecting it — or a stub
     of it — is what keeps these tests offline.
+
+    ``build_requires_of`` answers the third question, "what does this release need in
+    order to be built", and it is used for exactly one decision: which of this layer's
+    own pins some *other* pin's build needs installed before it
+    (:func:`early_install_pins`), so the layer's ``early_pins`` can say so. It is read
+    from the release's sdist and never executed; ``bake`` passes the run's
+    :func:`cached_build_requirements`, so a pin two bugs hold is downloaded once.
     """
     out: list[BugDeps] = []
     flagged: list[FlaggedBug] = []
@@ -6979,19 +7436,36 @@ def resolve_bug_deps(
         except BakeError as exc:
             flagged.append(FlaggedBug(key=key, reason=f"{type(exc).__name__}: {exc}"))
             continue
+        installs = installs_of(resolved)
+        build_specs = build_installs(built)
+        pins = pinned_parts(*build_specs, *installs)
+        early = early_install_pins(
+            tuple(
+                (name, version)
+                for name, version in pins
+                if classifier(name, version, minor).kind == SDIST_ONLY
+            ),
+            pins,
+            build_requires_of=build_requires_of,
+        )
         out.append(
             BugDeps(
                 entry=dict(entry),
                 checkpoint=sources.checkpoint,
-                installs=installs_of(resolved),
+                installs=installs,
                 provenance=deps_provenance(
                     sources,
                     resolved,
                     harness_pins=harness_pins,
                     build_pins=built,
+                    early=early,
                     dropped=dropped,
                 ),
-                build_pins=build_installs(built),
+                build_pins=build_specs,
+                # Spec strings, not ``pinned_parts``' ``(name, version)`` pairs: the
+                # recipe installs these, and ``satisfied_by`` is already the pin's own
+                # spelling. One pin can satisfy two builds, so the list is de-duplicated.
+                early_pins=tuple(dict.fromkeys(item.satisfied_by for item in early)),
             )
         )
     return out, flagged
@@ -7205,7 +7679,10 @@ def layer_recipes(
                 name,
                 python_checkpoint_name(minor),
                 requirements_recipe(
-                    item.installs, build_pins=item.build_pins, minor=minor
+                    item.installs,
+                    build_pins=item.build_pins,
+                    early_pins=item.early_pins,
+                    minor=minor,
                 ),
             )
         )
@@ -7702,6 +8179,18 @@ def run_bake_actions(
     prediction; a legacy-resolver install *succeeds* even when it is wrong, so nothing
     else in the run would catch it.
 
+    [VANTA-WHY] Before either of those, **every** built layer is checked for a
+    ``setuptools`` ``easy_install`` fetch (:func:`easy_install_fetches`) and fails
+    through :func:`easy_install_failure` when one is found. It runs first and for every
+    layer, own pins or not, because what it detects is not a conflict between pins but a
+    package that entered the environment from outside the pin list: with
+    ``--no-build-isolation`` an unsatisfied ``setup_requires``/``[build-system].requires``
+    is resolved by setuptools itself, which reaches PyPI and installs *today's* release.
+    A fetch is not tolerated the way a case (b) conflict is — the layer that results is
+    not the one its provenance describes, and it would bake green. The early install pass
+    (:func:`early_install_pins`, in the recipe) is how a layer whose own pins can satisfy
+    such a declaration avoids the fetch; this is what says the measure worked.
+
     Injected ``exists``/``remove``/``build``/``record``/``log`` so the whole sequence is
     a structural test rather than something only a real bake can exercise.
     """
@@ -7725,26 +8214,38 @@ def run_bake_actions(
         built = build(action.name, action.script, action.base)
         result = built
         verdict: Optional[ExecResult] = None
-        if built.ok and action.name in own:
-            conflicts = pip_check_conflicts(
-                pip_check_readings(built.stdout + built.stderr),
-                own=own[action.name],
-            )
-            for conflict in conflicts:
-                log(f"[{action.name}] {conflict.describe()}")
-            if conflicts and record is not None:
-                record(action.name, conflicts)
-            refused = tuple(
-                conflict
-                for conflict in conflicts
-                if conflict.case == CASE_HARNESS_CHOICE
-            )
-            if refused:
-                # The install succeeded and the marker is there; what failed is the
-                # gate after it. Reported through the same path a build failure takes,
-                # so a conflict names itself where the reader is already looking.
-                verdict = pip_check_failure(refused)
+        if built.ok:
+            # setuptools' easy_install, before the own-pin gate: a fetch is a failure
+            # for *every* layer, not only a bug layer, and it says something the pin
+            # gate cannot — the environment that was just built is not the one the
+            # layer's own pins describe (§3.2).
+            fetched = easy_install_fetches(built.stdout + built.stderr)
+            if fetched:
+                for line in fetched:
+                    log(f"[{action.name}] easy_install: {line}")
+                verdict = easy_install_failure(fetched)
                 result = verdict
+            elif action.name in own:
+                conflicts = pip_check_conflicts(
+                    pip_check_readings(built.stdout + built.stderr),
+                    own=own[action.name],
+                )
+                for conflict in conflicts:
+                    log(f"[{action.name}] {conflict.describe()}")
+                if conflicts and record is not None:
+                    record(action.name, conflicts)
+                refused = tuple(
+                    conflict
+                    for conflict in conflicts
+                    if conflict.case == CASE_HARNESS_CHOICE
+                )
+                if refused:
+                    # The install succeeded and the marker is there; what failed is the
+                    # gate after it. Reported through the same path a build failure
+                    # takes, so a conflict names itself where the reader is already
+                    # looking.
+                    verdict = pip_check_failure(refused)
+                    result = verdict
         if logs_dir is not None:
             logs[action.name] = write_bake_log(
                 logs_dir, action.name, _with_gate_verdict(built, verdict)

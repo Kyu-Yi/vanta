@@ -455,6 +455,13 @@ def cmd_bake(args: argparse.Namespace) -> int:
     # ``name==version`` for the whole run, which matters because the two readings cover
     # the same pins and the splits share them.
     metadata_of = bake_mod.cached_release_metadata()
+    # And one for the third question, which costs the most per answer: what a release
+    # needs in order to be *built*. It is not in ``requires_dist`` or any wheel's
+    # metadata — it is in the sdist's own ``pyproject.toml``/``setup.py`` — so this
+    # reader downloads a whole sdist, and a pin the layers share being read once is the
+    # difference between one download and several. Read by the resolution (which turns
+    # it into each layer's ``early_pins``) and by the preflight table below.
+    build_requires_of = bake_mod.cached_build_requirements()
     bug_deps, flagged = bake_mod.resolve_bug_deps(
         split,
         entries,
@@ -462,6 +469,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
         repo_for=repo_for,
         classify=classify,
         metadata_of=metadata_of,
+        build_requires_of=build_requires_of,
     )
 
     # Every run ends with this list, empty or not: a reader of a run that stopped at a
@@ -493,6 +501,10 @@ def cmd_bake(args: argparse.Namespace) -> int:
                 f"[{item.checkpoint}] build pins: {', '.join(item.build_pins) or '—'}",
                 flush=True,
             )
+            print(
+                f"[{item.checkpoint}] early pins: {', '.join(item.early_pins) or '—'}",
+                flush=True,
+            )
             print(f"[{item.checkpoint}] provenance: {path}", flush=True)
 
     # The preflight, before the first layer is built (§3.2): what every pin installs
@@ -501,7 +513,10 @@ def cmd_bake(args: argparse.Namespace) -> int:
     # discover, so the answer is computed, printed and recorded next to the
     # provenance before anything is built.
     preflight = bake_mod.preflight_layers(
-        bug_deps, classify=classify, metadata_of=metadata_of
+        bug_deps,
+        classify=classify,
+        metadata_of=metadata_of,
+        build_requires_of=build_requires_of,
     )
     for report in preflight:
         path = bake_mod.write_preflight(deps_dir, report)

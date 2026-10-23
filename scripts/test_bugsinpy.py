@@ -31,6 +31,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tarfile
 import zipfile
 from collections import Counter
 from dataclasses import replace
@@ -3501,6 +3502,54 @@ class TestBake:
         assert built.count("/tmp/pip-build-env-*") == 2
         assert "exit 1" in built
 
+    def test_the_pins_a_build_itself_needs_are_installed_before_the_dependency_list(self):
+        """The early pass, and the ordering is the whole of it (§3.2).
+
+        ``cryptography==2.9.2`` declares cffi in ``[build-system].requires``; with
+        ``--no-build-isolation`` setuptools resolves that declaration itself, and with
+        nothing installed that satisfies it ``easy_install`` reaches PyPI and installs
+        *today's* cffi beside the pin (measured: cffi 2.1.1 under a layer pinning
+        1.14.0). The pin is already in the main list — installing it *first* is what
+        makes the difference, and pip installing an already-satisfied pin is a no-op.
+        """
+        recipe = bake_mod.requirements_recipe(
+            ["cffi==1.14.0", "cryptography==2.9.2"], early_pins=["cffi==1.14.0"]
+        )
+        pip_lines = [
+            line for line in recipe.splitlines() if line.startswith("python -m pip install")
+        ]
+        assert pip_lines == [
+            "python -m pip install --no-cache-dir --no-build-isolation "
+            f"{bake_mod.LEGACY_RESOLVER_FLAG} -r /tmp/early-req.txt",
+            "python -m pip install --no-cache-dir --no-build-isolation "
+            f"{bake_mod.LEGACY_RESOLVER_FLAG} -r /tmp/req.txt",
+        ]
+        assert _heredoc(recipe, "VANTA_EARLY_REQUIRES") == "cffi==1.14.0"
+        assert recipe.index("VANTA_EARLY_REQUIRES") < recipe.index("VANTA_REQUIREMENTS")
+        assert "cffi==1.14.0" in _heredoc(recipe, "VANTA_REQUIREMENTS"), (
+            "installed early does not mean removed from the layer's own list"
+        )
+        # Both non-isolated installs are checked for a leftover build environment: the
+        # early one is a dependency install like the main one.
+        assert recipe.count("/tmp/pip-build-env-*") == 2
+
+    def test_the_early_pins_come_after_the_toolchain_and_before_the_dependencies(self):
+        """Order, in one reading: tools, the build requirements, then the early pass."""
+        recipe = bake_mod.requirements_recipe(
+            ["cffi==1.14.0"],
+            build_pins=["setuptools==47.1.1", "numpy==1.18.5"],
+            early_pins=["cffi==1.14.0"],
+        )
+        assert recipe.index("VANTA_BUILD_TOOLS") < recipe.index("VANTA_BUILD_REQUIRES")
+        assert recipe.index("VANTA_BUILD_REQUIRES") < recipe.index("VANTA_EARLY_REQUIRES")
+        assert recipe.index("VANTA_EARLY_REQUIRES") < recipe.index("VANTA_REQUIREMENTS")
+
+    def test_a_recipe_with_no_early_pins_writes_no_such_heredoc(self):
+        recipe = bake_mod.requirements_recipe(["decorator==4.4.0"])
+        assert "VANTA_EARLY_REQUIRES" not in recipe
+        assert "/tmp/early-req.txt" not in recipe
+        assert recipe.count("--no-build-isolation") == 1
+
     def test_a_recipe_without_build_pins_asks_for_no_toolchain(self):
         recipe = bake_mod.requirements_recipe(["decorator==4.4.0"])
         assert "/tmp/build-tools.txt" not in recipe
@@ -3571,6 +3620,29 @@ class TestBake:
         assert "setuptools==40.8.0" in recipe
         assert recipe.index("setuptools==40.8.0") < recipe.index("decorator==4.4.0")
         assert "--no-build-isolation" in recipe
+
+    def test_a_bug_layer_recipe_installs_the_early_pins_before_the_dependency_list(self):
+        """The ordering the resolution decided reaches the script, not just the record.
+
+        ``layer_recipes`` is the one place the layer's own ``early_pins`` becomes an
+        install order; a pin the build needs is no use to it installed beside the pin,
+        only before it (§3.2).
+        """
+        split = split_mod.Split(split_data(bugs=[bug_entry(checkpoint="vanta-bi-Demo-1")]))
+        entry = split.bug("Demo", 1)
+        deps = [
+            bake_mod.BugDeps(
+                entry=entry,
+                checkpoint="vanta-bi-Demo-1",
+                installs=("cryptography==2.9.2", "cffi==1.14.0"),
+                provenance={},
+                early_pins=("cffi==1.14.0",),
+            )
+        ]
+        layers = bake_mod.layer_recipes(split, pythons=["3.8"], entries=[entry], deps=deps)
+        recipe = {name: script for name, _, script in layers}["vanta-bi-Demo-1"]
+        assert _heredoc(recipe, "VANTA_EARLY_REQUIRES") == "cffi==1.14.0"
+        assert recipe.index("VANTA_EARLY_REQUIRES") < recipe.index("VANTA_REQUIREMENTS")
 
     @needs_clone
     def test_real_pysnooper_layers_are_the_interpreter_plus_one_thin_layer(self):
@@ -4675,7 +4747,8 @@ class TestPinPreflight:
         assert lines[0] == "preflight: 1 layer(s)"
         assert (
             "[vanta-bi-Demo-1] Demo/1 (cp38/linux-aarch64): 3 pin(s), 1 wheel, "
-            "1 sdist-only, 1 unavailable, 0 gap, 0 unbuildable, 0 dropped" in lines[1]
+            "1 sdist-only, 1 unavailable, 0 gap, 0 unbuildable, 0 early, 0 dropped"
+            in lines[1]
         )
         assert not any("cffi" in line for line in lines), (
             "an sdist a reviewed-table entry covers is a decision already taken"
@@ -4713,6 +4786,7 @@ class TestPinPreflight:
             "unavailable": 1,
             "gap": 0,
             "unbuildable": 0,
+            "early": 0,
         }
         assert [pin["pin"] for pin in data["pins"]] == [
             "decorator==4.4.0",
@@ -4801,6 +4875,153 @@ class TestPinPreflight:
         assert "[vanta-bi-Demo-1] build pins: —" in captured.out
         assert "[vanta-bi-Demo-1] provenance:" in captured.out
         assert code == run_mod.EXIT_OK
+
+
+class TestEarlyInstallPins:
+    """The build requirements a layer's *own* pins need installed before it (§3.2, D1).
+
+    [VANTA-WHY] ``cryptography==2.9.2``'s sdist declares ``cffi`` in
+    ``[build-system].requires``; with ``--no-build-isolation`` setuptools resolves that
+    declaration itself through ``easy_install``, which reaches PyPI and installs
+    *today's* cffi 2.1.1 beside a layer that pins 1.14.0. The remedy is ordering, not a
+    new pin: install the cffi the layer already holds **before** the build that wants
+    it. This is the decision, and it is a *pair* — what one pin's build needs and which
+    pin in the same layer answers it — so both sides and the declaration are recorded.
+    """
+
+    CRYPTO_REFS = (
+        bake_mod.DepRef(
+            "cffi",
+            "cffi>=1.8,!=1.11.3; platform_python_implementation != 'PyPy'",
+            "build-system.requires (pyproject.toml)",
+        ),
+    )
+
+    def test_a_build_requirement_another_pin_satisfies_is_installed_before_it(self):
+        """The measured D1 shape, and the whole of the finding."""
+        early = bake_mod.early_install_pins(
+            [("cryptography", "2.9.2")],
+            [("cryptography", "2.9.2"), ("cffi", "1.14.0")],
+            build_requires_of=lambda name, version: (
+                self.CRYPTO_REFS if (name, version) == ("cryptography", "2.9.2") else ()
+            ),
+        )
+        assert len(early) == 1
+        item = early[0]
+        assert item.pin == "cryptography==2.9.2"
+        assert item.satisfied_by == "cffi==1.14.0"
+        assert item.as_dict() == {
+            "pin": "cryptography==2.9.2",
+            "requires": (
+                "cffi>=1.8,!=1.11.3; platform_python_implementation != 'PyPy'"
+            ),
+            "source": "build-system.requires (pyproject.toml)",
+            "satisfied_by": "cffi==1.14.0",
+        }
+
+    def test_a_build_requirement_no_pin_satisfies_is_left_to_the_fetch_guard(self):
+        """Nothing here pins cffi, so there is no version to install early.
+
+        This function orders pins the layer **already holds**; it cannot invent a
+        version for a name nothing pinned. That case is ``run_bake_actions``'s
+        ``easy_install`` guard, which fails the layer that fetches one.
+        """
+        early = bake_mod.early_install_pins(
+            [("cryptography", "2.9.2")],
+            [("cryptography", "2.9.2")],
+            build_requires_of=lambda name, version: self.CRYPTO_REFS,
+        )
+        assert early == ()
+
+    def test_a_pin_whose_own_build_requires_itself_is_skipped(self):
+        """Installing it early would mean building it to build it."""
+        early = bake_mod.early_install_pins(
+            [("cffi", "1.14.0")],
+            [("cffi", "1.14.0")],
+            build_requires_of=lambda name, version: (
+                bake_mod.DepRef("cffi", "cffi>=1.8", "setup_requires (setup.py) line 1"),
+            ),
+        )
+        assert early == ()
+
+    def test_a_pin_that_installs_from_a_wheel_is_not_a_build_requirement_source(self):
+        """Only a build runs ``setup.py``; a wheel-only pin's declaration never is.
+
+        ``bcrypt==3.1.7`` declares cffi and installs from an ``abi3`` wheel on this
+        image (measured: ``fastapi/1``'s log has no ``Preparing metadata`` line for
+        it), so ``built`` — the caller's answer to "will pip compile this here" — does
+        not name it and its sdist is never read.
+        """
+        asked: list[tuple[str, str]] = []
+
+        def build_requires_of(name, version):
+            asked.append((name, version))
+            return self.CRYPTO_REFS
+
+        early = bake_mod.early_install_pins(
+            [("cryptography", "2.9.2")],
+            [("cryptography", "2.9.2"), ("bcrypt", "3.1.7"), ("cffi", "1.14.0")],
+            build_requires_of=build_requires_of,
+        )
+        assert asked == [("cryptography", "2.9.2")], "a wheel is never asked about"
+        assert [item.pin for item in early] == ["cryptography==2.9.2"]
+
+    def test_a_release_whose_metadata_cannot_be_read_is_not_a_failed_layer(self):
+        """A ``BakeError`` from the reader is answered as "nothing known".
+
+        The layer's own build is the backstop; refusing a bug before it is built over
+        a download that did not come back would be failing on a fetch, not on a fact.
+        """
+        def build_requires_of(name, version):
+            raise bake_mod.BakeError("cannot download cryptography-2.9.2.tar.gz")
+
+        assert bake_mod.early_install_pins(
+            [("cryptography", "2.9.2")],
+            [("cryptography", "2.9.2"), ("cffi", "1.14.0")],
+            build_requires_of=build_requires_of,
+        ) == ()
+
+    def _report(self, *, early: tuple = ()) -> bake_mod.PreflightBug:
+        return bake_mod.PreflightBug(
+            key="Demo/1",
+            checkpoint="vanta-bi-Demo-1",
+            python_minor="3.8",
+            pins=(
+                bake_mod.PreflightPin(
+                    "cffi", "1.14.0", bake_mod.SDIST_ONLY, "no cp38 aarch64 wheel"
+                ),
+            ),
+            early=early,
+        )
+
+    def test_the_printed_table_names_both_sides_of_the_ordering_decision(self):
+        """Printed because it is the one finding that changes what the recipe *does*."""
+        item = bake_mod.EarlyInstall(
+            pin="cryptography==2.9.2",
+            requirement=self.CRYPTO_REFS[0],
+            satisfied_by="cffi==1.14.0",
+        )
+        lines = bake_mod.preflight_lines([self._report(early=(item,))])
+        assert lines[1].endswith("1 early, 0 dropped")
+        assert "build requirement(s) the layer installs early (1):" in lines
+        assert (
+            "  EARLY cryptography==2.9.2's build needs "
+            "cffi>=1.8,!=1.11.3; platform_python_implementation != 'PyPy' → "
+            "cffi==1.14.0 — Demo/1" in lines
+        )
+
+    def test_an_early_finding_with_a_dropped_pin_is_not_printed(self):
+        """A dropped pin is not installed, so there is nothing to order it before."""
+        item = bake_mod.EarlyInstall(
+            pin="cryptography==2.9.2",
+            requirement=self.CRYPTO_REFS[0],
+            satisfied_by="cffi==1.14.0",
+        )
+        lines = bake_mod.preflight_lines(
+            [self._report(early=(item,))],
+            dropped={"vanta-bi-Demo-1": [{"pin": "cryptography==2.9.2"}]},
+        )
+        assert not any("EARLY" in line for line in lines)
 
 
 # ============================================================================
@@ -5652,6 +5873,144 @@ class TestPinConflicts:
 
 
 # ============================================================================
+# Item 4's measure, made observable — a layer that fetched through easy_install
+# ============================================================================
+class TestEasyInstallGate:
+    """``fastapi/1`` baked green having installed a package no pin list names.
+
+    Measured: ``cryptography==2.9.2`` declares ``cffi`` in its ``[build-system].requires``,
+    ``--no-build-isolation`` left setuptools to satisfy it itself, and ``easy_install``
+    reached PyPI and installed *today's* ``cffi 2.1.1`` beside the layer's
+    ``cffi==1.14.0`` pin. A legacy-resolver install *succeeds* when it is wrong, so the
+    layer's marker was there and nothing in the run had anything to refuse.
+
+    The guard reads the layer's own output for the two lines only ``easy_install`` writes
+    (:func:`bake_mod.easy_install_fetches`) and fails through
+    :func:`bake_mod.easy_install_failure`. It runs *before* the own-pin gate and for
+    every built layer, own pins or not: what it detects is not a conflict between pins but
+    a package that entered from outside the pin list, which no pin list can be checked
+    against. Its own test class rather than a case in :class:`TestPinConflicts` for the
+    same reason — the two gates answer different questions about the same build.
+    """
+
+    FETCHED = (
+        "+ python -m pip install -r /tmp/req.txt\n"
+        "Searching for cffi\n"
+        "Best match: cffi 2.1.1\n"
+    )
+    """The measured pair, in the shape the two markers are written by setuptools."""
+
+    CHILDREN = {"vanta-bi-Demo-1": PY38}
+
+    def _gate_run(self, tmp_path, *, output, own_pins=None, logged=None):
+        logged = [] if logged is None else logged
+        logs = tmp_path / "bake-logs"
+        present: set[str] = set()
+
+        def build(name, script, base):
+            present.add(name)
+            if name == PY38:
+                return bake_mod.ExecResult(
+                    stdout="ok", stderr="", exit_code=0, timed_out=False
+                )
+            return bake_mod.ExecResult(
+                stdout=output, stderr="", exit_code=0, timed_out=False
+            )
+
+        def exists(name):
+            return name in present
+
+        def remove(name):
+            present.discard(name)
+
+        summary = bake_mod.run_bake_actions(
+            bake_mod.plan_layers(
+                _layers(PY38, "vanta-bi-Demo-1"),
+                force=True,
+                children=self.CHILDREN,
+                exists=exists,
+            ),
+            children=self.CHILDREN,
+            exists=exists,
+            remove=remove,
+            build=build,
+            log=logged.append,
+            logs_dir=logs,
+            own_pins=own_pins,
+            record=lambda name, conflicts: None,
+        )
+        return summary, logged, logs
+
+    def test_a_layer_nobody_named_in_own_pins_is_still_gated_on_the_fetch(self, tmp_path):
+        """The gate is not the own-pin gate's, so a layer it does not name is not exempt."""
+        logged: list[str] = []
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._gate_run(tmp_path, output=self.FETCHED, logged=logged)
+        message = str(excinfo.value)
+        assert (
+            "vanta-bi-Demo-1: exit 1 — ERROR: setuptools' easy_install fetched a "
+            "distribution while this layer was being built" in message
+        ), "the one-line entry names the fetch, not the last line of pip's output"
+        assert "pip check found a conflict" not in message, "nothing was pip-checked here"
+        assert (
+            f"full build log: {bake_mod.bake_log_path(tmp_path / 'bake-logs', 'vanta-bi-Demo-1')}"
+            in message
+        )
+        assert "nothing was left behind" in message, "the half-baked layer is not kept"
+        assert [line for line in logged if "easy_install" in line] == [
+            "[vanta-bi-Demo-1] easy_install: Searching for cffi",
+            "[vanta-bi-Demo-1] easy_install: Best match: cffi 2.1.1",
+        ], "both markers are reported, so the reader sees which release was fetched"
+
+    def test_a_refused_layers_log_keeps_the_fetch_and_the_verdict_names_it(self, tmp_path):
+        """The log is the output the verdict was built on, with the verdict after it."""
+        with pytest.raises(bake_mod.BakeError):
+            self._gate_run(tmp_path, output=self.FETCHED)
+        text = bake_mod.bake_log_path(
+            tmp_path / "bake-logs", "vanta-bi-Demo-1"
+        ).read_text(encoding="utf-8")
+        assert "Best match: cffi 2.1.1" in text, "the fetch is still the layer's own log"
+        assert "ERROR: setuptools' easy_install fetched" in text
+        assert text.index("Best match: cffi 2.1.1") < text.index(
+            "ERROR: setuptools' easy_install fetched"
+        ), "the verdict reads as what happened to that output"
+
+    def test_the_fetch_guard_runs_before_the_own_pin_gate(self, tmp_path):
+        """A layer that both fetched and holds a case (a) conflict fails on the fetch.
+
+        The measured ``fastapi/1`` shape: the same build that fetched ``cffi 2.1.1``
+        installed the pins its ``pip check`` conflicts are between. A fetch is not
+        tolerated the way a case (b) conflict is, so it is the finding that has to be
+        reported — checking the pin list first would name the wrong thing.
+        """
+        output = self.FETCHED + (
+            f"{bake_mod.PIP_CHECK_PREFIX} {TestPinConflicts.PIP_CHECK_LINE}\n"
+        )
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._gate_run(
+                tmp_path,
+                output=output,
+                own_pins={"vanta-bi-Demo-1": frozenset({"httpcore"})},
+            )
+        message = str(excinfo.value)
+        assert "ERROR: setuptools' easy_install fetched" in message
+        assert "pip check found a conflict" not in message
+
+    def test_a_layer_that_fetched_nothing_passes(self, tmp_path):
+        summary, logged, logs = self._gate_run(
+            tmp_path,
+            output=(
+                "+ python -m pip install -r /tmp/req.txt\n"
+                "Successfully installed cffi-1.14.0\n"
+            ),
+        )
+        assert "[done] vanta-bi-Demo-1" in summary
+        assert not any("easy_install" in line for line in logged)
+        text = bake_mod.bake_log_path(logs, "vanta-bi-Demo-1").read_text(encoding="utf-8")
+        assert "Successfully installed cffi-1.14.0" in text
+
+
+# ============================================================================
 # §3.2's unresolvable-pin rule — drop it with a record, or flag the bug
 # ============================================================================
 class TestUnresolvablePins:
@@ -6217,23 +6576,30 @@ class TestUnresolvablePins:
         assert "imports it" in flagged[0].reason
         assert flagged[0].reason.startswith("BakeError: ")
 
-    def test_one_classifier_and_one_metadata_reader_are_shared_by_the_resolution_and_the_preflight(
+    def test_one_reader_per_question_is_shared_by_the_resolution_and_the_preflight(
         self, tmp_path, monkeypatch
     ):
         """``bake`` builds each once; both askers get the same object, so PyPI is paid once.
 
-        Two shared readers, not one, because there are two questions a run asks about a
-        pin — "what does it install as" (:func:`preflight_classifier`) and "what does it
-        declare" (:func:`cached_release_metadata`) — and each is asked in two places:
+        Three shared readers, not one, because there are three questions a run asks
+        about a pin — "what does it install as" (:func:`preflight_classifier`), "what
+        does it declare" (:func:`cached_release_metadata`) and "what does its *build*
+        need" (:func:`cached_build_requirements`) — and each is asked in two places:
         §3.2's drop rule and the preflight table for the first, the date rule's case-(a)
-        narrowing and the preflight's conflict check for the second. A second instance
-        anywhere would fetch the same JSON twice.
+        narrowing and the preflight's conflict check for the second, the layer's
+        ``early_pins`` and the preflight's early-install block for the third. A second
+        instance anywhere would fetch the same JSON — or the same sdist, which is the
+        expensive one — twice.
         """
         seen: dict[str, object] = {}
         sentinel = object()
         reader = object()
+        build_reader = object()
         monkeypatch.setattr(bake_mod, "preflight_classifier", lambda **kwargs: sentinel)
         monkeypatch.setattr(bake_mod, "cached_release_metadata", lambda **kwargs: reader)
+        monkeypatch.setattr(
+            bake_mod, "cached_build_requirements", lambda **kwargs: build_reader
+        )
         entry = bug_entry(checkpoint="vanta-bi-Demo-1")
         split = split_mod.Split(split_data(bugs=[entry], bugsinpy_root=str(tmp_path)))
         (tmp_path / "bugsinpy").mkdir()
@@ -6244,14 +6610,17 @@ class TestUnresolvablePins:
         def fake_resolve(*args, **kwargs):
             seen["resolve"] = kwargs["classify"]
             seen["resolve_metadata"] = kwargs["metadata_of"]
+            seen["resolve_build_requires"] = kwargs["build_requires_of"]
             return [], []
 
         monkeypatch.setattr(bake_mod, "resolve_bug_deps", fake_resolve)
         monkeypatch.setattr(
             bake_mod,
             "preflight_layers",
-            lambda deps, *, classify, metadata_of: seen.update(
-                preflight=classify, preflight_metadata=metadata_of
+            lambda deps, *, classify, metadata_of, build_requires_of: seen.update(
+                preflight=classify,
+                preflight_metadata=metadata_of,
+                preflight_build_requires=build_requires_of,
             )
             or [],
         )
@@ -6270,6 +6639,8 @@ class TestUnresolvablePins:
         assert seen["preflight"] is sentinel
         assert seen["resolve_metadata"] is reader
         assert seen["preflight_metadata"] is reader
+        assert seen["resolve_build_requires"] is build_reader
+        assert seen["preflight_build_requires"] is build_reader
 
     def test_a_dropped_pin_is_printed_in_the_bake_output(
         self, tmp_path, monkeypatch, capsys
@@ -6376,7 +6747,7 @@ class TestUnresolvablePins:
         assert not any(line.startswith("  UNBUILDABLE") for line in lines), (
             "it is in the drops block; printing it twice inflates the problem count"
         )
-        assert lines[1].endswith("1 unbuildable, 1 dropped")
+        assert lines[1].endswith("1 unbuildable, 0 early, 1 dropped")
         assert "  pyarrow==0.17.1 (unbuildable) — needs Arrow C++" in lines
         assert (
             "    Demo/1 — every one of its 3 import site(s) is behind an optional guard"
@@ -6833,6 +7204,135 @@ class TestPyprojectStaticReader:
 def pyproject_refs(pyproject: str, notes: list) -> list:
     """``bake_mod.pyproject_refs`` with no commit stamping — a pure parse."""
     return bake_mod.pyproject_refs(pyproject, notes)
+
+
+def _tarball(members: dict[str, str]) -> bytes:
+    """An sdist-shaped ``.tar.gz`` in memory — the archive the reader is handed."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, text in members.items():
+            data = text.encode("utf-8")
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+def _zipball(members: dict[str, str]) -> bytes:
+    """The same, as a ``.zip`` sdist: the other archive the reader must open."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, text in members.items():
+            archive.writestr(name, text)
+    return buffer.getvalue()
+
+
+class TestSdistBuildRequirements:
+    """What a *release's* sdist says it needs in order to be **built** (§3.2, D1).
+
+    [VANTA-WHY] The one reading that answers D1, and the reason it is a download rather
+    than a lookup: PyPI's ``requires_dist`` — and therefore the PEP 658 sidecar and the
+    wheel ``METADATA`` :func:`declared_requires` falls back to — carries *runtime*
+    requirements and never names ``cffi`` as a build requirement of
+    ``cryptography==2.9.2``. That declaration lives only in the sdist's
+    ``pyproject.toml``/``setup.py``, so this reads the archive and never the metadata —
+    and reads it, never executes it (design C3, :func:`pypi_build_requirements`).
+    """
+
+    def test_the_two_declaration_files_are_read_from_an_archives_top_level_only(self):
+        """An sdist's own files, and not a vendored copy of them.
+
+        ``<name>-<version>/pyproject.toml`` is the release's declaration; a
+        ``<name>-<version>/vendor/.../pyproject.toml`` belongs to another project, and
+        reading it would attribute that project's build requirements to this release.
+        Both archive formats are exercised because an sdist is a tar *or* a zip.
+        """
+        members = {
+            "cryptography-2.9.2/pyproject.toml": '[build-system]\nrequires = ["cffi"]\n',
+            "cryptography-2.9.2/setup.py": "setup(name='cryptography')\n",
+            "cryptography-2.9.2/README.rst": "not metadata\n",
+            "cryptography-2.9.2/vendor/pyproject.toml": "[build-system]\nrequires = ['x']\n",
+            "cryptography-2.9.2/src/nested/setup.py": "setup(name='nested')\n",
+        }
+        for blob in (_tarball(members), _zipball(members)):
+            texts = bake_mod._archive_texts(blob, bake_mod.SDIST_METADATA_MEMBERS)
+            assert texts == {
+                "pyproject.toml": '[build-system]\nrequires = ["cffi"]\n',
+                "setup.py": "setup(name='cryptography')\n",
+            }, "the top-level pair, and nothing the release vendored"
+
+    def test_a_releases_build_requirements_come_from_its_sdist_and_are_never_executed(self):
+        """``pypi_build_requirements`` parses the archive; executing it would abort.
+
+        The ``setup.py`` below raises on import — the same C3 guarantee the tree's own
+        reader is held to — and the ``pyproject.toml`` half is read anyway. Measured
+        text: ``cryptography==2.9.2``'s ``[build-system].requires``.
+        """
+        def files_of(name, version):
+            assert (name, version) == ("cryptography", "2.9.2")
+            return (_sdist("cryptography-2.9.2.tar.gz"),)
+
+        def texts_of(file):
+            assert file.filename == "cryptography-2.9.2.tar.gz"
+            return {
+                "setup.py": "raise SystemExit('executing this would abort the host')\n",
+                "pyproject.toml": (
+                    "[build-system]\n"
+                    "requires = [\"cffi>=1.8,!=1.11.3; "
+                    "platform_python_implementation != 'PyPy'\"]\n"
+                ),
+            }
+
+        refs = bake_mod.pypi_build_requirements(
+            "cryptography", "2.9.2", files_of=files_of, texts_of=texts_of
+        )
+        assert [ref.name for ref in refs] == ["cffi"]
+        assert refs[0].source == "build-system.requires (pyproject.toml)"
+        assert refs[0].spec == (
+            "cffi>=1.8,!=1.11.3; platform_python_implementation != 'PyPy'"
+        )
+
+    def test_a_release_pip_installs_from_a_wheel_declares_no_build_requirement(self):
+        """No sdist means nothing is ever built, so nothing can be fetched (§3.2).
+
+        ``bcrypt==3.1.7`` declares cffi in ``[build-system].requires`` and installs from
+        an aarch64 ``abi3`` wheel on this image — measured: its line in ``fastapi/1``'s
+        log carries no ``Preparing metadata``, so it never source-builds. A release with
+        no files at all is the same answer, not an error.
+        """
+        assert bake_mod.pypi_build_requirements(
+            "bcrypt",
+            "3.1.7",
+            files_of=lambda name, version: (_wheel("bcrypt-3.1.7-cp36-abi3-manylinux.whl"),),
+            texts_of=lambda file: pytest.fail("a wheel-only release has no sdist to read"),
+        ) == ()
+        assert bake_mod.pypi_build_requirements(
+            "gone",
+            "1.0",
+            files_of=lambda name, version: None,
+            texts_of=lambda file: pytest.fail("nothing to read"),
+        ) == ()
+
+    def test_the_build_requirement_reader_is_paid_once_for_a_pin_two_layers_hold(self):
+        """An sdist download is the expensive reading, so it is cached like the others."""
+        calls: list[tuple[str, str]] = []
+
+        def fetch(name, version):
+            calls.append((name, version))
+            return (
+                bake_mod.DepRef(
+                    "cffi", "cffi>=1.8", "build-system.requires (pyproject.toml)"
+                ),
+            )
+
+        read = bake_mod.cached_build_requirements(fetch=fetch)
+        first = read("cryptography", "2.9.2")
+        assert read("cryptography", "2.9.2") is first, "the same reading, not a re-download"
+        assert calls == [("cryptography", "2.9.2")]
+        read("bcrypt", "3.1.7")
+        assert calls == [("cryptography", "2.9.2"), ("bcrypt", "3.1.7")], (
+            "a different pin is a different question"
+        )
 
 
 class TestResolvePinsByDate:
@@ -7593,8 +8093,11 @@ class TestTheFetchIncludesTheBugsOwnPytest:
         releases.update(TestTheReportPluginFollowsTheBugsPytest.RELEASES)
         return releases
 
-    def _resolve(self, monkeypatch, *, refs):
+    def _resolve(
+        self, monkeypatch, *, refs, releases=None, classify=None, build_requires_of=None
+    ):
         fetched: list[str] = []
+        dates = dict(releases if releases is not None else self._releases())
 
         def fake_sources(entry, *, bugsinpy_root, repo, module_distributions=None):
             return bake_mod.DepSources(
@@ -7611,7 +8114,17 @@ class TestTheFetchIncludesTheBugsOwnPytest:
 
         def fetch(name):
             fetched.append(name)
-            return self._releases()[name]
+            return dates[name]
+
+        # Both readers the resolution now needs are stubbed so this class stays offline
+        # and about the pytest fetch: every pin is classified a wheel, so no pin is a
+        # source build and the early build-requirement pass has nothing to ask about.
+        classify = classify or (
+            lambda name, version, minor: bake_mod.PreflightPin(
+                name, version, bake_mod.INSTALLABLE_WHEEL, "this test's own stub"
+            )
+        )
+        build_requires_of = build_requires_of or (lambda name, version: ())
 
         monkeypatch.setattr(bake_mod, "bug_sources", fake_sources)
         split = split_mod.Split(split_data(bugs=[bug_entry(checkpoint="vanta-bi-Demo-1")]))
@@ -7622,6 +8135,8 @@ class TestTheFetchIncludesTheBugsOwnPytest:
             repo_for=lambda project: Path("/nonexistent"),
             fetch=fetch,
             metadata_of=TestTheReportPluginFollowsTheBugsPytest._metadata_of,
+            classify=classify,
+            build_requires_of=build_requires_of,
         )
         return fetched, layers, flagged
 
@@ -7663,6 +8178,65 @@ class TestTheFetchIncludesTheBugsOwnPytest:
         assert "pytest-json-report" not in fetched
         assert "pytest-metadata" not in fetched
         assert layers[0].installs == ("decorator==4.4.0",)
+
+    def test_the_pin_a_build_needs_is_installed_early_and_carried_on_the_layer(
+        self, monkeypatch
+    ):
+        """What the resolution answers reaches the recipe, not just the record.
+
+        ``cryptography==2.9.2``'s sdist declares cffi in ``[build-system].requires`` and
+        the same layer holds ``cffi==1.14.0``; under ``--no-build-isolation`` the build
+        finds it only if it is installed *first*, so the layer carries the ordering
+        decision to :func:`bake.layer_recipes` (:attr:`bake_mod.BugDeps.early_pins`).
+        """
+        releases = dict(self._releases())
+        releases["cryptography"] = {"2.9.2": "2020-05-27"}
+        releases["cffi"] = {"1.14.0": "2020-02-17"}
+
+        def classify(name, version, minor):
+            kind = (
+                bake_mod.SDIST_ONLY
+                if name in {"cryptography", "cffi"}
+                else bake_mod.INSTALLABLE_WHEEL
+            )
+            return bake_mod.PreflightPin(name, version, kind, "this test's own stub")
+
+        def build_requires_of(name, version):
+            if (name, version) == ("cryptography", "2.9.2"):
+                return (
+                    bake_mod.DepRef(
+                        "cffi",
+                        "cffi>=1.8,!=1.11.3; platform_python_implementation != 'PyPy'",
+                        "build-system.requires (pyproject.toml)",
+                    ),
+                )
+            return ()
+
+        _, layers, flagged = self._resolve(
+            monkeypatch,
+            refs=[
+                bake_mod.dep_ref("cryptography==2.9.2", "requirements.txt line 1"),
+                bake_mod.dep_ref("cffi==1.14.0", "requirements.txt line 2"),
+            ],
+            releases=releases,
+            classify=classify,
+            build_requires_of=build_requires_of,
+        )
+        assert flagged == []
+        assert set(layers[0].installs) == {"cryptography==2.9.2", "cffi==1.14.0"}
+        assert layers[0].early_pins == ("cffi==1.14.0",), (
+            "a spec the recipe can install, not a ``(name, version)`` pair"
+        )
+        assert layers[0].provenance["early_pins"] == [
+            {
+                "pin": "cryptography==2.9.2",
+                "requires": (
+                    "cffi>=1.8,!=1.11.3; platform_python_implementation != 'PyPy'"
+                ),
+                "source": "build-system.requires (pyproject.toml)",
+                "satisfied_by": "cffi==1.14.0",
+            }
+        ]
 
 
 class TestMergeRefs:
@@ -9100,6 +9674,41 @@ class TestDependencyProvenance:
     def test_a_layer_with_no_build_pins_records_an_empty_list_not_a_missing_key(self):
         provenance = bake_mod.deps_provenance(self._sources(), [], harness_pins={})
         assert provenance["build_pins"] == []
+        assert provenance["early_pins"] == [], (
+            "the ordering decision is a key from the start, like the pip check"
+        )
+
+    def test_the_build_requirements_the_layer_installs_early_are_recorded_with_both_pins(self):
+        """A subset of ``installs`` the recipe runs *first*, and why.
+
+        The two pins are in the layer either way; what this key adds is the ordering —
+        ``cryptography==2.9.2``'s build wants cffi, and cffi is installed before the
+        main list so that build finds it rather than fetching today's (:func:`early`).
+        """
+        early = (
+            bake_mod.EarlyInstall(
+                pin="cryptography==2.9.2",
+                requirement=bake_mod.DepRef(
+                    "cffi",
+                    "cffi>=1.8,!=1.11.3; platform_python_implementation != 'PyPy'",
+                    "build-system.requires (pyproject.toml)",
+                ),
+                satisfied_by="cffi==1.14.0",
+            ),
+        )
+        provenance = bake_mod.deps_provenance(
+            self._sources(), [], harness_pins={}, early=early
+        )
+        assert provenance["early_pins"] == [
+            {
+                "pin": "cryptography==2.9.2",
+                "requires": (
+                    "cffi>=1.8,!=1.11.3; platform_python_implementation != 'PyPy'"
+                ),
+                "source": "build-system.requires (pyproject.toml)",
+                "satisfied_by": "cffi==1.14.0",
+            }
+        ]
 
     def test_write_load_and_preflight_round_trip(self, tmp_path):
         deps_dir = tmp_path / "deps"

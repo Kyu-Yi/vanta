@@ -246,6 +246,22 @@ checkpoint is a filesystem and reading a file out of one means booting it
 PIP_CHECK_KEY = "pip_check"
 """The deps-provenance key the layer's ``pip check`` readings are recorded under."""
 
+PIP_CHECK_CLEAN = "No broken requirements found."
+"""What ``pip check`` writes when it has nothing to report — *no* conflicts, not a reading.
+
+[VANTA-WHY] It reaches the gate as a reading like any other line, and the gate's rule is
+that a line it cannot read is case (a) and refused (:func:`pip_check_conflicts`). Applied
+to this sentence that rule refuses a layer for its clean bill of health: measured on
+PySnooper/3, which installed its four pins, echoed this line, touched
+``/opt/vanta-deps-ok``, had its checkpoint saved — and was then deleted with
+``case (a) No broken requirements found. but the layer has nothing: not tolerated``. The
+sentence is the whole content of :data:`PIP_CHECK_OUTPUT` when the layer is clean, so it
+has to be recognised rather than read. It is matched exactly and not by prefix: a pip
+whose wording changed would fall back to the unreadable rule and stop the bake, which is
+the direction this gate has to fail in — but it would stop every layer at once, so a
+wording change must be a one-line change here and not a silent pass.
+"""
+
 
 class BakeError(RuntimeError):
     """A layer could not be baked or did not verify."""
@@ -4131,6 +4147,10 @@ measured misreading:
 
 Anything that does not match is kept as written and treated as case (a): a line this
 cannot read is not a line that says the conflict is tolerable.
+
+:data:`PIP_CHECK_CLEAN` is the one exception, and it is the exception that keeps this
+rule from refusing a clean layer — it says there is no conflict rather than that there is
+one this cannot read (:func:`pip_check_conflicts`).
 """
 
 
@@ -4142,11 +4162,14 @@ def pip_check_conflicts(
     ``own`` is the layer's :func:`own_pin_names`. Every conflict is returned, tolerated
     or not — the record is what the deps JSON and the bake output carry — and
     :attr:`PinConflict.tolerated` is the verdict the caller acts on.
+
+    A reading of :data:`PIP_CHECK_CLEAN` contributes nothing: it is pip saying it found
+    no conflict, and a layer that says that has passed the gate.
     """
     out: list[PinConflict] = []
     for line in readings:
         text = line.strip()
-        if not text:
+        if not text or text == PIP_CHECK_CLEAN:
             continue
         match = _REQUIREMENT_PROSE.match(text)
         if match is None:

@@ -4838,6 +4838,29 @@ class TestPinConflicts:
         assert conflicts[0].pins == ()
         assert conflicts[0].case == bake_mod.CASE_HARNESS_CHOICE
 
+    def test_pips_clean_reading_is_not_a_conflict(self):
+        """The false reject, measured: a layer refused for saying it had no conflict.
+
+        PySnooper/3 installed its four pins, echoed this line, touched
+        ``/opt/vanta-deps-ok`` and had its checkpoint saved — and the gate read the
+        sentence as case (a) with ``held="nothing"`` and deleted the layer. The
+        sentence is what the layer's ``pip check`` file holds when it is clean, so it
+        says *no* conflict; it is not a conflict this could not read.
+        """
+        assert bake_mod.PIP_CHECK_CLEAN == "No broken requirements found."
+        assert (
+            bake_mod.pip_check_conflicts(
+                (bake_mod.PIP_CHECK_CLEAN,), own=frozenset({"decorator"})
+            )
+            == ()
+        )
+        # Recognised among findings rather than instead of them.
+        conflicts = bake_mod.pip_check_conflicts(
+            (bake_mod.PIP_CHECK_CLEAN, self.PIP_CHECK_LINE),
+            own=frozenset({"httpcore", "h11"}),
+        )
+        assert [conflict.pins for conflict in conflicts] == [(self.HTTPCORE, self.H11)]
+
     def test_the_failure_the_gate_raises_carries_the_prefix_the_summary_reads(self):
         conflict = self._conflict(case=bake_mod.CASE_HARNESS_CHOICE)
         failure = bake_mod.pip_check_failure((conflict,))
@@ -5222,7 +5245,7 @@ class TestPinConflicts:
             "'nothing to report' and 'this file predates the reading' must not read alike"
         )
 
-    def _gate_run(self, tmp_path, *, own_pins):
+    def _gate_run(self, tmp_path, *, own_pins, reading=None):
         logged: list[str] = []
         recorded: list[tuple[str, tuple[bake_mod.PinConflict, ...]]] = []
         logs = tmp_path / "bake-logs"
@@ -5237,7 +5260,8 @@ class TestPinConflicts:
             return bake_mod.ExecResult(
                 stdout=(
                     "+ python -m pip check\n"
-                    f"{bake_mod.PIP_CHECK_PREFIX} {self.PIP_CHECK_LINE}\n"
+                    f"{bake_mod.PIP_CHECK_PREFIX} "
+                    f"{self.PIP_CHECK_LINE if reading is None else reading}\n"
                 ),
                 stderr="",
                 exit_code=0,
@@ -5342,6 +5366,21 @@ class TestPinConflicts:
         _summary, logged, recorded, _logs = self._gate_run(tmp_path, own_pins={})
         assert recorded == []
         assert not any("pip check found a conflict" in line for line in logged)
+
+    def test_a_clean_pip_check_is_a_layer_that_passed_not_one_that_was_deleted(
+        self, tmp_path
+    ):
+        """PySnooper/3: the whole layer was deleted over its clean bill of health."""
+        summary, logged, recorded, logs = self._gate_run(
+            tmp_path,
+            own_pins={"vanta-bi-Demo-1": frozenset({"httpcore"})},
+            reading=bake_mod.PIP_CHECK_CLEAN,
+        )
+        assert "[done] vanta-bi-Demo-1" in summary
+        assert recorded == [], "there is no conflict to record"
+        assert not any("pip check found a conflict" in line for line in logged)
+        text = bake_mod.bake_log_path(logs, "vanta-bi-Demo-1").read_text(encoding="utf-8")
+        assert bake_mod.PIP_CHECK_CLEAN in text, "the reading is still the layer's log"
 
 
 # ============================================================================

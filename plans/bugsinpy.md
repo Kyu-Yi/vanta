@@ -636,34 +636,48 @@ benchmark's environment, tolerated on purpose, and a verdict that called it "not
 for a decision §3.2 already took — and neither is a case (?) reading, which is a fetch that did not
 happen rather than a conflict.
 
-**What the check predicts for the two layers whose build logs were lost.** The two
-`*.preflight.json` files on disk predate it — neither carries a `conflicts` key — so they can confirm the
-classification half and cannot show the conflict half; the conflict half is the prediction:
+**What the check says about the two layers whose build logs were lost.** Both were read at HEAD by a
+`--preflight-only` run, so both halves are **measured** — each `*.preflight.json` under
+`runs/bugsinpy/deps/` now carries the `conflicts` and `narrowings` keys as well as the classification —
+and every number below is that file's own `counts`:
 
-- **`luigi/1` — `ready to bake`.** 173 pins (130 wheel / 43 sdist-only), 0 unavailable, 0 gap, 0
-  unbuildable; 2 dropped with their audit (`pywin32==227` — twelve wheels, every one `win_amd64`, no
-  sdist — and `requests-async==0.5.0`, which PyPI does not have). One conflict, **case (b)**:
-  `beautifulsoup4==4.9.1` declares `soupsieve<2.0` against `soupsieve==2.0.1`, and both are BugsInPy's
-  own exact pins, so it prints as `TOLERATED` and does not enter the verdict. Its `httpcore==0.3.0` sits
-  next to `h11==0.8.1` and is consistent — the same `httpcore` pin as `sanic/1` against a *different*
-  `h11`, which is why that layer fails and this one does not. One pin is **narrowed** at HEAD and the
-  recorded preflight predates it: its `deps/vanta-bi-luigi-1.json` holds `moto==1.3.8`, and 1.3.8
-  declares `idna (<2.9,>=2.5)` against the same layer's own `idna==2.9`, so the date rule takes
-  `moto==1.3.7` and prints it under `NARROWED` (§3.2's second direction). `beautifulsoup4`'s case (b)
-  pair is untouched by that rule — both sides are BugsInPy's own.
-- **`matplotlib/1` — `ready to bake`.** 10 pins (8 installs, 2 of which — `cython`, `numpy` — are also
-  build pins, plus `setuptools` and `wheel`), 2 sdist-only and both cleared: `numpy==1.18.5` by the
-  toolchain alone, `pillow==7.1.2` by the reviewed `libjpeg-dev` entry; 0 unavailable, 0 gap, 0
-  unbuildable, 0 dropped, **0 conflicts**, and **no own-pins at all** — its installs are the project's
-  own declarations and none was written by BugsInPy's two per-bug files, so `own_pin_names` is empty and
-  nothing in that layer could ever be case (b): a conflict there would be case (a) and refused.
-- Both layers gain one pin at HEAD that the recorded preflights predate: `pip==21.3.1`, the capability
-  pin, a `py3-none-any` wheel.
-- The unknowns are the caveat rather than a finding: PyPI's `requires_dist` is `null` for 106 of
-  `luigi/1`'s 173 pins and for 5 of `matplotlib/1`'s 10, and the chain resolves a null pin whenever its
-  release publishes a sidecar or a wheel — so what stays unknown is the sdist-only half, 24 pins for
-  `luigi/1` (measured shape: `httpcore==0.3.0`) and none for `matplotlib/1`, where all five nulls have a
-  wheel. They are printed by name under `UNKNOWN` and do not change the verdict.
+- **`luigi/1` — `ready to bake`.** 195 pins (147 wheel / 48 sdist-only), 0 unavailable, 0 gap, 0
+  unbuildable, 6 early. 195 is its 191 `installs` plus the four toolchain build pins (`pip`, `setuptools`,
+  `wheel`, `cython`), none of which it also installs — the table is the union of the two sets, and here
+  it happens to add up without an overlap. 4 pins are dropped, each with the audit that settled it: `pywin32==227` and
+  `requests-async==0.5.0`, which nothing pip can install on this image, and `cryptography==2.8`/`==2.9.2`,
+  the unbuildable pair, which reach the list through §3.2's one rule for a pin nothing can install —
+  every one of them with "nothing in either tree imports it" as its audit. One conflict, **case (b)**:
+  `beautifulsoup4==4.9.1` declares `soupsieve<2.0` against `soupsieve==2.0.1`, and both sides are
+  BugsInPy's own exact pins — this layer has 154 of them — so it prints as `TOLERATED` and does not enter
+  the verdict. Its other 27 readings are case (`?`) (`blinker==1.4`, `distlib==0.3.0`, `httpcore==0.3.0`,
+  ...), which is a fetch that did not happen rather than a conflict. One pin is **narrowed**: the date
+  rule takes `moto==1.3.7`, because `moto==1.3.8` declares `idna (<2.9,>=2.5)` against the same layer's
+  own `idna==2.9` (§3.2's second direction). Its `httpcore==0.3.0` sits next to `h11==0.8.1` and is
+  consistent — the same `httpcore` pin as `sanic/1` against a *different* `h11`, which is why the two
+  layers' readings are compared rather than assumed to agree.
+- **`matplotlib/1` — `ready to bake`.** 33 pins (31 wheel / 2 sdist-only), 0 unavailable, 0 gap, 0
+  unbuildable, 0 dropped, **0 conflicts**, 0 narrowings, 3 early. 33 is its 30 `installs` plus its five
+  build pins (`pip`, `setuptools`, `wheel`, `cython`, `numpy`), two of which — `cython` and `numpy` — it
+  also installs. The two sdist-only pins are both cleared: `numpy==1.18.5` by the toolchain alone,
+  `pillow==7.1.2` by the reviewed `libjpeg-dev`
+  entry. Its three early pins are the build requirements `numpy==1.18.5` declares (`setuptools`, `wheel`,
+  `Cython>=0.29.14`), answered by `setuptools==47.1.1`, `wheel==0.34.2` and `cython==0.29.19`. **No pin
+  in this layer is BugsInPy's own** — every one is the project's own declaration at one of the two
+  commits — so nothing here can be case (b), which needs both sides to be the benchmark's; a conflict
+  would be case (a) and refused, and there is none. Three of its pins move for reasons §3.2 now states:
+  the pre-release rule takes `pyparsing` off `3.0.0a1` to `2.4.7`, `jinja2` off `3.0.0a1` to `2.11.2` and
+  `markupsafe` off `2.0.0a1` to `1.1.1` (which is also what left the second sdist and the one gap in that
+  layer's earlier reading), while `cython` and `numpy` are pinned to the dependency set's own pins rather
+  than to a date-rule pick.
+- `pip==21.3.1` — the capability pin, a `py3-none-any` wheel — is in `build_pins` for **both** layers, and
+  is the pin that answers `multidict==4.7.6`'s `pip>=18` build requirement on `luigi/1`; it needs no
+  release dates, because §3.2 pins it by capability and never reads its listing.
+- The unknowns are the caveat rather than a finding: PyPI's `requires_dist` is `null` for 27 of
+  `luigi/1`'s 195 pins and for **none** of `matplotlib/1`'s 33, and the chain resolves a null pin whenever
+  its release publishes a sidecar or a wheel — so what stays unknown is the sdist-only half of the first,
+  measured shape `httpcore==0.3.0` (also `wrapt==1.11.1`, `sqlalchemy==1.3.3`, `avro==1.8.2`, ...). They
+  are printed by name under `UNKNOWN` and do not change the verdict.
 
 **One rule for a pin nothing here can install, and it is the import closure that decides.** The
 preflight produces three answers a *bake* cannot act on: a release PyPI does not have at all

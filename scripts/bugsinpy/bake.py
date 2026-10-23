@@ -430,11 +430,16 @@ SDIST_SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
     "bcrypt": ("libffi-dev",),
     "brotli": (),  # vendored c/; <vector> is libstdc++, which g++ brings
     "cffi": ("libffi-dev",),
+    "cftime": (),  # cftime/_cftime.pyx only (numpy's headers); udunits is named in its
+    # docstrings and nowhere else, and there is no site.cfg to point a build at one
     "coverage": (),  # coverage/ctracer/* only, all in the sdist
     "cython": (),  # its own setup.py names no library; Demos/ and docs/ do
     "distlib": (),  # PC/launcher.c is the Windows launcher, never built here
+    "fastparquet": (),  # speedups.pyx/.c; numpy's headers, CPython's own, and omp.h —
+    # which is the compiler's, and setup.py sets no -fopenmp for it to be used with
     "httptools": (),  # vendor/http-parser/ is inside the sdist
     "lxml": ("libxml2-dev", "libxslt1-dev"),
+    "markupsafe": (),  # markup/_speedups.c; <Python.h> only
     "matplotlib": (
         "libfreetype-dev",
         "libpng-dev",
@@ -444,12 +449,18 @@ SDIST_SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
     # default_libraries=[..., deplib('z')] — and get_pkg_config() is what locates them
     "multidict": (),  # multidict/_multidict.c + _multilib/*.h only
     "numpy": (),  # bundled f2c lapack_lite; get_info('lapack_opt', 0) falls back
+    "numexpr": (),  # setup.py's libraries=/library_dirs= are inside the MKL branch
+    # guarded by os.path.exists('site.cfg') — the sdist ships only site.cfg.example —
+    # so the extension that gets built is the other one, whose libraries=['m']
     "peewee": ("libsqlite3-dev",),  # setup.py libraries=['sqlite3'] (optional ext)
     "pillow": ("libjpeg-dev",),
     "psutil": (),  # its libraries= are devstat/kvm/kstat/perfstat — all non-Linux
     "psycopg2": ("libpq-dev",),
     "psycopg2-binary": ("libpq-dev",),
     "pynacl": ("libffi-dev",),
+    "pycryptodome": (),  # setup.py's get_libraries returns [] on purpose ("avoid linking
+    # Python's dynamic library"), and every include it adds is src/ or src/libtom/ —
+    # vendored — besides the compiler's own intrinsics headers
     "pyyaml": ("libyaml-dev",),  # setup.py libraries=['yaml'] for ext/_yaml.pyx
     "regex": (),  # regex_2/ and regex_3/ are in the sdist
     "ruamel-yaml-clib": (),  # libs come from its own ext_modules; it lists none
@@ -462,6 +473,7 @@ SDIST_SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
     "urwid": (),  # source/str_util.c only
     "uvloop": ("make", "autoconf", "automake", "libtool"),
     "websockets": (),  # src/websockets/speedups.c only
+    "wrapt": (),  # wrapt/_wrappers.c; <Python.h> and <structmember.h> only
     "yarl": (),  # yarl/_quoting.c only
     "zope-interface": (),  # src/zope/interface/_zope_interface_coptimizations.c
     "zstandard": (),  # vendored c-ext/ only

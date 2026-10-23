@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import ast
 import inspect
+import io
 import json
 import re
 import shlex
 import subprocess
 import sys
+import zipfile
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -3286,11 +3288,24 @@ class TestBake:
         ``decorator>=4.3.0`` would install a different environment every time the
         layer is rebuilt; the layer has to be a fact, so what goes on the command
         line is what :func:`resolve_pins` decided.
+
+        The recipe has exactly one ``|| true``, and it is not on an install: it is the
+        layer's own ``pip check`` (:data:`bake_mod.PIP_CHECK_OUTPUT`), whose exit status
+        is deliberately not the verdict — a conflict between two of BugsInPy's own pins
+        is tolerated (§3.2), so the reading is taken here and judged on the host
+        (:func:`pip_check_conflicts`). Every *install* fails the layer, because a bug
+        whose dependencies do not install is a bug that cannot be measured.
         """
         recipe = bake_mod.requirements_recipe(["requests==2.0", "decorator==4.4.0"])
         assert "requests==2.0" in recipe
         assert "decorator==4.4.0" in recipe
-        assert "|| true" not in recipe
+        installs = [
+            line for line in recipe.splitlines() if line.startswith("python -m pip install")
+        ]
+        assert installs, "the dependency install is the one thing this recipe is for"
+        assert not any("|| true" in line for line in installs)
+        assert recipe.count("|| true") == 1
+        assert bake_mod.PIP_CHECK_OUTPUT in recipe
         assert "VANTA_REQUIREMENTS" in recipe
 
     def test_requirements_recipe_without_deps_still_asserts_the_interpreter(self):
@@ -3308,6 +3323,12 @@ class TestBake:
         ``--no-build-isolation`` for the pins to be what the build uses. The
         toolchain call is the one install that keeps isolation, because at that point
         there is nothing in the layer for pip to build a pinned tool against.
+
+        It is also the one install **without** :data:`LEGACY_RESOLVER_FLAG`: it is the
+        call that installs the pinned pip, so the flag could not apply to it even if the
+        isolated build were otherwise fine. Every install after it carries the flag,
+        which is what reproduces the pre-2020 resolver the benchmark's environment was
+        frozen with (§3.2).
         """
         recipe = bake_mod.requirements_recipe(
             ["numpy==1.18.5"],
@@ -3318,8 +3339,10 @@ class TestBake:
         ]
         assert pip_lines == [
             "python -m pip install --no-cache-dir -r /tmp/build-tools.txt",
-            "python -m pip install --no-cache-dir --no-build-isolation -r /tmp/req.txt",
+            "python -m pip install --no-cache-dir --no-build-isolation "
+            f"{bake_mod.LEGACY_RESOLVER_FLAG} -r /tmp/req.txt",
         ]
+        assert bake_mod.LEGACY_RESOLVER_FLAG not in pip_lines[0]
         assert "VANTA_BUILD_TOOLS" in recipe
         assert recipe.index("setuptools==40.8.0") < recipe.index("--no-build-isolation")
         # The pinned versions are asserted, not assumed: a toolchain that did not land
@@ -3354,8 +3377,10 @@ class TestBake:
         ]
         assert pip_lines == [
             "python -m pip install --no-cache-dir -r /tmp/build-tools.txt",
-            "python -m pip install --no-cache-dir --no-build-isolation -r /tmp/build-req.txt",
-            "python -m pip install --no-cache-dir --no-build-isolation -r /tmp/req.txt",
+            "python -m pip install --no-cache-dir --no-build-isolation "
+            f"{bake_mod.LEGACY_RESOLVER_FLAG} -r /tmp/build-req.txt",
+            "python -m pip install --no-cache-dir --no-build-isolation "
+            f"{bake_mod.LEGACY_RESOLVER_FLAG} -r /tmp/req.txt",
         ]
         tools = _heredoc(recipe, "VANTA_BUILD_TOOLS")
         build_req = _heredoc(recipe, "VANTA_BUILD_REQUIRES")
@@ -4373,8 +4398,17 @@ class TestPinPreflight:
         assert records[1].as_dict()["unbuildable"] == "needs Arrow C++"
         assert "gap" not in records[1].as_dict()
 
-    def test_the_files_and_the_listing_of_a_shared_pin_are_fetched_once(self):
-        """The cache is what makes a 232-pin preflight cheap; numpy is in six bugs."""
+    def test_the_files_the_listing_and_the_declarations_of_a_shared_pin_are_fetched_once(self):
+        """The caches are what make a 232-pin preflight cheap; numpy is in six bugs.
+
+        Three readings per pin, each asked in more than one place and each cached once
+        per run: what it installs as and what it lists
+        (:func:`preflight_classifier`), and what it declares
+        (:func:`cached_release_metadata`, here wrapped round a stub so the count is
+        this test's). The declaration reading is the newest of the three and the reason
+        the last one is not the network: two layers holding one pin must not fetch it
+        twice.
+        """
         entries = [
             bug_entry(checkpoint="vanta-bi-Demo-1"),
             bug_entry(bug_id=2, checkpoint="vanta-bi-Demo-2"),
@@ -4390,6 +4424,7 @@ class TestPinPreflight:
         ]
         fetched: list[tuple[str, str]] = []
         listings: list[str] = []
+        read: list[tuple[str, str]] = []
 
         def files_of(name, version):
             fetched.append((name, version))
@@ -4399,11 +4434,18 @@ class TestPinPreflight:
             listings.append(file.filename)
             return ("numpy-1.18.5/numpy/core/src/multiarray/arrayobject.c",), False
 
+        def metadata(name, version):
+            read.append((name, version))
+            return (), None
+
         reports = bake_mod.preflight_layers(
-            deps, classify=bake_mod.preflight_classifier(files_of=files_of, sdist_of=sdist_of)
+            deps,
+            classify=bake_mod.preflight_classifier(files_of=files_of, sdist_of=sdist_of),
+            metadata_of=bake_mod.cached_release_metadata(fetch=metadata),
         )
         assert fetched == [("numpy", "1.18.5")]
         assert listings == ["numpy-1.18.5.tar.gz"]
+        assert read == [("numpy", "1.18.5")], "one reading for two layers"
         assert [report.checkpoint for report in reports] == [
             "vanta-bi-Demo-1",
             "vanta-bi-Demo-2",
@@ -4578,6 +4620,685 @@ class TestPinPreflight:
         assert "[vanta-bi-Demo-1] build pins: —" in captured.out
         assert "[vanta-bi-Demo-1] provenance:" in captured.out
         assert code == run_mod.EXIT_OK
+
+
+# ============================================================================
+# §3.2's two conflict cases — read from metadata before the build, and from
+# the layer's own ``pip check`` after it
+# ============================================================================
+class TestPinConflicts:
+    """``sanic/1``'s ``h11==0.9.0`` against ``httpcore==0.3.0``'s ``h11==0.8.*``.
+
+    [VANTA-WHY] The measured failure this is built on: both pins are BugsInPy's own,
+    pip's resolver refuses to install them at all, and the layer failed with
+    ``ResolutionImpossible`` naming neither of the two files the pins came from. The
+    two readings below answer the pair of questions that failure asks — *is this
+    conflict ours to tolerate* (:func:`bake_mod.metadata_conflicts`, before the build)
+    and *did pip install something it refuses* (:func:`bake_mod.pip_check_conflicts`,
+    after it) — and both judge by :func:`bake_mod.own_pin_names`, so a conflict cannot
+    be tolerated in one and refused in the other.
+    """
+
+    HTTPCORE = "httpcore==0.3.0"
+    H11 = "h11==0.9.0"
+    PIP_CHECK_LINE = "httpcore 0.3.0 has requirement h11==0.8.*, but you have h11 0.9.0."
+    """What ``pip check`` writes for this pair, measured against pip 21.3.1."""
+
+    CHILDREN = {"vanta-bi-Demo-1": PY38}
+
+    def _conflict(self, **over) -> bake_mod.PinConflict:
+        base = dict(
+            case=bake_mod.CASE_BOTH_OWN_PINS,
+            requires="httpcore==0.3.0 declares ==0.8.*",
+            held=self.H11,
+            source="PyPI metadata",
+            pins=(self.HTTPCORE, self.H11),
+        )
+        base.update(over)
+        return bake_mod.PinConflict(**base)
+
+    def _report(self, *conflicts: bake_mod.PinConflict) -> bake_mod.PreflightBug:
+        return bake_mod.PreflightBug(
+            key="Demo/1",
+            checkpoint="vanta-bi-Demo-1",
+            python_minor="3.8",
+            pins=(
+                bake_mod.PreflightPin("h11", "0.9.0", bake_mod.INSTALLABLE_WHEEL, "w"),
+            ),
+            conflicts=tuple(conflicts),
+        )
+
+    # ---- what one finding says about itself --------------------------------
+    def test_a_conflict_between_two_own_pins_is_tolerated_and_says_why(self):
+        conflict = self._conflict()
+        assert conflict.tolerated
+        assert conflict.describe() == (
+            "case (b) httpcore==0.3.0 declares ==0.8.* but the layer has h11==0.9.0: "
+            "tolerated (both sides are BugsInPy's own pins, installed as written)"
+        )
+        assert conflict.as_dict() == {
+            "case": "b",
+            "requires": "httpcore==0.3.0 declares ==0.8.*",
+            "held": "h11==0.9.0",
+            "source": "PyPI metadata",
+            "pins": ["httpcore==0.3.0", "h11==0.9.0"],
+            "tolerated": True,
+        }
+
+    def test_a_conflict_with_a_version_the_harness_chose_is_not_tolerated(self):
+        conflict = self._conflict(case=bake_mod.CASE_HARNESS_CHOICE)
+        assert not conflict.tolerated
+        assert conflict.describe() == (
+            "case (a) httpcore==0.3.0 declares ==0.8.* but the layer has h11==0.9.0: "
+            "not tolerated — a conflict with a pin this harness chose"
+        )
+        assert conflict.as_dict()["tolerated"] is False
+
+    def test_a_pin_nobody_could_read_is_not_a_conflict_and_not_a_refusal(self):
+        """Case (?) is the *absence* of a reading, so nothing is refused over it."""
+        conflict = self._conflict(
+            case=bake_mod.CASE_UNKNOWN,
+            requires="httpcore==0.3.0 — PyPI has no metadata for it",
+            held="unknown",
+            pins=(self.HTTPCORE,),
+        )
+        assert not conflict.tolerated
+        assert conflict.describe() == (
+            "case (?) unknown — httpcore==0.3.0 — PyPI has no metadata for it"
+        )
+        report = self._report(conflict)
+        assert report.refused == ()
+        assert bake_mod.preflight_verdict([report]) == "ready to bake"
+
+    # ---- the predicate both readings judge by ------------------------------
+    def test_the_case_is_decided_by_whether_both_sides_are_the_layers_own_pins(self):
+        own = frozenset({"httpcore", "h11"})
+        assert bake_mod._conflict_case("httpcore", "h11", own=own) == (
+            bake_mod.CASE_BOTH_OWN_PINS
+        )
+        assert bake_mod._conflict_case("httpcore", "decorator", own=own) == (
+            bake_mod.CASE_HARNESS_CHOICE
+        )
+        assert bake_mod._conflict_case("HttpCore", "H11", own=own) == (
+            bake_mod.CASE_BOTH_OWN_PINS
+        ), "PEP 503: two spellings of one name are one name"
+        assert bake_mod._conflict_case(own=own) == bake_mod.CASE_HARNESS_CHOICE, (
+            "nothing named is not 'both sides are ours'"
+        )
+
+    def test_own_pin_names_are_the_ones_bugs_inpy_wrote_not_the_harness_ones(self):
+        """Read off ``pin_rule``, so the record and the gate cannot disagree."""
+        provenance = {
+            "dependencies": [
+                {"name": "h11", "pin": "h11==0.9.0", "pin_rule": bake_mod.BUGSINPY_PIN_RULE},
+                {
+                    "name": "PyYAML",
+                    "pin": "PyYAML==5.3.1",
+                    "pin_rule": bake_mod.BUGSINPY_PIN_RULE,
+                },
+                {
+                    "name": "decorator",
+                    "pin": "decorator==4.4.0",
+                    "pin_rule": bake_mod.BUILD_PIN_RULE,
+                },
+                {
+                    "name": "pytest",
+                    "pin": "pytest==8.0.2",
+                    "pin_rule": "provisioned by the interpreter layer",
+                },
+            ]
+        }
+        assert bake_mod.own_pin_names(provenance) == frozenset({"h11", "pyyaml"})
+        assert bake_mod.own_pin_names({}) == frozenset()
+
+    # ---- the layer's own reading -------------------------------------------
+    def test_the_layers_pip_check_lines_are_lifted_out_by_their_marker(self):
+        """The only place the marker comes back off, and it comes off one line at a time."""
+        output = (
+            "+ python -m pip check\n"
+            f"{bake_mod.PIP_CHECK_PREFIX} {self.PIP_CHECK_LINE}\n"
+            f"{bake_mod.PIP_CHECK_PREFIX}no space after the marker\n"
+            "+ cat /opt/vanta-pip-check.txt\n"
+            "both steps ran\n"
+        )
+        assert bake_mod.pip_check_readings(output) == (
+            self.PIP_CHECK_LINE,
+            "no space after the marker",
+        )
+
+    def test_pips_prose_names_both_pins_and_the_case_follows_them(self):
+        own = frozenset({"httpcore", "h11"})
+        conflicts = bake_mod.pip_check_conflicts((self.PIP_CHECK_LINE,), own=own)
+        assert len(conflicts) == 1
+        conflict = conflicts[0]
+        assert conflict.case == bake_mod.CASE_BOTH_OWN_PINS
+        assert conflict.requires == "httpcore==0.3.0 declares h11==0.8.*"
+        assert conflict.held == "h11==0.9.0"
+        assert conflict.pins == (self.HTTPCORE, self.H11)
+        assert conflict.source == "pip check"
+        assert conflict.tolerated
+        # One side the harness chose, and the same prose is a refusal.
+        refused = bake_mod.pip_check_conflicts(
+            (self.PIP_CHECK_LINE,), own=frozenset({"httpcore"})
+        )
+        assert refused[0].case == bake_mod.CASE_HARNESS_CHOICE
+        assert not refused[0].tolerated
+
+    def test_a_specifier_with_a_comma_in_it_is_still_one_sentence(self):
+        """pip prints the declaration as written, and a range has a comma in it."""
+        conflict = bake_mod.pip_check_conflicts(
+            ("somepkg 1.0 has requirement h11>=0.8,<0.9, but you have h11 0.9.0.",),
+            own=frozenset({"somepkg", "h11"}),
+        )[0]
+        assert conflict.requires == "somepkg==1.0 declares h11>=0.8,<0.9"
+        assert conflict.held == "h11==0.9.0"
+        assert conflict.case == bake_mod.CASE_BOTH_OWN_PINS
+
+    def test_a_dependency_that_is_not_installed_at_all_is_read_too(self):
+        """The other sentence ``pip check`` writes, and it has no second version in it."""
+        conflict = bake_mod.pip_check_conflicts(
+            ("pytest-json-report 1.5.0 requires pytest-metadata, which is not installed.",),
+            own=frozenset(),
+        )[0]
+        assert conflict.requires == "pytest-json-report==1.5.0 declares pytest-metadata"
+        assert conflict.held == "nothing"
+        assert conflict.pins == ("pytest-json-report==1.5.0",)
+        assert conflict.case == bake_mod.CASE_HARNESS_CHOICE
+
+    def test_a_line_this_cannot_read_is_a_conflict_as_written(self):
+        """Not a line that says the conflict is tolerable, so case (a) and refused."""
+        conflicts = bake_mod.pip_check_conflicts(
+            ("something pip said that is not one of its sentences", ""),
+            own=frozenset({"h11"}),
+        )
+        assert len(conflicts) == 1, "a blank line is not a reading"
+        assert conflicts[0].requires == "something pip said that is not one of its sentences"
+        assert conflicts[0].held == "nothing"
+        assert conflicts[0].pins == ()
+        assert conflicts[0].case == bake_mod.CASE_HARNESS_CHOICE
+
+    def test_the_failure_the_gate_raises_carries_the_prefix_the_summary_reads(self):
+        conflict = self._conflict(case=bake_mod.CASE_HARNESS_CHOICE)
+        failure = bake_mod.pip_check_failure((conflict,))
+        assert failure.exit_code == 1
+        assert not failure.ok and not failure.timed_out
+        assert failure.stderr.startswith(
+            "ERROR: pip check found a conflict this layer may not keep:"
+        )
+        assert conflict.describe() in failure.stderr
+        assert bake_mod.last_error_line(failure.stdout + failure.stderr) == (
+            "ERROR: pip check found a conflict this layer may not keep:"
+        )
+
+    # ---- the same question, asked of PyPI before the build ------------------
+    def test_the_two_releases_declarations_are_enough_to_find_the_pair(self):
+        pins = (("httpcore", "0.3.0"), ("h11", "0.9.0"))
+        metadata = {
+            ("httpcore", "0.3.0"): (("h11==0.8.*",), None),
+            ("h11", "0.9.0"): ((), None),
+        }
+        conflicts = bake_mod.metadata_conflicts(
+            pins,
+            own=frozenset({"httpcore", "h11"}),
+            metadata_of=lambda name, version: metadata[(name, version)],
+        )
+        assert len(conflicts) == 1
+        conflict = conflicts[0]
+        assert conflict.case == bake_mod.CASE_BOTH_OWN_PINS
+        assert conflict.requires == "httpcore==0.3.0 declares ==0.8.*"
+        assert conflict.held == "h11==0.9.0"
+        assert conflict.pins == (self.HTTPCORE, self.H11)
+        assert conflict.source == "PyPI metadata"
+        # The same pair, with the h11 side a version the date rule chose.
+        refused = bake_mod.metadata_conflicts(
+            pins,
+            own=frozenset({"httpcore"}),
+            metadata_of=lambda name, version: metadata[(name, version)],
+        )
+        assert refused[0].case == bake_mod.CASE_HARNESS_CHOICE
+
+    def test_a_requirement_the_other_pin_satisfies_or_does_not_name_is_not_a_conflict(self):
+        pins = (("pytest-json-report", "1.5.0"), ("pytest", "5.4.3"))
+        metadata = {
+            ("pytest-json-report", "1.5.0"): (
+                # A bound the layer's pytest is inside, and a name it does not pin.
+                ("pytest (>=3.5.0)", "packaging (>=17.0)"),
+                None,
+            ),
+            ("pytest", "5.4.3"): ((), None),
+        }
+        assert (
+            bake_mod.metadata_conflicts(
+                pins,
+                own=frozenset(),
+                metadata_of=lambda name, version: metadata[(name, version)],
+            )
+            == ()
+        ), "only a requirement on a name this layer also pins can be a conflict"
+
+    def test_a_requirement_behind_an_extra_is_not_read_as_an_install(self):
+        """``h11==0.8.* ; extra == "test"`` is only installed when the extra is asked for."""
+        pins = (("plugin", "1.0"), ("h11", "0.9.0"))
+        metadata = {
+            ("plugin", "1.0"): (('h11==0.8.* ; extra == "test"',), None),
+            ("h11", "0.9.0"): ((), None),
+        }
+        assert (
+            bake_mod.metadata_conflicts(
+                pins,
+                own=frozenset(),
+                metadata_of=lambda name, version: metadata[(name, version)],
+            )
+            == ()
+        )
+
+    def test_a_pin_pypi_has_no_metadata_for_is_recorded_as_unknown_not_as_clean(self):
+        """'Checked and clean' and 'could not be checked' are different answers."""
+
+        def metadata(name, version):
+            if name == "httpcore":
+                raise bake_mod.BakeError(f"PyPI has no metadata for {name} {version}")
+            return (), None
+
+        conflicts = bake_mod.metadata_conflicts(
+            (("httpcore", "0.3.0"), ("h11", "0.9.0")),
+            own=frozenset(),
+            metadata_of=metadata,
+        )
+        assert len(conflicts) == 1
+        assert conflicts[0].case == bake_mod.CASE_UNKNOWN
+        assert conflicts[0].pins == ("httpcore==0.3.0",)
+        assert "PyPI has no metadata for httpcore 0.3.0" in conflicts[0].requires
+
+    def test_the_declarations_of_a_release_are_read_once_per_run(self):
+        fetched: list[tuple[str, str]] = []
+
+        def fetch(name, version):
+            fetched.append((name, version))
+            return (), None
+
+        read = bake_mod.cached_release_metadata(fetch=fetch)
+        assert read("numpy", "1.18.5") == ((), None)
+        read("numpy", "1.18.5")
+        read("numpy", "1.19.0")
+        assert fetched == [("numpy", "1.18.5"), ("numpy", "1.19.0")]
+
+    # ---- the three readings a release's declarations can come from ----------
+    WHEEL = ("matplotlib-3.2.1-cp38-cp38-manylinux1_x86_64.whl", "bdist_wheel", True)
+    SDIST = ("matplotlib-3.2.1.tar.gz", "sdist", False)
+    SIDECAR_TEXT = (
+        "Metadata-Version: 2.1\n"
+        "Name: matplotlib\n"
+        "Requires-Dist: cycler (>=0.10)\n"
+        "Requires-Dist: numpy (>=1.11)\n"
+    )
+
+    def _payload(self, *, requires_dist=None, files=()):
+        """One release's version JSON, as PyPI writes it: ``info`` and ``urls``."""
+        return {
+            "info": {"requires_dist": requires_dist, "requires_python": None},
+            "urls": [
+                {
+                    "filename": filename,
+                    "packagetype": kind,
+                    "url": f"https://files.pythonhosted.org/{filename}",
+                    **({"core-metadata": {"sha256": "0" * 64}} if sidecar else {}),
+                }
+                for filename, kind, sidecar in files
+            ],
+        }
+
+    def test_a_requires_dist_the_json_carries_is_the_reading_no_file_is_opened_for(self):
+        """Measured: ``matplotlib``'s JSON is null, but lots of releases' is not."""
+        requires = bake_mod.declared_requires(
+            self._payload(requires_dist=["cycler (>=0.10)"], files=[self.WHEEL]),
+            name="matplotlib",
+            version="3.2.1",
+            sidecar_of=pytest.fail,
+            wheel_of=pytest.fail,
+        )
+        assert requires == ("cycler (>=0.10)",)
+
+    def test_a_null_requires_dist_is_read_from_the_published_sidecar(self):
+        """The measured shape: ``matplotlib==3.2.1`` is null and declares five."""
+        requires = bake_mod.declared_requires(
+            self._payload(files=[self.WHEEL, self.SDIST]),
+            name="matplotlib",
+            version="3.2.1",
+            sidecar_of=lambda file: self.SIDECAR_TEXT,
+            wheel_of=pytest.fail,
+        )
+        assert requires == ("cycler (>=0.10)", "numpy (>=1.11)")
+
+    def test_a_sidecar_that_is_not_published_falls_through_to_the_wheel_itself(self):
+        """``core-metadata`` set and the file 404ing is an answer: read the wheel."""
+        requires = bake_mod.declared_requires(
+            self._payload(files=[self.WHEEL]),
+            name="matplotlib",
+            version="3.2.1",
+            sidecar_of=lambda file: None,
+            wheel_of=lambda file: "Requires-Dist: kiwisolver (>=1.0.1)\n",
+        )
+        assert requires == ("kiwisolver (>=1.0.1)",)
+
+    def test_a_release_with_no_sidecar_at_all_is_read_from_its_wheel(self):
+        requires = bake_mod.declared_requires(
+            self._payload(files=[("m-1-py3-none-any.whl", "bdist_wheel", False)]),
+            name="m",
+            version="1",
+            sidecar_of=pytest.fail,
+            wheel_of=lambda file: "Requires-Dist: packaging\n",
+        )
+        assert requires == ("packaging",)
+
+    def test_a_document_that_was_read_and_declares_nothing_is_not_unknown(self):
+        """Measured: ``pytest-json-report==0.2``'s sidecar names no requirement."""
+        requires = bake_mod.declared_requires(
+            self._payload(files=[self.WHEEL]),
+            name="pytest-json-report",
+            version="0.2",
+            sidecar_of=lambda file: "Metadata-Version: 2.1\nName: pytest-json-report\n",
+            wheel_of=pytest.fail,
+        )
+        assert requires == (), "empty and unreadable are different answers"
+
+    def test_an_sdist_no_reading_reaches_is_unknown_and_never_declares_nothing(self):
+        """``httpcore==0.3.0``: sdist-only, no sidecar, and its JSON says null."""
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            bake_mod.declared_requires(
+                self._payload(files=[("httpcore-0.3.0.tar.gz", "sdist", False)]),
+                name="httpcore",
+                version="0.3.0",
+                sidecar_of=pytest.fail,
+                wheel_of=pytest.fail,
+            )
+        assert "httpcore==0.3.0" in str(excinfo.value)
+        assert "unknown" in str(excinfo.value)
+
+    def test_the_published_document_is_read_for_its_requires_dist_fields_only(self):
+        text = (
+            "Metadata-Version: 2.1\n"
+            "Name: matplotlib\n"
+            "Requires-Dist: cycler (>=0.10)\n"
+            "requires-dist: numpy (>=1.11)\n"
+            "Summary: Requires-Dist: prose, not a field\n"
+            "Requires-Dist:\n"
+        )
+        assert bake_mod._requires_dist_fields(text) == (
+            "cycler (>=0.10)",
+            "numpy (>=1.11)",
+        ), "the field name is matched case-insensitively; an empty field is not one"
+        assert bake_mod._requires_dist_fields("Metadata-Version: 2.1\n") == ()
+
+    def test_each_pypi_file_carries_whether_its_metadata_is_published_beside_it(self):
+        files = bake_mod._release_files(
+            [
+                {
+                    "filename": "m-1-py3-none-any.whl",
+                    "packagetype": "bdist_wheel",
+                    "url": "https://files.test/m.whl",
+                    "size": 7,
+                    "core-metadata": {"sha256": "0" * 64},
+                },
+                {
+                    "filename": "m-1.tar.gz",
+                    "packagetype": "sdist",
+                    "url": "https://files.test/m.tar.gz",
+                },
+            ]
+        )
+        assert files[0].core_metadata and files[0].is_wheel and files[0].size == 7
+        assert not files[1].core_metadata and files[1].is_sdist
+
+    def test_the_wheels_own_metadata_document_is_read_out_of_the_archive(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("matplotlib/__init__.py", "")
+            archive.writestr(
+                "matplotlib-3.2.1.dist-info/METADATA",
+                "Name: matplotlib\nRequires-Dist: numpy (>=1.11)\n",
+            )
+        assert bake_mod._metadata_member(buffer.getvalue()) == (
+            "Name: matplotlib\nRequires-Dist: numpy (>=1.11)\n"
+        )
+        assert bake_mod._metadata_member(b"not an archive") is None
+
+    def test_an_exact_pin_nothing_can_be_read_for_narrows_no_version(self):
+        """The narrowing is a reading too, so an unread pin cannot make a choice."""
+        refs = (
+            bake_mod.DepRef(
+                name="httpcore", spec="httpcore==0.3.0", source="requirements.txt"
+            ),
+        )
+
+        def metadata(name, version):
+            raise bake_mod.BakeError(f"no reading for {name} {version}")
+
+        assert bake_mod._narrowing_requirements(refs, metadata_of=metadata) == {}
+
+    def test_a_plugin_release_that_cannot_be_read_is_never_chosen(self):
+        """'Could not be read' must not be read as 'accepts any pytest'."""
+        versions = {"2.0": "2020-01-01", "1.0": "2019-01-01"}
+
+        def metadata(name, version):
+            if version == "2.0":
+                raise bake_mod.BakeError("no reading")
+            return (("pytest (>=3.8.0)",), None)
+
+        assert bake_mod.newest_accepting_pytest(
+            "pytest-json-report",
+            versions,
+            pytest_version="4.2.0",
+            python_minor="3.8",
+            metadata_of=metadata,
+        ) == "1.0"
+
+    def test_the_unknown_section_names_every_pin_nothing_could_be_read_for(self):
+        report = self._report(
+            self._conflict(
+                case=bake_mod.CASE_UNKNOWN,
+                requires=f"{self.HTTPCORE} — no reading reached it",
+                held="unknown",
+                pins=(self.HTTPCORE,),
+            )
+        )
+        unknown = [
+            line
+            for line in bake_mod._conflict_sections([report], dropped=frozenset())
+            if line.startswith("  UNKNOWN ")
+        ]
+        assert len(unknown) == 1
+        assert self.HTTPCORE in unknown[0], "the pin is named, not just counted"
+        assert bake_mod.preflight_verdict([report]) == "ready to bake", (
+            "a reading that did not happen is not a conflict to decide"
+        )
+
+    # ---- what the preflight prints and what it decides ----------------------
+    def test_the_findings_are_printed_as_three_sections_case_a_first(self):
+        lines = bake_mod._conflict_sections(
+            [
+                self._report(
+                    self._conflict(case=bake_mod.CASE_HARNESS_CHOICE),
+                    self._conflict(),
+                    self._conflict(case=bake_mod.CASE_UNKNOWN, held="unknown"),
+                )
+            ],
+            dropped=frozenset(),
+        )
+        titles = [line for line in lines if line and not line.startswith("  ")]
+        assert titles == [
+            "pin conflict(s), §3.2 case (a) — one side is a version this harness chose, "
+            "so the layer cannot hold both (1):",
+            "pin conflict(s), §3.2 case (b) — both sides are BugsInPy's own pins, "
+            "installed as written (1):",
+            "pin(s) nothing could be read for — no PyPI 'requires_dist', no wheel "
+            "metadata, no PEP 658 sidecar — so what they declare is unknown, and their "
+            "layer's own pip check is the reading that covers them (1):",
+        ], "case (a) first: it is the only one that stops a layer"
+        assert any(line.startswith("  REFUSED ") for line in lines)
+        assert any(line.startswith("  TOLERATED ") for line in lines)
+        assert any(line.startswith("  UNKNOWN ") for line in lines)
+        assert all(line.endswith("— Demo/1") for line in lines if line.startswith("  "))
+
+    def test_a_conflict_with_a_pin_the_rule_dropped_is_not_a_finding(self):
+        """The layer will not install that pin, so there is no pair left to conflict."""
+        report = self._report(self._conflict())
+        assert bake_mod._conflict_sections([report], dropped=frozenset()) != []
+        assert bake_mod._conflict_sections([report], dropped={self.H11}) == []
+
+    def test_the_verdict_counts_a_refused_conflict_and_not_a_tolerated_one(self):
+        refused = self._report(self._conflict(case=bake_mod.CASE_HARNESS_CHOICE))
+        assert bake_mod.preflight_verdict([refused]) == (
+            "not ready to bake: 1 pin conflict(s) across 1 bug(s), none of them "
+            "§3.2 case (b)"
+        )
+        assert bake_mod.preflight_verdict([self._report(self._conflict())]) == (
+            "ready to bake"
+        ), "case (b) is the benchmark's own environment, tolerated on purpose"
+        assert bake_mod.preflight_verdict(
+            [refused], dropped={"vanta-bi-Demo-1": [{"pin": self.H11}]}
+        ) == "ready to bake", "a dropped pin leaves no pair to refuse"
+
+    # ---- what the layer does about it, and what is kept --------------------
+    def test_the_layers_own_reading_is_written_back_into_its_provenance(self, tmp_path):
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        (deps_dir / "vanta-bi-Demo-1.json").write_text(
+            json.dumps(
+                {
+                    "installs": ["h11==0.9.0"],
+                    "harness_pins": {"pytest": "8.0.2"},
+                    "dropped": [],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        conflict = self._conflict()
+        path = bake_mod.record_pip_check(deps_dir, "vanta-bi-Demo-1", (conflict,))
+        assert path == deps_dir / "vanta-bi-Demo-1.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data[bake_mod.PIP_CHECK_KEY] == [conflict.as_dict()]
+        assert data["installs"] == ["h11==0.9.0"], (
+            "every other key stays what the bake resolved"
+        )
+        assert data["harness_pins"] == {"pytest": "8.0.2"}
+
+    def test_the_reading_has_its_own_key_from_the_start(self):
+        provenance = bake_mod.deps_provenance(
+            bake_mod.DepSources(
+                project="Demo",
+                bug_id=1,
+                checkpoint="vanta-bi-Demo-1",
+                buggy_commit="b" * 40,
+                commit_date="2019-04-22",
+                import_name="demo",
+            ),
+            (),
+            harness_pins={},
+        )
+        assert provenance[bake_mod.PIP_CHECK_KEY] == [], (
+            "'nothing to report' and 'this file predates the reading' must not read alike"
+        )
+
+    def _gate_run(self, tmp_path, *, own_pins):
+        logged: list[str] = []
+        recorded: list[tuple[str, tuple[bake_mod.PinConflict, ...]]] = []
+        logs = tmp_path / "bake-logs"
+        present: set[str] = set()
+
+        def build(name, script, base):
+            present.add(name)
+            if name == PY38:
+                return bake_mod.ExecResult(
+                    stdout="ok", stderr="", exit_code=0, timed_out=False
+                )
+            return bake_mod.ExecResult(
+                stdout=(
+                    "+ python -m pip check\n"
+                    f"{bake_mod.PIP_CHECK_PREFIX} {self.PIP_CHECK_LINE}\n"
+                ),
+                stderr="",
+                exit_code=0,
+                timed_out=False,
+            )
+
+        def exists(name):
+            return name in present
+
+        def remove(name):
+            present.discard(name)
+
+        def record(name, conflicts):
+            recorded.append((name, conflicts))
+
+        summary = bake_mod.run_bake_actions(
+            bake_mod.plan_layers(
+                _layers(PY38, "vanta-bi-Demo-1"),
+                force=True,
+                children=self.CHILDREN,
+                exists=exists,
+            ),
+            children=self.CHILDREN,
+            exists=exists,
+            remove=remove,
+            build=build,
+            log=logged.append,
+            logs_dir=logs,
+            own_pins=own_pins,
+            record=record,
+        )
+        return summary, logged, recorded, logs
+
+    def test_a_conflict_with_a_harness_choice_fails_the_layer_after_it_built(self, tmp_path):
+        """The install succeeded and the marker is there; what failed is the gate."""
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._gate_run(
+                tmp_path,
+                own_pins={"vanta-bi-Demo-1": frozenset({"httpcore"})},
+            )
+        logs = tmp_path / "bake-logs"
+        message = str(excinfo.value)
+        assert (
+            "vanta-bi-Demo-1: exit 1 — ERROR: pip check found a conflict this layer "
+            "may not keep:" in message
+        )
+        assert f"full build log: {bake_mod.bake_log_path(logs, 'vanta-bi-Demo-1')}" in message
+        assert "nothing was left behind" in message, "the half-baked layer is not kept"
+        # One line in the summary; the finding itself is what the log is for.
+        text = bake_mod.bake_log_path(logs, "vanta-bi-Demo-1").read_text(encoding="utf-8")
+        assert (
+            "case (a) httpcore==0.3.0 declares h11==0.8.* but the layer has "
+            "h11==0.9.0: not tolerated" in text
+        )
+
+    def test_a_conflict_between_the_benchmarks_own_pins_is_logged_and_the_layer_kept(
+        self, tmp_path
+    ):
+        summary, logged, recorded, logs = self._gate_run(
+            tmp_path,
+            own_pins={"vanta-bi-Demo-1": frozenset({"httpcore", "h11"})},
+        )
+        assert "[done] vanta-bi-Demo-1" in summary
+        assert any(
+            line.startswith("[vanta-bi-Demo-1] case (b) ") and "tolerated" in line
+            for line in logged
+        ), "the reader is told, even though nothing is refused"
+        assert recorded == [
+            ("vanta-bi-Demo-1", bake_mod.pip_check_conflicts(
+                (self.PIP_CHECK_LINE,), own=frozenset({"httpcore", "h11"})
+            ))
+        ], "the deps JSON carries what pip actually said"
+        text = bake_mod.bake_log_path(logs, "vanta-bi-Demo-1").read_text(encoding="utf-8")
+        assert self.PIP_CHECK_LINE in text, (
+            "the log is the layer's own output, not the verdict built on top of it"
+        )
+
+    def test_the_interpreter_layer_is_not_gated_on_the_bugs_own_pins(self, tmp_path):
+        """No provenance names its own pins, and its install set is the harness's."""
+        _summary, logged, recorded, _logs = self._gate_run(tmp_path, own_pins={})
+        assert recorded == []
+        assert not any("pip check found a conflict" in line for line in logged)
 
 
 # ============================================================================
@@ -5141,13 +5862,23 @@ class TestUnresolvablePins:
         assert "imports it" in flagged[0].reason
         assert flagged[0].reason.startswith("BakeError: ")
 
-    def test_one_classifier_is_shared_by_the_drop_rule_and_the_preflight_table(
+    def test_one_classifier_and_one_metadata_reader_are_shared_by_the_resolution_and_the_preflight(
         self, tmp_path, monkeypatch
     ):
-        """``bake`` builds it once; both askers get the same object, so PyPI is paid once."""
+        """``bake`` builds each once; both askers get the same object, so PyPI is paid once.
+
+        Two shared readers, not one, because there are two questions a run asks about a
+        pin — "what does it install as" (:func:`preflight_classifier`) and "what does it
+        declare" (:func:`cached_release_metadata`) — and each is asked in two places:
+        §3.2's drop rule and the preflight table for the first, the date rule's case-(a)
+        narrowing and the preflight's conflict check for the second. A second instance
+        anywhere would fetch the same JSON twice.
+        """
         seen: dict[str, object] = {}
         sentinel = object()
+        reader = object()
         monkeypatch.setattr(bake_mod, "preflight_classifier", lambda **kwargs: sentinel)
+        monkeypatch.setattr(bake_mod, "cached_release_metadata", lambda **kwargs: reader)
         entry = bug_entry(checkpoint="vanta-bi-Demo-1")
         split = split_mod.Split(split_data(bugs=[entry], bugsinpy_root=str(tmp_path)))
         (tmp_path / "bugsinpy").mkdir()
@@ -5157,13 +5888,17 @@ class TestUnresolvablePins:
 
         def fake_resolve(*args, **kwargs):
             seen["resolve"] = kwargs["classify"]
+            seen["resolve_metadata"] = kwargs["metadata_of"]
             return [], []
 
         monkeypatch.setattr(bake_mod, "resolve_bug_deps", fake_resolve)
         monkeypatch.setattr(
             bake_mod,
             "preflight_layers",
-            lambda deps, *, classify: seen.update(preflight=classify) or [],
+            lambda deps, *, classify, metadata_of: seen.update(
+                preflight=classify, preflight_metadata=metadata_of
+            )
+            or [],
         )
         code = run_mod.main(
             [
@@ -5178,6 +5913,8 @@ class TestUnresolvablePins:
         assert code == run_mod.EXIT_OK
         assert seen["resolve"] is sentinel
         assert seen["preflight"] is sentinel
+        assert seen["resolve_metadata"] is reader
+        assert seen["preflight_metadata"] is reader
 
     def test_a_dropped_pin_is_printed_in_the_bake_output(
         self, tmp_path, monkeypatch, capsys
@@ -5968,6 +6705,34 @@ class TestTheReportPluginFollowsTheBugsPytest:
 
     METADATA = {
         # ``(requires_dist, requires_python)`` per release, measured from PyPI.
+        #
+        # pytest itself is here because an exact pin's own declarations are what §3.2's
+        # case (a) narrows a date-rule choice with: a bug that pins ``pytest==5.4.3`` is
+        # a bug whose pytest can constrain a name the date rule would otherwise pick
+        # freely (``pluggy (<1.0,>=0.12)``), so leaving it out of the reading would be
+        # the harness narrowing on some pins and not others.
+        ("pytest", "5.4.3"): (
+            (
+                "py (>=1.5.0)",
+                "packaging",
+                "attrs (>=17.4.0)",
+                "more-itertools (>=4.0.0)",
+                "pluggy (<1.0,>=0.12)",
+                "wcwidth",
+                'pathlib2 (>=2.2.0) ; python_version < "3.6"',
+                'importlib-metadata (>=0.12) ; python_version < "3.8"',
+                'atomicwrites (>=1.0) ; sys_platform == "win32"',
+                'colorama ; sys_platform == "win32"',
+                "mypy (==v0.761) ; extra == 'checkqa-mypy'",
+                "argcomplete ; extra == 'testing'",
+                "hypothesis (>=3.56) ; extra == 'testing'",
+                "mock ; extra == 'testing'",
+                "nose ; extra == 'testing'",
+                "requests ; extra == 'testing'",
+                "xmlschema ; extra == 'testing'",
+            ),
+            ">=3.5",
+        ),
         ("pytest-json-report", "0.2"): ((), None),
         ("pytest-json-report", "0.3"): (("pytest (>=3.3.2)",), None),
         ("pytest-json-report", "0.4"): (("pytest (>=3.3.2)",), None),
@@ -7273,20 +8038,33 @@ class TestBuildPinsByDate:
 
     def test_the_toolchain_gets_a_pin_for_every_bug_even_with_nothing_declared(self):
         """No project has to ask for setuptools, wheel and Cython: they are the answer
-        to "what was this tree built with", and every layer gets them."""
+        to "what was this tree built with", and every layer gets them.
+
+        ``pip`` is the first pin and the one that is *not* dated: the layer needs a pip
+        that still carries :data:`LEGACY_RESOLVER_FLAG`, which is a capability rather
+        than a date — the bug's own date would name a pip from before the flag existed —
+        so it has no ``released_at`` and its own ``pin_rule``.
+        """
         pins = self._pins()
         assert [pin.pin for pin in pins] == [
+            f"{bake_mod.PIP_TOOL}=={bake_mod.PIP_PIN_VERSION}",
             "setuptools==40.8.0",
             "wheel==0.33.1",
             "cython==0.29.6",
         ]
         assert [pin.released_at for pin in pins] == [
+            None,
             "2019-02-04",
             "2019-04-06",
             "2019-03-10",
         ]
-        assert {pin.source for pin in pins} == {bake_mod.BUILD_TOOL_SOURCE}
-        assert all(pin.pin_rule == bake_mod.BUILD_PIN_RULE for pin in pins)
+        assert {pin.source for pin in pins} == {
+            bake_mod.PIP_TOOL_SOURCE,
+            bake_mod.BUILD_TOOL_SOURCE,
+        }
+        assert pins[0].capability is True
+        assert pins[0].pin_rule == bake_mod.PIP_PIN_RULE
+        assert all(pin.pin_rule == bake_mod.BUILD_PIN_RULE for pin in pins[1:])
 
     def test_a_release_newer_than_the_commit_is_excluded_even_when_it_is_newest(self):
         """setuptools 41.0.0 exists and the buggy tree could not have been built with it."""
@@ -7374,6 +8152,7 @@ class TestBuildPinsByDate:
         # The releases mapping has no pytest in it at all: if the name were not skipped
         # this would raise, which is the assertion.
         assert [pin.name for pin in self._pins([ref])] == [
+            bake_mod.PIP_TOOL,
             "setuptools",
             "wheel",
             "cython",
@@ -7396,17 +8175,24 @@ class TestBuildPinsByDate:
         releases = dict(self.TOOLCHAIN)
         releases["numpy"] = {"1.16.4": "2019-04-01"}
         pins = self._pins(refs, releases=releases)
-        assert [pin.name for pin in pins] == ["setuptools", "wheel", "cython", "numpy"]
+        assert [pin.name for pin in pins] == [
+            bake_mod.PIP_TOOL,
+            "setuptools",
+            "wheel",
+            "cython",
+            "numpy",
+        ]
         # A toolchain name the project also declares records the declaration as its
         # source: "cython is here because this setup.py names it" says more than
         # "cython is here for every bug", and the toolchain rule still applied to the
         # pin's version — one pin, two reasons, and the more specific one recorded.
-        assert pins[2].source == "setup_requires (setup.py) line 271"
-        assert pins[2].pin == "cython==0.29.6"
-        assert pins[3].source == "build-system.requires (pyproject.toml)"
+        assert pins[3].source == "setup_requires (setup.py) line 271"
+        assert pins[3].pin == "cython==0.29.6"
+        assert pins[4].source == "build-system.requires (pyproject.toml)"
 
     def test_build_installs_is_the_pins_in_install_order(self):
         assert bake_mod.build_installs(self._pins()) == (
+            f"{bake_mod.PIP_TOOL}=={bake_mod.PIP_PIN_VERSION}",
             "setuptools==40.8.0",
             "wheel==0.33.1",
             "cython==0.29.6",
@@ -7741,12 +8527,20 @@ class TestDependencyProvenance:
             sources, resolved, harness_pins={}, build_pins=built
         )
         assert [pin["pin"] for pin in provenance["build_pins"]] == [
+            f"{bake_mod.PIP_TOOL}=={bake_mod.PIP_PIN_VERSION}",
             "setuptools==40.8.0",
             "wheel==0.33.1",
             "cython==0.29.6",
             "numpy==1.15.4",
         ]
         by_name = {pin["name"]: pin for pin in provenance["build_pins"]}
+        assert by_name[bake_mod.PIP_TOOL] == {
+            "name": bake_mod.PIP_TOOL,
+            "pin": f"{bake_mod.PIP_TOOL}=={bake_mod.PIP_PIN_VERSION}",
+            "source": bake_mod.PIP_TOOL_SOURCE,
+            "pin_rule": bake_mod.PIP_PIN_RULE,
+            "released_at": None,
+        }
         assert by_name["numpy"] == {
             "name": "numpy",
             "pin": "numpy==1.15.4",

@@ -170,6 +170,82 @@ that declared it.
 BUILD_PIN_RULE = "the newest release on or before the bug's commit date"
 """One phrase for the provenance, shared with §3.2's rule for dependencies."""
 
+BUGSINPY_PIN_RULE = "BugsInPy's own exact pin, installed as written"
+"""The ``pin_rule`` of a pin that came from BugsInPy's own files (:func:`reference_pin`).
+
+A module constant because it is also the **predicate** two later rules key off: which
+pins a conflict is allowed to involve (:func:`own_pin_names`), and which names the
+layer's own ``pip check`` readings may tolerate (:func:`pip_check_conflicts`). Two
+spellings of that one fact would let a conflict be tolerated in the record and refused
+in the layer.
+"""
+
+PIP_TOOL = "pip"
+"""The one build tool that is pinned by **name** rather than by date (§3.2).
+
+[VANTA-WHY] Measured on sanic/1. Its ``requirements.txt`` is a pip freeze from 2020 —
+``h11==0.9.0`` (line 40) and ``httpcore==0.3.0`` (line 44) — and httpcore 0.3.0's own
+metadata says ``h11==0.8.*``. Two of BugsInPy's own exact pins, jointly unsatisfiable.
+The environment they were frozen from installed both anyway, because pip before 20.3
+*had* no resolver that could refuse: it installed each requirement in turn and printed
+"pip's dependency resolver does not currently take into account all the packages that
+are installed". Today's pip answers ``ResolutionImpossible`` instead and the layer never
+gets built — which loses the benchmark's environment rather than reproducing it.
+
+So the layer installs with a pip that still has the old behaviour:
+``--use-deprecated=legacy-resolver``. Measured against pip's own tagged sources, that
+option is in ``pip/_internal/cli/cmdoptions.py`` at 20.3, 20.3.4, 21.0, 21.3, 21.3.1,
+23.1.2, 23.3.2, 24.0, 25.3, 26.1 and 26.2.2, and absent at 19.3.1, 20.0.2, 20.1 and
+20.2.4 — the opt-out arrived with the resolver that made it necessary. That choice is not
+a date rule either: sanic/1's commit date is 2020-05-12, *before* 20.3 existed, so the
+date rule would pick a pip with no flag at all. It is a capability instead, and
+:data:`PIP_PIN_VERSION` records which version and why.
+"""
+
+PIP_PIN_VERSION = "21.3.1"
+"""The pinned ``pip``: the newest flag-bearing release every split's Python can run.
+
+[VANTA-WHY] 21.3.1 is in the flag list above, and it is the *last* release that installs
+on Python 3.6 — 22.0 moved its floor to 3.7, 24.1 to 3.8, 25.0 to 3.9 — and the full
+split's oldest interpreter is 3.6.9. It is the newest of the candidates rather than the
+oldest for a reason: the pins are 2020-era, but the legacy resolver still installs
+*today's* newest release of everything the files left unpinned, and a newer pip reads
+more of what those wheels declare.
+"""
+
+PIP_TOOL_SOURCE = "the legacy resolver's pip (every bug)"
+"""The ``source`` recorded for the ``pip`` pin, next to the toolchain's own label."""
+
+PIP_PIN_RULE = "the newest pip that still carries --use-deprecated=legacy-resolver"
+"""How the ``pip`` pin's version was chosen — a capability, never a date."""
+
+LEGACY_RESOLVER_FLAG = "--use-deprecated=legacy-resolver"
+"""Every install *after* the toolchain carries this, and the reason is below.
+
+[VANTA-WHY] One rule and not a flag per bug: a layer's environment *was* built by a pip
+of this era, so every install in it that resolves this bug's pins reproduces those
+semantics. The toolchain install is the one exception, and it is not an oversight: it is
+the install that *puts this pip there*, so it runs under the interpreter layer's seeded
+pip and there is nothing yet for the flag to change. The tolerance is not open-ended
+either — what the legacy resolver installs a conflict for is judged afterwards, by the
+``pip check`` gate at the end of the recipe (:func:`pip_check_conflicts`).
+"""
+
+PIP_CHECK_PREFIX = "VANTA-PIP-CHECK"
+"""The marker the layer's ``pip check`` lines carry into the build log."""
+
+PIP_CHECK_OUTPUT = "/opt/vanta-pip-check.txt"
+"""Where the layer keeps its own ``pip check`` output, next to the freeze (§3.2).
+
+The recipe echoes it back with :data:`PIP_CHECK_PREFIX` on every line, because a
+checkpoint is a filesystem and reading a file out of one means booting it
+(:data:`DEPS_DIRNAME`). The judgement is made on the host, in
+:func:`pip_check_conflicts`, which is where the layer's own-pin names are known.
+"""
+
+PIP_CHECK_KEY = "pip_check"
+"""The deps-provenance key the layer's ``pip check`` readings are recorded under."""
+
 
 class BakeError(RuntimeError):
     """A layer could not be baked or did not verify."""
@@ -2494,6 +2570,14 @@ def requirements_recipe(
     ``[Errno 2]`` this environment exists to prevent. A minor with no toolchain gets
     no exports, so such a layer's recipe is unchanged.
 
+    Every install **after** the toolchain carries :data:`LEGACY_RESOLVER_FLAG`, and the
+    toolchain call carries none because it is the install that puts
+    :data:`PIP_PIN_VERSION` there (both spelled out above the recipe). Then, before the
+    freeze, the layer runs ``pip check`` and echoes its output on
+    :data:`PIP_CHECK_PREFIX`-marked lines: the legacy resolver tolerates a conflict
+    between two of BugsInPy's own pins, and this is the reading that says which
+    conflicts it actually installed (:func:`pip_check_conflicts`).
+
     ``build_pins`` is keyword-only and empty by default so that a caller with nothing
     to build — and every test of the dependency half — still gets a recipe, and the
     recipe says so rather than pretending to a toolchain it was not given.
@@ -2518,10 +2602,12 @@ def requirements_recipe(
             "cat > /tmp/build-tools.txt <<'VANTA_BUILD_TOOLS'",
             "\n".join(toolchain),
             "VANTA_BUILD_TOOLS",
-            # The toolchain itself, and the only install here that keeps isolation:
-            # pip has to be able to *build* a pinned tool that has no wheel for the
-            # platform, and at this point there is nothing in the layer to build it
-            # against. Everything built after this line is built without isolation.
+            # The toolchain itself, and the only install here that keeps isolation (and
+            # the only one without the legacy-resolver flag): pip has to be able to
+            # *build* a pinned tool that has no wheel for the platform, and at this
+            # point there is nothing in the layer to build it against. It is also the
+            # install that puts the pinned pip there, so the flag could not apply to it
+            # even if it were otherwise safe.
             "python -m pip install --no-cache-dir -r /tmp/build-tools.txt",
         ]
     if build_requires:
@@ -2533,7 +2619,8 @@ def requirements_recipe(
             # call above: numpy is what failed there. Built against the toolchain
             # instead, so a source build sees the setuptools this tree was built
             # with rather than the one pip would fetch today.
-            "python -m pip install --no-cache-dir --no-build-isolation -r /tmp/build-req.txt",
+            "python -m pip install --no-cache-dir --no-build-isolation "
+            f"{LEGACY_RESOLVER_FLAG} -r /tmp/build-req.txt",
             _no_isolated_build_env("the build requirements"),
         ]
     if toolchain or build_requires:
@@ -2553,10 +2640,19 @@ def requirements_recipe(
             # cannot be measured, and it must fail here rather than mid-wave. A
             # dependency pulled transitively can itself be a source build, which is
             # why this install carries the flag too.
-            "python -m pip install --no-cache-dir --no-build-isolation -r /tmp/req.txt",
+            "python -m pip install --no-cache-dir --no-build-isolation "
+            f"{LEGACY_RESOLVER_FLAG} -r /tmp/req.txt",
             _no_isolated_build_env("the dependency install"),
         ]
     lines += [
+        # `pip check` reads what is *installed* and reports every requirement the
+        # installed set does not satisfy, which is the only thing that can say whether
+        # the legacy resolver left a contradiction behind. Its exit status is not the
+        # verdict: a conflict between two of BugsInPy's own pins is tolerated (§3.2),
+        # so the reading is taken here and judged on the host, where those names are
+        # known (:func:`pip_check_conflicts`).
+        f"python -m pip check > {PIP_CHECK_OUTPUT} 2>&1 || true",
+        _pip_check_echo(),
         "python -m pytest --version",
         "python -m pip freeze > /opt/vanta-deps-freeze.txt",
         f"touch {MARKER}",
@@ -2564,7 +2660,33 @@ def requirements_recipe(
     return "\n".join(lines)
 
 
-_BUILD_TOOL_NAMES = frozenset(canonicalize_name(name) for name in BUILD_TOOLS)
+_BUILD_TOOL_NAMES = frozenset(
+    canonicalize_name(name) for name in (*BUILD_TOOLS, PIP_TOOL)
+)
+"""The names the recipe's **first** install carries: the toolchain, plus ``pip`` itself.
+
+``pip`` is in the toolchain call and not in the declared-build-requirements one
+(:func:`_split_build_pins`) because that call is the first thing that runs, and the pip
+pin has to be in place before any install that wants
+:data:`LEGACY_RESOLVER_FLAG`.
+"""
+
+
+def _pip_check_echo() -> str:
+    """One shell line that copies the layer's ``pip check`` output into the build log.
+
+    The checkpoint holds :data:`PIP_CHECK_OUTPUT`, and nothing on the host can read it
+    back without booting the layer (:data:`DEPS_DIRNAME`) — so the recipe reads it out
+    as it goes, one :data:`PIP_CHECK_PREFIX`-marked line per ``pip check`` line. The
+    marker is what the host filters on; the trailing ``print()`` is there because a
+    ``pip check`` output that does not end in a newline would otherwise swallow the
+    next line the recipe prints.
+    """
+    return (
+        "python -c \"import sys; "
+        f"sys.stdout.writelines('{PIP_CHECK_PREFIX} ' + line "
+        f"for line in open('{PIP_CHECK_OUTPUT}')); print()\""
+    )
 
 
 def _split_build_pins(build_pins: Sequence[str]) -> tuple[list[str], list[str]]:
@@ -2574,8 +2696,10 @@ def _split_build_pins(build_pins: Sequence[str]) -> tuple[list[str], list[str]]:
     arrived in: a build requirement that is one of :data:`BUILD_TOOLS` (pandas
     declares Cython, matplotlib Cython and numpy) is installed by the toolchain call,
     because the second call is the one that has to run *against* the toolchain rather
-    than fetch it. :func:`resolve_build_pins` already orders the toolchain first, so
-    this only has to survive a caller that did not.
+    than fetch it. :data:`PIP_TOOL` is in the first group for a third reason — it is
+    the pip the second call's :data:`LEGACY_RESOLVER_FLAG` needs, so it cannot be
+    installed by that call. :func:`resolve_build_pins` already orders the toolchain
+    first, so this only has to survive a caller that did not.
     """
     toolchain: list[str] = []
     build_requires: list[str] = []
@@ -2766,6 +2890,18 @@ class ResolvedDep:
     requirement accepts this pytest" (:func:`plugin_pins`), and without the pytest it
     accepts, the same pin would look arbitrary.
     """
+    narrowed_by: tuple[tuple[str, str], ...] = ()
+    """The exact pins whose own declared requirements narrowed this date-rule choice.
+
+    [VANTA-WHY] §3.2's date rule answers "the newest release on or before this
+    declaration's date", and that answer is not always installable: ``httpcore==0.3.0``
+    declares ``h11==0.8.*``, so a layer holding both it and a date-picked ``h11`` is a
+    layer pip refuses. When an exact pin in the same layer declares a requirement on
+    this name, the newest release that satisfies *both* the declaration and the date is
+    the answer, and each ``(pin, specifier)`` pair here says which pin narrowed it and
+    with what — a departure from "newest before the date", so it is recorded the same
+    way :attr:`overridden` is.
+    """
 
     @property
     def pin_rule(self) -> str:
@@ -2778,10 +2914,17 @@ class ResolvedDep:
                 f"pytest=={self.chosen_for_pytest}"
             )
         if self.exempt:
-            return "BugsInPy's own exact pin, installed as written"
+            return BUGSINPY_PIN_RULE
         if self.fixed:
-            return "the newest release on or before the fixed commit's date"
-        return "the newest release on or before the buggy commit's date"
+            rule = "the newest release on or before the fixed commit's date"
+        else:
+            rule = "the newest release on or before the buggy commit's date"
+        if not self.narrowed_by:
+            return rule
+        narrowed = "; ".join(
+            f"{pin} declares {specifier}" for pin, specifier in self.narrowed_by
+        )
+        return f"{rule} that satisfies {narrowed}"
 
     def as_dict(self) -> dict[str, Any]:
         data = {
@@ -2799,6 +2942,10 @@ class ResolvedDep:
             data["pinned_by"] = self.pin_source
         if self.chosen_for_pytest:
             data["chosen_for_pytest"] = self.chosen_for_pytest
+        if self.narrowed_by:
+            data["narrowed_by"] = [
+                {"pin": pin, "requires": specifier} for pin, specifier in self.narrowed_by
+            ]
         if self.overridden:
             data["overridden"] = [
                 {"spec": spec, "source": source} for spec, source in self.overridden
@@ -2988,6 +3135,62 @@ def _newest_release(available: Mapping[str, str]) -> tuple[str, str]:
     )
 
 
+def _narrowing_requirements(
+    refs: Sequence[DepRef],
+    *,
+    metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
+) -> dict[str, list[tuple[str, str]]]:
+    """``{name: [(pin, specifier)]}`` — what this layer's exact pins require of each name.
+
+    [VANTA-WHY] The input to §3.2's case (a): only an **exact** pin can narrow a date-rule
+    choice, because only an exact pin's own version is settled by the requirement itself
+    (``httpcore==0.3.0``), and therefore only an exact pin's ``requires_dist`` can be read
+    *before* the date rule runs. A range pin's version is not known yet, so it declares
+    nothing that could be honoured here — and its own constraint is already in the merged
+    refs. ``_exact_version`` is the same predicate the merge uses to decide what a claim
+    can be settled on, so "an exact pin" means one thing in this file.
+
+    A requirement carrying a marker is skipped: ``foo>=1; extra == "test"`` is only
+    installed when the extra is asked for, and narrowing a layer's version on the word of
+    a conditional requirement would pin something the bug's own environment never held.
+    The conservative direction is deliberate — a conditional that *does* apply leaves a
+    conflict for the ``pip check`` gate to report (:func:`pip_check_conflicts`) rather
+    than a version chosen for a reason that cannot be checked.
+
+    An exact pin whose own declarations cannot be read narrows nothing and is passed
+    over, for the same conservative reason: what it asks for is unknown, and choosing a
+    version for an unread requirement is a choice nothing can check. The layer's
+    ``pip check`` still reads what pip installs, and the preflight still prints the pin
+    as unknown (:data:`CASE_UNKNOWN`) — ``httpcore==0.3.0`` is unreadable from PyPI and
+    is exactly this case, so its ``h11==0.8.*`` narrows nothing here and is caught after
+    the build instead.
+    """
+    out: dict[str, list[tuple[str, str]]] = {}
+    for ref in refs:
+        version = _exact_version(_specifier_of(ref))
+        if version is None:
+            continue
+        try:
+            requires, _ = metadata_of(ref.name, str(version))
+        except BakeError:
+            continue
+        for raw in requires:
+            try:
+                requirement = Requirement(raw)
+            except InvalidRequirement:
+                continue
+            if requirement.marker is not None:
+                continue
+            text = str(requirement.specifier)
+            if not text:
+                continue
+            name = canonicalize_name(requirement.name)
+            pair = (f"{ref.name}=={version}", text)
+            if pair not in out.setdefault(name, []):
+                out[name].append(pair)
+    return out
+
+
 def resolve_pins(
     refs: Sequence[DepRef],
     *,
@@ -2995,6 +3198,9 @@ def resolve_pins(
     commit_date: str,
     harness_pins: Mapping[str, str],
     buggy_commit: Optional[str] = None,
+    metadata_of: Optional[
+        Callable[[str, str], tuple[tuple[str, ...], Optional[str]]]
+    ] = None,
 ) -> list[ResolvedDep]:
     """Pin each dependency to the newest release on or before its declaration's date.
 
@@ -3034,7 +3240,23 @@ def resolve_pins(
     convenience: if the constraint has no release on or before the declaration's date,
     the bug cannot be rebuilt and the bake stops rather than installing today's
     version.
+
+    One qualification on "the newest release on or before the date", and it is §3.2's
+    case (a): when an **exact** pin elsewhere in this layer declares its own requirement
+    on this name, the newest release the *date* allows is not the answer if it is one
+    the other pin refuses — ``httpcore==0.3.0`` declares ``h11==0.8.*``, so a date-picked
+    ``h11`` has to be one that satisfies both. The narrowing is read from the exact pins'
+    ``requires_dist`` (``metadata_of``) and recorded
+    (:attr:`ResolvedDep.narrowed_by`) *only when it changed the answer*, so an ordinary
+    pin still reads as the plain date rule. ``metadata_of`` is optional for the same
+    reason ``releases`` is an argument: a caller that passes none gets the date rule with
+    nothing consulted, and every test of the rule itself stays offline.
     """
+    narrowed = (
+        _narrowing_requirements(refs, metadata_of=metadata_of)
+        if metadata_of is not None
+        else {}
+    )
     resolved: list[ResolvedDep] = []
     for ref in refs:
         requirement = _requirement(ref.spec, ref.source)
@@ -3078,6 +3300,7 @@ def resolve_pins(
             and (not requirement.specifier or Version(version) in requirement.specifier)
         ]
         exempt = reference_pin(ref)
+        narrowed_by: tuple[tuple[str, str], ...] = ()
         if exempt:
             pin_source = ref.pin_source or ref.source
             if not matching:
@@ -3091,8 +3314,8 @@ def resolve_pins(
                 )
         else:
             pin_source = ref.pin_source
-            matching = [item for item in matching if item[1][:10] <= cutoff]
-            if not matching:
+            dated = [item for item in matching if item[1][:10] <= cutoff]
+            if not dated:
                 newest = _newest_release(available)
                 raise BakeError(
                     f"{ref.source}: {ref.spec} has no release on or before {cutoff} "
@@ -3100,6 +3323,31 @@ def resolve_pins(
                     "The tree this requirement was declared in could not have been "
                     "built with it."
                 )
+            claims = narrowed.get(canonicalize_name(ref.name), [])
+            if claims:
+                wanted = [
+                    item
+                    for item in dated
+                    if all(Version(item[0]) in SpecifierSet(spec) for _, spec in claims)
+                ]
+                if not wanted:
+                    raise BakeError(
+                        f"{ref.source}: {ref.spec} has no release on or before {cutoff} "
+                        "that satisfies "
+                        + "; ".join(
+                            f"{pin} declaring {spec}" for pin, spec in claims
+                        )
+                        + " — two pins of this layer cannot both hold, and neither is "
+                        "BugsInPy's own, so nothing here can be installed as written "
+                        "(§3.2)"
+                    )
+                if wanted != dated:
+                    narrowed_by = tuple(claims)
+                    matching = wanted
+                else:
+                    matching = dated
+            else:
+                matching = dated
         version, released_at = max(matching, key=lambda item: Version(item[0]))
         resolved.append(
             ResolvedDep(
@@ -3115,6 +3363,7 @@ def resolve_pins(
                 commit_date=ref.commit_date,
                 fixed=fixed,
                 overridden=ref.overridden,
+                narrowed_by=narrowed_by,
             )
         )
     return resolved
@@ -3157,38 +3406,68 @@ def pypi_releases(name: str) -> dict[str, str]:
 
 PYPI_VERSION_JSON = "https://pypi.org/pypi/{name}/{version}/json"
 
+PYPI_SIDECAR_SUFFIX = ".metadata"
+"""PEP 658's published metadata file: the release file's URL plus this suffix.
 
-def pypi_release_metadata(name: str, version: str) -> tuple[tuple[str, ...], Optional[str]]:
-    """``(requires_dist, requires_python)`` for one release, from PyPI's JSON API.
+[VANTA-WHY] It exists because the version JSON's ``info.requires_dist`` is **not**
+readable for most of the dev split's pins. Measured against PyPI: it is ``null`` for
+``matplotlib==3.2.1`` — a release that declares five requirements — for
+``sqlalchemy==1.3.17``, ``numpy==1.18.4``, ``six==1.17.0``, ``pytz``, ``tornado``,
+``kiwisolver``, ``pillow``, ``pyparsing`` and every ``httpcore``/``hpack``/
+``hyperframe``/``hstspreload`` pin; across the split it is ``null`` for 60 of
+``sanic/1``'s 145 pins, 106 of ``luigi/1``'s 173, 21 of ``pandas/1``'s 42 and 5 of
+``matplotlib/1``'s 10. PyPI never returns ``[]``, so a ``null`` cannot be told apart
+from "declares nothing" by that field alone — which is why reading it as "requires
+nothing" (``requires_dist or ()``) was wrong for most of a layer, and why every caller
+that cannot read a release is now told so instead (:data:`CASE_UNKNOWN`). The sidecar
+is the same document pip itself reads, published beside the file, and it is where
+those declarations were measured from.
+"""
 
-    [VANTA-WHY] ``info.requires_dist`` is what the release itself declares, so "which
-    release of pytest-json-report accepts this pytest" is answered by the packages
-    rather than by a table in this file that would be stale the next time either of
-    them ships. Measured against PyPI: 1.5.0 declares ``pytest>=3.8.0``, 1.2.4
-    ``pytest>=4.2.0``, 0.3 ``pytest>=3.3.2``, and 0.1/0.2 declare no pytest
-    requirement at all — which is why httpie/1's ``pytest==3.2.1`` lands on 0.2.
-    Called only by the bake, like :func:`pypi_releases`.
+REQUIRES_DIST_HEADER = "requires-dist"
+"""The Core Metadata field that carries one requirement of a release."""
+
+WHEEL_METADATA_MEMBER = ".dist-info/METADATA"
+"""Where a wheel keeps the document the sidecar would have published."""
+
+
+def _requires_dist_fields(text: str) -> tuple[str, ...]:
+    """The ``Requires-Dist`` fields of a Core Metadata document.
+
+    Field-name-only matching, because this document is not the version JSON: PyPI's
+    sidecar writes the field in mixed case (``Requires-Dist:``), separates the value
+    with a colon, and the value is the requirement itself (``cycler (>=0.10)``).
+
+    A document with no such field is a genuine **empty** reading — the release declares
+    nothing — and not the unreadable case, which is why this returns a tuple and never
+    raises: measured, ``pytest-json-report==0.2``'s sidecar has no ``Requires-Dist`` at
+    all, and that is what keeps httpie/1's plugin pin at 0.2
+    (:func:`newest_accepting_pytest`).
     """
-    url = PYPI_VERSION_JSON.format(name=name, version=version)
-    try:
-        with urllib.request.urlopen(url, timeout=PYPI_TIMEOUT_SECS) as response:
-            payload = json.load(response)
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
-        raise BakeError(
-            f"cannot read metadata for {name}=={version} from {url}: {exc}"
-        ) from exc
+    out: list[str] = []
+    for line in text.splitlines():
+        field, sep, value = line.partition(":")
+        if not sep or field.strip().lower() != REQUIRES_DIST_HEADER:
+            continue
+        value = value.strip()
+        if value:
+            out.append(value)
+    return tuple(out)
 
-    info = payload.get("info")
-    if not isinstance(info, dict):
-        raise BakeError(f"{url} returned no 'info' mapping")
-    requires = info.get("requires_dist") or ()
-    if isinstance(requires, str):
-        requires = (requires,)
-    requires_python = info.get("requires_python")
-    return (
-        tuple(str(item) for item in requires),
-        str(requires_python) if requires_python else None,
-    )
+
+def _metadata_member(data: bytes) -> Optional[str]:
+    """The ``METADATA`` document inside a wheel, or ``None`` when it holds none."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            names = [
+                name for name in archive.namelist()
+                if name.endswith(WHEEL_METADATA_MEMBER)
+            ]
+            if not names:
+                return None
+            return archive.read(names[0]).decode("utf-8", errors="replace")
+    except (zipfile.BadZipFile, OSError, KeyError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -3199,6 +3478,15 @@ class PyPIFile:
     packagetype: str
     url: str = ""
     size: int = 0
+    core_metadata: bool = False
+    """Whether PyPI publishes this file's PEP 658 metadata beside it.
+
+    [VANTA-WHY] ``core-metadata`` in the version JSON is a *mapping* — the sidecar's
+    digest — when the file has one, and absent when it does not, so it is read for
+    truth and carried as a flag. The sidecar is that file's own URL with
+    :data:`PYPI_SIDECAR_SUFFIX` appended, which makes "is there one" a fact about the
+    release rather than a 404 to discover per file (:func:`pypi_sidecar_text`).
+    """
 
     @property
     def is_wheel(self) -> bool:
@@ -3211,8 +3499,29 @@ class PyPIFile:
         return self.packagetype == "sdist" or self.filename.endswith((".tar.gz", ".zip"))
 
 
+def _release_files(listed: Any) -> tuple[PyPIFile, ...]:
+    """The version JSON's ``urls`` list as :class:`PyPIFile`s.
+
+    Shared by the two readers of one release — what it can be installed as
+    (:func:`pypi_release_files`) and, when the JSON carries no declarations, which of
+    its files the metadata should be read from (:func:`declared_requires`) — so that
+    "what files does this release have" is answered once.
+    """
+    return tuple(
+        PyPIFile(
+            filename=str(item.get("filename") or ""),
+            packagetype=str(item.get("packagetype") or ""),
+            url=str(item.get("url") or ""),
+            size=int(item.get("size") or 0),
+            core_metadata=bool(item.get("core-metadata")),
+        )
+        for item in listed
+        if isinstance(item, dict)
+    )
+
+
 def pypi_release_files(name: str, version: str) -> Optional[tuple[PyPIFile, ...]]:
-    """Every file PyPI lists for one release, out of the same JSON as the metadata.
+    """Every file PyPI lists for one release, out of the release's version JSON.
 
     ``None`` when PyPI has no such release — an HTTP 404, which is an *answer* ("this
     release does not exist") and not a fetch that failed. The distinction is the whole
@@ -3245,16 +3554,154 @@ def pypi_release_files(name: str, version: str) -> Optional[tuple[PyPIFile, ...]
     listed = payload.get("urls")
     if not isinstance(listed, list):
         raise BakeError(f"{url} returned no 'urls' list")
-    return tuple(
-        PyPIFile(
-            filename=str(item.get("filename") or ""),
-            packagetype=str(item.get("packagetype") or ""),
-            url=str(item.get("url") or ""),
-            size=int(item.get("size") or 0),
-        )
-        for item in listed
-        if isinstance(item, dict)
+    return _release_files(listed)
+
+
+def pypi_sidecar_text(file: PyPIFile) -> Optional[str]:
+    """The PEP 658 metadata published beside one release file, or ``None`` for none.
+
+    ``None`` is "PyPI published no sidecar for this file", returned rather than raised
+    for the same reason :func:`pypi_release_files` returns ``None`` for a 404: it is an
+    *answer*, and the caller's next reading is the wheel itself
+    (:func:`wheel_metadata_text`). Measured, the sidecar is what makes the declarations
+    of ``matplotlib==3.2.1`` (``cycler (>=0.10)``, ``kiwisolver (>=1.0.1)``,
+    ``numpy (>=1.11)``, ``pyparsing (!=2.0.4,!=2.1.2,!=2.1.6,>=2.0.1)``,
+    ``python-dateutil (>=2.1)``), of ``sqlalchemy==1.3.17`` (extras only) and of
+    ``pytest-json-report==0.1``/``==0.2`` (nothing at all) readable, none of which the
+    version JSON carries.
+    """
+    url = file.url + PYPI_SIDECAR_SUFFIX
+    try:
+        with urllib.request.urlopen(url, timeout=PYPI_TIMEOUT_SECS) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise BakeError(
+            f"cannot read the metadata beside {file.filename}: {exc}"
+        ) from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise BakeError(f"cannot read the metadata beside {file.filename}: {exc}") from exc
+
+
+def wheel_metadata_text(file: PyPIFile) -> Optional[str]:
+    """The ``METADATA`` document inside one wheel, or ``None`` when it holds none.
+
+    The last resort for a release whose declarations the JSON does not carry and whose
+    sidecar PyPI did not publish, and it downloads the wheel to read them — the same
+    document the sidecar would have served without the download, which is why it is
+    second and not first. A wheel past :data:`SDIST_MAX_BYTES` is not read: it is the
+    same fuse the sdist listing uses, and a release past it is reported as unknown
+    rather than guessed at.
+    """
+    try:
+        with urllib.request.urlopen(file.url, timeout=PYPI_TIMEOUT_SECS) as response:
+            data, _ = _read_capped(response, SDIST_MAX_BYTES)
+    except (urllib.error.URLError, OSError) as exc:
+        raise BakeError(f"cannot download {file.filename}: {exc}") from exc
+    return _metadata_member(data)
+
+
+def declared_requires(
+    payload: Mapping[str, Any],
+    *,
+    name: str,
+    version: str,
+    sidecar_of: Callable[[PyPIFile], Optional[str]] = pypi_sidecar_text,
+    wheel_of: Callable[[PyPIFile], Optional[str]] = wheel_metadata_text,
+) -> tuple[str, ...]:
+    """What one release declares it needs, or :class:`BakeError` for "unknown".
+
+    [VANTA-WHY] Three readings in order, because the first is missing for most of the
+    split's pins (:data:`PYPI_SIDECAR_SUFFIX`):
+
+    #. ``info.requires_dist`` from the version JSON. Present means read — **including
+       when it is an empty list**, which is the release saying it needs nothing.
+    #. The PEP 658 sidecar of any file that carries one: the document pip itself
+       installs from, without downloading the file.
+    #. The ``METADATA`` inside the wheel, when the sidecar was not published.
+
+    None of the three reaching a document is a **raise** and not an empty tuple:
+    "could not be read" and "declares nothing" are different answers, and only one of
+    them may be written into a layer's pin list as "nothing to honour". ``httpcore==0.3.0``
+    is the pin this is for — sdist-only, no sidecar, ``requires_dist`` null — and the
+    layer's own ``pip check`` is what reads its ``h11==0.8.*``
+    (:func:`pip_check_conflicts`). ``setup.py`` is deliberately *not* executed to find
+    out: an sdist's declarations cannot be had without running the code that writes
+    them, and running a benchmark's build code during a preflight is not a reading. An
+    sdist-only release therefore reads as unknown, which is what the preflight prints
+    by name (:data:`CASE_UNKNOWN`) and what does not stop a bake.
+    """
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        raise BakeError(f"PyPI's entry for {name}=={version} has no 'info' mapping")
+    declared = info.get("requires_dist")
+    if declared is not None:
+        if isinstance(declared, str):
+            return (declared,)
+        return tuple(str(item) for item in declared)
+    listed = payload.get("urls")
+    files = _release_files(listed) if isinstance(listed, list) else ()
+    for file in files:
+        if not file.core_metadata:
+            continue
+        text = sidecar_of(file)
+        if text is not None:
+            return _requires_dist_fields(text)
+    for file in files:
+        if not file.is_wheel:
+            continue
+        text = wheel_of(file)
+        if text is not None:
+            return _requires_dist_fields(text)
+    raise BakeError(
+        f"PyPI carries no 'requires_dist' for {name}=={version}, and neither a wheel "
+        "nor a PEP 658 sidecar to read it from, so what it declares is unknown"
     )
+
+
+def pypi_release_metadata(
+    name: str,
+    version: str,
+    *,
+    sidecar_of: Callable[[PyPIFile], Optional[str]] = pypi_sidecar_text,
+    wheel_of: Callable[[PyPIFile], Optional[str]] = wheel_metadata_text,
+) -> tuple[tuple[str, ...], Optional[str]]:
+    """``(requires_dist, requires_python)`` for one release, from PyPI.
+
+    [VANTA-WHY] ``requires_dist`` is what the release itself declares, so "which release
+    of pytest-json-report accepts this pytest" is answered by the packages rather than
+    by a table in this file that would be stale the next time either of them ships.
+    Measured against PyPI: 1.5.0 declares ``pytest>=3.8.0``, 1.2.4 ``pytest>=4.2.0``,
+    0.3 ``pytest>=3.3.2``, and 0.1/0.2 declare no pytest requirement at all — those two
+    read from their sidecar, because their version JSON carries no ``requires_dist`` —
+    which is why httpie/1's ``pytest==3.2.1`` lands on 0.2.
+
+    The declarations come from :func:`declared_requires`, which reads the JSON first and
+    falls back to the published metadata. A release no reading reaches is a
+    :class:`BakeError`, and every caller answers one as "unknown" rather than as
+    "nothing" (:data:`CASE_UNKNOWN`): a layer is never told a pin declares no
+    requirements because nobody could read it. ``requires_python`` is the version JSON's
+    own field and is read whether or not the declarations came from there.
+
+    ``sidecar_of`` and ``wheel_of`` are injected so the fallback chain is a structural
+    test, the same way :func:`pypi_release_files`'s callers inject theirs. Called only
+    by the bake, like :func:`pypi_releases`.
+    """
+    url = PYPI_VERSION_JSON.format(name=name, version=version)
+    try:
+        with urllib.request.urlopen(url, timeout=PYPI_TIMEOUT_SECS) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise BakeError(
+            f"cannot read metadata for {name}=={version} from {url}: {exc}"
+        ) from exc
+
+    requires = declared_requires(
+        payload, name=name, version=version, sidecar_of=sidecar_of, wheel_of=wheel_of
+    )
+    requires_python = payload["info"].get("requires_python")
+    return requires, str(requires_python) if requires_python else None
 
 
 SDIST_MAX_BYTES = 64 * 1024 * 1024
@@ -3519,6 +3966,312 @@ def compiled_sources(members: Sequence[str]) -> tuple[str, ...]:
         for name in members
         if name.endswith(SDIST_COMPILED_SUFFIXES)
         and not SDIST_DATA_DIRS.intersection(name.split("/")[:-1])
+    )
+
+
+@dataclass(frozen=True)
+class PinConflict:
+    """Two requirements of one layer that cannot both be satisfied (§3.2).
+
+    [VANTA-WHY] The record of §3.2's two cases, and it is deliberately one type for
+    both directions they are found from: the preflight reads every pin's
+    ``requires_dist`` and compares it against the layer's other pins, and the layer's
+    own ``pip check`` reads what pip *actually installed*. Both produce the same
+    finding — "this pin declares a requirement this layer's other pin refuses" — and
+    the decision that follows is the same, so one shape and one spelling of
+    :attr:`case` keep the two from drifting.
+
+    ``case`` is which side of §3.2's rule the conflict falls on. ``"b"`` means **both**
+    sides are BugsInPy's own exact pins (:data:`BUGSINPY_PIN_RULE`): the environment
+    they were frozen from installed both with a warning, so
+    :data:`LEGACY_RESOLVER_FLAG` reproduces that and the conflict is tolerated —
+    recorded, printed, and not a failure. ``"a"`` is everything else, and it is a
+    failure: at least one side came from a decision this harness made (the date rule,
+    or pip's own choice of a transitive dependency), so a layer holding both is a layer
+    whose environment is not the benchmark's. ``"?"`` is not a conflict at all but the
+    *absence* of the reading: no document could be reached for one of the pins, so what
+    it declares is unknown (:data:`CASE_UNKNOWN`).
+
+    ``pins`` is the two ``name==version`` spellings the finding is about, in the order
+    it names them. It is carried because both readings produce prose
+    (``"httpcore==0.3.0 declares h11==0.8.*"``) and the preflight has to ask a data
+    question of it — is either side a pin §3.2's rule dropped? — that a sentence cannot
+    answer.
+    """
+
+    case: str
+    requires: str
+    """The declaration, e.g. ``httpcore==0.3.0 declares h11==0.8.*``."""
+    held: str
+    """What the layer has instead, e.g. ``h11==0.9.0`` — ``"nothing"`` if absent."""
+    source: str
+    """Where the reading came from: ``"pip check"`` or ``"PyPI metadata"``."""
+    pins: tuple[str, ...] = ()
+    """The ``name==version`` spellings the finding is between, e.g. ``("h11==0.9.0",)``."""
+
+    @property
+    def tolerated(self) -> bool:
+        """Whether §3.2 lets this layer keep the conflict: both sides its own pins."""
+        return self.case == CASE_BOTH_OWN_PINS
+
+    def describe(self) -> str:
+        """One line a reader can act on, with the case and the verdict in it."""
+        if self.case == CASE_UNKNOWN:
+            return f"case (?) unknown — {self.requires}"
+        verdict = (
+            "tolerated (both sides are BugsInPy's own pins, installed as written)"
+            if self.tolerated
+            else "not tolerated — a conflict with a pin this harness chose"
+        )
+        return f"case ({self.case}) {self.requires} but the layer has {self.held}: {verdict}"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "case": self.case,
+            "requires": self.requires,
+            "held": self.held,
+            "source": self.source,
+            "pins": list(self.pins),
+            "tolerated": self.tolerated,
+        }
+
+
+CASE_BOTH_OWN_PINS = "b"
+"""§3.2's case (b): both sides are BugsInPy's own exact pins, so it is tolerated."""
+
+CASE_HARNESS_CHOICE = "a"
+"""§3.2's case (a): one side is a version this harness chose, so the bake fails."""
+
+CASE_UNKNOWN = "?"
+"""Neither case: no reading reached one of the pins, so nothing could be checked.
+
+[VANTA-WHY] It is recorded rather than skipped, because "checked and clean" and "could
+not be checked" are different answers and only one of them is reassuring. It is not a
+failure either: the layer's own ``pip check`` (:func:`pip_check_conflicts`) reads what
+pip *did* install and is what the gate uses, so a pin whose declarations could not be
+read — ``httpcore==0.3.0``, sdist-only, no sidecar — has still been checked by the
+layer. ``httpcore==0.3.0``'s own ``h11==0.8.*`` is the measured example of why this
+case cannot be treated as "declares nothing": the version JSON carries no
+``requires_dist``, pip reads the requirement from the sdist at resolution, and only the
+layer's reading finds it.
+"""
+
+
+def own_pin_names(deps: Mapping[str, Any]) -> frozenset[str]:
+    """The canonical names this layer installs as BugsInPy's own exact pin.
+
+    [VANTA-WHY] Read off ``pin_rule`` rather than re-derived from the declarations: the
+    provenance already answered "was this pin written by BugsInPy's files or chosen
+    here", and :data:`BUGSINPY_PIN_RULE` is the one spelling of that answer
+    (:func:`reference_pin` writes it). A second predicate would let a conflict be
+    tolerated in the record and refused in the layer.
+
+    This is what decides :attr:`PinConflict.case` for a reading that only names
+    distributions — pip's ``pip check`` prose says nothing about where a version came
+    from — so it is the layer's own-dependency names, and *not* the interpreter layer's
+    harness pins: ``pytest`` is provisioned, not pinned as written, and a conflict
+    against it is not one the benchmark's own environment had.
+    """
+    return frozenset(
+        canonicalize_name(str(dep.get("name")))
+        for dep in deps.get("dependencies") or ()
+        if dep.get("pin_rule") == BUGSINPY_PIN_RULE
+    )
+
+
+def _conflict_case(*names: str, own: Container[str]) -> str:
+    """§3.2's case letter for a conflict between ``names`` — (b) only when all are own."""
+    if names and all(canonicalize_name(name) in own for name in names):
+        return CASE_BOTH_OWN_PINS
+    return CASE_HARNESS_CHOICE
+
+
+def pip_check_readings(output: str) -> tuple[str, ...]:
+    """The layer's own ``pip check`` lines, lifted out of its build output.
+
+    The recipe echoes :data:`PIP_CHECK_OUTPUT` on :data:`PIP_CHECK_PREFIX`-marked lines
+    because a checkpoint is a filesystem (:data:`DEPS_DIRNAME`); this is the host's half
+    of that, and it is the only place the marker is stripped back off.
+    """
+    return tuple(
+        line[len(PIP_CHECK_PREFIX) :].strip()
+        for line in output.replace("\r", "\n").splitlines()
+        if line.startswith(PIP_CHECK_PREFIX)
+    )
+
+
+_REQUIREMENT_PROSE = re.compile(
+    r"^(?P<package>\S+)\s+(?P<package_version>\S+)\s+"
+    r"(?:has requirement|requires)\s+(?P<requires>.+?)"
+    r"(?:,\s*but you have\s+(?P<held>\S+)\s+(?P<held_version>\S+?))?"
+    r"(?:,\s*which is not installed)?\.?$"
+)
+"""pip's ``pip check`` sentences, as one pattern.
+
+Two of them reach here and they differ only in the second half: ``A 1.0 has requirement
+B<2, but you have B 2.0.`` and ``A 1.0 requires B<2, which is not installed.`` Measured
+against pip 21.3.1's own ``check`` command. Both names come with their version — pip
+spells a distribution the way ``pip freeze`` does, ``h11 0.9.0`` — and both are captured
+because a finding is between two *versions*, not two names: the record spells them
+``name==version`` like every other pin in this file.
+
+Three details are the pattern rather than the shape of one sentence, and each was a
+measured misreading:
+
+* ``requires`` is ``.+?`` and not ``[^,]+?``: pip prints the specifier *as declared*, and
+  ``B>=0.8,<0.9`` carries the comma this file splits its two halves on. A requirement that
+  cannot contain one is what ``[^,]+?`` would have read as an unreadable line — case (a),
+  refused — over a conflict that is the benchmark's own.
+* ``held_version`` is lazy and the full stop is the pattern's own: with ``\\S+`` the
+  version came back as ``0.9.0.``, so a finding named a pin ``h11==0.9.0.`` that matches
+  nothing in the layer's install list and nothing in the dropped set.
+* ``requires`` is lazy for the same reason: it stops at the first place the tail of the
+  sentence can match, so the declaration is the requirement and not the requirement plus
+  the clause about what the layer has.
+
+Anything that does not match is kept as written and treated as case (a): a line this
+cannot read is not a line that says the conflict is tolerable.
+"""
+
+
+def pip_check_conflicts(
+    readings: Iterable[str], *, own: Container[str]
+) -> tuple[PinConflict, ...]:
+    """Judge a layer's ``pip check`` readings by §3.2's rule, in order.
+
+    ``own`` is the layer's :func:`own_pin_names`. Every conflict is returned, tolerated
+    or not — the record is what the deps JSON and the bake output carry — and
+    :attr:`PinConflict.tolerated` is the verdict the caller acts on.
+    """
+    out: list[PinConflict] = []
+    for line in readings:
+        text = line.strip()
+        if not text:
+            continue
+        match = _REQUIREMENT_PROSE.match(text)
+        if match is None:
+            out.append(
+                PinConflict(
+                    case=CASE_HARNESS_CHOICE,
+                    requires=text,
+                    held="nothing",
+                    source="pip check",
+                )
+            )
+            continue
+        package = match.group("package")
+        package_version = match.group("package_version")
+        held = match.group("held")
+        held_version = match.group("held_version")
+        out.append(
+            PinConflict(
+                case=_conflict_case(
+                    *(name for name in (package, held) if name), own=own
+                ),
+                requires=f"{package}=={package_version} declares "
+                f"{match.group('requires').strip()}",
+                held=f"{held}=={held_version}" if held else "nothing",
+                source="pip check",
+                pins=tuple(
+                    spelling
+                    for spelling in (
+                        f"{package}=={package_version}",
+                        f"{held}=={held_version}" if held else "",
+                    )
+                    if spelling
+                ),
+            )
+        )
+    return tuple(out)
+
+
+def metadata_conflicts(
+    pins: Sequence[tuple[str, str]],
+    *,
+    own: Container[str],
+    metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
+) -> tuple[PinConflict, ...]:
+    """Every conflict §3.2's cases can be read from the pins' own ``requires_dist``.
+
+    ``pins`` is one layer's ``(name, version)`` pairs (:func:`layer_pins`), and each
+    pin's ``requires_dist`` is compared against the *other* pins: a pin whose metadata
+    declares a requirement on a name this layer also pins, in a version that
+    requirement excludes, is the conflict — no install needed, which is the point of
+    doing it in the preflight.
+
+    ``metadata_of`` is injected so the check is a structural test, and it is also why a
+    release nothing could be read for is *recorded* (:data:`CASE_UNKNOWN`) rather than
+    guessed at or passed over: :func:`pypi_release_metadata` raises when neither the
+    version JSON, a wheel nor a sidecar carries the declarations
+    (:func:`declared_requires`), the check cannot say anything about that pin, and "no
+    conflicts found" must not be what a reader takes from an answer nobody was able to
+    compute. The layer's own ``pip check`` is the backstop for those pins, and it is the
+    reading the gate uses.
+    """
+    versions = {
+        canonicalize_name(name): version for name, version in pins
+    }
+    out: list[PinConflict] = []
+    for name, version in pins:
+        try:
+            requires, _ = metadata_of(name, version)
+        except BakeError as exc:
+            out.append(
+                PinConflict(
+                    case=CASE_UNKNOWN,
+                    requires=f"{name}=={version} — {exc}",
+                    held="unknown",
+                    source="PyPI metadata",
+                    pins=(f"{name}=={version}",),
+                )
+            )
+            continue
+        for raw in requires:
+            try:
+                requirement = Requirement(raw)
+            except InvalidRequirement:
+                continue
+            if requirement.marker is not None:
+                continue
+            other = canonicalize_name(requirement.name)
+            held = versions.get(other)
+            if held is None:
+                continue
+            try:
+                allowed = Version(held) in requirement.specifier
+            except InvalidVersion:
+                continue
+            if allowed:
+                continue
+            out.append(
+                PinConflict(
+                    case=_conflict_case(name, other, own=own),
+                    requires=f"{name}=={version} declares {requirement.specifier}",
+                    held=f"{other}=={held}",
+                    source="PyPI metadata",
+                    pins=(f"{name}=={version}", f"{other}=={held}"),
+                )
+            )
+    return tuple(out)
+
+
+def pip_check_failure(conflicts: Sequence[PinConflict]) -> ExecResult:
+    """A failed build's result, synthesised from the conflicts that stopped the layer.
+
+    The layer installed and its marker was written; what failed is the *gate* after it
+    (:func:`pip_check_conflicts`). It is reported through the same path a build failure
+    takes — every failed layer, one line each, its own log kept — so a conflict names
+    itself where the reader is already looking, rather than becoming a second kind of
+    failure with its own reporting. The leading ``ERROR:`` is the same prefix pip's own
+    fatal lines carry, which is what the one-line summary picks out
+    (:func:`last_error_line`).
+    """
+    body = "\n".join(conflict.describe() for conflict in conflicts)
+    return ExecResult(
+        stdout="",
+        stderr=f"ERROR: pip check found a conflict this layer may not keep:\n{body}",
+        exit_code=1,
+        timed_out=False,
     )
 
 
@@ -3799,6 +4552,30 @@ class PreflightBug:
     checkpoint: str
     python_minor: str
     pins: tuple[PreflightPin, ...]
+    conflicts: tuple[PinConflict, ...] = ()
+    """The pairs of pins whose own metadata contradict each other (§3.2's cases).
+
+    [VANTA-WHY] Read here rather than discovered by the layer's ``pip check``, because
+    the point of the preflight is to say it *before* the layer is built: ``sanic/1``'s
+    ``h11==0.9.0`` against ``httpcore==0.3.0``'s declared ``h11==0.8.*`` is a fact about
+    the two releases, available from PyPI, and a bake that learns it from
+    ``ResolutionImpossible`` has spent a build cycle on it. The layer's own reading is
+    still taken (:func:`pip_check_conflicts`) — the two are not the same check, and the
+    one that says what pip *did* is the one the gate uses.
+    """
+
+    @property
+    def refused(self) -> tuple[PinConflict, ...]:
+        """The conflicts §3.2 does not tolerate: at least one side is a harness choice.
+
+        Case (a) only. A case (?) reading is excluded because it is not a conflict at
+        all — nobody could read that pin — and calling it refused would fail a layer over
+        a fetch that did not happen.
+        """
+        return tuple(
+            conflict for conflict in self.conflicts
+            if conflict.case == CASE_HARNESS_CHOICE
+        )
 
     @property
     def target(self) -> str:
@@ -3837,6 +4614,7 @@ class PreflightBug:
             "target": self.target,
             "counts": self.counts(),
             "pins": [pin.as_dict() for pin in self.pins],
+            "conflicts": [conflict.as_dict() for conflict in self.conflicts],
         }
 
 
@@ -3876,30 +4654,77 @@ def preflight_classifier(
     return classify
 
 
+def cached_release_metadata(
+    *,
+    fetch: Callable[
+        [str, str], tuple[tuple[str, ...], Optional[str]]
+    ] = pypi_release_metadata,
+) -> Callable[[str, str], tuple[tuple[str, ...], Optional[str]]]:
+    """``(name, version) -> (requires_dist, requires_python)``, fetched once per run.
+
+    [VANTA-WHY] The same shape as :func:`preflight_classifier`, and for the same
+    reason: two places in one run ask what a release declares — §3.2's date rule, when
+    an exact pin narrows a name the date rule would otherwise pick freely
+    (:func:`_narrowing_requirements`), and the case-(a)/(b) check the preflight prints
+    (:func:`metadata_conflicts`) — and the splits share their pins heavily, so a second
+    cache would pay PyPI once per pin *per layer* for the same JSON. Keyed
+    ``(name, version)`` and not ``(name, version, python_minor)`` like the classifier's:
+    what a release declares does not depend on the interpreter reading it, and
+    ``requires_python`` — the one field that does — is part of the answer rather than
+    part of the key.
+
+    ``fetch`` is injected so a test can hand it a dict; the default is the network.
+    """
+    cache: dict[tuple[str, str], tuple[tuple[str, ...], Optional[str]]] = {}
+
+    def read(name: str, version: str) -> tuple[tuple[str, ...], Optional[str]]:
+        key = (name, version)
+        if key not in cache:
+            cache[key] = fetch(name, version)
+        return cache[key]
+
+    return read
+
+
 def preflight_layers(
     layers: Sequence[BugDeps],
     *,
     classify: Optional[Callable[[str, str, str], PreflightPin]] = None,
+    metadata_of: Callable[
+        [str, str], tuple[tuple[str, ...], Optional[str]]
+    ] = pypi_release_metadata,
 ) -> list[PreflightBug]:
     """Classify every pin of every layer, through one shared classifier.
 
     ``classify`` is the run's own :func:`preflight_classifier` when the caller has one —
     ``bake`` builds it once and hands the same instance to the drop decision and to this
     report — and a fresh one otherwise, so the cache still covers a whole call.
+
+    ``metadata_of`` is the second reading each layer gets, and it is §3.2's case-(a)/(b)
+    check: every pin's ``requires_dist``, against the layer's other pins
+    (:func:`metadata_conflicts`). It comes from the same reader the date rule narrows
+    itself with, so "what does this release declare" has one answer in the file —
+    ``bake`` therefore hands it the run's :func:`cached_release_metadata` instance,
+    which is also the one it gave :func:`resolve_bug_deps`, so a pin two layers hold is
+    fetched once for both readings. It is the uncached network by default, and every
+    test that calls this passes a stub.
     """
     classifier = classify or preflight_classifier()
 
     out: list[PreflightBug] = []
     for layer in layers:
         minor = minor_version(str(layer.entry["python_version"]))
+        pins = layer_pins(layer)
         out.append(
             PreflightBug(
                 key=f"{layer.entry['project']}/{layer.entry['bug_id']}",
                 checkpoint=layer.checkpoint,
                 python_minor=minor,
-                pins=tuple(
-                    classifier(name, version, minor)
-                    for name, version in layer_pins(layer)
+                pins=tuple(classifier(name, version, minor) for name, version in pins),
+                conflicts=metadata_conflicts(
+                    pins,
+                    own=own_pin_names(layer.provenance),
+                    metadata_of=metadata_of,
                 ),
             )
         )
@@ -3977,8 +4802,9 @@ def preflight_lines(
     no compiler and a noticed-disposition is a decision nobody has to take, so both live
     in the layer's ``.preflight.json`` and not on the terminal (§3.2). What is printed is
     what is still open — an unreviewed GAP, an UNBUILDABLE, an UNAVAILABLE pin the rule
-    did not take, and what it did take — and the pins' own reasons are in that JSON,
-    next to the provenance.
+    did not take, the pins whose own declarations contradict each other
+    (:func:`_conflict_sections`), and what the rule did take — and the pins' own reasons
+    are in that JSON, next to the provenance.
 
     ``dropped`` is ``{checkpoint: that layer's dropped records}``, read from the
     provenance the run just wrote; the records are the dicts, so the audit's sites are
@@ -4005,6 +4831,7 @@ def preflight_lines(
     lines += _section("unreviewed sdist build(s)", "GAP", gaps)
     lines += _section("unbuildable pin(s)", "UNBUILDABLE", blocked)
     lines += _section("pin(s) nothing can install", "UNAVAILABLE", unavailable)
+    lines += _conflict_sections(reports, dropped=dropped_pins)
     if dropped_pins:
         lines += ["", f"dropped pin(s) ({len(dropped_pins)}) — §3.2's rule, with the "
                       "audit that settled it:"]
@@ -4032,6 +4859,57 @@ def _section(title: str, label: str, findings: Mapping[str, Sequence[str]]) -> l
     return lines
 
 
+_CONFLICT_SECTIONS: Mapping[str, tuple[str, str]] = {
+    CASE_HARNESS_CHOICE: (
+        "pin conflict(s), §3.2 case (a) — one side is a version this harness chose, "
+        "so the layer cannot hold both",
+        "REFUSED",
+    ),
+    CASE_BOTH_OWN_PINS: (
+        "pin conflict(s), §3.2 case (b) — both sides are BugsInPy's own pins, "
+        "installed as written",
+        "TOLERATED",
+    ),
+    CASE_UNKNOWN: (
+        "pin(s) nothing could be read for — no PyPI 'requires_dist', no wheel "
+        "metadata, no PEP 658 sidecar — so what they declare is unknown, and their "
+        "layer's own pip check is the reading that covers them",
+        "UNKNOWN",
+    ),
+}
+
+
+def _conflict_sections(
+    reports: Sequence[PreflightBug], *, dropped: Container[str]
+) -> list[str]:
+    """§3.2's cases, one section each, in the order a reader needs them.
+
+    Case (a) first, because it is the only one that stops a layer: the two pins are
+    there, the requirement is in one of them, and the other does not satisfy it — so a
+    reader who reads one section reads that one. Then case (b), which is the benchmark's
+    own environment reproduced, and last the pins nobody could read.
+
+    A conflict with a **dropped** pin on either side is not printed: the layer will not
+    install that pin, so no pair is left to conflict — the same reason
+    (:func:`_unavailable_pins`) skips a dropped pin, and the drops have their own block
+    below with the audit that settled them.
+    """
+    grouped: dict[str, dict[str, list[str]]] = {
+        case: {} for case in _CONFLICT_SECTIONS
+    }
+    for report in reports:
+        for conflict in report.conflicts:
+            if any(spelling in dropped for spelling in conflict.pins):
+                continue
+            grouped[conflict.case].setdefault(
+                f"{conflict.requires} → {conflict.held}", []
+            ).append(report.key)
+    out: list[str] = []
+    for case, (title, label) in _CONFLICT_SECTIONS.items():
+        out += _section(title, label, grouped[case])
+    return out
+
+
 def preflight_verdict(
     reports: Sequence[PreflightBug],
     *,
@@ -4041,22 +4919,41 @@ def preflight_verdict(
     """One line: whether this split is ready to bake.
 
     Ready means there is nothing left for a human to decide *before* the first layer is
-    built: no unreviewed sdist build (§3.2's table) and no flagged bug (a bug whose
+    built: no unreviewed sdist build (§3.2's table), no **case (a)** pin conflict — two
+    pins of one layer whose own declarations contradict each other with a version this
+    harness chose on one side, which is the one conflict the layer's own ``pip check``
+    will refuse (:func:`pip_check_conflicts`) — and no flagged bug (a bug whose
     dependencies could not be resolved). A dropped pin is a decision already recorded and
     not a blocker; if dropping one broke a bug, that shows up as a **flagged** bug — or
     at ``prepare``, which measures the buggy/fixed flip for real and names the drops when
     the gate fails. Either way the counts are printed, because "not ready" without them
     says nothing a reader can act on.
+
+    Case (b) is not counted: it is the benchmark's own environment, tolerated on purpose
+    (:data:`CASE_BOTH_OWN_PINS`), and a verdict that called it "not ready" would be
+    asking for a decision §3.2 already took. A case (?) reading is not counted either —
+    it is a fetch that did not happen, not a conflict.
     """
-    gaps = _finding_pins(
-        reports, dropped=_dropped_pins(dropped or {}), finding="gap"
-    )
-    if not gaps and not flags:
+    dropped_pins = _dropped_pins(dropped or {})
+    gaps = _finding_pins(reports, dropped=dropped_pins, finding="gap")
+    conflicts = [
+        (report, conflict)
+        for report in reports
+        for conflict in report.refused
+        if not any(spelling in dropped_pins for spelling in conflict.pins)
+    ]
+    if not gaps and not conflicts and not flags:
         return "ready to bake"
     counts: list[str] = []
     if gaps:
         bugs = {key for keys in gaps.values() for key in keys}
         counts.append(f"{len(gaps)} unreviewed sdist build(s) across {len(bugs)} bug(s)")
+    if conflicts:
+        bugs = {report.key for report, _ in conflicts}
+        counts.append(
+            f"{len(conflicts)} pin conflict(s) across {len(bugs)} bug(s), none of them "
+            "§3.2 case (b)"
+        )
     if flags:
         counts.append(f"{flags} flagged bug(s)")
     return "not ready to bake: " + ", ".join(counts)
@@ -4761,12 +5658,22 @@ def newest_accepting_pytest(
     layer's interpreter is skipped, because pip would refuse it — measured:
     ``pytest-metadata`` 2.0.4 declares ``pytest>=3.0.0,<8.0.0`` and ``>=3.7,<4.0``, so
     on the Python 3.6 bugs (tqdm/1) the newest acceptable release is 1.11.0, not 2.0.4.
+
+    A release whose declarations cannot be read at all is skipped too, and that is the
+    difference the reader's fallback chain makes: ``declares nothing`` and ``could not
+    be read`` are the same shape to this loop and only the first may be read as
+    "accepts any pytest". Measured, the fallback is what keeps httpie/1 at
+    ``pytest-json-report==0.2``: 0.1 and 0.2 carry no ``requires_dist`` in their version
+    JSON, and their sidecar is the document that says they declare nothing.
     """
     wanted = Version(pytest_version)
     for version in sorted(
         (item for item in versions if _parseable(item)), key=Version, reverse=True
     ):
-        requires, requires_python = metadata_of(name, version)
+        try:
+            requires, requires_python = metadata_of(name, version)
+        except BakeError:
+            continue
         if requires_python and python_minor is not None:
             try:
                 allowed = Version(f"{python_minor}.0") in SpecifierSet(requires_python)
@@ -4944,6 +5851,12 @@ def resolve_deps(
     caller that passes none of it — every test that is about the date rule itself — gets
     the pins the declarations and the dates decide, with nothing dropped and nothing
     raised.
+
+    ``metadata_of`` does double duty: it is the plugin step's "what does this release
+    declare about pytest", and it is the *date rule's* case-(a) narrowing — what this
+    layer's exact pins declare about each other (:func:`_narrowing_requirements`). One
+    reader of ``requires_dist`` and not two, so a caller that passes none gets neither
+    consultation.
     """
     merged, conflicts = merge_refs(sources.refs)
     if conflicts:
@@ -4964,6 +5877,7 @@ def resolve_deps(
         commit_date=sources.commit_date,
         harness_pins=harness_pins,
         buggy_commit=sources.buggy_commit,
+        metadata_of=metadata_of,
     )
     own = own_pytest_pin(sources.refs, harness_pytest=harness_pins.get("pytest"))
     if own is not None:
@@ -5013,10 +5927,22 @@ class BuildPin:
     dependency set already pins *is* that pin, installed early — the record says which
     one it followed, so "why is numpy at this version" has one answer and not two.
     """
+    capability: bool = False
+    """Whether the version came from what the tool must be able to *do* (§3.2).
+
+    [VANTA-WHY] Exactly one pin is like this: :data:`PIP_TOOL`, installed because the
+    layer's environment needs a pip that still carries :data:`LEGACY_RESOLVER_FLAG`.
+    That is a property of the tool and not of the date the bug is from — the bug's own
+    date would name a pip from before the flag existed — so no release was fetched to
+    choose it, ``released_at`` is empty, and a reader comparing the two keys would
+    otherwise find a date that had no part in the decision.
+    """
 
     @property
     def pin_rule(self) -> str:
         """How the pinned version was chosen, in one phrase, for the provenance."""
+        if self.capability:
+            return PIP_PIN_RULE
         if self.dependency_pin is not None:
             return "the dependency set's pin for the same package"
         return BUILD_PIN_RULE
@@ -5041,10 +5967,15 @@ def resolve_build_pins(
     releases: Mapping[str, Mapping[str, str]],
     commit_date: str,
 ) -> list[BuildPin]:
-    """The build-time tools this layer installs first, each pinned by date.
+    """The build-time tools this layer installs first, each pinned.
 
-    Two kinds of name, one rule each:
+    Three kinds of name, one rule each:
 
+    * :data:`PIP_TOOL` — the one name pinned by **capability** rather than by date
+      (§3.2): the layer's environment is installed by a pip that still carries
+      :data:`LEGACY_RESOLVER_FLAG`, and that is what :data:`PIP_PIN_VERSION` records.
+      It needs no release lookup and would get a wrong answer from one, so it is
+      emitted first and the date rule is never reached for it.
     * :data:`BUILD_TOOLS` — setuptools, wheel and Cython, the toolchain every bug's
       layer gets, held to the **bug's** commit date. There is no declaration to read
       a date from: the question is "what was available when this tree was built".
@@ -5075,7 +6006,10 @@ def resolve_build_pins(
     declared: dict[str, list[DepRef]] = {}
     for ref in refs:
         declared.setdefault(canonicalize_name(ref.name), []).append(ref)
-    ordered: list[str] = [canonicalize_name(name) for name in BUILD_TOOLS]
+    ordered: list[str] = [
+        canonicalize_name(PIP_TOOL),
+        *(canonicalize_name(name) for name in BUILD_TOOLS),
+    ]
     for ref in refs:
         name = canonicalize_name(ref.name)
         if name not in ordered:
@@ -5083,6 +6017,18 @@ def resolve_build_pins(
 
     pins: list[BuildPin] = []
     for name in ordered:
+        if name == canonicalize_name(PIP_TOOL):
+            # No date and no release lookup: the pin is the capability, and ``sources``
+            # / ``releases`` have nothing to say about it.
+            pins.append(
+                BuildPin(
+                    name=PIP_TOOL,
+                    pin=f"{PIP_TOOL}=={PIP_PIN_VERSION}",
+                    source=PIP_TOOL_SOURCE,
+                    capability=True,
+                )
+            )
+            continue
         if name in HARNESS_PACKAGES:
             continue
         from_refs = declared.get(name, [])
@@ -5370,6 +6316,13 @@ def deps_provenance(
     always present, empty when nothing was dropped, because "nothing was dropped" and
     "this file predates the rule" have to be distinguishable by a reader — and a layer
     whose install list is shorter than its declarations needs the record of why.
+
+    ``pip_check`` (:data:`PIP_CHECK_KEY`) is the layer's **own** verdict on itself, read
+    from ``pip check`` after the install and written back here by
+    :func:`record_pip_check`. It starts empty and stays empty for a layer whose install
+    had nothing to report, which is most of them — and the preflight's reading of the
+    same question from PyPI's metadata is not this key: that one is in the layer's
+    ``.preflight.json``, and it is a prediction. This one is what pip did.
     """
     return {
         "schema_version": 1,
@@ -5398,6 +6351,7 @@ def deps_provenance(
         ],
         "optional_imports": [item.as_dict() for item in sources.optional_imports],
         "skipped": [line.as_dict() for line in sources.skipped],
+        PIP_CHECK_KEY: [],
         "notes": list(sources.notes),
     }
 
@@ -5507,6 +6461,14 @@ def resolve_bug_deps(
             # The build toolchain's names are fetched from PyPI too: they are pinned
             # by date like everything else, and a name the harness provides is left
             # alone (:func:`resolve_build_pins`).
+            #
+            # :data:`PIP_TOOL` is deliberately **not** here, and its absence is the
+            # whole of "the pip pin needs no release dates": it is pinned by capability
+            # — the newest release that still carries :data:`LEGACY_RESOLVER_FLAG` — and
+            # :func:`resolve_build_pins` emits it without ever reading ``releases``
+            # (§3.2). Fetching it would only add a name to a dict nothing looks it up
+            # in; the date rule would answer a question about that name that has
+            # nothing to do with why the version was chosen.
             build_names = sorted(
                 {
                     canonicalize_name(name)
@@ -5635,6 +6597,31 @@ def load_deps(deps_dir: Path, checkpoint: str) -> dict[str, Any]:
     if not isinstance(data, dict) or "installs" not in data:
         raise BakeError(f"{path} is not dependency provenance")
     return data
+
+
+def record_pip_check(
+    deps_dir: Path, checkpoint: str, conflicts: Sequence[PinConflict]
+) -> Path:
+    """Write a layer's own ``pip check`` conflicts back into its provenance.
+
+    [VANTA-WHY] Back into the file rather than into a new one, and after the build
+    rather than before it: the layer's reading exists only once pip has run, and
+    ``prepare`` reads one provenance per bug. A second file would be a second thing to
+    find, and the key is in :func:`deps_provenance` from the start precisely so that
+    "nothing to report" (``[]``) and "this file predates the reading" (absent) stay
+    distinguishable.
+
+    Rewrites the whole file through :func:`load_deps`, so a provenance that is not one
+    fails here the same way it fails everywhere else, and only :data:`PIP_CHECK_KEY` is
+    touched — every other key stays byte-for-byte what the bake resolved.
+    """
+    data = load_deps(deps_dir, checkpoint)
+    data[PIP_CHECK_KEY] = [conflict.as_dict() for conflict in conflicts]
+    path = deps_path(deps_dir, checkpoint)
+    path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return path
 
 
 def layer_pin(deps: Mapping[str, Any], name: str) -> Optional[str]:
@@ -6191,6 +7178,8 @@ def run_bake_actions(
     build: Callable[[str, str, str], ExecResult] = _bake_layer,
     log: Callable[[str], None] = print,
     logs_dir: Optional[Path] = None,
+    own_pins: Optional[Mapping[str, Container[str]]] = None,
+    record: Optional[Callable[[str, tuple[PinConflict, ...]], None]] = None,
 ) -> str:
     """Delete, then build every layer the plan asks for, and report what happened.
 
@@ -6229,9 +7218,23 @@ def run_bake_actions(
     failure report enough: the line says what happened, the file holds the two hundred
     lines above it. ``None`` writes nothing, which is what a structural test wants.
 
-    Injected ``exists``/``remove``/``build``/``log`` so the whole sequence is
+    ``own_pins`` and ``record`` are §3.2's own-pin gate. ``own_pins`` maps a layer's name
+    to the canonical names it installs as **BugsInPy's own** pins
+    (:func:`own_pin_names`); a layer the mapping does not name is not gated — the
+    interpreter layer has no provenance to read its own pins from, and its install set is
+    the harness's rather than the bug's. For a layer it does name, the layer's own
+    ``pip check`` output (:func:`pip_check_readings`) is judged by §3.2's cases
+    (:func:`pip_check_conflicts`): a case (b) conflict — both sides BugsInPy's own pins —
+    is logged and tolerated, a case (a) one becomes the layer's failure through
+    :func:`pip_check_failure`, and **every** conflict is handed to ``record`` so the deps
+    JSON carries what pip actually said. This is the gate and the preflight is the
+    prediction; a legacy-resolver install *succeeds* even when it is wrong, so nothing
+    else in the run would catch it.
+
+    Injected ``exists``/``remove``/``build``/``record``/``log`` so the whole sequence is
     a structural test rather than something only a real bake can exercise.
     """
+    own = own_pins or {}
     logs: dict[str, Path] = {}
     if logs_dir is not None:
         clear_bake_logs(logs_dir)
@@ -6249,6 +7252,25 @@ def run_bake_actions(
         log(f"[{action.name}] building from {action.base} — {action.reason}")
         attempted.append(action.name)
         result = build(action.name, action.script, action.base)
+        if result.ok and action.name in own:
+            conflicts = pip_check_conflicts(
+                pip_check_readings(result.stdout + result.stderr),
+                own=own[action.name],
+            )
+            for conflict in conflicts:
+                log(f"[{action.name}] {conflict.describe()}")
+            if conflicts and record is not None:
+                record(action.name, conflicts)
+            refused = tuple(
+                conflict
+                for conflict in conflicts
+                if conflict.case == CASE_HARNESS_CHOICE
+            )
+            if refused:
+                # The install succeeded and the marker is there; what failed is the
+                # gate after it. Reported through the same path a build failure takes,
+                # so a conflict names itself where the reader is already looking.
+                result = pip_check_failure(refused)
         if logs_dir is not None:
             logs[action.name] = write_bake_log(logs_dir, action.name, result)
             log(f"[{action.name}] build log: {logs[action.name]}")

@@ -382,9 +382,12 @@ def cmd_bake(args: argparse.Namespace) -> int:
     typo should not start one.
 
     Every ``--yes`` run starts with the preflight (§3.2): what each pin installs as
-    on this image, written next to the provenance and printed before the first layer
-    is built. ``--preflight-only`` stops after it, and does not need ``--yes`` — the
-    preflight builds nothing, and the pins it classifies are the same ones either way.
+    on this image — written next to the provenance and printed before the first layer
+    is built — and what each pin *declares* against the layer's other pins, which is
+    §3.2's case (a)/(b): a pair pip would refuse to install is then visible before the
+    build rather than as a layer that failed for a reason the summary had to guess at.
+    ``--preflight-only`` stops after it, and does not need ``--yes`` — the preflight
+    builds nothing, and the pins it classifies are the same ones either way.
 
     Every layer the build attempts leaves its whole output in
     ``runs/bugsinpy/bake-logs/<layer>.log`` (emptied at the start of each bake), and
@@ -445,8 +448,20 @@ def cmd_bake(args: argparse.Namespace) -> int:
     # for every answer, and the splits share their pins heavily — numpy alone is in six
     # of the eleven dev-split bugs.
     classify = bake_mod.preflight_classifier()
+    # One reader for the other question the two places ask about the same pins: what a
+    # release *declares*. §3.2's date rule reads it when an exact pin narrows a name the
+    # rule would otherwise pick freely, and the preflight's case-(a)/(b) check reads it
+    # for every pin of every layer. Sharing one instance means one fetch per
+    # ``name==version`` for the whole run, which matters because the two readings cover
+    # the same pins and the splits share them.
+    metadata_of = bake_mod.cached_release_metadata()
     bug_deps, flagged = bake_mod.resolve_bug_deps(
-        split, entries, bugsinpy_root=bugsinpy_root, repo_for=repo_for, classify=classify
+        split,
+        entries,
+        bugsinpy_root=bugsinpy_root,
+        repo_for=repo_for,
+        classify=classify,
+        metadata_of=metadata_of,
     )
 
     # Every run ends with this list, empty or not: a reader of a run that stopped at a
@@ -485,7 +500,9 @@ def cmd_bake(args: argparse.Namespace) -> int:
     # its sdist, and every system library that build needs is a whole bake cycle to
     # discover, so the answer is computed, printed and recorded next to the
     # provenance before anything is built.
-    preflight = bake_mod.preflight_layers(bug_deps, classify=classify)
+    preflight = bake_mod.preflight_layers(
+        bug_deps, classify=classify, metadata_of=metadata_of
+    )
     for report in preflight:
         path = bake_mod.write_preflight(deps_dir, report)
         print(f"[{report.checkpoint}] preflight: {path}", flush=True)
@@ -525,6 +542,12 @@ def cmd_bake(args: argparse.Namespace) -> int:
     # layer that failed can be read in full rather than through the one error line the
     # summary prints.
     logs_dir = RUNS_DIR / "bake-logs"
+    # §3.2's own-pin gate needs to know which pins are BugsInPy's own for the layer
+    # being built, and to write back what the layer's own ``pip check`` found. Both are
+    # per checkpoint and both come from the provenance this run just wrote.
+    own_pins = {
+        item.checkpoint: bake_mod.own_pin_names(item.provenance) for item in bug_deps
+    }
     try:
         summary = bake_mod.run_bake_actions(
             actions,
@@ -533,6 +556,10 @@ def cmd_bake(args: argparse.Namespace) -> int:
                 name, script, base=base, disk_mb=args.disk_mb
             ),
             logs_dir=logs_dir,
+            own_pins=own_pins,
+            record=lambda name, conflicts: bake_mod.record_pip_check(
+                deps_dir, name, conflicts
+            ),
         )
     except BaseException:
         report_flagged()

@@ -6011,6 +6011,418 @@ class TestEasyInstallGate:
 
 
 # ============================================================================
+# §3.2's closure rule — what a *release* declares is pinned by the date rule
+# ============================================================================
+class TestTheClosureWalk:
+    """``transitive_pins``: the half of a layer's environment no file declared.
+
+    ``fastapi/1`` measured the cost of leaving it out — ``exceptiongroup`` resolved by
+    pip itself, at the newest release of the day, into a layer of 2020. The walk reads
+    each release's own ``requires_dist`` (:func:`bake_mod.marker_applies` evaluating the
+    markers for the layer's platform) and pins every name nothing in the layer already
+    pins, by the same date rule, recording which pin required it.
+    """
+
+    PYTEST_802 = (
+        "iniconfig",
+        "packaging",
+        "pluggy <2.0,>=1.3.0",
+        'exceptiongroup >=1.0.0rc8 ; python_version < "3.11"',
+        'tomli >=1.0.0 ; python_version < "3.11"',
+        'colorama ; sys_platform == "win32"',
+    )
+    """``pytest 8.0.2``'s own ``requires_dist``, as PyPI lists it.
+
+    The interpreter layer's pytest, and the one that matters here because a layer
+    re-pinning pytest **inherits** its dependencies rather than losing them.
+    ``exceptiongroup`` is the measured ``fastapi/1`` name and is in this list.
+    """
+
+    @staticmethod
+    def _metadata_of(name: str, version: str):
+        """The plugin fixture's measured reader, plus the interpreter layer's pytest.
+
+        Every other release reads as *unreadable* (a :class:`bake_mod.BakeError`), which
+        is the real reader's contract and what most of these tests rely on: a release
+        nothing is known about describes nothing and does not fail the walk.
+        """
+        if (name, version) == ("pytest", "8.0.2"):
+            return TestTheClosureWalk.PYTEST_802, ">=3.8"
+        return TestTheReportPluginFollowsTheBugsPytest._metadata_of(name, version)
+
+    @staticmethod
+    def _fetch(name: str) -> dict:
+        try:
+            return _fixture_releases()[name]
+        except KeyError as exc:
+            raise bake_mod.BakeError(f"no release dates for {name}") from exc
+
+    def _walk(self, pins, *, harness_pins=None, cutoffs=None):
+        return bake_mod.transitive_pins(
+            pins,
+            harness_pins=harness_pins or {},
+            commit_date="2019-04-22",
+            python_minor="3.8",
+            releases=_fixture_releases(),
+            fetch=self._fetch,
+            metadata_of=self._metadata_of,
+            cutoffs=cutoffs,
+        )
+
+    def test_a_releases_own_declarations_are_pinned_by_the_date_rule(self):
+        pins, provided = self._walk(
+            (("pytest", "5.4.3"),), cutoffs={"pytest": "2020-04-09"}
+        )
+        assert [dep.pin for dep in pins] == [
+            "attrs==19.3.0",
+            "more-itertools==8.2.0",
+            "packaging==20.3",
+            "pluggy==0.13.1",
+            "py==1.8.1",
+            "wcwidth==0.1.9",
+        ]
+        assert provided == (), "with no harness pins there is nothing inherited"
+
+    def test_the_declarations_the_layer_cannot_have_are_not_pinned(self):
+        """Markers are evaluated for the layer: Windows-only and py<3.8 are not read."""
+        pins, _provided = self._walk(
+            (("pytest", "5.4.3"),), cutoffs={"pytest": "2020-04-09"}
+        )
+        names = {dep.name for dep in pins}
+        assert names.isdisjoint(
+            {"colorama", "atomicwrites", "importlib-metadata", "pathlib2"}
+        )
+        # The ``extra == 'testing'`` block: ``mypy`` and ``requests`` are declared by the
+        # same release and are not in the environment either — and neither has a release
+        # date in the fixture, so a walk that read them would raise instead of pass.
+        assert names.isdisjoint({"mypy", "requests", "nose", "hypothesis"})
+
+    def test_every_pick_names_the_pin_that_required_it(self):
+        pins, _provided = self._walk(
+            (("pytest", "5.4.3"),), cutoffs={"pytest": "2020-04-09"}
+        )
+        for dep in pins:
+            assert dep.required_by == ("pytest==5.4.3",)
+            assert dep.transitive
+            assert dep.pin_rule == bake_mod.TRANSITIVE_PIN_RULE == "transitive, date rule"
+            assert dep.commit_date == "2020-04-09", "the window is the requirer's own"
+            assert dep.as_dict()["required_by"] == ["pytest==5.4.3"]
+
+    def test_a_reference_pins_own_release_is_the_window_and_the_commit_date_is_not(self):
+        """Held to the bug's date the walk fails, and that is the point of the cutoff.
+
+        ``pytest==5.4.3`` declares ``pluggy (<1.0,>=0.12)`` and ``0.12.0`` landed
+        2019-05-27 — a month after a 2019-04-22 commit. There is no release to pick, and
+        the answer is a refusal rather than a fallback to a newer one, because the
+        fallback *is* what pip does on its own. Its own release date is what makes the
+        layer buildable (:func:`bake_mod.pin_cutoff`).
+        """
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._walk((("pytest", "5.4.3"),))
+        assert "pluggy" in str(excinfo.value)
+        assert "no release on or before 2019-04-22" in str(excinfo.value)
+
+    def test_what_the_interpreter_layer_holds_is_provided_and_not_pinned(self):
+        """The exemption :func:`bake_mod.unpinned_freeze` reads, and its exact rule.
+
+        The interpreter layer's ``pytest 8.0.2`` and ``pytest-json-report 1.5.0`` are
+        walked at the versions it has — through ``pytest``, which this layer re-pins,
+        because pip does not uninstall what it replaces — and the names this layer
+        decides for itself are taken back out: ``packaging`` and ``pluggy`` are in
+        both, so they are pins and not provisions.
+        """
+        pins, provided = self._walk(
+            (("pytest", "5.4.3"),),
+            harness_pins={"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
+            cutoffs={"pytest": "2020-04-09"},
+        )
+        assert provided == (
+            "exceptiongroup",
+            "iniconfig",
+            "pytest-json-report",
+            "pytest-metadata",
+            "tomli",
+        )
+        assert {dep.name for dep in pins} == {
+            "attrs",
+            "more-itertools",
+            "packaging",
+            "pluggy",
+            "py",
+            "wcwidth",
+        }, "a name this layer decides for itself is a pin, not a provision"
+        assert "pytest" not in provided, "the layer's own pin is not something it inherits"
+
+
+class TestPinCutoff:
+    """The date a pin's own requirements are held to (§3.2).
+
+    Neither date alone is right. A pin chosen by the date rule was released on or before
+    the date it was declared against, so for those the two agree; a BugsInPy reference
+    pin is installed *as written* and can name a release a year after the tree it is
+    used with, and its own requirements are **that** release's.
+    """
+
+    def _dep(self, **over) -> bake_mod.ResolvedDep:
+        base = dict(
+            name="pytest",
+            spec="pytest==5.4.3",
+            sources=("requirements.txt line 7",),
+            pin="pytest==5.4.3",
+            harness=False,
+        )
+        base.update(over)
+        return bake_mod.ResolvedDep(**base)
+
+    def test_a_date_rule_pin_is_held_to_the_date_it_was_pinned_against(self):
+        assert (
+            bake_mod.pin_cutoff(
+                self._dep(commit_date="2019-04-22", released_at="2019-03-01")
+            )
+            == "2019-04-22"
+        )
+
+    def test_a_reference_pin_is_held_to_its_own_release(self):
+        """``pytest==5.4.3`` under a 2019 commit: 2020-04-09, not 2019-04-22."""
+        assert (
+            bake_mod.pin_cutoff(
+                self._dep(commit_date="2019-04-22", released_at="2020-04-09")
+            )
+            == "2020-04-09"
+        )
+
+    def test_one_date_is_enough(self):
+        assert bake_mod.pin_cutoff(self._dep(released_at="2020-04-09")) == "2020-04-09"
+        assert bake_mod.pin_cutoff(self._dep(commit_date="2019-04-22")) == "2019-04-22"
+
+    def test_a_pin_with_no_dates_has_no_window_of_its_own(self):
+        assert bake_mod.pin_cutoff(self._dep()) is None
+
+
+# ============================================================================
+# §3.2's freeze gate — the reading that says the pin list described the layer
+# ============================================================================
+class TestUnpinnedFreeze:
+    """The layer's own ``pip freeze``, diffed against its pins (§3.2).
+
+    The preflight's closure walk is a *prediction*; this is the layer's own account of
+    what is in it, taken after the install, and it is the only place a name pip resolved
+    for itself is written: ``--use-deprecated=legacy-resolver`` installs whatever it is
+    given, so nothing earlier in the run sees what pip added.
+    """
+
+    @staticmethod
+    def _frozen(*lines: str) -> str:
+        return "".join(f"{bake_mod.PIP_FREEZE_PREFIX} {line}\n" for line in lines)
+
+    def test_the_reading_is_the_marked_lines_and_nothing_else(self):
+        output = (
+            "+ python -m pip freeze\n"
+            f"{bake_mod.PIP_FREEZE_PREFIX} exceptiongroup==1.3.1\n"
+            f"{bake_mod.PIP_FREEZE_PREFIX}\n"
+            f"{bake_mod.PIP_FREEZE_PREFIX}   pytest==8.0.2  \n"
+            "Looking in indexes: https://pypi.org/simple\n"
+            "Successfully installed httpcore-0.9.0\n"
+        )
+        assert bake_mod.freeze_readings(output) == (
+            "exceptiongroup==1.3.1",
+            "pytest==8.0.2",
+        )
+
+    def test_a_distribution_no_pin_names_is_reported(self):
+        output = self._frozen("httpcore==0.3.0", "exceptiongroup==1.3.1")
+        assert bake_mod.unpinned_freeze(output, pins=(("httpcore", "0.3.0"),)) == (
+            "exceptiongroup==1.3.1",
+        )
+
+    def test_a_pin_of_this_layer_is_not_reported_even_at_another_version(self):
+        """The version is not this gate's question — a fetched pin is (§3.2)."""
+        assert bake_mod.unpinned_freeze(
+            self._frozen("httpcore==0.9.0"), pins=(("httpcore", "0.3.0"),)
+        ) == ()
+
+    def test_a_name_the_interpreter_layer_supplies_is_exempt(self):
+        assert (
+            bake_mod.unpinned_freeze(
+                self._frozen("pytest==8.0.2"),
+                pins=(("httpcore", "0.3.0"),),
+                provided=("pytest",),
+            )
+            == ()
+        )
+
+    def test_the_comparison_is_by_name_through_pep_503(self):
+        """``pip freeze`` spells a project its own way; a pin keeps its file's."""
+        assert (
+            bake_mod.unpinned_freeze(
+                self._frozen("pyyaml==5.3.1", "More_Itertools==8.2.0"),
+                pins=(("PyYAML", "5.3.1"), ("more-itertools", "8.2.0")),
+            )
+            == ()
+        )
+
+    def test_a_direct_reference_reading_is_compared_on_its_name(self):
+        output = self._frozen(
+            "pytest @ file:///opt/wheels/pytest-8.0.2-py3-none-any.whl"
+        )
+        assert bake_mod.unpinned_freeze(output, pins=(), provided=("pytest",)) == ()
+
+    def test_pips_own_forms_are_not_names(self):
+        output = self._frozen(
+            "-e git+https://github.com/x/y.git#egg=y",
+            "# Editable install with no version control",
+        )
+        assert bake_mod.unpinned_freeze(output, pins=()) == ()
+
+    def test_the_failure_is_what_the_report_reads(self):
+        result = bake_mod.freeze_failure(("exceptiongroup==1.3.1",))
+        assert not result.ok
+        assert result.exit_code == 1
+        assert "exceptiongroup==1.3.1" in result.stderr
+        assert bake_mod.last_error_line(result.stdout + result.stderr).startswith(
+            "ERROR: this layer installed distributions its pin list does not name"
+        )
+
+
+class TestFreezeGate:
+    """The gate in the run: a layer that installed a name no pin of it names (§3.2).
+
+    Measured: ``fastapi/1`` baked green with ``exceptiongroup==1.3.1`` in it — pip
+    resolved it while installing the pins, the legacy resolver *succeeded*, the marker
+    was written, and the layer's own pin list did not mention it. Nothing before the
+    install could have refused it, which is why the reading is taken after.
+    """
+
+    CHILDREN = {"vanta-bi-Demo-1": PY38}
+
+    STRAY = f"{bake_mod.PIP_FREEZE_PREFIX} exceptiongroup==1.3.1\n"
+    PINS = {"vanta-bi-Demo-1": (("httpcore", "0.3.0"),)}
+
+    def _gate_run(
+        self, tmp_path, *, output, pins=None, provided=None, own_pins=None, logged=None
+    ):
+        logged = [] if logged is None else logged
+        logs = tmp_path / "bake-logs"
+        present: set[str] = set()
+
+        def build(name, script, base):
+            present.add(name)
+            if name == PY38:
+                return bake_mod.ExecResult(
+                    stdout="ok", stderr="", exit_code=0, timed_out=False
+                )
+            return bake_mod.ExecResult(
+                stdout=output, stderr="", exit_code=0, timed_out=False
+            )
+
+        def exists(name):
+            return name in present
+
+        def remove(name):
+            present.discard(name)
+
+        summary = bake_mod.run_bake_actions(
+            bake_mod.plan_layers(
+                _layers(PY38, "vanta-bi-Demo-1"),
+                force=True,
+                children=self.CHILDREN,
+                exists=exists,
+            ),
+            children=self.CHILDREN,
+            exists=exists,
+            remove=remove,
+            build=build,
+            log=logged.append,
+            logs_dir=logs,
+            own_pins=own_pins,
+            record=lambda name, conflicts: None,
+            pins=pins,
+            provided=provided,
+        )
+        return summary, logged, logs
+
+    def test_a_layer_that_installed_an_unpinned_distribution_fails_and_names_it(
+        self, tmp_path
+    ):
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._gate_run(tmp_path, output=self.STRAY, pins=self.PINS)
+        message = str(excinfo.value)
+        assert (
+            "vanta-bi-Demo-1: exit 1 — ERROR: this layer installed distributions its "
+            "pin list does not name" in message
+        ), "the one-line entry names the unnamed distribution, not pip's last line"
+        assert "nothing was left behind" in message, "the half-baked layer is not kept"
+        assert (
+            f"full build log: {bake_mod.bake_log_path(tmp_path / 'bake-logs', 'vanta-bi-Demo-1')}"
+            in message
+        )
+        text = bake_mod.bake_log_path(
+            tmp_path / "bake-logs", "vanta-bi-Demo-1"
+        ).read_text(encoding="utf-8")
+        assert f"{bake_mod.PIP_FREEZE_PREFIX} exceptiongroup==1.3.1" in text, (
+            "the reading the verdict rests on is the layer's own log"
+        )
+        assert text.index("exceptiongroup==1.3.1") < text.index(
+            "ERROR: this layer installed distributions"
+        ), "the verdict reads as what happened to that output"
+
+    def test_a_layer_whose_freeze_is_all_pins_or_provisions_passes(self, tmp_path):
+        output = (
+            f"{bake_mod.PIP_FREEZE_PREFIX} httpcore==0.3.0\n"
+            f"{bake_mod.PIP_FREEZE_PREFIX} pytest==8.0.2\n"
+        )
+        summary, logged, _logs = self._gate_run(
+            tmp_path,
+            output=output,
+            pins=self.PINS,
+            provided={"vanta-bi-Demo-1": ("pytest",)},
+        )
+        assert "[done] vanta-bi-Demo-1" in summary
+        assert not [line for line in logged if "unpinned" in line]
+
+    def test_the_inherited_leftover_is_exempt_here_and_pip_check_refuses_it(
+        self, tmp_path
+    ):
+        """``fastapi/1`` exactly: the exempt name is the one the conflict was about.
+
+        ``exceptiongroup`` came in with the interpreter layer's ``pytest 8.0.2``, so it
+        is a provision of the layer and not something this layer resolved — the freeze
+        gate cannot refuse it, and what refuses it is ``pip check`` on the contradiction
+        it makes with the layer's own ``typing-extensions`` (§3.2 case (a), the own-pin
+        gate above).
+        """
+        summary, logged, _logs = self._gate_run(
+            tmp_path,
+            output=self.STRAY,
+            pins=self.PINS,
+            provided={"vanta-bi-Demo-1": ("exceptiongroup",)},
+        )
+        assert "[done] vanta-bi-Demo-1" in summary
+        assert not [line for line in logged if "unpinned" in line]
+
+    def test_a_layer_the_pin_list_does_not_name_is_not_gated(self, tmp_path):
+        """The interpreter layer has no pin list of its own to be described by."""
+        summary, _logged, _logs = self._gate_run(tmp_path, output=self.STRAY)
+        assert "[done] vanta-bi-Demo-1" in summary
+
+    def test_the_freeze_gate_runs_after_the_own_pin_gate(self, tmp_path):
+        """One finding in the report, and it is the pins', not the freeze's."""
+        output = self.STRAY + (
+            f"{bake_mod.PIP_CHECK_PREFIX} {TestPinConflicts.PIP_CHECK_LINE}\n"
+        )
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            self._gate_run(
+                tmp_path,
+                output=output,
+                pins=self.PINS,
+                own_pins={"vanta-bi-Demo-1": frozenset({"httpcore"})},
+            )
+        message = str(excinfo.value)
+        assert "pip check found a conflict this layer may not keep" in message
+        assert "installed distributions its pin list does not name" not in message
+
+
+# ============================================================================
 # §3.2's unresolvable-pin rule — drop it with a record, or flag the bug
 # ============================================================================
 class TestUnresolvablePins:
@@ -6779,6 +7191,20 @@ class TestUnresolvablePins:
         )
 
 
+def _fixture_releases() -> dict:
+    """The release tables the resolution tests share: the date-rule fixture plus the
+    plugin pair.
+
+    [VANTA-WHY] Both, not the one a test is about: §3.2's closure walk starts at the
+    layer's own pins *and* descends the interpreter layer's provision
+    (``transitive_pins``), so ``pytest-json-report``'s own ``pytest-metadata`` is a name
+    a stubbed ``fetch`` is asked for in every test that resolves a bug at all.
+    """
+    releases = dict(TestResolvePinsByDate.RELEASES)
+    releases.update(TestTheReportPluginFollowsTheBugsPytest.RELEASES)
+    return releases
+
+
 def _resolve_with_drops(monkeypatch, *, refs):
     """``resolve_bug_deps`` over one fake source set, with the network taken out.
 
@@ -6804,7 +7230,7 @@ def _resolve_with_drops(monkeypatch, *, refs):
 
     def fetch(name):
         fetched.append(name)
-        return TestResolvePinsByDate.RELEASES[name]
+        return _fixture_releases()[name]
 
     monkeypatch.setattr(bake_mod, "bug_sources", fake_sources)
     split = split_mod.Split(split_data(bugs=[bug_entry(checkpoint="vanta-bi-Demo-1")]))
@@ -7352,6 +7778,21 @@ class TestResolvePinsByDate:
         "cython": {"0.29.6": "2019-03-10", "0.29.13": "2019-08-30"},
         # The interpreter layer's own pair, for the harness-provides branch.
         "pytest": {"5.4.3": "2020-04-09", "8.0.2": "2023-12-30"},
+        # pytest 5.4.3's own ``requires_dist``, for §3.2's closure walk: a layer that
+        # pins pytest itself has to pin what that pytest declares, because pip will
+        # resolve the rest of that release's requirements itself at today's version
+        # (``fastapi/1``'s ``exceptiongroup``). Every date is PyPI's (read back from the
+        # JSON API, not typed from memory), and the window they are read against is the
+        # *pin's* own release (§3.2, ``pin_cutoff``) and not the bug's: at the 2019-04-22
+        # commit date ``pluggy 0.12.0`` (2019-05-27) is a month *after* it, so the walk
+        # has no release to pick and refuses — which is what the reference pin's own
+        # release date (2020-04-09) is the cutoff for.
+        "py": {"1.8.0": "2019-02-22", "1.8.1": "2019-12-27"},
+        "packaging": {"19.0": "2019-01-20", "20.3": "2020-03-05"},
+        "attrs": {"19.1.0": "2019-03-03", "19.3.0": "2019-10-15"},
+        "more-itertools": {"7.0.0": "2019-03-28", "8.2.0": "2020-01-29"},
+        "pluggy": {"0.12.0": "2019-05-27", "0.13.1": "2019-11-21"},
+        "wcwidth": {"0.1.7": "2016-07-02", "0.1.8": "2020-01-02", "0.1.9": "2020-03-23"},
     }
 
     def _resolve(self, refs, *, commit_date="2019-04-22", harness_pins=None):
@@ -8089,9 +8530,7 @@ class TestTheFetchIncludesTheBugsOwnPytest:
     """
 
     def _releases(self) -> dict:
-        releases = dict(TestResolvePinsByDate.RELEASES)
-        releases.update(TestTheReportPluginFollowsTheBugsPytest.RELEASES)
-        return releases
+        return _fixture_releases()
 
     def _resolve(
         self, monkeypatch, *, refs, releases=None, classify=None, build_requires_of=None
@@ -8156,15 +8595,46 @@ class TestTheFetchIncludesTheBugsOwnPytest:
         # The plugin releases follow from the same pin, so they are fetched too.
         assert "pytest-json-report" in fetched
         assert "pytest-metadata" in fetched
+        # And pytest 5.4.3's own closure, which the layer now pins rather than letting
+        # pip resolve it at today's version (§3.2). The window is the *pin's* release
+        # (2020-04-09), not the bug's: at the bug's date there is no ``pluggy<1.0,>=0.12``
+        # old enough to pick at all.
         assert layers[0].installs == (
             "decorator==4.4.0",
             "pytest==5.4.3",
             "pytest-json-report==1.5.0",
             "pytest-metadata==2.0.4",
+            "attrs==19.3.0",
+            "more-itertools==8.2.0",
+            "packaging==20.3",
+            "pluggy==0.13.1",
+            "py==1.8.1",
+            "wcwidth==0.1.9",
         )
+        assert {
+            dep["name"]: dep["required_by"]
+            for dep in layers[0].provenance["dependencies"]
+            if dep.get("required_by")
+        } == {
+            "py": ["pytest==5.4.3"],
+            "packaging": ["pytest==5.4.3"],
+            "attrs": ["pytest==5.4.3"],
+            "more-itertools": ["pytest==5.4.3"],
+            "pluggy": ["pytest==5.4.3"],
+            "wcwidth": ["pytest==5.4.3"],
+        }
 
-    def test_a_bug_without_its_own_pin_fetches_none_of_the_three(self, monkeypatch):
-        """PySnooper/3, matplotlib/1-2 and the rest keep the interpreter layer's pair."""
+    def test_a_bug_without_its_own_pin_fetches_none_of_the_harness_pair(
+        self, monkeypatch
+    ):
+        """PySnooper/3, matplotlib/1-2 and the rest keep the interpreter layer's pair.
+
+        Neither ``pytest`` nor ``pytest-json-report`` is fetched: the interpreter layer's
+        versions are the ones the layer keeps, so there is no release to choose. The
+        plugin's own ``pytest-metadata`` is fetched — the provision walk descends
+        ``pytest-json-report``'s declarations to name what the layer inherits, which is
+        the exemption the freeze gate reads — and it is *not* installed for it.
+        """
         fetched, layers, flagged = self._resolve(
             monkeypatch,
             refs=[
@@ -8176,8 +8646,13 @@ class TestTheFetchIncludesTheBugsOwnPytest:
         assert flagged == []
         assert "pytest" not in fetched
         assert "pytest-json-report" not in fetched
-        assert "pytest-metadata" not in fetched
+        assert "pytest-metadata" in fetched
         assert layers[0].installs == ("decorator==4.4.0",)
+        assert set(layers[0].provenance["provisioned"]) == {
+            "pytest",
+            "pytest-json-report",
+            "pytest-metadata",
+        }
 
     def test_the_pin_a_build_needs_is_installed_early_and_carried_on_the_layer(
         self, monkeypatch
@@ -9760,7 +10235,22 @@ class TestRealPySnooperDependencies:
     ``python-toolbox``, and must not install the project itself.
     """
 
-    RELEASE_DATES = TestResolvePinsByDate.RELEASES
+    RELEASE_DATES = _fixture_releases()
+
+    @classmethod
+    def _fetch(cls, name: str) -> dict:
+        """Release dates for the fixture's names, and none for the rest.
+
+        [VANTA-WHY] The empty answer is for the interpreter layer's own closure and
+        nothing else: ``transitive_pins`` descends the *provision* of the real
+        ``pytest 8.0.2`` (read from PyPI's metadata, which this class does not stub) and
+        asks for the release dates of names like ``iniconfig`` only to find the newest
+        version to descend through. The provision has no date rule, so no dates is an
+        answer — but a name the layer's *own* pins declare would be refused with
+        ``no release on or before ...`` rather than quietly given a version, which is
+        what makes an empty mapping here safe.
+        """
+        return cls.RELEASE_DATES.get(name, {})
 
     def _entries(self) -> tuple[split_mod.Split, list[dict]]:
         split = load_split(SPLIT_PATH)
@@ -9791,7 +10281,7 @@ class TestRealPySnooperDependencies:
             entries,
             bugsinpy_root=BUGSINPY_CLONE,
             repo_for=lambda project: REPO_ROOT / "runs" / "bugsinpy" / "repos" / f"{project}.git",
-            fetch=lambda name: self.RELEASE_DATES[name],
+            fetch=self._fetch,
         )
 
     def _layers(self, entries):
@@ -10425,7 +10915,7 @@ class TestOneBugDoesNotStopTheBatch:
             split.bugs,
             bugsinpy_root=Path("/nonexistent"),
             repo_for=lambda project: Path("/nonexistent"),
-            fetch=lambda name: TestResolvePinsByDate.RELEASES[name],
+            fetch=lambda name: _fixture_releases().get(name, {}),
         )
 
     def test_the_bug_after_the_unreadable_one_is_still_resolved(self, monkeypatch):

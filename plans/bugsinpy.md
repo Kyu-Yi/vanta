@@ -1205,6 +1205,66 @@ to `bake.record_pip_check` and written back into the layer's `runs/bugsinpy/deps
 key is in `bake.deps_provenance` from the start, which keeps "nothing to report" (`[]`) and "this file
 predates the reading" (absent) distinguishable.
 
+**A pin's own `requires_dist` is pinned too, by the same date rule — or the layer is not the one its
+pin list describes.** Measured, and it is what `fastapi/1` failed on: `exceptiongroup==1.3.1` (2025) in a
+layer whose own pins hold `typing-extensions==3.7.4.2`, reported by the layer's `pip check` as a
+contradiction **no pin in it had declared**. Everything above pins what a *file* declared; pip also
+resolves what a *release* declares, at the newest release the day allows, and the date rule never saw
+that answer. So the preflight walks each pin's `requires_dist` (the same sidecar/wheel metadata chain as
+everywhere else — an sdist is still never executed) to the full transitive closure, with
+`bake.marker_applies` evaluating each marker against the **layer's** platform and never the host's
+(`packaging.markers.default_environment` answers for the Mac running the bake and would silently drop
+every `sys_platform`-conditional requirement). A name the layer already pins is *satisfied* and stops the
+walk; a name nothing pins is pinned by the date rule and the walk continues into *that* release's
+declarations. Each such pin carries `pin_rule: "transitive, date rule"` (`bake.TRANSITIVE_PIN_RULE`) and
+`ResolvedDep.required_by` — the pins whose releases declared it — so "this name is here because
+`pytest==5.4.3` requires it" is in the record rather than inferred. A name for which no release satisfies
+the claims raises a `BakeError`: falling back to a newer release is exactly what pip does on its own, and
+that fallback is the failure this rule exists to refuse. Two boundaries: a release whose declarations
+cannot be read describes nothing and is not evidence it requires nothing (the layer's own `pip check` is
+the backstop), and the layer's own settled pins still get the last word (`bake._chosen_release`), so a
+transitive pick cannot install a release one of them refuses.
+
+**The window is the requiring pin's own release, not the bug's date.** `bake.pin_cutoff` is the later of
+a pin's declaration date and the date its release landed. For a date-rule pin those agree. For a BugsInPy
+reference pin they do not, and the difference is load-bearing: `pytest==5.4.3` (2020-04-09) installed as
+written under a 2019-04-22 commit declares `pluggy (<1.0,>=0.12)`, whose oldest release is 2019-05-27 —
+held to the commit date the walk has nothing to pick and refuses the layer, i.e. it would flag the bug
+for a dependency the reference environment itself satisfies. A pin's requirements cannot pre-date the
+release that declares them, which is what the later date says. A transitive pick's cutoff is the newest
+of its requirers' cutoffs, the rule `bake.resolve_build_pins` already uses for the same reason.
+
+**What the layer inherits is the mirror of the closure, and it is the other half of the record.** The
+interpreter layer installs `pytest` and `pytest-json-report` and everything those releases require, and
+pip does not uninstall what it replaces: a layer re-pinning `pytest==5.4.3` over 8.0.2 leaves 8.0.2's own
+dependencies (`exceptiongroup`) in the environment. The provision walk therefore descends the closure of
+**every** harness pin *at the versions the interpreter layer has* — through names this layer re-pins, on
+purpose — and reports as `provisioned` the names that remain after removing every name this layer decides
+for itself. `bake.deps_provenance` writes them out, and they are the exemption the freeze gate reads
+below. What this layer's own pins reach is pinned **regardless** of the inheritance, in the other
+direction: `pytest 5.4.3`'s `pluggy (<1.0,>=0.12)` is pinned by pytest's own cutoff even though the
+interpreter layer holds a `pluggy` of its own, because a walk that stopped at a provisioned name would
+install pytest 5.4.3 over a pluggy it refuses. The layer's pins win; the leftovers are what is exempt.
+The set is a *prediction* of the interpreter layer's environment, used for its **names** — the one thing
+it cannot see is a name that appears or disappears with a release.
+
+**Every distribution the layer ends up holding has to be one its pin list names or the interpreter layer
+supplies.** The closure walk above is a prediction; the layer's own `pip freeze` is the reading, and it
+is the only place a name pip resolved for itself is written down, because
+`--use-deprecated=legacy-resolver` installs whatever it is given and *succeeds*. The recipe writes
+`pip freeze > /opt/vanta-deps-freeze.txt` after the last install and echoes it into the build log on
+marked lines (the same reason `pip check` is echoed: a checkpoint is a filesystem, so nothing on the host
+can read that file back without booting the layer). The host takes the **diff** — `bake.unpinned_freeze`,
+comparing by canonical name and not by version, since a pinned name installed at some other version is
+the different question the `easy_install` gate answers — exempting the pins of this layer and the
+`provisioned` names above, and a name in neither is a layer whose environment its provenance does not
+describe: it fails through `bake.freeze_failure`, reported through the same path a build failure takes,
+naming the distribution. It runs after the own-pin gate, because the two answer different questions —
+that one asks whether the pins can *hold* together, this one whether the pin list *describes* the layer —
+and `fastapi/1` is exactly the shape where only the second can see `exceptiongroup`: it is exempt here
+(it came in with the interpreter layer's `pytest 8.0.2`) and it is refused there, on the contradiction it
+makes with this layer's own `typing-extensions`.
+
 **The bug's own `pytest` pin wins, and the report plugin follows it.** Measured, and the reason this
 rule exists: all four dev-pilot bugs flagged on the same thing — fastapi/1 and luigi/1 pin
 `pytest==5.4.3`, pandas/1 `5.4.2`, sanic/1 `5.2.1`, in BugsInPy's own `requirements.txt` — while the

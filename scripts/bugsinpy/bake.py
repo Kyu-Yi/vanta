@@ -58,6 +58,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Container, Iterable, Mapping, Optional, Sequence
 
+from packaging.markers import UndefinedEnvironmentName
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
@@ -260,6 +261,33 @@ has to be recognised rather than read. It is matched exactly and not by prefix: 
 whose wording changed would fall back to the unreadable rule and stop the bake, which is
 the direction this gate has to fail in — but it would stop every layer at once, so a
 wording change must be a one-line change here and not a silent pass.
+"""
+
+DEPS_FREEZE_OUTPUT = "/opt/vanta-deps-freeze.txt"
+"""Where a layer keeps its own ``pip freeze``, next to ``pip check``'s output (§3.2)."""
+
+PIP_FREEZE_PREFIX = "VANTA-PIP-FREEZE"
+"""The marker the layer's ``pip freeze`` lines carry into the build log.
+
+[VANTA-WHY] The freeze is the only reading of a layer that names *every* installed
+distribution — the pins and whatever ``pip`` resolved besides them — and like
+:data:`PIP_CHECK_OUTPUT` it is a file inside the checkpoint, which cannot be read
+without booting it (:data:`DEPS_DIRNAME`). The recipe echoes it back line by line with
+this prefix and the diff is taken on the host (:func:`unpinned_freeze`), because that is
+where the pin list is known — a shell test inside the layer has nothing to compare to.
+"""
+
+TRANSITIVE_PIN_RULE = "transitive, date rule"
+"""The ``pin_rule`` of a pin the closure walk added, and not a declaration (§3.2).
+
+[VANTA-WHY] Every other pin in a layer exists because something in the bug's tree, or
+the build toolchain, or BugsInPy's ``requirements.txt``, named it. These exist because a
+*release* named them: ``pip`` resolves those itself, at the version of the day, and the
+date rule never sees them — ``fastapi/1`` measured the cost, an ``exceptiongroup==1.3.1``
+from 2025 in a layer whose own pins hold ``typing-extensions==3.7.4.2``. The walk
+(:func:`transitive_pins`) closes that gap by pinning the name itself, and the provenance
+has to say that the pin is not a declaration: hence a phrase of its own and
+:attr:`ResolvedDep.required_by` naming the pin that required it.
 """
 
 
@@ -1058,7 +1086,7 @@ def python_recipe(minor: str, pin: PytestPin) -> str:
             # numpy (toolchain_smoke_lines). Before the marker, so a smoke failure makes
             # `checkpoint_create` delete the layer rather than cache it.
             *toolchain_smoke_lines(build_env),
-            "python -m pip freeze > /opt/vanta-deps-freeze.txt",
+            f"python -m pip freeze > {DEPS_FREEZE_OUTPUT}",
             f"touch {MARKER}",
         ]
     )
@@ -2879,7 +2907,8 @@ def requirements_recipe(
         f"python -m pip check > {PIP_CHECK_OUTPUT} 2>&1 || true",
         _pip_check_echo(),
         "python -m pytest --version",
-        "python -m pip freeze > /opt/vanta-deps-freeze.txt",
+        f"python -m pip freeze > {DEPS_FREEZE_OUTPUT}",
+        _freeze_echo(),
         f"touch {MARKER}",
     ]
     return "\n".join(lines)
@@ -2911,6 +2940,23 @@ def _pip_check_echo() -> str:
         "python -c \"import sys; "
         f"sys.stdout.writelines('{PIP_CHECK_PREFIX} ' + line "
         f"for line in open('{PIP_CHECK_OUTPUT}')); print()\""
+    )
+
+
+def _freeze_echo() -> str:
+    """One shell line that copies the layer's ``pip freeze`` into the build log.
+
+    The same reading problem as :func:`_pip_check_echo`, one file over: the checkpoint
+    holds :data:`DEPS_FREEZE_OUTPUT` and the host cannot open it, so the recipe echoes
+    it out one :data:`PIP_FREEZE_PREFIX`-marked line per distribution. The judgement is
+    the *diff* against the pin list, which only the host can take
+    (:func:`unpinned_freeze`), so what the host needs from here is the reading and
+    nothing else — hence one marker, one line, no opinion.
+    """
+    return (
+        "python -c \"import sys; "
+        f"sys.stdout.writelines('{PIP_FREEZE_PREFIX} ' + line "
+        f"for line in open('{DEPS_FREEZE_OUTPUT}')); print()\""
     )
 
 
@@ -3144,12 +3190,31 @@ class ResolvedDep:
     record therefore names both what was skipped and which pin skipped it, which is the
     whole departure from "newest before the date".
     """
+    required_by: tuple[str, ...] = ()
+    """The pins in this layer that declared this name, when nothing else did (§3.2).
+
+    [VANTA-WHY] An empty tuple for a pin the tree declares — the ``sources`` and
+    ``spec`` say that story. It is non-empty only for a *transitive* pick: a name
+    ``pip`` would have resolved on its own, out of a release's own ``requires_dist``
+    and against the wheel of the day. ``fastapi/1`` is what that costs — ``pytest``
+    itself declares nothing about it and no pin in the layer names it, so the layer's
+    environment is described by a list that does not mention what is in it. Which pin
+    required it is the one thing a reader cannot recover from the pin, so it is
+    recorded here, and :attr:`pin_rule` says the version came from the date rule.
+    """
+
+    @property
+    def transitive(self) -> bool:
+        """Whether this pin exists because another pin's declarations required it (§3.2)."""
+        return bool(self.required_by)
 
     @property
     def pin_rule(self) -> str:
         """How the pinned version was chosen, in one phrase, for the provenance."""
         if self.harness:
             return "provisioned by the interpreter layer"
+        if self.transitive:
+            return TRANSITIVE_PIN_RULE
         if self.chosen_for_pytest:
             return (
                 "the newest release whose declared pytest requirement accepts "
@@ -3195,6 +3260,8 @@ class ResolvedDep:
         }
         if self.pin_source:
             data["pinned_by"] = self.pin_source
+        if self.required_by:
+            data["required_by"] = list(self.required_by)
         if self.chosen_for_pytest:
             data["chosen_for_pytest"] = self.chosen_for_pytest
         if self.narrowed_by:
@@ -3769,6 +3836,328 @@ def resolve_pins(
 
 
 PYPI_JSON = "https://pypi.org/pypi/{name}/json"
+
+
+TRANSITIVE_SOURCE = "required by this layer's own pins"
+"""The ``source`` on the synthetic reference a transitive pick is chosen through.
+
+It reaches the reader only through a :class:`BakeError` message — a transitive pick has
+no declaring source, which is the whole point of :attr:`ResolvedDep.required_by` — and it
+is written as "required by this layer's own pins" rather than as a file name so that a
+refusal names the pins in :attr:`ResolvedDep.required_by` and not a file: nothing in the
+bug's tree wrote the requirement.
+"""
+
+
+def marker_applies(requirement: Requirement, *, python_minor: str) -> bool:
+    """Whether ``requirement``'s own marker holds **inside** the layer (§3.2).
+
+    [VANTA-WHY] :func:`_narrowing_requirements` skips every marker, and for its question
+    that is right: a conditional requirement is not something to move a settled pin's
+    version on. The closure asks the other way round — what will pip put in the
+    environment — and there a marker *is* the question. ``exceptiongroup`` reaches a
+    py3.8 environment through ``pytest``'s ``python_version < "3.11"`` and through
+    nothing else, so a walk that skipped markers would describe an environment it cannot
+    see.
+
+    Evaluated against the layer's own platform and never the host's:
+    :func:`packaging.markers.default_environment` answers for the machine running the
+    bake, which is a Mac, and would silently drop every ``sys_platform``-conditional
+    requirement the layer really installs. Every standard variable is supplied, so the
+    only marker this cannot evaluate is one naming a variable that does not exist — a
+    package's own typo — and that is read as *not applying*: pip cannot evaluate it
+    either, and the freeze gate (:func:`unpinned_freeze`) is what names the distribution
+    if pip installed it anyway.
+    """
+    if requirement.marker is None:
+        return True
+    environment = {
+        "python_version": python_minor,
+        "python_full_version": f"{python_minor}.0",
+        "implementation_name": "cpython",
+        "implementation_version": f"{python_minor}.0",
+        "os_name": "posix",
+        "sys_platform": "linux",
+        "platform_machine": "aarch64",
+        "platform_python_implementation": "CPython",
+        "platform_release": "",
+        "platform_system": "Linux",
+        "platform_version": "",
+        "extra": "",
+    }
+    try:
+        return bool(requirement.marker.evaluate(environment))
+    except UndefinedEnvironmentName:
+        return False
+
+
+def _transitive_pin(
+    name: str,
+    claims: Sequence[tuple[str, str]],
+    cutoff: str,
+    *,
+    releases: Mapping[str, Mapping[str, str]],
+    settled: Mapping[str, tuple[str, str]],
+    metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
+) -> ResolvedDep:
+    """The pin for one transitively required name, by the date rule (§3.2).
+
+    ``claims`` is ``(requiring pin, specifier)`` for every pin in the layer that declared
+    this name, and the answer is the newest release on or before ``cutoff`` that
+    satisfies **all** of them — the same rule :func:`resolve_pins` applies to a
+    declaration, with the declarations of a release standing in for the declarations of
+    a file. The layer's own unsettled pins still get the last word
+    (:func:`_chosen_release`), so a transitive pick cannot install a release one of them
+    refuses any more than a declared pin can.
+
+    [VANTA-WHY] An empty claim set cannot happen — the walk only ever asks about a name
+    some pin declared — and no release satisfying the claims raises :class:`BakeError`
+    rather than falling back to a newer one: the fallback is exactly what pip would have
+    done on its own, and it is what put a 2025 ``exceptiongroup`` in a 2020 layer.
+    """
+    spec = " ".join(sorted({specifier for _, specifier in claims if specifier}))
+    matching = [
+        (version, date)
+        for version, date in releases.items()
+        if _parseable(version)
+        and date[:10] <= cutoff
+        and all(
+            not specifier or Version(version) in SpecifierSet(specifier)
+            for _, specifier in claims
+        )
+    ]
+    required_by = tuple(pin for pin, _ in claims)
+    if not matching:
+        raise BakeError(
+            f"{TRANSITIVE_SOURCE}: {name}{spec} has no release on or before {cutoff} "
+            f"(required by {'; '.join(required_by)}). Nothing here pins {name}, so pip "
+            "would resolve it itself, at the newest release of the day — which is the "
+            "layer this rule exists to refuse (§3.2)"
+        )
+    version, released_at, refused = _chosen_release(
+        DepRef(name=name, spec=spec or name, source=TRANSITIVE_SOURCE),
+        matching,
+        cutoff=cutoff,
+        settled=settled,
+        metadata_of=metadata_of,
+    )
+    return ResolvedDep(
+        name=name,
+        spec=spec,
+        sources=(),
+        pin=f"{name}=={version}",
+        harness=False,
+        released_at=released_at[:10],
+        commit_date=cutoff,
+        refused=refused,
+        required_by=required_by,
+    )
+
+
+def pin_cutoff(dep: ResolvedDep) -> Optional[str]:
+    """The date a pin's own requirements are held to (§3.2).
+
+    [VANTA-WHY] The **later** of the pin's declaration date and the date its release
+    landed, because neither alone is right. A pin chosen by the date rule was released
+    on or before the date it was declared, so for those the two agree and this is that
+    date. A BugsInPy reference pin is installed *as written* and is not held to the
+    date rule at all: ``pytest==5.4.3`` (2020-04-09) under a 2019-04-22 commit names a
+    release a year after the tree it is used with, and its own requirements are that
+    release's — holding them to the commit date would refuse ``pluggy<1.0,>=0.12``
+    (whose 0.12.0 landed 2019-05-27), i.e. flag the bug for a dependency the reference
+    environment itself could satisfy. A pin's requirements cannot pre-date the release
+    that declares them, which is what ``max`` says.
+
+    ``None`` for a pin with neither date: nothing can be said about its window, so the
+    caller falls back to the layer's own commit date (:func:`transitive_pins`).
+    """
+    dates = [date for date in (dep.commit_date, dep.released_at) if date]
+    return max(dates) if dates else None
+
+
+def transitive_pins(
+    pins: Sequence[tuple[str, str]],
+    *,
+    harness_pins: Mapping[str, str],
+    commit_date: str,
+    python_minor: str,
+    releases: Mapping[str, Mapping[str, str]],
+    fetch: Callable[[str], Mapping[str, str]],
+    metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
+    cutoffs: Optional[Mapping[str, str]] = None,
+) -> tuple[tuple[ResolvedDep, ...], tuple[str, ...]]:
+    """``(transitive pins, names the interpreter layer provides)``.
+
+    [VANTA-WHY] Everything else in this file pins what a *file* declared. This walks what
+    a *release* declares, because that is the half of a layer's environment the pin list
+    never described: pip resolves a pin's own ``requires_dist`` against PyPI at install
+    time, at the newest release that moment allows, and the date rule never sees the
+    answer. ``fastapi/1`` measured the cost — ``exceptiongroup==1.3.1`` (2025) came in
+    under a layer whose own pins hold ``typing-extensions==3.7.4.2``, and ``pip check``
+    refused the layer for a contradiction no pin in it had declared.
+
+    The walk starts at every pin the layer installs (:func:`pinned_parts`, build pins
+    first) and follows each release's own declarations, markers evaluated for the layer's
+    platform (:func:`marker_applies`), to the full transitive closure. A name that is
+    already pinned is *satisfied* and stops the walk; a name nothing pins is pinned by
+    the same date rule and the walk continues into **that** release's declarations
+    (:func:`_transitive_pin`, :data:`TRANSITIVE_PIN_RULE`).
+
+    The second half of the answer is the set of names this layer must **not** pin, and it
+    is why the walk cannot simply start from the pins: the environment it is building is
+    *inherited*. The interpreter layer installs ``pytest`` and ``pytest-json-report`` and
+    everything those releases require, and pip does not uninstall what it replaces — a
+    layer whose own ``requirements.txt`` pins ``pytest==5.4.3`` swaps the name out while
+    ``pytest 8.0.2``'s own dependencies stay behind. So the **whole** closure of the
+    harness pins is walked, at the versions the interpreter layer has, and every name the
+    layer's own pins do not decide for themselves is reported back as *provided*: those
+    are the names :func:`unpinned_freeze` exempts, because this layer neither installed
+    them nor wrote them down. The closure of a provisioned name is resolved at the newest
+    release and not by date, because the interpreter layer has no date rule — it is the
+    harness's own environment and pip built it out of the day it was baked. That makes
+    this set a *prediction* of the interpreter layer's environment: what it is used for is
+    the **names**, which is what :func:`unpinned_freeze` compares, and a name that appears
+    or disappears with a release is the one thing this cannot see.
+
+    What this layer's own pins reach is pinned **regardless** of the inheritance, in the
+    other direction: ``pytest 5.4.3`` declares ``pluggy (<1.0,>=0.12)`` and the
+    interpreter layer holds a ``pluggy`` of its own, so a walk that stopped at a
+    provisioned name would install pytest 5.4.3 over a pluggy it refuses. The names the
+    layer pins win; the leftovers are what is exempt.
+
+    ``cutoffs`` maps a canonical pin name to the date that pin's **own** requirements are
+    held to (:func:`pin_cutoff` — for a date-rule pin that is the date it was pinned
+    against, and for a reference pin installed as written it is that release's own date,
+    which is later); a name with no entry is held to ``commit_date``. A transitive pick's
+    cutoff is the **newest** of its requirers' cutoffs, the rule
+    :func:`resolve_build_pins` uses for the same reason: the requirement is the later
+    one's own, so holding it to the earlier date would refuse the release that
+    declaration's environment had.
+
+    Pure apart from ``fetch``, which is called only for a name whose release dates are
+    not already in ``releases``: the transitive picks, and the names the interpreter
+    layer's provision walk has to descend through. A test that passes everything it
+    needs never touches the network.
+    """
+    dates: dict[str, Mapping[str, str]] = dict(releases)
+    cutoffs = cutoffs or {}
+    settled: dict[str, tuple[str, str]] = {
+        canonicalize_name(name): (f"{name}=={version}", version)
+        for name, version in harness_pins.items()
+    }
+    for name, version in pins:
+        # After the harness entries: the bug's own pin is installed *over* the
+        # interpreter layer's version and is what the layer ends up holding.
+        settled[canonicalize_name(name)] = (f"{name}=={version}", version)
+    pinned = frozenset(canonicalize_name(name) for name, _ in pins)
+
+    def releases_of(name: str) -> Mapping[str, str]:
+        if name not in dates:
+            dates[name] = dict(fetch(name))
+        return dates[name]
+
+    def declarations(name: str, version: str) -> tuple[tuple[str, str], ...]:
+        """``((canonical name, specifier), ...)`` for one release's own requirements."""
+        try:
+            requires, _ = metadata_of(name, version)
+        except BakeError:
+            # A release whose declarations cannot be read describes nothing: it is not
+            # evidence that it requires nothing (httpcore==0.3.0 is read no other way),
+            # and the layer's own pip check is the backstop for what the walk missed.
+            return ()
+        out: list[tuple[str, str]] = []
+        for raw in requires:
+            try:
+                requirement = Requirement(raw)
+            except InvalidRequirement:
+                continue
+            if not marker_applies(requirement, python_minor=python_minor):
+                continue
+            out.append((canonicalize_name(requirement.name), str(requirement.specifier)))
+        return tuple(out)
+
+    # (A) Everything the interpreter layer is predicted to hold: the closure of **every**
+    # harness pin, at the version the interpreter layer has. Descending through a name
+    # this layer re-pins is not an oversight — pip does not uninstall what it replaces.
+    # ``pytest 8.0.2``'s own dependencies stay in the environment after a layer installs
+    # ``pytest 5.4.3`` over it, and that leftover is exactly what ``fastapi/1``'s ``pip
+    # check`` failure was made of (``exceptiongroup``).
+    inherited: set[str] = set()
+    walking: list[tuple[str, str]] = []
+    for name, version in harness_pins.items():
+        canonical = canonicalize_name(name)
+        if canonical in inherited:
+            continue
+        inherited.add(canonical)
+        walking.append((canonical, version))
+    while walking:
+        name, version = walking.pop()
+        for required, _ in declarations(name, version):
+            if required in inherited:
+                continue
+            inherited.add(required)
+            try:
+                available = releases_of(required)
+            except BakeError:
+                # The walk only wanted the version in order to descend; the *name* is
+                # what the set is for, and a release list that cannot be read is not
+                # evidence the interpreter layer lacks it. Recorded and not descended,
+                # which is the conservative direction: an over-large exemption is what
+                # the layer's own ``pip check`` then has to catch.
+                continue
+            if available:
+                walking.append(
+                    (required, max(available, key=lambda item: Version(item)))
+                )
+
+    # The layer's own closure. Claims are collected per name before a version is chosen
+    # for it — a name two pins declare is pinned once, against both — and a claim that
+    # arrives after a choice was made re-chooses it, so the answer does not depend on the
+    # order the pins were read in.
+    claims: dict[str, list[tuple[str, str]]] = {}
+    node_cutoffs: dict[str, set[str]] = {}
+    chosen: dict[str, str] = {}
+    records: dict[str, ResolvedDep] = {}
+    queue: list[tuple[str, str, str]] = [
+        (canonicalize_name(name), version, cutoffs.get(canonicalize_name(name), commit_date))
+        for name, version in pins
+    ]
+    read: set[tuple[str, str]] = set()
+    while queue:
+        name, version, cutoff = queue.pop()
+        if (name, version) in read:
+            continue
+        read.add((name, version))
+        for required, specifier in declarations(name, version):
+            if required in pinned:
+                continue
+            node_cutoffs.setdefault(required, set()).add(cutoff)
+            wanted = (f"{name}=={version}", specifier)
+            bucket = claims.setdefault(required, [])
+            if wanted not in bucket:
+                bucket.append(wanted)
+                bucket.sort()
+            required_cutoff = max(node_cutoffs[required])
+            record = _transitive_pin(
+                required,
+                claims[required],
+                required_cutoff,
+                releases=releases_of(required),
+                settled=settled,
+                metadata_of=metadata_of,
+            )
+            records[required] = record
+            if chosen.get(required) != record.pin.partition("==")[2]:
+                chosen[required] = record.pin.partition("==")[2]
+                queue.append((required, chosen[required], required_cutoff))
+    # (B) The exemption the freeze gate reads: the interpreter layer's names minus the
+    # ones this layer decides for itself. A name this layer pins is not "supplied" — the
+    # layer installs over it at a version of its own.
+    return (
+        tuple(records[name] for name in sorted(records)),
+        tuple(sorted(inherited - pinned - set(records))),
+    )
+
 PYPI_TIMEOUT_SECS = 60
 
 
@@ -4888,6 +5277,99 @@ def easy_install_failure(lines: Sequence[str]) -> ExecResult:
             "layer satisfies — and it must be installed before the build that wants it "
             "(:func:`early_install_pins`) — or nothing here pins it and the layer "
             "cannot be built from its own pins:\n" + body
+        ),
+        exit_code=1,
+        timed_out=False,
+    )
+
+
+def freeze_readings(output: str) -> tuple[str, ...]:
+    """The layer's own ``pip freeze`` lines, lifted out of its build output.
+
+    The host's half of :func:`_freeze_echo` and the only place :data:`PIP_FREEZE_PREFIX`
+    is stripped back off, the same way :func:`pip_check_readings` is for
+    :data:`PIP_CHECK_PREFIX`.
+    """
+    prefix = PIP_FREEZE_PREFIX
+    out: list[str] = []
+    for raw in output.replace("\r", "\n").splitlines():
+        line = raw.strip()
+        if not line.startswith(prefix):
+            continue
+        reading = line[len(prefix) :].strip()
+        if reading:
+            out.append(reading)
+    return tuple(out)
+
+
+def unpinned_freeze(
+    output: str,
+    *,
+    pins: Sequence[tuple[str, str]],
+    provided: Container[str] = (),
+) -> tuple[str, ...]:
+    """The distributions a layer installed that no pin of it names (§3.2).
+
+    [VANTA-WHY] The closure walk (:func:`transitive_pins`) pins what a *release*
+    declared, and this is what says the walk was complete. A name in the built layer
+    that is in neither the pin list nor the interpreter layer's provision is one pip
+    resolved by itself, out of the PyPI of the day — ``fastapi/1``'s
+    ``exceptiongroup==1.3.1``, which no file, no pin and no walk had asked for. A pin
+    list can only be as honest as the environment it describes, and the freeze is the
+    layer's own account of what is in it, taken after the install rather than derived
+    from the pins (`--use-deprecated=legacy-resolver` installs whatever it is given,
+    so nothing before this point sees what pip added).
+
+    Compared by **name**, through :func:`canonicalize_name` because ``pip freeze``
+    spells a project per PEP 503 while a pin keeps the spelling its file used. The
+    list's versions are the exact ``==`` pins the recipe installs, so a name on the
+    list is at the version on the list; a *pinned* name installed at some other
+    version is a different reading and a different gate
+    (:func:`easy_install_fetches`), and this one deliberately does not double as it.
+
+    ``provided`` is the names the interpreter layer supplies
+    (:func:`transitive_pins`): every layer stacked on it inherits them, no bug's pin
+    list mentions them, and without the exemption every layer would fail on
+    ``pytest``'s own neighbours. It is a prediction of that environment and not a
+    reading of it, which is what the interpreter layer's own freeze is kept for
+    (:func:`_freeze_echo`).
+
+    A line that is not a distribution — pip's editable-install forms start with ``-``
+    or ``#`` — is passed over: it is not a name to compare, and nothing here can say
+    what it provides.
+    """
+    named = {canonicalize_name(name) for name, _ in pins} | {
+        canonicalize_name(name) for name in provided
+    }
+    out: list[str] = []
+    for reading in freeze_readings(output):
+        if reading.startswith(("-", "#")):
+            continue
+        name = reading.partition("==")[0].partition(" @ ")[0].strip()
+        if not name or canonicalize_name(name) in named:
+            continue
+        out.append(reading)
+    return tuple(out)
+
+
+def freeze_failure(lines: Sequence[str]) -> ExecResult:
+    """A failed build's result, synthesised from the distributions no pin names (§3.2).
+
+    Through the same path :func:`pip_check_failure` and :func:`easy_install_failure`
+    use, and for the same reason: the layer installed and its marker was written, so
+    what failed is the gate after it, and reporting it here keeps one kind of failure
+    in the summary. The leading ``ERROR:`` is the prefix :func:`last_error_line` picks
+    out, so the one-line entry names this rather than pip's last line.
+    """
+    body = "\n".join(lines)
+    return ExecResult(
+        stdout="",
+        stderr=(
+            "ERROR: this layer installed distributions its pin list does not name, so "
+            "the layer is not the environment its provenance describes (§3.2). Every "
+            "name has to come from a pin of this layer or from the interpreter layer "
+            "it is stacked on; these came from neither, and pip resolved them itself "
+            "at the newest release the day allowed:\n" + body
         ),
         exit_code=1,
         timed_out=False,
@@ -7133,6 +7615,7 @@ def deps_provenance(
     build_pins: Sequence[BuildPin] = (),
     early: Sequence[EarlyInstall] = (),
     dropped: Sequence[DroppedPin] = (),
+    provisioned: Sequence[str] = (),
 ) -> dict[str, Any]:
     """What the bake decided for one bug, as data a later stage can read.
 
@@ -7195,6 +7678,16 @@ def deps_provenance(
     had nothing to report, which is most of them — and the preflight's reading of the
     same question from PyPI's metadata is not this key: that one is in the layer's
     ``.preflight.json``, and it is a prediction. This one is what pip did.
+
+    ``provisioned`` is the mirror of ``harness_pins``: the canonical names the
+    interpreter layer is predicted to hold and this layer neither pins nor picks
+    (:func:`transitive_pins`) — the harness pins, everything their releases require at
+    the versions the interpreter layer has, minus every name this layer decides for
+    itself. It is written down because the freeze gate (:func:`unpinned_freeze`) exempts
+    exactly these names from "this layer has to pin what it installs", and an exemption
+    nothing records is one no reader can check: a name here that the interpreter layer
+    does **not** in fact hold is a distribution this layer inherited from nowhere, which
+    is the failure the gate exists to catch and would otherwise be its blind spot.
     """
     return {
         "schema_version": 1,
@@ -7207,6 +7700,7 @@ def deps_provenance(
         "fixed_commit_date": sources.fixed_commit_date,
         "import_name": sources.import_name,
         "harness_pins": dict(harness_pins),
+        "provisioned": list(provisioned),
         "installs": list(installs_of(resolved)),
         "dropped": [pin.as_dict() for pin in dropped],
         "build_pins": [pin.as_dict() for pin in build_pins],
@@ -7433,11 +7927,48 @@ def resolve_bug_deps(
                 releases=releases,
                 commit_date=sources.commit_date,
             )
+            # The layer's own pin list, before the closure walk adds to it — the walk
+            # starts *at* these pins and stops at them, so a list that already held its
+            # own answer would be a list about itself.
+            build_specs = build_installs(built)
+            own_pins = pinned_parts(*build_specs, *installs_of(resolved))
+            # §3.2's closure walk, inside the ``try`` because a transitive requirement
+            # this image cannot satisfy is one bug's flag and not the batch's — the same
+            # answer ``resolve_deps``'s own refusal gets. ``cutoffs`` is per pin, not per
+            # layer: a pin's own requirements come from the release that pin *is*, so the
+            # window they are held to is that release's — which for a reference pin
+            # installed as written is later than the buggy commit, and for a build pin is
+            # its own release date (:func:`pin_cutoff`).
+            transitive, provisioned = transitive_pins(
+                own_pins,
+                harness_pins=harness_pins,
+                commit_date=sources.commit_date,
+                python_minor=minor,
+                releases=releases,
+                fetch=fetch,
+                metadata_of=metadata_of,
+                cutoffs={
+                    **{
+                        canonicalize_name(tool.name): tool.released_at
+                        for tool in built
+                        if tool.released_at
+                    },
+                    **{
+                        canonicalize_name(dep.name): date
+                        for dep in resolved
+                        if (date := pin_cutoff(dep)) is not None
+                    },
+                },
+            )
         except BakeError as exc:
             flagged.append(FlaggedBug(key=key, reason=f"{type(exc).__name__}: {exc}"))
             continue
-        installs = installs_of(resolved)
-        build_specs = build_installs(built)
+        # The transitive picks are installed, recorded and gated exactly as the declared
+        # ones are: they are the same kind of pin, chosen by the same rule, and the only
+        # thing that distinguishes them is that no file in the bug's tree asked for them
+        # (:attr:`ResolvedDep.required_by`).
+        deps = (*resolved, *transitive)
+        installs = installs_of(deps)
         pins = pinned_parts(*build_specs, *installs)
         early = early_install_pins(
             tuple(
@@ -7455,11 +7986,12 @@ def resolve_bug_deps(
                 installs=installs,
                 provenance=deps_provenance(
                     sources,
-                    resolved,
+                    deps,
                     harness_pins=harness_pins,
                     build_pins=built,
                     early=early,
                     dropped=dropped,
+                    provisioned=provisioned,
                 ),
                 build_pins=build_specs,
                 # Spec strings, not ``pinned_parts``' ``(name, version)`` pairs: the
@@ -8125,6 +8657,8 @@ def run_bake_actions(
     logs_dir: Optional[Path] = None,
     own_pins: Optional[Mapping[str, Container[str]]] = None,
     record: Optional[Callable[[str, tuple[PinConflict, ...]], None]] = None,
+    pins: Optional[Mapping[str, Sequence[tuple[str, str]]]] = None,
+    provided: Optional[Mapping[str, Container[str]]] = None,
 ) -> str:
     """Delete, then build every layer the plan asks for, and report what happened.
 
@@ -8193,8 +8727,24 @@ def run_bake_actions(
 
     Injected ``exists``/``remove``/``build``/``record``/``log`` so the whole sequence is
     a structural test rather than something only a real bake can exercise.
+
+    ``pins`` and ``provided`` are §3.2's freeze gate. ``pins`` maps a layer's name to its
+    own pin list (:func:`layer_pins`) and ``provided`` to the names the interpreter layer
+    supplies it (:func:`transitive_pins`, recorded as ``provisioned`` in the provenance);
+    a layer the first of them does not name is not gated. What the gate reads is the
+    layer's ``pip freeze`` (:func:`unpinned_freeze`): every installed distribution has to
+    be a pin of this layer or something the interpreter layer provides, and a name in
+    neither is one pip resolved from the day's PyPI and failed through
+    :func:`freeze_failure`. It runs after the own-pin gate because the two answer
+    different questions — that one asks whether the pins can *hold* together, this one
+    whether the pin list *describes* the layer — and it is the preflight's
+    :func:`transitive_pins` that should make it pass: the walk pins what a release
+    declared, so a name here is a declaration the walk could not read (an sdist with no
+    metadata) rather than one it missed.
     """
     own = own_pins or {}
+    pin_lists = pins or {}
+    supplied = provided or {}
     logs: dict[str, Path] = {}
     if logs_dir is not None:
         clear_bake_logs(logs_dir)
@@ -8245,6 +8795,20 @@ def run_bake_actions(
                     # takes, so a conflict names itself where the reader is already
                     # looking.
                     verdict = pip_check_failure(refused)
+                    result = verdict
+            if verdict is None and action.name in pin_lists:
+                # The layer's own account of what it holds, after the install and not
+                # from the pins: a legacy-resolver install succeeds whatever it is
+                # given, so a name pip resolved itself is written nowhere else (§3.2).
+                unpinned = unpinned_freeze(
+                    built.stdout + built.stderr,
+                    pins=pin_lists[action.name],
+                    provided=supplied.get(action.name, ()),
+                )
+                if unpinned:
+                    for line in unpinned:
+                        log(f"[{action.name}] unpinned: {line}")
+                    verdict = freeze_failure(unpinned)
                     result = verdict
         if logs_dir is not None:
             logs[action.name] = write_bake_log(

@@ -563,6 +563,15 @@ def cmd_bake(args: argparse.Namespace) -> int:
     own_pins = {
         item.checkpoint: bake_mod.own_pin_names(item.provenance) for item in bug_deps
     }
+    # The freeze gate's two halves, from the same provenance: the layer's own pin list,
+    # which is what the layer's ``pip freeze`` has to be a subset of, and the names the
+    # interpreter layer supplies it with, which no pin of the bug's mentions and which
+    # every layer therefore inherits without pinning.
+    pin_lists = {item.checkpoint: bake_mod.layer_pins(item) for item in bug_deps}
+    provided = {
+        item.checkpoint: item.provenance.get("provisioned") or ()
+        for item in bug_deps
+    }
     try:
         summary = bake_mod.run_bake_actions(
             actions,
@@ -575,6 +584,8 @@ def cmd_bake(args: argparse.Namespace) -> int:
             record=lambda name, conflicts: bake_mod.record_pip_check(
                 deps_dir, name, conflicts
             ),
+            pins=pin_lists,
+            provided=provided,
         )
     except BaseException:
         report_flagged()

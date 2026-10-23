@@ -385,6 +385,11 @@ def cmd_bake(args: argparse.Namespace) -> int:
     on this image, written next to the provenance and printed before the first layer
     is built. ``--preflight-only`` stops after it, and does not need ``--yes`` — the
     preflight builds nothing, and the pins it classifies are the same ones either way.
+
+    Every layer the build attempts leaves its whole output in
+    ``runs/bugsinpy/bake-logs/<layer>.log`` (emptied at the start of each bake), and
+    each failed layer's one-line entry in the failure report names its own error and
+    points at that file.
     """
     split = load_split(args.split.resolve())
     pythons = parse_pythons(args.pythons, split)
@@ -515,6 +520,11 @@ def cmd_bake(args: argparse.Namespace) -> int:
     for action in actions:
         print(f"  {action.describe()}", flush=True)
 
+    # Every layer's whole build log is written here by run_bake_actions, and the
+    # directory is emptied first, so what it holds is always this bake's logs and a
+    # layer that failed can be read in full rather than through the one error line the
+    # summary prints.
+    logs_dir = RUNS_DIR / "bake-logs"
     try:
         summary = bake_mod.run_bake_actions(
             actions,
@@ -522,6 +532,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             build=lambda name, script, base: bake_mod.bake(
                 name, script, base=base, disk_mb=args.disk_mb
             ),
+            logs_dir=logs_dir,
         )
     except BaseException:
         report_flagged()

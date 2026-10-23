@@ -3721,9 +3721,22 @@ class TestRunBakeActions:
                 # command's failure is reported, so a failed build leaves a name
                 # behind. ``checkpoint_create`` deletes it; this asserts that if that
                 # delete does not take, the name does not survive as "baked".
+                #
+                # The two lines are the shape of a real failure's output, and the
+                # reason the report reads it the way it does: the inner command's own
+                # ``ERROR:`` line is what names the failure, and shuru's
+                # ``checkpoint … saved`` is *below* it and names nothing. Reported as
+                # "the last meaningful line" before that, this layer's whole reason was
+                # ``shuru: checkpoint 'vanta-bi-Demo-1' saved``.
                 self.present.add(name)
                 return bake_mod.ExecResult(
-                    stdout="", stderr=f"shuru: refusing to build {name}", exit_code=1, timed_out=False
+                    stdout="",
+                    stderr=(
+                        f"ERROR: Cannot install {name}'s pins\n"
+                        f"shuru: checkpoint '{name}' saved\n"
+                    ),
+                    exit_code=1,
+                    timed_out=False,
                 )
             self.present.add(name)
             return bake_mod.ExecResult(stdout="ok", stderr="", exit_code=0, timed_out=False)
@@ -3770,8 +3783,12 @@ class TestRunBakeActions:
         assert recorder.exists("vanta-bi-Demo-2")
         message = str(excinfo.value)
         assert "1 layer(s) failed to bake:" in message
-        # The last *meaningful* line of that layer's output, not a truncated tail.
-        assert "vanta-bi-Demo-1: exit 1 — shuru: refusing to build vanta-bi-Demo-1" in message
+        # The layer's own error, and not the line shuru left below it.
+        assert (
+            "vanta-bi-Demo-1: exit 1 — ERROR: Cannot install vanta-bi-Demo-1's pins"
+            in message
+        )
+        assert "shuru:" not in message
         assert "[FAILED] vanta-bi-Demo-1" in message
         assert "[done] vanta-bi-Demo-2" in message
         assert "nothing was left behind" in message
@@ -3858,6 +3875,88 @@ class TestRunBakeActions:
         ) in logged
         assert "[done] vanta-bugsinpy-py3.8" in summary
 
+    def test_every_attempted_layers_whole_log_is_written_under_its_own_name(self, tmp_path):
+        """The one-line error in the failure report is a pointer; this is the file.
+
+        Whole, not a tail, and written for a layer whether it succeeded or failed —
+        the layers that failed are the ones whose logs are worth reading, and the last
+        bake's three failures left no log at all between them.
+        """
+        logs = tmp_path / "bake-logs"
+        logs.mkdir()
+        stale = logs / "vanta-bi-Old-1.log"
+        stale.write_text("a log of a layer this bake does not build", encoding="utf-8")
+        logged: list[str] = []
+
+        def build(name, script, base):
+            return bake_mod.ExecResult(
+                stdout=f"{name}: first line\n{name}: last line\n",
+                stderr="",
+                exit_code=0,
+                timed_out=False,
+            )
+
+        bake_mod.run_bake_actions(
+            bake_mod.plan_layers(
+                _layers(PY38, "vanta-bi-Demo-1"),
+                force=True,
+                children=self.CHILDREN,
+                exists=lambda name: False,
+            ),
+            children=self.CHILDREN,
+            exists=lambda name: True,
+            remove=lambda name: None,
+            build=build,
+            log=logged.append,
+            logs_dir=logs,
+        )
+        assert not stale.exists(), "this bake's logs, and only this bake's"
+        for name in (PY38, "vanta-bi-Demo-1"):
+            path = bake_mod.bake_log_path(logs, name)
+            assert path.exists(), name
+            assert path.read_text(encoding="utf-8") == (
+                f"{name}: first line\n{name}: last line\n"
+            )
+            assert f"[{name}] build log: {path}" in logged
+
+    def test_the_failure_report_names_a_log_for_every_failed_layer(self, tmp_path):
+        """Every failure, not the last one's tail: that is what the nine-bug run did.
+
+        Three layers failed and the report printed the last one's output only; the
+        other two were a name and an exit code, and what the printed tail *was* was
+        shuru's ``checkpoint … saved``.
+        """
+        logs = tmp_path / "bake-logs"
+        recorder = self.Recorder(
+            present={PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"},
+            failing={"vanta-bi-Demo-1", "vanta-bi-Demo-2"},
+        )
+        with pytest.raises(bake_mod.BakeError) as excinfo:
+            bake_mod.run_bake_actions(
+                bake_mod.plan_layers(
+                    _layers(PY38, "vanta-bi-Demo-1", "vanta-bi-Demo-2"),
+                    force=True,
+                    children=self.CHILDREN,
+                    exists=recorder.exists,
+                ),
+                children=self.CHILDREN,
+                exists=recorder.exists,
+                remove=recorder.remove,
+                build=recorder.build,
+                log=lambda line: None,
+                logs_dir=logs,
+            )
+        message = str(excinfo.value)
+        assert "2 layer(s) failed to bake:" in message
+        for name in ("vanta-bi-Demo-1", "vanta-bi-Demo-2"):
+            assert f"{name}: exit 1 — ERROR: Cannot install {name}'s pins" in message
+            assert f"full build log: {bake_mod.bake_log_path(logs, name)}" in message
+            # The whole log, so the inner command's error is readable and not just the
+            # line the report chose to print.
+            text = bake_mod.bake_log_path(logs, name).read_text(encoding="utf-8")
+            assert f"ERROR: Cannot install {name}'s pins" in text
+            assert f"shuru: checkpoint '{name}' saved" in text
+
 
 class TestBakeLogProvenance:
     """What the bake's own log says about a layer, without booting anything."""
@@ -3904,6 +4003,78 @@ class TestBakeLogProvenance:
         )
         assert bake_mod.last_error_line("") == "(no output)"
         assert bake_mod.last_error_line("a\n\n  \n") == "(no output)"
+
+    def test_a_line_that_states_the_failure_wins_over_the_last_line_that_says_anything(self):
+        """pip's own ``ERROR:``, which is what sanic/1's failed install printed.
+
+        The layer's output ended with pip's explanation, then
+        ``ERROR: ResolutionImpossible``, then the recipe's remaining commands — so the
+        last line that says *something* is not the line that says what went wrong.
+        """
+        output = "\n".join(
+            [
+                "Collecting h11==0.9.0",
+                "ERROR: Cannot install -r /tmp/req.txt (line 44) and h11==0.9.0 because "
+                "these package versions have conflicting dependencies.",
+                "ERROR: ResolutionImpossible",
+                "+ exit 1",
+                "python -m pip freeze",
+            ]
+        )
+        assert bake_mod.last_error_line(output) == "ERROR: ResolutionImpossible"
+
+    def test_a_compilers_diagnostic_is_preferred_too(self):
+        """The other two spellings measured: ``error:`` and ``fatal error``."""
+        assert bake_mod.last_error_line(
+            "building 'numpy' extension\nerror: command 'gcc' failed with exit status 1\n"
+            "cleaning up\n"
+        ) == "error: command 'gcc' failed with exit status 1"
+        assert bake_mod.last_error_line(
+            "installing\nfatal error: Python.h: No such file or directory\n"
+            "compilation terminated.\n"
+        ) == "fatal error: Python.h: No such file or directory"
+
+    def test_shurus_own_lines_are_never_the_error(self):
+        """Measured on all three failures of the nine-bug bake.
+
+        ``shuru checkpoint create`` saves the checkpoint *before* it reports that the
+        inner command failed, so ``shuru: checkpoint '<name>' saved`` is the last line
+        of a failed layer — and it was reported as that layer's error, naming the layer
+        and nothing about why.
+        """
+        output = (
+            "ERROR: ResolutionImpossible\n"
+            "shuru: checkpoint 'vanta-bi-sanic-1' saved\n"
+        )
+        assert bake_mod.last_error_line(output) == "ERROR: ResolutionImpossible"
+        # Shuru's line by itself is not an error line at all.
+        assert bake_mod.last_error_line("shuru: checkpoint 'x' saved\n") == "(no output)"
+
+    def test_a_layers_log_is_written_whole_and_an_old_one_is_cleared(self, tmp_path):
+        """The one-line error in the summary is a pointer, so the file has to be there.
+
+        Whole and not a tail: the reason a layer failed is usually not near the end of
+        its log — pip's error is followed by shuru's ``checkpoint … saved``, and a
+        compiler's ``fatal error`` by the rest of the recipe.
+        """
+        logs = tmp_path / "bake-logs"
+        logs.mkdir()
+        stale = logs / "vanta-bi-Old-1.log"
+        stale.write_text("a previous bake's layer", encoding="utf-8")
+        kept = logs / "notes.txt"
+        kept.write_text("not a log this harness writes", encoding="utf-8")
+        assert bake_mod.clear_bake_logs(logs) == 1
+        assert not stale.exists(), "this bake's logs, and only this bake's"
+        assert kept.exists()
+        assert bake_mod.clear_bake_logs(tmp_path / "absent") == 0
+
+        result = bake_mod.ExecResult(
+            stdout="first line\n", stderr="ERROR: it did not install\n", exit_code=1,
+            timed_out=False,
+        )
+        path = bake_mod.write_bake_log(logs, "vanta-bi-Demo-1", result)
+        assert path == bake_mod.bake_log_path(logs, "vanta-bi-Demo-1")
+        assert path.read_text(encoding="utf-8") == "first line\nERROR: it did not install\n"
 
     def test_a_layer_not_reached_is_not_called_done(self):
         actions = bake_mod.plan_layers(

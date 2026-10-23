@@ -6069,21 +6069,107 @@ in the merged build output was a one-character fragment, so the tail of the log 
 not the same thing as the error. The last line that has anything in it is.
 """
 
+SHURU_LOG_PREFIX = "shuru:"
+"""What every line of shuru's own CLI output starts with, and none of it is the error.
+
+[VANTA-WHY] Measured, and it is the reason this constant exists: ``shuru checkpoint
+create`` saves the checkpoint *before* reporting that the inner command failed, so the
+last line of a failed layer's merged output is ``shuru: checkpoint 'vanta-bi-x' saved``
+(:mod:`bugsinpy.shuru` says the same thing at the delete). Reporting that as "the last
+meaningful line" named the layer that failed and nothing about why, on all three
+failures of the nine-bug run. The inner command's own error is still in the log — it is
+just above shuru's line, and this is what gets it read.
+"""
+
+ERROR_LINE_PREFIXES = ("ERROR", "error:", "fatal error")
+"""What a line that *is* the failure starts with, in the three spellings measured.
+
+A **prefix** test, and only that, because that is what a reader of the log can act on
+without guessing which of two hundred lines matters: ``ERROR:`` is pip's own
+(``ERROR: ResolutionImpossible``, ``ERROR: Cannot install …``), ``error:`` is a
+compiler's (``error: command 'gcc' failed …``), and ``fatal error`` opens a C
+compiler's fatal diagnostic (``fatal error: Python.h: No such file or directory``). A
+line that starts with one of these is preferred over the last line that merely says
+something (:func:`last_error_line`), because it is the one line of a two-hundred-line
+build log that states the reason rather than the progress.
+
+A compiler that prefixes its fatal diagnostic with the file it was reading
+(``numpy/core/setup_common.py:9:10: fatal error: …``, which gcc does) is not matched by
+this pass and falls through to the second one — which is a loss of precision and not of
+information: the line is still printed, and it is still the line that says the most.
+"""
+
 
 def last_error_line(output: str) -> str:
-    """The last line of a failed build that says something, or a placeholder.
+    """The one line of a failed build that names the failure, or a placeholder.
 
-    Lines are read from the end, so the *first* one that is not blank, not a ``set
-    -x`` trace (``+ …``), and not a fragment is the answer. ``\\r`` is treated as a
-    line break because pip's progress output overwrites a line in place: without it
-    the "line" is the whole carousel concatenated.
+    Two passes over the same list of lines, and the list is built once so both passes
+    skip the same things:
+
+    * shuru's own output (:data:`SHURU_LOG_PREFIX`) — never a failure, and, measured,
+      the line that used to be reported for every failed layer;
+    * blank lines, and ``set -x`` traces (``+ …``), which are the recipe rather than the
+      result.
+
+    The first pass takes the last line that starts with one of
+    :data:`ERROR_LINE_PREFIXES`; the second, for a build that says nothing that way,
+    takes the last line that is long enough to be a message rather than a fragment
+    (:data:`_MIN_ERROR_LINE_CHARS`). ``\\r`` is treated as a line break because pip's
+    progress output overwrites a line in place: without it the "line" is the whole
+    carousel concatenated.
     """
-    for raw in reversed(output.replace("\r", "\n").splitlines()):
-        line = raw.strip()
-        if len(line) < _MIN_ERROR_LINE_CHARS or line.startswith("+ "):
-            continue
-        return line
+    lines = [
+        line
+        for raw in output.replace("\r", "\n").splitlines()
+        if (line := raw.strip())
+        and not line.startswith(SHURU_LOG_PREFIX)
+        and not line.startswith("+ ")
+    ]
+    for line in reversed(lines):
+        if line.startswith(ERROR_LINE_PREFIXES):
+            return line
+    for line in reversed(lines):
+        if len(line) >= _MIN_ERROR_LINE_CHARS:
+            return line
     return "(no output)"
+
+
+def bake_log_path(logs_dir: Path, name: str) -> Path:
+    """Where one layer's full build log goes: ``<logs_dir>/<layer>.log``."""
+    return logs_dir / f"{name}.log"
+
+
+def clear_bake_logs(logs_dir: Path) -> int:
+    """Empty the bake-logs directory, returning how many files it held.
+
+    [VANTA-WHY] Emptied rather than accumulated: the summary prints this directory as
+    *this* bake's logs, and a layer that is not in this run's plan must not be able to
+    leave a file there that reads as though this run wrote it. The directory is the
+    harness's own scratch output (``runs/bugsinpy/bake-logs``) and never a source of
+    truth — the layer's checkpoint and its deps JSON are — so nothing is lost by
+    replacing it per bake.
+    """
+    if not logs_dir.is_dir():
+        return 0
+    removed = 0
+    for path in logs_dir.glob("*.log"):
+        path.unlink()
+        removed += 1
+    return removed
+
+
+def write_bake_log(logs_dir: Path, name: str, result: ExecResult) -> Path:
+    """Write one layer's whole build output under its own name, and say where.
+
+    The whole thing, not a tail: the one-line error in the summary is a pointer, and
+    the reason a layer failed is usually nowhere near the end of its log — pip's
+    resolution error is followed by shuru's own ``checkpoint … saved``, and a compiler's
+    ``fatal error`` is followed by the recipe's remaining commands.
+    """
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    path = bake_log_path(logs_dir, name)
+    path.write_text(result.stdout + result.stderr, encoding="utf-8")
+    return path
 
 
 def _bake_layer(name: str, script: str, base: str) -> ExecResult:
@@ -6104,6 +6190,7 @@ def run_bake_actions(
     remove: Callable[[str], None] = checkpoint_delete,
     build: Callable[[str, str, str], ExecResult] = _bake_layer,
     log: Callable[[str], None] = print,
+    logs_dir: Optional[Path] = None,
 ) -> str:
     """Delete, then build every layer the plan asks for, and report what happened.
 
@@ -6136,9 +6223,20 @@ def run_bake_actions(
     There is nothing to print for a layer that was skipped: it was not built in this
     run, and what is being reported is this run.
 
-    Injected ``exists``/``remove``/``build``/``log`` so the whole sequence is a
-    structural test rather than something only a real bake can exercise.
+    ``logs_dir`` is where each attempted layer's **whole** output is kept while the run
+    happens (:func:`write_bake_log`), emptied first (:func:`clear_bake_logs`) and
+    reported line by line through ``log``. It is what makes the one-line error in the
+    failure report enough: the line says what happened, the file holds the two hundred
+    lines above it. ``None`` writes nothing, which is what a structural test wants.
+
+    Injected ``exists``/``remove``/``build``/``log`` so the whole sequence is
+    a structural test rather than something only a real bake can exercise.
     """
+    logs: dict[str, Path] = {}
+    if logs_dir is not None:
+        clear_bake_logs(logs_dir)
+        log(f"[logs] this bake's build logs: {logs_dir}")
+
     for action in delete_order(actions, children):
         log(f"[{action.name}] deleting — {action.reason}")
         remove(action.name)
@@ -6151,6 +6249,9 @@ def run_bake_actions(
         log(f"[{action.name}] building from {action.base} — {action.reason}")
         attempted.append(action.name)
         result = build(action.name, action.script, action.base)
+        if logs_dir is not None:
+            logs[action.name] = write_bake_log(logs_dir, action.name, result)
+            log(f"[{action.name}] build log: {logs[action.name]}")
         if not result.ok:
             failed.append(action.name)
             results[action.name] = result
@@ -6172,20 +6273,25 @@ def run_bake_actions(
         actions, failed=failed, attempted=attempted, survived=survived
     )
     if failed:
-        raise BakeError(_failure_report(failed, results, summary))
+        raise BakeError(_failure_report(failed, results, summary, logs))
     return summary
 
 
 def _failure_report(
-    failed: Sequence[str], results: Mapping[str, ExecResult], summary: str
+    failed: Sequence[str],
+    results: Mapping[str, ExecResult],
+    summary: str,
+    logs: Optional[Mapping[str, Path]] = None,
 ) -> str:
-    """Every failed layer, one line each, then the summary and the last build log.
+    """Every failed layer's own error line, where its log is, then the summary.
 
-    The one-line entry carries the **last meaningful line** of that layer's output
-    (:func:`last_error_line`) rather than a tail: the measured message ended
-    ``failed (exit 1): i``, which names no failure at all. The tail is still there for
-    the last failure, below, because the one-line summary is a pointer and the log is
-    the evidence.
+    [VANTA-WHY] One line for **every** failed layer, and that line is the one line of
+    the layer's output that names the failure (:func:`last_error_line`) rather than a
+    tail: the tail of the last failure was all the nine-bug run printed, so the other
+    two failures were represented by their layer names and nothing else — and what that
+    tail ended in was shuru's ``checkpoint … saved``. Each layer's whole log is on disk
+    (:func:`write_bake_log`) and pointed at here, which is what makes the one-line form
+    enough.
     """
     lines = [f"{len(failed)} layer(s) failed to bake:"]
     for name in failed:
@@ -6196,10 +6302,9 @@ def _failure_report(
         lines.append(
             f"  {name}: {state} — {last_error_line(result.stdout + result.stderr)}"
         )
+        path = (logs or {}).get(name)
+        if path is not None:
+            lines.append(f"    full build log: {path}")
     lines.append("")
     lines.append(summary)
-    last = results[failed[-1]]
-    lines.append("")
-    lines.append("--- build log of the last failure (tail) ---")
-    lines.append((last.stdout + last.stderr).strip()[-2000:])
     return "\n".join(lines)

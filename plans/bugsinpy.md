@@ -404,6 +404,38 @@ anything — as `g++: not found`, i.e. as that bug's problem, on every wave. The
 written by the same script that does the install, beside the pip half `/opt/vanta-deps-freeze.txt` every
 layer already carries.
 
+**The compiler a source build runs, and the era's warning semantics.** The 3.8 interpreter is a
+`python-build-standalone` build, so its `sysconfig` records the compiler of the machine it was built on
+— a path that does not exist in this image — and an old-style `distutils` build runs exactly that string.
+`bake.COMPILER_ENV` exports `distutils`' documented override in every layer whose minor has a toolchain
+(`bake.build_env_for`): `CC=gcc`, `CXX=g++`, and CPython's own Linux link lines
+`LDSHARED='gcc -pthread -shared'` / `LDCXXSHARED='g++ -pthread -shared'`. The recipe asserts each
+variable reached the layer's shell, because an `export` is not the same fact as the variable the build
+reads. Measured on `matplotlib/1`: `numpy==1.18.5` has no wheel here, so the layer builds it from its
+sdist and the build ended in `error: [Errno 2] No such file or directory` — *after* the BLAS/LAPACK
+fallback warnings and the configure step, i.e. the failure was the compiler *invocation*. The interpreter
+layer then builds a throwaway C **and** C++ extension before its marker, so a broken toolchain fails the
+base layer instead of twenty minutes into numpy.
+
+The same environment carries `CFLAGS`, which is the second half of that failure: the compiler was right
+and its *defaults* are not. GCC 14 (the base image's) promotes six C diagnostics from warning to **error**
+— `incompatible-pointer-types`, `implicit-function-declaration`, `int-conversion`, `implicit-int`,
+`return-mismatch`, `declaration-missing-parameter-type` — and these are 2020-era sdists written for the
+GCC of their day, where all six were warnings that scrolled past. Measured on `lxml` (an incompatible
+pointer assignment) and `ruamel.yaml.clib` (a handler signature mismatch). The fix is `-Wno-error=` for
+each of the six, not `-Wno-`: the diagnostics stay **visible** and only their promotion to failure is
+undone, so what is restored is the era's *warning* semantics rather than silence. `CFLAGS` and not
+`CXXFLAGS` because all six are C-only diagnostics and both measured failures were in C sources; distutils'
+`customize_compiler` appends an environment `CFLAGS` to its `cflags` *and* to its link line, so it is the
+variable the C compilation actually reads. The interpreter layer's smoke check compiles one of the six
+(a `double *` assigned to an `int *`), so a layer where `CFLAGS` never reached `distutils` fails its own
+smoke check rather than reproducing the same error inside lxml.
+
+Both halves are recorded inside the layer at `/opt/vanta-build-env.txt`, together with `gcc --version`:
+the variables say what was asked for and the version says which compiler read them, and the flags are
+written for GCC 14's defaults — a layer whose `gcc` is a different major is a layer where they mean
+something else.
+
 **A package the platform cannot build says so, rather than arriving as a build error.**
 `bake.UNBUILDABLE_ON_PLATFORM` is the third answer the preflight can give about an sdist-only pin and it
 is a review, not a gap: `pyarrow` needs the Arrow C++ toolchain and `llvmlite`/`numba` a specific LLVM

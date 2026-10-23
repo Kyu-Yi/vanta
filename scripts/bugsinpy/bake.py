@@ -547,13 +547,44 @@ def system_package_lines(packages: Sequence[str]) -> list[str]:
     ]
 
 
+_ERA_WARNING_FLAGS = (
+    "-Wno-error=incompatible-pointer-types",
+    "-Wno-error=implicit-function-declaration",
+    "-Wno-error=int-conversion",
+    "-Wno-error=implicit-int",
+    "-Wno-error=return-mismatch",
+    "-Wno-error=declaration-missing-parameter-type",
+)
+"""The six diagnostics GCC 14 promotes from warning to **error**, demoted back.
+
+[VANTA-WHY] These are the *ancien régime* of C diagnostics: for the four decades the
+2020 sdists in this benchmark were written in, an implicit function declaration, an
+``int``↔pointer conversion, a mismatched pointer assignment and a missing parameter
+type were warnings that scrolled past. GCC 14 (the base image's compiler) turns all
+six into errors by default — the documented GCC 14 porting change — and that is the
+measured shape of the failures this fixes: lxml's C sources failed on
+``incompatible pointer type`` and ruamel.yaml.clib on a handler signature mismatch,
+both 2020-era code that compiled under the GCC of its day.
+
+``-Wno-error=``, not ``-Wno-``: the diagnostics stay *visible* as warnings and only
+their promotion to failure is undone, which is exactly "the era's warning semantics"
+and keeps a reader of the build log able to see what the old compiler saw.
+
+``CFLAGS`` rather than ``CXXFLAGS`` because every one of the six is a C-only
+diagnostic and the measured failures were in C sources; distutils'
+``customize_compiler`` appends an environment ``CFLAGS`` to both ``cflags`` and
+``ldshared``, so this is the variable the C compilation and the link line read.
+"""
+
 COMPILER_ENV: Mapping[str, str] = {
     "CC": "gcc",
     "CXX": "g++",
     "LDSHARED": "gcc -pthread -shared",
     "LDCXXSHARED": "g++ -pthread -shared",
+    "CFLAGS": " ".join(_ERA_WARNING_FLAGS),
 }
-"""The compiler a source build in these layers runs, and the linker that follows it.
+"""The compiler a source build in these layers runs, the linker that follows it, and
+the C flags that restore the warning semantics of the era the sources were written in.
 
 [VANTA-WHY] Measured on matplotlib/1: ``numpy==1.18.5`` has no wheel for the sandbox,
 so the layer builds it from source, and that build ended in
@@ -568,6 +599,12 @@ are installed by :data:`SYSTEM_PACKAGES` and were never being called. These four
 ``LDSHARED`` from the environment before the recorded value), and
 ``g++ -pthread -shared`` is CPython's own Linux default for ``LDCXXSHARED``, so
 nothing about the link line is invented here.
+
+The fifth variable is a different failure with the same shape — the *compiler* was
+wrong there, the compiler's *defaults* are wrong here — and it is in the same
+mapping for the same reason: both are facts about the toolchain this layer runs
+rather than about the tree being built, and a reader of a failed build should not
+have to know which of the two it was. See :data:`_ERA_WARNING_FLAGS`.
 """
 
 BUILD_ENV_RECORD = "/opt/vanta-build-env.txt"
@@ -647,6 +684,14 @@ def build_env_lines(env: Mapping[str, str]) -> list[str]:
 
     Empty when ``env`` is empty, so a layer whose minor has no toolchain keeps its
     recipe line for line (:func:`build_env_for`).
+
+    The record is the variables *and* the compiler's own version. The variables say
+    which flags were asked for; the version says which compiler read them, and those
+    are two different facts — the flags above are written for GCC 14's defaults, so a
+    layer whose ``gcc`` is a different major is a layer where the same flags mean
+    something else. Anything that reaches ``$CC`` without going through the
+    environment (``sysconfig``'s recorded value) is what :func:`_sysconfig_probe`
+    prints.
     """
     if not env:
         return []
@@ -658,6 +703,17 @@ def build_env_lines(env: Mapping[str, str]) -> list[str]:
         # `set -e` sees the last command in a pipeline, so this is the record rather
         # than the check — the check is the line above it.
         f"env | grep -E '^({pattern})=' | sort > {BUILD_ENV_RECORD}",
+        # The version, kept in the same `NAME=value` shape as the exports because the
+        # reader of this file only keeps lines of that shape
+        # (:func:`layer_provenance_lines`): a bare `gcc --version` line inside the
+        # block would be dropped, and a fact that is dropped is not a record. The
+        # assignment is its own statement so `set -e` catches a `gcc` that cannot run
+        # — a `printf "$(gcc …)"` would report the `printf`'s status and record an
+        # empty version silently.
+        'CC_VERSION="$(gcc --version | head -n 1)"',
+        '[ -n "$CC_VERSION" ] || { echo "gcc --version printed nothing; the compiler '
+        'this layer builds with cannot say what it is" >&2; exit 1; }',
+        f'printf "CC_VERSION=%s\\n" "$CC_VERSION" >> {BUILD_ENV_RECORD}',
         # Echoed between the two sentinels so the layer's own record reaches the bake
         # log (BUILD_ENV_HEADER): what the exports actually were is the one fact a
         # reader of a failed source build cannot recover from the recipe.
@@ -715,6 +771,21 @@ _TOOLCHAIN_SMOKE_DIR = "/tmp/vanta-toolchain-smoke"
 _TOOLCHAIN_SMOKE_C_SOURCE = """\
 #include <Python.h>
 
+/* [VANTA-WHY] The era's warning semantics, exercised rather than assumed. Assigning
+   a `double *` to an `int *` is one of the six diagnostics GCC 14 made an error and
+   the GCC these 2020 sources were written for printed as
+   `warning: assignment from incompatible pointer type`. This file therefore compiles
+   only if the flags in CFLAGS reached the compiler, which is the fact the smoke check
+   exists to establish -- every later source build in this layer (numpy, then pandas)
+   depends on the same flags having reached the same distutils path. */
+
+static int vanta_era_pointer_check(void) {
+    double *numbers = NULL;
+    int *wrong;
+    wrong = numbers;
+    return wrong == NULL;
+}
+
 static PyObject *vanta_value(PyObject *self, PyObject *args) {
     return PyLong_FromLong(1);
 }
@@ -729,6 +800,11 @@ static struct PyModuleDef vanta_module = {
 };
 
 PyMODINIT_FUNC PyInit_vanta_smoke_c(void) {
+    if (!vanta_era_pointer_check()) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "the layer's C flags did not reach the compiler");
+        return NULL;
+    }
     return PyModule_Create(&vanta_module);
 }
 """
@@ -783,6 +859,12 @@ def toolchain_smoke_lines(env: Mapping[str, str]) -> list[str]:
     (matplotlib's ``ft2font``, pandas' ``_libs``), and ``CC`` and ``CXX`` are two
     variables with two answers — a layer that can compile C and not C++ would pass a
     C-only smoke check.
+
+    The C half also carries one diagnosis GCC 14 promoted to an error
+    (:data:`_ERA_WARNING_FLAGS`), so this smoke fails on a layer where ``CFLAGS`` did
+    not reach ``distutils``. That is the same class of failure as the compiler: a
+    flag that is exported but never read is invisible until twenty minutes into
+    lxml's C sources.
 
     It runs under the interpreter layer's own **seeded** setuptools rather than a
     pinned toolchain: this layer's job is the interpreter and the compiler, and the

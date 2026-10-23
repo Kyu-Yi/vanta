@@ -3168,17 +3168,43 @@ class TestBake:
     # that string. ``gcc``/``g++`` are installed by the system packages above and were
     # never being called; ``CC``/``CXX``/``LDSHARED``/``LDCXXSHARED`` are distutils'
     # documented override.
+    #
+    # ``CFLAGS`` is the second half of the same idea: the compiler was right and its
+    # *defaults* were not. lxml's C sources failed on ``incompatible pointer type``
+    # and ruamel.yaml.clib on a handler signature mismatch — one of the six
+    # diagnostics GCC 14 promotes from warning to error — so the flags demote each of
+    # the six back, i.e. the warning semantics the sources were written under.
+
+    ERA_WARNING_FLAGS = (
+        "-Wno-error=incompatible-pointer-types",
+        "-Wno-error=implicit-function-declaration",
+        "-Wno-error=int-conversion",
+        "-Wno-error=implicit-int",
+        "-Wno-error=return-mismatch",
+        "-Wno-error=declaration-missing-parameter-type",
+    )
 
     COMPILER_ENV = {
         "CC": "gcc",
         "CXX": "g++",
         "LDSHARED": "gcc -pthread -shared",
         "LDCXXSHARED": "g++ -pthread -shared",
+        "CFLAGS": " ".join(ERA_WARNING_FLAGS),
     }
 
     def test_the_compiler_environment_is_the_distutils_override_for_this_toolchain(self):
         """One list, so the recipe and this expectation cannot drift apart."""
         assert bake_mod.COMPILER_ENV == self.COMPILER_ENV
+
+    def test_the_c_flags_are_the_six_gcc_14_default_errors_demoted(self):
+        """Spelled out, because it is GCC 14's list and not ours to abbreviate.
+
+        An entry dropped here is a diagnostic that goes back to being a hard error in
+        every 2020-era C source this harness builds, and the failure it would produce
+        names the source rather than this list.
+        """
+        assert bake_mod._ERA_WARNING_FLAGS == self.ERA_WARNING_FLAGS
+        assert bake_mod.COMPILER_ENV["CFLAGS"] == " ".join(self.ERA_WARNING_FLAGS)
 
     def test_the_interpreter_recipe_exports_the_compiler_for_source_builds(self):
         """Quoted as shell, because a linker line is more than one word."""
@@ -3187,6 +3213,7 @@ class TestBake:
         assert "export CXX=g++" in recipe
         assert "export LDSHARED='gcc -pthread -shared'" in recipe
         assert "export LDCXXSHARED='g++ -pthread -shared'" in recipe
+        assert f"export CFLAGS='{' '.join(self.ERA_WARNING_FLAGS)}'" in recipe
 
     def test_the_recipe_prints_what_the_standalone_recorded(self):
         """The evidence for the override: sysconfig's own CC/CXX, not ``$CC``.
@@ -3214,6 +3241,31 @@ class TestBake:
         recipe = self._recipe()
         assert bake_mod.BUILD_ENV_RECORD in recipe
         assert "env | grep -E" in recipe
+
+    def test_the_record_carries_the_compilers_own_version(self):
+        """Which compiler read those flags is a second fact, in the same shape.
+
+        ``NAME=value``, because that is the only shape :func:`layer_provenance_lines`
+        keeps — a bare ``gcc --version`` line inside the block would be dropped, and
+        the record would then say what was asked for without saying who read it. The
+        version matters here and not only in general: the flags in ``CFLAGS`` are
+        written for GCC 14's defaults, so a layer whose ``gcc`` is a different major
+        is a layer where they mean something else.
+        """
+        recipe = self._recipe()
+        assert 'CC_VERSION="$(gcc --version | head -n 1)"' in recipe
+        assert (
+            f'printf "CC_VERSION=%s\\n" "$CC_VERSION" >> {bake_mod.BUILD_ENV_RECORD}'
+            in recipe
+        )
+        # Written before the record is echoed, so the version is in the same file the
+        # layer keeps and the bake log re-prints.
+        assert recipe.index("gcc --version") < recipe.index(
+            f"cat {bake_mod.BUILD_ENV_RECORD}"
+        )
+        # And a `gcc` that cannot say what it is fails the layer rather than being
+        # recorded as an empty version.
+        assert "gcc --version printed nothing" in recipe
 
     def test_the_record_is_echoed_between_its_sentinels(self):
         """What the bake log re-prints has to be framed in the build's own output."""
@@ -3248,6 +3300,25 @@ class TestBake:
         ``_libs``), so the smoke check declares a ``language="c++"`` extension too.
         """
         assert 'language="c++"' in self._recipe()
+
+    def test_the_smoke_check_compiles_an_era_diagnostic(self):
+        """The C half carries one of the six, so the smoke fails if ``CFLAGS`` missed.
+
+        Without the flags this file is a GCC 14 *error* — ``incompatible pointer
+        type``, one of the six — which is precisely the failure that otherwise
+        surfaces twenty minutes into lxml's C sources. The smoke check is the only
+        place in the interpreter layer where that can be established, and a flag that
+        is exported but never read is exactly what it is for.
+        """
+        source = bake_mod._TOOLCHAIN_SMOKE_C_SOURCE
+        assert "double *numbers = NULL;" in source
+        assert "wrong = numbers;" in source
+        # The guard, so a layer that compiled it anyway still fails the *import*
+        # rather than passing the smoke on a check whose result nobody reads.
+        assert source.count("vanta_era_pointer_check()") == 1
+        # Not in the C++ half: in C++ that assignment is an error in every standard,
+        # so it would fail the smoke for a reason that is not these flags.
+        assert "vanta_era_pointer_check" not in bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE
 
     def test_the_compiler_environment_is_empty_for_a_minor_without_a_toolchain(self):
         """Keyed on ``SYSTEM_PACKAGES``, so a 3.6/3.7 layer gets neither lines."""
@@ -4015,6 +4086,8 @@ class TestBakeLogProvenance:
                 "vanta build env (/opt/vanta-build-env.txt):",
                 "+ cat /opt/vanta-build-env.txt",
                 "CC=gcc",
+                "CC_VERSION=gcc (Ubuntu 14.2.0-4ubuntu2) 14.2.0",
+                "CFLAGS=-Wno-error=incompatible-pointer-types",
                 "CXX=g++",
                 "LDCXXSHARED=g++ -pthread -shared",
                 "LDSHARED=gcc -pthread -shared",
@@ -4027,6 +4100,8 @@ class TestBakeLogProvenance:
         assert bake_mod.layer_provenance_lines(output) == [
             "vanta build env (/opt/vanta-build-env.txt):",
             "CC=gcc",
+            "CC_VERSION=gcc (Ubuntu 14.2.0-4ubuntu2) 14.2.0",
+            "CFLAGS=-Wno-error=incompatible-pointer-types",
             "CXX=g++",
             "LDCXXSHARED=g++ -pthread -shared",
             "LDSHARED=gcc -pthread -shared",

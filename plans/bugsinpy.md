@@ -488,6 +488,53 @@ BLAS half — and "compiles nothing" would be the wrong answer for the two packa
 `gfortran`. It is recorded, not enforced: the bake still installs what the recipe says, and the record
 is what makes the claim checkable afterwards.
 
+**Second reading: every pin's own declarations, against the layer's other pins.** The classification
+above says what pip will *do* with a pin; this says whether the layer's pins can hold each other at all,
+and it is the check that would have caught `sanic/1` from PyPI instead of from `ResolutionImpossible` one
+build cycle later. `bake.metadata_conflicts` reads each pin's `requires_dist` — through the run's one
+`bake.cached_release_metadata`, the same reader the date rule narrows itself with, so "what does this
+release declare" has one answer in the file — and compares each declaration against the *other* pins: a
+pin that requires a name this layer also pins, in a version the requirement excludes, is a conflict
+(§3.2's cases), recorded in `<checkpoint>.preflight.json` under `conflicts` beside the pins. A
+requirement carrying a marker is skipped — `foo>=1; extra == "test"` is only installed when the extra is
+asked for — so a conditional requirement neither narrows nor conflicts, deliberately: a version chosen on
+the word of a condition that may not apply is a choice nothing can check.
+
+**A missing `requires_dist` is never read as "requires nothing", and that is what the fallback chain is
+for.** Measured: PyPI's version JSON answers `requires_dist: null` for about **60%** of the pins in these
+splits — `matplotlib==3.2.1` (which declares five requirements), `sqlalchemy==1.3.17`, `numpy==1.18.4`,
+`six==1.17.0`, `pytz`, `tornado`, and every `httpcore`/`hpack`/`hstspreload`/`kiwisolver`/`pillow`/
+`pyparsing` pin among them — and PyPI **never** returns `[]` there, so the field alone cannot distinguish
+"declares nothing" from "we were not told". Read as `requires_dist or ()` it silently reports ~60% of the
+pins as declaring nothing, which is the blank answer this check exists to avoid. `bake.declared_requires`
+therefore tries, in order:
+
+1. the version JSON's `requires_dist` — including an explicit `[]`, which *is* the answer "this release
+   requires nothing";
+2. the **PEP 658 metadata sidecar** (`<file-url>.metadata`), for any file whose release entry carries a
+   `core-metadata` digest — measured to exist for `matplotlib 3.2.1` (13 of its 14 files; the sdist has
+   none), `sqlalchemy 1.3.17`, `numpy 1.18.4` and `beautifulsoup4 4.9.1`, and to be absent for
+   `httpcore 0.3.0`, which is sdist-only;
+3. the **wheel's own `METADATA` member** (`*.dist-info/METADATA`), downloaded and read as a zip, for a
+   release whose sidecar is not published but whose wheel is;
+
+and a pin that reaches none of the three is **unknown**, not empty. `setup.py` is deliberately **not**
+executed to find out: reading a pin's declarations must not mean running the pin's code. The two steps
+are not interchangeable, and the measurement that says so is `pytest-json-report`: every release has
+`requires_dist: null` in its JSON *and* a wheel with a sidecar, and 0.1/0.2's sidecar declares **no**
+`Requires-Dist` at all while 0.3+ declares `pytest>=3.3.2` — so the chain is what proves `httpie/1`'s
+plugin stays at `0.2`, and a reader that stopped at the null would have had to guess.
+
+**Unknowns are listed by name and do not block the bake; the layer's own `pip check` is what covers
+them.** A pin nothing could be read for is recorded as `bake.CASE_UNKNOWN` and printed under its own
+`UNKNOWN` heading — `httpcore==0.3.0` is the measured example, sdist-only with no sidecar, whose
+`h11==0.8.*` therefore reaches neither the preflight's case (b) nor the date rule's narrowing and is
+found by the layer's own `pip check` after the build. Calling it refused would fail a layer over a fetch
+that did not happen, so it stays outside the verdict: `bake.preflight_verdict` counts only case (a)
+conflicts, `gap`s and flagged bugs. Two places read a release and have to live with an unread one —
+`bake._narrowing_requirements` and `bake.newest_accepting_pytest` — and neither may read "could not be
+read" as "accepts anything": the first narrows nothing and the second skips the release.
+
 **The terminal prints one line per layer and each finding once, and ends on a verdict.**
 `bake.preflight_lines` prints exactly **one** line per layer —
 `[<checkpoint>] <key> (<target>): N pin(s), a wheel, b sdist-only, c unavailable, d gap, e unbuildable,
@@ -495,19 +542,52 @@ f dropped` — so a bug with nothing to report still appears (a table with the q
 say whether they were checked), and a bug's pure-Python sdists are **not** listed: a noticed
 disposition is a decision nobody has to take, and those live in `<checkpoint>.preflight.json` alone.
 Then each **finding** is printed once for the *whole split* rather than once per bug that carries it —
-a deduplicated `unreviewed sdist build(s) (N)`, `unbuildable pin(s) (N)` and `pin(s) nothing can
-install (N)` block, each line `<LABEL> <pin> — <bug keys>` — because the pins the split shares are why
-a reader is there (numpy alone is in six of the eleven dev-split bugs) and one decision printed six
-times is six times the reading. A pin the unresolvable-pin rule dropped is not repeated as a finding;
-it appears once in the drops block below, with the audit that settled it. A `--preflight-only` run also
+a deduplicated `unreviewed sdist build(s) (N)`, `unbuildable pin(s) (N)`, `pin(s) nothing can
+install (N)` block, and then §3.2's conflict cases as **three** more — `case (a)` first (`REFUSED`; it is
+the only one that stops a layer, so a reader who reads one section reads that one), then `case (b)`
+(`TOLERATED`), then the pins nobody could read (`UNKNOWN`) — each line `<LABEL> <pin> — <bug keys>` —
+because the pins the split shares are why a reader is there (numpy alone is in six of the eleven
+dev-split bugs) and one decision printed six times is six times the reading. A pin the unresolvable-pin
+rule dropped is not repeated as a finding; it appears once in the drops block below, with the audit that
+settled it — and a conflict with a **dropped** pin on either side is not printed either, because the
+layer will not install that pin and no pair is left to conflict. A `--preflight-only` run also
 leaves out the three **per-layer build lines** — `[<checkpoint>] installs:`, `[<checkpoint>] build
 pins:`, `[<checkpoint>] provenance:` — because they are the build's own log and that run is not
 building; they are written into `runs/bugsinpy/deps/<checkpoint>.json` either way, so the record is
 unchanged and only the terminal is quieter, which is the point of a run whose product is the findings
 below. A real bake still prints them, one per layer. `--preflight-only` then ends
-on a single line — `bake.preflight_verdict` — `ready to bake` when there are 0 gaps and 0 flags,
-otherwise `not ready to bake: N unreviewed sdist build(s) across M bug(s), F flagged bug(s)`; the
-counts are in it because "not ready" without them says nothing a reader can act on.
+on a single line — `bake.preflight_verdict` — `ready to bake` when there are 0 gaps, 0 **case (a)**
+conflicts and 0 flags, otherwise `not ready to bake: N unreviewed sdist build(s) across M bug(s), C pin
+conflict(s) across B bug(s), none of them §3.2 case (b), F flagged bug(s)`; the counts are in it because
+"not ready" without them says nothing a reader can act on. Case (b) is not counted — it is the
+benchmark's environment, tolerated on purpose, and a verdict that called it "not ready" would be asking
+for a decision §3.2 already took — and neither is a case (?) reading, which is a fetch that did not
+happen rather than a conflict.
+
+**What the check predicts for the two layers whose build logs were lost.** The two
+`*.preflight.json` files on disk predate it — neither carries a `conflicts` key — so they can confirm the
+classification half and cannot show the conflict half; the conflict half is the prediction:
+
+- **`luigi/1` — `ready to bake`.** 173 pins (130 wheel / 43 sdist-only), 0 unavailable, 0 gap, 0
+  unbuildable; 2 dropped with their audit (`pywin32==227` — twelve wheels, every one `win_amd64`, no
+  sdist — and `requests-async==0.5.0`, which PyPI does not have). One conflict, **case (b)**:
+  `beautifulsoup4==4.9.1` declares `soupsieve<2.0` against `soupsieve==2.0.1`, and both are BugsInPy's
+  own exact pins, so it prints as `TOLERATED` and does not enter the verdict. Its `httpcore==0.3.0` sits
+  next to `h11==0.8.1` and is consistent — the same `httpcore` pin as `sanic/1` against a *different*
+  `h11`, which is why that layer fails and this one does not.
+- **`matplotlib/1` — `ready to bake`.** 10 pins (8 installs, 2 of which — `cython`, `numpy` — are also
+  build pins, plus `setuptools` and `wheel`), 2 sdist-only and both cleared: `numpy==1.18.5` by the
+  toolchain alone, `pillow==7.1.2` by the reviewed `libjpeg-dev` entry; 0 unavailable, 0 gap, 0
+  unbuildable, 0 dropped, **0 conflicts**, and **no own-pins at all** — its installs are the project's
+  own declarations and none was written by BugsInPy's two per-bug files, so `own_pin_names` is empty and
+  nothing in that layer could ever be case (b): a conflict there would be case (a) and refused.
+- Both layers gain one pin at HEAD that the recorded preflights predate: `pip==21.3.1`, the capability
+  pin, a `py3-none-any` wheel.
+- The unknowns are the caveat rather than a finding: PyPI's `requires_dist` is `null` for 106 of
+  `luigi/1`'s 173 pins and for 5 of `matplotlib/1`'s 10, and the chain resolves a null pin whenever its
+  release publishes a sidecar or a wheel — so what stays unknown is the sdist-only half, 24 pins for
+  `luigi/1` (measured shape: `httpcore==0.3.0`) and none for `matplotlib/1`, where all five nulls have a
+  wheel. They are printed by name under `UNKNOWN` and do not change the verdict.
 
 **One rule for a pin nothing here can install, and it is the import closure that decides.** The
 preflight produces three answers a *bake* cannot act on: a release PyPI does not have at all
@@ -690,10 +770,44 @@ layer is labelled from what actually happened: `[done]` only for a layer that wa
 was verified, `[FAILED]`, `[not started]` for one a failed interpreter layer stopped the run short of,
 `[deleted]` for a stale child removed, `[skipped]` for one this run did not touch. `[done]` was
 previously printed for every layer the *plan* said to build, including the four after a failure that
-were never attempted — a list of names a reader, and `prepare`, would take for layers that exist. Each
-failure's line in the error carries the **last meaningful line** of that layer's own build output rather
-than a tail (`failed (exit 1): i` is what a tail produced), followed by the summary and the tail of the
-last failure's log.
+were never attempted — a list of names a reader, and `prepare`, would take for layers that exist.
+
+**One line per failed layer, read from the layer's own log, and every layer's whole log on disk.** The
+nine-bug run's error printed the **tail** of the last failure and nothing else, so two of the three
+failures were represented by their layer names alone — and what that tail ended in was
+`shuru: checkpoint 'vanta-bi-…' saved`, because `shuru checkpoint create` saves the checkpoint *before*
+reporting that the inner command failed (the delete below is written around the same fact). The tail of a
+build log is therefore not a description of its failure, and "the last meaningful line" read off it named
+the layer rather than the reason, on all three. Three rules follow.
+
+`bake.last_error_line` is a **two-pass** reader over a layer's merged output, and the lines both passes
+skip are dropped once, in one list: shuru's own output (`bake.SHURU_LOG_PREFIX`, `shuru:`) — never the
+failure — blank lines, and `set -x` traces (`+ …`), which are the recipe and not its result. The first
+pass takes the last line starting with one of `bake.ERROR_LINE_PREFIXES` — `ERROR` (pip's
+`ERROR: ResolutionImpossible`, `ERROR: Cannot install …`), `error:` (a compiler's
+`error: command 'gcc' failed`), `fatal error` (a C compiler's fatal diagnostic) — because that is the one
+line of a two-hundred-line log that states the reason rather than the progress. The second pass, for a
+build that says nothing that way, takes the last line long enough to be a message rather than a fragment:
+`failed (exit 1): i` is what a bare tail produced, and a one-character fragment is not an error message.
+A **prefix** test and only that, because it is what a reader of the log can act on without guessing which
+of two hundred lines matters; a compiler that prefixes its fatal diagnostic with the file it was reading
+(`numpy/core/setup_common.py:9:10: fatal error: …`, which gcc does) is not matched by the first pass and
+falls through to the second — a loss of precision and not of information, since the line is still printed
+and is still the line that says the most.
+
+`bake._failure_report` prints that line for **every** failed layer — `<layer>: exit <N>|timed out —
+<line>` — and not only for the last one, for the same reason `run_bake_actions` collects the failures
+instead of stopping at the first: one line each is what makes three failures three facts rather than one.
+
+Each attempted layer's **whole** build output is written to `runs/bugsinpy/bake-logs/<layer>.log`
+(`bake.write_bake_log`), with the path printed beside the layer's line and the directory named at the
+start of the run. The directory is emptied first (`bake.clear_bake_logs`), **overwritten per bake**, so a
+layer this run did not touch cannot leave a file that reads as this run's. That is what makes the
+one-line error enough: the line says what happened and the file holds the two hundred lines above it,
+which is where the reason usually is — pip's resolution error is followed by shuru's own
+`checkpoint … saved`, and a compiler's `fatal error` is followed by the recipe's remaining commands. The
+directory is the harness's own scratch output and never a source of truth (the layer's checkpoint and its
+deps JSON are), which is why replacing it per bake loses nothing.
 
 A built layer also echoes its own `/opt/vanta-build-env.txt` — the `CC`/`CXX`/`LDSHARED`/`LDCXXSHARED`
 the build actually exported, not the ones the recipe intended — and the interpreter layer's toolchain
@@ -939,6 +1053,62 @@ cannot be upgraded past it. Two exceptions:
   and one that does not is a decision the harness refuses to make rather than a silent downgrade of the
   plugin's host.
 
+**Two pins of one layer whose own declarations contradict each other: two cases, and only one of them is
+tolerated.** The date rule above is per *declaration*, and two declarations can land on releases that
+cannot live together — `sanic/1` is the measured case, and it is why the distinction exists. Its
+`requirements.txt` is a pip freeze from 2020 carrying `h11==0.9.0` (line 40) and `httpcore==0.3.0`
+(line 44), and `httpcore==0.3.0`'s own metadata declares `h11==0.8.*`: two of BugsInPy's own exact pins,
+jointly unsatisfiable, in one layer. The environment they were frozen from installed both anyway — pip
+before 20.3 had no resolver that could refuse, it installed each requirement in turn and printed "pip's
+dependency resolver does not currently take into account all the packages that are installed" — while
+today's pip answers `ResolutionImpossible` instead, so the layer never gets built and the benchmark loses
+the environment rather than reproducing it. Which case a conflict is decides what happens, and
+`bake.PinConflict.case` carries that decision:
+
+- **(b) both sides are BugsInPy's own exact pins** (`bake.CASE_BOTH_OWN_PINS`) — the benchmark's own
+  reference environment, and **tolerated**: recorded, printed under its own `TOLERATED` heading, and not
+  a failure. It is *reproduced* rather than refused, by installing with a pip that still has the old
+  behaviour (below).
+- **(a) anything else** (`bake.CASE_HARNESS_CHOICE`) — at least one side is a version *this harness*
+  chose: the date rule, or pip's own pick of a transitive dependency. A layer holding both is a layer
+  whose environment is not the benchmark's, so this one **fails the layer**, and the requirement is that
+  the date rule be *narrowed* until the conflict does not arise rather than that it be tolerated.
+- **(?) neither** (`bake.CASE_UNKNOWN`) — not a conflict at all, but the absence of the reading: no
+  document could be reached for one of the pins. Recorded so that "checked and clean" and "could not be
+  checked" stay different answers. See the preflight's fallback chain below.
+
+**The narrowing is recorded wherever it changed the answer.** When an exact pin in the same layer
+declares a requirement on a name the date rule is choosing freely, the answer becomes the newest release
+that satisfies the declaration **and** the cutoff, and `ResolvedDep.narrowed_by` carries each
+`(pin, specifier)` pair that did it — a departure from "newest before the date", recorded the same way an
+`overridden` claim is, so a reader can tell a narrowed choice from an ordinary one and from what it was
+narrowed by. Only an **exact** pin can narrow this way, and the reason is not stylistic: only an exact
+pin's own version is settled by the requirement itself, so only its `requires_dist` can be read *before*
+the date rule runs. A pin whose declarations cannot be read narrows nothing and is passed over rather
+than guessed at — what it asks for is unknown, and choosing a version for an unread requirement is a
+choice nothing can check. `httpcore==0.3.0` is exactly this case (its declarations are in neither PyPI's
+JSON, a wheel nor a sidecar — measured; the requirement lives in its **sdist**, which pip reads at
+resolution), so its `h11==0.8.*` narrows nothing before the build and is caught by the layer's own
+`pip check` after it.
+
+**A conflict is tolerated only when the layer's own `pip check` says so.** The preflight *predicts* from
+the pins' declarations; `pip check` is what reads what actually got installed, and the layer's reading is
+the gate. The recipe runs `python -m pip check > /opt/vanta-pip-check.txt 2>&1 || true` after the last
+install and before the freeze, and echoes it into the build log on marked lines (a checkpoint is a
+filesystem, so nothing on the host can read that file back without booting the layer). The host judges
+those lines by the same rule (`bake.pip_check_conflicts`) against the same predicate: `own` is
+`bake.own_pin_names`, read off each pin's own `pin_rule` and not re-derived from the declarations, so
+"BugsInPy's own pin" means one thing in the record and in the layer and a conflict cannot be tolerated in
+one and refused in the other. A **case (b)** conflict is logged and tolerated; a **case (a)** one becomes
+the layer's failure through `bake.pip_check_failure`, reported through the same path a build failure
+takes so the conflict names itself where the reader is already looking. `pip check`'s own exit status is
+**not** the verdict — it exits non-zero for a conflict the benchmark deliberately reproduces — which is
+why the reading is taken (`|| true`) and judged on the host. Every conflict, tolerated or not, is handed
+to `bake.record_pip_check` and written back into the layer's `runs/bugsinpy/deps/<checkpoint>.json` under
+`pip_check`, so that file carries what pip actually said and not only what PyPI's metadata predicted; the
+key is in `bake.deps_provenance` from the start, which keeps "nothing to report" (`[]`) and "this file
+predates the reading" (absent) distinguishable.
+
 **The bug's own `pytest` pin wins, and the report plugin follows it.** Measured, and the reason this
 rule exists: all four dev-pilot bugs flagged on the same thing — fastapi/1 and luigi/1 pin
 `pytest==5.4.3`, pandas/1 `5.4.2`, sanic/1 `5.2.1`, in BugsInPy's own `requirements.txt` — while the
@@ -1083,6 +1253,31 @@ layer and before anything else, a **build pin** set:
   build pin.
 - A build tool with **no release on or before its cutoff** flags the bug rather than being guessed at:
   a tree cannot have been built with a tool that did not exist yet.
+- **`pip` itself, pinned by capability and not by date** (`bake.PIP_PIN_VERSION`, emitted first of all):
+  the layer's environment is installed by a pip that still carries
+  `--use-deprecated=legacy-resolver`, and that is what makes §3.2's case (b) a reproduction of the
+  benchmark's environment rather than a refusal of it. That is a property of the *tool* and not of the
+  bug's date — `sanic/1`'s commit date is **2020-05-12**, *before* the flag existed, so the date rule
+  would name a pip with no flag at all — so no release is fetched for it, `released_at` is empty, and
+  `BuildPin.pin_rule` reports the capability rather than a date. The version is chosen by reading pip's
+  own tagged sources: the option is in `pip/_internal/cli/cmdoptions.py` at 20.3, 20.3.4, 21.0, 21.3,
+  **21.3.1**, 23.1.2, 23.3.2, 24.0, 25.3, 26.1 and 26.2.2, and absent at 19.3.1, 20.0.2, 20.1 and 20.2.4
+  — the opt-out arrived with the resolver that made it necessary. **21.3.1** is the newest of them that
+  installs on the split's oldest interpreter (22.0 moved pip's floor to 3.7, 24.1 to 3.8 and 25.0 to 3.9,
+  and 3.6.9 is in the split), and the newest rather than the oldest for a reason: the pins are 2020-era,
+  but the legacy resolver still installs *today's* newest release of everything the files left unpinned,
+  and a newer pip reads more of what those wheels declare.
+
+**Every install after the toolchain carries the flag, and the toolchain install is the one exception.**
+`pip` goes into the **first** pip call — the toolchain one, `setuptools`/`wheel`/`cython` plus `pip`
+itself — because that call is the first thing that runs and the pinned pip has to be in place before any
+install that wants the flag. It is also the call that keeps pip's own isolation, and it is the install
+that *puts this pip there*, so it runs under the interpreter layer's seeded pip and there is nothing yet
+for the flag to change. Every call after it — the project's declared build requirements and the
+dependency set — carries `--use-deprecated=legacy-resolver`. One rule rather than a flag per bug: a
+layer's environment *was* built by a pip of this era, so every install in it that resolves this bug's
+pins reproduces those semantics. The tolerance is not open-ended: the flag is only what lets the layer
+install, and *which* conflicts it installed is read afterwards by `pip check`.
 
 The order is what makes the pins mean anything, and `--no-build-isolation` is what makes the order
 apply. The pins go into the layer in **two** pip calls, and the split between them is the fix for a

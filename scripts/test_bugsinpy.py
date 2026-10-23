@@ -5219,6 +5219,86 @@ class TestEarlyInstallPins:
             python_minor="3.8",
         ) == ()
 
+    def test_a_build_requirement_the_held_pin_is_too_low_for_is_not_a_mapping(self):
+        """The held pin must *satisfy* the clause, not merely share its name (§3.2).
+
+        [VANTA-WHY] Measured on ``luigi/1``: ``numpy==1.18.4`` is built here — no
+        aarch64 wheel for py3.8 — and its own build reads the Cython it runs under and
+        stops with ``RuntimeError: Building NumPy requires Cython >= 0.29.14``, while the
+        layer held ``cython==0.29.7``. The name-only reading recorded that pair as EARLY
+        with a ``satisfied_by`` that does not satisfy it. The unsatisfied case is not an
+        ordering finding: the pin moves instead (:func:`narrow_build_pins`), which is why
+        it prints as NARROWED and never as EARLY.
+        """
+        early = bake_mod.early_install_pins(
+            [("numpy", "1.18.4")],
+            [("numpy", "1.18.4"), ("cython", "0.29.7")],
+            build_requires_of=lambda name, version: (
+                bake_mod.DepRef(
+                    "Cython",
+                    "Cython>=0.29.14",
+                    "build-system.requires (pyproject.toml)",
+                ),
+            ),
+            python_minor="3.8",
+        )
+        assert early == ()
+
+    def test_a_build_requirement_with_no_clause_is_satisfied_by_whatever_is_held(self):
+        """``sanic/1``'s measured bare declarations: ordering, and not a bound.
+
+        ``multidict==4.7.6`` and ``numpy==1.18.4`` each declare ``setuptools``/``wheel``
+        with no clause at all, and the layer's toolchain pins answer them; requiring an
+        exact match here would drop every one of them.
+        """
+        refs = (
+            bake_mod.DepRef(
+                "setuptools", "setuptools", "pyproject.toml [build-system].requires"
+            ),
+            bake_mod.DepRef("wheel", "wheel", "pyproject.toml [build-system].requires"),
+        )
+        early = bake_mod.early_install_pins(
+            [("numpy", "1.18.4")],
+            [("numpy", "1.18.4"), ("setuptools", "46.2.0"), ("wheel", "0.34.2")],
+            build_requires_of=lambda name, version: refs,
+            python_minor="3.8",
+        )
+        assert [item.satisfied_by for item in early] == [
+            "setuptools==46.2.0",
+            "wheel==0.34.2",
+        ]
+
+    def test_the_preflight_checks_every_early_mapping_against_its_specifier(self):
+        """The wiring: the reader that runs *before* the build asks the same question.
+
+        ``bake`` and the preflight call the one :func:`early_install_pins`, so a layer
+        whose recorded pins hold the required name too low reports no EARLY line rather
+        than a false one — the measured ``luigi/1`` shape, read off a layer's own pins.
+        """
+        layer = bake_mod.BugDeps(
+            entry=bug_entry(checkpoint="vanta-bi-luigi-1"),
+            checkpoint="vanta-bi-luigi-1",
+            installs=("numpy==1.18.4",),
+            build_pins=("cython==0.29.7",),
+            provenance={},
+        )
+        reports = bake_mod.preflight_layers(
+            [layer],
+            classify=lambda name, version, minor: bake_mod.PreflightPin(
+                name, version, bake_mod.SDIST_ONLY, "no cp38 aarch64 wheel"
+            ),
+            metadata_of=lambda name, version: ((), None),
+            build_requires_of=lambda name, version: (
+                bake_mod.DepRef(
+                    "Cython",
+                    "Cython>=0.29.14",
+                    "build-system.requires (pyproject.toml)",
+                ),
+            ),
+        )
+        assert reports[0].early == ()
+        assert not any("EARLY" in line for line in bake_mod.preflight_lines(reports))
+
     def _report(self, *, early: tuple = ()) -> bake_mod.PreflightBug:
         return bake_mod.PreflightBug(
             key="Demo/1",
@@ -5419,10 +5499,15 @@ class TestMarkerSkips:
     def test_the_preflight_records_the_drops_in_the_json_and_not_on_the_terminal(self):
         """The whole measured case, through :func:`bake_mod.preflight_layers`.
 
-        Before the rule the ``EARLY`` line read the ``3.5`` clause, which is false for
-        every layer this harness bakes; with it, the clause that holds is the one read,
-        and the two that do not are recorded on the report — which is what a
-        ``--preflight-only`` run writes, since it writes no other file.
+        Two rules read this one layer. The marker rule keeps the clause that holds here
+        (``>= '3.8'``) and drops the ``3.5`` one, recording it; the satisfied-by rule
+        (§3.2, the build-requirement block, :func:`bake_mod._specifier_accepts`) then
+        reads that kept clause against the release the layer actually holds —
+        ``numpy==1.17.3`` against ``numpy==1.18.4`` — and records no ordering, because
+        the layer's own pin does not satisfy it. So nothing at all is printed about this
+        layer: the terminal is for the findings a reader has to decide on, and the record
+        is the JSON's (which is what a ``--preflight-only`` run writes, it writing no
+        other file).
         """
         layer = bake_mod.BugDeps(
             entry=bug_entry(),
@@ -5446,9 +5531,11 @@ class TestMarkerSkips:
             build_requires_of=build_requires_of,
         )
         report = reports[0]
-        assert [item.requirement.spec for item in report.early] == [
-            "numpy==1.17.3; python_version>='3.8' and platform_system!='AIX'"
-        ], "the clause that holds in this layer is the one the ordering reads"
+        assert report.early == (), (
+            "the clause that holds here is the one the marker rule kept, and the layer "
+            "holds numpy==1.18.4, which numpy==1.17.3 refuses — so there is no ordering "
+            "to record and no EARLY line to print"
+        )
         assert [line.as_dict() for line in report.skipped] == [
             {
                 "source": "build-system.requires (pyproject.toml)",
@@ -5461,9 +5548,11 @@ class TestMarkerSkips:
             }
         ]
         assert report.as_dict()["skipped"] == [line.as_dict() for line in report.skipped]
-        assert not any("3.5" in line for line in bake_mod.preflight_lines(reports)), (
+        lines = bake_mod.preflight_lines(reports)
+        assert not any("3.5" in line for line in lines), (
             "the record is the JSON's; the terminal says nothing about it"
         )
+        assert not any("EARLY" in line for line in lines)
 
 
 # ============================================================================
@@ -6045,6 +6134,51 @@ class TestPinConflicts:
             ),
         ), "an ordinary pin says nothing, and both directions are recorded"
         assert bake_mod.pin_narrowings({}) == ()
+
+    def test_a_moved_build_pin_is_read_too_and_prints_as_narrowed(self):
+        """The build half of the layer moves for the same reason, and prints the same way.
+
+        [VANTA-WHY] Measured on ``luigi/1``: ``cython`` is a *toolchain* pin, moved to the
+        oldest release ``numpy==1.18.4``'s build accepts — so the record is on
+        ``build_pins`` and not on ``dependencies``, and one loop has to read both or the
+        moved tool would be invisible. It prints as NARROWED and never as EARLY:
+        the ordering table's job is the pairs that *do* hold.
+        """
+        provenance = {
+            "build_pins": [
+                {
+                    "name": "cython",
+                    "pin": "cython==0.29.14",
+                    "pin_rule": "the oldest release that satisfies numpy==1.18.4 declares "
+                    ">=0.29.14",
+                    "narrowed_by": [{"pin": "numpy==1.18.4", "requires": ">=0.29.14"}],
+                }
+            ],
+            "dependencies": [{"name": "numpy", "pin": "numpy==1.18.4"}],
+        }
+        assert bake_mod.pin_narrowings(provenance) == (
+            ("cython==0.29.14", "numpy==1.18.4 declares >=0.29.14"),
+        )
+        report = bake_mod.PreflightBug(
+            key="luigi/1",
+            checkpoint="vanta-bi-luigi-1",
+            python_minor="3.8",
+            pins=(
+                bake_mod.PreflightPin(
+                    "cython", "0.29.14", bake_mod.INSTALLABLE_WHEEL, "w"
+                ),
+            ),
+            narrowings=bake_mod.pin_narrowings(provenance),
+        )
+        lines = bake_mod._narrowing_section([report])
+        assert lines == [
+            "",
+            "narrowed pin(s) (1) — §3.2's date rule, moved to satisfy a pin in the same "
+            "layer:",
+            "  NARROWED cython==0.29.14 — numpy==1.18.4 declares >=0.29.14 (luigi/1)",
+        ]
+        assert not any("EARLY" in line for line in lines)
+        assert bake_mod.preflight_verdict([report]) == "ready to bake"
 
     def _narrowed(self) -> bake_mod.PreflightBug:
         return bake_mod.PreflightBug(
@@ -10777,6 +10911,249 @@ class TestBuildPinsByDate:
             "wheel==0.33.1",
             "cython==0.29.6",
         )
+
+
+class TestNarrowBuildPins:
+    """§3.2's build-requirement-wins rule: the build is the authority on its own tools.
+
+    [VANTA-WHY] Measured on ``luigi/1``: the date rule names the toolchain's
+    ``cython==0.29.7`` and the layer also holds ``numpy==1.18.4``, built here because it
+    has no aarch64 wheel for py3.8 — and numpy's own build reads the Cython it runs under
+    and stops with ``RuntimeError: Building NumPy requires Cython >= 0.29.14``. So a build
+    requirement the layer's pin does not satisfy **wins**: the pin moves to the *oldest*
+    release that satisfies it, and the move is recorded on the pin
+    (:attr:`BuildPin.narrowed_by`) in the same shape the dependency half uses
+    (:attr:`ResolvedDep.narrowed_by`), which is what makes it print as NARROWED instead of
+    EARLY.
+    """
+
+    TOOLCHAIN = {
+        "setuptools": {"40.8.0": "2019-02-04", "41.0.0": "2019-06-01"},
+        "wheel": {"0.33.1": "2019-04-06"},
+        "cython": {
+            "0.29.6": "2019-03-10",
+            "0.29.7": "2019-05-02",
+            "0.29.13": "2019-10-10",
+            "0.29.14": "2019-11-03",
+            "0.29.16": "2020-01-20",
+        },
+    }
+    """Dated releases, so the move is the only thing that can change a version."""
+
+    NUMPY_BUILD_REFS = (
+        bake_mod.DepRef(
+            "Cython", "Cython>=0.29.14", "build-system.requires (pyproject.toml)"
+        ),
+    )
+
+    def _releases(self) -> dict:
+        return {name: dict(versions) for name, versions in self.TOOLCHAIN.items()}
+
+    def _pins(self, refs=(), resolved=(), *, releases=None):
+        return bake_mod.resolve_build_pins(
+            list(refs),
+            list(resolved),
+            releases=self._releases() if releases is None else releases,
+            commit_date="2019-06-01",
+        )
+
+    def _narrow(self, pins, pinned, *, requires_of=None, releases=None):
+        return bake_mod.narrow_build_pins(
+            pins,
+            list(pinned),
+            build_requires_of=requires_of
+            or (
+                lambda name, version: (
+                    self.NUMPY_BUILD_REFS
+                    if (name, version) == ("numpy", "1.18.4")
+                    else ()
+                )
+            ),
+            python_minor="3.8",
+            releases=self._releases() if releases is None else releases,
+        )
+
+    def test_the_pin_moves_to_the_oldest_release_the_build_accepts(self):
+        """Oldest, not newest: 0.29.16 satisfies the clause too, and the point of pinning
+        by date is to stay as close to the bug's era as the requirement allows."""
+        pins = self._pins()
+        assert {pin.name: pin.pin for pin in pins}["cython"] == "cython==0.29.7", (
+            "the date rule's own answer, which is what the build refuses"
+        )
+        narrowed = self._narrow(
+            pins,
+            [("cython", "0.29.7"), ("numpy", "1.18.4"), ("setuptools", "41.0.0")],
+        )
+        cython = {pin.name: pin for pin in narrowed}["cython"]
+        assert cython.pin == "cython==0.29.14"
+        assert cython.released_at == "2019-11-03", (
+            "later than the commit date: that is exactly the departure being recorded"
+        )
+        assert cython.narrowed_by == (("numpy==1.18.4", ">=0.29.14"),)
+        assert cython.pin_rule == (
+            "the oldest release that satisfies numpy==1.18.4 declares >=0.29.14"
+        )
+        assert cython.as_dict()["narrowed_by"] == [
+            {"pin": "numpy==1.18.4", "requires": ">=0.29.14"}
+        ]
+        # One shape for both halves of the layer, so one reader prints both (§3.2).
+        assert bake_mod.pin_narrowings(
+            {"build_pins": [pin.as_dict() for pin in narrowed]}
+        ) == (("cython==0.29.14", "numpy==1.18.4 declares >=0.29.14"),)
+        assert {pin.name: pin.pin for pin in narrowed} == {
+            bake_mod.PIP_TOOL: f"{bake_mod.PIP_TOOL}=={bake_mod.PIP_PIN_VERSION}",
+            "setuptools": "setuptools==41.0.0",
+            "wheel": "wheel==0.33.1",
+            "cython": "cython==0.29.14",
+        }, "one pin moves and the rest of the toolchain is what the date rule said"
+
+    def test_two_builds_that_disagree_are_held_to_the_intersection(self):
+        """Two pins that both build here can ask for the same tool, and the pin has to
+        satisfy both — oldest release inside the intersection, both claims recorded."""
+        pins = self._pins()
+        narrowed = self._narrow(
+            pins,
+            [("cython", "0.29.7"), ("numpy", "1.18.4"), ("scipy", "1.4.1")],
+            requires_of=lambda name, version: {
+                ("numpy", "1.18.4"): (
+                    bake_mod.DepRef(
+                        "Cython",
+                        "Cython>=0.29.14",
+                        "build-system.requires (pyproject.toml)",
+                    ),
+                ),
+                ("scipy", "1.4.1"): (
+                    bake_mod.DepRef(
+                        "Cython",
+                        "Cython<0.29.16",
+                        "build-system.requires (pyproject.toml)",
+                    ),
+                ),
+            }.get((name, version), ()),
+        )
+        cython = {pin.name: pin for pin in narrowed}["cython"]
+        assert cython.pin == "cython==0.29.14"
+        assert cython.narrowed_by == (
+            ("numpy==1.18.4", ">=0.29.14"),
+            ("scipy==1.4.1", "<0.29.16"),
+        )
+
+    def test_a_pin_the_pin_already_satisfies_is_not_touched(self):
+        """The rule fires on a refusal, not on a build requirement existing at all."""
+        pins = self._pins()
+        narrowed = self._narrow(
+            pins,
+            [("cython", "0.29.7"), ("numpy", "1.18.4")],
+            requires_of=lambda name, version: (
+                bake_mod.DepRef(
+                    "Cython", "Cython>=0.29.0", "build-system.requires (pyproject.toml)"
+                ),
+            ),
+        )
+        assert narrowed == pins
+        assert all(pin.narrowed_by == () for pin in narrowed)
+
+    def test_a_requirement_with_no_clause_never_moves_a_pin(self):
+        """A bare name is satisfied by whatever the layer holds (:func:`_specifier_accepts`)."""
+        pins = self._pins()
+        narrowed = self._narrow(
+            pins,
+            [("cython", "0.29.7"), ("numpy", "1.18.4")],
+            requires_of=lambda name, version: (
+                bake_mod.DepRef(
+                    "Cython", "Cython", "pyproject.toml [build-system].requires"
+                ),
+            ),
+        )
+        assert {pin.name: pin.pin for pin in narrowed}["cython"] == "cython==0.29.7"
+
+    def test_a_requirement_that_does_not_apply_here_never_moves_a_pin(self):
+        """§3.2's marker rule reads the same way here as everywhere else."""
+        pins = self._pins()
+        narrowed = self._narrow(
+            pins,
+            [("cython", "0.29.7"), ("numpy", "1.18.4")],
+            requires_of=lambda name, version: (
+                bake_mod.DepRef(
+                    "Cython",
+                    'Cython>=0.29.14; python_version < "3.7"',
+                    "build-system.requires (pyproject.toml)",
+                ),
+            ),
+        )
+        assert {pin.name: pin.pin for pin in narrowed}["cython"] == "cython==0.29.7"
+
+    def test_a_pin_the_dependency_set_supplied_does_not_move(self):
+        """The one pin that cannot: the layer holds one numpy, and the dependency's is it.
+
+        Moving it would install the toolchain's version and then replace it with the
+        dependency's, compiling against one release and importing another — the case
+        :attr:`BuildPin.dependency_pin` exists to prevent. Measured shape:
+        ``pandas/1``'s ``scipy==1.4.1`` declares ``numpy==1.17.3`` while the layer holds
+        ``numpy==1.18.4``, and numpy is in both halves of the layer.
+        """
+        resolved = [
+            bake_mod.ResolvedDep(
+                name="numpy",
+                spec="numpy==1.18.4",
+                sources=("requirements.txt line 70",),
+                pin="numpy==1.18.4",
+                harness=False,
+                released_at="2020-05-03",
+            )
+        ]
+        ref = bake_mod.DepRef(
+            "numpy", "numpy>=1.15", "build-system.requires (pyproject.toml)"
+        )
+        pins = self._pins([ref], resolved)
+        assert {pin.name: pin for pin in pins}["numpy"].dependency_pin == "numpy==1.18.4"
+        moved = self._narrow(
+            pins,
+            [("numpy", "1.18.4"), ("scipy", "1.4.1"), ("cython", "0.29.7")],
+            requires_of=lambda name, version: (
+                (
+                    bake_mod.DepRef(
+                        "numpy",
+                        "numpy==1.17.3",
+                        "pyproject.toml [build-system].requires",
+                    ),
+                )
+                if (name, version) == ("scipy", "1.4.1")
+                else ()
+            ),
+        )
+        by_name = {pin.name: pin for pin in moved}
+        assert by_name["numpy"].pin == "numpy==1.18.4"
+        assert by_name["numpy"].narrowed_by == ()
+        assert by_name["cython"].pin == "cython==0.29.7", "and nothing else moved either"
+
+    def test_a_requirement_nothing_on_pypi_satisfies_flags_the_bug(self):
+        """The layer would be installed and then fail its own build; §3.2 refuses first."""
+        pins = self._pins()
+        with pytest.raises(bake_mod.BakeError, match="no release satisfies it"):
+            self._narrow(
+                pins,
+                [("cython", "0.29.7"), ("numpy", "1.18.4")],
+                requires_of=lambda name, version: (
+                    bake_mod.DepRef(
+                        "Cython",
+                        "Cython>=99.0",
+                        "build-system.requires (pyproject.toml)",
+                    ),
+                ),
+            )
+
+    def test_a_claimed_name_with_no_release_dates_is_not_guessed_at(self):
+        """The same refusal :func:`resolve_build_pins` makes for a name it cannot date."""
+        pins = self._pins()
+        releases = self._releases()
+        del releases["cython"]
+        with pytest.raises(bake_mod.BakeError, match="no release dates for 'cython'"):
+            self._narrow(
+                pins,
+                [("cython", "0.29.7"), ("numpy", "1.18.4")],
+                releases=releases,
+            )
 
 
 class TestNeedsBuildIsARule:

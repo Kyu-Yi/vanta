@@ -3523,6 +3523,28 @@ def _specifier_text(ref: DepRef) -> str:
     return str(_specifier_of(ref))
 
 
+def _specifier_accepts(specifier: SpecifierSet, version: str) -> bool:
+    """Whether ``specifier`` accepts ``version`` — an empty specifier accepts any (§3.2).
+
+    [VANTA-WHY] A requirement that names no version at all (``setuptools``) is satisfied
+    by whatever the layer holds, which is what makes ``sanic/1``'s bare
+    ``[build-system].requires`` entries ordering findings rather than problems. A clause
+    is checked against the held version instead of only the name, because a name-only
+    match records a satisfaction the build itself refuses: measured on ``luigi/1``,
+    ``numpy==1.18.4``'s build needs ``Cython>=0.29.14`` and the layer holds
+    ``cython==0.29.7`` — a recorded EARLY mapping whose ``satisfied_by`` does not satisfy
+    it, and the build stops with ``RuntimeError: Building NumPy requires Cython >=
+    0.29.14``.
+
+    An *unparseable* held version is not a satisfaction: a clause that cannot be read
+    against it is a question the build answers, and guessing yes here would record an
+    ordering that does not hold.
+    """
+    if not str(specifier):
+        return True
+    return _parseable(version) and specifier.contains(version)
+
+
 def _exact_version(specifier: SpecifierSet) -> Optional[Version]:
     """The single version of a ``==``-only constraint, or ``None``.
 
@@ -5659,31 +5681,40 @@ def pin_narrowings(provenance: Mapping[str, Any]) -> tuple[tuple[str, str], ...]
     """``(pin, reason)`` for every date-rule choice a pin in the same layer moved.
 
     [VANTA-WHY] Read off the provenance's own record — ``narrowed_by`` and ``refused``
-    (:attr:`ResolvedDep`) — rather than re-derived, for the same reason
-    :func:`own_pin_names` reads ``pin_rule``: the answer already exists and one spelling
-    of it is what keeps the record and the reading from disagreeing. The preflight's job
-    is to put it in front of a reader *before* the layer is built, because a pin that is
-    not simply "the newest release on or before the date" is the one thing a reader
-    cannot see in the pin list itself — ``moto==1.3.7`` beside ``luigi/1``'s
-    ``idna==2.9`` looks arbitrary until the reason is next to it. Nothing here is a
-    finding to act on: a narrowed pin is a decision already taken, which is why this is
-    printed as its own block and not counted against the verdict.
+    (:attr:`ResolvedDep`, and ``narrowed_by`` on :attr:`BuildPin` too) — rather than
+    re-derived, for the same reason :func:`own_pin_names` reads ``pin_rule``: the answer
+    already exists and one spelling of it is what keeps the record and the reading from
+    disagreeing. The preflight's job is to put it in front of a reader *before* the layer
+    is built, because a pin that is not simply "the newest release on or before the date"
+    is the one thing a reader cannot see in the pin list itself — ``moto==1.3.7`` beside
+    ``luigi/1``'s ``idna==2.9`` looks arbitrary until the reason is next to it. Nothing
+    here is a finding to act on: a narrowed pin is a decision already taken, which is why
+    this is printed as its own block and not counted against the verdict.
+
+    Both halves of the layer are read because both can move for the same reason: a
+    *dependency* is narrowed by what the layer's pins declare about it
+    (:func:`_narrowing_requirements`), and a *build tool* by what the layer's pins need
+    to build themselves (:func:`narrow_build_pins`). They are recorded in one shape —
+    ``{"pin": <the pin that asked>, "requires": <its clause>}`` — so one loop reads both,
+    and the moved build tool prints under NARROWED like any other moved pin rather than as
+    an EARLY ordering.
     """
     out: list[tuple[str, str]] = []
-    for dep in provenance.get("dependencies") or ():
-        pin = str(dep.get("pin") or "")
-        if not pin:
-            continue
-        for claim in dep.get("narrowed_by") or ():
-            out.append((pin, f"{claim.get('pin')} declares {claim.get('requires')}"))
-        for claim in dep.get("refused") or ():
-            out.append(
-                (
-                    pin,
-                    f"{claim.get('pin')} declares {claim.get('requires')}, which "
-                    f"{claim.get('held')} does not satisfy",
+    for group in ("build_pins", "dependencies"):
+        for dep in provenance.get(group) or ():
+            pin = str(dep.get("pin") or "")
+            if not pin:
+                continue
+            for claim in dep.get("narrowed_by") or ():
+                out.append((pin, f"{claim.get('pin')} declares {claim.get('requires')}"))
+            for claim in dep.get("refused") or ():
+                out.append(
+                    (
+                        pin,
+                        f"{claim.get('pin')} declares {claim.get('requires')}, which "
+                        f"{claim.get('held')} does not satisfy",
+                    )
                 )
-            )
     return tuple(out)
 
 
@@ -6418,6 +6449,18 @@ def early_install_pins(
     that fetches one: what this returns is an ordering decision about pins the layer
     already holds, and it cannot invent a version for a name nothing pinned.
 
+    The held pin must **satisfy** the requirement and not merely share its name
+    (:func:`_specifier_accepts`), which is §3.2's build-requirement-wins rule read from
+    this side: a name the layer pins too low is not an ordering finding but a pin that
+    has to move (:func:`narrow_build_pins`), and it is printed as NARROWED rather than
+    here. This is the one check both readers share — ``bake`` and the preflight
+    (:func:`preflight_layers`) call this same function — so "every EARLY mapping is
+    checked against its specifier" is a property of the function and not of one caller.
+    Measured on ``luigi/1``, the name-only reading recorded
+    ``numpy==1.18.4``'s build needing ``Cython>=0.29.14`` *satisfied by*
+    ``cython==0.29.7``; a requirement with no clause (``setuptools``, ``wheel``) is still
+    satisfied by whatever the layer holds.
+
     A pin whose own build requires itself is skipped: installing it early would mean
     building it to build it, which is the circularity the toolchain install exists to
     avoid, and no measured pin does it.
@@ -6440,7 +6483,8 @@ def early_install_pins(
     belongs to the deps JSON the bake writes.
     """
     held = {
-        canonicalize_name(name): f"{name}=={version}" for name, version in pinned
+        canonicalize_name(name): (f"{name}=={version}", version)
+        for name, version in pinned
     }
     out: list[EarlyInstall] = []
     seen: set[tuple[str, str]] = set()
@@ -6456,9 +6500,18 @@ def early_install_pins(
             marker_skipped += dropped
         for ref in refs:
             required = canonicalize_name(ref.name)
-            satisfied_by = held.get(required)
-            if required == own or satisfied_by is None:
+            holding = held.get(required)
+            if required == own or holding is None:
                 continue
+            # The held pin has to *satisfy* the clause, not merely share its name
+            # (:func:`_specifier_accepts`): a mapping whose ``satisfied_by`` the build
+            # itself refuses is a false record, and the unsatisfied case is not this
+            # function's to order — the pin it names moves instead
+            # (:func:`narrow_build_pins`), which is why it is printed as NARROWED and
+            # never as EARLY.
+            if not _specifier_accepts(_specifier_of(ref), holding[1]):
+                continue
+            satisfied_by = holding[0]
             if (spelling, satisfied_by) in seen:
                 continue
             seen.add((spelling, satisfied_by))
@@ -8042,6 +8095,20 @@ class BuildPin:
     choose it, ``released_at`` is empty, and a reader comparing the two keys would
     otherwise find a date that had no part in the decision.
     """
+    narrowed_by: tuple[tuple[str, str], ...] = ()
+    """The builds whose own requirements moved this pin off the date rule (§3.2).
+
+    [VANTA-WHY] A date is not the only thing a build tool has to satisfy: the build
+    itself reads the tools it runs under and refuses to go on. Measured on ``luigi/1``,
+    the date rule names ``cython==0.29.7`` and ``numpy==1.18.4`` — a pin of the same
+    layer, built here because it has no aarch64 wheel for py3.8 — stops with
+    ``RuntimeError: Building NumPy requires Cython >= 0.29.14``. So a build
+    requirement the layer's pin does not satisfy wins: the pin moves to the **oldest
+    release that satisfies it**, and each ``(builder, specifier)`` pair here says which
+    build moved it and with what, in the same shape
+    :attr:`ResolvedDep.narrowed_by` records for the dependency half — so
+    :func:`pin_narrowings` reads both halves with one spelling.
+    """
 
     @property
     def pin_rule(self) -> str:
@@ -8050,6 +8117,10 @@ class BuildPin:
             return PIP_PIN_RULE
         if self.dependency_pin is not None:
             return "the dependency set's pin for the same package"
+        if self.narrowed_by:
+            return "the oldest release that satisfies " + "; ".join(
+                f"{pin} declares {specifier}" for pin, specifier in self.narrowed_by
+            )
         return BUILD_PIN_RULE
 
     def as_dict(self) -> dict[str, Any]:
@@ -8062,6 +8133,11 @@ class BuildPin:
         }
         if self.dependency_pin is not None:
             data["dependency_pin"] = self.dependency_pin
+        if self.narrowed_by:
+            data["narrowed_by"] = [
+                {"pin": pin, "requires": specifier}
+                for pin, specifier in self.narrowed_by
+            ]
         return data
 
 
@@ -8198,6 +8274,123 @@ def resolve_build_pins(
 def build_installs(pins: Sequence[BuildPin]) -> tuple[str, ...]:
     """The build pins' install specs, in the order the recipe installs them."""
     return tuple(pin.pin for pin in pins)
+
+
+def narrow_build_pins(
+    pins: Sequence[BuildPin],
+    pinned: Sequence[tuple[str, str]],
+    *,
+    build_requires_of: Callable[[str, str], Sequence[DepRef]],
+    python_minor: str,
+    releases: Mapping[str, Mapping[str, str]],
+) -> list[BuildPin]:
+    """Move a build tool to the oldest release the layer's own builds accept (§3.2).
+
+    [VANTA-WHY] §3.2's build-requirement-wins rule, and the one way the date rule is not
+    the last word about a *build* pin. Measured on ``luigi/1``: the date rule names the
+    toolchain's ``cython==0.29.7``, the layer also holds ``numpy==1.18.4`` — built here,
+    because it has no aarch64 wheel for py3.8 — and numpy's own build reads the Cython it
+    runs under and stops with ``RuntimeError: Building NumPy requires Cython >=
+    0.29.14``. The build is the authority on what it needs: a requirement the layer's pin
+    does not satisfy wins, and the pin moves to the **oldest release that satisfies it**
+    — oldest, not newest, because the whole point of pinning by date is to stay as close
+    to the bug's own era as the requirement allows, and ``>=0.29.14`` is a bound the
+    build needs rather than a version it wants. **Every** claim on the name bounds the
+    move and not only the ones the held pin fails: the release the pin moves to has to
+    satisfy all of them, so a clause the held version happens to hold (``<0.29.16``
+    beside ``>=0.29.14``) bounds it too. The move itself happens only when at least one
+    claim does not hold as the pin stands — a name every claim already satisfies is left
+    exactly where the date rule put it.
+
+    ``pinned`` is the layer's whole pin list (:func:`pinned_parts` of the toolchain and
+    the installs), because *any* of them may be the pin doing the building: numpy is a
+    dependency here, not a tool. Only a build pin that the date rule alone chose can
+    move — a pin copying the dependency set's answer (:attr:`BuildPin.dependency_pin`)
+    and the capability pin (:data:`PIP_TOOL`) are left alone, or the layer would install
+    the toolchain's version and then replace it with the dependency's, compiling against
+    one release and importing another. A name the layer's own pins hold too low *and*
+    resolve as a dependency therefore stays where it is; the record of the requirement
+    is not an EARLY mapping either (:func:`early_install_pins` checks the clause), so
+    nothing claims a satisfaction the build does not have.
+
+    Each move is recorded on the pin itself (:attr:`BuildPin.narrowed_by`) in the shape
+    :attr:`ResolvedDep.narrowed_by` uses, which is what makes it print as NARROWED
+    through :func:`pin_narrowings` and never as EARLY.
+
+    A build requirement nothing on PyPI satisfies is a ``BakeError`` and flags the bug,
+    like every other unsatisfiable declaration (§3.2): the layer would be installed and
+    then fail its own build, and the harness's job is to refuse that before the build
+    runs. ``releases`` is the caller's, so the whole decision is exercised by a test
+    that never touches the network.
+    """
+    movable = {
+        canonicalize_name(pin.name): pin
+        for pin in pins
+        if pin.dependency_pin is None and not pin.capability
+    }
+    claims: dict[str, list[tuple[str, str]]] = {}
+    for name, version in pinned:
+        own = canonicalize_name(name)
+        spelling = f"{name}=={version}"
+        try:
+            refs = tuple(build_requires_of(name, version))
+        except BakeError:
+            continue
+        refs, _ = marker_skips(refs, python_minor=python_minor)
+        for ref in refs:
+            required = canonicalize_name(ref.name)
+            if required == own or required not in movable:
+                continue
+            # Every claim is collected, including one the held pin already holds: what
+            # moves has to satisfy *all* of them, and a clause the held version happens to
+            # satisfy still bounds the release the pin moves to. Only the *decision* to
+            # move reads the held version, below.
+            claims.setdefault(required, []).append((spelling, str(_specifier_of(ref))))
+    if not claims:
+        return list(pins)
+    out: list[BuildPin] = []
+    for pin in pins:
+        found = claims.get(canonicalize_name(pin.name))
+        if not found or pin.dependency_pin is not None or pin.capability:
+            out.append(pin)
+            continue
+        specifier = SpecifierSet(",".join(sorted({text for _, text in found})))
+        if _specifier_accepts(specifier, _pin_version(pin.pin)):
+            # Every claim already holds: the date rule's answer stands, and the move —
+            # which would have to satisfy all of them anyway — is not made.
+            out.append(pin)
+            continue
+        available = releases.get(canonicalize_name(pin.name))
+        if not available:
+            raise BakeError(
+                f"{pin.source}: no release dates for {pin.name!r} were fetched, so the "
+                "requirement this layer's own pins declare for it cannot be satisfied "
+                "(design §3.2)"
+            )
+        matching = [
+            version
+            for version in available
+            if _parseable(version)
+            and _date_rule_candidate(version, specifier)
+            and specifier.contains(version)
+        ]
+        if not matching:
+            newest = _newest_release(available)
+            raise BakeError(
+                f"{found[0][0]} declares {specifier} for {pin.name!r}, and no release "
+                f"satisfies it (newest is {newest[0]}, released {newest[1][:10]}). A "
+                "layer cannot be built under a tool the requirement refuses."
+            )
+        version = min(matching, key=Version)
+        out.append(
+            replace(
+                pin,
+                pin=f"{pin.name}=={version}",
+                released_at=available[version][:10],
+                narrowed_by=tuple(dict.fromkeys(found)),
+            )
+        )
+    return out
 
 
 def bug_sources(
@@ -8756,6 +8949,20 @@ def resolve_bug_deps(
                 resolved,
                 releases=releases,
                 commit_date=sources.commit_date,
+            )
+            # §3.2's build-requirement-wins rule, run before the toolchain's pin list
+            # reaches anything else: a build tool one of this layer's own pins refuses to
+            # be built under is moved to the oldest release that pin accepts, and the
+            # record of the move travels on the pin itself (:func:`narrow_build_pins`).
+            # It reads the pin list the *date rule* produced, which is why the two lines
+            # below are computed twice — the second pair is what the walk and the recipe
+            # see.
+            built = narrow_build_pins(
+                built,
+                pinned_parts(*build_installs(built), *installs_of(resolved)),
+                build_requires_of=build_requires_of,
+                python_minor=minor,
+                releases=releases,
             )
             # The layer's own pin list, before the closure walk adds to it — the walk
             # starts *at* these pins and stops at them, so a list that already held its

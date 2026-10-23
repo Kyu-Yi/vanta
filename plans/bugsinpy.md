@@ -1754,6 +1754,98 @@ neither carries an `easy_install` line at all, and `bcrypt==3.1.7` shows no `Pre
 it installs from an `aarch64` `abi3` wheel and is never a source build — so the fetch this guards
 against is a `cryptography==2.9.2`-shaped sdist-only pin and not every such pin.
 
+**A build requirement the layer's pin does not satisfy moves the pin, and the move prints as
+NARROWED.** The block above installs what a build wants *when a pin of the layer already satisfies
+it*; the other case was left unanswered, and it is what `luigi/1` measured. The date rule pins the
+toolchain's `cython==0.29.7` (2019-04-14, the newest on or before the 2019-05-15 commit), and the
+same layer builds `numpy==1.18.4` — built here rather than installed from a wheel, because there is
+no `aarch64` `cp38` wheel for it — whose own source reads the Cython it runs under and stops the
+layer with `RuntimeError: Building NumPy requires Cython >= 0.29.14`
+(`runs/bugsinpy/bake-logs/vanta-bi-luigi-1.log` 292; the pip-side reading is 315–318,
+`raise RuntimeError("Running cythonize failed!")` then `ERROR: Command errored out with exit status
+1: … prepare_metadata_for_build_wheel`). The pin was the reason, so the pin is what moves: **the
+build requirement wins**, and `bake.narrow_build_pins` moves the tool to the **oldest release that
+satisfies it** — oldest and not newest, because the date rule's purpose is to stay as near the bug's
+era as the requirement allows, and `>=0.29.14` is a floor the build needs rather than a version it
+wants: `cython==0.29.14` (2019-11-03), not `0.29.16`. **Every** claim on the name bounds
+the move and not only the claims the held pin fails: the release the pin moves *to* has to satisfy
+all of them, so the choice is made against `SpecifierSet(",".join(sorted(…)))` of them all — a
+layer where numpy wants `>=0.29.14` and scipy wants `<0.29.16` holds `cython==0.29.14` and the
+record names both claims. The move itself is made only when one of them does not hold as the pin
+stands; a name every claim already satisfies is left exactly where the date rule put it.
+
+`narrow_build_pins` reads the layer's **whole pin list** (`bake.pinned_parts` of the toolchain and
+the installs), because the pin doing the building is any of them — numpy here is a dependency and not
+a tool. Only a pin the date rule alone chose can move: a pin copying the dependency set's own answer
+(`bake.BuildPin.dependency_pin`) and the capability pin (`bake.PIP_TOOL`) are passed over, or the
+layer would install the toolchain's version and then replace it with the dependency's, compiling
+against one release and importing another. The move is recorded on the pin itself,
+`bake.BuildPin.narrowed_by`, in the same `(pin, specifier)` shape `bake.ResolvedDep.narrowed_by`
+already uses for the dependency-side case above (`narrowed_by: [{"pin", "requires"}]`) — and that is
+what puts it where it belongs: `bake.pin_narrowings` reads **both halves** of the provenance
+(`build_pins` and `dependencies`), so a moved toolchain pin is a `NARROWED` line under
+`bake._narrowing_section` and can never be an `EARLY` mapping.
+`bake.resolve_bug_deps` runs the move immediately after `resolve_build_pins` and before
+`build_installs` is read for the closure walk, so the walk, the constraint file and the recipe's
+`build-tools.txt` all see the moved pin rather than the one the date rule first named. Two
+boundaries, both `BakeError`s that flag the bug: a claimed name whose release dates were never
+fetched (nothing to choose from), and a name no release satisfies — the layer would be installed and
+then fail its own build, and refusing that before the build runs is the harness's job. The case
+`pandas/1` shows is the one it deliberately does **not** move: `scipy==1.4.1` and
+`scikit-learn==0.23.1` each claim `numpy==1.17.3; python_version>='3.8' and platform_system!='AIX'`
+while that layer holds `numpy==1.18.4`, but numpy is pinned by the dependency set
+(`"dependency_pin": "numpy==1.18.4"` in `runs/bugsinpy/deps/vanta-bi-pandas-1.json`) and so is not
+movable — the build proceeds against the held release, which is what `--no-build-isolation` does
+anyway.
+
+**Every EARLY mapping is checked against its specifier, because the same function is the
+preflight's.** What the measurement exposed was not only the missing move: the layer's provenance
+recorded `numpy==1.18.4`'s `Cython>=0.29.14` as *satisfied by* `cython==0.29.7`
+(`runs/bugsinpy/deps/vanta-bi-luigi-1.json`, `early_pins`) — a satisfaction the build itself
+refuses. `bake.early_install_pins` matched on the requirement's **name**; it now asks
+`bake._specifier_accepts` whether the held pin satisfies the clause, so a name the layer pins too
+low is not an ordering finding at all — it is the pin that has to move above — while a requirement
+with no clause (`setuptools`/`wheel` in `sanic/1`'s `[build-system].requires`, and numpy's own build
+needs of the same two on `luigi/1`) is still satisfied by whatever the layer holds. An unparseable
+held version is not a satisfaction: a clause that cannot be read against it is a question the build
+answers, and answering yes here is how the false mapping was recorded. The check lives in the
+function and not in a caller, which is what makes "the preflight checks every EARLY mapping against
+its specifier" a property rather than a hope — `bake.preflight_layers` calls this same
+`early_install_pins`, so an unbuildable mapping is one the preflight cannot print.
+`bake._specifier_accepts` reads the clause through `bake._specifier_of`, i.e. through
+`packaging.Requirement`, so a clause's marker is parsed off rather than string-matched.
+
+Measured across the six layers, this moves **one pin** and drops **three mappings from the
+`EARLY` list**. `luigi/1`'s `cython==0.29.7` becomes `cython==0.29.14`, and the layer's record of
+the move is the narrowing that prints as
+`NARROWED cython==0.29.14 — numpy==1.18.4 declares >=0.29.14 (luigi/1)`; the moved pin keeps the
+toolchain's source and takes the date of the release it moved to, so `build-tools.txt`, the
+constraint file and the layer's `pip freeze` all name 0.29.14, and the `numpy==1.18.4` → `Cython` 
+mapping comes back into the `EARLY` list — satisfied now by `cython==0.29.14` rather than by a pin
+that refuses it. The other two drops are `pandas/1`'s, whose early count falls from **18 to 16**:
+its two `numpy==1.17.3` claims name a release the layer does not hold, and nothing moves in their
+place because numpy is not movable there (above), so the requirement is left to the build — which
+is what `--no-build-isolation` does with it anyway.
+
+The preflight is read off each layer's **recorded** pins (`bake.layer_pins`), so what it prints
+before a re-bake is the drop and not yet the move: on the six records on disk today `luigi/1` shows
+`5 early` instead of 6 and `pandas/1` `16` instead of 18, with no `NARROWED` line anywhere, because
+the pin that moves does so while the layer is *being* baked and the record is written then. After
+the bake, that layer's record carries `cython==0.29.14` with its `narrowed_by`, and the preflight
+reads the move back out of it — which is the property the whole block rests on, the record and the
+printout being one thing rather than two. Every other layer's pin list, early count and verdict is
+unchanged, and the verdict stays `ready to bake`. The rules are tested on the decisions rather than
+on a bake: `scripts/test_bugsinpy.py::TestNarrowBuildPins` (eight cases — the oldest-release
+choice, the intersection, a satisfied pin left alone, a clause-less requirement, a marker that does
+not apply, a pin the dependency set supplied, and both `BakeError` boundaries) and
+`TestEarlyInstallPins` (an unsatisfied clause records no mapping, a clause-less one still does, and
+the preflight prints no `EARLY` line for it), plus
+`test_a_moved_build_pin_is_read_too_and_prints_as_narrowed` for the printout and
+`TestMarkerSkips::test_the_preflight_records_the_drops_in_the_json_and_not_on_the_terminal`, which
+now reads the same measured `pandas/1` layer through both rules — the marker rule keeping the
+`>= '3.8'` clause and dropping the `3.5` one, and this rule reading the kept clause against the
+release the layer holds and recording no ordering from it.
+
 **Mandatory bake-time gate (part of the wave-1 gate, §8.1).** For each version checkpoint, assert
 *inside the checkpoint*:
 

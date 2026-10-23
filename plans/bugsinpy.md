@@ -1247,13 +1247,38 @@ pip does not uninstall what it replaces: a layer re-pinning `pytest==5.4.3` over
 dependencies (`exceptiongroup`) in the environment. The provision walk therefore descends the closure of
 **every** harness pin *at the versions the interpreter layer has* — through names this layer re-pins, on
 purpose — and reports as `provisioned` the names that remain after removing every name this layer decides
-for itself. `bake.deps_provenance` writes them out, and they are the exemption the freeze gate reads
-below. What this layer's own pins reach is pinned **regardless** of the inheritance, in the other
-direction: `pytest 5.4.3`'s `pluggy (<1.0,>=0.12)` is pinned by pytest's own cutoff even though the
-interpreter layer holds a `pluggy` of its own, because a walk that stopped at a provisioned name would
-install pytest 5.4.3 over a pluggy it refuses. The layer's pins win; the leftovers are what is exempt.
-The set is a *prediction* of the interpreter layer's environment, used for its **names** — the one thing
-it cannot see is a name that appears or disappears with a release.
+for itself. Each harness pin is a **root** of that walk rather than a node in it: a path that reaches one
+from another root stops there, because `pytest-json-report` requires `pytest` and counting 8.0.2's
+declarations as the *plugin's* would attribute `exceptiongroup` to a harness pin this layer keeps — the one
+misreading that hides the orphan rule below. `bake.deps_provenance` writes the names out, and they are the
+exemption the freeze gate reads below. What this layer's own pins reach is pinned **regardless** of the
+inheritance, in the other direction: `pytest 5.4.3`'s `pluggy (<1.0,>=0.12)` is pinned by pytest's own
+cutoff even though the interpreter layer holds a `pluggy` of its own, because a walk that stopped at a
+provisioned name would install pytest 5.4.3 over a pluggy it refuses. The layer's pins win; the leftovers
+are what is exempt. The set is a *prediction* of the interpreter layer's environment, used for its
+**names** — the one thing it cannot see is a name that appears or disappears with a release.
+
+**What the layer *replaces*, it removes: the interpreter layer's residue is not an exemption
+(`bake.ORPHAN_RULE`).** Measured, and it is the rest of what `fastapi/1` failed on. The
+`exceptiongroup==1.3.1` its `pip check` refused was in the layer because the interpreter layer's
+`pytest 8.0.2` declares `exceptiongroup >=1.0.0rc8 ; python_version < "3.11"`, while this layer installs
+`pytest==5.4.3`, a release that declares nothing of the kind — so the name is not something the interpreter
+layer *provides this layer with*: it is leftover of a release this layer swapped out, and the layer may not
+keep it. `bake.transitive_pins` therefore answers a third value: the inherited names **every** path of
+which starts at a harness pin this layer replaced (`settled` says which those are — a harness pin whose
+entry the layer's own pins overwrote). Each is a `bake.OrphanedPin` carrying `name`, the harness pin that
+brought it in (`declared_by`), that release's own declaration of it (`declared`) and the pin this layer
+installs over it (`replaced_by`): "why it was there" is the half a reader cannot recover from the layer. A
+name a **kept** harness pin also reaches is that pin's own dependency and stays —
+`pytest-json-report`'s `pytest-metadata` is inherited, not removed, and uninstalling it would break the
+plugin the oracle is read from. The recipe uninstalls each orphan by name (`bake.orphan_removal_lines`)
+**after** every install — an install can pull one back in — and **before** `pip check`, so the check reads
+the environment the layer actually ends up with; each removal is echoed into the build log on
+`VANTA-ORPHAN`-marked lines, because the freeze block below cannot say *why* a name the interpreter layer
+installed is absent from it. The step carries no `|| true`: pip exits 0 for a name that is not installed,
+so anything else fails the layer. No orphans is the ordinary case and the recipe is unchanged — a layer
+whose bug does not re-pin a harness package removes nothing. Every removal is written into the deps JSON
+under `orphans` with its reason, and the names are deliberately **not** in `provisioned`.
 
 **Every distribution the layer ends up holding has to be one its pin list names or the interpreter layer
 supplies.** The closure walk above is a prediction; the layer's own `pip freeze` is the reading, and it
@@ -1266,11 +1291,14 @@ comparing by canonical name and not by version, since a pinned name installed at
 the different question the `easy_install` gate answers — exempting the pins of this layer and the
 `provisioned` names above, and a name in neither is a layer whose environment its provenance does not
 describe: it fails through `bake.freeze_failure`, reported through the same path a build failure takes,
-naming the distribution. It runs after the own-pin gate, because the two answer different questions —
-that one asks whether the pins can *hold* together, this one whether the pin list *describes* the layer —
-and `fastapi/1` is exactly the shape where only the second can see `exceptiongroup`: it is exempt here
-(it came in with the interpreter layer's `pytest 8.0.2`) and it is refused there, on the contradiction it
-makes with this layer's own `typing-extensions`.
+naming the distribution. The exemption is applied with **no tolerance for orphans**: an orphan removed
+above is in `provisioned` never and in the layer never, so the gate is a second reading of the removal —
+a name the layer failed to uninstall is in neither set and fails here rather than passing. It runs after
+the own-pin gate, because the two answer different questions — that one asks whether the pins can *hold*
+together, this one whether the pin list *describes* the layer — and `fastapi/1` is exactly the shape where
+the freeze gate would have passed the contradiction the `pip check` gate refused: the name is not in the
+pin list, so before the orphan rule it was exempt as an inherited one, and now it is removed from the
+layer and stated in the record instead.
 
 **The bug's own `pytest` pin wins, and the report plugin follows it.** Measured, and the reason this
 rule exists: all four dev-pilot bugs flagged on the same thing — fastapi/1 and luigi/1 pin

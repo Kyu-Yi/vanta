@@ -300,6 +300,39 @@ has to say that the pin is not a declaration: hence a phrase of its own and
 :attr:`ResolvedDep.required_by` naming the pin that required it.
 """
 
+ORPHAN_RULE = (
+    "the interpreter layer holds it as a dependency of a harness pin this layer "
+    "replaces, and this layer's pin list does not contain it"
+)
+"""Why a distribution is uninstalled from a bug layer rather than exempted (§3.2).
+
+[VANTA-WHY] The mirror of :data:`TRANSITIVE_PIN_RULE`, and the other half of the same
+fact: ``pip`` does not uninstall what it replaces, so a layer that installs
+``pytest==5.4.3`` over the interpreter layer's ``8.0.2`` is left holding 8.0.2's own
+dependencies — ``exceptiongroup==1.3.1``, ``iniconfig``, ``tomli`` — which no pin of it
+names. Exempting them (which is what the freeze gate did) leaves a layer of 2020 with a
+release of 2025 in it, and ``fastapi/1`` measured the cost: ``pip check`` refused the
+layer on ``exceptiongroup 1.3.1 requires typing-extensions>=4.6.0`` against its own
+``typing-extensions==3.7.4.2``, a contradiction nothing in the layer had declared. So
+they are **removed**, before the layer's own ``pip check`` and before the freeze: the
+recipe uninstalls each one by name, and the freeze gate is what reads that the removal
+happened (:func:`unpinned_freeze`). Which names those are is the walk's third answer
+(:func:`transitive_pins`), and the reason each was *there* is the record it returns with
+them (:class:`OrphanedPin`).
+"""
+
+ORPHAN_PREFIX = "VANTA-ORPHAN"
+"""The marker the recipe's uninstall step prints into the build log (§3.2).
+
+[VANTA-WHY] The deps JSON is the record of *which* names were removed and why
+(:class:`OrphanedPin`), and the freeze gate is what reads that the removal took:
+:func:`unpinned_freeze` exempts ``provisioned`` and these names are deliberately not in
+it, so a name the layer failed to uninstall is reported there rather than passed. This
+prefix exists for the human reading the build log — ``pip uninstall`` prints what it
+removed on lines nobody can grep, and the one thing a reader needs next to an empty
+``VANTA-PIP-FREEZE`` block is *why* those names are absent from it.
+"""
+
 
 class BakeError(RuntimeError):
     """A layer could not be baked or did not verify."""
@@ -2790,6 +2823,7 @@ def requirements_recipe(
     *,
     build_pins: Sequence[str] = (),
     early_pins: Sequence[str] = (),
+    orphans: Sequence[str] = (),
     minor: Optional[str] = None,
 ) -> str:
     """Install one bug's *resolved* dependencies on top of the interpreter layer.
@@ -2862,6 +2896,17 @@ def requirements_recipe(
     :data:`PIP_CHECK_PREFIX`-marked lines: the legacy resolver tolerates a conflict
     between two of BugsInPy's own pins, and this is the reading that says which
     conflicts it actually installed (:func:`pip_check_conflicts`).
+
+    ``orphans`` is the one thing the recipe **removes**, and it goes here rather than in
+    the pin list because it is the layer's own residue and not a dependency of anything in
+    it (:data:`ORPHAN_RULE`): the interpreter layer's environment is inherited whole, and a
+    ``pytest==5.4.3`` installed over its ``8.0.2`` leaves 8.0.2's ``exceptiongroup``,
+    ``iniconfig`` and ``tomli`` behind. They are uninstalled by name after every install
+    and before ``pip check`` — the check has to see the environment the layer ends up
+    with, and every install below can pull a name back in. No ``|| true``: ``pip`` skipping
+    a name that is not there is not a failure and anything else is, and the freeze gate is
+    the second reading either way, since an orphan is exempted from nothing
+    (:func:`unpinned_freeze`).
 
     ``build_pins`` is keyword-only and empty by default so that a caller with nothing
     to build — and every test of the dependency half — still gets a recipe, and the
@@ -2951,6 +2996,13 @@ def requirements_recipe(
             _no_isolated_build_env("the dependency install"),
         ]
     lines += [
+        # The inheritance, undone: the interpreter layer's environment arrives whole
+        # (`pip` does not uninstall what it replaces), so every name its *replaced*
+        # harness pins brought in and this layer's pin list does not contain is removed
+        # by name here (§3.2). After every install, because a pin below can pull one of
+        # them back in, and before `pip check`, because the check has to read the
+        # environment the layer actually ends up with.
+        *orphan_removal_lines(orphans),
         # `pip check` reads what is *installed* and reports every requirement the
         # installed set does not satisfy, which is the only thing that can say whether
         # the legacy resolver left a contradiction behind. Its exit status is not the
@@ -3010,6 +3062,53 @@ def _freeze_echo() -> str:
         "python -c \"import sys; "
         f"sys.stdout.writelines('{PIP_FREEZE_PREFIX} ' + line "
         f"for line in open('{DEPS_FREEZE_OUTPUT}')); print()\""
+    )
+
+
+def orphan_removal_lines(orphans: Sequence[str]) -> list[str]:
+    """The recipe lines that uninstall a bug layer's orphans, and say so in the log (§3.2).
+
+    Empty when there is nothing to remove, which is every layer whose bug does not re-pin
+    a harness package: the rule only fires on a layer that replaced one
+    (:func:`transitive_pins`), so the ordinary recipe is unchanged and this is a step a
+    reader sees only where it is warranted.
+
+    The names go in by ``-r`` file rather than on the command line so that the line the log
+    shows under ``set -x`` is the command and not the list, and each is echoed with
+    :data:`ORPHAN_PREFIX` afterwards (:func:`_orphan_echo`) — the freeze below cannot show
+    *why* a name the interpreter layer installed is absent from it, and this is the line
+    that says.
+
+    No ``--no-cache-dir`` — the step installs nothing — and no ``|| true``, for the reason
+    the same flag is absent from the installs: ``pip`` skipping a name that is not there is
+    a warning it exits ``0`` on, and anything else has to stop the layer
+    (:data:`ORPHAN_RULE`).
+    """
+    names = [name for name in (spec.strip() for spec in orphans) if name]
+    if not names:
+        return []
+    return [
+        "cat > /tmp/orphans.txt <<'VANTA_ORPHANS'",
+        "\n".join(names),
+        "VANTA_ORPHANS",
+        "python -m pip uninstall -y -r /tmp/orphans.txt",
+        _orphan_echo(names),
+    ]
+
+
+def _orphan_echo(names: Sequence[str]) -> str:
+    """One shell line saying, in the build log, which distributions were removed (§3.2).
+
+    The same reading problem as :func:`_pip_check_echo`, without a file to read: the recipe
+    already knows the names, and nothing on the host reads them back — the deps JSON is
+    the record (:class:`OrphanedPin`) and the freeze gate is the verdict. This is for the
+    reader of the log, one :data:`ORPHAN_PREFIX`-marked line per name, so that an
+    uninstall a reader would otherwise have to infer from a missing freeze line is stated.
+    """
+    return (
+        "python -c \"import sys; "
+        f"sys.stdout.writelines('{ORPHAN_PREFIX} ' + name + chr(10) for name in "
+        f"{sorted(names)!r})\""
     )
 
 
@@ -4028,6 +4127,73 @@ def pin_cutoff(dep: ResolvedDep) -> Optional[str]:
     return max(dates) if dates else None
 
 
+@dataclass(frozen=True)
+class OrphanedPin:
+    """One distribution the interpreter layer holds that this layer does **not** (§3.2).
+
+    [VANTA-WHY] ``pip`` does not uninstall what it replaces, so the environment a bug
+    layer starts from is the interpreter layer's *whole* one: a layer installing
+    ``pytest==5.4.3`` over ``8.0.2`` inherits 8.0.2's own dependencies and the base
+    layer's ``pip-json-report``'s, and the ones its own pin list does not contain are
+    left behind with nothing naming them. :data:`ORPHAN_RULE` is that fact; this record is
+    what the layer does about it — the recipe uninstalls each one
+    (:func:`requirements_recipe`), and the record says what was removed so a reader can
+    check the claim rather than take it on trust.
+
+    ``declared_by`` and ``declared`` are "why it was there", which is the half a reader
+    cannot recover from the layer: the harness pin whose release brought the name in, and
+    that release's own declaration of it — ``pytest==8.0.2`` declaring
+    ``exceptiongroup >=1.0.0rc8 ; python_version < "3.11"``. Both are the base layer's
+    *predicted* environment (:func:`transitive_pins`), taken at the versions the
+    interpreter layer was built with.
+
+    ``replaced_by`` is the other direction and the reason the name is removed rather than
+    exempted: the pin *this* layer installs for the harness name above, ``pytest==5.4.3``
+    for the example. It is empty only for a record built by hand — every orphan
+    :func:`transitive_pins` returns has at least one, because an inherited name is
+    orphaned only down a path from a harness pin this layer replaces, and the fix is the
+    name of that pin.
+    """
+
+    name: str
+    declared_by: tuple[str, ...] = ()
+    """The pins of the **base** layer whose releases declared this name, sorted."""
+    declared: tuple[str, ...] = ()
+    """The declaration that brought it in, as the releasing metadata wrote it, sorted.
+
+    A direct dependency of a harness pin writes it exactly as that pin's release did
+    (``exceptiongroup >=1.0.0rc8 ; python_version < "3.11"``); one further down the
+    inheritance names the release that declared *it*, which is the same fact one hop on.
+    """
+    replaced_by: tuple[str, ...] = ()
+    """The pins of *this* layer for the harness names above, sorted."""
+
+    @property
+    def rule(self) -> str:
+        """Why this name is removed, in one phrase, for the provenance."""
+        return ORPHAN_RULE
+
+    def as_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"name": self.name, "rule": self.rule}
+        if self.declared_by:
+            data["declared_by"] = list(self.declared_by)
+        if self.declared:
+            data["declared"] = list(self.declared)
+        if self.replaced_by:
+            data["replaced_by"] = list(self.replaced_by)
+        return data
+
+    def describe(self) -> str:
+        """One line for a build log or the preflight: the name and why it was there."""
+        because = ", ".join(self.declared_by) or "the interpreter layer"
+        instead = (
+            f" (this layer installs {', '.join(self.replaced_by)})"
+            if self.replaced_by
+            else ""
+        )
+        return f"{self.name} — installed for {because}{instead}"
+
+
 def transitive_pins(
     pins: Sequence[tuple[str, str]],
     *,
@@ -4038,8 +4204,8 @@ def transitive_pins(
     fetch: Callable[[str], Mapping[str, str]],
     metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
     cutoffs: Optional[Mapping[str, str]] = None,
-) -> tuple[tuple[ResolvedDep, ...], tuple[str, ...]]:
-    """``(transitive pins, names the interpreter layer provides)``.
+) -> tuple[tuple[ResolvedDep, ...], tuple[str, ...], tuple[OrphanedPin, ...]]:
+    """``(transitive pins, names provided, names orphaned)``.
 
     [VANTA-WHY] Everything else in this file pins what a *file* declared. This walks what
     a *release* declares, because that is the half of a layer's environment the pin list
@@ -4078,6 +4244,21 @@ def transitive_pins(
     provisioned name would install pytest 5.4.3 over a pluggy it refuses. The names the
     layer pins win; the leftovers are what is exempt.
 
+    The third answer is the exception to the second, and the only part of the inheritance
+    that cannot be left alone (:data:`ORPHAN_RULE`). A name the layer *replaces* a harness
+    pin for is not a name the interpreter layer provides *it* with — it is a leftover of a
+    release this layer swapped out, and the walk knows which because it remembers, for
+    every inherited name, which harness pins its path started at. ``pytest 8.0.2``'s
+    ``exceptiongroup``, ``iniconfig`` and ``tomli`` came in under a ``pytest`` this layer
+    re-pins to ``5.4.3``, the layer's own pins name none of them, its closure does not
+    reach them (pytest 5.4.3 does not declare them) — and a layer holding a 2025
+    ``exceptiongroup`` beside its own ``typing-extensions==3.7.4.2`` is the contradiction
+    ``fastapi/1``'s ``pip check`` refused. Each is an :class:`OrphanedPin`: removed from
+    the layer by the recipe and **not** exempted by the freeze gate, so a name left behind
+    is reported rather than passed. Only a name *every* one of whose paths starts at a
+    replaced harness pin is one of these: a name a kept harness pin also needs is that
+    pin's dependency and stays (:func:`OrphanedPin`'s own note on ``replaced_by``).
+
     ``cutoffs`` maps a canonical pin name to the date that pin's **own** requirements are
     held to (:func:`pin_cutoff` — for a date-rule pin that is the date it was pinned
     against, and for a reference pin installed as written it is that release's own date,
@@ -4109,8 +4290,14 @@ def transitive_pins(
             dates[name] = dict(fetch(name))
         return dates[name]
 
-    def declarations(name: str, version: str) -> tuple[tuple[str, str], ...]:
-        """``((canonical name, specifier), ...)`` for one release's own requirements."""
+    def declarations(name: str, version: str) -> tuple[tuple[str, str, str], ...]:
+        """``((canonical name, specifier, raw), ...)`` for one release's own requirements.
+
+        ``raw`` is the requirement as that release's own metadata wrote it, carried for the
+        one reader that has to quote it back: an orphan's record says which release brought
+        it in *and what that release declared* (:class:`OrphanedPin`), and the specifier
+        alone would not be the declaration.
+        """
         try:
             requires, _ = metadata_of(name, version)
         except BakeError:
@@ -4118,7 +4305,7 @@ def transitive_pins(
             # evidence that it requires nothing (httpcore==0.3.0 is read no other way),
             # and the layer's own pip check is the backstop for what the walk missed.
             return ()
-        out: list[tuple[str, str]] = []
+        out: list[tuple[str, str, str]] = []
         for raw in requires:
             try:
                 requirement = Requirement(raw)
@@ -4126,7 +4313,9 @@ def transitive_pins(
                 continue
             if not marker_applies(requirement, python_minor=python_minor):
                 continue
-            out.append((canonicalize_name(requirement.name), str(requirement.specifier)))
+            out.append(
+                (canonicalize_name(requirement.name), str(requirement.specifier), raw)
+            )
         return tuple(out)
 
     # (A) Everything the interpreter layer is predicted to hold: the closure of **every**
@@ -4135,20 +4324,43 @@ def transitive_pins(
     # ``pytest 8.0.2``'s own dependencies stay in the environment after a layer installs
     # ``pytest 5.4.3`` over it, and that leftover is exactly what ``fastapi/1``'s ``pip
     # check`` failure was made of (``exceptiongroup``).
+    #
+    # Walked once per (name, harness pin) pair rather than once per name, so that a name
+    # two harness pins reach carries **both** as its ``bringers`` *and* passes both on to
+    # what it declares: phase (C) discriminates on exactly that set, and a name whose
+    # descent stopped at the first pin to reach it would look like it came from one. A
+    # harness pin is a *root* of that walk and not a node in it, so a path that reaches
+    # one from another root stops there: ``pytest-json-report`` requires ``pytest``, and
+    # counting ``pytest 8.0.2``'s declarations as the plugin's would attribute
+    # ``exceptiongroup`` to a harness pin this layer keeps — the one misreading that makes
+    # phase (C) miss the ``fastapi/1`` orphan.
     inherited: set[str] = set()
-    walking: list[tuple[str, str]] = []
-    for name, version in harness_pins.items():
-        canonical = canonicalize_name(name)
-        if canonical in inherited:
-            continue
+    roots = frozenset(canonicalize_name(source) for source in harness_pins)
+    bringers: dict[str, set[str]] = {}
+    declared_raw: dict[str, set[str]] = {}
+    walking: list[tuple[str, str, str]] = []
+    read_from: set[tuple[str, str]] = set()
+    for source, version in harness_pins.items():
+        canonical = canonicalize_name(source)
         inherited.add(canonical)
-        walking.append((canonical, version))
+        bringers.setdefault(canonical, set()).add(source)
+        if (canonical, source) not in read_from:
+            read_from.add((canonical, source))
+            walking.append((canonical, version, source))
     while walking:
-        name, version = walking.pop()
-        for required, _ in declarations(name, version):
-            if required in inherited:
+        name, version, source = walking.pop()
+        for required, _, raw in declarations(name, version):
+            if required in roots:
+                # The interpreter layer's own pin, and a root of this walk: the root it is
+                # reached from is itself, so what it declares is its own closure and not
+                # the reaching pin's. Left as the seed recorded it.
                 continue
+            bringers.setdefault(required, set()).add(source)
+            declared_raw.setdefault(required, set()).add(raw)
             inherited.add(required)
+            if (required, source) in read_from:
+                continue
+            read_from.add((required, source))
             try:
                 available = releases_of(required)
             except BakeError:
@@ -4160,7 +4372,7 @@ def transitive_pins(
                 continue
             if available:
                 walking.append(
-                    (required, max(available, key=lambda item: Version(item)))
+                    (required, max(available, key=lambda item: Version(item)), source)
                 )
 
     # The layer's own closure. Claims are collected per name before a version is chosen
@@ -4181,7 +4393,7 @@ def transitive_pins(
         if (name, version) in read:
             continue
         read.add((name, version))
-        for required, specifier in declarations(name, version):
+        for required, specifier, _ in declarations(name, version):
             if required in pinned:
                 continue
             node_cutoffs.setdefault(required, set()).add(cutoff)
@@ -4206,9 +4418,40 @@ def transitive_pins(
     # (B) The exemption the freeze gate reads: the interpreter layer's names minus the
     # ones this layer decides for itself. A name this layer pins is not "supplied" — the
     # layer installs over it at a version of its own.
+    #
+    # (C) And minus the leftovers of a harness pin this layer *replaces*, which are the
+    # one part of the interpreter layer's environment it may not leave alone
+    # (:data:`ORPHAN_RULE`). ``settled`` already says which those are: it holds the
+    # interpreter layer's version for every harness pin and the layer's own over the top of
+    # it, so a harness pin whose entry moved is one this layer installs a different release
+    # of — and a name every path of which starts at one of those is a dependency of a
+    # release this layer swapped out, not a name the interpreter layer provides it with.
+    # A name a *kept* harness pin also reaches is that pin's own dependency and stays —
+    # ``bringers[name] <= replaced`` is the whole of that test, and the reason the walk
+    # above is taken per (name, harness pin) pair rather than per name.
+    replaced = {
+        source
+        for source, version in harness_pins.items()
+        if settled[canonicalize_name(source)][1] != version
+    }
+    supplied = inherited - pinned - set(records)
+    orphans = tuple(
+        OrphanedPin(
+            name=name,
+            declared_by=tuple(sorted(bringers[name])),
+            declared=tuple(sorted(declared_raw[name])),
+            replaced_by=tuple(
+                sorted(settled[canonicalize_name(pin)][0] for pin in bringers[name])
+            ),
+        )
+        for name in sorted(supplied)
+        if bringers[name] <= replaced
+    )
+    removed = {pin.name for pin in orphans}
     return (
         tuple(records[name] for name in sorted(records)),
-        tuple(sorted(inherited - pinned - set(records))),
+        tuple(sorted(supplied - removed)),
+        orphans,
     )
 
 PYPI_TIMEOUT_SECS = 60
@@ -7669,6 +7912,7 @@ def deps_provenance(
     early: Sequence[EarlyInstall] = (),
     dropped: Sequence[DroppedPin] = (),
     provisioned: Sequence[str] = (),
+    orphans: Sequence[OrphanedPin] = (),
 ) -> dict[str, Any]:
     """What the bake decided for one bug, as data a later stage can read.
 
@@ -7741,6 +7985,19 @@ def deps_provenance(
     nothing records is one no reader can check: a name here that the interpreter layer
     does **not** in fact hold is a distribution this layer inherited from nowhere, which
     is the failure the gate exists to catch and would otherwise be its blind spot.
+
+    ``orphans`` is the halves of that same prediction this layer may **not** inherit, and
+    it is why the two keys are not one (:data:`ORPHAN_RULE`): a name the interpreter layer
+    holds as a dependency of a harness pin this layer re-pins to another release is not
+    something it provides the layer *with* — it is the old release's residue, no pin of the
+    layer names it, and ``pip`` leaves it behind because it does not uninstall what it
+    replaces. Each is an :class:`OrphanedPin`: the recipe uninstalls it by name, and it is
+    **not** in ``provisioned``, so the freeze gate reports one whose removal did not take.
+    The record carries ``declared_by``, ``declared`` and ``replaced_by`` — the harness pin
+    whose release brought it in, what that release declared, and the pin this layer
+    installed over it — because that is the half a reader cannot recover from the layer.
+    Like ``dropped``, the key is always present and empty when nothing was removed, so
+    "nothing was orphaned" and "this file predates the rule" are distinguishable.
     """
     return {
         "schema_version": 1,
@@ -7756,6 +8013,7 @@ def deps_provenance(
         "provisioned": list(provisioned),
         "installs": list(installs_of(resolved)),
         "dropped": [pin.as_dict() for pin in dropped],
+        "orphans": [pin.as_dict() for pin in orphans],
         "build_pins": [pin.as_dict() for pin in build_pins],
         "early_pins": [item.as_dict() for item in early],
         "dependencies": [dep.as_dict() for dep in resolved],
@@ -7804,6 +8062,15 @@ class BugDeps:
     provenance: dict[str, Any]
     build_pins: tuple[str, ...] = ()
     early_pins: tuple[str, ...] = ()
+    orphans: tuple[str, ...] = ()
+    """The inherited names the layer's recipe has to **remove**, not install (§3.2).
+
+    Canonical names of the interpreter layer's distributions that this layer's own pins
+    do not contain and that nothing it keeps still needs (:class:`OrphanedPin`):
+    ``requirements_recipe`` uninstalls each one after every install and before its ``pip
+    check``, and the freeze gate exempts none of them. Empty for every layer that does not
+    re-pin a harness package, which is most of them.
+    """
 
 
 @dataclass(frozen=True)
@@ -7992,7 +8259,7 @@ def resolve_bug_deps(
             # window they are held to is that release's — which for a reference pin
             # installed as written is later than the buggy commit, and for a build pin is
             # its own release date (:func:`pin_cutoff`).
-            transitive, provisioned = transitive_pins(
+            transitive, provisioned, orphaned = transitive_pins(
                 own_pins,
                 harness_pins=harness_pins,
                 commit_date=sources.commit_date,
@@ -8019,7 +8286,10 @@ def resolve_bug_deps(
         # The transitive picks are installed, recorded and gated exactly as the declared
         # ones are: they are the same kind of pin, chosen by the same rule, and the only
         # thing that distinguishes them is that no file in the bug's tree asked for them
-        # (:attr:`ResolvedDep.required_by`).
+        # (:attr:`ResolvedDep.required_by`). The orphans are the other half of the same
+        # walk and the one part of it that is *removed*: they are carried to the recipe by
+        # name and recorded with their reason, and they are deliberately not in
+        # ``provisioned``, which is what makes the freeze gate their second reader.
         deps = (*resolved, *transitive)
         installs = installs_of(deps)
         pins = pinned_parts(*build_specs, *installs)
@@ -8045,12 +8315,14 @@ def resolve_bug_deps(
                     early=early,
                     dropped=dropped,
                     provisioned=provisioned,
+                    orphans=orphaned,
                 ),
                 build_pins=build_specs,
                 # Spec strings, not ``pinned_parts``' ``(name, version)`` pairs: the
                 # recipe installs these, and ``satisfied_by`` is already the pin's own
                 # spelling. One pin can satisfy two builds, so the list is de-duplicated.
                 early_pins=tuple(dict.fromkeys(item.satisfied_by for item in early)),
+                orphans=tuple(pin.name for pin in orphaned),
             )
         )
     return out, flagged
@@ -8267,6 +8539,7 @@ def layer_recipes(
                     item.installs,
                     build_pins=item.build_pins,
                     early_pins=item.early_pins,
+                    orphans=item.orphans,
                     minor=minor,
                 ),
             )
@@ -8783,11 +9056,13 @@ def run_bake_actions(
 
     ``pins`` and ``provided`` are §3.2's freeze gate. ``pins`` maps a layer's name to its
     own pin list (:func:`layer_pins`) and ``provided`` to the names the interpreter layer
-    supplies it (:func:`transitive_pins`, recorded as ``provisioned`` in the provenance);
-    a layer the first of them does not name is not gated. What the gate reads is the
-    layer's ``pip freeze`` (:func:`unpinned_freeze`): every installed distribution has to
-    be a pin of this layer or something the interpreter layer provides, and a name in
-    neither is one pip resolved from the day's PyPI and failed through
+    supplies it (:func:`transitive_pins`, recorded as ``provisioned`` in the provenance —
+    the orphans it removes are deliberately not among them); a layer the first of them
+    does not name is not gated. What the gate reads is the layer's ``pip freeze``
+    (:func:`unpinned_freeze`): every installed distribution has to be a pin of this layer
+    or something the interpreter layer provides, and a name in neither is one pip resolved
+    from the day's PyPI — or an orphan whose removal did not take, since a name the recipe
+    uninstalls is in neither set on purpose (:data:`ORPHAN_RULE`) — and is failed through
     :func:`freeze_failure`. It runs after the own-pin gate because the two answer
     different questions — that one asks whether the pins can *hold* together, this one
     whether the pin list *describes* the layer — and it is the preflight's

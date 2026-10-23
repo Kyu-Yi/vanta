@@ -3541,6 +3541,55 @@ class TestBake:
         assert "python -m pytest --version" in recipe
         assert "cat >" not in recipe, "an empty heredoc would install nothing useful"
 
+    def test_the_orphans_are_uninstalled_after_the_installs_and_before_the_check(self):
+        """``fastapi/1``'s shape: the layer removes what it replaced, then reads the result.
+
+        The order is the assertion. ``pip`` does not uninstall what it replaces, so the
+        interpreter layer's ``exceptiongroup`` is still there after this layer installs
+        its own ``pytest``; it has to go *after* the dependency install — an install can
+        pull an orphan back in — and *before* ``pip check``, because the check has to read
+        the environment the layer actually ends up with (§3.2). Removal by name is the only
+        way to say it: nothing in the layer's pin list mentions the name.
+
+        The step carries no ``|| true``: ``pip`` exits ``0`` for a name that is not
+        installed, so anything else is the layer failing — which is also why the count of
+        ``|| true`` in the whole recipe is unchanged at one (the ``pip check`` itself).
+        """
+        recipe = bake_mod.requirements_recipe(
+            ["pytest==5.4.3"], orphans=["exceptiongroup", "iniconfig", "tomli"]
+        )
+        install = recipe.index("python -m pip install")
+        uninstall = recipe.index("python -m pip uninstall -y -r /tmp/orphans.txt")
+        check = recipe.index(bake_mod.PIP_CHECK_OUTPUT)
+        assert install < uninstall < check
+        assert "VANTA_ORPHANS" in recipe
+        assert all(name in recipe for name in ("exceptiongroup", "iniconfig", "tomli"))
+        assert recipe.count("|| true") == 1
+        assert not any(
+            "|| true" in line
+            for line in recipe.splitlines()
+            if line.startswith("python -m pip uninstall")
+        )
+        # The log says which names went, so an empty freeze block below it is readable.
+        echo = [
+            line for line in recipe.splitlines() if bake_mod.ORPHAN_PREFIX in line
+        ]
+        assert len(echo) == 1, "one line, every name on it"
+        assert all(name in echo[0] for name in ("exceptiongroup", "iniconfig", "tomli"))
+
+    def test_a_recipe_without_orphans_carries_no_uninstall_step(self):
+        """The denominator: a layer that replaced nothing removes nothing.
+
+        Every bug layer but the ones that re-pin a harness package is unchanged by
+        :data:`bake_mod.ORPHAN_RULE`, and this is that claim as a property of the recipe
+        rather than of the walk: no heredoc, no ``pip uninstall``, no marker.
+        """
+        assert bake_mod.orphan_removal_lines(()) == []
+        recipe = bake_mod.requirements_recipe(["decorator==4.4.0"])
+        assert "pip uninstall" not in recipe
+        assert bake_mod.ORPHAN_PREFIX not in recipe
+        assert "VANTA_ORPHANS" not in recipe
+
     def test_the_toolchain_is_installed_first_and_the_builds_are_not_isolated(self):
         """The installs, in order, and which of them keeps pip's own isolation.
 
@@ -6201,7 +6250,7 @@ class TestTheClosureWalk:
         )
 
     def test_a_releases_own_declarations_are_pinned_by_the_date_rule(self):
-        pins, provided = self._walk(
+        pins, provided, orphans = self._walk(
             (("pytest", "5.4.3"),), cutoffs={"pytest": "2020-04-09"}
         )
         assert [dep.pin for dep in pins] == [
@@ -6213,10 +6262,11 @@ class TestTheClosureWalk:
             "wcwidth==0.1.9",
         ]
         assert provided == (), "with no harness pins there is nothing inherited"
+        assert orphans == (), "and nothing the layer replaced, so nothing to remove"
 
     def test_the_declarations_the_layer_cannot_have_are_not_pinned(self):
         """Markers are evaluated for the layer: Windows-only and py<3.8 are not read."""
-        pins, _provided = self._walk(
+        pins, _provided, _orphans = self._walk(
             (("pytest", "5.4.3"),), cutoffs={"pytest": "2020-04-09"}
         )
         names = {dep.name for dep in pins}
@@ -6229,7 +6279,7 @@ class TestTheClosureWalk:
         assert names.isdisjoint({"mypy", "requests", "nose", "hypothesis"})
 
     def test_every_pick_names_the_pin_that_required_it(self):
-        pins, _provided = self._walk(
+        pins, _provided, _orphans = self._walk(
             (("pytest", "5.4.3"),), cutoffs={"pytest": "2020-04-09"}
         )
         for dep in pins:
@@ -6260,20 +6310,18 @@ class TestTheClosureWalk:
         walked at the versions it has — through ``pytest``, which this layer re-pins,
         because pip does not uninstall what it replaces — and the names this layer
         decides for itself are taken back out: ``packaging`` and ``pluggy`` are in
-        both, so they are pins and not provisions.
+        both, so they are pins and not provisions. What is left is the pair the layer
+        keeps, and the three old-``pytest`` names that are the next test's subject.
         """
-        pins, provided = self._walk(
+        pins, provided, orphans = self._walk(
             (("pytest", "5.4.3"),),
             harness_pins={"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
             cutoffs={"pytest": "2020-04-09"},
         )
         assert provided == (
-            "exceptiongroup",
-            "iniconfig",
             "pytest-json-report",
             "pytest-metadata",
-            "tomli",
-        )
+        ), "the harness pair the layer keeps, minus every name it decides for itself"
         assert {dep.name for dep in pins} == {
             "attrs",
             "more-itertools",
@@ -6283,6 +6331,79 @@ class TestTheClosureWalk:
             "wcwidth",
         }, "a name this layer decides for itself is a pin, not a provision"
         assert "pytest" not in provided, "the layer's own pin is not something it inherits"
+        assert [pin.name for pin in orphans] == [
+            "exceptiongroup",
+            "iniconfig",
+            "tomli",
+        ], "8.0.2's own declarations, which 5.4.3 does not make and the layer did not name"
+
+    def test_the_residue_of_a_replaced_harness_pin_is_orphaned_and_says_why(self):
+        """``fastapi/1``'s shape: ``exceptiongroup==1.3.1`` exempted was the ``pip check``
+        failure, and it is an orphan of the base layer's ``pytest 8.0.2`` (§3.2).
+
+        The record is the half a reader cannot recover from the layer: which harness pin
+        brought the name in, what that release declared, and the pin this layer installed
+        over it. ``pytest-json-report`` is the counter-example the rule turns on — it is
+        *also* an inherited name no pin of this layer contains, and it is **not** an
+        orphan, because the harness pin it comes from is one this layer keeps.
+        """
+        _pins, provided, orphans = self._walk(
+            (("pytest", "5.4.3"),),
+            harness_pins={"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
+            cutoffs={"pytest": "2020-04-09"},
+        )
+        by_name = {pin.name: pin for pin in orphans}
+        assert set(by_name) == {"exceptiongroup", "iniconfig", "tomli"}
+        assert set(provided).isdisjoint(by_name), (
+            "an orphan is exempted from nothing: the freeze gate has to report one whose "
+            "removal did not take"
+        )
+        exceptiongroup = by_name["exceptiongroup"]
+        assert exceptiongroup.declared_by == ("pytest",)
+        assert exceptiongroup.declared == (
+            'exceptiongroup >=1.0.0rc8 ; python_version < "3.11"',
+        ), "the declaration as pytest 8.0.2's own metadata wrote it"
+        assert exceptiongroup.replaced_by == ("pytest==5.4.3",)
+        assert exceptiongroup.rule == bake_mod.ORPHAN_RULE
+        assert exceptiongroup.as_dict() == {
+            "name": "exceptiongroup",
+            "rule": bake_mod.ORPHAN_RULE,
+            "declared_by": ["pytest"],
+            "declared": ['exceptiongroup >=1.0.0rc8 ; python_version < "3.11"'],
+            "replaced_by": ["pytest==5.4.3"],
+        }
+        assert "exceptiongroup" in exceptiongroup.describe()
+        assert "pytest" in exceptiongroup.describe()
+
+    def test_a_name_a_kept_harness_pin_still_needs_is_not_an_orphan(self):
+        """The one way an inherited name is *not* removed: a harness pin this layer keeps
+        reaches it too, so it is that pin's own dependency and the layer inherits it.
+
+        ``pytest-json-report 1.5.0`` is the same release in both layers, so its
+        ``pytest-metadata`` stays — uninstalling it would break the plugin the oracle is
+        read from.
+        """
+        _pins, provided, orphans = self._walk(
+            (("pytest", "5.4.3"),),
+            harness_pins={"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
+            cutoffs={"pytest": "2020-04-09"},
+        )
+        assert "pytest-metadata" in provided
+        assert "pytest-metadata" not in {pin.name for pin in orphans}
+
+    def test_a_layer_that_re_pins_nothing_orphans_nothing(self):
+        """The rule's own denominator: no harness pin moved, so nothing is removed.
+
+        A layer whose bug pins only its own dependencies inherits the interpreter layer's
+        harness pair whole — ``pytest 8.0.2`` is still the pytest it has — and every name
+        its release declared is a name the interpreter layer provides it with.
+        """
+        _pins, provided, orphans = self._walk(
+            (("httpcore", "0.3.0"),),
+            harness_pins={"pytest": "8.0.2", "pytest-json-report": "1.5.0"},
+        )
+        assert orphans == ()
+        assert set(provided) >= {"exceptiongroup", "iniconfig", "tomli"}
 
 
 class TestPinCutoff:

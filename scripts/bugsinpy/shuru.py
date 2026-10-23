@@ -35,6 +35,155 @@ class ShuruError(RuntimeError):
     """The sandbox itself failed to start or to report a result."""
 
 
+DEV_SHM_PATH = "/dev/shm"
+"""Where CPython's POSIX semaphores live, and where the VM puts nothing.
+
+[VANTA-WHY] A Shuru microVM boots with no ``/dev/shm`` at all. CPython's
+``multiprocessing`` allocates its semaphores and its shared-memory segments as files
+*in that directory* (``multiprocessing/synchronize.py`` -> ``_multiprocessing.SemLock``
+-> ``sem_open``), so on such a VM the very first ``multiprocessing.Lock()`` raises
+``FileNotFoundError: [Errno 2] No such file or directory`` **with no filename** — the
+errno comes from the kernel, not from a failed open of a named path.
+
+Measured, and the shape is why it cost a debugging session: it is the same error text a
+missing compiler produces, so it read as a toolchain failure. ``DISTUTILS_DEBUG=1`` on
+numpy 1.18.5 showed the traceback ending in ``numpy/distutils/ccompiler.py`` ->
+``multiprocessing.pool.ThreadPool`` -> ``SemLock``; the archiver probe had already
+cleared ``ar``/``ARFLAGS``. The probe that settled it: ``ls /dev/shm`` -> *No such file
+or directory*, ``multiprocessing.Lock()`` -> the same ``FileNotFoundError``, and after
+``mkdir -p /dev/shm && mount -t tmpfs ... /dev/shm`` the lock is created.
+
+The blast radius is the whole benchmark, not the bake: any ``Pool``, ``Queue`` or
+``Lock`` inside a VM fails this way, so a bug whose tests use multiprocessing reports
+*false failures* that look like model errors. It is therefore fixed at every boot rather
+than around numpy.
+"""
+
+DEV_SHM_ENV = "VANTA_DEV_SHM"
+"""The variable name :data:`DEV_SHM_GUARD` exports, and the one the bake records.
+
+Named once because three readers depend on the exact spelling: the guard that sets
+it, :func:`bugsinpy.bake.build_env_lines`' filter and assertion, and anyone reading
+``/opt/vanta-build-env.txt`` afterwards. A second literal in the bake would not fail
+loudly — it would silently stop matching the guard and drop the fact from the record.
+"""
+
+DEV_SHM_MOUNTED = "tmpfs mounted"
+"""The value :data:`DEV_SHM_GUARD` exports as :data:`DEV_SHM_ENV` once the mount is in place.
+
+A value rather than a bare flag so a recipe can record it with the same ``NAME=value``
+shape as everything else in the build-environment record, which is the only shape that
+file's reader keeps (:func:`bugsinpy.bake.layer_provenance_lines`).
+"""
+
+DEV_SHM_MARKER = f"vanta dev/shm: {DEV_SHM_MOUNTED}"
+"""The line every VM prints on **stderr** after its start-up check passes.
+
+Stderr and not stdout: ``shuru.run``'s stdout is pytest's, and the harness parses it
+(``_exit_code``, ``parse_collected``). A start-up banner on stdout would be read as
+test output.
+"""
+
+STARTUP_CHECK_EXIT = 86
+"""Exit code of a VM whose start-up check could not run: no ``/dev/shm``.
+
+Distinct from 1 because it is not the command's failure: ``checkpoint_create``'s marker
+probe distinguishes it so a VM that cannot mount a tmpfs does not read as "the marker is
+missing" and delete a layer that is fine.
+"""
+
+MP_SMOKE_EXIT = 87
+"""Exit code of a VM where ``/dev/shm`` mounted but multiprocessing still cannot use it."""
+
+MP_SMOKE_PREFIX = "multiprocessing smoke ok"
+"""What the smoke check prints when ``Lock()`` and a 2-worker ``Pool`` both work."""
+
+MP_SMOKE_CODE = (
+    "import multiprocessing as mp; "
+    # Lock() is the direct translation of the failure: it is the call that raises
+    # FileNotFoundError when the semaphore directory is absent.
+    "lock = mp.Lock(); "
+    # A Pool is the indirect one and the reason this is not Lock-only: ThreadPool is
+    # what numpy 1.18.5's build_clib reaches through numpy/distutils/ccompiler.py, so
+    # a check that only made a Lock would not have reproduced the shipped traceback.
+    "pool = mp.Pool(2); "
+    "assert pool.map(abs, [-1, -2, -3]) == [1, 2, 3], 'Pool.map'; "
+    "pool.close(); pool.join()"
+)
+"""The one-liner that fails when a VM's ``multiprocessing`` has no semaphore store.
+
+Also run by the bake's toolchain smoke (:func:`bugsinpy.bake.toolchain_smoke_lines`),
+which is why it is public: two spellings of this check would drift, and the check is
+the whole point of the constant.
+"""
+
+DEV_SHM_GUARD = "; ".join(
+    [
+        # Idempotent: `run` boots a fresh VM from a checkpoint every time, and a
+        # checkpoint holds no mounts, but the same guard also runs on the boot that
+        # *created* a layer, where a later line could in principle have mounted it.
+        f"{DEV_SHM_ENV}=''",
+        f"if grep -q '^tmpfs {DEV_SHM_PATH} ' /proc/mounts 2>/dev/null; then "
+        f"{DEV_SHM_ENV}='{DEV_SHM_MOUNTED}'",
+        f"elif mkdir -p {DEV_SHM_PATH} && mount -t tmpfs -o rw,nosuid,nodev tmpfs "
+        f"{DEV_SHM_PATH}; then {DEV_SHM_ENV}='{DEV_SHM_MOUNTED}'",
+        "fi",
+        f"export {DEV_SHM_ENV}",
+        f'[ -n "${DEV_SHM_ENV}" ] || {{ echo "vanta dev/shm: the VM has no '
+        f"{DEV_SHM_PATH} and a tmpfs cannot be mounted on it, so CPython's "
+        f'multiprocessing cannot create a semaphore" >&2; exit {STARTUP_CHECK_EXIT}; }}',
+        f"echo {shlex.quote(DEV_SHM_MARKER)} >&2",
+        # The smoke, on whichever interpreter this VM has: `python3` first because the
+        # base image's is 3.13 while a layer's `python` is the venv wrapper, and either
+        # proves what this check is about (the *kernel* has a semaphore filesystem).
+        # Skipped, not failed, when the VM has no interpreter at all: a VM that will
+        # never run Python cannot have a Python multiprocessing problem, and the base
+        # image before `create_python_checkpoint` installs it is exactly that VM.
+        #
+        # `if`/`elif` rather than `$(command -v python3 || command -v python || true)`:
+        # this guard also runs inside recipe shells that set ``-e``, where an
+        # AND-OR list that fails is the list's status and would end the build — and a
+        # trailing ``|| true`` would be a second one in a recipe whose own test asserts
+        # there is exactly one (:func:`bugsinpy.requirements_recipe`'s).
+        'VANTA_MP_PY=""',
+        'if command -v python3 >/dev/null 2>&1; then VANTA_MP_PY="python3"',
+        'elif command -v python >/dev/null 2>&1; then VANTA_MP_PY="python"',
+        "fi",
+        f'export VANTA_MP_CODE={shlex.quote(MP_SMOKE_CODE)}',
+        '[ -z "$VANTA_MP_PY" ] || "$VANTA_MP_PY" -c "$VANTA_MP_CODE" || '
+        f'{{ echo "vanta {MP_SMOKE_PREFIX}: FAILED -- {DEV_SHM_PATH} is mounted but '
+        f'multiprocessing cannot use it (Lock and Pool are what every test in this VM '
+        f'would fail on)" >&2; exit {MP_SMOKE_EXIT}; }}',
+        f'[ -z "$VANTA_MP_PY" ] || echo "vanta {MP_SMOKE_PREFIX}: Lock and a 2-worker '
+        'Pool" >&2',
+    ]
+)
+"""Mount a tmpfs on :data:`DEV_SHM_PATH`, prove multiprocessing works, or stop the boot.
+
+[VANTA-WHY] One string, run first by every entry point that boots a VM
+(:func:`checkpoint_create`, :func:`run`), because the two facts it establishes are facts
+about *the VM* and not about any one command: mounts do not survive into a checkpoint, so
+"the layer has /dev/shm" is not a property that could be baked in and read later — it
+has to be re-established on every boot, and a boot that cannot establish it must fail
+loudly rather than let the command under it report a false test failure.
+
+Fail *before* the command runs, with :data:`STARTUP_CHECK_EXIT`/:data:`MP_SMOKE_EXIT`,
+because the alternative is the failure this exists to end: an ``[Errno 2]`` twenty
+minutes into a source build, naming no file and no variable.
+"""
+
+
+def startup_check_lines() -> list[str]:
+    """The start-up check as recipe lines, for a caller that records rather than boots.
+
+    The bake's interpreter layer wants the same check *inside* its own record
+    (``/opt/vanta-build-env.txt``) as well as at boot: the boot says "this VM has
+    /dev/shm", the record says "the layer that was baked carries that fact", and those
+    are two different claims about two different artifacts.
+    """
+    return [DEV_SHM_GUARD]
+
+
 @dataclass
 class ExecResult:
     """One command's outcome inside a microVM."""
@@ -107,7 +256,11 @@ def checkpoint_create(
     args += ["--disk-size", str(disk_mb)]
     if allow_net:
         args += ["--allow-net"]
-    args += ["--", "sh", "-c", script]
+    # [VANTA-WHY] The start-up check runs *before* the recipe, on the same boot, so a
+    # VM that cannot provide /dev/shm fails here rather than inside whatever build
+    # the recipe reaches first (DEV_SHM_GUARD). A mount cannot be baked into the
+    # layer, so this is not redundant with anything the recipe records.
+    args += ["--", "sh", "-c", f"{DEV_SHM_GUARD}\n{script}"]
 
     created = subprocess.run(
         args,
@@ -151,6 +304,21 @@ def checkpoint_create(
             )
             if probe.ok:
                 return result
+            if probe.exit_code == STARTUP_CHECK_EXIT:
+                # [VANTA-WHY] The probe boots the layer, so it runs the start-up check
+                # too (``run``). A VM whose check fails is a fact about the *machine*,
+                # not about the layer the recipe just built: the marker was never
+                # looked for. Deleting here would throw away a healthy layer for a
+                # tmpfs that could not be mounted on this boot — the failure mode
+                # ``checkpoint_create``'s two-attempt loop already guards against for
+                # a racy boot, arriving through a different door.
+                raise ShuruError(
+                    f"checkpoint {name!r} is left in place: the probe VM could not "
+                    f"establish {DEV_SHM_PATH} (exit {STARTUP_CHECK_EXIT}), so its "
+                    f"marker {marker!r} was never tested. Fix the host's ability to "
+                    "boot a VM with a tmpfs (DEV_SHM_GUARD) and re-run.\n"
+                    f"--- probe stderr ---\n{probe.stderr.strip()[-1000:]}"
+                )
             attempts.append(
                 f"attempt {attempt}: exit={probe.exit_code} "
                 f"timed_out={probe.timed_out}\n"
@@ -205,7 +373,14 @@ def run(
     # boot, so the probe reported the marker missing on two healthy checkpoints in
     # a row and the bake deleted a layer that was fine.
     inner = " && ".join(
-        [f"cd {shlex.quote(guest_cwd)}"]
+        # [VANTA-WHY] The start-up check is part of *every* boot, this one included:
+        # ``run`` is the path the suite, the runner, the oracle and the marker probe
+        # all take, and a mount does not survive into a checkpoint, so "the VM has
+        # /dev/shm" is a fact that has to be re-established on each one rather than
+        # read back out of the layer (DEV_SHM_GUARD). ``&&`` makes its non-zero exit
+        # the command's, so a VM that cannot provide a tmpfs reports the start-up
+        # check and not a test failure.
+        [DEV_SHM_GUARD, f"cd {shlex.quote(guest_cwd)}"]
         + ([f"export {k}={shlex.quote(v)}" for k, v in env.items()] if env else [])
         + [shlex.join(command)]
     )

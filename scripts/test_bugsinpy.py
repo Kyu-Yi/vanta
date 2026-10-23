@@ -2385,6 +2385,92 @@ class TestShuruCommandQuoting:
 
 
 # ============================================================================
+# shuru.py — the VM start-up check (/dev/shm), no VM
+# ============================================================================
+class TestShuruStartUpCheck:
+    """Every VM boot mounts ``/dev/shm`` first, or stops.
+
+    [WHY] A Shuru microVM boots with no ``/dev/shm``, and CPython's
+    ``multiprocessing`` puts its semaphores there, so the first ``Lock()`` raises
+    ``FileNotFoundError: [Errno 2]`` with no filename. The failure this prevents is
+    *silent on the developing machine*: a Mac has ``/dev/shm``, so a boot that
+    skipped the mount passes locally and fails inside the VM — as a test failure
+    that names no file.
+    """
+
+    def test_the_check_mounts_a_tmpfs_and_stops_the_boot_without_one(self):
+        guard = shuru_mod.DEV_SHM_GUARD
+        assert "mkdir -p /dev/shm" in guard
+        assert "mount -t tmpfs" in guard
+        assert f"exit {shuru_mod.STARTUP_CHECK_EXIT}" in guard
+        # Idempotent: the guard also runs on the boot that *created* a layer.
+        assert "grep -q '^tmpfs /dev/shm ' /proc/mounts" in guard
+
+    def test_the_check_smokes_lock_and_a_pool(self):
+        """Both halves: ``Lock()`` is the measured call, a ``Pool`` is numpy's path."""
+        assert "mp.Lock()" in shuru_mod.MP_SMOKE_CODE
+        assert "mp.Pool(2)" in shuru_mod.MP_SMOKE_CODE
+        # Embedded shell-quoted; the raw text would not survive the guard's own
+        # `sh -c` word splitting (the smoke has spaces and quotes in it).
+        assert shlex.quote(shuru_mod.MP_SMOKE_CODE) in shuru_mod.DEV_SHM_GUARD
+        assert f"exit {shuru_mod.MP_SMOKE_EXIT}" in shuru_mod.DEV_SHM_GUARD
+        # Skipped, not failed, on a VM with no interpreter at all — the base image
+        # before `create_python_checkpoint` installs one.
+        assert '[ -z "$VANTA_MP_PY" ] ||' in shuru_mod.DEV_SHM_GUARD
+
+    def test_startup_check_lines_is_the_guard(self):
+        """The bake records the same check rather than writing a second one."""
+        assert shuru_mod.startup_check_lines() == [shuru_mod.DEV_SHM_GUARD]
+
+    def test_the_marker_probe_keeps_the_layer_when_the_vm_has_no_tmpfs(self, monkeypatch):
+        """A failed start-up check is a fact about the machine, not about the layer.
+
+        The probe boots the checkpoint, so the check runs there too; read as "the
+        marker is missing" it would delete a layer that is fine — the same class of
+        loss the two-attempt loop exists to prevent, arriving through another door.
+        """
+        deleted: list[str] = []
+
+        def fake_run(args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        monkeypatch.setattr(shuru_mod, "_shuru_bin", lambda: "/usr/bin/shuru")
+        monkeypatch.setattr(shuru_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            shuru_mod,
+            "run",
+            lambda **kwargs: shuru_mod.ExecResult(
+                stdout="",
+                stderr="vanta dev/shm: the VM has no /dev/shm ...",
+                exit_code=shuru_mod.STARTUP_CHECK_EXIT,
+                timed_out=False,
+            ),
+        )
+        monkeypatch.setattr(shuru_mod, "checkpoint_delete", deleted.append)
+
+        with pytest.raises(shuru_mod.ShuruError, match="/dev/shm"):
+            shuru_mod.checkpoint_create(
+                "vanta-bi-Demo-1", "true", marker="/opt/vanta-deps-ok"
+            )
+        assert deleted == []
+
+    def test_checkpoint_create_runs_the_check_before_the_recipe(self, monkeypatch):
+        """The build boot carries it too, so a recipe cannot run under a broken VM."""
+        seen: dict = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        monkeypatch.setattr(shuru_mod, "_shuru_bin", lambda: "/usr/bin/shuru")
+        monkeypatch.setattr(shuru_mod.subprocess, "run", fake_run)
+        shuru_mod.checkpoint_create("vanta-bi-Demo-1", "set -eux\ntrue\n")
+        script = seen["args"][seen["args"].index("--") + 3]
+        assert script.startswith(shuru_mod.DEV_SHM_GUARD)
+        assert script.endswith("set -eux\ntrue\n")
+
+
+# ============================================================================
 # suite.py — command construction and report reading (no VM)
 # ============================================================================
 class TestSuiteCommand:
@@ -3352,6 +3438,51 @@ class TestBake:
         assert bake_mod.build_env_for(None) == {}
         assert bake_mod.build_env_lines({}) == []
         assert bake_mod.toolchain_smoke_lines({}) == []
+
+    def test_the_interpreter_recipe_runs_the_start_up_check(self):
+        """The layer's own log says its VM had a semaphore filesystem.
+
+        The boot already ran it (``shuru.checkpoint_create``). Running it *in the
+        recipe* as well is what makes ``VANTA_DEV_SHM`` a fact about this layer
+        rather than about the wrapper that happened to launch its build — and it has
+        to run before the record is written, or the record cannot contain it.
+        """
+        recipe = self._recipe()
+        assert shuru_mod.DEV_SHM_GUARD in recipe
+        assert recipe.index(shuru_mod.DEV_SHM_GUARD) < recipe.index(
+            "env | grep -E"
+        )
+
+    def test_the_per_bug_recipe_runs_the_start_up_check_without_a_toolchain(self):
+        """Unconditional, unlike the compiler environment: 3.6/3.7 has no compiler
+        but its VM still needs ``/dev/shm`` or every ``Pool`` in its suite fails."""
+        recipe = bake_mod.requirements_recipe(["decorator==4.4.0"], minor="3.6")
+        assert shuru_mod.DEV_SHM_GUARD in recipe
+        assert "export CC" not in recipe
+
+    def test_the_record_carries_the_semaphore_filesystem(self):
+        """``VANTA_DEV_SHM`` is the one fact here that no compiler flag can supply.
+
+        Asserted as well as filtered for: ``env | grep`` *drops* a variable that is
+        not set, so a layer whose boot never ran the check would write a record that
+        silently omits the line — and a reader cannot tell "absent" from "not
+        recorded".
+        """
+        lines = bake_mod.build_env_lines(bake_mod.COMPILER_ENV)
+        record = next(line for line in lines if "env | grep -E" in line)
+        assert shuru_mod.DEV_SHM_ENV in record
+        assert any(f'[ -n "${shuru_mod.DEV_SHM_ENV}" ]' in line for line in lines)
+
+    def test_the_toolchain_smoke_smokes_multiprocessing(self):
+        """Beside the compiler, on the interpreter the suites will use."""
+        lines = bake_mod.toolchain_smoke_lines(bake_mod.COMPILER_ENV)
+        smoke = next(
+            line for line in lines if shlex.quote(shuru_mod.MP_SMOKE_CODE) in line
+        )
+        assert smoke.startswith("python -c "), (
+            "this layer's venv wrapper, not the base image's 3.13"
+        )
+        assert any(shuru_mod.MP_SMOKE_PREFIX in line for line in lines)
 
     # ---- the per-bug recipe ----------------------------------------------
     def test_declared_deps_reads_setup_sh_and_drops_the_self_install(self):

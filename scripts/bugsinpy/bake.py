@@ -67,7 +67,17 @@ from packaging.version import InvalidVersion, Version
 from .bugsinpy_meta import read_metadata_text
 from . import suite as suite_mod
 from . import trees as tree_mod
-from .shuru import ExecResult, checkpoint_create, checkpoint_delete, checkpoint_exists
+from .shuru import (
+    DEV_SHM_ENV,
+    DEV_SHM_MOUNTED,
+    MP_SMOKE_CODE,
+    MP_SMOKE_PREFIX,
+    ExecResult,
+    checkpoint_create,
+    checkpoint_delete,
+    checkpoint_exists,
+    startup_check_lines,
+)
 from .split import Split, SplitError
 
 DEFAULT_BASE = "vanta-python"
@@ -691,22 +701,32 @@ COMPILER_ENV: Mapping[str, str] = {
 """The compiler a source build in these layers runs, the linker that follows it, and
 the C flags that restore the warning semantics of the era the sources were written in.
 
-[VANTA-WHY] Measured on matplotlib/1: ``numpy==1.18.5`` has no wheel for the sandbox,
-so the layer builds it from source, and that build ended in
-``error: [Errno 2] No such file or directory`` — *after* the normal BLAS/LAPACK
-fallback warnings and ``Unknown distribution option: 'define_macros'``, i.e. the
-configure step had already read the tree and what failed was the compiler
-*invocation*. uv's interpreter is a python-build-standalone build whose ``sysconfig``
-records the compiler its own build machine used (a path that does not exist here),
-and an old-style ``distutils`` build runs exactly that string — ``gcc`` and ``g++``
-are installed by :data:`SYSTEM_PACKAGES` and were never being called. These four are
-``distutils``' documented override (``customize_compiler`` reads ``CC``/``CXX``/
-``LDSHARED`` from the environment before the recorded value), and
+[VANTA-WHY] What the interpreter recorded is printed by :func:`_sysconfig_probe`
+before these exports, so it is a reading and not a guess; the baked
+``vanta-bi-fastapi-1`` log carries ``recorded CC: cc``, ``recorded CXX: c++``,
+``recorded LDSHARED: cc -shared -Wl,--exclude-libs,ALL`` and
+``recorded LDCXXSHARED: c++ -shared``. uv's interpreter is a python-build-standalone
+build, so those strings are its build machine's and an old-style ``distutils`` build
+prefers them to anything the caller assumed — bare drivers that do resolve here, but
+not the toolchain :data:`SYSTEM_PACKAGES` installs, and a ``CFLAGS`` exported into
+the shell reaches the compile *and* the link line only through the override below.
+These four are ``distutils``' documented override (``customize_compiler`` reads
+``CC``/``CXX``/``LDSHARED`` from the environment before the recorded value), and
 ``g++ -pthread -shared`` is CPython's own Linux default for ``LDCXXSHARED``, so
 nothing about the link line is invented here.
 
-The fifth variable is a different failure with the same shape — the *compiler* was
-wrong there, the compiler's *defaults* are wrong here — and it is in the same
+[VANTA-WHY] The ``error: [Errno 2]`` this mapping was first written for —
+``numpy==1.18.5`` built from its sdist in the ``matplotlib/1`` layer, *after* the
+BLAS/LAPACK fallback warnings, so it read as the compiler invocation — is not the
+compiler. It is the VM's missing ``/dev/shm``, which CPython's multiprocessing needs
+for the ``SemLock`` that numpy's parallel compile creates; measured, and fixed per
+boot rather than here (:data:`bugsinpy.shuru.DEV_SHM_PATH`). The four driver
+variables remain because they pin the toolchain the flags above are written for, and
+their assertion is what keeps that a fact about the layer rather than a recipe line
+nobody can read after the fact.
+
+The fifth variable is the other half of the same fact — which compiler runs, and
+what that compiler's *own* defaults make of 2020-era C — and it is in the same
 mapping for the same reason: both are facts about the toolchain this layer runs
 rather than about the tree being built, and a reader of a failed build should not
 have to know which of the two it was. See :data:`_ERA_WARNING_FLAGS`.
@@ -790,21 +810,32 @@ def build_env_lines(env: Mapping[str, str]) -> list[str]:
     Empty when ``env`` is empty, so a layer whose minor has no toolchain keeps its
     recipe line for line (:func:`build_env_for`).
 
-    The record is the variables *and* the compiler's own version. The variables say
-    which flags were asked for; the version says which compiler read them, and those
-    are two different facts — the flags above are written for GCC 14's defaults, so a
-    layer whose ``gcc`` is a different major is a layer where the same flags mean
-    something else. Anything that reaches ``$CC`` without going through the
-    environment (``sysconfig``'s recorded value) is what :func:`_sysconfig_probe`
-    prints.
+    The record is the variables *and* the compiler's own version *and* the fact that
+    this layer's VM had a semaphore filesystem. The variables say which flags were
+    asked for; the version says which compiler read them; and :data:`DEV_SHM_ENV`
+    says the layer's ``multiprocessing`` can make a semaphore at all — which is the
+    one fact about a layer that no compiler flag can supply and whose absence shows up
+    as a *test failure* rather than a build error (:data:`bugsinpy.shuru.DEV_SHM_PATH`).
+    Anything that reaches ``$CC`` without going through the environment
+    (``sysconfig``'s recorded value) is what :func:`_sysconfig_probe` prints.
     """
     if not env:
         return []
-    pattern = "|".join(env)
+    # The start-up check's variable is recorded beside the compiler's: same file, same
+    # shape, one reader for both (DEV_SHM_GUARD).
+    pattern = "|".join([*env, DEV_SHM_ENV])
     return [
         _sysconfig_probe(),
         *[f"export {name}={shlex.quote(value)}" for name, value in env.items()],
         _build_env_assert(env),
+        # Asserted, not merely filtered for: `env | grep` *drops* a variable that is
+        # not set, so a layer whose boot never ran the start-up check would record a
+        # file that silently omits the one line saying multiprocessing works — and the
+        # reader of that file cannot tell "absent" from "not recorded".
+        f'[ -n "${DEV_SHM_ENV}" ] || {{ echo "the VM has no {DEV_SHM_ENV}: its '
+        "start-up check did not run, so CPython's multiprocessing cannot create a "
+        "semaphore and every test using a Pool, a Queue or a Lock would fail\" >&2; "
+        "exit 1; }",
         # `set -e` sees the last command in a pipeline, so this is the record rather
         # than the check — the check is the line above it.
         f"env | grep -E '^({pattern})=' | sort > {BUILD_ENV_RECORD}",
@@ -998,6 +1029,16 @@ def toolchain_smoke_lines(env: Mapping[str, str]) -> list[str]:
         "vanta_smoke_c, vanta_smoke_cpp; assert vanta_smoke_c.value() == 1 and "
         f"vanta_smoke_cpp.value() == 2; print('{_SMOKE_PREFIX}: C and C++ "
         'extensions build and import\')"',
+        # [VANTA-WHY] The kernel, not the compiler — and here rather than only at boot
+        # because this is the layer whose record a reader consults afterwards. A VM
+        # whose multiprocessing cannot create a semaphore makes every ``Pool``,
+        # ``Queue`` and ``Lock`` in a later wave fail as a *test* failure, which reads
+        # as a model error; ``DEV_SHM_GUARD`` runs the same check at every boot, and
+        # this is the layer's own receipt that it passed on the interpreter the
+        # suites will use (``python``, i.e. this layer's venv wrapper, not the base
+        # image's 3.13).
+        f"python -c {shlex.quote(MP_SMOKE_CODE)}",
+        f'echo "vanta {MP_SMOKE_PREFIX}: Lock and a 2-worker Pool"',
     ]
 
 
@@ -1064,6 +1105,13 @@ def python_recipe(minor: str, pin: PytestPin) -> str:
             # context. (Measured: the 3.8.20 standalone carries OpenSSL 3.0.14 and
             # builds a context fine, so `ssl` does not depend on the base image.)
             'python -c "import ssl; assert ssl.OPENSSL_VERSION; ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)"',
+            # The start-up check, in the recipe as well as at every boot
+            # (DEV_SHM_GUARD). The boot already ran it on this VM; running it here is
+            # what puts the fact *in this layer's own log* and makes the export the
+            # next line records a fact about the layer rather than about the wrapper
+            # that happened to launch the build. Idempotent: it re-reads /proc/mounts
+            # before mounting.
+            *startup_check_lines(),
             # The compiler environment, set on the interpreter layer because that is
             # where the toolchain is installed and because every source build *above*
             # this layer (the smoke check below, then numpy, then pandas) inherits the
@@ -2832,6 +2880,11 @@ def requirements_recipe(
         # as `ModuleNotFoundError` inside a wave.
         'python -c "import ssl, sys; assert sys.prefix != sys.base_prefix, sys.prefix; '
         'print(sys.version.split()[0], ssl.OPENSSL_VERSION, sys.prefix)"',
+        # Same start-up check as the interpreter layer's, and unconditional: a bug
+        # layer with a 3.6/3.7 interpreter records no compiler environment
+        # (:func:`build_env_for`) but its VM still needs a semaphore filesystem or its
+        # suite fails on every ``Pool``/``Queue``/``Lock`` (DEV_SHM_GUARD).
+        *startup_check_lines(),
         *build_env_lines(build_env_for(minor)),
     ]
     if toolchain:

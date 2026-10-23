@@ -37,6 +37,65 @@ const DEFAULT_CHECKPOINT: &str = "vanta-python";
 // VANTA_SHURU_DISK_MB when a dependency checkpoint needs more space.
 const DEFAULT_DISK_MB: u64 = crate::sandbox::deps::BASE_DISK_MB;
 
+// ---------------------------------------------------------------------------
+// The VM start-up check — DEV_SHM_GUARD
+// ---------------------------------------------------------------------------
+//
+// [VANTA-WHY] A Shuru microVM boots with NO ``/dev/shm`` at all. CPython's
+// ``multiprocessing`` creates its semaphores and shared-memory segments as files
+// *in that directory* (``multiprocessing/synchronize.py`` ->
+// ``_multiprocessing.SemLock`` -> ``sem_open``), so the first
+// ``multiprocessing.Lock()`` in such a VM raises
+// ``FileNotFoundError: [Errno 2] No such file or directory`` — with **no
+// filename**, because the errno comes from the kernel rather than from a failed
+// open of a named path.
+//
+// Measured, and the shape is why it cost a debugging session: it is the same
+// error text a missing compiler produces. On the harness layer
+// (``vanta-bugsinpy-py3.8``):
+//
+//     ls: cannot access '/dev/shm': No such file or directory
+//     multiprocessing.Lock()  -> FileNotFoundError: [Errno 2]
+//     after `mkdir -p /dev/shm && mount -t tmpfs -o rw,nosuid,nodev tmpfs /dev/shm`
+//                             -> the lock is created
+//
+// [VANTA-WHY] Per boot, not per layer: a mount does not survive into a
+// checkpoint, so "the checkpoint has /dev/shm" is not a property that could be
+// baked in and read back later. Every boot re-establishes it.
+//
+// [VANTA-WHY] This is the same check the BugsInPy harness runs
+// (``scripts/bugsinpy/shuru.py``, DEV_SHM_GUARD), in the other language this repo
+// runs untrusted code from. One rule, two spellings — a second *rule* would drift.
+//
+// Without it, a bug whose tests use a ``Pool``, a ``Queue`` or a ``Lock`` fails
+// inside the VM for a reason that has nothing to do with the code under test: a
+// false failure that reads as a model error.
+const DEV_SHM_GUARD: &str = r#"VANTA_DEV_SHM=''
+if grep -q '^tmpfs /dev/shm ' /proc/mounts 2>/dev/null; then VANTA_DEV_SHM='tmpfs mounted'
+elif mkdir -p /dev/shm && mount -t tmpfs -o rw,nosuid,nodev tmpfs /dev/shm; then VANTA_DEV_SHM='tmpfs mounted'
+fi
+export VANTA_DEV_SHM
+[ -n "$VANTA_DEV_SHM" ] || { echo "vanta dev/shm: the VM has no /dev/shm and a tmpfs cannot be mounted on it, so CPython's multiprocessing cannot create a semaphore" >&2; exit 86; }
+VANTA_MP_PY="$(command -v python3 || command -v python || true)"
+if [ -n "$VANTA_MP_PY" ]; then
+  "$VANTA_MP_PY" -c 'import multiprocessing as mp; lock = mp.Lock(); pool = mp.Pool(2); assert pool.map(abs, [-1, -2, -3]) == [1, 2, 3], "Pool.map"; pool.close(); pool.join()' || { echo "vanta multiprocessing smoke: FAILED -- /dev/shm is mounted but multiprocessing cannot use it (Lock and Pool are what every test in this VM would fail on)" >&2; exit 87; }
+fi"#;
+
+/// The guest shell line for one sandboxed command: the start-up check, then the command.
+///
+/// [VANTA-WHY] Split out of :func:`ShuruBackend::execute` so the boot step is
+/// testable without booting a VM. The guard is the only part of that command line
+/// no caller supplies, so a regression that dropped it would stay invisible until
+/// a test using multiprocessing failed for a reason that had nothing to do with
+/// the code under test.
+///
+/// A newline rather than ``&&`` between the two, because the guard ends in an
+/// ``if`` block: the command's exit status has to be the command's, and an
+/// ``&&``-chain makes every failure look like the chain's.
+fn guest_inner_command(guest_cwd: &str, cmd: &[&str]) -> String {
+    format!("{DEV_SHM_GUARD}\ncd {guest_cwd} && {command}", command = cmd.join(" "))
+}
+
 pub struct RepoCheckpoint {
     pub name: String,
     pub disk_mb: u64,
@@ -463,8 +522,11 @@ impl SandboxBackend for ShuruBackend {
             format!("{guest_mount}/{}", cwd.display())
         };
 
-        // Build the command to run inside the VM.
-        let inner_cmd = format!("cd {guest_cwd} && {}", cmd.join(" "));
+        // Build the command to run inside the VM. The start-up check comes first on
+        // every boot (guest_inner_command): this is the single path
+        // ``src/pipeline/harness.rs`` runs third-party code through, and a mount does
+        // not persist in a checkpoint, so it cannot be folded into the layer.
+        let inner_cmd = guest_inner_command(&guest_cwd, cmd);
         let cmd_str = cmd.join(" ");
         debug!(cmd = %cmd_str, guest_cwd = %guest_cwd, timeout_secs, "shuru exec");
 
@@ -532,5 +594,59 @@ impl SandboxBackend for ShuruBackend {
     fn destroy(self) {
         // TempDir is dropped here → auto-deletes the host mount directory.
         info!(root = %self.root.display(), "shuru backend destroyed (host temp dir removed)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // [VANTA-WHY] These are the only assertions about the guard that do not need a
+    // VM. They exist because the failure it prevents is *silent* on the machine doing
+    // the developing: a host has /dev/shm, so a boot that skipped the mount works
+    // locally and fails inside the VM as a test failure that names no file.
+
+    #[test]
+    fn the_guard_mounts_a_tmpfs_and_stops_the_boot_without_one() {
+        assert!(DEV_SHM_GUARD.contains("mkdir -p /dev/shm"));
+        assert!(DEV_SHM_GUARD.contains("mount -t tmpfs"));
+        assert!(DEV_SHM_GUARD.contains("/dev/shm"));
+        // Loud, and before the command: the alternative is an `[Errno 2]` twenty
+        // minutes into a source build that names no file and no variable.
+        assert!(DEV_SHM_GUARD.contains("exit 86"));
+        // Idempotent, because the guard also runs on the boot that created a layer.
+        assert!(DEV_SHM_GUARD.contains("grep -q '^tmpfs /dev/shm ' /proc/mounts"));
+    }
+
+    #[test]
+    fn the_guard_smokes_multiprocessing_on_whichever_interpreter_the_vm_has() {
+        // Both halves of the smoke: `Lock()` is the call that raises the measured
+        // FileNotFoundError, and a `Pool` is what numpy 1.18.5's build reached
+        // through numpy/distutils/ccompiler.py.
+        assert!(DEV_SHM_GUARD.contains("mp.Lock()"));
+        assert!(DEV_SHM_GUARD.contains("mp.Pool(2)"));
+        assert!(DEV_SHM_GUARD.contains("exit 87"));
+        // Skipped, not failed, when the VM has no interpreter: the base image has
+        // none before `create_python_checkpoint` installs one, and a VM that will
+        // never run Python cannot have a Python multiprocessing problem.
+        assert!(DEV_SHM_GUARD.contains("if [ -n \"$VANTA_MP_PY\" ]; then"));
+    }
+
+    #[test]
+    fn every_sandboxed_command_runs_the_guard_first() {
+        let inner = guest_inner_command("/workspace", &["python", "-m", "pytest"]);
+        // First, so a VM that cannot provide a semaphore fails before the command
+        // rather than inside it.
+        assert!(inner.starts_with(DEV_SHM_GUARD));
+        // And the command still ends the line, so its exit status is the line's.
+        assert!(inner.ends_with("cd /workspace && python -m pytest"));
+    }
+
+    #[test]
+    fn the_guard_does_not_swallow_the_command_or_its_status() {
+        // A newline, not `&&`: the guard ends in an `if` block, and chaining it with
+        // `&&` would make every failure read as the chain's.
+        let inner = guest_inner_command("/workspace/x", &["sh", "-c", "exit 3"]);
+        assert_eq!(inner, format!("{DEV_SHM_GUARD}\ncd /workspace/x && sh -c exit 3"));
     }
 }

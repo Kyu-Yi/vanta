@@ -405,17 +405,24 @@ written by the same script that does the install, beside the pip half `/opt/vant
 layer already carries.
 
 **The compiler a source build runs, and the era's warning semantics.** The 3.8 interpreter is a
-`python-build-standalone` build, so its `sysconfig` records the compiler of the machine it was built on
-— a path that does not exist in this image — and an old-style `distutils` build runs exactly that string.
-`bake.COMPILER_ENV` exports `distutils`' documented override in every layer whose minor has a toolchain
-(`bake.build_env_for`): `CC=gcc`, `CXX=g++`, and CPython's own Linux link lines
-`LDSHARED='gcc -pthread -shared'` / `LDCXXSHARED='g++ -pthread -shared'`. The recipe asserts each
-variable reached the layer's shell, because an `export` is not the same fact as the variable the build
-reads. Measured on `matplotlib/1`: `numpy==1.18.5` has no wheel here, so the layer builds it from its
-sdist and the build ended in `error: [Errno 2] No such file or directory` — *after* the BLAS/LAPACK
-fallback warnings and the configure step, i.e. the failure was the compiler *invocation*. The interpreter
-layer then builds a throwaway C **and** C++ extension before its marker, so a broken toolchain fails the
-base layer instead of twenty minutes into numpy.
+`python-build-standalone` build, so its `sysconfig` records the compiler of the machine it was built on,
+and an old-style `distutils` build prefers that recorded string to anything the caller assumed. What it
+recorded is a fact about the layer rather than a guess: `bake._sysconfig_probe` prints it first in every
+toolchain layer's recipe, and the baked `vanta-bi-fastapi-1` / `vanta-bi-PySnooper-3` logs carry
+`recorded CC: cc`, `recorded CXX: c++`, `recorded LDSHARED: cc -shared -Wl,--exclude-libs,ALL`,
+`recorded LDCXXSHARED: c++ -shared` — bare driver names that *do* resolve in this image. That is the
+correction to this section's earlier reading of them as "a path that does not exist in this image", and to
+its attribution of `matplotlib/1`'s `numpy==1.18.5` `error: [Errno 2]` to the compiler *invocation*: that
+traceback is the VM's missing `/dev/shm` (the passage at the end of this section), not the compiler.
+`bake.COMPILER_ENV` still exports `distutils`' documented override in every layer whose minor has a
+toolchain (`bake.build_env_for`): `CC=gcc`, `CXX=g++`, and CPython's own Linux link lines
+`LDSHARED='gcc -pthread -shared'` / `LDCXXSHARED='g++ -pthread -shared'` — so the layer builds and links
+with the toolchain `SYSTEM_PACKAGES` installs rather than with whichever driver `cc` currently points at,
+and so the `CFLAGS` below reach the **link** line as well as the compile line (`customize_compiler`
+appends an environment `CFLAGS` to both). The recipe asserts each variable reached the layer's shell,
+because an `export` is not the same fact as the variable the build reads. The interpreter layer then
+builds a throwaway C **and** C++ extension before its marker, so a broken toolchain fails the base layer
+instead of twenty minutes into numpy.
 
 The same environment carries `CFLAGS`, which is the second half of that failure: the compiler was right
 and its *defaults* are not. GCC 14 (the base image's) promotes six C diagnostics from warning to **error**
@@ -1552,6 +1559,57 @@ so a run's row and a report years later name the versions the suite really ran u
 therefore needed **no edit** for this rule: `bugsinpy_dev_split.json` and `bugsinpy_split.json` still
 carry each entry's interpreter-layer pair, and the per-bug reality lives in the provenance beside the
 layer it describes.
+
+**A Shuru microVM boots with no `/dev/shm`, so every boot mounts one before it runs anything at all.** A
+mount does not survive into a checkpoint, so "the layer has `/dev/shm`" is not a property that could be
+baked once and read back later; it is re-established at each boot instead. Measured, and it is why the
+`numpy==1.18.5` build above read as a compiler problem: CPython's `multiprocessing` creates its
+semaphores with `sem_open` in that directory (`multiprocessing/synchronize.py` →
+`_multiprocessing.SemLock`), so the first `multiprocessing.Lock()` in such a VM raises
+`FileNotFoundError: [Errno 2] No such file or directory` — **with no filename**, because the errno comes
+from the kernel rather than from a failed open of a named path, and `multiprocessing.pool`'s own queues
+(`SimpleQueue`) take a `Lock` too, which is how numpy's parallel compile reached it under
+`distutils`' `CCompiler_compile`. On the harness layer `vanta-bugsinpy-py3.8`: `ls: cannot access
+'/dev/shm': No such file or directory`; `multiprocessing.Lock()` → `[Errno 2]`; and after
+`mkdir -p /dev/shm && mount -t tmpfs -o rw,nosuid,nodev tmpfs /dev/shm` the lock is created. It is not
+`AR`/`ARFLAGS`: both were probed in that layer and work (`AR=ar`, `create_static_lib` fine).
+
+**One guard, in the two languages this harness runs untrusted code from.** `bugsinpy.shuru.DEV_SHM_GUARD`
+(Python) and `src/sandbox/shuru.rs`'s `DEV_SHM_GUARD` (Rust) are one rule with two spellings — a second
+*rule* would drift. The guard is idempotent (`grep -q '^tmpfs /dev/shm ' /proc/mounts` first, so the boot
+that *created* a layer does not remount under itself), it **stops the boot loudly** (`exit 86`) when
+neither the directory nor the mount can be had, and it is wired into every entry point: `checkpoint_create`
+(whose recipe therefore also runs it), `run`, the interpreter and per-bug recipes (`bake.python_recipe`,
+`bake.requirements_recipe`), and the Rust backend's `execute` — which is the path `pipeline/harness.rs`
+uses for every sandboxed command, so the same guard precedes the native suite, the generated tests,
+`ruff` and the checkpoint-E probe. The checkpoint-marker probe reads `exit 86` as a fact about the
+*machine* rather than a missing marker, so a host that cannot mount a tmpfs fails the boot instead of
+deleting a layer that is fine — the same class of loss the two-attempt loop exists to prevent, arriving
+through another door.
+
+**The mount is a claim; the smoke is the reading.** The guard follows the mount with
+`multiprocessing.Lock()` and a 2-worker `Pool.map` (`shuru.MP_SMOKE_CODE`, the same string
+`bake.toolchain_smoke_lines` runs in the interpreter layer, so the layer and the boot make one check and
+not two), failing with `exit 87` if either raises. A VM with no interpreter skips it rather than failing —
+the bare base image, before `create_python_checkpoint` installs one.
+
+**Recorded, so a layer says whether it can make a semaphore at all.** `bake.build_env_lines` exports
+`VANTA_DEV_SHM=tmpfs mounted` into the shell the build runs in, asserts it is set *before* writing the
+record (`env | grep` omits an unset variable, so a layer whose boot never ran the check would otherwise
+write a file that says nothing either way), and the variable then appears in `/opt/vanta-build-env.txt`
+and in the layer's provenance beside `CC`/`CXX`/`LDSHARED`/`CC_VERSION`. `shuru.DEV_SHM_MOUNTED` is the
+one spelling of the value. Without this, a bug whose tests use a `Pool`, a `Queue` or a `Lock` fails
+inside the VM as a *test* failure that names no file — and §3.2's own gate cannot see the difference:
+`bugsinpy.suite.SKIPPED_OUTCOME` is excluded from both `F_before` and `F_after`, so a suite that reacts to
+a missing `/dev/shm` by **skipping** (tqdm's `tests/conftest.py` does exactly that, in the tree this repo
+already has) is invisible there as well.
+
+**No earlier result was affected.** Every `deps/*.json`, every `bake-logs/*`, the `prepare-wave1-*`
+reports and run logs, and the suite logs were searched for `SemLock`, `/dev/shm` and a `multiprocessing`
+`FileNotFoundError`. The only hit is source text — `sanic`'s own `tests/test_multiprocessing.py` inside a
+recorded import closure — and no run record contains such a failure or a skip attributed to one; the wave-1
+runs completed all six rows. No earlier suite result is invalidated: the recorded runs never reached a
+test that opens a semaphore, which is what makes this a fix in front of the failure rather than after it.
 
 ### 3.3 BLOCKER 2 — dependency detection under-provisions
 

@@ -1383,6 +1383,56 @@ platform_system!='AIX'`, kept — with none at all among the releases the layers
 `EARLY` line above is also the narrower reading of that block's promise: the preflight now names what
 the build will *want*, not the first clause the reader happened to write.
 
+**Every install in a layer reads the layer's one pin list, so no step can resolve a version no pin of
+it names.** Measured on `fastapi/1`, and it is the freeze gate that caught it. The layer's pin list holds
+`requests==2.23.0` — the date rule's answer for the release the tree's `requirements.txt` names — but the
+layer's **first** install, the dated build tool `flit==2.3.0` that `pyproject.toml`'s
+`[build-system].requires` names, ran with no `-c`: pip resolved flit's own `requires_dist` against the
+PyPI of the day, and the log shows plain, unversioned `Collecting` lines going in
+(`runs/bugsinpy/bake-logs/vanta-bi-fastapi-1.log` 46–63: `requests-2.32.4`, `charset_normalizer-3.5.2`,
+`idna-3.15`, `urllib3-2.2.3`, `certifi-2026.10.23`, `docutils-0.20.1`, `flit_core-4.1.0`). The dependency
+install that followed **downgraded** the names the layer's pins carry — requests to 2.23.0, idna to 2.9,
+urllib3 to 1.25.9, certifi to 2020.4.5.2, docutils to 0.16, flit-core to 2.3.0 — because pip does not
+uninstall what it replaces, and `charset-normalizer==3.5.2`, a dependency of requests 2.32.4 that no pin
+of this layer names, was left in the freeze (`VANTA-PIP-FREEZE charset-normalizer==3.5.2`, line 440); the
+bake failed with `ERROR: this layer installed distributions its pin list does not name` naming
+`charset-normalizer==3.5.2` (lines 608–609). The fix is one file and four flags: `bake.constraint_lines`
+writes the layer's whole pin list — build pins, early pins and the resolved dependency pins, each pin once
+and each as an exact `==` (`bake.pinned_parts`) — to `/tmp/constraints.txt` (`bake.CONSTRAINTS_FILE`,
+heredoc `bake.CONSTRAINTS_MARKER`) above the first install, and all **four** installs in
+`bake.requirements_recipe` carry `-c /tmp/constraints.txt` — the toolchain, the declared build
+requirements, the early pass and the dependency list — so no step in a layer can resolve a version the
+layer has not already decided. A recipe with no pins writes no file and passes no `-c`
+(`bake.constraint_lines(()) == []`), so a layer with nothing to install keeps the recipe it had. The
+freeze gate is unchanged: it is what *read* this, and it still fails a layer whose freeze names a
+distribution no pin of it names.
+
+The file can only be complete because the **build pins and early pins are pins of the walk like any
+other**, which is the other half of the same fix. `bake.resolve_bug_deps` seeds the closure walk with
+`own_pins = pinned_parts(*build_specs, *installs_of(resolved))` — the build pins first — and
+`bake.transitive_pins` starts at every one of them, so a build pin's own `requires_dist` is pinned by the
+same date rule as anything else. `fastapi/1` is the measurement: `flit==2.3.0` is a build pin, and its
+declarations put `flit-core==2.3.0` and `chardet==3.0.4` in the layer's `installs`
+(`runs/bugsinpy/deps/vanta-bi-fastapi-1.json`, and `chardet` is requests 2.23.0's own detector — the
+release the pin list holds). That is why the constraint file is an answer rather than a gesture: the
+toolchain step installs `flit==2.3.0` against `requests==2.23.0`, whose metadata requires `chardet` and
+not `charset-normalizer`, so the leftover the gate refused cannot be created. The early pins need no
+separate handling for the same reason — they are a subset of the layer's pins by construction
+(`bake.early_install_pins` returns `satisfied_by` values taken from `pinned_parts`), so their releases'
+declarations are walked at the same time as the pins they belong to, and they are passed to
+`bake.constraint_lines` explicitly so that the file says what it holds rather than depending on the
+subset.
+
+Measured across the six layers, this changes **one bug's toolchain step and no dependency install**:
+`fastapi/1` is the only layer with a build pin whose `requires_dist` was unpinned at install time
+(`flit==2.3.0`; `matplotlib/1`, `pandas/1`, `luigi/1`, `sanic/1` and `PySnooper/3` install either the
+toolchain alone or build pins whose requirements are already in their pin lists). Every other layer's
+installs are byte-identical commands with `-c /tmp/constraints.txt` added and the same pins behind it, so
+the preflight's per-layer counts — pins, early, dropped, skipped — do not move and the verdict stays
+`ready to bake`. The property is tested on the recipe rather than on a bake
+(`scripts/test_bugsinpy.py::TestBake::test_one_constraints_file_holds_the_whole_layer_and_every_install_carries_it`),
+including the negative: no pins, no file, no `-c`.
+
 **The window is the requiring pin's own release, not the bug's date.** `bake.pin_cutoff` is the later of
 a pin's declaration date and the date its release landed. For a date-rule pin those agree. For a BugsInPy
 reference pin they do not, and the difference is load-bearing: `pytest==5.4.3` (2020-04-09) installed as

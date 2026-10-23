@@ -3605,6 +3605,11 @@ class TestBake:
         isolated build were otherwise fine. Every install after it carries the flag,
         which is what reproduces the pre-2020 resolver the benchmark's environment was
         frozen with (§3.2).
+
+        Both carry ``-c`` on the layer's one constraints file, the toolchain included: the
+        pin list is what makes the layer an environment, and a step outside it resolved
+        ``fastapi/1``'s ``flit==2.3.0`` dependencies at the day's versions
+        (:data:`bake_mod.CONSTRAINTS_FILE`).
         """
         recipe = bake_mod.requirements_recipe(
             ["numpy==1.18.5"],
@@ -3613,9 +3618,10 @@ class TestBake:
         pip_lines = [
             line for line in recipe.splitlines() if line.startswith("python -m pip install")
         ]
+        held = f"-c {bake_mod.CONSTRAINTS_FILE} "
         assert pip_lines == [
-            "python -m pip install --no-cache-dir -r /tmp/build-tools.txt",
-            "python -m pip install --no-cache-dir --no-build-isolation "
+            f"python -m pip install --no-cache-dir {held}-r /tmp/build-tools.txt",
+            f"python -m pip install --no-cache-dir {held}--no-build-isolation "
             f"{bake_mod.LEGACY_RESOLVER_FLAG} -r /tmp/req.txt",
         ]
         assert bake_mod.LEGACY_RESOLVER_FLAG not in pip_lines[0]
@@ -3651,11 +3657,12 @@ class TestBake:
         pip_lines = [
             line for line in recipe.splitlines() if line.startswith("python -m pip install")
         ]
+        held = f"-c {bake_mod.CONSTRAINTS_FILE} "
         assert pip_lines == [
-            "python -m pip install --no-cache-dir -r /tmp/build-tools.txt",
-            "python -m pip install --no-cache-dir --no-build-isolation "
+            f"python -m pip install --no-cache-dir {held}-r /tmp/build-tools.txt",
+            f"python -m pip install --no-cache-dir {held}--no-build-isolation "
             f"{bake_mod.LEGACY_RESOLVER_FLAG} -r /tmp/build-req.txt",
-            "python -m pip install --no-cache-dir --no-build-isolation "
+            f"python -m pip install --no-cache-dir {held}--no-build-isolation "
             f"{bake_mod.LEGACY_RESOLVER_FLAG} -r /tmp/req.txt",
         ]
         tools = _heredoc(recipe, "VANTA_BUILD_TOOLS")
@@ -3664,6 +3671,51 @@ class TestBake:
         assert "numpy==1.18.5" in build_req
         assert "numpy" not in tools
         assert recipe.index("VANTA_BUILD_REQUIRES") < recipe.index("--no-build-isolation")
+
+    def test_one_constraints_file_holds_the_whole_layer_and_every_install_carries_it(self):
+        """``fastapi/1``'s failure, as a property of the recipe.
+
+        The layer's pin list held ``requests==2.23.0``, but the *toolchain* install ran
+        with no ``-c``: pip resolved ``flit==2.3.0``'s own requirements against the day's
+        PyPI, installed ``requests-2.32.4``, and the dependency install that followed
+        downgraded requests to its pin while leaving 2.32.4's ``charset-normalizer``
+        behind — a name no pin of the layer names, which is what the freeze gate then
+        refused. So there is one file, it holds every pin the layer installs by (toolchain,
+        declared build requirements, early pins, dependency pins), and all four installs
+        read it.
+        """
+        recipe = bake_mod.requirements_recipe(
+            ["requests==2.23.0", "decorator==4.4.0"],
+            build_pins=["setuptools==46.1.3", "flit==2.3.0"],
+            early_pins=["cython==0.29.6"],
+        )
+        constraints = _heredoc(recipe, bake_mod.CONSTRAINTS_MARKER)
+        assert constraints == "\n".join(
+            [
+                "setuptools==46.1.3",
+                "flit==2.3.0",
+                "cython==0.29.6",
+                "requests==2.23.0",
+                "decorator==4.4.0",
+            ]
+        ), "the layer's whole pin list, build pins first, each pin once"
+        installs = [
+            line for line in recipe.splitlines() if line.startswith("python -m pip install")
+        ]
+        assert len(installs) == 4, "all four installs: tools, build, early, deps"
+        assert all(f"-c {bake_mod.CONSTRAINTS_FILE}" in line for line in installs)
+        # Written before the first install: the toolchain step is one of the steps held.
+        assert recipe.index(bake_mod.CONSTRAINTS_MARKER) < recipe.index(installs[0])
+        assert bake_mod.constraint_pins(["decorator==4.4.0"], ["a==1", "a==1"]) == (
+            "decorator==4.4.0",
+            "a==1",
+        )
+        assert bake_mod.constraint_pins() == ()
+        # A recipe with nothing to install writes no file and passes no `-c`: a `-c`
+        # naming a file that does not exist would stop the layer on pip's own error.
+        assert bake_mod.constraint_lines(()) == []
+        assert bake_mod.CONSTRAINTS_FILE not in bake_mod.requirements_recipe([])
+        assert bake_mod.CONSTRAINTS_MARKER not in bake_mod.requirements_recipe([])
 
     def test_every_non_isolated_install_checks_for_a_leftover_build_env(self):
         """``/tmp/pip-build-env-*`` is the isolated build env made visible (§3.2).
@@ -3698,10 +3750,11 @@ class TestBake:
         pip_lines = [
             line for line in recipe.splitlines() if line.startswith("python -m pip install")
         ]
+        held = f"-c {bake_mod.CONSTRAINTS_FILE} "
         assert pip_lines == [
-            "python -m pip install --no-cache-dir --no-build-isolation "
+            f"python -m pip install --no-cache-dir {held}--no-build-isolation "
             f"{bake_mod.LEGACY_RESOLVER_FLAG} -r /tmp/early-req.txt",
-            "python -m pip install --no-cache-dir --no-build-isolation "
+            f"python -m pip install --no-cache-dir {held}--no-build-isolation "
             f"{bake_mod.LEGACY_RESOLVER_FLAG} -r /tmp/req.txt",
         ]
         assert _heredoc(recipe, "VANTA_EARLY_REQUIRES") == "cffi==1.14.0"

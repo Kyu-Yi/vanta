@@ -287,6 +287,27 @@ this prefix and the diff is taken on the host (:func:`unpinned_freeze`), because
 where the pin list is known — a shell test inside the layer has nothing to compare to.
 """
 
+CONSTRAINTS_FILE = "/tmp/constraints.txt"
+"""The one constraints file every install in a bug layer is held to (§3.2).
+
+[VANTA-WHY] ``fastapi/1`` measured what a step outside the pins costs. The layer's pin
+list holds ``requests==2.23.0`` (the date rule's answer for the release the tree's
+``requirements.txt`` named), but the layer's **first** install — the dated build tool
+``flit==2.3.0`` — ran with no ``-c``, so pip resolved flit's own ``requires_dist`` against
+the PyPI of the day and put ``requests-2.32.4`` in the layer. The install that followed
+then downgraded requests to its pin and left ``charset-normalizer-3.5.2`` behind, which is
+a dependency of 2.32.4 and of nothing in this layer's pin list — so the freeze gate
+refused the layer, correctly, for a name no pin of it names. Every pin a layer installs
+is an exact ``==`` (:func:`resolve_pins`, :func:`resolve_build_pins`, the closure walk),
+which is what makes one constraint file per layer a complete answer: written from the
+layer's whole pin list and passed to all four installs, it means pip cannot resolve a
+pin's requirements to any version the layer has not already decided — in the toolchain
+step, the build-requirement step, the early step or the dependency step.
+"""
+
+CONSTRAINTS_MARKER = "VANTA_CONSTRAINTS"
+"""The heredoc delimiter the constraints file is written with, beside the other four."""
+
 TRANSITIVE_PIN_RULE = "transitive, date rule"
 """The ``pin_rule`` of a pin the closure walk added, and not a declaration (§3.2).
 
@@ -2926,6 +2947,15 @@ def requirements_recipe(
     between two of BugsInPy's own pins, and this is the reading that says which
     conflicts it actually installed (:func:`pip_check_conflicts`).
 
+    All **four** installs carry ``-c`` on one constraints file holding the layer's whole
+    pin list (:data:`CONSTRAINTS_FILE`), written above the first of them. A pin list is only
+    the layer's environment if every install in the layer is held to it: ``fastapi/1``
+    measured the difference, a toolchain step that pulled today's ``requests`` for
+    ``flit==2.3.0`` and left ``charset-normalizer`` in a layer whose pins name neither —
+    which is what the freeze gate then refused. The file holds the same pins the installs
+    hold, so it cannot change what a layer installs; it only stops a step resolving a
+    dependency of a pin to a release no pin of this layer decided.
+
     ``orphans`` is the one thing the recipe **removes**, and it goes here rather than in
     the pin list because it is the layer's own residue and not a dependency of anything in
     it (:data:`ORPHAN_RULE`): the interpreter layer's environment is inherited whole, and a
@@ -2943,6 +2973,13 @@ def requirements_recipe(
     """
     body = "\n".join(spec.strip() for spec in install_specs if spec.strip()).strip()
     toolchain, build_requires = _split_build_pins(build_pins)
+    # The layer's whole pin list, written once and passed to every install below
+    # (:data:`CONSTRAINTS_FILE`). Four installs and one file, because the failure it is
+    # written against is exactly a *step* that resolved a name the layer's pins do not
+    # contain: the toolchain's own `flit==2.3.0` pulled today's `requests` and left
+    # `charset-normalizer` behind for the freeze gate to catch.
+    constraints = constraint_lines(build_pins, early_pins, install_specs)
+    held = f"-c {CONSTRAINTS_FILE} " if constraints else ""
 
     lines = [
         "set -eux",
@@ -2960,6 +2997,9 @@ def requirements_recipe(
         # suite fails on every ``Pool``/``Queue``/``Lock`` (DEV_SHM_GUARD).
         *startup_check_lines(),
         *build_env_lines(build_env_for(minor)),
+        # Before the first install rather than beside the last: this is the one file
+        # every install reads, and the toolchain step is one of the steps it holds.
+        *constraints,
     ]
     if toolchain:
         lines += [
@@ -2971,8 +3011,10 @@ def requirements_recipe(
             # *build* a pinned tool that has no wheel for the platform, and at this
             # point there is nothing in the layer to build it against. It is also the
             # install that puts the pinned pip there, so the flag could not apply to it
-            # even if it were otherwise safe.
-            "python -m pip install --no-cache-dir -r /tmp/build-tools.txt",
+            # even if it were otherwise safe. The constraints do apply to it: a build
+            # tool is a distribution like any other, and its own requirements resolved
+            # against the day's PyPI is the measured `fastapi/1` failure.
+            f"python -m pip install --no-cache-dir {held}-r /tmp/build-tools.txt",
         ]
     if build_requires:
         lines += [
@@ -2983,8 +3025,8 @@ def requirements_recipe(
             # call above: numpy is what failed there. Built against the toolchain
             # instead, so a source build sees the setuptools this tree was built
             # with rather than the one pip would fetch today.
-            "python -m pip install --no-cache-dir --no-build-isolation "
-            f"{LEGACY_RESOLVER_FLAG} -r /tmp/build-req.txt",
+            "python -m pip install --no-cache-dir "
+            f"{held}--no-build-isolation {LEGACY_RESOLVER_FLAG} -r /tmp/build-req.txt",
             _no_isolated_build_env("the build requirements"),
         ]
     if toolchain or build_requires:
@@ -3007,8 +3049,8 @@ def requirements_recipe(
             # easy_install at today's version rather than the pinned one (§3.2). It
             # carries the flag for the same reason the main install does — it is a
             # dependency install and a dependency can itself be a source build.
-            "python -m pip install --no-cache-dir --no-build-isolation "
-            f"{LEGACY_RESOLVER_FLAG} -r /tmp/early-req.txt",
+            "python -m pip install --no-cache-dir "
+            f"{held}--no-build-isolation {LEGACY_RESOLVER_FLAG} -r /tmp/early-req.txt",
             _no_isolated_build_env("the early build-requirement install"),
         ]
     if body:
@@ -3020,8 +3062,8 @@ def requirements_recipe(
             # cannot be measured, and it must fail here rather than mid-wave. A
             # dependency pulled transitively can itself be a source build, which is
             # why this install carries the flag too.
-            "python -m pip install --no-cache-dir --no-build-isolation "
-            f"{LEGACY_RESOLVER_FLAG} -r /tmp/req.txt",
+            "python -m pip install --no-cache-dir "
+            f"{held}--no-build-isolation {LEGACY_RESOLVER_FLAG} -r /tmp/req.txt",
             _no_isolated_build_env("the dependency install"),
         ]
     lines += [
@@ -6286,6 +6328,39 @@ def layer_pins(layer: BugDeps) -> tuple[tuple[str, str], ...]:
     Build pins first because that is the order the recipe installs them (§3.2).
     """
     return pinned_parts(*layer.build_pins, *layer.installs)
+
+
+def constraint_pins(*spec_groups: Sequence[str]) -> tuple[str, ...]:
+    """The layer's whole pin list, as one pip constraints file's lines (§3.2).
+
+    Every group the recipe installs by — the toolchain and the declared build requirements
+    (``build_pins``), the early pins, and the resolved dependency pins — because the file
+    has to hold the *layer's* pins and not one install's: the failure it exists to prevent
+    is a step that resolved a name no pin of this layer names (:data:`CONSTRAINTS_FILE`),
+    and a step cannot be constrained by a list it is not given. A spec that is not an exact
+    ``name==version`` is dropped rather than guessed at, and a repeated one is dropped too
+    (:func:`pinned_parts`), so the file is a set of pins and not a set of spellings.
+    """
+    specs: list[str] = []
+    for group in spec_groups:
+        specs.extend(group)
+    return tuple(f"{name}=={version}" for name, version in pinned_parts(*specs))
+
+
+def constraint_lines(*spec_groups: Sequence[str]) -> list[str]:
+    """The recipe lines that write the constraints file, ``[]`` when there are no pins.
+
+    Empty for a recipe with nothing to install, so such a layer keeps the recipe it had and
+    no install carries a ``-c`` pointing at a file that was never written.
+    """
+    constraints = constraint_pins(*spec_groups)
+    if not constraints:
+        return []
+    return [
+        f"cat > {CONSTRAINTS_FILE} <<'{CONSTRAINTS_MARKER}'",
+        "\n".join(constraints),
+        CONSTRAINTS_MARKER,
+    ]
 
 
 @dataclass(frozen=True)

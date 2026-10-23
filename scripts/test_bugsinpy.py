@@ -5265,6 +5265,114 @@ class TestPinConflicts:
         assert bake_mod._conflict_sections([report], dropped=frozenset()) != []
         assert bake_mod._conflict_sections([report], dropped={self.H11}) == []
 
+    # ---- the same case, read the other way round ---------------------------
+    def test_a_moved_pin_is_read_off_the_provenance_it_was_recorded_in(self):
+        """One reading of one record, so the printout and the pin cannot disagree."""
+        provenance = {
+            "dependencies": [
+                {
+                    "name": "h11",
+                    "pin": "h11==0.8.0",
+                    "narrowed_by": [{"pin": "httpcore==0.3.0", "requires": "==0.8.*"}],
+                },
+                {
+                    "name": "moto",
+                    "pin": "moto==1.3.7",
+                    "refused": [
+                        {
+                            "pin": "moto==1.3.8",
+                            "held": "idna==2.9",
+                            "requires": "idna<2.9,>=2.5",
+                        }
+                    ],
+                },
+                {"name": "decorator", "pin": "decorator==4.4.0"},
+            ]
+        }
+        assert bake_mod.pin_narrowings(provenance) == (
+            ("h11==0.8.0", "httpcore==0.3.0 declares ==0.8.*"),
+            (
+                "moto==1.3.7",
+                "moto==1.3.8 declares idna<2.9,>=2.5, which idna==2.9 does not satisfy",
+            ),
+        ), "an ordinary pin says nothing, and both directions are recorded"
+        assert bake_mod.pin_narrowings({}) == ()
+
+    def _narrowed(self) -> bake_mod.PreflightBug:
+        return bake_mod.PreflightBug(
+            key="luigi/1",
+            checkpoint="vanta-bi-luigi-1",
+            python_minor="3.8",
+            pins=(
+                bake_mod.PreflightPin("moto", "1.3.7", bake_mod.INSTALLABLE_WHEEL, "w"),
+                bake_mod.PreflightPin("idna", "2.9", bake_mod.INSTALLABLE_WHEEL, "w"),
+            ),
+            conflicts=(),
+            narrowings=(
+                (
+                    "moto==1.3.7",
+                    "moto==1.3.8 declares idna<2.9,>=2.5, which idna==2.9 does not "
+                    "satisfy",
+                ),
+            ),
+        )
+
+    def test_a_moved_pin_is_printed_before_any_build_and_decides_nothing(self):
+        """It is what the pin list cannot show, and it is not a finding to act on."""
+        report = self._narrowed()
+        assert bake_mod._narrowing_section([report]) == [
+            "",
+            "narrowed pin(s) (1) — §3.2's date rule, moved to satisfy a pin in the same "
+            "layer:",
+            "  NARROWED moto==1.3.7 — moto==1.3.8 declares idna<2.9,>=2.5, which "
+            "idna==2.9 does not satisfy (luigi/1)",
+        ]
+        assert bake_mod.preflight_verdict([report]) == "ready to bake"
+        assert report.as_dict()["narrowings"] == [
+            {
+                "pin": "moto==1.3.7",
+                "reason": "moto==1.3.8 declares idna<2.9,>=2.5, which idna==2.9 does "
+                "not satisfy",
+            }
+        ]
+
+    def test_an_unmoved_layer_prints_no_such_block(self):
+        assert bake_mod._narrowing_section([self._report()]) == []
+
+    def test_the_preflight_reads_the_moved_pins_off_the_layer_it_classifies(self):
+        """The wiring, not the reading: a layer's own record is what reaches the block."""
+        layer = bake_mod.BugDeps(
+            entry=bug_entry(checkpoint="vanta-bi-luigi-1"),
+            checkpoint="vanta-bi-luigi-1",
+            installs=("moto==1.3.7",),
+            provenance={
+                "dependencies": [
+                    {
+                        "name": "moto",
+                        "pin": "moto==1.3.7",
+                        "refused": [
+                            {
+                                "pin": "moto==1.3.8",
+                                "held": "idna==2.9",
+                                "requires": "idna<2.9,>=2.5",
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        reports = bake_mod.preflight_layers(
+            [layer],
+            classify=bake_mod.preflight_classifier(files_of=lambda name, version: ()),
+            metadata_of=lambda name, version: ((), None),
+        )
+        assert reports[0].narrowings == (
+            (
+                "moto==1.3.7",
+                "moto==1.3.8 declares idna<2.9,>=2.5, which idna==2.9 does not satisfy",
+            ),
+        )
+
     def test_the_verdict_counts_a_refused_conflict_and_not_a_tolerated_one(self):
         refused = self._report(self._conflict(case=bake_mod.CASE_HARNESS_CHOICE))
         assert bake_mod.preflight_verdict([refused]) == (
@@ -6826,6 +6934,180 @@ class TestResolvePinsByDate:
         assert resolved[0].released_at == "2019-03-16"
 
 
+class TestTheDateRuleObeysTheLayersOwnPins:
+    """``luigi/1``: the newest dated release is one the layer's own pins refuse.
+
+    [VANTA-WHY] Measured. ``moto`` is declared as a bare name, so no exact pin narrows
+    *its* version — the first direction of §3.2's case (a) has nothing to say — and the
+    date rule takes 1.3.8 (2019-04-23, the newest on or before the 2019-05-15 commit).
+    But 1.3.8 declares ``idna (<2.9,>=2.5)`` and the same layer installs BugsInPy's own
+    ``idna==2.9`` as written, so the layer that gets built is a contradiction its own
+    ``pip check`` reads as case (a) and the gate refuses: *"moto 1.3.8 has requirement
+    idna<2.9,>=2.5, but you have idna 2.9"*. Neither version can move, so the choice is
+    what has to: the newest release on or before the date **that the layer's own pins can
+    hold**. 1.3.7 (2018-11-04) declares nothing about ``idna``, and the refusal keeps the
+    release that was passed over next to the pin that refused it.
+
+    Every date and declaration below is PyPI's, read from moto's 1.3.6/1.3.7/1.3.8 wheel
+    metadata: only 1.3.8 mentions ``idna`` at all.
+    """
+
+    RELEASES = {
+        "moto": {"1.3.6": "2018-09-22", "1.3.7": "2018-11-04", "1.3.8": "2019-04-23"},
+        # BugsInPy's own pin, installed as written, and released *after* luigi/1's
+        # commit — the exemption is why the layer can hold it at all.
+        "idna": {"2.9": "2020-02-17", "2.10": "2020-06-27"},
+        "plugin": {"1.0": "2019-01-01", "2.0": "2019-05-01"},
+    }
+
+    METADATA = {
+        ("moto", "1.3.6"): ((), None),
+        ("moto", "1.3.7"): ((), None),
+        ("moto", "1.3.8"): (
+            ("idna (<2.9,>=2.5)", "python-dateutil (<3.0.0,>=2.1)"),
+            None,
+        ),
+        ("plugin", "1.0"): ((), None),
+        ("plugin", "2.0"): (("pytest (<5)",), None),
+    }
+
+    @classmethod
+    def _metadata_of(cls, name: str, version: str):
+        try:
+            return cls.METADATA[(name, version)]
+        except KeyError as exc:
+            raise bake_mod.BakeError(f"no metadata for {name}=={version}") from exc
+
+    def _resolve(self, refs, *, harness_pins=None, metadata_of=None):
+        return bake_mod.resolve_pins(
+            refs,
+            releases=self.RELEASES,
+            commit_date="2019-05-15",
+            harness_pins=harness_pins or {},
+            metadata_of=self._metadata_of if metadata_of is None else metadata_of,
+        )
+
+    def _moto_and_idna(self):
+        return [
+            bake_mod.dep_ref("moto", "install_requires (setup.py) line 5"),
+            bake_mod.dep_ref("idna==2.9", "requirements.txt line 52"),
+        ]
+
+    # ---- the choice --------------------------------------------------------
+    def test_the_newest_dated_release_is_passed_over_when_a_pin_refuses_it(self):
+        resolved = self._resolve(self._moto_and_idna())
+        moto = resolved[0]
+        assert moto.pin == "moto==1.3.7"
+        assert moto.released_at == "2018-11-04"
+        assert moto.refused == (("moto==1.3.8", "idna==2.9", "idna<2.9,>=2.5"),)
+        assert moto.as_dict()["refused"] == [
+            {"pin": "moto==1.3.8", "held": "idna==2.9", "requires": "idna<2.9,>=2.5"}
+        ], "the record names both what was skipped and which pin skipped it"
+
+    def test_the_pins_own_rule_says_why_it_is_not_the_plain_date_rule(self):
+        resolved = self._resolve(self._moto_and_idna())
+        assert resolved[0].pin_rule == (
+            "the newest release on or before the buggy commit's date that this layer's "
+            "own pins can hold, not moto==1.3.8 declaring idna<2.9,>=2.5, which "
+            "idna==2.9 does not satisfy"
+        )
+
+    def test_a_requirement_on_a_name_the_layer_does_not_pin_refuses_nothing(self):
+        """1.3.8 declares ``python-dateutil`` too, and this layer holds no such pin."""
+        resolved = self._resolve(self._moto_and_idna())
+        assert all(
+            claim[2] != "python-dateutil<3.0.0,>=2.1" for claim in resolved[0].refused
+        )
+
+    def test_nothing_settled_the_name_so_the_date_rule_is_untouched(self):
+        """The other half of the same rule: no settled pin, no departure to record."""
+        resolved = self._resolve([bake_mod.dep_ref("moto", "setup.sh line 2")])
+        assert resolved[0].pin == "moto==1.3.8", (
+            "with no idna pin in the layer, 1.3.8 is installable and is the answer"
+        )
+        assert resolved[0].refused == ()
+        assert resolved[0].pin_rule == "the newest release on or before the buggy commit's date"
+        assert "refused" not in resolved[0].as_dict()
+
+    def test_the_interpreter_layers_harness_pair_settles_a_version_too(self):
+        """``HARNESS_PACKAGES`` is never installed over, so it is settled by the same rule."""
+        resolved = self._resolve(
+            [bake_mod.dep_ref("plugin", "install_requires (setup.py) line 1")],
+            harness_pins={"pytest": "8.0.2"},
+        )
+        assert resolved[0].pin == "plugin==1.0"
+        assert resolved[0].refused == (("plugin==2.0", "pytest==8.0.2", "pytest<5"),)
+
+    def test_a_release_nothing_could_be_read_for_is_taken_not_refused(self):
+        """'Could not be read' is not evidence of a conflict — the pip check backstops it."""
+
+        def metadata(name, version):
+            raise bake_mod.BakeError(f"no reading for {name} {version}")
+
+        resolved = self._resolve(self._moto_and_idna(), metadata_of=metadata)
+        assert resolved[0].pin == "moto==1.3.8"
+        assert resolved[0].refused == ()
+
+    def test_a_layer_that_can_hold_no_release_of_the_name_is_an_error(self):
+        """Every candidate refused: a decision for the split, not a discovery at build time."""
+
+        def refusing(name, version):
+            outcome = self._metadata_of(name, version)
+            if name == "moto" and version != "1.3.8":
+                return (("idna (<2.9,>=2.5)",), None)
+            return outcome
+
+        with pytest.raises(
+            bake_mod.BakeError,
+            match="no release on or before 2019-05-15 that this layer's own pins can hold",
+        ):
+            self._resolve(self._moto_and_idna(), metadata_of=refusing)
+
+    # ---- what may move, and what may not -----------------------------------
+    def test_the_settled_versions_are_the_reference_pins_and_the_harness_pair(self):
+        refs = [
+            bake_mod.dep_ref("idna==2.9", "requirements.txt line 52"),
+            bake_mod.dep_ref("moto", "install_requires (setup.py) line 5"),
+        ]
+        assert bake_mod._settled_versions(refs, {"pytest": "8.0.2"}) == {
+            "pytest": ("pytest==8.0.2", "8.0.2"),
+            "idna": ("idna==2.9", "2.9"),
+        }
+
+    def test_a_projects_own_pin_settles_nothing(self):
+        """A project's exact pin is a date-rule choice itself, so it may move."""
+        refs = [bake_mod.dep_ref("six==1.13.0", "install_requires (setup.py) line 4")]
+        assert bake_mod._settled_versions(refs, {}) == {}
+
+    def test_a_range_from_bugsinpys_own_files_settles_nothing_either(self):
+        """Only an exact pin says which release the reference environment held."""
+        refs = [bake_mod.dep_ref("six>=1.12.0", "requirements.txt line 12")]
+        assert bake_mod._settled_versions(refs, {}) == {}
+
+    def test_a_bugs_own_pin_wins_over_the_harness_version_it_is_installed_over(self):
+        """fastapi/1 and luigi/1: the layer ends up holding 5.4.3, not the pair's 8.0.2."""
+        refs = [bake_mod.dep_ref("pytest==5.4.3", "requirements.txt line 7")]
+        assert bake_mod._settled_versions(refs, {"pytest": "8.0.2"}) == {
+            "pytest": ("pytest==5.4.3", "5.4.3")
+        }
+
+    def test_the_walk_starts_at_the_newest_candidate(self):
+        """One reading for an ordinary pin: the newest candidate, which is the answer."""
+        read: list[str] = []
+
+        def metadata(name, version):
+            if name == "moto":
+                read.append(version)
+            return self._metadata_of(name, version)
+
+        resolved = self._resolve(self._moto_and_idna(), metadata_of=metadata)
+        assert resolved[0].pin == "moto==1.3.7"
+        assert read == ["1.3.8", "1.3.7"], (
+            "the refusal costs one extra reading of the name that was refused, and the "
+            "walk stops at the answer"
+        )
+
+
 class TestTheReportPluginFollowsTheBugsPytest:
     """A bug's own pytest decides which report plugin its layer can carry (§3.2).
 
@@ -6904,7 +7186,21 @@ class TestTheReportPluginFollowsTheBugsPytest:
 
     @staticmethod
     def _metadata_of(name: str, version: str):
-        return TestTheReportPluginFollowsTheBugsPytest.METADATA[(name, version)]
+        """The real reader's contract: a release nothing could be read for raises.
+
+        [VANTA-WHY] ``pypi_release_metadata`` raises :class:`bake_mod.BakeError` when
+        neither the version JSON, a wheel nor a sidecar carries a release's
+        declarations, and every consumer of ``metadata_of`` catches exactly that
+        (``_narrowing_requirements``, ``newest_accepting_pytest``, ``metadata_conflicts``,
+        ``_chosen_release``). A release this table does not describe therefore has to
+        read as *unreadable* rather than as a ``KeyError``: ``_chosen_release`` reads the
+        declarations of every candidate a date rule considers, including names like
+        ``decorator`` whose metadata is not what this table is about.
+        """
+        try:
+            return TestTheReportPluginFollowsTheBugsPytest.METADATA[(name, version)]
+        except KeyError as exc:
+            raise bake_mod.BakeError(f"no metadata for {name}=={version}") from exc
 
     def _plugins(self, pytest_version: str, *, python_minor: str, taken=None):
         return bake_mod.plugin_pins(

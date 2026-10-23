@@ -579,7 +579,11 @@ install (N)` block, and then §3.2's conflict cases as **three** more — `case 
 the only one that stops a layer, so a reader who reads one section reads that one), then `case (b)`
 (`TOLERATED`), then the pins nobody could read (`UNKNOWN`) — each line `<LABEL> <pin> — <bug keys>` —
 because the pins the split shares are why a reader is there (numpy alone is in six of the eleven
-dev-split bugs) and one decision printed six times is six times the reading. A pin the unresolvable-pin
+dev-split bugs) and one decision printed six times is six times the reading. One block is not a finding
+and is printed for that reason: `narrowed pin(s) (N)` — `NARROWED <pin> — <why> (<bug keys>)`, the
+date-rule choices a pin in the same layer moved (`bake.pin_narrowings`, both directions of case (a)),
+which count in no verdict because the decision is already taken and which a reader cannot see in the pin
+list itself. A pin the unresolvable-pin
 rule dropped is not repeated as a finding; it appears once in the drops block below, with the audit that
 settled it — and a conflict with a **dropped** pin on either side is not printed either, because the
 layer will not install that pin and no pair is left to conflict. A `--preflight-only` run also
@@ -606,7 +610,11 @@ classification half and cannot show the conflict half; the conflict half is the 
   `beautifulsoup4==4.9.1` declares `soupsieve<2.0` against `soupsieve==2.0.1`, and both are BugsInPy's
   own exact pins, so it prints as `TOLERATED` and does not enter the verdict. Its `httpcore==0.3.0` sits
   next to `h11==0.8.1` and is consistent — the same `httpcore` pin as `sanic/1` against a *different*
-  `h11`, which is why that layer fails and this one does not.
+  `h11`, which is why that layer fails and this one does not. One pin is **narrowed** at HEAD and the
+  recorded preflight predates it: its `deps/vanta-bi-luigi-1.json` holds `moto==1.3.8`, and 1.3.8
+  declares `idna (<2.9,>=2.5)` against the same layer's own `idna==2.9`, so the date rule takes
+  `moto==1.3.7` and prints it under `NARROWED` (§3.2's second direction). `beautifulsoup4`'s case (b)
+  pair is untouched by that rule — both sides are BugsInPy's own.
 - **`matplotlib/1` — `ready to bake`.** 10 pins (8 installs, 2 of which — `cython`, `numpy` — are also
   build pins, plus `setuptools` and `wheel`), 2 sdist-only and both cleared: `numpy==1.18.5` by the
   toolchain alone, `pillow==7.1.2` by the reviewed `libjpeg-dev` entry; 0 unavailable, 0 gap, 0
@@ -1104,7 +1112,9 @@ the environment rather than reproducing it. Which case a conflict is decides wha
 - **(a) anything else** (`bake.CASE_HARNESS_CHOICE`) — at least one side is a version *this harness*
   chose: the date rule, or pip's own pick of a transitive dependency. A layer holding both is a layer
   whose environment is not the benchmark's, so this one **fails the layer**, and the requirement is that
-  the date rule be *narrowed* until the conflict does not arise rather than that it be tolerated.
+  the date rule be *narrowed* until the conflict does not arise rather than that it be tolerated — in
+  either direction, "a declaration in this layer on the name being chosen" or "the chosen release's own
+  declarations on a version this layer cannot move" (both below).
 - **(?) neither** (`bake.CASE_UNKNOWN`) — not a conflict at all, but the absence of the reading: no
   document could be reached for one of the pins. Recorded so that "checked and clean" and "could not be
   checked" stay different answers. See the preflight's fallback chain below.
@@ -1122,6 +1132,31 @@ choice nothing can check. `httpcore==0.3.0` is exactly this case (its declaratio
 JSON, a wheel nor a sidecar — measured; the requirement lives in its **sdist**, which pip reads at
 resolution), so its `h11==0.8.*` narrows nothing before the build and is caught by the layer's own
 `pip check` after it.
+
+**The same case, read the other way round — and it is what `luigi/1` measured.** The rule above fixes
+the version of a name *something in the layer declares a requirement on*; the mirror of it is a release
+whose **own** declarations refuse a version the layer cannot move — BugsInPy's own `==` pins and the
+interpreter layer's pair (`bake._settled_versions`: `bake.reference_pin`'s exact pins over
+`bake.HARNESS_PACKAGES`, with the bug's own pin winning over the pair, exactly as it does above). `moto`
+is declared in `luigi/1` as a bare name, so nothing narrows *its* version and the date rule takes
+`1.3.8` (2019-04-23, the newest on or before the 2019-05-15 commit) — but `1.3.8` declares
+`idna (<2.9,>=2.5)` while the same layer installs BugsInPy's own `idna==2.9` as written, so the layer
+that gets built is a contradiction its own `pip check` reports as case (a) and the gate refuses. Neither
+version can move, so the **choice** does: the answer is the newest release on or before the date that the
+layer's own pins can hold — `moto==1.3.7` (2018-11-04), which declares nothing about `idna` — and
+`ResolvedDep.refused` carries `(rejected, held, declared)`, here `moto==1.3.8` / `idna==2.9` /
+`idna<2.9,>=2.5`, so the record names both the release that was passed over and the pin that refused it.
+`ResolvedDep.pin_rule` renders both directions in one sentence, and `bake.preflight_lines` prints every
+moved pin under its own `NARROWED` heading **before** the build — `bake.pin_narrowings` reads it off the
+provenance's own `narrowed_by`/`refused`, so the record and the printout cannot disagree. That block is
+not a finding and counts in no verdict: a pin that was moved is a decision already taken, and it is
+printed because a pin which is *not* simply "the newest release on or before the date" is the one thing
+the pin list cannot show (`moto==1.3.7` beside `idna==2.9` looks arbitrary until the reason is next to
+it). Two boundaries on the walk, both inherited from the direction above: a candidate whose declarations
+cannot be read is **taken**, not refused — an unreadable release is not evidence of a conflict, and the
+layer's own `pip check` is the backstop — and a name for which *every* dated candidate is refused is a
+`BakeError`, because that is a decision for the split rather than something to install and discover.
+Conflicts between two of BugsInPy's own exact pins are untouched by any of this and stay case (b).
 
 **A conflict is tolerated only when the layer's own `pip check` says so.** The preflight *predicts* from
 the pins' declarations; `pip check` is what reads what actually got installed, and the layer's reading is

@@ -3000,6 +3000,23 @@ class ResolvedDep:
     with what — a departure from "newest before the date", so it is recorded the same
     way :attr:`overridden` is.
     """
+    refused: tuple[tuple[str, str, str], ...] = ()
+    """The releases the date rule would have picked and this layer's own pins refuse.
+
+    [VANTA-WHY] :attr:`narrowed_by` is one direction of §3.2's case (a) — a pin in this
+    layer declaring what release *this* name may be — and this is the other, which is
+    what ``luigi/1`` measured: ``moto`` is a bare declaration, so nothing in the layer
+    narrows *its* version, but ``moto==1.3.8`` declares ``idna (<2.9,>=2.5)`` while
+    ``idna==2.9`` is BugsInPy's own pin, installed as written. The date rule's answer
+    would be a layer whose own ``pip check`` reports case (a) and whose gate refuses it;
+    the answer instead is the newest release on or before the date that the layer *can*
+    hold — ``moto==1.3.7`` here, which declares nothing about ``idna``.
+
+    Each entry is ``(rejected, held, declared)``: the release passed over, the pin in
+    this layer whose version it does not satisfy, and what it requires of that name. The
+    record therefore names both what was skipped and which pin skipped it, which is the
+    whole departure from "newest before the date".
+    """
 
     @property
     def pin_rule(self) -> str:
@@ -3017,12 +3034,25 @@ class ResolvedDep:
             rule = "the newest release on or before the fixed commit's date"
         else:
             rule = "the newest release on or before the buggy commit's date"
-        if not self.narrowed_by:
+        if not self.narrowed_by and not self.refused:
             return rule
-        narrowed = "; ".join(
-            f"{pin} declares {specifier}" for pin, specifier in self.narrowed_by
-        )
-        return f"{rule} that satisfies {narrowed}"
+        clauses: list[str] = []
+        if self.narrowed_by:
+            clauses.append(
+                "that satisfies "
+                + "; ".join(
+                    f"{pin} declares {specifier}" for pin, specifier in self.narrowed_by
+                )
+            )
+        if self.refused:
+            clauses.append(
+                "that this layer's own pins can hold, not "
+                + "; ".join(
+                    f"{rejected} declaring {declared}, which {held} does not satisfy"
+                    for rejected, held, declared in self.refused
+                )
+            )
+        return f"{rule} " + " and ".join(clauses)
 
     def as_dict(self) -> dict[str, Any]:
         data = {
@@ -3043,6 +3073,11 @@ class ResolvedDep:
         if self.narrowed_by:
             data["narrowed_by"] = [
                 {"pin": pin, "requires": specifier} for pin, specifier in self.narrowed_by
+            ]
+        if self.refused:
+            data["refused"] = [
+                {"pin": rejected, "held": held, "requires": declared}
+                for rejected, held, declared in self.refused
             ]
         if self.overridden:
             data["overridden"] = [
@@ -3233,6 +3268,121 @@ def _newest_release(available: Mapping[str, str]) -> tuple[str, str]:
     )
 
 
+def _settled_versions(
+    refs: Sequence[DepRef], harness_pins: Mapping[str, str]
+) -> dict[str, tuple[str, str]]:
+    """``{name: (pin, version)}`` — the versions in this layer no date rule may move.
+
+    Two kinds and neither is a date-rule choice: a BugsInPy reference pin
+    (:func:`reference_pin`) is installed as written, and a package the interpreter layer
+    provides (:data:`HARNESS_PACKAGES`) is never installed over — unless this bug writes
+    its *own* exact pin for that same name, in which case the bug's pin wins and is the
+    one recorded here (:func:`resolve_pins`' harness branch).
+
+    [VANTA-WHY] This is the other half of §3.2's case (a), and it exists because the
+    first half was not enough. ``_narrowing_requirements`` reads what the layer's exact
+    pins declare *about* a name, which fixes a choice nothing else constrains — but
+    ``luigi/1``'s ``moto`` is a bare declaration that nothing narrows, and its newest
+    dated release (``1.3.8``) declares ``idna (<2.9,>=2.5)`` while ``idna==2.9`` is
+    BugsInPy's own pin. Neither pin could move, the layer installed a contradiction, and
+    the reading that found it was ``pip check`` *after* the build — case (a), refused.
+    The settled set is what lets the choice be checked at pin time instead: a candidate
+    that does not satisfy a settled pin is not an answer (:func:`_chosen_release`).
+    """
+    settled: dict[str, tuple[str, str]] = {
+        canonicalize_name(name): (f"{name}=={version}", version)
+        for name, version in harness_pins.items()
+    }
+    for ref in refs:
+        if not reference_pin(ref):
+            continue
+        version = _exact_version(_specifier_of(ref))
+        if version is not None:
+            # After the harness entries, because the bug's own pin is installed *over*
+            # the interpreter layer's version and is what the layer ends up holding.
+            settled[canonicalize_name(ref.name)] = (f"{ref.name}=={version}", str(version))
+    return settled
+
+
+def _chosen_release(
+    ref: DepRef,
+    candidates: Sequence[tuple[str, str]],
+    *,
+    cutoff: str,
+    settled: Mapping[str, tuple[str, str]],
+    metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
+) -> tuple[str, str, tuple[tuple[str, str, str], ...]]:
+    """``(version, released_at, refused)`` — the newest candidate this layer can hold.
+
+    [VANTA-WHY] §3.2's date rule asks for "the newest release on or before the
+    declaration's date", and a date is not the only thing a layer has to satisfy: the
+    pins the rule cannot move (:func:`_settled_versions`) are in the same environment,
+    and a release whose own ``requires_dist`` does not satisfy one of them makes the
+    layer a contradiction ``pip check`` reports as case (a) and the gate refuses. So the
+    candidates are walked **newest first** and the first one the layer can hold is the
+    answer, with every release passed over returned for the provenance
+    (:attr:`ResolvedDep.refused`).
+
+    A candidate whose declarations cannot be read is *taken*, not refused: an unreadable
+    release is not evidence that it is incompatible — ``httpcore==0.3.0`` is read no
+    other way — and the layer's own ``pip check`` is the backstop for it. That is the
+    same conservative direction :func:`_narrowing_requirements` takes, and it is why this
+    walk can only ever move a pin on a declaration that was actually read.
+
+    The walk stops at the first answer, so an ordinary pin costs one metadata read — the
+    newest candidate, which this layer's preflight reads anyway through the same cached
+    reader — and a refusal costs one more.
+
+    :class:`BakeError` when every candidate is refused: no release of this name is both
+    on or before the declaration's date and installable beside the layer's own pins, and
+    that is a decision for the split rather than something to install and discover
+    (§3.2's case (a)).
+    """
+    refused: list[tuple[str, str, str]] = []
+    for version, released_at in sorted(
+        candidates, key=lambda item: Version(item[0]), reverse=True
+    ):
+        try:
+            requires, _ = metadata_of(ref.name, str(version))
+        except BakeError:
+            return str(version), released_at, tuple(refused)
+        conflict: Optional[tuple[str, str, str]] = None
+        for raw in requires:
+            try:
+                requirement = Requirement(raw)
+            except InvalidRequirement:
+                continue
+            if requirement.marker is not None:
+                continue
+            held = settled.get(canonicalize_name(requirement.name))
+            if held is None:
+                continue
+            try:
+                allowed = Version(held[1]) in requirement.specifier
+            except InvalidVersion:
+                continue
+            if allowed:
+                continue
+            conflict = (
+                f"{ref.name}=={version}",
+                held[0],
+                f"{requirement.name}{requirement.specifier}",
+            )
+            break
+        if conflict is None:
+            return str(version), released_at, tuple(refused)
+        refused.append(conflict)
+    raise BakeError(
+        f"{ref.source}: {ref.spec} has no release on or before {cutoff} that this "
+        "layer's own pins can hold — "
+        + "; ".join(
+            f"{rejected} declares {declared}, which {held} does not satisfy"
+            for rejected, held, declared in refused
+        )
+        + ", and neither side is a version the date rule may move (§3.2)"
+    )
+
+
 def _narrowing_requirements(
     refs: Sequence[DepRef],
     *,
@@ -3349,12 +3499,22 @@ def resolve_pins(
     pin still reads as the plain date rule. ``metadata_of`` is optional for the same
     reason ``releases`` is an argument: a caller that passes none gets the date rule with
     nothing consulted, and every test of the rule itself stays offline.
+
+    The same case, read the other way round, is the second qualification: the pins the
+    date rule **cannot** move — BugsInPy's own ``==`` pins and the interpreter layer's
+    harness pins (:func:`_settled_versions`) — are in the layer too, and a release that
+    does not satisfy one of them is not an answer, however new it is (``moto==1.3.8``
+    declares ``idna (<2.9,>=2.5)`` against ``idna==2.9``, so ``luigi/1`` pins ``1.3.7``
+    and records why in :attr:`ResolvedDep.refused`). The two directions are one rule:
+    the answer is the newest release on or before the declaration's date that this
+    layer's other pins can hold.
     """
     narrowed = (
         _narrowing_requirements(refs, metadata_of=metadata_of)
         if metadata_of is not None
         else {}
     )
+    settled = _settled_versions(refs, harness_pins) if metadata_of is not None else {}
     resolved: list[ResolvedDep] = []
     for ref in refs:
         requirement = _requirement(ref.spec, ref.source)
@@ -3399,6 +3559,7 @@ def resolve_pins(
         ]
         exempt = reference_pin(ref)
         narrowed_by: tuple[tuple[str, str], ...] = ()
+        refused: tuple[tuple[str, str, str], ...] = ()
         if exempt:
             pin_source = ref.pin_source or ref.source
             if not matching:
@@ -3410,6 +3571,9 @@ def resolve_pins(
                     "benchmark's environment cannot be reproduced from a pin whose "
                     "release does not exist."
                 )
+            # Installed as written, so the layer's other pins have no say here: this is
+            # the release the benchmark's own environment held.
+            version, released_at = max(matching, key=lambda item: Version(item[0]))
         else:
             pin_source = ref.pin_source
             dated = [item for item in matching if item[1][:10] <= cutoff]
@@ -3441,12 +3605,21 @@ def resolve_pins(
                     )
                 if wanted != dated:
                     narrowed_by = tuple(claims)
-                    matching = wanted
-                else:
-                    matching = dated
+                    dated = wanted
+            if metadata_of is None:
+                version, released_at = max(dated, key=lambda item: Version(item[0]))
             else:
-                matching = dated
-        version, released_at = max(matching, key=lambda item: Version(item[0]))
+                # The layer's *own* pins get the last word over the date: a release
+                # whose declarations do not satisfy one of them is not an answer this
+                # layer can hold (§3.2's case (a), found before the build rather than by
+                # the layer's ``pip check`` after it).
+                version, released_at, refused = _chosen_release(
+                    ref,
+                    dated,
+                    cutoff=cutoff,
+                    settled=settled,
+                    metadata_of=metadata_of,
+                )
         resolved.append(
             ResolvedDep(
                 name=ref.name,
@@ -3462,6 +3635,7 @@ def resolve_pins(
                 fixed=fixed,
                 overridden=ref.overridden,
                 narrowed_by=narrowed_by,
+                refused=refused,
             )
         )
     return resolved
@@ -4177,6 +4351,38 @@ def own_pin_names(deps: Mapping[str, Any]) -> frozenset[str]:
     )
 
 
+def pin_narrowings(provenance: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    """``(pin, reason)`` for every date-rule choice a pin in the same layer moved.
+
+    [VANTA-WHY] Read off the provenance's own record — ``narrowed_by`` and ``refused``
+    (:attr:`ResolvedDep`) — rather than re-derived, for the same reason
+    :func:`own_pin_names` reads ``pin_rule``: the answer already exists and one spelling
+    of it is what keeps the record and the reading from disagreeing. The preflight's job
+    is to put it in front of a reader *before* the layer is built, because a pin that is
+    not simply "the newest release on or before the date" is the one thing a reader
+    cannot see in the pin list itself — ``moto==1.3.7`` beside ``luigi/1``'s
+    ``idna==2.9`` looks arbitrary until the reason is next to it. Nothing here is a
+    finding to act on: a narrowed pin is a decision already taken, which is why this is
+    printed as its own block and not counted against the verdict.
+    """
+    out: list[tuple[str, str]] = []
+    for dep in provenance.get("dependencies") or ():
+        pin = str(dep.get("pin") or "")
+        if not pin:
+            continue
+        for claim in dep.get("narrowed_by") or ():
+            out.append((pin, f"{claim.get('pin')} declares {claim.get('requires')}"))
+        for claim in dep.get("refused") or ():
+            out.append(
+                (
+                    pin,
+                    f"{claim.get('pin')} declares {claim.get('requires')}, which "
+                    f"{claim.get('held')} does not satisfy",
+                )
+            )
+    return tuple(out)
+
+
 def _conflict_case(*names: str, own: Container[str]) -> str:
     """§3.2's case letter for a conflict between ``names`` — (b) only when all are own."""
     if names and all(canonicalize_name(name) in own for name in names):
@@ -4669,6 +4875,16 @@ class PreflightBug:
     one that says what pip *did* is the one the gate uses.
     """
 
+    narrowings: tuple[tuple[str, str], ...] = ()
+    """The date-rule choices this layer's own pins moved, with the reason.
+
+    [VANTA-WHY] A narrowed pin is a decision already taken and not a finding, so it is
+    recorded here rather than counted by :func:`preflight_verdict` — but it is exactly
+    what the pin list cannot show: ``moto==1.3.7`` in ``luigi/1`` is not "the newest
+    release on or before the date" and looks arbitrary without the pin that moved it
+    (:func:`pin_narrowings`). Printed by :func:`preflight_lines` before any build.
+    """
+
     @property
     def refused(self) -> tuple[PinConflict, ...]:
         """The conflicts §3.2 does not tolerate: at least one side is a harness choice.
@@ -4720,6 +4936,9 @@ class PreflightBug:
             "counts": self.counts(),
             "pins": [pin.as_dict() for pin in self.pins],
             "conflicts": [conflict.as_dict() for conflict in self.conflicts],
+            "narrowings": [
+                {"pin": pin, "reason": reason} for pin, reason in self.narrowings
+            ],
         }
 
 
@@ -4831,6 +5050,7 @@ def preflight_layers(
                     own=own_pin_names(layer.provenance),
                     metadata_of=metadata_of,
                 ),
+                narrowings=pin_narrowings(layer.provenance),
             )
         )
     return out
@@ -4908,7 +5128,8 @@ def preflight_lines(
     in the layer's ``.preflight.json`` and not on the terminal (§3.2). What is printed is
     what is still open — an unreviewed GAP, an UNBUILDABLE, an UNAVAILABLE pin the rule
     did not take, the pins whose own declarations contradict each other
-    (:func:`_conflict_sections`), and what the rule did take — and the pins' own reasons
+    (:func:`_conflict_sections`), the pins the date rule moved for the layer's own pins
+    (:func:`_narrowing_section`), and what the rule did take — and the pins' own reasons
     are in that JSON, next to the provenance.
 
     ``dropped`` is ``{checkpoint: that layer's dropped records}``, read from the
@@ -4937,6 +5158,7 @@ def preflight_lines(
     lines += _section("unbuildable pin(s)", "UNBUILDABLE", blocked)
     lines += _section("pin(s) nothing can install", "UNAVAILABLE", unavailable)
     lines += _conflict_sections(reports, dropped=dropped_pins)
+    lines += _narrowing_section(reports)
     if dropped_pins:
         lines += ["", f"dropped pin(s) ({len(dropped_pins)}) — §3.2's rule, with the "
                       "audit that settled it:"]
@@ -5013,6 +5235,31 @@ def _conflict_sections(
     for case, (title, label) in _CONFLICT_SECTIONS.items():
         out += _section(title, label, grouped[case])
     return out
+
+
+def _narrowing_section(reports: Sequence[PreflightBug]) -> list[str]:
+    """One printed block for the date-rule choices a pin in the same layer moved.
+
+    Not a finding and not a section per §3.2's cases (:func:`_conflict_sections`): the
+    version was chosen, the pins do not conflict, and the block exists because the chosen
+    version is *not* what the date rule alone would give. Printed once per pin with every
+    layer that holds it, the same shape the other blocks use, so "which layers is this
+    pin in" is answerable from the line.
+    """
+    grouped: dict[str, tuple[str, list[str]]] = {}
+    for report in reports:
+        for pin, reason in report.narrowings:
+            grouped.setdefault(pin, (reason, []))[1].append(report.key)
+    if not grouped:
+        return []
+    lines = [
+        "",
+        f"narrowed pin(s) ({len(grouped)}) — §3.2's date rule, moved to satisfy a pin in "
+        "the same layer:",
+    ]
+    for pin, (reason, keys) in grouped.items():
+        lines.append(f"  NARROWED {pin} — {reason} ({', '.join(keys)})")
+    return lines
 
 
 def preflight_verdict(

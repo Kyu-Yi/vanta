@@ -3116,7 +3116,31 @@ class TestBake:
         assert table["psycopg2-binary"] == ("libpq-dev",)
         assert "gfortran" in table["scipy"]
         assert table["pillow"] == ("libjpeg-dev",)
-        assert bake_mod.UNBUILDABLE_ON_PLATFORM["pyarrow"]
+        assert "Arrow C++" in bake_mod.UNBUILDABLE_ON_PLATFORM["pyarrow"][0].reason
+
+    def test_cryptography_is_out_of_the_reviewed_table_and_limited_by_version(self):
+        """The entry it would have had cannot be a header: two builds, two impossibilities.
+
+        ``2.9.2`` — the release luigi/1 and sanic/1 pin — needs OpenSSL **1.1** headers,
+        which this trixie image does not carry, and every release from 35 needs a Rust
+        toolchain it does not carry either. A name-keyed reason was one answer where
+        there are two, so the name left :data:`SDIST_SYSTEM_PACKAGES` (and ``libssl-dev``
+        with it) and entered :data:`UNBUILDABLE_ON_PLATFORM` with a clause per window.
+        """
+        assert "cryptography" not in bake_mod.SDIST_SYSTEM_PACKAGES
+        assert "libssl-dev" not in bake_mod.SYSTEM_PACKAGES["3.8"]
+        early, late = bake_mod.UNBUILDABLE_ON_PLATFORM["cryptography"]
+        assert early.covers("2.9.2") and "OpenSSL" in early.reason
+        assert not early.covers("44.0.0")
+        assert late.covers("44.0.0") and "Rust" in late.reason
+        assert not late.covers("2.9.2")
+
+    def test_a_limit_with_no_bound_covers_every_release(self):
+        """The seeded entries answer for every release, which is what "no bound" means."""
+        seeded = bake_mod.UNBUILDABLE_ON_PLATFORM["pyarrow"][0]
+        assert not str(seeded.bound)
+        for version in ("0.17.1", "44.0.0", "not a version"):
+            assert seeded.covers(version)
 
     def test_the_layer_records_the_installed_versions_in_itself(self):
         """The interpreter layer's provenance for its non-pip half.
@@ -4452,7 +4476,9 @@ class TestPinPreflight:
     ):
         monkeypatch.setattr(bake_mod, "SDIST_SYSTEM_PACKAGES", {})
         monkeypatch.setattr(
-            bake_mod, "UNBUILDABLE_ON_PLATFORM", {"pyarrow": "needs Arrow C++"}
+            bake_mod,
+            "UNBUILDABLE_ON_PLATFORM",
+            {"pyarrow": (bake_mod.PlatformLimit("needs Arrow C++"),)},
         )
         pin = self._classify(
             [_sdist("pyarrow-0.17.1.tar.gz")],
@@ -4465,7 +4491,9 @@ class TestPinPreflight:
     def test_the_unreviewed_and_unbuildable_findings_reach_the_record(self, monkeypatch):
         monkeypatch.setattr(bake_mod, "SDIST_SYSTEM_PACKAGES", {})
         monkeypatch.setattr(
-            bake_mod, "UNBUILDABLE_ON_PLATFORM", {"pyarrow": "needs Arrow C++"}
+            bake_mod,
+            "UNBUILDABLE_ON_PLATFORM",
+            {"pyarrow": (bake_mod.PlatformLimit("needs Arrow C++"),)},
         )
         records = [
             self._classify(
@@ -4493,6 +4521,63 @@ class TestPinPreflight:
         assert records[0].as_dict()["gap"].startswith("unreviewed:")
         assert records[1].as_dict()["unbuildable"] == "needs Arrow C++"
         assert "gap" not in records[1].as_dict()
+
+    def test_a_platform_limit_names_the_one_window_it_is_a_reason_for(self, monkeypatch):
+        """The table is consulted clause by clause, so the pin's version decides the reason."""
+        monkeypatch.setattr(bake_mod, "SDIST_SYSTEM_PACKAGES", {})
+        monkeypatch.setattr(
+            bake_mod,
+            "UNBUILDABLE_ON_PLATFORM",
+            {
+                "cryptography": (
+                    bake_mod.PlatformLimit(
+                        "needs the 1.1 headers", bake_mod.SpecifierSet("<35")
+                    ),
+                    bake_mod.PlatformLimit(
+                        "needs Rust", bake_mod.SpecifierSet(">=35")
+                    ),
+                )
+            },
+        )
+        members = ("cryptography-2.9.2/src/_cffi_src/hazmat_src/padding.c",)
+        old = self._classify(
+            [_sdist("cryptography-2.9.2.tar.gz")],
+            members=members,
+            pin="cryptography==2.9.2",
+        )
+        new = self._classify(
+            [_sdist("cryptography-44.0.0.tar.gz")],
+            members=("cryptography-44.0.0/src/lib.rs",),
+            pin="cryptography==44.0.0",
+        )
+        assert old.unbuildable == "needs the 1.1 headers"
+        assert new.unbuildable == "needs Rust"
+        assert old.gap is None and new.gap is None
+
+    def test_a_version_no_clause_covers_falls_through_to_the_gap_report(self, monkeypatch):
+        """A bounded table says nothing about a version outside its bounds.
+
+        Falling through to the gap is the answer that asks for a review. The alternative —
+        treating the name as a limit whatever the pin — would report a version this table
+        has never judged as one it has.
+        """
+        monkeypatch.setattr(bake_mod, "SDIST_SYSTEM_PACKAGES", {})
+        monkeypatch.setattr(
+            bake_mod,
+            "UNBUILDABLE_ON_PLATFORM",
+            {
+                "cryptography": (
+                    bake_mod.PlatformLimit("needs Rust", bake_mod.SpecifierSet(">=35")),
+                )
+            },
+        )
+        pin = self._classify(
+            [_sdist("cryptography-2.9.2.tar.gz")],
+            members=("cryptography-2.9.2/src/x.c",),
+            pin="cryptography==2.9.2",
+        )
+        assert pin.unbuildable is None
+        assert pin.gap is not None
 
     def test_the_files_the_listing_and_the_declarations_of_a_shared_pin_are_fetched_once(self):
         """The caches are what make a 232-pin preflight cheap; numpy is in six bugs.
@@ -5793,7 +5878,9 @@ class TestUnresolvablePins:
         kept, dropped = bake_mod.drop_unresolvable_deps(
             (harness, closure),
             reason_of=self._reason_of(
-                unbuildable={"pyarrow": bake_mod.UNBUILDABLE_ON_PLATFORM["pyarrow"]},
+                unbuildable={
+                    "pyarrow": bake_mod.UNBUILDABLE_ON_PLATFORM["pyarrow"][0].reason
+                },
                 calls=calls,
             ),
             audit=self._audit(),
@@ -5846,7 +5933,10 @@ class TestUnresolvablePins:
         second = bake_mod.uninstallable_reason(
             "pyarrow", "0.17.1", releases=releases, classify=classifier, python_minor="3.8"
         )
-        expected = (bake_mod.UNBUILDABLE, bake_mod.UNBUILDABLE_ON_PLATFORM["pyarrow"])
+        expected = (
+            bake_mod.UNBUILDABLE,
+            bake_mod.UNBUILDABLE_ON_PLATFORM["pyarrow"][0].reason,
+        )
         assert first == second == expected
         assert fetched == [("pyarrow", "0.17.1")], "one fetch, two questions"
 
@@ -9583,7 +9673,7 @@ class TestRealMatplotlibAndPandasClosure:
                 spec=name,
                 sources=(source_of[name],),
                 outcome=bake_mod.UNBUILDABLE,
-                reason=bake_mod.UNBUILDABLE_ON_PLATFORM[name],
+                reason=bake_mod.UNBUILDABLE_ON_PLATFORM[name][0].reason,
                 audit=audit(name),
             )
             for name in self.PANDAS_ONE_UNUSABLE

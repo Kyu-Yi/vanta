@@ -343,7 +343,6 @@ SDIST_SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
     "brotli": (),  # vendored c/; <vector> is libstdc++, which g++ brings
     "cffi": ("libffi-dev",),
     "coverage": (),  # coverage/ctracer/* only, all in the sdist
-    "cryptography": ("libssl-dev",),
     "cython": (),  # its own setup.py names no library; Demos/ and docs/ do
     "distlib": (),  # PC/launcher.c is the Windows launcher, never built here
     "httptools": (),  # vendor/http-parser/ is inside the sdist
@@ -396,11 +395,15 @@ build time).
 The names are canonical distribution names, because that is what the resolver pins and
 what :func:`preflight_pin` classifies with. Three entries need a word:
 
-* ``cryptography`` is ``libssl-dev`` **only before 3.4** — from 3.4 on its sdist builds
-  the Rust binding, which needs a Rust toolchain this image does not carry at all. The
-  entry is a name and cannot carry that boundary, so it stands for the build the split
-  actually pins (``2.9.2``, the cffi/OpenSSL one); a wave that pins 3.4 or later has to
-  revisit it, and the pin's own ``reason`` in the preflight is where that would show.
+* ``cryptography`` is **not here**, and its absence is a measure of this table's shape
+  rather than an oversight. It was ``libssl-dev`` for as long as the review stood for
+  the one build the split pins (``2.9.2``, the cffi/OpenSSL one), and that build is one
+  no header can fix: ``2.9.2`` needs OpenSSL **1.1**, and this image is trixie, which
+  ships OpenSSL 3 — from 35.0 on the sdist takes 3.x, and from 3.4 on it needs a Rust
+  toolchain. So the pin is a :data:`UNBUILDABLE_ON_PLATFORM` one by its *version*, and
+  the version is what the entry now carries. ``libssl-dev`` consequently leaves the
+  interpreter layer (:func:`_system_packages_for_py38`), which is a fact about that
+  layer and not about this table: nothing else the split builds links OpenSSL.
 * ``pillow`` joins ``libjpeg-dev`` to the ``libpng-dev``/``libfreetype-dev``/``zlib1g-dev``
   the base list already carries: those three are for matplotlib's ``_png``/``ft2font``,
   and pillow needs the fourth for JPEG.
@@ -424,19 +427,87 @@ for that reason, and the count stays in the record as a raw fact rather than as 
 reason a build is said to need a library (:func:`_sdist_reason`).
 """
 
-UNBUILDABLE_ON_PLATFORM: Mapping[str, str] = {
+@dataclass(frozen=True)
+class PlatformLimit:
+    """One reason a package's sdist cannot be built here, and the releases it covers.
+
+    [VANTA-WHY] The reason and the releases it is a reason *for* used to be two facts in
+    two places — the table here carried the reason, and the boundary lived in a comment
+    (:data:`SDIST_SYSTEM_PACKAGES`'s ``cryptography`` bullet said "only before 3.4" and
+    then apologised that the entry could not carry it). ``cryptography`` is the case that
+    made the apology untenable: which of its two impossible builds a pin runs into
+    depends entirely on the version, so a name-keyed reason was one answer where there
+    are two.
+
+    ``bound`` is empty for a limit that holds for every release (``llvmlite``'s LLVM, and
+    the other two seeded entries), and a bounded :class:`SpecifierSet` otherwise. Clauses
+    are consulted **in order** and the first one whose bound covers the pin decides, so a
+    name with two impossible windows lists the reason a reader should see first for the
+    version at hand.
+    """
+
+    reason: str
+    bound: SpecifierSet = SpecifierSet("")
+
+    def covers(self, version: str) -> bool:
+        """Whether this reason applies to ``version``.
+
+        An empty bound is every release, and it is spelled out rather than left to
+        ``SpecifierSet``: an empty set excludes prereleases from ``in`` (packaging reads
+        the empty string as "no opinion about prereleases"), and "every release" has to
+        mean every release. ``prereleases=True`` on the bounded case is the same
+        arithmetic-and-not-install-policy decision — ``<35`` is a statement about release
+        order, and a ``35.0rc1`` is below 35 whatever pip would do with it.
+
+        A version nothing can be read for is not one this limit claims: the fall-through
+        is the gap report, which is the answer that asks for a review rather than
+        inventing one.
+        """
+        if not str(self.bound):
+            return True
+        try:
+            return self.bound.contains(version, prereleases=True)
+        except InvalidVersion:
+            return False
+
+    def __str__(self) -> str:
+        return f"{self.bound or 'every release'}: {self.reason}"
+
+
+UNBUILDABLE_ON_PLATFORM: Mapping[str, tuple[PlatformLimit, ...]] = {
+    "cryptography": (
+        PlatformLimit(
+            "its sdist builds the C bindings against OpenSSL's headers, and every "
+            "release before 35 needs the 1.1 ones, which this image does not carry: it "
+            "is trixie, whose OpenSSL is 3.x, and cryptography only builds against 3.x "
+            "from 35.0 on (its releases from 3.4 on need a Rust toolchain as well, "
+            "which is the other half of what this table has to say about it)",
+            bound=SpecifierSet("<35"),
+        ),
+        PlatformLimit(
+            "its sdist builds the Rust binding, and this image carries no Rust "
+            "toolchain at all",
+            bound=SpecifierSet(">=35"),
+        ),
+    ),
     "llvmlite": (
-        "its sdist builds against a specific LLVM release's C API; this image carries "
-        "no LLVM, and the version it wants is not the one any current trixie package "
-        "ships"
+        PlatformLimit(
+            "its sdist builds against a specific LLVM release's C API; this image "
+            "carries no LLVM, and the version it wants is not the one any current "
+            "trixie package ships"
+        ),
     ),
     "numba": (
-        "it is built against llvmlite, which needs a specific LLVM release this image "
-        "does not carry, so its own C extension cannot be built either"
+        PlatformLimit(
+            "it is built against llvmlite, which needs a specific LLVM release this "
+            "image does not carry, so its own C extension cannot be built either"
+        ),
     ),
     "pyarrow": (
-        "its sdist needs the Arrow C++ toolchain (a full C++17 build plus its vendored "
-        "third-party sources), which this image does not carry"
+        PlatformLimit(
+            "its sdist needs the Arrow C++ toolchain (a full C++17 build plus its "
+            "vendored third-party sources), which this image does not carry"
+        ),
     ),
 }
 """Packages whose *sdist* also cannot be built here, and why, as a review.
@@ -448,6 +519,12 @@ building Arrow C++ to find out (measured: pandas/1's ``pyarrow==0.17.1``), and
 :func:`decide_unresolvable` treats such a pin exactly like one with no Linux
 distribution at all (§3.2): dropped when nothing imports it, and the bug flagged when
 something does.
+
+Each value is the name's :class:`PlatformLimit` clauses, in the order they are read, and
+the first one covering the pin's version is what the preflight reports. A name with one
+clause is a package no release of which can be built here; a name with several is one
+whose impossible build changes with the version — which is the shape ``cryptography``
+forced, and the reason the table is version-scoped at all rather than name-keyed.
 """
 
 
@@ -4705,7 +4782,7 @@ def preflight_pin(
     sdist = sdists[0]
     members, truncated = sdist_of(sdist)
     compiled = compiled_sources(members)
-    review = _review_of(name, compiled=compiled, truncated=truncated)
+    review = _review_of(name, version, compiled=compiled, truncated=truncated)
     return PreflightPin(
         name=name,
         version=version,
@@ -4776,15 +4853,20 @@ def _sdist_reason(
 
 
 def _review_of(
-    name: str, *, compiled: Sequence[str], truncated: bool
+    name: str, version: str, *, compiled: Sequence[str], truncated: bool
 ) -> dict[str, Optional[str]]:
     """The reviewed table's verdict on one sdist build, as :class:`PreflightPin` fields.
 
     Three answers and each is a decision rather than a fallback:
 
-    * a :data:`UNBUILDABLE_ON_PLATFORM` entry — the reason, because no system package
-      would make this build work. Checked first: it is a fact about the package, and a
-      gap line on top of it would read as if a review could close it;
+    * a :data:`UNBUILDABLE_ON_PLATFORM` entry **whose bound covers ``version``** — the
+      reason, because no system package would make this build work. Checked first: it is
+      a fact about the package, and a gap line on top of it would read as if a review
+      could close it. The table is version-scoped (:class:`PlatformLimit`) because
+      ``cryptography`` has two impossible builds and which one a pin runs into is the
+      pin's version; a version outside every clause is not claimed by any of them and
+      falls through to the gap report below, which is the answer that asks for a review
+      rather than inventing one;
     * a :data:`SDIST_SYSTEM_PACKAGES` entry — nothing to report. The entry may be an
       empty tuple ("this compiles, against nothing but libc and the layer's compiler"),
       which is a review result and not a missing entry;
@@ -4807,9 +4889,9 @@ def _review_of(
     distribution names, and PEP 503 makes those one name.
     """
     canonical = canonicalize_name(name)
-    reason = UNBUILDABLE_ON_PLATFORM.get(canonical)
-    if reason is not None:
-        return {"gap": None, "unbuildable": reason}
+    for limit in UNBUILDABLE_ON_PLATFORM.get(canonical, ()):
+        if limit.covers(version):
+            return {"gap": None, "unbuildable": limit.reason}
     if canonical in SDIST_SYSTEM_PACKAGES or not compiled:
         return {"gap": None, "unbuildable": None}
     return {

@@ -443,6 +443,35 @@ release, so no entry in the system-package table could make those builds work on
 `UNBUILDABLE <pin> — <reason>` and recorded as such, because the alternative is discovering it as one
 bug's compile error (§3.2's unresolvable-pin rule then decides whether that bug bakes or is flagged).
 
+**The table is keyed by name *and* release, because one package can have two impossible builds.**
+Each value is a tuple of `bake.PlatformLimit(reason, bound)` clauses read in order, and the first whose
+`bound` covers the pin's version is the reason reported; an empty `bound` means every release, which is
+how the three seeded entries (`pyarrow`, `llvmlite`, `numba`) read. `cryptography` is the case that
+forced the shape rather than a nice-to-have: `2.9.2` — the release the split's own pins name — builds
+its C bindings against OpenSSL's headers and needs the **1.1** ones, which this trixie image does not
+carry (its OpenSSL is 3.x), while every release from `35.0` builds against 3.x but needs a **Rust**
+toolchain the image does not carry either. Those are two reasons for one name and only the version says
+which one a pin runs into, so the pin-versioned entry carries both and the name left
+`SDIST_SYSTEM_PACKAGES` — an entry there is consulted by *name* alone and could not have been narrowed to
+one of them. It was `libssl-dev` there for as long as the review stood for the 2.9.2 build, so that
+package leaves the interpreter layer's install list with it
+(`bake._system_packages_for_py38`), which is a fact about that layer and not about the table: nothing
+else the split builds links OpenSSL. A pin whose version **no** clause covers falls through to the
+unreviewed-`gap` answer instead of inheriting a limit stated for a different release — the reason to
+report is "nobody has judged this version", not a reason borrowed from its neighbour.
+
+Dropping `cryptography` by this rule is a drop like any other, so the dependents had to be checked
+rather than assumed, and the check is what makes the drop safe: `pyOpenSSL==19.1.0` (which the split
+pins) declares exactly one unconditional requirement on it — `cryptography (>=2.8)`, satisfied by the
+`2.9.2` the layer pins — and `service-identity==18.1.0`'s is a **bare** `cryptography`. Neither
+declares a floor above `2.9.2` and neither is what pulls a modern release in: with the pin gone, the
+legacy resolver has no requirement left that names a version of `cryptography`, so it installs nothing
+for it, and §3.2's audit decides per bug whether the two dependents drop with it (nothing in `luigi/1`'s
+or `sanic/1`'s graded-test import closure imports `cryptography`, `OpenSSL`, `pyopenssl` or
+`service_identity` — measured — so they drop by the same rule). `numpy` is deliberately **not** here: a
+missing header is a fixable fault of the table, and `numpy==1.18.5`'s sdist is what this image builds
+(the measured `[Errno 2]` is a toolchain invocation and not a platform limit).
+
 **One environment for every py3.8 bug is the point, and a compiler does not change a pure-Python bug's
 tests.** The layer is shared, so a compiler added for `matplotlib/1` is present for `luigi/1` as well.
 That is safe because `needs_build` (§3.2) decides per bug whether anything is compiled at all: a bug

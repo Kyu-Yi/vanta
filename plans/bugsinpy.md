@@ -812,6 +812,27 @@ from several bugs, so `bake.preflight_lines` prints the whole split's drops once
 are the same records and neither summarises the other: the block is what a reader watching the bake
 sees, and the JSON is what survives it — including the per-site audit, which the block does not repeat.
 
+**A transitive pick is a pin like any other, and the same rule judges it.** The drop above is applied
+by `bake.drop_unresolvable_deps`, and that function is called **twice**: once inside `resolve_deps`
+over the layer's *declared* pins, and once by `resolve_bug_deps` over the pins the **closure walk**
+picked, which do not exist until `resolve_deps` has already returned. That second call is the whole
+of the fix, because it is the half the rule was measured on and the half it was missing: `luigi/1` and
+`sanic/1` both install `cryptography==2.8` because `moto==1.3.7`, `pyopenssl==19.1.0` and
+`service-identity==18.1.0` declare it, `bake.UNBUILDABLE_ON_PLATFORM` reviews exactly that release as
+impossible on this image, and each layer's *own* `cryptography` pin (2.9.2) **was** dropped for that
+reason — while the transitive 2.8 went into the layer. A pick nothing here can install is the same
+finding whichever half of the layer produced it: it is dropped with the same record when nothing the
+graded tests reach imports it, and the bug is **flagged** by the same `bake.decide_unresolvable` when
+something does. To keep the two halves one rule rather than two, `bake.resolve_bug_deps` binds the
+rule's two callables **once per bug** — `reason_of` (the date rule's own release mapping, the run's
+shared classifier, the layer's minor version) and `audit` (`bake.import_auditor` over both commits'
+trees) — and hands the *same* two to `resolve_deps` and to the pass after `bake.transitive_pins`, so
+neither half can drift. The record lands in the one `dropped` list either way, and the preflight's drop
+block reads the two together. A pick has no `sources` — no file in either tree named it, which is what
+made it a pick — so its record falls back to `required_by`, the releases whose `requires_dist`
+declared it, which is what makes the entry name a distribution *and* a reason it is in the layer at
+all.
+
 **Rebuild semantics — `--force` means replace, and a rebuilt base invalidates its children.** A layer
 is deleted *before* it is created, never merely created over (shuru refuses a duplicate name with
 `checkpoint '<name>' already exists, delete it first`; `checkpoint_create` treats any non-zero result

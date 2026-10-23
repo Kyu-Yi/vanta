@@ -7240,6 +7240,71 @@ class TestUnresolvablePins:
         assert "imports it" in flagged[0].reason
         assert flagged[0].reason.startswith("BakeError: ")
 
+    # ---- and the same rule over the closure walk's own picks ---------------
+    def test_a_transitive_pick_nothing_can_install_is_dropped_the_same_way(
+        self, monkeypatch
+    ):
+        """``luigi/1``/``sanic/1``: ``cryptography==2.8`` arrives from a pin's metadata.
+
+        No file in either tree names it — ``moto``/``pyopenssl``/``service-identity``
+        declare it, so the *closure walk* picks it — and the walk's picks were never
+        passed to the audit, so the layer installed a release its own preflight had
+        already marked unbuildable while the layer's own ``cryptography`` pin was
+        dropped for exactly that reason. A transitive pick is a pin of the same kind,
+        so it is dropped with the same record.
+        """
+        releases, metadata_of, classify = _transitive_unbuildable_fixture()
+        monkeypatch.setattr(
+            bake_mod,
+            "import_auditor",
+            lambda repo, commits, **kwargs: lambda name: bake_mod.ImportAudit(
+                (), None, "nothing in either tree imports it"
+            ),
+        )
+        _, layers, flagged = _resolve_with_drops(
+            monkeypatch,
+            refs=(bake_mod.dep_ref("demo==1.0", "requirements.txt line 3"),),
+            classify=classify,
+            metadata_of=metadata_of,
+            releases=releases,
+        )
+        assert flagged == []
+        assert "demo==1.0" in layers[0].installs, "the declared pin stays"
+        assert not any(
+            spec.startswith("cryptography") for spec in layers[0].installs
+        ), "the walk's unbuildable pick does not"
+        record = layers[0].provenance["dropped"][0]
+        assert record["pin"] == "cryptography==2.8"
+        assert record["outcome"] == bake_mod.UNBUILDABLE
+        assert record["sources"] == ["demo==1.0"], (
+            "a pick no file declared names the release whose metadata required it"
+        )
+
+    def test_a_transitive_pick_the_graded_tests_import_flags_the_bug(self, monkeypatch):
+        """The other half of the same rule, and the half that is not a drop."""
+        releases, metadata_of, classify = _transitive_unbuildable_fixture()
+        monkeypatch.setattr(
+            bake_mod,
+            "import_auditor",
+            lambda repo, commits, **kwargs: lambda name: bake_mod.ImportAudit(
+                (bake_mod.ImportSite("demo/core.py", 1, name, None, "b" * 40),),
+                f"demo/core.py:1 at {'b' * 12}",
+                f"demo/core.py:1 at {'b' * 12} imports it unconditionally, inside the "
+                "failing tests' import closure",
+            ),
+        )
+        _, layers, flagged = _resolve_with_drops(
+            monkeypatch,
+            refs=(bake_mod.dep_ref("demo==1.0", "requirements.txt line 3"),),
+            classify=classify,
+            metadata_of=metadata_of,
+            releases=releases,
+        )
+        assert layers == []
+        assert [flag.key for flag in flagged] == ["Demo/1"]
+        assert "cryptography" in flagged[0].reason
+        assert flagged[0].reason.startswith("BakeError: ")
+
     def test_one_reader_per_question_is_shared_by_the_resolution_and_the_preflight(
         self, tmp_path, monkeypatch
     ):
@@ -7457,15 +7522,28 @@ def _fixture_releases() -> dict:
     return releases
 
 
-def _resolve_with_drops(monkeypatch, *, refs):
+def _resolve_with_drops(
+    monkeypatch, *, refs, classify=None, metadata_of=None, releases=None
+):
     """``resolve_bug_deps`` over one fake source set, with the network taken out.
 
     The pins are the caller's; the release dates are the fixture the date-rule tests
     use (so a version the fixture does not list is a version PyPI does not list); and
     the classifier is the wheel stub — these tests are about the rule *around* the
     pins, and the drop they measure comes from the dates, not from what PyPI ships.
+
+    ``classify``, ``metadata_of`` and ``releases`` are the seams a test needs when the
+    finding is about what a *release* declares rather than about a pin's own dates:
+    §3.2's closure walk reads both, so an unbuildable pick has to be reachable through
+    a requirer's metadata before it can be dropped.
     """
     fetched: list[str] = []
+    table = _fixture_releases() if releases is None else releases
+    reader = (
+        TestTheReportPluginFollowsTheBugsPytest._metadata_of
+        if metadata_of is None
+        else metadata_of
+    )
 
     def fake_sources(entry, *, bugsinpy_root, repo, module_distributions=None):
         return bake_mod.DepSources(
@@ -7482,7 +7560,7 @@ def _resolve_with_drops(monkeypatch, *, refs):
 
     def fetch(name):
         fetched.append(name)
-        return _fixture_releases()[name]
+        return table[name]
 
     monkeypatch.setattr(bake_mod, "bug_sources", fake_sources)
     split = split_mod.Split(split_data(bugs=[bug_entry(checkpoint="vanta-bi-Demo-1")]))
@@ -7492,10 +7570,45 @@ def _resolve_with_drops(monkeypatch, *, refs):
         bugsinpy_root=Path("/nonexistent"),
         repo_for=lambda project: Path("/nonexistent"),
         fetch=fetch,
-        metadata_of=TestTheReportPluginFollowsTheBugsPytest._metadata_of,
-        classify=_wheel_classifier(),
+        metadata_of=reader,
+        classify=classify or _wheel_classifier(),
     )
     return fetched, layers, flagged
+
+
+def _transitive_unbuildable_fixture():
+    """``(releases, metadata_of, classify)`` for one *transitively* unbuildable pick.
+
+    ``demo==1.0`` declares ``cryptography (>=2.1)`` and nothing in the bug's tree
+    declares ``cryptography`` at all, so the only way it can enter the layer is §3.2's
+    closure walk — which is the half of the rule these tests are about. ``cryptography
+    2.8`` is inside the window the walk holds ``demo``'s own declarations to and
+    ``2.9.2`` is not, and the classifier answers :data:`UNBUILDABLE` for it: the
+    measured shape of ``luigi/1`` and ``sanic/1``.
+    """
+    releases = dict(_fixture_releases())
+    releases["demo"] = {"1.0": "2019-04-01"}
+    releases["cryptography"] = {"2.8": "2019-03-01", "2.9.2": "2020-04-21"}
+
+    def metadata_of(name, version):
+        if (name, version) == ("demo", "1.0"):
+            return (("cryptography (>=2.1)",), None)
+        return TestTheReportPluginFollowsTheBugsPytest._metadata_of(name, version)
+
+    wheel = _wheel_classifier()
+
+    def classify(name, version, python_minor):
+        if name == "cryptography":
+            return bake_mod.PreflightPin(
+                name=name,
+                version=version,
+                kind=bake_mod.SDIST_ONLY,
+                reason="no aarch64 wheel; builds from the sdist",
+                unbuildable="links against an OpenSSL this image does not carry",
+            )
+        return wheel(name, version, python_minor)
+
+    return releases, metadata_of, classify
 
 
 # ============================================================================

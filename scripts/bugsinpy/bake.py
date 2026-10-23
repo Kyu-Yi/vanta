@@ -7236,6 +7236,15 @@ def drop_unresolvable_deps(
     whether it installs here. Measured, that is pandas/1's ``pyarrow``, which comes from
     the import closure with no version at all and resolves to 0.17.1.
 
+    It is called twice with two different kinds of pin, and that is the point: once by
+    :func:`resolve_deps` over the layer's *declared* pins and once by
+    :func:`resolve_bug_deps` over the **closure walk's** picks, which are produced after
+    ``resolve_deps`` has already returned. A transitive pick is a pin chosen by the same
+    date rule and installed the same way, so an unbuildable one is the same finding —
+    ``luigi/1``'s and ``sanic/1``'s ``cryptography==2.8`` came in through ``moto`` and
+    ``pyopenssl`` and were installed over a preflight that had already marked that
+    release unbuildable here.
+
     A package the interpreter layer carries is never asked: this layer does not install
     it, so there is nothing to drop.
     """
@@ -7250,7 +7259,12 @@ def drop_unresolvable_deps(
                 dep.name,
                 version,
                 spec=dep.spec,
-                sources=dep.sources,
+                # A declared pin's ``sources`` say which file asked for it; a transitive
+                # pick has none — no file in the bug's tree named it — so what it
+                # *was* declared by is the release whose ``requires_dist`` required it
+                # (:attr:`ResolvedDep.required_by`). Without that the record would name
+                # a distribution and no reason it is in the layer at all.
+                sources=dep.sources or dep.required_by,
                 reason_of=reason_of,
                 audit=audit,
             )
@@ -8214,31 +8228,36 @@ def resolve_bug_deps(
                 | pytest_dates
             )
             releases = {name: fetch(name) for name in needed}
-            # §3.2's unresolvable-pin rule, ready for whichever pass finds something:
-            # the date rule's own mapping answers "does this release exist", the run's
-            # shared classifier answers "what does it install as", and the bug's own
-            # two trees answer "is anything the graded tests reach importing it" —
-            # lazily, because the walk is a file read per ``.py`` and most bugs never
-            # ask.
             dropped: list[DroppedPin] = []
+            # §3.2's unresolvable-pin rule's two callables, bound once for this bug: the
+            # date rule's own mapping answers "does this release exist", the run's shared
+            # classifier answers "what does it install as", and the bug's own two trees
+            # answer "is anything the graded tests reach importing it" — lazily, because
+            # the walk is a file read per ``.py`` and most bugs never ask. Bound here
+            # rather than inline in the ``resolve_deps`` call because **both** halves of
+            # the layer go through them: the declared pins inside ``resolve_deps`` and
+            # the closure walk's picks below (:func:`drop_unresolvable_deps`), which is
+            # what makes a transitive pick's audit the same rule and not a second one.
+            reason_of = partial(
+                uninstallable_reason,
+                releases=releases,
+                classify=classifier,
+                python_minor=minor,
+            )
+            audit = import_auditor(
+                repo,
+                (sources.buggy_commit, sources.fixed_commit or ""),
+                distributions=distributions,
+                test_files=test_files,
+            )
             resolved = resolve_deps(
                 sources,
                 releases=releases,
                 harness_pins=harness_pins,
                 python_minor=minor,
                 metadata_of=metadata_of,
-                reason_of=partial(
-                    uninstallable_reason,
-                    releases=releases,
-                    classify=classifier,
-                    python_minor=minor,
-                ),
-                audit=import_auditor(
-                    repo,
-                    (sources.buggy_commit, sources.fixed_commit or ""),
-                    distributions=distributions,
-                    test_files=test_files,
-                ),
+                reason_of=reason_of,
+                audit=audit,
                 dropped=dropped,
             )
             built = resolve_build_pins(
@@ -8280,6 +8299,21 @@ def resolve_bug_deps(
                     },
                 },
             )
+            # The closure walk's own picks get the same audit, and they are the half of
+            # the layer it was measured on: ``luigi/1`` and ``sanic/1`` both install
+            # ``cryptography==2.8`` because ``moto==1.3.7``/``pyopenssl==19.1.0``/
+            # ``service-identity==18.1.0`` declare it, and that is the release the same
+            # preflight marks :data:`UNBUILDABLE` here — while each layer's *own*
+            # ``cryptography`` pin is dropped for exactly that reason. A pick nothing on
+            # this image can install is a pin like any other: dropped with a record when
+            # nothing the graded tests reach imports it, and the bug flagged when
+            # something does (:func:`decide_unresolvable`). The record lands in the same
+            # ``dropped`` list, so the provenance and the preflight's drop report read
+            # the two halves as one answer.
+            transitive, dropped_transitive = drop_unresolvable_deps(
+                transitive, reason_of=reason_of, audit=audit
+            )
+            dropped.extend(dropped_transitive)
         except BakeError as exc:
             flagged.append(FlaggedBug(key=key, reason=f"{type(exc).__name__}: {exc}"))
             continue

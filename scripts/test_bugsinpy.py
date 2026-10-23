@@ -3301,6 +3301,7 @@ class TestBake:
         "LDSHARED": "gcc -pthread -shared",
         "LDCXXSHARED": "g++ -pthread -shared",
         "CFLAGS": " ".join(ERA_WARNING_FLAGS),
+        "FFLAGS": "-fallow-argument-mismatch",
     }
 
     def test_the_compiler_environment_is_the_distutils_override_for_this_toolchain(self):
@@ -3317,6 +3318,17 @@ class TestBake:
         assert bake_mod._ERA_WARNING_FLAGS == self.ERA_WARNING_FLAGS
         assert bake_mod.COMPILER_ENV["CFLAGS"] == " ".join(self.ERA_WARNING_FLAGS)
 
+    def test_the_fortran_flags_are_the_gcc_10_argument_mismatch_error_demoted(self):
+        """The other compiler's one demoted error, spelled out for the same reason.
+
+        ``-fallow-argument-mismatch`` is what ``pandas/1``'s ``scipy==1.4.1`` needs:
+        without it gfortran 14 refuses ``dnaitr.f``'s pair of ``dvout`` calls with
+        ``Error: Rank mismatch between actual argument at (1) and actual argument at
+        (2) (scalar and rank-1)``. An entry dropped here is that error back.
+        """
+        assert bake_mod._ERA_FORTRAN_FLAGS == ("-fallow-argument-mismatch",)
+        assert bake_mod.COMPILER_ENV["FFLAGS"] == "-fallow-argument-mismatch"
+
     def test_the_interpreter_recipe_exports_the_compiler_for_source_builds(self):
         """Quoted as shell, because a linker line is more than one word."""
         recipe = self._recipe()
@@ -3325,6 +3337,7 @@ class TestBake:
         assert "export LDSHARED='gcc -pthread -shared'" in recipe
         assert "export LDCXXSHARED='g++ -pthread -shared'" in recipe
         assert f"export CFLAGS='{' '.join(self.ERA_WARNING_FLAGS)}'" in recipe
+        assert "export FFLAGS=-fallow-argument-mismatch" in recipe
 
     def test_the_recipe_prints_what_the_standalone_recorded(self):
         """The evidence for the override: sysconfig's own CC/CXX, not ``$CC``.
@@ -3430,6 +3443,42 @@ class TestBake:
         # Not in the C++ half: in C++ that assignment is an error in every standard,
         # so it would fail the smoke for a reason that is not these flags.
         assert "vanta_era_pointer_check" not in bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE
+
+    def test_the_smoke_check_compiles_a_fortran_rank_mismatch(self):
+        """The Fortran half of the smoke, on the shape ``pandas/1`` measured.
+
+        ``dnaitr.f`` calls one external subroutine twice with a different rank in the
+        same position, and gfortran 14 refuses the pair; the file below is that pair, so
+        this smoke fails on a layer where ``FFLAGS`` never reached the shell — the
+        failure otherwise surfacing twenty minutes into scipy's ARPACK sources.
+        """
+        source = bake_mod._TOOLCHAIN_SMOKE_F_SOURCE
+        # Fixed form, so the smoke really compiles the form that failed: statements
+        # from column 7, comments in column 1, and nothing past column 72 (where
+        # gfortran silently truncates).
+        lines = source.splitlines()
+        assert all(len(line) <= 72 for line in lines)
+        statements = [
+            line for line in lines if line.strip() and not line.startswith("c")
+        ]
+        assert statements
+        assert all(line.startswith("      ") for line in statements)
+        body = "\n".join(statements)
+        # Two calls, one callee, two ranks: the diagnostic is *between* the calls.
+        assert "call vanta_rank_consumer(scalar)" in body
+        assert "call vanta_rank_consumer(vector)" in body
+        assert "integer vector(2)" in body
+        # The callee is not defined here, which is the case the error is about: an
+        # implicit external procedure, exactly as the ARPACK sources call `dvout`.
+        # Asked of the statements rather than the whole file, because the comment
+        # block above them says the word "interface" on purpose.
+        assert "subroutine vanta_rank_consumer" not in body
+        assert "interface" not in body
+
+        recipe = self._recipe()
+        assert source.rstrip("\n") in recipe
+        assert "gfortran $FFLAGS -ffixed-form -c vanta_smoke_rank.f" in recipe
+        assert f"'{bake_mod._SMOKE_PREFIX}: a Fortran rank mismatch" in recipe
 
     def test_the_compiler_environment_is_empty_for_a_minor_without_a_toolchain(self):
         """Keyed on ``SYSTEM_PACKAGES``, so a 3.6/3.7 layer gets neither lines."""

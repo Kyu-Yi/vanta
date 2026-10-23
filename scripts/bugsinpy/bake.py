@@ -774,15 +774,49 @@ diagnostic and the measured failures were in C sources; distutils'
 ``ldshared``, so this is the variable the C compilation and the link line read.
 """
 
+_ERA_FORTRAN_FLAGS = ("-fallow-argument-mismatch",)
+"""GCC 10+'s Fortran counterpart to :data:`_ERA_WARNING_FLAGS`: one error, demoted.
+
+[VANTA-WHY] ``gfortran`` reads the same legacy code the C list above is written for, and
+GCC 10 promoted its *argument-mismatch* family from warning to **error** exactly as GCC
+14 promoted the six C diagnostics. Measured on ``pandas/1``, whose layer builds
+``scipy==1.4.1`` from its sdist: its ARPACK sources call ``dvout`` twice with the same
+arity and a different rank in one position, and gfortran refused the pair —
+
+``scipy/sparse/linalg/eigen/arpack/ARPACK/SRC/dnaitr.f:658:35:`` … ``376 | call dvout
+(logfil, 1, rnorm, ndigit,`` / ``658 | call dvout (logfil, 2, xtemp, ndigit,`` …
+``Error: Rank mismatch between actual argument at (1) and actual argument at (2) (scalar
+and rank-1)``
+
+— twice (``:658`` and ``:729``), after which the build stopped on ``error: Command
+"/usr/bin/gfortran -Wall -g -ffixed-form -fno-second-underscore -fPIC -O3 -funroll-loops
+… dnaitr.f -o dnaitr.o" failed with exit status 1`` and ``ERROR: Failed building wheel
+for scipy``. Nothing there was killed, out of memory, or missing a BLAS library: the
+compile ended in an ``Error:`` gfortran had printed as a ``Warning:`` in every release
+before GCC 10. The mismatch is *between two calls of the same external subroutine*, which
+is the shape this flag is documented for — "mismatches between different calls" — and it
+is the whole of what the flag does: the diagnostic stays **visible** in the log and stops
+being fatal, the same choice :data:`_ERA_WARNING_FLAGS` makes for C.
+
+``FFLAGS``, not ``F77FLAGS``/``F90FLAGS``: ``scipy``/``numpy`` build Fortran through
+``numpy.distutils``, whose ``FCompiler`` names ``FFLAGS`` as the environment variable of
+its **generic** flag list (``flag_vars.flags = ('self.get_flags', 'FFLAGS', 'fflags',
+…)`` in ``numpy/distutils/fcompiler/__init__.py``), so one variable reaches the
+fixed-form ``f77`` sources that failed here *and* the free-form ones beside them; the
+per-flavour variables are declared in the same table and cover only their own form.
+"""
+
 COMPILER_ENV: Mapping[str, str] = {
     "CC": "gcc",
     "CXX": "g++",
     "LDSHARED": "gcc -pthread -shared",
     "LDCXXSHARED": "g++ -pthread -shared",
     "CFLAGS": " ".join(_ERA_WARNING_FLAGS),
+    "FFLAGS": " ".join(_ERA_FORTRAN_FLAGS),
 }
 """The compiler a source build in these layers runs, the linker that follows it, and
-the C flags that restore the warning semantics of the era the sources were written in.
+the C and Fortran flags that restore the warning semantics of the era the sources were
+written in.
 
 [VANTA-WHY] What the interpreter recorded is printed by :func:`_sysconfig_probe`
 before these exports, so it is a reading and not a guess; the baked
@@ -813,6 +847,14 @@ what that compiler's *own* defaults make of 2020-era C — and it is in the same
 mapping for the same reason: both are facts about the toolchain this layer runs
 rather than about the tree being built, and a reader of a failed build should not
 have to know which of the two it was. See :data:`_ERA_WARNING_FLAGS`.
+
+The sixth is the same reading for the *other* compiler this toolchain installs.
+``gfortran`` is in the layer for the same reason ``g++`` is (``SYSTEM_PACKAGES``
+unions :data:`SDIST_SYSTEM_PACKAGES`, whose ``scipy``/``scikit-learn``/``statsmodels``
+entries name it), and its defaults are the same kind of problem — one diagnostic that
+was a warning in every release before GCC 10 and is an error in GCC 14 — so its answer
+sits beside the C one rather than in a separate mechanism. See
+:data:`_ERA_FORTRAN_FLAGS`.
 """
 
 BUILD_ENV_RECORD = "/opt/vanta-build-env.txt"
@@ -946,7 +988,11 @@ _ENV_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 """One ``NAME=value`` line of a build-environment record."""
 
 _SMOKE_PREFIX = "toolchain smoke ok"
-"""What the interpreter layer prints when both smoke extensions built and imported."""
+"""What the interpreter layer prints for each smoke check that passed: both extensions
+built and imported, and (with :data:`_ERA_FORTRAN_FLAGS` reaching it) a fixed-form
+Fortran rank mismatch compiled. One prefix for both, because the reader of a layer's log
+(:func:`layer_provenance_lines`) keeps the smoke lines by it and a second spelling would
+be a fact the reader drops."""
 
 
 def layer_provenance_lines(output: str) -> list[str]:
@@ -954,15 +1000,16 @@ def layer_provenance_lines(output: str) -> list[str]:
 
     ``output`` is a layer's own build output, so these are facts about *that* layer:
     the record is the file the build wrote inside it (:data:`BUILD_ENV_RECORD`), and
-    the smoke line is the interpreter layer's C/C++ extension check having passed.
+    the smoke lines are the interpreter layer's C, C++ and Fortran checks having
+    passed.
 
     Three rules keep this from turning noise into provenance. The block is read only
     between the exact sentinels, because ``set -x`` echoes the commands that print
     them. Inside the block only ``NAME=value`` lines are kept, because the trace of
-    the ``cat`` itself is a line in the same stream. The smoke line is matched at the
-    *start* of the stripped line, because the shell's trace of the ``python -c`` that
-    prints it contains the same words — measured shape of a log where the trace and
-    the output are interleaved.
+    the ``cat`` itself is a line in the same stream. The smoke lines are matched at
+    the *start* of the stripped line, because the shell's trace of the command that
+    prints each one contains the same words — measured shape of a log where the trace
+    and the output are interleaved.
     """
     inside = False
     out: list[str] = []
@@ -1049,6 +1096,29 @@ PyMODINIT_FUNC PyInit_vanta_smoke_cpp(void) {
 }
 """
 
+_TOOLCHAIN_SMOKE_F_SOURCE = """\
+      subroutine vanta_rank_pair(scalar, vector)
+c     [VANTA-WHY] The measured shape, in miniature: `dnaitr.f` calls
+c     `dvout` twice, same arity, a different rank in one position --
+c     `rnorm` (scalar) at 376 beside `xtemp` (rank-1) at 658 -- and
+c     gfortran 14 refused the pair:
+c       Error: Rank mismatch between actual argument at (1) and actual
+c       argument at (2) (scalar and rank-1)
+c     This file is that pair and nothing else: one implicit external
+c     subroutine, called once with a scalar and once with a rank-1
+c     array. `vanta_rank_consumer` is deliberately NOT defined here,
+c     because the error is about a procedure the file has no interface
+c     for -- a definition would hand gfortran the interface the ARPACK
+c     sources do not have either -- and the file is fixed form, the
+c     form that source is in (`-ffixed-form`, as its compile line
+c     reads).
+      integer scalar
+      integer vector(2)
+      call vanta_rank_consumer(scalar)
+      call vanta_rank_consumer(vector)
+      end
+"""
+
 _TOOLCHAIN_SMOKE_SETUP = """\
 from setuptools import Extension, setup
 
@@ -1064,7 +1134,7 @@ setup(
 
 
 def toolchain_smoke_lines(env: Mapping[str, str]) -> list[str]:
-    """Build and import a tiny C **and** C++ extension in the interpreter layer.
+    """Build and import a tiny C **and** C++ extension, and compile a Fortran file.
 
     [VANTA-WHY] The failure the compiler environment prevents surfaces twenty minutes
     into a dependency's source build (numpy, then pandas). This is that build in
@@ -1084,6 +1154,16 @@ def toolchain_smoke_lines(env: Mapping[str, str]) -> list[str]:
     not reach ``distutils``. That is the same class of failure as the compiler: a
     flag that is exported but never read is invisible until twenty minutes into
     lxml's C sources.
+
+    The Fortran half is the same check for the other flags, and it is a *compile*
+    rather than an extension build because the flags reach it by a different route:
+    the trees' Fortran goes through ``numpy.distutils``, whose ``FCompiler`` appends
+    an environment ``FFLAGS`` to its flag list (:data:`_ERA_FORTRAN_FLAGS`), while
+    this layer's seeded flat ``distutils`` has no Fortran flag handling at all — so
+    the smoke runs ``gfortran`` with the variable the build system reads, on a source
+    carrying the rank mismatch ``pandas/1`` measured. ``gfortran`` is installed by
+    this layer and not by the per-bug one (``SYSTEM_PACKAGES`` unions
+    :data:`SDIST_SYSTEM_PACKAGES`), which is what makes it the layer to check.
 
     It runs under the interpreter layer's own **seeded** setuptools rather than a
     pinned toolchain: this layer's job is the interpreter and the compiler, and the
@@ -1105,6 +1185,9 @@ def toolchain_smoke_lines(env: Mapping[str, str]) -> list[str]:
         f"cat > {directory}/vanta_smoke_cpp.cpp <<'VANTA_SMOKE_CPP'",
         _TOOLCHAIN_SMOKE_CPP_SOURCE.rstrip("\n"),
         "VANTA_SMOKE_CPP",
+        f"cat > {directory}/vanta_smoke_rank.f <<'VANTA_SMOKE_F'",
+        _TOOLCHAIN_SMOKE_F_SOURCE.rstrip("\n"),
+        "VANTA_SMOKE_F",
         f"cat > {directory}/setup.py <<'VANTA_SMOKE_SETUP'",
         _TOOLCHAIN_SMOKE_SETUP.rstrip("\n"),
         "VANTA_SMOKE_SETUP",
@@ -1112,6 +1195,14 @@ def toolchain_smoke_lines(env: Mapping[str, str]) -> list[str]:
         "vanta_smoke_c, vanta_smoke_cpp; assert vanta_smoke_c.value() == 1 and "
         f"vanta_smoke_cpp.value() == 2; print('{_SMOKE_PREFIX}: C and C++ "
         'extensions build and import\')"',
+        # Unquoted `$FFLAGS`, because a flag list is more than one word and this is
+        # the position the build system puts it in. `-ffixed-form` as the failing
+        # command reads, so the smoke compiles the form that failed. No `|| true`:
+        # an empty or unexported `FFLAGS` makes this file an `Error:` again, which
+        # is the failure being checked for.
+        f"cd {directory} && gfortran $FFLAGS -ffixed-form -c vanta_smoke_rank.f "
+        f"-o vanta_smoke_rank.o && echo '{_SMOKE_PREFIX}: a Fortran rank mismatch "
+        "compiles under FFLAGS'",
         # [VANTA-WHY] The kernel, not the compiler — and here rather than only at boot
         # because this is the layer whose record a reader consults afterwards. A VM
         # whose multiprocessing cannot create a semaphore makes every ``Pool``,

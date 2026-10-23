@@ -443,6 +443,48 @@ the variables say what was asked for and the version says which compiler read th
 written for GCC 14's defaults — a layer whose `gcc` is a different major is a layer where they mean
 something else.
 
+**The other compiler this toolchain installs has the same problem, and the same answer.** `SYSTEM_PACKAGES`
+unions `SDIST_SYSTEM_PACKAGES`, whose `scipy`/`scikit-learn`/`statsmodels` entries put `gfortran` in the
+interpreter layer, so Fortran sources are built in these layers too and run into the same era mismatch
+one decade later. Measured on `pandas/1`, whose layer builds `scipy==1.4.1` from its sdist: its ARPACK
+sources call `dvout` twice, with the same arity and a different rank in one position —
+
+```
+  scipy/sparse/linalg/eigen/arpack/ARPACK/SRC/dnaitr.f:658:35:
+    376 |             call dvout (logfil, 1, rnorm, ndigit,
+        |                                   2
+    658 |             call dvout (logfil, 2, xtemp, ndigit,
+        |                                   1
+  Error: Rank mismatch between actual argument at (1) and actual argument at (2) (scalar and rank-1)
+```
+
+— and gfortran refused it, at `:658` and again at `:729`, after which the build stopped on
+`error: Command "/usr/bin/gfortran -Wall -g -ffixed-form -fno-second-underscore -fPIC -O3 -funroll-loops
+… dnaitr.f -o dnaitr.o" failed with exit status 1` and `ERROR: Failed building wheel for scipy`
+(`ERROR: Could not build wheels for scipy, which is required to install pyproject.toml-based projects`).
+It is the same story as `CFLAGS`: GCC 10 promoted Fortran's *argument-mismatch* family from warning to
+error, and every release before it had printed this as a `Warning:`. Nothing in the log was killed, out of
+memory, or missing a BLAS library — a grep for `Killed`, `MemoryError` and `BLAS` in that layer's log is
+empty and the compile ended in an `Error:`, not a signal — so this is the flags path and not the
+resource-limit one. `bake._ERA_FORTRAN_FLAGS` is therefore `('-fallow-argument-mismatch',)`, sitting
+beside `_ERA_WARNING_FLAGS` for the same reason its counterpart does: the flag demotes the diagnostic
+rather than silencing it, and the mismatch it is documented for is *between different calls*, which is
+exactly the `dvout` pair. It goes in `FFLAGS` and not `F77FLAGS`/`F90FLAGS` because these trees build
+Fortran through `numpy.distutils`, whose `FCompiler` names `FFLAGS` as the environment variable of its
+**generic** flag list (`flag_vars.flags = ('self.get_flags', 'FFLAGS', 'fflags', …)` in
+`numpy/distutils/fcompiler/__init__.py`), so one variable reaches the fixed-form `f77` source that failed
+here and the free-form ones beside it; the per-flavour variables are in the same table and cover only
+their own form. `COMPILER_ENV` carries it like the rest, so it is asserted into the layer's shell and
+recorded in `/opt/vanta-build-env.txt` by the same two hooks that handle `CFLAGS` — `_build_env_assert`
+iterates the mapping and `build_env_lines` joins its keys into the recorded pattern — with no separate
+mechanism. The interpreter layer's smoke check gains a second file for it: `_TOOLCHAIN_SMOKE_F_SOURCE` is
+fixed-form Fortran calling one implicit external procedure twice, once with a scalar and once with a
+rank-1 array — the `dnaitr.f` shape in miniature, with the callee deliberately left undefined so gfortran
+has no interface for it, as it has none for `dvout` — and `toolchain_smoke_lines` compiles it with
+`gfortran $FFLAGS -ffixed-form -c …`, the form and the variable the failing command used. A layer where
+`FFLAGS` never reached the compiler fails that compile with the same `Error:` rather than reproducing it
+inside scipy.
+
 **A package the platform cannot build says so, rather than arriving as a build error.**
 `bake.UNBUILDABLE_ON_PLATFORM` is the third answer the preflight can give about an sdist-only pin and it
 is a review, not a gap: `pyarrow` needs the Arrow C++ toolchain and `llvmlite`/`numba` a specific LLVM

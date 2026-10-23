@@ -7159,6 +7159,40 @@ def write_bake_log(logs_dir: Path, name: str, result: ExecResult) -> Path:
     return path
 
 
+def _with_gate_verdict(built: ExecResult, verdict: Optional[ExecResult]) -> ExecResult:
+    """``built``'s own output, with the gate's verdict appended when the gate stopped it.
+
+    [VANTA-WHY] The gate used to *replace* the result it judged, and the log is written
+    from the result, so a refused layer's log held the verdict and nothing else — the
+    install that had just succeeded, the pin list pip printed, and the ``pip check``
+    output the verdict was built from were written nowhere. Measured on fastapi/1:
+    a 253-byte log for a layer that had installed 98 pins, which is why the other side
+    of its conflict (``exceptiongroup``, named by no pin list) could not be attributed
+    after the fact. The one-line entry in the summary still comes from the verdict
+    (:func:`_failure_report` reads what is passed to it), so nothing is reported twice.
+    """
+    if verdict is None:
+        return built
+    return ExecResult(
+        stdout=built.stdout,
+        stderr=built.stderr.rstrip("\n") + "\n" + verdict.stderr,
+        exit_code=verdict.exit_code,
+        timed_out=verdict.timed_out,
+    )
+
+
+def log_bake_line(line: str) -> None:
+    """The default ``log`` for a bake: one line, flushed.
+
+    [VANTA-WHY] A bake is usually piped into ``tee``, and a pipe makes ``print``
+    block-buffered. The plan is printed with ``flush=True`` and then *nothing* — every
+    ``building``/``build log``/``failed`` line waits in an 8 KB buffer until the
+    process exits, and a run that is working looks hung. Measured: five minutes of
+    baking, three failed layers, not one line after the plan.
+    """
+    print(line, flush=True)
+
+
 def _bake_layer(name: str, script: str, base: str) -> ExecResult:
     """The default ``build`` callable.
 
@@ -7176,7 +7210,7 @@ def run_bake_actions(
     exists: Callable[[str], bool] = layer_exists,
     remove: Callable[[str], None] = checkpoint_delete,
     build: Callable[[str, str, str], ExecResult] = _bake_layer,
-    log: Callable[[str], None] = print,
+    log: Callable[[str], None] = log_bake_line,
     logs_dir: Optional[Path] = None,
     own_pins: Optional[Mapping[str, Container[str]]] = None,
     record: Optional[Callable[[str, tuple[PinConflict, ...]], None]] = None,
@@ -7216,7 +7250,10 @@ def run_bake_actions(
     happens (:func:`write_bake_log`), emptied first (:func:`clear_bake_logs`) and
     reported line by line through ``log``. It is what makes the one-line error in the
     failure report enough: the line says what happened, the file holds the two hundred
-    lines above it. ``None`` writes nothing, which is what a structural test wants.
+    lines above it. ``None`` writes nothing, which is what a structural test wants. A
+    layer the gate refused keeps that same file, with the verdict appended to the
+    output the install produced (:func:`_with_gate_verdict`) — the log of a refused
+    layer is the only place its ``pip check`` reading and its install are recorded.
 
     ``own_pins`` and ``record`` are §3.2's own-pin gate. ``own_pins`` maps a layer's name
     to the canonical names it installs as **BugsInPy's own** pins
@@ -7251,10 +7288,12 @@ def run_bake_actions(
     for action in build_order(actions):
         log(f"[{action.name}] building from {action.base} — {action.reason}")
         attempted.append(action.name)
-        result = build(action.name, action.script, action.base)
-        if result.ok and action.name in own:
+        built = build(action.name, action.script, action.base)
+        result = built
+        verdict: Optional[ExecResult] = None
+        if built.ok and action.name in own:
             conflicts = pip_check_conflicts(
-                pip_check_readings(result.stdout + result.stderr),
+                pip_check_readings(built.stdout + built.stderr),
                 own=own[action.name],
             )
             for conflict in conflicts:
@@ -7270,9 +7309,12 @@ def run_bake_actions(
                 # The install succeeded and the marker is there; what failed is the
                 # gate after it. Reported through the same path a build failure takes,
                 # so a conflict names itself where the reader is already looking.
-                result = pip_check_failure(refused)
+                verdict = pip_check_failure(refused)
+                result = verdict
         if logs_dir is not None:
-            logs[action.name] = write_bake_log(logs_dir, action.name, result)
+            logs[action.name] = write_bake_log(
+                logs_dir, action.name, _with_gate_verdict(built, verdict)
+            )
             log(f"[{action.name}] build log: {logs[action.name]}")
         if not result.ok:
             failed.append(action.name)

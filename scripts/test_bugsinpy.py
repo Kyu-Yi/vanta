@@ -3982,6 +3982,27 @@ class TestRunBakeActions:
             assert f"ERROR: Cannot install {name}'s pins" in text
             assert f"shuru: checkpoint '{name}' saved" in text
 
+    def test_the_default_bake_logger_flushes_every_line(self):
+        """A piped bake is block-buffered, so an unflushed line is a line nobody sees.
+
+        Measured: a run that baked and lost three layers in five minutes wrote not one
+        line after its plan, which is what a hung command looks like.
+        """
+        assert (
+            inspect.signature(bake_mod.run_bake_actions).parameters["log"].default
+            is bake_mod.log_bake_line
+        )
+
+    def test_every_bake_line_is_written_as_it_happens(self, monkeypatch):
+        written: list[tuple[tuple[str, ...], dict[str, object]]] = []
+        monkeypatch.setattr(
+            "builtins.print", lambda *args, **kwargs: written.append((args, kwargs))
+        )
+        bake_mod.log_bake_line("[vanta-bi-Demo-1] building from vanta-bugsinpy-py3.8")
+        assert written == [
+            (("[vanta-bi-Demo-1] building from vanta-bugsinpy-py3.8",), {"flush": True})
+        ]
+
 
 class TestBakeLogProvenance:
     """What the bake's own log says about a layer, without booting anything."""
@@ -5270,6 +5291,28 @@ class TestPinConflicts:
         assert (
             "case (a) httpcore==0.3.0 declares h11==0.8.* but the layer has "
             "h11==0.9.0: not tolerated" in text
+        )
+
+    def test_a_refused_layers_log_keeps_the_output_the_verdict_was_built_on(self, tmp_path):
+        """Appended to the layer's output, not written instead of it.
+
+        Measured on fastapi/1: a 253-byte log for a layer that had just installed 98
+        pins. The install that ran and the ``pip check`` reading the verdict rests on
+        are the only way to attribute the *other* side of the conflict afterwards —
+        ``exceptiongroup``, which no pin list names — and the failure reported about
+        them was the one thing that threw them away.
+        """
+        with pytest.raises(bake_mod.BakeError):
+            self._gate_run(
+                tmp_path, own_pins={"vanta-bi-Demo-1": frozenset({"httpcore"})}
+            )
+        text = bake_mod.bake_log_path(
+            tmp_path / "bake-logs", "vanta-bi-Demo-1"
+        ).read_text(encoding="utf-8")
+        assert "+ python -m pip check" in text, "the layer's own output"
+        assert self.PIP_CHECK_LINE in text, "and the reading the verdict rests on"
+        assert text.index(self.PIP_CHECK_LINE) < text.index("ERROR: pip check"), (
+            "the verdict reads as what happened to that output"
         )
 
     def test_a_conflict_between_the_benchmarks_own_pins_is_logged_and_the_layer_kept(

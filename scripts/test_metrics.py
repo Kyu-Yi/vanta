@@ -687,3 +687,399 @@ def test_labels_with_no_matching_session_is_an_error(tmp_path, capsys):
 
     assert metrics.main(["--sessions-dir", str(tmp_path), "--labels", labels]) == 1
     assert "none of the" in capsys.readouterr().err
+
+
+# ============================================================================
+# Pooled, per config (§9.1–§9.4) — provenance grouping, Wilson, the oracle block
+# ============================================================================
+
+
+def provenance_summary(
+    decision: str = "Rejected",
+    *,
+    config: str = "vanta",
+    mode: str = "repair",
+    seed: str = "0",
+    model: str = "qwen3-4b",
+    top_p: str = "0.9",
+    commit: str = "abc1234",
+    dirty: str = "false",
+    sampling: str = (
+        "sampling_preset=default temperature_creator=0.1 max_tokens_creator=32768"
+    ),
+) -> str:
+    """A `run.summary` line carrying the §4.4 provenance keys, as driver.rs writes it."""
+    return (
+        f"attempts_run=1 fixed_at_attempt_1=false final_decision={decision} "
+        f"config={config} mode={mode} seed={seed} model={model} top_p={top_p} "
+        f"{sampling} commit={commit} dirty={dirty}"
+    )
+
+
+def write_provenance_session(tmp_path, session_id: str, summary: str) -> None:
+    record = {
+        "session_id": session_id,
+        "phase": "run.summary",
+        "summary": summary,
+        "timestamp": "2026-01-01T00:00:00Z",
+        "schema_version": 1,
+    }
+    (tmp_path / f"{session_id}_session.jsonl").write_text(
+        json.dumps(record) + "\n", encoding="utf-8"
+    )
+
+
+def manifest_row(
+    session_id: str,
+    *,
+    bug: str = "pysnooper/1",
+    seed=0,
+    apply_ok: bool = True,
+    hidden_pass: bool = True,
+    patch_good: bool = True,
+    regressions: int = 0,
+) -> dict:
+    return {
+        "session_id": session_id,
+        "bug": bug,
+        "seed": seed,
+        "oracle": {
+            "apply_ok": apply_ok,
+            "hidden_pass": hidden_pass,
+            "patch_good": patch_good,
+            "suite_regressions_count": regressions,
+            "suite_regressions": [],
+        },
+    }
+
+
+def write_manifest(tmp_path, rows: list[dict], name: str = "manifest.jsonl") -> str:
+    path = tmp_path / name
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return str(path)
+
+
+def groups_and_facts(tmp_path, labels=None, rows=None):
+    """Classify every session in tmp_path, then group it by provenance."""
+    labels = labels or {}
+    verdicts = []
+    provenance = {}
+    for session_id in sorted(metrics.discover_sessions(str(tmp_path))):
+        data = metrics.load_session(str(tmp_path), session_id)
+        verdicts.append(metrics.classify(data, labels.get(session_id)))
+        provenance[session_id] = metrics.session_provenance(data)
+    return (
+        metrics.pool_by_provenance(verdicts, provenance),
+        metrics.oracle_by_session(rows or []),
+    )
+
+
+def test_summary_pairs_keeps_a_spaced_value_together():
+    """`test_cmd`'s value contains spaces and uppercase assignments.
+
+    [WHY] The sampling schedule is not the only multi-token value on the line.
+    A scan that cut every value at the first space would read `test_cmd=env` and
+    then treat `PYTHONPATH=src` as a key — exactly the bug `_next_key_start`
+    exists to prevent.
+    """
+    summary = (
+        "attempts_run=2 test_cmd=env PYTHONPATH=src python -m pytest -q "
+        "final_decision=Rejected"
+    )
+    pairs = metrics.summary_pairs(summary)
+
+    assert pairs["attempts_run"] == "2"
+    assert pairs["test_cmd"] == "env PYTHONPATH=src python -m pytest -q"
+    assert pairs["final_decision"] == "Rejected"
+    assert "PYTHONPATH" not in pairs
+
+
+def test_provenance_reads_every_axis_and_the_whole_schedule(tmp_path):
+    write_provenance_session(tmp_path, "s1", provenance_summary(seed="7"))
+    axes = metrics.provenance_of(provenance_summary(seed="7"))
+
+    for key in metrics.PROVENANCE_KEYS:
+        assert axes[key] != metrics.PROVENANCE_UNKNOWN, key
+    assert axes["seed"] == "7"
+    # The per-site pairs are not in PROVENANCE_KEYS — they are found by prefix,
+    # one per call site, and both of the default preset's pins must land here.
+    assert axes["sampling_preset"] == "default"
+    assert axes["temperature_creator"] == "0.1"
+    assert axes["max_tokens_creator"] == "32768"
+
+
+def test_a_coding_preset_pin_is_provenance_too():
+    """Under `coding` the schedule pins `top_p_<site>`; it must be keyed, not lost.
+
+    [WHY] A bare `top_p` is the SERVER's default and a separate axis. If
+    `top_p_creator` were dropped, two runs sampling at different `top_p` would
+    pool as one experiment.
+    """
+    assert metrics.is_sampling_key("top_p_creator")
+    assert metrics.is_sampling_key("presence_penalty_auditor")
+    assert metrics.is_sampling_key("sampling_preset")
+    assert not metrics.is_sampling_key("top_p")
+
+
+def test_an_unrecorded_axis_does_not_pool_with_a_recorded_one(tmp_path):
+    """A legacy session has no provenance, and that is its own group.
+
+    [WHY] `unset` is a fact, not a default. Pooling a pre-§4.4 session with one
+    that recorded `config=vanta` would claim they are the same experiment.
+    """
+    write_provenance_session(tmp_path, "recorded", provenance_summary())
+    write_session(tmp_path, "legacy", decision="AllTestsPassed")
+
+    groups, _ = groups_and_facts(tmp_path)
+    assert len(groups) == 2
+    by_seed = {group.provenance["config"]: group for group in groups}
+    assert set(by_seed) == {"vanta", metrics.PROVENANCE_UNKNOWN}
+
+
+def test_a_different_seed_or_schedule_is_a_different_group(tmp_path):
+    write_provenance_session(tmp_path, "s1", provenance_summary(seed="0"))
+    write_provenance_session(tmp_path, "s2", provenance_summary(seed="1"))
+    write_provenance_session(
+        tmp_path,
+        "s3",
+        provenance_summary(seed="0", sampling="sampling_preset=default "
+                         "temperature_creator=0.6 max_tokens_creator=32768"),
+    )
+
+    groups, _ = groups_and_facts(tmp_path)
+    assert len(groups) == 3
+    sizes = sorted(len(group.verdicts) for group in groups)
+    assert sizes == [1, 1, 1]
+
+
+def test_pooled_metrics_use_each_metrics_own_denominator(tmp_path):
+    """§9.1's rates divide by what the metric asks for, never by `runs`.
+
+    [WHY] `approval_precision` over four runs, only two of which were approvals,
+    would read 25 % for a config that got both its approvals right; the
+    denominator is the rows the run actually approved.
+    """
+    summary = provenance_summary()
+    write_provenance_session(tmp_path, "catch", summary)
+    write_reruns(tmp_path, "catch", [signal(True)])
+    write_provenance_session(tmp_path, "spurious", summary)
+    write_reruns(tmp_path, "spurious", [signal(False)])
+    write_provenance_session(tmp_path, "good-approval", provenance_summary("AllTestsPassed"))
+    write_provenance_session(tmp_path, "bad-reject", summary)
+
+    groups, facts = groups_and_facts(
+        tmp_path,
+        labels={
+            "catch": True,
+            "spurious": True,
+            "good-approval": False,
+            "bad-reject": False,
+        },
+        rows=[
+            manifest_row("catch"),
+            manifest_row("spurious", hidden_pass=False, patch_good=False),
+            manifest_row("good-approval"),
+            manifest_row("bad-reject"),
+        ],
+    )
+    assert len(groups) == 1
+    pooled = metrics.pooled_metrics(groups[0], facts)
+    rates = pooled.rates()
+
+    assert pooled.runs == 4
+    assert pooled.buckets[metrics.TRUE_CATCH] == 1
+    assert pooled.buckets[metrics.SPURIOUS_REJECT] == 1
+    assert pooled.buckets[metrics.TRUE_APPROVAL] == 1
+    assert pooled.buckets[metrics.FALSE_REJECT] == 1
+    assert rates["approval_precision"] == (1, 1)
+    assert rates["spurious_reject_rate"] == (1, 2)
+    assert rates["infra_failure_rate"] == (0, 4)
+    assert rates["unobservable_rate"] == (0, 4)
+    assert rates["resolve_rate"] == (3, 4)
+    assert rates["patch_good_rate"] == (3, 4)
+
+
+def test_the_ecr_wilson_interval_uses_ecrs_conditional_denominator(tmp_path):
+    """`n` is the rows FAILING at N, not the rows in the run (C2)."""
+    write_provenance_session(tmp_path, "s1", provenance_summary())
+    write_transitions(
+        tmp_path,
+        "s1",
+        [transition(from_result="Failed", from_class="Logic", to_result="Passed")],
+    )
+
+    groups, facts = groups_and_facts(tmp_path)
+    pooled = metrics.pooled_metrics(groups[0], facts)
+    rates = pooled.rates()
+
+    assert rates["ECR"] == (1, 1)
+    assert rates["EIR"] == (0, 0)
+    assert pooled.eir_interval is None
+    low, high = pooled.ecr_interval
+    assert high == 1.0
+    assert low == pytest.approx(0.2065, abs=0.001)
+
+
+def test_wilson_interval_matches_the_closed_form_and_needs_a_denominator():
+    assert metrics.wilson_interval(0, 0) is None
+    assert metrics.wilson_interval(0, 10) == pytest.approx((0.0, 0.2775), abs=0.001)
+    assert metrics.wilson_interval(5, 10) == pytest.approx(
+        (0.2366, 0.7634), abs=0.001
+    )
+    # An all-success run's interval is clamped at 1.0, never printed above it.
+    assert metrics.wilson_interval(10, 10)[1] == 1.0
+    assert metrics.wilson_text(None) == "n/a"
+    assert metrics.wilson_text((0.11803, 0.76931)) == "[0.118, 0.769]"
+
+
+def test_an_unobservable_oracle_is_not_a_failed_patch(tmp_path):
+    """`apply_ok=false` is the oracle's own gauge, not a resolve failure.
+
+    [WHY] §9.1 keeps them apart: `unobservable_rate` says the harness could not
+    grade the patch, and folding those rows into `resolve_rate`'s denominator
+    would report a broken oracle as a model failure.
+    """
+    summary = provenance_summary()
+    write_provenance_session(tmp_path, "visible", summary)
+    write_provenance_session(tmp_path, "invisible", summary)
+
+    groups, facts = groups_and_facts(
+        tmp_path,
+        rows=[
+            manifest_row("visible"),
+            manifest_row("invisible", apply_ok=False, hidden_pass=False, patch_good=False),
+        ],
+    )
+    pooled = metrics.pooled_metrics(groups[0], facts)
+    rates = pooled.rates()
+
+    assert pooled.oracle_runs == 2
+    assert pooled.observable == 1
+    assert pooled.unobservable == 1
+    assert rates["resolve_rate"] == (1, 1)
+    assert rates["unobservable_rate"] == (1, 2)
+
+
+def test_a_group_without_manifest_rows_reports_na_not_zero(tmp_path):
+    write_provenance_session(tmp_path, "s1", provenance_summary())
+    groups, facts = groups_and_facts(tmp_path)
+    assert facts == {}
+
+    text = metrics.render_pooled(groups, facts)
+    assert "resolve_rate n/a" in text
+    assert "oracle rows 0/1" in text
+    assert "false_approvals[0]: (none)" in text
+
+
+def test_the_false_approval_list_names_the_bug_and_the_oracle_reason(tmp_path):
+    """§9.1: `(bug, seed, reason)` where reason is hidden_fail | suite_regression."""
+    summary = provenance_summary("AllTestsPassed")
+    write_provenance_session(tmp_path, "hidden", summary)
+    write_provenance_session(tmp_path, "regressed", summary)
+
+    groups, facts = groups_and_facts(
+        tmp_path,
+        labels={"hidden": True, "regressed": True},
+        rows=[
+            manifest_row("hidden", bug="httpie/1", seed=0, hidden_pass=False, patch_good=False),
+            manifest_row("regressed", bug="luigi/1", seed=3, patch_good=False, regressions=2),
+        ],
+    )
+    pooled = metrics.pooled_metrics(groups[0], facts)
+
+    assert pooled.false_approvals == [
+        ("httpie/1", 0, "hidden_fail"),
+        ("luigi/1", 3, "suite_regression"),
+    ]
+    assert "false_approvals[2]" in metrics.render_pooled(groups, facts)
+    assert "(httpie/1, 0, hidden_fail)" in metrics.render_pooled(groups, facts)
+
+
+def test_a_false_approval_with_no_manifest_row_prints_question_marks(tmp_path):
+    """An absent oracle fact is `?`, never a plausible-looking reason."""
+    write_provenance_session(tmp_path, "s1", provenance_summary("AllTestsPassed"))
+    groups, facts = groups_and_facts(tmp_path, labels={"s1": True})
+
+    pooled = metrics.pooled_metrics(groups[0], facts)
+    assert pooled.false_approvals == [(None, None, "unknown")]
+    assert "(?, ?, unknown)" in metrics.render_pooled(groups, facts)
+
+
+def test_render_pooled_names_every_group_with_its_own_axes(tmp_path):
+    write_provenance_session(tmp_path, "a", provenance_summary(config="vanta", seed="0"))
+    write_provenance_session(tmp_path, "b", provenance_summary(config="baseline", seed="0"))
+    groups, facts = groups_and_facts(tmp_path)
+
+    text = metrics.render_pooled(groups, facts)
+    assert "POOLED BY CONFIG" in text
+    assert "§9.3" in text
+    assert "config=vanta" in text
+    assert "config=baseline" in text
+    # The schedule prints in the same sorted order `provenance_key` groups by,
+    # so a reader can compare two blocks' keys by eye.
+    assert (
+        "sampling: max_tokens_creator=32768 sampling_preset=default "
+        "temperature_creator=0.1" in text
+    )
+    assert text.count("config=") == 2
+    assert "wilson 95% n/a" in text
+
+
+def test_pool_by_config_reports_the_pooled_table_from_the_cli(tmp_path, capsys):
+    write_provenance_session(tmp_path, "s1", provenance_summary())
+    manifest = write_manifest(tmp_path, [manifest_row("s1")])
+
+    assert metrics.main(["--sessions-dir", str(tmp_path), "--pool-by-config"]) == 0
+    assert "POOLED BY CONFIG" in capsys.readouterr().out
+
+    assert (
+        metrics.main(
+            [
+                "--sessions-dir",
+                str(tmp_path),
+                "--pool-by-config",
+                "--manifest",
+                manifest,
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "oracle rows 1/1" in out
+    assert "resolve_rate 1/1 (100.00%)" in out
+
+
+def test_pool_by_config_is_off_unless_asked_for(tmp_path, capsys):
+    """The additive section must not appear in the existing report."""
+    write_provenance_session(tmp_path, "s1", provenance_summary())
+    assert metrics.main(["--sessions-dir", str(tmp_path)]) == 0
+    assert "POOLED BY CONFIG" not in capsys.readouterr().out
+
+
+def test_a_missing_manifest_is_loud(tmp_path, capsys):
+    write_provenance_session(tmp_path, "s1", provenance_summary())
+    assert (
+        metrics.main(
+            [
+                "--sessions-dir",
+                str(tmp_path),
+                "--pool-by-config",
+                "--manifest",
+                str(tmp_path / "nope.jsonl"),
+            ]
+        )
+        == 1
+    )
+    assert "is not a file" in capsys.readouterr().err
+
+
+def test_load_manifest_drops_a_torn_last_line(tmp_path):
+    """A writer killed mid-append leaves a half row, not a corrupt batch."""
+    path = tmp_path / "manifest.jsonl"
+    path.write_text(
+        json.dumps(manifest_row("s1")) + "\n" + '{"session_id": "s2", "ora',
+        encoding="utf-8",
+    )
+    records = metrics.load_manifest(str(path))
+    assert [record["session_id"] for record in records] == ["s1"]
+

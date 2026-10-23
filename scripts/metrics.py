@@ -60,12 +60,21 @@ infra_failure      The run ended because an LLM call failed for every attempt
                    approval, a rejection, nor an "unresolved" budget exhaustion —
                    it is a property of the harness, not of the model. Counted on
                    its own so it can never inflate or deflate any other bucket.
+
+Pooled, per config
+------------------
+[WHY] The buckets above score ONE session. `--pool-by-config` adds §9.1's pooled
+metrics, computed inside each §4.4 provenance group and printed with that group's
+axes beside them — never averaged across groups, because two runs whose config,
+seed, model, sampling schedule or build commit differ are two experiments. That
+section is additive: no bucket, and no existing line of output, changes.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass, field
@@ -102,6 +111,28 @@ NEEDS_REVIEW_DECISIONS = {"NeedsReview"}
 # into APPROVED_DECISIONS or UNRESOLVED_DECISIONS: the run produced no verdict
 # about the candidate at all.
 INFRA_FAILURE_DECISIONS = {"InfraFailure"}
+
+# [WHY] The order every bucket is reported in, and the reason it is one tuple
+# rather than a literal in each renderer: a bucket that exists in `classify` but
+# is missing from a report is a count nobody sees. The two decisions that were
+# RIGHT (`true_catch`, `true_approval`) sit next to their wrong counterparts,
+# and the §14.6 refusals follow the approvals and rejections they are neither of,
+# so a reader comparing a wave against the previous one sees a refusal count next
+# to the two counts it could otherwise have been mistaken for.
+BUCKET_ORDER = (
+    TRUE_CATCH,
+    SPURIOUS_REJECT,
+    FALSE_REJECT,
+    FALSE_APPROVAL,
+    TRUE_APPROVAL,
+    NEEDS_REVIEW_ON_GOOD,
+    NEEDS_REVIEW_ON_BAD,
+    NEEDS_REVIEW_UNLABELED,
+    UNRESOLVED,
+    UNDETERMINED,
+    APPROVED_UNLABELED,
+    INFRA_FAILURE,
+)
 
 
 # ============================================================================
@@ -576,24 +607,7 @@ def render_table(verdicts: list[Verdict]) -> str:
         )
     lines.append("")
     lines.append("TOTALS")
-    for bucket in (
-        TRUE_CATCH,
-        SPURIOUS_REJECT,
-        FALSE_REJECT,
-        FALSE_APPROVAL,
-        TRUE_APPROVAL,
-        # [WHY] The refusals sit next to the approvals and rejections they are
-        # neither of, so a reader comparing a wave against the previous one sees
-        # a refusal count next to the two counts it could otherwise have been
-        # mistaken for (§14.6).
-        NEEDS_REVIEW_ON_GOOD,
-        NEEDS_REVIEW_ON_BAD,
-        NEEDS_REVIEW_UNLABELED,
-        UNRESOLVED,
-        UNDETERMINED,
-        APPROVED_UNLABELED,
-        INFRA_FAILURE,
-    ):
+    for bucket in BUCKET_ORDER:
         count = sum(1 for verdict in verdicts if verdict.bucket == bucket)
         lines.append(f"  {bucket:<{bucket_width}} {count}")
     lines.append("")
@@ -650,6 +664,482 @@ def render_metrics(verdicts: list[Verdict]) -> str:
     return "\n".join(lines)
 
 
+# ============================================================================
+# Pooled, per config (design §9.1–§9.4) — ADDITIVE
+# ============================================================================
+#
+# [WHY] Nothing above changes. `classify()` still buckets one session from that
+# session's own files, and the tables above are still per session. This section
+# answers the other question the pilot asks — "this config, many runs, one
+# number" — and it answers it by GROUPING, never by averaging across groups.
+#
+# [WHY] §4.4: a run's config, mode, seed, model, sampling schedule and the commit
+# its binary was built from are PROVENANCE, not metadata. Two runs that differ in
+# any of them are two experiments, and a pooled number that mixes them reports
+# one study's result under another study's name. So every metric here is computed
+# inside a group and printed with the group it belongs to.
+#
+# [WHY] The intervals are naive (§9.3): rows within one bug are not independent,
+# so the Wilson interval understates uncertainty. It is printed with that caveat
+# beside it rather than omitted, because "pooled 40 %" with no interval at all
+# would read as a measurement it is not.
+
+PROVENANCE_KEYS = ("config", "mode", "seed", "model", "top_p", "commit", "dirty")
+"""The named §4.4 axes, in the order they are keyed and printed."""
+
+PROVENANCE_UNKNOWN = "unset"
+"""What an axis reads as when `run.summary` did not record it.
+
+[WHY] `unset` is a provenance fact, not a hole to fill. A session written before
+§4.4 existed did not run with "no config" — nobody recorded one — and pooling it
+with a session that DID record its config would claim the two are the same
+experiment. The grouping key uses this same word, so an unrecorded axis can never
+collide with a recorded one.
+"""
+
+SAMPLING_PRESET_KEY = "sampling_preset"
+"""The one named key of the sampling block; it names the schedule (§4.3)."""
+
+SAMPLING_PIN_PREFIXES = (
+    "temperature_",
+    "max_tokens_",
+    "top_p_",
+    "top_k_",
+    "min_p_",
+    "presence_penalty_",
+)
+"""The per-site pins `llm::sampling_pin_table` can emit, `_<site>` suffixed.
+
+[WHY] Under the default preset only `temperature_<site>` / `max_tokens_<site>`
+appear; a `coding` run additionally pins `top_p`/`top_k`/`min_p`/
+`presence_penalty` on every site. All of them are provenance — a `top_k` one run
+never sampled at is not a value another run may be pooled with.
+[WHY] A bare `top_p` (no underscore) is deliberately NOT one of these: that key
+is the server's own default, recorded separately under `PROVENANCE_KEYS`.
+"""
+
+WILSON_Z = 1.96
+
+
+def run_summary_record(records: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """The first `run.summary` record, or None when the session wrote none.
+
+    [WHY] The row that states the run's own facts — its verdict AND its
+    provenance — so a reader of either looks at the same row.
+    """
+    for record in records:
+        if record.get("phase") == "run.summary":
+            return record
+    return None
+
+
+def summary_pairs(summary: str) -> dict[str, str]:
+    """Every lowercase `key=value` token of a summary line, as a dict.
+
+    [WHY] `summary_field` answers "what is <key>" for a key the caller names in
+    advance; the per-call sampling schedule (§4.3) has one key per call site, so
+    a caller that wants the whole schedule cannot name them all. This scan
+    applies the same rule `_next_key_start` already encodes — a key starts at the
+    string's start or after a space and is `[a-z_][a-z0-9_]*` — over the whole
+    line, so a value may contain spaces (`test_cmd=env PYTHONPATH=src <python> -m
+    pytest -q`) without being cut short.
+    """
+    pairs: dict[str, str] = {}
+    index = 0
+    size = len(summary)
+    while index < size:
+        if index != 0 and summary[index - 1] != " ":
+            index += 1
+            continue
+        key_end = index
+        while key_end < size and _is_key_char(summary[key_end], first=(key_end == index)):
+            key_end += 1
+        if key_end == index or summary[key_end : key_end + 1] != "=":
+            index += 1
+            continue
+        value_start = key_end + 1
+        value_end = _next_key_start(summary, value_start)
+        pairs[summary[index:key_end]] = summary[value_start:value_end]
+        index = value_end
+    return pairs
+
+
+def is_sampling_key(key: str) -> bool:
+    """Whether a summary key belongs to the §4.3 sampling schedule."""
+    return key == SAMPLING_PRESET_KEY or key.startswith(SAMPLING_PIN_PREFIXES)
+
+
+def provenance_of(summary: str) -> dict[str, str]:
+    """The §4.4 provenance axes, read from one `run.summary` line.
+
+    [WHY] Read from the line itself, not from an env var or the directory name a
+    session happens to sit in: a session copied out of the batch has to stay
+    self-describing (§4.4). An axis the line does not carry reads
+    `PROVENANCE_UNKNOWN`.
+    """
+    pairs = summary_pairs(summary or "")
+    axes = {key: pairs.get(key, PROVENANCE_UNKNOWN) for key in PROVENANCE_KEYS}
+    for key, value in pairs.items():
+        if is_sampling_key(key):
+            axes[key] = value
+    return axes
+
+
+def session_provenance(data: SessionData) -> dict[str, str]:
+    """The §4.4 provenance axes of one loaded session."""
+    record = run_summary_record(data.records) or {}
+    return provenance_of(str(record.get("summary") or ""))
+
+
+def provenance_key(axes: dict[str, str]) -> tuple:
+    """The identity of a provenance group: every axis, in a fixed order.
+
+    [WHY] The sampling schedule is variable-length (one pair per call site), so
+    the named axes come first in `PROVENANCE_KEYS` order and the sampling keys
+    follow sorted. A fixed order is what makes two groups' keys comparable and a
+    group's identity independent of the order the line happened to be written in.
+    """
+    named = tuple(
+        (key, axes.get(key, PROVENANCE_UNKNOWN)) for key in PROVENANCE_KEYS
+    )
+    sampling = tuple(
+        (key, axes[key]) for key in sorted(axes) if is_sampling_key(key)
+    )
+    return named + sampling
+
+
+def wilson_interval(
+    count: int, denominator: int, z: float = WILSON_Z
+) -> Optional[tuple[float, float]]:
+    """The Wilson score interval for `count / denominator` (§9.2).
+
+    [WHY] `None` — never `(0.0, 0.0)` — when there is no denominator. "No row
+    was in this denominator" and "every row failed" are opposite claims, and an
+    interval printed for the first would state the second. `z` is a parameter so
+    the arithmetic can be checked against a hand-computed interval.
+    """
+    if denominator <= 0:
+        return None
+    n = float(denominator)
+    p = count / n
+    z2 = z * z
+    shrink = 1.0 + z2 / n
+    centre = (p + z2 / (2.0 * n)) / shrink
+    half = z * math.sqrt(p * (1.0 - p) / n + z2 / (4.0 * n * n)) / shrink
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def wilson_text(interval: Optional[tuple[float, float]]) -> str:
+    """`[0.118, 0.769]`, or `n/a` when there is no interval to print."""
+    if interval is None:
+        return "n/a"
+    low, high = interval
+    return f"[{low:.3f}, {high:.3f}]"
+
+
+def load_manifest(path: str) -> list[dict[str, Any]]:
+    """Read a batch `manifest.jsonl` (§7.3).
+
+    [WHY] A torn last line means the writer died mid-append, and the batch's own
+    cursor still says `running` for that job, so `Manifest.records` drops it and
+    the job is re-run. This reader drops it for the same reason: a report taken
+    from a crashed batch must report the rows that exist rather than refuse to
+    run.
+    """
+    records: list[dict[str, Any]] = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+@dataclass
+class OracleFacts:
+    """One manifest row's oracle verdict, the source of §9.1's oracle gauges."""
+
+    bug: str
+    seed: Any
+    apply_ok: bool
+    hidden_pass: bool
+    patch_good: bool
+    suite_regressions: int
+
+    @property
+    def reason(self) -> str:
+        """Why a known-bad approval was bad (§9.1): hidden_fail | suite_regression."""
+        if not self.hidden_pass:
+            return "hidden_fail"
+        return "suite_regression"
+
+
+def oracle_by_session(records: list[dict[str, Any]]) -> dict[str, OracleFacts]:
+    """Index the manifest's oracle readings by session id.
+
+    [WHY] `hidden_pass` / `patch_good` / `apply_ok` are the oracle's facts, not
+    Vanta's: they are what makes a false approval NAMEABLE ("the hidden test
+    still failed" vs "the native suite regressed") instead of merely counted.
+    Reading them from the manifest keeps one copy of the oracle in one place.
+    """
+    out: dict[str, OracleFacts] = {}
+    for record in records:
+        session_id = record.get("session_id")
+        oracle = record.get("oracle")
+        if not session_id or not isinstance(oracle, dict):
+            continue
+        regressions = oracle.get("suite_regressions_count")
+        if regressions is None:
+            regressions = len(oracle.get("suite_regressions") or [])
+        out[str(session_id)] = OracleFacts(
+            bug=str(record.get("bug")),
+            seed=record.get("seed"),
+            apply_ok=bool(oracle.get("apply_ok")),
+            hidden_pass=bool(oracle.get("hidden_pass")),
+            patch_good=bool(oracle.get("patch_good")),
+            suite_regressions=int(regressions),
+        )
+    return out
+
+
+@dataclass
+class ProvenanceGroup:
+    """One §4.4 provenance group: its axes and the sessions that share them."""
+
+    provenance: dict[str, str]
+    verdicts: list[Verdict] = field(default_factory=list)
+
+
+@dataclass
+class PooledMetrics:
+    """§9.1's numbers for one provenance group."""
+
+    runs: int
+    buckets: dict[str, int]
+    oracle_runs: int
+    observable: int
+    hidden_pass: int
+    patch_good: int
+    unobservable: int
+    ecr: int
+    ecr_denominator: int
+    eir: int
+    eir_denominator: int
+    false_approvals: list[tuple[Any, Any, str]]
+    false_rejects: list[tuple[Any, Any]]
+
+    def rates(self) -> dict[str, tuple[int, int]]:
+        """§9.1's ratios as `(count, denominator)`, named as §9.1 names them.
+
+        [WHY] One definition of every denominator, so the printed rate and the
+        tested rate cannot disagree. Each denominator is the CONDITIONAL one the
+        metric's own definition asks for — `approval_precision` over the rows the
+        run actually approved, `spurious_reject_rate` over the known-bad
+        rejections — never `runs`, which would silently count rows the metric
+        never asked about.
+        """
+        approvals = self.buckets.get(TRUE_APPROVAL, 0) + self.buckets.get(
+            FALSE_APPROVAL, 0
+        )
+        rejected_known_bad = self.buckets.get(TRUE_CATCH, 0) + self.buckets.get(
+            SPURIOUS_REJECT, 0
+        )
+        return {
+            "resolve_rate": (self.hidden_pass, self.observable),
+            "patch_good_rate": (self.patch_good, self.observable),
+            "approval_precision": (self.buckets.get(TRUE_APPROVAL, 0), approvals),
+            "spurious_reject_rate": (
+                self.buckets.get(SPURIOUS_REJECT, 0),
+                rejected_known_bad,
+            ),
+            "infra_failure_rate": (self.buckets.get(INFRA_FAILURE, 0), self.runs),
+            "unobservable_rate": (self.unobservable, self.runs),
+            "ECR": (self.ecr, self.ecr_denominator),
+            "EIR": (self.eir, self.eir_denominator),
+        }
+
+    @property
+    def ecr_interval(self) -> Optional[tuple[float, float]]:
+        """Wilson interval on ECR's own conditional denominator (§9.2)."""
+        return wilson_interval(self.ecr, self.ecr_denominator)
+
+    @property
+    def eir_interval(self) -> Optional[tuple[float, float]]:
+        """Wilson interval on EIR's own conditional denominator (§9.2)."""
+        return wilson_interval(self.eir, self.eir_denominator)
+
+
+def pool_by_provenance(
+    verdicts: list[Verdict], provenance: dict[str, dict[str, str]]
+) -> list[ProvenanceGroup]:
+    """Group verdicts by their session's §4.4 provenance, in first-seen order.
+
+    [WHY] First-seen order, not sorted: a report of one batch reads in the order
+    the batch was built, and the ORDER IS NOT THE GROUPING — two groups are
+    distinct because their axes differ, never because of where they sit.
+    """
+    groups: dict[tuple, ProvenanceGroup] = {}
+    for verdict in verdicts:
+        axes = provenance.get(verdict.session_id)
+        if axes is None:
+            axes = provenance_of("")
+        group = groups.setdefault(
+            provenance_key(axes), ProvenanceGroup(provenance=axes)
+        )
+        group.verdicts.append(verdict)
+    return list(groups.values())
+
+
+def pooled_metrics(
+    group: ProvenanceGroup, facts_by_session: dict[str, OracleFacts]
+) -> PooledMetrics:
+    """Compute §9.1's metrics for one group.
+
+    [WHY] `oracle_runs` is counted separately from `runs` because a session with
+    no manifest row is not a run whose patch failed the oracle — it is a run whose
+    oracle fact is absent, and dividing `hidden_pass` by `runs` would report that
+    absence as a failure.
+    """
+    buckets = {name: 0 for name in BUCKET_ORDER}
+    counters = dict(_EMPTY_COUNTERS)
+    oracle_runs = observable = hidden_pass = patch_good = unobservable = 0
+    false_approvals: list[tuple[Any, Any, str]] = []
+    false_rejects: list[tuple[Any, Any]] = []
+    for verdict in group.verdicts:
+        buckets[verdict.bucket] = buckets.get(verdict.bucket, 0) + 1
+        session_metrics = verdict.metrics or {}
+        for key in counters:
+            counters[key] += session_metrics.get(key, 0)
+
+        facts = facts_by_session.get(verdict.session_id)
+        if facts is not None:
+            oracle_runs += 1
+            if not facts.apply_ok:
+                unobservable += 1
+            else:
+                observable += 1
+                hidden_pass += 1 if facts.hidden_pass else 0
+                patch_good += 1 if facts.patch_good else 0
+        if verdict.bucket == FALSE_APPROVAL:
+            false_approvals.append(
+                (
+                    facts.bug if facts else None,
+                    facts.seed if facts else None,
+                    facts.reason if facts else "unknown",
+                )
+            )
+        if verdict.bucket == FALSE_REJECT:
+            false_rejects.append(
+                (facts.bug if facts else None, facts.seed if facts else None)
+            )
+    return PooledMetrics(
+        runs=len(group.verdicts),
+        buckets=buckets,
+        oracle_runs=oracle_runs,
+        observable=observable,
+        hidden_pass=hidden_pass,
+        patch_good=patch_good,
+        unobservable=unobservable,
+        ecr=counters["ecr"],
+        ecr_denominator=counters["ecr_denominator"],
+        eir=counters["eir"],
+        eir_denominator=counters["eir_denominator"],
+        false_approvals=false_approvals,
+        false_rejects=false_rejects,
+    )
+
+
+def _entry_text(values: tuple) -> str:
+    """`(httpie/1, 0, hidden_fail)`; a value nobody recorded prints `?`."""
+    return "(" + ", ".join("?" if v is None else str(v) for v in values) + ")"
+
+
+def _entries_text(entries: list[tuple]) -> str:
+    if not entries:
+        return "(none)"
+    return " ".join(_entry_text(entry) for entry in entries)
+
+
+def render_axes(axes: dict[str, str]) -> str:
+    """The named axes on one line, the sampling schedule on the next."""
+    named = " ".join(
+        f"{key}={axes.get(key, PROVENANCE_UNKNOWN)}" for key in PROVENANCE_KEYS
+    )
+    lines = [f"  {named}"]
+    sampling = sorted(key for key in axes if is_sampling_key(key))
+    if sampling:
+        lines.append("  sampling: " + " ".join(f"{key}={axes[key]}" for key in sampling))
+    else:
+        lines.append(f"  sampling: {PROVENANCE_UNKNOWN} (no schedule was recorded)")
+    return "\n".join(lines)
+
+
+def render_pooled(
+    groups: list[ProvenanceGroup], facts_by_session: dict[str, OracleFacts]
+) -> str:
+    """§9.1's pooled table, one block per provenance group.
+
+    [WHY] Every line names its own group's axes, so a number can never be read
+    without the experiment it came from. When no manifest was given the oracle
+    gauges print `n/a` and the false-approval list prints `?` for the facts the
+    manifest would have supplied — an absence, never a zero.
+    """
+    lines = [
+        "",
+        "POOLED BY CONFIG (design §9.1; intervals are naive — §9.3)",
+    ]
+    if not groups:
+        lines.append("  (no sessions)")
+        return "\n".join(lines)
+    for group in groups:
+        pooled = pooled_metrics(group, facts_by_session)
+        rates = pooled.rates()
+        lines.append("")
+        lines.append(render_axes(group.provenance))
+        counted = " ".join(
+            f"{name}={count}" for name, count in pooled.buckets.items() if count
+        )
+        lines.append(f"  runs={pooled.runs}  {counted}")
+        lines.append(
+            "  "
+            + "  ".join(
+                f"{name} {rate_text(*rates[name])}"
+                for name in ("resolve_rate", "patch_good_rate", "approval_precision")
+            )
+        )
+        lines.append(
+            "  "
+            + "  ".join(
+                f"{name} {rate_text(*rates[name])}"
+                for name in (
+                    "spurious_reject_rate",
+                    "infra_failure_rate",
+                    "unobservable_rate",
+                )
+            )
+        )
+        lines.append(
+            f"  ECR {rate_text(*rates['ECR'])} "
+            f"wilson 95% {wilson_text(pooled.ecr_interval)}   "
+            f"EIR {rate_text(*rates['EIR'])} "
+            f"wilson 95% {wilson_text(pooled.eir_interval)}"
+        )
+        lines.append(f"  oracle rows {pooled.oracle_runs}/{pooled.runs}")
+        lines.append(
+            f"  false_approvals[{len(pooled.false_approvals)}]: "
+            f"{_entries_text(pooled.false_approvals)}"
+        )
+        lines.append(
+            f"  false_rejects[{len(pooled.false_rejects)}]: "
+            f"{_entries_text(pooled.false_rejects)}"
+        )
+    return "\n".join(lines)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -681,6 +1171,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         help=(
             "With --labels, report every session in the directory, not just the "
             "labelled ones."
+        ),
+    )
+    parser.add_argument(
+        "--pool-by-config",
+        dest="pool_by_config",
+        action="store_true",
+        help=(
+            "Also print §9.1's metrics pooled per §4.4 provenance group "
+            "(config x mode x seed x model x sampling x commit). Never pools "
+            "across groups; each block names its own axes."
+        ),
+    )
+    parser.add_argument(
+        "--manifest",
+        default=None,
+        help=(
+            "The batch's manifest.jsonl (§7.3). Supplies the oracle facts "
+            "(hidden_pass / patch_good / apply_ok) that --pool-by-config's "
+            "oracle gauges and false-approval reasons need; without it those "
+            "print n/a rather than zero."
         ),
     )
     parser.add_argument("--json", dest="json_out", default=None,
@@ -716,15 +1226,28 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             return 1
 
+    facts_by_session: dict[str, OracleFacts] = {}
+    if args.pool_by_config and args.manifest:
+        if not os.path.isfile(args.manifest):
+            print(f"error: {args.manifest} is not a file", file=sys.stderr)
+            return 1
+        facts_by_session = oracle_by_session(load_manifest(args.manifest))
+
     verdicts: list[Verdict] = []
+    provenance: dict[str, dict[str, str]] = {}
     for session_id in session_ids:
         data = load_session(args.sessions_dir, session_id)
         label = labels.get(session_id) or {}
         known_bad = label.get("known_bad")
         verdicts.append(classify(data, known_bad))
+        if args.pool_by_config:
+            provenance[session_id] = session_provenance(data)
 
     print(render_table(verdicts))
     print(render_metrics(verdicts))
+
+    if args.pool_by_config:
+        print(render_pooled(pool_by_provenance(verdicts, provenance), facts_by_session))
 
     warnings = [w for verdict in verdicts for w in verdict.warnings]
     if warnings:

@@ -2289,11 +2289,47 @@ pooled interval as naive. A cluster-robust alternative (per-bug proportion → i
 is noted as future work, not implemented in the pilot. At `seeds=[0]` the intervals are also
 dominated by run-to-run model variance, which §8.3 explicitly defers.
 
-### 9.4 Where the code goes
+### 9.4 Where the code goes (landed)
 
-**Decided:** an **additive section** in `scripts/metrics.py` — new functions, `--pool-by-config`,
-grouping by the §4.4 provenance axes, and an `oracle` block that consumes the harness manifest.
-Existing `classify()` semantics are untouched, so existing tests and existing reports are unaffected.
+**Decided and implemented:** an **additive section** in [metrics.py](file:///Users/kyu-yi/vanta/scripts/metrics.py)
+— new functions, `--pool-by-config`, grouping by the §4.4 provenance axes, and an `oracle` block that
+consumes the harness manifest. Existing `classify()` semantics are untouched, so existing tests and
+existing reports are unaffected. The section is self-contained and never re-derives a bucket: it reads
+`Verdict.bucket` and `Verdict.metrics`, so the two halves cannot drift.
+
+The shape, and the rule each piece is load-bearing for:
+
+- **`provenance_of(summary)` / `session_provenance(data)`** — the §4.4 axes read from the `run.summary`
+  line *itself*, never from an env var or the directory a session sits in, so a session copied out of
+  the batch stays self-describing. An axis the line does not carry reads `unset`, which is a different
+  value from any real one and therefore a different group.
+- **`provenance_key(axes)`** — the group identity: the named axes in `PROVENANCE_KEYS` order, then the
+  sampling keys **sorted**. The schedule is variable-length (one pair per §4.3 call site), so a fixed
+  order is what makes two groups comparable and a group's identity independent of the order the line
+  happened to be written in. A per-site `top_p_<site>` is provenance too — two runs sampling different
+  call sites at different `top_p` are two experiments.
+- **`wilson_interval(count, denominator)` / `wilson_text`** — §9.2's formula, local, `z = 1.96` a
+  parameter so the arithmetic can be checked against a hand-computed interval. `None` (printed `n/a`)
+  when the denominator is `0` — never `(0.0, 0.0)`, because "no row was in this denominator" and
+  "every row failed" are opposite claims.
+- **`PooledMetrics.rates()`** — §9.1's ratios as `(count, denominator)` pairs, each with the metric's
+  **own conditional denominator** (approval_precision over the approved rows, spurious_reject_rate over
+  the known-bad rejections, ECR/EIR over their transition rows). One definition of a denominator, so
+  the printed rate and the tested rate cannot disagree.
+- **`oracle_by_session` / `OracleFacts` / `load_manifest`** — the oracle facts come from the manifest's
+  `oracle` block, keyed by session. A session with no manifest row is `n/a`, never a failed patch:
+  `hidden_pass ÷ runs` would report an absent fact as a failure.
+- **`render_pooled`** — one block per group, each naming its own axes, so no number can be read without
+  the experiment it came from. Header carries the §9.3 naive-interval caveat.
+- **CLI** — `--pool-by-config` (off by default: the existing report is byte-identical without it) and
+  `--manifest`, which is loud when the path is not a file rather than silently printing `n/a`.
+  [bugsinpy_run.py](file:///Users/kyu-yi/vanta/scripts/bugsinpy_run.py) `cmd_report` passes both,
+  pointing `--manifest` at the batch's own `manifest.jsonl`.
+
+Tests: [test_metrics.py](file:///Users/kyu-yi/vanta/scripts/test_metrics.py) gained a section covering
+each of the above — including that an unset axis does not pool with a recorded one, that a different
+seed or schedule is a different group, that a group without manifest rows reports `n/a` and not zero,
+and that a false approval with no manifest row prints `?`.
 
 ---
 

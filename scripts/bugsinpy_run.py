@@ -749,6 +749,12 @@ def cmd_report(args: argparse.Namespace) -> int:
         str(runner_mod.sessions_dir()),
         "--labels",
         str(labels_path),
+        # §9.1/§9.4: the pooled table is cut by provenance, and the oracle facts
+        # its gauges read are the manifest's. Both are already on disk here, so
+        # the report asks for both rather than printing the per-session view alone.
+        "--pool-by-config",
+        "--manifest",
+        str(batch_dir / manifest_mod.MANIFEST_NAME),
     ]
     print()
     print("$ " + " ".join(argv), flush=True)

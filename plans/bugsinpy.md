@@ -406,7 +406,62 @@ carry a traceback frame into the file, does it name a `def`/`class` the file def
 *none* of them with hidden information, so a bug whose issue text says nothing about where the code
 is will still fall back to the tree plus whatever its one-hop neighbours reach. The per-bug
 predictions, with each bug's top-ranked files and the reason each was picked, are recorded in
-`runs/bugsinpy/measure-dev-1/selection_expectation.md` once `--select-context` (item 5) exists.
+`runs/bugsinpy/measure-dev-1/selection_expectation.md` (item 6, below).
+
+Landed in **item 6** — the ranking measured, on top of item 5 at `4cb560b`. Items 1 and 2 had no test of
+their own; five are added to `context::tests`:
+
+- `the_ranking_orders_by_reason_weight_and_breaks_ties_by_path` — the ranking pinned as a **unit**, on
+  hand-built candidates: a file scores the **sum** of the reasons it was picked for (a file named by path,
+  named again by a traceback frame and defining the symbol the issue names scores 900 = 400+300+200), a
+  stronger reason is never displaced by a weaker one, and a tie is broken by path (`pkg/alpha.py` 200 =
+  `pkg/beta.py` 200, ordered by path; `pkg/helper.py` 100 as the only neighbour; `pkg/unrelated.py`
+  absent because no reason reaches it). The order is total and stable.
+- `the_budget_fill_shows_small_files_whole_and_big_files_as_an_outline` — the fill is what makes the cap
+  safe: a small file goes in `Full`; a file over `MAX_FILE_BYTES` goes in as an `Outline` (smaller than
+  the source, keeping `def entry():`) rather than being skipped, and `dropped_for_budget` stays empty.
+- `the_budget_fill_reports_a_file_it_had_to_drop_instead_of_hiding_it` — the one case where the run is
+  shown *less* than the ranking chose (a budget the file tree has already spent) names the dropped file
+  in `dropped_for_budget`, which is what the gate's `selection_dropped_for_budget` verdict reads.
+- `the_buggy_file_is_found_from_a_traceback_in_the_issue` — the **integration** test: a real tree is
+  walked through `select_for_role` (the `--select-context` entry point), the bug's own file is selected
+  from a traceback frame in the issue with reasons `[Path, Traceback]`, the repo file tree travels
+  alongside it, and `render()` carries both the `# REPOSITORY FILES (paths only)` listing and the
+  `# FILE: …` body.
+- `review_selection_follows_a_real_patch_to_its_imports_and_tests` — the **review-mode** integration
+  test, also through `select_for_role` so the patch-splitting seam is exercised: the patch's touched file
+  is `Full` with reason `[PatchTouched]`, its one-hop `from .helper import helper` arrives as an
+  `ImportNeighbour`, the visible test that imports the touched module arrives as `Test`, and files the
+  patch does not reach stay out.
+
+The **per-bug expectation** is [`selection_expectation.py`](file:///Users/kyu-yi/vanta/runs/bugsinpy/scratch/selection_expectation.py)
+(a hand-run script, imported by nothing) →
+[`selection_expectation.md`](file:///Users/kyu-yi/vanta/runs/bugsinpy/measure-dev-1/selection_expectation.md).
+It shells out to the real `target/debug/vanta_m3 --select-context --json` through `ctx.select_context`, so
+every row is the run's own ranking and not a mirror; the per-bug JSON and the issue text each row measured
+are under `runs/bugsinpy/scratch/selection_expectation/`. Its one approximation is the issue text: under
+`--measure-only` there is no frozen text (the gate returns before `build_issue`), so each bug's text is
+derived with the real `issue` module from its fix commit message — a **superset** of the frozen text, so
+each selection is an **upper bound** (a real run can show fewer files, never more). `PySnooper/3` also has
+a frozen text on disk; measuring both isolates the approximation from the ranking, and both are empty, so
+the empty selection is the *text's* property, not the derivation's.
+
+**The result, stated plainly.** All 11 selections fit the 163584-token budget and **nothing is dropped for
+the cap**, so the `source_truncated_by_cap` rejection that took 10 of 11 out of the pilot is gone — that was
+the change's purpose and it holds. But only **2 of 11** bugs localize (`pandas/1` and `fastapi/2`, each
+showing 1 of the files the fix touched) and **7 of 11 selections are empty**. The mechanism is not the
+limit; the issue text is. BugsInPy's issue text is the *fix commit message*, and for most of these bugs
+that is a sentence of English prose — `fix calling method on wrong object` (luigi/1), `FIX: do not let
+no-op monkey patches to renderer leak out` (matplotlib/1) — naming no path, no traceback frame and no
+module-level symbol, so the ranking has nothing to rank and the prompt is the file tree alone. §1.6.2's
+prediction that such a bug "will still fall back to the tree plus whatever its one-hop neighbours reach" is
+too optimistic: with **zero** seeds there is no neighbour hop, so the fallback is the bare tree. A
+diagnostic on `PySnooper/3` confirms the other direction — given the frozen text plus one sentence naming
+the touched path, the selector shows `pysnooper/pysnooper.py` @400 [path] and its four @100
+[import_neighbour] files, exactly the behaviour `the_buggy_file_is_found_from_a_traceback_in_the_issue`
+pins. The finding is recorded honestly: the cap fix is necessary and done, and it is not sufficient,
+because the issue text the harness supplies (a fix-commit message) is what a repair run is left to
+localize from.
 
 ---
 

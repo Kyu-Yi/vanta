@@ -1506,4 +1506,240 @@ mod tests {
             );
         }
     }
+
+    /// [VANTA-WHY] §1.6.2 item 6 — the ranking is the whole point of the change,
+    /// so it is pinned as a unit, on hand-built candidates: a file scores the SUM
+    /// of the reasons it was picked for, a stronger reason is never displaced by a
+    /// weaker one, and a tie is broken by path so the order is total and stable.
+    /// The integration tests below exercise the same code through `select_for_role`
+    /// on a real tree.
+    #[test]
+    fn the_ranking_orders_by_reason_weight_and_breaks_ties_by_path() {
+        let candidates = vec![
+            candidate(
+                "pkg/core.py",
+                "from .helper import helper\n\n\ndef frobnicate(value):\n    return helper(value)\n",
+            ),
+            candidate("pkg/helper.py", "def helper(value):\n    return value\n"),
+            candidate("pkg/alpha.py", "def render():\n    return 1\n"),
+            candidate("pkg/beta.py", "def render():\n    return 2\n"),
+            candidate("pkg/unrelated.py", "def nothing():\n    return 3\n"),
+        ];
+        // `pkg/core.py` is named by path, named again by the traceback frame, and
+        // defines the symbol the issue names — the strongest possible file.
+        let issue = "`frobnicate` in pkg/core.py raises, and so does `render`.\n\n\
+                     Traceback (most recent call last):\n  \
+                     File \"pkg/core.py\", line 4, in frobnicate\n    \
+                     return helper(value)\nValueError: bad value\n";
+
+        let selection = select_repair_context(&candidates, issue, "creator", 60_000);
+
+        assert_eq!(
+            paths(&selection),
+            vec!["pkg/core.py", "pkg/alpha.py", "pkg/beta.py", "pkg/helper.py"],
+            "path+traceback+identifier (900) > identifier (200) > import-neighbour (100); \
+             the identifier tie is broken by path"
+        );
+        let scores: Vec<i64> = selection.files.iter().map(|file| file.score).collect();
+        assert_eq!(scores, vec![900, 200, 200, 100]);
+
+        let core = &selection.files[0];
+        assert_eq!(
+            core.reasons,
+            vec![
+                SelectionReason::Path,
+                SelectionReason::Traceback,
+                SelectionReason::Identifier,
+            ]
+        );
+        assert_eq!(
+            selection
+                .files
+                .iter()
+                .find(|file| file.path == "pkg/helper.py")
+                .unwrap()
+                .reasons,
+            vec![SelectionReason::ImportNeighbour],
+            "the neighbour of a named file scores below every file the issue names"
+        );
+        assert!(
+            !paths(&selection).contains(&"pkg/unrelated.py"),
+            "a file no reason reaches is not selected at all"
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 6 — the budget fill is what makes the cap safe. A
+    /// small file goes in whole; a file over `MAX_FILE_BYTES` goes in as an
+    /// outline rather than being skipped, so a big touched file is never silently
+    /// dropped; and a file whose outline still does not fit is *reported*, not
+    /// forgotten. Nothing here executes Python — the outline is line-based.
+    #[test]
+    fn the_budget_fill_shows_small_files_whole_and_big_files_as_an_outline() {
+        let big = format!(
+            "def entry():\n    \"\"\"Doc.\"\"\"\n    return 1\n# {}\n",
+            "x".repeat(MAX_FILE_BYTES + 1)
+        );
+        let candidates = vec![
+            candidate("pkg/small.py", "def small():\n    return 2\n"),
+            candidate("pkg/big.py", &big),
+        ];
+        // Both are named by path, so both are ranked; the budget is generous.
+        let issue = "pkg/small.py and pkg/big.py both matter.\n";
+
+        let selection = select_repair_context(&candidates, issue, "creator", 200_000);
+
+        let small = selection
+            .files
+            .iter()
+            .find(|file| file.path == "pkg/small.py")
+            .expect("a file that fits whole is selected");
+        assert_eq!(small.shown, ShownMode::Full);
+        assert_eq!(small.body, "def small():\n    return 2\n");
+
+        let big_file = selection
+            .files
+            .iter()
+            .find(|file| file.path == "pkg/big.py")
+            .expect("a file over the per-file cap is shown as an outline, never dropped");
+        assert_eq!(big_file.shown, ShownMode::Outline);
+        assert!(
+            big_file.bytes < big.len(),
+            "the outline is smaller than the source it stands in for ({} vs {})",
+            big_file.bytes,
+            big.len()
+        );
+        assert!(big_file.body.contains("def entry():"));
+        assert!(selection.dropped_for_budget.is_empty());
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 6 — a budget too small even for an outline must not
+    /// silently lose a ranked file: the caller has to be able to say "the run was
+    /// shown less than the ranking chose", which is what the gate's
+    /// `selection_dropped_for_budget` verdict reads.
+    #[test]
+    fn the_budget_fill_reports_a_file_it_had_to_drop_instead_of_hiding_it() {
+        let candidates = vec![candidate(
+            "pkg/core.py",
+            "def frobnicate(value):\n    return value\n",
+        )];
+        let issue = "pkg/core.py is broken.\n";
+
+        // The file tree alone consumes more than this, so nothing else can fit.
+        let selection = select_repair_context(&candidates, issue, "creator", 8);
+
+        assert!(
+            selection.files.is_empty(),
+            "nothing fits a budget the file tree has already spent"
+        );
+        assert_eq!(
+            selection.dropped_for_budget,
+            vec!["pkg/core.py"],
+            "the dropped file is named, so the gate can refuse the bug for the right reason"
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 6 — the end-to-end repair case, through the entry
+    /// point the `--select-context` subcommand calls. A real tree is walked and the
+    /// bug's own file is found from a traceback in the issue text, with the repo
+    /// file tree carried alongside so the model sees what exists.
+    #[test]
+    fn the_buggy_file_is_found_from_a_traceback_in_the_issue() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let write = |rel: &str, contents: &str| {
+            let path = tmp.path().join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        };
+        write("pkg/parser.py", "def parse(value):\n    return value\n");
+        write("pkg/other.py", "def other():\n    return 1\n");
+        write("tests/test_parser.py", "def test_parse():\n    assert True\n");
+
+        let issue = "Parsing blows up.\n\nTraceback (most recent call last):\n  \
+                     File \"pkg/parser.py\", line 2, in parse\n    \
+                     return value\nTypeError: bad\n";
+
+        let selection = select_for_role(tmp.path(), issue, None, "creator", 60_000);
+
+        assert_eq!(selection.mode, "repair");
+        assert_eq!(paths(&selection), vec!["pkg/parser.py"]);
+        let file = &selection.files[0];
+        assert!(file.reasons.contains(&SelectionReason::Path));
+        assert!(
+            file.reasons.contains(&SelectionReason::Traceback),
+            "the traceback frame is what makes this a localization and not a guess"
+        );
+        assert!(
+            selection.tree.contains(&"pkg/parser.py".to_string()),
+            "the repo file tree travels with the selection"
+        );
+        let rendered = selection.render();
+        assert!(rendered.contains("# REPOSITORY FILES (paths only)"));
+        assert!(rendered.contains("# FILE: pkg/parser.py"));
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 6 — the end-to-end review case: a real patch is
+    /// parsed into its touched files, and the selection is those files plus their
+    /// one-hop imports and the visible tests that cover them. This goes through
+    /// `select_for_role` (the `--select-context` entry point) rather than
+    /// `select_review_context`, so the patch-splitting seam is exercised too.
+    #[test]
+    fn review_selection_follows_a_real_patch_to_its_imports_and_tests() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let write = |rel: &str, contents: &str| {
+            let path = tmp.path().join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        };
+        write(
+            "pkg/core.py",
+            "from .helper import helper\n\n\ndef frobnicate(value):\n    return helper(value)\n",
+        );
+        write("pkg/helper.py", "def helper(value):\n    return value\n");
+        write("pkg/unrelated.py", "def unrelated():\n    return 1\n");
+        write(
+            "tests/test_core.py",
+            "from pkg.core import frobnicate\n\n\ndef test_frobnicate():\n    assert frobnicate(1) == 1\n",
+        );
+        write(
+            "tests/test_unrelated.py",
+            "from pkg.unrelated import unrelated\n\n\ndef test_unrelated():\n    assert unrelated() == 1\n",
+        );
+
+        let patch = "diff --git a/pkg/core.py b/pkg/core.py\n\
+                     --- a/pkg/core.py\n\
+                     +++ b/pkg/core.py\n\
+                     @@ -1,4 +1,4 @@\n\
+                     -def frobnicate(value):\n\
+                     +def frobnicate(value, *, strict=False):\n";
+
+        let selection = select_for_role(tmp.path(), "", Some(patch), "creator+attacker", 60_000);
+
+        assert_eq!(selection.mode, "review");
+        assert!(
+            selection.tree.is_empty(),
+            "review mode has no file tree: the patch already localizes the repo"
+        );
+        assert_eq!(
+            paths(&selection)[0],
+            "pkg/core.py",
+            "the patch's own file outranks its neighbours and the tests that cover it"
+        );
+        let touched = &selection.files[0];
+        assert_eq!(touched.reasons, vec![SelectionReason::PatchTouched]);
+        assert_eq!(touched.shown, ShownMode::Full);
+
+        let shown = paths(&selection);
+        assert!(
+            shown.contains(&"pkg/helper.py"),
+            "the touched file's module-level import comes along, one hop out"
+        );
+        assert!(
+            shown.contains(&"tests/test_core.py"),
+            "the visible test that covers the touched module is shown"
+        );
+        assert!(
+            !shown.contains(&"pkg/unrelated.py") && !shown.contains(&"tests/test_unrelated.py"),
+            "files the patch does not reach stay out of the review prompt"
+        );
+    }
 }

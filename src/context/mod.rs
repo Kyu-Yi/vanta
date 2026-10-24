@@ -1255,4 +1255,101 @@ mod tests {
             "the patch's own file outranks its neighbours and the tests that cover it"
         );
     }
+
+    /// [VANTA-WHY] §1.6.2 — the localizer must not be moved by what the harness
+    /// hides. The harness's half of that is tree surgery: `prepare` /
+    /// `trees::strip_hidden_tests` removes the F2P tests from `vanta_tree` and
+    /// from `vanta_clean` before any run sees them, and the fix commit, the fix
+    /// diff and `bug.info` are never written into the tree at all. This test
+    /// pins the localizer's half: walk a real tree, ADD a hidden test (a
+    /// F2P-shaped file that imports the touched module, which is the strongest
+    /// reason a test could ever be shown) and REMOVE it again, and assert that
+    /// the files shown for the visible tree do not move — same paths, scores,
+    /// reasons, bytes, tokens, order and bodies. A hidden test that could
+    /// reorder, displace or re-cut a visible file would make the selection a
+    /// channel for the answer.
+    #[test]
+    fn the_selection_is_unchanged_when_a_hidden_test_is_added_or_removed() {
+        const HIDDEN: &str = "tests/test_hidden_bug.py";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let write = |rel: &str, contents: &str| {
+            let path = tmp.path().join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        };
+        write(
+            "pkg/core.py",
+            "from .helper import helper\n\n\ndef frobnicate(value):\n    return helper(value)\n",
+        );
+        write("pkg/helper.py", "def helper(value):\n    return value\n");
+        write(
+            "tests/test_core.py",
+            "from pkg.core import frobnicate\n\n\ndef test_frobnicate():\n    assert frobnicate(1) == 1\n",
+        );
+
+        let issue = "`frobnicate` raises on a str.\n\nTraceback (most recent call last):\n  File \"pkg/core.py\", line 5, in frobnicate\n    return helper(value)\nValueError: bad value\n";
+        let touched = BTreeSet::from(["pkg/core.py".to_string()]);
+
+        // The whole entry, body included, so a hidden test cannot move a visible
+        // file even by changing what its outline would be.
+        type Entry = (String, i64, Vec<SelectionReason>, usize, u32, ShownMode, String);
+        let entries = |selection: &ContextSelection| -> Vec<Entry> {
+            selection
+                .files
+                .iter()
+                .filter(|file| file.path != HIDDEN)
+                .map(|file| {
+                    (
+                        file.path.clone(),
+                        file.score,
+                        file.reasons.clone(),
+                        file.bytes,
+                        file.tokens,
+                        file.shown,
+                        file.body.clone(),
+                    )
+                })
+                .collect()
+        };
+        let select = || {
+            let (candidates, _skipped) = walk_candidates(tmp.path());
+            (
+                select_repair_context(&candidates, issue, "repair", 60_000),
+                select_review_context(&candidates, &touched, "review", 60_000),
+            )
+        };
+
+        let (repair_alone, review_alone) = select();
+        assert!(
+            entries(&repair_alone)
+                .iter()
+                .any(|entry| entry.0 == "pkg/core.py"),
+            "the bug's own file is found from the issue before anything is added"
+        );
+
+        // ADDED: the hidden test now imports the touched module, so in review
+        // mode it IS a candidate — which is exactly why the harness has to strip
+        // it before the run sees the tree.
+        write(
+            HIDDEN,
+            "from pkg.core import frobnicate\n\n\ndef test_hidden_bug():\n    assert frobnicate(2) == 2\n",
+        );
+        let (repair_with, review_with) = select();
+        assert!(
+            review_with.files.iter().any(|file| file.path == HIDDEN),
+            "the scenario is only meaningful if the hidden test WOULD be shown"
+        );
+
+        // REMOVED again — the tree the run actually gets.
+        fs::remove_file(tmp.path().join(HIDDEN)).unwrap();
+        let (repair_after, review_after) = select();
+
+        assert_eq!(entries(&repair_alone), entries(&repair_with));
+        assert_eq!(entries(&repair_alone), entries(&repair_after));
+        assert_eq!(entries(&review_alone), entries(&review_with));
+        assert_eq!(entries(&review_alone), entries(&review_after));
+        assert!(entries(&review_alone)
+            .iter()
+            .any(|entry| entry.0 == "tests/test_core.py"));
+    }
 }

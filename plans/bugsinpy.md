@@ -313,6 +313,22 @@ selection through `ContextSelection::render` — the seam that used to be called
 ordered so a file the *issue* names always outranks a neighbour of one: `PatchTouched` 1000 > `Path`
 400 > `Traceback` 300 > `Identifier` 200 > `ImportNeighbour` 100 > `Test` 80.
 
+Landed in **item 3** — on top of item 2 at `bab6f97`. The landing is a test, because the harness's
+half of the rule is what it already did: `prepare` / `trees::strip_hidden_tests` removes the hidden
+(F2P) tests from `vanta_tree` and `vanta_clean` before any run sees a tree, and the fix commit's
+diff and `bug.info` are never written into a tree at all. The localizer's half is structural — its
+inputs are the tree, the issue text, the patch under review and the budget, and `FAIL_TO_PASS`, the
+fix commit, the fix diff and `bug.info` are not parameters of `select_review_context` or
+`select_repair_context` and cannot be reached from either. What was missing was a test that the
+*output* cannot move either:
+`context::tests::the_selection_is_unchanged_when_a_hidden_test_is_added_or_removed` walks a real tree
+(with the tempdir and the real `walk_candidates`), adds a F2P-shaped hidden test that imports the
+touched module — the strongest reason a test could ever be shown, and the test asserts it *would*
+be shown, so the scenario is not vacuous — and removes it again, then asserts the entries shown for
+the visible tree are equal in path, score, reason, bytes, tokens, order and body across all three
+walks, in both repair and review mode. A hidden test that could reorder, displace or re-cut a
+visible file would make the selection a channel for the answer.
+
 **Expected effect on the re-run.** The 10-of-11 `source_truncated_by_cap` rejections were a
 *whole-repo* measurement, and item 5 changes the gate to measure the selection, so the number to
 watch is not "how much of the repo is in the prompt" but "was the bug's own file selected". The

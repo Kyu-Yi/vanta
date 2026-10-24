@@ -302,6 +302,27 @@ the sorted walks in `repo::collect_source_files` / `candidate::collect_tree`. It
 own hash is reported with the commit, not cited here: a hash written into the commit it names cannot
 survive that commit's own creation.)
 
+Landed in **item 2** — repair mode, on top of item 1 at `51339e8`: `select_repair_context` and the
+issue-text parsers that feed it (`issue_tokens`, `issue_traceback_files`, `issue_identifiers`,
+`module_level_symbols`), the one hop of import neighbours for the seed files, the repo file tree in
+the prompt, and the driver seams `select_repair_prompt` / `creator_source_files`. The Creator now
+receives the *selected* files plus a `REPOSITORY FILE TREE (paths only)` listing entry instead of
+`repo.source_files`, and the Attacker, the auditor, BATE and the Diagnostician receive the same
+selection through `ContextSelection::render` — the seam that used to be called
+`review_prompt_concat` is `prompt_source_concat` because it is no longer review-only. Weights are
+ordered so a file the *issue* names always outranks a neighbour of one: `PatchTouched` 1000 > `Path`
+400 > `Traceback` 300 > `Identifier` 200 > `ImportNeighbour` 100 > `Test` 80.
+
+**Expected effect on the re-run.** The 10-of-11 `source_truncated_by_cap` rejections were a
+*whole-repo* measurement, and item 5 changes the gate to measure the selection, so the number to
+watch is not "how much of the repo is in the prompt" but "was the bug's own file selected". The
+selection now asks three separate questions — does the issue name the file's path or module, does it
+carry a traceback frame into the file, does it name a `def`/`class` the file defines — and answers
+*none* of them with hidden information, so a bug whose issue text says nothing about where the code
+is will still fall back to the tree plus whatever its one-hop neighbours reach. The per-bug
+predictions, with each bug's top-ranked files and the reason each was picked, are recorded in
+`runs/bugsinpy/measure-dev-1/selection_expectation.md` once `--select-context` (item 5) exists.
+
 ---
 
 ## 2. Issue text that never leaks the fix or the hidden test

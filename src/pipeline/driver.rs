@@ -34,7 +34,8 @@ use crate::agents::attacker::{
     audit_tests_intent,
 };
 use crate::agents::creator::{
-    CreatorRequest, creator_generate_patch, split_multi_file_patch, split_patch_into_files,
+    CreatorRequest, SourceFile, creator_generate_patch, split_multi_file_patch,
+    split_patch_into_files,
 };
 use crate::config::LlmConfig;
 use crate::core::{
@@ -576,11 +577,25 @@ pub async fn run(
         .original_tree
         .clone()
         .unwrap_or_else(|| config.repo_path.clone());
-    // [VANTA-WHY] The review prompt is a function of (tree, patch), and both are
-    // fixed for the whole run, so it is selected ONCE and reused across attempts.
-    // Re-walking per attempt would re-read the repo on every round and — worse —
-    // could select differently if the tree changed under us, which would make two
-    // attempts of one run incomparable.
+    // [VANTA-WHY] The context selection for the roles that are shown source. In
+    // review mode it is selected from the patch under review; in repair mode it is
+    // ranked from the issue text. Both are functions of (tree, issue text,
+    // patch-if-any) — all fixed for the whole run — so each is selected ONCE and
+    // reused across attempts. Re-walking per attempt would re-read the repo every
+    // round and, worse, could select differently if the tree changed under us,
+    // which would make two attempts of one run incomparable.
+    let repair_selection: Option<crate::context::ContextSelection> =
+        if config.patch_path.is_none() {
+            Some(select_repair_prompt(
+                &context_root,
+                &repo.issue_text,
+                prompt_budget_tokens,
+            ))
+        } else {
+            None
+        };
+    // Review mode selects lazily (only once the patch's touched files are known);
+    // repair mode is already fixed above.
     let mut review_selection: Option<crate::context::ContextSelection> = None;
 
     // ---- Repair loop ----
@@ -775,7 +790,15 @@ pub async fn run(
             println!("\n▌ CREATOR phase...");
             let creator_request = CreatorRequest {
                 issue_text: repo.issue_text.clone(),
-                source_files: repo.source_files.clone(),
+                // [VANTA-WHY] The Creator is shown the SELECTED context (the files
+                // the issue names, their one-hop imports, and the repo's file tree),
+                // not the capped dump `repo.source_files` holds. `repair_selection`
+                // is `Some` in exactly this branch (no `--patch`), so the fallback
+                // never fires in practice; it keeps the type honest.
+                source_files: repair_selection
+                    .as_ref()
+                    .map(creator_source_files)
+                    .unwrap_or_else(|| repo.source_files.clone()),
                 prior_feedback: prior_feedback.clone(),
             };
             let creator_response = match run_with_spinner("Creator generating patch", async {
@@ -994,14 +1017,17 @@ pub async fn run(
 
         // ---- Build source strings ----
         let original_concat = build_source_concat(&original_files);
-        // [VANTA-WHY] Review mode used to hand the Attacker and the auditor the
-        // capped dump (the first ~262 KB of the repo) if the narrowed set came out
-        // empty — which it did on any repo whose cap had already dropped the
-        // patch's own file. The selection now walks the FULL tree and narrows to
-        // the patch's touched files, their one-hop imports and the visible tests
-        // that exercise them, so "empty" means the patch touches nothing in this
-        // tree, and only then does the old concat apply.
-        let review_prompt_concat = if config.patch_path.is_some() {
+        // [VANTA-WHY] The source the Attacker, the auditor, BATE and the
+        // Diagnostician are shown. This used to be the capped dump (the first
+        // ~262 KB of the repo) in BOTH modes — which dropped the patch's own file
+        // on any repo whose cap had already passed it, and dropped the bug's file
+        // on matplotlib entirely. Now:
+        //   * review mode: the patch's touched files, their one-hop imports and
+        //     the visible tests that exercise them, so "empty" means the patch
+        //     touches nothing in this tree (only then does the old concat apply);
+        //   * repair mode: the files the issue names (path / traceback /
+        //     identifier) and their one-hop imports, with the repo's file tree.
+        let prompt_source_concat = if config.patch_path.is_some() {
             let selection = review_selection.get_or_insert_with(|| {
                 let touched: BTreeSet<String> = patch_files.keys().cloned().collect();
                 select_review_prompt(&context_root, &touched, prompt_budget_tokens)
@@ -1012,6 +1038,8 @@ pub async fn run(
             } else {
                 rendered
             }
+        } else if let Some(selection) = &repair_selection {
+            selection.render()
         } else {
             original_concat.clone()
         };
@@ -1052,7 +1080,7 @@ pub async fn run(
             };
             let attacker_request = AttackerRequest {
                 patch_text: patch_text.clone(),
-                original_source: review_prompt_concat.clone(),
+                original_source: prompt_source_concat.clone(),
                 issue_text: attacker_issue,
                 // [VANTA-WHY] Round >= 2: the Attacker is shown the probes already in
                 // the shared set so it attacks somewhere new instead of re-deriving
@@ -1131,7 +1159,7 @@ pub async fn run(
                 audit_tests_intent(
                     &cfg,
                     &repo.issue_text,
-                    &review_prompt_concat,
+                    &prompt_source_concat,
                     &generated_tests,
                     grounded_audit_enabled,
                     batch_audit_enabled,
@@ -1252,7 +1280,7 @@ pub async fn run(
                 &cfg,
                 &repo.issue_text,
                 &bate_baseline_concat(&original_files),
-                &review_prompt_concat,
+                &prompt_source_concat,
                 &attacker_tests,
                 &test_cmd,
                 grounded_audit_enabled,
@@ -1711,7 +1739,7 @@ pub async fn run(
                     !net_alive,
                     &graded_concat,
                     &cfg,
-                    &review_prompt_concat,
+                    &prompt_source_concat,
                     &test_cmd,
                     // [VANTA-WHY] Every test in `tests_to_run` has a BATE baseline:
                     // `valid_tests` were validated this attempt and `shared_tests`
@@ -2727,6 +2755,17 @@ fn bate_baseline_concat(original_files: &HashMap<String, String>) -> String {
     build_source_concat(original_files)
 }
 
+/// The roles that are shown source in REVIEW mode, in the order they are called.
+///
+/// [VANTA-WHY] One selection serves every role that sees source, so recording a
+/// single role's name in the provenance would be a lie in the other roles' rows.
+/// The label names the consumers instead: "which roles got this" is the question
+/// the artifact is read to answer.
+const REVIEW_SOURCE_ROLES: &str = "attacker+auditor+bate+diagnostician";
+/// The roles that are shown source in REPAIR mode: the same set, plus the
+/// Creator, which is the role that has to decide where to patch.
+const REPAIR_SOURCE_ROLES: &str = "creator+attacker+auditor+bate+diagnostician";
+
 /// Select and render the review prompt's source context from the FULL tree.
 ///
 /// [VANTA-WHY] The selection itself lives in `crate::context` — the ONE
@@ -2740,8 +2779,12 @@ fn select_review_prompt(
     budget_tokens: u32,
 ) -> crate::context::ContextSelection {
     let (candidates, skipped) = crate::context::walk_candidates(root);
-    let mut selection =
-        crate::context::select_review_context(&candidates, touched, "review", budget_tokens);
+    let mut selection = crate::context::select_review_context(
+        &candidates,
+        touched,
+        REVIEW_SOURCE_ROLES,
+        budget_tokens,
+    );
     selection.skipped = skipped;
 
     println!(
@@ -2758,6 +2801,78 @@ fn select_review_prompt(
         println!("  (pruned {} path(s); see the session log)", selection.skipped.len());
     }
     selection
+}
+
+/// Select and render the repair prompt's source context from the FULL tree.
+///
+/// [VANTA-WHY] Same seam as `select_review_prompt`, but ranked from the issue
+/// text: nothing else is an input, so this cannot read the fix commit, the fix
+/// diff, `FAIL_TO_PASS` or `bug.info` even by accident — none of them is a
+/// parameter of `crate::context::select_repair_context` and none can be reached
+/// from here. Before this, repair mode showed the Creator `repo.source_files`:
+/// the first ~262 KB of the repo in `read_dir` order, which on matplotlib
+/// (11.8 MB) usually did not contain the bug's own file.
+fn select_repair_prompt(
+    root: &Path,
+    issue_text: &str,
+    budget_tokens: u32,
+) -> crate::context::ContextSelection {
+    let (candidates, skipped) = crate::context::walk_candidates(root);
+    let mut selection = crate::context::select_repair_context(
+        &candidates,
+        issue_text,
+        REPAIR_SOURCE_ROLES,
+        budget_tokens,
+    );
+    selection.skipped = skipped;
+
+    println!(
+        "\n▌ REPAIR CONTEXT: {} of {} candidate files, {} tok of a {} tok budget",
+        selection.files.len(),
+        candidates.len(),
+        selection.total_tokens,
+        selection.budget_tokens,
+    );
+    for line in selection.summary_lines() {
+        println!("{line}");
+    }
+    if !selection.tree.is_empty() {
+        println!(
+            "  (plus the repo's file tree, {} paths, {} tok)",
+            selection.tree.len(),
+            selection.tree_tokens,
+        );
+    }
+    if !selection.skipped.is_empty() {
+        println!("  (pruned {} path(s); see the session log)", selection.skipped.len());
+    }
+    selection
+}
+
+/// The Creator's `source_files`, from a selection: the selected files in score
+/// order, then — repair mode only — the repo's file tree as one listing entry.
+///
+/// [VANTA-WHY] `CreatorRequest` carries `Vec<SourceFile>` rather than a rendered
+/// prompt, so the tree has to travel as an entry. It is labelled as a listing,
+/// not as a path, so the Creator cannot mistake it for a file it can patch. The
+/// Attacker, the auditor, BATE and the Diagnostician get the same tree through
+/// `ContextSelection::render`, so every role that sees source sees it.
+fn creator_source_files(selection: &crate::context::ContextSelection) -> Vec<SourceFile> {
+    let mut files: Vec<SourceFile> = selection
+        .files
+        .iter()
+        .map(|file| SourceFile {
+            path: file.path.clone(),
+            contents: file.body.clone(),
+        })
+        .collect();
+    if !selection.tree.is_empty() {
+        files.push(SourceFile {
+            path: "REPOSITORY FILE TREE (paths only)".to_string(),
+            contents: selection.tree.join("\n"),
+        });
+    }
+    files
 }
 
 // [VANTA-WHY] The python import resolution that used to live here

@@ -209,43 +209,51 @@ fn relative_path(base: &Path, path: &Path) -> String {
 // Selection result — what was shown, why, and at what cost (provenance, item 4)
 // ----------------------------------------------------------------------------
 /// Why a file was selected. The string form is what the session log records.
+///
+/// [VANTA-WHY] The weights are ordered so that a file the *issue* names always
+/// outranks a file that is merely an import neighbour of one: path 400,
+/// traceback 300, identifier 200, neighbour 100. The earlier review-only ordering
+/// had `ImportNeighbour` (100) above the issue signals, which would have put a
+/// neighbour of a named file into the prompt *ahead of* the named file itself.
+/// `PatchTouched` stays far above everything: in review mode the patch is the
+/// subject, so nothing outranks the files it touches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionReason {
     /// A file the patch under review touches (review mode).
     PatchTouched,
+    /// A path or module named explicitly in the issue text (repair mode).
+    Path,
+    /// A frame named in a traceback inside the issue text (repair mode).
+    Traceback,
+    /// A `def`/`class` defined in this file whose name the issue text mentions.
+    Identifier,
     /// A module-level import neighbour of a selected file, one hop out.
     ImportNeighbour,
     /// A visible test file that exercises a selected module (review mode).
     Test,
-    /// A frame named in a traceback inside the issue text.
-    Traceback,
-    /// A path or module named explicitly in the issue text.
-    Path,
-    /// A `def`/`class` defined in this file whose name the issue text mentions.
-    Identifier,
 }
 
 impl SelectionReason {
     pub fn weight(self) -> i64 {
         match self {
             SelectionReason::PatchTouched => 1000,
+            SelectionReason::Path => 400,
+            SelectionReason::Traceback => 300,
+            SelectionReason::Identifier => 200,
             SelectionReason::ImportNeighbour => 100,
-            SelectionReason::Test => 50,
-            SelectionReason::Traceback => 60,
-            SelectionReason::Path => 40,
-            SelectionReason::Identifier => 30,
+            SelectionReason::Test => 80,
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             SelectionReason::PatchTouched => "patch-touched",
+            SelectionReason::Path => "path",
+            SelectionReason::Traceback => "traceback",
+            SelectionReason::Identifier => "identifier",
             SelectionReason::ImportNeighbour => "import-neighbour",
             SelectionReason::Test => "test",
-            SelectionReason::Traceback => "traceback",
-            SelectionReason::Path => "path",
-            SelectionReason::Identifier => "identifier",
         }
     }
 }
@@ -264,14 +272,27 @@ pub struct SelectedFile {
     pub path: String,
     pub score: i64,
     pub reasons: Vec<SelectionReason>,
-    /// Bytes actually shown (the outline's bytes when `shown == Outline`).
+    /// Bytes actually shown (the framed text's bytes when `shown == Outline`).
     pub bytes: usize,
     pub tokens: u32,
     pub shown: ShownMode,
-    /// The text that goes into the prompt. Not serialized: the JSON artifact is
-    /// provenance, and the prompt text is already in the session's forensics.
+    /// The content shown for this file, WITHOUT the `# FILE: <path>` header: the
+    /// full source, or the outline body for a file that does not fit whole.
+    ///
+    /// [VANTA-WHY] Stored headerless so the two consumers can frame it their own
+    /// way — `render()` writes the `# FILE:` header the prompt uses, and the
+    /// Creator's `CreatorRequest` gets a plain `SourceFile` it frames itself — and
+    /// not serialized, since the JSON artifact is provenance and the prompt text
+    /// is already in the session's forensics.
     #[serde(skip)]
-    pub text: String,
+    pub body: String,
+}
+
+impl SelectedFile {
+    /// The prompt text for this file: the header plus its body.
+    pub fn framed(&self) -> String {
+        format!("# FILE: {}\n{}", self.path, self.body)
+    }
 }
 
 /// A complete context selection for one role.
@@ -303,7 +324,7 @@ impl ContextSelection {
             out.push_str("\n\n");
         }
         for file in &self.files {
-            out.push_str(&file.text);
+            out.push_str(&file.framed());
             out.push_str("\n\n");
         }
         out.trim_end().to_string()
@@ -336,22 +357,24 @@ impl ContextSelection {
 // ----------------------------------------------------------------------------
 // Budget fill — greedy by score, outline instead of dropping
 // ----------------------------------------------------------------------------
-/// The prompt text for one file: full contents, or an outline when the file is
-/// over `MAX_FILE_BYTES`.
-fn full_text(path: &str, contents: &str) -> String {
-    format!("# FILE: {path}\n{contents}")
+/// The framed bytes of one file: what `SelectedFile::framed` will write.
+fn framed_len(path: &str, body: &str) -> usize {
+    "# FILE: ".len() + path.len() + 1 + body.len()
 }
 
-fn outline_text(path: &str, contents: &str) -> String {
-    let body = outline(path, contents);
+/// The outline body for a file over `MAX_FILE_BYTES`: the outline plus a marker
+/// saying why the file is not shown in full.
+fn outline_body(path: &str, contents: &str) -> String {
     format!(
-        "# FILE: {path}\n# [OUTLINE — this file is over {} KB; signatures and docstrings only]\n{body}",
-        MAX_FILE_BYTES / 1024
+        "# [OUTLINE — this file is over {} KB; signatures and docstrings only]\n{}",
+        MAX_FILE_BYTES / 1024,
+        outline_for(path, contents),
     )
 }
 
-/// A structural outline. Nothing is executed; this is line-based parsing.
-pub fn outline(path: &str, contents: &str) -> String {
+/// The outline for `path`, choosing the Python grammar for `.py`/`.pyi`.
+/// Nothing is executed; this is line-based parsing.
+pub fn outline_for(path: &str, contents: &str) -> String {
     if path.ends_with(".py") || path.ends_with(".pyi") {
         python_outline(contents)
     } else {
@@ -599,6 +622,267 @@ pub fn select_review_context(
 }
 
 // ----------------------------------------------------------------------------
+// Repair-mode selection (item 2) — rank from the issue text only
+// ----------------------------------------------------------------------------
+/// Select the context for a REPAIR run (no patch).
+///
+/// The ranking reads the issue text and nothing else that a real run does not
+/// already have: the tree (for the file tree the model is shown) and the issue
+/// text. No hidden test, no fix commit, no fix diff, no `bug.info` — none is a
+/// parameter and none can be reached from here.
+///
+/// A file scores by the sum of the reasons it was picked for:
+///
+/// * `Path`       — the issue names its path, its basename or its module;
+/// * `Traceback`  — the issue contains a traceback whose frames name it;
+/// * `Identifier` — the issue names a symbol the file defines at module level
+///                  (a `def`/`class`, found by parsing, never by running code);
+/// * `ImportNeighbour` — a module-level import of one of the above, one hop out.
+///
+/// The seed files are the first three; import neighbours are added for them and
+/// score below every seed, so a file the issue names is never displaced by a
+/// neighbour of one. The repo's file tree (paths only) is included so the model
+/// can see what exists beyond the files that fit.
+pub fn select_repair_context(
+    candidates: &[Candidate],
+    issue_text: &str,
+    role: &str,
+    budget_tokens: u32,
+) -> ContextSelection {
+    let module_map = python_module_to_path(candidates);
+    let path_tokens = issue_tokens(issue_text);
+    let frame_tokens = issue_traceback_files(issue_text);
+    let identifiers = issue_identifiers(issue_text);
+
+    let mut reasons: BTreeMap<String, BTreeSet<SelectionReason>> = BTreeMap::new();
+
+    for candidate in candidates {
+        let module = python_module_path(&candidate.path);
+        if matches_path(&path_tokens, &candidate.path, module.as_deref()) {
+            mark_reason(&mut reasons, &candidate.path, SelectionReason::Path);
+        }
+        if matches_path(&frame_tokens, &candidate.path, module.as_deref()) {
+            mark_reason(&mut reasons, &candidate.path, SelectionReason::Traceback);
+        }
+        if !identifiers.is_empty() {
+            let symbols = module_level_symbols(&candidate.path, &candidate.contents);
+            if symbols.iter().any(|symbol| identifiers.contains(symbol)) {
+                mark_reason(&mut reasons, &candidate.path, SelectionReason::Identifier);
+            }
+        }
+    }
+
+    // One hop of import neighbours for the files the issue names. They score
+    // below every seed (see `SelectionReason::weight`), so they fill the budget
+    // only after the named files and their neighbours are in.
+    let seeds: Vec<String> = reasons.keys().cloned().collect();
+    let mut neighbours: BTreeSet<String> = BTreeSet::new();
+    for path in &seeds {
+        if let Some(candidate) = candidates.iter().find(|c| &c.path == path) {
+            neighbours.extend(imported_repo_paths(
+                &candidate.path,
+                &candidate.contents,
+                &module_map,
+            ));
+        }
+    }
+    for path in neighbours {
+        if !reasons.contains_key(&path) {
+            mark_reason(&mut reasons, &path, SelectionReason::ImportNeighbour);
+        }
+    }
+
+    let tree: Vec<String> = candidates.iter().map(|c| c.path.clone()).collect();
+    fill("repair", role, candidates, reasons, budget_tokens, &tree)
+}
+
+/// Record one reason for one path.
+fn mark_reason(
+    reasons: &mut BTreeMap<String, BTreeSet<SelectionReason>>,
+    path: &str,
+    reason: SelectionReason,
+) {
+    reasons.entry(path.to_string()).or_default().insert(reason);
+}
+
+/// The whitespace/punctuation-delimited tokens of the issue, keeping `.` and `/`
+/// so that `heretic/keyword_rate.py` and `heretic.keyword_rate` survive whole.
+pub fn issue_tokens(issue_text: &str) -> BTreeSet<String> {
+    issue_text
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '/' || c == '-'))
+        .map(|token| token.trim_matches(|c: char| c == '.' || c == '/' || c == '-' || c == '_'))
+        .filter(|token| token.len() >= 3 && token.chars().any(|c| c.is_alphanumeric()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The file paths named in a traceback inside the issue: `File "x/y.py", line N`
+/// and the bare `x/y.py:NN` form.
+pub fn issue_traceback_files(issue_text: &str) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for line in issue_text.lines() {
+        if let Some(start) = line.find("File \"") {
+            let rest = &line[start + "File \"".len()..];
+            if let Some(end) = rest.find('"') {
+                let path = rest[..end].trim();
+                if looks_like_source(path) {
+                    out.insert(path.to_string());
+                }
+            }
+        }
+        for raw in line.split_whitespace() {
+            let token = raw.trim_matches(|c: char| "(),;'\"[]".contains(c));
+            if let Some((path, number)) = token.rsplit_once(':') {
+                if !number.is_empty()
+                    && number.chars().all(|c| c.is_ascii_digit())
+                    && looks_like_source(path)
+                {
+                    out.insert(path.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The identifiers the issue names: everything in backticks, plus bare CamelCase
+/// or snake_case words. Dotted spans contribute each segment.
+pub fn issue_identifiers(issue_text: &str) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+
+    let segments: Vec<&str> = issue_text.split('`').collect();
+    for chunk in segments.iter().skip(1).step_by(2) {
+        for piece in chunk.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')) {
+            for segment in piece.split('.') {
+                if is_identifier(segment) && segment.len() >= 2 {
+                    out.insert(segment.to_string());
+                }
+            }
+        }
+    }
+
+    for piece in issue_text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')) {
+        for segment in piece.split('.') {
+            if looks_symbolish(segment) {
+                out.insert(segment.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The module-level `def`/`class` names a file defines, by line-based parsing.
+/// Nothing is imported or executed.
+pub fn module_level_symbols(path: &str, contents: &str) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for line in contents.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue; // not module level
+        }
+        let trimmed = line.trim_end();
+        let name = if path.ends_with(".py") || path.ends_with(".pyi") {
+            python_def_name(trimmed)
+        } else {
+            generic_def_name(trimmed)
+        };
+        if let Some(name) = name {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+fn python_def_name(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix("async def ")
+        .or_else(|| line.strip_prefix("def "))
+        .or_else(|| line.strip_prefix("class "))?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    identifier_or_none(&name)
+}
+
+fn generic_def_name(line: &str) -> Option<String> {
+    for keyword in ["pub fn ", "fn ", "pub struct ", "struct ", "pub enum ", "enum ", "interface ", "function ", "class "] {
+        if let Some(rest) = line.strip_prefix(keyword) {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if let Some(name) = identifier_or_none(&name) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+fn identifier_or_none(name: &str) -> Option<String> {
+    if is_identifier(name) {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+fn is_identifier(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
+        && token.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// CamelCase (starts upper, has a lower) or snake_case (has `_`, all lower-ish).
+fn looks_symbolish(token: &str) -> bool {
+    if !is_identifier(token) || token.len() < 3 {
+        return false;
+    }
+    let first_upper = token.chars().next().is_some_and(|c| c.is_uppercase());
+    let has_lower = token.chars().any(|c| c.is_lowercase());
+    let camel = first_upper && has_lower;
+    let snake = token.contains('_')
+        && token
+            .chars()
+            .all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_');
+    camel || snake
+}
+
+fn looks_like_source(path: &str) -> bool {
+    SOURCE_EXTENSIONS
+        .iter()
+        .any(|ext| path.ends_with(&format!(".{ext}")))
+}
+
+/// Does any token name `candidate_path` — exactly, by basename, by module name,
+/// or as the tail of a longer (e.g. absolute) path?
+fn matches_path(tokens: &BTreeSet<String>, candidate_path: &str, module: Option<&str>) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+    let base = Path::new(candidate_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(candidate_path);
+    if tokens.contains(candidate_path) || tokens.contains(base) {
+        return true;
+    }
+    if let Some(module) = module {
+        if tokens.contains(module) {
+            return true;
+        }
+    }
+    let full_tail = format!("/{candidate_path}");
+    let base_tail = format!("/{base}");
+    tokens
+        .iter()
+        .any(|token| token.ends_with(&full_tail) || token.ends_with(&base_tail))
+}
+
+// ----------------------------------------------------------------------------
 // The shared fill: order by score, then spend the budget
 // ----------------------------------------------------------------------------
 fn fill(
@@ -650,24 +934,24 @@ fn fill(
 
         // A file over the per-file cap is shown as an outline, never dropped.
         let fits_whole = candidate.contents.len() <= MAX_FILE_BYTES;
-        let mut text = if fits_whole {
-            full_text(&path, &candidate.contents)
+        let mut body = if fits_whole {
+            candidate.contents.clone()
         } else {
-            outline_text(&path, &candidate.contents)
+            outline_body(&path, &candidate.contents)
         };
         let mut shown = if fits_whole {
             ShownMode::Full
         } else {
             ShownMode::Outline
         };
-        let mut cost = estimate_tokens(text.len());
+        let mut cost = estimate_tokens(framed_len(&path, &body));
 
         if cost > remaining && fits_whole {
             // Even a file that would fit whole may not fit now; fall back to the
             // outline rather than dropping it.
-            text = outline_text(&path, &candidate.contents);
+            body = outline_body(&path, &candidate.contents);
             shown = ShownMode::Outline;
-            cost = estimate_tokens(text.len());
+            cost = estimate_tokens(framed_len(&path, &body));
         }
 
         if cost > remaining {
@@ -676,16 +960,17 @@ fn fill(
         }
 
         remaining -= cost;
-        total_bytes += text.len();
+        let bytes = framed_len(&path, &body);
+        total_bytes += bytes;
         total_tokens += cost;
         files.push(SelectedFile {
             path,
             score,
             reasons,
-            bytes: text.len(),
+            bytes,
             tokens: cost,
             shown,
-            text,
+            body,
         });
     }
 

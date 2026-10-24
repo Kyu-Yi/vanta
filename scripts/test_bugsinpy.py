@@ -6014,6 +6014,76 @@ class TestABuildRequirementNoPinCoversReachesTheLayer:
             "the build finds it only if it is installed first"
         )
 
+    def test_the_reading_sees_a_declarer_the_closure_walk_added(self, monkeypatch):
+        """The ``luigi/1`` shape: the declarer is a *transitive* pick, not a declared one.
+
+        [VANTA-WHY] The measured regression this class was written for and the fix above
+        still missed. There the declarer of ``setuptools_scm`` is ``ujson==2.0.3``, which
+        the bug's own tree never names — ``sanic==20.3.0`` declares it, so the pick is
+        §3.2's closure walk's. Read only over the pins the layer holds *before* the walk,
+        the reading finds no missing requirement at all: no name is fetched, no pin is
+        dated, and setuptools' ``easy_install`` fetches *today's* ``setuptools_scm`` for
+        ``ujson``'s metadata step — the ``ImportError`` this rule exists to prevent.
+        ``sanic/1`` is the control that hid it: the same ``ujson==2.0.3`` is *declared*
+        in that bug's tree, so the reading saw it there and dated the pin. Here ``demo``
+        stands in for ``sanic`` and ``ujson==2.0.3`` is the measured declarer, down to
+        its own ``setup_requires`` line in the provenance.
+        """
+        releases = dict(_fixture_releases())
+        releases["demo"] = {"1.0": "2019-04-01"}
+        releases["ujson"] = {"1.35": "2018-01-01", "2.0.3": "2019-03-24"}
+        releases["setuptools-scm"] = {"3.3.3": "2019-03-01", "3.4.1": "2019-09-05"}
+
+        def classify(name, version, minor):
+            kind = (
+                bake_mod.SDIST_ONLY if name == "ujson" else bake_mod.INSTALLABLE_WHEEL
+            )
+            return bake_mod.PreflightPin(name, version, kind, "this test's own stub")
+
+        def metadata_of(name, version):
+            if (name, version) == ("demo", "1.0"):
+                return (("ujson (>=1.35)",), None)
+            return TestTheReportPluginFollowsTheBugsPytest._metadata_of(name, version)
+
+        def build_requires_of(name, version):
+            if (name, version) == ("ujson", "2.0.3"):
+                return (
+                    bake_mod.DepRef(
+                        "setuptools_scm",
+                        "setuptools_scm",
+                        "setup_requires (setup.py) line 86",
+                    ),
+                )
+            return ()
+
+        fetched, layers, flagged = _resolve_with_drops(
+            monkeypatch,
+            refs=(bake_mod.dep_ref("demo>=1.0", "requirements.txt line 1"),),
+            classify=classify,
+            metadata_of=metadata_of,
+            build_requires_of=build_requires_of,
+            releases=releases,
+        )
+        assert flagged == []
+        assert layers[0].installs == ("demo==1.0", "ujson==2.0.3"), (
+            "the declarer is the walk's pick, and the walk's picks are installed"
+        )
+        assert fetched.count("setuptools-scm") == 1, (
+            "fetched once, because it has to be dated"
+        )
+        assert "setuptools-scm==3.3.3" in layers[0].build_pins
+        record = next(
+            dep
+            for dep in layers[0].provenance["build_pins"]
+            if dep["name"] == "setuptools-scm"
+        )
+        assert record["declared_by"] == "ujson==2.0.3"
+        assert record["source"] == "ujson==2.0.3 setup_requires (setup.py) line 86"
+        assert record["pin_rule"] == bake_mod.BUILD_REQUIREMENT_PIN_RULE
+        assert layers[0].early_pins == ("setuptools-scm==3.3.3",), (
+            "the build finds it only if it is installed first"
+        )
+
 
 # ============================================================================
 # §3.2's marker rule — a requirement whose marker is false here is not installed

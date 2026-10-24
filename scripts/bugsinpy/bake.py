@@ -8926,6 +8926,76 @@ def narrow_build_pins(
     return out
 
 
+def resolve_build_requirements(
+    built: Sequence[BuildPin],
+    installs: Sequence[str],
+    *,
+    classifier: Callable[[str, str, str], PreflightPin],
+    python_minor: str,
+    build_requires_of: Callable[[str, str], Sequence[DepRef]],
+    fetch: Callable[[str], Mapping[str, str]],
+    releases: dict[str, Mapping[str, str]],
+    commit_date: str,
+) -> list[BuildPin]:
+    """``built`` with a dated pin added for every build requirement nothing here covers.
+
+    §3.2's two build-requirement rules read over the pin list this is handed:
+    :func:`uncovered_build_requirements` names a build requirement no pin in that list
+    covers, :func:`build_requirement_pins` dates it
+    (:data:`BUILD_REQUIREMENT_PIN_RULE`), and :func:`narrow_build_pins` then applies
+    requirement-wins to the toolchain of the extended list — the last of the three
+    because the pin just added is a declarer too: its own build reads the toolchain it
+    is built under, exactly as the pins that were there already do.
+
+    [VANTA-WHY] A function of the pin list, and not a step inside
+    :func:`resolve_bug_deps`, because that list is not final until the closure walk has
+    run: the walk's picks are pins of this layer, so they declare build requirements
+    like any other pin. Measured on ``luigi/1``, the layer this rule was written for and
+    the one it still did not fix: ``ujson==2.0.3`` is a **transitive** pick there
+    (``sanic==20.3.0`` declares it), its ``setup_requires`` names ``setuptools_scm``,
+    and read over the pins the layer held *before* the walk the name was uncovered by
+    nothing and dated by nothing — so ``easy_install`` fetched today's
+    ``setuptools_scm`` for the metadata step, which died on ``from setuptools import
+    sic``, a name no setuptools of that era carries. ``sanic/1`` is the control: the
+    same ``ujson==2.0.3`` is *declared* there, the reading saw it, and that layer built
+    under ``setuptools-scm==3.5.0``. The caller therefore reads this twice — once before
+    the walk, so the toolchain and the walk's own pin list carry what the layer's builds
+    need, and once after it, over the pins the layer ends with.
+
+    ``releases`` is the caller's and is extended in place with the names the reading
+    turns up, which is what ``fetch`` is for: the caller learns those names here
+    (§3.2's "the one place a layer's name list is known only after its own pins are
+    read"), so a test that wants the whole decision without the network passes both in.
+    """
+    pinned = pinned_parts(*build_installs(built), *installs)
+    missing = uncovered_build_requirements(
+        tuple(
+            (name, version)
+            for name, version in pinned
+            if classifier(name, version, python_minor).kind == SDIST_ONLY
+        ),
+        pinned,
+        build_requires_of=build_requires_of,
+        python_minor=python_minor,
+    )
+    if missing:
+        for absent in sorted({item.name for item in missing}):
+            releases.setdefault(absent, fetch(absent))
+        built = [
+            *built,
+            *build_requirement_pins(
+                missing, releases=releases, commit_date=commit_date
+            ),
+        ]
+    return narrow_build_pins(
+        built,
+        pinned_parts(*build_installs(built), *installs),
+        build_requires_of=build_requires_of,
+        python_minor=python_minor,
+        releases=releases,
+    )
+
+
 def bug_sources(
     entry: Mapping[str, Any],
     *,
@@ -9597,39 +9667,24 @@ def resolve_bug_deps(
             # requirements are never fetched and there is nothing to pin. The names are
             # read before the fetch because they are what the fetch is for — this is the
             # one place a layer's name list is known only after its own pins are read.
-            date_rule_pins = pinned_parts(*build_installs(built), *installs_of(resolved))
-            missing = uncovered_build_requirements(
-                tuple(
-                    (name, version)
-                    for name, version in date_rule_pins
-                    if classifier(name, version, minor).kind == SDIST_ONLY
-                ),
-                date_rule_pins,
-                build_requires_of=build_requires_of,
-                python_minor=minor,
-            )
-            if missing:
-                for absent in sorted({item.name for item in missing}):
-                    releases.setdefault(absent, fetch(absent))
-                built = [
-                    *built,
-                    *build_requirement_pins(
-                        missing, releases=releases, commit_date=sources.commit_date
-                    ),
-                ]
-            # §3.2's build-requirement-wins rule, run before the toolchain's pin list
-            # reaches anything else: a build tool one of this layer's own pins refuses to
-            # be built under is moved to the oldest release that pin accepts, and the
-            # record of the move travels on the pin itself (:func:`narrow_build_pins`).
-            # It reads the pin list the *date rule* produced, which is why the two lines
-            # below are computed twice — the second pair is what the walk and the recipe
-            # see.
-            built = narrow_build_pins(
+            #
+            # This is the first of the rule's two readings, over the pins the layer holds
+            # *before* the closure walk, and it has to be here: the toolchain below and
+            # the walk's own pin list are computed from what it returns. The walk's picks
+            # are pins of this layer too and declare build requirements like any other pin
+            # — `luigi/1`'s `ujson==2.0.3` is a *transitive* pick there, and this layer
+            # failing the same way after this rule was added is the measurement — so the
+            # rule is read a second time once the walk has run
+            # (:func:`resolve_build_requirements`).
+            built = resolve_build_requirements(
                 built,
-                pinned_parts(*build_installs(built), *installs_of(resolved)),
-                build_requires_of=build_requires_of,
+                installs_of(resolved),
+                classifier=classifier,
                 python_minor=minor,
+                build_requires_of=build_requires_of,
+                fetch=fetch,
                 releases=releases,
+                commit_date=sources.commit_date,
             )
             # The layer's own pin list, before the closure walk adds to it — the walk
             # starts *at* these pins and stops at them, so a list that already held its
@@ -9691,18 +9746,35 @@ def resolve_bug_deps(
                 transitive, reason_of=reason_of, audit=audit
             )
             dropped.extend(dropped_transitive)
+            # The transitive picks are installed, recorded and gated exactly as the
+            # declared ones are: they are the same kind of pin, chosen by the same rule,
+            # and the only thing that distinguishes them is that no file in the bug's tree
+            # asked for them (:attr:`ResolvedDep.required_by`). The orphans are the other
+            # half of the same walk and the one part of it that is *removed*: they are
+            # carried to the recipe by name and recorded with their reason, and they are
+            # deliberately not in ``provisioned``, which is what makes the freeze gate
+            # their second reader.
+            deps = (*resolved, *transitive)
+            installs = installs_of(deps)
+            # §3.2's build-requirement rules read a second time, now over the pins the
+            # layer *ends* with — the walk's picks are declarers like any other pin, and
+            # they are the ones the first reading could not see
+            # (:func:`resolve_build_requirements`). It returns the toolchain the recipe
+            # below installs, so ``build_specs`` is what the pin list is built from again.
+            built = resolve_build_requirements(
+                built,
+                installs,
+                classifier=classifier,
+                python_minor=minor,
+                build_requires_of=build_requires_of,
+                fetch=fetch,
+                releases=releases,
+                commit_date=sources.commit_date,
+            )
+            build_specs = build_installs(built)
         except BakeError as exc:
             flagged.append(FlaggedBug(key=key, reason=f"{type(exc).__name__}: {exc}"))
             continue
-        # The transitive picks are installed, recorded and gated exactly as the declared
-        # ones are: they are the same kind of pin, chosen by the same rule, and the only
-        # thing that distinguishes them is that no file in the bug's tree asked for them
-        # (:attr:`ResolvedDep.required_by`). The orphans are the other half of the same
-        # walk and the one part of it that is *removed*: they are carried to the recipe by
-        # name and recorded with their reason, and they are deliberately not in
-        # ``provisioned``, which is what makes the freeze gate their second reader.
-        deps = (*resolved, *transitive)
-        installs = installs_of(deps)
         pins = pinned_parts(*build_specs, *installs)
         # §3.2's dropped-dependency pass, and the one thing the pin list cannot say for
         # itself: a drop removes a name from ``installs``, it does not remove the

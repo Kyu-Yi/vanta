@@ -345,6 +345,59 @@ Pinned by `context::tests::the_provenance_line_is_one_space_free_line_of_every_s
 builder) and the `context.select` / `context_selection=` assertions in
 `patch_mode_three_attempt_run_writes_multi_record_session_log` (the write to disk).
 
+Landed in **item 5** — the gate measures the run's selection, on top of item 4 at `bd633bd`. The gate
+used to *re-derive* what the run would send: `context.py` carried a Python mirror of the walk
+(`SOURCE_EXTENSIONS`, `SKIP_DIRS`, `MAX_FILE_BYTES`, `MAX_TOTAL_SOURCE_BYTES`), of the token estimate
+(`BYTES_PER_TOKEN_ESTIMATE`, `estimate_tokens`, `ConcatStats`) and of the prompt frame
+(`PROMPT_FRAME_TOKENS`), and the only thing holding the two implementations together was a test
+asserting they agreed. A gate that measures a *different* prompt from the one the run sends is worse
+than no gate: it can pass a bug the run then refuses, or refuse one it would have accepted, and the
+reason it prints describes neither. The fix is that there is now one implementation and the gate
+calls it:
+
+- **Rust.** `context::select_for_role(tree, issue, patch, role, budget)` is the single entry point
+  (`walk_candidates` → `select_review_context` / `select_repair_context` → the greedy budget fill), and
+  a new client subcommand on the same binary exposes it: `vanta_m3 --select-context --json --repo
+  TREE --issue ISSUE [--patch PATCH] --select-role ROLE --select-budget N` prints a
+  `SelectContextReport` (the mode, the selected files with score/reasons/bytes/tokens/shown, the tree
+  and prune counts, `dropped_for_budget`, the issue and prompt-frame token counts, the estimate and
+  `fits`). Its surface is *exactly* a real run's inputs and nothing else — there is no flag for
+  `FAIL_TO_PASS`, a hidden test, the fix commit, the fix diff or `bug.info`, and
+  `vanta_m3::tests::the_select_context_parser_has_no_flag_for_the_answer` walks the declared flag set
+  (`SELECT_CONTEXT_FLAGS`) so a future flag cannot add one by accident. `parse_args` was split into a
+  testable `parse_args_from(&[String])`, and the subcommand runs before the banner so it writes JSON
+  and nothing else.
+
+- **Python.** `context.py`'s mirror is **deleted**; `select_context()` shells out to that binary,
+  writes the issue text to a temp file and parses the JSON, and `precheck` now needs either an
+  already-computed `selection=` or the `vanta_bin=` to shell out to — there is deliberately **no
+  fallback** (`ContextError: … it has no walk of its own to fall back on`), so a caller that forgot
+  to thread the binary fails loudly instead of silently measuring something else. The rejection
+  reasons are the selection's, not the repo's: `no_prompt_budget`, `prompt_exceeds_budget`, and the
+  new `selection_dropped_for_budget` (the ranking chose a file the budget could not take even as an
+  outline — the one case where the run is shown *less* than the ranking decided).
+  `TestContextConstants` pins the plumbing: `ctx.SELECT_ROLE` must equal the Rust
+  `REPAIR_SOURCE_ROLES`, and the mirror's names must not come back (`not hasattr(ctx, …)`).
+
+- **`prepare` refuses a stale binary.** Because the gate is now the run's own code, `prepare` resolves
+  `vanta_bin`, calls the existing `runner.stale_binary_warning`, and **raises** when the binary was
+  built from an older commit than `HEAD` — a warning would be too late, since the number it is about
+  to write down *is* the gate's own output and no later `run`-time warning could undo it. Pinned by
+  `TestStaleBinary.test_prepare_refuses_to_size_the_gate_against_a_stale_binary`.
+
+- **`localization_hit` is computed after a run, from evidence.** `runner.localization_hit(prep,
+  context_selection)` takes the fix patch's touched **source** paths (`fix_touched_paths` drops the
+  test hunks first — a test path could never be shown, and counting one as a miss would report every
+  bug as unlocalized) and asks whether any of them is among the paths in the `selected=[…]` list of
+  the run's recorded `context_selection=` line (`selected_paths`). It is `None`, not `False`, when the
+  question cannot be answered — no `context_selection` (a batch from before item 4) or a fix that
+  touches only tests — so "no evidence" never pools with "the selection missed". It is written per run
+  in `build_record` and pooled in the digest as `hit` / `miss` / `unknown` per label. Pinned by
+  `TestLocalizationHit`.
+
+The harness suite goes from 917 to **931** tests, all passing; `cargo test --lib` is 338 (the two
+microVM-booting tests skipped on the host, as before) and `cargo test --bin vanta_m3` is 5.
+
 **Expected effect on the re-run.** The 10-of-11 `source_truncated_by_cap` rejections were a
 *whole-repo* measurement, and item 5 changes the gate to measure the selection, so the number to
 watch is not "how much of the repo is in the prompt" but "was the bug's own file selected". The

@@ -783,6 +783,70 @@ def read_run_summary(session_path: Path) -> tuple[str, dict[str, str]]:
     return raw, parse_summary(raw)
 
 
+# ---------------------------------------------------------------------------
+# localization_hit — the paper metric, computed AFTER a run (§1.6.2 item 5)
+# ---------------------------------------------------------------------------
+def selected_paths(context_selection: str) -> list[str]:
+    """The paths in a provenance line's ``selected=[…]`` list.
+
+    The line is ``context::ContextSelection::provenance_line``: one space-free
+    ``key=value`` blob whose ``selected`` list holds
+    ``path@score[reasons]shown:bytesB/tok`` entries joined by ``;`` (and the
+    literal ``none`` when nothing was shown). The path is everything before the
+    first ``@``, and the list ends at ``:pruned=[``: taking the first ``]``
+    instead would cut the entry off inside its own ``[reasons]`` brackets and
+    silently report a shorter name than the one the run was shown. Returns ``[]``
+    for ``none`` and for a line that carries no ``selected`` list.
+    """
+    if not context_selection or context_selection == "none":
+        return []
+    head = context_selection.partition(":pruned=[")[0]
+    if "selected=[" not in head:
+        return []
+    body = head.partition("selected=[")[2]
+    # The list is ``selected=[…]``: its closing ``]`` is still on ``body``. Without
+    # dropping it the literal-empty form ``selected=[none]`` would come back as the
+    # path ``none]`` — a path no tree has, counted as a localization miss forever.
+    if body.endswith("]"):
+        body = body[:-1]
+    if body in ("", "none"):
+        return []
+    return [entry.split("@", 1)[0] for entry in body.split(";") if entry]
+
+
+def fix_touched_paths(prep: prepare_mod.BugPrep) -> list[str]:
+    """The source files the developer's fix touches (§1.6.2 item 5).
+
+    The fix patch's **test** hunks are dropped first: BugsInPy's ``bug_patch.txt``
+    usually updates the test file too, and a test path is never a file the run's
+    source selection could show — the hidden tests are stripped from ``vanta_tree``
+    before any run sees it. Counting a test path as a miss would report every bug
+    as unlocalized, which is the opposite of a metric.
+    """
+    parsed = tree_mod.parse_patch(suite_mod.drop_test_file_hunks(prep.bug.bug_patch_txt))
+    return sorted(set(parsed.paths.changed) | set(parsed.paths.added))
+
+
+def localization_hit(
+    prep: prepare_mod.BugPrep, context_selection: Optional[str]
+) -> Optional[bool]:
+    """Whether a file the fix touched was among those the run was shown.
+
+    ``None`` — not ``False`` — when the question cannot be answered: a summary with
+    no ``context_selection`` (a batch from before §1.6.2 item 4), or a fix whose
+    patch touches only test files (so nothing could have been shown). "No evidence"
+    and "the selection missed" are two different findings and pooling them as
+    ``False`` would report a miss rate over rows that never had a chance.
+    """
+    if context_selection is None:
+        return None
+    touched = fix_touched_paths(prep)
+    if not touched:
+        return None
+    shown = set(selected_paths(context_selection))
+    return any(path in shown for path in touched)
+
+
 def sampling_block(summary: dict[str, str]) -> dict[str, Any]:
     """§7.3's ``sampling`` block, read back from the pipeline's own record.
 
@@ -1027,6 +1091,11 @@ def build_record(
         "timed_out": outcome.timed_out,
         "attempts_run": _int(summary.get("attempts_run")),
         "fixed_at_attempt_1": _bool(summary.get("fixed_at_attempt_1")),
+        # §1.6.2 item 5 — whether the run's own selection included a file the fix
+        # touched, computed here, AFTER the run and never during it: the selector
+        # must not be able to see the answer, so the answer is only ever compared
+        # against the selection afterwards. `null` means "no evidence", not "no".
+        "localization_hit": localization_hit(prep, summary.get("context_selection")),
         "oracle": oracle.as_dict(),
         "label": label_for(outcome.decision, oracle),
         "timings": {
@@ -1824,28 +1893,42 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
                 "vanta_build_dirty": record.get("vanta_build_dirty"),
                 "runs": 0,
                 "labels": {},
+                # §1.6.2 item 5 — the localization metric, pooled per group so the
+                # digest answers "was the bug's own file in the prompt" without a
+                # reader re-deriving it from `context_selection` strings. `unknown`
+                # is rows that carried no evidence, kept apart from `miss`.
+                "localization": {"hit": 0, "miss": 0, "unknown": 0},
             },
         )
         group["runs"] += 1
         label = str(record.get("label"))
         group["labels"][label] = group["labels"].get(label, 0) + 1
+        hit = record.get("localization_hit")
+        group["localization"][
+            "unknown" if hit is None else ("hit" if hit else "miss")
+        ] += 1
     return {"runs": len(records), "groups": list(groups.values())}
 
 
 def render_digest(payload: dict[str, Any]) -> str:
     lines = [
         f"{'config':<10} {'mode':<8} {'seed':>4} {'model':<18} {'harness':<10} "
-        f"{'build':<10} {'runs':>5}  labels",
-        "-" * 106,
+        f"{'build':<10} {'runs':>5}  labels  localization",
+        "-" * 122,
     ]
     for group in payload.get("groups", []):
         harness = str(group.get("harness_commit") or "")[:9]
         build = str(group.get("vanta_build_commit") or "")[:9]
         model = str(group.get("model") or "")[:18]
         labels = " ".join(f"{k}={v}" for k, v in sorted(group["labels"].items()))
+        loc = group.get("localization") or {}
+        localization = " ".join(
+            f"{key}={loc.get(key, 0)}" for key in ("hit", "miss", "unknown")
+        )
         lines.append(
             f"{str(group['config']):<10} {str(group['mode']):<8} {str(group['seed']):>4} "
-            f"{model:<18} {harness:<10} {build:<10} {group['runs']:>5}  {labels}"
+            f"{model:<18} {harness:<10} {build:<10} {group['runs']:>5}  {labels}  "
+            f"{localization}"
         )
     return "\n".join(lines)
 

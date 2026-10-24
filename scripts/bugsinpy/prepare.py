@@ -791,6 +791,10 @@ def write_context_report(
     measured = [prep for prep in preps if prep.context is not None]
     windows = {prep.context.n_ctx for prep in measured}
     budgets = {prep.context.budget_tokens for prep in measured}
+    # The frame is the selector's own number now (``--select-context``'s
+    # ``prompt_frame_tokens``), not a Python constant: there is no second estimate
+    # to keep in step, so it is read back from the measurement rather than mirrored.
+    frames = {prep.context.selection.prompt_frame_tokens for prep in measured}
     resolved = n_ctx if n_ctx is not None else (next(iter(windows)) if len(windows) == 1 else None)
     resolved_source = (
         n_ctx_source
@@ -802,8 +806,12 @@ def write_context_report(
         "kind": "context_report",
         "created_utc": utc_now(),
         "estimator": {
-            "bytes_per_token": ctx.BYTES_PER_TOKEN_ESTIMATE,
-            "prompt_frame_tokens": ctx.PROMPT_FRAME_TOKENS,
+            # [VANTA-WHY] The estimator is the run's own selector, reached by
+            # shelling out (§1.6.2 item 5). Naming it here is the point: this block
+            # used to describe a Python mirror of the Rust walk, and a reader who
+            # trusts a mirror is trusting the one thing the gate must not be.
+            "source": "vanta_m3 --select-context --json (vanta::context)",
+            "prompt_frame_tokens": next(iter(frames)) if len(frames) == 1 else None,
             "output_reserve_tokens": ctx.OUTPUT_RESERVE_TOKENS,
             "chat_overhead_tokens": ctx.CHAT_OVERHEAD_TOKENS,
             "margin_fraction": ctx.CONTEXT_MARGIN_FRACTION,
@@ -888,15 +896,16 @@ def _context_record(prep: BugPrep) -> dict[str, Any]:
             "headroom_tokens": None,
             "n_ctx": None,
             "n_ctx_source": None,
+            "mode": None,
             "source_bytes": None,
             "file_count": None,
-            "source_bytes_eligible": None,
-            "files_eligible": None,
-            "files_skipped_oversize": None,
-            "files_skipped_budget": None,
+            "tree_bytes": None,
+            "tree_count": None,
+            "dropped_for_budget": [],
+            "pruned_count": None,
             "reasons": list(prep.gate_failures),
         }
-    stats = verdict.stats
+    selection = verdict.selection
     return {
         "bug": prep.key,
         "wave": prep.wave,
@@ -911,12 +920,18 @@ def _context_record(prep: BugPrep) -> dict[str, Any]:
         "headroom_tokens": verdict.headroom_tokens,
         "n_ctx": verdict.n_ctx,
         "n_ctx_source": verdict.n_ctx_source,
-        "source_bytes": stats.bytes_included,
-        "file_count": stats.files_included,
-        "source_bytes_eligible": stats.bytes_eligible,
-        "files_eligible": stats.files_eligible,
-        "files_skipped_oversize": stats.files_skipped_oversize,
-        "files_skipped_budget": stats.files_skipped_budget,
+        # The selection itself, straight from the run's own selector: how many bytes
+        # and files went in, how big the tree listing was, which candidates the
+        # ranking chose but the budget could not fit (`dropped_for_budget`) and how
+        # many paths the walk pruned. `files_eligible`/`files_skipped_*` are gone
+        # with the capped walk they described (§1.6.2).
+        "mode": selection.mode,
+        "source_bytes": selection.selected_bytes,
+        "file_count": len(selection.files),
+        "tree_bytes": selection.tree_bytes,
+        "tree_count": selection.tree_count,
+        "dropped_for_budget": list(selection.dropped_for_budget),
+        "pruned_count": len(selection.skipped),
         "reasons": verdict.reasons,
     }
 
@@ -939,7 +954,7 @@ def render_context_table(preps: list[BugPrep]) -> str:
         lines.append(
             f"{prep.key:<18} {prep.prepare_mode:<12} {verdict.estimated_prompt_tokens:>8} "
             f"{'—':>9} {verdict.budget_tokens:>7} {verdict.headroom_tokens:>+9} "
-            f"{verdict.stats.bytes_included:>9} {verdict.stats.files_included:>6}  "
+            f"{verdict.selection.selected_bytes:>9} {len(verdict.selection.files):>6}  "
             f"{'ok' if verdict.context_ok else 'REJECT'}"
         )
     return "\n".join(lines)
@@ -1077,12 +1092,17 @@ def prepare_one(
     full: bool,
     n_ctx: int,
     n_ctx_source: str,
+    vanta_bin: Path,
 ) -> BugPrep:
     """Everything ``prepare`` does for one bug, in the order §1.3 fixes.
 
     ``n_ctx`` is required and threaded into both prechecks: the gate is only worth
     running if it measures the window the *run* will use, and the caller resolves
     that once for the whole batch (§1.6.1) rather than each bug guessing.
+
+    ``vanta_bin`` is the ``vanta_m3`` the batch's rows will measure: the gate
+    shells out to it (§1.6.2 item 5), so the selection it measures is the run's
+    own, not a second walk that only a test ever claimed agreed with it.
     """
     project = entry["project"]
     bug_id = int(entry["bug_id"])
@@ -1113,7 +1133,11 @@ def prepare_one(
     # saves the three double suite runs on a bug that cannot fit anyway — which is
     # the whole point of the precheck for a candidate like youtube-dl.
     early = ctx.precheck(
-        prep.root / "oracle_tree", "", n_ctx=n_ctx, n_ctx_source=n_ctx_source
+        prep.root / "oracle_tree",
+        "",
+        n_ctx=n_ctx,
+        n_ctx_source=n_ctx_source,
+        vanta_bin=vanta_bin,
     )
     if not early.context_ok:
         prep.context = early
@@ -1198,6 +1222,7 @@ def prepare_one(
         prep.issue.text if prep.issue else "",
         n_ctx=n_ctx,
         n_ctx_source=n_ctx_source,
+        vanta_bin=vanta_bin,
     )
     return prep
 

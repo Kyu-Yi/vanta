@@ -769,6 +769,38 @@ pub fn select_repair_context(
     fill("repair", role, candidates, reasons, budget_tokens, &tree)
 }
 
+/// Select the context a role is shown from the inputs a REAL run has, and only
+/// those: the tree, the issue text, the patch under review (when there is one),
+/// the role, and the budget.
+///
+/// [VANTA-WHY] This is the entry point `vanta_m3 --select-context --json` calls,
+/// so the harness's context gate measures the very selection the run will send
+/// rather than a re-derivation of it. It has no parameter for `FAIL_TO_PASS`, a
+/// hidden test, the fix commit, the fix diff or `bug.info`, and none of those can
+/// be reached from here — a gate that could see the answer would size the prompt
+/// around it.
+pub fn select_for_role(
+    tree: &Path,
+    issue_text: &str,
+    patch_text: Option<&str>,
+    role: &str,
+    budget_tokens: u32,
+) -> ContextSelection {
+    let (candidates, skipped) = walk_candidates(tree);
+    let mut selection = match patch_text {
+        Some(patch) => {
+            let touched: BTreeSet<String> = crate::agents::creator::split_patch_into_files(patch)
+                .keys()
+                .cloned()
+                .collect();
+            select_review_context(&candidates, &touched, role, budget_tokens)
+        }
+        None => select_repair_context(&candidates, issue_text, role, budget_tokens),
+    };
+    selection.skipped = skipped;
+    selection
+}
+
 /// Record one reason for one path.
 fn mark_reason(
     reasons: &mut BTreeMap<String, BTreeSet<SelectionReason>>,

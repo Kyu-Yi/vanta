@@ -229,6 +229,20 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         flush=True,
     )
 
+    # The context gate shells out to the run's own selector (§1.6.2 item 5), so the
+    # binary is not optional here and it may not be stale: a gate that measured an
+    # older Vanta's selection would pass a bug with a verdict the run then refutes
+    # with a different prompt. `run` warns about this (§7.3); `prepare` refuses,
+    # because the number it is about to write down is the gate's own output.
+    vanta_bin = runner_mod.require_vanta_bin(args.vanta_bin.resolve())
+    stale_warning = runner_mod.stale_binary_warning(vanta_bin)
+    if stale_warning:
+        raise runner_mod.RunnerError(
+            f"{stale_warning} `prepare` cannot size the context gate against it: the "
+            "gate shells out to this binary, so every verdict it writes would describe "
+            "a Vanta the batch will not run."
+        )
+
     # Preflight the checkpoints for everything that will run a suite, and the
     # dependency provenance the bake recorded, before the first checkout: a missing
     # layer is a batch-level mistake (§3.3) and a layer baked without a record is
@@ -289,6 +303,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
                 full=full,
                 n_ctx=n_ctx,
                 n_ctx_source=n_ctx_source,
+                vanta_bin=vanta_bin,
             )
         except Exception as exc:  # one bug must not take the batch down
             detail = f"{type(exc).__name__}: {exc}"
@@ -814,6 +829,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="prepare only these bugs (repeatable); forces full preparation",
     )
     prep.add_argument("--waves", default="", help="comma-separated wave numbers")
+    prep.add_argument(
+        "--vanta-bin",
+        type=Path,
+        default=runner_mod.DEFAULT_VANTA_BIN,
+        help=(
+            "the vanta_m3 binary the context gate shells out to and the run will use "
+            "(default: target/release/vanta_m3). `prepare` refuses a binary older than "
+            "the Rust sources: the gate measures that binary's selection, so a stale "
+            "one would write verdicts for a Vanta the batch will not run."
+        ),
+    )
     prep.add_argument(
         "--n-ctx",
         type=int,

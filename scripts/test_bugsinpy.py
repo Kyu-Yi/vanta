@@ -13,8 +13,8 @@ rather than an error:
 * a token stripped from the issue text that the buggy tree actually contains
   (the bug becomes unsolvable, and the low resolve rate looks like a model
   failure),
-* a context precheck measuring a different walk from ``repo::collect_source_files``
-  (bugs are rejected, or worse accepted, for the wrong reason).
+* a context gate measuring a *mirror* of the run's selector instead of the
+  selector itself (bugs are rejected, or worse accepted, for the wrong reason).
 
 Nothing in this file executes the project under test. The suite runner's Shuru
 wrappers are covered structurally (``build_command``, ``drop_test_file_hunks``),
@@ -153,6 +153,50 @@ def prep(**over) -> prepare_mod.BugPrep:
     base = dict(bug=bug_info(), root=Path("/nonexistent"), role="pilot", wave=1, test_cmd=["x"])
     base.update(over)
     return prepare_mod.BugPrep(**base)
+
+
+def selection(**over) -> ctx.Selection:
+    """A ``Selection`` shaped like ``vanta_m3 --select-context --json``'s answer.
+
+    Built directly rather than by running the binary: the tests that use it are
+    about what the gate *does* with a selection, and the shell-out itself is
+    covered on its own in ``TestSelectContext``.
+    """
+    base = dict(
+        role=ctx.SELECT_ROLE,
+        mode="repair",
+        budget_tokens=65_280,
+        files=[
+            ctx.SelectedFile(
+                path="pkg/core.py",
+                score=42,
+                reasons=["path", "traceback"],
+                bytes=700,
+                tokens=175,
+                shown="full",
+            )
+        ],
+        tree_count=1,
+        selected_bytes=700,
+        selected_tokens=175,
+        tree_bytes=8,
+        tree_tokens=2,
+        dropped_for_budget=[],
+        skipped=[],
+        issue_tokens=0,
+        prompt_frame_tokens=3_000,
+        prompt_tokens_estimate=3_177,
+        fits=True,
+    )
+    base.update(over)
+    return ctx.Selection(**base)
+
+
+def stub_vanta(path: Path, body: str) -> Path:
+    """An executable ``vanta_m3`` stand-in, so the shell-out is tested as a shell-out."""
+    script = write(path, "#!/usr/bin/env python3\n" + body)
+    script.chmod(0o755)
+    return script
 
 
 def _bug_deps(
@@ -322,7 +366,7 @@ class TestSplit:
                             "estimated_prompt_tokens": 68376,
                             "headroom_tokens": -3096,
                             "verdict": "reject",
-                            "reasons": ["source_truncated_by_cap: ..."],
+                            "reasons": ["prompt_exceeds_budget: ..."],
                         }
                     ],
                 }
@@ -1539,37 +1583,47 @@ class TestDeclaredFailToPass:
 
 
 # ============================================================================
-# context.py — the precheck must measure Vanta's walk, not a similar one
+# context.py — the gate measures the run's own selection, not a mirror of it
 # ============================================================================
 class TestContextConstants:
-    def test_match_src_repo_mod_rs(self):
-        """A drift here makes the precheck measure a different prompt.
+    def test_the_role_matches_the_runs_own_repair_roles(self):
+        """A drift here makes the gate label the prompt differently from the run.
 
-        The constants are duplicated in Python and Rust on purpose (the harness
-        must not link the crate), so the duplication is asserted rather than
-        trusted.
+        The label does not change WHAT is selected, but it is written into the
+        selection (and so into the run's ``context.select`` row): a gate that
+        labelled an identical prompt differently would make two identical prompts
+        look like two experiments. Pinned against the one place the run reads it.
         """
-        source = (REPO_ROOT / "src" / "repo" / "mod.rs").read_text(encoding="utf-8")
+        driver = (REPO_ROOT / "src" / "pipeline" / "driver.rs").read_text(encoding="utf-8")
+        match = re.search(r'const REPAIR_SOURCE_ROLES: &str = "([^"]+)";', driver)
+        assert match, "REPAIR_SOURCE_ROLES not found in src/pipeline/driver.rs"
+        assert match.group(1) == ctx.SELECT_ROLE
 
-        def string_list(name: str) -> set[str]:
-            body = re.search(
-                rf"const {name}: &\[&str\] = &\[(.*?)\];", source, re.DOTALL
-            )
-            assert body, f"{name} not found in src/repo/mod.rs"
-            return set(re.findall(r'"([^"]+)"', body.group(1)))
+    def test_the_gate_keeps_no_walk_of_its_own(self):
+        """One implementation, reached by shelling out (§1.6.2 item 5).
 
-        def number(name: str) -> int:
-            body = re.search(rf"const {name}: usize = ([^;]+);", source)
-            assert body, f"{name} not found in src/repo/mod.rs"
-            return eval(body.group(1), {"__builtins__": {}}, {})  # noqa: S307
+        ``context.py`` used to re-derive the walk (extensions, skip dirs, the two
+        caps) and the token estimate in Python, and the two "mirrors" could only
+        ever be asserted to agree. Every one of those names has to be gone: a
+        module that still has them can still measure a prompt the run would not
+        send, which is the failure this whole module was reduced to a shell-out to
+        avoid.
+        """
+        for name in (
+            "SOURCE_EXTENSIONS",
+            "SKIP_DIRS",
+            "MAX_FILE_BYTES",
+            "MAX_TOTAL_SOURCE_BYTES",
+            "BYTES_PER_TOKEN_ESTIMATE",
+            "PROMPT_FRAME_TOKENS",
+            "estimate_tokens",
+            "measure_tree",
+            "ConcatStats",
+        ):
+            assert not hasattr(ctx, name), f"context.py still mirrors {name}"
 
-        assert string_list("SOURCE_EXTENSIONS") == ctx.SOURCE_EXTENSIONS
-        assert string_list("SKIP_DIRS") == ctx.SKIP_DIRS
-        assert number("MAX_FILE_BYTES") == ctx.MAX_FILE_BYTES
-        assert number("MAX_TOTAL_SOURCE_BYTES") == ctx.MAX_TOTAL_SOURCE_BYTES
-
-    def test_the_estimator_and_the_output_reserve_match_the_run_time_guard(self):
-        """The precheck's boundary must be the guard's boundary, not near it.
+    def test_the_output_reserve_matches_the_run_time_guard(self):
+        """The gate's boundary must be the guard's boundary, not near it.
 
         ``context_budget_exceeded`` (in ``src/llm/mod.rs``) compares ``prompt +
         output + overhead > n_ctx``, and its ``output`` is the request body's
@@ -1578,20 +1632,18 @@ class TestContextConstants:
         Creator's literal out of ``src/agents/creator.rs`` and into the table, so
         the table is what this test reads, not a copy of the number. If the
         Creator's ``max_tokens`` grew and this module kept subtracting 32768, the
-        precheck would silently accept prompts the guard rejects, and the run
-        would die at attempt 1 after a checkpoint and a wave had been spent. So
-        the value is asserted against the table the request bodies are built from.
+        gate would silently accept prompts the guard rejects, and the run would die
+        at attempt 1 after a checkpoint and a wave had been spent. So the value is
+        asserted against the table the request bodies are built from.
         """
         llm = (REPO_ROOT / "src" / "llm" / "mod.rs").read_text(encoding="utf-8")
 
-        bytes_per_token = re.search(
-            r"const TOKEN_ESTIMATE_BYTES_PER_TOKEN: u32 = (\d+);", llm
-        )
         overhead = re.search(r"const CHAT_OVERHEAD_TOKENS: u32 = (\d+);", llm)
-        assert bytes_per_token, "TOKEN_ESTIMATE_BYTES_PER_TOKEN not found in src/llm/mod.rs"
         assert overhead, "CHAT_OVERHEAD_TOKENS not found in src/llm/mod.rs"
-        assert int(bytes_per_token.group(1)) == ctx.BYTES_PER_TOKEN_ESTIMATE
         assert int(overhead.group(1)) == ctx.CHAT_OVERHEAD_TOKENS
+        # The estimate itself is the subcommand's number now; the harness only
+        # shares the two guard terms with the Rust.
+        assert "TOKEN_ESTIMATE_BYTES_PER_TOKEN" in llm
 
         block = llm.split("pub const SAMPLING_SCHEDULE", 1)[1].split("];", 1)[0]
         pinned = {
@@ -1611,16 +1663,22 @@ class TestContextConstants:
         # so needs no term of its own.
         assert max(pinned.values()) == ctx.OUTPUT_RESERVE_TOKENS, pinned
 
-    def test_estimate_tokens_rounds_up_like_the_rust_does(self):
-        """``conservative_token_estimate`` ceils; a truncated mirror under-counts."""
-        rust = (REPO_ROOT / "src" / "llm" / "mod.rs").read_text(encoding="utf-8")
-        assert "bytes % TOKEN_ESTIMATE_BYTES_PER_TOKEN != 0" in rust  # the ceil
+    def test_the_gate_does_not_recompute_the_estimate(self):
+        """The estimate is the subcommand's number, passed through untouched.
 
-        assert ctx.estimate_tokens(0) == 0
-        assert ctx.estimate_tokens(1) == 1
-        assert ctx.estimate_tokens(4) == 1
-        assert ctx.estimate_tokens(5) == 2
-        assert ctx.estimate_tokens(4097) == 1025
+        Recomputing it here (the ``estimate_tokens`` mirror this module dropped) is
+        the second implementation in a different coat: the gate would then agree
+        with the run only for as long as the two stayed in step, which is a
+        property no test can pin by echoing the number back.
+        """
+        verdict = ctx.precheck(
+            Path("/nonexistent"),
+            "",
+            n_ctx=131_072,
+            n_ctx_source="test",
+            selection=selection(prompt_tokens_estimate=1_234),
+        )
+        assert verdict.estimated_prompt_tokens == 1_234
 
 
 class TestContextBudget:
@@ -1632,64 +1690,56 @@ class TestContextBudget:
         assert margin == 32_768
         assert 131_072 - ctx.OUTPUT_RESERVE_TOKENS - ctx.CHAT_OVERHEAD_TOKENS - margin == budget
 
-    def test_the_budget_is_just_under_vantas_own_source_cap(self):
-        """A coincidence worth keeping an eye on: 65280 tok ~ 255 KB < 256 KB."""
-        budget, _ = ctx.budget_tokens(131_072)
-        assert budget * ctx.BYTES_PER_TOKEN_ESTIMATE < ctx.MAX_TOTAL_SOURCE_BYTES
-
-    def test_headroom_is_what_the_prompt_may_still_grow_by(self, tmp_path):
-        write(tmp_path / "a.py", "x = 1\n")
-        verdict = ctx.precheck(tmp_path, "", n_ctx=131_072, n_ctx_source="test")
+    def test_headroom_is_what_the_prompt_may_still_grow_by(self):
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=131_072, n_ctx_source="test",
+            selection=selection(),
+        )
         assert verdict.headroom_tokens == verdict.budget_tokens - verdict.estimated_prompt_tokens
         assert verdict.output_reserve_tokens == ctx.OUTPUT_RESERVE_TOKENS
         assert verdict.to_dict()["headroom_tokens"] == verdict.headroom_tokens
 
-    def test_a_window_below_the_output_reserve_has_no_prompt_budget(self, tmp_path):
+    def test_a_window_below_the_output_reserve_has_no_prompt_budget(self):
         """Every real prompt is rejected *and* the reason says the window itself is
         the problem — otherwise a misconfigured server looks like a fat repo."""
-        write(tmp_path / "a.py", "x = 1\n")
-        verdict = ctx.precheck(tmp_path, "", n_ctx=32_768, n_ctx_source="test")
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=32_768, n_ctx_source="test",
+            selection=selection(),
+        )
         assert verdict.context_ok is False
         assert any(r.startswith("no_prompt_budget") for r in verdict.reasons)
         assert verdict.budget_tokens <= 0
 
-    def test_the_source_cap_alone_can_exceed_the_budget(self, tmp_path):
-        """The 256 KB cap is *not* the binding constraint — this budget is.
+    def test_a_selection_that_does_not_fit_the_budget_is_rejected(self):
+        """The binding constraint is the *selected* prompt, not the repo.
 
-        Filling Vanta's own total cap exactly (untruncated, so the walk reports no
-        rejection of its own) still estimates at 65536 tok, and 65536 + the 3000-tok
-        frame is over the 65280 budget. So a repo can pass Vanta's cap and still be
-        refused here, for a reason that is about the model's window rather than
-        about the walk.
+        The old gate compared a 256 KB whole-repo cap against the window, so a repo
+        under the cap could never be refused for size. The selection can be small
+        and still be over the budget, and it is the selection that is measured now.
         """
-        for index in range(4):  # 4 x 64 KB = the total cap exactly, none oversize
-            blob(tmp_path / f"f{index}.py", ctx.MAX_FILE_BYTES)
-        verdict = ctx.precheck(tmp_path, "", n_ctx=131_072, n_ctx_source="test")
-
-        assert verdict.stats.bytes_included == ctx.MAX_TOTAL_SOURCE_BYTES
-        assert verdict.stats.truncated is False
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=131_072, n_ctx_source="test",
+            selection=selection(prompt_tokens_estimate=70_000, fits=False),
+        )
+        assert verdict.estimated_prompt_tokens == 70_000
+        assert verdict.estimated_prompt_tokens > verdict.budget_tokens
+        assert verdict.context_ok is False
         assert verdict.reasons == [
             r for r in verdict.reasons if r.startswith("prompt_exceeds_budget")
         ]
-        assert verdict.estimated_prompt_tokens == 65_536 + ctx.PROMPT_FRAME_TOKENS
-        assert verdict.estimated_prompt_tokens > verdict.budget_tokens
-        assert verdict.context_ok is False
 
-    def test_the_precheck_is_stricter_than_the_guard_by_exactly_the_margin(self, tmp_path):
+    def test_the_precheck_is_stricter_than_the_guard_by_exactly_the_margin(self):
         """A prompt between the budget and the guard's limit: Vanta would run it,
-        the harness refuses it — and the gap *is* the feedback-growth margin.
-
-        The issue text is what makes that band reachable: it is not part of the
-        source walk and therefore not capped by ``MAX_TOTAL_SOURCE_BYTES``.
-        """
+        the harness refuses it — and the gap *is* the feedback-growth margin."""
         n_ctx = 131_072
         budget, margin = ctx.budget_tokens(n_ctx)
         guard_limit = n_ctx - ctx.OUTPUT_RESERVE_TOKENS - ctx.CHAT_OVERHEAD_TOKENS
         assert guard_limit - budget == margin
 
-        write(tmp_path / "a.py", "x = 1\n")
-        issue = "a" * ((budget + 512 - ctx.PROMPT_FRAME_TOKENS - 2) * 4)
-        verdict = ctx.precheck(tmp_path, issue, n_ctx=n_ctx, n_ctx_source="test")
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=n_ctx, n_ctx_source="test",
+            selection=selection(prompt_tokens_estimate=budget + 512),
+        )
         assert verdict.estimated_prompt_tokens > budget
         assert verdict.estimated_prompt_tokens <= guard_limit
         assert verdict.context_ok is False
@@ -1698,32 +1748,40 @@ class TestContextBudget:
 class TestRenderContextSizes:
     """``context_sizes.md`` is read to *choose the pilot set*, so it states the rule."""
 
-    def test_the_report_shows_the_budget_derivation(self, tmp_path):
-        write(tmp_path / "a.py", "x = 1\n")
-        verdict = ctx.precheck(tmp_path, "", n_ctx=131_072, n_ctx_source="test")
+    def test_the_report_shows_the_budget_derivation(self):
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=131_072, n_ctx_source="test",
+            selection=selection(),
+        )
         text = ctx.render_markdown([("Demo/1", "pilot", verdict)])
         assert "budget = n_ctx" in text
         assert "65280 = 131072 − 32768 − 256 − 32768" in text
-        assert "`TOKEN_ESTIMATE_BYTES_PER_TOKEN`" in text
+        assert "--select-context --json" in text
         assert "| Demo/1 | pilot | ok | 131072 (test)" in text
-        assert "| headroom |" in text
+        assert "headroom tok" in text
 
-    def test_a_mixed_window_is_called_out_rather_than_averaged(self, tmp_path):
-        write(tmp_path / "a.py", "x = 1\n")
+    def test_a_mixed_window_is_called_out_rather_than_averaged(self):
         rows = [
-            ("Demo/1", "pilot", ctx.precheck(tmp_path, "", n_ctx=131_072, n_ctx_source="a")),
-            ("Demo/2", "reserve", ctx.precheck(tmp_path, "", n_ctx=65_536, n_ctx_source="b")),
+            ("Demo/1", "pilot", ctx.precheck(
+                Path("/nonexistent"), "", n_ctx=131_072, n_ctx_source="a",
+                selection=selection(),
+            )),
+            ("Demo/2", "reserve", ctx.precheck(
+                Path("/nonexistent"), "", n_ctx=65_536, n_ctx_source="b",
+                selection=selection(),
+            )),
         ]
         text = ctx.render_markdown(rows)
         assert "More than one window was measured" in text
 
-    def test_a_fallback_window_is_flagged_as_not_a_decision(self, tmp_path):
+    def test_a_fallback_window_is_flagged_as_not_a_decision(self):
         """The first measure-only run silently used the 65536 fallback and rejected
         13 of 14 candidates; a report that can be read as a decision must say so."""
-        write(tmp_path / "a.py", "x = 1\n")
         verdict = ctx.precheck(
-            tmp_path, "", n_ctx=ctx.FALLBACK_CONTEXT_TOKENS,
+            Path("/nonexistent"), "",
+            n_ctx=ctx.FALLBACK_CONTEXT_TOKENS,
             n_ctx_source="fallback (server unreachable)",
+            selection=selection(),
         )
         text = ctx.render_markdown([("Demo/1", "pilot", verdict)])
         assert "**Not a decision.**" in text
@@ -1775,12 +1833,14 @@ class TestContextReport:
     """§1.6 measurements live here and in ``prepare.json``, never in the split."""
 
     @staticmethod
-    def _verdict(tmp_path, n_ctx=131_072, source="test"):
-        write(tmp_path / "a.py", "x = 1\n")
-        return ctx.precheck(tmp_path, "", n_ctx=n_ctx, n_ctx_source=source)
+    def _verdict(n_ctx=131_072, source="test", **selection_over):
+        return ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=n_ctx, n_ctx_source=source,
+            selection=selection(**selection_over),
+        )
 
     def test_the_report_carries_what_a_swap_decision_needs(self, tmp_path):
-        verdict = self._verdict(tmp_path)
+        verdict = self._verdict()
         path = prepare_mod.write_context_report(tmp_path, [prep(context=verdict)])
         report = json.loads(path.read_text(encoding="utf-8"))
         assert report["kind"] == "context_report"
@@ -1793,13 +1853,16 @@ class TestContextReport:
         assert bug["estimated_prompt_tokens"] == verdict.estimated_prompt_tokens
         assert bug["budget_tokens"] == 65_280
         assert bug["headroom_tokens"] == verdict.headroom_tokens
-        assert bug["source_bytes"] == verdict.stats.bytes_included
-        assert bug["file_count"] == verdict.stats.files_included
+        assert bug["source_bytes"] == verdict.selection.selected_bytes
+        assert bug["file_count"] == len(verdict.selection.files)
+        assert bug["mode"] == verdict.selection.mode
+        assert bug["tree_count"] == verdict.selection.tree_count
+        assert bug["pruned_count"] == len(verdict.selection.skipped)
 
     def test_real_tokens_are_null_until_a_run_has_paid_for_the_prompt(self, tmp_path):
         """The estimate is uncalibrated (~1.5x high on heretic), so the real number
         has to be a separate, explicitly-empty field rather than the same one."""
-        verdict = self._verdict(tmp_path)
+        verdict = self._verdict()
         report = json.loads(
             prepare_mod.write_context_report(
                 tmp_path, [prep(context=verdict)]
@@ -1811,9 +1874,7 @@ class TestContextReport:
         assert bug["prompt_tokens_real"] != bug["estimated_prompt_tokens"]
 
     def test_a_reject_carries_its_reasons(self, tmp_path):
-        for index in range(5):
-            blob(tmp_path / f"mod{index}.py", 60_000)
-        verdict = ctx.precheck(tmp_path, "", n_ctx=131_072, n_ctx_source="test")
+        verdict = self._verdict(dropped_for_budget=["pkg/core.py"])
         assert verdict.context_ok is False
         report = json.loads(
             prepare_mod.write_context_report(
@@ -1823,7 +1884,8 @@ class TestContextReport:
         bug = report["bugs"][0]
         assert bug["verdict"] == "reject"
         assert bug["reasons"] == verdict.reasons
-        assert "truncated" in bug["reasons"][0]
+        assert "dropped_for_budget" in bug["reasons"][0]
+        assert bug["dropped_for_budget"] == ["pkg/core.py"]
 
     def test_a_bug_that_was_never_measured_says_why(self, tmp_path):
         report = json.loads(
@@ -1839,7 +1901,6 @@ class TestContextReport:
 
     def test_a_fallback_window_is_flagged_in_the_json(self, tmp_path):
         verdict = self._verdict(
-            tmp_path,
             n_ctx=ctx.FALLBACK_CONTEXT_TOKENS,
             source="fallback (server unreachable)",
         )
@@ -1852,7 +1913,7 @@ class TestContextReport:
         assert report["n_ctx"] == ctx.FALLBACK_CONTEXT_TOKENS
 
     def test_the_table_prints_both_token_columns(self, tmp_path):
-        verdict = self._verdict(tmp_path)
+        verdict = self._verdict()
         table = prepare_mod.render_context_table(
             [prep(context=verdict), prep(bug=bug_info(bug_id=2))]
         )
@@ -1866,7 +1927,7 @@ class TestContextReport:
     def test_the_report_records_the_window_the_batch_was_sized_against(self, tmp_path):
         """The caller-resolved window wins over the per-verdict one: it is the one
         number ``run`` compares its own against (§1.6.1)."""
-        verdict = self._verdict(tmp_path, n_ctx=131_072, source="server /props")
+        verdict = self._verdict(n_ctx=131_072, source="server /props")
         report = json.loads(
             prepare_mod.write_context_report(
                 tmp_path, [prep(context=verdict)], n_ctx=131_072, n_ctx_source="--n-ctx"
@@ -1891,9 +1952,11 @@ class TestContextReport:
 class TestTheSummaryNamesTheWindow:
     """``prepare_summary.md`` states which window it sized against, and its source."""
 
-    def test_the_window_and_its_source_are_printed_above_the_table(self, tmp_path):
-        write(tmp_path / "a.py", "x = 1\n")
-        verdict = ctx.precheck(tmp_path, "", n_ctx=131_072, n_ctx_source="--n-ctx")
+    def test_the_window_and_its_source_are_printed_above_the_table(self):
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=131_072, n_ctx_source="--n-ctx",
+            selection=selection(),
+        )
         text = prepare_mod.render_summary(
             [prep(context=verdict)], n_ctx=131_072, n_ctx_source="--n-ctx"
         )
@@ -1937,70 +2000,173 @@ class TestTheSplitIsAnInput:
             assert not (set(entry) & split_mod.DERIVED_BUG_KEYS), entry["project"]
 
 
-class TestMeasureTree:
-    def test_filters_extensions_and_skip_dirs(self, tmp_path):
-        write(tmp_path / "pkg" / "mod.py", "x = 1\n")
-        write(tmp_path / "tests" / "test_a.py", "def test_a():\n    pass\n")
-        write(tmp_path / "README.md", "not source\n")
-        write(tmp_path / "__pycache__" / "mod.py", "cached\n")
-        write(tmp_path / "build" / "gen.py", "generated\n")
-        stats = ctx.measure_tree(tmp_path)
-        assert stats.files_eligible == 2
-        assert stats.files_included == 2
-        assert stats.truncated is False
+class TestSelectContext:
+    """The gate measures by running the run's own selector — that is the point.
 
-    def test_oversize_file_is_skipped_not_truncated(self, tmp_path):
-        blob(tmp_path / "big.py", ctx.MAX_FILE_BYTES + 1)
-        write(tmp_path / "small.py", "x = 1\n")
-        stats = ctx.measure_tree(tmp_path)
-        assert stats.files_eligible == 2
-        assert stats.files_skipped_oversize == 1
-        assert stats.files_included == 1
+    ``context.py`` no longer walks a tree (§1.6.2 item 5): it shells out to
+    ``vanta_m3 --select-context --json`` and parses the answer. These tests cover
+    the shell-out itself — the argv it builds, the JSON it parses, and the ways it
+    can fail — so the *selector's* behaviour stays in the Rust tests.
+    """
 
-    def test_total_budget_bites(self, tmp_path):
-        for index in range(5):
-            blob(tmp_path / f"f{index}.py", 60 * 1024)
-        stats = ctx.measure_tree(tmp_path)
-        assert stats.files_eligible == 5
-        assert stats.files_included == 4  # 4 x 60 KB fits under 256 KB, the 5th does not
-        assert stats.files_skipped_budget == 1
-        assert stats.bytes_included <= ctx.MAX_TOTAL_SOURCE_BYTES
-        assert stats.truncated is True
+    PAYLOAD = {
+        "role": ctx.SELECT_ROLE,
+        "mode": "repair",
+        "budget_tokens": 65_280,
+        "files": [
+            {
+                "path": "pkg/core.py",
+                "score": 42,
+                "reasons": ["path", "traceback"],
+                "bytes": 700,
+                "tokens": 175,
+                "shown": "full",
+            }
+        ],
+        "tree_count": 3,
+        "selected_bytes": 700,
+        "selected_tokens": 175,
+        "tree_bytes": 40,
+        "tree_tokens": 10,
+        "dropped_for_budget": ["pkg/huge.py"],
+        "skipped": [{"path": "vendor/x.py", "reason": "vendored"}],
+        "issue_tokens": 50,
+        "prompt_frame_tokens": 3_000,
+        "prompt_tokens_estimate": 3_225,
+        "fits": True,
+    }
 
-    def test_reports_the_largest_files(self, tmp_path):
-        blob(tmp_path / "a.py", 300)
-        blob(tmp_path / "b.py", 900)
-        stats = ctx.measure_tree(tmp_path)
-        assert stats.largest_files[0][0] == "b.py"
+    @classmethod
+    def _stub(cls, tmp_path, *, capture=None, extra=""):
+        """A ``vanta_m3`` that answers like the real one, optionally recording argv."""
+        lines = ["import json, sys"]
+        if capture is not None:
+            lines.append(f"open({str(capture)!r}, 'w').write('\\n'.join(sys.argv[1:]))")
+        lines.append(f"sys.stdout.write({json.dumps(cls.PAYLOAD)!r})")
+        return stub_vanta(tmp_path / "vanta_m3", "\n".join(lines) + "\n" + extra)
+
+    def test_it_parses_the_subcommands_json(self, tmp_path):
+        binary = self._stub(tmp_path)
+        got = ctx.select_context(
+            tmp_path, "an issue", vanta_bin=binary, budget_tokens=65_280
+        )
+        assert got.role == ctx.SELECT_ROLE
+        assert got.mode == "repair"
+        assert [file.path for file in got.files] == ["pkg/core.py"]
+        assert got.files[0].reasons == ["path", "traceback"]
+        assert got.files[0].shown == "full"
+        assert got.skipped == [("vendor/x.py", "vendored")]
+        assert got.dropped_for_budget == ["pkg/huge.py"]
+        assert got.tree_count == 3
+        assert got.prompt_tokens_estimate == 3_225
+        assert got.fits is True
+
+    def test_it_passes_exactly_a_real_runs_inputs_and_nothing_else(self, tmp_path):
+        """The leak guard, on the Python half.
+
+        ``--select-context`` takes the tree, the issue text, the patch under review
+        (if any), the role and the budget. A gate that could pass ``FAIL_TO_PASS``,
+        a hidden test, the fix commit or ``bug.info`` would size the prompt around
+        the answer, so the argv is pinned rather than trusted.
+        """
+        seen = tmp_path / "argv.txt"
+        binary = self._stub(tmp_path, capture=seen)
+        ctx.select_context(
+            tmp_path / "tree", "issue text", vanta_bin=binary, budget_tokens=1_000
+        )
+
+        argv = seen.read_text(encoding="utf-8").splitlines()
+        assert argv[0:2] == ["--select-context", "--json"]
+        assert argv[2] == "--repo" and argv[3] == str(tmp_path / "tree")
+        assert argv[4] == "--select-role" and argv[5] == ctx.SELECT_ROLE
+        assert argv[6] == "--select-budget" and argv[7] == "1000"
+        assert argv[8] == "--issue"
+        assert len(argv) == 10, argv  # the issue file is the only trailing input
+        flags = [item for item in argv if item.startswith("--")]
+        for forbidden in ("f2p", "fail", "hidden", "fix", "info", "commit", "expect"):
+            assert not any(forbidden in flag for flag in flags), (forbidden, flags)
+
+    def test_a_patch_is_passed_through_for_review_mode(self, tmp_path):
+        """Review mode is decided by ``--patch`` alone: the selector has no other
+        way to know a patch exists."""
+        seen = tmp_path / "argv.txt"
+        binary = self._stub(tmp_path, capture=seen)
+        patch = write(tmp_path / "fix.patch", "diff --git a/x b/x\n")
+        ctx.select_context(
+            tmp_path / "tree", "", vanta_bin=binary, budget_tokens=1_000,
+            patch_path=patch,
+        )
+        argv = seen.read_text(encoding="utf-8").splitlines()
+        assert argv[8:10] == ["--patch", str(patch)]
+        assert "--issue" not in argv  # an empty issue is not passed as an empty file
+
+    def test_a_missing_binary_is_an_error(self, tmp_path):
+        with pytest.raises(ctx.ContextError, match="no vanta_m3 binary"):
+            ctx.select_context(
+                tmp_path, "x", vanta_bin=tmp_path / "absent", budget_tokens=100
+            )
+
+    def test_a_nonzero_exit_is_an_error(self, tmp_path):
+        binary = stub_vanta(
+            tmp_path / "vanta_m3",
+            "import sys\nsys.stderr.write('nope\\n')\nsys.exit(3)\n",
+        )
+        with pytest.raises(ctx.ContextError, match=r"failed \(exit 3\)"):
+            ctx.select_context(tmp_path, "x", vanta_bin=binary, budget_tokens=100)
+
+    def test_output_that_is_not_json_is_an_error(self, tmp_path):
+        binary = stub_vanta(tmp_path / "vanta_m3", "print('not json')\n")
+        with pytest.raises(ctx.ContextError, match="did not print JSON"):
+            ctx.select_context(tmp_path, "x", vanta_bin=binary, budget_tokens=100)
 
 
 class TestPrecheck:
-    def test_accepts_a_tree_that_fits(self, tmp_path):
-        write(tmp_path / "a.py", "x = 1\n")
-        verdict = ctx.precheck(tmp_path, "hello", n_ctx=65536, n_ctx_source="test")
+    def test_accepts_a_selection_that_fits(self):
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "hello", n_ctx=65536, n_ctx_source="test",
+            selection=selection(prompt_tokens_estimate=1_000),
+        )
         assert verdict.context_ok is True
         assert verdict.reasons == []
         assert verdict.budget_tokens == ctx.budget_tokens(65536)[0]
 
-    def test_rejects_a_truncated_source(self, tmp_path):
-        blob(tmp_path / "big.py", ctx.MAX_FILE_BYTES + 1)
-        verdict = ctx.precheck(tmp_path, "", n_ctx=200_000, n_ctx_source="test")
+    def test_rejects_a_selection_that_dropped_a_ranked_file(self):
+        """Not the old whole-repo truncation: this is the ranking's own top file
+        failing to fit even as an outline, so the run would be shown less than the
+        ranking chose."""
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=200_000, n_ctx_source="test",
+            selection=selection(dropped_for_budget=["pkg/core.py"]),
+        )
         assert verdict.context_ok is False
         assert len(verdict.reasons) == 1
-        assert verdict.reasons[0].startswith("source_truncated_by_cap")
-        assert "may not be in it" in verdict.reasons[0]
+        assert verdict.reasons[0].startswith("selection_dropped_for_budget")
+        assert "pkg/core.py" in verdict.reasons[0]
+        assert "smaller context than its ranking chose" in verdict.reasons[0]
 
-    def test_rejects_a_prompt_over_budget(self, tmp_path):
-        write(tmp_path / "a.py", "x = 1\n")
-        verdict = ctx.precheck(tmp_path, "", n_ctx=4000, n_ctx_source="test")
+    def test_rejects_a_prompt_over_budget(self):
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=200_000, n_ctx_source="test",
+            selection=selection(prompt_tokens_estimate=200_000, fits=False),
+        )
         assert verdict.context_ok is False
         assert verdict.reasons[0].startswith("prompt_exceeds_budget")
 
-    def test_the_margin_is_reserved_for_feedback_growth(self, tmp_path):
-        """Same tree, two windows: the tighter one leaves no room for attempt 2."""
-        write(tmp_path / "a.py", "x" * 3000 + "\n")
-        tight = ctx.precheck(tmp_path, "", n_ctx=48_000, n_ctx_source="test")
-        roomy = ctx.precheck(tmp_path, "", n_ctx=96_000, n_ctx_source="test")
+    def test_the_gate_has_no_python_fallback(self):
+        """With neither a binary nor a selection there is nothing to measure; the
+        gate says so rather than inventing a walk of its own."""
+        with pytest.raises(ctx.ContextError, match="no walk of its own"):
+            ctx.precheck(Path("/nonexistent"), "", n_ctx=131_072, n_ctx_source="test")
+
+    def test_the_margin_is_reserved_for_feedback_growth(self):
+        """Same selection, two windows: the tighter one leaves no room for attempt 2."""
+        sel = selection(prompt_tokens_estimate=16_000)
+        tight = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=48_000, n_ctx_source="test", selection=sel
+        )
+        roomy = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=96_000, n_ctx_source="test", selection=sel
+        )
         assert tight.context_ok is False
         assert roomy.context_ok is True
         assert roomy.headroom_tokens > tight.headroom_tokens
@@ -2649,7 +2815,7 @@ class TestPrepareInvariants:
 
     def test_runnable_requires_a_clean_gate(self):
         good = prep(
-            context=ctx.ContextVerdict(True, [], 1, 2, 3, "test", ctx.ConcatStats()),
+            context=ctx.ContextVerdict(True, [], 1, 2, 3, "test", selection()),
             issue=issue_mod.IssueText(
                 text="x",
                 pre_gate="x",
@@ -2820,7 +2986,10 @@ class TestPrepareRunRecordContract:
         tree = tmp_path / "tree"
         write(tree / "pkg" / "mod.py", "def parse():\n    return None\n")
         issue = self._issue()
-        verdict = ctx.precheck(tree, issue.text, n_ctx=131_072, n_ctx_source="--n-ctx")
+        verdict = ctx.precheck(
+            tree, issue.text, n_ctx=131_072, n_ctx_source="--n-ctx",
+            selection=selection(),
+        )
         deps = {
             "checkpoint": "vanta-bi-Demo-1",
             "installs": ["pytest==8.0.2", "pytest-json-report==1.5.0"],
@@ -2909,7 +3078,10 @@ class TestPrepareRunRecordContract:
         tree = tmp_path / "tree"
         write(tree / "a.py", "x = 1\n")
         issue = self._issue()
-        verdict = ctx.precheck(tree, issue.text, n_ctx=131_072, n_ctx_source="--n-ctx")
+        verdict = ctx.precheck(
+            tree, issue.text, n_ctx=131_072, n_ctx_source="--n-ctx",
+            selection=selection(),
+        )
         original = prep(context=verdict, issue=issue, deps={})
         split, batch_dir, manifest = self._write_batch(tmp_path, preps=[original])
 
@@ -2939,7 +3111,10 @@ class TestPrepareRunRecordContract:
         tree = tmp_path / "tree"
         write(tree / "a.py", "x = 1\n")
         issue = self._issue()
-        verdict = ctx.precheck(tree, issue.text, n_ctx=131_072, n_ctx_source="--n-ctx")
+        verdict = ctx.precheck(
+            tree, issue.text, n_ctx=131_072, n_ctx_source="--n-ctx",
+            selection=selection(),
+        )
         original = prep(context=verdict, issue=issue, deps={})
         assert original.runnable is False  # needs_decision: not a candidate to run
 
@@ -14310,6 +14485,106 @@ class TestDigestAndLabels:
         assert (tmp_path / "run_digest.md").read_text().startswith("config")
 
 
+class TestLocalizationHit:
+    """§1.6.2 item 5 — ``localization_hit``, computed AFTER a run from evidence.
+
+    The answer never reaches the selector (``TestSelectContext`` pins that
+    ``--select-context`` cannot see a fix commit or a hidden test), so the only
+    place the fix and the selection meet is here, on a finished row.
+    """
+
+    FIX = (
+        "diff --git a/pkg/core.py b/pkg/core.py\n"
+        "--- a/pkg/core.py\n"
+        "+++ b/pkg/core.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-old\n"
+        "+new\n"
+        "diff --git a/tests/test_demo.py b/tests/test_demo.py\n"
+        "--- a/tests/test_demo.py\n"
+        "+++ b/tests/test_demo.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-a\n"
+        "+b\n"
+    )
+
+    LINE = (
+        "mode=repair:role=creator:budget=65280:files=2:tree=9:dropped=0:"
+        "total=1200B/300tok:selected=["
+        "pkg/core.py@42[path+traceback]full:700B/175tok;"
+        "pkg/util.py@8[import-neighbour]full:500B/125tok"
+        "]:pruned=[vendor/x.py:vendored]"
+    )
+
+    @staticmethod
+    def _prep(patch: str = FIX) -> prepare_mod.BugPrep:
+        return prep(bug=bug_info(bug_patch_txt=patch))
+
+    def test_it_reads_the_paths_out_of_a_provenance_line(self):
+        assert runner_mod.selected_paths(self.LINE) == ["pkg/core.py", "pkg/util.py"]
+
+    def test_a_reason_list_does_not_truncate_the_path(self):
+        """The list ends at ``:pruned=[``; stopping at the first ``]`` would cut the
+        path at the entry's own ``[reasons]`` and report a name nothing matches."""
+        line = "mode=repair:selected=[pkg/a@1[path]full:1B/1tok]:pruned=[none]"
+        assert runner_mod.selected_paths(line) == ["pkg/a"]
+
+    def test_no_selected_list_is_no_paths(self):
+        assert runner_mod.selected_paths("none") == []
+        assert runner_mod.selected_paths("") == []
+        assert runner_mod.selected_paths("mode=repair:selected=[none]:pruned=[none]") == []
+
+    def test_the_fix_test_hunks_are_not_counted(self):
+        """A test path is never a file the source selection could show: the hidden
+        tests are stripped from the tree before any run sees it, so counting one as
+        a touched file would report every bug as unlocalized."""
+        assert runner_mod.fix_touched_paths(self._prep()) == ["pkg/core.py"]
+
+    def test_a_hit_is_a_touched_file_among_the_shown_ones(self):
+        assert runner_mod.localization_hit(self._prep(), self.LINE) is True
+
+    def test_a_miss_is_a_selection_that_showed_none_of_them(self):
+        line = "mode=repair:selected=[pkg/other.py@9[path]full:1B/1tok]:pruned=[none]"
+        assert runner_mod.localization_hit(self._prep(), line) is False
+
+    def test_a_run_that_showed_no_source_is_a_miss(self):
+        """``none`` is the driver's word for "the run had no selection at all",
+        which is distinguishable from a row that never recorded one."""
+        assert runner_mod.localization_hit(self._prep(), "none") is False
+
+    def test_no_evidence_is_unknown_not_a_miss(self):
+        """A row from before the metric existed never had a chance to localize
+        anything, and pooling it as a miss would report a rate over those rows."""
+        assert runner_mod.localization_hit(self._prep(), None) is None
+
+    def test_a_test_only_fix_has_no_source_file_to_localize(self):
+        test_only = (
+            "diff --git a/tests/test_demo.py b/tests/test_demo.py\n"
+            "--- a/tests/test_demo.py\n"
+            "+++ b/tests/test_demo.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-a\n"
+            "+b\n"
+        )
+        assert runner_mod.localization_hit(self._prep(test_only), self.LINE) is None
+
+    def test_the_digest_pools_hits_misses_and_unknowns_apart(self):
+        base = dict(
+            kind="run", config="vanta", mode="repair", seed=0, model="m",
+            harness_commit="c" * 40, vanta_build_commit="d" * 40,
+        )
+        rows = [
+            dict(base, label="true_accept", localization_hit=True),
+            dict(base, label="true_reject", localization_hit=False),
+            dict(base, label="needs_review", localization_hit=None),
+        ]
+        payload = runner_mod.digest(rows)
+        assert payload["groups"][0]["localization"] == {
+            "hit": 1, "miss": 1, "unknown": 1
+        }
+        assert "hit=1 miss=1 unknown=1" in runner_mod.render_digest(payload)
+
+
 class TestStaleBinary:
     """§7.3: two commits, and a binary older than the Rust it claims to be built from.
 
@@ -14392,6 +14667,34 @@ class TestStaleBinary:
         assert "src" in runner_mod.VANTA_SOURCE_PATHS
         assert "build.rs" in runner_mod.VANTA_SOURCE_PATHS
         assert not any(path.startswith("scripts") for path in runner_mod.VANTA_SOURCE_PATHS)
+
+    def test_prepare_refuses_to_size_the_gate_against_a_stale_binary(self, monkeypatch):
+        """`run` warns about a stale binary; `prepare` has to refuse one (§1.6.2 item 5).
+
+        The gate's own output is what `prepare` writes down as the context verdict,
+        and it shells out to this binary — so a stale binary would produce verdicts
+        describing a Vanta the batch will not run, and no later warning could undo
+        that. Only the refusal is exercised here; everything expensive is stubbed.
+        """
+        entry = split_mod.Split(split_data()).bugs[0]
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split_mod.Split(split_data()))
+        monkeypatch.setattr(run_mod, "select", lambda *a, **k: [(entry, True)])
+        monkeypatch.setattr(meta_mod, "ensure_clone", lambda root, *, commit: commit)
+        monkeypatch.setattr(
+            ctx, "explicit_context_window", lambda n_ctx=None: (131_072, "test")
+        )
+        monkeypatch.setattr(
+            runner_mod, "require_vanta_bin", lambda path: Path("/nonexistent/vanta_m3")
+        )
+        monkeypatch.setattr(
+            runner_mod,
+            "stale_binary_warning",
+            lambda path: "the vanta_m3 binary at x was built from 44f58ab but HEAD is b2efa49",
+        )
+
+        args = run_mod.build_parser().parse_args(["prepare", "--split", "x.json"])
+        with pytest.raises(runner_mod.RunnerError, match="cannot size the context gate"):
+            run_mod.cmd_prepare(args)
 
 
 class TestPhaseOrder:

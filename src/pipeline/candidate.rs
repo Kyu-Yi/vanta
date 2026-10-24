@@ -373,9 +373,14 @@ fn collect_tree(
         Ok(e) => e,
         Err(_) => return,
     };
+    // [VANTA-WHY] Sorted for the same reason as `repo::collect_source_files`: with
+    // a byte cap in play, `read_dir` order decides WHICH files survive, so an
+    // unsorted walk makes the two-tree comparison depend on the filesystem.
+    let mut paths: Vec<std::path::PathBuf> =
+        entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in paths {
         if path.is_dir() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if skip.contains(&name) {

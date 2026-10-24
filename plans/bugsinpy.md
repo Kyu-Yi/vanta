@@ -199,8 +199,13 @@ context guard — *after* a checkpoint has been baked and a wave has been schedu
    from the estimate alone is uncalibrated. Wave 1's real `usage.prompt_tokens` is the calibration;
    waves 2–3 are re-measured against it and any proposed swap shows **both** the estimate and the
    observed number.
-6. **Narrowing files to fit is v2 work**, explicitly out of scope. A rejected bug is replaced from
-   the reserve list (§8); it is not patched up.
+6. **~~Narrowing files to fit is v2 work~~ — superseded by §1.6.2.** This point said a bug whose
+   source concat overran the window was replaced from the reserve list, never patched up. The
+   measurement that forced the reversal: `prepare --measure-only --reserves measure` rejected **10
+   of 11** dev/reserve bugs as `source_truncated_by_cap`, because Vanta was showing the Creator the
+   *first* ~262 KB of an 11.8 MB repo (matplotlib) and the bug's own file was usually past that
+   point. Replacing ten bugs is not a pilot; the prompt has to become the *relevant* files. §1.6.2
+   is that change.
 
 #### 1.6.1 The gate may only size against a window the run will use
 
@@ -231,6 +236,71 @@ The resolved window and its source are printed above the summary table, recorded
 **warns loudly on stderr** when its own window differs from the batch's — before `--plan` prints, so
 the cheap moment to notice is the moment it is noticed. The two halves are the rule: `prepare`
 refuses to start without an explicit source, `run` refuses to stay silent about a drift.
+
+#### 1.6.2 Selection replaces truncation — show the relevant files, not a capped dump
+
+The old prompt was built by `repo::collect_source_files`, which walked the repo in `fs::read_dir`
+order and applied **256 KB total / 64 KB per file during the walk**, `continue`-ing on any file that
+would exceed the cap. The surviving set was therefore "the files the filesystem happened to hand us
+first", and the bug's own file was frequently not in it. `matplotlib-1` (11.8 MB) got the first
+~262 KB; only `PySnooper-3` (20 KB) fit whole. This is the cap the 10-of-11 rejection names.
+
+The reversal is to **select**, not to truncate. One Rust module, `crate::context`
+([src/context/mod.rs](file:///Users/kyu-yi/vanta/src/context/mod.rs)), owns both halves so there is a
+single implementation for the run and for the gate (item 5 shells the gate out to it):
+
+1. **Walk the whole tree, deterministically, with no cap.** Directory entries are sorted at every
+   level and the candidate list is sorted by path, so two runs over the same tree — on any
+   filesystem — produce the same order. `.git`, build output and vendored/generated trees are pruned
+   by name (`SKIP_DIRS`); symlinks are never followed; the walk records a **skip ledger** of every
+   pruned path and why (`pruned_dir:<name>`, `symlink`, `unreadable`). "We skipped 3000 files" is not
+   checkable; "we pruned `build/`, `node_modules/`, `.git/` and these 4 symlinks" is.
+
+2. **The caps apply only to the selected set, never before selection.** A file chosen by the ranking
+   goes in **in full** where it fits the role's token budget; a file over **64 KB** goes in as an
+   **outline** (signatures + docstrings, parsed line-by-line — nothing is executed) rather than being
+   skipped, so a big touched file is never silently dropped. Only a file whose *outline* still does
+   not fit is dropped, and it is recorded in `dropped_for_budget`.
+
+3. **The budget is a token budget, computed the same way in the run and the gate**
+   (`context::budget_tokens`): `n_ctx − OUTPUT_RESERVE_TOKENS(32768) − CHAT_OVERHEAD_TOKENS(256) −
+   25 % of n_ctx`. The first two terms are exactly what `llm::context_budget_exceeded` subtracts, so
+   the budget's edge sits on the run-time guard's edge; the margin is the harness's addition (§1.6
+   point 2). At `n_ctx=131072` this is **65280** tok ≈ 255 KiB.
+
+4. **Fill greedily by score.** Each selected file carries its reason(s); the score is the sum of the
+   reason weights, ties broken by path (so the order is total and stable). The prompt is the file
+   tree (paths only, repair mode) followed by each file in full or as an outline, in score order.
+
+**Review mode (item 1).** With a patch under review, the selection is, in full: the patch's own
+touched files, the modules they import at module level (one hop), and the visible test files that
+import a touched module or name one of its modules. The patch is *the thing under review*, so reading
+it is not a peek at the answer; nothing else is an input.
+
+**Repair mode (item 2).** With no patch, files are ranked from the **issue text only**: explicit
+paths or module names, traceback frames, and identifiers the issue mentions (backticked, CamelCase or
+snake_case) that a file *defines* (`def`/`class` at module level, found by parsing, not by running
+code) — plus one hop of import neighbours for the top files, and the repo's file tree so the model
+sees what exists.
+
+**Never hidden information (item 3).** `F2P`/hidden tests, the fix commit and its diff, and
+`bug.info` are not inputs and cannot be reached from the selection. The harness keeps them out of the
+tree as today; a test proves selection is unchanged when the hidden tests are removed or added.
+
+**Provenance (item 4).** Every selected file, its score, its reason(s) and the bytes/tokens shown go
+into the session log and `run.summary`; the role prompts' versions are bumped.
+
+**The gate (item 5).** `prepare`'s context gate checks the **selected** context fits the budget (not
+that the whole repo does) by shelling out to `vanta_m3 --select-context --json` — the same binary and
+the same `crate::context` the run uses — and `context.py`'s mirror of the old walk is removed, so
+there is one implementation. `localization_hit` (whether the fix commit's touched files were among
+those shown) is computed **after** a run, never during, and recorded per run.
+
+Landed in **item 1** — review mode: `crate::context`, the budget block, the review prompt seam, and
+the sorted walks in `repo::collect_source_files` / `candidate::collect_tree`. It supersedes the
+`fs::read_dir`-ordered capped walk as it stood at `a29b9c8`, the parent of that commit. (The item's
+own hash is reported with the commit, not cited here: a hash written into the commit it names cannot
+survive that commit's own creation.)
 
 ---
 

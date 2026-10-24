@@ -34,8 +34,7 @@ use crate::agents::attacker::{
     audit_tests_intent,
 };
 use crate::agents::creator::{
-    CreatorRequest, SourceFile, creator_generate_patch, split_multi_file_patch,
-    split_patch_into_files,
+    CreatorRequest, creator_generate_patch, split_multi_file_patch, split_patch_into_files,
 };
 use crate::config::LlmConfig;
 use crate::core::{
@@ -350,6 +349,26 @@ pub async fn run(
         repo.issue_text.len()
     );
 
+    // ---- Context budget (design §1.6.2; feature item 1/2) ----
+    // [VANTA-WHY] The context selection fills a TOKEN budget, not a byte cap, so
+    // it has to know the window. This resolves it exactly as the run-time guard
+    // does (`llm::context_window_tokens`: `VANTA_LLM_CONTEXT_TOKENS`, else the
+    // server's `/props`, else 65536) and subtracts the same output reserve and
+    // chat overhead the guard subtracts, plus the harness margin. The probe is
+    // the same cached call the first LLM request would make, so this moves that
+    // cost earlier rather than adding one — and it lets a run state its budget
+    // before spending a single token on a prompt that could never fit.
+    let n_ctx = match build_reqwest_client(&cfg) {
+        Ok(client) => crate::llm::context_window_tokens(&client, &cfg).await,
+        Err(_) => crate::context::FALLBACK_CONTEXT_TOKENS,
+    };
+    let (prompt_budget_tokens, _prompt_margin_tokens) = crate::context::budget_tokens(n_ctx);
+    println!(
+        "▌ Context budget: {prompt_budget_tokens} tok (n_ctx {n_ctx} − {} output − {} overhead − 25 % margin)",
+        crate::context::OUTPUT_RESERVE_TOKENS,
+        crate::context::CHAT_OVERHEAD_TOKENS,
+    );
+
     // ---- Test command (Spec §7: explicit --test-cmd, pytest fallback) ----
     let test_cmd: TestCommand = match &config.test_cmd {
         Some(s) => TestCommand::from_shell(s),
@@ -549,6 +568,20 @@ pub async fn run(
     // ---- Governor + Gatekeeper ----
     let mut governor = Governor::new(config.max_attempts);
     let gatekeeper = Gatekeeper::new(VerificationPolicy::BestEffort);
+
+    // [VANTA-WHY] The tree the context selection reads. In two-tree mode the
+    // patch applies to the original worktree, so that is the tree whose contents
+    // belong in the prompt; otherwise the repo path is both.
+    let context_root: PathBuf = config
+        .original_tree
+        .clone()
+        .unwrap_or_else(|| config.repo_path.clone());
+    // [VANTA-WHY] The review prompt is a function of (tree, patch), and both are
+    // fixed for the whole run, so it is selected ONCE and reused across attempts.
+    // Re-walking per attempt would re-read the repo on every round and — worse —
+    // could select differently if the tree changed under us, which would make two
+    // attempts of one run incomparable.
+    let mut review_selection: Option<crate::context::ContextSelection> = None;
 
     // ---- Repair loop ----
     let mut prior_feedback: Option<String> = None;
@@ -961,12 +994,23 @@ pub async fn run(
 
         // ---- Build source strings ----
         let original_concat = build_source_concat(&original_files);
+        // [VANTA-WHY] Review mode used to hand the Attacker and the auditor the
+        // capped dump (the first ~262 KB of the repo) if the narrowed set came out
+        // empty — which it did on any repo whose cap had already dropped the
+        // patch's own file. The selection now walks the FULL tree and narrows to
+        // the patch's touched files, their one-hop imports and the visible tests
+        // that exercise them, so "empty" means the patch touches nothing in this
+        // tree, and only then does the old concat apply.
         let review_prompt_concat = if config.patch_path.is_some() {
-            let narrowed = review_prompt_source_concat(&repo.source_files, &original_files, &patch_files);
-            if narrowed.trim().is_empty() {
+            let selection = review_selection.get_or_insert_with(|| {
+                let touched: BTreeSet<String> = patch_files.keys().cloned().collect();
+                select_review_prompt(&context_root, &touched, prompt_budget_tokens)
+            });
+            let rendered = selection.render();
+            if rendered.trim().is_empty() {
                 original_concat.clone()
             } else {
-                narrowed
+                rendered
             }
         } else {
             original_concat.clone()
@@ -2683,205 +2727,45 @@ fn bate_baseline_concat(original_files: &HashMap<String, String>) -> String {
     build_source_concat(original_files)
 }
 
-fn review_prompt_source_concat(
-    repo_files: &[SourceFile],
-    original_files: &HashMap<String, String>,
-    patch_files: &HashMap<String, String>,
-) -> String {
-    let selected = select_review_prompt_paths(repo_files, patch_files);
-    let mut prompt_files = HashMap::new();
-    for path in selected {
-        if let Some(contents) = original_files.get(&path) {
-            prompt_files.insert(path, contents.clone());
-        }
+/// Select and render the review prompt's source context from the FULL tree.
+///
+/// [VANTA-WHY] The selection itself lives in `crate::context` — the ONE
+/// implementation of the walk, the ranking and the budget, which the harness's
+/// context gate reaches through `vanta_m3 --select-context --json`. This helper
+/// is only the seam: walk the tree the patch applies to, select for review, and
+/// log what was chosen so a reader can audit the prompt without re-running it.
+fn select_review_prompt(
+    root: &Path,
+    touched: &BTreeSet<String>,
+    budget_tokens: u32,
+) -> crate::context::ContextSelection {
+    let (candidates, skipped) = crate::context::walk_candidates(root);
+    let mut selection =
+        crate::context::select_review_context(&candidates, touched, "review", budget_tokens);
+    selection.skipped = skipped;
+
+    println!(
+        "\n▌ REVIEW CONTEXT: {} of {} candidate files, {} tok of a {} tok budget",
+        selection.files.len(),
+        candidates.len(),
+        selection.total_tokens,
+        selection.budget_tokens,
+    );
+    for line in selection.summary_lines() {
+        println!("{line}");
     }
-    build_source_concat(&prompt_files)
+    if !selection.skipped.is_empty() {
+        println!("  (pruned {} path(s); see the session log)", selection.skipped.len());
+    }
+    selection
 }
 
-fn select_review_prompt_paths(
-    repo_files: &[SourceFile],
-    patch_files: &HashMap<String, String>,
-) -> BTreeSet<String> {
-    let touched_paths: BTreeSet<String> = patch_files.keys().cloned().collect();
-    if touched_paths.is_empty() {
-        return touched_paths;
-    }
-    let mut selected = touched_paths.clone();
-
-    let module_map = python_module_to_path(repo_files);
-    let source_by_path: BTreeMap<&str, &SourceFile> =
-        repo_files.iter().map(|file| (file.path.as_str(), file)).collect();
-
-    let touched_modules: BTreeSet<String> = selected
-        .iter()
-        .filter_map(|path| python_module_path(path))
-        .collect();
-
-    let mut related_paths = BTreeSet::new();
-    for path in selected.clone() {
-        if let Some(file) = source_by_path.get(path.as_str()) {
-            related_paths.extend(imported_repo_paths(&file.path, &file.contents, &module_map));
-        }
-    }
-    selected.extend(related_paths);
-
-    for file in repo_files.iter().filter(|file| is_test_path(&file.path)) {
-        let imports = imported_repo_paths(&file.path, &file.contents, &module_map);
-        if !imports.is_disjoint(&touched_paths)
-            || test_covers_modules(&file.contents, &touched_modules)
-        {
-            selected.insert(file.path.clone());
-        }
-    }
-
-    selected
-}
-
-fn python_module_to_path(repo_files: &[SourceFile]) -> BTreeMap<String, String> {
-    let mut module_map = BTreeMap::new();
-    for file in repo_files {
-        if let Some(module) = python_module_path(&file.path) {
-            module_map.insert(module, file.path.clone());
-        }
-    }
-    module_map
-}
-
-fn python_module_path(path: &str) -> Option<String> {
-    if !path.ends_with(".py") {
-        return None;
-    }
-    let trimmed = path.trim_end_matches(".py");
-    if let Some(pkg) = trimmed.strip_suffix("/__init__") {
-        return Some(pkg.replace('/', "."));
-    }
-    Some(trimmed.replace('/', "."))
-}
-
-fn is_test_path(path: &str) -> bool {
-    let file_name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    path.starts_with("tests/")
-        || path.contains("/tests/")
-        || file_name.starts_with("test_")
-        || file_name.ends_with("_test.py")
-}
-
-fn imported_repo_paths(
-    current_path: &str,
-    contents: &str,
-    module_map: &BTreeMap<String, String>,
-) -> BTreeSet<String> {
-    let mut imported = BTreeSet::new();
-    let current_package = current_package_parts(current_path);
-
-    for raw_line in contents.lines() {
-        let line = raw_line.split('#').next().unwrap_or("").trim();
-        if let Some(rest) = line.strip_prefix("import ") {
-            for target in rest.split(',') {
-                let module = target
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .trim();
-                if let Some(path) = module_map.get(module) {
-                    imported.insert(path.clone());
-                }
-            }
-            continue;
-        }
-
-        let Some(rest) = line.strip_prefix("from ") else {
-            continue;
-        };
-        let Some((module_part, names_part)) = rest.split_once(" import ") else {
-            continue;
-        };
-        let Some(base_module) = resolve_import_base(&current_package, module_part.trim()) else {
-            continue;
-        };
-        if let Some(path) = module_map.get(&base_module) {
-            imported.insert(path.clone());
-        }
-        for name in parse_imported_names(names_part) {
-            let candidate = if base_module.is_empty() {
-                name
-            } else {
-                format!("{base_module}.{name}")
-            };
-            if let Some(path) = module_map.get(&candidate) {
-                imported.insert(path.clone());
-            }
-        }
-    }
-
-    imported
-}
-
-fn current_package_parts(path: &str) -> Vec<String> {
-    let Some(module) = python_module_path(path) else {
-        return Vec::new();
-    };
-    let mut parts: Vec<String> = module.split('.').map(|part| part.to_string()).collect();
-    if !path.ends_with("__init__.py") {
-        let _ = parts.pop();
-    }
-    parts
-}
-
-fn resolve_import_base(current_package: &[String], module_part: &str) -> Option<String> {
-    let trimmed = module_part.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if !trimmed.starts_with('.') {
-        return Some(trimmed.to_string());
-    }
-
-    let dot_count = trimmed.chars().take_while(|c| *c == '.').count();
-    let remainder = trimmed[dot_count..].trim();
-    let levels_up = dot_count.saturating_sub(1);
-    if levels_up > current_package.len() {
-        return None;
-    }
-    let kept = &current_package[..current_package.len().saturating_sub(levels_up)];
-    let mut base = kept.join(".");
-    if !remainder.is_empty() {
-        if !base.is_empty() {
-            base.push('.');
-        }
-        base.push_str(remainder);
-    }
-    Some(base)
-}
-
-fn parse_imported_names(names_part: &str) -> Vec<String> {
-    names_part
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .split(',')
-        .filter_map(|name| {
-            let token = name
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .trim_matches(',');
-            if token.is_empty() || token == "*" {
-                None
-            } else {
-                Some(token.to_string())
-            }
-        })
-        .collect()
-}
-
-fn test_covers_modules(test_source: &str, touched_modules: &BTreeSet<String>) -> bool {
-    touched_modules.iter().any(|module| test_source.contains(module))
-}
+// [VANTA-WHY] The python import resolution that used to live here
+// (`python_module_to_path`, `python_module_path`, `is_test_path`,
+// `imported_repo_paths`, `resolve_import_base`, `parse_imported_names`,
+// `test_covers_modules`) now lives in `crate::context`, next to the walk that
+// feeds it. Two copies of "what does this file import" is exactly the drift the
+// context gate exists to catch, so there is one.
 
 fn dependency_freeze_summary_value(freeze: Option<&str>) -> String {
     let rendered = freeze
@@ -3790,10 +3674,9 @@ mod tests {
         collapse_decision, dependency_freeze_summary_value, harness_infrastructure_collapse,
         modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
         rejection_signal_message, render_committed_test_file,
-        require_clean_target_repo_for_open_pr, review_prompt_source_concat, stamp_transition_row,
+        require_clean_target_repo_for_open_pr, stamp_transition_row,
         stable_patch_fingerprint,
     };
-    use crate::agents::creator::SourceFile;
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{AttemptTransition, EvidenceSource, FailureClass, GovernorDecision, TestIntent, TestResult};
     use crate::pipeline::governor::{AttemptVerdict, GovernorMode};
@@ -4382,53 +4265,10 @@ mod tests {
         assert_eq!(dependency_freeze_summary_value(None), "none");
     }
 
-    #[test]
-    fn review_prompt_context_includes_touched_imports_and_covering_tests() {
-        let repo_files = vec![
-            SourceFile {
-                path: "heretic/keyword_rate.py".into(),
-                contents: "from .plugin import Context\n\nclass KeywordRate:\n    pass\n".into(),
-            },
-            SourceFile {
-                path: "heretic/plugin.py".into(),
-                contents: "class Context:\n    pass\n".into(),
-            },
-            SourceFile {
-                path: "heretic/other.py".into(),
-                contents: "class Other:\n    pass\n".into(),
-            },
-            SourceFile {
-                path: "tests/test_keyword_rate.py".into(),
-                contents: "from heretic.keyword_rate import KeywordRate\nfrom heretic.plugin import Context\n\ndef test_keyword_rate():\n    assert KeywordRate is not None\n".into(),
-            },
-            SourceFile {
-                path: "tests/test_other.py".into(),
-                contents: "from heretic.other import Other\n\ndef test_other():\n    assert Other is not None\n".into(),
-            },
-        ];
-        let mut original_files = HashMap::new();
-        for file in &repo_files {
-            original_files.insert(file.path.clone(), file.contents.clone());
-        }
-
-        let rendered = review_prompt_source_concat(
-            &repo_files,
-            &original_files,
-            &HashMap::from([("heretic/keyword_rate.py".to_string(), "patched".to_string())]),
-        );
-
-        assert!(rendered.contains("# FILE: heretic/keyword_rate.py"));
-        assert!(rendered.contains("# FILE: heretic/plugin.py"));
-        assert!(rendered.contains("# FILE: tests/test_keyword_rate.py"));
-        assert!(
-            !rendered.contains("# FILE: heretic/other.py"),
-            "unrelated imports should stay out of the review prompt"
-        );
-        assert!(
-            !rendered.contains("# FILE: tests/test_other.py"),
-            "unrelated tests should stay out of the review prompt"
-        );
-    }
+    // [VANTA-WHY] The review-prompt selection test moved to `crate::context`
+    // together with the selection code it exercises. A test that pokes a private
+    // helper here would have kept passing while the prompt the run sends was
+    // built somewhere else.
 
     // [VANTA-WHY] BATE's tree is the patch-free ORIGINAL tree (see
     // `bate_baseline_concat`). "Document only" is not enough here: a candidate

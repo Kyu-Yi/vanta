@@ -62,6 +62,12 @@ pub mod core;
 // patch + Governor + Gatekeeper), sandbox (subprocess + Shuru backends),
 // session (provenance IDs + disk log), repo (load arbitrary repos for M3).
 pub mod agents;
+// [VANTA-WHY] context localizes the source a role is shown: the deterministic
+// walk, the prompt budget, and the ranking. It is the ONE implementation of
+// both, shared by the run and by the harness's context gate (which shells out to
+// `vanta_m3 --select-context --json`), so the gate measures the prompt the run
+// actually sends.
+pub mod context;
 pub mod llm;
 pub mod logging;
 pub mod pipeline;

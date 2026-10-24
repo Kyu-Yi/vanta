@@ -121,10 +121,16 @@ fn collect_source_files(
         Ok(e) => e,
         Err(_) => return,
     };
+    // [VANTA-WHY] `read_dir` order is filesystem-dependent, so once the byte cap
+    // bites the same tree can yield a different subset on a different machine —
+    // the bug's own file in the prompt here, absent there. Sorting makes the walk
+    // (and, while it lasts, the truncation) reproducible. `context::walk_candidates`
+    // is the cap-free replacement this walk feeds into; this stays as the loader
+    // for the trees BATE and the harness run against.
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-
+    for path in paths {
         // Skip directories in SKIP_DIRS
         if path.is_dir() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {

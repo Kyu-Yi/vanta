@@ -68,11 +68,15 @@ from .bugsinpy_meta import read_metadata_text
 from . import suite as suite_mod
 from . import trees as tree_mod
 from .shuru import (
+    BUILD_JOB_ENV,
+    DEFAULT_CPUS,
+    DEFAULT_MEMORY_MB,
     DEV_SHM_ENV,
     DEV_SHM_MOUNTED,
     MP_SMOKE_CODE,
     MP_SMOKE_PREFIX,
     ExecResult,
+    build_jobs,
     checkpoint_create,
     checkpoint_delete,
     checkpoint_exists,
@@ -90,6 +94,33 @@ MIN_DISK_MB = 8192
 BAKE_DISK_MB = 16384
 BAKE_TIMEOUT_SECS = 5400
 """90 min. py3.6/3.7 may compile OpenSSL 1.1.1 and CPython from source here."""
+
+BUILD_VM_KEY = "build_vm"
+"""The provenance key that says which VM a layer was baked in (§3.2).
+
+[VANTA-WHY] Recorded next to the pins rather than only printed, because from a layer's
+install list a build that ran out of memory is indistinguishable from one that built
+cleanly — and the two are different facts about it. "This environment cannot be built"
+and "this environment was built in a VM too small to build it" have different answers;
+only the second is fixed by re-baking.
+"""
+
+
+def build_vm_record(
+    cpus: int = DEFAULT_CPUS, memory_mb: int = DEFAULT_MEMORY_MB
+) -> dict[str, int]:
+    """:data:`BUILD_VM_KEY`'s value for a VM of this size.
+
+    ``build_jobs`` is in the record beside the CPU count and not instead of it: what
+    bounds a parallel *compile* is the cap (:data:`bugsinpy.shuru.BUILD_JOB_ENV`), so a
+    reader asking why scipy built here and not there needs both numbers.
+    """
+    return {
+        "cpus": cpus,
+        "memory_mb": memory_mb,
+        "build_jobs": build_jobs(cpus, memory_mb),
+    }
+
 
 HARNESS_PACKAGES = frozenset({"pytest", "pytest-json-report"})
 """Provisioned by the *interpreter* layer, for every bug on that Python minor.
@@ -8905,6 +8936,7 @@ def deps_provenance(
     provisioned: Sequence[str] = (),
     orphans: Sequence[OrphanedPin] = (),
     tree_satisfied: Sequence[TreeSatisfied] = (),
+    build_vm: Optional[Mapping[str, int]] = None,
 ) -> dict[str, Any]:
     """What the bake decided for one bug, as data a later stage can read.
 
@@ -9015,12 +9047,22 @@ def deps_provenance(
     that is the half a reader cannot recover from the layer. Like ``dropped``, the key is
     always present and empty when the tree answered nothing, so "the tree provided
     nothing" and "this file predates the rule" are distinguishable.
+
+    ``build_vm`` (:data:`BUILD_VM_KEY`) is the VM the layer was *baked in* — its CPUs,
+    its memory and how many parallel compile jobs that memory allowed. It is the one key
+    here that is not about the pins at all, and it is here because a source build that
+    the VM was too small for and one the environment cannot support look identical from
+    ``build_pins``: the same resolution, the same installs, and a compiler killed
+    mid-translation-unit. It defaults to the bake's own sizing (:func:`build_vm_record`)
+    rather than to an empty mapping, so a caller that bakes nothing still writes the VM a
+    bake would have used instead of a record claiming no CPUs.
     """
     return {
         "schema_version": 1,
         "project": sources.project,
         "bug_id": sources.bug_id,
         "checkpoint": sources.checkpoint,
+        BUILD_VM_KEY: dict(build_vm) if build_vm is not None else build_vm_record(),
         "buggy_commit": sources.buggy_commit,
         "commit_date": sources.commit_date,
         "fixed_commit": sources.fixed_commit,
@@ -9135,6 +9177,7 @@ def resolve_bug_deps(
         [str, str], Sequence[DepRef]
     ] = pypi_build_requirements,
     classify: Optional[Callable[[str, str, str], PreflightPin]] = None,
+    build_vm: Optional[Mapping[str, int]] = None,
 ) -> tuple[list[BugDeps], list[FlaggedBug]]:
     """Resolve every selected bug's layer, pinning by date from PyPI.
 
@@ -9169,6 +9212,12 @@ def resolve_bug_deps(
     (:func:`early_install_pins`), so the layer's ``early_pins`` can say so. It is read
     from the release's sdist and never executed; ``bake`` passes the run's
     :func:`cached_build_requirements`, so a pin two bugs hold is downloaded once.
+
+    ``build_vm`` is the VM every layer of this call is baked in, written into each
+    provenance (:data:`BUILD_VM_KEY`). It is a property of the *run* and not of a bug, so
+    it is passed once here rather than resolved per entry — the sizing is one decision
+    for the whole bake, and recording it per bug from one decision is what makes two
+    layers' records comparable.
     """
     out: list[BugDeps] = []
     flagged: list[FlaggedBug] = []
@@ -9418,6 +9467,7 @@ def resolve_bug_deps(
                     provisioned=provisioned,
                     orphans=orphaned,
                     tree_satisfied=tree_satisfied_pins,
+                    build_vm=build_vm,
                 ),
                 build_pins=build_specs,
                 # Spec strings, not ``pinned_parts``' ``(name, version)`` pairs: the
@@ -9547,8 +9597,18 @@ def bake(
     *,
     base: str = DEFAULT_BASE,
     disk_mb: int = BAKE_DISK_MB,
+    cpus: int = DEFAULT_CPUS,
+    memory_mb: int = DEFAULT_MEMORY_MB,
 ) -> ExecResult:
-    """Bake and verify one layer. Network is allowed here and only here."""
+    """Bake and verify one layer. Network is allowed here and only here.
+
+    ``cpus``/``memory_mb`` are shuru's ``--cpus``/``--memory`` for the layer's build
+    (:data:`bugsinpy.shuru.DEFAULT_CPUS`). They are the *VM's* size: they are not part
+    of ``script``, so a layer already baked under shuru's defaults is the same layer
+    this call would build, and a layer that failed on a source build the old VM was too
+    small for (``pandas/1``: two parallel ``cc1plus`` over 2048 MB) is a layer whose
+    recipe was never the problem.
+    """
     if disk_mb < MIN_DISK_MB:
         raise SplitError(
             f"disk_mb={disk_mb} is below the base image's {MIN_DISK_MB} MB; "
@@ -9562,6 +9622,8 @@ def bake(
         allow_net=True,
         timeout_secs=BAKE_TIMEOUT_SECS,
         marker=MARKER,
+        cpus=cpus,
+        memory_mb=memory_mb,
     )
 
 

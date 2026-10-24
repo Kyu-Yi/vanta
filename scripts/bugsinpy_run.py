@@ -485,6 +485,10 @@ def cmd_bake(args: argparse.Namespace) -> int:
         classify=classify,
         metadata_of=metadata_of,
         build_requires_of=build_requires_of,
+        # The VM every layer of this run is built in, recorded in each bug's provenance
+        # so a layer that failed a source build can be told from one the VM was too
+        # small for (§3.2). One decision for the run, like --disk-mb below it.
+        build_vm=bake_mod.build_vm_record(args.cpus, args.memory),
     )
 
     # Every run ends with this list, empty or not: a reader of a run that stopped at a
@@ -604,7 +608,12 @@ def cmd_bake(args: argparse.Namespace) -> int:
             actions,
             children=children,
             build=lambda name, script, base: bake_mod.bake(
-                name, script, base=base, disk_mb=args.disk_mb
+                name,
+                script,
+                base=base,
+                disk_mb=args.disk_mb,
+                cpus=args.cpus,
+                memory_mb=args.memory,
             ),
             logs_dir=logs_dir,
             own_pins=own_pins,
@@ -901,6 +910,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=bake_mod.BAKE_DISK_MB,
         help=f"shuru disk in MB; must be >= {bake_mod.MIN_DISK_MB} (the base image's)",
+    )
+    # The bake VM's size, which shuru's own defaults (2 CPUs, 2048 MB) are too small
+    # for: ``pandas/1``'s scipy build is two parallel ``cc1plus`` over 2048 MB and the
+    # kernel kills one. Sizing only — no layer's recipe depends on it — and recorded in
+    # every layer's provenance (bake.BUILD_VM_KEY) and its build log.
+    bake.add_argument(
+        "--cpus",
+        type=int,
+        default=bake_mod.DEFAULT_CPUS,
+        help="shuru --cpus for every layer's build VM",
+    )
+    bake.add_argument(
+        "--memory",
+        type=int,
+        default=bake_mod.DEFAULT_MEMORY_MB,
+        metavar="MB",
+        help="shuru --memory (MB) for every layer's build VM",
     )
     bake.add_argument(
         "--plan",

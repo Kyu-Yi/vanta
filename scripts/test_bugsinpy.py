@@ -2637,6 +2637,81 @@ class TestShuruStartUpCheck:
 
 
 # ============================================================================
+# shuru.py — the bake VM's size, no VM
+# ============================================================================
+class TestShuruVmSizing:
+    """The VM a bake builds in is sized for a *build*, and it is not a recipe line.
+
+    [WHY] shuru's own defaults are 2 CPUs and 2048 MB (measured in the boot line of
+    every layer's log), which is enough to run a suite and too small to build one:
+    ``pandas/1``'s ``scipy`` build compiles template-heavy C++ translation units in
+    parallel, two of them together exceed 2048 MB, and the kernel kills ``cc1plus`` —
+    ``g++: fatal error: Killed signal terminated program cc1plus``, a failure naming no
+    source file. The size reaches the VM through ``checkpoint create``'s
+    ``--cpus``/``--memory`` and nothing else, so a layer baked under the old defaults is
+    still the same layer; the parallel *cap* travels in the boot prelude for the same
+    reason, and prints itself into the layer's log.
+    """
+
+    def test_the_defaults_are_the_sized_vm_and_not_shurus(self):
+        assert shuru_mod.DEFAULT_CPUS == 8
+        assert shuru_mod.DEFAULT_MEMORY_MB == 8192
+
+    def test_the_parallel_build_is_capped_by_the_memory_not_the_cpus(self):
+        """8 CPUs and 8192 MB is 4 jobs: eight would be more than the VM holds."""
+        assert shuru_mod.build_jobs(8, 8192) == 4
+        assert shuru_mod.build_jobs(2, 2048) == 1
+        assert shuru_mod.build_jobs(16, 8192) == 4, "the memory binds before the CPUs do"
+        assert shuru_mod.build_jobs(1, 256) == 1, "one job always has to be able to run"
+
+    def test_the_guard_caps_the_build_and_records_the_sizing(self):
+        guard = shuru_mod.vm_sizing_guard(8, 8192)
+        assert f"export {shuru_mod.BUILD_JOB_ENV}=4" in guard
+        assert shuru_mod.VM_SIZING_PREFIX in guard
+        assert "8 cpus, 8192 MB RAM" in guard
+
+    def test_checkpoint_create_sizes_the_vm_and_runs_the_guard_before_the_recipe(
+        self, monkeypatch
+    ):
+        seen: dict = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        monkeypatch.setattr(shuru_mod, "_shuru_bin", lambda: "/usr/bin/shuru")
+        monkeypatch.setattr(shuru_mod.subprocess, "run", fake_run)
+        shuru_mod.checkpoint_create("vanta-bi-Demo-1", "true")
+        args = seen["args"]
+        assert args[args.index("--cpus") + 1] == str(shuru_mod.DEFAULT_CPUS)
+        assert args[args.index("--memory") + 1] == str(shuru_mod.DEFAULT_MEMORY_MB)
+        script = args[args.index("--") + 3]
+        # After the start-up check and before the recipe: the export has to be in the
+        # shell that runs the build, and the echo has to reach the layer's log.
+        assert script.index(shuru_mod.DEV_SHM_GUARD) < script.index(
+            shuru_mod.vm_sizing_guard()
+        )
+        assert script.endswith("true")
+
+    def test_a_caller_can_size_the_vm_itself(self, monkeypatch):
+        seen: dict = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        monkeypatch.setattr(shuru_mod, "_shuru_bin", lambda: "/usr/bin/shuru")
+        monkeypatch.setattr(shuru_mod.subprocess, "run", fake_run)
+        shuru_mod.checkpoint_create(
+            "vanta-bi-Demo-1", "true", cpus=4, memory_mb=4096
+        )
+        args = seen["args"]
+        assert args[args.index("--cpus") + 1] == "4"
+        assert args[args.index("--memory") + 1] == "4096"
+        assert f"export {shuru_mod.BUILD_JOB_ENV}=2" in args[args.index("--") + 3]
+
+
+# ============================================================================
 # suite.py — command construction and report reading (no VM)
 # ============================================================================
 class TestSuiteCommand:
@@ -11879,6 +11954,48 @@ class TestDependencyProvenance:
         assert by_name["pytest"]["pin_rule"] == "provisioned by the interpreter layer"
         assert provenance["import_name"] == "demo"
         assert provenance["harness_pins"] == {"pytest": "8.0.2"}
+
+    def test_the_vm_the_layer_was_baked_in_is_recorded(self):
+        """A layer killed by the OOM killer and one the environment cannot support look
+        identical from ``build_pins`` — same resolution, same installs; the VM's size is
+        the difference (§3.2 ``BUILD_VM_KEY``)."""
+        provenance = bake_mod.deps_provenance(
+            self._sources(),
+            (),
+            harness_pins={},
+            build_vm={"cpus": 8, "memory_mb": 8192, "build_jobs": 4},
+        )
+        assert provenance[bake_mod.BUILD_VM_KEY] == {
+            "cpus": 8,
+            "memory_mb": 8192,
+            "build_jobs": 4,
+        }
+
+    def test_the_vm_key_is_present_and_names_the_bakes_own_defaults(self):
+        """A caller that passes nothing records the VM a bake would have used, not a
+        record claiming no CPUs."""
+        provenance = bake_mod.deps_provenance(self._sources(), (), harness_pins={})
+        assert provenance[bake_mod.BUILD_VM_KEY] == bake_mod.build_vm_record()
+        assert provenance[bake_mod.BUILD_VM_KEY] == {
+            "cpus": shuru_mod.DEFAULT_CPUS,
+            "memory_mb": shuru_mod.DEFAULT_MEMORY_MB,
+            "build_jobs": shuru_mod.build_jobs(),
+        }
+
+    def test_bake_hands_the_vm_size_to_checkpoint_create(self, monkeypatch):
+        seen: dict = {}
+
+        def fake_create(name, script, **kwargs):
+            seen["name"] = name
+            seen.update(kwargs)
+            return shuru_mod.ExecResult(
+                stdout="", stderr="", exit_code=0, timed_out=False
+            )
+
+        monkeypatch.setattr(bake_mod, "checkpoint_create", fake_create)
+        bake_mod.bake("vanta-bi-Demo-1", "true", cpus=4, memory_mb=4096)
+        assert seen["cpus"] == 4
+        assert seen["memory_mb"] == 4096
 
     def test_a_reference_pin_released_after_the_buggy_commit_is_recorded_as_late(self):
         """The one departure from §3.2's date rule, as a queryable list.

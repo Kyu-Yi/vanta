@@ -19,6 +19,11 @@ fails** (observed upstream, documented in ``shuru.rs::verify_deps_marker``). Eve
 bake in this harness therefore ends with a sentinel ``touch`` and is verified by
 booting the result, so a broken environment cannot be cached and silently poison a
 whole wave.
+
+One thing is deliberately **not** mirrored: the VM's size. ``shuru.rs`` passes no
+``--cpus``/``--memory`` and so boots whatever shuru defaults to (2 CPUs, 2048 MB), which
+is enough to run a suite and not enough to build one; a bake asks for
+:data:`DEFAULT_CPUS`/:data:`DEFAULT_MEMORY_MB` instead.
 """
 
 from __future__ import annotations
@@ -233,6 +238,81 @@ def checkpoint_delete(name: str) -> None:
     )
 
 
+DEFAULT_CPUS = 8
+DEFAULT_MEMORY_MB = 8192
+"""The VM a *bake* boots with, and this wrapper's one deliberate divergence from
+``src/sandbox/shuru.rs``.
+
+[VANTA-WHY] The Rust backend and this wrapper both otherwise let shuru pick its own
+defaults, and those are 2 CPUs and 2048 MB — measured in the boot line of every bake
+layer's log (``shuru: booting VM (2cpus, 2048MB RAM, 16384MB disk)``). That is enough to
+*run* a bug's suite, which is all the backend ever asks of a VM, and it is not enough to
+*build* one: measured on ``pandas/1``, ``scipy``'s ``sparse/sparsetools`` C++ translation
+units are compiled in parallel by numpy's distutils, the two of them together exceed
+2048 MB, and the kernel kills ``cc1plus`` (``g++: fatal error: Killed signal terminated
+program cc1plus``) — a build failure that names no source file and reads as a compiler
+bug. Sizing reaches the VM through ``checkpoint create``'s own ``--cpus``/``--memory``
+and touches no recipe string, so a layer baked under the old defaults stays valid.
+"""
+
+BUILD_JOB_ENV = "NPY_NUM_BUILD_JOBS"
+"""How many parallel compile jobs numpy's distutils may start.
+
+[VANTA-WHY] CPUs and memory are not the same constraint, and the *parallel* build is
+bounded by the smaller of the two. numpy's ``ccompiler._cpu_count`` reads this variable
+and otherwise returns ``os.cpu_count()``, so on an 8-CPU VM it starts eight ``cc1plus``
+processes — roughly a gigabyte each for scipy's template-heavy C++ — which is more than
+8192 MB before the VM's own overhead. The cap is derived from the memory
+(:func:`build_jobs`) rather than fixed, because memory is the resource that ran out.
+"""
+
+_MB_PER_BUILD_JOB = 2048
+"""What one ``cc1plus`` of the largest measured build (scipy's sparsetools) is allowed.
+
+A cap on parallelism, not a measurement of the compiler: the point is only that the
+*number* of jobs cannot exceed what the VM's memory holds, and 2 GB per job is the value
+that leaves even the 2048 MB default able to run one.
+"""
+
+
+def build_jobs(cpus: int = DEFAULT_CPUS, memory_mb: int = DEFAULT_MEMORY_MB) -> int:
+    """How many parallel compile jobs a VM of this size may run: the smaller of the two.
+
+    At the defaults — 8 CPUs, 8192 MB — this is 4, which is what keeps scipy's
+    ``sparsetools`` build inside a VM sized for it.
+    """
+    return max(1, min(cpus, memory_mb // _MB_PER_BUILD_JOB))
+
+
+VM_SIZING_PREFIX = "vanta bake VM:"
+"""What :func:`vm_sizing_guard` prints, which is what makes the sizing a *record*.
+
+The boot prelude's output is the layer's own captured output, so the line reaches
+``runs/bugsinpy/bake-logs/<layer>.log`` without any recipe having to know the VM's size.
+"""
+
+
+def vm_sizing_guard(cpus: int = DEFAULT_CPUS, memory_mb: int = DEFAULT_MEMORY_MB) -> str:
+    """The boot-prelude half of the sizing: cap the parallel build, and say so.
+
+    [VANTA-WHY] Exported here rather than inside a layer's recipe, because sizing is the
+    *VM's* and recipes are the *layers*': a recipe that exported this variable would be a
+    different recipe, so every layer baked before the cap existed would have to be
+    rebuilt to stay comparable with the ones baked after it. The boot prelude is already
+    where a fact about the VM is established (:data:`DEV_SHM_GUARD`) and it runs on the
+    same boot as the recipe, in the same shell, so the export reaches every build either
+    way.
+    """
+    jobs = build_jobs(cpus, memory_mb)
+    return "; ".join(
+        [
+            f"export {BUILD_JOB_ENV}={jobs}",
+            f"echo '{VM_SIZING_PREFIX} {cpus} cpus, {memory_mb} MB RAM, "
+            f"{BUILD_JOB_ENV}={jobs}'",
+        ]
+    )
+
+
 def checkpoint_create(
     name: str,
     script: str,
@@ -242,6 +322,8 @@ def checkpoint_create(
     allow_net: bool = True,
     timeout_secs: int = 7200,
     marker: Optional[str] = None,
+    cpus: int = DEFAULT_CPUS,
+    memory_mb: int = DEFAULT_MEMORY_MB,
 ) -> ExecResult:
     """Bake a checkpoint, then verify it by booting it.
 
@@ -249,18 +331,29 @@ def checkpoint_create(
     existing Vanta pattern is ``/opt/vanta-deps-ok``). Without it a failed
     install would be cached under a valid-looking name and every later run would
     report ``InfraFailure`` for a reason that has nothing to do with the model.
+
+    ``cpus``/``memory_mb`` are shuru's own ``--cpus``/``--memory`` and are the *VM's*
+    size rather than the layer's contents (:data:`DEFAULT_CPUS`), so a layer baked
+    before they were passed is still the layer this call would produce.
     """
     args = [_shuru_bin(), "checkpoint", "create", name]
     if base is not None:
         args += ["--from", base]
-    args += ["--disk-size", str(disk_mb)]
+    args += ["--disk-size", str(disk_mb), "--cpus", str(cpus), "--memory", str(memory_mb)]
     if allow_net:
         args += ["--allow-net"]
     # [VANTA-WHY] The start-up check runs *before* the recipe, on the same boot, so a
     # VM that cannot provide /dev/shm fails here rather than inside whatever build
     # the recipe reaches first (DEV_SHM_GUARD). A mount cannot be baked into the
-    # layer, so this is not redundant with anything the recipe records.
-    args += ["--", "sh", "-c", f"{DEV_SHM_GUARD}\n{script}"]
+    # layer, so this is not redundant with anything the recipe records. The sizing's
+    # half follows it for the same reason and on the same boot: the export has to be in
+    # the shell that runs the recipe, and the echo has to reach the layer's log.
+    args += [
+        "--",
+        "sh",
+        "-c",
+        f"{DEV_SHM_GUARD}\n{vm_sizing_guard(cpus, memory_mb)}\n{script}",
+    ]
 
     created = subprocess.run(
         args,

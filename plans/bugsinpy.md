@@ -2292,6 +2292,30 @@ recorded import closure — and no run record contains such a failure or a skip 
 runs completed all six rows. No earlier suite result is invalidated: the recorded runs never reached a
 test that opens a semaphore, which is what makes this a fix in front of the failure rather than after it.
 
+**The build VM is sized for a build, not for a suite.** A bake boots the VM with 2 CPUs and 2048 MB
+because `checkpoint_create` passed no `--cpus`/`--memory` and inherited shuru's defaults — enough to
+run a suite, not enough to compile `scipy`. Measured: `pandas/1`'s `scipy==1.4.1` build died with
+`g++: fatal error: Killed signal terminated program cc1plus` on `scipy/sparse/sparsetools/*.cxx` — the
+kernel's OOM killer, not a compiler diagnostic — in a VM that logged
+`shuru: booting VM (2cpus, 2048MB RAM, 16384MB disk)`. `bake` now asks for
+`shuru.DEFAULT_CPUS` (8) and `shuru.DEFAULT_MEMORY_MB` (8192) on **every** layer's `checkpoint create`
+(`--cpus` / `--memory <MB>`, the real flag names), overridable with `bugsinpy_run.py bake --cpus` /
+`--memory`. The number of parallel compile jobs is capped to match the RAM — `NPY_NUM_BUILD_JOBS`
+(default `min(cpus, memory_mb // 2048)` = 4 at 8 CPU/8 GB), which numpy's `ccompiler._cpu_count` reads
+in place of `os.cpu_count()` — so a wide machine cannot re-open the same OOM through parallelism.
+
+**Both numbers are VM sizing, not recipe content, so no layer's recipe changes.** `--cpus`/`--memory`
+are `checkpoint create` flags (a sibling of `--disk-size`, itself already outside the recipe), and the
+`NPY_NUM_BUILD_JOBS` export plus its `vanta bake VM:` echo ride the **boot prelude** — the `sh -c` line
+`checkpoint_create` runs before the recipe, exactly where `DEV_SHM_GUARD` already sits. Neither edits
+the interpreter or per-bug recipe strings. The already-baked layers (`base`, `fastapi-1`,
+`matplotlib-1`, `sanic-1`, `PySnooper-3`) therefore **stay valid** and need no rebuild: their contents
+are unchanged, and the sizing is re-established at each boot rather than baked into the filesystem, the
+same property `/dev/shm` has. The sizing is *recorded* so a layer can be read back later: the
+`vanta bake VM:` line in the build log and `deps_provenance`'s `build_vm` block (`cpus`, `memory_mb`,
+`build_jobs`) in each `deps/*.json`, because from an install list alone a build that ran out of memory
+is indistinguishable from one that built cleanly.
+
 ### 3.3 BLOCKER 2 — dependency detection under-provisions
 
 [`deps::detect()`](file:///Users/kyu-yi/vanta/src/sandbox/deps.rs) reads `requirements.txt` and

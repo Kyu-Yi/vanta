@@ -905,6 +905,18 @@ decides the whole run before touching anything, in this order:
 
 A layer outside the selection is never touched except as a stale child in step 2.
 
+**Staleness is existence, not content: a recipe edit is invisible until the layer is replaced.**
+`bake.plan_layers` decides from `layer_exists(name)` alone — a layer baked from an older recipe is
+"already baked" and is skipped — and nothing else can see the edit, because the recipe is read only by
+the bake that writes it. So a change to a recipe requires `--force` for every layer it touches, and the
+two levels are told apart by which function the edit lands in. `bake.python_recipe` is the interpreter
+layers', so the `FFLAGS` export/assertion and the Fortran smoke file above are an interpreter-layer
+change: `vanta-bugsinpy-py3.8` was baked before it, and every bug layer stacks on that layer, so
+`--force` is what the run wants as a whole — without it the plan deletes the interpreter's children as
+stale (step 2) and rebuilds none of them, which is a run that ends with no usable layer at all.
+`bake.requirements_recipe` is the per-bug layers', so §3.2's `--no-deps` pass and the autoload-disabled
+`pytest --version` require `--force` for every `vanta-bi-<project>-<N>`.
+
 **One failed per-bug layer does not stop the others; a failed interpreter layer stops everything above
 it.** The per-bug layers are independent by construction — each is baked `--from` the interpreter layer
 and none is baked from another — so a bug that cannot resolve its dependencies says nothing about the
@@ -1523,31 +1535,44 @@ so anything else fails the layer. No orphans is the ordinary case and the recipe
 whose bug does not re-pin a harness package removes nothing. Every removal is written into the deps JSON
 under `orphans` with its reason, and the names are deliberately **not** in `provisioned`.
 
-**A name a pin this layer *drops* still requires is not an orphan either, and this is the fourth input
-to the walk.** Measured, and it is what `sanic/1` failed on. Its `pip check` read
-`cryptography 47.0.0 requires typing-extensions, which is not installed`, and the removal that preceded it
-was the orphan rule firing on `typing-extensions` — a name only the replaced `pytest 8.0.2` brought in, so
-by the paragraph above a name this layer may not keep. The rule above is right about *why* the name is
-there and wrong about whether it may go, because a drop removes a name from the **pin list** and does not
-remove the requirement another pin wrote for it: `pyopenssl==19.1.0` declares `cryptography (>=2.8)`, the
-date rule's `cryptography==2.8` has no wheel this image can build and is dropped, and pip resolves a
-release of its own for the name at install time — today's `cryptography 47.0.0`, whose own `requires_dist`
-names `typing-extensions`. Nothing pinned it, nothing this layer's closure reached it, and yet the layer
-ends up holding it, so it may not be uninstalled. `bake.transitive_pins` takes a fourth input,
-`installable_dropped` — the dropped names whose *reason* still lets pip install a release of them
-(`record.outcome == bake.UNBUILDABLE`; a name with no file that works here at all, `pywin32`, is
-`NO_DISTRIBUTION` and cannot be installed under any version, so it is not one) — and walks the closure of
-each name's **newest** release, the rule phase (A) already walks the interpreter layer's provision by: the
-walk wants the **names** that release declares, and pip is free to resolve today's. A name it reaches is
-excluded from the orphan set, and it is left exactly as the interpreter layer provides it and **not**
-re-pinned: `bake._transitive_pin` chooses by the date rule, and no release it could choose both satisfies a
-release pip resolved years after this layer's pins and holds on this image — the era's `typing-extensions
-3.7.4.2` is the one the `pip check` above refuses, and the release that does satisfy `cryptography 47.0.0`
-requires Python 3.9. The closure is descended and not read one level deep, for phase (A)'s reason: pip's
-own resolution is a closure too, and a name the dropped release reaches *through* another unpinned one
-would otherwise be removed while the release pip installs requires it. The measured effect is the whole of
-`sanic/1`: `typing-extensions` stays, `pip check` is clean of it, and only `exceptiongroup`, `iniconfig`
-and `tomli` — the names nothing in the layer requires — are removed.
+**A name this layer *drops* is not left to pip's judgement: the pin that declares it is installed
+`--no-deps` (`bake.dropped_dependents`).** Measured, and it is what `sanic/1` failed on. Its freeze held
+`cryptography 47.0.0`. A drop removes a name from the **pin list**; it does not remove the requirement
+another pin wrote for that name, so pip satisfies it at install time — and at the newest release of the
+day, because `-c` cannot stop what it is not told about: the constraints file is built from the pin list
+(`bake.constraint_pins`), a dropped name is in no pin list, and pip therefore never reads an opinion about
+it. `pyopenssl==19.1.0` declares `cryptography (>=2.8)` and `service-identity==18.1.0` declares it bare;
+the date rule's `cryptography==2.8` and its transitive pick `2.9.2` both have no wheel this image can build
+and both are dropped; pip resolves the name for itself and installs `47.0.0`, a release years newer than
+every pin in the layer. An exemption that *keeps* such a name is an accommodation of the leak, so the leak
+is closed instead: the pins whose **own** release declares a dropped name (`bake.dropped_dependents`, read
+from that release's `requires_dist`, the same metadata every other rule reads) are moved out of the main
+pass and installed in their own pass with `--no-deps` (`requirements_recipe`'s `/tmp/no-deps.txt`, written
+after the main install and before the orphan removal). Nothing is lost by that: everything those pins
+require is already installed by the main pass — the closure walk pinned it — except the dropped name
+itself, which is precisely the one thing that may not be installed. The pass carries the same `-c`, the
+same `--no-build-isolation` and the same legacy resolver as every other install; it is the same command
+with one flag more, not a second mechanism. `pip check` then reads the absence this leaves
+(`pyopenssl 19.1.0 requires cryptography, which is not installed`) and the own-pin gate tolerates exactly
+that reading, **by name only**: the requirement the line names has to canonicalize to a name this layer
+dropped, so a missing requirement that is anything else is still §3.2's case (a) and still fails the layer
+(`bake.CASE_DROPPED_DEPENDENCY`, `bake._required_name`). A reading with no held version is an *absence*
+rather than a conflict between two pins, so case (b) cannot apply to it at all. The freeze gate below
+fails hard if a dropped name appears in it at any version, whatever the pin list says: the pass not having
+taken is the only way for that to happen.
+
+**The orphan rule is the whole rule, and a dropped name is not an input to it.** An earlier revision of
+this section excluded a dropped name's own pip-resolved closure from the orphan set
+(`transitive_pins(..., installable_dropped=…)`, `ce963f6`). That was the same accommodation read from the
+other end — it made a name pip had resolved years late a permanent member of the layer rather than one pip
+never gets to install — and it is reverted. `bake.transitive_pins` takes no such input, and
+`bake.ORPHAN_RULE` reads as it always did: an orphan is a name the base layer brought that no pin of this
+layer — direct, transitive, build or early — requires. With the `--no-deps` pass above, `sanic/1`'s
+`typing-extensions` is no longer special: nothing in that layer's pin list requires it (its `pytest==5.2.1`
+era requires none of it), so it is an orphan and it goes, and the `pip check` line it used to appear in is
+now the dropped `cryptography` itself. The same revert is why `luigi/1` — which pins `pyopenssl==19.1.0`
+and `moto==1.3.7` too, and drops the same `cryptography` — loses `cryptography` from its freeze without
+losing the `typing-extensions==3.7.4.2` its own pin list does name.
 
 **Every distribution the layer ends up holding has to be one its pin list names or the interpreter layer
 supplies.** The closure walk above is a prediction; the layer's own `pip freeze` is the reading, and it
@@ -1568,6 +1593,17 @@ together, this one whether the pin list *describes* the layer — and `fastapi/1
 the freeze gate would have passed the contradiction the `pip check` gate refused: the name is not in the
 pin list, so before the orphan rule it was exempt as an inherited one, and now it is removed from the
 layer and stated in the record instead.
+
+**A dropped name is a hard failure here, at any version.** The diff above exempts what the pin list names
+and what the interpreter layer supplies; a dropped name is in neither, so it would already fail — but only
+while it is *absent* from the layer's own `dropped` record, and the judgements above depend on the exact
+reading of that absence, so the gate names the case instead of inferring it: `bake.unpinned_freeze` takes
+the layer's dropped names and reports a reading for one of them **whatever** the pin list or the provision
+says (`dropped=…`), and `bugsinpy_run.py` reads those names out of each layer's provenance and passes them
+to every gate that judges the layer. Measured, this is the half of `sanic/1` that would have caught the
+leak on its own: `cryptography 47.0.0` in the freeze, with `cryptography` dropped and in no pin list, is a
+layer whose `--no-deps` pass did not take. Any *other* name the freeze holds and the pin list does not
+describe still fails by the paragraph above, so the two readings together are one gate.
 
 **The bug's own `pytest` pin wins, and the report plugin follows it.** Measured, and the reason this
 rule exists: all four dev-pilot bugs flagged on the same thing — fastapi/1 and luigi/1 pin

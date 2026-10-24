@@ -5787,6 +5787,40 @@ class TestPinConflicts:
         assert conflict.pins == ("pytest-json-report==1.5.0",)
         assert conflict.case == bake_mod.CASE_HARNESS_CHOICE
 
+    def test_a_missing_requirement_the_layer_dropped_is_case_d_and_tolerated(self):
+        """``sanic/1``: the pin that declares a dropped name is installed ``--no-deps``.
+
+        The same sentence as the test above, and the difference is the ``dropped`` set:
+        ``pyopenssl==19.1.0`` declares ``cryptography``, the layer dropped it by §3.2's
+        audit, and the recipe installs ``pyopenssl`` with ``--no-deps`` so pip cannot
+        resolve the name at today's release. What ``pip check`` then says is the measure
+        working, and it is tolerated **by name only**.
+        """
+        line = "pyopenssl 19.1.0 requires cryptography, which is not installed."
+        tolerated = bake_mod.pip_check_conflicts(
+            (line,), own=frozenset({"pyopenssl"}), dropped=("cryptography",)
+        )[0]
+        assert tolerated.case == bake_mod.CASE_DROPPED_DEPENDENCY
+        assert tolerated.held == "nothing"
+        assert tolerated.tolerated
+        assert tolerated.requires == "pyopenssl==19.1.0 declares cryptography"
+        assert "dropped dependency, by §3.2's audit" in tolerated.describe()
+        # The declaration as pip spells it when it carries a specifier — same reading.
+        with_specifier = bake_mod.pip_check_conflicts(
+            (
+                "pyopenssl 19.1.0 requires cryptography>=2.8, which is not installed.",
+            ),
+            own=frozenset({"pyopenssl"}),
+            dropped=("cryptography",),
+        )[0]
+        assert with_specifier.case == bake_mod.CASE_DROPPED_DEPENDENCY
+        # Another name missing is a different finding: the rule is by name, not by shape.
+        other = bake_mod.pip_check_conflicts(
+            (line,), own=frozenset({"pyopenssl"}), dropped=("pywin32",)
+        )[0]
+        assert other.case == bake_mod.CASE_HARNESS_CHOICE
+        assert not other.tolerated
+
     def test_a_line_this_cannot_read_is_a_conflict_as_written(self):
         """Not a line that says the conflict is tolerable, so case (a) and refused."""
         conflicts = bake_mod.pip_check_conflicts(
@@ -6682,16 +6716,15 @@ class TestTheClosureWalk:
         harness_pins=None,
         cutoffs=None,
         tree_satisfied=None,
-        installable_dropped=(),
         releases=None,
         metadata_of=None,
     ):
         """The walk over one fake layer.
 
         ``releases`` and ``metadata_of`` are the two seams a test needs when the finding
-        is about a release this class's fixtures do not describe — the dropped-name
-        closure below reads both, and a test that needs its own table should not have to
-        widen the shared one for every other test in the file.
+        is about a release this class's fixtures do not describe — a test that needs its
+        own table should not have to widen the shared one for every other test in the
+        file.
         """
         table = _fixture_releases() if releases is None else releases
         reader = self._metadata_of if metadata_of is None else metadata_of
@@ -6714,7 +6747,6 @@ class TestTheClosureWalk:
             metadata_of=reader,
             cutoffs=cutoffs,
             tree_satisfied=tree_satisfied,
-            installable_dropped=installable_dropped,
         )
 
     def test_a_releases_own_declarations_are_pinned_by_the_date_rule(self):
@@ -6875,99 +6907,204 @@ class TestTheClosureWalk:
         assert set(provided) >= {"exceptiongroup", "iniconfig", "tomli"}
 
     DROPPED_RELEASES = {
-        # The ``sanic/1`` shape: the release pip is free to install for a name this
-        # layer dropped, and the name it requires, which only the *replaced* pytest
-        # brought in. ``cryptography 2.8`` is the unbuildable pick the drop removes and
-        # ``47.0.0`` the wheel pip installed in its place (log line 570).
+        # The ``sanic/1`` shape. ``cryptography`` is the name the layer drops, and
+        # ``typing-extensions`` is the name pip's own resolution for it required — which
+        # item A stops at its source, by installing the pin that declares the dropped
+        # name with ``--no-deps`` (``TestTheDroppedDependencyPass``).
         "cryptography": {"2.8": "2019-03-01", "47.0.0": "2026-01-05"},
         "typing-extensions": {"3.7.4.2": "2020-04-01", "4.13.2": "2025-04-10"},
         "exceptiongroup": {"1.3.1": "2025-06-19"},
-        "exotic-helper": {"2.0": "2026-01-04", "2.1": "2026-02-01"},
-        "exotic-middle": {"1.0": "2026-01-05"},
     }
     """The releases the shared fixture does not carry, measured where they can be.
 
-    ``typing-extensions`` is the name the layer removed and ``exceptiongroup 1.3.1`` is
-    how it entered the interpreter layer — its ``typing-extensions >=4.6.0 ; python_version
-    < "3.13"`` is pytest 8.0.2's own dependency path to it, which is what makes it an
-    orphan of the replaced pytest rather than a name a kept harness pin needs.
+    ``exceptiongroup 1.3.1`` is how ``typing-extensions`` reaches the interpreter layer:
+    its ``typing-extensions >=4.6.0 ; python_version < "3.13"`` is the dependency path
+    from pytest 8.0.2, which is what makes the name an orphan of the replaced pytest
+    rather than one a kept harness pin needs.
     """
 
-    def _dropped(self, *, installable_dropped=("cryptography",)):
-        """The walk with the dropped-name table above, and its two seams."""
+    def test_a_dropped_pins_own_resolution_is_not_an_input_to_the_walk(self):
+        """§3.2, restored: the orphan rule asks the layer's pins, not pip's resolution.
+
+        ``sanic/1`` measured the shape. The layer drops ``cryptography`` (unbuildable
+        here) while ``pyopenssl==19.1.0`` still declares it, so there *is* a release pip
+        would fetch that requires a name this walk is about to remove —
+        ``typing-extensions``, through ``cryptography 47.0.0``. Keeping the name is the
+        wrong answer to that: it leaves a release in the layer the harness never chose.
+        The fix is to stop the fetch, by installing ``pyopenssl`` with ``--no-deps``
+        (:func:`bake_mod.dropped_dependents`), which is why the walk takes no
+        dropped-name input and why this test's orphan set is the measured one.
+        """
         table = {**_fixture_releases(), **self.DROPPED_RELEASES}
 
         def metadata_of(name, version):
-            if (name, version) == ("cryptography", "47.0.0"):
-                return (("typing-extensions >=4.13.2",), ">=3.8")
             if (name, version) == ("exceptiongroup", "1.3.1"):
                 return (
                     ('typing-extensions >=4.6.0 ; python_version < "3.13"',),
                     ">=3.7",
                 )
-            if (name, version) == ("exotic-helper", "2.1"):
-                return (("exotic-middle",), ">=3.8")
-            if (name, version) == ("exotic-middle", "1.0"):
-                return (("tomli >=1.0.0",), ">=3.8")
             return self._metadata_of(name, version)
 
-        return self._walk(
+        _pins, provided, orphans, _tree = self._walk(
             (("pytest", "5.4.3"),),
             harness_pins={"pytest": "8.0.2"},
             cutoffs={"pytest": "2020-04-09"},
-            installable_dropped=installable_dropped,
             releases=table,
             metadata_of=metadata_of,
         )
-
-    def test_a_name_a_dropped_pins_own_resolution_needs_is_not_an_orphan(self):
-        """``sanic/1``: the ``pip check`` failure was ``typing-extensions`` removed.
-
-        The layer replaces ``pytest 8.0.2`` with ``5.4.3`` and removes what only 8.0.2
-        declared — but ``pyopenssl==19.1.0``'s unbuildable-and-dropped ``cryptography``
-        is still required by that pin, so pip installs today's ``cryptography 47.0.0``,
-        which requires ``typing-extensions``. A name this layer ends up holding may not
-        be uninstalled, whoever declared it.
-        """
-        _pins, provided, orphans, _tree = self._dropped()
-        assert "typing-extensions" in provided, "kept as the base layer provides it"
-        assert "typing-extensions" not in {pin.name for pin in orphans}
-        assert [pin.name for pin in orphans] == [
-            "exceptiongroup",
-            "iniconfig",
-            "tomli",
-        ], "and only the names nothing in the layer requires are removed"
-
-    def test_the_dropped_closure_is_walked_and_not_just_its_first_level(self):
-        """A name the dropped release reaches *through* another unpinned one stays too.
-
-        ``exotic-helper``'s newest release declares ``exotic-middle``, which nothing pins
-        and nothing else requires, and ``exotic-middle 1.0`` re-declares ``tomli`` — a name
-        only the *replaced* ``pytest 8.0.2`` brought in, so one this layer would otherwise
-        remove. A rule that read only the dropped release's own declarations would stop at
-        ``exotic-middle`` and leave ``tomli`` to be uninstalled while the release pip
-        installs still requires it.
-        """
-        _pins, provided, orphans, _tree = self._dropped(
-            installable_dropped=("exotic-helper",)
+        assert "typing-extensions" not in provided, (
+            "removed, and not kept: nothing in this layer's pins requires it"
         )
-        assert "tomli" in provided, "kept as the base layer provides it"
-        assert "tomli" not in {pin.name for pin in orphans}
-        assert [pin.name for pin in orphans] == [
-            "exceptiongroup",
-            "iniconfig",
-            "typing-extensions",
-        ], "cryptography is not in this run, so nothing requires typing-extensions"
-
-    def test_a_layer_with_nothing_dropped_orphans_exactly_as_before(self):
-        """The rule's own denominator: no dropped name, no exception to the orphan rule."""
-        _pins, _provided, orphans, _tree = self._dropped(installable_dropped=())
         assert [pin.name for pin in orphans] == [
             "exceptiongroup",
             "iniconfig",
             "tomli",
             "typing-extensions",
+        ], "the measured sanic/1 orphan set, with nothing excused for a dropped name"
+
+
+class TestTheDroppedDependencyPass:
+    """§3.2: a pin that declares a name the layer dropped is installed ``--no-deps``.
+
+    [VANTA-WHY] A drop removes a name from ``installs``; it does not remove the
+    requirement another pin wrote for that name, so pip resolves it — and at the newest
+    release of the day, because a dropped name is in no pin list and in no constraints
+    file (``-c`` is silent about a name it does not name). ``sanic/1`` measured the whole
+    chain: ``cryptography`` dropped for both its declared and its transitive pick,
+    ``pyopenssl==19.1.0`` and ``service-identity==18.1.0`` declaring it, and the layer
+    ending up with ``cryptography 47.0.0`` — whose own ``requires_dist`` names a package
+    the layer had just removed, which is what its ``pip check`` reported. Installing the
+    declaring pins ``--no-deps`` is what closes it; the two gates below read the result
+    back.
+    """
+
+    INSTALLS = (
+        "sanic==19.12.2",
+        "pyopenssl==19.1.0",
+        "service-identity==18.1.0",
+        "cryptography==2.9.2",
+    )
+    """One layer's install list, in the shape ``installs_of`` produces it."""
+
+    DECLARES = {
+        ("pyopenssl", "19.1.0"): "cryptography>=2.8",
+        ("service-identity", "18.1.0"): "cryptography",
+        ("sanic", "19.12.2"): "uvloop; sys_platform != 'win32'",
+        ("cryptography", "2.9.2"): "cffi>=1.8,!=1.11.3",
+    }
+
+    def _dropped(self, *names: str):
+        return tuple(
+            bake_mod.DroppedPin(
+                name=name,
+                spec=f"{name}==2.8",
+                sources=("pyopenssl==19.1.0",),
+                version="2.8",
+                outcome=bake_mod.UNBUILDABLE,
+                reason="no entry in the reviewed table can build it here",
+            )
+            for name in names
+        )
+
+    @staticmethod
+    def _metadata_of(name: str, version: str):
+        declared = TestTheDroppedDependencyPass.DECLARES.get((name, version))
+        if declared is None:
+            raise bake_mod.BakeError(f"no metadata for {name}=={version}")
+        return ((declared,), None)
+
+    # ---- which pins are moved out of the main pass -------------------------
+    def test_the_pins_that_declare_a_dropped_name_are_the_only_ones_moved(self):
+        no_deps = bake_mod.dropped_dependents(
+            self.INSTALLS,
+            self._dropped("cryptography"),
+            metadata_of=self._metadata_of,
+        )
+        assert no_deps == (
+            "pyopenssl==19.1.0",
+            "service-identity==18.1.0",
+        ), "sanic and the dropped pin itself declare no dropped name"
+        # A bare declaration counts exactly as a ranged one does.
+        assert bake_mod.dropped_dependents(
+            ("service-identity==18.1.0",),
+            self._dropped("cryptography"),
+            metadata_of=self._metadata_of,
+        ) == ("service-identity==18.1.0",)
+
+    def test_a_layer_with_nothing_dropped_moves_nothing(self):
+        assert (
+            bake_mod.dropped_dependents(
+                self.INSTALLS, (), metadata_of=self._metadata_of
+            )
+            == ()
+        )
+        assert (
+            bake_mod.dropped_dependents(
+                self.INSTALLS, self._dropped("pywin32"), metadata_of=self._metadata_of
+            )
+            == ()
+        ), "a dropped name nothing declares moves no pin"
+
+    def test_a_release_nothing_could_be_read_for_is_not_guessed_at(self):
+        """The reader's contract, not a silent pass: an unreadable release moves nothing."""
+        assert (
+            bake_mod.dropped_dependents(
+                ("unknown-pin==1.0", "pyopenssl==19.1.0"),
+                self._dropped("cryptography"),
+                metadata_of=self._metadata_of,
+            )
+            == ("pyopenssl==19.1.0",)
+        )
+
+    # ---- the recipe --------------------------------------------------------
+    def test_the_moved_pins_are_installed_no_deps_and_leave_the_main_pass(self):
+        recipe = bake_mod.requirements_recipe(
+            self.INSTALLS,
+            no_deps_pins=("pyopenssl==19.1.0",),
+            orphans=("typing-extensions",),
+        )
+        assert "--no-deps" in recipe
+        # Split on the *opener* lines: the bare terminators occur first, so splitting on
+        # the name alone would hand back the text after the terminator, not the file.
+        no_deps_block = recipe.split("<<'VANTA_NO_DEPS'\n", 1)[1]
+        assert no_deps_block.startswith("pyopenssl==19.1.0\n")
+        assert "--no-deps " in no_deps_block
+        # The main pass still holds every other pin, and not the moved one.
+        main = (
+            recipe.split("<<'VANTA_REQUIREMENTS'\n", 1)[1]
+            .split("\nVANTA_REQUIREMENTS", 1)[0]
+        )
+        assert main.splitlines() == [
+            "sanic==19.12.2",
+            "service-identity==18.1.0",
+            "cryptography==2.9.2",
         ]
+        assert recipe.index("<<'VANTA_REQUIREMENTS'") < recipe.index("<<'VANTA_NO_DEPS'"), (
+            "after the main pass, so everything the moved pin declared is installed"
+        )
+        assert recipe.index("<<'VANTA_NO_DEPS'") < recipe.index("<<'VANTA_ORPHANS'"), (
+            "and before the orphan removal, which is the last word on the environment"
+        )
+        assert recipe.index("<<'VANTA_NO_DEPS'") < recipe.index("pip check"), (
+            "and before the reading the gate judges"
+        )
+
+    def test_the_moved_pass_is_constrained_like_every_other_install(self):
+        """``-c`` on the layer's own pin list, so the pass cannot resolve anything else."""
+        recipe = bake_mod.requirements_recipe(
+            self.INSTALLS,
+            build_pins=("setuptools==44.0.0",),
+            no_deps_pins=("pyopenssl==19.1.0",),
+        )
+        no_deps = recipe.split("<<'VANTA_NO_DEPS'\n", 1)[1]
+        assert f"-c {bake_mod.CONSTRAINTS_FILE}" in no_deps
+        assert f"{bake_mod.LEGACY_RESOLVER_FLAG}" in no_deps
+        assert "--no-build-isolation" in no_deps
+
+    def test_a_layer_with_no_moved_pins_has_no_such_pass(self):
+        recipe = bake_mod.requirements_recipe(self.INSTALLS)
+        assert "VANTA_NO_DEPS" not in recipe
+        assert "--no-deps" not in recipe
 
 
 class TestTheBugUnderTestIsNeverATransitivePin:
@@ -7260,6 +7397,34 @@ class TestUnpinnedFreeze:
             "# Editable install with no version control",
         )
         assert bake_mod.unpinned_freeze(output, pins=()) == ()
+
+    def test_a_dropped_name_is_reported_even_where_the_provision_would_exempt_it(self):
+        """§3.2's dropped-dependency pass, read back by the gate that says it worked.
+
+        The recipe installs a pin that declares a dropped name with ``--no-deps``, so the
+        name cannot come back; this reading is what says it did not. It is reported
+        **whatever** the pin list and the provision say — the case here is a name the
+        interpreter layer is predicted to supply, which the exemption above would
+        otherwise let through, because the leak item A closes is precisely a release the
+        harness never chose.
+        """
+        output = self._frozen("cryptography==47.0.0", "pyopenssl==19.1.0")
+        assert bake_mod.unpinned_freeze(
+            output,
+            pins=(("pyopenssl", "19.1.0"),),
+            provided=("cryptography",),
+            dropped=("cryptography",),
+        ) == ("cryptography==47.0.0",)
+        # And the layer that got it right reports nothing, which is the pass taking.
+        assert (
+            bake_mod.unpinned_freeze(
+                self._frozen("pyopenssl==19.1.0"),
+                pins=(("pyopenssl", "19.1.0"),),
+                provided=("cryptography",),
+                dropped=("cryptography",),
+            )
+            == ()
+        )
 
     def test_the_failure_is_what_the_report_reads(self):
         result = bake_mod.freeze_failure(("exceptiongroup==1.3.1",))

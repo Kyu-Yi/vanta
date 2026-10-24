@@ -572,6 +572,18 @@ def cmd_bake(args: argparse.Namespace) -> int:
         item.checkpoint: item.provenance.get("provisioned") or ()
         for item in bug_deps
     }
+    # The names §3.2 dropped for each layer, which both gates read by name: the own-pin
+    # gate tolerates the ``pip check`` reading that names one and fails on any other
+    # missing requirement, and the freeze gate fails on a dropped name at any version
+    # (bake.CASE_DROPPED_DEPENDENCY, bake.unpinned_freeze). Read from the same
+    # provenance: the recipe installs the pins that declare one with ``--no-deps``, so
+    # a dropped name in the layer is the pass not having taken.
+    dropped = {
+        item.checkpoint: tuple(
+            pin["name"] for pin in item.provenance.get("dropped") or ()
+        )
+        for item in bug_deps
+    }
     try:
         summary = bake_mod.run_bake_actions(
             actions,
@@ -586,6 +598,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             ),
             pins=pin_lists,
             provided=provided,
+            dropped=dropped,
         )
     except BaseException:
         report_flagged()

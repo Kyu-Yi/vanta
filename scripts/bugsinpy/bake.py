@@ -2964,6 +2964,7 @@ def requirements_recipe(
     *,
     build_pins: Sequence[str] = (),
     early_pins: Sequence[str] = (),
+    no_deps_pins: Sequence[str] = (),
     orphans: Sequence[str] = (),
     minor: Optional[str] = None,
 ) -> str:
@@ -3038,14 +3039,16 @@ def requirements_recipe(
     between two of BugsInPy's own pins, and this is the reading that says which
     conflicts it actually installed (:func:`pip_check_conflicts`).
 
-    All **four** installs carry ``-c`` on one constraints file holding the layer's whole
+    Every install carries ``-c`` on one constraints file holding the layer's whole
     pin list (:data:`CONSTRAINTS_FILE`), written above the first of them. A pin list is only
     the layer's environment if every install in the layer is held to it: ``fastapi/1``
     measured the difference, a toolchain step that pulled today's ``requests`` for
     ``flit==2.3.0`` and left ``charset-normalizer`` in a layer whose pins name neither —
     which is what the freeze gate then refused. The file holds the same pins the installs
     hold, so it cannot change what a layer installs; it only stops a step resolving a
-    dependency of a pin to a release no pin of this layer decided.
+    dependency of a pin to a release no pin of this layer decided. It is also the reason
+    ``no_deps_pins`` has to be its own pass and not a line left in the main one: a dropped
+    name is in no constraints file either, so ``-c`` is silent about it.
 
     ``orphans`` is the one thing the recipe **removes**, and it goes here rather than in
     the pin list because it is the layer's own residue and not a dependency of anything in
@@ -3061,11 +3064,28 @@ def requirements_recipe(
     ``build_pins`` is keyword-only and empty by default so that a caller with nothing
     to build — and every test of the dependency half — still gets a recipe, and the
     recipe says so rather than pretending to a toolchain it was not given.
+
+    ``no_deps_pins`` is §3.2's dropped-dependency pass and the one subset of
+    ``install_specs`` installed **separately**, with ``--no-deps``
+    (:func:`dropped_dependents`): a pin whose own release declares a name the layer
+    dropped, because leaving it in the main pass is what lets pip resolve that dropped
+    name — at the newest release of the day, since the name is in no pin list and in no
+    constraints file. Measured, ``sanic/1``'s ``pyopenssl==19.1.0`` declares
+    ``cryptography (>=2.8)`` and the layer held ``cryptography 47.0.0`` for it. It runs
+    **after** the main pass, so everything the pin declared is already installed (the
+    closure walk pinned it) and ``--no-deps`` costs nothing but the dropped name, and
+    **before** the orphan removal, which is the last thing before the reading.
     """
-    body = "\n".join(spec.strip() for spec in install_specs if spec.strip()).strip()
+    no_deps = [spec.strip() for spec in no_deps_pins if spec.strip()]
+    no_deps_set = set(no_deps)
+    body = "\n".join(
+        spec.strip()
+        for spec in install_specs
+        if spec.strip() and spec.strip() not in no_deps_set
+    ).strip()
     toolchain, build_requires = _split_build_pins(build_pins)
     # The layer's whole pin list, written once and passed to every install below
-    # (:data:`CONSTRAINTS_FILE`). Four installs and one file, because the failure it is
+    # (:data:`CONSTRAINTS_FILE`). One file and every install, because the failure it is
     # written against is exactly a *step* that resolved a name the layer's pins do not
     # contain: the toolchain's own `flit==2.3.0` pulled today's `requests` and left
     # `charset-normalizer` behind for the freeze gate to catch.
@@ -3156,6 +3176,26 @@ def requirements_recipe(
             "python -m pip install --no-cache-dir "
             f"{held}--no-build-isolation {LEGACY_RESOLVER_FLAG} -r /tmp/req.txt",
             _no_isolated_build_env("the dependency install"),
+        ]
+    if no_deps:
+        lines += [
+            "cat > /tmp/no-deps.txt <<'VANTA_NO_DEPS'",
+            "\n".join(no_deps),
+            "VANTA_NO_DEPS",
+            # §3.2's dropped-dependency pass, and the one install that must not resolve
+            # anything: each of these pins declares a name the layer dropped, so pip's
+            # own resolution would fetch it — at the newest release of the day, since a
+            # dropped name is in no pin list and no constraints file. `--no-deps` stops
+            # the resolution instead of accommodating it; the pins' other requirements
+            # are already installed by the pass above, so nothing but the dropped name
+            # is withheld, and `pip check` below is left to report exactly that
+            # (:data:`CASE_DROPPED_DEPENDENCY`). Runs *after* the main pass so those
+            # requirements are all there, and *before* the orphan removal so the
+            # uninstalls it does are the last word on the environment.
+            "python -m pip install --no-cache-dir "
+            f"{held}--no-build-isolation {LEGACY_RESOLVER_FLAG} --no-deps "
+            "-r /tmp/no-deps.txt",
+            _no_isolated_build_env("the dropped-dependency install"),
         ]
     lines += [
         # The inheritance, undone: the interpreter layer's environment arrives whole
@@ -4628,7 +4668,6 @@ def transitive_pins(
     metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
     cutoffs: Optional[Mapping[str, str]] = None,
     tree_satisfied: Optional[Mapping[str, str]] = None,
-    installable_dropped: Sequence[str] = (),
 ) -> tuple[
     tuple[ResolvedDep, ...],
     tuple[str, ...],
@@ -4688,33 +4727,6 @@ def transitive_pins(
     is reported rather than passed. Only a name *every* one of whose paths starts at a
     replaced harness pin is one of these: a name a kept harness pin also needs is that
     pin's dependency and stays (:func:`OrphanedPin`'s own note on ``replaced_by``).
-
-    ``installable_dropped`` is the fourth input and the one the rule above gets wrong on
-    its own: the names this layer's pin list **drops** for a reason that does not stop pip
-    from installing them. A drop removes a name from the list; it does not remove the
-    requirement another pin wrote for that name, so pip resolves it at install time and
-    the layer holds a release the harness never chose. Measured on ``sanic/1``:
-    ``pyopenssl==19.1.0`` declares ``cryptography (>=2.8)``, the date rule's
-    ``cryptography==2.8`` is unbuildable here and is dropped, and pip installed
-    ``cryptography 47.0.0`` — whose own ``requires_dist`` names ``typing-extensions``,
-    a name only the replaced ``pytest 8.0.2`` brought in and which the layer therefore
-    removed. The removal was a ``pip check`` failure in the layer's own log
-    (``cryptography 47.0.0 requires typing-extensions, which is not installed``). So the
-    closure of each of these names is walked too, and a name it reaches is **not** an
-    orphan: nothing in this layer requires it is a claim the walk can only make from the
-    release pip is about to install.
-
-    The walk is at the *newest* release and not by date, for phase (A)'s reason: nothing
-    pins these names, so pip is free to resolve them at today's, and what this pass needs
-    from that release is the **names** it declares — the same prediction phase (A) makes
-    of the interpreter layer, with the same blind spot (a name that appears or disappears
-    with a release is the one thing this cannot see). Such a name is left exactly as the
-    interpreter layer provides it and not pinned: :func:`_transitive_pin` chooses by the
-    date rule, and no release it could choose both satisfies a release pip resolved years
-    after this layer's pins and holds on this image — the era's ``typing-extensions
-    3.7.4.2`` is the one ``pip check`` above refuses, and the release that does satisfy it
-    requires Python 3.9. The interpreter layer's own version is the one that satisfies
-    both, and it is already installed; that is what "the base layer brought it in" means.
 
     ``cutoffs`` maps a canonical pin name to the date that pin's **own** requirements are
     held to (:func:`pin_cutoff` — for a date-rule pin that is the date it was pinned
@@ -4938,44 +4950,6 @@ def transitive_pins(
         if settled[canonicalize_name(source)][1] != version
     }
     supplied = inherited - pinned - set(records)
-    # (D) The names pip's own resolution adds for a pin this layer drops, and the reason
-    # the filter below may not remove them (:data:`ORPHAN_RULE`'s measured exception,
-    # ``sanic/1``'s ``typing-extensions``). The roots are the releases pip is free to
-    # install for a dropped name — the *newest* one, the rule phase (A) walks the
-    # interpreter layer's provision by — and what is collected is the **names** they
-    # declare: a name the layer ends up holding may not be uninstalled, whoever required
-    # it. Descended like phase (A) rather than one level deep, because pip's resolution is
-    # a closure too; a name this layer pins, a name its own closure reaches, a harness pin
-    # and the tree's own names are all decided elsewhere and stop the walk.
-    pip_resolved: set[str] = set()
-    if installable_dropped:
-        pending: list[tuple[str, str]] = []
-        for source in installable_dropped:
-            canonical = canonicalize_name(source)
-            try:
-                available = releases_of(canonical)
-            except BakeError:
-                continue
-            if available:
-                pending.append((canonical, _newest_release(available)[0]))
-        walked: set[tuple[str, str]] = set()
-        while pending:
-            name, version = pending.pop()
-            if (name, version) in walked:
-                continue
-            walked.add((name, version))
-            for required, _, _raw in declarations(name, version):
-                if required in pinned or required in records or required in roots:
-                    continue
-                if required in tree:
-                    continue
-                pip_resolved.add(required)
-                try:
-                    available = releases_of(required)
-                except BakeError:
-                    continue
-                if available:
-                    pending.append((required, _newest_release(available)[0]))
     orphans = tuple(
         OrphanedPin(
             name=name,
@@ -4986,7 +4960,7 @@ def transitive_pins(
             ),
         )
         for name in sorted(supplied)
-        if bringers[name] <= replaced and name not in pip_resolved
+        if bringers[name] <= replaced
     )
     removed = {pin.name for pin in orphans}
     # The fourth answer, and the one the layer installs nothing for: a requirement a
@@ -5743,9 +5717,12 @@ class PinConflict:
     recorded, printed, and not a failure. ``"a"`` is everything else, and it is a
     failure: at least one side came from a decision this harness made (the date rule,
     or pip's own choice of a transitive dependency), so a layer holding both is a layer
-    whose environment is not the benchmark's. ``"?"`` is not a conflict at all but the
-    *absence* of the reading: no document could be reached for one of the pins, so what
-    it declares is unknown (:data:`CASE_UNKNOWN`).
+    whose environment is not the benchmark's. ``"d"`` is the one *absence* that is
+    expected rather than a finding (:data:`CASE_DROPPED_DEPENDENCY`): a requirement the
+    layer dropped on purpose, so the pin that declares it is installed ``--no-deps``
+    and the requirement is legitimately missing. ``"?"`` is not a conflict at all but
+    the *absence* of the reading: no document could be reached for one of the pins, so
+    what it declares is unknown (:data:`CASE_UNKNOWN`).
 
     ``pins`` is the two ``name==version`` spellings the finding is about, in the order
     it names them. It is carried because both readings produce prose
@@ -5766,13 +5743,20 @@ class PinConflict:
 
     @property
     def tolerated(self) -> bool:
-        """Whether §3.2 lets this layer keep the conflict: both sides its own pins."""
-        return self.case == CASE_BOTH_OWN_PINS
+        """Whether §3.2 lets this layer keep the finding: an expected absence, or both
+        sides its own pins (:data:`CASE_BOTH_OWN_PINS`, :data:`CASE_DROPPED_DEPENDENCY`).
+        """
+        return self.case in (CASE_BOTH_OWN_PINS, CASE_DROPPED_DEPENDENCY)
 
     def describe(self) -> str:
         """One line a reader can act on, with the case and the verdict in it."""
         if self.case == CASE_UNKNOWN:
             return f"case (?) unknown — {self.requires}"
+        if self.case == CASE_DROPPED_DEPENDENCY:
+            return (
+                f"case ({self.case}) {self.requires}: dropped dependency, by §3.2's "
+                "audit — tolerated"
+            )
         verdict = (
             "tolerated (both sides are BugsInPy's own pins, installed as written)"
             if self.tolerated
@@ -5796,6 +5780,22 @@ CASE_BOTH_OWN_PINS = "b"
 
 CASE_HARNESS_CHOICE = "a"
 """§3.2's case (a): one side is a version this harness chose, so the bake fails."""
+
+CASE_DROPPED_DEPENDENCY = "d"
+"""§3.2's dropped dependency: a requirement this layer dropped on purpose is absent.
+
+[VANTA-WHY] This is the one ``pip check`` reading that must not be a failure, and the
+one that would otherwise be one. A pin this layer installs may declare a name §3.2's
+unresolvable-pin rule dropped (:func:`decide_unresolvable`); the pin is installed
+``--no-deps`` so pip cannot resolve that name at the newest release of the day
+(:func:`dropped_dependents`), and ``pip check`` then reports the missing requirement —
+``pyopenssl 19.1.0 requires cryptography, which is not installed``. That reading is the
+measure working, not failing: the drop is recorded in the provenance with the audit that
+justified it, and the alternative is the layer holding a release the harness never chose.
+Tolerated **by name only**: the requirement the reading names has to be one this layer
+dropped, so a missing requirement that is anything else is still case (a)
+(:data:`CASE_HARNESS_CHOICE`) and still fails the layer.
+"""
 
 CASE_UNKNOWN = "?"
 """Neither case: no reading reached one of the pins, so nothing could be checked.
@@ -5934,8 +5934,27 @@ one this cannot read (:func:`pip_check_conflicts`).
 """
 
 
+def _required_name(text: str) -> Optional[str]:
+    """The canonical distribution name at the head of a requirement pip spelled out.
+
+    ``cryptography`` and ``cryptography>=2.8`` have to answer the same, because which
+    one pip writes depends on the requirement and not on the finding: its
+    ``which is not installed`` sentence names the requirement as declared. A string
+    that is not a requirement at all yields ``None``, and the caller then treats the
+    reading as case (a) rather than deciding it is tolerable.
+    """
+    try:
+        return canonicalize_name(Requirement(text).name)
+    except InvalidRequirement:
+        match = re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*", text.strip())
+        return canonicalize_name(match.group(0)) if match else None
+
+
 def pip_check_conflicts(
-    readings: Iterable[str], *, own: Container[str]
+    readings: Iterable[str],
+    *,
+    own: Container[str],
+    dropped: Container[str] = (),
 ) -> tuple[PinConflict, ...]:
     """Judge a layer's ``pip check`` readings by §3.2's rule, in order.
 
@@ -5943,9 +5962,18 @@ def pip_check_conflicts(
     or not — the record is what the deps JSON and the bake output carry — and
     :attr:`PinConflict.tolerated` is the verdict the caller acts on.
 
+    ``dropped`` is the canonical names §3.2 dropped for this layer, and it is what makes
+    an *absence* tolerable instead of a failure: a reading that names no held version
+    (``… requires cryptography, which is not installed``) is
+    :data:`CASE_DROPPED_DEPENDENCY` when the requirement it names is a dropped name, and
+    case (a) — a failure — for every other missing requirement. Nothing else about the
+    reading changes, so a missing requirement this layer did *not* drop still stops the
+    layer.
+
     A reading of :data:`PIP_CHECK_CLEAN` contributes nothing: it is pip saying it found
     no conflict, and a layer that says that has passed the gate.
     """
+    names = {canonicalize_name(name) for name in dropped}
     out: list[PinConflict] = []
     for line in readings:
         text = line.strip()
@@ -5966,6 +5994,35 @@ def pip_check_conflicts(
         package_version = match.group("package_version")
         held = match.group("held")
         held_version = match.group("held_version")
+        declared = match.group("requires").strip()
+        if held is None:
+            # A reading with no held version is an *absence*, not a conflict between two
+            # pins, so §3.2's case (b) cannot apply to it — there is only one side. The
+            # one absence this layer may have is a name it dropped on purpose
+            # (:data:`CASE_DROPPED_DEPENDENCY`); every other missing requirement fails the
+            # layer, whatever the name that declared it.
+            required = _required_name(declared)
+            if required is not None and required in names:
+                out.append(
+                    PinConflict(
+                        case=CASE_DROPPED_DEPENDENCY,
+                        requires=f"{package}=={package_version} declares {declared}",
+                        held="nothing",
+                        source="pip check",
+                        pins=(f"{package}=={package_version}",),
+                    )
+                )
+            else:
+                out.append(
+                    PinConflict(
+                        case=CASE_HARNESS_CHOICE,
+                        requires=f"{package}=={package_version} declares {declared}",
+                        held="nothing",
+                        source="pip check",
+                        pins=(f"{package}=={package_version}",),
+                    )
+                )
+            continue
         out.append(
             PinConflict(
                 case=_conflict_case(
@@ -6167,6 +6224,7 @@ def unpinned_freeze(
     *,
     pins: Sequence[tuple[str, str]],
     provided: Container[str] = (),
+    dropped: Container[str] = (),
 ) -> tuple[str, ...]:
     """The distributions a layer installed that no pin of it names (§3.2).
 
@@ -6194,6 +6252,19 @@ def unpinned_freeze(
     reading of it, which is what the interpreter layer's own freeze is kept for
     (:func:`_freeze_echo`).
 
+    ``dropped`` is the one name this gate fails on **whatever** the pin list and the
+    provision say, and it is the second reader of §3.2's dropped-dependency pass
+    (:func:`dropped_dependents`). A dropped name is in neither ``pins`` nor ``provided``
+    (:func:`drop_unresolvable_deps` never asks about a package the interpreter layer
+    carries), so it would be reported above anyway — but only *by accident*, and only for
+    a layer that happens to have a pin list. This makes it the rule it is: the layer's
+    recipe installs the pins that declare a dropped name with ``--no-deps`` precisely so
+    that pip cannot resolve it, so a dropped name in the freeze at **any** version means
+    the pass did not take, and that is a failure even when the version would otherwise be
+    exempt. Without it the leak the pass closes could reopen silently, because a leaked
+    release is a name the pin list does not contain and would look like any other
+    finding.
+
     A line that is not a distribution — pip's editable-install forms start with ``-``
     or ``#`` — is passed over: it is not a name to compare, and nothing here can say
     what it provides.
@@ -6201,12 +6272,18 @@ def unpinned_freeze(
     named = {canonicalize_name(name) for name, _ in pins} | {
         canonicalize_name(name) for name in provided
     }
+    dropped_names = {canonicalize_name(name) for name in dropped}
     out: list[str] = []
     for reading in freeze_readings(output):
         if reading.startswith(("-", "#")):
             continue
         name = reading.partition("==")[0].partition(" @ ")[0].strip()
-        if not name or canonicalize_name(name) in named:
+        if not name:
+            continue
+        if canonicalize_name(name) in dropped_names:
+            out.append(reading)
+            continue
+        if canonicalize_name(name) in named:
             continue
         out.append(reading)
     return tuple(out)
@@ -7137,6 +7214,13 @@ def _conflict_sections(
     install that pin, so no pair is left to conflict — the same reason
     (:func:`_unavailable_pins`) skips a dropped pin, and the drops have their own block
     below with the audit that settled them.
+
+    There is no section for :data:`CASE_DROPPED_DEPENDENCY`, and it is the one case this
+    report cannot produce: every conflict here comes from the pins' own metadata
+    (:func:`metadata_conflicts`), and case (d) is a *reading* — the layer's own ``pip
+    check`` saying a requirement is absent — so it exists only in
+    :func:`run_bake_actions`' gate. The preflight would have to install the layer to have
+    that reading, which is the layer's own build log, not this one.
     """
     grouped: dict[str, dict[str, list[str]]] = {
         case: {} for case in _CONFLICT_SECTIONS
@@ -8745,6 +8829,59 @@ def installs_of(resolved: Sequence[ResolvedDep]) -> tuple[str, ...]:
     return tuple(dep.pin for dep in resolved if not dep.harness)
 
 
+def dropped_dependents(
+    installs: Sequence[str],
+    dropped: Sequence[DroppedPin],
+    *,
+    metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
+) -> tuple[str, ...]:
+    """The pins whose **own** release declares a name §3.2 dropped, as spec strings.
+
+    [VANTA-WHY] A drop removes a name from ``installs``; it does not remove the
+    requirement another pin wrote for that name, so pip resolves it at install time —
+    and at the newest release of the day, because a dropped name is in no pin list and
+    therefore in no ``-c`` constraints file either. Measured, ``sanic/1``: the date
+    rule's ``cryptography==2.8`` and its declared ``cryptography==2.9.2`` are both
+    unbuildable here and dropped, ``pyopenssl==19.1.0`` declares ``cryptography (>=2.8)``
+    and ``service-identity==18.1.0`` declares it too, and the layer ended up holding
+    ``cryptography 47.0.0`` — a release newer than the layer's own Python, whose
+    ``requires_dist`` names a package the layer had just removed as an orphan, which is
+    what its own ``pip check`` reported.
+
+    So the pins that declare a dropped name are installed ``--no-deps`` in their own
+    pass (:func:`requirements_recipe`). Nothing is lost by that: everything those pins
+    require is already in ``installs`` — the closure walk pinned it — except the dropped
+    name itself, which is precisely what may not be installed. ``pip check`` then reports
+    the drop and nothing else, which is the one reading the gate tolerates by name
+    (:data:`CASE_DROPPED_DEPENDENCY`).
+
+    A pin is a dependent when its **own** release's ``requires_dist`` names a dropped
+    name (:func:`_declared_requirement`), read at the version ``installs`` carries. A
+    release whose metadata cannot be read is skipped rather than guessed at: the walk
+    already recorded that release's declarations, and inventing a dependency here would
+    be the second reader the rest of this module exists to avoid.
+    """
+    names = {canonicalize_name(record.name) for record in dropped}
+    if not names:
+        return ()
+    out: list[str] = []
+    for spec in installs:
+        parts = _pinned_parts(spec)
+        if parts is None:
+            continue
+        name, version = parts
+        try:
+            requires, _requires_python = metadata_of(name, version)
+        except BakeError:
+            continue
+        if any(
+            _declared_requirement(requires, dropped_name) is not None
+            for dropped_name in names
+        ):
+            out.append(spec)
+    return tuple(out)
+
+
 def deps_provenance(
     sources: DepSources,
     resolved: Sequence[ResolvedDep],
@@ -8753,6 +8890,7 @@ def deps_provenance(
     build_pins: Sequence[BuildPin] = (),
     early: Sequence[EarlyInstall] = (),
     dropped: Sequence[DroppedPin] = (),
+    no_deps: Sequence[str] = (),
     provisioned: Sequence[str] = (),
     orphans: Sequence[OrphanedPin] = (),
     tree_satisfied: Sequence[TreeSatisfied] = (),
@@ -8812,12 +8950,26 @@ def deps_provenance(
     "this file predates the rule" have to be distinguishable by a reader — and a layer
     whose install list is shorter than its declarations needs the record of why.
 
+    ``no_deps`` is the other half of ``dropped`` and the one pass the pin list cannot
+    describe (:func:`dropped_dependents`): the spec strings of the pins whose **own**
+    release declares a dropped name. They are in ``installs`` — they are installed —
+    but ``requirements_recipe`` moves them out of the main pass into their own
+    ``--no-deps`` one, because a pin that declares a dropped name is what makes pip
+    resolve that name at install time, and to the newest release of the day since the
+    dropped name is in no pin list and in no constraints file. Measured, ``sanic/1``'s
+    ``pyopenssl==19.1.0`` declares ``cryptography (>=2.8)`` and the layer ended up with
+    ``cryptography 47.0.0``. The key is always present, empty when nothing was dropped.
+
     ``pip_check`` (:data:`PIP_CHECK_KEY`) is the layer's **own** verdict on itself, read
     from ``pip check`` after the install and written back here by
     :func:`record_pip_check`. It starts empty and stays empty for a layer whose install
     had nothing to report, which is most of them — and the preflight's reading of the
     same question from PyPI's metadata is not this key: that one is in the layer's
-    ``.preflight.json``, and it is a prediction. This one is what pip did.
+    ``.preflight.json``, and it is a prediction. This one is what pip did. For a layer
+    that dropped something, the one expected reading is the dropped name itself
+    (``<package> <ver> requires <dropped name>, which is not installed``), which
+    :data:`CASE_DROPPED_DEPENDENCY` tolerates by name and which the freeze gate would
+    otherwise have to fail on.
 
     ``provisioned`` is the mirror of ``harness_pins``: the canonical names the
     interpreter layer is predicted to hold and this layer neither pins nor picks
@@ -8867,6 +9019,7 @@ def deps_provenance(
         "provisioned": list(provisioned),
         "installs": list(installs_of(resolved)),
         "dropped": [pin.as_dict() for pin in dropped],
+        "no_deps": list(no_deps),
         "orphans": [pin.as_dict() for pin in orphans],
         "tree_satisfied": [item.as_dict() for item in tree_satisfied],
         "build_pins": [pin.as_dict() for pin in build_pins],
@@ -8917,6 +9070,17 @@ class BugDeps:
     provenance: dict[str, Any]
     build_pins: tuple[str, ...] = ()
     early_pins: tuple[str, ...] = ()
+    no_deps_pins: tuple[str, ...] = ()
+    """The pins whose *own* release declares a name §3.2 dropped, so they are installed
+    with ``--no-deps`` (:func:`dropped_dependents`).
+
+    Spec strings, because the recipe installs them: they are in ``installs`` and in the
+    freeze gate's pin list — they are installed, just not with their dependencies — and
+    what ``requirements_recipe`` does with them is move them out of the main pass into
+    their own ``--no-deps`` one, which is what stops pip resolving the dropped name at
+    the newest release of the day. Empty for every layer with nothing dropped, which is
+    most of them.
+    """
     orphans: tuple[str, ...] = ()
     """The inherited names the layer's recipe has to **remove**, not install (§3.2).
 
@@ -9165,23 +9329,6 @@ def resolve_bug_deps(
                         if (date := pin_cutoff(dep)) is not None
                     },
                 },
-                # The dropped names pip will install anyway, which is what the orphan
-                # rule needs to answer "does anything in this layer still require it"
-                # (:func:`transitive_pins`). ``unbuildable`` and not ``unavailable``: the
-                # first is a name whose *pinned* release nothing here can build and whose
-                # requirement another pin still carries, so pip resolves a release of it
-                # at install time — ``sanic/1``'s ``cryptography``. The second is a name
-                # with no file that works on this image at all (``pywin32``), which pip
-                # cannot install under any version.
-                installable_dropped=tuple(
-                    sorted(
-                        {
-                            record.name
-                            for record in dropped
-                            if record.outcome == UNBUILDABLE
-                        }
-                    )
-                ),
             )
             # The closure walk's own picks get the same audit, and they are the half of
             # the layer it was measured on: ``luigi/1`` and ``sanic/1`` both install
@@ -9211,6 +9358,19 @@ def resolve_bug_deps(
         deps = (*resolved, *transitive)
         installs = installs_of(deps)
         pins = pinned_parts(*build_specs, *installs)
+        # §3.2's dropped-dependency pass, and the one thing the pin list cannot say for
+        # itself: a drop removes a name from ``installs``, it does not remove the
+        # requirement another pin wrote for that name, so pip installs a release of it —
+        # the newest of the day, since the name is in no pin list and in no constraints
+        # file. ``sanic/1`` measured it: ``cryptography`` is dropped for both its declared
+        # and its transitive pick, ``pyopenssl==19.1.0`` and ``service-identity==18.1.0``
+        # declare it, and the layer ended up with ``cryptography 47.0.0``. The pins whose
+        # own release declares a dropped name are therefore installed with ``--no-deps``
+        # in their own pass (:func:`requirements_recipe`), which is what stops pip
+        # resolving it at all; ``pip check`` then reports the dropped dependency itself and
+        # nothing else, which is what the gate tolerates by name
+        # (:data:`CASE_DROPPED_DEPENDENCY`).
+        no_deps = dropped_dependents(installs, dropped, metadata_of=metadata_of)
         # §3.2's marker rule over the pinned releases' own build declarations, which is
         # this rule's early-pass half: a ``[build-system].requires`` entry that does not
         # hold on this image is not something the build orders anything for. The dropped
@@ -9243,6 +9403,7 @@ def resolve_bug_deps(
                     build_pins=built,
                     early=early,
                     dropped=dropped,
+                    no_deps=no_deps,
                     provisioned=provisioned,
                     orphans=orphaned,
                     tree_satisfied=tree_satisfied_pins,
@@ -9252,6 +9413,7 @@ def resolve_bug_deps(
                 # recipe installs these, and ``satisfied_by`` is already the pin's own
                 # spelling. One pin can satisfy two builds, so the list is de-duplicated.
                 early_pins=tuple(dict.fromkeys(item.satisfied_by for item in early)),
+                no_deps_pins=no_deps,
                 orphans=tuple(pin.name for pin in orphaned),
             )
         )
@@ -9469,6 +9631,7 @@ def layer_recipes(
                     item.installs,
                     build_pins=item.build_pins,
                     early_pins=item.early_pins,
+                    no_deps_pins=item.no_deps_pins,
                     orphans=item.orphans,
                     minor=minor,
                 ),
@@ -9915,6 +10078,7 @@ def run_bake_actions(
     record: Optional[Callable[[str, tuple[PinConflict, ...]], None]] = None,
     pins: Optional[Mapping[str, Sequence[tuple[str, str]]]] = None,
     provided: Optional[Mapping[str, Container[str]]] = None,
+    dropped: Optional[Mapping[str, Container[str]]] = None,
 ) -> str:
     """Delete, then build every layer the plan asks for, and report what happened.
 
@@ -9998,11 +10162,16 @@ def run_bake_actions(
     whether the pin list *describes* the layer — and it is the preflight's
     :func:`transitive_pins` that should make it pass: the walk pins what a release
     declared, so a name here is a declaration the walk could not read (an sdist with no
-    metadata) rather than one it missed.
+    metadata) rather than one it missed. ``dropped`` maps a layer to the canonical names
+    §3.2 dropped for it, and it is passed to both gates: the own-pin gate tolerates the
+    ``pip check`` reading that names one (:data:`CASE_DROPPED_DEPENDENCY`) and fails on
+    every other missing requirement, and the freeze gate fails on a dropped name at any
+    version whatever the pin list and provision say (:func:`unpinned_freeze`).
     """
     own = own_pins or {}
     pin_lists = pins or {}
     supplied = provided or {}
+    dropped_names = dropped or {}
     logs: dict[str, Path] = {}
     if logs_dir is not None:
         clear_bake_logs(logs_dir)
@@ -10037,6 +10206,7 @@ def run_bake_actions(
                 conflicts = pip_check_conflicts(
                     pip_check_readings(built.stdout + built.stderr),
                     own=own[action.name],
+                    dropped=dropped_names.get(action.name, ()),
                 )
                 for conflict in conflicts:
                     log(f"[{action.name}] {conflict.describe()}")
@@ -10062,6 +10232,7 @@ def run_bake_actions(
                     built.stdout + built.stderr,
                     pins=pin_lists[action.name],
                     provided=supplied.get(action.name, ()),
+                    dropped=dropped_names.get(action.name, ()),
                 )
                 if unpinned:
                     for line in unpinned:

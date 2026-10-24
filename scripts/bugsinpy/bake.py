@@ -212,6 +212,29 @@ that declared it.
 BUILD_PIN_RULE = "the newest release on or before the bug's commit date"
 """One phrase for the provenance, shared with §3.2's rule for dependencies."""
 
+BUILD_REQUIREMENT_PIN_RULE = "build requirement, date rule"
+"""The ``pin_rule`` of a build requirement one of this layer's own pins declares (§3.2).
+
+[VANTA-WHY] This is the *fourth* kind of build pin, and it exists because the other three
+all read the tree's own files. ``ujson==2.0.3`` is a dependency of ``luigi/1`` that has no
+aarch64 wheel for py3.8, so pip builds it here — and its ``setup.py`` says
+``setup_requires=["setuptools_scm"]``. Nothing in the layer pinned that name, so
+``--no-build-isolation`` (which is what makes the toolchain pins mean anything) left
+setuptools' ``easy_install`` to fetch **today's** release of it, and today's
+``setuptools_scm`` imports ``setuptools.sic``, a name no setuptools the layer could
+possibly hold still carries — so the metadata step died with ``ImportError: cannot import
+name 'sic' from 'setuptools'`` and the layer never built.
+
+The name is a build requirement like any other and it gets the date rule like any other:
+the newest release on or before the bug's commit date that satisfies the declared range.
+That is also what makes it *work* with the layer's own setuptools, which is pinned by the
+same rule and therefore from the same era: a release from the tree's own date predates the
+setuptools API a today-release needs. Kept as its own phrase rather than reusing
+:data:`BUILD_PIN_RULE` because the reader has to be able to tell a pin the *tree* asked for
+from one a *dependency's* sdist asked for — ``setuptools_scm`` appearing in a luigi layer's
+pin list is otherwise unexplainable.
+"""
+
 BUGSINPY_PIN_RULE = "BugsInPy's own exact pin, installed as written"
 """The ``pin_rule`` of a pin that came from BugsInPy's own files (:func:`reference_pin`).
 
@@ -5897,6 +5920,13 @@ def pin_narrowings(provenance: Mapping[str, Any]) -> tuple[tuple[str, str], ...]
     ``{"pin": <the pin that asked>, "requires": <its clause>}`` — so one loop reads both,
     and the moved build tool prints under NARROWED like any other moved pin rather than as
     an EARLY ordering.
+
+    A claim with **no clause** is not read: a requirement that names no version bounds
+    nothing, so it cannot be why a pin moved, and printing it would name a declarer that
+    asked for nothing (``setuptools==42.0.0 — pip==21.3.1 declares``). Both writers drop
+    them (:func:`narrow_build_pins`, :func:`_narrowing_requirements`); this is the reader
+    refusing to make a reason out of one anyway, so a provenance written before that rule
+    reads the same way as one written after it.
     """
     out: list[tuple[str, str]] = []
     for group in ("build_pins", "dependencies"):
@@ -5905,7 +5935,10 @@ def pin_narrowings(provenance: Mapping[str, Any]) -> tuple[tuple[str, str], ...]
             if not pin:
                 continue
             for claim in dep.get("narrowed_by") or ():
-                out.append((pin, f"{claim.get('pin')} declares {claim.get('requires')}"))
+                requires = str(claim.get("requires") or "")
+                if not requires:
+                    continue
+                out.append((pin, f"{claim.get('pin')} declares {requires}"))
             for claim in dep.get("refused") or ():
                 out.append(
                     (
@@ -6700,6 +6733,176 @@ class EarlyInstall:
         }
 
 
+@dataclass(frozen=True)
+class BuildRequirement:
+    """A build requirement one of this layer's own pins declares and no pin covers (§3.2).
+
+    [VANTA-WHY] The one gap :func:`early_install_pins` and :func:`narrow_build_pins` both
+    leave: the first orders a requirement the layer *already holds* and the second moves a
+    pin the requirement refuses, and both are silent about a name **nothing** pins. That
+    silence is what killed ``luigi/1``: ``ujson==2.0.3`` declares
+    ``setup_requires=["setuptools_scm"]``, no pin held it, and setuptools fetched today's
+    release for it (:data:`BUILD_REQUIREMENT_PIN_RULE`). Naming the declarer is the point —
+    "setuptools_scm" alone would not say whose sdist asked, and the fix is a pin chosen
+    *for that declaration*.
+    """
+
+    name: str
+    """The required distribution's canonical name."""
+    declarer: str
+    """The pin whose own build declared it, as ``name==version``."""
+    requirement: DepRef
+    """The declaration as the declaring release wrote it, with its source."""
+
+    @property
+    def source(self) -> str:
+        """The provenance's ``source`` for this pin: the declarer and the line it wrote."""
+        return f"{self.declarer} {self.requirement.source}"
+
+
+def uncovered_build_requirements(
+    built: Sequence[tuple[str, str]],
+    pinned: Sequence[tuple[str, str]],
+    *,
+    build_requires_of: Callable[[str, str], Sequence[DepRef]],
+    python_minor: str,
+) -> list[BuildRequirement]:
+    """The build requirements this layer's own builds declare and no pin covers (§3.2).
+
+    ``built`` and ``pinned`` are the same two arguments :func:`early_install_pins` takes
+    and for the same reason: what a pin's build *needs* is a fact about that release's
+    sdist, and which names the layer *has* is the pin list. ``built`` — the pins pip will
+    compile here, the caller's answer — is what is read, because only a build runs
+    ``setup.py`` at all: a release that installs from a wheel never exercises its own
+    ``[build-system].requires``, so there is nothing for it to fetch and nothing to pin.
+
+    A name this layer already pins is **not** here: whether that pin needs *ordering*
+    before the build is :func:`early_install_pins`'s finding, and whether it is too low is
+    :func:`narrow_build_pins`'s. What is left is a name with no version at all, which is
+    the one case that ends in ``easy_install`` fetching a release nobody chose.
+
+    A harness name is skipped for the same reason :func:`resolve_build_pins` skips it: what
+    the interpreter layer already carries is not something a tree's build gets to re-pin
+    (§3.2). A pin whose own metadata cannot be read narrows nothing and is passed over —
+    the same conservative answer :func:`early_install_pins` gives, and for the same reason:
+    refusing a bug over a download that did not come back is failing on a fetch and not on
+    a fact.
+
+    ``python_minor`` is applied here (§3.2's marker rule, :func:`marker_skips`), on the
+    *declaring* release's own field: a build requirement that does not hold on this image
+    is not something a build of it fetches.
+    """
+    held = {canonicalize_name(name) for name, _ in pinned}
+    out: list[BuildRequirement] = []
+    seen: set[tuple[str, str, str]] = set()
+    for name, version in built:
+        own = canonicalize_name(name)
+        spelling = f"{name}=={version}"
+        try:
+            refs = tuple(build_requires_of(name, version))
+        except BakeError:
+            continue
+        refs, _ = marker_skips(refs, python_minor=python_minor)
+        for ref in refs:
+            required = canonicalize_name(ref.name)
+            if required == own or required in held or required in HARNESS_PACKAGES:
+                continue
+            key = (required, spelling, ref.source)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                BuildRequirement(name=required, declarer=spelling, requirement=ref)
+            )
+    return out
+
+
+def build_requirement_pins(
+    requirements: Sequence[BuildRequirement],
+    *,
+    releases: Mapping[str, Mapping[str, str]],
+    commit_date: str,
+) -> list[BuildPin]:
+    """Date-pin each build requirement nothing in the layer covers (§3.2).
+
+    One pin per **name**, not per declaration: two of this layer's pins can declare the
+    same tool (``ujson==2.0.3``'s ``setup_requires`` and ``zipp==3.1.0``'s
+    ``[build-system].requires`` both name ``setuptools_scm``), and a layer holds one
+    version of a name like every other pin it carries. The chosen release therefore
+    satisfies **every** declaration's range, the same "all of them bound it" reading
+    :func:`narrow_build_pins` uses, and each declaration is still recorded — the pin's
+    ``source`` names the first declarer and ``pin_rule`` names the rule
+    (:data:`BUILD_REQUIREMENT_PIN_RULE`).
+
+    The rules are :func:`resolve_build_pins`'s with one difference, and it is the
+    difference between a tree's declaration and a dependency's: the declared **range** is
+    honoured here. ``build_refs`` deliberately reads only the *name* of a tree's build
+    requirement, because ``numpy==1.15.4`` in pandas' ``setup.py`` is what pandas' own CI
+    used and not a bound anything needs — while ``setuptools_scm[toml]>=3.4.1`` in a
+    *published sdist's* ``[build-system].requires`` is a real declaration that release was
+    built under, and pip honours it when it builds one. A name with no release on or
+    before ``commit_date`` inside the declared range is a ``BakeError`` and flags the bug,
+    like every other date-rule refusal: a declaration nothing at the bug's date satisfies
+    is exactly the layer that would fall back on ``easy_install``.
+
+    ``releases`` is the caller's — it has to include these names, which the caller learns
+    from :func:`uncovered_build_requirements` — so the whole decision is exercised by a
+    test that never touches the network.
+    """
+    declared_by: dict[str, list[BuildRequirement]] = {}
+    for item in requirements:
+        declared_by.setdefault(item.name, []).append(item)
+    pins: list[BuildPin] = []
+    for name in sorted(declared_by):
+        claims = declared_by[name]
+        specifier = SpecifierSet(
+            ",".join(
+                sorted(
+                    {
+                        text
+                        for text in map(
+                            _specifier_text, (claim.requirement for claim in claims)
+                        )
+                        if text
+                    }
+                )
+            )
+        )
+        available = releases.get(name)
+        if not available:
+            raise BakeError(
+                f"{claims[0].source}: no release dates for {name!r} were fetched, so the "
+                "build requirement cannot be pinned by date (design §3.2 pins by date, "
+                "not by guess)"
+            )
+        matching = [
+            (version, date)
+            for version, date in available.items()
+            if _parseable(version)
+            and date[:10] <= commit_date
+            and _date_rule_candidate(version, specifier)
+            and _specifier_accepts(specifier, version)
+        ]
+        if not matching:
+            newest = _newest_release(available)
+            raise BakeError(
+                f"{claims[0].source}: {name!r} has no release on or before {commit_date} "
+                f"that satisfies {specifier or 'the declaration'}, and a layer cannot be "
+                f"built without it (newest is {newest[0]}, released {newest[1][:10]})"
+            )
+        version, released_at = max(matching, key=lambda item: Version(item[0]))
+        pins.append(
+            BuildPin(
+                name=name,
+                pin=f"{name}=={version}",
+                source=claims[0].source,
+                released_at=released_at[:10],
+                build_requirement_of=claims[0].declarer,
+            )
+        )
+    return pins
+
+
 def early_install_pins(
     built: Sequence[tuple[str, str]],
     pinned: Sequence[tuple[str, str]],
@@ -7288,20 +7491,34 @@ def _narrowing_section(reports: Sequence[PreflightBug]) -> list[str]:
     version is *not* what the date rule alone would give. Printed once per pin with every
     layer that holds it, the same shape the other blocks use, so "which layers is this
     pin in" is answerable from the line.
+
+    [VANTA-WHY] Each **distinct** declaration is printed once and the layers are
+    deduplicated, because a pin has one reason for one move and the inputs here are
+    per-*claim*, not per-pin: :func:`pin_narrowings` emits one entry for every
+    ``narrowed_by`` record, and reading them with "the first reason wins, append the key
+    again" printed ``setuptools==42.0.0 — pip==21.3.1 declares`` followed by the same bug
+    key seventeen times. The line named the wrong declarer *and* an empty clause, and
+    neither was the fact: the one claim that moved that pin was
+    ``zipp==3.1.0 declares >=42``. Claims with no clause are dropped by the reader that
+    writes them (:func:`narrow_build_pins`) and are not a reason here either.
     """
-    grouped: dict[str, tuple[str, list[str]]] = {}
+    reasons: dict[str, dict[str, None]] = {}
+    keys: dict[str, dict[str, None]] = {}
     for report in reports:
         for pin, reason in report.narrowings:
-            grouped.setdefault(pin, (reason, []))[1].append(report.key)
-    if not grouped:
+            reasons.setdefault(pin, {})[reason] = None
+            keys.setdefault(pin, {})[report.key] = None
+    if not reasons:
         return []
     lines = [
         "",
-        f"narrowed pin(s) ({len(grouped)}) — §3.2's date rule, moved to satisfy a pin in "
+        f"narrowed pin(s) ({len(reasons)}) — §3.2's date rule, moved to satisfy a pin in "
         "the same layer:",
     ]
-    for pin, (reason, keys) in grouped.items():
-        lines.append(f"  NARROWED {pin} — {reason} ({', '.join(keys)})")
+    for pin, claims in reasons.items():
+        lines.append(
+            f"  NARROWED {pin} — {'; '.join(claims)} ({', '.join(keys[pin])})"
+        )
     return lines
 
 
@@ -8356,7 +8573,13 @@ class BuildPin:
     name: str
     pin: str
     source: str
-    """What asked for this pin: :data:`BUILD_TOOL_SOURCE`, or the line that declared it."""
+    """What asked for this pin: :data:`BUILD_TOOL_SOURCE`, or the line that declared it.
+
+    A *pinned release's* build requirement prefixes the declarer, because there the line
+    belongs to a published sdist rather than to the tree — ``ujson==2.0.3 setup_requires
+    (setup.py) line 24`` says which release's build asked, and the same field without the
+    prefix would read as a line of the bug's own ``setup.py`` (:func:`build_requirement_pins`).
+    """
     released_at: Optional[str] = None
     dependency_pin: Optional[str] = None
     """The dependency pin this one copies, when both name the same package.
@@ -8392,6 +8615,16 @@ class BuildPin:
     :attr:`ResolvedDep.narrowed_by` records for the dependency half — so
     :func:`pin_narrowings` reads both halves with one spelling.
     """
+    build_requirement_of: Optional[str] = None
+    """The pin whose own build requirement this pin answers, when nothing else did (§3.2).
+
+    [VANTA-WHY] Set by :func:`build_requirement_pins` and ``None`` for every other kind:
+    this is the fourth ``pin_rule`` (:data:`BUILD_REQUIREMENT_PIN_RULE`), and it is the
+    only pin in a layer that neither the tree nor the dependency set asked for. Recorded
+    rather than left to ``source`` alone, which is prose: "which release's build dragged
+    ``setuptools_scm`` into this layer" is a question a reader asks of the JSON, and
+    ``source`` is where it is answered rather than a key they can query.
+    """
 
     @property
     def pin_rule(self) -> str:
@@ -8404,6 +8637,8 @@ class BuildPin:
             return "the oldest release that satisfies " + "; ".join(
                 f"{pin} declares {specifier}" for pin, specifier in self.narrowed_by
             )
+        if self.build_requirement_of is not None:
+            return BUILD_REQUIREMENT_PIN_RULE
         return BUILD_PIN_RULE
 
     def as_dict(self) -> dict[str, Any]:
@@ -8416,6 +8651,8 @@ class BuildPin:
         }
         if self.dependency_pin is not None:
             data["dependency_pin"] = self.dependency_pin
+        if self.build_requirement_of is not None:
+            data["declared_by"] = self.build_requirement_of
         if self.narrowed_by:
             data["narrowed_by"] = [
                 {"pin": pin, "requires": specifier}
@@ -8628,7 +8865,20 @@ def narrow_build_pins(
             # moves has to satisfy *all* of them, and a clause the held version happens to
             # satisfy still bounds the release the pin moves to. Only the *decision* to
             # move reads the held version, below.
-            claims.setdefault(required, []).append((spelling, str(_specifier_of(ref))))
+            #
+            # A requirement that names **no** version is not a claim and is not collected
+            # (:func:`_specifier_text`): it bounds nothing, and the readers here are the
+            # same ones :func:`_narrowing_requirements` and :func:`resolve_build_pins` use,
+            # both of which drop the empty text for this reason. Measured on ``luigi/1``,
+            # ``multidict==4.7.6`` and ``numpy==1.18.4`` each declare a bare ``setuptools``
+            # — six bare claims plus one real one (``zipp==3.1.0 declares >=42``) — and
+            # recording them put seventeen entries, six of them ``"requires": ""``, on the
+            # one pin whose version they had no part in choosing, while the NARROWED line
+            # printed the *first* of them and so named a declarer that asked for nothing.
+            text = _specifier_text(ref)
+            if not text:
+                continue
+            claims.setdefault(required, []).append((spelling, text))
     if not claims:
         return list(pins)
     out: list[BuildPin] = []
@@ -9331,6 +9581,42 @@ def resolve_bug_deps(
                 releases=releases,
                 commit_date=sources.commit_date,
             )
+            # §3.2's build-requirement-date rule, and the one gap the two rules around it
+            # leave. `narrow_build_pins` below moves a pin a requirement refuses and
+            # `early_install_pins` orders one the layer already holds; a requirement that
+            # **no** pin holds is neither, and it is the one that ends in
+            # `easy_install` fetching today's release of it. Measured on `luigi/1`:
+            # `ujson==2.0.3` builds here from its sdist and its setup_requires names
+            # `setuptools_scm`, nothing pinned it, and the metadata step died importing a
+            # name modern setuptools_scm wants but no setuptools of this era carries
+            # (:data:`BUILD_REQUIREMENT_PIN_RULE`).
+            #
+            # Read over the pins that will actually be *built* — the same filter
+            # `early_install_pins` uses below and for the same reason: a release pip
+            # installs from a wheel never runs its own `setup.py`, so its build
+            # requirements are never fetched and there is nothing to pin. The names are
+            # read before the fetch because they are what the fetch is for — this is the
+            # one place a layer's name list is known only after its own pins are read.
+            date_rule_pins = pinned_parts(*build_installs(built), *installs_of(resolved))
+            missing = uncovered_build_requirements(
+                tuple(
+                    (name, version)
+                    for name, version in date_rule_pins
+                    if classifier(name, version, minor).kind == SDIST_ONLY
+                ),
+                date_rule_pins,
+                build_requires_of=build_requires_of,
+                python_minor=minor,
+            )
+            if missing:
+                for absent in sorted({item.name for item in missing}):
+                    releases.setdefault(absent, fetch(absent))
+                built = [
+                    *built,
+                    *build_requirement_pins(
+                        missing, releases=releases, commit_date=sources.commit_date
+                    ),
+                ]
             # §3.2's build-requirement-wins rule, run before the toolchain's pin list
             # reaches anything else: a build tool one of this layer's own pins refuses to
             # be built under is moved to the oldest release that pin accepts, and the

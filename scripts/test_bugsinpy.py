@@ -5476,12 +5476,15 @@ class TestEarlyInstallPins:
             "satisfied_by": "cffi==1.14.0",
         }
 
-    def test_a_build_requirement_no_pin_satisfies_is_left_to_the_fetch_guard(self):
-        """Nothing here pins cffi, so there is no version to install early.
+    def test_a_build_requirement_no_pin_satisfies_is_not_this_functions_finding(self):
+        """Nothing here pins cffi, so there is no *ordering* to decide.
 
         This function orders pins the layer **already holds**; it cannot invent a
-        version for a name nothing pinned. That case is ``run_bake_actions``'s
-        ``easy_install`` guard, which fails the layer that fetches one.
+        version for a name nothing pinned. That name is dated into the layer by
+        :func:`build_requirement_pins` *before* this runs (:func:`resolve_bug_deps`), so
+        by the time the recipe is built there is a version and this function orders it —
+        and ``run_bake_actions``'s ``easy_install`` guard stays as the backstop for a
+        name that still reaches a build unpinned.
         """
         early = bake_mod.early_install_pins(
             [("cryptography", "2.9.2")],
@@ -5663,6 +5666,353 @@ class TestEarlyInstallPins:
             dropped={"vanta-bi-Demo-1": [{"pin": "cryptography==2.9.2"}]},
         )
         assert not any("EARLY" in line for line in lines)
+
+
+class TestUncoveredBuildRequirements:
+    """The build requirement *no* pin in the layer covers — the ``luigi/1`` gap (§3.2).
+
+    [VANTA-WHY] The two rules either side of this one are both about a name the layer
+    holds: :func:`early_install_pins` orders a requirement the layer already satisfies and
+    :func:`narrow_build_pins` moves a pin the requirement refuses. Neither says anything
+    about a name with **no** version at all, and that silence is what killed ``luigi/1``:
+    ``ujson==2.0.3``'s ``setup_requires=["setuptools_scm"]``, nothing pinned it, and
+    ``--no-build-isolation`` left setuptools to satisfy it itself through ``easy_install``
+    — which fetched *today's* release, whose metadata step dies with ``ImportError: cannot
+    import name 'sic' from 'setuptools'`` against the layer's own ``setuptools==42.0.0``.
+    This reading names such a requirement, and its declarer, before the build does.
+    """
+
+    SCM = (
+        bake_mod.DepRef(
+            "setuptools_scm", "setuptools_scm", "setup_requires (setup.py) line 24"
+        ),
+    )
+
+    @staticmethod
+    def _reader(table):
+        """A ``build_requires_of`` that answers from a table of ``(name, version)``."""
+
+        def build_requires_of(name, version):
+            return table.get((name, version), ())
+
+        return build_requires_of
+
+    def test_a_name_no_pin_holds_is_reported_with_its_declarer(self):
+        found = bake_mod.uncovered_build_requirements(
+            [("ujson", "2.0.3")],
+            [("ujson", "2.0.3"), ("setuptools", "42.0.0")],
+            build_requires_of=self._reader({("ujson", "2.0.3"): self.SCM}),
+            python_minor="3.8",
+        )
+        assert len(found) == 1
+        item = found[0]
+        assert item.name == "setuptools-scm", (
+            "the canonical name, so the pin it becomes is one name and not two"
+        )
+        assert item.declarer == "ujson==2.0.3", (
+            "'setuptools-scm' alone does not say whose build asked for it"
+        )
+        assert item.source == "ujson==2.0.3 setup_requires (setup.py) line 24"
+        assert item.requirement is self.SCM[0]
+
+    def test_a_name_the_layer_already_pins_is_left_to_the_two_rules_around_it(self):
+        """Ordering is :func:`early_install_pins`'s finding, and a too-low pin
+        :func:`narrow_build_pins`'s; inventing a version here would shadow both."""
+        found = bake_mod.uncovered_build_requirements(
+            [("ujson", "2.0.3")],
+            [("ujson", "2.0.3"), ("setuptools_scm", "3.3.3")],
+            build_requires_of=self._reader({("ujson", "2.0.3"): self.SCM}),
+            python_minor="3.8",
+        )
+        assert found == []
+
+    def test_a_build_that_requires_itself_is_not_reported(self):
+        """Installing it early would mean building it to build it."""
+        found = bake_mod.uncovered_build_requirements(
+            [("setuptools_scm", "3.3.3")],
+            [("setuptools_scm", "3.3.3")],
+            build_requires_of=self._reader(
+                {
+                    ("setuptools_scm", "3.3.3"): (
+                        bake_mod.DepRef(
+                            "setuptools_scm",
+                            "setuptools_scm",
+                            "setup_requires (setup.py) line 3",
+                        ),
+                    )
+                }
+            ),
+            python_minor="3.8",
+        )
+        assert found == []
+
+    def test_a_harness_name_is_not_invented_here(self):
+        """What the interpreter layer carries is not a tree's build's to re-pin (§3.2)."""
+        found = bake_mod.uncovered_build_requirements(
+            [("ujson", "2.0.3")],
+            [("ujson", "2.0.3")],
+            build_requires_of=self._reader(
+                {
+                    ("ujson", "2.0.3"): (
+                        bake_mod.DepRef(
+                            "pytest", "pytest>=4.4.1", "setup_requires (setup.py) line 7"
+                        ),
+                    )
+                }
+            ),
+            python_minor="3.8",
+        )
+        assert found == []
+
+    def test_only_a_pin_pip_will_build_is_asked_about(self):
+        """``built`` is the caller's answer to "will pip compile this here", and it is
+        the whole filter: a release that installs from a wheel never runs its own
+        ``setup.py``, so its declarations are never fetched and there is nothing to pin."""
+        asked: list[tuple[str, str]] = []
+
+        def build_requires_of(name, version):
+            asked.append((name, version))
+            return self.SCM
+
+        bake_mod.uncovered_build_requirements(
+            [("ujson", "2.0.3")],
+            [("ujson", "2.0.3"), ("bcrypt", "3.1.7")],
+            build_requires_of=build_requires_of,
+            python_minor="3.8",
+        )
+        assert asked == [("ujson", "2.0.3")], "a wheel is never asked about"
+
+    def test_a_release_whose_metadata_cannot_be_read_is_passed_over(self):
+        """A fetch that did not come back is not a fact to fail a bug on; the build is
+        the backstop, and the same conservative answer :func:`early_install_pins` gives."""
+        def build_requires_of(name, version):
+            raise bake_mod.BakeError("cannot download ujson-2.0.3.tar.gz")
+
+        found = bake_mod.uncovered_build_requirements(
+            [("ujson", "2.0.3")],
+            [("ujson", "2.0.3")],
+            build_requires_of=build_requires_of,
+            python_minor="3.8",
+        )
+        assert found == []
+
+    def test_a_requirement_that_does_not_apply_here_is_passed_over(self):
+        """§3.2's marker rule, on the declaring release's own field."""
+        found = bake_mod.uncovered_build_requirements(
+            [("ujson", "2.0.3")],
+            [("ujson", "2.0.3")],
+            build_requires_of=self._reader(
+                {
+                    ("ujson", "2.0.3"): (
+                        bake_mod.DepRef(
+                            "setuptools_scm",
+                            'setuptools_scm; python_version < "3.7"',
+                            "setup_requires (setup.py) line 24",
+                        ),
+                    )
+                }
+            ),
+            python_minor="3.8",
+        )
+        assert found == []
+
+    def test_two_pins_declaring_the_same_tool_are_both_recorded(self):
+        """One name, two declarers, and the pin that answers it names which asked first.
+
+        ``ujson==2.0.3``'s ``setup_requires`` and ``zipp==3.1.0``'s
+        ``[build-system].requires`` both name ``setuptools_scm`` (the measured
+        ``luigi/1`` pair); a pin per name satisfies both, so the reading keeps both
+        claims to bound the choice (:func:`build_requirement_pins`)."""
+        found = bake_mod.uncovered_build_requirements(
+            [("ujson", "2.0.3"), ("zipp", "3.1.0")],
+            [("ujson", "2.0.3"), ("zipp", "3.1.0")],
+            build_requires_of=self._reader(
+                {
+                    ("ujson", "2.0.3"): self.SCM,
+                    ("zipp", "3.1.0"): (
+                        bake_mod.DepRef(
+                            "setuptools_scm",
+                            "setuptools_scm[toml]>=3.4.1",
+                            "build-system.requires (pyproject.toml)",
+                        ),
+                    ),
+                }
+            ),
+            python_minor="3.8",
+        )
+        assert [(item.declarer, item.requirement.spec) for item in found] == [
+            ("ujson==2.0.3", "setuptools_scm"),
+            ("zipp==3.1.0", "setuptools_scm[toml]>=3.4.1"),
+        ]
+
+
+class TestBuildRequirementPins:
+    """The date rule for a build requirement nothing in the layer covers (§3.2).
+
+    [VANTA-WHY] The shape is :func:`resolve_build_pins`'s — the newest release on or
+    before the bug's commit date — with one difference, and it is the difference between
+    a tree's declaration and a dependency's. ``build_refs`` reads only the *name* of a
+    **tree's** build requirement, because ``numpy==1.15.4`` in pandas' ``setup.py`` is
+    what pandas' own CI used and not a bound anything needs; but ``setuptools_scm[toml]
+    >=3.4.1`` in a *published sdist's* ``[build-system].requires`` is a real declaration
+    that release was built under, and pip honours it when it builds one. So the range is
+    read here, and a name with no release inside it at the bug's date flags the bug.
+    """
+
+    RELEASES = {
+        "setuptools-scm": {
+            "3.3.3": "2019-03-01",
+            "3.3.4": "2019-04-10",
+            "3.4.1": "2019-09-05",
+            "3.5.0": "2020-01-01",
+        }
+    }
+
+    def _requirement(self, declarer, spec, source="setup_requires (setup.py) line 24"):
+        return bake_mod.BuildRequirement(
+            name="setuptools-scm",
+            declarer=declarer,
+            requirement=bake_mod.DepRef("setuptools_scm", spec, source),
+        )
+
+    def _pins(self, requirements, *, commit_date="2019-04-22", releases=None):
+        return bake_mod.build_requirement_pins(
+            list(requirements),
+            releases=self.RELEASES if releases is None else releases,
+            commit_date=commit_date,
+        )
+
+    def test_the_newest_release_on_or_before_the_commit_date_wins(self):
+        """3.4.1 exists and the buggy tree could not have been built with it."""
+        pins = self._pins([self._requirement("ujson==2.0.3", "setuptools_scm")])
+        assert [pin.pin for pin in pins] == ["setuptools-scm==3.3.4"]
+
+    def test_the_declared_range_bounds_the_choice(self):
+        """The tree's own declarations bound nothing here; a published sdist's do."""
+        pins = self._pins(
+            [self._requirement("zipp==3.1.0", "setuptools_scm<=3.3.3")]
+        )
+        assert [pin.pin for pin in pins] == ["setuptools-scm==3.3.3"]
+
+    def test_a_declaration_nothing_at_the_date_satisfies_flags_the_bug(self):
+        """A declaration nothing at the bug's date satisfies is exactly the layer that
+        would fall back on ``easy_install`` fetching today's release."""
+        with pytest.raises(
+            bake_mod.BakeError,
+            match="'setuptools-scm' has no release on or before 2019-04-22",
+        ):
+            self._pins(
+                [self._requirement("zipp==3.1.0", "setuptools_scm>=3.4.1")]
+            )
+
+    def test_a_name_with_no_release_dates_was_not_fetched(self):
+        """The same refusal :func:`resolve_build_pins` makes for a name it cannot date,
+        because the pin is chosen by date and not by guess."""
+        with pytest.raises(
+            bake_mod.BakeError, match="no release dates for 'setuptools-scm'"
+        ):
+            self._pins(
+                [self._requirement("ujson==2.0.3", "setuptools_scm")],
+                releases={"setuptools-scm": {}},
+            )
+
+    def test_one_pin_satisfies_every_declaration_and_records_the_first_declarer(self):
+        """A layer holds one version of a name like every other pin it carries, so the
+        release chosen is inside **every** declared range and each claim still bounds it."""
+        pins = self._pins(
+            [
+                self._requirement(
+                    "ujson==2.0.3", "setuptools_scm>=3.3", "setup_requires (setup.py) line 24"
+                ),
+                self._requirement(
+                    "zipp==3.1.0",
+                    "setuptools_scm<3.3.4",
+                    "build-system.requires (pyproject.toml)",
+                ),
+            ]
+        )
+        assert [pin.pin for pin in pins] == ["setuptools-scm==3.3.3"]
+        assert pins[0].source == "ujson==2.0.3 setup_requires (setup.py) line 24"
+        assert pins[0].build_requirement_of == "ujson==2.0.3"
+
+    def test_the_pin_records_the_rule_and_the_declarer_in_the_provenance(self):
+        """``pin_rule`` names the rule and ``declared_by`` the release whose build asked,
+        because "which release dragged this into the layer" is a question of the JSON."""
+        pin = self._pins([self._requirement("ujson==2.0.3", "setuptools_scm")])[0]
+        assert pin.pin_rule == bake_mod.BUILD_REQUIREMENT_PIN_RULE
+        assert pin.released_at == "2019-04-10"
+        assert pin.as_dict() == {
+            "name": "setuptools-scm",
+            "pin": "setuptools-scm==3.3.4",
+            "source": "ujson==2.0.3 setup_requires (setup.py) line 24",
+            "pin_rule": bake_mod.BUILD_REQUIREMENT_PIN_RULE,
+            "released_at": "2019-04-10",
+            "declared_by": "ujson==2.0.3",
+        }
+
+
+class TestABuildRequirementNoPinCoversReachesTheLayer:
+    """The wiring, end to end: the reading and the date rule into a real layer (§3.2).
+
+    [VANTA-WHY] The measured ``luigi/1`` failure, and the whole point of the fix:
+    ``ujson==2.0.3`` builds here from its sdist, its ``setup_requires`` names
+    ``setuptools_scm``, no pin held it, and ``--no-build-isolation`` left setuptools to
+    fetch *today's* release — whose metadata step imports ``setuptools.sic``, which no
+    setuptools of the layer's era carries. Both halves are asserted: the pin the layer
+    gained (a *build* pin, not an install) and the ordering decision that puts it before
+    the build that wants it.
+    """
+
+    def test_the_name_is_fetched_dated_recorded_and_installed_early(self, monkeypatch):
+        releases = dict(_fixture_releases())
+        releases["setuptools-scm"] = {"3.3.3": "2019-03-01", "3.4.1": "2019-09-05"}
+
+        def classify(name, version, minor):
+            kind = (
+                bake_mod.SDIST_ONLY if name == "decorator" else bake_mod.INSTALLABLE_WHEEL
+            )
+            return bake_mod.PreflightPin(name, version, kind, "this test's own stub")
+
+        def build_requires_of(name, version):
+            if (name, version) == ("decorator", "4.4.0"):
+                return (
+                    bake_mod.DepRef(
+                        "setuptools_scm",
+                        "setuptools_scm",
+                        "setup_requires (setup.py) line 24",
+                    ),
+                )
+            return ()
+
+        fetched, layers, flagged = _resolve_with_drops(
+            monkeypatch,
+            refs=(bake_mod.dep_ref("decorator>=4.3.0", "requirements.txt line 1"),),
+            classify=classify,
+            build_requires_of=build_requires_of,
+            releases=releases,
+        )
+        assert flagged == []
+        assert "setuptools-scm" in fetched, "fetched because it has to be dated"
+        assert layers[0].installs == ("decorator==4.4.0",), (
+            "a build requirement is a build pin and not an install"
+        )
+        assert "setuptools-scm==3.3.3" in layers[0].build_pins
+        record = next(
+            dep
+            for dep in layers[0].provenance["build_pins"]
+            if dep["name"] == "setuptools-scm"
+        )
+        assert record == {
+            "name": "setuptools-scm",
+            "pin": "setuptools-scm==3.3.3",
+            "source": "decorator==4.4.0 setup_requires (setup.py) line 24",
+            "pin_rule": bake_mod.BUILD_REQUIREMENT_PIN_RULE,
+            "released_at": "2019-03-01",
+            "declared_by": "decorator==4.4.0",
+        }
+        assert layers[0].early_pins == ("setuptools-scm==3.3.3",), (
+            "the build finds it only if it is installed first"
+        )
 
 
 # ============================================================================
@@ -6491,6 +6841,66 @@ class TestPinConflicts:
             ),
         ), "an ordinary pin says nothing, and both directions are recorded"
         assert bake_mod.pin_narrowings({}) == ()
+
+    def test_a_narrowing_claim_with_no_clause_is_not_made_into_a_reason(self):
+        """A record written before the writers dropped empty clauses reads the same.
+
+        [VANTA-WHY] The measured ``luigi/1`` line printed ``setuptools==42.0.0 —
+        pip==21.3.1 declares`` with nothing after *declares*: a claim whose ``requires``
+        is empty says the declarer asked for nothing, so it is not a reason a pin moved,
+        and printing it names the wrong declarer. Both writers drop such claims now
+        (:func:`narrow_build_pins`, :func:`_narrowing_requirements`); this is the reader
+        refusing to make a reason out of a line already on disk.
+        """
+        provenance = {
+            "build_pins": [
+                {
+                    "name": "setuptools",
+                    "pin": "setuptools==42.0.0",
+                    "narrowed_by": [
+                        {"pin": "pip==21.3.1", "requires": ""},
+                        {"pin": "zipp==3.1.0", "requires": ">=42"},
+                    ],
+                }
+            ]
+        }
+        assert bake_mod.pin_narrowings(provenance) == (
+            ("setuptools==42.0.0", "zipp==3.1.0 declares >=42"),
+        )
+
+    def test_a_repeated_reason_and_key_print_once(self):
+        """[VANTA-WHY] The inputs are per-*claim*, not per-pin, so the same declaration
+        can arrive once per record that holds it. Reading them with "the first reason
+        wins, append the key again" printed ``setuptools==42.0.0 — pip==21.3.1 declares``
+        and then the one bug key seventeen times. Both the reasons and the keys are
+        deduplicated, so the line names the fact once.
+        """
+        repeated = (
+            ("setuptools==42.0.0", "zipp==3.1.0 declares >=42"),
+            ("setuptools==42.0.0", "zipp==3.1.0 declares >=42"),
+        )
+        reports = [
+            bake_mod.PreflightBug(
+                key="luigi/1",
+                checkpoint="vanta-bi-luigi-1",
+                python_minor="3.8",
+                pins=(),
+                narrowings=repeated,
+            ),
+            bake_mod.PreflightBug(
+                key="luigi/1",
+                checkpoint="vanta-bi-luigi-1",
+                python_minor="3.8",
+                pins=(),
+                narrowings=repeated,
+            ),
+        ]
+        assert bake_mod._narrowing_section(reports) == [
+            "",
+            "narrowed pin(s) (1) — §3.2's date rule, moved to satisfy a pin in the same "
+            "layer:",
+            "  NARROWED setuptools==42.0.0 — zipp==3.1.0 declares >=42 (luigi/1)",
+        ]
 
     def test_a_moved_build_pin_is_read_too_and_prints_as_narrowed(self):
         """The build half of the layer moves for the same reason, and prints the same way.
@@ -8697,7 +9107,14 @@ def _fixture_releases() -> dict:
 
 
 def _resolve_with_drops(
-    monkeypatch, *, refs, classify=None, metadata_of=None, releases=None, tree_modules=()
+    monkeypatch,
+    *,
+    refs,
+    classify=None,
+    metadata_of=None,
+    releases=None,
+    tree_modules=(),
+    build_requires_of=None,
 ):
     """``resolve_bug_deps`` over one fake source set, with the network taken out.
 
@@ -8712,7 +9129,10 @@ def _resolve_with_drops(
     a requirer's metadata before it can be dropped. ``tree_modules`` is the other seam
     the walk reads (:attr:`bake_mod.DepSources.tree_modules`) — the names the tree
     under test provides for itself, which it must never pin
-    (:data:`bake_mod.TREE_SATISFIED_RULE`).
+    (:data:`bake_mod.TREE_SATISFIED_RULE`). ``build_requires_of`` is the seam §3.2's two
+    build-requirement passes read (:func:`bake.early_install_pins`,
+    :func:`bake.uncovered_build_requirements`): with the wheel stub nothing is a source
+    build and neither pass asks anything, so the default is "nothing declared".
     """
     fetched: list[str] = []
     table = _fixture_releases() if releases is None else releases
@@ -8750,6 +9170,7 @@ def _resolve_with_drops(
         fetch=fetch,
         metadata_of=reader,
         classify=classify or _wheel_classifier(),
+        build_requires_of=build_requires_of or (lambda name, version: ()),
     )
     return fetched, layers, flagged
 
@@ -11659,7 +12080,13 @@ class TestNarrowBuildPins:
         assert all(pin.narrowed_by == () for pin in narrowed)
 
     def test_a_requirement_with_no_clause_never_moves_a_pin(self):
-        """A bare name is satisfied by whatever the layer holds (:func:`_specifier_accepts`)."""
+        """A bare name is satisfied by whatever the layer holds (:func:`_specifier_accepts`).
+
+        It is not collected as a claim either, so it cannot appear in the ``narrowed_by``
+        record: a clause-less declaration bounds nothing
+        (:func:`_specifier_text`), and printing it named a declarer that asked for
+        nothing — the measured ``setuptools==42.0.0 — pip==21.3.1 declares`` line.
+        """
         pins = self._pins()
         narrowed = self._narrow(
             pins,
@@ -11670,7 +12097,42 @@ class TestNarrowBuildPins:
                 ),
             ),
         )
-        assert {pin.name: pin.pin for pin in narrowed}["cython"] == "cython==0.29.7"
+        cython = {pin.name: pin for pin in narrowed}["cython"]
+        assert cython.pin == "cython==0.29.7"
+        assert cython.narrowed_by == ()
+
+    def test_a_bare_claim_beside_a_real_one_is_not_recorded(self):
+        """The measured ``luigi/1`` shape — six bare claims plus one real one.
+
+        ``multidict==4.7.6`` and ``numpy==1.18.4`` each declare a bare ``setuptools`` and
+        ``zipp==3.1.0`` declares ``setuptools>=42``; only the clause that bounded the move
+        is recorded, so the NARROWED line names the declarer that actually asked.
+        """
+        releases = self._releases()
+        releases["setuptools"] = {"40.8.0": "2019-02-04", "42.0.0": "2019-11-20"}
+        pins = self._pins(releases=releases)
+        narrowed = self._narrow(
+            pins,
+            [("numpy", "1.18.4"), ("zipp", "3.1.0")],
+            requires_of=lambda name, version: {
+                ("numpy", "1.18.4"): (
+                    bake_mod.DepRef(
+                        "setuptools", "setuptools", "pyproject.toml [build-system].requires"
+                    ),
+                ),
+                ("zipp", "3.1.0"): (
+                    bake_mod.DepRef(
+                        "setuptools", "setuptools>=42", "pyproject.toml [build-system].requires"
+                    ),
+                ),
+            }.get((name, version), ()),
+            releases=releases,
+        )
+        setuptools = {pin.name: pin for pin in narrowed}["setuptools"]
+        assert setuptools.pin == "setuptools==42.0.0", (
+            "the date rule's 40.8.0 moved to the oldest release the real clause accepts"
+        )
+        assert setuptools.narrowed_by == (("zipp==3.1.0", ">=42"),)
 
     def test_a_requirement_that_does_not_apply_here_never_moves_a_pin(self):
         """§3.2's marker rule reads the same way here as everywhere else."""

@@ -892,7 +892,14 @@ dev-split bugs) and one decision printed six times is six times the reading. One
 and is printed for that reason: `narrowed pin(s) (N)` — `NARROWED <pin> — <why> (<bug keys>)`, the
 date-rule choices a pin in the same layer moved (`bake.pin_narrowings`, both directions of case (a)),
 which count in no verdict because the decision is already taken and which a reader cannot see in the pin
-list itself. A pin the unresolvable-pin
+list itself. The `<why>` is the **claim** itself — the declaring release and the clause it wrote, as in
+`NARROWED cython==0.29.14 — numpy==1.18.4 declares >=0.29.14` — printed **once per distinct claim** and
+with the bug keys deduplicated (`bake._narrowing_section` keyed both maps), because the inputs are
+per-claim and the same pin has one reason for one move; and a claim that wrote **no** clause is not a
+reason at all, dropped by the reader that writes it (`bake.narrow_build_pins`) and skipped again by
+`bake.pin_narrowings`. What `luigi/1` printed before this — `NARROWED setuptools==42.0.0 — pip==21.3.1
+declares` with an empty specifier, the wrong declarer, and seventeen copies of one bug key — was neither
+the fact nor the count. A pin the unresolvable-pin
 rule dropped is not repeated as a finding; it appears once in the drops block below, with the audit that
 settled it — and a conflict with a **dropped** pin on either side is not printed either, because the
 layer will not install that pin and no pair is left to conflict. A `--preflight-only` run also
@@ -2068,8 +2075,10 @@ sdist-only pin's read build requirements and, where **another pin in the same la
 installs that pin in an **earlier pass**: the recipe's third non-isolated call, written to
 `/tmp/early-req.txt` and run before `/tmp/req.txt`, so the build finds the pinned version already in the
 environment. `EarlyInstall.satisfied_by` records which of the layer's pins it was, and a requirement no
-pin satisfies is deliberately **not** invented here — pinning a version the layer never chose is exactly
-what the date rule exists to prevent, so that case is left to the guard. **After** — *every* built
+pin satisfies is deliberately **not** invented *here*: this pass only **orders** a version the layer
+already holds, and naming a version for a name nothing pins is a different question with its own answer
+(`bake.uncovered_build_requirements` and `bake.build_requirement_pins`, the date rule below — item 2's
+fix for `luigi/1`). **After** — *every* built
 layer's output is read for the two lines only `easy_install` writes (`bake.easy_install_fetches`:
 `Searching for ` and `Best match: `; the second names the release it settled on, and pip writes neither),
 and a layer where one appears fails through `bake.easy_install_failure`, which names the fetched
@@ -2315,6 +2324,91 @@ same property `/dev/shm` has. The sizing is *recorded* so a layer can be read ba
 `vanta bake VM:` line in the build log and `deps_provenance`'s `build_vm` block (`cpus`, `memory_mb`,
 `build_jobs`) in each `deps/*.json`, because from an install list alone a build that ran out of memory
 is indistinguishable from one that built cleanly.
+
+**A build requirement *no* pin covers is date-pinned and installed before the build — the third rule
+(§3.2, item 2, on top of item 1's `2f8cbb3`).** The two blocks above install what a build wants *when a
+pin of the layer satisfies it* and move a pin a requirement refuses; between them they still say nothing
+about a name the layer holds **no version** of, and that third case is what `luigi/1` measured.
+`ujson==2.0.3` builds here from its sdist, its `setup.py` declares `setup_requires` naming
+`setuptools_scm` (`ujson==2.0.3 setup_requires (setup.py) line 24`), and no pin held it, so with
+`--no-build-isolation` setuptools resolved it itself: `setuptools/dist.py:740 finalize_options` loaded
+the entry point of `setuptools_scm-10.3.4` out of `ujson/.eggs/` — *today's* release, fetched by
+`fetch_build_eggs` while the metadata step ran — and that release's
+`setuptools_scm/_integration/version_inference.py:18` does `from setuptools import sic as
+setuptools_sic`, while the layer's own `setuptools==42.0.0` has no `sic` (quoted from the log's
+traceback, `runs/bugsinpy/bake-logs/vanta-bi-luigi-1.log` 585–603; read off the wheels: `sic` is absent
+in `setuptools` 42.0.0, 45.3.0 and 46.0.0 and present from **46.1.0**, as `class sic(str)` in
+`setuptools/__init__.py`). The metadata step died with `ImportError: cannot import name 'sic' from
+'setuptools'` and `checkpoint create` saved the half-built layer anyway, which is why the failure read as
+a saved checkpoint plus one error line.
+
+`bake.uncovered_build_requirements` names such a requirement before the build runs: it reads each pin pip
+will actually **build** here (the same `bake.SDIST_ONLY` filter `early_install_pins` uses, and for the
+same reason — a release pip installs from a wheel never runs its own `setup.py`) and reports every build
+requirement whose canonical name no pin of the layer holds, whose declaring release is not itself, and
+which is not a harness name (`bake.HARNESS_PACKAGES`) — recording the declarer and the line it wrote,
+once per `(required, declarer, source)`, with §3.2's marker rule applied to the **declaring** release's
+own field. `bake.build_requirement_pins` then dates it the way every other unpinned pick is dated: **one
+pin per name** (a layer holds one version of a name, and two of its pins can declare the same tool), the
+newest release on or before the bug's commit date that satisfies **every** declaration's range, recorded
+with `pin_rule = "build requirement, date rule"` and a `declared_by` naming the release whose build asked
+— and a declaration nothing at the bug's date satisfies is a `BakeError` that **flags** the bug, like
+every other date-rule refusal, because that is exactly the layer that would fall back on `easy_install`.
+The pins ride the existing `build_pins` list, so the constraint file, `build-tools.txt`, the recipe's
+early pass and the preflight table all pick them up with no new channel; `bake.resolve_bug_deps` runs the
+reading and the dating **before** `narrow_build_pins`, so a name that is both covered by nothing and
+refused by a held pin is answered by both rules over one pin list. The `easy_install` fetch guard above is
+unchanged and stays as the backstop.
+
+**The `NARROWED` line was printing the wrong declarer, an empty clause and one bug key seventeen times.**
+The preflight's special-cause reading of that layer was wrong in the print and not in the pin:
+`setuptools==42.0.0` is the date rule's own answer for `luigi/1`'s commit date, and the one claim that
+moved it is `zipp==3.1.0 declares >=42` — not `pip==21.3.1` (which declares nothing on that name) and not
+an empty clause. `bake.narrow_build_pins` now drops a claim that wrote **no** clause before it is stored
+(`text = _specifier_text(ref); if not text: continue`), `bake.pin_narrowings` skips a stored claim with an
+empty `requires`, and `bake._narrowing_section` keys both its maps, so each distinct claim and each bug
+key print once: `NARROWED <pin> — <declarer> declares <clause> (<keys>)`. An empty clause never bounded or
+moved a pin, so the guard that drops it **cannot change any version** — the change is on the terminal
+only.
+
+**Measured over the six bug layers on disk, the rule dates a pin into four of them.** Re-applying the
+reading to each layer's recorded pin list and per-pin `kind` (via the harness's own sdist reader, so the
+answer is the code's and not a hand count):
+
+| layer | new build pin(s) | declarer(s) | commit date |
+|---|---|---|---|
+| `luigi/1` | `setuptools-scm==3.2.0`, `pytest-runner==4.4` | `ujson==2.0.3`, `idna-ssl==1.1.0` | 2019-05-09 |
+| `pandas/1` | `pybind11==2.5.0`, `pytest-runner==5.2` | `scipy==1.4.1`, `fastparquet==0.4.0` | 2020-05-21 |
+| `fastapi/1` | `setuptools-scm==3.5.0` | `ujson==3.0.0` | 2020-04-05 |
+| `sanic/1` | `setuptools-scm==3.5.0`, `pytest-runner==5.2` | `ujson==2.0.3`, `idna-ssl==1.1.0` | 2020-05-12 |
+| `matplotlib/1` | — | — | — |
+| `PySnooper/3` | — | — | — |
+
+`luigi/1`'s `setuptools-scm==3.2.0` is the release that fixes the measured failure: 3.2.0 predates the
+`setuptools.sic` import (which arrives with 10.3.4's requirement on a setuptools ≥ 46.1.0), so the
+metadata step the layer died in now runs. Because two *already-baked* layers gain a pin, the next bake is
+**not** `bake --only luigi/1 --only pandas/1 --yes`: that would leave `fastapi-1` and `sanic-1` baked
+under the old pins. Rebuilding exactly the four changed layers means the two stale checkpoints are
+deleted first (`shuru checkpoint delete vanta-bi-fastapi-1 vanta-bi-sanic-1`) and then
+`bake --only fastapi/1 --only sanic/1 --only luigi/1 --only pandas/1 --yes`, which skips the
+`vanta-bugsinpy-py3.8` interpreter layer as "already baked". `--force` would also work but is not free: it
+deletes and rebuilds the interpreter layer, and because that base is rebuilt, `plan_layers` deletes every
+**unselected** per-bug child stacked on it (`matplotlib-1`, `PySnooper-3`, and any other `3.8` layer the
+split has), so those would have to be baked again for contents the rule does not change. `matplotlib-1`
+and `PySnooper-3` themselves stay valid as they are.
+
+**Tests.** `scripts/test_bugsinpy.py::TestUncoveredBuildRequirements` (eight cases: the declarer is kept,
+a name the layer pins is left to the two rules around it, a build requiring itself, a harness name, only a
+pin pip will build is asked about, an unreadable release, a marker that does not apply, and two declarers
+of one tool) and `TestBuildRequirementPins` (the newest release on or before the date, the declared range
+bounding it, both `BakeError` boundaries, one pin satisfying every declaration, and the `pin_rule`/
+`declared_by` provenance), plus `TestABuildRequirementNoPinCoversReachesTheLayer` for the wiring —
+fetched, dated, recorded as a *build* pin and ordered early — and `TestPinConflicts`' two print cases
+(`test_a_narrowing_claim_with_no_clause_is_not_made_into_a_reason`,
+`test_a_repeated_reason_and_key_print_once`) and `TestNarrowBuildPins`' clause-less case. The canonical
+name is asserted throughout: the reader stores `canonicalize_name(ref.name)`, so `setuptools_scm` becomes
+`setuptools-scm` in the pin and only the recorded declarer keeps the raw spelling. Full run:
+`957 passed`.
 
 ### 3.3 BLOCKER 2 — dependency detection under-provisions
 

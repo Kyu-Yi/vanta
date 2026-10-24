@@ -266,6 +266,15 @@ pub enum ShownMode {
     Outline,
 }
 
+impl ShownMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShownMode::Full => "full",
+            ShownMode::Outline => "outline",
+        }
+    }
+}
+
 /// One file in the selection, with the provenance a reader needs to explain it.
 #[derive(Debug, Clone, Serialize)]
 pub struct SelectedFile {
@@ -351,6 +360,70 @@ impl ContextSelection {
                 )
             })
             .collect()
+    }
+
+    /// The provenance of this selection as ONE line, for the session log and
+    /// `run.summary`.
+    ///
+    /// [VANTA-WHY] §1.6.2 item 4 — "was the bug's file in the prompt, and what
+    /// did it cost" is a question a report must answer from the artifacts alone,
+    /// without re-running the selector, so every selected file travels with its
+    /// score, the reason(s) that chose it, whether it went in whole or as an
+    /// outline, and the bytes and tokens it occupied. The walk's prune ledger
+    /// rides along for the same reason: the console can only afford a count, and
+    /// the count is read against the list that says WHICH paths were dropped —
+    /// a repo that skipped a vendored directory and a repo that skipped the
+    /// package under test must not look alike.
+    ///
+    /// The line is single and space-free because it is embedded in rows that are
+    /// parsed as space-separated `key=value` pairs, where a space would silently
+    /// split a key and a newline would split a row.
+    pub fn provenance_line(&self) -> String {
+        let files = if self.files.is_empty() {
+            "none".to_string()
+        } else {
+            self.files
+                .iter()
+                .map(|file| {
+                    format!(
+                        "{}@{}[{}]{}:{}B/{}tok",
+                        file.path,
+                        file.score,
+                        file.reasons
+                            .iter()
+                            .map(|reason| reason.as_str())
+                            .collect::<Vec<_>>()
+                            .join("+"),
+                        file.shown.as_str(),
+                        file.bytes,
+                        file.tokens,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        let pruned = if self.skipped.is_empty() {
+            "none".to_string()
+        } else {
+            self.skipped
+                .iter()
+                .map(|skip| format!("{}:{}", skip.path, skip.reason))
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        format!(
+            "mode={}:role={}:budget={}:files={}:tree={}:dropped={}:total={}B/{}tok:selected=[{}]:pruned=[{}]",
+            self.mode,
+            self.role,
+            self.budget_tokens,
+            self.files.len(),
+            self.tree.len(),
+            self.dropped_for_budget.len(),
+            self.total_bytes,
+            self.total_tokens,
+            files,
+            pruned,
+        )
     }
 }
 
@@ -1351,5 +1424,54 @@ mod tests {
         assert!(entries(&review_alone)
             .iter()
             .any(|entry| entry.0 == "tests/test_core.py"));
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 4 — the provenance line is the artifact a report
+    /// reads back, and it is embedded in `run.summary` and in a session record,
+    /// both of which are parsed as space-separated `key=value` pairs. A space in
+    /// a value would split a key and a newline would split a row, so both are
+    /// pinned here; so is the content the item asks for — every selected file,
+    /// with its score, its reason(s) and the bytes and tokens it was shown at.
+    #[test]
+    fn the_provenance_line_is_one_space_free_line_of_every_selected_file() {
+        let candidates = vec![
+            candidate(
+                "pkg/core.py",
+                "from .helper import helper\n\n\ndef frobnicate(value):\n    return helper(value)\n",
+            ),
+            candidate("pkg/helper.py", "def helper(value):\n    return value\n"),
+        ];
+        let issue = "`frobnicate` raises on a str.\n\nTraceback (most recent call last):\n  File \"pkg/core.py\", line 5, in frobnicate\n    return helper(value)\nValueError: bad value\n";
+        let selection = select_repair_context(&candidates, issue, "creator+attacker", 60_000);
+        let line = selection.provenance_line();
+
+        assert!(!line.contains('\n'), "the line is embedded in a one-line row");
+        assert!(
+            !line.contains(' '),
+            "no space: the row is space-separated key=value pairs; got {line}"
+        );
+        assert!(
+            line.starts_with("mode=repair:role=creator+attacker:budget=60000:files=2:"),
+            "the header names what the selection was for; got {line}"
+        );
+
+        for (path, score, reasons) in [
+            ("pkg/core.py", 900, "path+traceback+identifier"),
+            ("pkg/helper.py", 100, "import-neighbour"),
+        ] {
+            let file = selection
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .expect("both files are selected");
+            let entry = format!(
+                "{}@{}[{}]full:{}B/{}tok",
+                path, score, reasons, file.bytes, file.tokens
+            );
+            assert!(
+                line.contains(&entry),
+                "each selected file travels with score, reason, bytes and tokens; missing {entry} in {line}"
+            );
+        }
     }
 }

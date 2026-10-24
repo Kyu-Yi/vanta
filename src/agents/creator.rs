@@ -30,7 +30,15 @@ use tracing::{debug, info, trace, warn};
 // agent prompt in the run, so a later change to the Creator's Verify-First
 // wording is visible in the log instead of looking like "no change". Bump this
 // whenever the Creator system/user prompt text changes.
-pub const CREATOR_PROMPT_VERSION: &str = "2";
+//
+// [VANTA-WHY] Bumped for the context-localization change (§1.6.2): the system
+// text is unchanged, but what the Creator is SHOWN is not. It used to receive
+// `repo.source_files` — the first ~262 KB of the repo in `read_dir` order — and
+// now receives the selected files (ranked from the issue text) plus the repo's
+// file tree as a labelled listing. Two runs whose Creator read different code
+// are different experiments; a tag that only moves for system-text edits would
+// log them as one.
+pub const CREATOR_PROMPT_VERSION: &str = "3";
 
 // ============================================================================
 // CREATOR_SYSTEM_PROMPT — the Verify-First system prompt, as a const

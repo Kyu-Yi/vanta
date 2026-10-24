@@ -329,6 +329,22 @@ the visible tree are equal in path, score, reason, bytes, tokens, order and body
 walks, in both repair and review mode. A hidden test that could reorder, displace or re-cut a
 visible file would make the selection a channel for the answer.
 
+Landed in **item 4** — provenance, on top of item 3 at `eb811d2`. `ContextSelection::provenance_line`
+renders one **space-free, newline-free** `key=value` line — the session log is a one-record-per-line,
+space-delimited store, so a value that carried either would split a row — naming the mode, the role(s),
+the budget, the file and tree counts, the dropped-for-budget count, the total bytes/tokens, then every
+selected file as `path@score[reasons]shown:bytesB/tok` (reasons joined by `+`, `shown` is `full` or
+`outline`) and the prune ledger as `path:reason` for everything `walk_candidates` skipped and why. The
+driver records it once per run on a new run-level `context.select` row **and** appends it as
+`context_selection=` on `run.summary`, so a paper table read from `run.summary` alone can see which
+files a run was shown. All four role prompt versions are bumped (`CREATOR_PROMPT_VERSION` `3`,
+`ATTACKER_PROMPT_VERSION` `10.localized-source-context`, `INTENT_AUDITOR_PROMPT_VERSION`
+`6.localized-source-context`, `DIAGNOSTICIAN_PROMPT_VERSION` `2`): the system text did not change, but
+what each role is *shown* did, and two runs whose roles read different code are different experiments.
+Pinned by `context::tests::the_provenance_line_is_one_space_free_line_of_every_selected_file` (the
+builder) and the `context.select` / `context_selection=` assertions in
+`patch_mode_three_attempt_run_writes_multi_record_session_log` (the write to disk).
+
 **Expected effect on the re-run.** The 10-of-11 `source_truncated_by_cap` rejections were a
 *whole-repo* measurement, and item 5 changes the gate to measure the selection, so the number to
 watch is not "how much of the repo is in the prompt" but "was the bug's own file selected". The

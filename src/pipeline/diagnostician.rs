@@ -43,7 +43,11 @@ use tracing::{debug, info, warn};
 // lists every agent prompt so that a future Diagnostician-side prompt change is
 // visible in the log rather than silently counted as "no change"; that change
 // must bump this tag.
-pub const DIAGNOSTICIAN_PROMPT_VERSION: &str = "1";
+//
+// [VANTA-WHY] Bumped for the context-localization change (§1.6.2): the
+// Diagnostician is in the set of roles shown source, so what it reads changed
+// even though its own text did not.
+pub const DIAGNOSTICIAN_PROMPT_VERSION: &str = "2";
 
 /// Cap on the pytest output saved with a failing test (the fix-list's ~4 KB).
 /// A full traceback for one test is far below this; the cap only bounds a

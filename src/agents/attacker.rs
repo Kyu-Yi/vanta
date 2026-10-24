@@ -74,7 +74,13 @@ use tracing::{debug, info, trace, warn};
 // pulled against the fallback in exactly the late-round state the fallback exists
 // for), and the ONE PASS line bounds the plan to a single pass over the
 // candidates so the 45x re-listing loop has no work to do.
-pub const ATTACKER_PROMPT_VERSION: &str = "9.one-pass-plan-and-qualified-repeat";
+//
+// [VANTA-WHY] Bumped for the context-localization change (§1.6.2): the Attacker's
+// system text is unchanged, but the source it is shown is not — the run now
+// ranks the tree and shows the selected files plus the repo's file tree instead
+// of the first ~262 KB in `read_dir` order. Which code a probe was written
+// against is part of the experiment's identity.
+pub const ATTACKER_PROMPT_VERSION: &str = "10.localized-source-context";
 
 // ============================================================================
 // INTENT_AUDITOR_PROMPT_VERSION — the run-identity tag for the intent check
@@ -99,7 +105,12 @@ pub const ATTACKER_PROMPT_VERSION: &str = "9.one-pass-plan-and-qualified-repeat"
 // in all four auditor prompts, so the auditor's own tag has to move — the run's
 // budget behaviour changed with it (21 truncations in the 12-run Ornith-1.5 toy
 // run that motivated the batch).
-pub const INTENT_AUDITOR_PROMPT_VERSION: &str = "5.preservation-q1-and-grounded-scope";
+//
+// [VANTA-WHY] Bumped for the context-localization change (§1.6.2), same reason as
+// the Attacker's: the auditor's system text is unchanged, but it now reads the
+// selected files and the repo file tree instead of the capped dump, and what the
+// auditor is shown is what it judges against.
+pub const INTENT_AUDITOR_PROMPT_VERSION: &str = "6.localized-source-context";
 
 // ============================================================================
 // AttackerRequest — input to the Attacker agent

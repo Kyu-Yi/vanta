@@ -2372,6 +2372,37 @@ pub async fn run(
         GovernorDecision::InfraFailure => Some("infra_failure".to_string()),
         _ => None,
     };
+    // [VANTA-WHY] §1.6.2 item 4 — the source selection's provenance, on its own
+    // run-level row AND in `run.summary`. "What was this run shown, and why" has
+    // to be answerable from the artifacts alone: the prompt that carried the
+    // selection is only in the debug forensics, and a report that has to re-run
+    // the selector to learn which files a run saw is measuring a different
+    // thing from the run. One selection serves every source-seeing role, so
+    // there is at most one: `repair_selection` in repair mode, `review_selection`
+    // in review mode (selected on first use, above); "none" is written rather
+    // than nothing so a run that showed no source is distinguishable from a run
+    // whose row is missing.
+    //
+    // `patch_attempt_id` is null for the same reason `session.start`'s is: the
+    // selection happens before attempt 1 and is fixed for the whole run, so
+    // stamping an attempt id would write an unobserved value to disk as a fact.
+    let context_selection_line = repair_selection
+        .as_ref()
+        .or(review_selection.as_ref())
+        .map(crate::context::ContextSelection::provenance_line)
+        .unwrap_or_else(|| "none".to_string());
+    session_log.append(SessionRecord {
+        session_id: session_id.clone(),
+        schema_version: Some(SCHEMA_VERSION),
+        patch_attempt_id: None,
+        testing_iteration_id: None,
+        test_id: None,
+        phase: "context.select".to_string(),
+        summary: context_selection_line.clone(),
+        timestamp: now_iso(),
+        benchmark_instance: Some(config_name.to_string()),
+        benchmark_label: None,
+    })?;
     session_log.append(SessionRecord {
         session_id: session_id.clone(),
         schema_version: Some(SCHEMA_VERSION),
@@ -2388,7 +2419,7 @@ pub async fn run(
              corroborate={} grounded_audit={} batch_audit={} \
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
-             commit={} dirty={} prompt_version={} prompt_hash={}",
+             commit={} dirty={} prompt_version={} prompt_hash={} context_selection={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -2437,6 +2468,11 @@ pub async fn run(
             // exact text each role sends, so a wording change shows up in the log
             // whether or not anyone remembered the label.
             crate::pipeline::prompt_hashes(),
+            // [VANTA-WHY] §1.6.2 item 4 — the same provenance the `context.select`
+            // row carries, folded into the terminal row so a reader of
+            // `run.summary` alone can tell whether the bug's own file was in the
+            // prompt without opening the session log.
+            context_selection_line,
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),

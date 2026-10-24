@@ -662,14 +662,31 @@ and its *defaults* are not. GCC 14 (the base image's) promotes six C diagnostics
 GCC of their day, where all six were warnings that scrolled past. Measured on `lxml` (an incompatible
 pointer assignment) and `ruamel.yaml.clib` (a handler signature mismatch). The fix is `-Wno-error=` for
 each of the six, not `-Wno-`: the diagnostics stay **visible** and only their promotion to failure is
-undone, so what is restored is the era's *warning* semantics rather than silence. `CFLAGS` and not
-`CXXFLAGS` because all six are C-only diagnostics and both measured failures were in C sources; distutils'
-`customize_compiler` appends an environment `CFLAGS` to its `cflags` *and* to its link line, so it is the
-variable the C compilation actually reads. The interpreter layer's smoke check compiles one of the six
-(a `double *` assigned to an `int *`), so a layer where `CFLAGS` never reached `distutils` fails its own
-smoke check rather than reproducing the same error inside lxml.
+undone, so what is restored is the era's *warning* semantics rather than silence.
 
-Both halves are recorded inside the layer at `/opt/vanta-build-env.txt`, together with `gcc --version`:
+The same variable carries the other thing GCC 14 took from the same sources: the standard header old C++
+code no longer gets pulled in for it. `bake._ERA_STDINT_INCLUDE` is `('-include', 'stdint.h')`, and it is a
+member of `CFLAGS` rather than a variable of its own for the measured reason `CXXFLAGS` cannot be used:
+distutils' `customize_compiler` reads `CC`, `CXX` and `CFLAGS` from the environment — appending `CFLAGS`
+to its `cflags` *and* to its link line — and never reads `CXXFLAGS` at all, so the fix cannot be spelled
+the way the compiler's error invites. It reaches the `.cxx` compile by the route the six diagnostics do:
+`numpy.distutils`' C++ compiler keeps that flag list and swaps only the driver, and `pandas/1`'s log shows
+its C++ compile line already carrying the six. `stdint.h` and not the `cstdint` the error names, because
+this variable reaches the **C** compiles too and `cstdint` is a C++-only header that is not on `gcc`'s C
+include path, so `-include cstdint` would turn every C file in the tree into
+`fatal error: cstdint: No such file or directory`. `stdint.h` is one name in both languages: the C
+standard header there, and under `g++` libstdc++'s `c_compatibility/stdint.h`, which declares
+`namespace std { using ::uint16_t; … }` for C++11 and later — what `pybind11==2.5.0`'s `attr.h` needs for
+its `std::uint16_t nargs;`.
+
+The interpreter layer's smoke check covers both halves of the variable: one C file compiles one of the six
+demotions (a `double *` assigned to an `int *`), and the C++ file references `std::uint16_t` without
+including anything that would supply it — which only compiles if the header was reached by `-include`, and
+only declares the `std` name if that reach went through C++ mode. A layer where `CFLAGS` never reached
+`distutils`, or reached the C compile but not the C++ one, therefore fails its own smoke check rather than
+reproducing the error inside lxml or twenty minutes into `scipy`.
+
+The whole mapping is recorded inside the layer at `/opt/vanta-build-env.txt`, together with `gcc --version`:
 the variables say what was asked for and the version says which compiler read them, and the flags are
 written for GCC 14's defaults — a layer whose `gcc` is a different major is a layer where they mean
 something else.
@@ -2377,25 +2394,35 @@ answer is the code's and not a hand count):
 
 | layer | new build pin(s) | declarer(s) | commit date |
 |---|---|---|---|
-| `luigi/1` | `setuptools-scm==3.2.0`, `pytest-runner==4.4` | `ujson==2.0.3`, `idna-ssl==1.1.0` | 2019-05-09 |
+| `luigi/1` | `pytest-runner==4.4`; `setuptools-scm` **missed** (`2874f27`) | `idna-ssl==1.1.0`; `ujson==2.0.3`, but only as a *transitive* pick | 2019-05-09 |
 | `pandas/1` | `pybind11==2.5.0`, `pytest-runner==5.2` | `scipy==1.4.1`, `fastparquet==0.4.0` | 2020-05-21 |
 | `fastapi/1` | `setuptools-scm==3.5.0` | `ujson==3.0.0` | 2020-04-05 |
 | `sanic/1` | `setuptools-scm==3.5.0`, `pytest-runner==5.2` | `ujson==2.0.3`, `idna-ssl==1.1.0` | 2020-05-12 |
 | `matplotlib/1` | — | — | — |
 | `PySnooper/3` | — | — | — |
 
-`luigi/1`'s `setuptools-scm==3.2.0` is the release that fixes the measured failure: 3.2.0 predates the
-`setuptools.sic` import (which arrives with 10.3.4's requirement on a setuptools ≥ 46.1.0), so the
-metadata step the layer died in now runs. Because two *already-baked* layers gain a pin, the next bake is
-**not** `bake --only luigi/1 --only pandas/1 --yes`: that would leave `fastapi-1` and `sanic-1` baked
-under the old pins. Rebuilding exactly the four changed layers means the two stale checkpoints are
-deleted first (`shuru checkpoint delete vanta-bi-fastapi-1 vanta-bi-sanic-1`) and then
-`bake --only fastapi/1 --only sanic/1 --only luigi/1 --only pandas/1 --yes`, which skips the
-`vanta-bugsinpy-py3.8` interpreter layer as "already baked". `--force` would also work but is not free: it
-deletes and rebuilds the interpreter layer, and because that base is rebuilt, `plan_layers` deletes every
-**unselected** per-bug child stacked on it (`matplotlib-1`, `PySnooper-3`, and any other `3.8` layer the
-split has), so those would have to be baked again for contents the rule does not change. `matplotlib-1`
-and `PySnooper-3` themselves stay valid as they are.
+**The `luigi/1` row above was wrong, and the bake is what showed it.** The `setuptools-scm==3.2.0` figure
+came from an offline re-reading that was handed the layer's **full post-walk** pin list, and at that point
+the code did not have one: `bake.resolve_bug_deps` ran the reading over the pins the layer held *before*
+its syntax closure walk, and in `luigi/1` the declarer `ujson==2.0.3` is a **transitive** pick —
+`sanic==20.3.0` declares it and the bug's own tree never names it — so its `setup_requires` was never
+read. The baked evidence is in `runs/bugsinpy/deps/vanta-bi-luigi-1.json`: `pytest-runner==4.4` is there
+(`build requirement, date rule`, declared by `idna-ssl==1.1.0`) and `setuptools-scm` is not mentioned at
+all, and that layer died on the same `ImportError: cannot import name 'sic'` the rule was written for.
+`sanic/1` is the control that hid it: the same `ujson==2.0.3` is *declared* in that bug's own tree, the
+pre-walk reading saw it, and that layer built under `setuptools-scm==3.5.0` — so the rule was right and its
+*reader* was scoped to the wrong list. `2874f27` narrows that scope (the landing note below); after it
+`luigi/1` carries whatever release the next bake dates for 2019-05-09, not this row's 3.2.0.
+
+**The next bake is `--force`, for the pandas half rather than the luigi one.** `1737bf6` adds a member to
+`COMPILER_ENV`, and that mapping is written into the **interpreter** layer's recipe (`export CFLAGS=…`), so
+`vanta-bugsinpy-py3.8`'s recipe changes and every per-bug layer is `--from` a base that no longer matches
+it. `plan_layers` skips a layer that is already present unless `--force` and does not invalidate on a
+recipe change, so `--force` for the whole run is the answer — the same shape item 3's `FFLAGS` change had.
+The luigi half alone would have needed only `vanta-bi-luigi-1` rebuilt, because the two layers the rule
+was measured on are evidence that it works rather than victims of it: `fastapi-1` and `sanic-1` already
+carry the pins it produces. That is also why the retry is not `--only luigi/1 --only pandas/1`: those two
+would be rebuilt over an interpreter layer whose `CFLAGS` no longer matches their build logs.
 
 **Tests.** `scripts/test_bugsinpy.py::TestUncoveredBuildRequirements` (eight cases: the declarer is kept,
 a name the layer pins is left to the two rules around it, a build requiring itself, a harness name, only a

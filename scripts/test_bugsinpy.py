@@ -3590,6 +3590,30 @@ class TestBake:
         assert "python -m pytest --version" in recipe
         assert "cat >" not in recipe, "an empty heredoc would install nothing useful"
 
+    def test_the_layers_own_pytest_check_does_not_autoload_plugins(self):
+        """Item B: the check proves pytest runs here, and nothing about the tree.
+
+        [VANTA-WHY] The interpreter layer carries every project's plugins, so a bare
+        ``pytest --version`` in a *bug* layer loads each plugin's entry point — and
+        ``pytest_sanic`` imports ``sanic`` at startup, which is not in the layer.
+        Measured, ``sanic/1``: ``ModuleNotFoundError: No module named 'sanic'`` killed the
+        layer after a clean install. Autoload off is not a workaround: at test time the
+        tree *is* importable, because both the suite and the Rust runner run ``python -m
+        pytest`` with the working directory at the tree root (``suite.py``'s
+        ``guest_cwd=guest_tree_root(...)``). The interpreter layer's own check keeps the
+        bare form: it is where the plugins are installed, and it has the pytest they were
+        installed for.
+        """
+        recipe = bake_mod.requirements_recipe(["requests==2.0"])
+        assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest --version" in recipe
+        # The bare form must not survive anywhere in a bug layer's recipe.
+        assert "\npython -m pytest --version" not in recipe
+        # The interpreter layer is where the plugins are installed, and it has no tree to
+        # hide behind: its own check stays bare, and stays a claim about the interpreter.
+        interpreter = bake_mod.python_recipe("3.8", bake_mod.PytestPin("8.0.2", "1.5.0"))
+        assert "\npython -m pytest --version" in interpreter
+        assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD" not in interpreter
+
     def test_the_orphans_are_uninstalled_after_the_installs_and_before_the_check(self):
         """``fastapi/1``'s shape: the layer removes what it replaced, then reads the result.
 

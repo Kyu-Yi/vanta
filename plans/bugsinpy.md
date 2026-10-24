@@ -1968,6 +1968,29 @@ install anything — only shows up when the module is *used*. Standalone builds 
 are fine; a source-built 3.6/3.7 reports 1.1.1x. Both satisfy the gate, so the gate asserts the
 property (works) rather than the version (which would fail the very build §3.2 recommends).
 
+**A *bug* layer runs that same `pytest --version` with plugin autoload off, and the tree's own
+importability is not what it is measuring.** Measured, and it is the other half of what `sanic/1`
+failed on: after a clean install — every pin present, `pip check` reading one tolerated line — the
+layer's own gate died `ModuleNotFoundError: No module named 'sanic'`, because the interpreter layer
+carries *every* project's pytest plugins (that is what the per-version checkpoint is for), so a bare
+`pytest --version` loads each plugin's entry point, and `pytest_sanic` imports `sanic` at startup. The
+project under test is not in the layer by design — it lives in the tree, which is mounted at test
+time — so loading its plugin is not a property this gate can hold. It runs as
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest --version` (`requirements_recipe`), which asserts
+exactly what the gate was for: pytest itself imports and runs under this interpreter. The interpreter
+layer's own check keeps the bare form — it is where the plugins are installed, and it has the pytest
+they were installed for — and neither form claims anything about a tree. The real suite is
+unaffected, and that was checked in the code rather than assumed: `prepare` runs its runs through
+`suite.py:run_suite_twice`, which issues `python -m pytest` with `guest_cwd=guest_tree_root(tree_rel)`
+and an env of `PYTHONDONTWRITEBYTECODE`/`PYTHONUNBUFFERED` and **no `PYTHONPATH`** — the tree reaches
+`sys.path` through `python -m`'s CWD prepend, which `suite.py` states as a deliberate property
+(`import_module_path`'s probe reuses the same invocation for that reason) — and Vanta's runner does the
+same: `harness.rs` executes `TestCommand::as_cmd_vec()` (`python3 -m pytest`) through
+`sandbox.execute(…, Path::new(""), …)`, and the Shuru backend resolves an empty cwd to `/workspace`,
+the mount of the sandbox root the tree was written to (`shuru.rs`). Both paths therefore run with the
+working directory at the tree root, so the tree *is* importable when the entry-point plugins load, and
+no fix is needed there — the gate was the only place running pytest outside the tree.
+
 **Version pins.** `pytest` and `pytest-json-report` are pinned to versions that support each
 interpreter — 3.6 caps at pytest 6.x, 3.7 at 7.4.x, 3.8 at 8.0.x — written into the checkpoint build
 and recorded per bug in the split (`pytest_version`, `json_report_version`) so a report can be read

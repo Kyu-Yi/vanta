@@ -3213,7 +3213,18 @@ def requirements_recipe(
         # known (:func:`pip_check_conflicts`).
         f"python -m pip check > {PIP_CHECK_OUTPUT} 2>&1 || true",
         _pip_check_echo(),
-        "python -m pytest --version",
+        # `pytest --version` proves exactly one thing — that pytest itself runs under
+        # this interpreter — and nothing about the bug's own tree, which is not in the
+        # layer. Plugin *autoload* is what made it prove something else: the interpreter
+        # layer carries every project's plugins, so a bare `pytest --version` here loads
+        # each one's entry point, and `pytest_sanic` imports `sanic` at startup.
+        # Measured, `sanic/1`: the check died `ModuleNotFoundError: No module named
+        # 'sanic'` in the layer's own log. Disabling autoload is not a workaround for a
+        # real problem — at test time the tree *is* importable, because the suite runs
+        # `python -m pytest` with the working directory at the tree root
+        # (``suite.py:run_suite_twice``) — it is this check declining to claim
+        # something it was never measuring.
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest --version",
         f"python -m pip freeze > {DEPS_FREEZE_OUTPUT}",
         _freeze_echo(),
         f"touch {MARKER}",

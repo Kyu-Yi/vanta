@@ -33,6 +33,7 @@
     "usb": "pyusb",
     "zmq": "pyzmq",
     "MySQLdb": "mysqlclient",
+    "mysql.connector": "mysql-connector-python",
     "pylab": "matplotlib",
     "mpl_toolkits": "matplotlib",
     "pkg_resources": "setuptools",
@@ -278,6 +279,12 @@
       "reason": "The tests only need the module to import: they skip without a database server, so nothing opens a connection and the binary wheel is enough. The source `psycopg2` builds against libpq and needs pg_config, which the sandbox does not have, so choosing it would turn a dependency into a build failure the test never asked for. Recorded here as well as in the development split because the table is the protocol for every wave, not a dev-only detail.",
       "decided_by": "user review, 2026-10-22",
       "rule": "The choice is the distribution's, not the harness's, and is pinned by the same date rule as every other dependency (the newest release on or before the declaration's commit date; the closure's own stamp is the fixed commit's). If the pinned psycopg2-binary has no wheel for the sandbox's platform and the bake fails, that is a normal build failure for the bug that needed it, recorded as such -- not special-cased, and not worked around by installing the source distribution."
+    },
+    {
+      "change": "`module_distributions` maps `mysql.connector` -> `mysql-connector-python`. `import mysql.connector` under the fallback resolves to the top-level word `mysql`, which is a PyPI distribution of its own -- `mysql` 0.0.2, a 2018 'virtual package' whose sdist declares `mysqlclient` -- and that is not the distribution that provides the module.",
+      "reason": "The module is `mysql.connector`, which is mysql-connector-python's; the reviewed table is keyed by the import spelling precisely so the dotted name is matched before its top-level one (`google.protobuf` is the same case). Under the date rule the newest release of mysql-connector-python on or before the declaring commit's date that PyPI still carries is 8.0.5 (2017-11-20), which publishes a `py2.py3-none-any` wheel: pure Python, nothing to build and no system library. Recorded here as well as in the development split because the table is the protocol for every wave, not a dev-only detail -- it was measured on `luigi/1` in the development split.",
+      "decided_by": "user review, 2026-10-24",
+      "rule": "Pinned by the same date rule as every other dependency -- the newest release on or before the fixed commit's date -- and installed from the wheel it publishes for any platform. The mapping is a decision recorded in the protocol, not a guess in the harness: a module whose top-level word happens to name an unrelated PyPI project is exactly what the table is for."
     }
   ],
   "bugs": [

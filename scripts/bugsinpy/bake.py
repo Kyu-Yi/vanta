@@ -828,6 +828,35 @@ diagnostic and the measured failures were in C sources; distutils'
 ``ldshared``, so this is the variable the C compilation and the link line read.
 """
 
+_ERA_GNU_SOURCE = ("-D_GNU_SOURCE",)
+"""The feature-test macro :data:`_ERA_STDINT_INCLUDE` takes away, defined on the line.
+
+[VANTA-WHY] Measured on the bake that carried the ``stdint`` include and nothing else:
+it repaired ``pandas/1``'s ``scipy`` and broke every *C* tree in the same layer —
+
+``numpy/core/src/multiarray/temp_elide.c:158:9: error: unknown type name
+'Dl_info'`` — matplotlib/1, pandas/1 **and** sanic/1, all inside ``numpy``'s own
+sources, then ``ERROR: Failed building wheel for numpy``. ``sanic/1`` had baked clean
+before that change, which is what makes this a regression and not a fourth bug.
+
+Why ``-include`` costs the macro: it is processed as if the file were the first line of
+the translation unit, so glibc's ``<stdint.h>`` reaches ``<bits/libc-header-start.h>``
+and ``<features.h>`` *before* the source's own feature-test macros are seen. ``features.h``
+is then past its include guard for the rest of the compile, ``__USE_GNU`` is never set,
+and ``Dl_info``/``dladdr`` — declared in ``<dlfcn.h>`` behind that macro — are not
+declared at all; GCC 14 makes the unknown *type* an error (the ``dladdr`` call beside it
+was only an implicit-declaration warning). Defining the macro on the command line is what
+restores it, because GCC applies every ``-D``/``-U`` before reading any input, ``-include``
+files included, so the one pass of ``features.h`` sees ``_GNU_SOURCE``. ``_GNU_SOURCE``
+and not the narrower ``_DEFAULT_SOURCE``: it is the widest declaration set glibc offers,
+and the 2020-era sources in these layers are the code written against exactly that.
+
+The alternative — a shim header that defines ``_GNU_SOURCE`` and then includes
+``stdint.h`` — would have to be written into every layer that exports this environment,
+because a checkpoint is a filesystem and an ``export`` does not survive into a layer
+baked ``--from`` another. One token in the variable needs no file at all.
+"""
+
 _ERA_STDINT_INCLUDE = ("-include", "stdint.h")
 """The header a 2020-era C++ source no longer gets included for it (§3.2, GCC 14).
 
@@ -855,16 +884,32 @@ libstdc++'s ``c_compatibility/stdint.h``, which does declare ``namespace std { u
 ::uint16_t; … }``. ``-include`` rather than a line in the source: the file is not
 ours to edit, and the declaration has to be in scope *before* ``attr.h``.
 
+It is only half the flag: :data:`_ERA_GNU_SOURCE` is the other half, and it is in the
+same variable for the same reason. Read them as one decision — the header restores
+``std::uint16_t`` and the macro restores ``Dl_info`` on the *same* command lines.
+
 [VANTA-WHY] ``CFLAGS`` and not ``CXXFLAGS``, which is the name the failure invites.
 CPython 3.8's ``distutils.sysconfig.customize_compiler`` reads ``CC``, ``CXX`` and
 ``CFLAGS`` from the environment (then appends ``CFLAGS`` to ``cflags`` *and*
 ``ldshared``) and never reads ``CXXFLAGS`` at all — a ``CXXFLAGS`` export reaches
-nothing, so the fix cannot be spelled the way the error reads. It reaches the
-``.cxx`` compile by exactly the route the six diagnostics do, and that layer's own
-log is the evidence: its C++ compile line reads ``C compiler: g++ -Wno-unused-result
-… -Wno-error=declaration-missing-parameter-type -fPIC`` — ``CXX``'s driver with this
-``CFLAGS`` attached, because ``numpy.distutils``' ``cxx_compiler`` keeps the flag
-list and swaps only the driver.
+nothing, so the fix cannot be spelled the way the error reads. It reaches a ``.cxx``
+compile through the *C* command line that ``numpy.distutils`` reuses: its
+``cxx_compiler`` keeps the flag list and swaps only the first word for ``CXX``'s, which
+is why ``pandas/1``'s scipy log shows its ``.cxx`` compile line reading ``C compiler:
+g++ -Wno-unused-result … -Wno-error=declaration-missing-parameter-type -fPIC``.
+
+``numpy.distutils`` is the load-bearing word, and it is not the whole world. Plain
+``distutils``/``setuptools`` compiles a C++ ``Extension`` with ``compiler_so`` — the
+*C* line — only in the stdlib implementation, which reads no ``CXXFLAGS`` either; the
+modern ``setuptools._distutils`` fork seeds its C++ flags from the **recorded**
+``cflags`` *before* it applies an environment ``CFLAGS``, so on a layer whose seeded
+setuptools is a recent one an environment ``CFLAGS`` does **not** reach a plain
+``BuildExt`` C++ compile — only ``CXXFLAGS`` moves that. The measured
+``vanta_smoke_cpp.cpp`` compile line in the interpreter layer's own log carries none of
+this variable for exactly that reason. The reach this flag depends on is therefore a
+fact about the trees being built (``scipy`` builds through ``numpy.distutils``), not
+about ``distutils`` in general, and the smoke check no longer claims otherwise
+(:data:`_TOOLCHAIN_SMOKE_CPP_SOURCE`).
 """
 
 _ERA_FORTRAN_FLAGS = ("-fallow-argument-mismatch",)
@@ -904,7 +949,9 @@ COMPILER_ENV: Mapping[str, str] = {
     "CXX": "g++",
     "LDSHARED": "gcc -pthread -shared",
     "LDCXXSHARED": "g++ -pthread -shared",
-    "CFLAGS": " ".join((*_ERA_WARNING_FLAGS, *_ERA_STDINT_INCLUDE)),
+    "CFLAGS": " ".join(
+        (*_ERA_WARNING_FLAGS, *_ERA_GNU_SOURCE, *_ERA_STDINT_INCLUDE)
+    ),
     "FFLAGS": " ".join(_ERA_FORTRAN_FLAGS),
 }
 """The compiler a source build in these layers runs, the linker that follows it, and
@@ -939,13 +986,17 @@ The fifth variable is the other half of the same fact — which compiler runs, a
 what that compiler's *own* defaults make of 2020-era C — and it is in the same
 mapping for the same reason: both are facts about the toolchain this layer runs
 rather than about the tree being built, and a reader of a failed build should not
-have to know which of the two it was. It carries two answers and not one, because
+have to know which of the two it was. It carries three answers and not one, because
 GCC 14 changed two things about the same sources: the diagnostics it promotes
 (:data:`_ERA_WARNING_FLAGS`) and the standard headers ``g++`` no longer pulls in
-beside them (:data:`_ERA_STDINT_INCLUDE`). That both reach the C **and** the C++
-compile is the property that put them in one variable; the reader who wants to
-know which diagnosis a line belongs to reads the log the way the compiler wrote
-it.
+beside them (:data:`_ERA_STDINT_INCLUDE`) — and the second of those costs a
+feature-test macro that has to be defined on the same line (:data:`_ERA_GNU_SOURCE`),
+or the header's own arrival breaks the *C* trees it was never meant for. The three
+are one string rather than three variables because they are one decision, taken at
+once, about one compiler: the reader who wants to know which diagnosis a line belongs
+to reads the log the way the compiler wrote it. What reaches the C compile and what
+reaches a C++ compile are *not* the same set in general — see
+:data:`_ERA_STDINT_INCLUDE`.
 
 The sixth is the same reading for the *other* compiler this toolchain installs.
 ``gfortran`` is in the layer for the same reason ``g++`` is (``SYSTEM_PACKAGES``
@@ -1176,16 +1227,26 @@ PyMODINIT_FUNC PyInit_vanta_smoke_c(void) {
 
 _TOOLCHAIN_SMOKE_CPP_SOURCE = """\
 #include <Python.h>
+#include <cstdint>
 
-/* [VANTA-WHY] The second measured failure the flags exist for, in miniature. `scipy`
-   1.4.1's `pypocketfft.cxx` builds against `pybind11==2.5.0`, whose `attr.h` declares
-   `std::uint16_t nargs;`, and nothing on that file's include chain declares the name
-   under GCC 14 -- so `pandas/1`'s scipy build died at `attr.h:185` with
-   `'uint16_t' in namespace 'std' does not name a type` followed by five readers of the
-   member. This reference therefore compiles only if `-include stdint.h` reached the
-   C++ compile, which is the half of `_ERA_STDINT_INCLUDE` no C source can check: the
-   header is on the *C* include path in both languages, but only C++ mode's resolve of
-   it declares the `std` names. */
+/* [VANTA-WHY] What this checks, and what it deliberately does not. The C half
+   (:data:`_TOOLCHAIN_SMOKE_C_SOURCE`) is the layer's receipt that an environment
+   `CFLAGS` reached `distutils` at all: its `-Wno-error=incompatible-pointer-types`
+   demotion is what lets its intentional pointer mismatch compile. This half is the
+   *other* variable — that `CC` and `CXX` are two answers and a layer able to compile C
+   and not C++ would pass a C-only check, which is the measured shape of the trees
+   (`matplotlib`'s `ft2font`, `pandas`' `_libs`).
+
+   It does not check that `_ERA_STDINT_INCLUDE` reached a C++ compile, and the include
+   on line 2 is why: measured, a plain `distutils`/`setuptools` C++ `Extension` on this
+   layer's *seeded* setuptools compiles with none of the environment `CFLAGS` — the
+   modern fork seeds its C++ flags from the recorded `cflags` before the environment
+   one is applied, and only `CXXFLAGS` moves them — so a reference that needed
+   `std::uint16_t` supplied by `-include stdint.h` could never compile here. It would
+   fail every interpreter layer forever, which is exactly what the first version of
+   this file did (see :data:`_ERA_GNU_SOURCE`). The flag's C++ reach is a property of
+   `numpy.distutils`, the build system `scipy` uses (`pandas/1`), not of `distutils`,
+   and nothing in this layer builds through it. */
 static std::uint16_t vanta_era_stdint_check = 16;
 
 static PyObject *vanta_value(PyObject *self, PyObject *args) {
@@ -1259,10 +1320,20 @@ def toolchain_smoke_lines(env: Mapping[str, str]) -> list[str]:
     too. A broken toolchain therefore fails *this* layer's bake, before any per-bug
     layer is attempted, and one line of the log says so.
 
+    Every step is its own statement, and that is load-bearing rather than style: an
+    AND-OR list swallows the failure of everything but its last member under ``set -e``
+    (measured), so the first version of this smoke — one ``cd … && build_ext && python
+    -c …`` chain — let a hard C++ compile error scroll past into ``pip freeze`` and
+    ``touch /opt/vanta-deps-ok``, and the layer was reported ``[done]``. The ``cd`` is
+    a statement too, so a missing directory fails here rather than at the first check.
+
     The C++ half is not redundant: the measured trees compile C++ extensions
     (matplotlib's ``ft2font``, pandas' ``_libs``), and ``CC`` and ``CXX`` are two
     variables with two answers — a layer that can compile C and not C++ would pass a
-    C-only smoke check.
+    C-only smoke check. It is a *build and import* check and nothing more; what it
+    deliberately does not check is the C++ reach of ``CFLAGS``, which only
+    ``numpy.distutils`` provides and nothing in this layer builds through
+    (:data:`_TOOLCHAIN_SMOKE_CPP_SOURCE`).
 
     The C half also carries one diagnosis GCC 14 promoted to an error
     (:data:`_ERA_WARNING_FLAGS`), so this smoke fails on a layer where ``CFLAGS`` did
@@ -1306,18 +1377,29 @@ def toolchain_smoke_lines(env: Mapping[str, str]) -> list[str]:
         f"cat > {directory}/setup.py <<'VANTA_SMOKE_SETUP'",
         _TOOLCHAIN_SMOKE_SETUP.rstrip("\n"),
         "VANTA_SMOKE_SETUP",
-        f'cd {directory} && python setup.py build_ext --inplace && python -c "import '
-        "vanta_smoke_c, vanta_smoke_cpp; assert vanta_smoke_c.value() == 1 and "
-        f"vanta_smoke_cpp.value() == 2; print('{_SMOKE_PREFIX}: C and C++ "
-        'extensions build and import\')"',
+        # [VANTA-WHY] Each check is its own statement, and this is a correction of a
+        # measured defect: written as one `cd DIR && setup.py build_ext && python -c …`
+        # AND-OR list, a failure anywhere but the *last* member does not trip `set -e`
+        # (`sh -c 'set -eux; false && true; echo CONTINUED'` prints `CONTINUED` and
+        # exits 0), so the C++ compile's hard error at `vanta_smoke_cpp.cpp` left the
+        # recipe running to `pip freeze` and `touch /opt/vanta-deps-ok` — the layer was
+        # reported `[done]` with a broken toolchain inside it, which is the opposite of
+        # what this function is for. The `cd` is a statement of its own for the same
+        # reason and stays in effect for the Fortran check below, exactly as it did
+        # inside the chain.
+        f"cd {directory}",
+        "python setup.py build_ext --inplace",
+        'python -c "import vanta_smoke_c, vanta_smoke_cpp; assert '
+        "vanta_smoke_c.value() == 1 and vanta_smoke_cpp.value() == 2; "
+        f"print('{_SMOKE_PREFIX}: C and C++ extensions build and import')\"",
         # Unquoted `$FFLAGS`, because a flag list is more than one word and this is
         # the position the build system puts it in. `-ffixed-form` as the failing
         # command reads, so the smoke compiles the form that failed. No `|| true`:
         # an empty or unexported `FFLAGS` makes this file an `Error:` again, which
-        # is the failure being checked for.
-        f"cd {directory} && gfortran $FFLAGS -ffixed-form -c vanta_smoke_rank.f "
-        f"-o vanta_smoke_rank.o && echo '{_SMOKE_PREFIX}: a Fortran rank mismatch "
-        "compiles under FFLAGS'",
+        # is the failure being checked for. Its own statement, for the reason above.
+        "gfortran $FFLAGS -ffixed-form -c vanta_smoke_rank.f "
+        "-o vanta_smoke_rank.o",
+        f"echo '{_SMOKE_PREFIX}: a Fortran rank mismatch compiles under FFLAGS'",
         # [VANTA-WHY] The kernel, not the compiler — and here rather than only at boot
         # because this is the layer whose record a reader consults afterwards. A VM
         # whose multiprocessing cannot create a semaphore makes every ``Pool``,

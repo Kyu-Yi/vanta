@@ -669,22 +669,59 @@ code no longer gets pulled in for it. `bake._ERA_STDINT_INCLUDE` is `('-include'
 member of `CFLAGS` rather than a variable of its own for the measured reason `CXXFLAGS` cannot be used:
 distutils' `customize_compiler` reads `CC`, `CXX` and `CFLAGS` from the environment — appending `CFLAGS`
 to its `cflags` *and* to its link line — and never reads `CXXFLAGS` at all, so the fix cannot be spelled
-the way the compiler's error invites. It reaches the `.cxx` compile by the route the six diagnostics do:
-`numpy.distutils`' C++ compiler keeps that flag list and swaps only the driver, and `pandas/1`'s log shows
-its C++ compile line already carrying the six. `stdint.h` and not the `cstdint` the error names, because
-this variable reaches the **C** compiles too and `cstdint` is a C++-only header that is not on `gcc`'s C
+the way the compiler's error invites. `stdint.h` and not the `cstdint` the error names, because this
+variable reaches the **C** compiles too and `cstdint` is a C++-only header that is not on `gcc`'s C
 include path, so `-include cstdint` would turn every C file in the tree into
 `fatal error: cstdint: No such file or directory`. `stdint.h` is one name in both languages: the C
 standard header there, and under `g++` libstdc++'s `c_compatibility/stdint.h`, which declares
 `namespace std { using ::uint16_t; … }` for C++11 and later — what `pybind11==2.5.0`'s `attr.h` needs for
 its `std::uint16_t nargs;`.
 
-The interpreter layer's smoke check covers both halves of the variable: one C file compiles one of the six
-demotions (a `double *` assigned to an `int *`), and the C++ file references `std::uint16_t` without
-including anything that would supply it — which only compiles if the header was reached by `-include`, and
-only declares the `std` name if that reach went through C++ mode. A layer where `CFLAGS` never reached
-`distutils`, or reached the C compile but not the C++ one, therefore fails its own smoke check rather than
-reproducing the error inside lxml or twenty minutes into `scipy`.
+**How far this variable reaches a C++ compile is narrower than it first reads, and it is worth stating
+rather than assuming.** It reaches the `.cxx` compile of `pandas/1`'s `scipy` by one route: `numpy.distutils`
+keeps one flag list and swaps only the driver word, so the environment `CFLAGS` rides the command line that
+compiles `pypocketfft.cxx`, and that log shows it carrying the six. A plain `distutils`/`setuptools` C++
+`Extension` is a different path and does *not* see it: the stdlib implementation compiles C++ with
+`compiler_so` — the *C* line, whose flags came from the recorded cflags and which reads no `CXXFLAGS`
+either — and the modern `setuptools._distutils` fork seeds its C++ flags from the **recorded** `cflags`
+*before* it applies an environment `CFLAGS`, so only `CXXFLAGS` would move them. The repository's own
+`vanta_smoke_cpp.cpp` compile in the interpreter layer's log carries none of this variable for exactly that
+reason. The header is therefore carried for `numpy.distutils`' sake, which is the build system the one
+measured failure went through, and the general statement of the reach is left as what was measured.
+
+**The header costs a glibc feature-test macro, and the macro is a member of the same variable.** Measured
+on the bake that carried `-include stdint.h` and nothing else: `matplotlib/1`, `pandas/1` **and** `sanic/1`
+all died inside `numpy`'s own sources, at
+
+```
+  numpy/core/src/multiarray/temp_elide.c:158:9: error: unknown type name 'Dl_info'
+```
+
+followed by `ERROR: Failed building wheel for numpy`. `sanic/1` had baked clean before that change, so this
+is a regression rather than a fourth bug. The mechanism: `-include` is processed as if the file were the
+translation unit's *first line*, so glibc's `<stdint.h>` reaches `<bits/libc-header-start.h>` and
+`<features.h>` before the source's own feature-test macros are seen, `__USE_GNU` is never set, and
+`Dl_info`/`dladdr` from `<dlfcn.h>` — both behind `__USE_GNU` — are never declared; GCC 14 makes the
+unknown *type* a hard error while the `dladdr` call is only an implicit-declaration warning. The answer is
+`bake._ERA_GNU_SOURCE`, which is `('-D_GNU_SOURCE',)` and sits in the same `CFLAGS` string immediately
+before the include: GCC applies every command-line `-D` and `-U` before it reads any input, `-include`
+files included, so the feature-test macro is in force when the pre-included header arrives. The two are one
+decision and one variable — the header restores `std::uint16_t` for `scipy`'s `.cxx` sources and the macro
+restores `Dl_info` for the C trees beside them, and dropping either is a measured failure.
+
+The interpreter layer's smoke check covers the C half of the variable and the two compilers, and it no
+longer claims the half it cannot establish. One C file compiles one of the six demotions (a `double *`
+assigned to an `int *`), which is the receipt that an environment `CFLAGS` reached `distutils` at all; one
+C++ file *builds and imports*, which is the receipt that `CXX` names a compiler able to build a Python C++
+extension — the `matplotlib`/`pandas` shape. What it deliberately does **not** check is the C++ reach of
+`CFLAGS`, because a plain C++ `Extension` on that layer cannot see it (above) and an earlier version of the
+C++ file that left `std::uint16_t` to `-include stdint.h` therefore failed every layer forever. Each smoke
+step is its own shell statement rather than an `&&` chain, which is load-bearing rather than style: measured,
+an AND-OR list swallows the failure of every member but its last under `set -e`
+(`sh -c 'set -eux; false && true; echo CONTINUED'` prints `CONTINUED` and exits 0), so the first version's
+`cd … && build_ext && python -c …` chain let the C++ compile's hard error scroll past into `pip freeze` and
+`touch /opt/vanta-deps-ok` and the layer was reported `[done]` with a broken toolchain inside it. The
+de-chained smoke fails the layer it is in, which is what it exists to do.
 
 The whole mapping is recorded inside the layer at `/opt/vanta-build-env.txt`, together with `gcc --version`:
 the variables say what was asked for and the version says which compiler read them, and the flags are
@@ -2414,15 +2451,61 @@ pre-walk reading saw it, and that layer built under `setuptools-scm==3.5.0` — 
 *reader* was scoped to the wrong list. `2874f27` narrows that scope (the landing note below); after it
 `luigi/1` carries whatever release the next bake dates for 2019-05-09, not this row's 3.2.0.
 
-**The next bake is `--force`, for the pandas half rather than the luigi one.** `1737bf6` adds a member to
-`COMPILER_ENV`, and that mapping is written into the **interpreter** layer's recipe (`export CFLAGS=…`), so
-`vanta-bugsinpy-py3.8`'s recipe changes and every per-bug layer is `--from` a base that no longer matches
-it. `plan_layers` skips a layer that is already present unless `--force` and does not invalidate on a
-recipe change, so `--force` for the whole run is the answer — the same shape item 3's `FFLAGS` change had.
-The luigi half alone would have needed only `vanta-bi-luigi-1` rebuilt, because the two layers the rule
-was measured on are evidence that it works rather than victims of it: `fastapi-1` and `sanic-1` already
-carry the pins it produces. That is also why the retry is not `--only luigi/1 --only pandas/1`: those two
-would be rebuilt over an interpreter layer whose `CFLAGS` no longer matches their build logs.
+**The next bake is `--force`, and this time because the last one proved the rule needs it twice over.**
+`1737bf6` added a member to `COMPILER_ENV`, and that mapping is written into the **interpreter** layer's
+recipe (`export CFLAGS=…`), so `vanta-bugsinpy-py3.8`'s recipe changes and every per-bug layer is `--from` a
+base that no longer matches it. `plan_layers` skips a layer that is already present unless `--force` and does
+not invalidate on a recipe change, so `--force` for the whole run is the answer — the same shape item 3's
+`FFLAGS` change had. **The bake that ran `--force` over `1737bf6` is what turned that from a rule into a
+measured need**: the member it added was the header alone, three layers died on `Dl_info` (above), and
+`plan_layers` rebuilding nothing would have hidden it behind the stale checkpoints. The luigi half alone
+would have needed only `vanta-bi-luigi-1` rebuilt, because the two layers the two-rule reading was measured
+on are evidence that it works rather than victims of it: `fastapi-1` and `sanic-1` already carry the pins it
+produces. That is also why the retry is not `--only luigi/1 --only pandas/1`: those two would be rebuilt over
+an interpreter layer whose `CFLAGS` no longer matches their build logs.
+
+**Two defects the same bake exposed, fixed together — the header's cost and the smoke that could not see
+it.** Both are recorded here rather than in the paragraph above because they are corrections of *that*
+commit's two halves, and both are measured rather than reasoned:
+
+*The header needs a feature-test macro beside it.* `bake._ERA_GNU_SOURCE` is `('-D_GNU_SOURCE',)`, a member of
+`CFLAGS` immediately before `_ERA_STDINT_INCLUDE`. `-include stdint.h` alone lost glibc's `__USE_GNU` on every
+**C** tree in the layer — `matplotlib/1`, `pandas/1` and `sanic/1` all at
+`numpy/core/src/multiarray/temp_elide.c:158:9: error: unknown type name 'Dl_info'` — because `-include` is
+read as the translation unit's first line, before the source's own feature-test macros can set it (the
+mechanism is in §3.2 above). GCC applies command-line `-D` before any input, `-include` files included, so the
+macro belongs on the command line and not in a source. The signature this leaves a reader: the *same* layer
+that built clean before the header now fails, which is a regression and not a fourth bug.
+
+*The smoke check was inert, and unsatisfiable.* `bake.toolchain_smoke_lines` wrote its three checks as one
+`cd DIR && setup.py build_ext && python -c …` AND-OR list, and measured, an AND-OR list does not trip `set -e`
+on a non-final member (`sh -c 'set -eux; false && true; echo CONTINUED'` prints `CONTINUED`, `exit=0`), so the
+C++ compile's hard error let `checkpoint create` run on to `pip freeze` and `touch /opt/vanta-deps-ok` — the
+layer was saved and reported `[done]` with a broken toolchain inside it. The same C++ file could never have
+compiled anyway: it left `std::uint16_t` to `-include stdint.h`, and a plain `distutils`/`setuptools` C++
+`Extension` on that layer seeds its C++ flags from the **recorded** `cflags` and never reads the environment
+`CFLAGS` (§3.2), so the check was red on every layer by construction. Each step is now its own statement
+(de-chaining both `&&` groups) and the C++ file includes `<cstdint>` and is a **build-and-import** check of
+`CXX` and nothing more. `bake._TOOLCHAIN_SMOKE_CPP_SOURCE`'s comment and the §3.2 smoke paragraph state what
+it deliberately does not check.
+
+**`luigi/1`'s error had moved, and the fix is a reviewed mapping — `mysql.connector`.** With the toolchain
+fixed and de-chained, `luigi/1` no longer died on `ImportError: cannot import name 'sic'` (the build pins are
+correct: the log's `pip freeze` shows `setuptools==42.0.0`, `setuptools-scm==3.4.1`, `pytest-runner==4.4`); it
+died one layer down, on a *dependency*. The import closure at `test/_mysqldb_test.py line 20` imports
+`mysql.connector`, and the fallback resolved it to the top-level word `mysql` — a PyPI distribution of its
+own, `mysql` 0.0.2 (2018), a 'virtual package' whose sdist declares `mysqlclient` — so the layer tried to
+build `mysqlclient` and stopped on
+`Exception: Can not find valid pkg-config name. Specify MYSQLCLIENT_CFLAGS and MYSQLCLIENT_LDFLAGS env vars
+manually`, the sandbox having no MySQL client library. The module is `mysql.connector`, not `mysql`; the
+reviewed table is keyed by the **import spelling** precisely so the dotted name is matched before its
+top-level one (`google.protobuf` is the precedent). Both splits now map
+`"mysql.connector": "mysql-connector-python"` (line 36 of each), with the matching `reviewed_changes` entry
+recorded on `2026-10-24`. Under §3.2's date rule the newest release of `mysql-connector-python` on or before
+the declaring commit's date that PyPI still carries is **8.0.5** (2017-11-20; 8.0.6–8.0.22 are absent from
+the index), which publishes `mysql_connector_python-8.0.5-py2.py3-none-any.whl` — pure Python, nothing to
+build, no system library. The harness change is only the two split files: the reviewed table is data, and
+nothing in `bake.py` learns a project name.
 
 **Tests.** `scripts/test_bugsinpy.py::TestUncoveredBuildRequirements` (eight cases: the declarer is kept,
 a name the layer pins is left to the two rules around it, a build requiring itself, a harness name, only a
@@ -2434,8 +2517,12 @@ fetched, dated, recorded as a *build* pin and ordered early — and `TestPinConf
 (`test_a_narrowing_claim_with_no_clause_is_not_made_into_a_reason`,
 `test_a_repeated_reason_and_key_print_once`) and `TestNarrowBuildPins`' clause-less case. The canonical
 name is asserted throughout: the reader stores `canonicalize_name(ref.name)`, so `setuptools_scm` becomes
-`setuptools-scm` in the pin and only the recorded declarer keeps the raw spelling. Full run:
-`957 passed`.
+`setuptools-scm` in the pin and only the recorded declarer keeps the raw spelling. This change adds
+`test_the_c_flags_define_the_macro_the_pre_included_header_costs` (the macro is in `CFLAGS` and precedes the
+include), `test_the_smoke_checks_are_separate_statements` (no line of the smoke is an `&&` chain, `cd` stands
+alone), the rewritten `test_the_smoke_check_builds_and_imports_the_cpp_half`, and the `mysql.connector` row in
+`test_the_reviewed_module_table_is_pinned_in_both_splits` and its entry in
+`test_real_split_reviewed_changes_carry_the_rule_and_its_measurements`. Full run: `962 passed`.
 
 ### 3.3 BLOCKER 2 — dependency detection under-provisions
 

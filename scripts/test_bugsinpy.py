@@ -302,8 +302,8 @@ class TestSplit:
         """
         split = load_split(SPLIT_PATH)
         changes = split.data["reviewed_changes"]
-        assert len(changes) == 6
-        excluded, promoted, removed, dropped, development, mapped = changes
+        assert len(changes) == 7
+        excluded, promoted, removed, dropped, development, mapped, mysql_mapped = changes
         assert "PySnooper/1" in excluded["change"]
         assert "Python-2-only" in excluded["reason"]
 
@@ -351,6 +351,15 @@ class TestSplit:
         assert "skip without a database server" in mapped["reason"]
         assert "date rule" in mapped["rule"]
         assert "measurements" not in mapped
+
+        # The seventh is the same kind of reviewed mapping for a dotted import: the
+        # fallback's top-level word `mysql` is a different PyPI project, so the
+        # reviewer names the distribution the module actually comes from.
+        assert "mysql.connector" in mysql_mapped["change"]
+        assert "mysql-connector-python" in mysql_mapped["change"]
+        assert "virtual package" in mysql_mapped["change"]
+        assert "date rule" in mysql_mapped["rule"]
+        assert "measurements" not in mysql_mapped
 
     def test_reviewed_change_validates(self):
         data = split_data(
@@ -537,6 +546,7 @@ class TestSplit:
             "usb": "pyusb",
             "zmq": "pyzmq",
             "MySQLdb": "mysqlclient",
+            "mysql.connector": "mysql-connector-python",
             "pylab": "matplotlib",
             "mpl_toolkits": "matplotlib",
             "pkg_resources": "setuptools",
@@ -547,6 +557,10 @@ class TestSplit:
         assert dev == required
         assert evaluation == required
         assert dev["psycopg2"] == "psycopg2-binary", "the reviewer's pick, not a guess"
+        # The dotted spelling is a key of its own, matched before its top-level word:
+        # `mysql` is an unrelated PyPI project, and matching it would build
+        # `mysqlclient` for a module that never asked for it.
+        assert dev["mysql.connector"] == "mysql-connector-python"
 
     def test_import_package_is_an_optional_declared_key(self):
         """The last-resort import name, carried only by a bug that needs it (§3.2).
@@ -3547,12 +3561,16 @@ class TestBake:
 
     ERA_STDINT_INCLUDE = ("-include", "stdint.h")
 
+    ERA_GNU_SOURCE = ("-D_GNU_SOURCE",)
+
     COMPILER_ENV = {
         "CC": "gcc",
         "CXX": "g++",
         "LDSHARED": "gcc -pthread -shared",
         "LDCXXSHARED": "g++ -pthread -shared",
-        "CFLAGS": " ".join((*ERA_WARNING_FLAGS, *ERA_STDINT_INCLUDE)),
+        "CFLAGS": " ".join(
+            (*ERA_WARNING_FLAGS, *ERA_GNU_SOURCE, *ERA_STDINT_INCLUDE)
+        ),
         "FFLAGS": "-fallow-argument-mismatch",
     }
 
@@ -3586,16 +3604,46 @@ class TestBake:
         Measured on ``pandas/1``: ``scipy==1.4.1``'s ``pypocketfft.cxx`` builds against
         ``pybind11==2.5.0`` and died at ``attr.h:185`` on
         ``'uint16_t' in namespace 'std' does not name a type``. The variable has to
-        reach the **C** compiles too (``numpy.distutils`` keeps one flag list and swaps
-        only the driver), and ``cstdint`` is not on ``gcc``'s C include path at all —
+        reach the **C** compiles too — ``numpy.distutils`` keeps one flag list and swaps
+        only the driver — and ``cstdint`` is not on ``gcc``'s C include path at all, so
         spelling the flag the error names would turn every C file in the tree into
-        ``fatal error: cstdint: No such file or directory``. ``std::uint16_t`` is what
-        the smoke check's C++ half therefore compiles, because nothing else in a
-        recipe can tell "the flag landed" from "the flag was written down".
+        ``fatal error: cstdint: No such file or directory``.
+
+        What this no longer claims, because it was measured false, is that the smoke
+        check can establish the *C++* reach from inside the interpreter layer: a plain
+        ``distutils``/``setuptools`` C++ compile on that layer's seeded setuptools
+        carries none of an environment ``CFLAGS``. See
+        :meth:`test_the_smoke_check_builds_and_imports_the_cpp_half` and
+        :data:`bake._ERA_STDINT_INCLUDE`.
         """
         assert bake_mod._ERA_STDINT_INCLUDE == self.ERA_STDINT_INCLUDE
         assert bake_mod.COMPILER_ENV["CFLAGS"].endswith("-include stdint.h")
         assert "cstdint" not in bake_mod.COMPILER_ENV["CFLAGS"]
+
+    def test_the_c_flags_define_the_macro_the_pre_included_header_costs(self):
+        """``-D_GNU_SOURCE``, because ``-include stdint.h`` is applied first.
+
+        Measured on the bake that carried only the include: ``numpy``'s own
+        ``temp_elide.c`` — so matplotlib/1, pandas/1 *and* sanic/1 — died on
+        ``error: unknown type name 'Dl_info'``, and sanic/1 had baked clean before it.
+        ``-include`` acts as if the file were the translation unit's first line, so
+        glibc's ``features.h`` is read before the source's own feature-test macros,
+        ``__USE_GNU`` is never set, and ``Dl_info``/``dladdr`` from ``<dlfcn.h>`` are
+        never declared. GCC applies every command-line ``-D`` before it reads any input,
+        ``-include`` files included, so the definition has to be on the command line.
+
+        The two are one variable and one decision: the header restores
+        ``std::uint16_t`` for scipy's ``.cxx`` sources and the macro restores
+        ``Dl_info`` for the C trees beside them. Dropping either is a measured failure.
+        """
+        assert bake_mod._ERA_GNU_SOURCE == self.ERA_GNU_SOURCE
+        assert "-D_GNU_SOURCE" in bake_mod.COMPILER_ENV["CFLAGS"]
+        # Before the include in the string, so a reader of the log sees the macro the
+        # header depends on first; GCC's own ordering does not depend on it, and that is
+        # why the assertion above is on membership and not on position.
+        assert bake_mod.COMPILER_ENV["CFLAGS"].index("-D_GNU_SOURCE") < (
+            bake_mod.COMPILER_ENV["CFLAGS"].index("-include stdint.h")
+        )
 
     def test_the_fortran_flags_are_the_gcc_10_argument_mismatch_error_demoted(self):
         """The other compiler's one demoted error, spelled out for the same reason.
@@ -3696,6 +3744,27 @@ class TestBake:
         assert "vanta_smoke_cpp" in recipe
         assert recipe.index("build_ext") < recipe.index(f"touch {bake_mod.MARKER}")
 
+    def test_the_smoke_checks_are_separate_statements(self):
+        """Each smoke step is its own shell statement, so ``set -e`` can see it fail.
+
+        Measured: an AND-OR list swallows every failure but its last member
+        (``sh -c 'set -eux; false && true; echo CONTINUED'`` prints ``CONTINUED`` and
+        exits 0). The first version of this smoke was one ``cd … && build_ext && python
+        -c …`` chain, so its C++ hard error did not fail the recipe: the layer ran on to
+        ``touch /opt/vanta-deps-ok`` and was reported ``[done]`` with a broken toolchain
+        inside it. No line of the smoke may therefore be an ``&&`` chain, and the ``cd``
+        must stand alone so a missing directory fails here.
+        """
+        lines = bake_mod.toolchain_smoke_lines({"CC": "gcc"})
+        assert f"cd {bake_mod._TOOLCHAIN_SMOKE_DIR}" in lines
+        assert "python setup.py build_ext --inplace" in lines
+        assert not any("&&" in line for line in lines)
+        # The `cd` is not smuggled into the build line it used to precede.
+        assert not any(
+            line.startswith("cd ") and line != f"cd {bake_mod._TOOLCHAIN_SMOKE_DIR}"
+            for line in lines
+        )
+
     def test_the_smoke_check_builds_both_c_and_cpp(self):
         """``CC`` and ``CXX`` are two variables; a C-only smoke check passes a broken C++.
 
@@ -3723,29 +3792,34 @@ class TestBake:
         # so it would fail the smoke for a reason that is not these flags.
         assert "vanta_era_pointer_check" not in bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE
 
-    def test_the_smoke_check_compiles_the_std_name_the_old_cpp_headers_lost(self):
-        """The C++ half carries ``std::uint16_t``, so the smoke fails if it did not land.
+    def test_the_smoke_check_builds_and_imports_the_cpp_half(self):
+        """The C++ half *builds and imports*, and it supplies its own ``std::uint16_t``.
 
-        The measured shape: ``scipy==1.4.1``'s ``pypocketfft.cxx`` builds against
-        ``pybind11==2.5.0``, whose ``attr.h`` declares ``std::uint16_t nargs;``, and
-        under GCC 14 nothing on that file's include chain declares the name —
-        ``pandas/1``'s scipy build died at ``attr.h:185`` on exactly that. The smoke's
-        C++ file references the name *without* including anything that would supply it,
-        so it compiles only if ``-include stdint.h`` reached the C++ compile, which is
-        the half of :data:`bake._ERA_STDINT_INCLUDE` the C half above cannot check: the
-        header resolves in both languages, but only C++ mode's resolve of it declares
-        the ``std`` names. A C-only smoke check would pass on a layer whose C++ compile
-        still fails twenty minutes into scipy.
+        This test is the correction of a measured defect. The first version left the
+        name to ``-include stdint.h`` so the smoke would be the receipt that the header
+        reached a C++ compile. It could never pass: a plain ``distutils``/``setuptools``
+        C++ ``Extension`` on this layer's seeded setuptools compiles with none of the
+        environment ``CFLAGS`` (the modern fork seeds C++ flags from the *recorded*
+        ``cflags`` before the environment override, and only ``CXXFLAGS`` moves them),
+        and ``numpy.distutils`` — the one build system whose ``CFLAGS`` *does* reach a
+        ``.cxx`` compile — builds nothing in this layer. So the check failed every layer
+        forever, and worse, the ``cd DIR && setup.py build_ext && python -c …`` AND-OR
+        chain it sat in did not trip ``set -e``: the recipe ran on to ``touch`` the
+        marker and the layer was saved as ``[done]`` with a broken toolchain inside.
+
+        What it checks now is what it can: that ``CXX`` names a compiler able to build
+        *and import* a Python C++ extension, which is the ``matplotlib``/``pandas``
+        shape (``ft2font``, ``_libs``). The C++ reach of ``CFLAGS`` is not checked,
+        because nothing in this layer builds through the only path that provides it.
         """
-        assert "std::uint16_t" in bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE
-        # Nothing in the file may supply the name itself: the flag is the subject.
-        assert "#include <stdint.h>" not in bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE
-        assert "#include <cstdint>" not in bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE
+        source = bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE
+        # The file supplies the name it needs, so the compile does not depend on a flag
+        # that cannot reach it.
+        assert "#include <cstdint>" in source
+        assert "std::uint16_t" in source
         # The guard, as in the C half: a layer that compiled it anyway still fails the
         # *import* rather than passing a check whose result nobody reads.
-        assert bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE.count(
-            "vanta_era_stdint_check"
-        ) == 2
+        assert source.count("vanta_era_stdint_check") == 2
 
     def test_the_smoke_check_compiles_a_fortran_rank_mismatch(self):
         """The Fortran half of the smoke, on the shape ``pandas/1`` measured.

@@ -3545,12 +3545,14 @@ class TestBake:
         "-Wno-error=declaration-missing-parameter-type",
     )
 
+    ERA_STDINT_INCLUDE = ("-include", "stdint.h")
+
     COMPILER_ENV = {
         "CC": "gcc",
         "CXX": "g++",
         "LDSHARED": "gcc -pthread -shared",
         "LDCXXSHARED": "g++ -pthread -shared",
-        "CFLAGS": " ".join(ERA_WARNING_FLAGS),
+        "CFLAGS": " ".join((*ERA_WARNING_FLAGS, *ERA_STDINT_INCLUDE)),
         "FFLAGS": "-fallow-argument-mismatch",
     }
 
@@ -3564,9 +3566,36 @@ class TestBake:
         An entry dropped here is a diagnostic that goes back to being a hard error in
         every 2020-era C source this harness builds, and the failure it would produce
         names the source rather than this list.
+
+        The list is the *head* of the variable rather than the whole of it: the same
+        ``CFLAGS`` carries the header the old C++ sources lost
+        (:meth:`test_the_c_flags_also_include_the_header_old_cpp_sources_lost`), and
+        the whole value is pinned by
+        :meth:`test_the_compiler_environment_is_the_distutils_override_for_this_toolchain`.
+        An assertion here on equality would have to be edited beside every addition to
+        this variable, which is the drift this test exists to catch.
         """
         assert bake_mod._ERA_WARNING_FLAGS == self.ERA_WARNING_FLAGS
-        assert bake_mod.COMPILER_ENV["CFLAGS"] == " ".join(self.ERA_WARNING_FLAGS)
+        assert bake_mod.COMPILER_ENV["CFLAGS"].startswith(
+            " ".join(self.ERA_WARNING_FLAGS)
+        )
+
+    def test_the_c_flags_also_include_the_header_old_cpp_sources_lost(self):
+        """``stdint.h``, and not the ``cstdint`` the compiler error names.
+
+        Measured on ``pandas/1``: ``scipy==1.4.1``'s ``pypocketfft.cxx`` builds against
+        ``pybind11==2.5.0`` and died at ``attr.h:185`` on
+        ``'uint16_t' in namespace 'std' does not name a type``. The variable has to
+        reach the **C** compiles too (``numpy.distutils`` keeps one flag list and swaps
+        only the driver), and ``cstdint`` is not on ``gcc``'s C include path at all —
+        spelling the flag the error names would turn every C file in the tree into
+        ``fatal error: cstdint: No such file or directory``. ``std::uint16_t`` is what
+        the smoke check's C++ half therefore compiles, because nothing else in a
+        recipe can tell "the flag landed" from "the flag was written down".
+        """
+        assert bake_mod._ERA_STDINT_INCLUDE == self.ERA_STDINT_INCLUDE
+        assert bake_mod.COMPILER_ENV["CFLAGS"].endswith("-include stdint.h")
+        assert "cstdint" not in bake_mod.COMPILER_ENV["CFLAGS"]
 
     def test_the_fortran_flags_are_the_gcc_10_argument_mismatch_error_demoted(self):
         """The other compiler's one demoted error, spelled out for the same reason.
@@ -3586,7 +3615,7 @@ class TestBake:
         assert "export CXX=g++" in recipe
         assert "export LDSHARED='gcc -pthread -shared'" in recipe
         assert "export LDCXXSHARED='g++ -pthread -shared'" in recipe
-        assert f"export CFLAGS='{' '.join(self.ERA_WARNING_FLAGS)}'" in recipe
+        assert f"export CFLAGS='{self.COMPILER_ENV['CFLAGS']}'" in recipe
         assert "export FFLAGS=-fallow-argument-mismatch" in recipe
 
     def test_the_recipe_prints_what_the_standalone_recorded(self):
@@ -3693,6 +3722,30 @@ class TestBake:
         # Not in the C++ half: in C++ that assignment is an error in every standard,
         # so it would fail the smoke for a reason that is not these flags.
         assert "vanta_era_pointer_check" not in bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE
+
+    def test_the_smoke_check_compiles_the_std_name_the_old_cpp_headers_lost(self):
+        """The C++ half carries ``std::uint16_t``, so the smoke fails if it did not land.
+
+        The measured shape: ``scipy==1.4.1``'s ``pypocketfft.cxx`` builds against
+        ``pybind11==2.5.0``, whose ``attr.h`` declares ``std::uint16_t nargs;``, and
+        under GCC 14 nothing on that file's include chain declares the name —
+        ``pandas/1``'s scipy build died at ``attr.h:185`` on exactly that. The smoke's
+        C++ file references the name *without* including anything that would supply it,
+        so it compiles only if ``-include stdint.h`` reached the C++ compile, which is
+        the half of :data:`bake._ERA_STDINT_INCLUDE` the C half above cannot check: the
+        header resolves in both languages, but only C++ mode's resolve of it declares
+        the ``std`` names. A C-only smoke check would pass on a layer whose C++ compile
+        still fails twenty minutes into scipy.
+        """
+        assert "std::uint16_t" in bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE
+        # Nothing in the file may supply the name itself: the flag is the subject.
+        assert "#include <stdint.h>" not in bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE
+        assert "#include <cstdint>" not in bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE
+        # The guard, as in the C half: a layer that compiled it anyway still fails the
+        # *import* rather than passing a check whose result nobody reads.
+        assert bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE.count(
+            "vanta_era_stdint_check"
+        ) == 2
 
     def test_the_smoke_check_compiles_a_fortran_rank_mismatch(self):
         """The Fortran half of the smoke, on the shape ``pandas/1`` measured.

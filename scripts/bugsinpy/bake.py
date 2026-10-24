@@ -828,6 +828,45 @@ diagnostic and the measured failures were in C sources; distutils'
 ``ldshared``, so this is the variable the C compilation and the link line read.
 """
 
+_ERA_STDINT_INCLUDE = ("-include", "stdint.h")
+"""The header a 2020-era C++ source no longer gets included for it (§3.2, GCC 14).
+
+[VANTA-WHY] Measured on ``pandas/1``, whose layer builds ``scipy==1.4.1`` from its
+sdist: ``scipy/fft/_pocketfft/pypocketfft.cxx`` compiles against
+``pybind11==2.5.0``, and the compile died at ``pybind11/attr.h:185`` —
+
+``error: 'uint16_t' in namespace 'std' does not name a type; did you mean
+'wint_t'?`` / ``185 | std::uint16_t nargs;``
+
+— followed by every *reader* of that member (``attr.h:287``, ``attr.h:288``,
+``pybind11.h:288``/``:486``/``:617``): one missing declaration and five
+consequences of it, which is what the rest of that log is. ``attr.h`` includes
+``cast.h`` and nothing else, and ``std::uint16_t`` is declared by libstdc++'s
+``stdint.h``/``cstdint``, which nothing on that include chain reaches under GCC 14;
+the one header the chain does reach is ``Python.h`` and it does not supply the name.
+
+``stdint.h`` and **not** the ``cstdint`` the error names, because this variable
+reaches the **C** compiles as well as the C++ one (:data:`_ERA_WARNING_FLAGS`) and
+``cstdint`` is a C++-only header: it is not on ``gcc``'s C include path at all, so
+``-include cstdint`` turns every C file in the tree into ``fatal error: cstdint: No
+such file or directory``. ``stdint.h`` is one name in both languages — the C
+standard header there, and in C++ ``g++``'s own include path resolves it to
+libstdc++'s ``c_compatibility/stdint.h``, which does declare ``namespace std { using
+::uint16_t; … }``. ``-include`` rather than a line in the source: the file is not
+ours to edit, and the declaration has to be in scope *before* ``attr.h``.
+
+[VANTA-WHY] ``CFLAGS`` and not ``CXXFLAGS``, which is the name the failure invites.
+CPython 3.8's ``distutils.sysconfig.customize_compiler`` reads ``CC``, ``CXX`` and
+``CFLAGS`` from the environment (then appends ``CFLAGS`` to ``cflags`` *and*
+``ldshared``) and never reads ``CXXFLAGS`` at all — a ``CXXFLAGS`` export reaches
+nothing, so the fix cannot be spelled the way the error reads. It reaches the
+``.cxx`` compile by exactly the route the six diagnostics do, and that layer's own
+log is the evidence: its C++ compile line reads ``C compiler: g++ -Wno-unused-result
+… -Wno-error=declaration-missing-parameter-type -fPIC`` — ``CXX``'s driver with this
+``CFLAGS`` attached, because ``numpy.distutils``' ``cxx_compiler`` keeps the flag
+list and swaps only the driver.
+"""
+
 _ERA_FORTRAN_FLAGS = ("-fallow-argument-mismatch",)
 """GCC 10+'s Fortran counterpart to :data:`_ERA_WARNING_FLAGS`: one error, demoted.
 
@@ -865,7 +904,7 @@ COMPILER_ENV: Mapping[str, str] = {
     "CXX": "g++",
     "LDSHARED": "gcc -pthread -shared",
     "LDCXXSHARED": "g++ -pthread -shared",
-    "CFLAGS": " ".join(_ERA_WARNING_FLAGS),
+    "CFLAGS": " ".join((*_ERA_WARNING_FLAGS, *_ERA_STDINT_INCLUDE)),
     "FFLAGS": " ".join(_ERA_FORTRAN_FLAGS),
 }
 """The compiler a source build in these layers runs, the linker that follows it, and
@@ -900,7 +939,13 @@ The fifth variable is the other half of the same fact — which compiler runs, a
 what that compiler's *own* defaults make of 2020-era C — and it is in the same
 mapping for the same reason: both are facts about the toolchain this layer runs
 rather than about the tree being built, and a reader of a failed build should not
-have to know which of the two it was. See :data:`_ERA_WARNING_FLAGS`.
+have to know which of the two it was. It carries two answers and not one, because
+GCC 14 changed two things about the same sources: the diagnostics it promotes
+(:data:`_ERA_WARNING_FLAGS`) and the standard headers ``g++`` no longer pulls in
+beside them (:data:`_ERA_STDINT_INCLUDE`). That both reach the C **and** the C++
+compile is the property that put them in one variable; the reader who wants to
+know which diagnosis a line belongs to reads the log the way the compiler wrote
+it.
 
 The sixth is the same reading for the *other* compiler this toolchain installs.
 ``gfortran`` is in the layer for the same reason ``g++`` is (``SYSTEM_PACKAGES``
@@ -1132,6 +1177,17 @@ PyMODINIT_FUNC PyInit_vanta_smoke_c(void) {
 _TOOLCHAIN_SMOKE_CPP_SOURCE = """\
 #include <Python.h>
 
+/* [VANTA-WHY] The second measured failure the flags exist for, in miniature. `scipy`
+   1.4.1's `pypocketfft.cxx` builds against `pybind11==2.5.0`, whose `attr.h` declares
+   `std::uint16_t nargs;`, and nothing on that file's include chain declares the name
+   under GCC 14 -- so `pandas/1`'s scipy build died at `attr.h:185` with
+   `'uint16_t' in namespace 'std' does not name a type` followed by five readers of the
+   member. This reference therefore compiles only if `-include stdint.h` reached the
+   C++ compile, which is the half of `_ERA_STDINT_INCLUDE` no C source can check: the
+   header is on the *C* include path in both languages, but only C++ mode's resolve of
+   it declares the `std` names. */
+static std::uint16_t vanta_era_stdint_check = 16;
+
 static PyObject *vanta_value(PyObject *self, PyObject *args) {
     return PyLong_FromLong(2);
 }
@@ -1146,6 +1202,11 @@ static struct PyModuleDef vanta_module = {
 };
 
 PyMODINIT_FUNC PyInit_vanta_smoke_cpp(void) {
+    if (vanta_era_stdint_check == 0) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "the layer's C flags did not reach the C++ compile");
+        return NULL;
+    }
     return PyModule_Create(&vanta_module);
 }
 """

@@ -463,6 +463,67 @@ pins. The finding is recorded honestly: the cap fix is necessary and done, and i
 because the issue text the harness supplies (a fix-commit message) is what a repair run is left to
 localize from.
 
+#### 1.6.3 The fallback a seed-less selection needed — a listing is not a context
+
+Measured on the second measure-only run (`runs/bugsinpy/measure-dev-2/context_report.json`), all 11 dev
+bugs passed the gate with `file_count 0` and `source_bytes` **exactly** equal to `tree_bytes`
+(`PySnooper/3`: tree 9 paths / 204 B, source 204 B). That equality is the arithmetic of an empty
+`files` list — `ContextSelection::total_bytes` is `selected_bytes + tree_bytes`, so with nothing
+selected the "context" is the tree listing and its size is the listing's size. The gate was therefore
+passing every bug for a reason that had nothing to do with a context: **a listing of paths always
+fits**. Item 1's diagnosis, run with exactly a real run's inputs (`--repo TREE --issue ISSUE
+--select-role … --select-budget 163584`, `n_ctx = 262144`), separates the two possible causes:
+
+| bug | case | mode | files | sel B | tree B | issue tok |
+|---|---|---|---|---|---|---|
+| `PySnooper/3` | no `--issue` | repair | 0 | 204 | 204 | 0 |
+| `PySnooper/3` | the built issue text | repair | 0 | 204 | 204 | 38 |
+| `matplotlib/1` | no `--issue` | repair | 0 | 45118 | 45118 | 0 |
+| `matplotlib/1` | the built issue text | repair | 0 | 45118 | 45118 | 54 |
+| `PySnooper/3` | an issue naming `pysnooper/pysnooper.py` | repair | 5 | 11053 | 204 | — |
+| `PySnooper/3` | `bug_patch.txt` as `--patch` | review | 5 | 10849 | 0 | — |
+| `matplotlib/1` | `bug_patch.txt` as `--patch` | review | 5 | 213510 | 0 | — |
+| `pandas/1` | `bug_patch.txt` as `--patch` | review | 47 | 654090 | 0 | — |
+
+Two answers, both from the run's own selector. **The issue text does reach it** in measure-only mode —
+`issue_tokens` is 38 and 54, not 0, because a measure-only prepare still shells out to
+`vanta_m3 --select-context` (with `""` for the pre-strip tree, then the real text for the final tree),
+so the empty selection is not a measure-only artifact. **And a real run selects no source either**: the
+authoritative gate (`prepare.py:1220`, with `prep.issue.text`) produces the same zero files. The code
+path is `precheck` → `select_context` (shell-out) → `select_for_role` → `select_repair_context` →
+`fill`: `select_repair_context` marks `Path`/`Traceback`/`Identifier` on candidates the issue text
+names, and with **no seed** the one-hop `ImportNeighbour` loop has nothing to expand from, so `fill`
+receives an empty `reasons` map and selects nothing. `selected_bytes == tree_bytes` is the arithmetic
+of that emptiness, not a measurement of a context.
+
+(The selector is not broken: given the issue *plus* one sentence naming the touched path, or given the
+patch under review, it ranks and includes real source — `pysnooper/pysnooper.py` @700
+[path+traceback] plus its neighbours; `matplotlib/1`'s three patch-touched files, one of them 63 KB as
+an outline; `pandas/1`'s touched file plus 46 neighbours and tests. §1.6.2's ranking works, and it is
+what a repair run does *not* get to use, because BugsInPy's issue text is a fix-commit message.)
+
+The fix is at the one place every mode shares — `fill` — and it is a fallback, not a filler:
+
+- **`SelectionReason::Tree`, weight 10.** A ranking that reached **no** file at all falls back to the
+  tree's own files, in walk order (the walk sorts the candidate list by path, so the order is as
+  deterministic as any other ranking), under a reason of its own. It is the weakest weight on the
+  ladder (`PatchTouched` 1000 > `Path` 400 > `Traceback` 300 > `Identifier` 200 > `ImportNeighbour`
+  100 > `Test` 80 > **`Tree` 10**) because it says only "this file is in the repository", and it is
+  *named* rather than anonymous so a report can still tell a file the issue named from a file that
+  merely exists. It fires in **both** modes, because both go through `fill` — a review run whose patch
+  touches nothing selectable has the same problem a repair run has.
+- **It is a fallback, not a filler.** When the ranking reached a file, nothing is added: a bug whose
+  issue names one path still shows that path and its neighbours, not the tree as well. Pinned by
+  `context::tests::a_ranking_that_reaches_no_file_falls_back_to_the_trees_own_source`, which asserts
+  both directions plus the two properties below.
+- **A file the fallback could not fit is not a *drop*.** `dropped_for_budget` means "the ranking chose
+  this and the budget refused it" — the one case where a run is shown less than its ranking decided,
+  and the case the gate's `selection_dropped_for_budget` reads. The fallback does not choose anything
+  (the walk does), and the paths it could not fit are already in the prompt as the tree listing, so
+  recording them would turn "the repository is bigger than the window", which is the normal case, into
+  a rejection of every large project. A file over `MAX_FILE_BYTES` still goes in as an outline as
+  before.
+
 ---
 
 ## 2. Issue text that never leaks the fix or the hidden test

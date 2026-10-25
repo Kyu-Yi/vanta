@@ -336,6 +336,36 @@ rules above rather than new signals:
   `_written_as_code`). So `fig` inside `matplotlib/1`'s fenced block is a local and stays out, and the
   fence's own `dtype` is plain English.
 
+**The fallback for an issue that names no definition (item 3).** The three signals above all read
+*names*: a path, a frame, a symbol a file declares. Some reports name none of those — `fastapi/1`'s
+report names `response_model_exclude_defaults`, which is a **parameter**, so no candidate declares it and
+the selection came out empty. A fourth, lowest signal closes that: **BM25 over the code-shaped tokens of
+the issue text against the file contents**, which is SWE-bench's own retrieval baseline. The query is
+`issue_identifiers`' keys, the same reader every other signal uses; each file's contents are counted as
+term frequencies over identifier-shaped tokens; the score is the standard BM25 sum, `k1 = 1.2`,
+`b = 0.75`, with `idf = ln(1 + (N - df + 0.5)/(df + 0.5))`. It is recorded as the reason **`bm25`**, rule
+`bm25`, and its **score is recorded with it** — quantized onto `[1, BM25_WEIGHT 40]` by the run's own
+maximum, so the best match tops the band and the rest are ordered by ratio below it.
+
+Three properties make it a fallback rather than a signal:
+
+- **It is marked only on a file no other signal reached.** A file the issue's own path, frame or
+  definition reached keeps exactly the score that signal gave it; `bm25` is never folded into it. So the
+  fallback cannot re-price or displace a file the report named — it orders the files nothing named
+  (`fastapi/1`) and nothing else.
+- **Its band tops out below every other reason's**, at 40, below `Test` (80). A file the text reached can
+  therefore never outrank one a real signal reached, whatever the corpus.
+- **Its corpus is the project's source with the tests left out.** A test is the harness's to strip — the
+  F2P test *is* the answer — and a document the harness removes must not re-price the documents that
+  stay; the same rule the identifier's document frequency follows. The frequencies are read from the tree
+  the run holds, so the fallback never learns anything the run was not given.
+
+It is **not** §1.6.3's deleted fallback. That one filled the tree in walk order — a listing with the
+alphabet on top — and the gate rightly refuses an ungrounded selection. This one is reached from the
+issue text's own tokens against the tree's contents, so the file it finds is grounded in what the
+reporter wrote, which is what `grounds_content` asks. It carries a body only where §1.6.8 allows one: a
+`.md` or an example reached by text alone travels as its path in the listing.
+
 **Never hidden information (item 3).** `F2P`/hidden tests, the fix commit and its diff, and
 `bug.info` are not inputs and cannot be reached from the selection. The harness keeps them out of the
 tree as today; a test proves selection is unchanged when the hidden tests are removed or added.

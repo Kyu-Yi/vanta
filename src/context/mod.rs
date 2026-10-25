@@ -306,6 +306,14 @@ pub enum SelectionReason {
     ImportNeighbour,
     /// A visible test file that exercises a selected module (review mode).
     Test,
+    /// The BM25 fallback: a file no stronger signal reached, ordered by how well
+    /// its contents match the code-shaped tokens of the issue text (§1.6.2 item
+    /// 3). The lowest-weight signal there is, and the only one that reaches an
+    /// issue that names no *definition* — `fastapi/1` names
+    /// `response_model_exclude_defaults`, a parameter, which no `def`/`class`/
+    /// binding declares, so the names-based signals all come up empty and the
+    /// ranking has to fall back to the text itself.
+    Bm25,
 }
 
 /// What an `Identifier` match is worth at its utmost: a name no other candidate
@@ -323,6 +331,22 @@ pub const IDENTIFIER_WEIGHT: i64 = 200;
 /// historical 200.
 pub const IDENTIFIER_WEIGHT_FLOOR: i64 = 120;
 
+/// What a `Bm25` match is worth at its most (§1.6.2 item 3).
+///
+/// [VANTA-WHY] The band's top is below `Test` (80), the weakest signal that
+/// reaches a file for something the *run named* rather than for the words it
+/// happens to share with the issue. A file the text-only signal reached must
+/// therefore never outrank one a real signal reached, whatever the corpus — the
+/// same guarantee `IDENTIFIER_WEIGHT_FLOOR` states one rung up. The signal is
+/// also recorded only for a file no stronger signal reached, so the two rules
+/// agree and neither has to be relied on alone: BM25 orders the files nothing
+/// else reached, and it cannot displace a file something did.
+pub const BM25_WEIGHT: i64 = 40;
+/// BM25's term-frequency saturation, the standard `k1`.
+const BM25_K1: f64 = 1.2;
+/// BM25's document-length normalization, the standard `b`.
+const BM25_B: f64 = 0.75;
+
 impl SelectionReason {
     pub fn weight(self) -> i64 {
         match self {
@@ -332,6 +356,7 @@ impl SelectionReason {
             SelectionReason::Identifier => IDENTIFIER_WEIGHT,
             SelectionReason::ImportNeighbour => 100,
             SelectionReason::Test => 80,
+            SelectionReason::Bm25 => BM25_WEIGHT,
         }
     }
 
@@ -343,6 +368,7 @@ impl SelectionReason {
             SelectionReason::Identifier => "identifier",
             SelectionReason::ImportNeighbour => "import-neighbour",
             SelectionReason::Test => "test",
+            SelectionReason::Bm25 => "bm25",
         }
     }
 
@@ -376,6 +402,13 @@ impl SelectionReason {
     /// grounded today; the predicate is the seam a future reason has to pass, and
     /// it is what makes the refusal a property of the selector rather than of a
     /// string the harness happens to recognize.
+    ///
+    /// `Bm25` is grounded: its score is computed from the issue text's own
+    /// code-shaped tokens against the file's contents, so the file is reached by
+    /// what the *report* said, not by its place in the walk. It is the one
+    /// grounded reason a file may carry without the run having named it, which is
+    /// why it is not in `names_the_file` — the issue's words are evidence of the
+    /// subject, not of the file.
     pub fn grounds_content(self) -> bool {
         matches!(
             self,
@@ -385,6 +418,7 @@ impl SelectionReason {
                 | SelectionReason::Identifier
                 | SelectionReason::ImportNeighbour
                 | SelectionReason::Test
+                | SelectionReason::Bm25
         )
     }
 }
@@ -430,6 +464,8 @@ pub enum SelectionRule {
     Import,
     /// A visible test file that imports or covers a selected module.
     CoveringTest,
+    /// The file's contents match the code-shaped tokens of the issue (BM25).
+    Bm25,
 }
 
 impl SelectionRule {
@@ -449,6 +485,7 @@ impl SelectionRule {
             SelectionRule::Attribute => "attribute",
             SelectionRule::Import => "import",
             SelectionRule::CoveringTest => "covering-test",
+            SelectionRule::Bm25 => "bm25",
         }
     }
 }
@@ -469,7 +506,8 @@ pub struct SelectionMatch {
 }
 
 impl SelectionMatch {
-    /// A fixed-weight signal — every reason but `Identifier`.
+    /// A signal priced by its reason's own constant — every reason but
+    /// `Identifier` and `Bm25`, whose worth is derived from the corpus.
     pub fn of(reason: SelectionReason, rule: SelectionRule) -> SelectionMatch {
         SelectionMatch {
             rule,
@@ -1100,6 +1138,25 @@ pub fn select_repair_context(
         }
     }
 
+    // The BM25 fallback (§1.6.2 item 3), for the issue that names no definition.
+    // It is marked ONLY on a file no signal above reached: that is what makes it
+    // a fallback rather than another signal — it orders the files the issue names
+    // nothing in (`fastapi/1`'s `response_model_exclude_defaults` is a parameter,
+    // so every names-based signal is empty), and it never re-prices or displaces a
+    // file the report's own symbols already reached. `BM25_WEIGHT` (40) is below
+    // every other reason's, so the guarantee holds even if that ever changed.
+    //
+    // [VANTA-WHY] This is not §1.6.3's deleted fallback. That one filled the tree
+    // in walk order — a listing with the alphabet on top, ungrounded — and the
+    // gate rightly refuses it. This one is reached from the issue text's own
+    // tokens against the tree's contents, so the file it finds is grounded in what
+    // the reporter wrote, which is what `grounds_content` asks.
+    for (path, weight) in bm25_weights(candidates, &issue_code_tokens(issue_text)) {
+        if !reasons.contains_key(&path) {
+            mark_signal(&mut reasons, &path, SelectionReason::Bm25, SelectionRule::Bm25, weight);
+        }
+    }
+
     let tree: Vec<String> = candidates.iter().map(|c| c.path.clone()).collect();
     // The issue text is part of the prompt the model is sent, so its cost is
     // reserved out of the budget before the first file is priced (§1.6.9).
@@ -1155,32 +1212,40 @@ fn mark_reason(
     reason: SelectionReason,
     rule: SelectionRule,
 ) {
-    reasons
-        .entry(path.to_string())
-        .or_default()
-        .entry(reason)
-        .or_insert(SelectionMatch::of(reason, rule));
+    mark_signal(reasons, path, reason, rule, reason.weight());
 }
 
-/// Record an `Identifier` match with the weight that name is worth (§1.6.2 item
-/// 2), which is the one signal whose weight is not the reason's own.
+/// Record one signal for one path at an explicit weight.
 ///
-/// Kept apart from `mark_reason` because it is the only caller that has a weight
-/// to pass: every other signal's worth is a constant of its reason, and letting
-/// them all take an explicit number would invite one of them to be priced by a
-/// bug. The identifier's weight is derived — from how rare the name is across the
-/// candidates — so it is passed, not looked up.
-fn mark_identifier(
+/// Kept apart from `mark_reason` because two signals are priced by something
+/// other than their reason's own constant: the identifier match, by how rare the
+/// name is across the candidates (`identifier_worth`), and the BM25 fallback, by
+/// how well the file's contents match the issue (`bm25_weights`). Both are
+/// *derived*, so they are passed, not looked up, and every other signal goes
+/// through `mark_reason` and cannot be priced by a number a caller invented.
+fn mark_signal(
     reasons: &mut BTreeMap<String, BTreeMap<SelectionReason, SelectionMatch>>,
     path: &str,
+    reason: SelectionReason,
     rule: SelectionRule,
     weight: i64,
 ) {
     reasons
         .entry(path.to_string())
         .or_default()
-        .entry(SelectionReason::Identifier)
+        .entry(reason)
         .or_insert(SelectionMatch { rule, weight });
+}
+
+/// Record an `Identifier` match with the weight that name is worth (§1.6.2 item
+/// 2), which is the one signal whose weight is not the reason's own.
+fn mark_identifier(
+    reasons: &mut BTreeMap<String, BTreeMap<SelectionReason, SelectionMatch>>,
+    path: &str,
+    rule: SelectionRule,
+    weight: i64,
+) {
+    mark_signal(reasons, path, SelectionReason::Identifier, rule, weight);
 }
 
 /// The whitespace/punctuation-delimited tokens of the issue, keeping `.` and `/`
@@ -1341,6 +1406,122 @@ fn code_shape_rule(token: &str) -> Option<SelectionRule> {
         return Some(SelectionRule::Camel);
     }
     None
+}
+
+/// The code-shaped tokens of the issue text — the query BM25 reads (§1.6.2 item
+/// 3).
+///
+/// The query is `issue_identifiers`' keys: the names the issue writes as code,
+/// whether because of their shape (`response_model_exclude_defaults` is
+/// underscored) or because the text writes them as code (`` `registry` ``). Those
+/// are exactly the tokens SWE-bench's own retrieval baseline indexes the report
+/// for, and taking them from the same reader every other signal uses is what
+/// keeps the fallback from seeing a *different* issue than the signals above it.
+pub fn issue_code_tokens(issue_text: &str) -> BTreeSet<String> {
+    issue_identifiers(issue_text).into_keys().collect()
+}
+
+/// How often each token appears in one file's contents: the corpus the BM25
+/// fallback ranks over (§1.6.2 item 3).
+///
+/// Split on every character an identifier cannot contain, so `register_named_
+/// middleware(` yields `register_named_middleware` and `def`, and case is kept:
+/// `Series` and `series` are different tokens, as they are in Python.
+fn code_token_counts(contents: &str) -> BTreeMap<String, usize> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for token in contents.split(|c: char| !is_identifier_char(c)) {
+        if !token.is_empty() {
+            *counts.entry(token.to_string()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Score every candidate by BM25 against `query` and return the ones that
+/// matched, priced onto `[1, BM25_WEIGHT]` (§1.6.2 item 3).
+///
+/// [VANTA-WHY] This is SWE-bench's own retrieval baseline — BM25 over the issue's
+/// code-shaped tokens against the file contents — and it exists for the issue that
+/// names no *definition*: `fastapi/1`'s `response_model_exclude_defaults` is a
+/// parameter, so no candidate declares it and every names-based signal comes up
+/// empty. The text still says which file the reporter was in.
+///
+/// The corpus is the project's own source with the tests left out. A test is the
+/// harness's to strip — the F2P test *is* the answer — and a document that the
+/// harness removes must not re-price the documents that stay, which is the same
+/// rule the identifier's document frequency follows one paragraph up. The
+/// frequencies are read from the tree the run holds, so the fallback never learns
+/// anything the run was not given.
+///
+/// The raw score is quantized onto the band by the run's own maximum, so the best
+/// match sits at `BM25_WEIGHT` and the rest are ordered below it; a file that
+/// matched nothing gets no entry at all. A tie needs the whole score, so a run
+/// with one strong match and several weak ones still orders the weak ones by ratio,
+/// not by the accident of a fixed bucket width.
+fn bm25_weights(candidates: &[Candidate], query: &BTreeSet<String>) -> BTreeMap<String, i64> {
+    let mut out: BTreeMap<String, i64> = BTreeMap::new();
+    if query.is_empty() {
+        return out;
+    }
+    // (path, term counts, length in tokens) for each document of the corpus.
+    let corpus: Vec<(&str, BTreeMap<String, usize>, usize)> = candidates
+        .iter()
+        .filter(|candidate| !is_test_path(&candidate.path))
+        .map(|candidate| {
+            let counts = code_token_counts(&candidate.contents);
+            let length = counts.values().sum::<usize>();
+            (candidate.path.as_str(), counts, length)
+        })
+        .collect();
+    let total = corpus.len();
+    if total == 0 {
+        return out;
+    }
+    let average = corpus.iter().map(|(_, _, length)| *length).sum::<usize>() as f64 / total as f64;
+    // ln(1 + (N - df + 0.5)/(df + 0.5)), the standard BM25 IDF. Only a term a
+    // document actually contains is ever summed, so df >= 1 wherever it is used.
+    let idf: BTreeMap<&str, f64> = query
+        .iter()
+        .map(|term| {
+            let df = corpus
+                .iter()
+                .filter(|(_, counts, _)| counts.contains_key(term.as_str()))
+                .count();
+            let ratio = (total - df) as f64 + 0.5;
+            (term.as_str(), (1.0 + ratio / (df as f64 + 0.5)).ln())
+        })
+        .collect();
+
+    let raw: Vec<(&str, f64)> = corpus
+        .iter()
+        .map(|(path, counts, length)| {
+            let score: f64 = query
+                .iter()
+                .filter_map(|term| {
+                    let frequency = *counts.get(term.as_str())? as f64;
+                    let normalizer =
+                        BM25_K1 * (1.0 - BM25_B + BM25_B * (*length as f64) / average);
+                    Some(idf[term.as_str()] * (frequency * (BM25_K1 + 1.0))
+                        / (frequency + normalizer))
+                })
+                .sum();
+            (*path, score)
+        })
+        .collect();
+    let best = raw.iter().map(|(_, score)| *score).fold(0.0f64, f64::max);
+    if best <= 0.0 {
+        return out;
+    }
+    for (path, score) in raw {
+        if score <= 0.0 {
+            continue;
+        }
+        let weight = ((score / best) * BM25_WEIGHT as f64)
+            .ceil()
+            .clamp(1.0, BM25_WEIGHT as f64) as i64;
+        out.insert(path.to_string(), weight);
+    }
+    out
 }
 
 /// How many of the candidates *define* `symbol` — the document frequency the
@@ -2455,19 +2636,33 @@ mod tests {
         let selection = select_repair_context(&candidates, issue, "creator", 60_000);
 
         assert_eq!(
-            paths(&selection),
-            vec!["pandas/core/dtypes/common.py"],
-            "the report named the symbol, not the package: the file that defines \
+            selection.files[0].path, "pandas/core/dtypes/common.py",
+            "the report named the symbol, not the package: the file that DEFINES \
              `is_string_dtype` is the ranking"
         );
         assert_eq!(
             selection.files[0].rules.get("identifier").map(String::as_str),
             Some("snake")
         );
-        assert!(
-            !paths(&selection).contains(&"pandas/__init__.py"),
-            "the word `pandas` in prose is the project's name, not a path the report gave"
-        );
+        // The package's `__init__.py` re-exports the symbol, so it may be reached
+        // by the BM25 fallback — it *mentions* the name — but never by a `path`
+        // signal (the word `pandas` in prose is the project's name, not a path the
+        // report gave) and never above the file that defines it (§1.6.2 items 2, 3).
+        if let Some(init) = selection
+            .files
+            .iter()
+            .find(|file| file.path == "pandas/__init__.py")
+        {
+            assert_eq!(
+                init.reasons,
+                vec![SelectionReason::Bm25],
+                "a mention reaches a file only through the text fallback"
+            );
+            assert!(
+                init.rank > selection.files[0].rank,
+                "the definer outranks the mentioner"
+            );
+        }
 
         // The dotted form is still a path signal: a module the reporter spelled out.
         assert_eq!(
@@ -2615,6 +2810,117 @@ mod tests {
             "`Series` is a name the block wrote as code — its own shape names it, \
              which is tested before the written forms, so the rule recorded is the \
              shape and not `attribute`"
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 3 — the fallback for an issue that names no
+    /// definition. `fastapi/1`'s report names `response_model_exclude_defaults`,
+    /// which is a *parameter*: no candidate declares it, so the path, frame and
+    /// identifier signals all come up empty and the selection used to be nothing at
+    /// all. BM25 over the issue's code-shaped tokens against the file contents —
+    /// SWE-bench's own retrieval baseline — still says which file the reporter was
+    /// in, priced below every other signal so it orders only what nothing stronger
+    /// reached.
+    #[test]
+    fn an_issue_that_names_no_definition_falls_back_to_the_text() {
+        let candidates = vec![
+            candidate(
+                "fastapi/routing.py",
+                "def get(path, response_model_exclude_defaults: bool = False):\n    return path\n",
+            ),
+            candidate("fastapi/utils.py", "def helper():\n    return 1\n"),
+            candidate(
+                "tests/test_routing.py",
+                "def test_response_model_exclude_defaults():\n    assert True\n",
+            ),
+        ];
+        let issue = "Setting `response_model_exclude_defaults` on a route drops the \
+                     fields from the response.\n";
+
+        let selection = select_repair_context(&candidates, issue, "creator", 60_000);
+
+        assert_eq!(
+            paths(&selection),
+            vec!["fastapi/routing.py"],
+            "the parameter is declared nowhere, so only the file whose text contains \
+             it is reached — and that is `fastapi/routing.py`"
+        );
+        let file = &selection.files[0];
+        assert_eq!(file.reasons, vec![SelectionReason::Bm25]);
+        assert_eq!(file.rules.get("bm25").map(String::as_str), Some("bm25"));
+        // The score is recorded, not hidden: it is the file's own score, and it sits
+        // at the band's top because this file is the only match in the run.
+        assert_eq!(file.score, BM25_WEIGHT, "the best match sits at the band's top");
+        assert!(
+            !paths(&selection).contains(&"tests/test_routing.py"),
+            "a test is not a document of the corpus: the harness strips the F2P test, \
+             so it must not re-price the files that stay"
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 3 — the fallback is a *fallback*: it never re-prices
+    /// or displaces a file a stronger signal reached. `pkg/core.py` defines the name
+    /// the issue writes as code, `pkg/noise.py` only mentions it; the definer keeps
+    /// its identifier score exactly (no `bm25` folded in), the mentioner is reached
+    /// by the text alone, and the definer still ranks first.
+    #[test]
+    fn the_text_fallback_never_displaces_a_file_a_signal_reached() {
+        let candidates = vec![
+            candidate("pkg/core.py", "def frobnicate(value):\n    return value\n"),
+            candidate("pkg/noise.py", "# callers use frobnicate here\nx = 1\n"),
+        ];
+        let issue = "`frobnicate` returns the wrong type.\n";
+
+        let selection = select_repair_context(&candidates, issue, "creator", 60_000);
+
+        let core = selection
+            .files
+            .iter()
+            .find(|file| file.path == "pkg/core.py")
+            .expect("the file that defines the name is selected");
+        assert_eq!(core.reasons, vec![SelectionReason::Identifier]);
+        assert_eq!(
+            core.score, IDENTIFIER_WEIGHT,
+            "a file a signal reached is priced by that signal, and the text fallback \
+             is not folded into it"
+        );
+        let noise = selection
+            .files
+            .iter()
+            .find(|file| file.path == "pkg/noise.py")
+            .expect("a file only the text reached is selected");
+        assert_eq!(noise.reasons, vec![SelectionReason::Bm25]);
+        assert!(noise.score >= 1 && noise.score <= BM25_WEIGHT);
+        assert!(core.rank < noise.rank, "the definer outranks the mentioner");
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 3 — the recorded weight ORDERS the files the
+    /// fallback reached: the better match is at the band's top and the weaker one
+    /// below it, so the two are told apart by their own scores instead of both
+    /// reading the band's constant. Both files only *mention* the name, so neither
+    /// has an identifier match to be priced by.
+    #[test]
+    fn the_text_fallback_records_a_score_that_orders_its_files() {
+        let candidates = vec![
+            candidate(
+                "pkg/strong.py",
+                "def a():\n    zzz_rare_token = 1\n    return zzz_rare_token\n",
+            ),
+            candidate("pkg/weak.py", "def b():\n    return zzz_rare_token\n"),
+        ];
+        let issue = "`zzz_rare_token` is wrong.\n";
+
+        let selection = select_repair_context(&candidates, issue, "creator", 60_000);
+
+        assert_eq!(paths(&selection), vec!["pkg/strong.py", "pkg/weak.py"]);
+        let strong = &selection.files[0];
+        let weak = &selection.files[1];
+        assert_eq!(strong.score, BM25_WEIGHT, "the best match tops the band");
+        assert!(
+            weak.score < strong.score && weak.score >= 1,
+            "the weaker match is ordered below it and still recorded: {} vs {}",
+            weak.score,
+            strong.score
         );
     }
 

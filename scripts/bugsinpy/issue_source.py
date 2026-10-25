@@ -443,20 +443,28 @@ class IssueReport:
     def content(self) -> str:
         """The frozen text: title, body and the included comments. Gated later, not here.
 
+        **The reporter's own bytes.** Line endings folded to ``\\n`` and the newlines the
+        framing adds at a part's edges dropped — :func:`_report_text`'s rule, and the only rule
+        applied — with every space, tab and blank line *inside* a part left exactly as the API
+        returned it. A code block in a report is Python the reporter pasted, and its
+        indentation is part of what the Creator has to read: ``sanic/1``'s report carries
+        ``    print('1')``, which is not the same statement as `` print('1')`` (§2.4.4).
+
         Empty for a ``none`` report — there is no text — and the frozen file says so by
         carrying nothing after its content marker.
         """
-        if not self.title.strip() and not self.body.strip() and not self.comments:
-            return ""
-        parts = [f"# {self.title}".rstrip()]
-        if self.body.strip():
-            parts.append(self.body.strip())
+        parts: list[str] = []
+        if self.title.strip():
+            parts.append(f"# {self.title.strip()}")
+        body = _report_text(self.body)
+        if body:
+            parts.append(body)
         if self.comments:
             parts.append("## Comments")
             for comment in self.comments:
                 parts.append(f"### {comment.author} — {comment.created_at}")
-                parts.append(comment.body.strip())
-        return "\n\n".join(part for part in parts if part) + "\n"
+                parts.append(_report_text(comment.body))
+        return "\n\n".join(parts) + "\n" if parts else ""
 
     def resolved_as(self) -> str:
         if self.source == SOURCE_VIA_PR:
@@ -623,7 +631,7 @@ def _comments(
             IssueComment(
                 author=((item.get("user") or {}).get("login") or "unknown"),
                 created_at=created,
-                body=str(item.get("body") or ""),
+                body=_report_text(str(item.get("body") or "")),
             )
         )
     return out
@@ -651,12 +659,29 @@ from a truncated file. The raw report comes before the gated text so that a huma
 the committed artifact sees what the reporter wrote before seeing what the gate left."""
 
 
+def _report_text(value: str) -> str:
+    """The reporter's own text: line endings folded, and **only** its edge newlines dropped.
+
+    [VANTA-WHY] This is the one rule applied to any part of a report — a title, a body, a
+    comment — and it deliberately does almost nothing. ``\\r\\n`` and a lone ``\\r`` become
+    ``\\n``, and the newlines that the framing around a part would otherwise duplicate are
+    dropped; a space, a tab, a run of blanks and a line's indent are bytes of the text and are
+    never touched. ``str.strip()`` — which is what this replaced — also eats a trailing space or
+    the leading indentation of a body that opens with a code block, and a code block is Python
+    the reporter pasted: ``sanic/1``'s ``    print('1')`` is a different statement as
+    `` print('1')`` (§2.4.4).
+    """
+    return value.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+
+
 def _canonical(text: str) -> str:
     """The one form a section body takes — in the file, and in the hash of it.
 
     Three rules, and they are the *same* rule for the writer and the reader: line endings are
     folded to ``\\n``; the blank lines the framing puts at a section's edges are dropped; and a
-    non-empty body ends with exactly one ``\\n``.
+    non-empty body ends with exactly one ``\\n``. The first two are :func:`_report_text` — the
+    same function that shapes a report's own parts, so the text stored is the text read — and the
+    third is only about the file's shape.
 
     [VANTA-WHY] The fold is what the first dev freeze got wrong, and that failure was silent
     rather than loud. The API returns an issue body with whatever ``\\r\\n`` the reporter's
@@ -677,12 +702,12 @@ def _canonical(text: str) -> str:
     let a hand-edited artifact verify. ``test_an_edited_gated_text_is_refused_by_its_content_hash``
     is that byte, appended to the last line of a report, and the hash has to catch it.
 
-    This is a rule about the **file**, applied to every section. It has nothing to do with the
-    whitespace the leak gate collapses inside the text it gates (§2.4.4): the gate's collapse is
-    part of what the text *is*, and this is only how the text is stored.
+    This is a rule about the **file**, applied to every section. It is not a licence to
+    reformat: the gate substitutes tokens and changes nothing else (§2.4.4), so a section's
+    bytes are the reporter's own.
     """
-    text = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
-    return text + "\n" if text else ""
+    folded = _report_text(text)
+    return folded + "\n" if folded else ""
 
 
 def _section(text: str, marker: str) -> tuple[str, str]:
@@ -973,12 +998,19 @@ def _parse_content(content: str) -> tuple[str, str, list[IssueComment]]:
             body_buf.append(line)
     if current is not None:
         comments.append(_with_body(current, body_buf))
-    return title, "\n".join(body_lines).strip(), comments
+    return title, _report_text("\n".join(body_lines)), comments
 
 
 def _with_body(comment: IssueComment, lines: Sequence[str]) -> IssueComment:
+    """The comment's body, read back by the same rule that wrote it (:func:`_report_text`).
+
+    Not ``.strip()``: a comment is as much the reporter's text as the body is, and an indented
+    code block inside one has to come back with its indentation.
+    """
     return IssueComment(
-        author=comment.author, created_at=comment.created_at, body="\n".join(lines).strip()
+        author=comment.author,
+        created_at=comment.created_at,
+        body=_report_text("\n".join(lines)),
     )
 
 

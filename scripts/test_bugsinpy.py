@@ -2633,6 +2633,34 @@ class TestLeakGate:
         assert [r.token for r in result.removals] == ["parse_with_dots"]
         assert result.removals[0].action == "stripped"
 
+    def test_the_gate_never_collapses_whitespace(self):
+        """The gate substitutes tokens and changes nothing else (§2.4.4).
+
+        It used to end with ``re.sub(r"[ \\t]{2,}", " ", ...).strip()``, which is a *rewrite*: a
+        fenced block's ``    print('1')`` came out `` print('1')``. The substituted text has to
+        be the text it was given with the leaking token replaced, and nothing else — indentation,
+        runs of spaces, tabs and blank lines all survive.
+        """
+        text = (
+            "Here is what I ran:\n"
+            "\n"
+            "```\n"
+            "def main():\n"
+            "    print('1')\n"
+            "\n"
+            "    print('2')\n"
+            "```\n"
+            "\n"
+            "It calls parse_with_dots and fails.\n"
+        )
+        result = issue_mod.leak_gate(
+            text, answer_tokens={"parse_with_dots": 1}, tree_tokens={}
+        )
+        assert "parse_with_dots" not in result.text
+        assert result.text == text.replace("parse_with_dots", "[redacted]"), (
+            "the whole of the gate's output is the text with the leaking token substituted"
+        )
+
     def test_answer_shaped_rules(self):
         assert issue_mod.is_answer_shaped("fix_widget", "ident") is True
         assert issue_mod.is_answer_shaped("widget", "ident") is True  # six characters
@@ -3349,7 +3377,7 @@ class TestFrozenIssueReport:
                 )
             ],
         )
-        assert "\r\n" in report.content(), "the API text is the CRLF text"
+        assert "\r\n" in report.body, "the API body is the CRLF text"
 
         path = source_mod.write_frozen(tmp_path / "pandas_1.md", report)
         back = source_mod.load_frozen(path)
@@ -3363,7 +3391,9 @@ class TestFrozenIssueReport:
             "the content section is the gate's text, stored canonically"
         )
         assert back.content_sha256 == split_mod.sha256_text(back.content)
-        assert back.content_sha256 != split_mod.sha256_text(report.content()), (
+        assert back.content_sha256 != split_mod.sha256_text(
+            report.content().replace("\n", "\r\n")
+        ), (
             "the hash is taken *after* the line endings are folded, so it is not the hash of "
             "the CRLF text the API returned — that is the value the first freeze wrote into "
             "the header, and the one the reader could never reproduce"
@@ -3419,6 +3449,52 @@ class TestFrozenIssueReport:
         report = self._report()
         assert "Traceback (most recent call last)" in report.content()
         assert "```" in report.content()
+
+    def test_a_fenced_code_block_survives_freezing_byte_identical(self, tmp_path):
+        """The gate removes tokens and never reformats (§2.4.4).
+
+        ``sanic/1``'s report carries a fenced block whose lines are indented — ``    print('1')``
+        — and the gate used to collapse every run of spaces and tabs to one, which turned that
+        line into `` print('1')``: not the reporter's Python, and not runnable. So this freezes
+        a report whose body *is* the fenced block and compares the strings literally, which is
+        the only comparison that would have caught it.
+        """
+        block = (
+            "```python\n"
+            "def main():\n"
+            "    print('1')\n"
+            "\n"
+            "    if True:\n"
+            "        print('2')\n"
+            "```"
+        )
+        report = self._report(title="Indented code in the report", body=block, comments=[])
+        back = source_mod.load_frozen(
+            source_mod.write_frozen(tmp_path / "PySnooper_3.md", report)
+        )
+        assert back.content == f"# Indented code in the report\n\n{block}\n"
+        assert back.body == block
+        assert "\n    print('1')\n" in back.content, "the four-space indent is the statement"
+        assert "\n print('1')\n" not in back.content, (
+            "a one-space indent is not the reporter's Python — the collapse did this"
+        )
+
+    def test_an_indented_body_keeps_its_leading_whitespace(self, tmp_path):
+        """A body that opens with an indented block must not lose that indent (§2.4.4).
+
+        The old canonical form ended with ``str.strip()``, which ate the leading spaces of a
+        body whose first line was indented — a body that opens with a pasted block is exactly
+        that shape. Only the framing's edge *newlines* are dropped now.
+        """
+        report = self._report(
+            title="A pasted fragment", body="    value = compute()\n    return value\n",
+            comments=[],
+        )
+        back = source_mod.load_frozen(
+            source_mod.write_frozen(tmp_path / "PySnooper_3.md", report)
+        )
+        assert back.content == "# A pasted fragment\n\n    value = compute()\n    return value\n"
+        assert back.body == "    value = compute()\n    return value"
 
     def test_an_edited_report_is_refused_by_its_raw_hash(self, tmp_path):
         """The raw record is what a reviewer checks the removals against (§2.4 item 3).

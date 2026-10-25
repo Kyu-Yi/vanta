@@ -41,7 +41,9 @@ function name, a test name or a new constant take. Short unadorned prose words
 (``the``, ``fix``, ``bug``) are **listed but not stripped**: gating them would
 shred the text into a placeholder soup, and they carry no answer. The leak report
 records the ungated set explicitly, so a reviewer can see exactly what was and was
-not checked rather than trusting a summary.
+not checked rather than trusting a summary. The gate **removes tokens and does nothing else**:
+it never collapses whitespace, never re-wraps and never trims, because the report is the
+reporter's own text and a code block in it has to survive as the Python they pasted (§2.4.4).
 """
 
 from __future__ import annotations
@@ -397,7 +399,24 @@ def leak_gate(
     answer_tokens: dict[str, int],
     tree_tokens: dict[str, int],
 ) -> LeakResult:
-    """Strip every answer-shaped token that exists only in the answer."""
+    """Strip every answer-shaped token that exists only in the answer — and change nothing else.
+
+    [VANTA-WHY] The gate substitutes and never reformats. It used to end with
+    ``re.sub(r"[ \\t]{2,}", " ", ...).strip()``, and that collapse turned the four-space
+    indentation of a fenced code block in ``sanic/1``'s report into one space: ``    print('1')``
+    came out `` print('1')``, which is not Python, in the one part of the prompt the Creator is
+    meant to be able to run. A collapse is a *rewrite* of the reporter's text, and the gate's
+    job is to remove answer tokens and record what it removed — a stage that also reformats
+    what it passes through ships a prompt nobody wrote and no reviewer can compare against the
+    report. ``[redacted]`` and the removal table already say exactly what the gate did.
+
+    What it returns is therefore the text it was given, byte-for-byte, except for the
+    substitutions it recorded. Runs of spaces, tabs, leading indentation and blank lines all
+    survive: skipping a token leaves the text on either side of it untouched. The only
+    normalisation anywhere on the way to the prompt is the line-ending fold, and it lives in
+    one place — :func:`issue_source._canonical`, which is about *storing* the text, not about
+    what the text says (§2.4.3, §2.4.4).
+    """
     leaks: dict[str, int] = {
         token: count
         for token, count in answer_tokens.items()
@@ -438,7 +457,7 @@ def leak_gate(
         out.append("[redacted]")
 
     out.append(text[cursor:])
-    cleaned = re.sub(r"[ \t]{2,}", " ", "".join(out)).strip()
+    cleaned = "".join(out)
 
     ok, reason = is_actionable(cleaned)
     return LeakResult(

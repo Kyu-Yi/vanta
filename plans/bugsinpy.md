@@ -940,8 +940,10 @@ every line had already lost its `\r` before hashing; written and read forms ther
 every report containing a carriage return — five of the six dev bugs, the pandas report naming
 `2820bbb3…` in the header while the reader computed `0f9eb3c9…`. Both sides now fold first, and the
 file on disk is the LF-only form that was hashed, so the artifact is one git, an editor and a diff
-all read the same way. This is a rule about the **file**; it is not the whitespace the gate
-collapses inside the text it gates (§2.4.4), which is part of what the text *is*.
+all read the same way. This is a rule about the **file**: it folds line endings and it never
+touches anything else. It is not the whitespace *inside* the text the gate removes tokens from —
+that whitespace is part of what the text *is*, and the gate leaves it exactly as the reporter
+wrote it (§2.4.4).
 
 **`write_frozen` verifies before it writes, through the reader's own parser.** It renders, runs
 `parse_frozen` over the exact text it is about to store, and only then opens the file
@@ -1010,9 +1012,23 @@ a refusal naming any file outside that set, telling the reader to delete the art
 it against the oracle the batch derived. Silently re-gating would produce a second text for the same
 bug — exactly the drift §2.4.3 exists to prevent.
 
-**Reporter code blocks and tracebacks are kept.** They are legitimate report content and are exactly
-what §1.6.7's traceback and path signals are for — a real bug report that contains a traceback is
-the case localization is supposed to handle, not a case to sanitise away.
+**The gate removes tokens and never reformats, and a test says so over a code block.** The report
+is the reporter's own text: a fenced block or an indented traceback in it is Python they pasted,
+and its indentation is a byte of the text. So the gated section is the raw section with
+`[redacted]` in place of the removed tokens and **nothing else changed** — no whitespace collapse,
+no re-wrapping, no trimming of runs of spaces — apart from the one line-end fold of §2.4.3
+(`\r` out, and a trailing `\n` normalised at the section's edge). The addendum's test freezes a
+body containing `    print('1')` inside a fence, reads the artifact back, and asserts the section
+is byte-identical; a second test does the same for an indented non-fenced body. A gate that
+collapsed runs of spaces would turn that line into `print('1')`, which is not Python, and the
+freeze would be destroying the evidence the bug is about.
+
+**Reporter code blocks and tracebacks are kept, byte for byte.** They are legitimate report content
+and are exactly what §1.6.7's traceback and path signals are for — a real bug report that contains a
+traceback is the case localization is supposed to handle, not a case to sanitise away. Keeping them
+is a claim about bytes as well as about policy: the gate substitutes tokens and changes nothing
+else, so an indented block arrives in the prompt exactly as the reporter pasted it (§2.4.3, and the
+freeze-time test that asserts it).
 
 #### 2.4.5 What is dropped
 

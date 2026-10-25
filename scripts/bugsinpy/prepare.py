@@ -115,6 +115,17 @@ text a run sends has to be the text that was committed and reviewed. The remedy 
 message — delete the frozen report and re-freeze it against the derived oracle."""
 
 
+NO_ISSUE_SOURCE_REASON = "issue_source=none"
+"""[VANTA-WHY] A bug whose fix commit points at no issue has no report to send, and §2.4
+refuses to give it the commit message back: that message is written by the person who fixed
+the bug and names the fix location for most of the development split. So the bug is
+**excluded from the main evaluation** — it leaves before the precheck, so nothing measures a
+prompt no run will send — and the reason says which bug and why. The count is reported with
+the batch's other verdicts rather than left for a reader to reconstruct from the failures,
+because "this bug was never a candidate" and "this bug failed a gate" are different claims
+about the same file."""
+
+
 @dataclass(frozen=True)
 class IssueSources:
     """Where the frozen issue reports live, and where the API responses are cached.
@@ -178,6 +189,14 @@ class BugPrep:
     gate_failures: list[str] = field(default_factory=list)
     context: Optional[ctx.ContextVerdict] = None
     issue: Optional[issue_mod.IssueText] = None
+    issue_source: str = ""
+    """How the report was resolved — ``issue`` / ``via-pr`` / ``none``, else empty.
+
+    [VANTA-WHY] Recorded rather than inferred from the text: the whole point of §2.4 is that
+    a bug with no issue report is a different kind of absence from a bug whose text failed
+    the gate, and an empty ``text`` looks the same in both. ``none`` is the value that
+    excludes the bug from the main evaluation, and the per-bug report the paper needs is
+    this field against the frozen artifact's own header."""
     deps: Optional[dict[str, Any]] = None
 
     @property
@@ -199,6 +218,19 @@ class BugPrep:
             and self.issue is not None
             and self.issue.ok
         )
+
+    @property
+    def excluded(self) -> bool:
+        """§2.4: no issue report to send, so the bug is out of the main evaluation."""
+        return self.issue_source == issue_source.SOURCE_NONE
+
+    @property
+    def exclusion_reason(self) -> str:
+        """The recorded reason, for the artifact that counts the exclusions."""
+        for failure in self.gate_failures:
+            if failure.startswith(NO_ISSUE_SOURCE_REASON):
+                return failure
+        return "no issue report to send"
 
     def to_dict(self) -> dict[str, Any]:
         """The writer for :meth:`from_dict`, and the only shape ``prepare.json`` has.
@@ -229,6 +261,7 @@ class BugPrep:
             "gate_failures": self.gate_failures,
             "context": self.context.to_dict() if self.context else None,
             "issue": self.issue.to_dict() if self.issue else None,
+            "issue_source": self.issue_source,
             "deps": self.deps,
         }
 
@@ -299,6 +332,7 @@ class BugPrep:
             issue=None
             if issue_payload is None
             else issue_mod.IssueText.from_dict(issue_payload, where=where),
+            issue_source=str(field_of(payload, "issue_source", owner=owner, where=where)),
             deps=field_of(payload, "deps", owner=owner, where=where),
         )
 
@@ -845,6 +879,17 @@ def build_issue(
         if frozen.gate.ok
         else (frozen.gate.reason or "the frozen issue report is not actionable"),
     )
+    prep.issue_source = frozen.source
+    if frozen.source == issue_source.SOURCE_NONE:
+        # §2.4: no report means the bug has no text Vanta may read, and the commit message
+        # is not a substitute for one. Excluded and counted, not handed a leak. It is not a
+        # NEEDS DECISION either — there is nothing for a human to decide, only a bug that
+        # cannot take part — so the reason replaces the gate's "not actionable" verdict.
+        prep.issue.needs_decision = None
+        prep.gate_failures.append(
+            f"{NO_ISSUE_SOURCE_REASON}: {frozen.reason or 'no report to send'} — excluded "
+            "from the main evaluation (§2.4)."
+        )
     return frozen
 
 
@@ -862,9 +907,11 @@ def write_leak_gate(batch_dir: Path, prep: BugPrep) -> Path:
 def write_issue_texts(batch_dir: Path, preps: list[BugPrep]) -> Path:
     texts_dir = batch_dir / "issue_texts"
     texts_dir.mkdir(parents=True, exist_ok=True)
-    for prep in preps:
-        if prep.issue is None:
-            continue
+    # A bug with no report is not a text to review — it is missing one, and the reason in its
+    # gate failures says so. Listing it here as "NEEDS DECISION" would ask a human to decide
+    # what cannot be decided (§2.4).
+    readable = [prep for prep in preps if prep.issue is not None and not prep.excluded]
+    for prep in readable:
         body = [
             f"# {prep.key}",
             "",
@@ -911,7 +958,7 @@ def write_issue_texts(batch_dir: Path, preps: list[BugPrep]) -> Path:
         (texts_dir / f"{prep.slug}.md").write_text("\n".join(body), encoding="utf-8")
 
     all_path = batch_dir / "issue_texts_all.md"
-    needs = [prep for prep in preps if prep.issue is not None and not prep.issue.ok]
+    needs = [prep for prep in readable if not prep.issue.ok]
     summary = [
         "# Issue texts — all candidates, for hand review before any run",
         "",
@@ -932,9 +979,20 @@ def write_issue_texts(batch_dir: Path, preps: list[BugPrep]) -> Path:
         summary.append("None — every candidate produced an actionable text.")
     summary += ["", "---", ""]
 
-    for prep in preps:
-        if prep.issue is None:
-            continue
+    excluded = [prep for prep in preps if prep.excluded]
+    if excluded:
+        summary += [
+            f"## Excluded — no issue report ({len(excluded)})",
+            "",
+            "Their fix commits name no issue, so there is no text to send and §2.4 does not "
+            "hand them the commit message instead. Counted here, and left out of the run "
+            "rather than failing a gate they never reached.",
+            "",
+        ]
+        summary += [f"- **{prep.key}** — {prep.exclusion_reason}" for prep in excluded]
+        summary += ["", "---", ""]
+
+    for prep in readable:
         summary += [
             f"## {prep.key} ({prep.role}, wave {prep.wave})",
             "",
@@ -1363,6 +1421,11 @@ def prepare_one(
     )
     if prep.issue is None:
         return prep
+    if prep.issue_source == issue_source.SOURCE_NONE:
+        # Excluded before the precheck (§2.4): the size of a prompt that will never be sent
+        # is not a measurement, and the three suite runs behind the authoritative one would
+        # be spent on a bug no run grades.
+        return prep
 
     # Cheap gate first. The pre-strip tree is the same source as the final one
     # (the strip only removes test functions), so measuring it costs nothing and
@@ -1536,7 +1599,11 @@ def render_summary(
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for prep in preps:
-        if prep.gate_failures:
+        if prep.excluded:
+            # Not a gate failure even though it is recorded as one: the bug never became a
+            # candidate, and the table says which kind of absence this is (§2.4).
+            verdict = "excluded"
+        elif prep.gate_failures:
             verdict = "**gate**"
         elif prep.prepare_mode != FULL:
             verdict = "measured"
@@ -1561,9 +1628,13 @@ def render_summary(
                 if prep.prepare_mode == FULL
                 else "—",
                 tokens=prep.context.estimated_prompt_tokens if prep.context else "—",
-                issue="ok"
-                if prep.issue and prep.issue.ok
-                else ("**decision**" if prep.issue else "—"),
+                issue="none"
+                if prep.excluded
+                else (
+                    "ok"
+                    if prep.issue and prep.issue.ok
+                    else ("**decision**" if prep.issue else "—")
+                ),
             )
         )
     lines.append("")
@@ -1577,5 +1648,12 @@ def render_summary(
                 "flipping test(s) BugsInPy does not declare for this bug, removed from "
                 f"FAIL_TO_PASS and from vanta_tree: {prep.f2p_undeclared}"
             )
+    excluded = [prep for prep in preps if prep.excluded]
+    if excluded:
+        lines.append(
+            f"- {len(excluded)} of {len(preps)} bug(s) have no issue report "
+            "(issue_source=none) and are **excluded from the main evaluation**: "
+            + ", ".join(prep.key for prep in excluded)
+        )
     lines.append("")
     return "\n".join(lines)

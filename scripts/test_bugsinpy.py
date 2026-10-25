@@ -3440,6 +3440,45 @@ class TestTheFreezeGatesTheText:
         assert frozen is None and prep.issue is None
         assert prepare_mod.FROZEN_ISSUE_REASON in prep.gate_failures[0]
 
+    def test_a_bug_with_no_issue_is_excluded_not_handed_the_commit_message(
+        self, tmp_path, monkeypatch
+    ):
+        """§2.4 item 4: the fallback was the leak, so there is no fallback.
+
+        A message with no number in it resolves to nothing, and the bug leaves as
+        ``issue_source=none`` — not as a text a human is asked to decide about, and not as
+        a bug measured under a prompt no run will ever send.
+        """
+        monkeypatch.setattr(
+            issue_mod, "fix_commit_message", lambda repo, commit: "Fix the loader\n"
+        )
+        monkeypatch.setattr(
+            issue_mod, "fix_commit_date", lambda repo, commit: "2018-06-01T00:00:00Z"
+        )
+        prep = self._prep(tmp_path, project="luigi", bug_id=1)
+        frozen = prepare_mod.build_issue(
+            prep,
+            repo_cache=tmp_path,
+            issue_sources=self._sources(tmp_path, ScriptedAPI({})),
+            github_url="https://github.com/spotify/luigi",
+            full=True,
+        )
+        assert frozen is not None
+        assert frozen.source == source_mod.SOURCE_NONE
+        assert prep.issue_source == source_mod.SOURCE_NONE
+        assert prep.excluded is True
+        assert prep.runnable is False
+        assert prep.issue is not None and prep.issue.text == ""
+        assert prep.issue.needs_decision is None, (
+            "an exclusion is not a decision a human can make"
+        )
+        assert prepare_mod.NO_ISSUE_SOURCE_REASON in prep.exclusion_reason
+        assert "excluded from the main evaluation" in prep.exclusion_reason
+        # The artifact still says so, in the header every stage reads.
+        assert "- resolved: none" in (
+            tmp_path / "issues" / "luigi_1.md"
+        ).read_text(encoding="utf-8")
+
     def test_the_drift_check_flags_an_oracle_the_freeze_never_gated_with(self, tmp_path):
         """A derived F2P file outside the gate's inputs is reported, never re-gated: the
         committed text is what the run sends."""
@@ -3962,6 +4001,71 @@ class TestPrepareInvariants:
         summary = prepare_mod.render_summary([prep(prepare_mode=prepare_mod.MEASURE_ONLY)])
         assert "measured" in summary
         assert "—" in summary
+
+    def test_the_summary_counts_the_bugs_with_no_issue_report(self):
+        """§2.4 item 4: excluded bugs are counted, and told apart from gate failures."""
+        reason = (
+            f"{prepare_mod.NO_ISSUE_SOURCE_REASON}: the fix commit's message references no "
+            "issue or pull request number — excluded from the main evaluation (§2.4)."
+        )
+        excluded = prep(
+            bug=bug_info(project="Other", bug_id=2),
+            issue_source=source_mod.SOURCE_NONE,
+            gate_failures=[reason],
+        )
+        summary = prepare_mod.render_summary([prep(), excluded])
+        assert "excluded" in summary
+        assert "**gate**" not in summary.replace(reason, ""), (
+            "an exclusion is not a failed gate in the table"
+        )
+        assert "1 of 2 bug(s) have no issue report" in summary
+        assert "excluded from the main evaluation" in summary
+        assert "Other/2" in summary
+
+    def test_the_excluded_bug_is_listed_apart_from_the_texts_to_review(self, tmp_path):
+        """An empty text and a failed gate must not look the same in the review artifact."""
+        good = issue_mod.IssueText(
+            text="The loader raises on an empty file and reports success instead.",
+            pre_gate="The loader raises on an empty file and reports success instead.",
+            leak=issue_mod.LeakResult(
+                text="The loader raises on an empty file and reports success instead.",
+                removals=[],
+                ungated_prose=[],
+                ok=True,
+                reason=None,
+            ),
+            failure_kinds=[],
+            ok=True,
+            needs_decision=None,
+        )
+        reason = (
+            f"{prepare_mod.NO_ISSUE_SOURCE_REASON}: the fix commit's message references no "
+            "issue or pull request number — excluded from the main evaluation (§2.4)."
+        )
+        excluded = prep(
+            bug=bug_info(project="Other", bug_id=2),
+            issue_source=source_mod.SOURCE_NONE,
+            gate_failures=[reason],
+            issue=issue_mod.IssueText(
+                text="",
+                pre_gate="",
+                leak=issue_mod.LeakResult(
+                    text="", removals=[], ungated_prose=[], ok=False, reason="too short"
+                ),
+                failure_kinds=[],
+                ok=False,
+                needs_decision=None,
+            ),
+        )
+        prepare_mod.write_issue_texts(tmp_path / "batch", [prep(issue=good), excluded])
+        all_text = (tmp_path / "batch" / "issue_texts_all.md").read_text(encoding="utf-8")
+        assert "## Excluded — no issue report (1)" in all_text
+        assert "**Other/2** — issue_source=none" in all_text
+        assert "None — every candidate produced an actionable text." in all_text, (
+            "the exclusion is not a text for a human to decide about"
+        )
+        assert not (tmp_path / "batch" / "issue_texts" / "Other_2.md").exists()
+        assert (tmp_path / "batch" / "issue_texts" / "Demo_1.md").is_file()
 
 
 class TestPrepareRunRecordContract:

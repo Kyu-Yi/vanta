@@ -2,34 +2,43 @@
 
 The highest-risk part of the harness: a leaky issue text turns the pilot into
 "copy the answer out of the prompt", and the leak is invisible in every metric
-afterwards. Two independent mechanisms guard it.
+afterwards.
 
-**Step 2 — strip diff and code only.** The fix-commit message is run through a
-stripper that removes diff hunks, fenced and indented code blocks, and inline code
-spans. Nothing else.
+**The text is the project's own report, and it is a committed file.** The freeze
+step in ``prepare`` writes ``plans/bugsinpy_issues/<project>_<bug>.md`` once, from
+the GitHub issue the fix commit references; ``prepare``, a measure-only run and the
+run all read that file's gated section, so the text a measure-only run measures and
+the text a run sends are the same bytes by construction (§2.4). This module
+supplies what that step needs: the token counts, the gate, and the actionability
+rule.
 
-[VANTA-WHY] An earlier draft *also* stripped every line containing a symbol found
-in ``bug_patch.txt``. That rule deletes the name of the function being fixed — a
-name that is present in the buggy tree and that the Creator needs in order to work
-at all — and it would have made many issues unsolvable. Symbol-level leakage is
-the leak gate's job, and the gate is strictly better because it fires only on
-tokens that exist *nowhere* in the tree the Creator is allowed to read.
+[VANTA-WHY] The fix commit's message used to *be* the text. It is written by the
+person who fixed the bug, after they fixed it, and on the development split it
+names the fix location outright for 7 of 11 bugs — a leak the gate below cannot
+take back, because a symbol named by the person who fixed it is by definition
+present in the buggy tree. So the commit-message body is dropped from the prompt
+entirely, and with it the hidden-test behavioural sentence that used to be appended
+to it: a real report's own words are the behaviour. What remains here of that
+route — :func:`strip_diff_and_code`, :func:`default_behavioural_line`,
+:func:`build_issue_text` — is kept for the offline record of what the commit
+message alone would have said, which is never shown to Vanta.
 
-**Step 4 — the leak gate (hard).** A token is a leak when it appears in the fix
-diff or in the hidden test and appears **zero** times in ``vanta_tree/``. That is
-the precise meaning of "this came from the answer". The gate strips leaks from the
-text, logs every removal with its class and reason, and marks a text that is no
-longer actionable as ``NEEDS DECISION`` so a human decides rather than the harness
-guessing.
+**The leak gate (hard).** A token is a leak when it appears in the fix diff or in
+the hidden test and appears **zero** times in the tree the Creator may read. That
+is the precise meaning of "this came from the answer". The gate strips leaks from
+the text, logs every removal with its class and reason, and marks a text that is no
+longer actionable as needing a decision rather than guessing — and a report whose
+project has no issue at all is not a text to fix but a bug that cannot take part
+(§2.4).
 
 [VANTA-WHY] Which tokens the gate gates. Identifiers that are *answer-shaped* —
 contain ``_`` or a digit, are six characters or longer, or are quoted strings,
 numeric literals, or file paths — are gated, because those are the shapes a
 function name, a test name or a new constant take. Short unadorned prose words
 (``the``, ``fix``, ``bug``) are **listed but not stripped**: gating them would
-shred every commit message into a placeholder soup, and they carry no answer. The
-leak report records the ungated set explicitly, so a reviewer can see exactly what
-was and was not checked rather than trusting a summary.
+shred the text into a placeholder soup, and they carry no answer. The leak report
+records the ungated set explicitly, so a reviewer can see exactly what was and was
+not checked rather than trusting a summary.
 """
 
 from __future__ import annotations

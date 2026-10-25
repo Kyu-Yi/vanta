@@ -864,6 +864,13 @@ the case localization is supposed to handle, not a case to sanitise away.
 - If no issue can be resolved, the bug is marked `issue_source=none` and **excluded from the main
   evaluation** — the count is reported — rather than falling back to the commit message. The
   fallback was the leak; removing it does not create localization out of a text that carries none.
+  The exclusion is mechanical, not a judgement call: `prepare_one` returns before the precheck, so
+  nothing measures a prompt no run will send, and the bug's own record carries the reason. It is
+  **not** a `NEEDS DECISION` — there is nothing for a human to decide — so the summary reports it as
+  `excluded` with the count of such bugs beside the batch's other verdicts, and
+  `issue_texts_all.md` lists them in their own section rather than among the texts awaiting review.
+  This is the one place where "the bug has no issue report" and "this report failed the gate" must
+  stay distinguishable: both leave an empty `text` in the record.
 
 #### 2.4.6 Offline, for the paper only
 

@@ -543,6 +543,13 @@ SDIST_SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
     "scipy": ("gfortran", "libopenblas-dev", "liblapack-dev"),
     "sqlalchemy": (),  # cextension/{processors,resultproxy,utils}.c only
     "statsmodels": ("gfortran", "libopenblas-dev", "liblapack-dev"),
+    "thrift": (),  # src/ext/{module,types,binary,compact}.cpp and every header they
+    # include (ext/{types,binary,compact,protocol}.h, ext/endian.h, ext/protocol.tcc) are
+    # in the sdist, and setup.py's include_dirs=['src'] names the archive itself: measured,
+    # the only includes are those, <Python.h>, <limits> and <stdint.h>, and there is no
+    # libraries=/library_dirs=/pkg-config/ctypes.util call at all. Its build_ext also
+    # falls back to a pure-python install when the compile raises (setup.py's
+    # `except BuildFailed: run_setup(False)`), so the extension is an optimisation here
     "tornado": (),  # tornado/speedups.c only
     "ujson": (),  # vendored double-conversion; -lstdc++/-lm are the toolchain's
     "urwid": (),  # source/str_util.c only
@@ -874,19 +881,32 @@ consequences of it, which is what the rest of that log is. ``attr.h`` includes
 ``stdint.h``/``cstdint``, which nothing on that include chain reaches under GCC 14;
 the one header the chain does reach is ``Python.h`` and it does not supply the name.
 
-``stdint.h`` and **not** the ``cstdint`` the error names, because this variable
-reaches the **C** compiles as well as the C++ one (:data:`_ERA_WARNING_FLAGS`) and
-``cstdint`` is a C++-only header: it is not on ``gcc``'s C include path at all, so
-``-include cstdint`` turns every C file in the tree into ``fatal error: cstdint: No
-such file or directory``. ``stdint.h`` is one name in both languages — the C
-standard header there, and in C++ ``g++``'s own include path resolves it to
-libstdc++'s ``c_compatibility/stdint.h``, which does declare ``namespace std { using
-::uint16_t; … }``. ``-include`` rather than a line in the source: the file is not
+[VANTA-WHY] This header does **not** supply ``std::uint16_t``, and the bake that would
+have shown it was never run: the flag's C++ reach was assumed from the standard rather
+than measured, and the assumption is wrong on this toolchain. ``<stdint.h>`` is the *C*
+standard header — glibc's, with no ``namespace std`` block and no ``__cplusplus``
+guarded one — and C++'s ``std::uint16_t`` comes from libstdc++'s ``<cstdint>``, which
+is where ``c_compatibility``'s ``stdint.h`` wrapper is *not*. Measured on ``pandas/1``'s
+own dependency layer (``runs/bugsinpy/bake-logs/vanta-bi-pandas-1.log``): the ``.cxx``
+compile line carried this flag — ``g++ -Wno-unused-result
+… -Wno-error=declaration-missing-parameter-type -D_GNU_SOURCE -include stdint.h -fPIC
+-DPOCKETFFT_PTHREADS … -c scipy/fft/_pocketfft/pypocketfft.cxx`` — and the compile died
+at the same place, ``pybind11/attr.h:185``, on ``std::uint16_t``. The header the error
+asks for is the one to send, and it cannot be sent from here: ``cstdint`` is a C++-only
+header, so ``-include cstdint`` in a variable that reaches every *C* file turns each one
+into ``fatal error: cstdint: No such file or directory``. The C++ compile is therefore
+served where the C one cannot be touched at all — in the driver's own word
+(:data:`VANTA_CXX_PATH`, :data:`VANTA_CXX_SOURCE`).
+
+``-include`` rather than a line in the source stays right either way: the file is not
 ours to edit, and the declaration has to be in scope *before* ``attr.h``.
 
-It is only half the flag: :data:`_ERA_GNU_SOURCE` is the other half, and it is in the
-same variable for the same reason. Read them as one decision — the header restores
-``std::uint16_t`` and the macro restores ``Dl_info`` on the *same* command lines.
+The pair ``-include stdint.h`` / ``-D_GNU_SOURCE`` is retained as it stands, and the
+record should say plainly what it is: the residue of the first attempt at this fix,
+inert for the C trees (``stdint.h`` is the C standard header, and the macro that costs
+its early arrival is defined on the same line) and *not* what the C++ compile needed.
+Taking it out is a change to the C command line of every layer that already builds,
+which is a change this fix is not entitled to make (§3.2 records it as outstanding).
 
 [VANTA-WHY] ``CFLAGS`` and not ``CXXFLAGS``, which is the name the failure invites.
 CPython 3.8's ``distutils.sysconfig.customize_compiler`` reads ``CC``, ``CXX`` and
@@ -909,7 +929,15 @@ setuptools is a recent one an environment ``CFLAGS`` does **not** reach a plain
 this variable for exactly that reason. The reach this flag depends on is therefore a
 fact about the trees being built (``scipy`` builds through ``numpy.distutils``), not
 about ``distutils`` in general, and the smoke check no longer claims otherwise
-(:data:`_TOOLCHAIN_SMOKE_CPP_SOURCE`).
+(:data:`_TOOLCHAIN_SMOKE_CPP_SOURCE`) — a C++-only flag is served from the one position
+that *is* only ever C++, the driver's own word, and which word that is depends on the
+build: ``CXX`` when the build picks a C++ word per source (``numpy.distutils``, and the
+``setuptools._distutils`` fork's ``compiler_so_cxx``), ``CC`` when it does not
+(``stdlib`` ``distutils``, whose ``_compile`` sends every source through
+``compiler_so`` — the measured matplotlib ``ft2font.cpp``, :data:`VANTA_CC_PATH`). The
+wrapper on ``CXX`` is what the smoke check measures (:data:`VANTA_CXX_PATH`); the one on
+``CC`` is measured by the probe recorded in §3.2 and asserted by the wrapper's own unit
+test.
 """
 
 _ERA_FORTRAN_FLAGS = ("-fallow-argument-mismatch",)
@@ -944,9 +972,176 @@ fixed-form ``f77`` sources that failed here *and* the free-form ones beside them
 per-flavour variables are declared in the same table and cover only their own form.
 """
 
+VANTA_CXX_PATH = "/opt/vanta-cxx"
+"""What ``CXX`` names in a layer whose minor has a toolchain: a wrapper, not ``g++``.
+
+[VANTA-WHY] The measured ``pandas/1`` failure — ``scipy==1.4.1``'s
+``pypocketfft.cxx`` dying on ``std::uint16_t`` at ``pybind11/attr.h:185`` — is a C++
+header GCC 14 no longer reaches the source for, and neither variable that could carry
+it can be used. ``CFLAGS`` reaches the ``.cxx`` compile (``numpy.distutils`` reuses the
+C flag list) but reaches every *C* file beside it too, and ``cstdint`` is a C++-only
+header: ``-include cstdint`` there turns each C file into ``fatal error: cstdint: No
+such file or directory``, the measured shape of the ``stdint`` include that broke
+numpy's own C sources (:data:`_ERA_GNU_SOURCE`). ``CXXFLAGS`` is not an answer either —
+``customize_compiler`` never reads it (:data:`_ERA_STDINT_INCLUDE`). What is left is
+the one position that is *only* ever a C++ compile: the driver word itself, which is
+the whole of the difference between the ``gcc`` line and the ``g++`` line in one log
+(``runs/bugsinpy/bake-logs/vanta-bi-pandas-1.log``). Every C++ compile in the layer
+comes from there — ``numpy.distutils``' ``CXX``, plain ``distutils``' recorded value —
+and no C compile reads it at all, so a file named by ``CXX`` that prepends the flag is
+the scoped injection the flag needs.
+
+The file, not a shell function or an alias, and the same reasoning
+:data:`_ERA_GNU_SOURCE` records for its alternative: a checkpoint is a filesystem and
+an ``export`` does not survive into a layer baked ``--from`` another, so the wrapper is
+written by every layer's own recipe (:func:`build_env_lines`) rather than exported by
+the one that happens to install the compiler. It is also why the *path* and the script
+are two constants here: the path is what ``CXX`` holds and what the record in the layer
+shows, and the script is what that path must contain.
+"""
+
+VANTA_CXX_SOURCE = """\
+#!/bin/sh
+# [VANTA-WHY] Written by the layer's own recipe, not exported (VANTA_CXX_PATH).
+# g++ and nothing else by default, so this wrapper is invisible to a link, to a
+# `--version` probe and to every C compile; it adds the one header a C++ source on
+# this toolchain no longer gets for itself, and only when the command really carries
+# a C++ translation unit.
+for vanta_arg in "$@"; do
+    case "$vanta_arg" in
+        *.cc|*.cpp|*.cxx|*.c++|*.C|*.CC|*.CPP|*.CXX)
+            exec g++ -include cstdint "$@"
+            ;;
+    esac
+done
+exec g++ "$@"
+"""
+"""The wrapper's text: ``g++``, plus ``-include cstdint`` for a C++ translation unit.
+
+[VANTA-WHY] The scan over ``"$@"`` is what keeps "only C++" a fact rather than an
+intention, and it is the reason the wrapper is not simply ``g++ -include cstdint``.
+Two measured commands go through this word without compiling anything: the *link* step
+of a C++ extension, where ``-include`` names a header nothing will read, and a version
+or capability probe (``CXX -v``, ``CXX --version``) of which distutils' ``CXX`` check
+runs one. Neither carries a source file, and neither should be handed a flag for a
+language it is not compiling — so the flag appears exactly when an argument ends in a
+C++ source extension, which is distutils' own ``CXX`` list (``.cc``, ``.cpp``, ``.cxx``,
+``.c++`` and their capitalised spellings) and never ``.c``.
+
+``-include cstdint`` and not ``-include stdint.h``: the name the error asks for is
+``std::uint16_t``, which lives in libstdc++'s ``<cstdint>`` — glibc's ``<stdint.h>``
+has no ``namespace std`` block at all (:data:`_ERA_STDINT_INCLUDE`). The flag is
+prepended rather than appended so the one line of the log that changed says so at its
+head; the position carries no meaning to GCC here, because ``g++`` defines
+``_GNU_SOURCE`` itself and every command-line ``-D`` is applied before any ``-include``
+file is read (:data:`_ERA_GNU_SOURCE`).
+
+``exec``, so the compile is the shell's own process: its exit status and its signal
+handling are the compiler's, and nothing sits between distutils and the compiler that
+could change either.
+"""
+
+VANTA_CC_PATH = "/opt/vanta-cc"
+"""What ``CC`` names in a layer whose minor has a toolchain: a wrapper, not ``gcc``.
+
+[VANTA-WHY] The measured ``pandas/1`` failure that follows scipy's is matplotlib
+3.2.1's ``src/ft2font.cpp`` against the base image's **FreeType 2.13.3**. FreeType
+changed the field's signedness in that release — ``ftimage.h:353`` on this layer reads
+``unsigned char*   tags;``, and the 2.13.2→2.13.3 ``CHANGES`` entry says so in as many
+words ("Some fields in the ``FT_Outline`` structure have been changed from signed to
+unsigned type", commit ``2a7bb4596f566a34fd53932af0ef53b956459d25``) — while the 2020
+source declares its own view of that struct's field as ``char *tags;``
+(``ft2font.cpp:208`` and ``:326``) and fills it from the outline
+(``tags = outline.tags + first;``, ``:230`` and ``:346``). Measured on the layer
+(``runs/bugsinpy/bake-logs/vanta-bi-pandas-1.log``), the compile ended
+
+``src/ft2font.cpp:230:29: error: invalid conversion from 'unsigned char*' to 'char*'
+[-fpermissive]`` (and ``:346:29``, the same two lines) … ``error: command 'gcc' failed
+with exit status 1`` … ``ERROR: Failed building wheel for matplotlib``.
+
+[VANTA-WHY] Not a diagnostic :data:`_ERA_WARNING_FLAGS` can demote, and not a header
+either. ``incompatible pointer types`` is a *C* diagnostic; in C++ this conversion is
+a frontend error in every standard, which is why GCC prints its own remedy in the
+brackets — ``[-fpermissive]`` — and the demotion has to be spelled that way. Measured
+the other spelling on this layer: ``cc1plus: error: '-Wno-error=permissive': no option
+'-Wpermissive'; did you mean '-fpermissive'?`` — ``-fpermissive`` is a frontend
+acceptance flag, not a member of the ``-W`` family, so no ``-Wno-error=…`` can carry
+it. ``-include cstdint`` (:data:`VANTA_CXX_SOURCE`) is a different failure of the same
+layer and does not reach this one: matplotlib's sources name no ``std::uintN_t`` at
+all, and gcc's own advice here is the conversion, not a missing header.
+
+[VANTA-WHY] The C++ compile this must reach is driven by the **C** word, which is the
+whole reason the existing wrapper cannot serve it. ``setupext.FT2Font().get_extension()``
+builds ``Extension('matplotlib.ft2font', sources)`` — *no* ``language='c++'`` — so the
+word distutils runs for ``ft2font.cpp`` is ``compiler_so``, i.e. ``CC`` + ``CCSHARED``,
+and that is exactly the ``gcc`` the measured line above begins with. The ``CXX`` word is
+never consulted for it, and there is no other C++-only position in the environment:
+``CFLAGS`` reaches the compile, but it appends to ``ldshared`` and to every *C* file in
+the layer beside it, which is the blast radius :data:`_ERA_STDINT_INCLUDE` records for
+the same variable. So the flag goes where ``CXX``'s flag goes — on the driver's own
+word, behind an argument scan that makes "only C++" a fact rather than an intention
+(:data:`VANTA_CC_SOURCE`), which is the precedent :data:`VANTA_CXX_PATH` set and the
+mechanism the same reasoning gives here.
+
+Measured on ``pandas/1``, all three of the alternatives and this one (the probe's own
+sections, route letters kept): with a logging passthrough on ``CC``/``LDSHARED`` and
+``-fpermissive`` appended to the environment ``CFLAGS``, the ``ft2font.cpp`` argv *did*
+carry the flag (route B) — the flag works, the position is the objection; a pure C
+compile carrying it is silent and succeeds (route C, ``rc=0``); and with this wrapper
+on ``CC`` the ``ft2font.cpp`` argv carries ``-fpermissive`` while **the argv that
+compiled the C source in the same extension, ``src/checkdep_freetype2.c``, carries
+none** (route D, which is the measurement this file records). Not a linker flag and not
+a flag for a probe: ``-fpermissive`` is inert on a C compile and on a link, and the
+scan keeps it off both.
+
+[VANTA-WHY] The cost, because it is real and belongs in the record rather than in a
+commit message: ``CC`` is no longer the bare ``gcc``, so this changes
+:data:`COMPILER_ENV` and :func:`build_env_lines` and with them the *interpreter* tail
+of every layer's recipe — the next bake of all six layers is a ``--force`` bake
+(§3.2). ``LDSHARED`` is untouched and exported separately, which is what keeps the link
+line exactly as it was: on Linux ``customize_compiler`` derives ``ldshared`` from ``CC``
+only on Darwin, where it also requires ``LDSHARED`` to be unset, so neither branch
+applies to a layer that exports ``LDSHARED`` itself.
+"""
+
+VANTA_CC_SOURCE = """\
+#!/bin/sh
+# [VANTA-WHY] Written by the layer's own recipe, not exported (VANTA_CC_PATH).
+# gcc and nothing else by default, so this wrapper is invisible to a link, to a
+# `--version` probe and to every C compile; it adds the one demotion a C++ translation
+# unit on this toolchain needs from a source that cannot say which language it is in.
+for vanta_arg in "$@"; do
+    case "$vanta_arg" in
+        *.cc|*.cpp|*.cxx|*.c++|*.C|*.CC|*.CPP|*.CXX)
+            exec gcc -fpermissive "$@"
+            ;;
+    esac
+done
+exec gcc "$@"
+"""
+"""The wrapper's text: ``gcc``, plus ``-fpermissive`` for a C++ translation unit.
+
+[VANTA-WHY] The scan over ``"$@"`` is the same one :data:`VANTA_CXX_SOURCE` documents,
+over the same list — distutils' own C++ ``Extension`` list, ``.cc``, ``.cpp``, ``.cxx``,
+``.c++`` and their capitalised spellings, never ``.c`` — and it is what makes the
+measured claim true rather than hopeful: matplotlib's ``FT2Font`` extension has five
+sources, one of them the C ``checkdep_freetype2.c`` FreeType's ``add_flags`` inserts at
+index 0, and every one of them is compiled by this one word. Without the scan the C file
+would carry ``-fpermissive`` too; with it, the measured ``src/checkdep_freetype2.c``
+argv carries none.
+
+``-fpermissive`` and not ``-Wno-error=permissive``: the second spelling does not exist
+(measured, above), and the flag it names demotes *every* frontend error of this shape in
+the translation unit rather than the one line of it — which is the same trade
+:data:`_ERA_WARNING_FLAGS` makes deliberately for C: the diagnostic stays visible and
+stops being fatal, because the source is 2020 code the 2020 GCC compiled.
+
+``exec``, so the compile is the shell's own process, as in :data:`VANTA_CXX_SOURCE`.
+"""
+
 COMPILER_ENV: Mapping[str, str] = {
-    "CC": "gcc",
-    "CXX": "g++",
+    "CC": VANTA_CC_PATH,
+    "CXX": VANTA_CXX_PATH,
     "LDSHARED": "gcc -pthread -shared",
     "LDCXXSHARED": "g++ -pthread -shared",
     "CFLAGS": " ".join(
@@ -971,6 +1166,18 @@ These four are ``distutils``' documented override (``customize_compiler`` reads
 ``CC``/``CXX``/``LDSHARED`` from the environment before the recorded value), and
 ``g++ -pthread -shared`` is CPython's own Linux default for ``LDCXXSHARED``, so
 nothing about the link line is invented here.
+
+``CC`` and ``CXX`` are the two of the six that are *paths* rather than bare drivers,
+and each names a wrapper :func:`build_env_lines` writes into the layer: ``CXX`` names
+:data:`VANTA_CXX_PATH` and ``CC`` names :data:`VANTA_CC_PATH`
+(:data:`VANTA_CXX_SOURCE`, :data:`VANTA_CC_SOURCE`). Both exist for the same reason —
+the only position a language-scoped flag can be injected from is the driver word itself
+— and they are two rather than one because an ``Extension`` that declares no
+``language='c++'`` is compiled by the *C* word even when every source in it is a
+``.cpp``: scipy's ``pypocketfft`` is driven by ``CXX``, matplotlib's ``ft2font`` by
+``CC``, and neither word reaches the other's compile. ``LDSHARED`` and ``LDCXXSHARED``
+stay bare ``gcc``/``g++`` because a link reads no header and is not a translation unit,
+so neither wrapper is needed there.
 
 [VANTA-WHY] The ``error: [Errno 2]`` this mapping was first written for —
 ``numpy==1.18.5`` built from its sdist in the ``matplotlib/1`` layer, *after* the
@@ -1079,6 +1286,33 @@ def _build_env_assert(env: Mapping[str, str]) -> str:
     )
 
 
+def _wrapper_lines(name: str, path: str, source: str, why: str) -> list[str]:
+    """The recipe lines that write one driver-word wrapper into this layer.
+
+    ``name`` is the variable that will name the file and ``why`` the sentence the check
+    adds when the file is not there: the failure this prevents is an ``exec`` error at
+    the first compile of that language, which names the path and not the recipe that was
+    supposed to write it.
+
+    The heredoc's delimiter is derived from ``name`` rather than spelled out, so the two
+    wrappers cannot be written with each other's delimiter and the recipe stays readable
+    (``VANTA_CXX_WRAPPER``, ``VANTA_CC_WRAPPER``).
+    """
+    delimiter = f"VANTA_{name}_WRAPPER"
+    return [
+        # Quoted delimiter, so nothing in the script is expanded as the heredoc is read;
+        # the file's own `"$@"` survives into it and expands at the compile.
+        f"cat > {path} <<'{delimiter}'",
+        *source.rstrip("\n").splitlines(),
+        delimiter,
+        f"chmod +x {path}",
+        # The check, so a layer that exported the path and failed to write the file
+        # fails here by name rather than at the first compile with an exec error.
+        f'[ -x {path} ] || {{ echo "{name} names {path}, which this layer did not '
+        f'write: {why}" >&2; exit 1; }}',
+    ]
+
+
 def build_env_lines(env: Mapping[str, str]) -> list[str]:
     """Probe, export, check and record one layer's compiler environment.
 
@@ -1093,15 +1327,42 @@ def build_env_lines(env: Mapping[str, str]) -> list[str]:
     as a *test failure* rather than a build error (:data:`bugsinpy.shuru.DEV_SHM_PATH`).
     Anything that reaches ``$CC`` without going through the environment
     (``sysconfig``'s recorded value) is what :func:`_sysconfig_probe` prints.
+
+    When ``CC``/``CXX`` name :data:`VANTA_CC_PATH` / :data:`VANTA_CXX_PATH` the files
+    they name are written here, and asserted to be executable: those values are paths
+    into *this* layer's filesystem, so a layer whose recipe exported the path without
+    writing the file would run every compile of that language against a name nothing
+    answers to. Written, not exported, for the reason :data:`_ERA_GNU_SOURCE` records: a
+    checkpoint is a filesystem and an ``export`` does not survive into a layer baked
+    ``--from`` another (:data:`VANTA_CXX_PATH`, :data:`VANTA_CC_PATH`).
     """
     if not env:
         return []
     # The start-up check's variable is recorded beside the compiler's: same file, same
     # shape, one reader for both (DEV_SHM_GUARD).
     pattern = "|".join([*env, DEV_SHM_ENV])
+    wrapper: list[str] = []
+    if env.get("CC") == VANTA_CC_PATH:
+        wrapper += _wrapper_lines(
+            "CC",
+            VANTA_CC_PATH,
+            VANTA_CC_SOURCE,
+            "every C++ compile the C driver runs — matplotlib's ft2font among them — "
+            "would keep the modern frontend's error where the era's compiler printed a "
+            "warning",
+        )
+    if env.get("CXX") == VANTA_CXX_PATH:
+        wrapper += _wrapper_lines(
+            "CXX",
+            VANTA_CXX_PATH,
+            VANTA_CXX_SOURCE,
+            "every C++ compile would run without the header GCC 14 no longer includes "
+            "for it",
+        )
     return [
         _sysconfig_probe(),
         *[f"export {name}={shlex.quote(value)}" for name, value in env.items()],
+        *wrapper,
         _build_env_assert(env),
         # Asserted, not merely filtered for: `env | grep` *drops* a variable that is
         # not set, so a layer whose boot never ran the start-up check would record a
@@ -1227,26 +1488,39 @@ PyMODINIT_FUNC PyInit_vanta_smoke_c(void) {
 
 _TOOLCHAIN_SMOKE_CPP_SOURCE = """\
 #include <Python.h>
-#include <cstdint>
 
-/* [VANTA-WHY] What this checks, and what it deliberately does not. The C half
-   (:data:`_TOOLCHAIN_SMOKE_C_SOURCE`) is the layer's receipt that an environment
-   `CFLAGS` reached `distutils` at all: its `-Wno-error=incompatible-pointer-types`
-   demotion is what lets its intentional pointer mismatch compile. This half is the
-   *other* variable — that `CC` and `CXX` are two answers and a layer able to compile C
-   and not C++ would pass a C-only check, which is the measured shape of the trees
-   (`matplotlib`'s `ft2font`, `pandas`' `_libs`).
+/* [VANTA-WHY] What this checks. The C half (:data:`_TOOLCHAIN_SMOKE_C_SOURCE`) is
+   the layer's receipt that an environment `CFLAGS` reached `distutils` at all: its
+   `-Wno-error=incompatible-pointer-types` demotion is what lets its intentional
+   pointer mismatch compile. This half is the *other* variable — that `CC` and `CXX`
+   are two answers and a layer able to compile C and not C++ would pass a C-only check,
+   which is the measured shape of the trees (`matplotlib`'s `ft2font`, `pandas`'
+   `_libs`) — and it is also the receipt for the one flag a C++-only compile needs.
 
-   It does not check that `_ERA_STDINT_INCLUDE` reached a C++ compile, and the include
-   on line 2 is why: measured, a plain `distutils`/`setuptools` C++ `Extension` on this
-   layer's *seeded* setuptools compiles with none of the environment `CFLAGS` — the
-   modern fork seeds its C++ flags from the recorded `cflags` before the environment
-   one is applied, and only `CXXFLAGS` moves them — so a reference that needed
-   `std::uint16_t` supplied by `-include stdint.h` could never compile here. It would
-   fail every interpreter layer forever, which is exactly what the first version of
-   this file did (see :data:`_ERA_GNU_SOURCE`). The flag's C++ reach is a property of
-   `numpy.distutils`, the build system `scipy` uses (`pandas/1`), not of `distutils`,
-   and nothing in this layer builds through it. */
+   It carries no `#include <cstdint>` on purpose. The first version did, because the
+   delivery of `-include cstdint` to a `.cxx` was the open question it could not
+   answer: the environment `CFLAGS` does not reach a plain `setuptools` C++ compile at
+   all, so a name the flag had to supply could not be referenced from here at all
+   (:data:`_ERA_STDINT_INCLUDE`). That question is now answered by *where* the flag is
+   injected — `CXX` names :data:`VANTA_CXX_PATH`, the wrapper, and the C++ word in a
+   `setuptools` build in this layer is that wrapper — so `std::uint16_t` below is
+   supplied by no line of this file and the smoke compiles only if the wrapper's
+   `-include cstdint` arrived.
+
+   Which *build* compiles it is the second half of that fact, and the smoke runs under
+   a different one than the trees do. This file is built by `python setup.py build_ext`
+   in the interpreter layer, whose setuptools is `uv venv --seed`'s (75.3.4): the
+   `setuptools._distutils` fork, whose `unixccompiler._compile` picks its word per
+   source — `if self.detect_language(src) == 'c++'` → `compiler_so_cxx` — and whose
+   `customize_compiler` derives that word from the environment's `CXX`
+   (`compiler_so_cxx=cxx_cmd + ' ' + ccshared`). The 2020 trees are built by the pins
+   their own layers install (`setuptools==46.4.0`), which have no `setuptools._distutils`
+   at all: on Python 3.8 that is the *stdlib* `distutils`, whose `_compile` sends every
+   source through `compiler_so` — the `CC` word — whatever its extension, which is the
+   measured `gcc … -c src/ft2font.cpp`. So this file is the receipt for
+   :data:`VANTA_CXX_PATH` and not for :data:`VANTA_CC_PATH`, and the second wrapper
+   could not be covered from here even if this file wanted the flag: the position it
+   fills is a `.cpp` the *stdlib* driver reads. */
 static std::uint16_t vanta_era_stdint_check = 16;
 
 static PyObject *vanta_value(PyObject *self, PyObject *args) {
@@ -1265,7 +1539,7 @@ static struct PyModuleDef vanta_module = {
 PyMODINIT_FUNC PyInit_vanta_smoke_cpp(void) {
     if (vanta_era_stdint_check == 0) {
         PyErr_SetString(PyExc_RuntimeError,
-                        "the layer's C flags did not reach the C++ compile");
+                        "the layer's C++ driver did not supply the header");
         return NULL;
     }
     return PyModule_Create(&vanta_module);
@@ -1330,10 +1604,10 @@ def toolchain_smoke_lines(env: Mapping[str, str]) -> list[str]:
     The C++ half is not redundant: the measured trees compile C++ extensions
     (matplotlib's ``ft2font``, pandas' ``_libs``), and ``CC`` and ``CXX`` are two
     variables with two answers — a layer that can compile C and not C++ would pass a
-    C-only smoke check. It is a *build and import* check and nothing more; what it
-    deliberately does not check is the C++ reach of ``CFLAGS``, which only
-    ``numpy.distutils`` provides and nothing in this layer builds through
-    (:data:`_TOOLCHAIN_SMOKE_CPP_SOURCE`).
+    C-only smoke check. It is a *build and import* check, and it is also where the one
+    C++-only flag is measured: its source names ``std::uint16_t`` and includes nothing
+    that declares it, so the compile succeeds only if the wrapper ``CXX`` names prepends
+    ``-include cstdint`` (:data:`VANTA_CXX_SOURCE`, :data:`_TOOLCHAIN_SMOKE_CPP_SOURCE`).
 
     The C half also carries one diagnosis GCC 14 promoted to an error
     (:data:`_ERA_WARNING_FLAGS`), so this smoke fails on a layer where ``CFLAGS`` did
@@ -4141,6 +4415,7 @@ def _chosen_release(
     *,
     cutoff: str,
     settled: Mapping[str, tuple[str, str]],
+    python_minor: str,
     metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
 ) -> tuple[str, str, tuple[tuple[str, str, str], ...]]:
     """``(version, released_at, refused)`` — the newest candidate this layer can hold.
@@ -4164,26 +4439,45 @@ def _chosen_release(
     newest candidate, which this layer's preflight reads anyway through the same cached
     reader — and a refusal costs one more.
 
+    A declaration is read only when its own marker holds **inside this layer**
+    (:func:`marker_applies`, ``python_minor``), because that is the reading ``pip check``
+    takes and therefore the one this walk has to agree with. [VANTA-WHY] ``luigi/1``
+    measured what reading only the unmarked clauses costs: ``botocore==1.12.149``
+    declares ``urllib3>=1.20,<1.25`` under ``python_version >= "3.4"`` — true for every
+    layer this harness bakes — and against BugsInPy's own ``urllib3==1.25.9`` that is
+    the conflict ``pip check`` reported. The marker was the whole of why the walk did
+    not see it, and a marker that does *not* hold is skipped for the same reason pip
+    skips it: ``python_version == "2.6"`` clauses are not in this layer's environment.
+
+    One entry per pin held against, not one per release passed over: the walk is newest
+    first, so the entry kept for a held pin is the newest and highest release that pin
+    refuses, which is the release the date rule would itself have chosen. ``luigi/1``
+    is why the record is bounded: ``botocore`` is refused by ``urllib3==1.25.9`` on
+    every release from ``1.12.149`` down to the one that is taken, and ``boto3`` by
+    ``botocore==1.10.84`` on every release of its own — one entry each names the fact
+    ("the date rule's answer was ``botocore==1.12.149``, and this layer cannot hold
+    it"), while a hundred and sixty near-identical entries name the walk.
+
     :class:`BakeError` when every candidate is refused: no release of this name is both
     on or before the declaration's date and installable beside the layer's own pins, and
     that is a decision for the split rather than something to install and discover
     (§3.2's case (a)).
     """
-    refused: list[tuple[str, str, str]] = []
+    refused: dict[str, tuple[str, str, str]] = {}
     for version, released_at in sorted(
         candidates, key=lambda item: Version(item[0]), reverse=True
     ):
         try:
             requires, _ = metadata_of(ref.name, str(version))
         except BakeError:
-            return str(version), released_at, tuple(refused)
+            return str(version), released_at, tuple(refused.values())
         conflict: Optional[tuple[str, str, str]] = None
         for raw in requires:
             try:
                 requirement = Requirement(raw)
             except InvalidRequirement:
                 continue
-            if requirement.marker is not None:
+            if not marker_applies(requirement, python_minor=python_minor):
                 continue
             held = settled.get(canonicalize_name(requirement.name))
             if held is None:
@@ -4201,14 +4495,17 @@ def _chosen_release(
             )
             break
         if conflict is None:
-            return str(version), released_at, tuple(refused)
-        refused.append(conflict)
+            return str(version), released_at, tuple(refused.values())
+        # ``setdefault``, not ``append``: the walk is newest first, so the first entry
+        # recorded for a held pin is the newest release it refuses, and a later release
+        # refused by the *same* pin is the same fact about the layer twice.
+        refused.setdefault(conflict[1], conflict)
     raise BakeError(
         f"{ref.source}: {ref.spec} has no release on or before {cutoff} that this "
         "layer's own pins can hold — "
         + "; ".join(
             f"{rejected} declares {declared}, which {held} does not satisfy"
-            for rejected, held, declared in refused
+            for rejected, held, declared in refused.values()
         )
         + ", and neither side is a version the date rule may move (§3.2)"
     )
@@ -4217,6 +4514,7 @@ def _chosen_release(
 def _narrowing_requirements(
     refs: Sequence[DepRef],
     *,
+    python_minor: str,
     metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
 ) -> dict[str, list[tuple[str, str]]]:
     """``{name: [(pin, specifier)]}`` — what this layer's exact pins require of each name.
@@ -4229,12 +4527,18 @@ def _narrowing_requirements(
     refs. ``_exact_version`` is the same predicate the merge uses to decide what a claim
     can be settled on, so "an exact pin" means one thing in this file.
 
-    A requirement carrying a marker is skipped: ``foo>=1; extra == "test"`` is only
-    installed when the extra is asked for, and narrowing a layer's version on the word of
-    a conditional requirement would pin something the bug's own environment never held.
-    The conservative direction is deliberate — a conditional that *does* apply leaves a
-    conflict for the ``pip check`` gate to report (:func:`pip_check_conflicts`) rather
-    than a version chosen for a reason that cannot be checked.
+    A requirement whose marker does not hold in this layer is skipped
+    (:func:`marker_applies`, ``python_minor``): ``foo>=1; python_version == "3.6"`` is
+    not installed in a 3.8 layer, so narrowing a version on the word of it would pin
+    something the bug's own environment never held — and ``foo>=1; extra == "test"`` is
+    only installed when the extra is asked for, which the empty ``extra`` here says it
+    was not. A marker that *does* hold is a requirement pip installs, and it is read
+    for exactly that reason: skipping every marker, which is what this did, is what left
+    ``luigi/1``'s ``botocore`` narrowing nothing while its own declaration carried the
+    ``urllib3`` bound that ``pip check`` then reported. A conditional that does apply
+    and cannot be satisfied still leaves the conflict to the ``pip check`` gate
+    (:func:`pip_check_conflicts`) — the narrowing only *moves* a choice here, it never
+    admits one the gate would refuse.
 
     An exact pin whose own declarations cannot be read narrows nothing and is passed
     over, for the same conservative reason: what it asks for is unknown, and choosing a
@@ -4258,7 +4562,7 @@ def _narrowing_requirements(
                 requirement = Requirement(raw)
             except InvalidRequirement:
                 continue
-            if requirement.marker is not None:
+            if not marker_applies(requirement, python_minor=python_minor):
                 continue
             text = str(requirement.specifier)
             if not text:
@@ -4270,18 +4574,28 @@ def _narrowing_requirements(
     return out
 
 
-def resolve_pins(
+def _pin_each_ref(
     refs: Sequence[DepRef],
     *,
     releases: Mapping[str, Mapping[str, str]],
     commit_date: str,
     harness_pins: Mapping[str, str],
+    python_minor: str,
+    narrowed: Mapping[str, list[tuple[str, str]]],
+    settled: Mapping[str, tuple[str, str]],
     buggy_commit: Optional[str] = None,
     metadata_of: Optional[
         Callable[[str, str], tuple[tuple[str, ...], Optional[str]]]
     ] = None,
 ) -> list[ResolvedDep]:
-    """Pin each dependency to the newest release on or before its declaration's date.
+    """One pass of :func:`resolve_pins`: pin each dependency to the newest release on or
+    before its declaration's date.
+
+    ``narrowed`` (:func:`_narrowing_requirements`) and ``settled`` (:func:`_settled_versions`)
+    arrive computed rather than being derived here, because :func:`resolve_pins` re-runs
+    this pass with its own previous picks added to ``settled`` and neither of the other
+    two changes between rounds: an exact pin is the same pin whatever the date rule
+    chose for the rest of the layer.
 
     Pure, and deliberately so: ``releases`` is passed in, so every rule here — the
     cutoff, the two exceptions, "no candidate" — is exercised by a test that never
@@ -4350,12 +4664,6 @@ def resolve_pins(
     the answer is the newest release on or before the declaration's date that this
     layer's other pins can hold.
     """
-    narrowed = (
-        _narrowing_requirements(refs, metadata_of=metadata_of)
-        if metadata_of is not None
-        else {}
-    )
-    settled = _settled_versions(refs, harness_pins) if metadata_of is not None else {}
     resolved: list[ResolvedDep] = []
     for ref in refs:
         requirement = _requirement(ref.spec, ref.source)
@@ -4471,6 +4779,7 @@ def resolve_pins(
                     dated,
                     cutoff=cutoff,
                     settled=settled,
+                    python_minor=python_minor,
                     metadata_of=metadata_of,
                 )
         resolved.append(
@@ -4494,6 +4803,113 @@ def resolve_pins(
     return resolved
 
 
+def resolve_pins(
+    refs: Sequence[DepRef],
+    *,
+    releases: Mapping[str, Mapping[str, str]],
+    commit_date: str,
+    harness_pins: Mapping[str, str],
+    python_minor: str,
+    buggy_commit: Optional[str] = None,
+    metadata_of: Optional[
+        Callable[[str, str], tuple[tuple[str, ...], Optional[str]]]
+    ] = None,
+) -> list[ResolvedDep]:
+    """Pin every dependency of one layer to the newest release on or before its
+    declaration's date (§3.2).
+
+    :func:`_pin_each_ref` is one pass of this and its docstring is the rule — the
+    per-declaration cutoff, the two exceptions, the pre-release carve-out, the
+    narrowing, and the settled set. What this function adds is the reading those rules
+    cannot make in a single pass, because a pass that reads one ref before another has
+    not read the layer's own picks for the refs it read *first*.
+
+    [VANTA-WHY] The pass is repeated until its own answer stops changing, and
+    ``luigi/1`` is why. ``botocore``'s newest dated release, ``1.12.149``, declares
+    ``urllib3>=1.20,<1.25`` under ``python_version >= "3.4"`` — true in every layer this
+    harness bakes — against BugsInPy's own ``urllib3==1.25.9``, so ``botocore`` falls to
+    ``1.10.84``, the newest release declaring no ``urllib3`` bound at all. But
+    ``boto3``'s newest dated release, ``1.9.149``, declares ``botocore>=1.12.149,<1.13.0``,
+    which refuses the ``botocore`` just chosen, so ``boto3`` falls to ``1.7.84`` — and
+    ``moto``'s newest, ``1.3.7``, declares ``botocore>=1.12.13`` and falls to ``1.3.6``,
+    whose own ``boto3 (<1.8,>=1.6.16)`` the ``1.7.84`` satisfies. Three picks, one
+    answer, and it is not the answer of any single pass: the claims name each other's
+    *picks*, so the first ref read gets the wrong last word. Folding this round's picks
+    into ``settled`` and running the pass again is that fixpoint, and it is the same
+    shape :func:`transitive_pins`' re-choose queue already has — the answer does not
+    depend on the order the refs were read in.
+
+    A round whose picks the pass has returned before is a cycle and raises, rather than
+    a choice for the date rule to make: the layer's pins are naming each other in a
+    circle, §3.2's case (a) has no reading for a layer whose own pins cannot agree, and
+    installing the contradiction is exactly what the layer's ``pip check`` would then
+    report. Note that ``settled`` is *replaced* each round and not accumulated — it
+    holds the version the layer ends up with, so a name whose pick moved is held at the
+    release it moved to, not at both.
+
+    Only the **last** round's records are returned: its :attr:`ResolvedDep.refused` and
+    :attr:`ResolvedDep.narrowed_by` describe the version the layer actually installs,
+    and an intermediate round's would name a rejection the final answer no longer
+    stands on.
+    """
+    narrowed = (
+        _narrowing_requirements(
+            refs, python_minor=python_minor, metadata_of=metadata_of
+        )
+        if metadata_of is not None
+        else {}
+    )
+    settled = _settled_versions(refs, harness_pins) if metadata_of is not None else {}
+    history: list[dict[str, str]] = []
+    while True:
+        resolved = _pin_each_ref(
+            refs,
+            releases=releases,
+            commit_date=commit_date,
+            harness_pins=harness_pins,
+            python_minor=python_minor,
+            narrowed=narrowed,
+            settled=settled,
+            buggy_commit=buggy_commit,
+            metadata_of=metadata_of,
+        )
+        if metadata_of is None:
+            # Nothing to read a declaration from, so nothing in the pass consults
+            # ``settled`` and one round is the whole answer.
+            return resolved
+        grown = False
+        for dep in resolved:
+            if dep.harness:
+                # The harness branch already holds the interpreter layer's version and
+                # is never installed over; the layer's own pin for the same name, if it
+                # has one, is the exempt record that wins (:func:`_settled_versions`).
+                continue
+            key = canonicalize_name(dep.name)
+            entry = (dep.pin, dep.pin.partition("==")[2])
+            if settled.get(key) != entry:
+                settled[key] = entry
+                grown = True
+        if not grown:
+            return resolved
+        picks = {canonicalize_name(dep.name): dep.pin for dep in resolved}
+        if picks in history:
+            start = history.index(picks)
+            cycling = sorted(
+                name
+                for name in picks
+                if any(round_picks.get(name) != picks[name] for round_picks in history[start:])
+            )
+            raise BakeError(
+                "this layer's own pins do not settle: the pass returns to a set of picks "
+                f"it has already made, with {', '.join(cycling)} moving between rounds — "
+                "the pins this harness chose name each other in a circle. §3.2's case (a) "
+                "refuses a choice this harness made that another pin of the layer does "
+                "not satisfy, and none of them is BugsInPy's own pin, so there is no "
+                "release of them all this layer can install as written."
+            )
+        history.append(picks)
+
+
 PYPI_JSON = "https://pypi.org/pypi/{name}/json"
 
 
@@ -4511,17 +4927,21 @@ bug's tree wrote the requirement.
 def marker_applies(requirement: Requirement, *, python_minor: str, extra: str = "") -> bool:
     """Whether ``requirement``'s own marker holds **inside** the layer (§3.2).
 
-    [VANTA-WHY] The three readers that move a settled version on a declaration
+    [VANTA-WHY] Every reader of a declaration asks this, and until it did, three of them
     (:func:`_chosen_release`, :func:`_narrowing_requirements`, :func:`metadata_conflicts`)
-    skip every marker, and for their question that is right: a conditional requirement is
-    not something to move a settled pin's, or to refuse a layer's, on — the conservative
-    direction there is to leave the declaration unread and let the layer's own ``pip
-    check`` report it. Everywhere a requirement is read *as an install* the question is
-    the other way round — what will pip put in the environment — and there a marker is
-    the question, because pip skips what does not apply. Measured, that is what
-    ``pandas/1``'s early pass got wrong: ``scikit-learn==0.23.1``'s build declares
-    ``numpy==1.13.3`` under ``python_version == "3.6"``, which is false for every layer
-    this harness bakes, and the ordering finding named it anyway.
+    skipped markers outright on the reasoning that a conditional requirement is not
+    something to move a settled pin's, or to refuse a layer's, on — the conservative
+    direction being to leave it unread and let the layer's own ``pip check`` report it.
+    ``luigi/1`` measured what that costs when the marker is true: ``botocore==1.12.149``
+    declares ``urllib3>=1.20,<1.25`` under ``python_version >= "3.4"``, true in every
+    layer this harness bakes, and against BugsInPy's own ``urllib3==1.25.9`` it is the
+    conflict ``pip check`` reported after the build. The question those readers are
+    asking is what pip will put in the environment, and there a marker *is* the
+    question, because pip skips what does not apply: a clause read as an install is read
+    only when it holds here. Measured the other way, it is also what ``pandas/1``'s early
+    pass got wrong: ``scikit-learn==0.23.1``'s build declares ``numpy==1.13.3`` under
+    ``python_version == "3.6"``, which is false for every layer this harness bakes, and
+    the ordering finding named it anyway.
 
     ``extra`` is the extra the requirement was read *from*, and it is empty unless the
     requirement's own marker asks for one (:func:`marker_skips`): a declaration inside an
@@ -4656,6 +5076,7 @@ def _transitive_pin(
     *,
     releases: Mapping[str, Mapping[str, str]],
     settled: Mapping[str, tuple[str, str]],
+    python_minor: str,
     metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
 ) -> ResolvedDep:
     """The pin for one transitively required name, by the date rule (§3.2).
@@ -4709,6 +5130,7 @@ def _transitive_pin(
         matching,
         cutoff=cutoff,
         settled=settled,
+        python_minor=python_minor,
         metadata_of=metadata_of,
     )
     return ResolvedDep(
@@ -5132,6 +5554,7 @@ def transitive_pins(
                 required_cutoff,
                 releases=releases_of(required),
                 settled=settled,
+                python_minor=python_minor,
                 metadata_of=metadata_of,
             )
             records[required] = record
@@ -5430,10 +5853,13 @@ def declared_requires(
     version: str,
     sidecar_of: Callable[[PyPIFile], Optional[str]] = pypi_sidecar_text,
     wheel_of: Callable[[PyPIFile], Optional[str]] = wheel_metadata_text,
+    install_requires_of: Optional[
+        Callable[[PyPIFile], Optional[tuple[str, ...]]]
+    ] = None,
 ) -> tuple[str, ...]:
     """What one release declares it needs, or :class:`BakeError` for "unknown".
 
-    [VANTA-WHY] Three readings in order, because the first is missing for most of the
+    [VANTA-WHY] Four readings in order, because the first is missing for most of the
     split's pins (:data:`PYPI_SIDECAR_SUFFIX`):
 
     #. ``info.requires_dist`` from the version JSON. Present means read — **including
@@ -5441,17 +5867,35 @@ def declared_requires(
     #. The PEP 658 sidecar of any file that carries one: the document pip itself
        installs from, without downloading the file.
     #. The ``METADATA`` inside the wheel, when the sidecar was not published.
+    #. The sdist's own ``install_requires`` (:func:`sdist_install_requires`), when there
+       is no wheel and no sidecar to read it from — the shape of a release published
+       before PyPI's ``requires_dist`` existed for it.
 
-    None of the three reaching a document is a **raise** and not an empty tuple:
+    None of the four reaching a document is a **raise** and not an empty tuple:
     "could not be read" and "declares nothing" are different answers, and only one of
     them may be written into a layer's pin list as "nothing to honour". ``httpcore==0.3.0``
-    is the pin this is for — sdist-only, no sidecar, ``requires_dist`` null — and the
-    layer's own ``pip check`` is what reads its ``h11==0.8.*``
-    (:func:`pip_check_conflicts`). ``setup.py`` is deliberately *not* executed to find
-    out: an sdist's declarations cannot be had without running the code that writes
-    them, and running a benchmark's build code during a preflight is not a reading. An
-    sdist-only release therefore reads as unknown, which is what the preflight prints
-    by name (:data:`CASE_UNKNOWN`) and what does not stop a bake.
+    is the pin the raise is for — sdist-only, no sidecar, ``requires_dist`` null — and
+    the layer's own ``pip check`` is the second reader of its ``h11==0.8.*``
+    (:func:`pip_check_conflicts`). ``setup.py`` is read with ``ast`` and never executed,
+    in this reading as in :func:`pypi_build_requirements` (design C3): an sdist's
+    declarations cannot be had by *running* the code that writes them, and running a
+    benchmark's build code on the host is not a reading.
+
+    The fourth reading is what makes pip's own resolution of a release like
+    ``fastparquet==0.4.0`` visible to the date rule at all. Measured: its version JSON
+    is null, it has no wheel this platform can use and no sidecar, and pip therefore
+    read ``thrift>=0.11.0``, ``numba>=0.28`` and ``pandas>=0.19`` out of its sdist at
+    install time — the newest releases of *today*, under a layer pinned to 2020's
+    setuptools, which is the ``setuptools.errors`` failure that stopped the bake. No
+    other reader in this file could see any of the three.
+
+    ``install_requires_of`` is ``None`` rather than the reader itself because
+    :func:`sdist_install_requires` is defined *below* this function — a default argument
+    is evaluated where the function is defined, and the sdist readers come after the
+    metadata ones — so it is resolved on call, like :func:`preflight_layers`'
+    ``classify``. It is *not* called ``sdist_of``: :func:`preflight_pin` already uses that
+    name for :func:`sdist_file_list`, and the same name for "list the members" and "read
+    the runtime declarations" would be two different readings of the same archive.
     """
     info = payload.get("info")
     if not isinstance(info, dict):
@@ -5475,9 +5919,16 @@ def declared_requires(
         text = wheel_of(file)
         if text is not None:
             return _requires_dist_fields(text)
+    sdist = _release_sdist(files)
+    if sdist is not None:
+        read_sdist = install_requires_of or sdist_install_requires
+        from_sdist = read_sdist(sdist)
+        if from_sdist is not None:
+            return tuple(from_sdist)
     raise BakeError(
         f"PyPI carries no 'requires_dist' for {name}=={version}, and neither a wheel "
-        "nor a PEP 658 sidecar to read it from, so what it declares is unknown"
+        "nor a PEP 658 sidecar to read it from, and the sdist's setup.py does not "
+        "declare install_requires as literals, so what it declares is unknown"
     )
 
 
@@ -5487,6 +5938,9 @@ def pypi_release_metadata(
     *,
     sidecar_of: Callable[[PyPIFile], Optional[str]] = pypi_sidecar_text,
     wheel_of: Callable[[PyPIFile], Optional[str]] = wheel_metadata_text,
+    install_requires_of: Optional[
+        Callable[[PyPIFile], Optional[tuple[str, ...]]]
+    ] = None,
 ) -> tuple[tuple[str, ...], Optional[str]]:
     """``(requires_dist, requires_python)`` for one release, from PyPI.
 
@@ -5499,15 +5953,17 @@ def pypi_release_metadata(
     which is why httpie/1's ``pytest==3.2.1`` lands on 0.2.
 
     The declarations come from :func:`declared_requires`, which reads the JSON first and
-    falls back to the published metadata. A release no reading reaches is a
+    falls back to the published metadata — and, last, to the sdist's own
+    ``install_requires``, read with ``ast`` and never executed
+    (:func:`sdist_install_requires`). A release no reading reaches is a
     :class:`BakeError`, and every caller answers one as "unknown" rather than as
     "nothing" (:data:`CASE_UNKNOWN`): a layer is never told a pin declares no
     requirements because nobody could read it. ``requires_python`` is the version JSON's
     own field and is read whether or not the declarations came from there.
 
-    ``sidecar_of`` and ``wheel_of`` are injected so the fallback chain is a structural
-    test, the same way :func:`pypi_release_files`'s callers inject theirs. Called only
-    by the bake, like :func:`pypi_releases`.
+    ``sidecar_of``, ``wheel_of`` and ``install_requires_of`` are injected so the fallback
+    chain is a structural test, the same way :func:`pypi_release_files`'s callers inject
+    theirs. Called only by the bake, like :func:`pypi_releases`.
     """
     url = PYPI_VERSION_JSON.format(name=name, version=version)
     try:
@@ -5519,7 +5975,12 @@ def pypi_release_metadata(
         ) from exc
 
     requires = declared_requires(
-        payload, name=name, version=version, sidecar_of=sidecar_of, wheel_of=wheel_of
+        payload,
+        name=name,
+        version=version,
+        sidecar_of=sidecar_of,
+        wheel_of=wheel_of,
+        install_requires_of=install_requires_of,
     )
     requires_python = payload["info"].get("requires_python")
     return requires, str(requires_python) if requires_python else None
@@ -5553,6 +6014,29 @@ def _read_capped(response: Any, max_bytes: int) -> tuple[bytes, bool]:
         read += len(chunk)
 
 
+def sdist_archive(
+    file: PyPIFile, *, max_bytes: int = SDIST_MAX_BYTES
+) -> tuple[bytes, bool]:
+    """One sdist, downloaded and capped, as ``(bytes, truncated)``.
+
+    [VANTA-WHY] Three readers want the same bytes — the member listing that says whether
+    the release compiles anything (:func:`sdist_file_list`), the ``setup.py``/``pyproject``
+    that say what it needs to be *built* (:func:`sdist_metadata_texts`) and the
+    ``setup.py`` that says what it needs to *run* (:func:`sdist_install_requires`) — and
+    a fourth copy of this download would be a fourth place for the timeout, the cap and
+    the error text to drift. The cap flag travels with the bytes because only
+    :func:`sdist_file_list` judges by it, but "was this the whole file" is a fact about
+    the download and not about that reader. The failure raises rather than returning
+    ``b""``: an unreachable sdist is "this was not read", and an empty archive would be
+    read as one that contains nothing.
+    """
+    try:
+        with urllib.request.urlopen(file.url, timeout=PYPI_TIMEOUT_SECS) as response:
+            return _read_capped(response, max_bytes)
+    except (urllib.error.URLError, OSError) as exc:
+        raise BakeError(f"cannot download {file.filename}: {exc}") from exc
+
+
 def _archive_names(data: bytes) -> tuple[str, ...]:
     """The member names of a tar or zip archive held in memory.
 
@@ -5584,17 +6068,27 @@ def sdist_file_list(
     listing is not the whole archive either way, and the caller must not read an
     empty list as "this sdist compiles nothing".
     """
-    try:
-        with urllib.request.urlopen(file.url, timeout=PYPI_TIMEOUT_SECS) as response:
-            data, cut = _read_capped(response, max_bytes)
-    except (urllib.error.URLError, OSError) as exc:
-        raise BakeError(f"cannot download {file.filename}: {exc}") from exc
+    data, cut = sdist_archive(file, max_bytes=max_bytes)
     names = _archive_names(data)
     return names, cut or not names
 
 
 SDIST_METADATA_MEMBERS = ("pyproject.toml", "setup.py")
 """The two files a release declares its **build** requirements in (PEP 518 + setuptools)."""
+
+
+def _release_sdist(files: Sequence[PyPIFile]) -> Optional[PyPIFile]:
+    """The first sdist among a release's files, or ``None`` when it published none.
+
+    The counterpart of the ``file.is_wheel`` filters :func:`declared_requires` runs over
+    the files it was handed, and it exists for the same reason: the fourth reading has to
+    pick *one* archive to open, and the version JSON lists them in no order this reader
+    may depend on.
+    """
+    for file in files:
+        if file.is_sdist:
+            return file
+    return None
 
 
 def _top_level_member(name: str, wanted: Sequence[str]) -> Optional[str]:
@@ -5654,12 +6148,88 @@ def sdist_metadata_texts(
     ``tomllib`` for the first, ``ast`` for the second — by the same
     :func:`build_refs` :func:`bug_sources` hands the tree's two files to.
     """
-    try:
-        with urllib.request.urlopen(file.url, timeout=PYPI_TIMEOUT_SECS) as response:
-            data, _ = _read_capped(response, max_bytes)
-    except (urllib.error.URLError, OSError) as exc:
-        raise BakeError(f"cannot download {file.filename}: {exc}") from exc
+    data, _ = sdist_archive(file, max_bytes=max_bytes)
     return _archive_texts(data, SDIST_METADATA_MEMBERS)
+
+
+SDIST_INSTALL_REQUIRES = "install_requires"
+"""The ``setup()`` keyword a release declares its **runtime** requirements in."""
+
+
+def sdist_install_requires(
+    file: PyPIFile,
+    *,
+    archive_of: Callable[[PyPIFile], tuple[bytes, bool]] = sdist_archive,
+) -> Optional[tuple[str, ...]]:
+    """What an sdist declares it needs at run time, read from inside the archive.
+
+    [VANTA-WHY] The fourth reading of :func:`declared_requires`, and the only one that
+    reaches a release published before PyPI's ``requires_dist`` existed for it. Measured
+    on ``fastparquet==0.4.0``: its version JSON carries a null ``requires_dist``, it
+    publishes no wheel this platform can install and no PEP 658 sidecar, so nothing above
+    this function could see that it requires ``thrift>=0.11.0`` — and pip, reading the
+    same archive at install time, therefore chose ``thrift 0.25.0``, whose ``setup.py``
+    imports ``setuptools.errors.CompileError`` and fails against the layer's pinned
+    ``setuptools==46.4.0``. The date rule cannot hold a claim it was never shown, so the
+    claim is read here and handed to it like any other.
+
+    ``setup.py`` is parsed with ``ast`` and never executed, in this reading as in
+    :func:`pypi_build_requirements` (design C3). Two shapes are read, because both are
+    declarations written down statically:
+
+    * ``install_requires=['a>=1', 'b']`` — the string literals themselves.
+    * ``install_requires=open('requirements.txt').read().split('\\n')`` — measured on
+      ``fastparquet==0.4.0`` (``setup.py:50``), which is the shape that made this reading
+      necessary at all: the requirement list is *computed*, but the file it is computed
+      from is inside the same archive and is itself static data. The name is found with
+      :func:`_file_literals`, the same reader :func:`_entry_refs` uses to follow a
+      project's ``read_file('requirements.in')``, and the file's lines are parsed with
+      :func:`requirements_refs`.
+
+    ``None`` — never an empty tuple — when no reading reaches a declaration: no
+    ``setup.py``, one that does not parse, no ``install_requires`` keyword, a value
+    ``ast`` cannot resolve to literals or to a readable file, or a file name that is not
+    in this archive. "Nobody could read it" and "it declares nothing" are different
+    answers, and only one of them may be written into a pin list as nothing to honour.
+    ``archive_of`` is injected for the same reason :func:`sdist_metadata_texts`' callers
+    inject theirs: a reading that can only be tested by reaching PyPI is a reading nobody
+    tests.
+    """
+    data, _ = archive_of(file)
+    setup_py = _archive_texts(data, ("setup.py",)).get("setup.py")
+    if setup_py is None:
+        return None
+    try:
+        kwargs = _setup_kwargs(setup_py)
+    except BakeError:
+        return None
+    node = kwargs.get(SDIST_INSTALL_REQUIRES)
+    if node is None:
+        return None
+    named = _file_literals(node)
+    if named:
+        # ``_archive_texts`` keys by the member's own name under the archive root, so a
+        # declaration that spells the file with a path (``'etc/requirements.txt'``) is
+        # matched by its basename: the reader follows a *name the project wrote*, and
+        # where inside the archive it put that name is not the question.
+        wanted = tuple(sorted({name.rsplit("/", 1)[-1] for name in named}))
+        contents = _archive_texts(data, wanted)
+        out: list[str] = []
+        for name in named:
+            text = contents.get(name.rsplit("/", 1)[-1])
+            if text is None:
+                continue
+            refs, _ = requirements_refs(text, source=f"{file.filename} ({name})")
+            for ref in refs:
+                if ref.spec not in out:
+                    out.append(ref.spec)
+        return tuple(out) if out else None
+    literals = [
+        literal.value.strip()
+        for literal in _literal_nodes(node)
+        if literal.value.strip() and not literal.value.strip().startswith("#")
+    ]
+    return tuple(dict.fromkeys(literals)) if literals else None
 
 
 def pypi_build_requirements(
@@ -6267,6 +6837,7 @@ def metadata_conflicts(
     pins: Sequence[tuple[str, str]],
     *,
     own: Container[str],
+    python_minor: str,
     metadata_of: Callable[[str, str], tuple[tuple[str, ...], Optional[str]]],
 ) -> tuple[PinConflict, ...]:
     """Every conflict §3.2's cases can be read from the pins' own ``requires_dist``.
@@ -6276,6 +6847,15 @@ def metadata_conflicts(
     declares a requirement on a name this layer also pins, in a version that
     requirement excludes, is the conflict — no install needed, which is the point of
     doing it in the preflight.
+
+    A declaration is read when its marker holds in **this layer** (:func:`marker_applies`,
+    ``python_minor``), because that is the reading ``pip check`` takes and this check is
+    the preflight's stand-in for it: ``luigi/1``'s ``botocore==1.12.149`` declares
+    ``urllib3>=1.20,<1.25`` under ``python_version >= "3.4"``, which is true here, and
+    that clause against BugsInPy's own ``urllib3==1.25.9`` is the conflict ``pip check``
+    reported — skipping every marker is what kept this check from naming it before the
+    build. A marker that does *not* hold is skipped for the same reason pip skips it, so
+    ``python_version == "2.6"`` clauses and a conditional extra are not read as installs.
 
     ``metadata_of`` is injected so the check is a structural test, and it is also why a
     release nothing could be read for is *recorded* (:data:`CASE_UNKNOWN`) rather than
@@ -6309,7 +6889,7 @@ def metadata_conflicts(
                 requirement = Requirement(raw)
             except InvalidRequirement:
                 continue
-            if requirement.marker is not None:
+            if not marker_applies(requirement, python_minor=python_minor):
                 continue
             other = canonicalize_name(requirement.name)
             held = versions.get(other)
@@ -7412,6 +7992,7 @@ def preflight_layers(
                 conflicts=metadata_conflicts(
                     pins,
                     own=own_pin_names(layer.provenance),
+                    python_minor=minor,
                     metadata_of=metadata_of,
                 ),
                 narrowings=pin_narrowings(layer.provenance),
@@ -8677,6 +9258,7 @@ def resolve_deps(
         releases=releases,
         commit_date=sources.commit_date,
         harness_pins=harness_pins,
+        python_minor=python_minor or "",
         buggy_commit=sources.buggy_commit,
         metadata_of=metadata_of,
     )

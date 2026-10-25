@@ -615,7 +615,7 @@ archive, never executing it) for `libraries=`, `library_dirs`, a pkg-config / `f
 as the comment on the entry, so a reader argues with the evidence rather than with the verdict. The
 measures that review settled (`coverage`, `multidict`, `yarl`, `websockets`, `tornado`, `urwid`,
 `zope-interface`, `regex`, `sqlalchemy`, `psutil`, `ruamel-yaml-clib`, `httptools`, `ujson`, `brotli`,
-`zstandard`, `asyncpg`, `numpy`, `cython`, `distlib` → toolchain only; `pyyaml` → `libyaml-dev`;
+`zstandard`, `asyncpg`, `numpy`, `cython`, `distlib`, `thrift` → toolchain only; `pyyaml` → `libyaml-dev`;
 `peewee` → `libsqlite3-dev`; `matplotlib` → `libfreetype-dev` + `libpng-dev` + `zlib1g-dev` +
 `pkg-config`) are in the map itself, each with its evidence. The matplotlib entry is the case that shows
 the two readers are one design and not two lists: its four packages are already in
@@ -646,7 +646,9 @@ correction to this section's earlier reading of them as "a path that does not ex
 its attribution of `matplotlib/1`'s `numpy==1.18.5` `error: [Errno 2]` to the compiler *invocation*: that
 traceback is the VM's missing `/dev/shm` (the passage at the end of this section), not the compiler.
 `bake.COMPILER_ENV` still exports `distutils`' documented override in every layer whose minor has a
-toolchain (`bake.build_env_for`): `CC=gcc`, `CXX=g++`, and CPython's own Linux link lines
+toolchain (`bake.build_env_for`): `CC` and `CXX`, which name the two wrappers `bake.VANTA_CC_PATH` /
+`bake.VANTA_CXX_PATH` rather than a driver — the passages further down are the reason each of them is a
+file rather than a name — together with CPython's own Linux link lines
 `LDSHARED='gcc -pthread -shared'` / `LDCXXSHARED='g++ -pthread -shared'` — so the layer builds and links
 with the toolchain `SYSTEM_PACKAGES` installs rather than with whichever driver `cc` currently points at,
 and so the `CFLAGS` below reach the **link** line as well as the compile line (`customize_compiler`
@@ -672,22 +674,105 @@ to its `cflags` *and* to its link line — and never reads `CXXFLAGS` at all, so
 the way the compiler's error invites. `stdint.h` and not the `cstdint` the error names, because this
 variable reaches the **C** compiles too and `cstdint` is a C++-only header that is not on `gcc`'s C
 include path, so `-include cstdint` would turn every C file in the tree into
-`fatal error: cstdint: No such file or directory`. `stdint.h` is one name in both languages: the C
-standard header there, and under `g++` libstdc++'s `c_compatibility/stdint.h`, which declares
-`namespace std { using ::uint16_t; … }` for C++11 and later — what `pybind11==2.5.0`'s `attr.h` needs for
-its `std::uint16_t nargs;`.
+`fatal error: cstdint: No such file or directory`. **That flag does not supply the C++ name, and the bake that
+would have shown it was never run.** The paragraph above went on to say that under `g++` this is
+libstdc++'s `c_compatibility/stdint.h`, declaring `namespace std { using ::uint16_t; … }` for
+`pybind11==2.5.0`'s `std::uint16_t nargs;`. On this toolchain that is **false**: `stdint.h` is glibc's,
+the *C* standard header, with no `namespace std` block and no `__cplusplus`-guarded one, and C++'s
+`std::uint16_t` is declared by libstdc++'s `cstdint`, a *different* header that nothing on `attr.h`'s
+include chain reaches. Measured on `pandas/1`'s own dependency layer
+(`runs/bugsinpy/bake-logs/vanta-bi-pandas-1.log`): the `.cxx` compile line carried the flag —
 
-**How far this variable reaches a C++ compile is narrower than it first reads, and it is worth stating
-rather than assuming.** It reaches the `.cxx` compile of `pandas/1`'s `scipy` by one route: `numpy.distutils`
-keeps one flag list and swaps only the driver word, so the environment `CFLAGS` rides the command line that
-compiles `pypocketfft.cxx`, and that log shows it carrying the six. A plain `distutils`/`setuptools` C++
-`Extension` is a different path and does *not* see it: the stdlib implementation compiles C++ with
-`compiler_so` — the *C* line, whose flags came from the recorded cflags and which reads no `CXXFLAGS`
-either — and the modern `setuptools._distutils` fork seeds its C++ flags from the **recorded** `cflags`
-*before* it applies an environment `CFLAGS`, so only `CXXFLAGS` would move them. The repository's own
-`vanta_smoke_cpp.cpp` compile in the interpreter layer's log carries none of this variable for exactly that
-reason. The header is therefore carried for `numpy.distutils`' sake, which is the build system the one
-measured failure went through, and the general statement of the reach is left as what was measured.
+```
+  g++ -Wno-unused-result … -D_GNU_SOURCE -include stdint.h -fPIC -DPOCKETFFT_PTHREADS … \
+      -c scipy/fft/_pocketfft/pypocketfft.cxx
+```
+
+— and the compile died at the same place, `pybind11/attr.h:185`, on `std::uint16_t`, with the five
+consequences of it that follow. `_ERA_STDINT_INCLUDE` is therefore **retained in `CFLAGS` as it stands and
+is *not* the C++ fix**: it is inert for the C trees beside the failure (`stdint.h` *is* the C standard
+header, and the `-D_GNU_SOURCE` on the same line is what keeps its early arrival from costing `Dl_info`),
+and taking it out would change the C command line of every layer that already builds — a change this fix is
+not entitled to make. It is recorded here as outstanding residue rather than mistaken for the mechanism.
+
+**How far this variable reaches a C++ compile is narrower than it reads, and that is exactly why the fix
+had to leave it.** The measurement stands: the environment `CFLAGS` rides the command line that compiles
+`pypocketfft.cxx` only because `numpy.distutils` keeps one flag list and swaps only the driver word — that
+log shows the `.cxx` line reading `C compiler: g++ -Wno-unused-result … -fPIC`. A plain
+`distutils`/`setuptools` C++ `Extension` is a different path and does *not* see it: the stdlib
+implementation compiles C++ with `compiler_so` — the *C* line, whose flags came from the recorded cflags and
+which reads no `CXXFLAGS` either — and the modern `setuptools._distutils` fork seeds its C++ flags from the
+**recorded** `cflags` *before* it applies an environment `CFLAGS`, so only `CXXFLAGS` would move them. The
+repository's own `vanta_smoke_cpp.cpp` compile in the interpreter layer's log carries none of this variable
+for exactly that reason. Read together with the paragraph above, the conclusion is not "carry the header for
+`numpy.distutils`' sake" but the opposite: a **C++-only** flag has no environment variable that delivers it
+— an environment `CFLAGS` would reach the C files too, and `CXXFLAGS` is read by nothing — so the one
+position that is only ever a C++ compile is the driver word itself.
+
+**A C++-only flag is delivered by the driver word, and each driver word is a file its layer writes
+itself.** `bake.VANTA_CXX_PATH` is `/opt/vanta-cxx`, and `bake.COMPILER_ENV["CXX"]` names it instead of
+`g++`; the wrapper it names (`bake.VANTA_CXX_SOURCE`) scans its arguments and, for a C++ source
+(`.cc`/`.cpp`/`.cxx`/`.c++`/`.C`/`.CC`/`.CPP`/`.CXX`), runs `exec g++ -include cstdint "$@"`, and otherwise
+`exec g++ "$@"` — so a C compile sees the flag nowhere and a C++ compile sees it *first on the line*, before
+`attr.h`. Anything that is not a compile passes through unchanged (`g++ --version`, which `distutils`
+probes), and `bake.LDCXXSHARED` stays `g++ -pthread -shared` because the link step is not a compile and has
+no pre-include to give. The file is **written by each layer's own recipe** (`bake.build_env_lines`, between
+the `export`s and its assert) and not exported from a parent, for the reason `bake._ERA_GNU_SOURCE` records:
+a checkpoint is a filesystem and an `export` does not survive into a layer baked `--from` another, so a
+wrapper `export`ed by the interpreter layer would be a dangling path in every dependency layer. The recipe
+`chmod +x`es it and then asserts it is executable, so a layer that failed to write it fails at bake time
+rather than silently compiling C++ without the header it needs. It is one of **two** such files: a single
+helper writes them (`bake._wrapper_lines`), once per driver word that is a path, each guarded on its own
+variable and with the heredoc delimiter derived from that variable's name (`VANTA_CXX_WRAPPER`,
+`VANTA_CC_WRAPPER`) — so neither can be written with the other's delimiter and a mapping that names one of
+the two writes one file, not two.
+
+**The second driver word carries the one flag the first cannot reach, because the extension that needs it
+declares no C++ language at all.** `pandas/1`'s next failure after scipy is matplotlib 3.2.1's
+`src/ft2font.cpp` against the base image's **FreeType 2.13.3**. Measured in
+`runs/bugsinpy/bake-logs/vanta-bi-pandas-1.log`, the compile ended
+
+```
+  src/ft2font.cpp:230:29: error: invalid conversion from 'unsigned char*' to 'char*' [-fpermissive]
+  src/ft2font.cpp:346:29: error: invalid conversion from 'unsigned char*' to 'char*' [-fpermissive]
+  error: command 'gcc' failed with exit status 1
+  ERROR: Failed building wheel for matplotlib
+```
+
+and the `gcc` that word names is the point: the failing command is a `gcc … -c src/ft2font.cpp`, not a
+`g++`. `setupext.FT2Font().get_extension()` builds `Extension('matplotlib.ft2font', sources)` with no
+`language='c++'` anywhere in `setupext.py`, so `distutils` never consults `CXX` for it and runs
+`compiler_so` — `CC` plus `CCSHARED` — instead; `bake.VANTA_CXX_SOURCE` is therefore on the wrong word for
+this file, whatever flag it carries. The diagnostic is the era mismatch again, one layer out: FreeType
+changed the field's signedness in 2.13.3 (`ftimage.h:353` reads `unsigned char* tags;` here, and the
+release's own `CHANGES` entry says the `FT_Outline` fields moved from signed to unsigned), while the 2020
+source declares its own view of that struct as `char *tags;` (`ft2font.cpp:208`, `:326`) and fills it from
+the outline (`tags = outline.tags + first;`, `:230`, `:346`). **The flag is `-fpermissive`, and it is the
+only spelling that exists**: GCC prints its own remedy in the brackets, and `-Wno-error=permissive` is not a
+member of the `-W` family at all — measured on this layer, `cc1plus: error: '-Wno-error=permissive': no
+option '-Wpermissive'; did you mean '-fpermissive'?` — while the `incompatible-pointer-types` demotion of
+`_ERA_WARNING_FLAGS` is a *C* diagnostic and this is a C++ frontend error in every standard. So
+`bake.VANTA_CC_PATH` is `/opt/vanta-cc` and `bake.COMPILER_ENV["CC"]` names it instead of `gcc`, with
+`bake.VANTA_CC_SOURCE` the same argument scan over the same list, running `exec gcc -fpermissive "$@"` for a
+C++ translation unit and `exec gcc "$@"` otherwise.
+
+**The evidence for that position is four measurements, and three of them are rejections.** On the layer
+(`runs/bugsinpy/probe-v3.log`): **A**, the control, is `CC=gcc` with today's `CFLAGS` and reproduces the two
+errors above verbatim; **B**, `-fpermissive` appended to the environment `CFLAGS` with a pure logging
+passthrough on `CC`, *does* put the flag on the `ft2font.cpp` argv — the flag works, and the objection is
+the position, because `customize_compiler` appends that variable to `ldshared` and it reaches every *C*
+compile in the layer beside this one; **C**, a pure C compile carrying `-fpermissive`, prints only FreeType's
+own `#pragma message: Compiling with FreeType version 2.13.3.` and exits `rc=0` — inert on C, which is what
+makes the scan the difference between the flag and the flag on the right file; and **D**, this wrapper on
+`CC`, carries `-fpermissive` on all **four** C++ translation units of that extension and on **none** of the
+argv that compiled the extension's one C source, `src/checkdep_freetype2.c` (`FT2Font`'s five sources are
+four `cxx` and one `c`, and every one of them is compiled by this one word — which is why the scan and not
+the word does the scoping). The same shape is asserted at unit level rather than only measured once:
+`scripts/test_bugsinpy.py` executes the wrapper against a stub `gcc` and asserts the flag for
+`src/ft2font.cpp` and its absence for `src/checkdep_freetype2.c` and for `--version`. The wrapper is not
+covered by the interpreter layer's smoke check, because the file it would need is a C++ source compiled by
+the *C* word — a `.cpp` in an `Extension` with no `language='c++'` — and the smoke's C++ extension is
+deliberately the other case.
 
 **The header costs a glibc feature-test macro, and the macro is a member of the same variable.** Measured
 on the bake that carried `-include stdint.h` and nothing else: `matplotlib/1`, `pandas/1` **and** `sanic/1`
@@ -705,17 +790,31 @@ translation unit's *first line*, so glibc's `<stdint.h>` reaches `<bits/libc-hea
 unknown *type* a hard error while the `dladdr` call is only an implicit-declaration warning. The answer is
 `bake._ERA_GNU_SOURCE`, which is `('-D_GNU_SOURCE',)` and sits in the same `CFLAGS` string immediately
 before the include: GCC applies every command-line `-D` and `-U` before it reads any input, `-include`
-files included, so the feature-test macro is in force when the pre-included header arrives. The two are one
-decision and one variable — the header restores `std::uint16_t` for `scipy`'s `.cxx` sources and the macro
-restores `Dl_info` for the C trees beside them, and dropping either is a measured failure.
+files included, so the feature-test macro is in force when the pre-included header arrives. The macro is not
+optional even though the header it protects turns out not to be the C++ fix (above): the header is retained
+on every C command line, and *its* early arrival is what costs the macro, so dropping the macro and keeping
+the header is a measured failure in `matplotlib/1`, `pandas/1` and `sanic/1` alike.
 
-The interpreter layer's smoke check covers the C half of the variable and the two compilers, and it no
-longer claims the half it cannot establish. One C file compiles one of the six demotions (a `double *`
+The interpreter layer's smoke check covers the C half of the variable, the two compilers, **and the C++
+header's new route**. One C file compiles one of the six demotions (a `double *`
 assigned to an `int *`), which is the receipt that an environment `CFLAGS` reached `distutils` at all; one
 C++ file *builds and imports*, which is the receipt that `CXX` names a compiler able to build a Python C++
-extension — the `matplotlib`/`pandas` shape. What it deliberately does **not** check is the C++ reach of
-`CFLAGS`, because a plain C++ `Extension` on that layer cannot see it (above) and an earlier version of the
-C++ file that left `std::uint16_t` to `-include stdint.h` therefore failed every layer forever. Each smoke
+extension — the `matplotlib`/`pandas` shape. The C++ source deliberately does **not** `#include <cstdint>`
+and does use `std::uint16_t`, so its compiling is the receipt that the header arrived from the driver word
+and not from the file — the version of it that included `<cstdint>` itself proved nothing about the wrapper,
+and the version before that left the name to `-include stdint.h` and was red on every layer forever.
+
+Which *build* compiles that file is what makes it a receipt for one wrapper and not the other. The smoke
+runs `python setup.py build_ext` in the interpreter layer, whose setuptools is `uv venv --seed`'s (75.3.4) —
+the `setuptools._distutils` fork, whose `unixccompiler._compile` chooses its word per source
+(`if self.detect_language(src) == 'c++'` → `compiler_so_cxx`, read in the released wheel) and whose
+`customize_compiler` builds that word from the environment's `CXX`. The 2020 trees are built by the pins
+their own layers install (`setuptools==46.4.0`), which have no `setuptools._distutils` at all: on Python 3.8
+that is the *stdlib* `distutils`, whose `_compile` sends **every** source through `compiler_so` — the `CC`
+word — whatever its extension, which is why the measured `ft2font.cpp` line begins `gcc`. So the smoke
+measures `bake.VANTA_CXX_PATH` and cannot measure `bake.VANTA_CC_PATH`: the position the second wrapper
+fills is a `.cpp` that only the stdlib driver reads. What the smoke does **not** claim is the C++ reach of
+`CFLAGS`, which no C++ compile has (above). Each smoke
 step is its own shell statement rather than an `&&` chain, which is load-bearing rather than style: measured,
 an AND-OR list swallows the failure of every member but its last under `set -e`
 (`sh -c 'set -eux; false && true; echo CONTINUED'` prints `CONTINUED` and exits 0), so the first version's
@@ -912,13 +1011,45 @@ therefore tries, in order:
    `httpcore 0.3.0`, which is sdist-only;
 3. the **wheel's own `METADATA` member** (`*.dist-info/METADATA`), downloaded and read as a zip, for a
    release whose sidecar is not published but whose wheel is;
+4. the **sdist's own `install_requires`**, read from inside the archive without executing any of it, for
+   a release that publishes no wheel and no sidecar at all — the `ast`-only `_setup_kwargs` reader of
+   `setup.py` follows `install_requires=['a>=1','b']` literals, and follows `install_requires` written as
+   a **file read** — `open('requirements.txt').read().split('\n')` — by opening the file it names and
+   parsing its `requirements_refs`. Measured, and the reason the reading exists: `fastparquet==0.4.0`'s
+   `setup.py:50` is `install_requires = open('requirements.txt').read().strip().split('\n')`, and the
+   `requirements.txt` inside its sdist is `pandas>=0.19`, `numba>=0.28`, `numpy>=1.11`,
+   `thrift>=0.11.0`, `six`. Nothing in the JSON, sidecar or wheel had said so, so `thrift` was not a pin
+   this layer's date rule narrowed; pip resolved it against PyPI at install time, took the newest
+   `thrift` (`0.25.0`), and its `setup.py` opened with `from setuptools.errors import ...`, which the
+   layer's pinned `setuptools==46.4.0` does not carry — `ImportError: cannot import name 'CompileError'
+   from 'setuptools.errors'`, the measured failure this reading turns into a date-rule pin
+   (`thrift==0.13.0`, newest ≤ `2020-05-21`). It is a *declaration* being read, not code being run: the
+   two are not interchangeable, and `_file_literals` filters to names with a `.` in the last path
+   segment, so a name that is not a file inside the same archive is followed nowhere;
 
-and a pin that reaches none of the three is **unknown**, not empty. `setup.py` is deliberately **not**
-executed to find out: reading a pin's declarations must not mean running the pin's code. The two steps
-are not interchangeable, and the measurement that says so is `pytest-json-report`: every release has
+and a pin that reaches none of the **four** is **unknown**, not empty. `setup.py` is deliberately **not**
+executed to find out: reading a pin's declarations must not mean running the pin's code. The first three
+steps are not interchangeable, and the measurement that says so is `pytest-json-report`: every release has
 `requires_dist: null` in its JSON *and* a wheel with a sidecar, and 0.1/0.2's sidecar declares **no**
 `Requires-Dist` at all while 0.3+ declares `pytest>=3.3.2` — so the chain is what proves `httpie/1`'s
-plugin stays at `0.2`, and a reader that stopped at the null would have had to guess.
+plugin stays at `0.2`, and a reader that stopped at the null would have had to guess. The fourth step is
+held to the same rule — a computed `install_requires` whose file the archive does not carry, or whose read
+raises, answers `None` and stays unknown; it never answers `()` — and it is behind `install_requires_of`,
+an injection point named apart from `preflight_pin`'s existing `sdist_of` (which is `sdist_file_list`), so
+a caller can see which of the two archive readings it is passing.
+
+**The fourth reading widened `pandas/1`'s system-package review by one entry.** `thrift==0.13.0` is now a
+date-rule pin of that layer and an unreviewed sdist build would be a `gap`, so
+`bake.SDIST_SYSTEM_PACKAGES` gained `"thrift": ()` — an **empty** tuple, the same shape as the
+pure-Python entries: `thrift-0.13.0.tar.gz` builds `Extension('thrift.protocol.fastbinary',
+sources=['src/ext/{module,types,binary,compact}.cpp'], include_dirs=['src'])`, and the measured reads say
+those four `.cpp` files and every header they include (`ext/{types,binary,compact,protocol}.h`,
+`ext/endian.h`, `ext/protocol.tcc`) are **in the sdist** and `include_dirs=['src']` names the archive
+itself, so the only includes are those, `<Python.h>`, `<limits>` and `<stdint.h>` — there is no
+`libraries=`, `library_dirs=`, `pkg-config` or `ctypes.util` call at all. It is an empty tuple and not a
+package list because the build needs no system package; and it does not break the pure-Python fallback
+either — `setup.py`'s `except BuildFailed: run_setup(False)` installs the extension's Python shim alone if
+the compile fails, so the extension is an optimisation for this layer, not a requirement.
 
 **Unknowns are listed by name and do not block the bake; the layer's own `pip check` is what covers
 them.** A pin nothing could be read for is recorded as `bake.CASE_UNKNOWN` and printed under its own
@@ -975,21 +1106,25 @@ happen rather than a conflict.
 `runs/bugsinpy/deps/` now carries the `conflicts` and `narrowings` keys as well as the classification —
 and every number below is that file's own `counts`:
 
-- **`luigi/1` — `ready to bake`.** 195 pins (147 wheel / 48 sdist-only), 0 unavailable, 0 gap, 0
-  unbuildable, 6 early. 195 is its 191 `installs` plus the four toolchain build pins (`pip`, `setuptools`,
-  `wheel`, `cython`), none of which it also installs — the table is the union of the two sets, and here
-  it happens to add up without an overlap. 4 pins are dropped, each with the audit that settled it: `pywin32==227` and
+- **`luigi/1` — `ready to bake`.** 198 pins (151 wheel / 47 sdist-only), 0 unavailable, 0 gap, 0
+  unbuildable, 8 early. 198 is its 192 `installs` plus its six build pins (`pip`, `setuptools`, `wheel`,
+  `cython`, `pytest-runner`, `setuptools-scm`), none of which it also installs — the table is the union of
+  the two sets, and here it happens to add up without an overlap. 4 pins are dropped, each with the audit that settled it: `pywin32==227` and
   `requests-async==0.5.0`, which nothing pip can install on this image, and `cryptography==2.8`/`==2.9.2`,
   the unbuildable pair, which reach the list through §3.2's one rule for a pin nothing can install —
   every one of them with "nothing in either tree imports it" as its audit. One conflict, **case (b)**:
   `beautifulsoup4==4.9.1` declares `soupsieve<2.0` against `soupsieve==2.0.1`, and both sides are
   BugsInPy's own exact pins — this layer has 154 of them — so it prints as `TOLERATED` and does not enter
-  the verdict. Its other 27 readings are case (`?`) (`blinker==1.4`, `distlib==0.3.0`, `httpcore==0.3.0`,
-  ...), which is a fetch that did not happen rather than a conflict. One pin is **narrowed**: the date
-  rule takes `moto==1.3.7`, because `moto==1.3.8` declares `idna (<2.9,>=2.5)` against the same layer's
-  own `idna==2.9` (§3.2's second direction). Its `httpcore==0.3.0` sits next to `h11==0.8.1` and is
-  consistent — the same `httpcore` pin as `sanic/1` against a *different* `h11`, which is why the two
-  layers' readings are compared rather than assumed to agree.
+  the verdict. Its other 26 readings are case (`?`) (`blinker==1.4`, `distlib==0.3.0`, `httpcore==0.3.0`,
+  ...), which is a fetch that did not happen rather than a conflict. **Six pins are narrowed**, 19 readings
+  in all, and both of §3.2's directions are among them: three build pins are narrowed *by* the layer's own
+  pins (`setuptools==42.0.0` by eleven of them, `cython==0.29.14` by `numpy==1.18.4`,
+  `setuptools-scm==3.4.1` by three), and three dependency pins are the **refusal triple** — the record
+  names the release each moved off and the pin that refused it: `botocore==1.12.149` (refused by
+  `urllib3==1.25.9`), `boto3==1.9.149` (refused by `botocore==1.10.84`) and *both* `moto==1.3.8` and
+  `moto==1.3.7` (refused by `boto3==1.7.84` and `botocore==1.10.84`). Its `httpcore==0.3.0` sits next to
+  `h11==0.8.1` and is consistent — the same `httpcore` pin as `sanic/1` against a *different* `h11`, which
+  is why the two layers' readings are compared rather than assumed to agree.
 - **`matplotlib/1` — `ready to bake`.** 33 pins (31 wheel / 2 sdist-only), 0 unavailable, 0 gap, 0
   unbuildable, 0 dropped, **0 conflicts**, 0 narrowings, 3 early. 33 is its 30 `installs` plus its five
   build pins (`pip`, `setuptools`, `wheel`, `cython`, `numpy`), two of which — `cython` and `numpy` — it
@@ -1007,8 +1142,8 @@ and every number below is that file's own `counts`:
 - `pip==21.3.1` — the capability pin, a `py3-none-any` wheel — is in `build_pins` for **both** layers, and
   is the pin that answers `multidict==4.7.6`'s `pip>=18` build requirement on `luigi/1`; it needs no
   release dates, because §3.2 pins it by capability and never reads its listing.
-- The unknowns are the caveat rather than a finding: PyPI's `requires_dist` is `null` for 27 of
-  `luigi/1`'s 195 pins and for **none** of `matplotlib/1`'s 33, and the chain resolves a null pin whenever
+- The unknowns are the caveat rather than a finding: PyPI's `requires_dist` is `null` for 26 of
+  `luigi/1`'s 198 pins and for **none** of `matplotlib/1`'s 33, and the chain resolves a null pin whenever
   its release publishes a sidecar or a wheel — so what stays unknown is the sdist-only half of the first,
   measured shape `httpcore==0.3.0` (also `wrapt==1.11.1`, `sqlalchemy==1.3.3`, `avro==1.8.2`, ...). They
   are printed by name under `UNKNOWN` and do not change the verdict.
@@ -1165,7 +1300,7 @@ by `bake.drop_unresolvable_deps`, and that function is called **twice**: once in
 over the layer's *declared* pins, and once by `resolve_bug_deps` over the pins the **closure walk**
 picked, which do not exist until `resolve_deps` has already returned. That second call is the whole
 of the fix, because it is the half the rule was measured on and the half it was missing: `luigi/1` and
-`sanic/1` both install `cryptography==2.8` because `moto==1.3.7`, `pyopenssl==19.1.0` and
+`sanic/1` both install `cryptography==2.8` because `moto==1.3.6`, `pyopenssl==19.1.0` and
 `service-identity==18.1.0` declare it, `bake.UNBUILDABLE_ON_PLATFORM` reviews exactly that release as
 impossible on this image, and each layer's *own* `cryptography` pin (2.9.2) **was** dropped for that
 reason — while the transitive 2.8 went into the layer. A pick nothing here can install is the same
@@ -1208,6 +1343,17 @@ change: `vanta-bugsinpy-py3.8` was baked before it, and every bug layer stacks o
 stale (step 2) and rebuilds none of them, which is a run that ends with no usable layer at all.
 `bake.requirements_recipe` is the per-bug layers', so §3.2's `--no-deps` pass and the autoload-disabled
 `pytest --version` require `--force` for every `vanta-bi-<project>-<N>`.
+
+Two edits of the current wave land in the interpreter half for the same reason and with the same cost.
+`COMPILER_ENV["CC"]` now names `bake.VANTA_CC_PATH` instead of `gcc` (§3.2, the FreeType 2.13.3 conversion
+on matplotlib's `ft2font.cpp`) and `build_env_lines` writes a second wrapper file beside the first, so both
+the exported `CC` line and the recipe tail below it change; `COMPILER_ENV["FFLAGS"]` was added to the same
+mapping a commit earlier, which is the same kind of change. The wave's third edit to that region does not:
+`SDIST_SYSTEM_PACKAGES["thrift"] = ()` adds an **empty** tuple, so `_system_packages_for_py38()` is
+byte-identical and the interpreter recipe with it. The next bake is therefore `--force` for every layer in
+the wave — the interpreter layer and each per-bug layer, whether or not that layer has a checkpoint already
+— because every per-bug layer is `--from` a base whose recipe has moved, and a layer left in place would be
+one whose build log no longer describes its base.
 
 **One failed per-bug layer does not stop the others; a failed interpreter layer stops everything above
 it.** The per-bug layers are independent by construction — each is baked `--from` the interpreter layer
@@ -1558,22 +1704,55 @@ interpreter layer's pair (`bake._settled_versions`: `bake.reference_pin`'s exact
 is declared in `luigi/1` as a bare name, so nothing narrows *its* version and the date rule takes
 `1.3.8` (2019-04-23, the newest on or before the 2019-05-15 commit) — but `1.3.8` declares
 `idna (<2.9,>=2.5)` while the same layer installs BugsInPy's own `idna==2.9` as written, so the layer
-that gets built is a contradiction its own `pip check` reports as case (a) and the gate refuses. Neither
-version can move, so the **choice** does: the answer is the newest release on or before the date that the
-layer's own pins can hold — `moto==1.3.7` (2018-11-04), which declares nothing about `idna` — and
-`ResolvedDep.refused` carries `(rejected, held, declared)`, here `moto==1.3.8` / `idna==2.9` /
-`idna<2.9,>=2.5`, so the record names both the release that was passed over and the pin that refused it.
+that gets built is a contradiction its own `pip check` would report as case (a) and the gate would refuse.
+Neither version can move, so the **choice** does: the answer is the newest release on or before the date
+that the layer's own pins can hold. `ResolvedDep.refused` carries `(rejected, held, declared)`, so the
+record names both the release that was passed over and the pin that refused it.
 `ResolvedDep.pin_rule` renders both directions in one sentence, and `bake.preflight_lines` prints every
 moved pin under its own `NARROWED` heading **before** the build — `bake.pin_narrowings` reads it off the
 provenance's own `narrowed_by`/`refused`, so the record and the printout cannot disagree. That block is
 not a finding and counts in no verdict: a pin that was moved is a decision already taken, and it is
 printed because a pin which is *not* simply "the newest release on or before the date" is the one thing
-the pin list cannot show (`moto==1.3.7` beside `idna==2.9` looks arbitrary until the reason is next to
-it). Two boundaries on the walk, both inherited from the direction above: a candidate whose declarations
-cannot be read is **taken**, not refused — an unreadable release is not evidence of a conflict, and the
-layer's own `pip check` is the backstop — and a name for which *every* dated candidate is refused is a
-`BakeError`, because that is a decision for the split rather than something to install and discover.
-Conflicts between two of BugsInPy's own exact pins are untouched by any of this and stay case (b).
+the pin list cannot show (`botocore==1.10.84` beside `urllib3==1.25.9` looks arbitrary until the reason is
+next to it). Two boundaries on the walk, both inherited from the direction above: a candidate whose
+declarations cannot be read is **taken**, not refused — an unreadable release is not evidence of a
+conflict, and the layer's own `pip check` is the backstop — and a name for which *every* dated candidate is
+refused is a `BakeError`, because that is a decision for the split rather than something to install and
+discover. Conflicts between two of BugsInPy's own exact pins are untouched by any of this and stay case
+(b).
+
+**A refusal can name *another pick of this same pass*, so the pass is a fixpoint and not one walk — and the
+clause it is read from is read only when its marker holds here.** Both halves are `luigi/1`, and the second
+is what the three declaration readers below now do. Every `botocore` release that bounds `urllib3` at all
+carries the bound under a `python_version` marker: `1.12.149` (2019-03-20) declares
+`urllib3>=1.20,<1.25; python_version >= "3.4"`, which holds in every layer this harness bakes, against
+BugsInPy's own `urllib3==1.25.9` (line 144 of this bug's `requirements.txt`). That pin **cannot move** — a
+reference pin is installed as written, and it wins over everything the date rule would pick — so
+`urllib3==1.24.3`, which *does* satisfy the bound, is not installable here either: the resolver gives, not
+the benchmark's pin. Read as the install pip will make, `1.12.149` is refused and `botocore` falls to
+**`1.10.84`** (2018-08-23), the newest release that declares no `urllib3` bound at all. That is not the end,
+because the refusal it produces names this layer's *own* pick rather than a BugsInPy pin: `boto3`'s newest
+dated release, `1.9.149`, declares `botocore>=1.12.149,<1.13.0`, which refuses the `botocore==1.10.84` the
+same pass just chose, so `boto3` falls to **`1.7.84`** (2018-08-23, declaring `botocore>=1.10.84,<1.11.0`);
+and `moto`'s `1.3.7` declares `botocore>=1.12.13`, so `moto` falls to **`1.3.6`** (2018-09-22), whose own
+`boto3 (<1.8,>=1.6.16)` and `botocore (<1.11,>=1.9.16)` the answers above satisfy. Three picks, one answer,
+and it is not the answer of any single pass: the claims name each other's picks, so whichever ref is read
+first gets the wrong last word. `bake.resolve_pins` is therefore the **fixpoint** of `bake._pin_each_ref` —
+the pass is repeated with its own non-harness picks folded into the `settled` set, `settled` *replaced*
+each round rather than accumulated, so a name whose pick moved is held at the release it moved to and not at
+both. Only the **last** round's records are returned, because its `refused`/`narrowed_by` describe the
+version the layer actually installs and an intermediate round's would name a rejection the final answer no
+longer stands on. This is the same shape `bake.transitive_pins`' re-choose queue already has, and the answer
+does not depend on the order the refs were read in. A round whose picks the pass has returned before is a
+**cycle** and raises a `BakeError` naming the names that move between rounds, rather than a choice for the
+date rule to make: §3.2's case (a) has no reading for a layer whose own pins cannot agree, and installing
+the contradiction is exactly what that layer's `pip check` would then report. **The refusal record is
+bounded at one entry per pin held against** (`refused.setdefault(held, …)`, not `append`), and the
+newest-first walk makes the kept entry the *newest* release that pin refuses: without that bound a single
+pass over `luigi/1` produces 160 distinct refusals for `boto3` alone and `ResolvedDep.pin_rule` becomes a
+160-clause sentence, where the same fact about the layer — "this pin cannot hold that release" — would be
+repeated once per release. The bound keeps `pin_rule`'s one-sentence rendering, `bake.pin_narrowings` and
+`bake._narrowing_section` readable, and `ResolvedDep.as_dict`'s shape unchanged.
 
 **A conflict is tolerated only when the layer's own `pip check` says so.** The preflight *predicts* from
 the pins' declarations; `pip check` is what reads what actually got installed, and the layer's reading is
@@ -1685,10 +1864,29 @@ is a measurement rather than a hope: on `packaging 26.3`, `Requirement('foo; pyt
 raises `InvalidRequirement` at *parse*, so `bake._requirement` raises and the ref is kept as
 unparseable instead of being read as a conditional that does not hold.
 
-The rule is applied **once, to the collected refs**, and not per reader — which is why nothing had to
-be threaded through the parsers: `bake.DepRef.spec` is the requirement verbatim and still carries its
-marker. `bake.marker_skips(refs, *, python_minor)` returns the refs to keep and a `bake.SkippedLine`
-for each one dropped, and it is called where the refs come together: twice in `bake.bug_sources` (the
+**Three readers of a *release's* declarations skipped the marker instead, and that is what `luigi/1`
+measured.** `bake._chosen_release` (does one of the layer's settled pins refuse this candidate?),
+`bake._narrowing_requirements` (does a pin in this layer narrow a name the date rule is choosing?) and
+`bake.metadata_conflicts` (does this release contradict another pin of the layer?) each read a release's
+`requires_dist`, and each used to `continue` on `requirement.marker is not None` — on the reasoning that a
+conditional requirement is not something to move a settled pin's, or to refuse a layer's, on, the
+conservative direction being to leave it unread and let the layer's own `pip check` report it. The question
+those three are asking is what pip will put in the environment, and there a marker *is* the question, because
+pip skips what does not apply: a clause is read as an install only when it holds here. Measured, the
+omission cost `luigi/1` its whole layer — every `botocore` release that bounds `urllib3` carries the bound
+under a `python_version` marker (`1.12.149`'s is `python_version >= "3.4"`, true in every layer this harness
+bakes), so all three readers were blind to the `urllib3<1.25` against BugsInPy's own `urllib3==1.25.9`, and
+the bake reached `pip check` with the contradiction the preflight had not predicted. All three now call
+`marker_applies` with the layer's minor and read only the clauses that hold. The mirror check that this is
+narrow: `pandas/1`'s early pass once named `scikit-learn==0.23.1`'s build dependency
+`numpy==1.13.3; python_version == "3.6"`, which is false for every layer this harness bakes — a reader that
+read it as an install would pin a name the build never asks for.
+
+The **collected refs** are filtered once as well, and that is a third place rather than the same one: it
+happens before any pin is chosen, over the refs themselves instead of over a release's metadata, and nothing
+had to be threaded through the parsers for it because `bake.DepRef.spec` is the requirement verbatim and
+still carries its marker. `bake.marker_skips(refs, *, python_minor)` returns the refs to keep and a `bake.SkippedLine` for each one
+dropped, and it is called where the refs come together: twice in `bake.bug_sources` (the
 deps refs and the build refs, covering `install_requires`, `requires_dist`, `setup_requires` and
 `[build-system].requires` alike) and once per pinned release inside `bake.early_install_pins`. `extra`
 is empty by default — `requires_dist`'s `; extra == "test"` entries and the whole `extras_require`
@@ -1704,7 +1902,7 @@ a `SkippedLine(source, line, text, reason)`, its `reason` naming the marker that
 `--preflight-only` run *is* the measurement and has to leave it somewhere the reader can check rather
 than on the terminal, which is for the findings a reader has to decide on.
 
-Measured across the six layers, **one bug changes and nothing else does**. `pandas/1`'s two
+Measured across the six layers, this pre-pass costs **one bug's `skipped` list and nothing else**. `pandas/1`'s two
 sdist-only pins whose build wants `numpy` — `scipy==1.4.1` and `scikit-learn==0.23.1` — each write a
 family of `numpy` clauses into their `build-system.requires`, selected by `python_version` and
 `platform_system` (and, for `scikit-learn`, also by `platform_python_implementation`), and exactly one
@@ -1713,9 +1911,10 @@ platform_system!='AIX'`. The other **thirteen** are dropped and recorded; the tw
 used to name a false clause now name the one that holds — `scipy==1.4.1` used to print its
 `python_version=='3.5'` clause and now prints the `>= '3.8'` one, and `scikit-learn==0.23.1` its
 `'3.6' and platform_python_implementation == 'CPython'` one, likewise. The clause **count** does not
-move — `pandas/1` still installs `numpy==1.18.4` early and still counts `18 early` — and every other
-layer's preflight line is byte-identical, with the other five recording an empty `skipped` list, so the
-verdict stays `ready to bake` with no bug flagged. On disk the reading is one key:
+move — `pandas/1` still installs `numpy==1.18.4` early and still counts `18 early` — and the other five
+layers record an empty `skipped` list, so this change alone leaves the verdict `ready to bake` with no bug
+flagged. (The `skipped` list is what this pre-pass moves; the *pins* the three release-readers move are
+`luigi/1`'s, measured above.) On disk the reading is one key:
 `runs/bugsinpy/deps/vanta-bi-pandas-1.preflight.json` carries `"skipped": [ … thirteen entries … ]`,
 each naming the clause verbatim and the marker that dropped it — and nothing about them reaches the
 terminal, which is the point of recording a measurement a reader can check rather than a line they have
@@ -1863,7 +2062,7 @@ layer — direct, transitive, build or early — requires. With the `--no-deps` 
 `typing-extensions` is no longer special: nothing in that layer's pin list requires it (its `pytest==5.2.1`
 era requires none of it), so it is an orphan and it goes, and the `pip check` line it used to appear in is
 now the dropped `cryptography` itself. The same revert is why `luigi/1` — which pins `pyopenssl==19.1.0`
-and `moto==1.3.7` too, and drops the same `cryptography` — loses `cryptography` from its freeze without
+and `moto==1.3.6` too, and drops the same `cryptography` — loses `cryptography` from its freeze without
 losing the `typing-extensions==3.7.4.2` its own pin list does name.
 
 **Every distribution the layer ends up holding has to be one its pin list names or the interpreter layer
@@ -2105,10 +2304,11 @@ list rather than a missing key.
 **A *dependency's* build requirement is read from that dependency's sdist, never from its metadata.**
 `bake.build_refs` reads the declarations in the **bug's own tree**, which is the right answer for the
 project's own `setup.py`/`pyproject.toml`. A dependency makes the same declaration in its own source
-release, and none of the three places the pin metadata is read from carries it: measured on
-`cryptography==2.9.2`, `info.requires_dist`, the PEP 658 sidecar and the wheel's `dist-info/METADATA`
-each answer with *runtime* requirements only, and its `cffi` build requirement lives solely in the
-sdist's `pyproject.toml`. `bake.pypi_build_requirements` therefore opens the release's sdist — the same
+release, and none of the four places the pin metadata is read from carries it: measured on
+`cryptography==2.9.2`, `info.requires_dist`, the PEP 658 sidecar, the wheel's `dist-info/METADATA` and the
+sdist's own `install_requires` each answer with *runtime* requirements only, and its `cffi` build
+requirement lives solely in the sdist's `pyproject.toml`. `bake.pypi_build_requirements` therefore opens
+the release's sdist — the same
 cached archive `bake.sdist_file_list` already reads, capped and streamed — and reads its **top-level**
 `<name>-<version>/pyproject.toml` and `.../setup.py` (`bake._archive_texts` over
 `SDIST_METADATA_MEMBERS`, tar then zip, and nothing the release vendored under a subdirectory), through
@@ -2485,9 +2685,12 @@ layer was saved and reported `[done]` with a broken toolchain inside it. The sam
 compiled anyway: it left `std::uint16_t` to `-include stdint.h`, and a plain `distutils`/`setuptools` C++
 `Extension` on that layer seeds its C++ flags from the **recorded** `cflags` and never reads the environment
 `CFLAGS` (§3.2), so the check was red on every layer by construction. Each step is now its own statement
-(de-chaining both `&&` groups) and the C++ file includes `<cstdint>` and is a **build-and-import** check of
-`CXX` and nothing more. `bake._TOOLCHAIN_SMOKE_CPP_SOURCE`'s comment and the §3.2 smoke paragraph state what
-it deliberately does not check.
+(de-chaining both `&&` groups), and the C++ file has since been brought back to what it should have been: it
+uses `std::uint16_t` and does **not** include `<cstdint>` itself, so a successful build-and-import is the
+receipt that the header arrived from the driver word (`bake.VANTA_CXX_PATH`, §3.2) and not from the file —
+the version that included `<cstdint>` proved nothing about the wrapper.
+`bake._TOOLCHAIN_SMOKE_CPP_SOURCE`'s comment and the §3.2 smoke paragraph state what it checks and what it
+deliberately does not.
 
 **`luigi/1`'s error had moved, and the fix is a reviewed mapping — `mysql.connector`.** With the toolchain
 fixed and de-chained, `luigi/1` no longer died on `ImportError: cannot import name 'sic'` (the build pins are

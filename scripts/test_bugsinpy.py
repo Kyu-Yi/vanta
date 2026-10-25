@@ -27,6 +27,7 @@ import ast
 import inspect
 import io
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -3563,9 +3564,22 @@ class TestBake:
 
     ERA_GNU_SOURCE = ("-D_GNU_SOURCE",)
 
+    # What ``CXX`` names: a path, not a driver, because the one C++-only flag has no
+    # other scoped position — ``CFLAGS`` reaches the C files beside it and ``CXXFLAGS``
+    # is never read (bake._ERA_STDINT_INCLUDE). The recipe writes it; this is the path
+    # the export and the record carry.
+    VANTA_CXX_PATH = "/opt/vanta-cxx"
+
+    # What ``CC`` names, for the same reason and one layer later: matplotlib 3.2.1's
+    # ``FT2Font`` extension declares no ``language='c++'``, so its ``ft2font.cpp`` is
+    # compiled by the *C* word and ``CXX``'s wrapper never sees it — the flag
+    # ``-fpermissive`` has to sit on this word to be scoped to that translation unit
+    # (bake.VANTA_CC_PATH).
+    VANTA_CC_PATH = "/opt/vanta-cc"
+
     COMPILER_ENV = {
-        "CC": "gcc",
-        "CXX": "g++",
+        "CC": VANTA_CC_PATH,
+        "CXX": VANTA_CXX_PATH,
         "LDSHARED": "gcc -pthread -shared",
         "LDCXXSHARED": "g++ -pthread -shared",
         "CFLAGS": " ".join(
@@ -3586,8 +3600,8 @@ class TestBake:
         names the source rather than this list.
 
         The list is the *head* of the variable rather than the whole of it: the same
-        ``CFLAGS`` carries the header the old C++ sources lost
-        (:meth:`test_the_c_flags_also_include_the_header_old_cpp_sources_lost`), and
+        ``CFLAGS`` still carries the include the first attempt added
+        (:meth:`test_the_c_flags_keep_the_stdint_include_the_first_attempt_added`), and
         the whole value is pinned by
         :meth:`test_the_compiler_environment_is_the_distutils_override_for_this_toolchain`.
         An assertion here on equality would have to be edited beside every addition to
@@ -3598,23 +3612,23 @@ class TestBake:
             " ".join(self.ERA_WARNING_FLAGS)
         )
 
-    def test_the_c_flags_also_include_the_header_old_cpp_sources_lost(self):
+    def test_the_c_flags_keep_the_stdint_include_the_first_attempt_added(self):
         """``stdint.h``, and not the ``cstdint`` the compiler error names.
 
-        Measured on ``pandas/1``: ``scipy==1.4.1``'s ``pypocketfft.cxx`` builds against
-        ``pybind11==2.5.0`` and died at ``attr.h:185`` on
-        ``'uint16_t' in namespace 'std' does not name a type``. The variable has to
-        reach the **C** compiles too — ``numpy.distutils`` keeps one flag list and swaps
-        only the driver — and ``cstdint`` is not on ``gcc``'s C include path at all, so
-        spelling the flag the error names would turn every C file in the tree into
-        ``fatal error: cstdint: No such file or directory``.
+        The include is inert for what it was added for — measured on ``pandas/1``,
+        ``scipy==1.4.1``'s ``pypocketfft.cxx`` died at ``attr.h:185`` on
+        ``'uint16_t' in namespace 'std' does not name a type`` *with* this flag on its
+        compile line, because glibc's ``<stdint.h>`` is the C header and declares no
+        ``std::uint16_t`` (bake._ERA_STDINT_INCLUDE). It stays because taking it out is
+        a change to the C command line of every layer that already builds, and the
+        header the C++ compile actually needs is supplied from the one position that is
+        only ever C++ (:meth:`test_the_cxx_wrapper_supplies_the_header_only_to_cxx`).
 
-        What this no longer claims, because it was measured false, is that the smoke
-        check can establish the *C++* reach from inside the interpreter layer: a plain
-        ``distutils``/``setuptools`` C++ compile on that layer's seeded setuptools
-        carries none of an environment ``CFLAGS``. See
-        :meth:`test_the_smoke_check_builds_and_imports_the_cpp_half` and
-        :data:`bake._ERA_STDINT_INCLUDE`.
+        What it must not become is the ``cstdint`` spelling: ``-include`` acts as the
+        translation unit's first line, ``cstdint`` is not on ``gcc``'s C include path at
+        all, and ``numpy.distutils`` hands the same flag list to the C files beside the
+        ``.cxx`` ones — so it would turn each of them into ``fatal error: cstdint: No
+        such file or directory``.
         """
         assert bake_mod._ERA_STDINT_INCLUDE == self.ERA_STDINT_INCLUDE
         assert bake_mod.COMPILER_ENV["CFLAGS"].endswith("-include stdint.h")
@@ -3659,12 +3673,148 @@ class TestBake:
     def test_the_interpreter_recipe_exports_the_compiler_for_source_builds(self):
         """Quoted as shell, because a linker line is more than one word."""
         recipe = self._recipe()
-        assert "export CC=gcc" in recipe
-        assert "export CXX=g++" in recipe
+        assert f"export CC={self.VANTA_CC_PATH}" in recipe
+        assert f"export CXX={self.VANTA_CXX_PATH}" in recipe
         assert "export LDSHARED='gcc -pthread -shared'" in recipe
         assert "export LDCXXSHARED='g++ -pthread -shared'" in recipe
         assert f"export CFLAGS='{self.COMPILER_ENV['CFLAGS']}'" in recipe
         assert "export FFLAGS=-fallow-argument-mismatch" in recipe
+
+    def test_the_recipe_writes_the_cxx_wrapper_it_exports(self):
+        """``CXX`` names a path, so the file has to be *in* the layer.
+
+        Written by the recipe that exports it and not exported with it, for the reason
+        :data:`bake._ERA_GNU_SOURCE` records: a checkpoint is a filesystem, and an
+        ``export`` does not survive into a layer baked ``--from`` another. The
+        ``chmod`` and the ``-x`` check are the difference between an exported name and
+        a compile that runs: a file written without the bit, or not written at all,
+        fails here by name rather than at the first C++ compile in the layer.
+        """
+        assert bake_mod.VANTA_CXX_PATH == self.VANTA_CXX_PATH
+        recipe = self._recipe()
+        assert f"cat > {self.VANTA_CXX_PATH} <<'VANTA_CXX_WRAPPER'" in recipe
+        assert bake_mod.VANTA_CXX_SOURCE.rstrip("\n") in recipe
+        assert f"chmod +x {self.VANTA_CXX_PATH}" in recipe
+        assert f"[ -x {self.VANTA_CXX_PATH} ]" in recipe
+        # Written after the export it belongs to and before anything that compiles.
+        assert recipe.index(f"export CXX={self.VANTA_CXX_PATH}") < recipe.index(
+            f"cat > {self.VANTA_CXX_PATH}"
+        )
+        assert recipe.index(f"chmod +x {self.VANTA_CXX_PATH}") < recipe.index("build_ext")
+        # And a layer whose environment does not name the wrapper writes no file: the
+        # guard is on ``CXX``, not on "a compiler environment exists".
+        assert not any(
+            "VANTA_CXX_WRAPPER" in line
+            for line in bake_mod.build_env_lines({"CC": "gcc"})
+        )
+
+    def test_the_cxx_wrapper_supplies_the_header_only_to_cxx(self, tmp_path):
+        """Run, not read: the flag has to appear for exactly one kind of command.
+
+        The wrapper is what every C++ compile in the layer goes through
+        (``numpy.distutils``' ``CXX``, plain ``distutils``' recorded value), so its
+        behaviour is the injection. It is executed here against a stub ``g++`` first on
+        ``PATH``, which prints the arguments it was handed: a ``.cxx`` argument is
+        ``scipy``'s ``pypocketfft`` compile and must carry ``-include cstdint``; a
+        ``.c`` argument is every C file in the layer, where that header does not exist;
+        and a bare probe is what ``distutils`` runs to check ``CXX`` at all. Neither of
+        the last two may carry it.
+        """
+        stub = tmp_path / "g++"
+        stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+        stub.chmod(0o755)
+        wrapper = tmp_path / "vanta-cxx"
+        wrapper.write_text(bake_mod.VANTA_CXX_SOURCE)
+        wrapper.chmod(0o755)
+        env = dict(os.environ, PATH=f"{tmp_path}:{os.environ.get('PATH', '')}")
+
+        def arguments(*argv: str) -> list[str]:
+            done = subprocess.run(
+                ["sh", str(wrapper), *argv],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            return done.stdout.split()
+
+        cxx = arguments("-c", "scipy/fft/_pocketfft/pypocketfft.cxx", "-o", "p.o")
+        assert cxx[:2] == ["-include", "cstdint"]
+        # The rest of the line is what the caller asked for, unmoved.
+        assert cxx[2:] == ["-c", "scipy/fft/_pocketfft/pypocketfft.cxx", "-o", "p.o"]
+        assert "-include" not in arguments("-c", "numpy/core/src/temp_elide.c")
+        assert "-include" not in arguments("--version")
+
+    def test_the_recipe_writes_the_cc_wrapper_it_exports(self):
+        """The second driver word, written by the same helper and guarded on itself.
+
+        ``CC`` names a path for the *other* measured failure: matplotlib's ``ft2font``
+        has no ``language='c++'``, so the word that compiles it is the C one
+        (bake.VANTA_CC_PATH). The heredoc delimiter is derived from the variable name, so
+        the two wrappers cannot be written with each other's delimiter — and the guard is
+        on ``CC``, so a layer whose environment names only ``CXX`` writes one file, not
+        two.
+        """
+        assert bake_mod.VANTA_CC_PATH == self.VANTA_CC_PATH
+        recipe = self._recipe()
+        assert f"cat > {self.VANTA_CC_PATH} <<'VANTA_CC_WRAPPER'" in recipe
+        assert bake_mod.VANTA_CC_SOURCE.rstrip("\n") in recipe
+        assert f"chmod +x {self.VANTA_CC_PATH}" in recipe
+        assert f"[ -x {self.VANTA_CC_PATH} ]" in recipe
+        # Written after the export it belongs to and before anything that compiles.
+        assert recipe.index(f"export CC={self.VANTA_CC_PATH}") < recipe.index(
+            f"cat > {self.VANTA_CC_PATH}"
+        )
+        assert recipe.index(f"chmod +x {self.VANTA_CC_PATH}") < recipe.index("build_ext")
+        # Each wrapper is guarded on its own variable: this is the difference between
+        # two conditional blocks and one that writes whatever the mapping happens to hold.
+        assert not any(
+            "VANTA_CC_WRAPPER" in line
+            for line in bake_mod.build_env_lines({"CXX": self.VANTA_CXX_PATH})
+        )
+        assert not any(
+            "VANTA_CXX_WRAPPER" in line
+            for line in bake_mod.build_env_lines({"CC": self.VANTA_CC_PATH})
+        )
+
+    def test_the_cc_wrapper_supplies_permissive_to_the_cxx_sources_only(self, tmp_path):
+        """Run, not read — and the measurement is the *absence* on the C source.
+
+        Route D of the probe, restated as an assertion: with this wrapper on ``CC`` the
+        ``ft2font.cpp`` argv carries ``-fpermissive`` while the argv that compiled the
+        one C source in the same extension, ``src/checkdep_freetype2.c``, carries none.
+        The scan is what makes the scoped claim true rather than hopeful, because
+        ``CC`` runs every source of that extension — five files, one of them C.
+
+        The other two commands are here for the same reason the CXX test has them: the
+        C source of that same extension must reach ``gcc`` with the line the caller
+        wrote, and a bare probe (what ``distutils`` runs to check the driver at all)
+        must not be treated as a translation unit.
+        """
+        stub = tmp_path / "gcc"
+        stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+        stub.chmod(0o755)
+        wrapper = tmp_path / "vanta-cc"
+        wrapper.write_text(bake_mod.VANTA_CC_SOURCE)
+        wrapper.chmod(0o755)
+        env = dict(os.environ, PATH=f"{tmp_path}:{os.environ.get('PATH', '')}")
+
+        def arguments(*argv: str) -> list[str]:
+            done = subprocess.run(
+                ["sh", str(wrapper), *argv],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            return done.stdout.split()
+
+        cpp = arguments("-c", "src/ft2font.cpp", "-o", "ft2font.o")
+        assert cpp[:2] == ["-fpermissive", "-c"]
+        # The rest of the line is what the caller asked for, unmoved.
+        assert cpp[2:] == ["src/ft2font.cpp", "-o", "ft2font.o"]
+        assert "-fpermissive" not in arguments("-c", "src/checkdep_freetype2.c")
+        assert "-fpermissive" not in arguments("--version")
 
     def test_the_recipe_prints_what_the_standalone_recorded(self):
         """The evidence for the override: sysconfig's own CC/CXX, not ``$CC``.
@@ -3733,8 +3883,10 @@ class TestBake:
     def test_a_source_build_runs_after_the_compiler_is_exported(self):
         """The export is what the build reads; before it, the recorded compiler runs."""
         recipe = self._recipe()
-        assert recipe.index("export CC=gcc") < recipe.index("build_ext")
-        assert recipe.index("export CC=gcc") < recipe.index(f"touch {bake_mod.MARKER}")
+        assert recipe.index(f"export CC={self.VANTA_CC_PATH}") < recipe.index("build_ext")
+        assert recipe.index(f"export CC={self.VANTA_CC_PATH}") < recipe.index(
+            f"touch {bake_mod.MARKER}"
+        )
 
     def test_the_interpreter_recipe_smokes_the_toolchain_before_the_marker(self):
         """A broken toolchain fails the base layer, not twenty minutes into numpy."""
@@ -3793,29 +3945,36 @@ class TestBake:
         assert "vanta_era_pointer_check" not in bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE
 
     def test_the_smoke_check_builds_and_imports_the_cpp_half(self):
-        """The C++ half *builds and imports*, and it supplies its own ``std::uint16_t``.
+        """The C++ half *builds and imports*, and it is where the C++-only flag lands.
 
-        This test is the correction of a measured defect. The first version left the
-        name to ``-include stdint.h`` so the smoke would be the receipt that the header
-        reached a C++ compile. It could never pass: a plain ``distutils``/``setuptools``
-        C++ ``Extension`` on this layer's seeded setuptools compiles with none of the
-        environment ``CFLAGS`` (the modern fork seeds C++ flags from the *recorded*
-        ``cflags`` before the environment override, and only ``CXXFLAGS`` moves them),
-        and ``numpy.distutils`` — the one build system whose ``CFLAGS`` *does* reach a
-        ``.cxx`` compile — builds nothing in this layer. So the check failed every layer
-        forever, and worse, the ``cd DIR && setup.py build_ext && python -c …`` AND-OR
-        chain it sat in did not trip ``set -e``: the recipe ran on to ``touch`` the
-        marker and the layer was saved as ``[done]`` with a broken toolchain inside.
+        This test is the correction of a measured defect, twice over. The first version
+        left the name to ``-include stdint.h`` so the smoke would be the receipt that the
+        header reached a C++ compile. It could never pass: a plain
+        ``distutils``/``setuptools`` C++ ``Extension`` on this layer's seeded setuptools
+        compiles with none of the environment ``CFLAGS`` (the modern fork seeds C++ flags
+        from the *recorded* ``cflags`` before the environment override, and only
+        ``CXXFLAGS`` moves them), and ``numpy.distutils`` — the one build system whose
+        ``CFLAGS`` *does* reach a ``.cxx`` compile — builds nothing in this layer. So the
+        check failed every layer forever, and worse, the ``cd DIR && setup.py build_ext
+        && python -c …`` AND-OR chain it sat in did not trip ``set -e``: the recipe ran on
+        to ``touch`` the marker and the layer was saved as ``[done]`` with a broken
+        toolchain inside. The second version therefore ``#include <cstdint>``d its way
+        out of the question, and the question was answered nowhere in the layer.
 
-        What it checks now is what it can: that ``CXX`` names a compiler able to build
-        *and import* a Python C++ extension, which is the ``matplotlib``/``pandas``
-        shape (``ft2font``, ``_libs``). The C++ reach of ``CFLAGS`` is not checked,
-        because nothing in this layer builds through the only path that provides it.
+        The file now carries no ``cstdint`` again, and it can: the flag is supplied by the
+        *driver word* — ``CXX`` names :data:`bake.VANTA_CXX_PATH`, the wrapper — which is
+        the position this very compile comes from (measured: ``g++ … -c
+        vanta_smoke_cpp.cpp``, carrying none of the era ``CFLAGS``). So the smoke is the
+        receipt: ``std::uint16_t`` compiles here only if the wrapper prepended ``-include
+        cstdint``, and the layer fails by name if it did not.
         """
         source = bake_mod._TOOLCHAIN_SMOKE_CPP_SOURCE
-        # The file supplies the name it needs, so the compile does not depend on a flag
-        # that cannot reach it.
-        assert "#include <cstdint>" in source
+        # The interpreter's own header is the file's only include, so no line of it
+        # declares the name it needs — which is what makes this a check of the flag
+        # rather than of the file.
+        assert [
+            line for line in source.splitlines() if line.startswith("#include")
+        ] == ["#include <Python.h>"]
         assert "std::uint16_t" in source
         # The guard, as in the C half: a layer that compiled it anyway still fails the
         # *import* rather than passing a check whose result nobody reads.
@@ -4257,9 +4416,16 @@ class TestBake:
         numpy) run the compiler the standalone recorded for its own build machine.
         """
         recipe = bake_mod.requirements_recipe(["numpy==1.18.5"], minor="3.8")
-        assert "export CC=gcc" in recipe
-        assert "export CXX=g++" in recipe
-        assert recipe.index("export CC=gcc") < recipe.index("--no-build-isolation")
+        assert f"export CC={bake_mod.VANTA_CC_PATH}" in recipe
+        assert f"export CXX={bake_mod.VANTA_CXX_PATH}" in recipe
+        # The wrapper the export names is written here too, for the same reason: it is
+        # the *interpreter* layer's file that does not survive `--from`, and numpy's
+        # C++ sources are compiled in this layer.
+        assert f"cat > {bake_mod.VANTA_CXX_PATH}" in recipe
+        assert f"cat > {bake_mod.VANTA_CC_PATH}" in recipe
+        assert recipe.index(f"export CC={bake_mod.VANTA_CC_PATH}") < recipe.index(
+            "--no-build-isolation"
+        )
 
     def test_a_per_bug_recipe_without_a_toolchain_minor_is_unchanged(self):
         """The default is no environment, so every existing caller keeps its recipe."""
@@ -4283,7 +4449,7 @@ class TestBake:
         ]
         layers = bake_mod.layer_recipes(split, pythons=["3.8"], entries=[entry], deps=deps)
         recipe = {name: script for name, _, script in layers}["vanta-bi-Demo-1"]
-        assert "export CC=gcc" in recipe
+        assert f"export CC={bake_mod.VANTA_CC_PATH}" in recipe
 
     def test_a_bug_layer_recipe_carries_its_own_build_pins(self):
         """``layer_recipes`` is what wires the resolution into the layer's script."""
@@ -6700,6 +6866,7 @@ class TestPinConflicts:
         conflicts = bake_mod.metadata_conflicts(
             pins,
             own=frozenset({"httpcore", "h11"}),
+            python_minor="3.8",
             metadata_of=lambda name, version: metadata[(name, version)],
         )
         assert len(conflicts) == 1
@@ -6713,6 +6880,7 @@ class TestPinConflicts:
         refused = bake_mod.metadata_conflicts(
             pins,
             own=frozenset({"httpcore"}),
+            python_minor="3.8",
             metadata_of=lambda name, version: metadata[(name, version)],
         )
         assert refused[0].case == bake_mod.CASE_HARNESS_CHOICE
@@ -6731,6 +6899,7 @@ class TestPinConflicts:
             bake_mod.metadata_conflicts(
                 pins,
                 own=frozenset(),
+                python_minor="3.8",
                 metadata_of=lambda name, version: metadata[(name, version)],
             )
             == ()
@@ -6747,6 +6916,64 @@ class TestPinConflicts:
             bake_mod.metadata_conflicts(
                 pins,
                 own=frozenset(),
+                python_minor="3.8",
+                metadata_of=lambda name, version: metadata[(name, version)],
+            )
+            == ()
+        )
+
+    def test_a_marker_that_holds_here_is_read_as_the_install_pip_will_make(self):
+        """``luigi/1``: botocore's ``urllib3<1.25`` clause is behind a true marker.
+
+        The clause ``urllib3>=1.20,<1.25 ; python_version >= "3.4"`` is true in every
+        layer this harness bakes, so it is a requirement pip installs, and against
+        BugsInPy's own ``urllib3==1.25.9`` it is the conflict the layer's ``pip check``
+        reported. Skipping every marker — which is what this check did — left the
+        preflight silent about a contradiction it had the metadata to find.
+        """
+        pins = (("botocore", "1.12.149"), ("urllib3", "1.25.9"))
+        metadata = {
+            ("botocore", "1.12.149"): (
+                (
+                    'python-dateutil>=2.1,<3.0.0; python_version >= "2.7"',
+                    'urllib3>=1.20,<1.23; python_version == "3.3"',
+                    'urllib3>=1.20,<1.25; python_version >= "3.4"',
+                ),
+                None,
+            ),
+            ("urllib3", "1.25.9"): ((), None),
+        }
+        conflicts = bake_mod.metadata_conflicts(
+            pins,
+            own=frozenset(),
+            python_minor="3.8",
+            metadata_of=lambda name, version: metadata[(name, version)],
+        )
+        assert [conflict.held for conflict in conflicts] == ["urllib3==1.25.9"]
+        # The one entry is the clause this layer's platform holds, not the 3.3 one:
+        # ``<1.23`` and ``<1.25`` both refuse the pin, so a reader that read every
+        # marker instead of the applicable ones would have reported both.
+        assert conflicts[0].requires == "botocore==1.12.149 declares <1.25,>=1.20"
+        assert conflicts[0].case == bake_mod.CASE_HARNESS_CHOICE
+
+    def test_a_marker_that_does_not_hold_here_is_not_read(self):
+        """The counterpart: a clause for another python is not an install here."""
+        pins = (("botocore", "1.12.149"), ("urllib3", "1.25.9"))
+        metadata = {
+            ("botocore", "1.12.149"): (
+                (
+                    'ordereddict==1.1; python_version == "2.6"',
+                    'urllib3>=1.20,<1.24; python_version == "2.6"',
+                ),
+                None,
+            ),
+            ("urllib3", "1.25.9"): ((), None),
+        }
+        assert (
+            bake_mod.metadata_conflicts(
+                pins,
+                own=frozenset(),
+                python_minor="3.8",
                 metadata_of=lambda name, version: metadata[(name, version)],
             )
             == ()
@@ -6763,6 +6990,7 @@ class TestPinConflicts:
         conflicts = bake_mod.metadata_conflicts(
             (("httpcore", "0.3.0"), ("h11", "0.9.0")),
             own=frozenset(),
+            python_minor="3.8",
             metadata_of=metadata,
         )
         assert len(conflicts) == 1
@@ -6871,9 +7099,110 @@ class TestPinConflicts:
                 version="0.3.0",
                 sidecar_of=pytest.fail,
                 wheel_of=pytest.fail,
+                install_requires_of=lambda file: None,
             )
         assert "httpcore==0.3.0" in str(excinfo.value)
         assert "unknown" in str(excinfo.value)
+
+    # ---- the fourth reading: the sdist's own install_requires ---------------
+    def _sdist_tar(self, root: str, members):
+        """A real ``.tar.gz`` in memory, as ``<root>/<name>`` for each member."""
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            for name, text in members.items():
+                data = text.encode("utf-8")
+                info = tarfile.TarInfo(f"{root}/{name}")
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+        return buffer.getvalue()
+
+    def _read_sdist(self, members, root="demo-1.0"):
+        file = bake_mod.PyPIFile(
+            filename=f"{root}.tar.gz", packagetype="sdist", url="https://files.test/x"
+        )
+        data = self._sdist_tar(root, members)
+        return bake_mod.sdist_install_requires(
+            file, archive_of=lambda f: (data, False)
+        )
+
+    def test_a_computed_install_requires_is_read_from_the_file_it_names(self):
+        """Measured on ``fastparquet==0.4.0``: the claim pip resolves from, unread.
+
+        ``setup.py:50`` is ``install_requires = open('requirements.txt')…``, so nothing
+        in ``setup.py`` declares a requirement — the declarations are a file the same
+        *archive* carries, and reading it is what turns ``thrift>=0.11.0`` into a claim
+        §3.2's date rule can hold. Reproduced verbatim, because the shape is the point.
+        """
+        setup_py = (
+            "from setuptools import setup\n"
+            "install_requires = open('requirements.txt').read().strip().split('\\n')\n"
+            "setup(name='fastparquet', install_requires=install_requires)\n"
+        )
+        requires = self._read_sdist(
+            {
+                "setup.py": setup_py,
+                "requirements.txt": (
+                    "pandas>=0.19\nnumba>=0.28\nnumpy>=1.11\nthrift>=0.11.0\nsix\n"
+                ),
+            }
+        )
+        assert requires == (
+            "pandas>=0.19",
+            "numba>=0.28",
+            "numpy>=1.11",
+            "thrift>=0.11.0",
+            "six",
+        ), "the computed list is read from inside the same archive"
+
+    def test_install_requires_written_as_literals_is_the_declaration(self):
+        requires = self._read_sdist(
+            {
+                "setup.py": (
+                    "from setuptools import setup\n"
+                    "setup(name='demo', install_requires=['six', 'thrift>=0.11.0'])\n"
+                )
+            }
+        )
+        assert requires == ("six", "thrift>=0.11.0")
+
+    def test_a_declaration_ast_cannot_follow_is_unknown_and_not_nothing(self):
+        """The file it names is not in the archive: unread, never "declares nothing"."""
+        requires = self._read_sdist(
+            {
+                "setup.py": (
+                    "from setuptools import setup\n"
+                    "install_requires = open('reqs/base.txt').read().split('\\n')\n"
+                    "setup(name='demo', install_requires=install_requires)\n"
+                )
+            }
+        )
+        assert requires is None
+
+    def test_an_sdist_with_no_setup_py_declares_nothing_that_can_be_read(self):
+        assert self._read_sdist({"pyproject.toml": "[build-system]\n"}) is None
+        assert self._read_sdist({"setup.py": "this is not python ("}) is None
+
+    def test_the_sdist_reading_is_reached_only_after_the_json_sidecar_and_wheel(self):
+        """The reading is fourth, and a release that has any of the three never gets here."""
+        requires = bake_mod.declared_requires(
+            self._payload(files=[self.SDIST]),
+            name="matplotlib",
+            version="3.2.1",
+            sidecar_of=pytest.fail,
+            wheel_of=pytest.fail,
+            install_requires_of=lambda file: ("cycler>=0.10",),
+        )
+        assert requires == ("cycler>=0.10",)
+
+    def test_several_files_means_the_sdist_is_the_archive_the_fourth_reading_opens(self):
+        files = bake_mod._release_files(
+            [
+                {"filename": "m-1-py3-none-any.whl", "packagetype": "bdist_wheel"},
+                {"filename": "m-1.tar.gz", "packagetype": "sdist"},
+            ]
+        )
+        assert bake_mod._release_sdist(files) is files[1]
+        assert bake_mod._release_sdist(files[:1]) is None
 
     def test_the_published_document_is_read_for_its_requires_dist_fields_only(self):
         text = (
@@ -6934,7 +7263,70 @@ class TestPinConflicts:
         def metadata(name, version):
             raise bake_mod.BakeError(f"no reading for {name} {version}")
 
-        assert bake_mod._narrowing_requirements(refs, metadata_of=metadata) == {}
+        assert (
+            bake_mod._narrowing_requirements(
+                refs, python_minor="3.8", metadata_of=metadata
+            )
+            == {}
+        )
+
+    def test_a_narrowing_clause_is_read_only_when_its_marker_holds_here(self):
+        """``luigi/1``: the clause that bounds ``urllib3`` sits behind a true marker.
+
+        Read as an install, ``urllib3>=1.20,<1.25 ; python_version >= "3.4"`` is a
+        requirement this layer installs, and it is what refuses BugsInPy's own
+        ``urllib3==1.25.9``. The clause for another python is not an install here, and
+        reading it would narrow a choice on the word of a requirement the bug's own
+        environment never held.
+        """
+        refs = (
+            bake_mod.DepRef(
+                name="botocore",
+                spec="botocore==1.12.149",
+                source="requirements.txt line 9",
+            ),
+        )
+        metadata = {
+            ("botocore", "1.12.149"): (
+                (
+                    'urllib3>=1.20,<1.24; python_version == "2.6"',
+                    'urllib3>=1.20,<1.25; python_version >= "3.4"',
+                ),
+                None,
+            )
+        }
+        narrowed = bake_mod._narrowing_requirements(
+            refs,
+            python_minor="3.8",
+            metadata_of=lambda name, version: metadata[(name, version)],
+        )
+        assert narrowed == {
+            "urllib3": [("botocore==1.12.149", "<1.25,>=1.20")]
+        }, "the clause this layer's platform holds is the one that narrows"
+
+    def test_one_release_declaring_the_same_clause_twice_records_it_once(self):
+        """The claims feed ``narrowed_by`` and the refusal sentence, so they are a set."""
+        refs = (
+            bake_mod.DepRef(
+                name="botocore",
+                spec="botocore==1.12.149",
+                source="requirements.txt line 9",
+            ),
+        )
+        metadata = {
+            ("botocore", "1.12.149"): (
+                (
+                    'urllib3>=1.20,<1.25; python_version >= "3.4"',
+                    'urllib3>=1.20,<1.25; python_version >= "3.4"',
+                ),
+                None,
+            )
+        }
+        assert bake_mod._narrowing_requirements(
+            refs,
+            python_minor="3.8",
+            metadata_of=lambda name, version: metadata[(name, version)],
+        ) == {"urllib3": [("botocore==1.12.149", "<1.25,>=1.20")]}
 
     def test_a_plugin_release_that_cannot_be_read_is_never_chosen(self):
         """'Could not be read' must not be read as 'accepts any pytest'."""
@@ -9962,6 +10354,7 @@ class TestResolvePinsByDate:
             releases=self.RELEASES,
             commit_date=commit_date,
             harness_pins=harness_pins or {},
+            python_minor="3.8",
         )
 
     def test_the_newest_release_on_or_before_the_commit_date_wins(self):
@@ -9998,6 +10391,7 @@ class TestResolvePinsByDate:
             releases={"mystery": {"not-a-version": "2019-01-01", "1.0": "2019-01-02"}},
             commit_date="2019-04-22",
             harness_pins={},
+            python_minor="3.8",
         )
         assert resolved[0].pin == "mystery==1.0"
 
@@ -10178,6 +10572,7 @@ class TestTheDateRuleNeverPicksAPreRelease:
             releases=self.RELEASES,
             commit_date=self.COMMIT,
             harness_pins=harness_pins or {},
+            python_minor="3.8",
             metadata_of=metadata_of,
         )
 
@@ -10246,6 +10641,7 @@ class TestTheDateRuleNeverPicksAPreRelease:
             "2020-06-08",
             releases=self.RELEASES["jinja2"],
             settled={},
+            python_minor="3.8",
             metadata_of=lambda name, version: ((), None),
         )
         assert dep.pin == "jinja2==2.11.2"
@@ -10260,6 +10656,7 @@ class TestTheDateRuleNeverPicksAPreRelease:
             "2020-06-08",
             releases=self.RELEASES["jinja2"],
             settled={},
+            python_minor="3.8",
             metadata_of=lambda name, version: ((), None),
         )
         assert dep.pin == "jinja2==3.0.0a1"
@@ -10282,6 +10679,7 @@ class TestTheDateRuleNeverPicksAPreRelease:
                 "0.14.0": "2019-11-05",
             },
             settled={},
+            python_minor="3.8",
             metadata_of=lambda name, version: ((), None),
         )
         assert dep.pin == "uvloop==0.14.0"
@@ -10360,6 +10758,7 @@ class TestTheDateRuleObeysTheLayersOwnPins:
             releases=self.RELEASES,
             commit_date="2019-05-15",
             harness_pins=harness_pins or {},
+            python_minor="3.8",
             metadata_of=self._metadata_of if metadata_of is None else metadata_of,
         )
 
@@ -10478,9 +10877,208 @@ class TestTheDateRuleObeysTheLayersOwnPins:
 
         resolved = self._resolve(self._moto_and_idna(), metadata_of=metadata)
         assert resolved[0].pin == "moto==1.3.7"
-        assert read == ["1.3.8", "1.3.7"], (
-            "the refusal costs one extra reading of the name that was refused, and the "
-            "walk stops at the answer"
+        assert read == ["1.3.8", "1.3.7"] * 2, (
+            "each pass starts at the newest candidate and stops at the answer, the "
+            "refusal costing one extra reading of the name that was refused; and the "
+            "pass runs twice because :func:`resolve_pins` folds this layer's own picks "
+            "into the settled set and re-runs until they stop moving"
+        )
+
+
+class TestTheLayersOwnPinsNameEachOther:
+    """``luigi/1``: no single pass reaches the answer the layer can actually hold.
+
+    [VANTA-WHY] Measured. ``botocore``, ``boto3`` and ``moto`` are all declared as bare
+    names, so the date rule reads all three at once and gets ``botocore==1.12.149``,
+    ``boto3==1.9.149`` and ``moto==1.3.7`` — and that layer is a contradiction:
+    ``botocore 1.12.149`` declares ``urllib3>=1.20,<1.25`` under
+    ``python_version >= "3.4"`` against BugsInPy's own ``urllib3==1.25.9``;
+    ``boto3 1.9.149`` declares ``botocore>=1.12.149,<1.13.0``; ``moto 1.3.7`` declares
+    ``botocore>=1.12.13``. Each refusal is a fact about *another pin's pick*, so the
+    first ref read gets the wrong last word and the answer only falls out of the
+    fixpoint (:func:`resolve_pins`): ``botocore==1.10.84`` — the newest release that
+    declares no ``urllib3`` bound at all — ``boto3==1.7.84`` and ``moto==1.3.6``.
+
+    Every version, date and declaration below is PyPI's, and the transient dip the walk
+    takes through ``moto==1.3.5`` on the second round is the measured one: ``moto 1.3.6``
+    declares ``boto3 (<1.8,>=1.6.16)`` and refuses ``1.9.149``, so only after ``boto3``
+    has come down does ``1.3.6`` become the answer. An intermediate round's refusals
+    name rejections the final answer no longer stands on, which is why only the last
+    round's records are returned.
+    """
+
+    RELEASES = {
+        # BugsInPy's own pin, installed as written (``requirements.txt`` line 144), and
+        # the pin every botocore release before 1.10.85 refuses.
+        "urllib3": {"1.24.3": "2019-04-16", "1.25.9": "2020-04-16"},
+        "botocore": {
+            "1.10.84": "2018-08-23",
+            "1.11.0": "2018-09-06",
+            "1.12.148": "2019-05-14",
+            "1.12.149": "2019-05-15",
+        },
+        "boto3": {"1.7.84": "2018-08-23", "1.9.149": "2019-05-15"},
+        "moto": {"1.3.5": "2018-09-01", "1.3.6": "2018-09-22", "1.3.7": "2018-11-04"},
+    }
+
+    METADATA = {
+        ("urllib3", "1.24.3"): ((), None),
+        ("urllib3", "1.25.9"): ((), None),
+        ("botocore", "1.10.84"): ((), None),
+        # Unmarked, so it refuses ``urllib3==1.25.9`` whatever the python is.
+        ("botocore", "1.11.0"): (("urllib3>=1.20,<1.24",), None),
+        ("botocore", "1.12.148"): (("urllib3>=1.20,<1.25",), None),
+        # Marked, and true in every layer this harness bakes.
+        ("botocore", "1.12.149"): (
+            ('urllib3>=1.20,<1.25; python_version >= "3.4"',),
+            None,
+        ),
+        ("boto3", "1.7.84"): (
+            ("botocore>=1.10.84,<1.11.0", "s3transfer>=0.2.0,<0.3.0"),
+            None,
+        ),
+        ("boto3", "1.9.149"): (("botocore>=1.12.149,<1.13.0",), None),
+        ("moto", "1.3.5"): (
+            ("boto3 (>=1.6.16)", "botocore (<1.11,>=1.9.16)", "cookies"),
+            None,
+        ),
+        ("moto", "1.3.6"): (
+            ("boto3 (<1.8,>=1.6.16)", "botocore (<1.11,>=1.9.16)", "cookies"),
+            None,
+        ),
+        ("moto", "1.3.7"): (("boto3 (>=1.6.16)", "botocore (>=1.12.13)"), None),
+    }
+
+    @classmethod
+    def _metadata_of(cls, name: str, version: str):
+        try:
+            return cls.METADATA[(name, version)]
+        except KeyError as exc:
+            raise bake_mod.BakeError(f"no metadata for {name}=={version}") from exc
+
+    def _resolve(self, refs, metadata_of=None):
+        return bake_mod.resolve_pins(
+            refs,
+            releases=self.RELEASES,
+            commit_date="2019-05-15",
+            harness_pins={},
+            python_minor="3.8",
+            metadata_of=self._metadata_of if metadata_of is None else metadata_of,
+        )
+
+    def _luigi_one(self):
+        return [
+            bake_mod.dep_ref("moto", "install_requires (setup.py) line 5"),
+            bake_mod.dep_ref("boto3", "install_requires (setup.py) line 11"),
+            bake_mod.dep_ref("botocore", "install_requires (setup.py) line 12"),
+            bake_mod.dep_ref("urllib3==1.25.9", "requirements.txt line 144"),
+        ]
+
+    def test_the_pins_settle_on_the_triple_no_single_pass_reaches(self):
+        pins = {
+            dep.name: dep
+            for dep in self._resolve(self._luigi_one())
+        }
+        assert pins["botocore"].pin == "botocore==1.10.84", (
+            "the newest botocore that declares no urllib3 bound at all; 1.11.0 refuses "
+            "urllib3==1.25.9 without a marker of its own"
+        )
+        assert pins["boto3"].pin == "boto3==1.7.84"
+        assert pins["moto"].pin == "moto==1.3.6"
+        assert pins["urllib3"].pin == "urllib3==1.25.9", (
+            "BugsInPy's own pin is installed as written and never moved"
+        )
+        assert pins["urllib3"].pin_rule == bake_mod.BUGSINPY_PIN_RULE
+
+    def test_each_refusal_names_the_pin_that_forced_the_move(self):
+        pins = {dep.name: dep for dep in self._resolve(self._luigi_one())}
+        assert pins["botocore"].refused == (
+            ("botocore==1.12.149", "urllib3==1.25.9", "urllib3<1.25,>=1.20"),
+        ), (
+            "one entry for the one pin held against, naming the newest release that pin "
+            "refuses — not the three releases of botocore that refuse it"
+        )
+        assert pins["boto3"].refused == (
+            ("boto3==1.9.149", "botocore==1.10.84", "botocore<1.13.0,>=1.12.149"),
+        )
+        assert pins["moto"].refused == (
+            ("moto==1.3.7", "botocore==1.10.84", "botocore>=1.12.13"),
+        )
+
+    def test_the_date_rules_own_answer_is_the_contradiction_that_was_refused(self):
+        """The refusal is a fact about the walk, so the plain rule's answer is in it."""
+        pins = {dep.name: dep for dep in self._resolve(self._luigi_one())}
+        assert "botocore==1.12.149" in pins["botocore"].pin_rule
+        assert "boto3==1.9.149" in pins["boto3"].pin_rule
+        assert "moto==1.3.7" in pins["moto"].pin_rule
+
+    def test_the_transient_dip_is_read_and_not_returned(self):
+        """The walk passes through ``moto==1.3.5``, and the answer is still ``1.3.6``.
+
+        ``moto 1.3.6`` declares ``boto3 (<1.8,>=1.6.16)``, so on the round where
+        ``boto3`` is still ``1.9.149`` the walk passes over both and reaches ``1.3.5``;
+        once ``boto3`` has come down, ``1.3.6`` is the answer. Only the last round's
+        records are returned, so the refusals that describe the dip are not in the
+        provenance.
+        """
+        read: list[str] = []
+
+        def metadata(name, version):
+            if name == "moto":
+                read.append(version)
+            return self._metadata_of(name, version)
+
+        pins = {
+            dep.name: dep
+            for dep in self._resolve(self._luigi_one(), metadata_of=metadata)
+        }
+        assert "1.3.5" in read, "the dip is real: the walk does read 1.3.5"
+        assert pins["moto"].pin == "moto==1.3.6"
+        assert pins["moto"].refused == (
+            ("moto==1.3.7", "botocore==1.10.84", "botocore>=1.12.13"),
+        ), "and the record returned is the last round's, not the dip's"
+        assert not any("1.3.5" in rejected for rejected, _, _ in pins["moto"].refused)
+
+    def test_pins_that_name_each_other_in_a_circle_are_refused_not_guessed_at(self):
+        """Constructed, because the failure is a property of the walk and not of a bug.
+
+        ``alpha 2.0`` declares ``beta<2.0`` and ``beta 2.0`` declares ``alpha<2.0``:
+        each pass takes both newest, then both oldest, and the pass returns to a pick
+        set it has already made. There is no release of the two this layer can hold —
+        which is §3.2's case (a) with nothing left for the date rule to decide — so the
+        bake stops rather than installing the contradiction and letting ``pip check``
+        find it.
+        """
+        releases = {
+            "alpha": {"1.0": "2019-01-01", "2.0": "2019-05-01"},
+            "beta": {"1.0": "2019-01-01", "2.0": "2019-05-01"},
+        }
+        metadata = {
+            ("alpha", "1.0"): ((), None),
+            ("alpha", "2.0"): (("beta<2.0",), None),
+            ("beta", "1.0"): (("alpha>=2.0",), None),
+            ("beta", "2.0"): (("alpha<2.0",), None),
+        }
+
+        def metadata_of(name, version):
+            return metadata[(name, version)]
+
+        with pytest.raises(
+            bake_mod.BakeError, match="alpha, beta moving between rounds"
+        ):
+            bake_mod.resolve_pins(
+                [
+                    bake_mod.dep_ref("alpha", "install_requires (setup.py) line 1"),
+                    bake_mod.dep_ref("beta", "install_requires (setup.py) line 2"),
+                ],
+                releases=releases,
+                commit_date="2019-05-15",
+                harness_pins={},
+                python_minor="3.8",
+                metadata_of=metadata_of,
+            )
+        assert releases["alpha"]["2.0"] == "2019-05-01", (
+            "the stub is read, not written to: a cycle is a reading of these releases"
         )
 
 
@@ -11375,6 +11973,7 @@ class TestUnionAcrossCommits:
             releases=TestResolvePinsByDate.RELEASES,
             commit_date=self.BUGGY_DATE,
             harness_pins={},
+            python_minor="3.8",
         )
         assert dep.pin == "decorator==4.4.1"
         assert dep.fixed is True
@@ -13210,6 +13809,7 @@ class TestRealLuigiTornadoPin:
             releases={"tornado": self.TORNADO},
             commit_date=tree_mod.commit_date(self.REPO, self.BUGGY),
             harness_pins={},
+            python_minor="3.8",
             buggy_commit=self.BUGGY,
         )
         assert resolved[0].pin == "tornado==5.0"

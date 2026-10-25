@@ -650,13 +650,37 @@ the committed artifact sees what the reporter wrote before seeing what the gate 
 
 
 def _canonical(text: str) -> str:
-    """A section body as the file stores it: stripped, with exactly one trailing newline.
+    """The one form a section body takes — in the file, and in the hash of it.
 
-    Canonicalising is what makes the hashes comparable between the writer and the reader:
-    the header hashes this form, and :func:`load_frozen` hashes the parsed section the same
-    way, so a file that was edited fails on its hash rather than on a whitespace difference.
+    Three rules, and they are the *same* rule for the writer and the reader: line endings are
+    folded to ``\\n``; the blank lines the framing puts at a section's edges are dropped; and a
+    non-empty body ends with exactly one ``\\n``.
+
+    [VANTA-WHY] The fold is what the first dev freeze got wrong, and that failure was silent
+    rather than loud. The API returns an issue body with whatever ``\\r\\n`` the reporter's
+    editor used; the writer hashed that text as it stood and then wrote it, while the reader
+    got it back through a universal-newline ``read_text``, so every line had already lost its
+    ``\\r`` by the time it was hashed. Writer and reader therefore disagreed on **every** report
+    that contained a carriage return, which is most of them — the pandas report hashes to
+    ``2820bbb3…`` with its 89 carriage returns and ``0f9eb3c9…`` without them, the header held
+    the first and the reader computed the second. Folding first makes them agree *by rule*
+    rather than by both sides happening to do the same thing, and it makes the artifact a file
+    that git, an editor and a diff all read the same way.
+
+    [VANTA-WHY] The edge rule removes **newlines only, and never whitespace**. ``render_frozen``
+    separates the sections with a blank line, so a section's own first and last character are
+    never the ones the writer added as framing; dropping newlines recovers the body exactly.
+    Stripping instead — which is what this did at first — also ate a trailing space or tab, and
+    that is not framing: it is a byte of the text Vanta is given, and a rule that hides it would
+    let a hand-edited artifact verify. ``test_an_edited_gated_text_is_refused_by_its_content_hash``
+    is that byte, appended to the last line of a report, and the hash has to catch it.
+
+    This is a rule about the **file**, applied to every section. It has nothing to do with the
+    whitespace the leak gate collapses inside the text it gates (§2.4.4): the gate's collapse is
+    part of what the text *is*, and this is only how the text is stored.
     """
-    return text.strip() + "\n" if text.strip() else ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    return text + "\n" if text else ""
 
 
 def _section(text: str, marker: str) -> tuple[str, str]:
@@ -668,15 +692,6 @@ def _section(text: str, marker: str) -> tuple[str, str]:
     raise IssueSourceError(
         f"the frozen report has no {marker} line — it is not a file this reader may use"
     )
-
-
-def _unpad(section: str) -> str:
-    """Drop the one blank line the writer puts on each side of a section body."""
-    if section.startswith("\n"):
-        section = section[1:]
-    if section.endswith("\n"):
-        section = section[:-1]
-    return section
 
 
 def render_frozen(report: IssueReport) -> str:
@@ -773,9 +788,26 @@ class FrozenIssue:
 
 
 def write_frozen(path: Path, report: IssueReport) -> Path:
+    """Write the artifact — after :func:`parse_frozen` has accepted the exact text it will hold.
+
+    [VANTA-WHY] The render is verified *before* it is written, through the same parser a stage
+    reads with. The first dev freeze wrote five artifacts that its own reader refused, and
+    nothing said so at the time: the refusal surfaced one stage later, as a gate failure on a
+    bug whose file looked fine on disk, which is the slowest possible way to learn that the
+    writer and the reader disagreed. Verifying first makes an internally inconsistent artifact
+    impossible to create rather than merely detectable, and it leaves no file behind when the
+    two do disagree — which is the one thing a later run could not tell from a valid one.
+
+    ``newline=""`` because the bytes this writes are the bytes ``load_frozen`` hashes: a
+    platform that translated ``\\n`` on the way out would put the hashes off by one byte per
+    line, which is the same defect through a different door (§2.4.3).
+    """
     target = Path(path)
+    text = render_frozen(report)
+    parse_frozen(text, path=target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(render_frozen(report), encoding="utf-8")
+    with target.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
     return target
 
 
@@ -797,20 +829,33 @@ def _header_block(text: str) -> tuple[dict[str, str], str]:
 
 
 def load_frozen(path: Path) -> FrozenIssue:
-    """Read a frozen artifact, verifying both hashes — refusing a file that was edited.
+    """Read a frozen artifact from disk, and verify it (:func:`parse_frozen`)."""
+    target = Path(path)
+    try:
+        # ``newline=""``: no translation in either direction, so the bytes hashed are the
+        # bytes written. Reading with universal newlines is what let this reader lose one
+        # ``\\r`` per line that the writer had hashed (§2.4.3).
+        with target.open("r", encoding="utf-8", newline="") as handle:
+            text = handle.read()
+    except OSError as exc:
+        raise IssueSourceError(f"cannot read the frozen issue report {target}: {exc}") from exc
+    return parse_frozen(text, path=target)
+
+
+def parse_frozen(text: str, *, path: Path) -> FrozenIssue:
+    """Verify and read the artifact's text — the one parser, for the writer and the reader.
 
     The round trip is *the* guarantee §2.4 item 2 rests on: ``prepare``, a measure-only run
     and the run all read this file, so their issue texts are identical by construction. A
     file whose content no longer hashes to its header is not that file any more, and reading
     it anyway would put an unverifiable text in the prompt. The raw report is verified the
     same way, so the record of what the gate removed cannot be quietly rewritten either.
+
+    Both hashes are taken over :func:`_canonical` of the parsed section, and the string handed
+    out as ``content`` is that same canonical form — so "what is hashed" and "what Vanta is
+    given" are one object, and not two things that have to be kept in step.
     """
     target = Path(path)
-    try:
-        text = target.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise IssueSourceError(f"cannot read the frozen issue report {target}: {exc}") from exc
-
     header, body = _header_block(text)
     for key in FROZEN_HEADER_KEYS:
         if key not in header:
@@ -822,8 +867,8 @@ def load_frozen(path: Path) -> FrozenIssue:
     _, after_gate = _section(body, GATE_MARKER)
     gate_section, after_raw = _section(after_gate, RAW_MARKER)
     raw_section, after_content = _section(after_raw, CONTENT_MARKER)
-    raw = _unpad(raw_section)
-    content = _unpad(after_content)
+    raw = _canonical(raw_section)
+    content = _canonical(after_content)
 
     if sha256_text(content) != header["content-sha256"]:
         raise IssueSourceError(
@@ -838,7 +883,7 @@ def load_frozen(path: Path) -> FrozenIssue:
             "edited after it was frozen"
         )
     try:
-        gate_payload = json.loads(_unpad(gate_section) or "{}")
+        gate_payload = json.loads(_canonical(gate_section) or "{}")
     except ValueError as exc:
         raise IssueSourceError(f"{target}: the {GATE_MARKER} section is not JSON: {exc}") from exc
     gate = issue_mod.LeakResult(
@@ -999,6 +1044,7 @@ __all__ = [
     "load_frozen",
     "load_or_none",
     "owner_repo",
+    "parse_frozen",
     "referenced_numbers",
     "render_frozen",
     "resolve",

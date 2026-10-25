@@ -3258,6 +3258,86 @@ class TestFrozenIssueReport:
         assert gated in on_disk
         assert len(on_disk) > len(gated), "the file carries provenance the text does not"
 
+    def test_a_report_the_api_returned_with_crlf_round_trips(self, tmp_path):
+        """The defect the first dev freeze hit, pinned: writer and reader, one newline rule.
+
+        GitHub returns an issue body carrying the ``\\r\\n`` the reporter's editor used. The
+        writer hashed that text as it stood and wrote it; the reader got it back through a
+        universal-newline ``read_text``, so every line had lost its ``\\r`` before hashing, and
+        the file refused itself — five of the six dev bugs, with the header naming one hash and
+        the reader computing another. Two things have to hold now, and this test is both: the
+        hashes are taken over the text *after* line endings are folded to ``\\n``, and the file
+        that lands on disk is that same LF-only text, so the bytes hashed are the bytes read.
+        """
+        crlf_body = "Steps to reproduce:\r\n\r\n1. call the helper\r\n2. read the column\r\n"
+        report = self._report(
+            project="pandas",
+            bug_id=1,
+            title="BUG: `is_string_dtype` fails",
+            body=crlf_body,
+            comments=[
+                source_mod.IssueComment(
+                    author="reporter",
+                    created_at="2018-05-01T00:00:00Z",
+                    body="any update?\r\n",
+                )
+            ],
+        )
+        assert "\r\n" in report.content(), "the API text is the CRLF text"
+
+        path = source_mod.write_frozen(tmp_path / "pandas_1.md", report)
+        back = source_mod.load_frozen(path)
+
+        assert b"\r" not in path.read_bytes(), "the committed artifact is LF-only"
+        assert "\r" not in back.raw and "\r" not in back.content
+        assert back.raw == source_mod._canonical(report.content()), (
+            "the raw section is the API's own text, stored canonically"
+        )
+        assert back.content == source_mod._canonical(report.gate.leak.text), (
+            "the content section is the gate's text, stored canonically"
+        )
+        assert back.content_sha256 == split_mod.sha256_text(back.content)
+        assert back.content_sha256 != split_mod.sha256_text(report.content()), (
+            "the hash is taken *after* the line endings are folded, so it is not the hash of "
+            "the CRLF text the API returned — that is the value the first freeze wrote into "
+            "the header, and the one the reader could never reproduce"
+        )
+
+    def test_a_header_or_a_gate_edit_leaves_the_content_hash_alone(self, tmp_path):
+        """The three parts have three jobs, and the content hash answers for one of them (§2.4.3).
+
+        Editing the header — provenance, not text — or the gate's record changes neither the
+        content nor its hash, and reading the file still succeeds: those parts are not the
+        guarantee ``content-sha256`` makes. What the hash refuses is an edit that lands in the
+        *content*, which is the test below this one.
+        """
+        path = source_mod.write_frozen(tmp_path / "PySnooper_3.md", self._report())
+        before = source_mod.load_frozen(path)
+        text = path.read_text(encoding="utf-8")
+        head, marker, rest = text.partition(source_mod.GATE_MARKER)
+        gate, raw_marker, tail = rest.partition(source_mod.RAW_MARKER)
+        payload = json.loads(gate)
+        payload["note_added_by_hand"] = "a gate byte that changes nothing about the text"
+        head = head.replace("- comments-included: 1", "- comments-included: 9")
+        path.write_text(
+            head
+            + marker
+            + "\n\n"
+            + json.dumps(payload, indent=2)
+            + "\n\n"
+            + raw_marker
+            + tail,
+            encoding="utf-8",
+        )
+        assert "- comments-included: 9" in path.read_text(encoding="utf-8"), "the header edit"
+        assert "note_added_by_hand" in path.read_text(encoding="utf-8"), "the gate edit"
+
+        after = source_mod.load_frozen(path)
+        assert after.content == before.content
+        assert after.content_sha256 == before.content_sha256
+        assert after.raw == before.raw
+        assert after.gate_files == before.gate_files
+
     def test_the_header_says_how_the_issue_was_resolved(self, tmp_path):
         path = source_mod.write_frozen(
             tmp_path / "pandas_1.md", self._report(project="pandas", bug_id=1, source=source_mod.SOURCE_VIA_PR, via_pr=34294)

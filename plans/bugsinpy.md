@@ -912,6 +912,34 @@ re-running: there is one text, and every stage reads the same bytes. `load_froze
 what was removed — is refused rather than silently shipped. A test asserts that measure-only and a
 full `prepare` produce byte-identical issue text.
 
+**One canonical function, applied to a section on both sides, and it is the text Vanta is given.**
+`_canonical` is that form: line endings folded to `\n`, the blank lines the framing adds at a
+section's edges dropped, and exactly one trailing `\n` on a non-empty body. Both hashes are taken
+over it (`content-sha256 = sha256(_canonical(gated))`, and likewise for `raw-sha256`), and the
+string `FrozenIssue.content` hands out **is** that form — so "what is hashed" and "what the prompt
+holds" are one object rather than two that have to be kept in step. The edge rule removes newlines
+and nothing else: a `strip()` would also eat a trailing space, which is a byte of the text, and a
+hand edit that only moved whitespace would then verify.
+
+**The fold is the rule, not an accident of who called which reader.** The API returns an issue body
+carrying whatever `\r\n` the reporter's editor used. The first dev freeze hashed that text as it
+stood and then wrote it, while the reader got it back through a universal-newline `read_text`, so
+every line had already lost its `\r` before hashing; written and read forms therefore disagreed on
+every report containing a carriage return — five of the six dev bugs, the pandas report naming
+`2820bbb3…` in the header while the reader computed `0f9eb3c9…`. Both sides now fold first, and the
+file on disk is the LF-only form that was hashed, so the artifact is one git, an editor and a diff
+all read the same way. This is a rule about the **file**; it is not the whitespace the gate
+collapses inside the text it gates (§2.4.4), which is part of what the text *is*.
+
+**`write_frozen` verifies before it writes, through the reader's own parser.** It renders, runs
+`parse_frozen` over the exact text it is about to store, and only then opens the file
+(`newline=""`, no translation in either direction). An artifact its own reader would refuse thus
+cannot be created, and nothing is left behind when the two disagree — which matters because the
+first freeze's refusal surfaced a stage later, as a gate failure on a file that looked fine on
+disk. Three tests pin the round trip: write-and-read verifies; one content byte changed (a trailing
+space, the case a naive rule absorbs) fails the content hash; a header or a gate byte changed
+leaves the content and its hash alone, because those parts carry their own provenance.
+
 The markers are explicit lines rather than blank ones because a `none` report's content is empty,
 and a reader that split on "the first blank line after the header" could not tell that from a
 truncated file.

@@ -3023,6 +3023,38 @@ class TestGitHubClient:
 class TestFrozenIssueReport:
     """The artifact every stage reads, so the text is identical by construction."""
 
+    @staticmethod
+    def _gate(raw):
+        """A gate record that removes nothing, so the round trip is about the file.
+
+        The real gate's inputs and behaviour belong to ``prepare.freeze_gate`` and are
+        tested there; what this class is about is the three-section artifact and its two
+        hashes, and a passthrough keeps the comparison honest.
+        """
+        ok, reason = issue_mod.is_actionable(raw)
+        return source_mod.GateRecord(
+            leak=issue_mod.LeakResult(
+                text=raw, removals=[], ungated_prose=[], ok=ok, reason=reason
+            ),
+            tree_sha256="a" * 64,
+            answer_sha256="b" * 64,
+            files=("tests/test_pysnooper.py",),
+        )
+
+    @staticmethod
+    def _gated(report, old, new):
+        """Give the report a gate that actually removed something, so raw ≠ gated."""
+        report.gate = source_mod.GateRecord(
+            leak=issue_mod.LeakResult(
+                text=report.content().replace(old, new),
+                removals=[], ungated_prose=[], ok=True, reason=None,
+            ),
+            tree_sha256="a" * 64,
+            answer_sha256="b" * 64,
+            files=("tests/test_pysnooper.py",),
+        )
+        return report
+
     def _report(self, **over):
         base = dict(
             project="PySnooper",
@@ -3041,7 +3073,10 @@ class TestFrozenIssueReport:
             fix_commit_date="2018-06-01T00:00:00Z",
         )
         base.update(over)
-        return source_mod.IssueReport(**base)
+        report = source_mod.IssueReport(**base)
+        if report.gate is None:
+            report.gate = self._gate(report.content())
+        return report
 
     def test_it_round_trips_and_carries_the_resolution(self, tmp_path):
         report = self._report()
@@ -3054,6 +3089,27 @@ class TestFrozenIssueReport:
         assert back.comments == report.comments
         assert back.content == report.content()
         assert back.content_sha256 == split_mod.sha256_text(report.content())
+
+    def test_the_raw_report_is_stored_beside_the_gated_text(self, tmp_path):
+        """§2.4 item 3: the gate's removals are only legible next to what was removed."""
+        raw = self._report()
+        gated = raw.content().replace("pysnooper/pysnooper.py", "[redacted]")
+        raw.gate = source_mod.GateRecord(
+            leak=issue_mod.LeakResult(
+                text=gated, removals=[], ungated_prose=[], ok=True, reason=None
+            ),
+            tree_sha256="a" * 64,
+            answer_sha256="b" * 64,
+            files=("tests/test_pysnooper.py",),
+        )
+        back = source_mod.load_frozen(source_mod.write_frozen(tmp_path / "PySnooper_3.md", raw))
+        assert back.raw == raw.content()
+        assert back.content == gated
+        assert "pysnooper/pysnooper.py" in back.raw
+        assert "pysnooper/pysnooper.py" not in back.content
+        assert back.gate_files == ("tests/test_pysnooper.py",)
+        assert back.gate_tree_sha256 == "a" * 64
+        assert back.gate_answer_sha256 == "b" * 64
 
     def test_the_header_says_how_the_issue_was_resolved(self, tmp_path):
         path = source_mod.write_frozen(
@@ -3071,9 +3127,32 @@ class TestFrozenIssueReport:
         assert "Traceback (most recent call last)" in report.content()
         assert "```" in report.content()
 
-    def test_an_edited_file_is_refused_by_its_hash(self, tmp_path):
+    def test_an_edited_report_is_refused_by_its_raw_hash(self, tmp_path):
+        """The raw record is what a reviewer checks the removals against (§2.4 item 3).
+
+        The edit lands in the raw section alone: a gate that removed something keeps
+        the gated text's hash honest, so the raw-sha check is the one that fires.
+        """
+        report = self._gated(self._report(), "pysnooper/pysnooper.py", "[redacted]")
+        path = source_mod.write_frozen(tmp_path / "PySnooper_3.md", report)
+        head, raw_marker, rest = path.read_text().partition(source_mod.RAW_MARKER)
+        raw, content_marker, content = rest.partition(source_mod.CONTENT_MARKER)
+        path.write_text(
+            head
+            + raw_marker
+            + raw.replace("any update?", "here is the fix")
+            + content_marker
+            + content
+        )
+        with pytest.raises(source_mod.IssueSourceError, match="raw-sha256"):
+            source_mod.load_frozen(path)
+
+    def test_an_edited_gated_text_is_refused_by_its_content_hash(self, tmp_path):
         path = source_mod.write_frozen(tmp_path / "PySnooper_3.md", self._report())
-        path.write_text(path.read_text().replace("any update?", "here is the fix"))
+        before, _marker, after = path.read_text().partition(source_mod.CONTENT_MARKER)
+        path.write_text(
+            before + source_mod.CONTENT_MARKER + after.replace("any update?", "any update? ")
+        )
         with pytest.raises(source_mod.IssueSourceError, match="content-sha256"):
             source_mod.load_frozen(path)
 
@@ -3085,7 +3164,10 @@ class TestFrozenIssueReport:
 
     def test_a_file_without_the_content_marker_is_refused(self, tmp_path):
         path = tmp_path / "X_1.md"
-        path.write_text("# X/1\n\n- issue: u\n- resolved: none\n\nbody\n")
+        header = "\n".join(f"- {key}: x" for key in source_mod.FROZEN_HEADER_KEYS)
+        path.write_text(
+            f"# X/1\n\n{header}\n\n<!-- gate -->\n\n{{}}\n\n<!-- raw -->\n\nbody\n"
+        )
         with pytest.raises(source_mod.IssueSourceError, match="content -->"):
             source_mod.load_frozen(path)
 
@@ -3124,7 +3206,7 @@ class TestFrozenIssueReport:
         first = source_mod.ensure_frozen(
             client, issues_dir=issues, project="PySnooper", bug_id=3,
             github_url="https://github.com/cool-RR/PySnooper", message="Fix #2\n",
-            fix_commit_date="2018-06-01T00:00:00Z",
+            fix_commit_date="2018-06-01T00:00:00Z", gate=self._gate,
         )
         assert first.source == source_mod.SOURCE_ISSUE
         calls = list(api.paths)
@@ -3132,10 +3214,193 @@ class TestFrozenIssueReport:
         second = source_mod.ensure_frozen(
             client, issues_dir=issues, project="PySnooper", bug_id=3,
             github_url="https://github.com/cool-RR/PySnooper", message="Fix #2\n",
-            fix_commit_date="2018-06-01T00:00:00Z",
+            fix_commit_date="2018-06-01T00:00:00Z", gate=self._gate,
         )
         assert second.content == first.content
         assert api.paths == calls, "the frozen file answers the second run; no API"
+
+
+class TestTheFreezeGatesTheText:
+    """§2.4: the gate runs once, at freeze time, and its inputs come from git alone."""
+
+    def _prep(self, tmp_path, *, project="Demo", bug_id=1, bug_patch=""):
+        root = tmp_path / "work"
+        write(
+            root / "src_buggy" / "pkg" / "mod.py",
+            "def parse_rows(text):\n    return text.split('.')\n",
+        )
+        write(
+            root / "src_fixed" / "tests" / "test_demo.py",
+            "def test_parse_rows():\n    assert parse_rows('a.b')\n",
+        )
+        return prepare_mod.BugPrep(
+            bug=bug_info(project=project, bug_id=bug_id, bug_patch_txt=bug_patch),
+            root=root,
+            role="pilot",
+            wave=1,
+            test_cmd=["python", "-m", "pytest", "tests"],
+        )
+
+    def _frozen(self, issues, *, files=("tests/test_demo.py",)):
+        report = source_mod.IssueReport(
+            project="PySnooper",
+            bug_id=3,
+            source=source_mod.SOURCE_ISSUE,
+            number=2,
+            url="https://github.com/cool-RR/PySnooper/issues/2",
+            title="Logging inside a generator",
+            body="The report body, which is long enough to be actionable for a Creator.",
+            fetched_at="2026-10-25T06:00:00Z",
+            fix_commit_date="2018-06-01T00:00:00Z",
+        )
+        report.gate = source_mod.GateRecord(
+            leak=issue_mod.LeakResult(
+                text=report.content(), removals=[], ungated_prose=[], ok=True, reason=None
+            ),
+            tree_sha256="a" * 64,
+            answer_sha256="b" * 64,
+            files=tuple(files),
+        )
+        return source_mod.write_frozen(
+            source_mod.frozen_path(issues, "PySnooper", 3), report
+        )
+
+    def _sources(self, tmp_path, api=None):
+        return prepare_mod.IssueSources(
+            issues_dir=tmp_path / "issues",
+            github_cache_dir=tmp_path / "cache",
+            client=None
+            if api is None
+            else source_mod.GitHubClient(tmp_path / "cache", transport=api),
+        )
+
+    def test_declared_test_files_is_what_bug_info_and_its_runner_name(self):
+        assert prepare_mod.declared_test_files(bug_info()) == ["tests/test_demo.py"]
+        named = bug_info(run_test_sh="python -m pytest tests/test_other.py\n")
+        assert prepare_mod.declared_test_files(named) == [
+            "tests/test_demo.py",
+            "tests/test_other.py",
+        ]
+
+    def test_the_gate_strips_a_token_only_the_answer_has(self, tmp_path):
+        prep = self._prep(
+            tmp_path,
+            bug_patch=(
+                "diff --git a/pkg/mod.py b/pkg/mod.py\n"
+                "-    return text.split('.')\n"
+                "+    return parse_with_dots(text)\n"
+            ),
+        )
+        record = prepare_mod.freeze_gate(
+            prep, "The report says parse_with_dots is broken and it should not be.\n"
+        )
+        assert "parse_with_dots" not in record.leak.text
+        assert "[redacted]" in record.leak.text
+        assert [r.token for r in record.leak.removals] == ["parse_with_dots"]
+        assert record.files == ("tests/test_demo.py",)
+        assert record.tree_sha256 != record.answer_sha256
+
+    def test_a_token_the_buggy_tree_carries_is_never_stripped(self, tmp_path):
+        """The structural blind spot §2.4 exists for: a symbol the fix names *and* the
+        buggy tree carries cannot be gated out — which is why the text is the reporter's
+        report and not the fix commit's message."""
+        prep = self._prep(tmp_path, bug_patch="+    return parse_rows(text)\n")
+        record = prepare_mod.freeze_gate(
+            prep, "The report says parse_rows is broken and it should not be.\n"
+        )
+        assert "parse_rows" in record.leak.text
+        assert record.leak.removals == []
+
+    def test_measure_only_and_full_read_the_same_frozen_issue_text(
+        self, tmp_path, monkeypatch
+    ):
+        """§2.4 item 2: identical by construction. A full prepare freezes the text once;
+        a measure-only run reads that file and resolves nothing."""
+        monkeypatch.setattr(
+            issue_mod, "fix_commit_message", lambda repo, commit: "Fix #2\n"
+        )
+        monkeypatch.setattr(
+            issue_mod, "fix_commit_date", lambda repo, commit: "2018-06-01T00:00:00Z"
+        )
+        api = ScriptedAPI(
+            {
+                "/repos/cool-RR/PySnooper/issues/2": (
+                    200,
+                    {
+                        "number": 2,
+                        "title": "Logging inside a generator",
+                        "body": "The report body, which is long enough to be actionable.",
+                        "html_url": "https://github.com/cool-RR/PySnooper/issues/2",
+                        "comments": 0,
+                    },
+                )
+            }
+        )
+        sources = self._sources(tmp_path, api)
+
+        full = self._prep(tmp_path / "full", project="PySnooper", bug_id=3)
+        prepare_mod.build_issue(
+            full,
+            repo_cache=tmp_path,
+            issue_sources=sources,
+            github_url="https://github.com/cool-RR/PySnooper",
+            full=True,
+        )
+        assert full.issue is not None
+        assert (tmp_path / "issues" / "PySnooper_3.md").is_file(), (
+            "a full prepare freezes the report"
+        )
+
+        calls = list(api.paths)
+        measure = self._prep(tmp_path / "measure", project="PySnooper", bug_id=3)
+        prepare_mod.build_issue(
+            measure,
+            repo_cache=tmp_path,
+            issue_sources=sources,
+            github_url="https://github.com/cool-RR/PySnooper",
+            full=False,
+        )
+        assert measure.issue is not None
+        assert measure.issue.text == full.issue.text
+        assert measure.issue.pre_gate == full.issue.pre_gate
+        assert api.paths == calls, "measure-only reads the frozen file; it never resolves"
+
+    def test_measure_only_refuses_when_nothing_was_frozen(self, tmp_path):
+        prep = self._prep(tmp_path, project="PySnooper", bug_id=3)
+        frozen = prepare_mod.build_issue(
+            prep,
+            repo_cache=tmp_path,
+            issue_sources=self._sources(tmp_path),
+            github_url="https://github.com/cool-RR/PySnooper",
+            full=False,
+        )
+        assert frozen is None and prep.issue is None
+        assert prepare_mod.FROZEN_ISSUE_REASON in prep.gate_failures[0]
+
+    def test_the_drift_check_flags_an_oracle_the_freeze_never_gated_with(self, tmp_path):
+        """A derived F2P file outside the gate's inputs is reported, never re-gated: the
+        committed text is what the run sends."""
+        issues = tmp_path / "issues"
+        self._frozen(issues)
+        prep = self._prep(tmp_path, project="PySnooper", bug_id=3)
+        frozen = prepare_mod.build_issue(
+            prep,
+            repo_cache=tmp_path,
+            issue_sources=self._sources(tmp_path),
+            github_url="https://github.com/cool-RR/PySnooper",
+            full=False,
+        )
+        assert frozen is not None
+
+        prep.fail_to_pass = ["tests/test_demo.py::test_a"]
+        assert prepare_mod.check_gate_drift(prep, frozen, issues_dir=issues) is None
+
+        prep.fail_to_pass = ["tests/test_other.py::test_b"]
+        reason = prepare_mod.check_gate_drift(prep, frozen, issues_dir=issues)
+        assert reason is not None
+        assert "tests/test_other.py" in reason
+        assert prepare_mod.GATE_DRIFT_REASON in reason
+        assert "re-freeze" in reason
 
 
 # ============================================================================
@@ -15788,13 +16053,17 @@ class TestDevFixSelfCheck:
         assert prep.gate_failures == []
         assert "gradings" not in graded
 
-    def test_prepare_one_runs_it_after_the_strip_and_before_the_issue(self):
-        """Wiring, not behaviour: the check needs the post-strip baseline, and a bug it
-        refuses must not go on to be measured as a candidate."""
+    def test_prepare_one_orders_the_freeze_the_oracle_and_the_self_check(self):
+        """Wiring, not behaviour. The frozen issue text is read before the precheck — the
+        measured size has to be the size of the prompt a run sends (§2.4) — the gate-drift
+        check needs the derived oracle, the self-check needs the post-strip baseline, and a
+        bug either of them refuses must not go on to be measured as a candidate."""
         source = inspect.getsource(prepare_mod.prepare_one)
-        assert 0 <= source.index("strip_and_baseline(")
+        assert source.index("build_issue(") < source.index("ctx.precheck(")
+        assert source.index("ctx.precheck(") < source.index("derive_hidden(")
+        assert source.index("derive_hidden(") < source.index("check_gate_drift(")
+        assert source.index("check_gate_drift(") < source.index("strip_and_baseline(")
         assert source.index("strip_and_baseline(") < source.index("selfcheck_dev_fix(")
-        assert source.index("selfcheck_dev_fix(") < source.index("build_issue(")
 
 
 # ============================================================================

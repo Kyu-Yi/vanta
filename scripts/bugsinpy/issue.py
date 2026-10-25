@@ -37,11 +37,13 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from . import suite
 from .records import RecordError, field_of, strings_of
+from .split import sha256_text
 from .trees import nodeid_chain, nodeid_file
 
 MIN_ACTIONABLE_WORDS = 8
@@ -79,6 +81,33 @@ def fix_commit_message(repo: Path, commit: str) -> str:
     if proc.returncode != 0:
         raise IssueError(f"git show {commit} failed: {proc.stderr.strip()}")
     return proc.stdout.strip()
+
+
+def fix_commit_date(repo: Path, commit: str) -> str:
+    """The fix commit's own date, ISO-8601 UTC (``...Z``) — §2.4's comment cut.
+
+    Taken as a Unix timestamp and formatted here rather than with ``--format=%cI``,
+    because ``%cI`` keeps the commit's own UTC offset: the GitHub API reports every
+    ``created_at`` in ``Z``, and comparing ``2020-06-01T10:34:56+02:00`` against
+    ``2020-06-01T10:34:56Z`` as strings would cut the comments in the wrong place.
+    """
+    import subprocess
+
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "show", "-s", "--format=%ct", commit],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise IssueError(f"git show {commit} failed: {proc.stderr.strip()}")
+    try:
+        stamp = int(proc.stdout.strip())
+    except ValueError as exc:
+        raise IssueError(
+            f"git show {commit} did not report a committer timestamp: {proc.stdout!r}"
+        ) from exc
+    return datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def strip_diff_and_code(message: str) -> str:
@@ -323,6 +352,20 @@ def answer_token_counts(
             key = normalise_token(token)
             counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def token_counts_sha256(counts: Mapping[str, int]) -> str:
+    """A stable hash of a token→count map — the frozen artifact's input provenance.
+
+    [VANTA-WHY] The gate runs once, at freeze time, and its inputs are computed from the
+    trees rather than from a suite run (§2.4). Recording what those inputs *were* is the
+    only way a later reader can tell whether the frozen text was gated against the same
+    oracle it is being run with: a re-derivation that produced a different answer set
+    would make the frozen text's removals wrong, and nothing in the text itself shows it.
+    Sorted, so the hash is a property of the set and not of the walk's order.
+    """
+    lines = [f"{token}\t{count}" for token, count in sorted(counts.items())]
+    return sha256_text("\n".join(lines) + "\n")
 
 
 def hidden_test_sources(oracle_tree: Path, nodeids: Sequence[str]) -> list[str]:

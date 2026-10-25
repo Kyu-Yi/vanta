@@ -52,6 +52,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
+from . import issue as issue_mod
 from .records import RecordError
 from .split import sha256_text
 
@@ -71,8 +72,18 @@ FROZEN_HEADER_KEYS = (
     "fetched",
     "fix-commit-date",
     "comments-included",
+    "gate-tree-sha256",
+    "gate-answer-sha256",
+    "raw-sha256",
     "content-sha256",
 )
+"""Every header line :func:`load_frozen` needs before it will hand out a text.
+
+``raw-sha256`` and ``content-sha256`` are the pair the artifact is *for*: the raw report
+is kept beside the gated text so a reader can see what the gate took out, and the gated
+hash is what every stage checks the file against. The two ``gate-*-sha256`` lines are the
+gate's *inputs*, not its output (§2.4): the token maps the freeze step computed from the
+buggy commit's source and from the fix diff plus the test files ``bug.info`` declares."""
 
 SOURCE_ISSUE = "issue"
 SOURCE_VIA_PR = "via-pr"
@@ -382,6 +393,27 @@ class IssueComment:
     body: str
 
 
+@dataclass(frozen=True)
+class GateRecord:
+    """The leak gate's result *and* its inputs, as the freeze step computed them (§2.4).
+
+    [VANTA-WHY] The gate runs at freeze time and never again. That is the whole reason
+    ``prepare``, a measure-only run and the run can hand Vanta byte-identical text: the
+    gate's own inputs come from git alone — the buggy commit's source for ``tree_tokens``,
+    the fix diff plus the test files ``bug.info`` declares for ``answer_tokens`` — so the
+    step needs no suite run and a measure-only run (which has no ``FAIL_TO_PASS``) can read
+    a text that was gated exactly as a real run's would have been. The two hashes are what
+    a later reader compares against, and they are recorded rather than recomputed because
+    re-gating would be a second answer to a question that already has one.
+    """
+
+    leak: "issue_mod.LeakResult"
+    tree_sha256: str
+    answer_sha256: str
+    files: tuple[str, ...]
+    """The test files the answer tokens came from — ``bug.info``'s declaration, resolved."""
+
+
 @dataclass
 class IssueReport:
     """The project's own report: title, body, and the comments up to the fix."""
@@ -399,6 +431,8 @@ class IssueReport:
     fix_commit_date: str = ""
     reason: str = ""
     """Why the source is ``none``; empty otherwise."""
+    gate: Optional[GateRecord] = None
+    """The gated text and the inputs it was gated against. Set before the write."""
 
     @property
     def slug(self) -> str:
@@ -605,14 +639,64 @@ def frozen_path(issues_dir: Path, project: str, bug_id: int) -> Path:
 
 
 CONTENT_MARKER = "<!-- content -->"
-"""Marks where the frozen file's header stops. An explicit line rather than a blank
-one, because a ``none`` report's content is empty and a reader that split on "the
-first blank line after the header" could not tell that from a truncated file."""
+RAW_MARKER = "<!-- raw -->"
+GATE_MARKER = "<!-- gate -->"
+"""The frozen file's three sections, in this order, each introduced by its own line.
+
+Explicit marker lines rather than blank ones, because a ``none`` report's text is empty
+and a reader that split on "the first blank line after the header" could not tell that
+from a truncated file. The raw report comes before the gated text so that a human reading
+the committed artifact sees what the reporter wrote before seeing what the gate left."""
+
+
+def _canonical(text: str) -> str:
+    """A section body as the file stores it: stripped, with exactly one trailing newline.
+
+    Canonicalising is what makes the hashes comparable between the writer and the reader:
+    the header hashes this form, and :func:`load_frozen` hashes the parsed section the same
+    way, so a file that was edited fails on its hash rather than on a whitespace difference.
+    """
+    return text.strip() + "\n" if text.strip() else ""
+
+
+def _section(text: str, marker: str) -> tuple[str, str]:
+    """``(before, after)`` the first line equal to ``marker``, that line dropped."""
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.strip() == marker:
+            return "".join(lines[:index]), "".join(lines[index + 1 :])
+    raise IssueSourceError(
+        f"the frozen report has no {marker} line — it is not a file this reader may use"
+    )
+
+
+def _unpad(section: str) -> str:
+    """Drop the one blank line the writer puts on each side of a section body."""
+    if section.startswith("\n"):
+        section = section[1:]
+    if section.endswith("\n"):
+        section = section[:-1]
+    return section
 
 
 def render_frozen(report: IssueReport) -> str:
-    """The artifact's exact bytes. The hash covers everything after the marker."""
-    content = report.content()
+    """The artifact's exact bytes: provenance, the gate's record, raw report, gated text.
+
+    [VANTA-WHY] The raw report is stored *beside* the gated text rather than instead of it.
+    The gate's removals are only legible next to what was removed, and the paper's question
+    (§2.4 item 6) is how much a fix-commit message would have inflated ``localization_hit``
+    — a question nobody can answer from a gate report that no longer has the text it gated.
+    Nothing after the content marker is read by a stage: ``FrozenIssue.content`` is the
+    gated text, and that is what ``prepare``, a measure-only run and the run all send.
+    """
+    if report.gate is None:
+        raise IssueSourceError(
+            f"{report.project}/{report.bug_id}: the report has no gate record, so it has no "
+            "gated text. The frozen file stores the *gated* report (§2.4) — gate the text "
+            "before writing it."
+        )
+    raw = report.content()
+    gated = report.gate.leak.text
     header = [
         f"# {report.project}/{report.bug_id} — the project's own issue report",
         "",
@@ -621,11 +705,36 @@ def render_frozen(report: IssueReport) -> str:
         f"- fetched: {report.fetched_at}",
         f"- fix-commit-date: {report.fix_commit_date}",
         f"- comments-included: {len(report.comments)}",
-        f"- content-sha256: {sha256_text(content)}",
+        f"- gate-tree-sha256: {report.gate.tree_sha256}",
+        f"- gate-answer-sha256: {report.gate.answer_sha256}",
+        f"- gate-removals: {len(report.gate.leak.removals)}",
+        f"- raw-sha256: {sha256_text(_canonical(raw))}",
+        f"- content-sha256: {sha256_text(_canonical(gated))}",
     ]
     if report.reason:
         header.append(f"- note: {report.reason}")
-    return "\n".join(header) + "\n\n" + CONTENT_MARKER + "\n\n" + content
+    gate = {
+        "files": list(report.gate.files),
+        "ok": report.gate.leak.ok,
+        "reason": report.gate.leak.reason,
+        "removals": [removal.to_dict() for removal in report.gate.leak.removals],
+        "ungated_prose": list(report.gate.leak.ungated_prose),
+    }
+    parts = [
+        "\n".join(header),
+        "",
+        GATE_MARKER,
+        "",
+        json.dumps(gate, indent=2, ensure_ascii=False),
+        "",
+        RAW_MARKER,
+        "",
+        _canonical(raw),
+        CONTENT_MARKER,
+        "",
+        _canonical(gated),
+    ]
+    return "\n".join(parts) + "\n"
 
 
 @dataclass
@@ -644,6 +753,16 @@ class FrozenIssue:
     body: str
     comments: list[IssueComment]
     content: str
+    raw: str
+    """What the reporter wrote, before the gate — never sent to Vanta."""
+    gate: "issue_mod.LeakResult"
+    """The gate's record: what it removed, and the text it left (``content``)."""
+    gate_files: tuple[str, ...]
+    """The test files the answer tokens came from, for the F2P drift check (§2.4)."""
+    gate_tree_sha256: str
+    gate_answer_sha256: str
+    reason: str = ""
+    """The header's ``note`` — why the source is ``none``, when it is."""
 
     def resolved_as(self) -> str:
         if self.source == SOURCE_VIA_PR:
@@ -660,13 +779,31 @@ def write_frozen(path: Path, report: IssueReport) -> Path:
     return target
 
 
-def load_frozen(path: Path) -> FrozenIssue:
-    """Read a frozen artifact, verifying its hash — refusing a file that was edited.
+def _header_block(text: str) -> tuple[dict[str, str], str]:
+    """``(header, the rest)`` — the ``- key: value`` lines, up to the first blank line."""
+    lines = text.splitlines(keepends=True)
+    header: dict[str, str] = {}
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("- ") and ":" in line:
+            key, _, value = line[2:].partition(":")
+            header[key.strip()] = value.strip()
+        elif header and not line.strip():
+            index += 1
+            break
+        index += 1
+    return header, "".join(lines[index:])
 
-    The round trip is *the* guarantee §2.4 item 2 rests on: ``prepare``, a
-    measure-only run and the run all read this file, so their issue texts are identical
-    by construction. A file whose content no longer hashes to its header is not that
-    file any more, and reading it anyway would put an unverifiable text in the prompt.
+
+def load_frozen(path: Path) -> FrozenIssue:
+    """Read a frozen artifact, verifying both hashes — refusing a file that was edited.
+
+    The round trip is *the* guarantee §2.4 item 2 rests on: ``prepare``, a measure-only run
+    and the run all read this file, so their issue texts are identical by construction. A
+    file whose content no longer hashes to its header is not that file any more, and reading
+    it anyway would put an unverifiable text in the prompt. The raw report is verified the
+    same way, so the record of what the gate removed cannot be quietly rewritten either.
     """
     target = Path(path)
     try:
@@ -674,39 +811,49 @@ def load_frozen(path: Path) -> FrozenIssue:
     except OSError as exc:
         raise IssueSourceError(f"cannot read the frozen issue report {target}: {exc}") from exc
 
-    lines = text.splitlines(keepends=True)
-    header: dict[str, str] = {}
-    marker = None
-    for index, line in enumerate(lines):
-        if line.strip() == CONTENT_MARKER:
-            marker = index + 1
-            break
-        if line.startswith("- ") and ":" in line:
-            key, _, value = line[2:].partition(":")
-            header[key.strip()] = value.strip()
-    if marker is None:
-        raise IssueSourceError(
-            f"{target}: no {CONTENT_MARKER} line — the frozen report must say where its "
-            "header stops, or its content cannot be told from its provenance"
-        )
+    header, body = _header_block(text)
     for key in FROZEN_HEADER_KEYS:
         if key not in header:
             raise IssueSourceError(
                 f"{target}: the header has no {key!r} line; a frozen report that cannot "
-                "say how it was resolved is not one the reader may use"
+                "say how it was resolved and gated is not one the reader may use"
             )
-    content = "".join(lines[marker:])
-    if content.startswith("\n"):
-        content = content[1:]
+
+    _, after_gate = _section(body, GATE_MARKER)
+    gate_section, after_raw = _section(after_gate, RAW_MARKER)
+    raw_section, after_content = _section(after_raw, CONTENT_MARKER)
+    raw = _unpad(raw_section)
+    content = _unpad(after_content)
+
     if sha256_text(content) != header["content-sha256"]:
         raise IssueSourceError(
             f"{target}: content-sha256 in the header is {header['content-sha256']}, but the "
             f"content hashes to {sha256_text(content)} — the file was edited after it was "
             "frozen"
         )
+    if sha256_text(raw) != header["raw-sha256"]:
+        raise IssueSourceError(
+            f"{target}: raw-sha256 in the header is {header['raw-sha256']}, but the raw "
+            f"report hashes to {sha256_text(raw)} — the record of what the gate removed was "
+            "edited after it was frozen"
+        )
+    try:
+        gate_payload = json.loads(_unpad(gate_section) or "{}")
+    except ValueError as exc:
+        raise IssueSourceError(f"{target}: the {GATE_MARKER} section is not JSON: {exc}") from exc
+    gate = issue_mod.LeakResult(
+        text=content,
+        removals=[
+            issue_mod.LeakRemoval.from_dict(item, where=f"{target} gate removals[]")
+            for item in gate_payload.get("removals") or []
+        ],
+        ungated_prose=[str(word) for word in gate_payload.get("ungated_prose") or []],
+        ok=bool(gate_payload.get("ok")),
+        reason=gate_payload.get("reason"),
+    )
 
     source, via_pr = _parse_resolved(header["resolved"])
-    title, body, comments = _parse_content(content)
+    title, body_text, comments = _parse_content(content)
     return FrozenIssue(
         path=target,
         source=source,
@@ -717,9 +864,15 @@ def load_frozen(path: Path) -> FrozenIssue:
         fix_commit_date=header["fix-commit-date"],
         content_sha256=header["content-sha256"],
         title=title,
-        body=body,
+        body=body_text,
         comments=comments,
         content=content,
+        raw=raw,
+        gate=gate,
+        gate_files=tuple(str(name) for name in gate_payload.get("files") or []),
+        gate_tree_sha256=header["gate-tree-sha256"],
+        gate_answer_sha256=header["gate-answer-sha256"],
+        reason=header.get("note", ""),
     )
 
 
@@ -786,13 +939,20 @@ def ensure_frozen(
     github_url: str,
     message: str,
     fix_commit_date: str,
+    gate: Callable[[str], GateRecord],
 ) -> FrozenIssue:
-    """Read the frozen report, resolving and writing it once if it is not there yet.
+    """Read the frozen report, resolving and gating it once if it is not there yet.
 
-    This is §2.4 item 1's "prepare step, cached": the *resolution* happens here, the
-    network is touched at most once per bug ever (the client's cache answers every
-    later run), and what it produced is written down and committed, so the text a run
-    sees is a file in the repository rather than a live API response.
+    This is §2.4 item 1's "prepare step, cached": the *resolution* happens here, the network
+    is touched at most once per bug ever (the client's cache answers every later run), and
+    what it produced is written down and committed, so the text a run sees is a file in the
+    repository rather than a live API response.
+
+    ``gate`` is the freeze step's other half and is supplied by the caller because its inputs
+    are the caller's: the buggy commit's source and the fix diff are on the caller's disk,
+    and neither the API client nor this module walks a tree (§2.4). It is called once, on the
+    raw report, and what it returns is stored beside the raw text — after that no stage gates
+    anything again, which is what "identical by construction" means here.
     """
     target = frozen_path(issues_dir, project, bug_id)
     if not target.is_file():
@@ -804,6 +964,7 @@ def ensure_frozen(
             message=message,
             fix_commit_date=fix_commit_date,
         )
+        report.gate = gate(report.content())
         write_frozen(target, report)
     return load_frozen(target)
 
@@ -816,13 +977,16 @@ def load_or_none(issues_dir: Path, project: str, bug_id: int) -> Optional[Frozen
 __all__ = [
     "DEFAULT_TIMEOUT_S",
     "FROZEN_HEADER_KEYS",
+    "GATE_MARKER",
     "GITHUB_API",
     "ISSUES_DIR",
+    "GateRecord",
     "IssueComment",
     "IssueReport",
     "IssueSourceError",
     "GitHubClient",
     "HttpResponse",
+    "RAW_MARKER",
     "RefCandidate",
     "SOURCE_ISSUE",
     "SOURCE_NONE",

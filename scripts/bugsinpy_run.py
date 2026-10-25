@@ -53,6 +53,7 @@ from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
 from bugsinpy import compact as compact_mod  # noqa: E402
 from bugsinpy import context as context_mod  # noqa: E402
 from bugsinpy import issue as issue_mod  # noqa: E402
+from bugsinpy import issue_source  # noqa: E402
 from bugsinpy import manifest as manifest_mod  # noqa: E402
 from bugsinpy import oracle as oracle_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
@@ -268,6 +269,12 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     batch_dir: Path = (args.batch or (RUNS_DIR / f"prepare-{utc_stamp()}")).resolve()
     batch_dir.mkdir(parents=True, exist_ok=True)
     repo_cache = RUNS_DIR / "repos"
+    # The frozen issue reports are committed (§2.4); the API cache is machine-local and
+    # stays under `runs/`, which `.gitignore` already ignores.
+    issue_sources = prepare_mod.IssueSources(
+        issues_dir=REPO_ROOT / issue_source.ISSUES_DIR,
+        github_cache_dir=RUNS_DIR / "github-cache",
+    )
 
     preps: list[prepare_mod.BugPrep] = []
     broken: list[tuple[str, str]] = []
@@ -305,6 +312,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
                 repo_cache=repo,
                 batch_dir=batch_dir,
                 deps_dir=deps_dir,
+                issue_sources=issue_sources,
                 full=full,
                 n_ctx=n_ctx,
                 n_ctx_source=n_ctx_source,

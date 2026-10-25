@@ -28,9 +28,15 @@ from typing import Any, Mapping, Optional, Sequence
 from . import bake as bake_mod
 from . import context as ctx
 from . import issue as issue_mod
+from . import issue_source
 from . import suite as suite_mod
 from . import trees as tree_mod
-from .bugsinpy_meta import BugInfo, MetadataError, load_bug_info
+from .bugsinpy_meta import (
+    BugInfo,
+    MetadataError,
+    load_bug_info,
+    project_github_url,
+)
 from .records import field_of, strings_of
 from .split import Split, sha256_file, sha256_text
 
@@ -86,6 +92,47 @@ indistinguishable from Vanta being conservative: the baseline approved a no-op, 
 rejected everything, and the gate the batch was supposed to enforce had never been asked
 about the one patch it could not get wrong. Grading it at prepare time is cheap next to
 the run it invalidates."""
+
+
+FROZEN_ISSUE_REASON = "frozen issue report"
+"""[VANTA-WHY] The issue text is a committed file, not something a stage derives (§2.4).
+``prepare``, a measure-only run and the run all read ``plans/bugsinpy_issues/<project>_
+<bug>.md``; only a full prepare may create it, and only from the GitHub API. A stage that
+cannot start without it says so with this reason instead of falling back to the fix
+commit's message — the fallback is the leak §2.4 exists to remove."""
+
+
+GATE_DRIFT_REASON = (
+    "the frozen issue report was gated at freeze time against the test files bug.info "
+    "declares, and the oracle this batch just derived names a test file outside that set"
+)
+"""[VANTA-WHY] The gate's inputs are the ones a freeze step can compute from git alone
+(§2.4): the buggy commit's source, the fix diff, and the tests ``bug.info`` declares. A full
+prepare goes on to derive ``FAIL_TO_PASS`` from real suite runs, and if that reached a test
+file the freeze never treated as answer material, the committed text may be carrying a token
+the run hides. Flagging is the point: re-gating would silently produce a second text, and the
+text a run sends has to be the text that was committed and reviewed. The remedy is in the
+message — delete the frozen report and re-freeze it against the derived oracle."""
+
+
+@dataclass(frozen=True)
+class IssueSources:
+    """Where the frozen issue reports live, and where the API responses are cached.
+
+    Two paths rather than one because they belong to different things: the frozen
+    reports are **committed** (they are the text Vanta is given, §2.4), while the
+    cache is a machine-local artefact that must never enter the repository.
+    """
+
+    issues_dir: Path
+    github_cache_dir: Path
+    client: Optional[issue_source.GitHubClient] = None
+    """The API client, when the caller already has one; ``None`` builds the cached default.
+
+    The seam exists because resolution is the only networked step in ``prepare``, and a test
+    that exercised the freeze would otherwise have to reach the network to do it. It is used
+    only when the file is being *created* — reading a frozen report never touches the API.
+    """
 
 
 class PrepareError(RuntimeError):
@@ -639,24 +686,166 @@ def selfcheck_dev_fix(prep: BugPrep, *, batch_dir: Path, checkpoint: str) -> boo
 # ---------------------------------------------------------------------------
 # issue text
 # ---------------------------------------------------------------------------
-def build_issue(prep: BugPrep, *, repo_cache: Path, batch_dir: Path) -> None:
-    message = issue_mod.fix_commit_message(repo_cache, prep.bug.fixed_commit)
-    report = _read_report(batch_dir, f"{prep.slug}-oracle")
-    kinds = issue_mod.failure_kinds_from_report(report)
+def declared_test_files(bug: BugInfo) -> list[str]:
+    """The test files BugsInPy declares for this bug — ``bug.info`` and its own runner.
 
-    hidden_sources = issue_mod.hidden_test_sources(
-        prep.root / "oracle_tree", prep.fail_to_pass
-    )
+    The same two ways :func:`_declared_by_bugsinpy` recognises an oracle test (the file
+    ``bug.info`` names, and any file the project's ``run_test.sh`` names), read without a
+    suite run. That is the whole point (§2.4): the freeze step's inputs come from git
+    alone, so a measure-only run — which has no ``FAIL_TO_PASS`` — reads a text gated
+    exactly as a real run's would have been.
+    """
+    files = [bug.test_file] if bug.test_file else []
+    for token in (bug.run_test_command() or "").split():
+        name = token.strip("'\"")
+        if name.endswith(".py") and "::" not in name and name not in files:
+            files.append(name)
+    return files
+
+
+def read_declared_test_files(fixed_dir: Path, files: Sequence[str]) -> list[str]:
+    """Their contents at the fixed commit — the hidden tests' own text.
+
+    A declared file the fixed commit does not carry is skipped rather than raising: the
+    set is a declaration, and a path that was never there is not answer material.
+    """
+    sources: list[str] = []
+    for rel in files:
+        try:
+            sources.append((Path(fixed_dir) / rel).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue
+    return sources
+
+
+def freeze_gate(prep: BugPrep, raw: str) -> issue_source.GateRecord:
+    """Gate the raw report at freeze time, from git-only inputs (§2.4).
+
+    ``tree_tokens`` are the buggy commit's own source — the tree the report is *about*,
+    materialised before any suite runs — and ``answer_tokens`` are the fix diff plus the
+    declared test files' contents at the fixed commit. Neither needs a derivation, which
+    is what lets the gate live in the one step that knows the report and never run again:
+    measure-only, prepare and the run then read a single frozen text.
+    """
+    files = declared_test_files(prep.bug)
+    tree_tokens = issue_mod.vanta_tree_token_counts(prep.root / "src_buggy")
     answer_tokens = issue_mod.answer_token_counts(
-        prep.bug.bug_patch_txt, hidden_sources, prep.fail_to_pass
+        prep.bug.bug_patch_txt,
+        read_declared_test_files(prep.root / "src_fixed", files),
+        files,
     )
-    tree_tokens = issue_mod.vanta_tree_token_counts(prep.root / "vanta_tree")
-    prep.issue = issue_mod.build_issue_text(
-        stripped_message=message,
-        failure_kinds=kinds,
-        answer_tokens=answer_tokens,
-        tree_tokens=tree_tokens,
+    return issue_source.GateRecord(
+        leak=issue_mod.leak_gate(raw, answer_tokens=answer_tokens, tree_tokens=tree_tokens),
+        tree_sha256=issue_mod.token_counts_sha256(tree_tokens),
+        answer_sha256=issue_mod.token_counts_sha256(answer_tokens),
+        files=tuple(files),
     )
+
+
+def check_gate_drift(
+    prep: BugPrep, frozen: issue_source.FrozenIssue, *, issues_dir: Path
+) -> Optional[str]:
+    """The reason to refuse, if the oracle names a test file the freeze never gated with.
+
+    [VANTA-WHY] The frozen text is committed and reviewed, so re-gating it here would
+    silently produce a second text and break "identical by construction" (§2.4). The drift
+    is reported instead, with the remedy in the message.
+    """
+    outside = sorted(
+        {
+            tree_mod.nodeid_file(nodeid)
+            for nodeid in prep.fail_to_pass
+            if tree_mod.nodeid_file(nodeid) not in frozen.gate_files
+        }
+    )
+    if not outside:
+        return None
+    path = issue_source.frozen_path(issues_dir, prep.bug.project, prep.bug.bug_id)
+    return (
+        f"{GATE_DRIFT_REASON}: {' '.join(outside)}. Delete {path} and re-freeze it against "
+        "the oracle this batch derived."
+    )
+
+
+def build_issue(
+    prep: BugPrep,
+    *,
+    repo_cache: Path,
+    issue_sources: "IssueSources",
+    github_url: str,
+    full: bool,
+) -> Optional[issue_source.FrozenIssue]:
+    """Read the bug's frozen issue report — and freeze it, once, if it is not there.
+
+    [VANTA-WHY] The issue text used to be the fix commit's message. That message is
+    written by the person who fixed the bug, after they fixed it, and on the
+    development split it names the fix location outright for 7 of 11 bugs; §2.4
+    replaces it with the project's own report. The report is resolved host-side from
+    the fix commit's referenced numbers, **gated here** against git-only inputs
+    (:func:`freeze_gate`), and frozen as
+    ``plans/bugsinpy_issues/<project>_<bug>.md``, which is committed. Every stage
+    then reads *that file* — and only its gated section — so ``prepare``, a
+    measure-only run and the run hand Vanta byte-identical text by construction
+    rather than by agreeing to rebuild it the same way.
+
+    Resolution is the only networked part and it happens at most once per bug: the
+    client caches every response, and the file's existence is what decides. A
+    measure-only run therefore never resolves anything — it reads what a full
+    prepare froze, and says so if that file is missing.
+
+    Returns the frozen artifact it read (or wrote), so the caller can check the derived
+    oracle against the test files the freeze gated with (:func:`check_gate_drift`) without
+    reading the file a second time. ``None`` means the bug had no issue text to read.
+    """
+    path = issue_source.frozen_path(
+        issue_sources.issues_dir, prep.bug.project, prep.bug.bug_id
+    )
+    if path.is_file():
+        # The file *is* the text, and reading it never touches the API: a measure-only
+        # run reads exactly what a run reads (§2.4).
+        frozen = issue_source.load_frozen(path)
+    else:
+        if not full:
+            prep.gate_failures.append(
+                f"{FROZEN_ISSUE_REASON}: {path} does not exist, and a measure-only run "
+                "freezes nothing. Freeze it with a full prepare (or commit the file) "
+                "first — the measured size would otherwise be for a prompt no run sends."
+            )
+            return None
+        client = issue_sources.client or issue_source.default_client(
+            issue_sources.github_cache_dir
+        )
+        try:
+            frozen = issue_source.ensure_frozen(
+                client,
+                issues_dir=issue_sources.issues_dir,
+                project=prep.bug.project,
+                bug_id=prep.bug.bug_id,
+                github_url=github_url,
+                message=issue_mod.fix_commit_message(repo_cache, prep.bug.fixed_commit),
+                fix_commit_date=issue_mod.fix_commit_date(
+                    repo_cache, prep.bug.fixed_commit
+                ),
+                gate=lambda raw: freeze_gate(prep, raw),
+            )
+        except issue_source.IssueSourceError as exc:
+            # A network or rate-limit failure must never be recorded as "this bug has
+            # no issue": that would silently shrink the evaluation. It is a gate
+            # failure, so the bug leaves the run with the reason attached.
+            prep.gate_failures.append(f"{FROZEN_ISSUE_REASON}: {exc}")
+            return None
+
+    prep.issue = issue_mod.IssueText(
+        text=frozen.content,
+        pre_gate=frozen.raw,
+        leak=frozen.gate,
+        failure_kinds=[],
+        ok=frozen.gate.ok,
+        needs_decision=None
+        if frozen.gate.ok
+        else (frozen.gate.reason or "the frozen issue report is not actionable"),
+    )
+    return frozen
 
 
 # ---------------------------------------------------------------------------
@@ -1117,6 +1306,7 @@ def prepare_one(
     repo_cache: Path,
     batch_dir: Path,
     deps_dir: Path,
+    issue_sources: "IssueSources",
     full: bool,
     n_ctx: int,
     n_ctx_source: str,
@@ -1156,13 +1346,31 @@ def prepare_one(
 
     prep.test_paths = build_trees(bug, repo_cache, prep.root)
 
+    # The issue text comes from the committed frozen report, and it is read *here*
+    # — before the precheck and in both modes — so that the size a measure-only run
+    # measures is the size of the prompt the run will send (§2.4). Deriving it later
+    # (or only in a full prepare) is how the two numbers came to differ.
+    github_url = project_github_url(bugsinpy_root, project)
+    if not github_url:
+        prep.gate_failures.append(f"{FROZEN_ISSUE_REASON}: no github_url for {project}")
+        return prep
+    frozen = build_issue(
+        prep,
+        repo_cache=repo_cache,
+        issue_sources=issue_sources,
+        github_url=github_url,
+        full=full,
+    )
+    if prep.issue is None:
+        return prep
+
     # Cheap gate first. The pre-strip tree is the same source as the final one
     # (the strip only removes test functions), so measuring it costs nothing and
     # saves the three double suite runs on a bug that cannot fit anyway — which is
     # the whole point of the precheck for a candidate like youtube-dl.
     early = ctx.precheck(
         prep.root / "oracle_tree",
-        "",
+        prep.issue.text,
         n_ctx=n_ctx,
         n_ctx_source=n_ctx_source,
         vanta_bin=vanta_bin,
@@ -1220,6 +1428,18 @@ def prepare_one(
         return prep
     note_drops()
 
+    # The derivation is the first thing here that knows the real oracle, so it is the
+    # only place the freeze's git-only gate inputs can be checked against it (§2.4): a
+    # F2P nodeid in a test file the gate never read as answer material means the frozen
+    # text was gated against a narrower oracle than the run grades with. Flagged, never
+    # re-gated — the committed text is what the run sends.
+    if frozen is not None:
+        drift = check_gate_drift(prep, frozen, issues_dir=issue_sources.issues_dir)
+        if drift:
+            prep.gate_failures.append(drift)
+            note_drops()
+            return prep
+
     try:
         strip_and_baseline(prep, checkpoint=checkpoint, batch_dir=batch_dir)
     except suite_mod.SuiteError as exc:
@@ -1241,10 +1461,10 @@ def prepare_one(
         note_drops()
         return prep
 
-    build_issue(prep, repo_cache=repo_cache, batch_dir=batch_dir)
-
     # Authoritative measurement: the tree Vanta will actually be given, with the
-    # issue text it will actually be given. Smaller than `early`, never larger.
+    # issue text it will actually be given. Smaller than `early`, never larger — the
+    # text is the same frozen file, and the tree is the same source with the hidden
+    # tests stripped.
     prep.context = ctx.precheck(
         prep.root / "vanta_tree",
         prep.issue.text if prep.issue else "",

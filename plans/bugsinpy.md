@@ -793,31 +793,64 @@ cache, to a log, or into a cache key.
 
 #### 2.4.3 The frozen artifact — identical by construction
 
-`prepare` writes `plans/bugsinpy_issues/<project>_<bug>.md` and **commits it**. It carries a header —
-`issue` (URL), `resolved` (`direct` / `via PR #N` / `none`), `fetched` (UTC), `fix-commit-date`,
-`comments-included`, and `content-sha256` — then an explicit `<!-- content -->` marker, then the
+`prepare` writes `plans/bugsinpy_issues/<project>_<bug>.md` and **commits it**. It carries the
 title, body and the issue's comments **up to the fix commit's date and never anything after it**.
 The cut is the point: the fix commit's date is the last moment at which the report says what the
 reporter knew; a comment posted after the fix can only be about the fix.
 
-`prepare`, the measure-only precheck and the run all read this file rather than re-deriving a text.
-Identity is therefore **by construction**, not by convention or by re-running: there is one text,
-and every stage reads the same bytes. `load_frozen` verifies `content-sha256`, so a file edited by
-hand is refused rather than silently shipped as a prompt. A test asserts that measure-only and a
+The file has three sections behind one header, in this order:
+
+- `<!-- gate -->` — the gate record as JSON: the removals, their classes, and the ungated prose
+  (§2.4.4). Legible only next to what was removed, which is why the raw section exists.
+- `<!-- raw -->` — the report exactly as the API returned it, ungated.
+- `<!-- content -->` — the **gated** text, and the only section any stage reads.
+
+The header carries `issue` (URL), `resolved` (`direct` / `via PR #N` / `none`), `fetched` (UTC),
+`fix-commit-date`, `comments-included`, then the gate's own provenance — `gate-tree-sha256`,
+`gate-answer-sha256`, `gate-removals` — and the pair the artifact is *for*: `raw-sha256` and
+`content-sha256`. The two `gate-*-sha256` lines make the freeze auditable: they are hashes of the
+gate's **inputs**, so a reader can tell which tree and which answer tokens produced the removals
+without re-deriving them.
+
+`prepare`, the measure-only precheck and the run all read this file's `<!-- content -->` section
+rather than re-deriving a text. Identity is therefore **by construction**, not by convention or by
+re-running: there is one text, and every stage reads the same bytes. `load_frozen` verifies both
+`content-sha256` and `raw-sha256`, so a file edited by hand — in the prompt text or in the record of
+what was removed — is refused rather than silently shipped. A test asserts that measure-only and a
 full `prepare` produce byte-identical issue text.
 
-The marker is an explicit line rather than a blank one because a `none` report's content is empty,
+The markers are explicit lines rather than blank ones because a `none` report's content is empty,
 and a reader that split on "the first blank line after the header" could not tell that from a
 truncated file.
 
-#### 2.4.4 The leak gate, now applied to the issue text
+#### 2.4.4 The leak gate, now applied to the issue text — once, at freeze time
 
 The gate of §2.2 step 4 is kept, unchanged in rule, and now runs over the issue text instead of the
 commit message: strip any token that occurs in the fix diff or the hidden tests and **nowhere** in
-the buggy tree, and record every removal in `leak_gate/<bug>.json`. Applied to a real issue report
-the rule is finally doing what it was written for — the reporter has not seen the fix, so a token
-they use that occurs nowhere in the buggy tree is genuinely suspicious, while a symbol that *is* in
-the tree is not removed, which is correct.
+the buggy tree, and record every removal. Applied to a real issue report the rule is finally doing
+what it was written for — the reporter has not seen the fix, so a token they use that occurs nowhere
+in the buggy tree is genuinely suspicious, while a symbol that *is* in the tree is not removed,
+which is correct.
+
+**It runs once, when the report is frozen, and its inputs come from `git` alone.** This is what
+lets measure-only and a full run agree. Measure-only has no `vanta_tree` — that tree is cut from the
+oracle after the strip, and the strip needs `FAIL_TO_PASS`, which measure-only does not derive — so a
+gate that needed the run's own oracle could not run in both modes, and the two would ship different
+prompts. The freeze-time inputs are:
+
+- **tree tokens** — counted over `src_buggy`, the buggy commit's own source. No test run, no oracle.
+- **answer tokens** — the fix diff (`bug_patch.txt`) plus the test files `bug.info` declares, read at
+  `src_fixed`. The hidden test sources and `FAIL_TO_PASS` nodeids are *not* needed: the file the
+  hidden tests live in is enough to catch a token that came from the answer.
+
+`freeze_gate` records the two token→count maps' hashes in the header (above), so the inputs are
+pinned even though they are not stored.
+
+**If a full `prepare` later derives a different `FAIL_TO_PASS` set, that is flagged, not re-gated.**
+`check_gate_drift` compares the derived F2P files against the files the freeze gated with and appends
+a refusal naming any file outside that set, telling the reader to delete the artifact and re-freeze
+it against the oracle the batch derived. Silently re-gating would produce a second text for the same
+bug — exactly the drift §2.4.3 exists to prevent.
 
 **Reporter code blocks and tracebacks are kept.** They are legitimate report content and are exactly
 what §1.6.7's traceback and path signals are for — a real bug report that contains a traceback is

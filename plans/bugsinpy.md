@@ -797,6 +797,18 @@ it:
 So the run is shown a *prefix* of the ranking's forms, never a patchwork: one monotone boundary, which is
 what makes "the model was shown this file" a property of the ranking rather than a per-file accident.
 
+**The budget is the whole prompt's, so the fill reserves it before pricing the first file.** The number
+`--select-budget` hands the fill is the whole prompt's, so `fill` subtracts everything that is *not* a
+selected file from it first: the file-tree listing, the issue text, and `PROMPT_FRAME_TOKENS`. The issue
+text and the frame are exactly what `prompt_tokens_estimate` adds back on top of the selection
+(§1.6.4), so reserving them inside the fill — not merely computing them afterwards — is what makes "a
+selection can never exceed the budget" true rather than nearly true. Before this the fill reserved the
+listing alone, and a selection that spent all of what it was handed overshot the whole-prompt budget by
+exactly `issue_tokens + PROMPT_FRAME_TOKENS`: on pandas/1 that was 167,098 estimated against a 163,584
+budget, an over-budget refusal produced by the fill's own arithmetic rather than by the selection being
+too large. The reservation is priced with the same `estimate_tokens` the gate's `issue_tokens` uses
+(§1.6.4), so the fill's boundary and the gate's `prompt_exceeds_budget` sit on one number.
+
 **The per-file cap is not the budget, and must not move the ladder.** A file over `MAX_FILE_BYTES`
 (64 KB) is denied its *source* by the cap — that is §1.6.2 item 6's rule, and it still holds — so it goes
 to an outline *on its own*, at whatever rank it sits. It must not push the files below it down: the

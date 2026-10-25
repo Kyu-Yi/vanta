@@ -1030,7 +1030,7 @@ pub async fn run(
         let prompt_source_concat = if config.patch_path.is_some() {
             let selection = review_selection.get_or_insert_with(|| {
                 let touched: BTreeSet<String> = patch_files.keys().cloned().collect();
-                select_review_prompt(&context_root, &touched, prompt_budget_tokens)
+                select_review_prompt(&context_root, &touched, prompt_budget_tokens, &repo.issue_text)
             });
             let rendered = selection.render();
             if rendered.trim().is_empty() {
@@ -2813,6 +2813,7 @@ fn select_review_prompt(
     root: &Path,
     touched: &BTreeSet<String>,
     budget_tokens: u32,
+    issue_text: &str,
 ) -> crate::context::ContextSelection {
     let (candidates, skipped) = crate::context::walk_candidates(root);
     let mut selection = crate::context::select_review_context(
@@ -2820,6 +2821,7 @@ fn select_review_prompt(
         touched,
         REVIEW_SOURCE_ROLES,
         budget_tokens,
+        crate::context::estimate_tokens(issue_text.len()),
     );
     selection.skipped = skipped;
 

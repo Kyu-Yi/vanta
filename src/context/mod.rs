@@ -122,6 +122,21 @@ pub fn prompt_tokens_estimate(selection: &ContextSelection, issue_tokens: u32) -
         .saturating_add(PROMPT_FRAME_TOKENS)
 }
 
+/// The prompt the selection does *not* cover: the issue text and the frame
+/// around it.
+///
+/// [VANTA-WHY] `fill` subtracts this — and the file-tree listing — from the
+/// budget before it prices the first file, so `prompt_tokens_estimate`, which
+/// adds exactly these two back, can never land above `budget_tokens`.
+/// Reserving the listing alone (as the fill used to) left the issue text and the
+/// frame unbudgeted, and a selection that spent everything it was handed then
+/// overshot the whole-prompt budget by `issue_tokens + PROMPT_FRAME_TOKENS`
+/// (§1.6.9). The same `estimate_tokens` the gate uses prices it, so the gate's
+/// `prompt_exceeds_budget` and the fill's own arithmetic sit on one number.
+pub fn reserved_prompt_tokens(issue_tokens: u32) -> u32 {
+    issue_tokens.saturating_add(PROMPT_FRAME_TOKENS)
+}
+
 /// `(budget, margin)` for a window: `n_ctx − output reserve − overhead − margin`,
 /// with `margin = 25 % of n_ctx` (§1.6.2).
 ///
@@ -855,11 +870,16 @@ fn read_docstring(lines: &[&str], start: usize) -> (Option<String>, usize) {
 /// already has. `FAIL_TO_PASS`, the fix commit, the fix diff and `bug.info` are
 /// not parameters and cannot be reached from here. The patch is "the thing under
 /// review", so reading it is not a peek at the answer — it is the subject.
+/// `issue_tokens` is the token cost of the issue text this prompt carries. It is
+/// not a *ranking* input — nothing here reads the issue's words — it is the part
+/// of the whole prompt the selection must leave room for (§1.6.9), exactly as the
+/// gate counts it.
 pub fn select_review_context(
     candidates: &[Candidate],
     touched: &BTreeSet<String>,
     role: &str,
     budget_tokens: u32,
+    issue_tokens: u32,
 ) -> ContextSelection {
     let by_path: BTreeMap<&str, &Candidate> = candidates
         .iter()
@@ -917,6 +937,7 @@ pub fn select_review_context(
         reasons,
         budget_tokens,
         &[],
+        reserved_prompt_tokens(issue_tokens),
     )
 }
 
@@ -1006,7 +1027,10 @@ pub fn select_repair_context(
     }
 
     let tree: Vec<String> = candidates.iter().map(|c| c.path.clone()).collect();
-    fill("repair", role, candidates, reasons, budget_tokens, &tree)
+    // The issue text is part of the prompt the model is sent, so its cost is
+    // reserved out of the budget before the first file is priced (§1.6.9).
+    let reserved = reserved_prompt_tokens(estimate_tokens(issue_text.len()));
+    fill("repair", role, candidates, reasons, budget_tokens, &tree, reserved)
 }
 
 /// Select the context a role is shown from the inputs a REAL run has, and only
@@ -1027,13 +1051,16 @@ pub fn select_for_role(
     budget_tokens: u32,
 ) -> ContextSelection {
     let (candidates, skipped) = walk_candidates(tree);
+    // The issue text travels in both prompts, so both selections reserve it out
+    // of the budget — same estimate `--select-context` reports to the gate.
+    let issue_tokens = estimate_tokens(issue_text.len());
     let mut selection = match patch_text {
         Some(patch) => {
             let touched: BTreeSet<String> = crate::agents::creator::split_patch_into_files(patch)
                 .keys()
                 .cloned()
                 .collect();
-            select_review_context(&candidates, &touched, role, budget_tokens)
+            select_review_context(&candidates, &touched, role, budget_tokens, issue_tokens)
         }
         None => select_repair_context(&candidates, issue_text, role, budget_tokens),
     };
@@ -1459,6 +1486,7 @@ fn fill(
     reasons: BTreeMap<String, BTreeMap<SelectionReason, SelectionRule>>,
     budget_tokens: u32,
     tree: &[String],
+    reserved_tokens: u32,
 ) -> ContextSelection {
     let by_path: BTreeMap<&str, &Candidate> = candidates
         .iter()
@@ -1510,7 +1538,16 @@ fn fill(
     }
     let tree_tokens = estimate_tokens(tree_bytes);
 
-    let mut remaining = budget_tokens.saturating_sub(tree_tokens);
+    // [VANTA-WHY] The budget is for the WHOLE prompt, so everything that is not a
+    // selected file is reserved before the first file is priced: the file-tree
+    // listing, and — through `reserved_tokens` — the issue text and the frame
+    // around it. `prompt_tokens_estimate` adds exactly these back, so a selection
+    // that spends to the last token of `remaining` still lands at or below
+    // `budget_tokens` (§1.6.9). Reserving the listing alone let a full selection
+    // overshoot by `issue_tokens + PROMPT_FRAME_TOKENS`.
+    let mut remaining = budget_tokens
+        .saturating_sub(tree_tokens)
+        .saturating_sub(reserved_tokens);
     let mut files: Vec<SelectedFile> = Vec::new();
     let mut dropped_for_budget: Vec<String> = Vec::new();
     let mut total_bytes: usize = 0;
@@ -1888,7 +1925,7 @@ mod tests {
         ];
         let touched = BTreeSet::from(["heretic/keyword_rate.py".to_string()]);
 
-        let selection = select_review_context(&candidates, &touched, "review", 60_000);
+        let selection = select_review_context(&candidates, &touched, "review", 60_000, 0);
         let rendered = selection.render();
 
         assert!(rendered.contains("# FILE: heretic/keyword_rate.py"));
@@ -1976,7 +2013,13 @@ mod tests {
             let (candidates, _skipped) = walk_candidates(tmp.path());
             (
                 select_repair_context(&candidates, issue, "repair", 60_000),
-                select_review_context(&candidates, &touched, "review", 60_000),
+                select_review_context(
+                    &candidates,
+                    &touched,
+                    "review",
+                    60_000,
+                    estimate_tokens(issue.len()),
+                ),
             )
         };
 
@@ -2356,7 +2399,7 @@ mod tests {
         ];
         let touched = BTreeSet::from(["heretic/keyword_rate.py".to_string()]);
 
-        let selection = select_review_context(&candidates, &touched, "review", 60_000);
+        let selection = select_review_context(&candidates, &touched, "review", 60_000, 0);
 
         let rules: Vec<(&str, Vec<(&str, &str)>)> = selection
             .files
@@ -2534,7 +2577,7 @@ mod tests {
         ];
         let touched = BTreeSet::from(["web/toggle.js".to_string()]);
 
-        let selection = select_review_context(&candidates, &touched, "review", 60_000);
+        let selection = select_review_context(&candidates, &touched, "review", 60_000, 0);
 
         assert_eq!(paths(&selection), vec!["web/toggle.js"]);
         assert_eq!(selection.files[0].reasons, vec![SelectionReason::PatchTouched]);
@@ -2667,14 +2710,15 @@ mod tests {
         ];
         let issue = "pkg/a.py and pkg/b.py and pkg/c.py all matter.\n";
 
-        // The budget is exactly what the listing plus a whole `a`, an outline `b`
-        // and a path-only `c` cost, so the ladder is forced to descend and the test
-        // depends on no magic number.
+        // The budget is exactly what the WHOLE prompt costs — the issue text, the
+        // frame, the listing, a whole `a`, an outline `b` and a path-only `c` — so
+        // the ladder is forced to descend and the test depends on no magic number.
         let tree = "# REPOSITORY FILES (paths only)\n".len()
             + "pkg/a.py\n".len()
             + "pkg/b.py\n".len()
             + "pkg/c.py\n".len();
-        let budget = estimate_tokens(tree)
+        let budget = reserved_prompt_tokens(estimate_tokens(issue.len()))
+            + estimate_tokens(tree)
             + estimate_tokens(framed_len("pkg/a.py", a))
             + estimate_tokens(framed_len("pkg/b.py", &outline_body("pkg/b.py", &b)))
             + estimate_tokens(framed_len("pkg/c.py", &path_only_body()));
@@ -2707,10 +2751,73 @@ mod tests {
             "the listing plus the three framed files, exactly"
         );
         assert_eq!(
-            selection.total_tokens, budget,
-            "the fill stops before the budget and leaves no room unused it could have spent"
+            prompt_tokens_estimate(&selection, estimate_tokens(issue.len())),
+            budget,
+            "the whole prompt — issue, frame, listing and the three framed files — \
+             lands exactly on the budget, and so can never land above it"
         );
         assert!(selection.dropped_for_budget.is_empty());
+    }
+
+    /// [VANTA-WHY] §1.6.9 — the listing is part of the prompt, so a large listing
+    /// has to be paid for out of the budget *before* any file is. This walks 2000
+    /// paths, a listing that on its own is most of the budget, and shows the whole
+    /// prompt — issue, frame, listing and the one file the issue names — still
+    /// landing at or below the budget: one token less and the file is dropped by
+    /// name, never silently overrun. Reserving the listing alone (the old fill)
+    /// would have overshot here by the issue text plus the frame.
+    #[test]
+    fn a_large_tree_listing_is_spent_from_the_budget_before_any_file() {
+        let mut candidates: Vec<Candidate> = (0..2000)
+            .map(|n| candidate(&format!("pkg/module_{n:04}.py"), "def helper():\n    return 1\n"))
+            .collect();
+        // One definition over a long body, so the forms are strictly ordered by
+        // cost — full > outline > path — and the path form is the only one that can
+        // fit the token left over.
+        let target = format!(
+            "def frobnicate():\n    \"\"\"Doc.\"\"\"\n{}",
+            "    return 1\n".repeat(40)
+        );
+        candidates.push(candidate("pkg/target.py", &target));
+        let issue = "pkg/target.py raises on every call.\n";
+
+        let tree_bytes = "# REPOSITORY FILES (paths only)\n".len()
+            + candidates.iter().map(|c| c.path.len() + 1).sum::<usize>();
+        let exact = reserved_prompt_tokens(estimate_tokens(issue.len()))
+            + estimate_tokens(tree_bytes)
+            + estimate_tokens(framed_len("pkg/target.py", &path_only_body()));
+
+        // One token short of the path form: the listing has spent the rest, so the
+        // file the issue names cannot be shown at all — and the prompt the
+        // selection describes still does not exceed the budget.
+        let short = select_repair_context(&candidates, issue, "creator", exact - 1);
+        assert!(
+            short.tree_tokens * 4 > short.budget_tokens * 3,
+            "the fixture must have a listing large enough to matter ({} of {} tok)",
+            short.tree_tokens,
+            short.budget_tokens
+        );
+        assert!(
+            short.files.is_empty(),
+            "the listing left no room for a body, got {:?}",
+            paths(&short)
+        );
+        assert_eq!(short.dropped_for_budget, vec!["pkg/target.py"]);
+        assert!(
+            prompt_tokens_estimate(&short, estimate_tokens(issue.len())) <= short.budget_tokens,
+            "the whole prompt never exceeds the budget, however large the listing"
+        );
+
+        // Exactly enough: the path form fits, and the whole prompt lands on the
+        // budget and no higher.
+        let fitting = select_repair_context(&candidates, issue, "creator", exact);
+        assert_eq!(paths(&fitting), vec!["pkg/target.py"]);
+        assert_eq!(fitting.files[0].shown, ShownMode::Path);
+        assert_eq!(
+            prompt_tokens_estimate(&fitting, estimate_tokens(issue.len())),
+            exact
+        );
+        assert!(fitting.dropped_for_budget.is_empty());
     }
 
     /// [VANTA-WHY] §1.6.10 — the gate refuses a role whose selection has no *body*
@@ -2724,10 +2831,12 @@ mod tests {
         let candidates = vec![candidate("pkg/d.py", &d)];
         let issue = "pkg/d.py is broken.\n";
 
-        // Room for the tree and the path form, and no more: the whole body and the
-        // outline are both denied.
+        // Room for the issue, the frame, the tree and the path form, and no more:
+        // the whole body and the outline are both denied.
         let tree = "# REPOSITORY FILES (paths only)\n".len() + "pkg/d.py\n".len();
-        let budget = estimate_tokens(tree) + estimate_tokens(framed_len("pkg/d.py", &path_only_body()));
+        let budget = reserved_prompt_tokens(estimate_tokens(issue.len()))
+            + estimate_tokens(tree)
+            + estimate_tokens(framed_len("pkg/d.py", &path_only_body()));
 
         let selection = select_repair_context(&candidates, issue, "creator", budget);
 

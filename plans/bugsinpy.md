@@ -787,7 +787,8 @@ Two questions had been answered by one list, and they are not the same question:
 
 **The rule: a file's body is carried only when**
 
-1. **its extension is the project's own source** — `.py`, `.pyx`, `.pxd`, `.pyi`; **or**
+1. **its extension is the project's own source** — `.py`, `.pyx`, `.pxd`, `.pyi` — **and it is not the
+   project's paratext**; **or**
 2. **the run's own inputs name that file** — `Path` (the issue names its path, basename or module),
    `Traceback` (a frame of a traceback inside the issue names it), or `PatchTouched` (the patch under
    review touches it).
@@ -796,6 +797,24 @@ Everything else a signal reaches is a path, never a body. Being in the tree is n
 and neither is being *reachable* from something the issue named: an import neighbour, and a covering
 test of a file that is not project source, are reachable rather than named, and §1.6.6's listing is
 already where their paths belong.
+
+**The paratext carve-out (item 4).** The dev-2 run exposed a gap the extension rule alone leaves open:
+`sanic/1`'s issue names `add_task`, and `examples/add_task_sanic.py` *declares* it, so the example was
+shown in full at rank 4. A `.py` example passes the extension test — it is Python the project wrote —
+but it is not the code a bug is fixed in: it is a demonstrator, and a demonstrator is a name's
+*mention*, never its *place*. The same holds for the documentation (`docs/conf.py` is Python and is
+never the bug) and for an `asv_bench` harness. These directories are the project's **paratext**:
+
+- `example`, `examples`; `doc`, `docs`; `benchmark`, `benchmarks`, `asv_bench`.
+
+A file under one of them is a **path only**, even when its extension is project source, unless a
+**path** signal — `Path`, `Traceback` or `PatchTouched` — names it. An `Identifier` or a `bm25` match is
+not enough; the escape is the same one every non-source file has, and it is deliberate that a *name*
+does not open it, exactly as §1.6.8's last paragraph refuses a body to a `.js` class the issue names.
+Only **directories** are tested, and only the *directory* components — the file's own name is dropped
+first — so a `pkg/docs.py` module is source and a `docs/conf.py` is not. The predicate lives beside the
+extension rule as `is_paratext`, and `carries_body` asks both: `names_the_file(reasons) ||
+(is_project_source(path) && !is_paratext(path))`.
 
 `.pyx`, `.pxd` and `.pyi` count as project source alongside `.py`. pandas and spacy have real bugs in
 Cython files — `pandas/_libs/algos.pyx` is where this corpus's `.pyx` bugs live — and a `.pxd` is the

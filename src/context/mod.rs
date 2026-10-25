@@ -63,6 +63,29 @@ pub const SOURCE_EXTENSIONS: &[&str] = &[
 /// was not walked, so that branch was dead on every real tree.
 pub const PROJECT_SOURCE_EXTENSIONS: &[&str] = &["py", "pyx", "pxd", "pyi"];
 
+/// Directory names whose files are the project's *paratext* — its examples, its
+/// documentation and its benchmarks — rather than the code a bug is fixed in
+/// (§1.6.8 item 4).
+///
+/// [VANTA-WHY] A `.py` example is Python, so the extension rule alone showed
+/// `sanic/1`'s `examples/add_task_sanic.py` in full at rank 4: the issue's own
+/// symbol was declared in it — or, before the fence fix, merely appeared in it —
+/// and an identifier is a name, not a place. §1.6.8 already refuses a body to a
+/// `.js` class the issue names, for the same reason: being *reachable* from a
+/// name is not being *named*. A demonstrator, a doc build and a `asv` harness
+/// cannot hold the bug either, so they get the path the listing already gives
+/// them and nothing more. A file here is still shown in full when the run names
+/// its *path* — the same escape every non-source file has.
+pub const PARATEXT_DIRECTORIES: &[&str] = &[
+    "example",
+    "examples",
+    "doc",
+    "docs",
+    "benchmark",
+    "benchmarks",
+    "asv_bench",
+];
+
 /// A selected file larger than this is shown as an outline rather than in full.
 ///
 /// [VANTA-WHY] This was a *skip* threshold in the old walk: a 70 KB file was
@@ -1698,20 +1721,43 @@ fn looks_like_source(path: &str) -> bool {
 }
 
 /// Is this path the project's own source, and so entitled to a body on its own?
+///
+/// The question is the *extension* alone: an `examples/*.py` file is Python, and
+/// `defined_names` must parse it as Python. Whether that extension entitles the
+/// file to a body is `carries_body`'s question, and it also weighs the directory
+/// (`is_paratext`).
 fn is_project_source(path: &str) -> bool {
     PROJECT_SOURCE_EXTENSIONS
         .iter()
         .any(|ext| path.ends_with(&format!(".{ext}")))
 }
 
+/// Whether `path` sits in one of `PARATEXT_DIRECTORIES` — an example, the
+/// documentation, or a benchmark harness (§1.6.8 item 4).
+///
+/// Only *directories* are tested: the file's own name is dropped first, so a
+/// `pkg/docs.py` module is source and a `docs/conf.py` is not.
+fn is_paratext(path: &str) -> bool {
+    let mut components: Vec<&str> = path.split('/').collect();
+    components.pop();
+    components
+        .iter()
+        .any(|component| PARATEXT_DIRECTORIES.contains(component))
+}
+
 /// May this file's *body* be carried, or only its path (§1.6.8)?
 ///
 /// A body is the expensive half of the prompt, so it is carried for the project's
-/// own source, or for a file the run's inputs named — the issue's path or module,
-/// a traceback frame, the patch under review. Everything else a signal reached
-/// (an import neighbour, a covering test of a file that is not source) is a path.
+/// own source — which is source by extension *and* not paratext by directory —
+/// or for a file the run's inputs named: the issue's path or module, a traceback
+/// frame, the patch under review. Everything else a signal reached (an import
+/// neighbour, a covering test of a file that is not source, an example the
+/// issue's symbol happens to appear in) is a path.
 fn carries_body(path: &str, reasons: &[SelectionReason]) -> bool {
-    is_project_source(path) || reasons.iter().any(|reason| reason.names_the_file())
+    if reasons.iter().any(|reason| reason.names_the_file()) {
+        return true;
+    }
+    is_project_source(path) && !is_paratext(path)
 }
 
 /// Which rule names `candidate_path` — exactly, by basename, by module name, as a
@@ -3228,6 +3274,61 @@ mod tests {
             by_symbol.dropped_for_budget.is_empty(),
             "the budget did not refuse it, so it must not be reported as a drop"
         );
+    }
+
+    /// [VANTA-WHY] §1.6.8 item 4 — an example, the documentation and a benchmark
+    /// harness are the project's *paratext*, not the code a bug is fixed in. A
+    /// `.py` example is Python, so the extension rule alone showed
+    /// `sanic/1`'s `examples/add_task_sanic.py` in full at rank 4 for a symbol the
+    /// issue named — reachable, not named. Being `Identifier`-reached is not
+    /// enough: only a *path* signal buys these files a body.
+    #[test]
+    fn an_example_benchmark_or_doc_is_a_path_only_however_it_is_reached() {
+        let candidates = vec![
+            candidate("sanic/app.py", "def add_task(app):\n    return app\n"),
+            candidate("examples/add_task_sanic.py", "def add_task(app):\n    return app\n"),
+            candidate("docs/conf.py", "def add_task(app):\n    return app\n"),
+            candidate("benchmarks/add_task.py", "def add_task(app):\n    return app\n"),
+        ];
+        let issue = "`add_task` never runs.\n";
+
+        // A symbol the issue names, defining in all four. Only the project's own
+        // source carries a body; the paratext is left to the listing.
+        let by_symbol = select_repair_context(&candidates, issue, "creator", 60_000);
+        assert_eq!(
+            paths(&by_symbol),
+            vec!["sanic/app.py"],
+            "an `identifier` hit reaches a file; it does not name it (§1.6.8 item 4)"
+        );
+        for path in [
+            "examples/add_task_sanic.py",
+            "docs/conf.py",
+            "benchmarks/add_task.py",
+        ] {
+            assert!(
+                by_symbol.tree.contains(&path.to_string()),
+                "the path still travels in the listing: {path}"
+            );
+        }
+
+        // A path the issue does give buys the example its body, exactly as it does
+        // for a `.js` file: the rule is about being named, not about the directory.
+        let by_path = select_repair_context(
+            &candidates,
+            "`add_task` in examples/add_task_sanic.py never runs.\n",
+            "creator",
+            60_000,
+        );
+        let example = by_path
+            .files
+            .iter()
+            .find(|file| file.path == "examples/add_task_sanic.py")
+            .expect("the file the issue named by path is selected");
+        assert!(
+            example.reasons.contains(&SelectionReason::Path),
+            "the path signal is what names it"
+        );
+        assert_eq!(example.shown, ShownMode::Full);
     }
 
     /// [VANTA-WHY] §1.6.8 — the other half of the rule, and the half that makes

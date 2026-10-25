@@ -916,6 +916,17 @@ The markers are explicit lines rather than blank ones because a `none` report's 
 and a reader that split on "the first blank line after the header" could not tell that from a
 truncated file.
 
+**Only the content section is sent, and a test says so over the gate's own inputs.** The gate's
+inputs are answer-side — `GateRecord.files` is the hidden test file the answer tokens were counted
+from, and the removals are the tokens that occurred in the fix diff or those files. A reader that
+took "the file's text" rather than its content section would put both in the prompt, and nothing in
+any metric afterwards would show it. So the assertion is not "the text looks clean" but "every path
+the gate counted answer tokens from is present in the committed file (the record is honest) and
+absent from `content` (the prompt is clean)", plus the header's own lines and the two other markers
+being absent from `content`. Read back, `FrozenIssue.content` is the *only* string `prepare` hands
+the selector and the run (`build_issue` sets `prep.issue.text` from it), so the test's subject and
+the prompt's are the same bytes.
+
 #### 2.4.4 The leak gate, now applied to the issue text — once, at freeze time
 
 The gate of §2.2 step 4 is kept, unchanged in rule, and now runs over the issue text instead of the

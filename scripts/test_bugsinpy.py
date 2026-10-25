@@ -3189,6 +3189,75 @@ class TestFrozenIssueReport:
         assert back.gate_tree_sha256 == "a" * 64
         assert back.gate_answer_sha256 == "b" * 64
 
+    def test_the_text_vanta_receives_names_no_gate_input_path(self, tmp_path):
+        """§2.4 item 3: only the ``<!-- content -->`` section is the issue text.
+
+        The artifact carries four things — the header, the gate's record, the raw report
+        and the gated text — and exactly one of them is sent. The other three exist so a
+        reviewer can see what was removed and against which inputs, and two of those
+        inputs are *answer-side*: the hidden test files the gate counted tokens from
+        (``GateRecord.files``) and the tokens it stripped for occurring in the fix diff or
+        those files. A reader that took the file's text rather than its content section
+        would put both in the prompt, and no metric afterwards would show it. So the
+        assertion is over the gate's own inputs: every one of them is present in the
+        committed file (the record is honest) and absent from ``content`` (the prompt is
+        clean).
+        """
+        hidden = "pandas/tests/dtypes/test_dtypes.py"
+        fix_file = "pandas/core/dtypes/common.py"
+        report = self._report(
+            project="pandas",
+            bug_id=1,
+            body=f"The failing test is {hidden} and the fix belongs in {fix_file}.",
+            comments=[],
+        )
+        gated = (
+            report.content().replace(hidden, "[redacted]").replace(fix_file, "[redacted]")
+        )
+        report.gate = source_mod.GateRecord(
+            leak=issue_mod.LeakResult(
+                text=gated,
+                removals=[
+                    issue_mod.LeakRemoval(
+                        token=name,
+                        token_class="path",
+                        reason="occurs in the answer and nowhere in the vanta tree",
+                        occurrences_in_answer=1,
+                        occurrences_in_vanta_tree=0,
+                        action="stripped",
+                    )
+                    for name in (hidden, fix_file)
+                ],
+                ungated_prose=[],
+                ok=True,
+                reason=None,
+            ),
+            tree_sha256="a" * 64,
+            answer_sha256="b" * 64,
+            files=(hidden,),
+        )
+        path = source_mod.write_frozen(tmp_path / "pandas_1.md", report)
+        on_disk = path.read_text(encoding="utf-8")
+        back = source_mod.load_frozen(path)
+
+        gate_inputs = {hidden, fix_file} | set(back.gate_files)
+        for name in sorted(gate_inputs):
+            assert name in on_disk, (
+                f"{name} is one of the gate's own inputs, so the committed artifact has "
+                "to record it — otherwise the removals cannot be checked against what "
+                "was removed"
+            )
+            assert name not in back.content, (
+                f"{name} is answer-side (the hidden test or the fix), and it reached the "
+                "text Vanta is given — only the content section may be sent"
+            )
+        assert back.content == gated
+        for marker in (source_mod.GATE_MARKER, source_mod.RAW_MARKER):
+            assert marker not in back.content
+        assert "- gate-tree-sha256:" not in back.content
+        assert gated in on_disk
+        assert len(on_disk) > len(gated), "the file carries provenance the text does not"
+
     def test_the_header_says_how_the_issue_was_resolved(self, tmp_path):
         path = source_mod.write_frozen(
             tmp_path / "pandas_1.md", self._report(project="pandas", bug_id=1, source=source_mod.SOURCE_VIA_PR, via_pr=34294)

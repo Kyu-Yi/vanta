@@ -603,6 +603,17 @@ def cmd_bake(args: argparse.Namespace) -> int:
         )
         for item in bug_deps
     }
+    # The names the tree under test provides, read from the same provenance
+    # (bake.TREE_SATISFIED_RULE): the walk pins nothing for them, the recipe installs the
+    # pins that declare one with ``--no-deps`` so pip cannot resolve them either, and the
+    # own-pin gate therefore tolerates the ``pip check`` reading that names one
+    # (bake.CASE_TREE_PROVIDED) while failing on any other missing requirement.
+    tree_provided = {
+        item.checkpoint: tuple(
+            record["name"] for record in item.provenance.get("tree_satisfied") or ()
+        )
+        for item in bug_deps
+    }
     try:
         summary = bake_mod.run_bake_actions(
             actions,
@@ -623,6 +634,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             pins=pin_lists,
             provided=provided,
             dropped=dropped,
+            tree_provided=tree_provided,
         )
     except BaseException:
         report_flagged()

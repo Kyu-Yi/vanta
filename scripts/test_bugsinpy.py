@@ -6808,6 +6808,32 @@ class TestPinConflicts:
         assert other.case == bake_mod.CASE_HARNESS_CHOICE
         assert not other.tolerated
 
+    def test_a_missing_requirement_the_tree_provides_is_case_t_and_tolerated(self):
+        """``pandas/1``: the pin that declares the tree's own name is ``--no-deps`` too.
+
+        The same sentence as case (d)'s and the same verdict, and the difference is the
+        ``tree_provided`` set: ``statsmodels==0.11.1`` declares ``pandas``, the tree under
+        test provides that name so the layer installs nothing for it, and the recipe stops
+        pip resolving it the same way — so the absence is the measure working.
+        """
+        line = "statsmodels 0.11.1 requires pandas, which is not installed."
+        tolerated = bake_mod.pip_check_conflicts(
+            (line,), own=frozenset({"statsmodels"}), tree_provided=("pandas",)
+        )[0]
+        assert tolerated.case == bake_mod.CASE_TREE_PROVIDED
+        assert tolerated.held == "nothing"
+        assert tolerated.tolerated
+        assert tolerated.requires == "statsmodels==0.11.1 declares pandas"
+        assert tolerated.pins == ("statsmodels==0.11.1",)
+        assert "the tree under test provides it, by §3.2's audit" in tolerated.describe()
+        # By name, and per rule: a tree-provided name that is not the one the reading names
+        # is still case (a), even though the layer installs nothing for it either.
+        other = bake_mod.pip_check_conflicts(
+            (line,), own=frozenset({"statsmodels"}), tree_provided=("xarray",)
+        )[0]
+        assert other.case == bake_mod.CASE_HARNESS_CHOICE
+        assert not other.tolerated
+
     def test_a_line_this_cannot_read_is_a_conflict_as_written(self):
         """Not a line that says the conflict is tolerable, so case (a) and refused."""
         conflicts = bake_mod.pip_check_conflicts(
@@ -7666,7 +7692,7 @@ class TestPinConflicts:
             "'nothing to report' and 'this file predates the reading' must not read alike"
         )
 
-    def _gate_run(self, tmp_path, *, own_pins, reading=None):
+    def _gate_run(self, tmp_path, *, own_pins, reading=None, tree_provided=None):
         logged: list[str] = []
         recorded: list[tuple[str, tuple[bake_mod.PinConflict, ...]]] = []
         logs = tmp_path / "bake-logs"
@@ -7713,6 +7739,7 @@ class TestPinConflicts:
             logs_dir=logs,
             own_pins=own_pins,
             record=record,
+            tree_provided=tree_provided,
         )
         return summary, logged, recorded, logs
 
@@ -7802,6 +7829,40 @@ class TestPinConflicts:
         assert not any("pip check found a conflict" in line for line in logged)
         text = bake_mod.bake_log_path(logs, "vanta-bi-Demo-1").read_text(encoding="utf-8")
         assert bake_mod.PIP_CHECK_CLEAN in text, "the reading is still the layer's log"
+
+    def test_a_missing_requirement_the_tree_provides_keeps_the_layer(self, tmp_path):
+        """``pandas/1``'s shape through the gate, which is where the reader is told.
+
+        The layer's own reading names a requirement it installs nothing for on purpose —
+        the tree under test provides that name — so the layer is kept and the finding is
+        logged as the case it is, exactly as a dropped name's absence is.
+        """
+        line = "statsmodels 0.11.1 requires pandas, which is not installed."
+        summary, logged, recorded, logs = self._gate_run(
+            tmp_path,
+            own_pins={"vanta-bi-Demo-1": frozenset({"statsmodels"})},
+            reading=line,
+            tree_provided={"vanta-bi-Demo-1": ("pandas",)},
+        )
+        assert "[done] vanta-bi-Demo-1" in summary
+        assert any(
+            entry.startswith("[vanta-bi-Demo-1] case (t) ") and "tolerated" in entry
+            for entry in logged
+        ), "the reader is told which absence this is"
+        assert [conflict.case for _name, conflicts in recorded for conflict in conflicts] == [
+            bake_mod.CASE_TREE_PROVIDED
+        ], "and the deps JSON carries it, so a later stage can see why it was kept"
+        text = bake_mod.bake_log_path(logs, "vanta-bi-Demo-1").read_text(encoding="utf-8")
+        assert line in text
+
+    def test_the_same_absence_without_the_tree_in_the_map_is_refused(self, tmp_path):
+        """The gate is by name and reads the provenance: nothing else makes it tolerable."""
+        with pytest.raises(bake_mod.BakeError):
+            self._gate_run(
+                tmp_path,
+                own_pins={"vanta-bi-Demo-1": frozenset({"statsmodels"})},
+                reading="statsmodels 0.11.1 requires pandas, which is not installed.",
+            )
 
 
 # ============================================================================
@@ -8205,7 +8266,7 @@ class TestTheClosureWalk:
         ``typing-extensions``, through ``cryptography 47.0.0``. Keeping the name is the
         wrong answer to that: it leaves a release in the layer the harness never chose.
         The fix is to stop the fetch, by installing ``pyopenssl`` with ``--no-deps``
-        (:func:`bake_mod.dropped_dependents`), which is why the walk takes no
+        (:func:`bake_mod.no_deps_dependents`), which is why the walk takes no
         dropped-name input and why this test's orphan set is the measured one.
         """
         table = {**_fixture_releases(), **self.DROPPED_RELEASES}
@@ -8236,19 +8297,22 @@ class TestTheClosureWalk:
         ], "the measured sanic/1 orphan set, with nothing excused for a dropped name"
 
 
-class TestTheDroppedDependencyPass:
-    """§3.2: a pin that declares a name the layer dropped is installed ``--no-deps``.
+class TestTheAbsentNamePass:
+    """§3.2: a pin declaring a name the layer installs nothing for goes ``--no-deps``.
 
-    [VANTA-WHY] A drop removes a name from ``installs``; it does not remove the
-    requirement another pin wrote for that name, so pip resolves it — and at the newest
-    release of the day, because a dropped name is in no pin list and in no constraints
-    file (``-c`` is silent about a name it does not name). ``sanic/1`` measured the whole
-    chain: ``cryptography`` dropped for both its declared and its transitive pick,
-    ``pyopenssl==19.1.0`` and ``service-identity==18.1.0`` declaring it, and the layer
-    ending up with ``cryptography 47.0.0`` — whose own ``requires_dist`` names a package
-    the layer had just removed, which is what its ``pip check`` reported. Installing the
-    declaring pins ``--no-deps`` is what closes it; the two gates below read the result
-    back.
+    [VANTA-WHY] Two rules leave a name out of ``installs`` — §3.2's unresolvable-pin rule
+    *drops* it, and :data:`bake_mod.TREE_SATISFIED_RULE` leaves the tree under test's own
+    name to the tree — and neither removes the requirement another pin wrote for that
+    name, so pip resolves it, and at the newest release of the day, because such a name is
+    in no pin list and in no constraints file (``-c`` is silent about a name it does not
+    name). Measured once per rule. ``sanic/1``: ``cryptography`` dropped for both its
+    declared and its transitive pick, ``pyopenssl==19.1.0`` and
+    ``service-identity==18.1.0`` declaring it, and the layer ending up with
+    ``cryptography 47.0.0`` — whose own ``requires_dist`` names a package the layer had
+    just removed, which is what its ``pip check`` reported. ``pandas/1``: ``pandas`` left
+    to the tree, ``statsmodels==0.11.1``, ``xarray==0.15.1`` and ``fastparquet==0.4.0``
+    declaring it, and the layer ending up with ``pandas 2.0.3``. Installing the declaring
+    pins ``--no-deps`` is what closes it; the gates below read the result back.
     """
 
     INSTALLS = (
@@ -8259,61 +8323,84 @@ class TestTheDroppedDependencyPass:
     )
     """One layer's install list, in the shape ``installs_of`` produces it."""
 
+    TREE_INSTALLS = (
+        "statsmodels==0.11.1",
+        "xarray==0.15.1",
+        "fastparquet==0.4.0",
+        "numpy==1.18.4",
+    )
+    """``pandas/1``'s shape: three pins that declare the tree's own name, and one that does
+    not."""
+
     DECLARES = {
-        ("pyopenssl", "19.1.0"): "cryptography>=2.8",
-        ("service-identity", "18.1.0"): "cryptography",
-        ("sanic", "19.12.2"): "uvloop; sys_platform != 'win32'",
-        ("cryptography", "2.9.2"): "cffi>=1.8,!=1.11.3",
+        ("pyopenssl", "19.1.0"): ("cryptography>=2.8",),
+        ("service-identity", "18.1.0"): ("cryptography",),
+        ("sanic", "19.12.2"): ("uvloop; sys_platform != 'win32'",),
+        ("cryptography", "2.9.2"): ("cffi>=1.8,!=1.11.3",),
+        ("statsmodels", "0.11.1"): ("pandas>=0.25",),
+        ("xarray", "0.15.1"): ("pandas>=0.25",),
+        ("fastparquet", "0.4.0"): ("pandas>=0.19",),
+        ("numpy", "1.18.4"): ("six",),
+        ("both", "1.0"): ("cryptography>=2.8", "pandas>=0.25"),
     }
+    """What each release declares, sparse: a name not here is a release nothing was read
+    for, which is the case :func:`bake_mod.no_deps_dependents` skips rather than guesses
+    at."""
 
-    def _dropped(self, *names: str):
-        return tuple(
-            bake_mod.DroppedPin(
-                name=name,
-                spec=f"{name}==2.8",
-                sources=("pyopenssl==19.1.0",),
-                version="2.8",
-                outcome=bake_mod.UNBUILDABLE,
-                reason="no entry in the reviewed table can build it here",
-            )
-            for name in names
-        )
-
-    @staticmethod
-    def _metadata_of(name: str, version: str):
-        declared = TestTheDroppedDependencyPass.DECLARES.get((name, version))
+    def _metadata_of(self, name: str, version: str):
+        declared = self.DECLARES.get((name, version))
         if declared is None:
             raise bake_mod.BakeError(f"no metadata for {name}=={version}")
-        return ((declared,), None)
+        return (declared, None)
 
     # ---- which pins are moved out of the main pass -------------------------
-    def test_the_pins_that_declare_a_dropped_name_are_the_only_ones_moved(self):
-        no_deps = bake_mod.dropped_dependents(
-            self.INSTALLS,
-            self._dropped("cryptography"),
-            metadata_of=self._metadata_of,
+    def test_the_pins_that_declare_an_absent_name_are_the_only_ones_moved(self):
+        no_deps = bake_mod.no_deps_dependents(
+            self.INSTALLS, ("cryptography",), metadata_of=self._metadata_of
         )
         assert no_deps == (
             "pyopenssl==19.1.0",
             "service-identity==18.1.0",
         ), "sanic and the dropped pin itself declare no dropped name"
         # A bare declaration counts exactly as a ranged one does.
-        assert bake_mod.dropped_dependents(
+        assert bake_mod.no_deps_dependents(
             ("service-identity==18.1.0",),
-            self._dropped("cryptography"),
+            ("cryptography",),
             metadata_of=self._metadata_of,
         ) == ("service-identity==18.1.0",)
 
-    def test_a_layer_with_nothing_dropped_moves_nothing(self):
+    def test_the_tree_own_name_is_moved_by_the_same_pass(self):
+        """``pandas/1``: the name the walk refuses to pin is the one pip resolved anyway.
+
+        The rule the walk applies and the rule this pass applies are the same rule, which
+        is why it is one function and one ``--no-deps`` block and not two of each: leaving
+        the name out of the pin list is not enough on its own, and the pins that declare it
+        have to be moved out of the resolving pass as well.
+        """
+        assert bake_mod.no_deps_dependents(
+            self.TREE_INSTALLS, ("pandas",), metadata_of=self._metadata_of
+        ) == (
+            "statsmodels==0.11.1",
+            "xarray==0.15.1",
+            "fastparquet==0.4.0",
+        ), "numpy is read and declares no such name, so it stays in the main pass"
+
+    def test_a_pin_that_declares_a_name_of_each_rule_is_moved_once(self):
+        """The caller passes one union of both rules' names, not the result of two calls."""
+        assert bake_mod.no_deps_dependents(
+            ("both==1.0", "pyopenssl==19.1.0"),
+            ("cryptography", "pandas"),
+            metadata_of=self._metadata_of,
+        ) == ("both==1.0", "pyopenssl==19.1.0"), "once each, never twice"
+
+    def test_a_layer_with_nothing_absent_moves_nothing(self):
         assert (
-            bake_mod.dropped_dependents(
-                self.INSTALLS, (), metadata_of=self._metadata_of
-            )
+            bake_mod.no_deps_dependents(self.INSTALLS, (), metadata_of=self._metadata_of)
             == ()
         )
         assert (
-            bake_mod.dropped_dependents(
-                self.INSTALLS, self._dropped("pywin32"), metadata_of=self._metadata_of
+            bake_mod.no_deps_dependents(
+                self.INSTALLS, ("pywin32",), metadata_of=self._metadata_of
             )
             == ()
         ), "a dropped name nothing declares moves no pin"
@@ -8321,9 +8408,9 @@ class TestTheDroppedDependencyPass:
     def test_a_release_nothing_could_be_read_for_is_not_guessed_at(self):
         """The reader's contract, not a silent pass: an unreadable release moves nothing."""
         assert (
-            bake_mod.dropped_dependents(
+            bake_mod.no_deps_dependents(
                 ("unknown-pin==1.0", "pyopenssl==19.1.0"),
-                self._dropped("cryptography"),
+                ("cryptography",),
                 metadata_of=self._metadata_of,
             )
             == ("pyopenssl==19.1.0",)
@@ -8378,6 +8465,28 @@ class TestTheDroppedDependencyPass:
         recipe = bake_mod.requirements_recipe(self.INSTALLS)
         assert "VANTA_NO_DEPS" not in recipe
         assert "--no-deps" not in recipe
+
+    def test_a_tree_name_moves_its_declarers_out_of_the_main_pass_too(self):
+        """``pandas/1`` end to end, at the recipe: the one ``--no-deps`` block, both rules.
+
+        The pins the walk pinned for the tree's own name are the ones that have to leave
+        the resolving pass, so this is the reading of the same pass from the other rule —
+        and there is one block, not two, because the two rules' dependents are one list.
+        """
+        recipe = bake_mod.requirements_recipe(
+            self.TREE_INSTALLS, no_deps_pins=("statsmodels==0.11.1", "xarray==0.15.1")
+        )
+        assert recipe.count("<<'VANTA_NO_DEPS'") == 1
+        no_deps_block = recipe.split("<<'VANTA_NO_DEPS'\n", 1)[1]
+        assert no_deps_block.startswith("statsmodels==0.11.1\nxarray==0.15.1\n")
+        assert "--no-deps " in no_deps_block
+        main = (
+            recipe.split("<<'VANTA_REQUIREMENTS'\n", 1)[1]
+            .split("\nVANTA_REQUIREMENTS", 1)[0]
+        )
+        assert main.splitlines() == ["fastparquet==0.4.0", "numpy==1.18.4"]
+        assert recipe.index("<<'VANTA_REQUIREMENTS'") < recipe.index("<<'VANTA_NO_DEPS'")
+        assert recipe.index("<<'VANTA_NO_DEPS'") < recipe.index("pip check")
 
 
 class TestTheBugUnderTestIsNeverATransitivePin:
@@ -8540,6 +8649,11 @@ class TestTheBugUnderTestIsNeverATransitivePin:
         assert layers[0].installs == ("statsmodels==0.11.1",), (
             "the tree's own pandas is not installed over the tree"
         )
+        assert layers[0].no_deps_pins == ("statsmodels==0.11.1",), (
+            "and the pin that declares it leaves the resolving pass, or pip resolves the "
+            "name the walk just refused to pin (§3.2's absent-name pass)"
+        )
+        assert layers[0].provenance["no_deps"] == ["statsmodels==0.11.1"]
         assert layers[0].provenance["tree_satisfied"] == [
             {
                 "name": "pandas",

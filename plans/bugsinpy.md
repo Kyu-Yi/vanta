@@ -1837,11 +1837,42 @@ they asked, carried in the deps JSON under `tree_satisfied` beside `dropped` and
 present, empty when the tree answered nothing), because "the requirement was satisfied" has to be a
 statement a reader can check rather than a name that quietly went missing. The names are read once, in
 `bake.bug_sources`, and carried on `DepSources.tree_modules`, so the test side's import closure and this
-walk cannot disagree about what the tree ships. Measured across the six layers, **exactly one pick
-disappears**: `pandas/1` no longer installs `pandas==1.0.3`
-(`required_by ['statsmodels==0.11.1', 'xarray==0.15.1']`); `fastapi/1`, `luigi/1`, `matplotlib/1`,
-`sanic/1` and `PySnooper/1` have neither the project's own name nor a tree-shipped module spelling in
-their transitive lists.
+walk cannot disagree about what the tree ships.
+
+**Leaving the name out of the pin list is not enough on its own, and the first bake of `pandas/1` is the
+measurement that says so.** The exemption removes `pandas` from `installs`; it does not remove the
+requirement `statsmodels==0.11.1`, `xarray==0.15.1` and `fastparquet==0.4.0` each wrote for it, and a name
+that is in no pin list is in no `-c` constraints file either (`bake.constraint_lines` writes the layer's
+own pins and nothing else), so pip resolved it itself. The layer took `pandas 2.0.3` — a 2023 wheel whose
+own `requires_dist` refuses the layer's `numpy==1.18.4` and `python-dateutil==2.8.1`, which is exactly what
+the layer's own `pip check` then reported (`pandas 2.0.3 has requirement numpy>=1.20.3; python_version <
+"3.10", but you have numpy 1.18.4`) — beside a `tzdata 2026.5` that is no pin's dependency either, so the
+exemption did not hold end to end: the released pandas the walk refused to pin was installed anyway, by
+pip, one step later. The remedy is the pass §3.2 already has for the *other* rule that leaves a name out
+of `installs`: the pins that declare an absent name are installed `--no-deps` in their own block, after
+the main pass and before the orphan removal (`bake.no_deps_dependents` — one function for both rules,
+because it is one behaviour over one list of names, and the caller passes the union of the dropped names
+and the tree's). Nothing is lost by that: everything those pins require is already installed, since the
+closure walk pinned it, except the absent name, which is precisely what may not be installed.
+
+The absence that leaves is a case of its own rather than a dropped dependency, because a reader acts
+differently on the two — a dropped name is one this image could not build, a tree-provided one is one the
+layer must not install: `bake.CASE_TREE_PROVIDED` (`"t"`), whose tolerated line reads
+`case (t) <pin> declares <name>: the tree under test provides it, by §3.2's audit — tolerated`. It is read
+**by name** off the provenance's `tree_satisfied` and reaches the gate through
+`bake.run_bake_actions(tree_provided=…)` from `scripts/bugsinpy_run.py`, beside the `dropped` map that has
+been there since the drop rule; a missing requirement that is neither is still case (a) and still fails
+the layer. Nothing is whitelisted: the declaring pins are moved out of the resolving pass, pip is stopped
+from resolving the name at all, and the absence that remains is attributed to the rule that caused it. The
+freeze gate needed no parameter of its own for this: a tree-provided name is in neither the layer's pins
+nor its provision, so a leaked release of it fails there on the rule that already fails an orphan —
+`pandas/1`'s own line was `VANTA-PIP-FREEZE pandas==2.0.3`, and the gate that refused the layer first was
+the own-pin gate above it.
+
+Measured across the six layers, **exactly one layer moves**: `pandas/1`, whose `pandas==1.0.3` pick became
+no pin, no install and one `--no-deps` block; `fastapi/1`, `luigi/1`, `matplotlib/1`, `sanic/1` and
+`PySnooper/1` have neither the project's own name nor a tree-shipped module spelling in their transitive
+lists, so their `tree_satisfied` is `[]` and their recipes are unchanged.
 
 **A requirement whose marker is false for *this* layer is not a requirement, and every reader that
 sees one says so.** A marker is a conditional, and reading it as decoration installs what pip would
@@ -2026,31 +2057,37 @@ so anything else fails the layer. No orphans is the ordinary case and the recipe
 whose bug does not re-pin a harness package removes nothing. Every removal is written into the deps JSON
 under `orphans` with its reason, and the names are deliberately **not** in `provisioned`.
 
-**A name this layer *drops* is not left to pip's judgement: the pin that declares it is installed
-`--no-deps` (`bake.dropped_dependents`).** Measured, and it is what `sanic/1` failed on. Its freeze held
-`cryptography 47.0.0`. A drop removes a name from the **pin list**; it does not remove the requirement
-another pin wrote for that name, so pip satisfies it at install time — and at the newest release of the
-day, because `-c` cannot stop what it is not told about: the constraints file is built from the pin list
-(`bake.constraint_pins`), a dropped name is in no pin list, and pip therefore never reads an opinion about
-it. `pyopenssl==19.1.0` declares `cryptography (>=2.8)` and `service-identity==18.1.0` declares it bare;
-the date rule's `cryptography==2.8` and its transitive pick `2.9.2` both have no wheel this image can build
-and both are dropped; pip resolves the name for itself and installs `47.0.0`, a release years newer than
-every pin in the layer. An exemption that *keeps* such a name is an accommodation of the leak, so the leak
-is closed instead: the pins whose **own** release declares a dropped name (`bake.dropped_dependents`, read
-from that release's `requires_dist`, the same metadata every other rule reads) are moved out of the main
+**A name this layer installs nothing for is not left to pip's judgement: the pin that declares it is
+installed `--no-deps` (`bake.no_deps_dependents`).** Measured, and it is what `sanic/1` failed on. Its
+freeze held `cryptography 47.0.0`. A drop removes a name from the **pin list**; it does not remove the
+requirement another pin wrote for that name, so pip satisfies it at install time — and at the newest
+release of the day, because `-c` cannot stop what it is not told about: the constraints file is built from
+the pin list (`bake.constraint_pins`), a dropped name is in no pin list, and pip therefore never reads an
+opinion about it. `pyopenssl==19.1.0` declares `cryptography (>=2.8)` and `service-identity==18.1.0`
+declares it bare; the date rule's `cryptography==2.8` and its transitive pick `2.9.2` both have no wheel
+this image can build and both are dropped; pip resolves the name for itself and installs `47.0.0`, a
+release years newer than every pin in the layer. An exemption that *keeps* such a name is an
+accommodation of the leak, so the leak is closed instead: the pins whose **own** release declares such a
+name (`bake.no_deps_dependents`, read from that release's `requires_dist`, the same metadata every other
+rule reads) are moved out of the main
 pass and installed in their own pass with `--no-deps` (`requirements_recipe`'s `/tmp/no-deps.txt`, written
-after the main install and before the orphan removal). Nothing is lost by that: everything those pins
-require is already installed by the main pass — the closure walk pinned it — except the dropped name
-itself, which is precisely the one thing that may not be installed. The pass carries the same `-c`, the
+after the main install and before the orphan removal). The function takes one list of absent names because
+the drop rule is not the only rule that leaves a name out of `installs`: the tree under test's own name
+does too, by the paragraph above, and it is the same leak with the same remedy — the tree paragraph carries
+that measurement (`pandas 2.0.3`) and the case it is tolerated under. Nothing is lost by that: everything
+those pins require is already installed by the main pass — the closure walk pinned it — except the absent
+name itself, which is precisely the one thing that may not be installed. The pass carries the same `-c`, the
 same `--no-build-isolation` and the same legacy resolver as every other install; it is the same command
 with one flag more, not a second mechanism. `pip check` then reads the absence this leaves
 (`pyopenssl 19.1.0 requires cryptography, which is not installed`) and the own-pin gate tolerates exactly
-that reading, **by name only**: the requirement the line names has to canonicalize to a name this layer
-dropped, so a missing requirement that is anything else is still §3.2's case (a) and still fails the layer
-(`bake.CASE_DROPPED_DEPENDENCY`, `bake._required_name`). A reading with no held version is an *absence*
-rather than a conflict between two pins, so case (b) cannot apply to it at all. The freeze gate below
-fails hard if a dropped name appears in it at any version, whatever the pin list says: the pass not having
-taken is the only way for that to happen.
+that reading, **by name only and per rule**: the requirement the line names has to canonicalize to a name
+this layer dropped (`bake.CASE_DROPPED_DEPENDENCY`) or one the tree under test provides
+(`bake.CASE_TREE_PROVIDED`), so a missing requirement that is neither is still §3.2's case (a) and still
+fails the layer (`bake._required_name`, and the `tree_provided` map `scripts/bugsinpy_run.py` builds from
+the provenance's `tree_satisfied`). A reading with no held version is an *absence* rather than a conflict
+between two pins, so case (b) cannot apply to it at all. The freeze gate below
+fails hard if a name from **either** rule appears in it at any version, whatever the pin list says: the
+pass not having taken is the only way for that to happen.
 
 **The orphan rule is the whole rule, and a dropped name is not an input to it.** An earlier revision of
 this section excluded a dropped name's own pip-resolved closure from the orphan set

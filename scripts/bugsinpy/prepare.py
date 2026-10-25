@@ -197,6 +197,21 @@ class BugPrep:
     the gate, and an empty ``text`` looks the same in both. ``none`` is the value that
     excludes the bug from the main evaluation, and the per-bug report the paper needs is
     this field against the frozen artifact's own header."""
+    issue_text_commit: Optional[str] = None
+    """§2.4.6 — the fix commit's own message, **offline, for the paper only**.
+
+    [VANTA-WHY] Nothing that builds a prompt reads this: the prompt's text is
+    ``issue.text``, which is the frozen report's gated section. This field exists so the
+    write-up can report how much the commit message alone would have inflated the
+    localization audit's hit rate (§2.4.6) — the counterfactual that section rests on —
+    without re-cloning the corpus or re-deriving a number nobody recorded. It is the
+    message after :func:`issue.strip_diff_and_code` and **without** the hidden-test
+    behavioural sentence: the claim being measured is about the commit message, and that
+    sentence came from the tests, not from the message.
+
+    Recorded even for a bug that is excluded (``issue_source=none``), because those are
+    precisely the bugs whose only text would have been this message.
+    """
     deps: Optional[dict[str, Any]] = None
 
     @property
@@ -262,6 +277,7 @@ class BugPrep:
             "context": self.context.to_dict() if self.context else None,
             "issue": self.issue.to_dict() if self.issue else None,
             "issue_source": self.issue_source,
+            "issue_text_commit": self.issue_text_commit,
             "deps": self.deps,
         }
 
@@ -333,6 +349,9 @@ class BugPrep:
             if issue_payload is None
             else issue_mod.IssueText.from_dict(issue_payload, where=where),
             issue_source=str(field_of(payload, "issue_source", owner=owner, where=where)),
+            issue_text_commit=field_of(
+                payload, "issue_text_commit", owner=owner, where=where
+            ),
             deps=field_of(payload, "deps", owner=owner, where=where),
         )
 
@@ -833,6 +852,14 @@ def build_issue(
     """
     path = issue_source.frozen_path(
         issue_sources.issues_dir, prep.bug.project, prep.bug.bug_id
+    )
+    # §2.4.6, offline only: the fix commit's own message, kept beside the report so the
+    # write-up can report how much the commit message alone would have inflated the
+    # localization audit's hit rate. Read from the same clone the freeze reads, and read
+    # here so a measure-only run records it too — the counterfactual is a property of the
+    # bug, not of which stage happened to prepare it. Nothing that builds a prompt reads it.
+    prep.issue_text_commit = issue_mod.strip_diff_and_code(
+        issue_mod.fix_commit_message(repo_cache, prep.bug.fixed_commit)
     )
     if path.is_file():
         # The file *is* the text, and reading it never touches the API: a measure-only
@@ -1565,6 +1592,7 @@ def derive_verdict(prep: BugPrep) -> dict[str, Any]:
         "context_reasons": prep.context.reasons if prep.context else ["not measured"],
         "issue_text": issue_text,
         "issue_text_sha256": sha256_text(issue_text) if issue_text is not None else None,
+        "issue_text_commit": prep.issue_text_commit,
         "issue_ok": bool(prep.issue and prep.issue.ok),
         "issue_needs_decision": (
             prep.issue.needs_decision

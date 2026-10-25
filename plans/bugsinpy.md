@@ -878,6 +878,19 @@ The old commit-message text is still recorded per bug as `issue_text_commit`, **
 Vanta**. It exists so that the write-up can report how much the commit message alone would have
 inflated `localization_hit` — the counterfactual that justifies this section.
 
+- It is the fix commit's message after `strip_diff_and_code`, and **not** the old assembled text:
+  the behavioural sentence §2.2 appends came from the hidden tests, not from the message, and the
+  claim being measured is about the message.
+- `build_issue` records it in **both** modes, from the same clone the freeze reads, so a
+  measure-only run and a full prepare record the same value — it is a property of the bug, not of
+  the stage. It is read with the same `fix_commit_message` the freeze already calls, so a commit
+  the clone cannot show fails the bug exactly as it would have while freezing.
+- Recorded even for an `issue_source=none` bug, because those are exactly the bugs whose only
+  possible text was this message.
+- Written to the record (`BugPrep` → `prepare.json` and `derive_verdict` → the split's
+  `issue_text_commit`), and read by **nothing** that builds a prompt: the prompt's text is
+  `issue.text`, the frozen report's gated section.
+
 ---
 
 ## 3. Environments in Shuru

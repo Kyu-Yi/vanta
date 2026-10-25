@@ -19,9 +19,12 @@ take back, because a symbol named by the person who fixed it is by definition
 present in the buggy tree. So the commit-message body is dropped from the prompt
 entirely, and with it the hidden-test behavioural sentence that used to be appended
 to it: a real report's own words are the behaviour. What remains here of that
-route — :func:`strip_diff_and_code`, :func:`default_behavioural_line`,
-:func:`build_issue_text` — is kept for the offline record of what the commit
-message alone would have said, which is never shown to Vanta.
+route is offline only. :func:`strip_diff_and_code` produces
+``issue_text_commit`` — the message as the record keeps it (§2.4.6) — and
+:func:`default_behavioural_line` and :func:`build_issue_text` survive so the old
+assembled text can still be replayed for the write-up's counterfactual. None of
+them is ever shown to Vanta; the prompt's text is the frozen report's gated
+section.
 
 **The leak gate (hard).** A token is a leak when it appears in the fix diff or in
 the hidden test and appears **zero** times in the tree the Creator may read. That

@@ -3428,7 +3428,10 @@ class TestTheFreezeGatesTheText:
         assert measure.issue.pre_gate == full.issue.pre_gate
         assert api.paths == calls, "measure-only reads the frozen file; it never resolves"
 
-    def test_measure_only_refuses_when_nothing_was_frozen(self, tmp_path):
+    def test_measure_only_refuses_when_nothing_was_frozen(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            issue_mod, "fix_commit_message", lambda repo, commit: "Fix the loader\n"
+        )
         prep = self._prep(tmp_path, project="PySnooper", bug_id=3)
         frozen = prepare_mod.build_issue(
             prep,
@@ -3474,14 +3477,62 @@ class TestTheFreezeGatesTheText:
         )
         assert prepare_mod.NO_ISSUE_SOURCE_REASON in prep.exclusion_reason
         assert "excluded from the main evaluation" in prep.exclusion_reason
+        assert prep.issue_text_commit == "Fix the loader", (
+            "§2.4.6: the excluded bug is exactly the one whose only text was this message"
+        )
         # The artifact still says so, in the header every stage reads.
         assert "- resolved: none" in (
             tmp_path / "issues" / "luigi_1.md"
         ).read_text(encoding="utf-8")
 
-    def test_the_drift_check_flags_an_oracle_the_freeze_never_gated_with(self, tmp_path):
+    def test_the_commit_message_is_kept_offline_beside_the_report(
+        self, tmp_path, monkeypatch
+    ):
+        """§2.4.6, offline only: record the counterfactual, never send it.
+
+        The write-up has to report how much the commit message alone would have inflated
+        ``localization_hit``, so the message is kept beside the report — stripped of diff
+        and code, and without the hidden-test behavioural sentence, because the claim is
+        about the message. What a run sends is still the frozen report's gated section, and
+        the assertions below tell the two apart by content rather than by field name.
+        """
+        monkeypatch.setattr(
+            issue_mod,
+            "fix_commit_message",
+            lambda repo, commit: "Fix the loader\n\n```\n+ secret()\n```\n",
+        )
+        monkeypatch.setattr(
+            issue_mod, "fix_commit_date", lambda repo, commit: "2018-06-01T00:00:00Z"
+        )
+        self._frozen(tmp_path / "issues")
+        prep = self._prep(tmp_path, project="PySnooper", bug_id=3, bug_patch="+ x\n")
+        prepare_mod.build_issue(
+            prep,
+            repo_cache=tmp_path,
+            issue_sources=self._sources(tmp_path),
+            github_url="https://github.com/cool-RR/PySnooper",
+            full=False,
+        )
+        assert prep.issue_text_commit == "Fix the loader", (
+            "the code block is stripped from the recorded message"
+        )
+        assert prep.issue is not None
+        assert "The report body" in prep.issue.text
+        assert "Fix the loader" not in prep.issue.text, (
+            "the recorded message is not the text a run sends"
+        )
+        assert prepare_mod.derive_verdict(prep)["issue_text_commit"] == "Fix the loader", (
+            "the record the paper reads carries it"
+        )
+
+    def test_the_drift_check_flags_an_oracle_the_freeze_never_gated_with(
+        self, tmp_path, monkeypatch
+    ):
         """A derived F2P file outside the gate's inputs is reported, never re-gated: the
         committed text is what the run sends."""
+        monkeypatch.setattr(
+            issue_mod, "fix_commit_message", lambda repo, commit: "Fix the loader\n"
+        )
         issues = tmp_path / "issues"
         self._frozen(issues)
         prep = self._prep(tmp_path, project="PySnooper", bug_id=3)
@@ -4177,6 +4228,7 @@ class TestPrepareRunRecordContract:
             gate_failures=[],
             context=verdict,
             issue=issue,
+            issue_text_commit="Fix the loader\n",
             deps=deps,
         )
         split, batch_dir, _ = self._write_batch(tmp_path, preps=[original])
@@ -4216,6 +4268,7 @@ class TestPrepareRunRecordContract:
         assert loaded.issue == issue
         assert loaded.issue.needs_decision == issue.needs_decision
         assert loaded.issue.leak.removals == issue.leak.removals
+        assert loaded.issue_text_commit == original.issue_text_commit
         assert loaded.context == verdict
         assert loaded.deps == deps
         assert loaded.runnable == original.runnable

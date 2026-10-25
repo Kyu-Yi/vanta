@@ -72,3 +72,21 @@ def strings_of(payload: Any, key: str, *, owner: str, where: str = "") -> list[s
             f"{type(value).__name__}, not a list"
         )
     return [str(item) for item in value]
+
+
+def map_of(payload: Any, key: str, *, owner: str, where: str = "") -> dict[str, str]:
+    """``payload[key]`` as a ``str -> str`` mapping.
+
+    The counterpart of :func:`strings_of` for the fields whose value is a record
+    rather than a list (``builds``): the shape is checked so that a writer which
+    recorded a list where the reader expects a mapping arrives as a
+    :class:`RecordError` naming the field, not as an ``AttributeError`` from inside
+    the reader.
+    """
+    value = field_of(payload, key, owner=owner, where=where)
+    if not isinstance(value, Mapping):
+        raise RecordError(
+            f"{_origin(owner, where)}: field {key!r} is "
+            f"{type(value).__name__}, not a mapping"
+        )
+    return {str(k): str(v) for k, v in value.items()}

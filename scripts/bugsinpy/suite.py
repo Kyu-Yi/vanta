@@ -24,7 +24,7 @@ import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from . import shuru
 
@@ -277,6 +277,85 @@ def guest_tree_root(tree_rel: str) -> str:
     directory the suite ran in.
     """
     return f"/workspace/{tree_rel}"
+
+
+# ---------------------------------------------------------------------------
+# building a tree that its suite imports out of a compiler (§3.4)
+# ---------------------------------------------------------------------------
+DEFAULT_BUILD_TIMEOUT_SECS = 3600
+"""How long one tree's in-place build may take before it is abandoned.
+
+Measured shapes, not padding: matplotlib's ``build_ext --inplace`` compiles the
+vendored Agg and freetype trees (hundreds of translation units) and pandas builds its
+Cython output, and a per-bug layer starts with a cold cache and no compiler cache at
+all. It is longer than the whole-suite timeout (:func:`run_suite_twice`'s 1800 s) on
+purpose: a build that runs long must be reported as a *build* failure, and a timeout
+that shares the suite's number would report the two most different failures there are
+in the same words.
+"""
+
+
+def build_tree_in_place(
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    tree_rel: str,
+    python: str,
+    setup_args: Sequence[str],
+    disk_mb: int,
+    env: Optional[Mapping[str, str]] = None,
+    timeout_secs: int = DEFAULT_BUILD_TIMEOUT_SECS,
+) -> None:
+    """``python setup.py <setup_args>`` in the tree, inside the layer's VM.
+
+    [VANTA-WHY] The failure this exists for: matplotlib/1's oracle tree was never
+    built, so ``lib/matplotlib/tests/conftest.py`` died with ``ImportError: cannot
+    import name 'ft2font' from partially initialized module 'matplotlib'`` — the C
+    extension is compiled from ``src/ft2font.cpp`` into the package and nothing had
+    compiled it. The generator is not the tree: it is a git export of the bug's commit,
+    and a project whose package has C extensions is not importable until
+    ``setup.py`` has run. The gate then reported it as ``deps: collection failed``,
+    sending a reader after a missing dependency that was never missing.
+
+    ``setup_args`` is the command, and the caller chooses it (:func:`prepare.setup_args_for`):
+    there is one tree and two shapes of "built". ``env`` is the layer's own compiler
+    environment — ``bake.COMPILER_ENV`` for a minor that installed a toolchain — and it
+    has to be passed here rather than assumed: a checkpoint is a filesystem, and an
+    export does not survive into a layer baked ``--from`` another
+    (``bake.build_env_lines``), so without it the build runs the compiler the
+    interpreter *recorded*, which is the machine it was built on.
+
+    The build writes into the host tree (the batch directory is mounted ``rw``), so the
+    compiled objects are there for every suite that runs afterwards.
+
+    Raises :class:`SuiteError`, whose message names the tree and carries the error lines
+    (:func:`failure_excerpt`), so a build failure is reported as itself and never as the
+    collection it would otherwise have caused.
+    """
+    command = [python, "setup.py", *setup_args]
+    env_full = {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"}
+    if env:
+        env_full.update(env)
+    result = shuru.run(
+        checkpoint=checkpoint,
+        host_root=batch_dir,
+        command=["sh", "-c", _shell_quote(command)],
+        disk_mb=disk_mb,
+        guest_cwd=guest_tree_root(tree_rel),
+        timeout_secs=timeout_secs,
+        env=env_full,
+    )
+    where = guest_tree_root(tree_rel)
+    if result.timed_out:
+        raise SuiteError(
+            f"build timed out after {timeout_secs}s in {where} "
+            f"(`{_shell_quote(command)}`); {failure_excerpt(result.stdout + result.stderr)}"
+        )
+    if not result.ok:
+        raise SuiteError(
+            f"build failed in {where}: `{_shell_quote(command)}` exited "
+            f"{result.exit_code}; {failure_excerpt(result.stdout + result.stderr)}"
+        )
 
 
 def collect_only(

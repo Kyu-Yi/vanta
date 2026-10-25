@@ -5212,6 +5212,13 @@ class TestPrepareRunRecordContract:
             issue_text_names_paths=["pkg/mod.py"],
             issue_text_names_symbols=["parse_rows"],
             deps=deps,
+            builds={
+                "oracle_tree": "built: python setup.py build_ext --inplace",
+                "src_buggy": "built: python setup.py build_ext --inplace",
+                "src_fixed": "not built: setup.py declares no ext_modules and the tree "
+                "carries no extension sources",
+                "vanta_tree": prepare_mod.VANTA_TREE_INHERITANCE,
+            },
         )
         split, batch_dir, _ = self._write_batch(tmp_path, preps=[original])
         batch = self._load(monkeypatch, split, batch_dir, tmp_path)
@@ -5255,6 +5262,7 @@ class TestPrepareRunRecordContract:
         assert loaded.issue_text_names_symbols == ["parse_rows"]
         assert loaded.context == verdict
         assert loaded.deps == deps
+        assert loaded.builds == original.builds
         assert loaded.runnable == original.runnable
         assert batch.entries["Demo/1"]["checkpoint"] == "vanta-bi-Demo-1"
 
@@ -16644,6 +16652,242 @@ class TestDepGate:
         assert calls == [], "`collected` was handed in; the gate already paid for it"
 
 
+class TestBuildTreeInPlace:
+    """A tree whose tests import a compiled package has to be built first (§3.4).
+
+    Measured: matplotlib/1's oracle tree was a bare git export, its conftest died on
+    ``ImportError: cannot import name 'ft2font' from partially initialized module
+    'matplotlib'``, and the dependency gate reported the missing *extension* as a
+    missing *dependency*.
+    """
+
+    @staticmethod
+    def _result(**over) -> shuru_mod.ExecResult:
+        base = dict(stdout="", stderr="", exit_code=0, timed_out=False)
+        base.update(over)
+        return shuru_mod.ExecResult(**base)
+
+    def test_it_runs_setup_py_in_the_tree_with_the_layers_env(self, monkeypatch):
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod.shuru, "run", lambda **kwargs: seen.update(kwargs) or self._result()
+        )
+
+        suite_mod.build_tree_in_place(
+            checkpoint="vanta-bi-matplotlib-1",
+            batch_dir=Path("/nonexistent"),
+            tree_rel="worktrees/matplotlib_1/oracle_tree",
+            python="python",
+            setup_args=("build_ext", "--inplace"),
+            disk_mb=42,
+            env={"CC": "/opt/vanta-cc"},
+        )
+
+        assert seen["checkpoint"] == "vanta-bi-matplotlib-1"
+        assert seen["guest_cwd"] == "/workspace/worktrees/matplotlib_1/oracle_tree"
+        assert seen["disk_mb"] == 42
+        assert seen["command"][:2] == ["sh", "-c"]
+        assert "python setup.py build_ext --inplace" in seen["command"][2]
+        assert seen["env"]["CC"] == "/opt/vanta-cc", (
+            "the layer's toolchain does not survive into a checkpoint; it has to be "
+            "exported for this command"
+        )
+        assert seen["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+
+    def test_a_failed_build_names_the_tree_and_carries_the_error_lines(self, monkeypatch):
+        monkeypatch.setattr(
+            suite_mod.shuru,
+            "run",
+            lambda **kwargs: self._result(
+                stdout="running build_ext\n",
+                stderr=(
+                    "ImportError: cannot import name 'ft2font' from partially "
+                    "initialized module 'matplotlib'\n"
+                ),
+                exit_code=1,
+            ),
+        )
+
+        with pytest.raises(suite_mod.SuiteError) as excinfo:
+            suite_mod.build_tree_in_place(
+                checkpoint="chk",
+                batch_dir=Path("/nonexistent"),
+                tree_rel="worktrees/matplotlib_1/oracle_tree",
+                python="python",
+                setup_args=("build_ext", "--inplace"),
+                disk_mb=42,
+            )
+
+        message = str(excinfo.value)
+        assert message.startswith(
+            "build failed in /workspace/worktrees/matplotlib_1/oracle_tree"
+        ), message
+        assert "exited 1" in message
+        assert "ft2font" in message, (
+            "the error lines, not the tail: on this failure the tail is the compiler's "
+            "progress output"
+        )
+
+    def test_a_build_that_hangs_is_a_build_failure_not_a_suite_timeout(self, monkeypatch):
+        monkeypatch.setattr(
+            suite_mod.shuru,
+            "run",
+            lambda **kwargs: self._result(exit_code=None, timed_out=True),
+        )
+
+        with pytest.raises(suite_mod.SuiteError, match="^build timed out after 7s in "):
+            suite_mod.build_tree_in_place(
+                checkpoint="chk",
+                batch_dir=Path("/nonexistent"),
+                tree_rel="worktrees/Demo_1/oracle_tree",
+                python="python",
+                setup_args=("build_ext", "--inplace"),
+                disk_mb=42,
+                timeout_secs=7,
+            )
+
+
+class TestBuildTreesInPlace:
+    """``prepare`` builds every tree the bug's own suites will import (§3.4)."""
+
+    @staticmethod
+    def _prep(tmp_path: Path, **over) -> prepare_mod.BugPrep:
+        base = dict(
+            root=tmp_path / "batch" / "worktrees" / "Demo_1",
+            test_cmd=["python", "-m", "pytest", "tests", "--json-report-file={report}"],
+        )
+        base.update(over)
+        return prep(**base)
+
+    @staticmethod
+    def _rule(monkeypatch, *, needed: bool, why: str = "measured reason") -> None:
+        monkeypatch.setattr(
+            bake_mod,
+            "needs_build_at",
+            lambda repo, commit, pythonpath=None: (needed, why),
+        )
+
+    def test_every_independent_tree_is_built_and_the_copy_is_not(self, tmp_path, monkeypatch):
+        calls: list = []
+        monkeypatch.setattr(
+            suite_mod,
+            "build_tree_in_place",
+            lambda **kwargs: calls.append(kwargs),
+        )
+        self._rule(monkeypatch, needed=True)
+
+        bug_prep = self._prep(tmp_path)
+        prepare_mod.build_trees_in_place(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", repo=tmp_path / "clone"
+        )
+
+        assert [call["tree_rel"] for call in calls] == [
+            "worktrees/Demo_1/oracle_tree",
+            "worktrees/Demo_1/src_buggy",
+            "worktrees/Demo_1/src_fixed",
+        ], "`vanta_tree` is copied from the built oracle tree; building it again is a "
+        "second compile of the same bytes"
+
+        for call in calls:
+            assert call["python"] == "python"
+            assert call["setup_args"] == ("build_ext", "--inplace")
+            assert call["checkpoint"] == "chk"
+            assert call["disk_mb"] == prepare_mod.DISK_MB
+
+        assert bug_prep.builds == {
+            "vanta_tree": prepare_mod.VANTA_TREE_INHERITANCE,
+            "oracle_tree": "built: python setup.py build_ext --inplace",
+            "src_buggy": "built: python setup.py build_ext --inplace",
+            "src_fixed": "built: python setup.py build_ext --inplace",
+        }
+
+    def test_the_layers_own_compiler_environment_reaches_the_build(self, tmp_path, monkeypatch):
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod,
+            "build_tree_in_place",
+            lambda **kwargs: seen.update(kwargs),
+        )
+        self._rule(monkeypatch, needed=True)
+
+        prepare_mod.build_trees_in_place(
+            self._prep(tmp_path),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            repo=tmp_path / "clone",
+        )
+
+        assert seen["env"] == dict(bake_mod.build_env_for("3.8")), (
+            "the compiler the interpreter recorded is the builder's, not the layer's"
+        )
+        assert seen["env"]["CC"] == bake_mod.VANTA_CC_PATH
+
+    def test_a_bug_that_needs_no_build_records_why_it_was_not_built(
+        self, tmp_path, monkeypatch
+    ):
+        calls: list = []
+        monkeypatch.setattr(
+            suite_mod, "build_tree_in_place", lambda **kwargs: calls.append(kwargs)
+        )
+        self._rule(monkeypatch, needed=False, why="declares no ext_modules")
+
+        bug_prep = self._prep(tmp_path)
+        prepare_mod.build_trees_in_place(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", repo=tmp_path / "clone"
+        )
+
+        assert calls == []
+        assert bug_prep.builds == {
+            "vanta_tree": prepare_mod.VANTA_TREE_INHERITANCE,
+            "oracle_tree": "not built: declares no ext_modules",
+            "src_buggy": "not built: declares no ext_modules",
+            "src_fixed": "not built: declares no ext_modules",
+        }, "a tree with no entry would read as a stage that never ran"
+
+    def test_the_build_directory_trigger_builds_the_package_out_of_tree(
+        self, tmp_path, monkeypatch
+    ):
+        """BugsInPy's ``pythonpath`` points at ``build/lib``: only a full build puts the
+        package there, so the command is not ``build_ext --inplace``."""
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod,
+            "build_tree_in_place",
+            lambda **kwargs: seen.update(kwargs),
+        )
+        self._rule(monkeypatch, needed=True)
+
+        prepare_mod.build_trees_in_place(
+            self._prep(tmp_path, bug=bug_info(pythonpath="tqdm/build/lib/")),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            repo=tmp_path / "clone",
+        )
+
+        assert seen["setup_args"] == ("build",)
+
+    def test_a_build_failure_stops_that_tree_and_keeps_its_own_words(
+        self, tmp_path, monkeypatch
+    ):
+        built: list = []
+
+        def boom(**kwargs):
+            built.append(kwargs["tree_rel"])
+            raise suite_mod.SuiteError("build failed in /workspace/…: the compiler said no")
+
+        monkeypatch.setattr(suite_mod, "build_tree_in_place", boom)
+        self._rule(monkeypatch, needed=True)
+
+        with pytest.raises(suite_mod.SuiteError, match="^build failed in "):
+            prepare_mod.build_trees_in_place(
+                self._prep(tmp_path),
+                checkpoint="chk",
+                batch_dir=tmp_path / "batch",
+                repo=tmp_path / "clone",
+            )
+        assert built == ["worktrees/Demo_1/oracle_tree"]
+
+
 class TestImportProbe:
     """``import_probe`` reuses the suite invocation, not a convenient one."""
 
@@ -17268,6 +17512,12 @@ class TestDevFixSelfCheck:
         assert source.index("derive_hidden(") < source.index("check_gate_drift(")
         assert source.index("check_gate_drift(") < source.index("strip_and_baseline(")
         assert source.index("strip_and_baseline(") < source.index("selfcheck_dev_fix(")
+        # §3.4: the build needs the layer (the toolchain and the compiler environment)
+        # and has to precede the gate that imports the tree — a project whose package
+        # has C extensions is not importable until its own setup.py has run.
+        assert source.index("load_deps(") < source.index("build_trees_in_place(")
+        assert source.index("build_trees_in_place(") < source.index("check_deps(")
+        assert source.index("check_deps(") < source.index("derive_hidden(")
 
 
 # ============================================================================

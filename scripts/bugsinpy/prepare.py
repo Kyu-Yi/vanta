@@ -37,7 +37,7 @@ from .bugsinpy_meta import (
     load_bug_info,
     project_github_url,
 )
-from .records import field_of, strings_of
+from .records import field_of, map_of, strings_of
 from .split import Split, sha256_file, sha256_text
 
 DISK_MB = 16384
@@ -259,6 +259,18 @@ class BugPrep:
     nothing that builds a prompt.
     """
     deps: Optional[dict[str, Any]] = None
+    builds: dict[str, str] = field(default_factory=dict)
+    """§3.4 — what the in-place build did to each tree, per tree, built or not.
+
+    [VANTA-WHY] Recorded per tree rather than as one boolean, because "this bug needs
+    a build" and "this bug's oracle tree *was* built" are different facts and only the
+    second one explains a suite that imports. ``matplotlib/1`` was rejected with
+    ``deps: collection failed`` and an ``ImportError`` about ``ft2font`` — a tree that
+    had never been compiled, reported as a missing dependency. The value is the command
+    that ran (``built: python setup.py build_ext --inplace``) or the reason it did not
+    (``not built: setup.py declares no ext_modules…``), so a tree with no entry would
+    mean the stage was skipped rather than that the tree needed nothing.
+    """
 
     @property
     def key(self) -> str:
@@ -344,6 +356,7 @@ class BugPrep:
             "issue_text_names_paths": sorted(self.issue_text_names_paths),
             "issue_text_names_symbols": sorted(self.issue_text_names_symbols),
             "deps": self.deps,
+            "builds": self.builds,
         }
 
     @classmethod
@@ -424,6 +437,7 @@ class BugPrep:
                 payload, "issue_text_names_symbols", owner=owner, where=where
             ),
             deps=field_of(payload, "deps", owner=owner, where=where),
+            builds=map_of(payload, "builds", owner=owner, where=where),
         )
 
 
@@ -513,6 +527,86 @@ def check_deps(
             f"loaded {where}, which is not under {root}"
         )
     return nodeids
+
+
+# ---------------------------------------------------------------------------
+# the in-place build (§3.4) — before the gate, because the gate imports the tree
+# ---------------------------------------------------------------------------
+BUILD_TREES = ("oracle_tree", "src_buggy", "src_fixed")
+"""The trees that are independent exports from ``git`` and need their own build.
+
+``vanta_tree`` and ``vanta_clean`` are :func:`trees.copy_tree` copies of
+``oracle_tree``, taken in :func:`strip_and_baseline` — i.e. **after** this step — so
+the compiled extensions travel with the copy. That is why Vanta's own tree is not
+built here: a second ``build_ext`` over the same sources would be minutes of compiler
+time for bytes that are already on disk. The record still names it, so a reader
+looking for "was Vanta's tree importable?" finds the answer rather than an absence.
+"""
+
+VANTA_TREE_INHERITANCE = "copied from oracle_tree (built in place)"
+"""What :data:`BUILD_TREES`' record says about the tree the Creator is given."""
+
+
+def setup_args_for(pythonpath: Optional[str]) -> tuple[str, ...]:
+    """The ``setup.py`` command that makes a tree importable where its suite looks.
+
+    Two shapes, keyed on the same fact :func:`bake.needs_build` is keyed on:
+    BugsInPy's ``pythonpath`` points *into* a build directory (``tqdm/build/lib/``), so
+    only a full ``build`` puts the package where the suite imports it; otherwise the
+    tree's extensions have to land beside their sources for the tree itself to be
+    importable, which is ``build_ext --inplace`` (the shape ``bake``'s own toolchain
+    smoke uses).
+    """
+    return ("build",) if pythonpath else ("build_ext", "--inplace")
+
+
+def build_trees_in_place(
+    prep: BugPrep, *, checkpoint: str, batch_dir: Path, repo: Path
+) -> None:
+    """Build each of the bug's trees in the layer, and record what happened.
+
+    [VANTA-WHY] The measured failure this answers: ``matplotlib/1``'s oracle tree was a
+    git export with no compiled extensions in it, so its ``conftest.py`` died on
+    ``ImportError: cannot import name 'ft2font' from partially initialized module
+    'matplotlib'`` and the gate reported it as ``deps: collection failed`` — a build
+    that never ran, described as a dependency that was missing. pandas/1 is the same
+    rule (``needs_build: true``, ``ext_modules`` and Cython sources of its own), and so
+    is anything else whose tests import a package the tree has to compile.
+
+    The rule is read *again* here rather than threaded down from
+    :func:`check_build_declared`, which validated the split's flag against the same
+    tree: one function answers "does this need a build" (§3.2), and a second
+    interpretation of it here could disagree with the one the split was checked
+    against. The command follows the rule's own trigger (:func:`setup_args_for`) and the
+    environment is the layer's (``bake.build_env_for``), for the reason
+    ``suite.build_tree_in_place`` records.
+
+    Only ``full`` prepares reach this — it is called after ``load_deps`` and before the
+    dependency gate — so a measure-only run never pays a compiler.
+    """
+    needed, why = bake_mod.needs_build_at(
+        repo, prep.bug.buggy_commit, pythonpath=prep.bug.pythonpath
+    )
+    prep.builds["vanta_tree"] = VANTA_TREE_INHERITANCE
+    if not needed:
+        for tree_name in BUILD_TREES:
+            prep.builds[tree_name] = f"not built: {why}"
+        return
+
+    env = dict(bake_mod.build_env_for(bake_mod.minor_version(prep.bug.python_version)))
+    setup_args = setup_args_for(prep.bug.pythonpath)
+    command = f"python setup.py {' '.join(setup_args)}"
+    for tree_name in BUILD_TREES:
+        suite_mod.build_tree_in_place(
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            tree_rel=_rel(prep, tree_name),
+            python=prep.test_cmd[0],
+            setup_args=setup_args,
+            disk_mb=DISK_MB,
+            env=env,
+        )
+        prep.builds[tree_name] = f"built: {command}"
 
 
 # ---------------------------------------------------------------------------
@@ -1622,6 +1716,19 @@ def prepare_one(
             for reason in prep.gate_failures
         ]
 
+    # The build comes before the gate that imports the tree. A project whose package
+    # has C extensions is not importable until its own `setup.py` has run (§3.4), so
+    # without this the gate's failure would be the ImportError the build exists to
+    # prevent — a missing *extension* reported as a missing *dependency*.
+    try:
+        build_trees_in_place(
+            prep, checkpoint=checkpoint, batch_dir=batch_dir, repo=repo_cache
+        )
+    except suite_mod.SuiteError as exc:
+        prep.gate_failures.append(str(exc))
+        note_drops()
+        return prep
+
     try:
         collected = check_deps(
             prep, checkpoint=checkpoint, batch_dir=batch_dir, deps=deps
@@ -1725,6 +1832,7 @@ def derive_verdict(prep: BugPrep) -> dict[str, Any]:
             else "issue text was not built (context-rejected or measurement-only)"
         ),
         "deps": prep.deps,
+        "builds": prep.builds,
     }
 
 

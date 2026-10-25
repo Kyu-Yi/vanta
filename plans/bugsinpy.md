@@ -3639,6 +3639,41 @@ actually have. The module name comes from the project's own `setup.py` (`name=`,
 non-`tests` package), never from a guess. A tree that passes both checks is one whose suite can
 import what it tests.
 
+#### 3.4.1 The tree is built before either check (item 5)
+
+Both checks above were run on a tree that had never been compiled, and on `matplotlib/1` that is the
+whole failure: `lib/matplotlib/tests/conftest.py` died with
+
+```
+ImportError: cannot import name 'ft2font' from partially initialized module 'matplotlib'
+```
+
+so `--collect-only` collected nothing and the gate reported `deps: collection failed` — a missing
+**extension** described as a missing **dependency**, which is the confusion §3.3 exists to prevent,
+in the other direction. A tree is a `git` export of the bug's commit; a project whose package has C
+extensions is not importable until its own `setup.py` has run, and the export never runs it.
+
+**The step.** After the layer is loaded and **before** the dependency gate, `prepare` builds each of
+the bug's trees in place, inside the layer's VM
+([`prepare.build_trees_in_place`](file:///Users/kyu-yi/vanta/scripts/bugsinpy/prepare.py),
+[`suite.build_tree_in_place`](file:///Users/kyu-yi/vanta/scripts/bugsinpy/suite.py)):
+
+| | |
+| --- | --- |
+| **Which trees** | `oracle_tree`, `src_buggy`, `src_fixed` — the three independent exports. `vanta_tree` / `vanta_clean` are `copy_tree` copies of `oracle_tree`, taken **after** this step in `strip_and_baseline`, so the compiled objects travel with the copy and are not built a second time. The record names `vanta_tree` anyway, so "was Vanta's own tree importable?" has an answer and not an absence. |
+| **When** | only in a `full` prepare, after `load_deps` (the layer is where the toolchain and the compiler environment live) and before `check_deps` (the gate that imports the tree). |
+| **The rule** | `bake.needs_build_at` — read *again* here rather than threaded out of `check_build_declared`, because one function answers "does this need a build" (§3.2) and a second reading could disagree with the one the split's flag was validated against. |
+| **The command** | `python setup.py build_ext --inplace` — or `python setup.py build` when BugsInPy's `pythonpath` points *into* a build directory (`tqdm/build/lib/`), where only a full build puts the package the suite imports ([`prepare.setup_args_for`](file:///Users/kyu-yi/vanta/scripts/bugsinpy/prepare.py)). Both triggers of §3.2's rule have a command. |
+| **The environment** | `bake.build_env_for(minor)` — `COMPILER_ENV`, passed **per command** and not assumed: a checkpoint is a filesystem, and an export does not survive into a layer baked `--from` another (`bake.build_env_lines`), so without it the build runs the compiler the interpreter *recorded*, which is the machine it was built on. |
+| **Recorded** | `BugPrep.builds: {tree → "built: <command>" \| "not built: <why>"}`, written to both `prepare.json` and the split's derived block (a `DERIVED_BUG_KEYS` member, beside `deps`). A tree with no entry would mean the stage was skipped rather than that the tree needed nothing. |
+| **On failure** | its own gate reason — `build failed in <tree>: \`python setup.py …\` exited N; <error lines>` — and the bug stops there. It is never reported as the collection it would have caused. A build that runs long is `build timed out after <n>s`, with a timeout longer than the suite's own (3600 s vs 1800 s) so the two most different failures never share a sentence. |
+
+`pandas/1` is the same rule (`needs_build: true`; `ext_modules` and Cython sources of its own), and
+so is anything else whose tests import a package the tree has to compile. `build/` is in the Rust
+walker's `SKIP_DIRS` and the compiled objects (`.so`) are not a `PROJECT_SOURCE_EXTENSIONS` suffix,
+so building in place does not change the file set the §1.6 gate measures — the two prechecks and
+this step cannot drift because of it.
+
 ---
 
 ## 4. Configurations

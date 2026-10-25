@@ -55,7 +55,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from .records import RecordError, field_of, strings_of
 
@@ -114,12 +114,23 @@ class SelectedFile:
     bytes: int
     tokens: int
     shown: str
+    #: §1.6.4 — per signal, the rule that matched it, keyed by the reason's own
+    #: name: ``{"path": "exact", "identifier": "camel"}``. A reason says which input
+    #: named a file, not which of the rules inside that input did — `path` alone
+    #: covers five — so this is what lets the audit print WHY a file ranked.
+    #:
+    #: Defaulted rather than required, unlike `Selection.grounded`: it is display
+    #: only (no weight and no gate reads it), so a selection recorded before the
+    #: selector recorded rules stays readable, and the audit prints the signal
+    #: without its rule rather than refusing a selection it can already judge.
+    rules: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "path": self.path,
             "score": self.score,
             "reasons": list(self.reasons),
+            "rules": dict(self.rules),
             "bytes": self.bytes,
             "tokens": self.tokens,
             "shown": self.shown,
@@ -132,10 +143,28 @@ class SelectedFile:
             path=str(field_of(payload, "path", owner=owner, where=where)),
             score=int(field_of(payload, "score", owner=owner, where=where)),
             reasons=strings_of(payload, "reasons", owner=owner, where=where),
+            rules=rules_of(payload),
             bytes=int(field_of(payload, "bytes", owner=owner, where=where)),
             tokens=int(field_of(payload, "tokens", owner=owner, where=where)),
             shown=str(field_of(payload, "shown", owner=owner, where=where)),
         )
+
+
+def rules_of(payload: object) -> dict[str, str]:
+    """``payload["rules"]`` as ``{signal: rule}``, or ``{}`` when it is absent.
+
+    The one tolerant field of this record, and deliberately so: §1.6.4 added it so
+    the ranking audit can say why a file ranked, nothing acts on it, and a report
+    written before the selector recorded rules is still one the audit can read.
+    Everything else here goes through :func:`field_of`, because everything else is
+    a number the gate decides on.
+    """
+    if not isinstance(payload, Mapping):
+        return {}
+    rules = payload.get("rules")
+    if not isinstance(rules, Mapping):
+        return {}
+    return {str(signal): str(rule) for signal, rule in rules.items()}
 
 
 @dataclass

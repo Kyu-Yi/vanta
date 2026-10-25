@@ -173,6 +173,7 @@ def selection(**over) -> ctx.Selection:
                 path="pkg/core.py",
                 score=42,
                 reasons=["path", "traceback"],
+                rules={"path": "exact", "traceback": "basename"},
                 bytes=700,
                 tokens=175,
                 shown="full",
@@ -1967,6 +1968,7 @@ class TestContextReport:
             "path": "pkg/core.py",
             "score": 42,
             "reasons": ["path", "traceback"],
+            "rules": {"path": "exact", "traceback": "basename"},
             "bytes": 700,
             "tokens": 175,
             "shown": "full",
@@ -18249,8 +18251,8 @@ class TestLocalizationTable:
 
     @staticmethod
     def _shown(*paths: str) -> list[dict]:
-        return [{"path": path, "score": 400, "reasons": ["path"], "bytes": 10,
-                 "tokens": 3, "shown": "full"} for path in paths]
+        return [{"path": path, "score": 400, "reasons": ["path"], "rules": {"path": "exact"},
+                 "bytes": 10, "tokens": 3, "shown": "full"} for path in paths]
 
     def test_the_table_names_the_selection_the_top_three_and_the_hit(self, tmp_path):
         root, split = self._fixture(tmp_path, {"Demo": self.FIX, "Other": self.FIX})
@@ -18267,11 +18269,40 @@ class TestLocalizationTable:
         )
         assert [row["hit"] for row in rows] == [True, False]
         assert rows[0]["selected"] == 4
-        assert rows[0]["top"] == ["pkg/core.py", "pkg/util.py", "pkg/api.py"]
+        assert rows[0]["top"] == ["pkg/core.py[path:exact]", "pkg/util.py[path:exact]",
+                                 "pkg/api.py[path:exact]"]
         assert rows[0]["touched"] == ["pkg/core.py"]
         assert "files selected" in table and "top 3 files" in table
-        assert "pkg/core.py, pkg/util.py, pkg/api.py" in table
+        assert ("pkg/core.py[path:exact], pkg/util.py[path:exact], "
+                "pkg/api.py[path:exact]") in table
         assert "hit 1 / miss 1 / unknown 0 over 2 dev bug(s)" in table
+
+    def test_the_third_column_says_why_each_file_ranked(self, tmp_path):
+        """§1.6.4: a reason says which input named a file, not which rule inside that
+        input matched — `path` alone covers five — so the audit prints the rule that
+        did, signal by signal. A record from before the selector recorded rules still
+        prints the signal, not a placeholder: the selection is judgeable either way."""
+        root, split = self._fixture(tmp_path, {"Demo": self.FIX})
+        batch_dir = self._report(tmp_path, [
+            {"bug": "Demo/1", "verdict": "accept", "selected_files": [
+                {"path": "pkg/core.py", "score": 900,
+                 "reasons": ["path", "identifier"],
+                 "rules": {"path": "blob-url", "identifier": "camel"},
+                 "bytes": 10, "tokens": 3, "shown": "full"},
+                {"path": "pkg/older.py", "score": 400, "reasons": ["path"],
+                 "bytes": 10, "tokens": 3, "shown": "full"},
+            ]},
+        ])
+
+        table, rows = runner_mod.localization_table(
+            batch_dir=batch_dir, split=split, bugsinpy_root=root
+        )
+
+        assert rows[0]["top"] == [
+            "pkg/core.py[path:blob-url+identifier:camel]",
+            "pkg/older.py[path]",
+        ]
+        assert "path:blob-url+identifier:camel" in table
 
     def test_a_not_measured_row_is_unknown_not_a_miss(self, tmp_path):
         """No selection was made, so there is nothing to judge — and pooling it as a

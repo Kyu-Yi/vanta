@@ -290,10 +290,19 @@ import a touched module or name one of its modules. The patch is *the thing unde
 it is not a peek at the answer; nothing else is an input.
 
 **Repair mode (item 2).** With no patch, files are ranked from the **issue text only**: explicit
-paths or module names, traceback frames, and identifiers the issue mentions (backticked, CamelCase or
-snake_case) that a file *defines* (`def`/`class` at module level, found by parsing, not by running
-code) — plus one hop of import neighbours for the top files, and the repo's file tree so the model
-sees what exists.
+paths or module names, traceback frames, and identifiers the issue mentions that a file *defines* —
+found by parsing, never by running code — plus one hop of import neighbours for the top files, and the
+repo's file tree so the model sees what exists.
+
+Two rules keep a plain English word in an issue from boosting a file's rank. **A name is counted only
+when it is code-shaped:** it contains `_`, a digit or an inner capital (CamelCase), or the reporter
+writes it as code — in backticks, as `name(`, or as the name side of `obj.name`. So `a`, `in`, `fig`,
+`release`, `version` and `report` are not names, while `register_named_middleware`, `is_string_dtype`
+and `BigQueryTarget` are. **A definition is any `def`/`class` at any depth** — a method counts, not only
+a module-level function — **or a column-0 binding** at the top of a module; a binding nested inside a
+function is not a definition a reporter could be naming. A GitHub blob URL into the project's own
+repository (`github.com/<org>/<repo>/blob/<sha>/<path>#L<n>`) is a **path** mention of `<path>`: the
+reporter named that file, the line anchor is stripped and the sha is never read.
 
 **Never hidden information (item 3).** `F2P`/hidden tests, the fix commit and its diff, and
 `bug.info` are not inputs and cannot be reached from the selection. The harness keeps them out of the
@@ -560,12 +569,22 @@ Each bug record now carries, alongside the counts it already had:
   split role (`pilot`/`reserve`); the two are different questions and a report that conflated them could
   not be lined up with a run.
 - **`selected_files`** — one entry per file, in the order the prompt puts them, each with `path`,
-  `score`, `reasons`, `bytes`, `tokens` and `shown`. `reasons` is the ranked vocabulary and is what makes
-  the ranking auditable: `patch-touched` (1000) > `path` (400) > `traceback` (300) > `identifier` (200)
-  > `import-neighbour` (100) > `test` (80). There is no seventh entry: §1.6.6 removed the `tree` reason,
-  so every reason in the vocabulary is a signal and a `reasons` list that is empty is impossible. `shown`
-  is `full` or `outline`, so a file that only contributed its signatures is not counted as if its body
-  were in the prompt.
+  `score`, `reasons`, `rules`, `bytes`, `tokens` and `shown`. `reasons` is the ranked vocabulary and is
+  what makes the ranking auditable: `patch-touched` (1000) > `path` (400) > `traceback` (300) >
+  `identifier` (200) > `import-neighbour` (100) > `test` (80). There is no seventh entry: §1.6.6 removed
+  the `tree` reason, so every reason in the vocabulary is a signal and a `reasons` list that is empty is
+  impossible. `shown` is `full` or `outline`, so a file that only contributed its signatures is not
+  counted as if its body were in the prompt.
+- **`rules`** — per signal, the rule that matched it, keyed by the signal's own name in `reasons`:
+  `{"path": "exact"}` or `{"identifier": "camel", "path": "blob-url"}`. A reason alone says *which*
+  input named the file; it is not enough to audit one, because `path` (400) covers five rules —
+  `hunk`, `exact`, `basename`, `module` and `blob-url` — and a file the issue names outright is a
+  different finding from one that matched a bare basename in another directory. The rules are the same
+  ones §1.6.2 item 2 sets out: `identifier` records `snake`/`digit`/`camel` for shape and
+  `backtick`/`call`/`attribute` for the written form, `import-neighbour` records `import`, `test`
+  records `covering-test`, and `patch-touched` records `hunk`. Nothing reads `rules`: no weight and no
+  gate depends on it, so a report written before the selector recorded it stays readable and the audit
+  (§1.6.5) prints the signal without its rule rather than refusing a selection it can already judge.
 - **`files_bytes` / `files_tokens`** — what the file content cost, *separately* from `tree_bytes` /
   `tree_count`, which are the listing. `source_bytes` is kept as the selector's own total
   (`files_bytes + tree_bytes`) for continuity with earlier reports, so the identity
@@ -598,6 +617,13 @@ bug           files selected  top 3 files                hit
 --------------------------------------------------------------
 PySnooper/3   9               pysnooper/pysnooper.py …   yes
 ```
+
+`top 3 files` carries each file's reasons *and* the rule that matched each one — `pkg/core.py[path:exact]`,
+`sanic/app.py[path:blob-url]` — because the reason alone is not enough to audit the ranking: `path`
+covers five rules and `identifier` six, so `[path:exact]` and `[path:basename]` are different findings
+that read the same without the rule beside them. It is the `rules` map of §1.6.4 printed per signal. A
+report whose selector did not yet record rules prints the bare reason — `pkg/older.py[path]` — never a
+placeholder, so an older batch is still readable.
 
 Three properties are the point of the command, not decoration:
 

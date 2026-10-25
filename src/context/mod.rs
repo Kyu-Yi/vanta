@@ -59,7 +59,7 @@ pub const SOURCE_EXTENSIONS: &[&str] = &[
 /// [VANTA-WHY] `pyx`/`pxd` are here because pandas and spacy have real bugs in
 /// Cython files — `pandas/_libs/algos.pyx` among them — and a `.pxd` is the
 /// declaration half of the same code. `pyi` is Python the project wrote, and
-/// `module_level_symbols` already parses it by the Python rules; before this it
+/// `defined_names` already parses it by the Python rules; before this it
 /// was not walked, so that branch was dead on every real tree.
 pub const PROJECT_SOURCE_EXTENSIONS: &[&str] = &["py", "pyx", "pxd", "pyi"];
 
@@ -272,7 +272,9 @@ pub enum SelectionReason {
     Path,
     /// A frame named in a traceback inside the issue text (repair mode).
     Traceback,
-    /// A `def`/`class` defined in this file whose name the issue text mentions.
+    /// A name this file *defines* — a `def`/`class` at any depth, or a
+    /// module-level binding — that the issue text writes as code (`defined_names`,
+    /// §1.6.2 item 2).
     Identifier,
     /// A module-level import neighbour of a selected file, one hop out.
     ImportNeighbour,
@@ -346,6 +348,70 @@ impl SelectionReason {
     }
 }
 
+/// HOW each reason matched (§1.6.4) — the rule beside the signal.
+///
+/// [VANTA-WHY] A reason name alone says which input named a file, not which of
+/// the rules inside that signal did. `path` covers five of them here, and the
+/// difference is the whole question a reader of the ranking asks: `pkg/app.py`
+/// named outright is a strong signal, `app.py` matched as a bare basename could
+/// be a coincidence in another directory, and a plain English word that reached
+/// a file only because it was written in backticks is weaker than a CamelCase
+/// name that is code on its face. Recording the rule is what lets
+/// `localization_table` show why a file ranked instead of asserting it did
+/// (§1.6.5) — and it is display only: no weight, and no gate, reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SelectionRule {
+    /// A hunk of the patch under review names the file.
+    Hunk,
+    /// The token IS the path.
+    Exact,
+    /// The token is the path's basename.
+    Basename,
+    /// The token is the file's dotted module name.
+    Module,
+    /// The token is a GitHub blob URL naming the path.
+    BlobUrl,
+    /// The token ends with the path or its basename (an absolute or longer path).
+    Tail,
+    /// A `def`/`class` name, or a module-level binding, with an underscore.
+    Snake,
+    /// The same, containing a digit.
+    Digit,
+    /// The same, CamelCase: a leading capital and a lower after it.
+    Camel,
+    /// A name written between backticks, whatever its shape.
+    Backtick,
+    /// A name written as a call: `name(`.
+    Call,
+    /// A name written as an attribute: `obj.name` — the name after the dot.
+    Attribute,
+    /// A module the file imports.
+    Import,
+    /// A visible test file that imports or covers a selected module.
+    CoveringTest,
+}
+
+impl SelectionRule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SelectionRule::Hunk => "hunk",
+            SelectionRule::Exact => "exact",
+            SelectionRule::Basename => "basename",
+            SelectionRule::Module => "module",
+            SelectionRule::BlobUrl => "blob-url",
+            SelectionRule::Tail => "tail",
+            SelectionRule::Snake => "snake",
+            SelectionRule::Digit => "digit",
+            SelectionRule::Camel => "camel",
+            SelectionRule::Backtick => "backtick",
+            SelectionRule::Call => "call",
+            SelectionRule::Attribute => "attribute",
+            SelectionRule::Import => "import",
+            SelectionRule::CoveringTest => "covering-test",
+        }
+    }
+}
+
 /// Whether a selected file is shown whole or as an outline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -369,6 +435,10 @@ pub struct SelectedFile {
     pub path: String,
     pub score: i64,
     pub reasons: Vec<SelectionReason>,
+    /// Per signal, the rule that matched it, keyed by the reason's own name —
+    /// `{"path": "exact", "identifier": "camel"}`. Same signals as `reasons`, and
+    /// a key for each of them; `SelectionRule` says why the two travel apart.
+    pub rules: BTreeMap<String, String>,
     /// Bytes actually shown (the framed text's bytes when `shown == Outline`).
     pub bytes: usize,
     pub tokens: u32,
@@ -748,14 +818,18 @@ pub fn select_review_context(
         .collect();
     let module_map = python_module_to_path(candidates);
 
-    let mut reasons: BTreeMap<String, BTreeSet<SelectionReason>> = BTreeMap::new();
-    let mut mark = |path: &str, reason: SelectionReason| {
-        reasons.entry(path.to_string()).or_default().insert(reason);
+    let mut reasons: BTreeMap<String, BTreeMap<SelectionReason, SelectionRule>> = BTreeMap::new();
+    let mut mark = |path: &str, reason: SelectionReason, rule: SelectionRule| {
+        reasons
+            .entry(path.to_string())
+            .or_default()
+            .entry(reason)
+            .or_insert(rule);
     };
 
     for path in touched {
         if by_path.contains_key(path.as_str()) {
-            mark(path, SelectionReason::PatchTouched);
+            mark(path, SelectionReason::PatchTouched, SelectionRule::Hunk);
         }
     }
 
@@ -771,7 +845,7 @@ pub fn select_review_context(
     }
     for path in neighbours {
         if !touched.contains(&path) && by_path.contains_key(path.as_str()) {
-            mark(&path, SelectionReason::ImportNeighbour);
+            mark(&path, SelectionReason::ImportNeighbour, SelectionRule::Import);
         }
     }
 
@@ -783,7 +857,7 @@ pub fn select_review_context(
         let imports = imported_repo_paths(&candidate.path, &candidate.contents, &module_map);
         if !imports.is_disjoint(touched) || test_covers_modules(&candidate.contents, &touched_modules)
         {
-            mark(&candidate.path, SelectionReason::Test);
+            mark(&candidate.path, SelectionReason::Test, SelectionRule::CoveringTest);
         }
     }
 
@@ -841,20 +915,23 @@ pub fn select_repair_context(
     let frame_tokens = issue_traceback_files(issue_text);
     let identifiers = issue_identifiers(issue_text);
 
-    let mut reasons: BTreeMap<String, BTreeSet<SelectionReason>> = BTreeMap::new();
+    let mut reasons: BTreeMap<String, BTreeMap<SelectionReason, SelectionRule>> = BTreeMap::new();
 
     for candidate in candidates {
         let module = python_module_path(&candidate.path);
-        if matches_path(&path_tokens, &candidate.path, module.as_deref()) {
-            mark_reason(&mut reasons, &candidate.path, SelectionReason::Path);
+        if let Some(rule) = path_match_rule(&path_tokens, &candidate.path, module.as_deref()) {
+            mark_reason(&mut reasons, &candidate.path, SelectionReason::Path, rule);
         }
-        if matches_path(&frame_tokens, &candidate.path, module.as_deref()) {
-            mark_reason(&mut reasons, &candidate.path, SelectionReason::Traceback);
+        if let Some(rule) = path_match_rule(&frame_tokens, &candidate.path, module.as_deref()) {
+            mark_reason(&mut reasons, &candidate.path, SelectionReason::Traceback, rule);
         }
         if !identifiers.is_empty() {
-            let symbols = module_level_symbols(&candidate.path, &candidate.contents);
-            if symbols.iter().any(|symbol| identifiers.contains(symbol)) {
-                mark_reason(&mut reasons, &candidate.path, SelectionReason::Identifier);
+            let symbols = defined_names(&candidate.path, &candidate.contents);
+            // The first symbol in path order that the issue names, so the rule
+            // recorded for the file is deterministic when it defines several.
+            if let Some(symbol) = symbols.iter().find(|symbol| identifiers.contains_key(*symbol)) {
+                let rule = identifiers[symbol];
+                mark_reason(&mut reasons, &candidate.path, SelectionReason::Identifier, rule);
             }
         }
     }
@@ -875,7 +952,7 @@ pub fn select_repair_context(
     }
     for path in neighbours {
         if !reasons.contains_key(&path) {
-            mark_reason(&mut reasons, &path, SelectionReason::ImportNeighbour);
+            mark_reason(&mut reasons, &path, SelectionReason::ImportNeighbour, SelectionRule::Import);
         }
     }
 
@@ -915,13 +992,23 @@ pub fn select_for_role(
     selection
 }
 
-/// Record one reason for one path.
+/// Record one reason for one path, with the rule that matched it.
+///
+/// The FIRST rule recorded for a (path, reason) pair is kept: each pair is
+/// marked once per pass today, and where a signal could match by more than one
+/// rule, the matcher itself returns the strongest (see `path_match_rule`), so
+/// the record does not depend on the order candidates are visited.
 fn mark_reason(
-    reasons: &mut BTreeMap<String, BTreeSet<SelectionReason>>,
+    reasons: &mut BTreeMap<String, BTreeMap<SelectionReason, SelectionRule>>,
     path: &str,
     reason: SelectionReason,
+    rule: SelectionRule,
 ) {
-    reasons.entry(path.to_string()).or_default().insert(reason);
+    reasons
+        .entry(path.to_string())
+        .or_default()
+        .entry(reason)
+        .or_insert(rule);
 }
 
 /// The whitespace/punctuation-delimited tokens of the issue, keeping `.` and `/`
@@ -964,40 +1051,134 @@ pub fn issue_traceback_files(issue_text: &str) -> BTreeSet<String> {
     out
 }
 
-/// The identifiers the issue names: everything in backticks, plus bare CamelCase
-/// or snake_case words. Dotted spans contribute each segment.
-pub fn issue_identifiers(issue_text: &str) -> BTreeSet<String> {
-    let mut out: BTreeSet<String> = BTreeSet::new();
-
-    let segments: Vec<&str> = issue_text.split('`').collect();
-    for chunk in segments.iter().skip(1).step_by(2) {
-        for piece in chunk.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')) {
-            for segment in piece.split('.') {
-                if is_identifier(segment) && segment.len() >= 2 {
-                    out.insert(segment.to_string());
-                }
-            }
+/// The names the issue writes as code, each with the rule that made it one — the
+/// Rust half of the reader `scripts/bugsinpy/issue.py` implements for the paper
+/// flag (§1.6.2 item 2, §2.4.6).
+///
+/// [VANTA-WHY] The rule is the whole point of this function, not a decoration.
+/// The issue texts are prose: `sanic/1` says "the registry is never reset, and
+/// the release drops the last row", and a reader that takes every word of that
+/// as a name of the tree hands a file that happens to bind `release` a signal it
+/// never earned. So a word counts only when the text writes it as code — shaped
+/// like code (`snake`, `digit`, `camel`) or written as code (backticks, a call,
+/// an attribute) — and `SelectionRule` records which of those it was, so the
+/// file's rank can be read back as "matched because the issue backticked
+/// `registry`" rather than as an unattributed score.
+///
+/// A dotted span contributes each segment on its own, and only the segment after
+/// the dot counts as an attribute: in `fig.savefig(` it is `savefig` that the
+/// reporter named, and `fig` is their own local variable.
+///
+/// A fenced code block is deliberately NOT one of the writing-as-code forms. The
+/// reproduction snippet in `matplotlib/1`'s report is a ```python block whose
+/// `fig`, `ax` and `data` are the reporter's own locals; treating the fence as
+/// permission puts them back in the list this rule exists to keep honest.
+pub fn issue_identifiers(issue_text: &str) -> BTreeMap<String, SelectionRule> {
+    let mut out: BTreeMap<String, SelectionRule> = BTreeMap::new();
+    let chars: Vec<char> = issue_text.chars().collect();
+    let mut index = 0usize;
+    // Backticks toggle; an odd number of them before a token means the token is
+    // inside one, which is how `` `report` `` counts and bare `report` does not.
+    let mut in_backticks = false;
+    // True for the token that starts right after a `.` whose own predecessor is
+    // an identifier character — `obj.name`, never the `.` of a sentence.
+    let mut after_dot = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '`' {
+            in_backticks = !in_backticks;
+            after_dot = false;
+            index += 1;
+            continue;
         }
-    }
-
-    for piece in issue_text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')) {
-        for segment in piece.split('.') {
-            if looks_symbolish(segment) {
-                out.insert(segment.to_string());
-            }
+        if !is_identifier_char(ch) {
+            after_dot = ch == '.' && index > 0 && is_identifier_char(chars[index - 1]);
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < chars.len() && is_identifier_char(chars[index]) {
+            index += 1;
+        }
+        let token: String = chars[start..index].iter().collect();
+        let next = chars.get(index).copied().unwrap_or(' ');
+        let rule = identifier_rule(&token, in_backticks, after_dot, next);
+        after_dot = false;
+        if let Some(rule) = rule {
+            out.entry(token).or_insert(rule);
         }
     }
     out
 }
 
-/// The module-level `def`/`class` names a file defines, by line-based parsing.
-/// Nothing is imported or executed.
-pub fn module_level_symbols(path: &str, contents: &str) -> BTreeSet<String> {
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// The rule that makes `token` a name the issue wrote as code, or `None`.
+///
+/// Shape is tested before the written forms, the order the flag's reader tests
+/// them in (``issue.py``'s ``is_code_shaped`` then ``_written_as_code``), so the
+/// two record the same rule for the same word. The written forms are tested
+/// attribute-then-call rather than call-then-attribute: a span that is both —
+/// `fig.savefig(` — records the dotted access, which is the narrower fact and the
+/// one that says which side of the dot the reporter named.
+fn identifier_rule(
+    token: &str,
+    in_backticks: bool,
+    after_dot: bool,
+    next: char,
+) -> Option<SelectionRule> {
+    if !is_identifier(token) || token.len() < 2 {
+        return None;
+    }
+    if let Some(rule) = code_shape_rule(token) {
+        return Some(rule);
+    }
+    if in_backticks {
+        return Some(SelectionRule::Backtick);
+    }
+    if after_dot {
+        return Some(SelectionRule::Attribute);
+    }
+    if next == '(' {
+        return Some(SelectionRule::Call);
+    }
+    None
+}
+
+/// Code-shaped: an underscore, a digit, or CamelCase — `register_named_middleware`,
+/// `parse2`, `BigQueryTarget`. A plain lowercase English word is none of these.
+fn code_shape_rule(token: &str) -> Option<SelectionRule> {
+    if token.contains('_') {
+        return Some(SelectionRule::Snake);
+    }
+    if token.chars().any(|c| c.is_ascii_digit()) {
+        return Some(SelectionRule::Digit);
+    }
+    let first_upper = token.chars().next().is_some_and(|c| c.is_uppercase());
+    let has_lower = token.chars().any(|c| c.is_lowercase());
+    if first_upper && has_lower {
+        return Some(SelectionRule::Camel);
+    }
+    None
+}
+
+/// Every name a file DEFINES: a `def`/`class` at ANY depth — a method counts,
+/// and so does a closure — and a module-level binding at column 0. By line-based
+/// parsing; nothing is imported or executed.
+///
+/// [VANTA-WHY] This was `module_level_symbols`, and it skipped every indented
+/// line. `sanic/1`'s report names `register_named_middleware`, which
+/// `sanic/app.py` declares on line 642 as an indented `def` inside a class, so
+/// the old reader answered "the tree does not define the one thing the report
+/// names" — a false statement, made by the component whose whole job is to
+/// answer that question. A `def`/`class` is a definition wherever it sits; the
+/// depth that matters is depth in the *file*, and Python puts a method's name in
+/// the same namespace a caller writes.
+pub fn defined_names(path: &str, contents: &str) -> BTreeSet<String> {
     let mut out: BTreeSet<String> = BTreeSet::new();
     for line in contents.lines() {
-        if line.starts_with(' ') || line.starts_with('\t') {
-            continue; // not module level
-        }
         let trimmed = line.trim_end();
         // The project's own source is Python in every one of its forms — `.pyx`
         // is Python with Cython's declaration keywords, `.pxd` is the declaration
@@ -1005,15 +1186,34 @@ pub fn module_level_symbols(path: &str, contents: &str) -> BTreeSet<String> {
         // Python rules (§1.6.8). Only the other extensions fall through to the
         // generic keywords.
         let name = if is_project_source(path) {
-            python_def_name(trimmed)
+            python_def_name(trimmed.trim_start()).or_else(|| {
+                // A binding is module level or it is a local: only column 0,
+                // which is the flag's rule too (issue.py's MODULE_BINDING_RE).
+                if line.starts_with(' ') || line.starts_with('\t') {
+                    None
+                } else {
+                    python_binding_name(trimmed)
+                }
+            })
         } else {
-            generic_def_name(trimmed)
+            generic_def_name(trimmed.trim_start())
         };
         if let Some(name) = name {
             out.insert(name);
         }
     }
     out
+}
+
+/// `x =` / `x: T =` at column 0 — the name a module binds, not `==` and not a
+/// tuple unpacking.
+fn python_binding_name(line: &str) -> Option<String> {
+    let (head, rest) = line.split_once('=')?;
+    if rest.starts_with('=') {
+        return None; // a comparison, not a binding
+    }
+    let head = head.split(':').next().unwrap_or(head).trim_end();
+    identifier_or_none(head)
 }
 
 fn python_def_name(line: &str) -> Option<String> {
@@ -1083,21 +1283,6 @@ fn is_identifier(token: &str) -> bool {
         && token.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
-/// CamelCase (starts upper, has a lower) or snake_case (has `_`, all lower-ish).
-fn looks_symbolish(token: &str) -> bool {
-    if !is_identifier(token) || token.len() < 3 {
-        return false;
-    }
-    let first_upper = token.chars().next().is_some_and(|c| c.is_uppercase());
-    let has_lower = token.chars().any(|c| c.is_lowercase());
-    let camel = first_upper && has_lower;
-    let snake = token.contains('_')
-        && token
-            .chars()
-            .all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_');
-    camel || snake
-}
-
 fn looks_like_source(path: &str) -> bool {
     SOURCE_EXTENSIONS
         .iter()
@@ -1121,29 +1306,74 @@ fn carries_body(path: &str, reasons: &[SelectionReason]) -> bool {
     is_project_source(path) || reasons.iter().any(|reason| reason.names_the_file())
 }
 
-/// Does any token name `candidate_path` — exactly, by basename, by module name,
-/// or as the tail of a longer (e.g. absolute) path?
-fn matches_path(tokens: &BTreeSet<String>, candidate_path: &str, module: Option<&str>) -> bool {
+/// Which rule names `candidate_path` — exactly, by basename, by module name, as a
+/// GitHub blob URL, or as the tail of a longer (e.g. absolute) path — or `None`.
+///
+/// The rules are tried strongest first and the FIRST match is returned, so a
+/// token that would match two ways is recorded by the stronger: `pkg/app.py`
+/// written out is `exact` even though it also ends with `/app.py`. The blob URL
+/// is tested before the tail rule for the same reason — `github.com/o/r/blob/
+/// <sha>/pkg/app.py` does end with `/pkg/app.py`, and telling the two apart is
+/// what the rule is for (§1.6.2 item 2).
+fn path_match_rule(
+    tokens: &BTreeSet<String>,
+    candidate_path: &str,
+    module: Option<&str>,
+) -> Option<SelectionRule> {
     if tokens.is_empty() {
-        return false;
+        return None;
     }
     let base = Path::new(candidate_path)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(candidate_path);
-    if tokens.contains(candidate_path) || tokens.contains(base) {
-        return true;
+    if tokens.contains(candidate_path) {
+        return Some(SelectionRule::Exact);
+    }
+    if tokens.contains(base) {
+        return Some(SelectionRule::Basename);
     }
     if let Some(module) = module {
         if tokens.contains(module) {
-            return true;
+            return Some(SelectionRule::Module);
         }
+    }
+    if tokens
+        .iter()
+        .any(|token| blob_url_path(token).is_some_and(|path| path == candidate_path))
+    {
+        return Some(SelectionRule::BlobUrl);
     }
     let full_tail = format!("/{candidate_path}");
     let base_tail = format!("/{base}");
-    tokens
+    if tokens
         .iter()
         .any(|token| token.ends_with(&full_tail) || token.ends_with(&base_tail))
+    {
+        return Some(SelectionRule::Tail);
+    }
+    None
+}
+
+/// The repo-relative path a GitHub blob URL names:
+/// `github.com/sanic-org/sanic/blob/e7001b0/sanic/app.py` → `sanic/app.py`.
+///
+/// [VANTA-WHY] A reporter who links the file they are talking about has named
+/// that file, which is what the `path` signal means — so the URL resolves to the
+/// path and nothing else. The ref (a commit sha) is skipped, never read: nothing
+/// here fetches, and nothing here lets a sha decide which file is talked about.
+/// The `#L656` anchor is not part of the path either — `issue_tokens` has already
+/// split it off, and it is trimmed here so this holds for any caller.
+fn blob_url_path(token: &str) -> Option<String> {
+    let rest = token.split_once("github.com/")?.1;
+    let rest = rest.split(['#', '?']).next().unwrap_or(rest);
+    let parts: Vec<&str> = rest.split('/').collect();
+    // `owner/repo/blob/<ref>/<path…>`: five parts at the fewest, a file directly
+    // under the repo root.
+    if parts.len() < 5 || parts[2] != "blob" {
+        return None;
+    }
+    Some(parts[4..].join("/"))
 }
 
 // ----------------------------------------------------------------------------
@@ -1163,7 +1393,7 @@ fn fill(
     mode: &str,
     role: &str,
     candidates: &[Candidate],
-    reasons: BTreeMap<String, BTreeSet<SelectionReason>>,
+    reasons: BTreeMap<String, BTreeMap<SelectionReason, SelectionRule>>,
     budget_tokens: u32,
     tree: &[String],
 ) -> ContextSelection {
@@ -1173,14 +1403,25 @@ fn fill(
         .collect();
 
     // Score = sum of the weights of the reasons a file was picked for; ties are
-    // broken by path, so the order is total and stable.
-    let mut ranked: Vec<(String, i64, Vec<SelectionReason>)> = reasons
+    // broken by path, so the order is total and stable. The keys of the inner map
+    // iterate in `SelectionReason`'s own order, which is what makes `reasons` and
+    // `rules` line up signal for signal.
+    let mut ranked: Vec<(
+        String,
+        i64,
+        Vec<SelectionReason>,
+        BTreeMap<String, String>,
+    )> = reasons
         .into_iter()
         .filter(|(path, _)| by_path.contains_key(path.as_str()))
-        .map(|(path, reasons)| {
-            let list: Vec<SelectionReason> = reasons.iter().copied().collect();
+        .map(|(path, signals)| {
+            let list: Vec<SelectionReason> = signals.keys().copied().collect();
             let score: i64 = list.iter().map(|reason| reason.weight()).sum();
-            (path, score, list)
+            let rules: BTreeMap<String, String> = signals
+                .iter()
+                .map(|(reason, rule)| (reason.as_str().to_string(), rule.as_str().to_string()))
+                .collect();
+            (path, score, list, rules)
         })
         .collect();
     ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
@@ -1218,7 +1459,7 @@ fn fill(
     // run named it, so a `.js` the issue mentions does not spend the budget on
     // itself. A file refused here is not a budget drop: the budget never saw it,
     // and `dropped_for_budget` saying otherwise would report the wrong cause.
-    for (path, score, reasons) in ranked {
+    for (path, score, reasons, rules) in ranked {
         let candidate = match by_path.get(path.as_str()) {
             Some(candidate) => *candidate,
             None => continue,
@@ -1270,6 +1511,7 @@ fn fill(
             path,
             score,
             reasons,
+            rules,
             bytes,
             tokens: cost,
             shown,
@@ -1687,7 +1929,11 @@ mod tests {
 
         for (path, score, reasons) in [
             ("pkg/core.py", 900, "path+traceback+identifier"),
-            ("pkg/helper.py", 100, "import-neighbour"),
+            // `helper` is a NAME of the tree: the traceback's own source line
+            // writes `helper(`, and a call is one of the forms that count as code,
+            // so the file that defines it is identified (200) — more than the 100
+            // the import hop alone would have scored it.
+            ("pkg/helper.py", 200, "identifier"),
         ] {
             let file = selection
                 .files
@@ -1716,9 +1962,10 @@ mod tests {
         let candidates = vec![
             candidate(
                 "pkg/core.py",
-                "from .helper import helper\n\n\ndef frobnicate(value):\n    return helper(value)\n",
+                "from .helper import helper\nfrom .util import util_fn\n\n\ndef frobnicate(value):\n    return helper(value)\n",
             ),
             candidate("pkg/helper.py", "def helper(value):\n    return value\n"),
+            candidate("pkg/util.py", "def util_fn():\n    return 0\n"),
             candidate("pkg/alpha.py", "def render():\n    return 1\n"),
             candidate("pkg/beta.py", "def render():\n    return 2\n"),
             candidate("pkg/unrelated.py", "def nothing():\n    return 3\n"),
@@ -1734,12 +1981,19 @@ mod tests {
 
         assert_eq!(
             paths(&selection),
-            vec!["pkg/core.py", "pkg/alpha.py", "pkg/beta.py", "pkg/helper.py"],
-            "path+traceback+identifier (900) > identifier (200) > import-neighbour (100); \
-             the identifier tie is broken by path"
+            vec![
+                "pkg/core.py",
+                "pkg/alpha.py",
+                "pkg/beta.py",
+                "pkg/helper.py",
+                "pkg/util.py",
+            ],
+            "path+traceback+identifier (900) > identifier (200) > import-neighbour \
+             (100); the identifier tie is broken by path, so `alpha` and `beta` come \
+             before `helper`"
         );
         let scores: Vec<i64> = selection.files.iter().map(|file| file.score).collect();
-        assert_eq!(scores, vec![900, 200, 200, 100]);
+        assert_eq!(scores, vec![900, 200, 200, 200, 100]);
 
         let core = &selection.files[0];
         assert_eq!(
@@ -1750,19 +2004,267 @@ mod tests {
                 SelectionReason::Identifier,
             ]
         );
+        // `helper` is a NAME of the tree: the traceback's own source line writes
+        // `helper(`, so the file that defines it is identified (200) — and a file
+        // already reached is *not* also credited as a neighbour (the neighbour pass
+        // skips it), so the two reasons do not add up to 300.
+        let helper = selection
+            .files
+            .iter()
+            .find(|file| file.path == "pkg/helper.py")
+            .expect("the file that defines the called name is selected");
+        assert_eq!(helper.reasons, vec![SelectionReason::Identifier]);
         assert_eq!(
-            selection
-                .files
-                .iter()
-                .find(|file| file.path == "pkg/helper.py")
-                .unwrap()
-                .reasons,
-            vec![SelectionReason::ImportNeighbour],
-            "the neighbour of a named file scores below every file the issue names"
+            helper.rules.get("identifier").map(String::as_str),
+            Some("call"),
+            "the issue wrote `helper(`, and the recorded rule says so"
+        );
+        // `util_fn` is imported but named nowhere: the neighbour hop is the only
+        // reason that reaches it, which is why the ladder has a rung below the
+        // issue's own signals.
+        let util = selection
+            .files
+            .iter()
+            .find(|file| file.path == "pkg/util.py")
+            .expect("an import neighbour of a named file is selected");
+        assert_eq!(util.reasons, vec![SelectionReason::ImportNeighbour]);
+        assert_eq!(
+            util.rules.get("import-neighbour").map(String::as_str),
+            Some("import")
         );
         assert!(
             !paths(&selection).contains(&"pkg/unrelated.py"),
             "a file no reason reaches is not selected at all"
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 2 — an identifier is a name, not a word. A bug
+    /// report is prose, and a project binds ordinary English too: `matplotlib/1`
+    /// says "the 3.2.0 release" and the tree binds `release`, so a reader that
+    /// took every token a file defines as a match ranked a file for the sentence
+    /// it appeared in. Only a name written as code reaches a file.
+    #[test]
+    fn a_plain_english_word_in_the_issue_never_reaches_the_file_that_binds_it() {
+        let candidates = vec![
+            candidate(
+                "pkg/notes.py",
+                "release = '3.2.0'\nversion = 1\nreport = {}\n",
+            ),
+            candidate(
+                "pkg/middleware.py",
+                "def register_named_middleware(app):\n    return app\n",
+            ),
+        ];
+        let issue = "The 3.2.0 release is wrong, and version 4 of the report too.\n\
+                     `register_named_middleware` is what breaks.\n";
+
+        let selection = select_repair_context(&candidates, issue, "creator", 60_000);
+
+        assert_eq!(
+            paths(&selection),
+            vec!["pkg/middleware.py"],
+            "`release`, `version` and `report` are English: a word a file happens to \
+             bind is not a name the issue named"
+        );
+        let file = &selection.files[0];
+        assert_eq!(file.reasons, vec![SelectionReason::Identifier]);
+        assert_eq!(
+            file.rules.get("identifier").map(String::as_str),
+            Some("snake"),
+            "the underscore is what makes `register_named_middleware` a name"
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 2 — the other half of the shape rule: a word the
+    /// text writes *as code* counts even when it is plain English, because
+    /// backticks are the reporter saying "this is a name". `release` in "the 3.2.0
+    /// release" is prose; `` `release` `` is the name of something.
+    #[test]
+    fn a_plain_word_the_issue_backticks_reaches_the_file_that_defines_it() {
+        let candidates = vec![
+            candidate("pkg/notes.py", "release = '3.2.0'\n"),
+            candidate("pkg/other.py", "python = 1\n"),
+        ];
+        let selection = select_repair_context(
+            &candidates,
+            "`release` is the wrong value.\n",
+            "creator",
+            60_000,
+        );
+
+        assert_eq!(paths(&selection), vec!["pkg/notes.py"]);
+        assert_eq!(
+            selection.files[0].rules.get("identifier").map(String::as_str),
+            Some("backtick")
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 2 — a method is a name of the tree, and
+    /// `sanic/1`'s report names one: `register_named_middleware` is declared in
+    /// `sanic/app.py` as an indented `def` inside a class. A module-level-only scan
+    /// answered "the tree does not define it" for the file that defines it.
+    #[test]
+    fn an_indented_method_is_a_name_the_tree_defines() {
+        let source = "class Sanic:\n    def register_named_middleware(self, app):\n        return app\n";
+        assert!(
+            defined_names("sanic/app.py", source).contains("register_named_middleware"),
+            "depth is not a filter on `def`: a method is a name the tree defines"
+        );
+
+        let candidates = vec![
+            candidate("sanic/app.py", source),
+            candidate("sanic/other.py", "class Other:\n    pass\n"),
+        ];
+        let selection = select_repair_context(
+            &candidates,
+            "`register_named_middleware` never runs.\n",
+            "creator",
+            60_000,
+        );
+
+        assert_eq!(paths(&selection), vec!["sanic/app.py"]);
+        assert_eq!(selection.files[0].reasons, vec![SelectionReason::Identifier]);
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 2 — a reporter who pastes
+    /// `github.com/sanic-org/sanic/blob/e7001b0/sanic/app.py#L656` has named
+    /// `sanic/app.py` as much as one who typed the path. The `e7001b0` is a commit
+    /// sha and is *skipped*, never resolved or fetched: nothing here reads it, and
+    /// the `#L656` anchor is not part of the path either.
+    #[test]
+    fn a_github_blob_url_names_the_path_it_points_at() {
+        assert_eq!(
+            blob_url_path("github.com/sanic-org/sanic/blob/e7001b0/sanic/app.py#L656").as_deref(),
+            Some("sanic/app.py"),
+            "the ref and the line anchor are both stripped"
+        );
+
+        let candidates = vec![
+            candidate("sanic/app.py", "def handle():\n    return 1\n"),
+            candidate("sanic/other.py", "def other():\n    return 2\n"),
+        ];
+        let selection = select_repair_context(
+            &candidates,
+            "See https://github.com/sanic-org/sanic/blob/e7001b0/sanic/app.py#L656\n",
+            "creator",
+            60_000,
+        );
+
+        assert_eq!(paths(&selection), vec!["sanic/app.py"]);
+        assert_eq!(selection.files[0].reasons, vec![SelectionReason::Path]);
+        assert_eq!(
+            selection.files[0].rules.get("path").map(String::as_str),
+            Some("blob-url")
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 2 — in `fig.savefig(` the reporter named
+    /// `savefig`, a name of the tree; `fig` is their own local variable and is one
+    /// of the words the write-up must not report as a localisation. So only the
+    /// name side of a dotted access is a name, and only the name side is recorded.
+    #[test]
+    fn only_the_name_side_of_a_dotted_access_is_a_name() {
+        let candidates = vec![
+            candidate("pkg/figure.py", "fig = None\n"),
+            candidate("pkg/objects.py", "myfig = None\n"),
+            candidate("pkg/saving.py", "def savefig(path):\n    return path\n"),
+            candidate("pkg/plotting.py", "def dataframe(name):\n    return name\n"),
+        ];
+        let issue = "fig.savefig() writes nothing, and myfig.dataframe is empty.\n";
+
+        let selection = select_repair_context(&candidates, issue, "creator", 60_000);
+
+        assert_eq!(
+            paths(&selection),
+            vec!["pkg/plotting.py", "pkg/saving.py"],
+            "`savefig` and `dataframe` are the names; `fig` and `myfig` are the \
+             reporter's own objects and name nothing (the tie is broken by path)"
+        );
+        let rules: Vec<(&str, Option<&str>)> = selection
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.path.as_str(),
+                    file.rules.get("identifier").map(String::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rules,
+            vec![("pkg/plotting.py", Some("attribute")), ("pkg/saving.py", Some("attribute"))],
+            "both are the name side of a dotted access, and that is what is recorded"
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.4 — a reason says which input named a file, not which rule
+    /// inside that input did, and `path` alone covers five of them. The pair is
+    /// what a reader of the report needs: `identifier` says the issue named a name
+    /// this file defines, `camel` says the name was code on its face.
+    #[test]
+    fn the_rule_that_matched_each_signal_is_recorded_beside_it() {
+        let candidates = vec![candidate("pkg/target.py", "class BigQueryTarget:\n    pass\n")];
+        let issue = "`BigQueryTarget` in pkg/target.py returns nothing.\n";
+
+        let selection = select_repair_context(&candidates, issue, "creator", 60_000);
+
+        let file = &selection.files[0];
+        assert_eq!(
+            file.reasons,
+            vec![SelectionReason::Path, SelectionReason::Identifier]
+        );
+        assert_eq!(
+            file.rules
+                .iter()
+                .map(|(name, rule)| (name.as_str(), rule.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("identifier", "camel"), ("path", "exact")],
+            "one rule per signal, keyed by the signal's own name and in its order"
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.4 — review mode's three signals are recorded the same way,
+    /// so a report of a review selection says why each file is in the prompt too.
+    #[test]
+    fn a_review_selection_records_the_rule_of_every_signal() {
+        let candidates = vec![
+            candidate(
+                "heretic/keyword_rate.py",
+                "from .plugin import Context\n\nclass KeywordRate:\n    pass\n",
+            ),
+            candidate("heretic/plugin.py", "class Context:\n    pass\n"),
+            candidate(
+                "tests/test_keyword_rate.py",
+                "from heretic.keyword_rate import KeywordRate\n\ndef test_keyword_rate():\n    assert KeywordRate is not None\n",
+            ),
+        ];
+        let touched = BTreeSet::from(["heretic/keyword_rate.py".to_string()]);
+
+        let selection = select_review_context(&candidates, &touched, "review", 60_000);
+
+        let rules: Vec<(&str, Vec<(&str, &str)>)> = selection
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.path.as_str(),
+                    file.rules
+                        .iter()
+                        .map(|(name, rule)| (name.as_str(), rule.as_str()))
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rules,
+            vec![
+                ("heretic/keyword_rate.py", vec![("patch-touched", "hunk")]),
+                ("heretic/plugin.py", vec![("import-neighbour", "import")]),
+                (
+                    "tests/test_keyword_rate.py",
+                    vec![("test", "covering-test")]
+                ),
+            ]
         );
     }
 
@@ -1967,7 +2469,7 @@ mod tests {
         );
 
         // The declaration's own name, never its return type.
-        let symbols = module_level_symbols("pkg/_libs/algos.pyx", &candidates[2].contents);
+        let symbols = defined_names("pkg/_libs/algos.pyx", &candidates[2].contents);
         assert!(symbols.contains("is_string_dtype"), "got {symbols:?}");
         assert!(symbols.contains("Engine"), "got {symbols:?}");
         assert!(!symbols.contains("int"), "a return type is not a symbol");

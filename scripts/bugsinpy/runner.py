@@ -59,7 +59,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from . import bake as bake_mod
 from . import compact as compact_mod
@@ -918,17 +918,18 @@ def localization_table(
             split, bugsinpy_root, str(entry["project"]), int(entry["bug_id"])
         )
         touched = fix_touched_paths_from_patch(bug.bug_patch_txt)
-        selected = [
-            str(file.get("path"))
+        entries = [
+            file
             for file in (record or {}).get("selected_files", [])
             if file.get("path")
         ]
+        selected = [str(file["path"]) for file in entries]
         was_measured = bool(record) and record.get("verdict") != "not_measured"
         rows.append(
             {
                 "bug": key,
                 "selected": len(selected),
-                "top": selected[:3],
+                "top": [selection_entry(file) for file in entries[:3]],
                 "touched": touched,
                 "hit": paths_hit(touched, selected) if was_measured else None,
             }
@@ -936,8 +937,37 @@ def localization_table(
     return render_localization_table(rows), rows
 
 
+def selection_entry(file: Mapping[str, Any]) -> str:
+    """``path[reason:rule+reason:rule]`` — a selected file, and why it ranked (§1.6.4).
+
+    The reason alone says which input named the file; the rule beside it says which
+    of that signal's rules matched, and it is the half a reader needs here: `path`
+    covers five of them, and a file the issue names outright is a different
+    finding from one that matched a bare basename in another directory. A signal
+    whose rule was not recorded — a ``context_report.json`` written before the
+    selector recorded them — prints as the reason alone, never as a placeholder.
+    """
+    path = str(file.get("path") or "")
+    rules = file.get("rules")
+    if not isinstance(rules, Mapping):
+        rules = {}
+    parts = [
+        f"{reason}:{rules[reason]}"
+        if isinstance(rules.get(reason), str) and rules[reason]
+        else str(reason)
+        for reason in (file.get("reasons") or [])
+    ]
+    return f"{path}[{'+'.join(parts)}]" if parts else path
+
+
 def render_localization_table(rows: list[dict[str, Any]]) -> str:
     """The four columns the audit is read for, aligned to their own widest cell.
+
+    ``top 3 files`` carries each file's reasons *and* the rule that matched each
+    one, so a row says why those three ranked and not only that they did. The
+    audit's question is whether the ranking put the fix's own files first, and a
+    list of paths that agrees with the numbers while disagreeing with the recipe is
+    exactly what a reader has to be able to see.
 
     Column widths come from the data rather than a constant: a path can be longer
     than any guessed width, and a table whose ``hit`` column has drifted a space to

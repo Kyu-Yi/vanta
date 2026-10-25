@@ -733,6 +733,111 @@ Option A's text is *derived from* the fix commit, so it is not independent of th
 "real bug report" evidence in a paper. It is, however, the only option that is (a) automatable over
 a committed list and (b) leak-gated. Reported as such.
 
+### 2.4 Superseded: the text is the project's own issue report
+
+**This section replaces the recommendation in §2.2.** Option A above is withdrawn, and the reason is
+the one §2.3 could not fix.
+
+#### 2.4.1 Why the fix commit's message cannot be the text
+
+The message of the fix commit is written by the person who fixed the bug, *after* they fixed it. On
+the development split it names the fix location outright for **7 of 11** bugs — `is_string_dtype`,
+`allowed_domains`, `conllu2json`, `beam_dataflow`, `named_response_middlware`,
+`response_model_exclude_defaults`, `monkey patches to renderer`. Those are not incidental mentions;
+they are the symbol the Creator is being asked to find.
+
+The leak gate (§2.2 step 4) cannot take them back, and this is structural rather than a tuning
+problem. The gate strips a token only when it appears in the fix diff **or** the hidden test **and
+nowhere in the tree the Creator may read**: `tree_tokens.get(token, 0) == 0`. A symbol the developer
+fixed is, by definition, *present in the buggy tree* — that is what "the bug is in this function"
+means. So the gate's rule ("this came from the answer") does not fire on "this came from the
+answer's *author*". Raising the gate's strictness does not help; the condition it tests is false for
+exactly the tokens that matter.
+
+The text the model should read is the **report the bug was filed against** — what a real repair run
+gets, and what a reader of the paper would expect the prompt to be. So it becomes the source.
+
+#### 2.4.2 Resolution — host side, in `prepare`, cached
+
+`issue_source.py` (`referenced_numbers`, `resolve`, `GitHubClient`) implements a one-off, cached
+step:
+
+1. Read the fix commit's message and pull the numbers it references, most explicit phrasing first:
+   cross-repo `owner/repo#N`; `close[sd]/fix(es/ed)/resolve[sd] #N`; `Merge pull request #N`;
+   `Issue N` / `issues #N`; and the squash-merge `(#N)`. Order is the point — for `thefuck/3`,
+   `Fix #869` is the report and `(#917)` is the pull request it came through, and the closing
+   keyword is what the committer meant.
+2. Ask the GitHub API whether that number is an issue or a pull request.
+3. For a pull request, follow it to the issue it closes: its body's own closing keywords first, then
+   the `cross-referenced` events on its timeline. **The pull request's body and diff are never used
+   as issue text** — a pull request *is* the fix, so its prose is the answer's prose. The body is
+   *read* only to find a number, and from the payload already in hand: for a pull request
+   `/issues/N` and `/pulls/N` carry the same body, so the second request would buy nothing but rate
+   limit.
+4. A cross-repo reference is recognised but is not a candidate for this bug: the text has to be this
+   project's own report, so `oh-my-fish/plugin-thefuck#11` is reported and set aside, and is masked
+   out of the same-repo scan so it cannot be re-read as `thefuck#11`.
+
+**No `gh`, no `git` fallback.** `gh` is a second implementation of the same API behind a binary that
+may not be installed and whose output format is not the API's; `git` cannot answer the question at
+all, and every `git`-shaped shortcut would be a way for the issue text to come from somewhere other
+than the cached, hashed API response. One implementation, one record. A test asserts this by
+grepping the module's own source for `gh` and for `subprocess`.
+
+**Rate limit and token.** Unauthenticated by default: 60 requests per hour, which the on-disk cache
+and the backoff make sufficient — a bug costs at most a handful of requests, once, ever. On
+`403`/`429` the client waits out `Retry-After` or the `X-RateLimit-Reset` and retries **once**; a
+wait beyond the ceiling (3600 s) is an error that names `VANTA_GITHUB_TOKEN` rather than hanging.
+`VANTA_GITHUB_TOKEN`, if set, is used read-only for public repositories and is never written to the
+cache, to a log, or into a cache key.
+
+#### 2.4.3 The frozen artifact — identical by construction
+
+`prepare` writes `plans/bugsinpy_issues/<project>_<bug>.md` and **commits it**. It carries a header —
+`issue` (URL), `resolved` (`direct` / `via PR #N` / `none`), `fetched` (UTC), `fix-commit-date`,
+`comments-included`, and `content-sha256` — then an explicit `<!-- content -->` marker, then the
+title, body and the issue's comments **up to the fix commit's date and never anything after it**.
+The cut is the point: the fix commit's date is the last moment at which the report says what the
+reporter knew; a comment posted after the fix can only be about the fix.
+
+`prepare`, the measure-only precheck and the run all read this file rather than re-deriving a text.
+Identity is therefore **by construction**, not by convention or by re-running: there is one text,
+and every stage reads the same bytes. `load_frozen` verifies `content-sha256`, so a file edited by
+hand is refused rather than silently shipped as a prompt. A test asserts that measure-only and a
+full `prepare` produce byte-identical issue text.
+
+The marker is an explicit line rather than a blank one because a `none` report's content is empty,
+and a reader that split on "the first blank line after the header" could not tell that from a
+truncated file.
+
+#### 2.4.4 The leak gate, now applied to the issue text
+
+The gate of §2.2 step 4 is kept, unchanged in rule, and now runs over the issue text instead of the
+commit message: strip any token that occurs in the fix diff or the hidden tests and **nowhere** in
+the buggy tree, and record every removal in `leak_gate/<bug>.json`. Applied to a real issue report
+the rule is finally doing what it was written for — the reporter has not seen the fix, so a token
+they use that occurs nowhere in the buggy tree is genuinely suspicious, while a symbol that *is* in
+the tree is not removed, which is correct.
+
+**Reporter code blocks and tracebacks are kept.** They are legitimate report content and are exactly
+what §1.6.7's traceback and path signals are for — a real bug report that contains a traceback is
+the case localization is supposed to handle, not a case to sanitise away.
+
+#### 2.4.5 What is dropped
+
+- The commit-message body is dropped from the issue text **entirely**.
+- When a real issue exists, the hidden-test behavioural sentence (§2.2 step 3) is **dropped** too:
+  the report's own words are the behaviour.
+- If no issue can be resolved, the bug is marked `issue_source=none` and **excluded from the main
+  evaluation** — the count is reported — rather than falling back to the commit message. The
+  fallback was the leak; removing it does not create localization out of a text that carries none.
+
+#### 2.4.6 Offline, for the paper only
+
+The old commit-message text is still recorded per bug as `issue_text_commit`, **never shown to
+Vanta**. It exists so that the write-up can report how much the commit message alone would have
+inflated `localization_hit` — the counterfactual that justifies this section.
+
 ---
 
 ## 3. Environments in Shuru

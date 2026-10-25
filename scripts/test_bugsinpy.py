@@ -49,6 +49,7 @@ from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
 from bugsinpy import compact as compact_mod  # noqa: E402
 from bugsinpy import context as ctx  # noqa: E402
 from bugsinpy import issue as issue_mod  # noqa: E402
+from bugsinpy import issue_source as source_mod  # noqa: E402
 from bugsinpy import manifest as manifest_mod  # noqa: E402
 from bugsinpy import oracle as oracle_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
@@ -2613,6 +2614,528 @@ class TestBuildIssueText:
         assert issue.needs_decision, "an unactionable text must be flagged for a human"
         assert issue.pre_gate == "Fix it"
         assert issue.text == "Fix it"
+
+
+# ============================================================================
+# issue_source.py — the project's own report, not the fix commit (§2.4)
+# ============================================================================
+class ScriptedAPI:
+    """A GitHub API with the routes a test names and a 404 for everything else."""
+
+    def __init__(self, routes=None, *, header_script=None):
+        self.routes = dict(routes or {})
+        self.calls: list[tuple[str, dict]] = []
+        self.header_script = header_script or {}
+
+    def __call__(self, path, headers):
+        self.calls.append((path, dict(headers)))
+        if path in self.header_script:
+            script = self.header_script[path]
+            status, body, extra = script.pop(0)
+            return source_mod.HttpResponse(status=status, headers=extra, body=body)
+        status, body = self.routes.get(path, (404, {"message": "Not Found"}))
+        return source_mod.HttpResponse(status=status, headers={}, body=body)
+
+    @property
+    def paths(self):
+        return [path for path, _headers in self.calls]
+
+
+class TestIssueReferences:
+    """Which number a fix commit's message points at, and in what order."""
+
+    def test_a_closing_keyword_beats_the_squash_pull_request(self):
+        """``thefuck/2``: ``Fix #902`` is the bug; ``(#917)`` is the PR it came through."""
+        refs = source_mod.referenced_numbers(
+            "#902: Use `os.pathsep` to split PATH env var (#917)\n\nFix #902\n",
+            owner="nvbn",
+            repo="thefuck",
+        )
+        assert [(r.number, r.kind) for r in refs] == [(902, "closing"), (917, "squash")]
+
+    def test_an_issue_word_beats_a_squash_number(self):
+        """``spacy/4``: ``Issue 4665`` is the report; ``(#4953)`` is the fix's PR."""
+        refs = source_mod.referenced_numbers(
+            "Fix for Issue 4665 - conllu2json (#4953)\n", owner="explosion", repo="spaCy"
+        )
+        assert [(r.number, r.kind) for r in refs] == [
+            (4665, "issue-word"),
+            (4953, "squash"),
+        ]
+
+    def test_a_cross_repo_reference_is_not_read_as_this_repositorys(self):
+        """``thefuck/3`` mentions ``oh-my-fish/plugin-thefuck#11``; the bug is ``#869``."""
+        refs = source_mod.referenced_numbers(
+            "#869: Use `fish --version` instead of an interactive shell for info()\n\n"
+            "Fix #869\nRef oh-my-fish/plugin-thefuck#11\n",
+            owner="nvbn",
+            repo="thefuck",
+        )
+        assert [(r.number, r.kind) for r in refs] == [
+            (11, "cross-repo"),
+            (869, "closing"),
+        ]
+        assert refs[0].owner == "oh-my-fish" and refs[0].repo == "plugin-thefuck"
+        assert [r.number for r in refs if r.owner == "nvbn"] == [869]
+
+    def test_a_merge_commit_names_the_pull_request(self):
+        refs = source_mod.referenced_numbers(
+            "Merge pull request #2705 from spotify/claire/fix_dataflow_bq_return_type\n\n"
+            "Fix BigQueryTarget parsing in beam_dataflow module\n",
+            owner="spotify",
+            repo="luigi",
+        )
+        assert [(r.number, r.kind) for r in refs] == [(2705, "merge")]
+
+    def test_a_message_with_no_number_yields_nothing(self):
+        assert source_mod.referenced_numbers(
+            "fix calling method on wrong object\n", owner="spotify", repo="luigi"
+        ) == []
+
+    def test_the_owner_repo_reader_refuses_a_non_github_url(self):
+        assert source_mod.owner_repo("https://github.com/psf/black") == ("psf", "black")
+        assert source_mod.owner_repo("https://github.com/ytdl-org/youtube-dl.git") == (
+            "ytdl-org",
+            "youtube-dl",
+        )
+        with pytest.raises(source_mod.IssueSourceError):
+            source_mod.owner_repo("https://gitlab.com/psf/black")
+
+
+class TestIssueResolution:
+    """Issue versus pull request, and the pull request's road to the report."""
+
+    def _client(self, tmp_path, api):
+        return source_mod.GitHubClient(tmp_path / "cache", transport=api, sleep=lambda _s: None)
+
+    def test_an_issue_number_is_used_directly(self, tmp_path):
+        api = ScriptedAPI(
+            {
+                "/repos/nvbn/thefuck/issues/869": (
+                    200,
+                    {
+                        "number": 869,
+                        "title": "Recursive loop in the fish alias",
+                        "body": "`fish -ic` re-enters thefuck.",
+                        "html_url": "https://github.com/nvbn/thefuck/issues/869",
+                        "comments": 0,
+                    },
+                )
+            }
+        )
+        report = source_mod.resolve(
+            self._client(tmp_path, api),
+            project="thefuck",
+            bug_id=3,
+            github_url="https://github.com/nvbn/thefuck",
+            message="Fix #869\n",
+            fix_commit_date="2020-01-01T00:00:00Z",
+        )
+        assert report.source == source_mod.SOURCE_ISSUE
+        assert report.number == 869 and report.via_pr is None
+        assert report.resolved_as() == "direct"
+        assert "Recursive loop" in report.content()
+
+    def test_a_pull_request_is_followed_through_its_bodys_closing_keywords(self, tmp_path):
+        api = ScriptedAPI(
+            {
+                "/repos/pandas-dev/pandas/issues/34294": (
+                    200,
+                    {"number": 34294, "pull_request": {"url": "x"}, "title": "PR", "body": "Fixes #33566"},
+                ),
+                "/repos/pandas-dev/pandas/issues/33566": (
+                    200,
+                    {
+                        "number": 33566,
+                        "title": "is_string_dtype returns True for object dtype",
+                        "body": "Repro attached.",
+                        "html_url": "https://github.com/pandas-dev/pandas/issues/33566",
+                        "comments": 0,
+                    },
+                ),
+            }
+        )
+        report = source_mod.resolve(
+            self._client(tmp_path, api),
+            project="pandas",
+            bug_id=1,
+            github_url="https://github.com/pandas-dev/pandas",
+            message="Fixes is_string_dtype (#34294)\n",
+            fix_commit_date="2020-05-01T00:00:00Z",
+        )
+        assert report.source == source_mod.SOURCE_VIA_PR
+        assert report.number == 33566 and report.via_pr == 34294
+        assert report.resolved_as() == "via PR #34294"
+
+    def test_a_pull_request_is_followed_through_its_timeline_cross_references(self, tmp_path):
+        api = ScriptedAPI(
+            {
+                "/repos/matplotlib/matplotlib/issues/17567": (
+                    200,
+                    {"number": 17567, "pull_request": {"url": "x"}, "title": "PR", "body": "no keywords"},
+                ),
+                "/repos/matplotlib/matplotlib/pulls/17567": (
+                    200,
+                    {"number": 17567, "body": "no keywords here either"},
+                ),
+                "/repos/matplotlib/matplotlib/issues/17567/timeline": (
+                    200,
+                    [
+                        {"event": "labeled"},
+                        {
+                            "event": "cross-referenced",
+                            "source": {
+                                "type": "issue",
+                                "issue": {"number": 17542, "title": "monkey patches leak out"},
+                            },
+                        },
+                    ],
+                ),
+                "/repos/matplotlib/matplotlib/issues/17542": (
+                    200,
+                    {
+                        "number": 17542,
+                        "title": "monkey patches leak out",
+                        "body": "Calling `set_foo` leaves the patch behind.",
+                        "html_url": "https://github.com/matplotlib/matplotlib/issues/17542",
+                        "comments": 0,
+                    },
+                ),
+            }
+        )
+        report = source_mod.resolve(
+            self._client(tmp_path, api),
+            project="matplotlib",
+            bug_id=1,
+            github_url="https://github.com/matplotlib/matplotlib",
+            message="FIX: do not let no-op monkey patches to renderer leak out\n\ncloses #17567\n",
+            fix_commit_date="2020-06-01T00:00:00Z",
+        )
+        assert report.source == source_mod.SOURCE_VIA_PR
+        assert report.number == 17542 and report.via_pr == 17567
+
+    def test_a_pull_requests_own_body_never_becomes_the_issue_text(self, tmp_path):
+        """The PR *is* the fix, so its prose is the answer's prose (§2.4 item 1)."""
+        api = ScriptedAPI(
+            {
+                "/repos/psf/black/issues/1325": (
+                    200,
+                    {"number": 1325, "pull_request": {"url": "x"}, "title": "PR", "body": "Fixes nothing"},
+                ),
+                "/repos/psf/black/issues/1325/timeline": (200, []),
+            }
+        )
+        report = source_mod.resolve(
+            self._client(tmp_path, api),
+            project="black",
+            bug_id=2,
+            github_url="https://github.com/psf/black",
+            message='Fix for "# fmt: on" with decorators (#1325)\n',
+            fix_commit_date="2021-01-01T00:00:00Z",
+        )
+        assert report.source == source_mod.SOURCE_NONE
+        assert report.content() == ""
+        assert "Fixes nothing" not in report.content()
+        assert "#1325" in report.reason
+
+    def test_a_message_that_references_nothing_is_none(self, tmp_path):
+        api = ScriptedAPI()
+        report = source_mod.resolve(
+            self._client(tmp_path, api),
+            project="luigi",
+            bug_id=1,
+            github_url="https://github.com/spotify/luigi",
+            message="fix calling method on wrong object\n",
+            fix_commit_date="2020-01-01T00:00:00Z",
+        )
+        assert report.source == source_mod.SOURCE_NONE
+        assert report.reason.startswith("the fix commit's message references no issue")
+        assert api.paths == [], "never asked the API a question it had no number for"
+
+    def test_a_cross_repo_only_message_is_none_without_asking(self, tmp_path):
+        api = ScriptedAPI()
+        report = source_mod.resolve(
+            self._client(tmp_path, api),
+            project="thefuck",
+            bug_id=3,
+            github_url="https://github.com/nvbn/thefuck",
+            message="Ref oh-my-fish/plugin-thefuck#11\n",
+            fix_commit_date="2020-01-01T00:00:00Z",
+        )
+        assert report.source == source_mod.SOURCE_NONE
+        assert "different repository" in report.reason
+        assert api.paths == []
+
+    def test_comments_after_the_fix_commit_are_not_included(self, tmp_path):
+        api = ScriptedAPI(
+            {
+                "/repos/nvbn/thefuck/issues/869": (
+                    200,
+                    {
+                        "number": 869,
+                        "title": "Recursive loop",
+                        "body": "Report.",
+                        "html_url": "https://github.com/nvbn/thefuck/issues/869",
+                        "comments": 2,
+                    },
+                ),
+                "/repos/nvbn/thefuck/issues/869/comments": (
+                    200,
+                    [
+                        {
+                            "user": {"login": "reporter"},
+                            "created_at": "2019-12-01T00:00:00Z",
+                            "body": "still broken",
+                        },
+                        {
+                            "user": {"login": "maintainer"},
+                            "created_at": "2020-01-02T00:00:00Z",
+                            "body": "the fix in #870 changed this line",
+                        },
+                    ],
+                ),
+            }
+        )
+        report = source_mod.resolve(
+            self._client(tmp_path, api),
+            project="thefuck",
+            bug_id=3,
+            github_url="https://github.com/nvbn/thefuck",
+            message="Fix #869\n",
+            fix_commit_date="2020-01-01T00:00:00Z",
+        )
+        assert [c.author for c in report.comments] == ["reporter"]
+        assert "the fix in #870" not in report.content()
+
+    def test_an_issue_with_no_comments_costs_no_second_request(self, tmp_path):
+        api = ScriptedAPI(
+            {
+                "/repos/nvbn/thefuck/issues/869": (
+                    200,
+                    {
+                        "number": 869,
+                        "title": "t",
+                        "body": "b",
+                        "html_url": "u",
+                        "comments": 0,
+                    },
+                )
+            }
+        )
+        source_mod.resolve(
+            self._client(tmp_path, api),
+            project="thefuck",
+            bug_id=3,
+            github_url="https://github.com/nvbn/thefuck",
+            message="Fix #869\n",
+            fix_commit_date="2020-01-01T00:00:00Z",
+        )
+        assert api.paths == ["/repos/nvbn/thefuck/issues/869"]
+
+
+class TestGitHubClient:
+    """Cache, backoff and the token — the three things that must not leak or stall."""
+
+    def test_the_cache_answers_a_second_get_without_the_transport(self, tmp_path):
+        api = ScriptedAPI({"/repos/o/r/issues/1": (200, {"number": 1, "title": "t"})})
+        client = source_mod.GitHubClient(tmp_path / "cache", transport=api)
+        assert client.get("/repos/o/r/issues/1")["title"] == "t"
+        assert client.get("/repos/o/r/issues/1")["title"] == "t"
+        assert api.paths == ["/repos/o/r/issues/1"], "the second read must come from disk"
+
+    def test_a_cache_file_that_is_not_the_answer_is_refused(self, tmp_path):
+        """The cache is keyed by a hash of the path, so a mismatch means the body
+        beside it is not the answer to the question being asked."""
+        api = ScriptedAPI({"/repos/o/r/issues/1": (200, {"number": 1})})
+        client = source_mod.GitHubClient(tmp_path / "cache", transport=api)
+        cached = client.cache_path("/repos/o/r/issues/1")
+        client.get("/repos/o/r/issues/1")
+        payload = json.loads(cached.read_text())
+        payload["path"] = "/repos/o/r/issues/2"
+        cached.write_text(json.dumps(payload))
+        with pytest.raises(source_mod.IssueSourceError, match="cache file"):
+            client.get("/repos/o/r/issues/1")
+
+    def test_a_rate_limit_waits_out_the_reset_then_retries(self, tmp_path):
+        slept: list[float] = []
+        api = ScriptedAPI(
+            {"/repos/o/r/issues/1": (200, {"number": 1})},
+            header_script={
+                "/repos/o/r/issues/1": [
+                    (403, {"message": "rate limit"}, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1000"}),
+                    (200, {"number": 1}, {}),
+                ]
+            },
+        )
+        client = source_mod.GitHubClient(
+            tmp_path / "cache", transport=api, sleep=slept.append, now=lambda: 940.0
+        )
+        assert client.get("/repos/o/r/issues/1") == {"number": 1}
+        assert slept == [60.0]
+        assert api.paths == ["/repos/o/r/issues/1", "/repos/o/r/issues/1"]
+
+    def test_a_wait_beyond_the_ceiling_says_what_is_blocking(self, tmp_path):
+        api = ScriptedAPI(
+            header_script={
+                "/repos/o/r/issues/1": [
+                    (
+                        403,
+                        {"message": "rate limit"},
+                        {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "99999"},
+                    )
+                ]
+            }
+        )
+        client = source_mod.GitHubClient(
+            tmp_path / "cache", transport=api, sleep=lambda _s: None, now=lambda: 0.0
+        )
+        with pytest.raises(source_mod.IssueSourceError) as excinfo:
+            client.get("/repos/o/r/issues/1")
+        assert "rate limited" in str(excinfo.value)
+        assert source_mod.TOKEN_ENV in str(excinfo.value)
+
+    def test_the_token_goes_out_but_is_never_written_down(self, tmp_path):
+        api = ScriptedAPI({"/repos/o/r/issues/1": (200, {"number": 1})})
+        client = source_mod.GitHubClient(
+            tmp_path / "cache", token="s3cret-token", transport=api
+        )
+        client.get("/repos/o/r/issues/1")
+        assert api.calls[0][1]["Authorization"] == "Bearer s3cret-token"
+        cached = client.cache_path("/repos/o/r/issues/1").read_text()
+        assert "s3cret-token" not in cached
+        assert "Authorization" not in cached
+
+    def test_a_404_is_nothing_at_that_reference_and_not_an_error(self, tmp_path):
+        api = ScriptedAPI()
+        client = source_mod.GitHubClient(tmp_path / "cache", transport=api)
+        assert client.get_or_none("/repos/o/r/issues/1") is None
+
+    def test_only_the_http_api_is_used_never_gh_or_git(self):
+        """A ``gh``/``git`` fallback would be a second implementation of the same
+        question, and one that answers from somewhere other than the cached
+        response (§2.4 item 1)."""
+        text = inspect.getsource(source_mod)
+        assert "subprocess" not in text
+        assert '"gh"' not in text and "'gh'" not in text
+        assert "urllib" in text
+
+
+class TestFrozenIssueReport:
+    """The artifact every stage reads, so the text is identical by construction."""
+
+    def _report(self, **over):
+        base = dict(
+            project="PySnooper",
+            bug_id=3,
+            source=source_mod.SOURCE_ISSUE,
+            number=2,
+            url="https://github.com/cool-RR/PySnooper/issues/2",
+            title="Logging inside a generator",
+            body="```\nTraceback (most recent call last):\n  File \"pysnooper/pysnooper.py\", line 12\n```",
+            comments=[
+                source_mod.IssueComment(
+                    author="reporter", created_at="2018-05-01T00:00:00Z", body="any update?"
+                )
+            ],
+            fetched_at="2026-10-25T06:00:00Z",
+            fix_commit_date="2018-06-01T00:00:00Z",
+        )
+        base.update(over)
+        return source_mod.IssueReport(**base)
+
+    def test_it_round_trips_and_carries_the_resolution(self, tmp_path):
+        report = self._report()
+        path = source_mod.write_frozen(tmp_path / "PySnooper_3.md", report)
+        back = source_mod.load_frozen(path)
+        assert back.source == source_mod.SOURCE_ISSUE
+        assert back.issue_number == 2
+        assert back.title == report.title
+        assert back.body == report.body
+        assert back.comments == report.comments
+        assert back.content == report.content()
+        assert back.content_sha256 == split_mod.sha256_text(report.content())
+
+    def test_the_header_says_how_the_issue_was_resolved(self, tmp_path):
+        path = source_mod.write_frozen(
+            tmp_path / "pandas_1.md", self._report(project="pandas", bug_id=1, source=source_mod.SOURCE_VIA_PR, via_pr=34294)
+        )
+        text = path.read_text()
+        assert "- resolved: via PR #34294" in text
+        assert "- fetched: 2026-10-25T06:00:00Z" in text
+        assert "- fix-commit-date: 2018-06-01T00:00:00Z" in text
+
+    def test_a_traceback_the_reporter_wrote_is_kept(self, tmp_path):
+        """A real report's traceback and code blocks are exactly what the selector's
+        traceback and path signals are for (§2.4 item 3)."""
+        report = self._report()
+        assert "Traceback (most recent call last)" in report.content()
+        assert "```" in report.content()
+
+    def test_an_edited_file_is_refused_by_its_hash(self, tmp_path):
+        path = source_mod.write_frozen(tmp_path / "PySnooper_3.md", self._report())
+        path.write_text(path.read_text().replace("any update?", "here is the fix"))
+        with pytest.raises(source_mod.IssueSourceError, match="content-sha256"):
+            source_mod.load_frozen(path)
+
+    def test_a_file_without_the_header_fields_is_refused(self, tmp_path):
+        path = tmp_path / "X_1.md"
+        path.write_text("# X/1\n\n- issue: u\n\n<!-- content -->\n\n# a title\n")
+        with pytest.raises(source_mod.IssueSourceError, match="header has no"):
+            source_mod.load_frozen(path)
+
+    def test_a_file_without_the_content_marker_is_refused(self, tmp_path):
+        path = tmp_path / "X_1.md"
+        path.write_text("# X/1\n\n- issue: u\n- resolved: none\n\nbody\n")
+        with pytest.raises(source_mod.IssueSourceError, match="content -->"):
+            source_mod.load_frozen(path)
+
+    def test_none_is_a_source_a_reader_can_see(self, tmp_path):
+        path = source_mod.write_frozen(
+            tmp_path / "luigi_1.md",
+            self._report(
+                project="luigi", bug_id=1, source=source_mod.SOURCE_NONE, number=None,
+                url="", title="", body="", comments=[],
+                reason="no number in the fix commit's message",
+            ),
+        )
+        back = source_mod.load_frozen(path)
+        assert back.source == source_mod.SOURCE_NONE
+        assert back.resolved_as() == "none"
+        assert back.content == "", "a none report carries no text, and says so"
+        assert back.title == "" and back.body == ""
+
+    def test_ensure_frozen_resolves_once_and_then_reads_the_file(self, tmp_path):
+        api = ScriptedAPI(
+            {
+                "/repos/cool-RR/PySnooper/issues/2": (
+                    200,
+                    {
+                        "number": 2,
+                        "title": "Logging inside a generator",
+                        "body": "Report.",
+                        "html_url": "https://github.com/cool-RR/PySnooper/issues/2",
+                        "comments": 0,
+                    },
+                )
+            }
+        )
+        client = source_mod.GitHubClient(tmp_path / "cache", transport=api)
+        issues = tmp_path / "issues"
+        first = source_mod.ensure_frozen(
+            client, issues_dir=issues, project="PySnooper", bug_id=3,
+            github_url="https://github.com/cool-RR/PySnooper", message="Fix #2\n",
+            fix_commit_date="2018-06-01T00:00:00Z",
+        )
+        assert first.source == source_mod.SOURCE_ISSUE
+        calls = list(api.paths)
+        api.routes.clear()
+        second = source_mod.ensure_frozen(
+            client, issues_dir=issues, project="PySnooper", bug_id=3,
+            github_url="https://github.com/cool-RR/PySnooper", message="Fix #2\n",
+            fix_commit_date="2018-06-01T00:00:00Z",
+        )
+        assert second.content == first.content
+        assert api.paths == calls, "the frozen file answers the second run; no API"
 
 
 # ============================================================================

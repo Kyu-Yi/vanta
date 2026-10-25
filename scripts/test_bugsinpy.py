@@ -1856,6 +1856,41 @@ class TestSelectMeasureOnly:
         assert args.measure_only is False
 
 
+class TestSelectRefreeze:
+    """``--refreeze PROJECT/BUG`` (§2.4.3): a named rewrite, and it is a full prepare."""
+
+    def _two_bugs(self):
+        return split_mod.Split(
+            split_data(bugs=[bug_entry(role="pilot", bug_id=1), bug_entry(role="reserve", bug_id=2)])
+        )
+
+    def test_it_selects_only_the_bugs_it_names(self):
+        split = self._two_bugs()
+        selected = run_mod.select(
+            split, only=[], waves=[], reserves="measure", refreeze=["Demo/2"]
+        )
+        assert selected == [(split.bugs[1], True)], (
+            "a reserve named for a rewrite is prepared in full: re-freezing re-fetches the "
+            "report and re-runs the gate, and a context-only pass boots neither"
+        )
+
+    def test_it_joins_only_and_is_validated_like_it(self):
+        split = self._two_bugs()
+        selected = run_mod.select(
+            split, only=["Demo/1"], waves=[], reserves="measure", refreeze=["Demo/2"]
+        )
+        assert [entry["bug_id"] for entry, _ in selected] == [1, 2]
+        with pytest.raises(SplitError, match="not in the split"):
+            run_mod.select(
+                split, only=[], waves=[], reserves="measure", refreeze=["Nope/9"]
+            )
+
+    def test_the_flag_exists_and_defaults_to_nothing(self):
+        args = run_mod.build_parser().parse_args(["prepare", "--refreeze", "Demo/1", "--plan"])
+        assert args.refreeze == ["Demo/1"]
+        assert run_mod.build_parser().parse_args(["prepare", "--plan"]).refreeze == []
+
+
 class TestContextReport:
     """§1.6 measurements live here and in ``prepare.json``, never in the split."""
 
@@ -3446,6 +3481,65 @@ class TestFrozenIssueReport:
         assert second.content == first.content
         assert api.paths == calls, "the frozen file answers the second run; no API"
 
+    def test_a_refreeze_rewrites_the_file_and_records_the_date(self, tmp_path):
+        """§2.4.3: the one way past a refusal — explicit, named, and dated in the header.
+
+        A file whose hashes disagree with its own header is refused, and a refusal never
+        writes: the artifact on disk is what the refusal was about, and replacing it in
+        passing would ship a text nobody has reviewed under the name of one that was. The
+        rewrite happens only when someone names the bug (``prepare --refreeze``), and the
+        new header carries the date, so a reader of the diff sees a decision rather than
+        wondering why ``content-sha256`` moved.
+        """
+        api = ScriptedAPI(
+            {
+                "/repos/cool-RR/PySnooper/issues/2": (
+                    200,
+                    {
+                        "number": 2,
+                        "title": "Logging inside a generator",
+                        "body": "Report.",
+                        "html_url": "https://github.com/cool-RR/PySnooper/issues/2",
+                        "comments": 0,
+                    },
+                )
+            }
+        )
+        client = source_mod.GitHubClient(tmp_path / "cache", transport=api)
+        issues = tmp_path / "issues"
+        kwargs = dict(
+            issues_dir=issues,
+            project="PySnooper",
+            bug_id=3,
+            github_url="https://github.com/cool-RR/PySnooper",
+            message="Fix #2\n",
+            fix_commit_date="2018-06-01T00:00:00Z",
+            gate=self._gate,
+        )
+        first = source_mod.ensure_frozen(client, **kwargs)
+        path = source_mod.frozen_path(issues, "PySnooper", 3)
+        assert "refrozen" not in path.read_text(encoding="utf-8"), (
+            "a first freeze is not a refreeze, and the header does not pretend otherwise"
+        )
+
+        head, marker, tail = path.read_text(encoding="utf-8").partition(
+            source_mod.CONTENT_MARKER
+        )
+        path.write_text(head + marker + tail.replace("Report.", "Report!"), encoding="utf-8")
+        edited = path.read_bytes()
+        with pytest.raises(source_mod.IssueSourceError, match="content-sha256"):
+            source_mod.ensure_frozen(client, **kwargs)
+        assert path.read_bytes() == edited, (
+            "the refusal is the whole of the behaviour: the file it refused is left as it was"
+        )
+
+        again = source_mod.ensure_frozen(client, **kwargs, refreeze=True)
+        assert again.content == first.content, "the refreeze re-fetches the same report"
+        assert again.refrozen_at, "the header says when the rewrite happened"
+        assert f"- refrozen: {again.refrozen_at}" in path.read_text(encoding="utf-8")
+        assert path.read_bytes() != edited
+        assert source_mod.load_frozen(path).refrozen_at == again.refrozen_at
+
 
 class TestTheFreezeGatesTheText:
     """§2.4: the gate runs once, at freeze time, and its inputs come from git alone."""
@@ -3721,6 +3815,48 @@ class TestTheFreezeGatesTheText:
         assert prepare_mod.derive_verdict(prep)["issue_text_commit"] == "Fix the loader", (
             "the record the paper reads carries it"
         )
+
+    def test_a_refused_artifact_is_left_alone_and_the_reason_names_the_remedy(
+        self, tmp_path, monkeypatch
+    ):
+        """§2.4.3: never overwritten, and never refused silently either.
+
+        The command that produced this bug's file is what the reader needs: the refusal
+        alone would leave a bug that cannot run and no stated way to fix it, and the two
+        wrong answers around it — write over the artifact, or drop the bug with no reason —
+        are both worse than saying "the file is untouched; name it with ``--refreeze`` if
+        the rewrite is what you intend".
+        """
+        monkeypatch.setattr(
+            issue_mod, "fix_commit_message", lambda repo, commit: "Fix the loader\n"
+        )
+        issues = tmp_path / "issues"
+        path = self._frozen(issues)
+        head, marker, tail = path.read_text(encoding="utf-8").partition(
+            source_mod.CONTENT_MARKER
+        )
+        path.write_text(
+            head + marker + tail.replace("The report body", "A body nobody gated"),
+            encoding="utf-8",
+        )
+        edited = path.read_bytes()
+
+        prep = self._prep(tmp_path, project="PySnooper", bug_id=3)
+        frozen = prepare_mod.build_issue(
+            prep,
+            repo_cache=tmp_path,
+            issue_sources=self._sources(tmp_path),
+            github_url="https://github.com/cool-RR/PySnooper",
+            full=True,
+        )
+        assert frozen is None and prep.issue is None
+        assert prep.runnable is False
+        assert len(prep.gate_failures) == 1
+        reason = prep.gate_failures[0]
+        assert prepare_mod.FROZEN_ISSUE_REASON in reason
+        assert "content-sha256" in reason
+        assert "--refreeze PySnooper/3" in reason, "the refusal carries its remedy"
+        assert path.read_bytes() == edited, "a full prepare does not overwrite it either"
 
     def test_the_drift_check_flags_an_oracle_the_freeze_never_gated_with(
         self, tmp_path, monkeypatch

@@ -139,6 +139,7 @@ def select(
     waves: list[int],
     reserves: str,
     measure_only: bool = False,
+    refreeze: Sequence[str] = (),
 ) -> list[tuple[dict[str, Any], bool]]:
     """``[(entry, full)]`` in the committed file order.
 
@@ -147,6 +148,11 @@ def select(
     that ``context_sizes.md`` can justify promoting it, but its suites are not run
     until someone changes its ``role`` and re-runs prepare (§8). Naming a bug with
     ``--only`` is an explicit request, so it is always ``full``.
+
+    ``refreeze`` is the same kind of request and is selected the same way: naming a
+    bug with ``--refreeze PROJECT/BUG`` selects only it, in full, because the
+    rewrite has to re-fetch the report and re-run the gate (§2.4.3) — a
+    measure-only pass would read the very file the caller is saying is wrong.
 
     ``measure_only`` forces every candidate to ``full=False`` — the checkout, the
     SWE-bench trees and the §1.6 context precheck, and nothing that boots a VM.
@@ -157,12 +163,13 @@ def select(
     """
     entries = split.bugs
 
-    if only:
+    named = sorted(set(only) | set(refreeze))
+    if named:
         known = {bug_key(entry) for entry in entries}
-        unknown = sorted(set(only) - known)
+        unknown = sorted(set(named) - known)
         if unknown:
-            raise SplitError(f"--only names bugs that are not in the split: {unknown}")
-        wanted = set(only)
+            raise SplitError(f"--only/--refreeze name bugs that are not in the split: {unknown}")
+        wanted = set(named)
         return [(entry, not measure_only) for entry in entries if bug_key(entry) in wanted]
 
     if waves:
@@ -201,12 +208,23 @@ def render_plan(selected: list[tuple[dict[str, Any], bool]]) -> str:
 def cmd_prepare(args: argparse.Namespace) -> int:
     split_path: Path = args.split.resolve()
     split = load_split(split_path)
+    if args.refreeze and args.measure_only:
+        # The two flags want opposite things from the frozen file: --measure-only reads the
+        # text a full prepare wrote and boots nothing, while --refreeze has to re-fetch the
+        # report and re-run the gate. Silently honouring one would leave the caller believing
+        # the other had happened (§2.4.3).
+        raise SplitError(
+            "--refreeze rewrites a frozen issue report, and --measure-only freezes nothing: "
+            "a measure-only pass reads the file a full prepare wrote. The re-fetch and the "
+            "rewrite have to run with suites (§2.4.3), so drop --measure-only."
+        )
     selected = select(
         split,
         only=args.only,
         waves=parse_waves(args.waves),
         reserves=args.reserves,
         measure_only=args.measure_only,
+        refreeze=args.refreeze,
     )
     if not selected:
         raise SplitError("the selection is empty")
@@ -278,6 +296,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     preps: list[prepare_mod.BugPrep] = []
     broken: list[tuple[str, str]] = []
+    refreeze_keys = set(args.refreeze)
 
     for entry, full in selected:
         key = bug_key(entry)
@@ -317,6 +336,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
                 n_ctx=n_ctx,
                 n_ctx_source=n_ctx_source,
                 vanta_bin=vanta_bin,
+                refreeze=key in refreeze_keys,
             )
         except Exception as exc:  # one bug must not take the batch down
             detail = f"{type(exc).__name__}: {exc}"
@@ -888,6 +908,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="PROJECT/BUG",
         help="prepare only these bugs (repeatable); forces full preparation",
+    )
+    prep.add_argument(
+        "--refreeze",
+        action="append",
+        default=[],
+        metavar="PROJECT/BUG",
+        help=(
+            "re-fetch and rewrite this bug's frozen issue report "
+            "(plans/bugsinpy_issues/<project>_<bug>.md), recording the date in its header "
+            "(§2.4.3). Repeatable, and it selects only the bugs it names, in full. Without "
+            "it an artifact is never replaced, however wrong it looks: a file whose hashes "
+            "disagree with its header is refused and left untouched."
+        ),
     )
     prep.add_argument("--waves", default="", help="comma-separated wave numbers")
     prep.add_argument(

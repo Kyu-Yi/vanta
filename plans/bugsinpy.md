@@ -940,6 +940,20 @@ disk. Three tests pin the round trip: write-and-read verifies; one content byte 
 space, the case a naive rule absorbs) fails the content hash; a header or a gate byte changed
 leaves the content and its hash alone, because those parts carry their own provenance.
 
+**A mismatched artifact is refused and left exactly as it is, and `--refreeze` is the one way
+past that.** A file whose hashes disagree with its own header arises two ways — a hand edit, or a
+writer that has since been fixed — and in both cases it is not a text to run: it is a file that
+cannot say what it contains. So nothing overwrites it, not even a full `prepare`; the refusal is a
+gate failure naming the file, the hashes and the remedy, and the bug leaves the batch with that
+reason on it. The rewrite is `prepare --refreeze PROJECT/BUG`: it names the bug, re-fetches the
+report (the client's cache answers, so it may touch no network at all), re-runs the gate, and
+writes the new artifact with `- refrozen: <UTC>` in its header when it replaced a file that was
+already there — the date is what lets a reviewer of the diff read a decision with a moment on it
+rather than an unexplained move of `content-sha256`, and a first freeze carries no such line.
+`--refreeze` selects only the bugs it names and prepares them **in full**, because the re-fetch
+re-runs the gate and the gate's inputs are the bug's trees; `--refreeze` together with
+`--measure-only` is refused outright rather than half-honoured.
+
 The markers are explicit lines rather than blank ones because a `none` report's content is empty,
 and a reader that split on "the first blank line after the header" could not tell that from a
 truncated file.

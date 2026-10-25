@@ -827,6 +827,7 @@ def build_issue(
     issue_sources: "IssueSources",
     github_url: str,
     full: bool,
+    refreeze: bool = False,
 ) -> Optional[issue_source.FrozenIssue]:
     """Read the bug's frozen issue report — and freeze it, once, if it is not there.
 
@@ -846,6 +847,12 @@ def build_issue(
     measure-only run therefore never resolves anything — it reads what a full
     prepare froze, and says so if that file is missing.
 
+    A file that exists but no longer hashes to its own header is **refused, and left
+    exactly as it is** — the refusal is a gate failure carrying the remedy, and
+    ``refreeze`` (only ever set by ``prepare --refreeze``, §2.4.3) is the one way past
+    it. Overwriting instead would be the one outcome worse than a refusal: the run
+    would ship a text nobody has reviewed under the name of the text somebody did.
+
     Returns the frozen artifact it read (or wrote), so the caller can check the derived
     oracle against the test files the freeze gated with (:func:`check_gate_drift`) without
     reading the file a second time. ``None`` means the bug had no issue text to read.
@@ -861,10 +868,18 @@ def build_issue(
     prep.issue_text_commit = issue_mod.strip_diff_and_code(
         issue_mod.fix_commit_message(repo_cache, prep.bug.fixed_commit)
     )
-    if path.is_file():
+    if path.is_file() and not refreeze:
         # The file *is* the text, and reading it never touches the API: a measure-only
         # run reads exactly what a run reads (§2.4).
-        frozen = issue_source.load_frozen(path)
+        try:
+            frozen = issue_source.load_frozen(path)
+        except issue_source.IssueSourceError as exc:
+            prep.gate_failures.append(
+                f"{FROZEN_ISSUE_REASON}: {exc} The file is left untouched: re-fetch and "
+                f"rewrite it with `prepare --refreeze {prep.bug.project}/{prep.bug.bug_id}` "
+                "if the rewrite is what you intend."
+            )
+            return None
     else:
         if not full:
             prep.gate_failures.append(
@@ -888,6 +903,7 @@ def build_issue(
                     repo_cache, prep.bug.fixed_commit
                 ),
                 gate=lambda raw: freeze_gate(prep, raw),
+                refreeze=refreeze,
             )
         except issue_source.IssueSourceError as exc:
             # A network or rate-limit failure must never be recorded as "this bug has
@@ -1396,6 +1412,7 @@ def prepare_one(
     n_ctx: int,
     n_ctx_source: str,
     vanta_bin: Path,
+    refreeze: bool = False,
 ) -> BugPrep:
     """Everything ``prepare`` does for one bug, in the order §1.3 fixes.
 
@@ -1406,6 +1423,9 @@ def prepare_one(
     ``vanta_bin`` is the ``vanta_m3`` the batch's rows will measure: the gate
     shells out to it (§1.6.2 item 5), so the selection it measures is the run's
     own, not a second walk that only a test ever claimed agreed with it.
+
+    ``refreeze`` comes from ``prepare --refreeze PROJECT/BUG`` and means exactly one
+    thing: this bug's committed report is to be re-fetched and rewritten (§2.4.3).
     """
     project = entry["project"]
     bug_id = int(entry["bug_id"])
@@ -1445,6 +1465,7 @@ def prepare_one(
         issue_sources=issue_sources,
         github_url=github_url,
         full=full,
+        refreeze=refreeze,
     )
     if prep.issue is None:
         return prep

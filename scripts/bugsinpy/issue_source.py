@@ -433,6 +433,8 @@ class IssueReport:
     """Why the source is ``none``; empty otherwise."""
     gate: Optional[GateRecord] = None
     """The gated text and the inputs it was gated against. Set before the write."""
+    refrozen_at: str = ""
+    """When an explicit refreeze replaced an artifact that was already on disk (§2.4.3)."""
 
     @property
     def slug(self) -> str:
@@ -726,6 +728,8 @@ def render_frozen(report: IssueReport) -> str:
         f"- raw-sha256: {sha256_text(_canonical(raw))}",
         f"- content-sha256: {sha256_text(_canonical(gated))}",
     ]
+    if report.refrozen_at:
+        header.append(f"- refrozen: {report.refrozen_at}")
     if report.reason:
         header.append(f"- note: {report.reason}")
     gate = {
@@ -778,6 +782,8 @@ class FrozenIssue:
     gate_answer_sha256: str
     reason: str = ""
     """The header's ``note`` — why the source is ``none``, when it is."""
+    refrozen_at: str = ""
+    """The header's ``refrozen`` date, when an explicit refreeze wrote this file."""
 
     def resolved_as(self) -> str:
         if self.source == SOURCE_VIA_PR:
@@ -918,6 +924,7 @@ def parse_frozen(text: str, *, path: Path) -> FrozenIssue:
         gate_tree_sha256=header["gate-tree-sha256"],
         gate_answer_sha256=header["gate-answer-sha256"],
         reason=header.get("note", ""),
+        refrozen_at=header.get("refrozen", ""),
     )
 
 
@@ -985,6 +992,7 @@ def ensure_frozen(
     message: str,
     fix_commit_date: str,
     gate: Callable[[str], GateRecord],
+    refreeze: bool = False,
 ) -> FrozenIssue:
     """Read the frozen report, resolving and gating it once if it is not there yet.
 
@@ -998,19 +1006,31 @@ def ensure_frozen(
     and neither the API client nor this module walks a tree (§2.4). It is called once, on the
     raw report, and what it returns is stored beside the raw text — after that no stage gates
     anything again, which is what "identical by construction" means here.
+
+    ``refreeze`` is the *only* way an existing artifact is ever replaced, and it can only be
+    set by someone naming the bug on the command line (§2.4.3). A file that exists is
+    otherwise read, and read *once*: a refusal comes back to the caller as an error, never as
+    a reason to write a new text, because an artifact whose hashes disagree with its own
+    header is exactly the case where a silent rewrite would replace something nobody can
+    verify with something nobody has reviewed. When it is set and the file did exist, the new
+    artifact records a ``refrozen`` date, so a reader of the diff can tell a deliberate
+    rewrite from drift rather than wondering why ``content-sha256`` moved.
     """
     target = frozen_path(issues_dir, project, bug_id)
-    if not target.is_file():
-        report = resolve(
-            client,
-            project=project,
-            bug_id=bug_id,
-            github_url=github_url,
-            message=message,
-            fix_commit_date=fix_commit_date,
-        )
-        report.gate = gate(report.content())
-        write_frozen(target, report)
+    if target.is_file() and not refreeze:
+        return load_frozen(target)
+    report = resolve(
+        client,
+        project=project,
+        bug_id=bug_id,
+        github_url=github_url,
+        message=message,
+        fix_commit_date=fix_commit_date,
+    )
+    report.gate = gate(report.content())
+    if target.is_file():
+        report.refrozen_at = _utc_now()
+    write_frozen(target, report)
     return load_frozen(target)
 
 

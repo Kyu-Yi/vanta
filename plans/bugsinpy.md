@@ -306,6 +306,36 @@ function is not a definition a reporter could be naming. A GitHub blob URL into 
 repository (`github.com/<org>/<repo>/blob/<sha>/<path>#L<n>`) is a **path** mention of `<path>`: the
 reporter named that file, the line anchor is stripped and the sha is never read.
 
+**Three refinements the dev-2 ranking needed.** The first ranking put `pandas/__init__.py` first for
+`pandas/1`, and a dozen generic `pandas/core/arrays/*.py` above `pandas/core/dtypes/common.py` — the file
+that defines the one symbol the issue backticked. Three rules close that, and they are amendments to the
+rules above rather than new signals:
+
+- **A dotless module name is not a path signal.** `python_module_path("pandas/__init__.py")` is `pandas`,
+  and every pandas report writes "the latest version of pandas" in ordinary prose, so matching a module
+  with no `.` in it made the package's own `__init__.py` a `path` match at weight 400 — the top of the
+  ranking — for an issue that never named it. `path_match_rule` now requires the module to be **dotted**:
+  `sanic.app` is a path the reporter had to spell out, `pandas` is the project's name.
+- **A definition outranks a mention, and the match's worth is scaled by the name's rarity.** A file is
+  reached by `Identifier` only when it *defines* a name the issue names; a mention earns nothing from that
+  signal, so the string merely appearing in a file can never be worth more than the file the name lives
+  in. What the match is worth is then weighted by document frequency — the IDF the retrieval literature
+  uses, `ln(1 + N/df)`, with `N` the tree's file count and `df` the count that *define* the name — mapped
+  onto the band `[IDENTIFIER_WEIGHT_FLOOR 120, IDENTIFIER_WEIGHT 200]`: a name exactly one file defines is
+  evidence and sits at the top, a name a large share of the tree defines stands near the floor. The
+  population counted is definitions, not mentions, so a file's score is a property of the tree the run is
+  given: a hidden test defines no symbol the issue names, which is why
+  `the_selection_is_unchanged_when_a_hidden_test_is_added_or_removed` still holds. The floor sits above
+  `ImportNeighbour` (100) on purpose, so a definition is never displaced by reachability.
+- **A fenced code block is not a form that writes a name as code.** The reader used to count backticks as
+  a toggle, so the three backticks of a ```python fence flipped the state and every token in the block
+  became `backtick`: `pandas/1`'s reproduction binds `dtype`, a dozen array modules define a `dtype`
+  method, and they ranked above the file the issue named. `issue_identifiers` now reads the written forms
+  by **adjacency** — a token touching a backtick, a token followed by `(`, the name side of `obj.name` —
+  which is both the rule stated above and the reader the paper's flag uses (`issue.py`'s
+  `_written_as_code`). So `fig` inside `matplotlib/1`'s fenced block is a local and stays out, and the
+  fence's own `dtype` is plain English.
+
 **Never hidden information (item 3).** `F2P`/hidden tests, the fix commit and its diff, and
 `bug.info` are not inputs and cannot be reached from the selection. The harness keeps them out of the
 tree as today; a test proves selection is unchanged when the hidden tests are removed or added.

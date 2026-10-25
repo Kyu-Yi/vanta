@@ -278,6 +278,16 @@ fn relative_path(base: &Path, path: &Path) -> String {
 /// in the prompt as a line and absent from it as source. A variant meaning
 /// "walked to it" was tried and removed: it made a prompt out of the listing while
 /// looking exactly like a grounded selection in the report (§1.6.6).
+///
+/// [VANTA-WHY] There is deliberately no "this file mentions the name" member
+/// either. A definition is evidence that the issue's own symbol lives here; a
+/// mention is the string appearing in a file whether or not it is the symbol's
+/// home, and on a real tree a name like `True` or `Series` is mentioned by most
+/// of the repo — scoring mentions as a reason selects hundreds of files at the
+/// bottom of the ranking and spends the budget on the noise (item 4's own
+/// complaint, at repo scale). Mentions are not free, but they are *graded*: what
+/// orders files by their contents is the BM25 fallback, and it is priced below
+/// every signal here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionReason {
@@ -289,7 +299,8 @@ pub enum SelectionReason {
     Traceback,
     /// A name this file *defines* — a `def`/`class` at any depth, or a
     /// module-level binding — that the issue text writes as code (`defined_names`,
-    /// §1.6.2 item 2).
+    /// §1.6.2 item 2). Its weight is scaled by how rare the name is across the
+    /// repo (`identifier_worth`), and never falls to a neighbour's.
     Identifier,
     /// A module-level import neighbour of a selected file, one hop out.
     ImportNeighbour,
@@ -297,13 +308,28 @@ pub enum SelectionReason {
     Test,
 }
 
+/// What an `Identifier` match is worth at its utmost: a name no other candidate
+/// in the repo defines or mentions.
+pub const IDENTIFIER_WEIGHT: i64 = 200;
+/// What an `Identifier` match is worth at its least: a name nearly every
+/// candidate mentions, which is a word the repo shares rather than evidence.
+///
+/// [VANTA-WHY] The floor sits above `ImportNeighbour` (100) on purpose. §1.6.2
+/// item 2 orders a file the *issue* names above a file merely reachable from one,
+/// and that guarantee is a property of the weights, not of the corpus: a scaling
+/// that could price a common name's definition below 100 would let a neighbour of
+/// a named file displace the file the issue named — which is exactly the ordering
+/// the weights were re-cut to fix. The band is [120, 200]; the rare end keeps the
+/// historical 200.
+pub const IDENTIFIER_WEIGHT_FLOOR: i64 = 120;
+
 impl SelectionReason {
     pub fn weight(self) -> i64 {
         match self {
             SelectionReason::PatchTouched => 1000,
             SelectionReason::Path => 400,
             SelectionReason::Traceback => 300,
-            SelectionReason::Identifier => 200,
+            SelectionReason::Identifier => IDENTIFIER_WEIGHT,
             SelectionReason::ImportNeighbour => 100,
             SelectionReason::Test => 80,
         }
@@ -423,6 +449,31 @@ impl SelectionRule {
             SelectionRule::Attribute => "attribute",
             SelectionRule::Import => "import",
             SelectionRule::CoveringTest => "covering-test",
+        }
+    }
+}
+
+/// One signal that matched one file, with what it was worth *for that file*.
+///
+/// [VANTA-WHY] The rule is display only (§1.6.4), but the weight is not: a name
+/// an issue writes as code is worth less when the whole repo mentions it, so an
+/// `Identifier` match is priced by how rare the name is across the candidates
+/// (§1.6.2 item 2). The fixed signals keep `SelectionReason::weight` exactly;
+/// only the identifier match scales, which is why the score lives beside the
+/// match rather than being re-derived from the reason alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionMatch {
+    pub rule: SelectionRule,
+    /// This signal's contribution to the file's score.
+    pub weight: i64,
+}
+
+impl SelectionMatch {
+    /// A fixed-weight signal — every reason but `Identifier`.
+    pub fn of(reason: SelectionReason, rule: SelectionRule) -> SelectionMatch {
+        SelectionMatch {
+            rule,
+            weight: reason.weight(),
         }
     }
 }
@@ -887,13 +938,13 @@ pub fn select_review_context(
         .collect();
     let module_map = python_module_to_path(candidates);
 
-    let mut reasons: BTreeMap<String, BTreeMap<SelectionReason, SelectionRule>> = BTreeMap::new();
+    let mut reasons: BTreeMap<String, BTreeMap<SelectionReason, SelectionMatch>> = BTreeMap::new();
     let mut mark = |path: &str, reason: SelectionReason, rule: SelectionRule| {
         reasons
             .entry(path.to_string())
             .or_default()
             .entry(reason)
-            .or_insert(rule);
+            .or_insert(SelectionMatch::of(reason, rule));
     };
 
     for path in touched {
@@ -985,9 +1036,32 @@ pub fn select_repair_context(
     let frame_tokens = issue_traceback_files(issue_text);
     let identifiers = issue_identifiers(issue_text);
 
-    let mut reasons: BTreeMap<String, BTreeMap<SelectionReason, SelectionRule>> = BTreeMap::new();
+    let mut reasons: BTreeMap<String, BTreeMap<SelectionReason, SelectionMatch>> = BTreeMap::new();
 
-    for candidate in candidates {
+    // What every candidate defines, read once. Two things need it: the per-file
+    // `Identifier` match, and the document frequency that prices each name the
+    // issue writes as code (§1.6.2 item 2).
+    let defined: Vec<BTreeSet<String>> = candidates
+        .iter()
+        .map(|candidate| defined_names(&candidate.path, &candidate.contents))
+        .collect();
+
+    // What each name the issue writes as code is worth: a name one file of the
+    // tree defines is the rarest there is, a name most of the tree defines is a
+    // word the repo shares rather than evidence (§1.6.2 item 2). Computed once
+    // per name, not once per (file, name): it is a property of the corpus, and
+    // the corpus does not change while its files are being ranked.
+    let rarity: BTreeMap<&str, i64> = identifiers
+        .keys()
+        .map(|symbol| {
+            (
+                symbol.as_str(),
+                identifier_worth(identifier_df(symbol, &defined), defined.len()),
+            )
+        })
+        .collect();
+
+    for (candidate, names) in candidates.iter().zip(&defined) {
         let module = python_module_path(&candidate.path);
         if let Some(rule) = path_match_rule(&path_tokens, &candidate.path, module.as_deref()) {
             mark_reason(&mut reasons, &candidate.path, SelectionReason::Path, rule);
@@ -996,12 +1070,12 @@ pub fn select_repair_context(
             mark_reason(&mut reasons, &candidate.path, SelectionReason::Traceback, rule);
         }
         if !identifiers.is_empty() {
-            let symbols = defined_names(&candidate.path, &candidate.contents);
             // The first symbol in path order that the issue names, so the rule
             // recorded for the file is deterministic when it defines several.
-            if let Some(symbol) = symbols.iter().find(|symbol| identifiers.contains_key(*symbol)) {
+            if let Some(symbol) = names.iter().find(|symbol| identifiers.contains_key(*symbol)) {
                 let rule = identifiers[symbol];
-                mark_reason(&mut reasons, &candidate.path, SelectionReason::Identifier, rule);
+                let weight = rarity[symbol.as_str()];
+                mark_identifier(&mut reasons, &candidate.path, rule, weight);
             }
         }
     }
@@ -1068,14 +1142,15 @@ pub fn select_for_role(
     selection
 }
 
-/// Record one reason for one path, with the rule that matched it.
+/// Record one reason for one path, with the rule that matched it and what the
+/// match is worth for that file.
 ///
-/// The FIRST rule recorded for a (path, reason) pair is kept: each pair is
+/// The FIRST match recorded for a (path, reason) pair is kept: each pair is
 /// marked once per pass today, and where a signal could match by more than one
 /// rule, the matcher itself returns the strongest (see `path_match_rule`), so
 /// the record does not depend on the order candidates are visited.
 fn mark_reason(
-    reasons: &mut BTreeMap<String, BTreeMap<SelectionReason, SelectionRule>>,
+    reasons: &mut BTreeMap<String, BTreeMap<SelectionReason, SelectionMatch>>,
     path: &str,
     reason: SelectionReason,
     rule: SelectionRule,
@@ -1084,7 +1159,28 @@ fn mark_reason(
         .entry(path.to_string())
         .or_default()
         .entry(reason)
-        .or_insert(rule);
+        .or_insert(SelectionMatch::of(reason, rule));
+}
+
+/// Record an `Identifier` match with the weight that name is worth (§1.6.2 item
+/// 2), which is the one signal whose weight is not the reason's own.
+///
+/// Kept apart from `mark_reason` because it is the only caller that has a weight
+/// to pass: every other signal's worth is a constant of its reason, and letting
+/// them all take an explicit number would invite one of them to be priced by a
+/// bug. The identifier's weight is derived — from how rare the name is across the
+/// candidates — so it is passed, not looked up.
+fn mark_identifier(
+    reasons: &mut BTreeMap<String, BTreeMap<SelectionReason, SelectionMatch>>,
+    path: &str,
+    rule: SelectionRule,
+    weight: i64,
+) {
+    reasons
+        .entry(path.to_string())
+        .or_default()
+        .entry(SelectionReason::Identifier)
+        .or_insert(SelectionMatch { rule, weight });
 }
 
 /// The whitespace/punctuation-delimited tokens of the issue, keeping `.` and `/`
@@ -1148,25 +1244,22 @@ pub fn issue_traceback_files(issue_text: &str) -> BTreeSet<String> {
 /// A fenced code block is deliberately NOT one of the writing-as-code forms. The
 /// reproduction snippet in `matplotlib/1`'s report is a ```python block whose
 /// `fig`, `ax` and `data` are the reporter's own locals; treating the fence as
-/// permission puts them back in the list this rule exists to keep honest.
+/// permission puts them back in the list this rule exists to keep honest. The
+/// mechanism that makes this true is adjacency: a token is backticked when a
+/// backtick touches it, and a fence's backticks touch only its first and last
+/// lines. Counting backticks as a toggle instead made a three-backtick fence flip
+/// the state and turned a whole block into one long `` ` `` span, which is how
+/// `pandas/1`'s `dtype` — never backticked, never code-shaped — came to be one of
+/// the names the issue was read as naming (§1.6.2 item 2).
 pub fn issue_identifiers(issue_text: &str) -> BTreeMap<String, SelectionRule> {
     let mut out: BTreeMap<String, SelectionRule> = BTreeMap::new();
     let chars: Vec<char> = issue_text.chars().collect();
     let mut index = 0usize;
-    // Backticks toggle; an odd number of them before a token means the token is
-    // inside one, which is how `` `report` `` counts and bare `report` does not.
-    let mut in_backticks = false;
     // True for the token that starts right after a `.` whose own predecessor is
     // an identifier character — `obj.name`, never the `.` of a sentence.
     let mut after_dot = false;
     while index < chars.len() {
         let ch = chars[index];
-        if ch == '`' {
-            in_backticks = !in_backticks;
-            after_dot = false;
-            index += 1;
-            continue;
-        }
         if !is_identifier_char(ch) {
             after_dot = ch == '.' && index > 0 && is_identifier_char(chars[index - 1]);
             index += 1;
@@ -1178,7 +1271,15 @@ pub fn issue_identifiers(issue_text: &str) -> BTreeMap<String, SelectionRule> {
         }
         let token: String = chars[start..index].iter().collect();
         let next = chars.get(index).copied().unwrap_or(' ');
-        let rule = identifier_rule(&token, in_backticks, after_dot, next);
+        // The written forms are read by ADJACENCY, not by toggling a state
+        // machine, because a fence is three backticks and a toggle reads them as
+        // three flips. `sanic/1`'s reproduction is a ```python block: with a
+        // toggle, everything inside it became `backtick` and the example files
+        // that merely *mention* a name the block happens to contain were ranked
+        // by `identifier` (§1.6.2 item 2, item 4). Adjacency is the reader the
+        // flag uses (`issue.py`'s `_written_as_code`), so the two cannot disagree.
+        let after_backtick = start > 0 && chars[start - 1] == '`';
+        let rule = identifier_rule(&token, after_backtick, after_dot, next);
         after_dot = false;
         if let Some(rule) = rule {
             out.entry(token).or_insert(rule);
@@ -1195,13 +1296,15 @@ fn is_identifier_char(ch: char) -> bool {
 ///
 /// Shape is tested before the written forms, the order the flag's reader tests
 /// them in (``issue.py``'s ``is_code_shaped`` then ``_written_as_code``), so the
-/// two record the same rule for the same word. The written forms are tested
-/// attribute-then-call rather than call-then-attribute: a span that is both —
-/// `fig.savefig(` — records the dotted access, which is the narrower fact and the
-/// one that says which side of the dot the reporter named.
+/// two record the same rule for the same word. The written forms are the flag's
+/// three: a token touching a backtick (`` `name` ``), a token followed by an open
+/// paren (``name(``), and the name side of an attribute access (``obj.name``,
+/// read from `after_dot`). A token inside a fenced code block touches no backtick
+/// — the fence's own backticks are on its first and last lines, not beside the
+/// token — so a fence is not one of the forms, exactly as §1.6.2 says.
 fn identifier_rule(
     token: &str,
-    in_backticks: bool,
+    after_backtick: bool,
     after_dot: bool,
     next: char,
 ) -> Option<SelectionRule> {
@@ -1211,7 +1314,7 @@ fn identifier_rule(
     if let Some(rule) = code_shape_rule(token) {
         return Some(rule);
     }
-    if in_backticks {
+    if after_backtick || next == '`' {
         return Some(SelectionRule::Backtick);
     }
     if after_dot {
@@ -1238,6 +1341,54 @@ fn code_shape_rule(token: &str) -> Option<SelectionRule> {
         return Some(SelectionRule::Camel);
     }
     None
+}
+
+/// How many of the candidates *define* `symbol` — the document frequency the
+/// identifier weight is scaled by (§1.6.2 item 2).
+///
+/// [VANTA-WHY] The population is definitions, not mentions, and that choice is
+/// what keeps a hidden test from re-pricing a visible file. The `Identifier`
+/// reason means "this file defines a name the issue names", so a name's rarity is
+/// measured on the same population the signal draws from. Counting mentions
+/// instead would make the weight a function of every file in the corpus that
+/// writes the name — including the F2P test the harness strips before the run —
+/// and a file added or removed anywhere would then re-cut the score of a file the
+/// issue named. `the_selection_is_unchanged_when_a_hidden_test_is_added_or_removed`
+/// is exactly that invariant, and a hidden test defines no symbol the report
+/// names. Within the definition population the count is still a real IDF: `dtype`
+/// is defined by a dozen files of pandas and `is_string_dtype` by one, so the name
+/// the issue actually named is the one that scores highest.
+fn identifier_df(symbol: &str, defined: &[BTreeSet<String>]) -> usize {
+    defined
+        .iter()
+        .filter(|names| names.contains(symbol))
+        .count()
+}
+
+/// What an `Identifier` match is worth when the name is defined by `df` of
+/// `total` candidates: a name one file defines is worth `IDENTIFIER_WEIGHT`, one
+/// the whole tree defines `IDENTIFIER_WEIGHT_FLOOR` (§1.6.2 item 2).
+///
+/// [VANTA-WHY] The scaling is IDF — `ln(1 + N/df)` — mapped onto the band, not a
+/// scale composed from scratch. `ln(1 + N/1)` (a name one file of the tree
+/// defines) and `ln(1 + N/N) = ln 2` (a name every file defines) are the two ends,
+/// and where a name sits between them is its worth. Monotone in `df`, so a rarer
+/// name is never worth less than a commoner one; bounded, so no name ever beats a
+/// `Path` (400) or falls below an `ImportNeighbour` (100) — which is what keeps
+/// §1.6.2 item 2's guarantee that a file the issue names a definition in still
+/// outranks a file merely reachable from one, whatever the corpus.
+fn identifier_worth(df: usize, total: usize) -> i64 {
+    if total <= 1 {
+        return IDENTIFIER_WEIGHT;
+    }
+    let df = df.clamp(1, total) as f64;
+    let total = total as f64;
+    let idf = (1.0 + total / df).ln();
+    let rarest = (1.0 + total).ln(); // df == 1
+    let commonest = 2.0f64.ln(); // df == total
+    let ratio = ((idf - commonest) / (rarest - commonest)).clamp(0.0, 1.0);
+    let span = (IDENTIFIER_WEIGHT - IDENTIFIER_WEIGHT_FLOOR) as f64;
+    IDENTIFIER_WEIGHT_FLOOR + (span * ratio).round() as i64
 }
 
 /// Every name a file DEFINES: a `def`/`class` at ANY depth — a method counts,
@@ -1410,7 +1561,16 @@ fn path_match_rule(
         return Some(SelectionRule::Basename);
     }
     if let Some(module) = module {
-        if tokens.contains(module) {
+        // [VANTA-WHY] A module name with no `.` in it is the top-level package —
+        // `python_module_path("pandas/__init__.py")` is `pandas` — and a bare
+        // package name is the one word every one of that project's reports writes
+        // in ordinary prose ("I have confirmed this bug exists on the latest
+        // version of pandas"). Matching it made `pandas/__init__.py` the top-ranked
+        // file for issues that never named it, at `path` weight, above the file
+        // that defines the symbol the issue did name (§1.6.2 item 2). A dotted
+        // module is a real path — `sanic.app` is something the reporter had to
+        // spell out — and still counts.
+        if module.contains('.') && tokens.contains(module) {
             return Some(SelectionRule::Module);
         }
     }
@@ -1483,7 +1643,7 @@ fn fill(
     mode: &str,
     role: &str,
     candidates: &[Candidate],
-    reasons: BTreeMap<String, BTreeMap<SelectionReason, SelectionRule>>,
+    reasons: BTreeMap<String, BTreeMap<SelectionReason, SelectionMatch>>,
     budget_tokens: u32,
     tree: &[String],
     reserved_tokens: u32,
@@ -1493,10 +1653,12 @@ fn fill(
         .map(|candidate| (candidate.path.as_str(), candidate))
         .collect();
 
-    // Score = sum of the weights of the reasons a file was picked for; ties are
-    // broken by path, so the order is total and stable. The keys of the inner map
-    // iterate in `SelectionReason`'s own order, which is what makes `reasons` and
-    // `rules` line up signal for signal.
+    // Score = sum of what each signal a file was picked for is worth *for that
+    // file* — the identifier's worth is scaled by the name's rarity, every other
+    // signal's is its reason's constant (§1.6.2 item 2). Ties are broken by path,
+    // so the order is total and stable. The keys of the inner map iterate in
+    // `SelectionReason`'s own order, which is what makes `reasons` and `rules`
+    // line up signal for signal.
     let mut ranked: Vec<(
         String,
         i64,
@@ -1506,11 +1668,13 @@ fn fill(
         .into_iter()
         .filter(|(path, _)| by_path.contains_key(path.as_str()))
         .map(|(path, signals)| {
+            let score: i64 = signals.values().map(|matched| matched.weight).sum();
             let list: Vec<SelectionReason> = signals.keys().copied().collect();
-            let score: i64 = list.iter().map(|reason| reason.weight()).sum();
             let rules: BTreeMap<String, String> = signals
                 .iter()
-                .map(|(reason, rule)| (reason.as_str().to_string(), rule.as_str().to_string()))
+                .map(|(reason, matched)| {
+                    (reason.as_str().to_string(), matched.rule.as_str().to_string())
+                })
                 .collect();
             (path, score, list, rules)
         })
@@ -2142,17 +2306,23 @@ mod tests {
             paths(&selection),
             vec![
                 "pkg/core.py",
+                "pkg/helper.py",
                 "pkg/alpha.py",
                 "pkg/beta.py",
-                "pkg/helper.py",
                 "pkg/util.py",
             ],
-            "path+traceback+identifier (900) > identifier (200) > import-neighbour \
-             (100); the identifier tie is broken by path, so `alpha` and `beta` come \
-             before `helper`"
+            "path+traceback+identifier (900) > identifier > import-neighbour (100); \
+             `helper` is defined by one file and `render` by two, so the rarer name \
+             ranks higher, and the `render` tie is broken by path"
         );
         let scores: Vec<i64> = selection.files.iter().map(|file| file.score).collect();
-        assert_eq!(scores, vec![900, 200, 200, 200, 100]);
+        assert_eq!(
+            scores,
+            vec![900, 200, 164, 164, 100],
+            "the identifier's worth is scaled by the name's rarity across the tree \
+             (§1.6.2 item 2): `frobnicate` and `helper` are defined once (200), \
+             `render` twice (164), and the import hop is the constant 100"
+        );
 
         let core = &selection.files[0];
         assert_eq!(
@@ -2255,6 +2425,196 @@ mod tests {
         assert_eq!(
             selection.files[0].rules.get("identifier").map(String::as_str),
             Some("backtick")
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 2 — the top-level package name is not a path
+    /// signal. `pandas/__init__.py`'s module is `pandas`, and every pandas report
+    /// says "the latest version of pandas" in ordinary prose, so matching a
+    /// dotless module made the package's own `__init__.py` the top-ranked file for
+    /// an issue that never named it — above the file that defines the symbol the
+    /// issue did name. A dotted module (`sanic.app`) is a path the reporter had to
+    /// spell and still counts.
+    #[test]
+    fn a_bare_package_name_in_prose_is_not_a_path_signal() {
+        let candidates = vec![
+            candidate(
+                "pandas/__init__.py",
+                "from pandas.core.dtypes.common import is_string_dtype\n",
+            ),
+            candidate(
+                "pandas/core/dtypes/common.py",
+                "def is_string_dtype(value):\n    return True\n",
+            ),
+            candidate("pandas/io/other.py", "def other():\n    return 1\n"),
+        ];
+        let issue = "I have confirmed this bug exists on the latest version of pandas.\n\n\
+                     The current implementation of `is_string_dtype` incorrectly \
+                     evaluates to True for categorical series.\n";
+
+        let selection = select_repair_context(&candidates, issue, "creator", 60_000);
+
+        assert_eq!(
+            paths(&selection),
+            vec!["pandas/core/dtypes/common.py"],
+            "the report named the symbol, not the package: the file that defines \
+             `is_string_dtype` is the ranking"
+        );
+        assert_eq!(
+            selection.files[0].rules.get("identifier").map(String::as_str),
+            Some("snake")
+        );
+        assert!(
+            !paths(&selection).contains(&"pandas/__init__.py"),
+            "the word `pandas` in prose is the project's name, not a path the report gave"
+        );
+
+        // The dotted form is still a path signal: a module the reporter spelled out.
+        assert_eq!(
+            path_match_rule(
+                &BTreeSet::from(["pandas.core.dtypes.common".to_string()]),
+                "pandas/core/dtypes/common.py",
+                python_module_path("pandas/core/dtypes/common.py").as_deref(),
+            ),
+            Some(SelectionRule::Module)
+        );
+        assert_eq!(
+            path_match_rule(
+                &BTreeSet::from(["pandas".to_string()]),
+                "pandas/__init__.py",
+                python_module_path("pandas/__init__.py").as_deref(),
+            ),
+            None,
+            "a dotless module is the top-level package, and its name is a prose word"
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 2(b) — a file that *defines* a name the issue named
+    /// is evidence that the name lives here; a file that merely mentions it is the
+    /// string passing through. The definer carries the `Identifier` reason and the
+    /// mentioner carries none at all, so no amount of mentioning can outscore a
+    /// definition.
+    #[test]
+    fn the_file_that_defines_a_name_the_issue_names_beats_one_that_mentions_it() {
+        let candidates = vec![
+            candidate(
+                "pkg/caller.py",
+                "from .impl import is_string_dtype\n\n\ndef use(value):\n    return is_string_dtype(value)\n",
+            ),
+            candidate("pkg/impl.py", "def is_string_dtype(value):\n    return value\n"),
+        ];
+        let issue = "`is_string_dtype` returns True for a categorical series.\n";
+
+        let selection = select_repair_context(&candidates, issue, "creator", 60_000);
+
+        let definer = selection
+            .files
+            .iter()
+            .find(|file| file.path == "pkg/impl.py")
+            .expect("the file that defines the named symbol is selected");
+        assert_eq!(definer.reasons, vec![SelectionReason::Identifier]);
+        assert_eq!(
+            definer.rules.get("identifier").map(String::as_str),
+            Some("snake")
+        );
+
+        let caller = selection
+            .files
+            .iter()
+            .find(|file| file.path == "pkg/caller.py");
+        assert!(
+            caller.map_or(true, |file| !file.reasons.contains(&SelectionReason::Identifier)),
+            "`pkg/caller.py` mentions `is_string_dtype` and defines nothing the issue \
+             named, so it earns no identifier match"
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 2(c) — the identifier's worth is weighted by how
+    /// rare the name is across the tree. A name one file defines is the strongest
+    /// evidence there is; a name three files define is a word the project shares,
+    /// and is worth less to the ranking — though never less than an import
+    /// neighbour, so a definition can never be displaced by reachability.
+    #[test]
+    fn a_name_few_files_define_outranks_one_many_files_define() {
+        let candidates = vec![
+            candidate("pkg/rare.py", "def is_string_dtype(value):\n    return value\n"),
+            candidate("pkg/common_a.py", "def dtype(value):\n    return value\n"),
+            candidate("pkg/common_b.py", "def dtype(value):\n    return value\n"),
+            candidate("pkg/common_c.py", "def dtype(value):\n    return value\n"),
+        ];
+        let issue = "`is_string_dtype` and `dtype` are both wrong.\n";
+
+        let selection = select_repair_context(&candidates, issue, "creator", 60_000);
+
+        let rare = &selection.files[0];
+        assert_eq!(rare.path, "pkg/rare.py", "the rarer name is the stronger evidence");
+        assert_eq!(
+            rare.score, IDENTIFIER_WEIGHT,
+            "a name exactly one file defines is priced at the top of the band"
+        );
+        let common = selection
+            .files
+            .iter()
+            .find(|file| file.path == "pkg/common_a.py")
+            .expect("a file that defines a widely defined name still matches");
+        assert!(
+            common.score < rare.score,
+            "`dtype` is defined by three files of four and must score below the name \
+             only one file defines; got {} against {}",
+            common.score,
+            rare.score
+        );
+        assert!(
+            common.score >= IDENTIFIER_WEIGHT_FLOOR,
+            "the floor sits above `ImportNeighbour` (100), so a definition always \
+             beats reachability; got {}",
+            common.score
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.2 item 2 — a fenced code block is not a form that writes a
+    /// name as code. Reading backticks as a toggle made the three backticks of a
+    /// ```python fence flip the state, so everything in the block became a
+    /// backticked name: `pandas/1`'s reproduction binds `dtype`, and a dozen
+    /// `pandas/core/arrays/*.py` files define a `dtype` method, so a fence the
+    /// reporter pasted for a different reason ranked them ahead of the file that
+    /// defines `is_string_dtype`. Only the forms the rule names survive: a name the
+    /// block writes as `pd.Series` is still the name side of an attribute access.
+    #[test]
+    fn a_fenced_code_block_is_not_a_form_that_writes_a_name_as_code() {
+        let issue = "Bug:\n\n\
+                     ```python\n\
+                     s = pd.Series(['a', 'b', 'c'], dtype='category')\n\
+                     pdt.is_string_dtype(s)\n\
+                     ```\n\n\
+                     The result is wrong.\n";
+
+        let identifiers = issue_identifiers(issue);
+
+        assert!(
+            !identifiers.contains_key("dtype"),
+            "`dtype` is plain English inside the block: not code-shaped, and a fence \
+             is not one of the writing-as-code forms"
+        );
+        assert!(
+            !identifiers.contains_key("pd"),
+            "`pd` is the object side of an access, and only the name side is a name"
+        );
+        assert!(
+            !identifiers.contains_key("s"),
+            "a one-character local is not a name: got {identifiers:?}"
+        );
+        assert_eq!(
+            identifiers.get("is_string_dtype"),
+            Some(&SelectionRule::Snake),
+            "the underscore makes it a name of its own shape, fence or no fence"
+        );
+        assert_eq!(
+            identifiers.get("Series"),
+            Some(&SelectionRule::Camel),
+            "`Series` is a name the block wrote as code — its own shape names it, \
+             which is tested before the written forms, so the rule recorded is the \
+             shape and not `attribute`"
         );
     }
 

@@ -18576,7 +18576,7 @@ class TestLocalizationHit:
 
 
 class TestLocalizationTable:
-    """§1.6.5 — the ranking audit, computed offline from the selection already recorded.
+    """§1.6.5 and §1.6.11 — the ranking audit, computed offline from what prepare recorded.
 
     ``TestLocalizationHit`` covers the metric as a *run* produces it, from the driver's
     ``context_selection=`` provenance. This is the same question asked one stage earlier:
@@ -18585,6 +18585,11 @@ class TestLocalizationTable:
     more than the arithmetic — it never runs the selector (a metric computed *inside*
     selection is a term the ranking then optimises), and it is a dev-split-only number
     (a tuning number produced over a held-out set is how that set stops being held out).
+
+    §1.6.11 sharpens the row: a hit is a touched file shown **in full** rather than merely
+    selected, and each touched file is printed with the rank the selection gave it, read
+    three-valued so "ranked but outlined", "ranked with no rank recorded" and "never
+    reached" do not read as the same thing.
     """
 
     FIX = (
@@ -18646,8 +18651,11 @@ class TestLocalizationTable:
 
     @staticmethod
     def _shown(*paths: str) -> list[dict]:
-        return [{"path": path, "score": 400, "reasons": ["path"], "rules": {"path": "exact"},
-                 "bytes": 10, "tokens": 3, "shown": "full"} for path in paths]
+        return [
+            {"path": path, "score": 400, "reasons": ["path"], "rules": {"path": "exact"},
+             "bytes": 10, "tokens": 3, "shown": "full", "rank": rank}
+            for rank, path in enumerate(paths, start=1)
+        ]
 
     def test_the_table_names_the_selection_the_top_three_and_the_hit(self, tmp_path):
         root, split = self._fixture(tmp_path, {"Demo": self.FIX, "Other": self.FIX})
@@ -18663,14 +18671,80 @@ class TestLocalizationTable:
             batch_dir=batch_dir, split=split, bugsinpy_root=root
         )
         assert [row["hit"] for row in rows] == [True, False]
-        assert rows[0]["selected"] == 4
+        assert rows[0]["selected"] == 4 and rows[0]["in_full"] == 4
         assert rows[0]["top"] == ["pkg/core.py[path:exact]", "pkg/util.py[path:exact]",
                                  "pkg/api.py[path:exact]"]
         assert rows[0]["touched"] == ["pkg/core.py"]
-        assert "files selected" in table and "top 3 files" in table
+        assert rows[0]["touched_ranks"] == ["pkg/core.py #1 (full)"]
+        assert rows[1]["touched_ranks"] == ["pkg/core.py #—"]
+        assert "files in full" in table and "top 3 files" in table
+        assert "touched (rank)" in table and "refused" in table
+        assert "4/4" in table and "1/1" in table
+        assert "pkg/core.py #1 (full)" in table
         assert ("pkg/core.py[path:exact], pkg/util.py[path:exact], "
                 "pkg/api.py[path:exact]") in table
         assert "hit 1 / miss 1 / unknown 0 over 2 dev bug(s)" in table
+
+    def test_a_touched_file_shown_as_a_path_is_a_near_miss_not_a_hit(self, tmp_path):
+        """§1.6.11: a path row is a pointer to the fix, not the fix. The ranking reached
+        the file the developer changed — it ranked it 2nd — but handed the run a bare tree
+        entry, so the audit reports the rank it reached and the hit it did not."""
+        root, split = self._fixture(tmp_path, {"Demo": self.FIX})
+        batch_dir = self._report(tmp_path, [
+            {"bug": "Demo/1", "verdict": "accept", "selected_files": [
+                {"path": "pkg/other.py", "score": 500, "reasons": ["path"],
+                 "rules": {"path": "basename"}, "bytes": 10, "tokens": 3,
+                 "shown": "full", "rank": 1},
+                {"path": "pkg/core.py", "score": 300, "reasons": ["identifier"],
+                 "rules": {"identifier": "snake"}, "bytes": 10, "tokens": 3,
+                 "shown": "path", "rank": 2},
+            ]},
+        ])
+        table, rows = runner_mod.localization_table(
+            batch_dir=batch_dir, split=split, bugsinpy_root=root
+        )
+        assert rows[0]["hit"] is False
+        assert rows[0]["in_full"] == 1 and rows[0]["selected"] == 2
+        assert rows[0]["touched_ranks"] == ["pkg/core.py #2 (path)"]
+        assert "1/2" in table
+        assert "pkg/core.py #2 (path)" in table
+        row_line = next(line for line in table.splitlines() if line.startswith("Demo/1"))
+        # ``hit`` is the second-to-last cell; ``refused`` comes after it.
+        assert row_line.split()[-2] == "no"
+
+    def test_an_outline_is_not_a_hit_either(self, tmp_path):
+        root, split = self._fixture(tmp_path, {"Demo": self.FIX})
+        batch_dir = self._report(tmp_path, [
+            {"bug": "Demo/1", "verdict": "accept", "selected_files": [
+                {"path": "pkg/core.py", "score": 300, "reasons": ["identifier"],
+                 "rules": {"identifier": "snake"}, "bytes": 10, "tokens": 3,
+                 "shown": "outline", "rank": 1},
+            ]},
+        ])
+        _table, rows = runner_mod.localization_table(
+            batch_dir=batch_dir, split=split, bugsinpy_root=root
+        )
+        assert rows[0]["in_full"] == 0
+        assert rows[0]["touched_ranks"] == ["pkg/core.py #1 (outline)"]
+        assert rows[0]["hit"] is False
+
+    def test_a_selection_without_a_recorded_rank_prints_the_tolerant_mark(self, tmp_path):
+        """§1.6.9's tolerance, read where it matters: a report written before ranks were
+        recorded still says *which* place the fix's file took — the array order is not this
+        function's to interpret — so it prints ``#?`` and never a number it invented."""
+        root, split = self._fixture(tmp_path, {"Demo": self.FIX})
+        batch_dir = self._report(tmp_path, [
+            {"bug": "Demo/1", "verdict": "accept", "selected_files": [
+                {"path": "pkg/core.py", "score": 300, "reasons": ["identifier"],
+                 "rules": {"identifier": "snake"}, "bytes": 10, "tokens": 3,
+                 "shown": "full"},
+            ]},
+        ])
+        _table, rows = runner_mod.localization_table(
+            batch_dir=batch_dir, split=split, bugsinpy_root=root
+        )
+        assert rows[0]["touched_ranks"] == ["pkg/core.py #? (full)"]
+        assert rows[0]["hit"] is True
 
     def test_the_third_column_says_why_each_file_ranked(self, tmp_path):
         """§1.6.4: a reason says which input named a file, not which rule inside that
@@ -18712,8 +18786,34 @@ class TestLocalizationTable:
         assert rows[0]["hit"] is None
         assert "unknown 1" in table
         row = next(line for line in table.splitlines() if line.startswith("Demo/1"))
-        # No file was shown and none could be judged: both cells are the unknown mark.
-        assert row.split() == ["Demo/1", "0", "—", "—"]
+        # No file was shown, so the count is 0/0, the fix's file was never reached
+        # (#—), nothing could be judged and there was no refusal: every cell is its
+        # own unknown mark.
+        assert row.split() == ["Demo/1", "0/0", "—", "pkg/core.py", "#—", "—", "—"]
+
+    def test_a_refusal_is_named_so_it_is_not_read_as_a_miss(self, tmp_path):
+        """§1.6.10: the gate refuses by name. The audit prints that name beside the row,
+        because a budget refusal and a ranking that reached nothing produce the same
+        ``no`` and are different findings — the one place the audit could lie by
+        silence."""
+        root, split = self._fixture(tmp_path, {"Demo": self.FIX, "Other": self.FIX})
+        batch_dir = self._report(tmp_path, [
+            {"bug": "Demo/1", "verdict": "reject",
+             "reasons": ["selection_dropped_for_budget: 81 selected file(s) did not fit"],
+             "selected_files": self._shown("pkg/elsewhere.py")},
+            {"bug": "Other/1", "verdict": "not_measured",
+             "reasons": ["frozen issue report: nowhere.md does not exist"],
+             "selected_files": []},
+        ])
+        table, rows = runner_mod.localization_table(
+            batch_dir=batch_dir, split=split, bugsinpy_root=root
+        )
+        assert rows[0]["refused"] == "selection_dropped_for_budget"
+        # A reason that is a sentence has no name, so it prints the honest unknown mark
+        # rather than its first word.
+        assert rows[1]["refused"] == "—"
+        assert "selection_dropped_for_budget" in table
+        assert "frozen" not in table
 
     def test_a_bug_with_no_report_row_is_unknown(self, tmp_path):
         root, split = self._fixture(tmp_path, {"Demo": self.FIX})
@@ -18722,8 +18822,9 @@ class TestLocalizationTable:
             batch_dir=batch_dir, split=split, bugsinpy_root=root
         )
         assert rows[0] == {
-            "bug": "Demo/1", "selected": 0, "top": [], "touched": ["pkg/core.py"],
-            "hit": None,
+            "bug": "Demo/1", "selected": 0, "in_full": 0, "top": [],
+            "touched": ["pkg/core.py"], "touched_ranks": ["pkg/core.py #—"],
+            "hit": None, "refused": "—",
         }
 
     def test_a_fix_that_touches_only_tests_has_no_source_to_hit(self, tmp_path):

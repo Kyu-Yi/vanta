@@ -815,13 +815,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_localize(args: argparse.Namespace) -> int:
-    """Ranking quality on the dev split, from evidence already on disk (§1.6.5).
+    """Ranking quality on the dev split, from evidence already on disk (§1.6.5, §1.6.11).
 
     No VM, no LLM, no selector: it reads the selection ``prepare`` measured
     (``context_report.json``) and each bug's fix-commit patch, and prints whether
-    the fix's own files were among those shown. That is what makes it a *view* of
-    the ranking rather than an input to it — nothing in ``prepare`` calls this, and
-    the split is the dev one so the number stays a tuning number.
+    the fix's own files were among those shown **in full**, with the rank the
+    selection gave each of them. That is what makes it a *view* of the ranking
+    rather than an input to it — nothing in ``prepare`` calls this, and the split is
+    the dev one so the number stays a tuning number.
     """
     split_path = args.split.resolve()
     if split_path != DEV_SPLIT.resolve():

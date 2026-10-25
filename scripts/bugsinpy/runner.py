@@ -854,6 +854,77 @@ def paths_hit(touched: Iterable[str], shown: Iterable[str]) -> Optional[bool]:
     return any(path in shown for path in touched)
 
 
+def shown_full(entries: Iterable[Mapping[str, Any]]) -> list[str]:
+    """The selected paths the run was shown **in full** — not outlined, not as a path.
+
+    §1.6.11's narrowing of the audit's question. §1.6.5 asked whether a touched file
+    was *among those shown*; shown is three forms, and a path the prompt prints as a
+    bare tree entry is not a file the model can read. The audit now asks the stricter
+    question — was the file the fix changed handed over whole? — because a hit on an
+    outline or a path row says the prompt carried a *pointer* to the fix, which is a
+    different finding from carrying the fix.
+    """
+    return [
+        str(file["path"])
+        for file in entries
+        if file.get("path") and str(file.get("shown") or "") == "full"
+    ]
+
+
+def touched_rank_entry(path: str, entries: Iterable[Mapping[str, Any]]) -> str:
+    """``path #rank (form)`` — where the selection put a file the fix changed (§1.6.11).
+
+    Read three-valued, the way :func:`context.rank_of` reads the field, because the
+    three states are three different findings and only one of them is a ranking
+    failure:
+
+    * **in the selection, rank recorded** — ``#3 (outline)``: the ranker put the
+      fix's file third and showed it as an outline;
+    * **in the selection, no rank recorded** — ``#?``: a report written before §1.6.9
+      recorded ranks. The tolerant mark, never an invented number pulled from the
+      array's order;
+    * **not in the selection** — ``#—``: the ranking reached nothing for the file the
+      fix changed.
+
+    The form beside it is the same three forms the fill ranks in (§1.6.1), so a row
+    where the fix's file was ranked but only outlined reads as that and not as a hit.
+    """
+    for file in entries:
+        if str(file.get("path") or "") != path:
+            continue
+        rank = ctx_mod.rank_of(file)
+        place = str(rank) if rank else "?"
+        return f"{path} #{place} ({str(file.get('shown') or '?')})"
+    return f"{path} #—"
+
+
+def refusal_name(reasons: object) -> str:
+    """The gate's own name for a row that was not a clean selection (§1.6.10), or ``—``.
+
+    ``prepare`` writes each context row's ``reasons`` as ``name: what it means`` — the
+    name is the vocabulary §1.6.10 fixed (``no_issue_grounded_selection``,
+    ``selection_dropped_for_budget``, ``issue_source=none``) and the prose after the
+    colon is the sentence a reader is shown elsewhere. The audit prints the name beside
+    the row so a refusal does not read as a ranking miss: ``matplotlib/1``'s ``no`` is a
+    selection the budget refused, and ``fastapi/1``'s ``no`` is a selection that ranked
+    nothing the fix's files touch — the same cell, two different findings.
+
+    The name is the token before the first colon, and only when that token is
+    identifier-shaped (letters, digits, ``_``, ``=``). A reason that is a sentence — a
+    measure-only run's ``frozen issue report: …`` — has no name and prints ``—``, the
+    honest answer rather than a first word pretending to be one.
+    """
+    if isinstance(reasons, (str, bytes)) or not isinstance(reasons, Sequence):
+        return "—"
+    for reason in reasons:
+        if not isinstance(reason, str) or ":" not in reason:
+            continue
+        name = reason.split(":", 1)[0].strip()
+        if name and re.fullmatch(r"[a-z][a-z0-9_=]*", name):
+            return name
+    return "—"
+
+
 def localization_hit(
     prep: prepare_mod.BugPrep, context_selection: Optional[str]
 ) -> Optional[bool]:
@@ -896,6 +967,12 @@ def localization_table(
     A bug whose report row is missing, or says ``not_measured``, is reported as
     ``None`` (printed ``—``) rather than as a miss: no selection was made, so
     there is nothing to judge.
+
+    §1.6.11 widens the row: not *was the fix's file among those shown* but **was it
+    shown in full**, and each touched file is printed with the **rank the selection
+    gave it**. A path that reached the prompt as a tree entry, or as an outline, is a
+    pointer to the fix rather than the fix, and a hit rate that counted it would
+    report the ranking as better than the prompt the model read.
     """
     report = _read_json(batch_dir / CONTEXT_REPORT_NAME)
     if not report:
@@ -923,15 +1000,23 @@ def localization_table(
             for file in (record or {}).get("selected_files", [])
             if file.get("path")
         ]
-        selected = [str(file["path"]) for file in entries]
+        # §1.6.11: a hit is a touched file shown **in full**, and the selection's full
+        # set is the narrower one the hit is asked about. The rank column still prints
+        # every touched file, so an outline or a path row is visible as a near miss.
+        full = shown_full(entries)
         was_measured = bool(record) and record.get("verdict") != "not_measured"
         rows.append(
             {
                 "bug": key,
-                "selected": len(selected),
+                "selected": len(entries),
+                "in_full": len(full),
                 "top": [selection_entry(file) for file in entries[:3]],
                 "touched": touched,
-                "hit": paths_hit(touched, selected) if was_measured else None,
+                "touched_ranks": [touched_rank_entry(path, entries) for path in touched],
+                "hit": paths_hit(touched, full) if was_measured else None,
+                # §1.6.10: the gate's own name for why the row is not a clean selection,
+                # printed beside the hit so a refusal is not read as a ranking miss.
+                "refused": refusal_name((record or {}).get("reasons")),
             }
         )
     return render_localization_table(rows), rows
@@ -961,26 +1046,35 @@ def selection_entry(file: Mapping[str, Any]) -> str:
 
 
 def render_localization_table(rows: list[dict[str, Any]]) -> str:
-    """The four columns the audit is read for, aligned to their own widest cell.
+    """The six columns the audit is read for, aligned to their own widest cell.
 
     ``top 3 files`` carries each file's reasons *and* the rule that matched each
-    one, so a row says why those three ranked and not only that they did. The
-    audit's question is whether the ranking put the fix's own files first, and a
-    list of paths that agrees with the numbers while disagreeing with the recipe is
-    exactly what a reader has to be able to see.
+    one, so a row says why those three ranked and not only that they did. ``files in
+    full`` is written ``in full / selected`` — the count the hit is asked over, beside
+    the count the ranking chose, because a run that selected thirty files and showed
+    two of them whole is a different finding from one that selected two. ``touched
+    (rank)`` prints every file the fix changed with the place the selection gave it
+    (§1.6.11), so a fix file that ranked 7th and was outlined is visible as the near
+    miss it is. ``refused`` prints the gate's own name for a row that was not a clean
+    selection (§1.6.10), so ``no`` on a budget refusal is not read as ``no`` on a
+    ranking that reached nothing. The audit's question is whether the ranking put the
+    fix's own files first, and a list of paths that agrees with the numbers while
+    disagreeing with the recipe is exactly what a reader has to be able to see.
 
     Column widths come from the data rather than a constant: a path can be longer
     than any guessed width, and a table whose ``hit`` column has drifted a space to
     the right on the rows that matter is read as noise.
     """
-    headers = ("bug", "files selected", "top 3 files", "hit")
+    headers = ("bug", "files in full", "top 3 files", "touched (rank)", "hit", "refused")
     hits = {True: "yes", False: "no", None: "—"}
     body = [
         {
             "bug": str(row["bug"]),
-            "files selected": str(row["selected"]),
+            "files in full": f"{row['in_full']}/{row['selected']}",
             "top 3 files": ", ".join(row["top"]) or "—",
+            "touched (rank)": ", ".join(row["touched_ranks"]) or "—",
             "hit": hits[row["hit"]],
+            "refused": str(row["refused"]),
         }
         for row in rows
     ]
@@ -996,8 +1090,9 @@ def render_localization_table(rows: list[dict[str, Any]]) -> str:
     lines += [
         "",
         f"localization_hit: hit {tally[True]} / miss {tally[False]} / unknown "
-        f"{tally[None]} over {len(rows)} dev bug(s) — computed offline from the "
-        "selection already recorded, never fed back into it (§1.6.5)",
+        f"{tally[None]} over {len(rows)} dev bug(s) — a hit is a file the fix touched "
+        "shown **in full** (not merely selected, nor outlined), computed offline from "
+        "the selection already recorded and never fed back into it (§1.6.11)",
     ]
     return "\n".join(lines)
 

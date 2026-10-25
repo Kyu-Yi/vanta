@@ -726,6 +726,12 @@ so none of them could have shown the fix's file. The failure that read as 11 cle
 reads as a 0-of-11 hit rate here — which is what the audit is for. After a measure-only rerun on the
 fixed selector the same command reports the real selections.
 
+The columns above are the ones the audit printed when this section was written. §1.6.11 widens the row to
+ask a sharper question — was the fix's file shown **in full**, and what rank did the selection give it —
+so `files selected` is now `files in full`, `touched (rank)` and `refused` are new columns, and `hit`
+means "shown in full" rather than "among those shown". The three properties above are unchanged; only the
+question and the row are.
+
 #### 1.6.6 The tree is a listing, not a reason
 
 The third measure-only run (`runs/bugsinpy/measure-dev-2/context_report.json`, overwritten after §1.6.3)
@@ -1109,6 +1115,116 @@ harness would not need to change to refuse it.
 The over-budget half is `prompt_exceeds_budget`, acting on `prompt_tokens_estimate` and nothing else —
 now a number that counts the listing once (§1.6.4), which is what makes it the same comparison the run's
 own guard makes.
+
+#### 1.6.11 The audit asks its second question — shown, or shown **in full**
+
+§1.6.5's audit asks whether the fix's own files were *among those shown*. Shown is three forms
+(§1.6.1) — full, outline, path — and a file the prompt prints as a bare tree entry, or cuts to its
+signatures, is a **pointer** to the fix and not the fix. An audit that counts that as a hit reports the
+ranking's *reach* as though it were the prompt's *content*, which is the one number §1.6.5 exists to
+keep honest. §1.6.11 widens the row and sharpens the question.
+
+    python3 scripts/bugsinpy_run.py localize --split plans/bugsinpy_dev_split.json \
+        --batch runs/bugsinpy/<batch>
+
+The same command §1.6.5 defined, and the same three properties: no VM, no LLM and no selector; the dev
+split only, refused with `SplitError` for any other path; and never read by `prepare`, so the number
+stays a view of the ranking rather than a term it optimises. Three things a row says change:
+
+- **`files in full` replaces `files selected`**, written `in full / selected`. The count the hit is
+  asked over, beside the count the ranking chose — a run that selected thirty files and showed two of
+  them whole is a different finding from one that selected two, and folding them into one number is how
+  a thin prompt reads as a full one.
+- **`touched (rank)` is a new column**: every path the fix commit changed, each with the place the
+  selection gave it and the form it was shown in.
+- **`refused` is a new column**: the gate's own name for a row that was not a clean selection
+  (§1.6.10), read from the report's `reasons` as the identifier-shaped token before the first colon. A
+  refused selection and a ranking that reached nothing produce the same `no`, and the column is where
+  the audit stops reading them as one finding — which is exactly the name §1.6.10 said a reader would be
+  able to filter on.
+- **`hit` is `yes` only when a touched file was shown in full.** The set `paths_hit` is handed is now
+  `runner.shown_full(entries)` — the selection's `shown == "full"` rows — in place of every selected
+  path. `paths_hit` itself is unchanged and reused: what moved is *which* set it is asked about, not a
+  second definition of "touched", so §1.6.5's third property (one implementation for the run-time
+  metric and the audit) still holds.
+
+`touched (rank)` is **three-valued**, read the way `context.rank_of` reads the field, because its states
+are three different findings and only one of them is a ranking failure:
+
+| cell | means |
+|---|---|
+| `pandas/core/dtypes/common.py #1 (full)` | the ranker put the fix's file first, and the fill afforded it whole |
+| `lib/matplotlib/figure.py #3 (outline)` | reached, ranked, and cut to a signature — a near miss the `hit` column does not count |
+| `pkg/core.py #?` | in the selection, but the report recorded no rank (written before §1.6.9) — the tolerant mark, never a number read off the array's order |
+| `fastapi/applications.py #—` | the ranking reached nothing for the file the fix changed |
+
+Read over the dev split with `measure-dev-5` — the same report §1.6.7 reads, whose rows are the early
+precheck's selection (see the note there):
+
+| bug | files in full | top 3 files | touched (rank) | hit | refused |
+|---|---|---|---|---|---|
+| `fastapi/1` | 11/11 | `docs_src/advanced_middleware/tutorial002.py[bm25:bm25]`, `docs_src/cors/tutorial001.py[bm25:bm25]`, `docs_src/custom_response/tutorial006.py[bm25:bm25]` | `fastapi/applications.py #—`, `fastapi/encoders.py #—`, `fastapi/openapi/utils.py #—`, `fastapi/routing.py #—` | no | — |
+| `luigi/1` | 0/0 | — | `luigi/server.py #—` | — | `issue_source=none` |
+| `matplotlib/1` | 6/32 | `lib/matplotlib/__init__.py[identifier:snake]`, `lib/matplotlib/axes/_base.py[identifier:snake]`, `lib/matplotlib/figure.py[identifier:snake]` | `lib/matplotlib/backend_bases.py #17 (path)`, `lib/matplotlib/figure.py #3 (outline)`, `lib/matplotlib/tight_layout.py #28 (path)` | no | `selection_dropped_for_budget` |
+| `pandas/1` | 24/167 | `pandas/core/dtypes/common.py[identifier:snake]`, `pandas/core/series.py[identifier:camel]`, `pandas/io/s3.py[identifier:digit]` | `pandas/core/dtypes/common.py #1 (full)` | yes | `selection_dropped_for_budget` |
+| `sanic/1` | 29/29 | `sanic/app.py[path:blob-url+identifier:camel]`, `sanic/response.py[path:module+identifier:call]`, `sanic/blueprints.py[identifier:camel]` | `sanic/app.py #1 (full)` | yes | — |
+| `scrapy/1` | 0/0 | — | `scrapy/spidermiddlewares/offsite.py #—` | — | — |
+| `spacy/4` | 0/0 | — | `spacy/cli/converters/conllu2json.py #—` | — | — |
+| `fastapi/2` | 0/0 | — | `fastapi/routing.py #—` | — | — |
+| `luigi/2` | 0/0 | — | `luigi/contrib/beam_dataflow.py #—` | — | — |
+| `matplotlib/2` | 0/0 | — | `lib/matplotlib/axes/_axes.py #—` | — | — |
+| `PySnooper/3` | 6/6 | `pysnooper/pysnooper.py[path:blob-url]`, `pysnooper/__init__.py[import_neighbour]`, `pysnooper/pycompat.py[import_neighbour]` | `pysnooper/pysnooper.py #1 (full)` | yes | — |
+
+and the footer, verbatim:
+
+```
+localization_hit: hit 3 / miss 2 / unknown 6 over 11 dev bug(s) — a hit is a file the fix touched
+shown **in full** (not merely selected, nor outlined), computed offline from the selection already
+recorded and never fed back into it (§1.6.11)
+```
+
+**What the rows show.**
+
+- **The item-2 fix is visible as a *rank*, not only as a first place.** `pandas/1`'s
+  `pandas/core/dtypes/common.py` — the file that *defines* `is_string_dtype`, the name the issue
+  backticks — is `#1 (full)`, and the row is a `hit`. §1.6.2 made the defining file outrank the files
+  that merely mention the name; the audit now prints the rank that says so, and the generic
+  `pandas/core/arrays/*.py` files and `pandas/__init__.py` (the top-level-package-as-a-path case §1.6.2
+  item 2a removed) are no longer the top of the row.
+- **`sanic/1` and `PySnooper/3` hit at rank 1, by different rules.** `sanic/app.py #1 (full)` on
+  `path:blob-url + identifier:camel`; `pysnooper/pysnooper.py #1 (full)` on `path:blob-url`. These are
+  the two bugs the dev prepare was already right about, and here is why: both were reached by a signal
+  that names the file's own module, not by a common word.
+- **`fastapi/1` is a full prompt and a total miss, on a selection nothing refused.** `11/11` shown in
+  full, every one of the fix's four files `#—`, and `refused` empty — so the `no` is the ranking's own,
+  not a gate's. Eight of its eleven full files are `docs_src/**` tutorials and two more are `scripts/**`
+  (`gitter_releases_bot.py`, `docs.py`), the BM25 fallback (§1.6.2 item 3) filling the prompt from prose
+  since `docs_src` is not a directory `PARATEXT_DIRECTORIES` lists (§1.6.8). A row that read only
+  `files selected 11` would call this a healthy selection; the `touched` column is what says the prompt
+  held none of the fix.
+- **`matplotlib/1` is a reached-but-not-afforded miss, and it is the refused case beside `fastapi/1`'s
+  clean one.** The fix's files *were* ranked — `figure.py` at **#3**, `backend_bases.py` at **#17**,
+  `tight_layout.py` at **#28** — and all three were shown as an outline or a path. Under §1.6.5's
+  "among those shown" they would read as three hits for a prompt that carried none of their bodies. The
+  row's `selection_dropped_for_budget` says why: the same budget §1.6.7 measured (165 files dropped at
+  est 163575 against 163584). The ranking found the fix and the fill could not pay for it — §1.6.9's
+  finding read from the other end — and the `refused` column is what keeps that from reading as the
+  ranker's fault.
+- **`pandas/1` is a hit *and* a refusal**, and the two columns have to be read together: `#1 (full)` is
+  the ranking scoring a clean hit, and `selection_dropped_for_budget` is the fill dropping 81 of the 167
+  files it chose after the fix's own file was already in. A refusal is not a miss; a hit is not an
+  approval.
+- **Six rows are `0/0 … #— … —`, and they are `unknown` rather than misses.** `luigi/1` is
+  `issue_source=none` (§2.4) and the five reserve bugs are not measured by a measure-only run (no frozen
+  text), and their `refused` cell is `—` where the recorded reason is a *sentence* rather than a name
+  (`frozen issue report: …`) — the audit prints the honest unknown mark instead of a first word
+  pretending to be a name. They cannot be judged, so they are not counted: the number is a 3-of-11 hit
+  rate, not a 3-of-11 with six rows read as misses.
+- **The audit reads the report it finds, whichever prepare wrote it.** `measure-dev-5` is a
+  measure-only batch, so its record is the *early precheck's* selection against `oracle_tree` (§1.6.7's
+  note). A full prepare replaces that record with the post-strip `vanta_tree` reading, which is never
+  larger and so never a better hit rate; the audit prints whatever the report holds and never re-runs a
+  selector to improve it.
 
 ---
 

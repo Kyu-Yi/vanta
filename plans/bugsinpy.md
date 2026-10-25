@@ -463,7 +463,14 @@ pins. The finding is recorded honestly: the cap fix is necessary and done, and i
 because the issue text the harness supplies (a fix-commit message) is what a repair run is left to
 localize from.
 
-#### 1.6.3 The fallback a seed-less selection needed — a listing is not a context
+#### 1.6.3 The fallback a seed-less selection needed — **superseded by §1.6.6**
+
+> **Superseded.** The fallback below was implemented, measured, and removed. It was the wrong answer:
+> a seed-less selection is not a context, and filling it with the tree's own files in walk order produced
+> a prompt that was a listing with the top of the alphabet pasted in — 11 of 11 dev bugs, every file at
+> score 10 under one reason, `localization_hit 0 / 11`. §1.6.6 records what replaced it (nothing: the
+> selection stays empty and the gate refuses it). The reasoning below is kept because the *problem* it
+> names is real and still governs the refusal.
 
 Measured on the second measure-only run (`runs/bugsinpy/measure-dev-2/context_report.json`), all 11 dev
 bugs passed the gate with `file_count 0` and `source_bytes` **exactly** equal to `tree_bytes`
@@ -543,8 +550,10 @@ Each bug record now carries, alongside the counts it already had:
 - **`selected_files`** — one entry per file, in the order the prompt puts them, each with `path`,
   `score`, `reasons`, `bytes`, `tokens` and `shown`. `reasons` is the ranked vocabulary and is what makes
   the ranking auditable: `patch-touched` (1000) > `path` (400) > `traceback` (300) > `identifier` (200)
-  > `import-neighbour` (100) > `test` (80) > `tree` (10, §1.6.3). `shown` is `full` or `outline`, so a
-  file that only contributed its signatures is not counted as if its body were in the prompt.
+  > `import-neighbour` (100) > `test` (80). There is no seventh entry: §1.6.6 removed the `tree` reason,
+  so every reason in the vocabulary is a signal and a `reasons` list that is empty is impossible. `shown`
+  is `full` or `outline`, so a file that only contributed its signatures is not counted as if its body
+  were in the prompt.
 - **`files_bytes` / `files_tokens`** — what the file content cost, *separately* from `tree_bytes` /
   `tree_count`, which are the listing. `source_bytes` is kept as the selector's own total
   (`files_bytes + tree_bytes`) for continuity with earlier reports, so the identity
@@ -608,6 +617,49 @@ That is 11 misses for the same reason §1.6.3 existed: each of those selections 
 so none of them could have shown the fix's file. The failure that read as 11 clean passes in the report
 reads as a 0-of-11 hit rate here — which is what the audit is for. After a measure-only rerun on the
 fixed selector the same command reports the real selections.
+
+#### 1.6.6 The tree is a listing, not a reason
+
+The third measure-only run (`runs/bugsinpy/measure-dev-2/context_report.json`, overwritten after §1.6.3)
+selects real file *content* at last, and it is still not localization. Every selected file in all 11 bugs
+scores **10** with `reasons ["tree"]` — no `path`, no `traceback`, no `identifier`, no
+`import-neighbour`, no `test`, anywhere — and the files arrive in path order: `fastapi/1` starts at
+`docs/en/docs/js/chat.js`, `matplotlib/1` at `doc/conf.py`, `pandas/1` at `asv_bench/benchmarks/...`.
+That is the old capped repository dump with a bigger cap:
+
+| bug | files | src B | tree paths | budget | est tok | verdict |
+|---|---|---|---|---|---|---|
+| `fastapi/1` | 381 | 653752 | 505 | 163584 | 172157 | REJECT |
+| `matplotlib/1` | 285 | 653890 | 1114 | 163584 | 177860 | REJECT |
+| `pandas/1` | 99 | 654208 | 1125 | 163584 | 177364 | REJECT |
+| `sanic/1` | 116 | 628597 | 116 | 163584 | 160942 | ok (by 2642 tok) |
+| `PySnooper/3` | 9 | 21162 | 9 | 163584 | 8345 | ok |
+| *(the other six)* | 89–371 | ~654000 | 268–1114 | 163584 | 168–172000 | REJECT |
+
+Nine of eleven exceed the budget, and `dropped_for_budget` is empty for **all** eleven — §1.6.3's third
+bullet suppressed the drop ledger for fallback files, so the report could not even say that a budget had
+run out.
+
+**The rule, which replaces §1.6.3's fallback: `tree` is never a reason to include content.** The file
+tree travels as paths and nothing else; content comes only from scored signals. There is no
+`SelectionReason::Tree` any more, `fill` has no fallback, and a ranking that reaches no file returns no
+file. Everything the fallback did was the wrong shape: it invented a reason ("this path exists"), it made
+the prompt alphabetical at the top, and it spent the whole budget on it, because a fill that is told to
+fill will fill.
+
+The three consequences, all of them the point:
+
+- **A seed-less selection stays empty.** `files == []`, so `total_bytes == tree_bytes` exactly — the same
+  signature §1.6.3 read, now with the honest meaning: the prompt is the listing and the issue text.
+- **The gate refuses it** (§1.6.10): a role whose selection has no grounded file is refused by name, not
+  sized. This is what makes the failure visible instead of tidy.
+- **A drop is a drop again.** `dropped_for_budget` records every file the ranking chose and the budget
+  could not take, unconditionally, so "the budget ran out" is legible in the report.
+
+What this does **not** fix is the underlying problem §1.6.2 item 6 named: BugsInPy's issue text is the
+fix commit message, and for most of these bugs it names no path, no frame and no symbol. Removing the
+fallback does not create localization out of a text that carries none — it stops pretending there is
+some. §1.6.7 prints exactly what the selector extracts from those texts.
 
 ---
 

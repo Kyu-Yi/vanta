@@ -216,9 +216,16 @@ fn relative_path(base: &Path, path: &Path) -> String {
 /// had `ImportNeighbour` (100) above the issue signals, which would have put a
 /// neighbour of a named file into the prompt *ahead of* the named file itself.
 /// `PatchTouched` stays far above everything: in review mode the patch is the
-/// subject, so nothing outranks the files it touches. `Tree` (10) sits below all
-/// of them: it says only "this file is in the repository", so it is used only
-/// when no other reason reached any file.
+/// subject, so nothing outranks the files it touches.
+///
+/// [VANTA-WHY] There is deliberately no "it is in the tree" member. Selection
+/// *content* is only ever a scored signal — a path or frame the issue names, a
+/// symbol the issue names, a neighbour of one of those, a file the patch touches,
+/// a test that exercises one of those. The repository file tree is still sent, as
+/// listing of paths and nothing more, so a file that no signal reached is present
+/// in the prompt as a line and absent from it as source. A variant meaning
+/// "walked to it" was tried and removed: it made a prompt out of the listing while
+/// looking exactly like a grounded selection in the report (§1.6.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionReason {
@@ -234,23 +241,6 @@ pub enum SelectionReason {
     ImportNeighbour,
     /// A visible test file that exercises a selected module (review mode).
     Test,
-    /// A file of the tree itself, in walk order: the fallback a ranking with no
-    /// seed at all falls back to.
-    ///
-    /// [VANTA-WHY] A selection with no seed used to be *empty*, and the prompt
-    /// was then the repository file tree and nothing else — a listing of paths,
-    /// not source. A role shown only a listing has been told where the code is
-    /// and nothing about what it does, which is not a context; the harness's gate
-    /// passed 7 of 11 dev bugs on exactly that (a selection whose bytes were
-    /// byte-for-byte the tree listing's, because `total_bytes = 0 + tree_bytes`).
-    /// §1.6.2's prediction that such a bug "will still fall back to the tree plus
-    /// whatever its one-hop neighbours reach" had no seed to hop from, so the
-    /// fallback is made explicit here instead of silently empty: the tree's own
-    /// files, in walk order, to the budget. It carries the weakest weight, it is
-    /// used only when nothing else scored, and it is named in the provenance so a
-    /// reader can tell a file the *issue* named from a file that is merely in the
-    /// repository.
-    Tree,
 }
 
 impl SelectionReason {
@@ -262,7 +252,6 @@ impl SelectionReason {
             SelectionReason::Identifier => 200,
             SelectionReason::ImportNeighbour => 100,
             SelectionReason::Test => 80,
-            SelectionReason::Tree => 10,
         }
     }
 
@@ -274,8 +263,30 @@ impl SelectionReason {
             SelectionReason::Identifier => "identifier",
             SelectionReason::ImportNeighbour => "import-neighbour",
             SelectionReason::Test => "test",
-            SelectionReason::Tree => "tree",
         }
+    }
+
+    /// Whether this reason grounds the *content* of a selection in something the
+    /// run was given — the issue text, or the patch under review.
+    ///
+    /// [VANTA-WHY] The harness's gate refuses a role whose selection has no
+    /// grounded file ("no issue-grounded selection", §1.6.2 item 5). That check
+    /// lives here rather than in the harness so the two cannot disagree about
+    /// what grounded means: the gate reads the reason vocabulary this enum
+    /// serializes, and this is the predicate that classifies it. Every variant is
+    /// grounded today; the predicate is the seam a future reason has to pass, and
+    /// it is what makes the refusal a property of the selector rather than of a
+    /// string the harness happens to recognize.
+    pub fn grounds_content(self) -> bool {
+        matches!(
+            self,
+            SelectionReason::PatchTouched
+                | SelectionReason::Path
+                | SelectionReason::Traceback
+                | SelectionReason::Identifier
+                | SelectionReason::ImportNeighbour
+                | SelectionReason::Test
+        )
     }
 }
 
@@ -740,10 +751,14 @@ pub fn select_review_context(
 ///
 /// [VANTA-WHY] An issue text that names nothing — BugsInPy's is usually the fix
 /// commit message, one sentence of prose, e.g. `fix calling method on wrong
-/// object` — reaches no file with any of the three reasons, has no seed for the
-/// neighbour hop, and used to leave the selection empty: the prompt was then the
-/// file tree alone. It now falls back to the tree's own files in walk order
-/// (`SelectionReason::Tree`), so "no file the issue named" is not "no context".
+/// object` — reaches no file with any of the three reasons and has no seed for the
+/// neighbour hop, so the selection is empty and `files` is empty with it. That is
+/// the honest answer and the whole point of §1.6.6: the prompt is then the file
+/// tree (paths only) and the issue text, nothing else, and the harness's gate
+/// refuses the role as having no issue-grounded selection rather than a run
+/// starting from a listing and guessing. BugsInPy/3 shows how thin these messages
+/// are: its built text is `Fix #2` plus the kind template, and the selector
+/// extracts no path, no frame and no symbol from it (§1.6.6's evidence table).
 pub fn select_repair_context(
     candidates: &[Candidate],
     issue_text: &str,
@@ -1022,9 +1037,10 @@ fn matches_path(tokens: &BTreeSet<String>, candidate_path: &str, module: Option<
 ///
 /// A file that fits goes in `Full`; one over `MAX_FILE_BYTES` goes in as an
 /// `Outline`; one whose outline still does not fit is dropped and named in
-/// `dropped_for_budget`. When the ranking is empty the tree's own files are
-/// ranked by walk order under `SelectionReason::Tree` (see the comment at the
-/// fallback below) instead of an empty selection being returned as a "context".
+/// `dropped_for_budget`. A ranking that reached no file selects no file: the tree
+/// listing alone is a list of paths, not a context, and the gate refuses it by
+/// name ("no issue-grounded selection", §1.6.2 item 5) instead of the fill
+/// inventing files to fill the prompt with (§1.6.6).
 fn fill(
     mode: &str,
     role: &str,
@@ -1051,32 +1067,17 @@ fn fill(
         .collect();
     ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
 
-    // A ranking that reached no file at all is not a context: the repository file
-    // tree is a list of paths, and §1.6.2's fallback ("the tree plus whatever its
-    // one-hop neighbours reach") has no seed to hop from when the issue names
-    // nothing. Rather than send a listing and call it a prompt, the fallback is
-    // made explicit — the tree's own files, in walk order (the walk sorts the
-    // candidate list by path), which is as deterministic as any other ranking and
-    // costs the same budget.
-    //
-    // [VANTA-WHY] This was the gate's wrong reason for passing: with `reasons`
-    // empty the loop below selected nothing, `total_bytes` fell back to the tree
-    // listing alone, and every such bug "fit" trivially because a listing always
-    // fits. `SelectionReason::Tree` names what the fallback is so the report can
-    // still tell a file the issue named from a file that merely exists.
-    let fallback = ranked.is_empty();
-    if fallback {
-        ranked = candidates
-            .iter()
-            .map(|candidate| {
-                (
-                    candidate.path.clone(),
-                    SelectionReason::Tree.weight(),
-                    vec![SelectionReason::Tree],
-                )
-            })
-            .collect();
-    }
+    // [VANTA-WHY] There is no fallback here, deliberately. §1.6.3 added one — when
+    // the ranking reached no file, the tree's own files were filled in walk order
+    // under a `SelectionReason::Tree` — and it was the wrong answer to a real
+    // problem: the prompt was then the file tree with the top of the walk pasted
+    // in, which is the listing plus alphabetical noise, not a context. The
+    // measure-only run that followed made that legible: 11 of 11 dev bugs showed
+    // every file at score 10 with reason `["tree"]`, in path order (`docs/en/docs/
+    // js/chat.js` first for fastapi, `doc/conf.py` first for matplotlib), and 9
+    // exceeded the budget because the fallback fills until the budget is gone.
+    // A selection that reaches no file stays empty; the tree listing still travels
+    // and the gate refuses the role for having no grounded file (§1.6.6).
 
     let mut tree_lines: Vec<String> = tree.to_vec();
     tree_lines.sort();
@@ -1122,17 +1123,15 @@ fn fill(
         }
 
         if cost > remaining {
-            // A file the RANKING chose and the budget cannot take is a drop, and is
+            // A file the ranking chose and the budget cannot take is a drop, and is
             // recorded: the run would be shown less than the ranking decided, which
-            // is what the gate's `selection_dropped_for_budget` reads. In fallback
-            // mode the ranking did not choose anything — the tree did — so leaving a
-            // file out is not the ranking being overruled: it is the tail of a walk
-            // whose paths the prompt already carries as the tree listing. Recording
-            // those would turn "the fallback ran out of budget", which is the normal
-            // case on a repo larger than the window, into a rejection.
-            if !fallback {
-                dropped_for_budget.push(path);
-            }
+            // is what the gate's `selection_dropped_for_budget` reads. Everything
+            // named here already travels to the model as a path in the tree
+            // listing, so a drop costs the file's *source*, never its existence —
+            // and the ranking put it this far down the list, so the loss is the
+            // tail of a budget that ran out rather than a named file being
+            // withheld (§1.6.2 item 4).
+            dropped_for_budget.push(path);
             continue;
         }
 
@@ -1640,18 +1639,19 @@ mod tests {
         );
     }
 
-    /// [VANTA-WHY] The gate passed 7 of 11 dev bugs for the wrong reason: their
-    /// issue text names no path, no traceback frame and no module-level symbol, so
-    /// the ranking reached no file, the selection was empty, and the prompt was the
-    /// repository file tree alone — `selected_bytes == tree_bytes` exactly. A
-    /// listing always fits, so every one of them "passed" a check about a context
-    /// none of them had. An empty ranking must fall back to the tree's own source,
-    /// in walk order, under its own reason, and the fallback must not report the
-    /// files it could not fit as *drops* (the ranking did not choose them; the walk
-    /// did) — otherwise a repo larger than the window would be rejected for having
-    /// a big tree rather than for having no context.
+    /// [VANTA-WHY] §1.6.3 made an empty ranking fall back to the tree's own source
+    /// in walk order, so that a listing alone would not be sent as "the context".
+    /// The measure-only run that followed showed what it actually produced: 11 of
+    /// 11 dev bugs with every file at one score under the same `tree` reason, in
+    /// path order (`docs/en/docs/js/chat.js` first for fastapi, `doc/conf.py` first
+    /// for matplotlib), 9 of them over budget — the old whole-repo dump with a
+    /// bigger cap. The fallback is gone: a ranking that reaches no file selects no
+    /// file, and the gate refuses that as having no grounded file.
+    ///
+    /// What this pins is the signature the report reads: `total_bytes ==
+    /// tree_bytes` exactly, because nothing but the listing is in the selection.
     #[test]
-    fn a_ranking_that_reaches_no_file_falls_back_to_the_trees_own_source() {
+    fn a_ranking_that_reaches_no_file_selects_no_file() {
         let candidates = vec![
             // In walk order: `walk_candidates` hands the list over sorted by path.
             candidate("pkg/alpha.py", "def a():\n    return 2\n"),
@@ -1659,51 +1659,35 @@ mod tests {
             candidate("pkg/zeta.py", "def z():\n    return 1\n"),
         ];
         // One sentence of prose naming nothing the tree contains: no path, no
-        // traceback frame, no `def`/`class` name.
+        // traceback frame, no `def`/`class` name. This is what BugsInPy's own
+        // messages look like once stripped (`Fix #2`, one behavioural sentence).
         let issue = "Fix calling method on the wrong object.\n";
 
-        // A budget that fits the two small files and not the big one whole.
-        let selection = select_repair_context(&candidates, issue, "repair", 300);
+        // A budget that would comfortably fit all three: the selection is empty
+        // because nothing was *grounded*, not because nothing fit.
+        let selection = select_repair_context(&candidates, issue, "repair", 60_000);
 
+        assert!(
+            selection.files.is_empty(),
+            "a listing of paths is not a context, so an empty ranking selects nothing"
+        );
+        assert!(
+            selection.dropped_for_budget.is_empty(),
+            "nothing was dropped for budget: nothing was ever chosen"
+        );
         assert_eq!(
-            paths(&selection),
+            selection.total_bytes, selection.tree_bytes,
+            "the selection is the listing and nothing else — the `source_bytes == \
+             tree_bytes` signature the gate reads (§1.6.6)"
+        );
+        assert_eq!(
+            selection.tree,
             vec!["pkg/alpha.py", "pkg/mid.py", "pkg/zeta.py"],
-            "the fallback shows the tree's own files in walk (path) order"
-        );
-        let scores: Vec<i64> = selection.files.iter().map(|file| file.score).collect();
-        assert_eq!(scores, vec![10, 10, 10], "the fallback carries its own weight");
-        assert!(selection
-            .files
-            .iter()
-            .all(|file| file.reasons == vec![SelectionReason::Tree]));
-        let big = selection
-            .files
-            .iter()
-            .find(|file| file.path == "pkg/mid.py")
-            .unwrap();
-        assert_eq!(
-            big.shown,
-            ShownMode::Outline,
-            "a fallback file too big to fit whole goes in as an outline, not out"
-        );
-        assert!(big.bytes < 24_000);
-        assert!(
-            selection.total_bytes > selection.tree_bytes,
-            "the selection is not the tree listing: it carries source bytes"
+            "the tree listing still travels, paths only"
         );
 
-        // A budget the tree listing has already spent: the fallback shows nothing,
-        // and still records nothing as a *drop* — the walk did not choose those
-        // files, so a big repository must not be rejected for being big.
-        let starved = select_repair_context(&candidates, issue, "repair", 5);
-        assert!(starved.files.is_empty());
-        assert!(
-            starved.dropped_for_budget.is_empty(),
-            "a file the fallback could not fit is not a file the ranking dropped"
-        );
-
-        // The same tree with an issue that DOES name a file is unaffected: the
-        // fallback is only what an empty ranking falls back to.
+        // The same tree with an issue that DOES name a file is unaffected: the walk
+        // supplies paths, the ranking supplies content.
         let named = select_repair_context(
             &candidates,
             "`a` fails in pkg/alpha.py\n",

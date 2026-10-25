@@ -15,7 +15,9 @@
 //   1. Walk the WHOLE tree deterministically, applying no cap at all. Record
 //      every directory and file we deliberately skipped and why.
 //   2. Rank the candidates (review mode: the patch's own touched files; repair
-//      mode: the issue text).
+//      mode: the issue text), and carry a BODY only for the project's own source
+//      or a file the run itself named — everything else a signal reached travels
+//      as a path (§1.6.8).
 //   3. Fill the role's token budget greedily BY SCORE — a file that fits goes in
 //      full, a file over 64 KB goes in as an outline (signatures + docstrings),
 //      so a big touched file is never silently dropped.
@@ -40,9 +42,26 @@ use serde::Serialize;
 // ----------------------------------------------------------------------------
 // Walk constants — the extension set and prune list, one definition
 // ----------------------------------------------------------------------------
+/// What the walk can *see*: a file whose extension is not here is not a
+/// candidate at all, whichever signal would otherwise have reached it.
+///
+/// [VANTA-WHY] This answers "which paths exist", not "what may be shown as code"
+/// — the second question is `is_project_source` (§1.6.8), and keeping the two
+/// apart is what lets a `.pyx` be walked without a repo's own `docs/*.js` being
+/// shown in full.
 pub const SOURCE_EXTENSIONS: &[&str] = &[
-    "py", "rs", "go", "js", "ts", "jsx", "tsx", "java", "c", "cpp", "h", "hpp",
+    "py", "pyx", "pxd", "pyi", "rs", "go", "js", "ts", "jsx", "tsx", "java", "c", "cpp", "h", "hpp",
 ];
+
+/// The extensions whose files are the project's own source, and therefore carry a
+/// body without needing a signal to name them (§1.6.8).
+///
+/// [VANTA-WHY] `pyx`/`pxd` are here because pandas and spacy have real bugs in
+/// Cython files — `pandas/_libs/algos.pyx` among them — and a `.pxd` is the
+/// declaration half of the same code. `pyi` is Python the project wrote, and
+/// `module_level_symbols` already parses it by the Python rules; before this it
+/// was not walked, so that branch was dead on every real tree.
+pub const PROJECT_SOURCE_EXTENSIONS: &[&str] = &["py", "pyx", "pxd", "pyi"];
 
 /// A selected file larger than this is shown as an outline rather than in full.
 ///
@@ -264,6 +283,25 @@ impl SelectionReason {
             SelectionReason::ImportNeighbour => "import-neighbour",
             SelectionReason::Test => "test",
         }
+    }
+
+    /// Whether this reason says the run's inputs named *this file* — its path,
+    /// its module, or a frame that points at it — which can be true of a file that
+    /// is not the project's own source.
+    ///
+    /// [VANTA-WHY] §1.6.8 lets a body into the prompt for the project's source
+    /// alone, plus any file the run itself named. "Named" is narrower than
+    /// `grounds_content` below, and deliberately: being *reachable* from a named
+    /// file — an import neighbour, a covering test — is not being named, so a
+    /// neighbour of a `.js` the issue mentions arrives as its path and not as its
+    /// code. `PatchTouched` is in the list because in review mode the patch is the
+    /// subject: a hunk in a file the walk lists is content whatever its
+    /// extension.
+    pub fn names_the_file(self) -> bool {
+        matches!(
+            self,
+            SelectionReason::PatchTouched | SelectionReason::Path | SelectionReason::Traceback
+        )
     }
 
     /// Whether this reason grounds the *content* of a selection in something the
@@ -928,7 +966,12 @@ pub fn module_level_symbols(path: &str, contents: &str) -> BTreeSet<String> {
             continue; // not module level
         }
         let trimmed = line.trim_end();
-        let name = if path.ends_with(".py") || path.ends_with(".pyi") {
+        // The project's own source is Python in every one of its forms — `.pyx`
+        // is Python with Cython's declaration keywords, `.pxd` is the declaration
+        // half of it, `.pyi` is the project's own stubs — so all four parse by the
+        // Python rules (§1.6.8). Only the other extensions fall through to the
+        // generic keywords.
+        let name = if is_project_source(path) {
             python_def_name(trimmed)
         } else {
             generic_def_name(trimmed)
@@ -941,6 +984,9 @@ pub fn module_level_symbols(path: &str, contents: &str) -> BTreeSet<String> {
 }
 
 fn python_def_name(line: &str) -> Option<String> {
+    if let Some(name) = cython_def_name(line) {
+        return Some(name);
+    }
     let rest = line
         .strip_prefix("async def ")
         .or_else(|| line.strip_prefix("def "))
@@ -950,6 +996,26 @@ fn python_def_name(line: &str) -> Option<String> {
         .take_while(|c| c.is_alphanumeric() || *c == '_')
         .collect();
     identifier_or_none(&name)
+}
+
+/// The name of a Cython declaration: `cpdef int frobnicate(int x)` yields
+/// `frobnicate`, not the return type, and `cdef class Context` yields `Context`.
+///
+/// [VANTA-WHY] `cpdef`/`cdef` are the declarations a Cython module's API consists
+/// of, so an issue that names one has to reach its file by `Identifier` — that is
+/// what makes the `.pyx` extension mean anything for localization (§1.6.8). The
+/// name is taken as the last identifier before the declaration's `(`, which is
+/// what makes the return type (`int`, `object *`) drop out. A declaration with
+/// neither, a module-level `cdef int x = 5`, yields the name it declares or
+/// nothing at all if that is a literal.
+fn cython_def_name(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix("cpdef ")
+        .or_else(|| line.strip_prefix("cdef "))?;
+    let rest = rest.strip_prefix("class ").unwrap_or(rest);
+    let head = rest.split(['(', ':']).next().unwrap_or(rest);
+    let name = head.split_whitespace().last().unwrap_or("");
+    identifier_or_none(name.trim_matches('*'))
 }
 
 fn generic_def_name(line: &str) -> Option<String> {
@@ -1005,6 +1071,23 @@ fn looks_like_source(path: &str) -> bool {
         .any(|ext| path.ends_with(&format!(".{ext}")))
 }
 
+/// Is this path the project's own source, and so entitled to a body on its own?
+fn is_project_source(path: &str) -> bool {
+    PROJECT_SOURCE_EXTENSIONS
+        .iter()
+        .any(|ext| path.ends_with(&format!(".{ext}")))
+}
+
+/// May this file's *body* be carried, or only its path (§1.6.8)?
+///
+/// A body is the expensive half of the prompt, so it is carried for the project's
+/// own source, or for a file the run's inputs named — the issue's path or module,
+/// a traceback frame, the patch under review. Everything else a signal reached
+/// (an import neighbour, a covering test of a file that is not source) is a path.
+fn carries_body(path: &str, reasons: &[SelectionReason]) -> bool {
+    is_project_source(path) || reasons.iter().any(|reason| reason.names_the_file())
+}
+
 /// Does any token name `candidate_path` — exactly, by basename, by module name,
 /// or as the tail of a longer (e.g. absolute) path?
 fn matches_path(tokens: &BTreeSet<String>, candidate_path: &str, module: Option<&str>) -> bool {
@@ -1037,10 +1120,12 @@ fn matches_path(tokens: &BTreeSet<String>, candidate_path: &str, module: Option<
 ///
 /// A file that fits goes in `Full`; one over `MAX_FILE_BYTES` goes in as an
 /// `Outline`; one whose outline still does not fit is dropped and named in
-/// `dropped_for_budget`. A ranking that reached no file selects no file: the tree
-/// listing alone is a list of paths, not a context, and the gate refuses it by
-/// name ("no issue-grounded selection", §1.6.2 item 5) instead of the fill
-/// inventing files to fill the prompt with (§1.6.6).
+/// `dropped_for_budget`. A file the run did not name — not the project's own
+/// source, and reached only as an import neighbour or a covering test — carries no
+/// body at all (§1.6.8) and so never spends the budget. A ranking that reached no
+/// file selects no file: the tree listing alone is a list of paths, not a context,
+/// and the gate refuses it by name ("no issue-grounded selection", §1.6.2 item 5)
+/// instead of the fill inventing files to fill the prompt with (§1.6.6).
 fn fill(
     mode: &str,
     role: &str,
@@ -1094,11 +1179,20 @@ fn fill(
     let mut total_bytes: usize = 0;
     let mut total_tokens: u32 = 0;
 
+    // [VANTA-WHY] §1.6.6 established which files may be *reached* — a scored
+    // signal, never "it is in the tree". §1.6.8 closes the other half: a file a
+    // signal reached carries a body only if it is the project's own source or the
+    // run named it, so a `.js` the issue mentions does not spend the budget on
+    // itself. A file refused here is not a budget drop: the budget never saw it,
+    // and `dropped_for_budget` saying otherwise would report the wrong cause.
     for (path, score, reasons) in ranked {
         let candidate = match by_path.get(path.as_str()) {
             Some(candidate) => *candidate,
             None => continue,
         };
+        if !carries_body(&path, &reasons) {
+            continue;
+        }
 
         // A file over the per-file cap is shown as an outline, never dropped.
         let fits_whole = candidate.contents.len() <= MAX_FILE_BYTES;
@@ -1696,6 +1790,136 @@ mod tests {
         );
         assert_eq!(paths(&named), vec!["pkg/alpha.py"]);
         assert_eq!(named.files[0].reasons, vec![SelectionReason::Path]);
+    }
+
+    /// [VANTA-WHY] §1.6.8 — the walk's extension set says which paths exist; this
+    /// says which of them may spend the budget on a body. Reaching a `.js` file is
+    /// not the same as the run naming it: an issue that names its *path* buys it a
+    /// body, an issue that names only a *symbol it defines* does not.
+    #[test]
+    fn a_body_goes_to_the_projects_source_and_to_what_the_run_named() {
+        let candidates = vec![
+            candidate("docs/chat.js", "class Chat {\n  render() {}\n}\n"),
+            candidate("pkg/core.py", "def frobnicate():\n    return 1\n"),
+        ];
+
+        // The issue names the `.js` file by path: it is named, so it is content
+        // whatever its extension.
+        let by_path = select_repair_context(
+            &candidates,
+            "The bundle at docs/chat.js is stale.\n",
+            "creator",
+            60_000,
+        );
+        assert_eq!(paths(&by_path), vec!["docs/chat.js"]);
+        assert!(by_path.files[0].reasons.contains(&SelectionReason::Path));
+        assert_eq!(by_path.files[0].shown, ShownMode::Full);
+
+        // The issue names a symbol the `.js` file *defines*, and nothing else. A
+        // symbol is a name, not a file: the file is reachable, not named, so it
+        // travels as a path in the listing and never as code.
+        let by_symbol = select_repair_context(
+            &candidates,
+            "The `Chat` widget misrenders.\n",
+            "creator",
+            60_000,
+        );
+        assert!(
+            by_symbol.files.is_empty(),
+            "an `identifier` hit on a file that is not the project's source is a \
+             path, not a body (§1.6.8); got {:?}",
+            paths(&by_symbol)
+        );
+        assert!(
+            by_symbol.tree.contains(&"docs/chat.js".to_string()),
+            "its path still travels — the listing is where a reachable file lives"
+        );
+        assert!(
+            by_symbol.dropped_for_budget.is_empty(),
+            "the budget did not refuse it, so it must not be reported as a drop"
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.8 — the other half of the rule, and the half that makes
+    /// review mode meaningful: the patch under review is the subject, so a hunk in
+    /// a file the walk lists is content even when the extension is not the
+    /// project's own source. Without this the reviewer would be told about a file
+    /// it cannot read.
+    #[test]
+    fn the_patch_gives_a_body_even_outside_the_projects_own_source() {
+        let candidates = vec![
+            candidate("pkg/core.py", "def frobnicate():\n    return 1\n"),
+            candidate("web/toggle.js", "function toggle() {\n  return 1\n}\n"),
+        ];
+        let touched = BTreeSet::from(["web/toggle.js".to_string()]);
+
+        let selection = select_review_context(&candidates, &touched, "review", 60_000);
+
+        assert_eq!(paths(&selection), vec!["web/toggle.js"]);
+        assert_eq!(selection.files[0].reasons, vec![SelectionReason::PatchTouched]);
+        assert_eq!(
+            selection.files[0].shown,
+            ShownMode::Full,
+            "a patch-touched file always gets content, whatever its extension"
+        );
+        assert!(
+            !selection.tree.contains(&"web/toggle.js".to_string()),
+            "review mode has no listing: the patch is what localizes the repo"
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.8 — `.pyx`, `.pxd` and `.pyi` are the project's own
+    /// source, so the walk has to *see* them and their declarations have to be
+    /// parsed as the symbols they are. pandas and spacy have real bugs in Cython
+    /// files, and an issue that names a `cpdef` has to reach its file.
+    #[test]
+    fn cython_and_stub_files_are_walked_and_their_declarations_are_symbols() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("pkg/_libs")).unwrap();
+        fs::write(
+            tmp.path().join("pkg/_libs/algos.pyx"),
+            "cpdef int is_string_dtype(object arr):\n    return 1\n\n\ncdef class Engine:\n    pass\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("pkg/_libs/algos.pxd"),
+            "cdef class Engine:\n    cdef int is_string_dtype(self, object arr)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("pkg/_libs/algos.pyi"),
+            "def is_string_dtype(arr: object) -> bool: ...\n",
+        )
+        .unwrap();
+
+        let (candidates, _) = walk_candidates(tmp.path());
+        assert_eq!(
+            candidates.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+            vec![
+                "pkg/_libs/algos.pxd",
+                "pkg/_libs/algos.pyi",
+                "pkg/_libs/algos.pyx"
+            ],
+            "the walk lists Cython and stub source, not only `.py`"
+        );
+
+        // The declaration's own name, never its return type.
+        let symbols = module_level_symbols("pkg/_libs/algos.pyx", &candidates[2].contents);
+        assert!(symbols.contains("is_string_dtype"), "got {symbols:?}");
+        assert!(symbols.contains("Engine"), "got {symbols:?}");
+        assert!(!symbols.contains("int"), "a return type is not a symbol");
+
+        // End to end: an issue naming the Cython function reaches its file.
+        let selection = select_repair_context(
+            &[candidates[2].clone()],
+            "`is_string_dtype` returns the wrong answer.\n",
+            "creator",
+            60_000,
+        );
+        assert_eq!(paths(&selection), vec!["pkg/_libs/algos.pyx"]);
+        assert!(selection.files[0]
+            .reasons
+            .contains(&SelectionReason::Identifier));
     }
 
     /// [VANTA-WHY] §1.6.2 item 6 — the budget fill is what makes the cap safe. A

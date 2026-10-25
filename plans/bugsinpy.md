@@ -661,6 +661,63 @@ fix commit message, and for most of these bugs it names no path, no frame and no
 fallback does not create localization out of a text that carries none — it stops pretending there is
 some. §1.6.7 prints exactly what the selector extracts from those texts.
 
+#### 1.6.8 What a file's body may be
+
+§1.6.6 removed the reason that meant "this file is in the tree". What it left is still too broad: a file
+a *signal* reached was shown as code whatever it was. The signals are textual — a path the issue names,
+a traceback frame, a symbol a file defines — and they fire on any file the walk lists, so a Python
+repo's own `docs/en/docs/js/chat.js`, its `asv_bench` harness, or a `.ts` example could be shown in full
+to a role whose bug is in a `.py` file. A body is the expensive half of the prompt, and for a file that
+is not the project's code it can only spend budget on text that cannot hold the bug.
+
+Two questions had been answered by one list, and they are not the same question:
+
+- **what the walk can see** — `SOURCE_EXTENSIONS`. This decides which paths exist as candidates at all.
+  It is a fact about the tree, and it is what §1.6.2 item 1's walk applies.
+- **what a body may be** — this section. A file the walk listed, and a signal reached, may still
+  contribute only its path.
+
+**The rule: a file's body is carried only when**
+
+1. **its extension is the project's own source** — `.py`, `.pyx`, `.pxd`, `.pyi`; **or**
+2. **the run's own inputs name that file** — `Path` (the issue names its path, basename or module),
+   `Traceback` (a frame of a traceback inside the issue names it), or `PatchTouched` (the patch under
+   review touches it).
+
+Everything else a signal reaches is a path, never a body. Being in the tree is not a signal (§1.6.6),
+and neither is being *reachable* from something the issue named: an import neighbour, and a covering
+test of a file that is not project source, are reachable rather than named, and §1.6.6's listing is
+already where their paths belong.
+
+`.pyx`, `.pxd` and `.pyi` count as project source alongside `.py`. pandas and spacy have real bugs in
+Cython files — `pandas/_libs/algos.pyx` is where this corpus's `.pyx` bugs live — and a `.pxd` is the
+declaration half of the same code. `.pyi` is Python the project wrote, and `module_level_symbols`
+already parses it with the Python rules; the walk did not list it, which made that branch dead on every
+walked tree. All three join `SOURCE_EXTENSIONS`, so the walk can *see* them and this rule can then give
+them a body. A Cython `def`/`cpdef` is parsed as the symbol it is, so an issue naming a Cython function
+reaches its file by `Identifier` as well.
+
+`PatchTouched` wins whatever the extension. In review mode the patch is the subject, so a hunk in a file
+the walk lists is shown even when the extension is not project source; §1.6.2's review rule ("the
+patch's own touched files") is what the review selection is *for*. A touched file whose extension the
+walk does not list at all (a `.rst` changelog, a `.yaml` CI file) is not a candidate and contributes no
+content: the walk's extension set decides what can be reached, and a review reads the patch itself
+rather than the whole of every file it touches.
+
+**Where it lives.** The predicate is a method on the reason vocabulary —
+`SelectionReason::names_the_file`, true for `Path`, `Traceback` and `PatchTouched` — so "named by the
+run's inputs" has one definition, sitting next to the weights and next to `grounds_content` (§1.6.10's
+and the gate's predicate, which answers a different question: whether the selection as a whole is
+grounded, not whether one file's body is). `fill` consults it once per ranked file, before the caps. A
+file that fails it is not selected and is **not** recorded as a budget drop: the budget did not refuse
+it, and `dropped_for_budget` naming it would report the wrong cause.
+
+The one reachable case this rule refuses is `Identifier` on a file that is not project source — a `.js`
+class the issue names, say. That refusal is deliberate: a symbol is a name, not a file, and the
+extension rule is the thing that keeps a repo's documentation site out of a Python bug's prompt. A
+JavaScript bug would need `.js` in the project-source set; that is a corpus question, not a selector
+tweak.
+
 ---
 
 ## 2. Issue text that never leaks the fix or the hidden test

@@ -230,19 +230,34 @@ something the tree defines? — so the answer has to be about the tree, not abou
 it :mod:`ast` happens to parse.
 """
 
-TOP_LEVEL_DEF_RE = re.compile(
-    r"^(?:async[ \t]+)?def[ \t]+([A-Za-z_]\w*)"
-    r"|^class[ \t]+([A-Za-z_]\w*)"
-    r"|^([A-Za-z_]\w*)[ \t]*(?::[^=\n]*)?=(?!=)",
+DEF_CLASS_RE = re.compile(
+    r"^[ \t]*(?:async[ \t]+)?def[ \t]+([A-Za-z_]\w*)"
+    r"|^[ \t]*class[ \t]+([A-Za-z_]\w*)",
     re.MULTILINE,
 )
-"""The three shapes that bind a name at module level: ``def``, ``class``, ``x =`` / ``x: T =``.
+"""``def`` and ``class`` at **any** depth — a method and a closure count, not just a module.
 
-Column 0 only, which is what "top level" means: a method of a class or a closure body is not a
-name of the tree in the sense §2.4.6 asks about. A regex rather than :mod:`ast` so one rule
-covers ``.py``, ``.pyi``, ``.pyx`` and ``.pxd`` alike. Its false positive is a binding written
-at column 0 *inside a string literal*, which can only matter if the issue text also names that
-identical token — and what this feeds is a flag the paper reports, never a selection.
+[VANTA-WHY] §2.4.6 wants to know whether the visible text names a name of the tree, and a method
+is a name of the tree. ``sanic/1``'s report names ``register_named_middleware``, which
+``sanic/app.py`` declares on line 642 as an indented ``def`` inside a class: a module-level-only
+scan reported "the tree does not define it", which is false, and it lost the sharpest instance of
+the very fact the flag exists to record. The Rust selector's symbol scan (§1.6.2 item 2) was
+changed the same way in the same breath, because it is the same question about the same file.
+A regex rather than :mod:`ast` so one rule covers ``.py``, ``.pyi``, ``.pyx`` and ``.pxd`` alike.
+Its false positive is a ``def`` written inside a string literal, which only matters if the issue
+text names that identical token — and what this feeds is a flag the paper reports, never a
+selection.
+"""
+
+MODULE_BINDING_RE = re.compile(r"^([A-Za-z_]\w*)[ \t]*(?::[^=\n]*)?=(?!=)", re.MULTILINE)
+"""``x =`` / ``x: T =`` at column 0: the bindings that are public to a whole module.
+
+Bindings stay module-level while definitions do not: a name bound at column 0 is part of what the
+module exports and is what a report means when it says "``CONSTANT`` is never reset", whereas a
+local variable inside someone's function is not a name of the tree in any sense the paper
+reports. ``cdef int LIMIT = 4`` is not matched — Cython's typed bindings would need a per-language
+rule for a case with no instance in the trees, and a name missed here is a name the flag does not
+claim, which is the safe direction for a flag the write-up cites.
 """
 
 
@@ -436,18 +451,99 @@ def _names_one_file(named: str, rel: str) -> bool:
     return named.endswith("/" + rel) or rel.endswith("/" + named)
 
 
-def top_level_names(source: str) -> set[str]:
-    """The names one file binds at module level (:data:`TOP_LEVEL_DEF_RE`)."""
+def defined_names(source: str) -> set[str]:
+    """Every name a source file defines: ``def``/``class`` at any depth, plus column-0 bindings.
+
+    See :data:`DEF_CLASS_RE` for why depth is not a filter and :data:`MODULE_BINDING_RE` for why
+    bindings are.
+    """
     names: set[str] = set()
-    for match in TOP_LEVEL_DEF_RE.finditer(source):
-        name = match.group(1) or match.group(2) or match.group(3)
+    for match in DEF_CLASS_RE.finditer(source):
+        name = match.group(1) or match.group(2)
         if name:
             names.add(name)
+    for match in MODULE_BINDING_RE.finditer(source):
+        names.add(match.group(1))
     return names
 
 
+BLOB_URL_RE = re.compile(r"github\.com/[^/\s]+/[^/\s]+/blob/[^/\s#?]+/(?P<path>[^\s#?]+)")
+"""A GitHub blob URL and the repo path it names, so the flag can read the tail of it.
+
+[VANTA-WHY] ``PySnooper/3`` and ``sanic/1`` both quote the fix's own file as a blob URL, and a
+reporter who found the file on GitHub has named that file exactly as much as one who typed
+``sanic/app.py``. Only the path after the ref is taken: the ref is a sha, and it is *stripped*
+rather than resolved, so nothing here reads from the network and nothing depends on the sha
+existing. The line anchor (``#L656``) is outside the path by construction — ``#`` ends the match —
+and a query string after it stops it too.
+"""
+
+
+def blob_url_path(token: str) -> Optional[str]:
+    """``github.com/o/r/blob/<ref>/sanic/app.py#L656`` → ``sanic/app.py``, else ``None``."""
+    match = BLOB_URL_RE.search(token.strip("\"'"))
+    return match.group("path") if match else None
+
+
+def is_code_shaped(token: str) -> bool:
+    """``register_named_middleware`` is an identifier; ``release`` is an English word.
+
+    The shape test is ``_``, a digit, or CamelCase, and nothing else — deliberately the same test
+    the Rust selector applies to the identifiers it reads out of an issue (§1.6.2 item 2,
+    ``looks_symbolish``), so the flag and the ranking cannot disagree about what counts as a name:
+    one rule, two languages. A single leading capital is not enough (``X``); CamelCase here means
+    a leading capital with a lowercase somewhere after it (``Sanic``, ``BigQueryTarget``), which
+    is what makes ``Sanic`` and ``Blueprint`` names and ``VERSIONS`` a constant.
+    """
+    bare = token.removeprefix("self.")
+    if not bare:
+        return False
+    if "_" in bare or any(char.isdigit() for char in bare):
+        return True
+    return bare[:1].isupper() and any(char.islower() for char in bare)
+
+
+def _attribute_access(text: str, start: int, end: int) -> bool:
+    """``obj.name``: the token after the dot, with an identifier character before it.
+
+    Only the name side counts. ``fig.savefig(...)`` is the reporter calling ``savefig``, and
+    ``savefig`` is what a file of the tree defines and what a rank would be about; the ``fig`` in
+    front of it is their own local variable, and ``fig`` is one of the words the paper must not
+    report as a localisation. So the object side of the access is prose as far as this is
+    concerned, exactly like a bare lowercase word.
+    """
+    return (
+        start >= 2
+        and text[start - 1] == "."
+        and (text[start - 2].isalnum() or text[start - 2] == "_")
+    )
+
+
+def _written_as_code(text: str, start: int, end: int) -> bool:
+    """Is the token at ``text[start:end]`` written as code rather than as prose?
+
+    The three markup forms a report uses for a name it means as code: ``backticks``, a call
+    ``name(``, and an attribute access ``obj.name``. A plain lowercase English word counts only in
+    one of these forms — ``release`` in "the 3.2.0 release notes" is prose, ``release(...)`` is a
+    function — and that is what keeps ordinary English out of the ranking (§1.6.2 item 2).
+
+    [VANTA-WHY] A fenced code block is deliberately **not** one of these forms. It is a far bigger
+    net than it looks: a reporter's reproduction script is full of their own local names
+    (``fig``, ``data``, ``ax``), and those are precisely the module-level names a project's test
+    files bind too, so "everything inside a block is code, so everything counts" re-imports the
+    noise the shape test exists to remove. ``fig`` is on the list of words the paper must not
+    report as a localisation, and in ``matplotlib/1``'s report ``fig`` sits inside the fenced
+    ``python`` block — reading the block as a permission would put it straight back.
+    """
+    if start > 0 and text[start - 1] == "`":
+        return True
+    if end < len(text) and text[end] in "`(":
+        return True
+    return _attribute_access(text, start, end)
+
+
 def tree_names_in_text(text: str, tree: Path) -> tuple[list[str], list[str]]:
-    """What the text names that the tree itself defines: repo paths, then top-level names.
+    """What the text names that the tree itself defines: repo paths, then names.
 
     [VANTA-WHY] A reporting fact about the prompt, and nothing else. A report that says
     ``sanic/app.py`` or ``register_named_middleware`` has localised the bug for the Creator to
@@ -463,9 +559,20 @@ def tree_names_in_text(text: str, tree: Path) -> tuple[list[str], list[str]]:
     ``tree`` is the buggy source the gate already reads, so the flag cannot disagree with the
     text about which tree it is talking about.
 
-    A path is recorded when the tree contains a file for it (:func:`_names_one_file`), and a
-    name when some source file of the tree binds it at module level. Both lists are sorted and
-    hold the tokens *as the text writes them*, so the paper can quote the report's own words.
+    Two questions decide whether a token counts, and both are asked of the *text*:
+
+    * **Is it code as the reporter wrote it?** A path counts when the tree has a file for it
+      (:func:`_names_one_file`), and a GitHub blob URL counts as the file it points at
+      (:func:`blob_url_path`) — the reporter who pasted that link named that file.
+    * **Is the name worth counting?** A token counts only if it is code-shaped
+      (:func:`is_code_shaped`) or the reporter wrote it as code (:func:`_written_as_code`), so
+      that ``release``, ``version`` and ``report`` in ordinary prose never appear while
+      ``register_named_middleware``, ``is_string_dtype`` and ``BigQueryTarget`` do. The tree must
+      also define it, at any depth for ``def``/``class`` (:func:`defined_names`).
+
+    Both lists are sorted and hold the tokens *as the text writes them* — a blob URL is recorded
+    as the repo path it names, which is the thing that was named — so the paper can quote the
+    report's own words.
     """
     rel_paths: set[str] = set()
     defined: set[str] = set()
@@ -484,19 +591,25 @@ def tree_names_in_text(text: str, tree: Path) -> tuple[list[str], list[str]]:
                 source = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            defined |= top_level_names(source)
+            defined |= defined_names(source)
 
     paths: set[str] = set()
     symbols: set[str] = set()
-    for token, klass in tokenize(text):
+    for match in TOKEN_RE.finditer(text):
+        klass = match.lastgroup or "ident"
+        token = match.group(0)
         if klass == "ident":
-            if token in defined:
+            if token in defined and (
+                is_code_shaped(token) or _written_as_code(text, *match.span())
+            ):
                 symbols.add(token)
         elif klass in ("path", "string"):
             # A quoted path tokenizes as a string, not as a path: ``"pkg/mod.py"`` starts with
             # a quote, so the path alternative cannot match at that position — which is how a
             # report's own traceback writes it (§2.4.4).
-            named = token.strip("\"'") if klass == "string" else token
+            named = blob_url_path(token) or (
+                token.strip("\"'") if klass == "string" else token
+            )
             if any(_names_one_file(named, rel) for rel in rel_paths):
                 paths.add(named)
     return sorted(paths), sorted(symbols)

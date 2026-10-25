@@ -1113,7 +1113,7 @@ inflated `localization_hit` — the counterfactual that justifies this section.
   `issue.text`, the frozen report's gated section.
 
 **What the visible text names.** A second per-bug reporting fact is recorded beside it: the repo
-paths, and the top-level names the buggy tree defines, that the text a run sends itself names
+paths, and the names the buggy tree defines, that the text a run sends itself names
 (`issue_text_names_paths`, `issue_text_names_symbols`). `sanic/1`'s report names `sanic/app.py`
 and `register_named_middleware` — the visible text has already done the localisation the harness
 is about to ask the Creator for, and `localization_hit` cannot see that, because it scores where
@@ -1124,12 +1124,34 @@ the patch went and not what the prompt said. The write-up needs the rate.
   file would be a fact about a prompt nobody sends (§2.4.4).
 - The tree is the buggy source the gate already reads (`src_buggy`), so the flag cannot disagree
   with the text about which tree is meant. A path counts when the tree contains a file for it; a
-  bare basename (`app.py`) does not, because a basename is not a repo path. A name counts when a
-  source file of the tree binds it at module level (`def`/`class`/assignment at column 0) —
-  `def foo` nested in a class is not a name of the tree in this sense — over `.py`, `.pyi`,
-  `.pyx` and `.pxd` alike, since `.pyx` is where pandas' and spaCy's bugs sometimes are.
-- Both lists hold the tokens **as the text writes them**, so the paper can quote the report's own
-  words, and both are sorted.
+  bare basename (`app.py`) does not, because a basename is not a repo path.
+- A **GitHub blob URL into the project's own repo** counts as the path it names:
+  `github.com/…/blob/<sha>/sanic/app.py#L656` is recorded as `sanic/app.py`. The line anchor is
+  dropped with the rest of the URL, and the ref — a sha — is *stripped*, never resolved, never
+  fetched, so the flag stays offline and cannot depend on the ref existing. Both `PySnooper/3` and
+  `sanic/1` name the fix's own file this way, and a reporter who pasted the link named that file
+  as surely as one who typed the path.
+- A name counts when a source file of the tree **defines** it — `def`/`class` at **any** depth, a
+  method included, or a binding at column 0 — over `.py`, `.pyi`, `.pyx` and `.pxd` alike, since
+  `.pyx` is where pandas' and spaCy's bugs sometimes are. Depth is not a filter: `sanic/app.py`
+  declares `register_named_middleware` as an indented `def` inside a class, so a module-level-only
+  scan answered "the tree does not define it" — which is false, and it lost the sharpest instance
+  of the very fact the flag exists to record. Bindings stay module-level, because a name bound at
+  column 0 is public to the module while a local variable inside someone's function is not a name
+  of the tree in any sense the paper reports.
+- **The name must be written as code.** It counts only if it is code-shaped — an underscore, a
+  digit, or CamelCase (`register_named_middleware`, `is_string_dtype`, `jinja2`, `BigQueryTarget`)
+  — or the reporter wrote it in one of the code forms: `` `backticks` ``, `name(`, or `obj.name`
+  (the name *after* the dot: in `fig.savefig(` it is `savefig` that counts, and `fig` is the
+  reporter's own variable). Plain English in ordinary prose never counts, so `a`, `in`, `release`,
+  `version` and `report` cannot appear: a report saying "the 3.2.0 release notes" has named
+  nothing, and a flag the write-up cites must not claim it did. A fenced code block is **not** one
+  of the code forms — a reproduction script is made of the reporter's own local names (`fig`,
+  `data`, `ax`), which are exactly what a project's test files bind at module level too, so
+  reading a block as "everything inside counts" would put back the noise this bullet removes.
+- Both lists hold the tokens **as the text writes them** — a blob URL is recorded as the repo path
+  it names, which is the thing that was named — so the paper can quote the report's own words, and
+  both are sorted.
 - Recorded in **both** modes, like `issue_text_commit`, and read by **nothing** that builds a
   prompt. It is never used in selection: a bug whose report names half the tree is selected, sized
   and graded exactly like one whose report names nothing.

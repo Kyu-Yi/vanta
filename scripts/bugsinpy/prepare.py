@@ -239,19 +239,24 @@ class BugPrep:
     rebuild.
     Computed by :func:`issue.tree_names_in_text` over ``issue.text`` — the frozen report's
     gated section, the only text a run sends — and never over the comments, which the default
-    setting does not send (§2.4.4). Read by **nothing** that builds a prompt: the prompt's
-    text is ``issue.text``, as for ``issue_text_commit`` above. The flag is "this list is
-    non-empty".
+    setting does not send (§2.4.4). A GitHub blob URL into the project's own repo counts as the
+    path it names: the reporter who pasted the link named that file. Read by **nothing** that
+    builds a prompt: the prompt's text is ``issue.text``, as for ``issue_text_commit`` above.
+    The flag is "this list is non-empty".
     """
     issue_text_names_symbols: list[str] = field(default_factory=list)
-    """§2.4.6 — top-level names the **visible** issue text names and the buggy tree defines.
+    """§2.4.6 — names the **visible** issue text names and the buggy tree defines.
 
     [VANTA-WHY] The other half of the same reporting fact: a report that names
     ``register_named_middleware`` has pointed at the fix's own function, and whether it did so
-    is a property of the prompt, not of the patch. A name counts when a source file of the
-    buggy tree binds it at module level (``def``/``class``/assignment, column 0) — the tree
-    the gate itself reads, so the flag and the text cannot disagree about which tree is meant.
-    Reporting only, and read by nothing that builds a prompt.
+    is a property of the prompt, not of the patch. Three conditions, all of them the text's:
+    the buggy tree defines the name (``def``/``class`` at **any** depth, so a method counts, or a
+    binding at column 0) — the tree the gate itself reads, so the flag and the text cannot
+    disagree about which tree is meant; the token is code-shaped (``_``, a digit, or CamelCase);
+    and the reporter wrote it as code or it is one of those shapes, so that ``release``,
+    ``version`` and ``report`` in ordinary prose never appear. Recording prose as a localisation
+    would make the flag the write-up cites say something untrue. Reporting only, and read by
+    nothing that builds a prompt.
     """
     deps: Optional[dict[str, Any]] = None
 

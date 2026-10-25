@@ -3768,6 +3768,10 @@ class TestTheVisibleTextNamingTheTree:
             "    return text.split('.')\n"
             "\n"
             "\n"
+            "def parse2(text):\n"
+            "    return text\n"
+            "\n"
+            "\n"
             "class Widget:\n"
             "    def render(self):\n"
             "        return 2\n",
@@ -3817,13 +3821,104 @@ class TestTheVisibleTextNamingTheTree:
         )
         assert paths == ["home/me/pkg/mod.py"]
 
-    def test_a_method_or_a_closure_is_not_a_name_of_the_tree(self, tmp_path):
-        """Top level is what the tree defines at module level, and nothing deeper."""
+    def test_a_method_or_a_closure_is_a_name_of_the_tree(self, tmp_path):
+        """Any ``def``/``class`` at any depth counts — a method is a name of the tree.
+
+        ``sanic/1`` is the case: its report names ``register_named_middleware``, which
+        ``sanic/app.py`` declares as an indented ``def`` inside a class. A module-level-only scan
+        answered "the tree does not define it", which is false. ``render`` is reached through the
+        attribute form ``Widget.render`` and ``inner`` is backticked, which is how each is
+        written as code rather than as prose.
+        """
         _, symbols = issue_mod.tree_names_in_text(
-            "Widget.render and inner are both never called with the right thing.",
+            "`Widget.render` and `inner` are both never called with the right thing.",
             self._tree(tmp_path),
         )
-        assert symbols == ["Widget"]
+        assert symbols == ["Widget", "inner", "render"]
+
+    def test_a_plain_english_word_is_not_a_name_of_the_tree(self, tmp_path):
+        """§1.6.2 item 2: ordinary prose must never lift a file's rank, or this flag.
+
+        ``registry`` is a module-level binding of the tree and ``render`` is one of its methods,
+        and in a sentence of English neither is a name the reporter meant as code.
+        """
+        _, symbols = issue_mod.tree_names_in_text(
+            "The registry is never reset, and the render step drops the last row.",
+            self._tree(tmp_path),
+        )
+        assert symbols == []
+
+    def test_a_backticked_plain_word_is_a_name_of_the_tree(self, tmp_path):
+        """The other half of that rule: a plain word counts when the text writes it as code."""
+        _, symbols = issue_mod.tree_names_in_text(
+            "The `registry` is never reset for this input.",
+            self._tree(tmp_path),
+        )
+        assert symbols == ["registry"]
+
+    def test_a_call_is_a_name_of_the_tree(self, tmp_path):
+        """``name(`` is code: a reporter who wrote the call meant that function."""
+        _, symbols = issue_mod.tree_names_in_text(
+            "It raises when inner( is called with a None argument.",
+            self._tree(tmp_path),
+        )
+        assert symbols == ["inner"]
+
+    def test_an_attribute_is_a_name_of_the_tree(self, tmp_path):
+        """``obj.name`` is code, and it reaches a method the module-level-only rule missed."""
+        _, symbols = issue_mod.tree_names_in_text(
+            "It raises when widget.render is called on an empty frame.",
+            self._tree(tmp_path),
+        )
+        assert symbols == ["render"]
+
+    def test_a_camel_case_or_digit_name_is_a_name_of_the_tree(self, tmp_path):
+        """``BigQueryTarget``, ``jinja2``: the shape of an identifier, unwritten as code."""
+        _, symbols = issue_mod.tree_names_in_text(
+            "Widget and parse2 both drop the last row for this input.",
+            self._tree(tmp_path),
+        )
+        assert symbols == ["Widget", "parse2"]
+
+    def test_a_reproduction_block_does_not_make_a_plain_word_a_name(self, tmp_path):
+        """A fenced block is not a permission to count the reporter's own local names.
+
+        ``fig``, ``data`` and ``ax`` are what a reproduction script is full of, and they are also
+        what a project's test files bind at module level, so "everything inside a block counts"
+        would re-import the noise the shape test exists to remove. ``matplotlib/1`` puts ``fig``
+        inside its fenced ``python`` block; it must stay out.
+        """
+        _, symbols = issue_mod.tree_names_in_text(
+            "**Code for reproduction**\n"
+            "\n"
+            "```python\n"
+            "registry = {}\n"
+            "```\n"
+            "\n"
+            "The program writes the wrong file for this input.\n",
+            self._tree(tmp_path),
+        )
+        assert symbols == []
+
+    def test_a_blob_url_names_the_file_it_points_at(self, tmp_path):
+        """A reporter who pasted the GitHub link named that file, anchor and ref aside.
+
+        The ref is a sha and it is stripped rather than resolved: nothing here reads from it.
+        """
+        paths, _ = issue_mod.tree_names_in_text(
+            "See https://github.com/huge-success/sanic/blob/e7001b0/pkg/mod.py#L656 for the"
+            " traceback.",
+            self._tree(tmp_path),
+        )
+        assert paths == ["pkg/mod.py"]
+
+    def test_a_blob_url_the_repo_does_not_have_is_not_a_path(self, tmp_path):
+        """The tail still has to be a file of the tree, as for any path."""
+        paths, _ = issue_mod.tree_names_in_text(
+            "See https://github.com/huge-success/sanic/blob/e7001b0/other/missing.py#L1 for it.",
+            self._tree(tmp_path),
+        )
+        assert paths == []
 
     def test_a_cython_definition_is_a_name_of_the_tree(self, tmp_path):
         """§1.6.8 counts ``.pyx`` as source; a name it defines is a name of the tree."""

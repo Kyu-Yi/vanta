@@ -823,8 +823,34 @@ def fix_touched_paths(prep: prepare_mod.BugPrep) -> list[str]:
     before any run sees it. Counting a test path as a miss would report every bug
     as unlocalized, which is the opposite of a metric.
     """
-    parsed = tree_mod.parse_patch(suite_mod.drop_test_file_hunks(prep.bug.bug_patch_txt))
+    return fix_touched_paths_from_patch(prep.bug.bug_patch_txt)
+
+
+def fix_touched_paths_from_patch(bug_patch_txt: str) -> list[str]:
+    """The same question, asked of the patch text alone.
+
+    Split out of :func:`fix_touched_paths` for the **offline** ranking audit
+    (:func:`localization_table`, §1.6.5): that audit has the fix-commit patch and
+    nothing else, and building a :class:`BugPrep` just to hand its own patch text
+    back would be a fabricated record. One implementation, so the run-time metric
+    and the audit cannot come to differ about what "touched" means.
+    """
+    parsed = tree_mod.parse_patch(suite_mod.drop_test_file_hunks(bug_patch_txt))
     return sorted(set(parsed.paths.changed) | set(parsed.paths.added))
+
+
+def paths_hit(touched: Iterable[str], shown: Iterable[str]) -> Optional[bool]:
+    """Whether any of ``touched`` is among ``shown``; ``None`` when nothing was touched.
+
+    ``None`` — never ``False`` — for an empty ``touched`` set: a fix that changes
+    only test files has no source path the selection could have shown, and pooling
+    that as a miss would report a miss rate over rows that never had a chance.
+    """
+    touched = list(touched)
+    if not touched:
+        return None
+    shown = set(shown)
+    return any(path in shown for path in touched)
 
 
 def localization_hit(
@@ -840,11 +866,109 @@ def localization_hit(
     """
     if context_selection is None:
         return None
-    touched = fix_touched_paths(prep)
-    if not touched:
-        return None
-    shown = set(selected_paths(context_selection))
-    return any(path in shown for path in touched)
+    return paths_hit(fix_touched_paths(prep), selected_paths(context_selection))
+
+
+CONTEXT_REPORT_NAME = "context_report.json"
+
+
+def localization_table(
+    *,
+    batch_dir: Path,
+    split: Split,
+    bugsinpy_root: Path,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Ranking quality per dev bug, **from the recorded selection** (§1.6.5).
+
+    ``localization_hit`` as the paper metric is computed per run, from the
+    ``context_selection=`` provenance the driver wrote. This is the same question
+    asked one stage earlier and offline: read the selection ``prepare`` already
+    measured (`context_report.json`), read each bug's fix-commit patch from
+    BugsInPy, and report whether the fix's own files were among those shown. It
+    **never runs the selector**, and nothing in ``prepare`` reads its answer — the
+    audit is a view of evidence, so it cannot become a term the ranking optimises.
+
+    The split is the **dev** split by construction: ranking quality is a tuning
+    number, and a tuning number produced over the evaluation split is how a
+    held-out set stops being held out. ``cmd_localize`` refuses any other.
+
+    A bug whose report row is missing, or says ``not_measured``, is reported as
+    ``None`` (printed ``—``) rather than as a miss: no selection was made, so
+    there is nothing to judge.
+    """
+    report = _read_json(batch_dir / CONTEXT_REPORT_NAME)
+    if not report:
+        raise RunnerError(
+            f"no {CONTEXT_REPORT_NAME} in {batch_dir}. The audit reads the selection "
+            "a prepare already measured, so run `bugsinpy_run.py prepare "
+            "--measure-only --batch <dir>` (or a full prepare) first; it does not "
+            "run the selector itself."
+        )
+    measured = {str(row.get("bug")): row for row in report.get("bugs", [])}
+    rows: list[dict[str, Any]] = []
+    for entry in split.bugs:
+        key = _bug_key(entry)
+        record = measured.get(key)
+        # The fix patch through the harness's own reader (``load_bug`` →
+        # ``bugsinpy_meta.load_bug_info``, the one that reads ``bug_patch.txt``), so a
+        # moved clone fails here the way it fails in prepare instead of making the
+        # audit quietly report every bug as a miss.
+        bug = prepare_mod.load_bug(
+            split, bugsinpy_root, str(entry["project"]), int(entry["bug_id"])
+        )
+        touched = fix_touched_paths_from_patch(bug.bug_patch_txt)
+        selected = [
+            str(file.get("path"))
+            for file in (record or {}).get("selected_files", [])
+            if file.get("path")
+        ]
+        was_measured = bool(record) and record.get("verdict") != "not_measured"
+        rows.append(
+            {
+                "bug": key,
+                "selected": len(selected),
+                "top": selected[:3],
+                "touched": touched,
+                "hit": paths_hit(touched, selected) if was_measured else None,
+            }
+        )
+    return render_localization_table(rows), rows
+
+
+def render_localization_table(rows: list[dict[str, Any]]) -> str:
+    """The four columns the audit is read for, aligned to their own widest cell.
+
+    Column widths come from the data rather than a constant: a path can be longer
+    than any guessed width, and a table whose ``hit`` column has drifted a space to
+    the right on the rows that matter is read as noise.
+    """
+    headers = ("bug", "files selected", "top 3 files", "hit")
+    hits = {True: "yes", False: "no", None: "—"}
+    body = [
+        {
+            "bug": str(row["bug"]),
+            "files selected": str(row["selected"]),
+            "top 3 files": ", ".join(row["top"]) or "—",
+            "hit": hits[row["hit"]],
+        }
+        for row in rows
+    ]
+    widths = {head: max([len(head)] + [len(row[head]) for row in body]) for head in headers}
+
+    def line(cells: dict[str, str]) -> str:
+        return "  ".join(cells[head].ljust(widths[head]) for head in headers).rstrip()
+
+    head = line({h: h for h in headers})
+    lines = [head, "-" * len(head)]
+    lines += [line(row) for row in body]
+    tally = {verdict: sum(1 for r in rows if r["hit"] is verdict) for verdict in hits}
+    lines += [
+        "",
+        f"localization_hit: hit {tally[True]} / miss {tally[False]} / unknown "
+        f"{tally[None]} over {len(rows)} dev bug(s) — computed offline from the "
+        "selection already recorded, never fed back into it (§1.6.5)",
+    ]
+    return "\n".join(lines)
 
 
 def sampling_block(summary: dict[str, str]) -> dict[str, Any]:

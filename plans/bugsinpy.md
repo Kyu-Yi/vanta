@@ -554,6 +554,61 @@ Each bug record now carries, alongside the counts it already had:
 The `not_measured` record carries the same keys with nulls (and an empty `selected_files`), so a reader
 never has to branch on the schema to ask which files a bug was shown.
 
+#### 1.6.5 The ranking audit — offline, dev split only, and never an input
+
+§1.6.2 item 5 defines `localization_hit`: were the files the fix commit touched among those the run was
+shown? The run-time answer is computed per row from the `context_selection=` provenance the driver
+wrote. The same question can be asked one stage earlier and **offline**, and it should be, because the
+selection is written down by then:
+
+    python3 scripts/bugsinpy_run.py localize --batch runs/bugsinpy/<batch>
+
+reads `context_report.json`'s `selected_files` (§1.6.4) and each bug's `bug_patch.txt` through the
+harness's own reader, and prints one row per dev bug:
+
+```
+bug           files selected  top 3 files                hit
+--------------------------------------------------------------
+PySnooper/3   9               pysnooper/pysnooper.py …   yes
+```
+
+Three properties are the point of the command, not decoration:
+
+- **It never runs the selector.** The audit is a *view* of a selection that was already made, so it can
+  not become a term the ranking optimises — the failure mode being that a metric computed *inside*
+  selection turns the dev split into training data for the ranker. Nothing in `prepare` calls it; it
+  reads files, prints a table, and exits.
+- **The dev split only, and it refuses anything else.** Ranking quality is a tuning number, and a tuning
+  number produced over the evaluation split is how a held-out set stops being held out. `cmd_localize`
+  compares the resolved `--split` against `plans/bugsinpy_dev_split.json` and raises `SplitError` for any
+  other path, so `--split plans/bugsinpy_split.json` is refused rather than quietly obeyed. The
+  evaluation split's ranking is reported once, at the end, from its runs.
+- **One definition of "touched".** `fix_touched_paths` now delegates to `fix_touched_paths_from_patch`,
+  which the audit calls directly, for the same reason §1.6.1 gave for shelling out to the real selector:
+  two implementations of the same question is how the run-time metric and the audit come to disagree
+  while both look authoritative. Both drop the fix patch's test hunks first — the hidden tests are
+  stripped from the tree before any run sees it, so a test path is never a file a selection could show.
+
+`hit` is three-valued, and the third value is the one that keeps the number honest. `paths_hit` returns
+`None` — printed `—`, pooled as `unknown` — for a bug whose report row is `not_measured` (no selection
+was made, so there is nothing to judge) and for a fix whose patch touches only test files (there is no
+source path the selection could have shown). Pooling either as a miss would report a miss *rate* over
+rows that never had a chance to hit.
+
+The first reading is the honest one for the evidence that existed at the time. Run against the second
+measure-only batch — whose report predates §1.6.3 — the command printed `files selected 0`, `—` and
+`hit no` for all 11 dev bugs, with the footer
+
+```
+localization_hit: hit 0 / miss 11 / unknown 0 over 11 dev bug(s) — computed offline from the selection
+already recorded, never fed back into it (§1.6.5)
+```
+
+That is 11 misses for the same reason §1.6.3 existed: each of those selections contained no file at all,
+so none of them could have shown the fix's file. The failure that read as 11 clean passes in the report
+reads as a 0-of-11 hit rate here — which is what the audit is for. After a measure-only rerun on the
+fixed selector the same command reports the real selections.
+
 ---
 
 ## 2. Issue text that never leaks the fix or the hidden test

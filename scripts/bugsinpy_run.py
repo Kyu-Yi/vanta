@@ -90,6 +90,11 @@ as an unhandled exception instead, which is how ``ContextError`` used to look.
 """
 
 DEFAULT_SPLIT = REPO_ROOT / "plans" / "bugsinpy_split.json"
+DEV_SPLIT = REPO_ROOT / "plans" / "bugsinpy_dev_split.json"
+"""The tuning split (§8). The localization audit is for this one only: ranking
+quality is a number one tunes on, and a tuning number computed over the
+evaluation split is how a held-out set stops being held out."""
+
 RUNS_DIR = REPO_ROOT / "runs" / "bugsinpy"
 
 EXIT_OK = 0
@@ -778,6 +783,33 @@ def cmd_run(args: argparse.Namespace) -> int:
     return code
 
 
+def cmd_localize(args: argparse.Namespace) -> int:
+    """Ranking quality on the dev split, from evidence already on disk (§1.6.5).
+
+    No VM, no LLM, no selector: it reads the selection ``prepare`` measured
+    (``context_report.json``) and each bug's fix-commit patch, and prints whether
+    the fix's own files were among those shown. That is what makes it a *view* of
+    the ranking rather than an input to it — nothing in ``prepare`` calls this, and
+    the split is the dev one so the number stays a tuning number.
+    """
+    split_path = args.split.resolve()
+    if split_path != DEV_SPLIT.resolve():
+        raise SplitError(
+            f"the localization audit runs on the dev split only ({DEV_SPLIT}), because "
+            "it exists to judge ranking quality — a number produced for a held-out set "
+            "is a number one tunes on it. Refusing to audit "
+            f"{split_path}."
+        )
+    split = load_split(split_path)
+    batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
+    bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
+    table, _rows = runner_mod.localization_table(
+        batch_dir=batch_dir, split=split, bugsinpy_root=bugsinpy_root
+    )
+    print(table)
+    return EXIT_OK
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     """Re-derive the batch report from the manifest, then score the review rows.
 
@@ -1026,6 +1058,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="the batch directory `run` wrote its manifest into",
     )
     rep.set_defaults(func=cmd_report)
+
+    loc = sub.add_parser(
+        "localize",
+        help=(
+            "dev split only: did the selection a prepare measured contain the files "
+            "the fix commit touched? (ranking quality, offline)"
+        ),
+    )
+    loc.add_argument(
+        "--split",
+        type=Path,
+        default=DEV_SPLIT,
+        help=f"the dev split (default and only accepted value: {DEV_SPLIT})",
+    )
+    loc.add_argument(
+        "--batch",
+        type=Path,
+        required=True,
+        help="a prepare batch directory — it must hold context_report.json",
+    )
+    loc.set_defaults(func=cmd_localize)
 
     return parser
 

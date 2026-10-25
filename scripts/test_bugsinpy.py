@@ -16193,6 +16193,179 @@ class TestLocalizationHit:
         assert "hit=1 miss=1 unknown=1" in runner_mod.render_digest(payload)
 
 
+class TestLocalizationTable:
+    """§1.6.5 — the ranking audit, computed offline from the selection already recorded.
+
+    ``TestLocalizationHit`` covers the metric as a *run* produces it, from the driver's
+    ``context_selection=`` provenance. This is the same question asked one stage earlier:
+    read the files ``prepare`` recorded in ``context_report.json``, read each bug's fix
+    patch, and print whether the fix's own files were among them. Two properties matter
+    more than the arithmetic — it never runs the selector (a metric computed *inside*
+    selection is a term the ranking then optimises), and it is a dev-split-only number
+    (a tuning number produced over a held-out set is how that set stops being held out).
+    """
+
+    FIX = (
+        "diff --git a/pkg/core.py b/pkg/core.py\n"
+        "--- a/pkg/core.py\n"
+        "+++ b/pkg/core.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-old\n"
+        "+new\n"
+        "diff --git a/tests/test_demo.py b/tests/test_demo.py\n"
+        "--- a/tests/test_demo.py\n"
+        "+++ b/tests/test_demo.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-a\n"
+        "+b\n"
+    )
+
+    TEST_ONLY = (
+        "diff --git a/tests/test_demo.py b/tests/test_demo.py\n"
+        "--- a/tests/test_demo.py\n"
+        "+++ b/tests/test_demo.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-a\n"
+        "+b\n"
+    )
+
+    @staticmethod
+    def _root(tmp_path: Path, patches: dict[str, str]) -> Path:
+        """A BugsInPy tree with only what the audit reads: ``bug.info`` and the patch."""
+        root = tmp_path / "bugsinpy"
+        for project, patch in patches.items():
+            bug_dir = root / "projects" / project / "bugs" / "1"
+            write(
+                bug_dir / "bug.info",
+                'python_version="3.8.1"\n'
+                f'buggy_commit_id="{"b" * 40}"\n'
+                f'fixed_commit_id="{"f" * 40}"\n'
+                'test_file="tests/test_demo.py"\n',
+            )
+            write(bug_dir / "bug_patch.txt", patch)
+        return root
+
+    @classmethod
+    def _fixture(cls, tmp_path: Path, patches: dict[str, str]):
+        root = cls._root(tmp_path, patches)
+        split = split_mod.Split(
+            split_data(bugs=[bug_entry(project=name) for name in patches])
+        )
+        return root, split
+
+    @staticmethod
+    def _report(tmp_path: Path, rows: list[dict]) -> Path:
+        batch_dir = tmp_path / "batch"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        (batch_dir / runner_mod.CONTEXT_REPORT_NAME).write_text(
+            json.dumps({"bugs": rows}), encoding="utf-8"
+        )
+        return batch_dir
+
+    @staticmethod
+    def _shown(*paths: str) -> list[dict]:
+        return [{"path": path, "score": 400, "reasons": ["path"], "bytes": 10,
+                 "tokens": 3, "shown": "full"} for path in paths]
+
+    def test_the_table_names_the_selection_the_top_three_and_the_hit(self, tmp_path):
+        root, split = self._fixture(tmp_path, {"Demo": self.FIX, "Other": self.FIX})
+        batch_dir = self._report(tmp_path, [
+            {"bug": "Demo/1", "verdict": "accept",
+             "selected_files": self._shown(
+                 "pkg/core.py", "pkg/util.py", "pkg/api.py", "pkg/db.py"
+             )},
+            {"bug": "Other/1", "verdict": "accept",
+             "selected_files": self._shown("pkg/elsewhere.py")},
+        ])
+        table, rows = runner_mod.localization_table(
+            batch_dir=batch_dir, split=split, bugsinpy_root=root
+        )
+        assert [row["hit"] for row in rows] == [True, False]
+        assert rows[0]["selected"] == 4
+        assert rows[0]["top"] == ["pkg/core.py", "pkg/util.py", "pkg/api.py"]
+        assert rows[0]["touched"] == ["pkg/core.py"]
+        assert "files selected" in table and "top 3 files" in table
+        assert "pkg/core.py, pkg/util.py, pkg/api.py" in table
+        assert "hit 1 / miss 1 / unknown 0 over 2 dev bug(s)" in table
+
+    def test_a_not_measured_row_is_unknown_not_a_miss(self, tmp_path):
+        """No selection was made, so there is nothing to judge — and pooling it as a
+        miss would report a rate over a row that never had a chance to hit."""
+        root, split = self._fixture(tmp_path, {"Demo": self.FIX})
+        batch_dir = self._report(tmp_path, [
+            {"bug": "Demo/1", "verdict": "not_measured", "selected_files": []},
+        ])
+        table, rows = runner_mod.localization_table(
+            batch_dir=batch_dir, split=split, bugsinpy_root=root
+        )
+        assert rows[0]["hit"] is None
+        assert "unknown 1" in table
+        row = next(line for line in table.splitlines() if line.startswith("Demo/1"))
+        # No file was shown and none could be judged: both cells are the unknown mark.
+        assert row.split() == ["Demo/1", "0", "—", "—"]
+
+    def test_a_bug_with_no_report_row_is_unknown(self, tmp_path):
+        root, split = self._fixture(tmp_path, {"Demo": self.FIX})
+        batch_dir = self._report(tmp_path, [])
+        _table, rows = runner_mod.localization_table(
+            batch_dir=batch_dir, split=split, bugsinpy_root=root
+        )
+        assert rows[0] == {
+            "bug": "Demo/1", "selected": 0, "top": [], "touched": ["pkg/core.py"],
+            "hit": None,
+        }
+
+    def test_a_fix_that_touches_only_tests_has_no_source_to_hit(self, tmp_path):
+        """The hidden tests are stripped from the tree before any run sees it, so a test
+        path is never a file a selection could show — an unavoidable `unknown`, not a
+        miss the ranker is answerable for."""
+        root, split = self._fixture(tmp_path, {"Demo": self.TEST_ONLY})
+        batch_dir = self._report(tmp_path, [
+            {"bug": "Demo/1", "verdict": "accept",
+             "selected_files": self._shown("pkg/core.py")},
+        ])
+        _table, rows = runner_mod.localization_table(
+            batch_dir=batch_dir, split=split, bugsinpy_root=root
+        )
+        assert runner_mod.fix_touched_paths_from_patch(self.TEST_ONLY) == []
+        assert rows[0]["hit"] is None
+
+    def test_a_batch_with_no_context_report_is_refused(self, tmp_path):
+        """The audit reads a selection, so a batch with none is a refusal that names the
+        file it wanted — not an empty table that reads as "nothing was missed"."""
+        root, split = self._fixture(tmp_path, {"Demo": self.FIX})
+        with pytest.raises(runner_mod.RunnerError, match="context_report.json"):
+            runner_mod.localization_table(
+                batch_dir=tmp_path / "absent", split=split, bugsinpy_root=root
+            )
+
+    def test_the_audit_never_runs_the_selector(self):
+        """The whole point of asking offline: a metric computed *inside* selection becomes
+        a term the ranking optimises, and the dev split stops being a check on it."""
+        source = inspect.getsource(runner_mod.localization_table)
+        assert "select_context" not in source
+        assert "vanta_bin" not in source
+
+    def test_nothing_in_prepare_reads_the_audit(self):
+        source = (REPO_ROOT / "scripts" / "bugsinpy" / "prepare.py").read_text(encoding="utf-8")
+        assert "localization_table" not in source
+        assert "localization_hit" not in source
+
+    def test_the_audit_refuses_the_evaluation_split(self, tmp_path, capsys):
+        """Ranking quality is a tuning number; the evaluation split's is reported once,
+        from its runs. `--split` is accepted so the refusal is explicit rather than a
+        value quietly ignored."""
+        code = run_mod.main([
+            "localize",
+            "--split", str(SPLIT_PATH),
+            "--batch", str(tmp_path),
+        ])
+        captured = capsys.readouterr()
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert "dev split only" in captured.err
+        assert "Traceback" not in captured.err
+
+
 class TestStaleBinary:
     """§7.3: two commits, and a binary older than the Rust it claims to be built from.
 

@@ -886,6 +886,7 @@ def _context_record(prep: BugPrep) -> dict[str, Any]:
             "bug": prep.key,
             "wave": prep.wave,
             "role": prep.role,
+            "select_role": None,
             "prepare_mode": prep.prepare_mode,
             "verdict": "not_measured",
             "context_ok": None,
@@ -898,18 +899,37 @@ def _context_record(prep: BugPrep) -> dict[str, Any]:
             "n_ctx_source": None,
             "mode": None,
             "source_bytes": None,
+            "files_bytes": None,
+            "files_tokens": None,
             "file_count": None,
             "tree_bytes": None,
             "tree_count": None,
+            "selected_files": [],
             "dropped_for_budget": [],
             "pruned_count": None,
             "reasons": list(prep.gate_failures),
         }
     selection = verdict.selection
+    # The selector's `selected_bytes`/`selected_tokens` are the file bytes PLUS the
+    # tree listing's (``ContextSelection::total_bytes`` is
+    # ``sum(files.bytes) + tree_bytes``), so the equality
+    # ``selected_bytes == tree_bytes`` is the signature of a selection with no file
+    # — a listing, always under budget, which is how all 11 dev bugs passed the
+    # second measure-only run (§1.6.3). The two halves are therefore recorded
+    # apart: `files_bytes`/`files_tokens` are what the file content cost,
+    # `tree_bytes`/`tree_count` are the listing, and `source_bytes` is the
+    # selector's own total, kept unchanged for continuity with earlier reports.
+    files_bytes = sum(file.bytes for file in selection.files)
+    files_tokens = sum(file.tokens for file in selection.files)
     return {
         "bug": prep.key,
         "wave": prep.wave,
         "role": prep.role,
+        # The role the context was SELECTED for (`SELECT_ROLE`, the union of the
+        # repair roles), not the split role above: it is written into the run's
+        # `context.select` row, and a report that named only `pilot`/`reserve`
+        # could not be lined up with the run's own row.
+        "select_role": selection.role,
         "prepare_mode": prep.prepare_mode,
         "verdict": "ok" if verdict.context_ok else "reject",
         "context_ok": verdict.context_ok,
@@ -927,9 +947,17 @@ def _context_record(prep: BugPrep) -> dict[str, Any]:
         # with the capped walk they described (§1.6.2).
         "mode": selection.mode,
         "source_bytes": selection.selected_bytes,
+        "files_bytes": files_bytes,
+        "files_tokens": files_tokens,
         "file_count": len(selection.files),
         "tree_bytes": selection.tree_bytes,
         "tree_count": selection.tree_count,
+        # Per file, what an audit of the ranking needs: why it was picked
+        # (`path` / `traceback` / `identifier` / `patch-touched` / `import-neighbour`
+        # / `test` / `tree`), the score that ordering put on it, what it cost, and
+        # whether it is shown whole or as an outline. Without this the report named
+        # counts and could not be checked (§1.6.2 item 4).
+        "selected_files": [file.to_dict() for file in selection.files],
         "dropped_for_budget": list(selection.dropped_for_budget),
         "pruned_count": len(selection.skipped),
         "reasons": verdict.reasons,

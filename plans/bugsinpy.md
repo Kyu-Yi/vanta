@@ -524,6 +524,36 @@ The fix is at the one place every mode shares — `fill` — and it is a fallbac
   a rejection of every large project. A file over `MAX_FILE_BYTES` still goes in as an outline as
   before.
 
+#### 1.6.4 The report must name the files, not only count them
+
+`context_report.json` recorded the size of the selection and never its contents: `file_count`,
+`source_bytes`, `tree_bytes`, `tree_count`, `dropped_for_budget`, `reasons`. A reader could therefore
+not tell a selection of nine files from a selection of none, because both were described by the same
+arithmetic — `selected_bytes` is `sum(files.bytes) + tree_bytes`, so a listing and a real context differ
+only by whether `source_bytes` is *larger* than `tree_bytes`, and nothing in the report said a word
+about which files produced the difference. That is how the second measure-only run was read as 11 clean
+passes.
+
+Each bug record now carries, alongside the counts it already had:
+
+- **`select_role`** — the role the context was *selected* for (`SELECT_ROLE`, the union of the repair
+  roles), which is what the run's own `context.select` row names. The record's `role` field stays the
+  split role (`pilot`/`reserve`); the two are different questions and a report that conflated them could
+  not be lined up with a run.
+- **`selected_files`** — one entry per file, in the order the prompt puts them, each with `path`,
+  `score`, `reasons`, `bytes`, `tokens` and `shown`. `reasons` is the ranked vocabulary and is what makes
+  the ranking auditable: `patch-touched` (1000) > `path` (400) > `traceback` (300) > `identifier` (200)
+  > `import-neighbour` (100) > `test` (80) > `tree` (10, §1.6.3). `shown` is `full` or `outline`, so a
+  file that only contributed its signatures is not counted as if its body were in the prompt.
+- **`files_bytes` / `files_tokens`** — what the file content cost, *separately* from `tree_bytes` /
+  `tree_count`, which are the listing. `source_bytes` is kept as the selector's own total
+  (`files_bytes + tree_bytes`) for continuity with earlier reports, so the identity
+  `files_bytes + tree_bytes == source_bytes` is checkable in the file itself. With these two fields a
+  listing is visible as what it is: `files_bytes == 0` and `source_bytes == tree_bytes`.
+
+The `not_measured` record carries the same keys with nulls (and an empty `selected_files`), so a reader
+never has to branch on the schema to ask which files a bug was shown.
+
 ---
 
 ## 2. Issue text that never leaks the fix or the hidden test

@@ -178,8 +178,13 @@ def selection(**over) -> ctx.Selection:
             )
         ],
         tree_count=1,
-        selected_bytes=700,
-        selected_tokens=175,
+        # ``selected_bytes``/``selected_tokens`` are the selector's totals: the file
+        # content PLUS the tree listing (``ContextSelection::total_bytes``), which is
+        # why ``prompt_tokens_estimate`` below is 3_000 + 177 and not 3_000 + 175. A
+        # fixture that left the listing out would hide exactly the arithmetic the
+        # second measure-only run was misread from (§1.6.3).
+        selected_bytes=708,
+        selected_tokens=177,
         tree_bytes=8,
         tree_tokens=2,
         dropped_for_budget=[],
@@ -1901,6 +1906,70 @@ class TestContextReport:
         assert bug["reasons"] == verdict.reasons
         assert "dropped_for_budget" in bug["reasons"][0]
         assert bug["dropped_for_budget"] == ["pkg/core.py"]
+
+    def test_the_report_names_every_selected_file_and_why(self, tmp_path):
+        """Item 4: a count is not auditable. Each selected file carries its score,
+        its reason(s), its bytes and whether it is full or an outline, and the tree
+        listing is sized separately from the file content."""
+        verdict = self._verdict()
+        report = json.loads(
+            prepare_mod.write_context_report(
+                tmp_path, [prep(context=verdict)]
+            ).read_text(encoding="utf-8")
+        )
+        bug = report["bugs"][0]
+        assert bug["select_role"] == verdict.selection.role
+        assert bug["selected_files"] == [file.to_dict() for file in verdict.selection.files]
+        first = bug["selected_files"][0]
+        assert first == {
+            "path": "pkg/core.py",
+            "score": 42,
+            "reasons": ["path", "traceback"],
+            "bytes": 700,
+            "tokens": 175,
+            "shown": "full",
+        }
+        assert bug["files_bytes"] == 700
+        assert bug["files_tokens"] == 175
+
+    def test_the_file_content_and_the_tree_listing_are_sized_apart(self, tmp_path):
+        """``selected_bytes`` is file bytes PLUS tree bytes, so every dev report read
+        ``source_bytes == tree_bytes`` — the signature of a selection with no file.
+        Splitting the two is what makes that visible instead of arithmetically
+        invisible."""
+        verdict = self._verdict()
+        report = json.loads(
+            prepare_mod.write_context_report(
+                tmp_path, [prep(context=verdict)]
+            ).read_text(encoding="utf-8")
+        )
+        bug = report["bugs"][0]
+        assert bug["source_bytes"] == verdict.selection.selected_bytes
+        assert bug["files_bytes"] + bug["tree_bytes"] == bug["source_bytes"]
+        assert bug["tree_bytes"] == 8
+        assert bug["tree_count"] == 1
+
+    def test_a_selection_with_no_file_says_so_per_file_list(self, tmp_path):
+        """The pathological record, in the shape a reader can grep for: no files,
+        zero content bytes, and the whole of ``source_bytes`` accounted for by the
+        tree listing — never again mistakable for a context."""
+        verdict = self._verdict(
+            files=[], tree_count=9, selected_bytes=204, selected_tokens=51,
+            tree_bytes=204, tree_tokens=51, prompt_tokens_estimate=3_000,
+        )
+        report = json.loads(
+            prepare_mod.write_context_report(
+                tmp_path, [prep(context=verdict)]
+            ).read_text(encoding="utf-8")
+        )
+        bug = report["bugs"][0]
+        assert bug["verdict"] == "reject"
+        assert bug["selected_files"] == []
+        assert bug["file_count"] == 0
+        assert bug["files_bytes"] == 0
+        assert bug["files_tokens"] == 0
+        assert bug["source_bytes"] == bug["tree_bytes"] == 204
+        assert any(r.startswith("no source selected") for r in bug["reasons"])
 
     def test_a_bug_that_was_never_measured_says_why(self, tmp_path):
         report = json.loads(

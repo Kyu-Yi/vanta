@@ -411,6 +411,21 @@ pub struct ContextSelection {
 }
 
 impl ContextSelection {
+    /// Whether the selection's content is grounded in the run's own inputs — the
+    /// question the gate's `no_issue_grounded_selection` asks (§1.6.10).
+    ///
+    /// [VANTA-WHY] The answer is computed here, from the reasons, and travels in
+    /// the report, so the harness refuses a role without holding its own copy of
+    /// what "grounded" means. A reason that named a file without grounding its
+    /// body would be refused by a gate that never learned the reason's name — the
+    /// same reason `context.py` shells out to this selector instead of walking a
+    /// tree itself (§1.6.2 item 5).
+    pub fn grounded(&self) -> bool {
+        self.files
+            .iter()
+            .any(|file| file.reasons.iter().any(|reason| reason.grounds_content()))
+    }
+
     /// The prompt text: the file tree (when present), then each file in full or
     /// as an outline, in score order.
     pub fn render(&self) -> String {

@@ -712,17 +712,47 @@ rather than the whole of every file it touches.
 
 **Where it lives.** The predicate is a method on the reason vocabulary —
 `SelectionReason::names_the_file`, true for `Path`, `Traceback` and `PatchTouched` — so "named by the
-run's inputs" has one definition, sitting next to the weights and next to `grounds_content` (§1.6.10's
-and the gate's predicate, which answers a different question: whether the selection as a whole is
-grounded, not whether one file's body is). `fill` consults it once per ranked file, before the caps. A
-file that fails it is not selected and is **not** recorded as a budget drop: the budget did not refuse
-it, and `dropped_for_budget` naming it would report the wrong cause.
+run's inputs" has one definition, sitting next to the weights and next to `grounds_content`, the gate's
+own predicate (§1.6.10), which answers a different question: whether the selection as a whole is
+grounded, not whether one file's body may be shown. `fill` consults it once per ranked file, before the
+caps. A file that fails it is not selected and is **not** recorded as a budget drop: the budget did not
+refuse it, and `dropped_for_budget` naming it would report the wrong cause.
 
 The one reachable case this rule refuses is `Identifier` on a file that is not project source — a `.js`
 class the issue names, say. That refusal is deliberate: a symbol is a name, not a file, and the
 extension rule is the thing that keeps a repo's documentation site out of a Python bug's prompt. A
 JavaScript bug would need `.js` in the project-source set; that is a corpus question, not a selector
 tweak.
+
+#### 1.6.10 The gate refuses by name, and the selector owns the name
+
+The refusal §1.6.6 left the gate was free text — `no source selected: the selection carries no file at
+all — only the repository file tree (…)` — found by a reader looking for the phrase. It also described
+the wrong thing. What the gate is refusing is a selection whose content is not *grounded in the run's
+own inputs*, which is a claim about the reasons a file carries, not about a list being empty.
+
+- The reason is **`no_issue_grounded_selection`**. It is a name a reader can filter on, and both the
+  §1.6.6 table and §1.6.11's audit do.
+- The verdict is the **selector's own answer**, not the harness deriving one. `SelectContextReport`
+  carries `grounded` — `SelectionReason::grounds_content`, the predicate on the reason vocabulary,
+  applied to the files the selection carries: true when at least one selected file's content is grounded
+  in the issue text or the patch under review.
+- `precheck` refuses on `not selection.grounded`, so a reason that does not ground content is refused
+  **without the harness learning its name** — the harness asks a question instead of holding a copy of
+  the answer. That is the same reason `context.py` shells out to the selector rather than walking a
+  tree (§1.6.2 item 5), and the same reason the predicate sits on the enum rather than in `precheck`.
+- `Selection.from_dict` **requires** the field. A binary that does not print it is a gate that cannot
+  judge, so the module fails loudly rather than reading a missing `grounded` as `false` — which would
+  refuse every bug the moment the field ever dropped off the wire format.
+
+Every reason grounds content today, so on this vocabulary `grounded` coincides with "the selection
+carries a file". The predicate is what makes that a coincidence of the vocabulary rather than the
+definition of the gate: a reason that names a file without grounding its body would be refused, and the
+harness would not need to change to refuse it.
+
+The over-budget half is `prompt_exceeds_budget`, acting on `prompt_tokens_estimate` and nothing else —
+now a number that counts the listing once (§1.6.4), which is what makes it the same comparison the run's
+own guard makes.
 
 ---
 

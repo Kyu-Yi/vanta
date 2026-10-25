@@ -152,6 +152,11 @@ class Selection:
     mode: str
     budget_tokens: int
     files: list[SelectedFile] = field(default_factory=list)
+    #: §1.6.10 — whether the selection carries content grounded in the run's own
+    #: inputs, as the selector's own reason vocabulary has it. The gate refuses on
+    #: this and never re-derives it: a reason that named a file without grounding
+    #: its body would be refused here without this module knowing its name.
+    grounded: bool = False
     tree_count: int = 0
     selected_bytes: int = 0
     selected_tokens: int = 0
@@ -171,6 +176,7 @@ class Selection:
             "budget_tokens": self.budget_tokens,
             "file_count": len(self.files),
             "files": [file.to_dict() for file in self.files],
+            "grounded": self.grounded,
             "tree_count": self.tree_count,
             "selected_bytes": self.selected_bytes,
             "selected_tokens": self.selected_tokens,
@@ -204,6 +210,11 @@ class Selection:
             files=[
                 SelectedFile.from_dict(item, where=f"{where} files[]") for item in files
             ],
+            # Required, not defaulted (§1.6.10): a selector that does not answer
+            # this is a gate that cannot judge, and reading a missing `grounded`
+            # as `false` would refuse every bug the moment the field dropped off
+            # the wire format.
+            grounded=bool(field_of(payload, "grounded", owner=owner, where=where)),
             tree_count=int(field_of(payload, "tree_count", owner=owner, where=where)),
             selected_bytes=int(
                 field_of(payload, "selected_bytes", owner=owner, where=where)
@@ -445,19 +456,27 @@ def precheck(
             f"{', '.join(selection.dropped_for_budget[:3])}); the run would be shown "
             "a smaller context than its ranking chose"
         )
-    if not selection.files:
-        # A selection with no file at all is a listing, not a context: the prompt
-        # would be the repository file tree — ``tree_count`` paths — and nothing
-        # else. That is what the second measure-only run measured for all 11 dev
-        # bugs, and why this reason exists: a listing always fits the budget, so
-        # the two checks above pass a bug that was never shown any source
-        # (`selected_bytes == tree_bytes` exactly, §1.6.3). A selection with no
-        # file is refused for the thing it is missing, not for its size.
+    if not selection.grounded:
+        # [VANTA-WHY] The verdict is the SELECTOR's own answer (§1.6.10):
+        # `grounded` is the selector's reason vocabulary asking whether any
+        # selected file's content is grounded in this run's own inputs, so a
+        # reason that named a file without grounding its body is refused here
+        # without this module learning the reason's name — the same reason the
+        # walk lives in the binary and not here (§1.6.2 item 5).
+        #
+        # What it refuses is a listing, not a context: the prompt would be the
+        # repository file tree — ``tree_count`` paths — and nothing else. That is
+        # what the second measure-only run measured for all 11 dev bugs, and why
+        # this reason exists: a listing always fits the budget, so the two checks
+        # above pass a bug that was never shown any source (`selected_bytes ==
+        # tree_bytes` exactly, §1.6.3). A selection is refused for the thing it is
+        # missing, not for its size.
         reasons.append(
-            "no source selected: the selection carries no file at all — only the "
-            f"repository file tree ({selection.tree_count} path(s), "
-            f"{selection.tree_bytes} B). A listing of paths says where code is, not "
-            "what it does, so a role shown only that has no context to work from"
+            "no_issue_grounded_selection: the selection carries no file grounded in "
+            "this run's own inputs — only the repository file tree "
+            f"({selection.tree_count} path(s), {selection.tree_bytes} B). A listing "
+            "of paths says where code is, not what it does, so a role shown only "
+            "that has no context to work from"
         )
 
     return ContextVerdict(

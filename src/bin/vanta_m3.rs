@@ -285,6 +285,11 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
 /// uses, rather than in Python: the whole point of the subcommand is that the
 /// gate stops carrying its own copy of the walk AND of the estimate. The gate
 /// still owns the *window* it passes in as `--select-budget`.
+///
+/// `grounded` is here for the same reason (§1.6.10): whether the selection carries
+/// content the run's own inputs grounded is a claim about the selector's reason
+/// vocabulary, so the gate asks the selector instead of inferring it from
+/// `file_count`.
 #[derive(serde::Serialize)]
 struct SelectContextReport<'a> {
     role: &'a str,
@@ -292,6 +297,7 @@ struct SelectContextReport<'a> {
     budget_tokens: u32,
     files: &'a [vanta::context::SelectedFile],
     file_count: usize,
+    grounded: bool,
     selected_bytes: usize,
     selected_tokens: u32,
     tree_count: usize,
@@ -353,6 +359,7 @@ fn run_select_context(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + S
         budget_tokens: selection.budget_tokens,
         files: &selection.files,
         file_count: selection.files.len(),
+        grounded: selection.grounded(),
         selected_bytes: selection.total_bytes,
         selected_tokens: selection.total_tokens,
         tree_count: selection.tree.len(),
@@ -370,12 +377,13 @@ fn run_select_context(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + S
         println!("{}", serde_json::to_string(&report)?);
     } else {
         println!(
-            "selection: mode={} role={} budget={} tok, {} file(s), {} tok, fits={}",
+            "selection: mode={} role={} budget={} tok, {} file(s), {} tok, grounded={}, fits={}",
             report.mode,
             report.role,
             report.budget_tokens,
             report.file_count,
             report.prompt_tokens_estimate,
+            report.grounded,
             report.fits,
         );
         for line in selection.summary_lines() {

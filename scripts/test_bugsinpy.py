@@ -196,6 +196,12 @@ def selection(**over) -> ctx.Selection:
         fits=True,
     )
     base.update(over)
+    # §1.6.10: the selector's own answer to "is any selected file's content grounded
+    # in this run's own inputs". The fixture derives it from the files it ends up
+    # carrying, because that is what it is a function of — a fixture that carries
+    # none says it is ungrounded — and a test that wants the two to disagree passes
+    # ``grounded=`` explicitly, which is what the field is on the wire for.
+    base.setdefault("grounded", bool(base["files"]))
     return ctx.Selection(**base)
 
 
@@ -1970,7 +1976,7 @@ class TestContextReport:
         assert bug["files_bytes"] == 0
         assert bug["files_tokens"] == 0
         assert bug["source_bytes"] == bug["tree_bytes"] == 204
-        assert any(r.startswith("no source selected") for r in bug["reasons"])
+        assert any(r.startswith("no_issue_grounded_selection") for r in bug["reasons"])
 
     def test_a_bug_that_was_never_measured_says_why(self, tmp_path):
         report = json.loads(
@@ -2109,6 +2115,7 @@ class TestSelectContext:
             }
         ],
         "tree_count": 3,
+        "grounded": True,
         "selected_bytes": 700,
         "selected_tokens": 175,
         "tree_bytes": 40,
@@ -2143,6 +2150,7 @@ class TestSelectContext:
         assert got.skipped == [("vendor/x.py", "vendored")]
         assert got.dropped_for_budget == ["pkg/huge.py"]
         assert got.tree_count == 3
+        assert got.grounded is True
         assert got.prompt_tokens_estimate == 3_225
         assert got.fits is True
 
@@ -2204,6 +2212,25 @@ class TestSelectContext:
         with pytest.raises(ctx.ContextError, match="did not print JSON"):
             ctx.select_context(tmp_path, "x", vanta_bin=binary, budget_tokens=100)
 
+    def test_a_selector_that_does_not_answer_the_grounding_question_is_an_error(
+        self, tmp_path
+    ):
+        """§1.6.10: ``grounded`` is required on the wire, not defaulted.
+
+        Reading a missing field as ``false`` would refuse every bug the moment the
+        field dropped off the format, and reading it as ``true`` would let the gate
+        act on an answer the selector never gave. Either guess is a gate judging a
+        selection it did not read, so the parse fails loudly instead.
+        """
+        payload = dict(self.PAYLOAD)
+        del payload["grounded"]
+        binary = stub_vanta(
+            tmp_path / "vanta_m3",
+            f"import sys\nsys.stdout.write({json.dumps(payload)!r})\n",
+        )
+        with pytest.raises(records_mod.RecordError, match="missing field 'grounded'"):
+            ctx.select_context(tmp_path, "x", vanta_bin=binary, budget_tokens=100)
+
 
 class TestPrecheck:
     def test_accepts_a_selection_that_fits(self):
@@ -2248,11 +2275,30 @@ class TestPrecheck:
         )
         assert verdict.context_ok is False
         assert verdict.reasons == [
-            "no source selected: the selection carries no file at all — only the "
-            "repository file tree (9 path(s), 204 B). A listing of paths says where "
-            "code is, not what it does, so a role shown only that has no context to "
-            "work from"
+            "no_issue_grounded_selection: the selection carries no file grounded in "
+            "this run's own inputs — only the repository file tree (9 path(s), 204 B). "
+            "A listing of paths says where code is, not what it does, so a role shown "
+            "only that has no context to work from"
         ], "the only thing wrong with this selection is that it holds no source"
+
+    def test_a_selection_with_files_the_selector_calls_ungrounded_is_refused(self):
+        """§1.6.10: the reason is the *selector's* answer, not "are there files".
+
+        A listing and a context can both carry a file, and only the selector knows
+        which one it produced: it is the one that extracted the file's content from
+        the run's own inputs. The gate reads that answer rather than inferring it
+        from ``files``, so the two can disagree here — which is what makes this a
+        test of the gate owning no second copy of the predicate.
+        """
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=200_000, n_ctx_source="test",
+            selection=selection(grounded=False),
+        )
+        assert verdict.context_ok is False
+        assert len(verdict.reasons) == 1, verdict.reasons
+        assert verdict.reasons[0].startswith("no_issue_grounded_selection"), (
+            "an ungrounded selection is refused for that reason, and nothing else"
+        )
 
     def test_a_selection_with_one_file_is_not_refused_for_missing_source(self):
         """The new reason is about the selection's shape, not a second budget
@@ -2262,7 +2308,9 @@ class TestPrecheck:
             selection=selection(prompt_tokens_estimate=1_000),
         )
         assert verdict.context_ok is True
-        assert not any(r.startswith("no source selected") for r in verdict.reasons)
+        assert not any(
+            r.startswith("no_issue_grounded_selection") for r in verdict.reasons
+        )
 
     def test_a_listing_over_budget_is_refused_for_both_reasons(self):
         """When even the listing does not fit, both are true and both are said:
@@ -2276,7 +2324,7 @@ class TestPrecheck:
         )
         assert verdict.context_ok is False
         kinds = {reason.split(":", 1)[0] for reason in verdict.reasons}
-        assert kinds == {"prompt_exceeds_budget", "no source selected"}
+        assert kinds == {"prompt_exceeds_budget", "no_issue_grounded_selection"}
 
     def test_rejects_a_prompt_over_budget(self):
         verdict = ctx.precheck(

@@ -354,6 +354,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             prepare_mod.write_leak_gate(batch_dir, prep)
     prepare_mod.write_issue_texts(batch_dir, preps)
     prepare_mod.write_context_sizes(batch_dir, preps)
+    prepare_mod.write_signals(batch_dir, preps)
     prepare_mod.write_context_report(
         batch_dir, preps, n_ctx=n_ctx, n_ctx_source=n_ctx_source
     )
@@ -401,6 +402,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     for artifact in (
         "context_report.json",
         "context_sizes.md",
+        "signals.md",
         "issue_texts_all.md",
         "prepare_summary.md",
     ):

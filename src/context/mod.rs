@@ -1444,6 +1444,24 @@ pub fn issue_code_tokens(issue_text: &str) -> BTreeSet<String> {
     issue_identifiers(issue_text).into_keys().collect()
 }
 
+/// The issue's **path-shaped** tokens — the half of `issue_tokens` a reader
+/// means when they say "the report named a path" (§1.6.7).
+///
+/// [VANTA-WHY] `issue_tokens` is every word the `path` and `traceback` signals
+/// match against, and it is mostly prose: `matplotlib/1`'s report contains
+/// `figure`, `the` and `version`, and matching those against a path is what the
+/// rules are for, not what the *extraction* is. This reader is the narrower set —
+/// a token carrying a `/` or a source extension — so the §1.6.7 table can print
+/// what the issue actually named as a file rather than hundreds of words that
+/// happened to reach a basename. It is **reporting only**: nothing ranks with it,
+/// and the signals still match against the whole of `issue_tokens`.
+pub fn issue_path_tokens(issue_text: &str) -> BTreeSet<String> {
+    issue_tokens(issue_text)
+        .into_iter()
+        .filter(|token| token.contains('/') || looks_like_source(token))
+        .collect()
+}
+
 /// How often each token appears in one file's contents: the corpus the BM25
 /// fallback ranks over (§1.6.2 item 3).
 ///
@@ -2856,6 +2874,31 @@ mod tests {
             "`Series` is a name the block wrote as code — its own shape names it, \
              which is tested before the written forms, so the rule recorded is the \
              shape and not `attribute`"
+        );
+    }
+
+    /// [VANTA-WHY] §1.6.7 — the extraction the report prints must be what the issue
+    /// *named as a file*, not every word the path signal matches against. The whole
+    /// of `issue_tokens` reaches a basename in some directory; the §1.6.7 table is
+    /// read for the paths a reporter actually wrote.
+    #[test]
+    fn the_path_extraction_keeps_only_tokens_shaped_like_a_file() {
+        let issue = "On the latest version of pandas, pdt.is_string_dtype(s) raises.\n\
+                     See pandas/core/dtypes/common.py and app.py for the details.\n";
+
+        let paths = issue_path_tokens(issue);
+
+        assert_eq!(
+            paths,
+            ["app.py", "pandas/core/dtypes/common.py"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>(),
+            "only the tokens carrying a `/` or a source extension are paths: got {paths:?}"
+        );
+        assert!(
+            !paths.contains("pandas"),
+            "the bare package name is a word of the prose, not a path the report named"
         );
     }
 

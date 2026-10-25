@@ -192,6 +192,81 @@ def rank_of(payload: object) -> int:
 
 
 @dataclass
+class IssueSignals:
+    """What the selector read **out of the issue text**, per signal (§1.6.7).
+
+    [VANTA-WHY] ``selected_files`` records what the reading *reached*; this records
+    what it *found*. Those are different questions and a ranking audit needs both:
+    "`pandas/__init__.py` ranked first" is a fact about the selection, and "the
+    report named `is_string_dtype`, and no token of it is path-shaped" is a fact
+    about the reading. Without this block a reader cannot tell a text that named
+    nothing from a text that named three paths none of which the ranking could
+    reach.
+
+    Tolerant on read for the same reason as :func:`rules_of`: nothing acts on it,
+    so a report written before the selector recorded it stays readable. The empty
+    instance is the honest answer for such a report — it says no extraction was
+    recorded, not that the extraction found nothing.
+    """
+
+    #: The issue's path-shaped tokens — what it named as a file (§1.6.7).
+    paths: list[str] = field(default_factory=list)
+    #: The file paths a traceback inside the issue names.
+    traceback_files: list[str] = field(default_factory=list)
+    #: The names the issue writes as code, each with the rule that made it one.
+    #: ``(name, rule)``, in name order. The BM25 fallback's query is exactly these
+    #: names — the selector's ``issue_code_tokens`` is their keys — so the query is
+    #: recorded once, beside the rule that made each name code.
+    identifiers: list[tuple[str, str]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "paths": list(self.paths),
+            "traceback_files": list(self.traceback_files),
+            "identifiers": [
+                {"name": name, "rule": rule} for name, rule in self.identifiers
+            ],
+        }
+
+
+def signals_of(payload: object) -> Optional[IssueSignals]:
+    """``payload["signals"]`` — the extraction (§1.6.7) — or ``None`` when absent.
+
+    The third tolerant field of this module, and deliberately so: like ``rules``
+    and ``rank`` it is recorded for readers and nothing acts on it, so a
+    ``context_report.json`` written before the selector recorded the extraction
+    does not become unreadable. A malformed ``identifiers`` entry is dropped rather
+    than raising, because a *display* field is not worth failing a batch over.
+
+    ``None`` — never an empty instance — for a report that does not carry the
+    block: "the extraction found nothing" and "no extraction was recorded" are two
+    different findings, and pooling them would let a report written before §1.6.7
+    read as a text that named nothing. That is the same distinction
+    :func:`rank_of` draws with ``0``.
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    signals = payload.get("signals")
+    if not isinstance(signals, Mapping):
+        return None
+    identifiers: list[tuple[str, str]] = []
+    for entry in signals.get("identifiers") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        name = entry.get("name")
+        rule = entry.get("rule")
+        if isinstance(name, str) and isinstance(rule, str) and name:
+            identifiers.append((name, rule))
+    return IssueSignals(
+        paths=[str(item) for item in (signals.get("paths") or []) if item],
+        traceback_files=[
+            str(item) for item in (signals.get("traceback_files") or []) if item
+        ],
+        identifiers=identifiers,
+    )
+
+
+@dataclass
 class Selection:
     """``vanta_m3 --select-context --json``'s answer, field for field.
 
@@ -217,6 +292,10 @@ class Selection:
     tree_tokens: int = 0
     dropped_for_budget: list[str] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    #: §1.6.7 — what the reading found in the issue text, per signal. Report only.
+    #: ``None`` means the report did not record it (written before §1.6.7), which is
+    #: not the same finding as an extraction that found nothing.
+    signals: Optional[IssueSignals] = None
     issue_tokens: int = 0
     prompt_frame_tokens: int = 0
     prompt_tokens_estimate: int = 0
@@ -237,6 +316,7 @@ class Selection:
             "tree_tokens": self.tree_tokens,
             "dropped_for_budget": list(self.dropped_for_budget),
             "skipped": [{"path": path, "reason": reason} for path, reason in self.skipped],
+            "signals": self.signals.to_dict() if self.signals else None,
             "issue_tokens": self.issue_tokens,
             "prompt_frame_tokens": self.prompt_frame_tokens,
             "prompt_tokens_estimate": self.prompt_tokens_estimate,
@@ -287,6 +367,10 @@ class Selection:
                 )
                 for item in skipped
             ],
+            # Report only (§1.6.7): tolerant, like `rules`/`rank`, because nothing
+            # acts on it and a report written before the extraction was recorded is
+            # still one a reader can open.
+            signals=signals_of(payload),
             issue_tokens=int(field_of(payload, "issue_tokens", owner=owner, where=where)),
             prompt_frame_tokens=int(
                 field_of(payload, "prompt_frame_tokens", owner=owner, where=where)

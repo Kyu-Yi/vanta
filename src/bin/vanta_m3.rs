@@ -279,6 +279,34 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
 // ============================================================================
 // `--select-context` — select, then print; never a pipeline
 // ============================================================================
+/// What the selector read OUT of the issue text, per signal (§1.6.7).
+///
+/// [VANTA-WHY] The report says which files the ranking *reached* and never a word
+/// about what the reading found. That is the difference between "the ranking put
+/// `pandas/core/dtypes/common.py` first" and "the issue named `is_string_dtype` and
+/// `common.py` defines it" — and a reader auditing a ranking needs the second. Each
+/// field is one signal's extraction, taken from the same readers the selection
+/// itself uses, so the record cannot describe a reading the selection did not make.
+///
+/// The `bm25` fallback's query is `identifiers`' names: `issue_code_tokens` is
+/// `issue_identifiers(..).into_keys()`, so the code-shaped tokens are recorded once,
+/// beside the rule that made each one code.
+#[derive(serde::Serialize)]
+struct IssueSignals {
+    /// The path-shaped tokens of the issue (§1.6.7) — what it named as a file.
+    paths: Vec<String>,
+    /// The file paths a traceback inside the issue names.
+    traceback_files: Vec<String>,
+    /// The names the issue writes as code, each with the rule that made it one.
+    identifiers: Vec<IdentifierSignal>,
+}
+
+#[derive(serde::Serialize)]
+struct IdentifierSignal {
+    name: String,
+    rule: &'static str,
+}
+
 /// The JSON artifact the harness's context gate reads.
 ///
 /// [VANTA-WHY] `fits` is computed HERE, from the same constants the run's guard
@@ -305,6 +333,8 @@ struct SelectContextReport<'a> {
     tree_tokens: u32,
     dropped_for_budget: &'a [String],
     skipped: &'a [vanta::context::SkipRecord],
+    /// What the reading found, per signal (§1.6.7) — not what it reached.
+    signals: IssueSignals,
     issue_tokens: u32,
     prompt_frame_tokens: u32,
     prompt_tokens_estimate: u32,
@@ -353,6 +383,22 @@ fn run_select_context(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + S
 
     let issue_tokens = context::estimate_tokens(issue_text.len());
     let prompt_tokens_estimate = context::prompt_tokens_estimate(&selection, issue_tokens);
+    // The extraction itself, from the selector's own readers (§1.6.7): the same
+    // functions the ranking matches with, so the record cannot describe a reading
+    // the selection did not make.
+    let signals = IssueSignals {
+        paths: context::issue_path_tokens(&issue_text).into_iter().collect(),
+        traceback_files: context::issue_traceback_files(&issue_text)
+            .into_iter()
+            .collect(),
+        identifiers: context::issue_identifiers(&issue_text)
+            .into_iter()
+            .map(|(name, rule)| IdentifierSignal {
+                name,
+                rule: rule.as_str(),
+            })
+            .collect(),
+    };
     let report = SelectContextReport {
         role: &selection.role,
         mode: &selection.mode,
@@ -367,6 +413,7 @@ fn run_select_context(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + S
         tree_tokens: selection.tree_tokens,
         dropped_for_budget: &selection.dropped_for_budget,
         skipped: &selection.skipped,
+        signals,
         issue_tokens,
         prompt_frame_tokens: context::PROMPT_FRAME_TOKENS,
         prompt_tokens_estimate,

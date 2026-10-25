@@ -1818,6 +1818,81 @@ class TestRenderContextSizes:
         assert "VANTA_LLM_CONTEXT_TOKENS" in text
 
 
+class TestRenderSignals:
+    """``signals.md`` prints the extraction beside the ranking (§1.6.7).
+
+    The report carried the ranking alone, so a thin selection had two causes a
+    reader could not tell apart: a text that names nothing, and a text that names
+    things no candidate defines. These tests hold the table to printing both.
+    """
+
+    @staticmethod
+    def _verdict(**over):
+        return ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=131_072, n_ctx_source="test",
+            selection=selection(**over),
+        )
+
+    def test_the_table_prints_the_extraction_and_the_top_of_the_ranking(self):
+        verdict = self._verdict(
+            signals=ctx.IssueSignals(
+                paths=["pkg/core.py"],
+                traceback_files=["pkg/frame.py"],
+                identifiers=[("is_string_dtype", "snake")],
+            )
+        )
+
+        text = prepare_mod.render_signals([prep(context=verdict)])
+
+        assert "| `path` (400) | `pkg/core.py` |" in text
+        assert "| `traceback` (300) | `pkg/frame.py` |" in text
+        assert "1 name(s): `is_string_dtype` (snake)" in text
+        assert "| `bm25` (1–40) | the 1 name(s) above" in text
+        assert (
+            "| 1 | 42 | full | `pkg/core.py` | `path:exact` + `traceback:basename` |"
+            in text
+        )
+
+    def test_a_reading_that_found_nothing_is_not_a_reading_that_was_not_recorded(self):
+        """§1.6.7 — the same distinction §1.6.9's ``rank == 0`` draws: a report that
+        predates the extraction must not read as a text that named nothing."""
+        recorded = prepare_mod.render_signals(
+            [prep(context=self._verdict(signals=ctx.IssueSignals()))]
+        )
+        absent = prepare_mod.render_signals([prep(context=self._verdict())])
+
+        assert "— none —" in recorded
+        assert "not recorded" in absent
+        assert "not recorded" not in recorded
+
+    def test_a_bug_that_was_never_measured_prints_its_reason(self):
+        text = prepare_mod.render_signals([prep(gate_failures=["boom"])])
+
+        assert "not measured" in text
+        assert "boom" in text
+
+    def test_only_the_top_ten_ranked_files_are_printed(self):
+        files = [
+            ctx.SelectedFile(
+                path=f"pkg/f{index:02d}.py",
+                score=200 - index,
+                reasons=["identifier"],
+                rules={"identifier": "snake"},
+                bytes=10,
+                tokens=3,
+                shown="full",
+                rank=index + 1,
+            )
+            for index in range(12)
+        ]
+
+        text = prepare_mod.render_signals([prep(context=self._verdict(files=files))])
+
+        assert "top 10 of 12 by score" in text
+        assert "`pkg/f09.py`" in text
+        assert "`pkg/f10.py`" not in text
+
+
 class TestSelectMeasureOnly:
     """``--measure-only`` is how the pilot set becomes a measured choice (§8)."""
 
@@ -2194,6 +2269,11 @@ class TestSelectContext:
         "tree_tokens": 10,
         "dropped_for_budget": ["pkg/huge.py"],
         "skipped": [{"path": "vendor/x.py", "reason": "vendored"}],
+        "signals": {
+            "paths": ["pkg/core.py"],
+            "traceback_files": ["pkg/other.py"],
+            "identifiers": [{"name": "is_string_dtype", "rule": "snake"}],
+        },
         "issue_tokens": 50,
         "prompt_frame_tokens": 3_000,
         "prompt_tokens_estimate": 3_225,
@@ -2223,6 +2303,10 @@ class TestSelectContext:
         assert got.files[0].rank == 1
         assert got.skipped == [("vendor/x.py", "vendored")]
         assert got.dropped_for_budget == ["pkg/huge.py"]
+        assert got.signals is not None
+        assert got.signals.paths == ["pkg/core.py"]
+        assert got.signals.traceback_files == ["pkg/other.py"]
+        assert got.signals.identifiers == [("is_string_dtype", "snake")]
         assert got.tree_count == 3
         assert got.grounded is True
         assert got.prompt_tokens_estimate == 3_225
@@ -2247,6 +2331,41 @@ class TestSelectContext:
         assert got.files[0].rules == {}
         assert got.files[0].rank == 0
         assert got.files[0].shown == "path"
+
+    def test_a_report_written_before_the_signals_field_reads_as_not_recorded(
+        self, tmp_path
+    ):
+        """§1.6.7 — ``signals`` is recorded for readers and nothing acts on it, so a
+        selection written before the extraction was recorded is still one the gate
+        judges. It reads as ``None``, never as an empty extraction: "the reading
+        found nothing" and "no reading was recorded" are different findings, and
+        pooling them would let an old report read as a text that named nothing."""
+        payload = json.loads(json.dumps(self.PAYLOAD))
+        del payload["signals"]
+        binary = stub_vanta(
+            tmp_path / "vanta_m3",
+            f"import sys\nsys.stdout.write({json.dumps(payload)!r})\n",
+        )
+
+        got = ctx.select_context(tmp_path, "x", vanta_bin=binary, budget_tokens=65_280)
+
+        assert got.signals is None
+
+    def test_the_signals_round_trip_through_the_wire_format(self):
+        """``Selection.to_dict``/``from_dict`` are a round trip for the extraction
+        too — the record the batch writes is the one the ``signals.md`` printer
+        reads back (§1.6.7)."""
+        original = selection(
+            signals=ctx.IssueSignals(
+                paths=["pkg/core.py"],
+                traceback_files=["pkg/frame.py"],
+                identifiers=[("is_string_dtype", "snake"), ("Series", "camel")],
+            )
+        )
+
+        got = ctx.Selection.from_dict(original.to_dict(), where="round trip")
+
+        assert got.signals == original.signals
 
     def test_it_passes_exactly_a_real_runs_inputs_and_nothing_else(self, tmp_path):
         """The leak guard, on the Python half.

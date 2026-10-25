@@ -769,6 +769,163 @@ fix commit message, and for most of these bugs it names no path, no frame and no
 fallback does not create localization out of a text that carries none — it stops pretending there is
 some. §1.6.7 prints exactly what the selector extracts from those texts.
 
+#### 1.6.7 What the reading extracts, and the top of what it reaches
+
+§1.6.6 refused the fallback and left one question open: a thin selection has two causes — the text names
+nothing, or it names something no candidate defines — and the report carried only the ranking, so a
+reader could not tell them apart. `signals.md` is the answer, and this section is what it contains.
+
+**The extraction is recorded beside the selection.** `--select-context --json` carries `signals`, built
+from the selector's own readers — so the report cannot describe a reading the ranking did not make:
+
+- **`paths`** — `issue_path_tokens`: the tokens of `issue_tokens` that carry a `/` or a source extension.
+  [VANTA-WHY] `issue_tokens` is every word the `path` and `traceback` signals match against, and it is
+  mostly prose — `matplotlib/1`'s text contains `figure`, `the` and `version`, and matching those against
+  a path is what the *rules* are for, not what the *extraction* is. This reader is the narrower set, so
+  the table can print what the issue named as a file rather than hundreds of words that happened to reach
+  a basename. It is reporting only: nothing ranks with it, and the signals still match against the whole
+  of `issue_tokens`.
+- **`traceback_files`** — the file paths a traceback inside the issue names (`issue_traceback_files`),
+  the input the `traceback` signal's `frame` rule reads.
+- **`identifiers`** — every name the issue writes *as code*, each with the rule that made it one
+  (`issue_identifiers`: `snake`, `camel`, `attribute`, `call`, `backtick`, `digit`). The rule travels
+  with the name because the name alone does not say why it qualified.
+
+`prepare` writes the block into `context_report.json` as `issue_signals` (§1.6.4) and renders it into
+`signals.md`: per bug the signals in weight order, above the top `SIGNALS_TOP_N = 10` files with rank,
+score, form, path and `reason:rule`.
+
+[VANTA-WHY] **Nothing ranks with it.** `signals` is a view of a selection that was already made — the
+same property, for the same reason, that §1.6.5's audit is offline — so it cannot become a term the
+ranking optimises, and it is never fed back. It is read tolerantly like `rules` and `rank`: a
+`context_report.json` written before the field existed reads as `None`, never as an empty extraction,
+because "the text named nothing" and "no reading was recorded" are different findings.
+
+**What the six dev texts extract** (n_ctx 262144, budget 163584 tok, `runs/bugsinpy/measure-dev-5`):
+
+| bug | gated text | `path` (400) | `traceback` (300) | `identifier` (120–200) |
+|---|---|---|---|---|
+| `fastapi/1` | 169 B, 43 tok | `github.com/…/pull/1166` | — none — | 3: `Documented` (camel), `These` (camel), `com` (attribute) |
+| `luigi/1` | *not measured* — excluded before the precheck, `issue_source=none` (§2.4) | | | |
+| `matplotlib/1` | 1994 B, 499 tok | `tmp/image.png`, two `user-images…png`, `x_size/100`, `y_size/100` | — none — | 48 |
+| `pandas/1` | 2127 B, 532 tok | — none — | — none — | 30 |
+| `sanic/1` | 2746 B, 687 tok | the `blob` URL of `sanic/app.py`, the issue URL, the PR URL | — none — | 49 |
+| `PySnooper/3` | 234 B, 59 tok | the `blob` URL of `pysnooper/pysnooper.py` | — none — | 8 |
+
+**And the top ten of each selection**, as `signals.md` prints it. `why` is `reason:rule` per §1.6.4; a
+bare reason means the file's rules were not recorded, never a placeholder.
+
+`fastapi/1` — 11 files, estimate 17066 of 163584 tok, `bm25` alone, nothing dropped:
+
+| rank | score | form | file | why |
+|---|---|---|---|---|
+| 1 | 40 | full | `docs_src/advanced_middleware/tutorial002.py` | `bm25:bm25` |
+| 2 | 39 | full | `docs_src/cors/tutorial001.py` | `bm25:bm25` |
+| 3 | 35 | full | `docs_src/custom_response/tutorial006.py` | `bm25:bm25` |
+| 4 | 27 | full | `docs_src/extending_openapi/tutorial001.py` | `bm25:bm25` |
+| 5 | 27 | full | `docs_src/security/tutorial002.py` | `bm25:bm25` |
+| 6 | 25 | full | `docs_src/security/tutorial003.py` | `bm25:bm25` |
+| 7 | 22 | full | `fastapi/openapi/docs.py` | `bm25:bm25` |
+| 8 | 20 | full | `scripts/gitter_releases_bot.py` | `bm25:bm25` |
+| 9 | 17 | full | `docs_src/security/tutorial005.py` | `bm25:bm25` |
+| 10 | 12 | full | `docs_src/security/tutorial004.py` | `bm25:bm25` |
+
+`matplotlib/1` — 32 files, estimate 163575 of 163584 tok, **165 dropped**, `identifier` alone:
+
+| rank | score | form | file | why |
+|---|---|---|---|---|
+| 1 | 200 | full | `lib/matplotlib/__init__.py` | `identifier:snake` |
+| 2 | 200 | outline | `lib/matplotlib/axes/_base.py` | `identifier:snake` |
+| 3 | 200 | outline | `lib/matplotlib/figure.py` | `identifier:snake` |
+| 4 | 200 | full | `setupext.py` | `identifier:camel` |
+| 5 | 191 | outline | `lib/mpl_toolkits/mplot3d/axes3d.py` | `identifier:snake` |
+| 6 | 186 | full | `lib/matplotlib/artist.py` | `identifier:snake` |
+| 7 | 186 | outline | `lib/matplotlib/axes/_axes.py` | `identifier:camel` |
+| 8 | 186 | full | `lib/matplotlib/backend_managers.py` | `identifier:attribute` |
+| 9 | 186 | full | `lib/matplotlib/backend_tools.py` | `identifier:attribute` |
+| 10 | 186 | outline | `lib/matplotlib/pyplot.py` | `identifier:attribute` |
+
+`pandas/1` — 167 files, estimate 163560 of 163584 tok, **81 dropped**, `identifier` then `import-neighbour`:
+
+| rank | score | form | file | why |
+|---|---|---|---|---|
+| 1 | 200 | full | `pandas/core/dtypes/common.py` | `identifier:snake` |
+| 2 | 200 | outline | `pandas/core/series.py` | `identifier:camel` |
+| 3 | 200 | full | `pandas/io/s3.py` | `identifier:digit` |
+| 4 | 200 | full | `pandas/tests/io/test_gbq.py` | `identifier:snake` |
+| 5 | 200 | full | `pandas/util/_print_versions.py` | `identifier:snake` |
+| 6 | 191 | full | `pandas/io/formats/style.py` | `identifier:digit` |
+| 7 | 191 | full | `pandas/tests/io/formats/test_style.py` | `identifier:digit` |
+| 8 | 100 | full | `pandas/__init__.py` | `import-neighbour:import` |
+| 9 | 100 | full | `pandas/_config/__init__.py` | `import-neighbour:import` |
+| 10 | 100 | full | `pandas/_libs/__init__.py` | `import-neighbour:import` |
+
+`sanic/1` — 29 files, estimate 70098 of 163584 tok, nothing dropped:
+
+| rank | score | form | file | why |
+|---|---|---|---|---|
+| 1 | 600 | full | `sanic/app.py` | `path:blob-url` + `identifier:camel` |
+| 2 | 600 | full | `sanic/response.py` | `path:module` + `identifier:call` |
+| 3 | 200 | full | `sanic/blueprints.py` | `identifier:camel` |
+| 4 | 187 | full | `sanic/handlers.py` | `identifier:attribute` |
+| 5 | 187 | full | `sanic/worker.py` | `identifier:attribute` |
+| 6 | 179 | full | `sanic/blueprint_group.py` | `identifier:attribute` |
+| 7–10 | 100 | full | `sanic/__init__.py`, `sanic/asgi.py`, `sanic/compat.py`, `sanic/config.py` | `import-neighbour:import` |
+
+`PySnooper/3` — 6 files, estimate 6106 of 163584 tok, nothing dropped:
+
+| rank | score | form | file | why |
+|---|---|---|---|---|
+| 1 | 400 | full | `pysnooper/pysnooper.py` | `path:blob-url` |
+| 2–5 | 100 | full | `pysnooper/__init__.py`, `pysnooper/pycompat.py`, `pysnooper/tracer.py`, `pysnooper/utils.py` | `import-neighbour:import` |
+| 6 | 40 | full | `setup.py` | `bm25:bm25` |
+
+**Which tree these numbers are from.** Both are the batch's own: `--measure-only` records the *early*
+precheck, which `prepare` runs against `oracle_tree` to avoid three suite runs on a bug that cannot fit
+anyway, and a full `prepare` replaces it with `vanta_tree` — the same source with the hidden tests
+stripped (§1.6.9), so never larger. A `signals.md` written by a full prepare is therefore the smaller of
+the two readings.
+
+**What the tables show.** Read as a set, five findings:
+
+- **Item 2's fix is visible and the ranking is right where the text is informative.** `pandas/1`'s `#1`
+  is `pandas/core/dtypes/common.py`, the file that *defines* the backticked `is_string_dtype`;
+  `pandas/__init__.py` fell from `#1` to `#8`, behind seven scored files, and arrives at all only as an
+  import neighbour. `sanic/1`'s `#1` is `sanic/app.py` at 600 (`path:blob-url` + `identifier:camel`),
+  `PySnooper/3`'s `#1` is `pysnooper/pysnooper.py` at 400, both `#1` by two independent signals.
+- **`fastapi/1` is the section's first named case, and it is worse than "names no definition": its gated
+  text names nothing at all.** The frozen text is 169 B and its whole body is a PR link plus two
+  `[redacted]` markers — the leak gate's own record strips two names,
+  `response_model_exclude_none` and `response_model_exclude_defaults`, at 71 and 70 occurrences in the
+  answer and **0** in the tree Vanta may read — so the only names the extraction finds are
+  `Documented`, `These` and `com`. The whole selection is therefore `bm25`'s (§1.6.2
+  item 3), and it reaches FastAPI's *tutorial scripts* — this is the case BM25 exists for, and it is the
+  case where a retrieval baseline is the only signal a benchmark's own text can support.
+- **Two of the five selections are refused, and not for size.** `matplotlib/1` (165) and `pandas/1` (81)
+  are refused as `selection_dropped_for_budget`: `est ≤ budget` holds for both — item 1's overshoot is
+  gone, 167098 → 163560 on `pandas/1` — but the ranking chose more files than the budget takes even as
+  paths, and §1.6.9 makes a drop a drop rather than a silent truncation. The refusal is the gate saying
+  "the run would be shown a smaller context than the ranking decided on", which is true and is the point
+  of the ladder; it is also the honest reason those two bugs are still not runnable, and it is the
+  first thing a reader of this table should see.
+- **The `camel` rule fires on English prose.** `matplotlib/1`'s 48 names include `Actual`, `However`,
+  `Operating`, `Produced`; `sanic/1`'s 49 include `Additional`, `Describe`, `See`, `There`. That is not a
+  bug in the extraction (a capitalized word is camel-shaped by the only rule that can be applied without
+  a symbol table) — it is exactly why §1.6.2 item 2c weights identifier matches by rarity across the
+  repo: `However` matches a file that contains it and scores with it, and combinations against
+  `add_axes`/`set_visible` are what put `lib/matplotlib/*` on top.
+- **A URL is path-shaped.** Every `path` reading above except `pandas/1`'s (none) is a URL, because a URL
+  carries `/`. That is the extraction being deliberately looser than the matching: the `path` signal
+  applies five rules to those tokens, and `blob-url` is the one that reads a GitHub blob link as the file
+  it points at. The `rule` column is what reconciles the two readings, which is why §1.6.4 records it and
+  why `signals.md` prints it beside the reason.
+- **`docs_src` is paratext this repo's list does not have.** `fastapi/1`'s BM25 top ten is nine
+  `docs_src/**` paths and one `scripts/**` path, all in **full** — `PARATEXT_DIRECTORIES` (§1.6.8) holds
+  `docs`, `doc`, `examples`, `benchmarks` and their kin, and `docs_src/` is neither, so §1.6.8's
+  extension-and-paratext test lets a tutorial's source through as a body. Worth stating where it is
+  visible rather than inferred: the path-only rule is only as good as that list, and `docs_src` is one
+  entry a real repository disagrees with it about.
+
 #### 1.6.8 What a file's body may be
 
 §1.6.6 removed the reason that meant "this file is in the tree". What it left is still too broad: a file

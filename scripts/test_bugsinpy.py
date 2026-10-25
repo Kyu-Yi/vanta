@@ -2489,6 +2489,36 @@ class TestLeakGate:
         assert "hidden_helper.py" not in result.text
         assert "4096" not in result.text
 
+    def test_a_reporter_code_block_and_traceback_survive_the_gate(self):
+        """§2.4 item 3: what the reporter wrote is the report, not sanitising to do.
+
+        The traceback and the fenced block are exactly what the selector's traceback and
+        path signals read, so a gate that removed them would delete the only grounding a
+        real report gives — while the answer-only symbol the reporter pasted in is still
+        redacted, and the removal is recorded.
+        """
+        result = issue_mod.leak_gate(
+            "This traceback is what I get:\n"
+            "\n"
+            "```\n"
+            "Traceback (most recent call last):\n"
+            '  File "pkg/mod.py", line 3, in parse_rows\n'
+            "    return text.split('.')\n"
+            "ValueError: not enough values to unpack\n"
+            "```\n"
+            "\n"
+            "The parser should never reach parse_with_dots at all.\n",
+            answer_tokens={"parse_with_dots": 2},
+            tree_tokens={"parse_rows": 3, "pkg/mod.py": 1},
+        )
+        assert "Traceback (most recent call last)" in result.text
+        assert "```" in result.text
+        assert '"pkg/mod.py", line 3, in parse_rows' in result.text
+        assert "ValueError: not enough values to unpack" in result.text
+        assert "parse_with_dots" not in result.text
+        assert [r.token for r in result.removals] == ["parse_with_dots"]
+        assert result.removals[0].action == "stripped"
+
     def test_answer_shaped_rules(self):
         assert issue_mod.is_answer_shaped("fix_widget", "ident") is True
         assert issue_mod.is_answer_shaped("widget", "ident") is True  # six characters
@@ -3310,6 +3340,39 @@ class TestTheFreezeGatesTheText:
         )
         assert "parse_rows" in record.leak.text
         assert record.leak.removals == []
+
+    def test_the_frozen_report_keeps_the_reporters_traceback(self, tmp_path):
+        """End to end through the freeze: the reporter's own traceback and code block reach
+        the frozen text, and only the answer-only token inside them is removed (§2.4 item 3).
+        """
+        prep = self._prep(
+            tmp_path,
+            bug_patch=(
+                "diff --git a/pkg/mod.py b/pkg/mod.py\n"
+                "-\treturn text.split('.')\n"
+                "+\treturn parse_with_dots(text)\n"
+            ),
+        )
+        record = prepare_mod.freeze_gate(
+            prep,
+            "Here is the traceback:\n"
+            "\n"
+            "```\n"
+            "Traceback (most recent call last):\n"
+            '  File "pkg/mod.py", line 2, in parse_rows\n'
+            "ValueError: not enough values to unpack\n"
+            "```\n"
+            "\n"
+            "parse_with_dots should never be called for this input.\n",
+        )
+        assert "Traceback (most recent call last)" in record.leak.text
+        assert "```" in record.leak.text
+        assert '"pkg/mod.py", line 2, in parse_rows' in record.leak.text
+        assert "parse_with_dots" not in record.leak.text
+        assert [r.token for r in record.leak.removals] == ["parse_with_dots"]
+        # Recorded, not just applied: the artifact's gate section is the audit trail.
+        assert record.leak.removals[0].occurrences_in_answer > 0
+        assert record.leak.removals[0].occurrences_in_vanta_tree == 0
 
     def test_measure_only_and_full_read_the_same_frozen_issue_text(
         self, tmp_path, monkeypatch

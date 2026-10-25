@@ -104,6 +104,24 @@ pub fn estimate_tokens(bytes: usize) -> u32 {
     (whole + over) as u32
 }
 
+/// What the whole prompt costs: the selection, the issue text, and the frame
+/// around them.
+///
+/// [VANTA-WHY] One definition, because the gate's `prompt_exceeds_budget` and the
+/// run's own guard must sit on the same number, and `--select-context` is what the
+/// gate reads. The listing is **not** added here: `ContextSelection::total_tokens`
+/// is already `files + tree` (§1.6.4), so adding `tree_tokens` back — as this
+/// arithmetic used to — counted one listing twice. On the corpus's larger trees
+/// that is on the order of ten thousand tokens, which is not a rounding
+/// difference: it is a large part of the margin that decides an over-budget
+/// verdict, so it was rejecting selections that fit.
+pub fn prompt_tokens_estimate(selection: &ContextSelection, issue_tokens: u32) -> u32 {
+    selection
+        .total_tokens
+        .saturating_add(issue_tokens)
+        .saturating_add(PROMPT_FRAME_TOKENS)
+}
+
 /// `(budget, margin)` for a window: `n_ctx − output reserve − overhead − margin`,
 /// with `margin = 25 % of n_ctx` (§1.6.2).
 ///
@@ -1790,6 +1808,36 @@ mod tests {
         );
         assert_eq!(paths(&named), vec!["pkg/alpha.py"]);
         assert_eq!(named.files[0].reasons, vec![SelectionReason::Path]);
+    }
+
+    /// [VANTA-WHY] The gate's `prompt_exceeds_budget` reads this arithmetic and
+    /// nothing else, so the listing has to enter it exactly once: it travels inside
+    /// `total_tokens` (which is `files + tree`, §1.6.4), and adding `tree_tokens`
+    /// again inflated every estimate by one whole listing — enough to turn a
+    /// selection that fits into an over-budget refusal.
+    #[test]
+    fn the_prompt_estimate_counts_the_listing_exactly_once() {
+        let candidates = vec![
+            candidate("pkg/alpha.py", "def one():\n    return 1\n"),
+            candidate("pkg/beta.py", "def two():\n    return 2\n"),
+        ];
+        let selection = select_repair_context(
+            &candidates,
+            "`one` fails in pkg/alpha.py\n",
+            "creator",
+            60_000,
+        );
+
+        assert!(
+            selection.tree_tokens > 0,
+            "the fixture must have a listing for this test to mean anything"
+        );
+        assert_eq!(
+            prompt_tokens_estimate(&selection, 100),
+            selection.total_tokens + 100 + PROMPT_FRAME_TOKENS,
+            "the estimate is the selection, the issue and the frame — the listing is \
+             already in `total_tokens` and must not be counted twice"
+        );
     }
 
     /// [VANTA-WHY] §1.6.8 — the walk's extension set says which paths exist; this

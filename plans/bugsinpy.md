@@ -559,6 +559,12 @@ Each bug record now carries, alongside the counts it already had:
   (`files_bytes + tree_bytes`) for continuity with earlier reports, so the identity
   `files_bytes + tree_bytes == source_bytes` is checkable in the file itself. With these two fields a
   listing is visible as what it is: `files_bytes == 0` and `source_bytes == tree_bytes`.
+- **`prompt_tokens_estimate`** — the selection's own total plus the issue text and a fixed frame, from
+  `context::prompt_tokens_estimate`, and the only number `prompt_exceeds_budget` acts on. It is a
+  function rather than an expression in the binary because the selector's total *already* carries the
+  listing (`selected_tokens` is `files + tree`, §1.6.4), and the expression added `tree_tokens` a second
+  time: one extra listing per selection, on the corpus's larger trees on the order of ten thousand
+  tokens, which is a large part of the margin that decides an over-budget verdict.
 
 The `not_measured` record carries the same keys with nulls (and an empty `selected_files`), so a reader
 never has to branch on the schema to ask which files a bug was shown.

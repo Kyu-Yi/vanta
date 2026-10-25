@@ -346,11 +346,7 @@ fn run_select_context(cli: &CliArgs) -> Result<(), Box<dyn std::error::Error + S
     );
 
     let issue_tokens = context::estimate_tokens(issue_text.len());
-    let prompt_tokens_estimate = selection
-        .total_tokens
-        .saturating_add(selection.tree_tokens)
-        .saturating_add(issue_tokens)
-        .saturating_add(context::PROMPT_FRAME_TOKENS);
+    let prompt_tokens_estimate = context::prompt_tokens_estimate(&selection, issue_tokens);
     let report = SelectContextReport {
         role: &selection.role,
         mode: &selection.mode,

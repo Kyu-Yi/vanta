@@ -2050,6 +2050,37 @@ class TestContextReport:
         assert "Demo/2" in table
         assert "not measured" in table
 
+    def test_a_not_measured_row_prints_the_reason_it_recorded(self):
+        """The verdict column is the one thing read per bug, and the first dev prepare
+        printed ``not measured`` for all eleven bugs with no cause beside any of them:
+        the reasons were recorded, and printed in the summary's bullet list, but never
+        next to the row they belonged to. ``fastapi/1`` was refused on its content hash
+        exactly like the other four, and the table read as if it had never been reached.
+        """
+        table = prepare_mod.render_context_table(
+            [
+                prep(gate_failures=[f"{prepare_mod.FROZEN_ISSUE_REASON}: refused"]),
+                prep(bug=bug_info(bug_id=2)),
+            ]
+        )
+        assert "not measured: frozen issue report: refused" in table
+
+    def test_every_not_measured_row_prints_a_reason(self):
+        """No row may say ``not measured`` and nothing else — including the row of a bug
+        whose gate recorded no failure at all, which is a defect in ``prepare`` and is
+        named as one rather than left blank."""
+        table = prepare_mod.render_context_table([prep(bug=bug_info(bug_id=2))])
+        row = next(line for line in table.splitlines() if "Demo/2" in line)
+        assert row.rstrip().endswith(f"not measured: {prepare_mod.NO_MEASUREMENT_REASON}")
+
+    def test_a_not_measured_bug_with_no_reason_still_records_one(self, tmp_path):
+        report = json.loads(
+            prepare_mod.write_context_report(
+                tmp_path, [prep()]
+            ).read_text(encoding="utf-8")
+        )
+        assert report["bugs"][0]["reasons"] == [prepare_mod.NO_MEASUREMENT_REASON]
+
     def test_the_report_records_the_window_the_batch_was_sized_against(self, tmp_path):
         """The caller-resolved window wins over the per-verdict one: it is the one
         number ``run`` compares its own against (§1.6.1)."""

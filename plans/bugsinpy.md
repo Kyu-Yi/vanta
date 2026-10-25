@@ -187,6 +187,18 @@ context guard — *after* a checkpoint has been baked and a wave has been schedu
    it in), `budget_tokens`, `verdict`, `source_bytes` and `file_count`, plus the reasons for a
    rejection. Its top level carries the batch's `n_ctx` / `n_ctx_source` (the window the gate was
    sized against — §1.6.1), and `prepare` prints the same numbers as a table on stdout.
+   **A bug with no measurement prints its reason beside the verdict, in the table and in the JSON,
+   and both are never empty.** `not measured` is `context is None`, which every early return in
+   `prepare_one` produces, and each of those has already recorded why in `gate_failures` — a refused
+   frozen report, a missing `github_url`, a bug with no report to send, a metadata mismatch. The
+   first dev prepare printed the verdict for all eleven bugs and the cause of none of them beside a
+   row, so `fastapi/1`'s refusal — one of five, in the same words as the other four — was visible
+   only in the summary's bullet list, three tables above the row, and the row itself read as if the
+   bug had never been reached. The reason column is not decoration: "failed a gate" and "never got
+   to" license different responses, and a table that cannot tell them apart makes a batch look empty
+   for the wrong reason. A row with no recorded failure prints `NO_MEASUREMENT_REASON`, which says
+   the reason was lost in `prepare` itself and names that as the defect — an empty `reasons` list in
+   `context_report.json` is the same hole, so it is filled the same way.
 4. **`plans/bugsinpy_split.json` is an input and is never written by a stage.** Measurements live in
    the batch directory (`context_report.json`, `prepare.json`); the split only changes through a
    deliberate edit that is reviewed. A stage that rewrites the split turns a measurement into a

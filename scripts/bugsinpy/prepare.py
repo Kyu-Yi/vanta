@@ -126,6 +126,22 @@ because "this bug was never a candidate" and "this bug failed a gate" are differ
 about the same file."""
 
 
+NO_MEASUREMENT_REASON = (
+    "no reason recorded. A bug reaches the table as `not measured` only through an early "
+    "return in prepare_one, and every one of those records a gate failure: to have none is "
+    "to have returned without saying why, which is a defect in prepare itself and never a "
+    "property of the bug."
+)
+"""[VANTA-WHY] ``not measured`` is the table's word for ``context is None``, and the first
+dev prepare printed it for all eleven bugs while naming the cause of none of them — the
+reasons were there, in the summary's bullet list, and nowhere beside the row they belonged
+to, so ``fastapi/1``'s refusal looked exactly like a bug the run never reached. The reason
+is always already recorded (:attr:`BugPrep.gate_failures`), so the table prints it. This
+fallback is the one case that would otherwise print nothing, and it is deliberately about
+*prepare* and not about the bug: a silent ``not measured`` is a hole in the record, and the
+honest reading of an empty ``gate_failures`` is that the code lost the reason."""
+
+
 @dataclass(frozen=True)
 class IssueSources:
     """Where the frozen issue reports live, and where the API responses are cached.
@@ -246,6 +262,23 @@ class BugPrep:
             if failure.startswith(NO_ISSUE_SOURCE_REASON):
                 return failure
         return "no issue report to send"
+
+    @property
+    def not_measured_reason(self) -> str:
+        """Why this bug has no context measurement — what the table prints after it.
+
+        [VANTA-WHY] The table says ``not measured`` when :attr:`context` is ``None``, and
+        every path that leaves it ``None`` is an early return in :func:`prepare_one` that
+        has already recorded why. Printing the verdict without the reason is how eleven
+        bugs came back ``not measured`` with no cause visible beside any of them —
+        ``fastapi/1``'s refusal among them, in the same words as the other four. A bug can
+        only arrive here without a reason if a return in :func:`prepare_one` forgot to
+        record one, which is a defect in this module, so the fallback names it as such
+        rather than leaving the column blank.
+        """
+        if self.gate_failures:
+            return "; ".join(self.gate_failures)
+        return NO_MEASUREMENT_REASON
 
     def to_dict(self) -> dict[str, Any]:
         """The writer for :meth:`from_dict`, and the only shape ``prepare.json`` has.
@@ -1197,7 +1230,10 @@ def _context_record(prep: BugPrep) -> dict[str, Any]:
             "selected_files": [],
             "dropped_for_budget": [],
             "pruned_count": None,
-            "reasons": list(prep.gate_failures),
+            # Never empty for the same reason the table never prints the verdict
+            # alone: a `not_measured` row whose `reasons` is `[]` is the hole a
+            # reader cannot tell from "this bug was never reached".
+            "reasons": list(prep.gate_failures) or [prep.not_measured_reason],
         }
     selection = verdict.selection
     # The selector's `selected_bytes`/`selected_tokens` are the file bytes PLUS the
@@ -1255,7 +1291,15 @@ def _context_record(prep: BugPrep) -> dict[str, Any]:
 
 
 def render_context_table(preps: list[BugPrep]) -> str:
-    """The same numbers as ``context_report.json``, as a table on stdout."""
+    """The same numbers as ``context_report.json``, as a table on stdout.
+
+    [VANTA-WHY] ``not measured`` names the verdict and, after it, the reason
+    (:attr:`BugPrep.not_measured_reason`) — a bug whose context is unmeasured is a bug
+    that failed a gate or was excluded, and the table is the one place a reader of the
+    batch sees which. The first dev prepare printed the verdict alone for all eleven
+    bugs, so a refused frozen report and a bug with no report to send looked identical
+    to a bug that simply had not been reached yet.
+    """
     head = (
         f"{'bug':<18} {'mode':<12} {'est tok':>8} {'real tok':>9} {'budget':>7} "
         f"{'headroom':>9} {'src B':>9} {'files':>6}  verdict"
@@ -1266,7 +1310,7 @@ def render_context_table(preps: list[BugPrep]) -> str:
         if verdict is None:
             lines.append(
                 f"{prep.key:<18} {prep.prepare_mode:<12} {'—':>8} {'—':>9} {'—':>7} "
-                f"{'—':>9} {'—':>9} {'—':>6}  not measured"
+                f"{'—':>9} {'—':>9} {'—':>6}  not measured: {prep.not_measured_reason}"
             )
             continue
         lines.append(

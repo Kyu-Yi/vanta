@@ -177,6 +177,7 @@ def selection(**over) -> ctx.Selection:
                 bytes=700,
                 tokens=175,
                 shown="full",
+                rank=1,
             )
         ],
         tree_count=1,
@@ -1972,6 +1973,7 @@ class TestContextReport:
             "bytes": 700,
             "tokens": 175,
             "shown": "full",
+            "rank": 1,
         }
         assert bug["files_bytes"] == 700
         assert bug["files_tokens"] == 175
@@ -2177,9 +2179,11 @@ class TestSelectContext:
                 "path": "pkg/core.py",
                 "score": 42,
                 "reasons": ["path", "traceback"],
+                "rules": {"path": "exact", "traceback": "basename"},
                 "bytes": 700,
                 "tokens": 175,
                 "shown": "full",
+                "rank": 1,
             }
         ],
         "tree_count": 3,
@@ -2215,12 +2219,34 @@ class TestSelectContext:
         assert [file.path for file in got.files] == ["pkg/core.py"]
         assert got.files[0].reasons == ["path", "traceback"]
         assert got.files[0].shown == "full"
+        assert got.files[0].rules == {"path": "exact", "traceback": "basename"}
+        assert got.files[0].rank == 1
         assert got.skipped == [("vendor/x.py", "vendored")]
         assert got.dropped_for_budget == ["pkg/huge.py"]
         assert got.tree_count == 3
         assert got.grounded is True
         assert got.prompt_tokens_estimate == 3_225
         assert got.fits is True
+
+    def test_a_report_written_before_the_rank_and_rules_fields_still_reads(self, tmp_path):
+        """§1.6.9/§1.6.4 — `rank` and `rules` are recorded for readers of the report
+        and nothing acts on them, so a selection written before either existed is
+        still one the gate can judge: they default, they do not refuse. The `path`
+        form is likewise just a value of `shown`, read as it is written."""
+        payload = json.loads(json.dumps(self.PAYLOAD))
+        del payload["files"][0]["rules"]
+        del payload["files"][0]["rank"]
+        payload["files"][0]["shown"] = "path"
+        binary = stub_vanta(
+            tmp_path / "vanta_m3",
+            f"import sys\nsys.stdout.write({json.dumps(payload)!r})\n",
+        )
+
+        got = ctx.select_context(tmp_path, "x", vanta_bin=binary, budget_tokens=65_280)
+
+        assert got.files[0].rules == {}
+        assert got.files[0].rank == 0
+        assert got.files[0].shown == "path"
 
     def test_it_passes_exactly_a_real_runs_inputs_and_nothing_else(self, tmp_path):
         """The leak guard, on the Python half.

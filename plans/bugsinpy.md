@@ -271,8 +271,9 @@ single implementation for the run and for the gate (item 5 shells the gate out t
 2. **The caps apply only to the selected set, never before selection.** A file chosen by the ranking
    goes in **in full** where it fits the role's token budget; a file over **64 KB** goes in as an
    **outline** (signatures + docstrings, parsed line-by-line — nothing is executed) rather than being
-   skipped, so a big touched file is never silently dropped. Only a file whose *outline* still does
-   not fit is dropped, and it is recorded in `dropped_for_budget`.
+   skipped, so a big touched file is never silently dropped. A file the budget leaves no room for in
+   full is priced down the ladder to an outline, and then to its **path alone** (§1.6.9); only a file
+   that does not fit even as a path is dropped, and it is recorded in `dropped_for_budget`.
 
 3. **The budget is a token budget, computed the same way in the run and the gate**
    (`context::budget_tokens`): `n_ctx − OUTPUT_RESERVE_TOKENS(32768) − CHAT_OVERHEAD_TOKENS(256) −
@@ -282,7 +283,8 @@ single implementation for the run and for the gate (item 5 shells the gate out t
 
 4. **Fill greedily by score.** Each selected file carries its reason(s); the score is the sum of the
    reason weights, ties broken by path (so the order is total and stable). The prompt is the file
-   tree (paths only, repair mode) followed by each file in full or as an outline, in score order.
+   tree (paths only, repair mode) followed by each file in score order, each in the richest of the three
+   forms — full, outline, path — the remaining budget still allows (§1.6.9).
 
 **Review mode (item 1).** With a patch under review, the selection is, in full: the patch's own
 touched files, the modules they import at module level (one hop), and the visible test files that
@@ -569,12 +571,14 @@ Each bug record now carries, alongside the counts it already had:
   split role (`pilot`/`reserve`); the two are different questions and a report that conflated them could
   not be lined up with a run.
 - **`selected_files`** — one entry per file, in the order the prompt puts them, each with `path`,
-  `score`, `reasons`, `rules`, `bytes`, `tokens` and `shown`. `reasons` is the ranked vocabulary and is
-  what makes the ranking auditable: `patch-touched` (1000) > `path` (400) > `traceback` (300) >
+  `rank`, `score`, `reasons`, `rules`, `bytes`, `tokens` and `shown`. `reasons` is the ranked vocabulary
+  and is what makes the ranking auditable: `patch-touched` (1000) > `path` (400) > `traceback` (300) >
   `identifier` (200) > `import-neighbour` (100) > `test` (80). There is no seventh entry: §1.6.6 removed
   the `tree` reason, so every reason in the vocabulary is a signal and a `reasons` list that is empty is
-  impossible. `shown` is `full` or `outline`, so a file that only contributed its signatures is not
-  counted as if its body were in the prompt.
+  impossible. `shown` is `full`, `outline` or `path` (§1.6.9), so a file that contributed only its
+  signatures — or only its path — is not counted as if its body were in the prompt. `rank` is the file's
+  1-based place in score order, restating the array's order for a report read on its own; like `rules`
+  (§1.6.9), it is recorded for readers and nothing acts on it.
 - **`rules`** — per signal, the rule that matched it, keyed by the signal's own name in `reasons`:
   `{"path": "exact"}` or `{"identifier": "camel", "path": "blob-url"}`. A reason alone says *which*
   input named the file; it is not enough to audit one, because `path` (400) covers five rules —
@@ -761,6 +765,72 @@ class the issue names, say. That refusal is deliberate: a symbol is a name, not 
 extension rule is the thing that keeps a repo's documentation site out of a Python bug's prompt. A
 JavaScript bug would need `.js` in the project-source set; that is a corpus question, not a selector
 tweak.
+
+#### 1.6.9 The fill's ladder — whole, outline, path, and never over budget
+
+§1.6.8 decided *whether* a reached file may carry a body at all. What it did not decide is how much of
+it, and the fill had only two answers — whole or outline — with a file that fit neither silently
+dropped. That is wrong in the direction that reads least obviously: a ranking that reached a monolith
+first could spend what remained on one file's outline and drop every file below it, and the report said
+only `dropped_for_budget: [three paths]` — "the budget ran out", with no way to see that the ranking
+wanted those files and that a listing is all they got.
+
+The fill is now a ladder of three forms, richest first:
+
+- **full** — the whole source.
+- **outline** — signatures and docstrings: §1.6.8's `outline_body`, the module docstring and imports,
+  then every `def`/`class` signature with its docstring.
+- **path** — the `# FILE:` header and one marker line, and no source at all.
+
+Files are walked in score order and each takes the richest form the budget still allows. The three are
+*ordered* — `ShownMode` derives `Ord` from that order — and the fill carries one `form`: the richest form
+still available to the files below the current one. `form` only ever descends, and only the budget moves
+it:
+
+- a file that fits whole is shown whole, and `form` is untouched;
+- a file whose whole body does not fit is priced again as an outline, and from there **every file below
+  it takes an outline at best**;
+- a file whose outline does not fit is priced again as a path, and from there every file below it takes a
+  path at best;
+- a file that does not fit even as its path is **dropped**, and named in `dropped_for_budget`.
+
+So the run is shown a *prefix* of the ranking's forms, never a patchwork: one monotone boundary, which is
+what makes "the model was shown this file" a property of the ranking rather than a per-file accident.
+
+**The per-file cap is not the budget, and must not move the ladder.** A file over `MAX_FILE_BYTES`
+(64 KB) is denied its *source* by the cap — that is §1.6.2 item 6's rule, and it still holds — so it goes
+to an outline *on its own*, at whatever rank it sits. It must not push the files below it down: the
+cascade is driven by what budget *remains*, and one oversized file the budget could still afford an
+outline for is that file's own business. So the cap is applied as that file's own ceiling — the lower of
+the form the ladder would allow and the cap's answer — and `form` is left exactly where it was. A small
+helper ranked below a monolith still goes in whole; a small helper ranked below a file the budget could
+not take in full does not, because that denial *was* the budget's.
+
+**What is recorded.** Every selected file carries `rank`, `score`, `reasons`, `rules`, `bytes`, `tokens`
+and `shown` (§1.6.4), and `shown` is which of the three forms it got. `rank` is `index + 1` — a second
+statement of the array's order, recorded because the report is read on its own by analyses that sort the
+array their own way. Recording the form is what lets a later audit say a bug was *shown* a file and mean
+its source rather than its path.
+
+**The path form is a body, and it costs.** A `# FILE:` header with nothing under it reads as an *empty*
+file, and a model that believes a module is empty reasons about the bug as if its code did not exist. So
+the path form is not header-only: it is the header and one marker line saying the budget ran out before
+this file's source could be shown. It is the cheapest form, not a free one, and it is priced like any
+other — a file whose header and marker do not fit is a drop, in `dropped_for_budget`, not a silent
+omission.
+
+**A path is not content.** §1.6.10's gate asks whether the selection has any of the project's content
+grounded in the run's inputs, and a file travelling as a path has none. `ShownMode::carries_content` is
+false only for `Path`, and `grounded` consults it: a selection spent entirely on the listing and
+path-only headers is refused as `no_issue_grounded_selection`, the same refusal as a listing with no
+files. The path-only file is still a *selected* file — it is what the ranking decided, and it is
+recorded — it is simply not a body.
+
+**Where it lives.** `ShownMode` and `carries_content` sit with the record; the ladder is the body of
+`fill`; `path_only_body` is its own function for the same reason `outline_body` is — the marker is the
+whole reason the form costs anything and it should be findable. Nothing outside `fill` branches on the
+form except `grounded`, so a fourth form would be a change to the ladder and to `carries_content`, not to
+a scattered set of call sites.
 
 #### 1.6.10 The gate refuses by name, and the selector owns the name
 

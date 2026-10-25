@@ -412,12 +412,19 @@ impl SelectionRule {
     }
 }
 
-/// Whether a selected file is shown whole or as an outline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// The form a selected file is shown in: its source, its outline, or its path
+/// alone (§1.6.9).
+///
+/// The three are a ladder, and they are ordered: `Full` is the whole file,
+/// `Outline` its signatures and docstrings, `Path` its `# FILE:` header and
+/// nothing else. `Ord` is derived from that order so the fill can say "no file
+/// below this one gets a richer form than this" as one comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShownMode {
-    Full,
+    Path,
     Outline,
+    Full,
 }
 
 impl ShownMode {
@@ -425,7 +432,19 @@ impl ShownMode {
         match self {
             ShownMode::Full => "full",
             ShownMode::Outline => "outline",
+            ShownMode::Path => "path",
         }
+    }
+
+    /// Whether this form carries the file's text at all — false only for `Path`,
+    /// which is the header and nothing else (§1.6.9).
+    ///
+    /// The gate's question is whether a role has any of the project's *content*
+    /// grounded in the run's inputs, and a file that travels as a path has none
+    /// (§1.6.10). A path-only entry is a selected file all the same — it is what
+    /// the ranking decided, and it is recorded — but it is not a body.
+    pub fn carries_content(self) -> bool {
+        self != ShownMode::Path
     }
 }
 
@@ -433,18 +452,29 @@ impl ShownMode {
 #[derive(Debug, Clone, Serialize)]
 pub struct SelectedFile {
     pub path: String,
+    /// The file's 1-based rank in the selection — its place in score order
+    /// (§1.6.9).
+    ///
+    /// The array is already in that order, so this is a second statement of the
+    /// same fact; it is recorded because the report is read on its own, by
+    /// analyses that sort the list their own way, and a rank that had to be
+    /// re-derived from the array would be re-derived differently by each of them.
+    /// `rank == index + 1` is an invariant of the record, not a convention.
+    pub rank: usize,
     pub score: i64,
     pub reasons: Vec<SelectionReason>,
     /// Per signal, the rule that matched it, keyed by the reason's own name —
     /// `{"path": "exact", "identifier": "camel"}`. Same signals as `reasons`, and
     /// a key for each of them; `SelectionRule` says why the two travel apart.
     pub rules: BTreeMap<String, String>,
-    /// Bytes actually shown (the framed text's bytes when `shown == Outline`).
+    /// Bytes actually shown: the framed text's bytes, which for `Outline` and
+    /// `Path` is the outline or the header rather than the source.
     pub bytes: usize,
     pub tokens: u32,
     pub shown: ShownMode,
     /// The content shown for this file, WITHOUT the `# FILE: <path>` header: the
-    /// full source, or the outline body for a file that does not fit whole.
+    /// full source, the outline, or — for `Path` — the one-line marker that says
+    /// the file is here and its body is not (§1.6.9).
     ///
     /// [VANTA-WHY] Stored headerless so the two consumers can frame it their own
     /// way — `render()` writes the `# FILE:` header the prompt uses, and the
@@ -482,7 +512,7 @@ pub struct ContextSelection {
 
 impl ContextSelection {
     /// Whether the selection's content is grounded in the run's own inputs — the
-    /// question the gate's `no_issue_grounded_selection` asks (§1.6.10).
+    /// question the gate's `no_issue_grounded_selection` asks (§1.6.10, §1.6.9).
     ///
     /// [VANTA-WHY] The answer is computed here, from the reasons, and travels in
     /// the report, so the harness refuses a role without holding its own copy of
@@ -490,14 +520,21 @@ impl ContextSelection {
     /// body would be refused by a gate that never learned the reason's name — the
     /// same reason `context.py` shells out to this selector instead of walking a
     /// tree itself (§1.6.2 item 5).
+    ///
+    /// A file shown as a path alone is not content, so it does not ground the
+    /// selection: the question is whether the role has any of the project's *text*,
+    /// and a selection that spent its whole budget on the listing and the tail's
+    /// headers has none of it. That is the same refusal as a listing with no files
+    /// at all, which is what it is.
     pub fn grounded(&self) -> bool {
-        self.files
-            .iter()
-            .any(|file| file.reasons.iter().any(|reason| reason.grounds_content()))
+        self.files.iter().any(|file| {
+            file.shown.carries_content()
+                && file.reasons.iter().any(|reason| reason.grounds_content())
+        })
     }
 
-    /// The prompt text: the file tree (when present), then each file in full or
-    /// as an outline, in score order.
+    /// The prompt text: the file tree (when present), then each file in the form
+    /// it got — full, outline or path only — in score order.
     pub fn render(&self) -> String {
         let mut out = String::new();
         if !self.tree.is_empty() {
@@ -601,7 +638,7 @@ impl ContextSelection {
 }
 
 // ----------------------------------------------------------------------------
-// Budget fill — greedy by score, outline instead of dropping
+// Budget fill — greedy by score, three forms, never over budget
 // ----------------------------------------------------------------------------
 /// The framed bytes of one file: what `SelectedFile::framed` will write.
 fn framed_len(path: &str, body: &str) -> usize {
@@ -616,6 +653,18 @@ fn outline_body(path: &str, contents: &str) -> String {
         MAX_FILE_BYTES / 1024,
         outline_for(path, contents),
     )
+}
+
+/// The body of a file shown as its path alone (§1.6.9): one marker line, no
+/// source at all.
+///
+/// [VANTA-WHY] The marker is not decoration. A `# FILE:` header with nothing
+/// under it reads as a file that is *empty*, and a model that believes a module
+/// is empty will reason about the bug as if its code did not exist. The line says
+/// what happened — the budget ran out, not the file — and it is the whole reason
+/// the form costs anything at all.
+fn path_only_body() -> String {
+    "# [PATH ONLY — the budget ran out before this file's source could be shown]\n".to_string()
 }
 
 /// The outline for `path`, choosing the Python grammar for `.py`/`.pyi`.
@@ -1379,16 +1428,30 @@ fn blob_url_path(token: &str) -> Option<String> {
 // ----------------------------------------------------------------------------
 // The shared fill: order by score, then spend the budget
 // ----------------------------------------------------------------------------
-/// Order the ranked files by score, then spend the budget on them.
+/// Order the ranked files by score, then spend the budget on them in three forms
+/// (§1.6.9).
 ///
-/// A file that fits goes in `Full`; one over `MAX_FILE_BYTES` goes in as an
-/// `Outline`; one whose outline still does not fit is dropped and named in
-/// `dropped_for_budget`. A file the run did not name — not the project's own
-/// source, and reached only as an import neighbour or a covering test — carries no
-/// body at all (§1.6.8) and so never spends the budget. A ranking that reached no
-/// file selects no file: the tree listing alone is a list of paths, not a context,
-/// and the gate refuses it by name ("no issue-grounded selection", §1.6.2 item 5)
-/// instead of the fill inventing files to fill the prompt with (§1.6.6).
+/// The forms are a ladder: `Full` while the file's source fits, then `Outline`
+/// (signatures and docstrings) for the files below the point where it stopped
+/// fitting, then `Path` — the header and a marker, no source — for the tail. The
+/// budget is never exceeded: each form is priced before it is written, and the
+/// richest form that fits is the one taken.
+///
+/// Two distinct things can deny a file its full body, and they are not the same
+/// event. The **budget** denying it (§1.6.9's cascade) lowers the bar for every
+/// file below, so the prompt reads top to bottom as full, then outlines, then
+/// paths. The **per-file cap** (`MAX_FILE_BYTES`) denying it is that file's own
+/// property: a file over the cap is an outline, and the ranking continues as if
+/// nothing had happened, so a 1 KB helper below a 100 KB monolith still goes in
+/// whole while the budget lasts.
+///
+/// A file the run did not name — not the project's own source, and reached only as
+/// an import neighbour or a covering test — carries no body at all (§1.6.8) and so
+/// never spends the budget. A file whose very header does not fit is dropped and
+/// named in `dropped_for_budget`. A ranking that reached no file selects no file:
+/// the tree listing alone is a list of paths, not a context, and the gate refuses
+/// it by name ("no issue-grounded selection", §1.6.2 item 5) instead of the fill
+/// inventing files to fill the prompt with (§1.6.6).
 fn fill(
     mode: &str,
     role: &str,
@@ -1459,6 +1522,11 @@ fn fill(
     // run named it, so a `.js` the issue mentions does not spend the budget on
     // itself. A file refused here is not a budget drop: the budget never saw it,
     // and `dropped_for_budget` saying otherwise would report the wrong cause.
+    //
+    // `form` is the richest form still available to the files below the current
+    // one (§1.6.9). It only ever descends, and only the budget moves it: a file the
+    // per-file cap denies a full body leaves it untouched.
+    let mut form = ShownMode::Full;
     for (path, score, reasons, rules) in ranked {
         let candidate = match by_path.get(path.as_str()) {
             Some(candidate) => *candidate,
@@ -1468,37 +1536,84 @@ fn fill(
             continue;
         }
 
-        // A file over the per-file cap is shown as an outline, never dropped.
-        let fits_whole = candidate.contents.len() <= MAX_FILE_BYTES;
-        let mut body = if fits_whole {
-            candidate.contents.clone()
-        } else {
-            outline_body(&path, &candidate.contents)
-        };
-        let mut shown = if fits_whole {
-            ShownMode::Full
-        } else {
+        let over_cap = candidate.contents.len() > MAX_FILE_BYTES;
+        // The richest form the *per-file cap* allows this file. A file over
+        // `MAX_FILE_BYTES` is denied its source, but that denial is the file's own
+        // property: it never moves `form`, so a small helper ranked below a
+        // monolith still goes in whole (§1.6.9).
+        let ceiling = if over_cap {
             ShownMode::Outline
+        } else {
+            ShownMode::Full
         };
-        let mut cost = estimate_tokens(framed_len(&path, &body));
 
-        if cost > remaining && fits_whole {
-            // Even a file that would fit whole may not fit now; fall back to the
-            // outline rather than dropping it.
-            body = outline_body(&path, &candidate.contents);
-            shown = ShownMode::Outline;
-            cost = estimate_tokens(framed_len(&path, &body));
+        // Full: the whole source, while the cap allows it and the budget has room.
+        if form.min(ceiling) == ShownMode::Full {
+            let body = candidate.contents.clone();
+            let cost = estimate_tokens(framed_len(&path, &body));
+            if cost <= remaining {
+                remaining -= cost;
+                let bytes = framed_len(&path, &body);
+                total_bytes += bytes;
+                total_tokens += cost;
+                files.push(SelectedFile {
+                    rank: files.len() + 1,
+                    path,
+                    score,
+                    reasons,
+                    rules,
+                    bytes,
+                    tokens: cost,
+                    shown: ShownMode::Full,
+                    body,
+                });
+                continue;
+            }
+            // The budget, not the cap, denied this file its source: from here down
+            // the ranking carries outlines at best. The file itself is not dropped
+            // — it is priced again below, in the next form that fits.
+            form = ShownMode::Outline;
         }
 
+        // Outline: signatures and docstrings. It runs for the files the budget
+        // stopped showing whole — and, on its own, for a file the per-file cap
+        // denied a full body, in which case `form` was never moved (§1.6.9).
+        if form.min(ceiling) >= ShownMode::Outline {
+            let body = outline_body(&path, &candidate.contents);
+            let cost = estimate_tokens(framed_len(&path, &body));
+            if cost <= remaining {
+                remaining -= cost;
+                let bytes = framed_len(&path, &body);
+                total_bytes += bytes;
+                total_tokens += cost;
+                files.push(SelectedFile {
+                    rank: files.len() + 1,
+                    path,
+                    score,
+                    reasons,
+                    rules,
+                    bytes,
+                    tokens: cost,
+                    shown: ShownMode::Outline,
+                    body,
+                });
+                continue;
+            }
+            // Even the outline did not fit: the tail is paths only.
+            form = ShownMode::Path;
+        }
+
+        // Path only: the header and the marker, which is all the budget leaves.
+        let body = path_only_body();
+        let cost = estimate_tokens(framed_len(&path, &body));
         if cost > remaining {
-            // A file the ranking chose and the budget cannot take is a drop, and is
-            // recorded: the run would be shown less than the ranking decided, which
-            // is what the gate's `selection_dropped_for_budget` reads. Everything
-            // named here already travels to the model as a path in the tree
-            // listing, so a drop costs the file's *source*, never its existence —
-            // and the ranking put it this far down the list, so the loss is the
-            // tail of a budget that ran out rather than a named file being
-            // withheld (§1.6.2 item 4).
+            // A file the ranking chose and the budget cannot take *at all* is a drop,
+            // and is recorded: the run would be shown less than the ranking decided,
+            // which is what the gate's `selection_dropped_for_budget` reads. It takes
+            // a budget already spent to the last few tokens to reach this — the tree
+            // listing plus every richer form above it — and everything named here
+            // travels to the model as a path in that listing regardless, so a drop
+            // costs the file's *source*, never its existence (§1.6.2 item 4).
             dropped_for_budget.push(path);
             continue;
         }
@@ -1508,13 +1623,14 @@ fn fill(
         total_bytes += bytes;
         total_tokens += cost;
         files.push(SelectedFile {
+            rank: files.len() + 1,
             path,
             score,
             reasons,
             rules,
             bytes,
             tokens: cost,
-            shown,
+            shown: ShownMode::Path,
             body,
         });
     }
@@ -2529,6 +2645,105 @@ mod tests {
         );
         assert!(big_file.body.contains("def entry():"));
         assert!(selection.dropped_for_budget.is_empty());
+    }
+
+    /// [VANTA-WHY] §1.6.9 — the fill descends a three-form ladder as the budget
+    /// runs out: a file is shown whole while it fits, then as its outline, then as
+    /// its path alone. Once the budget has denied a file a richer form, no file
+    /// below it gets one — the run must be shown a *prefix* of the ranking's forms,
+    /// not a patchwork — and every file records which form it got, so an analysis
+    /// can tell "the model saw this file" from "the model saw its path".
+    #[test]
+    fn the_budget_fill_descends_the_form_ladder_and_the_tail_never_climbs_back() {
+        let a = "def a():\n    return 1\n";
+        // Big bodies under few definitions: the outline is far smaller than the
+        // source, which is what lets a whole body be denied while its outline fits.
+        let b = format!("def b():\n    \"\"\"Doc.\"\"\"\n{}", "    return 1\n".repeat(20));
+        let c = format!("def c():\n    \"\"\"Doc.\"\"\"\n{}", "    return 1\n".repeat(20));
+        let candidates = vec![
+            candidate("pkg/a.py", a),
+            candidate("pkg/b.py", &b),
+            candidate("pkg/c.py", &c),
+        ];
+        let issue = "pkg/a.py and pkg/b.py and pkg/c.py all matter.\n";
+
+        // The budget is exactly what the listing plus a whole `a`, an outline `b`
+        // and a path-only `c` cost, so the ladder is forced to descend and the test
+        // depends on no magic number.
+        let tree = "# REPOSITORY FILES (paths only)\n".len()
+            + "pkg/a.py\n".len()
+            + "pkg/b.py\n".len()
+            + "pkg/c.py\n".len();
+        let budget = estimate_tokens(tree)
+            + estimate_tokens(framed_len("pkg/a.py", a))
+            + estimate_tokens(framed_len("pkg/b.py", &outline_body("pkg/b.py", &b)))
+            + estimate_tokens(framed_len("pkg/c.py", &path_only_body()));
+
+        let selection = select_repair_context(&candidates, issue, "creator", budget);
+
+        assert_eq!(paths(&selection), vec!["pkg/a.py", "pkg/b.py", "pkg/c.py"]);
+        assert_eq!(selection.files[0].shown, ShownMode::Full);
+        assert_eq!(selection.files[1].shown, ShownMode::Outline);
+        assert_eq!(selection.files[2].shown, ShownMode::Path);
+
+        // Each file records its place in score order and what it cost.
+        for (index, file) in selection.files.iter().enumerate() {
+            assert_eq!(file.rank, index + 1, "rank states the position in score order");
+            assert!(file.tokens > 0);
+        }
+
+        // The path form travels as its header and the marker, and nothing else.
+        assert_eq!(selection.files[2].body, path_only_body());
+        assert!(
+            !selection.files[2].body.contains("def c():"),
+            "a path-only entry carries no source at all"
+        );
+
+        assert_eq!(
+            selection.total_bytes,
+            tree + framed_len("pkg/a.py", a)
+                + framed_len("pkg/b.py", &outline_body("pkg/b.py", &b))
+                + framed_len("pkg/c.py", &path_only_body()),
+            "the listing plus the three framed files, exactly"
+        );
+        assert_eq!(
+            selection.total_tokens, budget,
+            "the fill stops before the budget and leaves no room unused it could have spent"
+        );
+        assert!(selection.dropped_for_budget.is_empty());
+    }
+
+    /// [VANTA-WHY] §1.6.10 — the gate refuses a role whose selection has no *body*
+    /// grounded in the run's inputs. A file that travels as its path alone is a
+    /// selected file — its reason still grounds the selection — but it carries no
+    /// content, so a role shown only paths is refused exactly as a role shown only
+    /// a listing is.
+    #[test]
+    fn a_selection_of_paths_only_is_not_grounded() {
+        let d = format!("def d():\n    \"\"\"Doc.\"\"\"\n{}", "    return 1\n".repeat(20));
+        let candidates = vec![candidate("pkg/d.py", &d)];
+        let issue = "pkg/d.py is broken.\n";
+
+        // Room for the tree and the path form, and no more: the whole body and the
+        // outline are both denied.
+        let tree = "# REPOSITORY FILES (paths only)\n".len() + "pkg/d.py\n".len();
+        let budget = estimate_tokens(tree) + estimate_tokens(framed_len("pkg/d.py", &path_only_body()));
+
+        let selection = select_repair_context(&candidates, issue, "creator", budget);
+
+        assert_eq!(selection.files.len(), 1);
+        assert_eq!(selection.files[0].shown, ShownMode::Path);
+        assert!(
+            selection.files[0]
+                .reasons
+                .iter()
+                .any(|reason| reason.grounds_content()),
+            "the reason still grounds the selection; it is the form that carries no content"
+        );
+        assert!(
+            !selection.grounded(),
+            "a role shown only paths has no content grounded in the issue"
+        );
     }
 
     /// [VANTA-WHY] §1.6.2 item 6 — a budget too small even for an outline must not

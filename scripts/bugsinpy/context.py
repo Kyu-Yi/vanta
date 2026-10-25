@@ -124,6 +124,11 @@ class SelectedFile:
     #: selector recorded rules stays readable, and the audit prints the signal
     #: without its rule rather than refusing a selection it can already judge.
     rules: dict[str, str] = field(default_factory=dict)
+    #: §1.6.9 — the file's 1-based rank in the selection, its place in score order.
+    #: The array is already in that order, so this restates it; it is recorded
+    #: because a report is read on its own, by analyses that sort the list their own
+    #: way. ``0`` means the report did not record one (written before §1.6.9).
+    rank: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -134,6 +139,7 @@ class SelectedFile:
             "bytes": self.bytes,
             "tokens": self.tokens,
             "shown": self.shown,
+            "rank": self.rank,
         }
 
     @classmethod
@@ -147,17 +153,18 @@ class SelectedFile:
             bytes=int(field_of(payload, "bytes", owner=owner, where=where)),
             tokens=int(field_of(payload, "tokens", owner=owner, where=where)),
             shown=str(field_of(payload, "shown", owner=owner, where=where)),
+            rank=rank_of(payload),
         )
 
 
 def rules_of(payload: object) -> dict[str, str]:
     """``payload["rules"]`` as ``{signal: rule}``, or ``{}`` when it is absent.
 
-    The one tolerant field of this record, and deliberately so: §1.6.4 added it so
-    the ranking audit can say why a file ranked, nothing acts on it, and a report
-    written before the selector recorded rules is still one the audit can read.
-    Everything else here goes through :func:`field_of`, because everything else is
-    a number the gate decides on.
+    One of the two tolerant fields of this record, and deliberately so: §1.6.4
+    added it so the ranking audit can say why a file ranked, nothing acts on it,
+    and a report written before the selector recorded rules is still one the audit
+    can read. Everything else here goes through :func:`field_of`, because everything
+    else is a number the gate decides on.
     """
     if not isinstance(payload, Mapping):
         return {}
@@ -165,6 +172,23 @@ def rules_of(payload: object) -> dict[str, str]:
     if not isinstance(rules, Mapping):
         return {}
     return {str(signal): str(rule) for signal, rule in rules.items()}
+
+
+def rank_of(payload: object) -> int:
+    """``payload["rank"]`` — the file's place in score order (§1.6.9) — or ``0``.
+
+    Tolerant for the same reason as :func:`rules_of`: rank is recorded for readers
+    of the report and nothing acts on it, so a report written before §1.6.9 does
+    not become unreadable. ``0`` says plainly that no rank was recorded, rather
+    than inventing one from the array's order, which is a reader's decision and not
+    this function's.
+    """
+    if not isinstance(payload, Mapping):
+        return 0
+    rank = payload.get("rank")
+    if isinstance(rank, bool) or not isinstance(rank, int):
+        return 0
+    return rank
 
 
 @dataclass

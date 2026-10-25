@@ -135,6 +135,8 @@ DERIVED_BUG_KEYS = frozenset(
         "issue_text",
         "issue_text_sha256",
         "issue_text_commit",
+        "issue_text_names_paths",
+        "issue_text_names_symbols",
         "issue_ok",
         "issue_needs_decision",
         "deps",

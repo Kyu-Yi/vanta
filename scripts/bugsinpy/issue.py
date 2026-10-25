@@ -220,6 +220,31 @@ IGNORED_DIRS = frozenset({".git", "__pycache__", "node_modules"})
 IGNORED_SUFFIXES = (".pyc", ".pyo")
 IGNORED_NAMES = ("_manifest.json",)
 
+SOURCE_SUFFIXES = (".py", ".pyi", ".pyx", ".pxd")
+"""Files that define a name at module level — the same set §1.6.8 hands content for.
+
+[VANTA-WHY] ``.pyx``/``.pxd`` are here because pandas and spaCy have real bugs in Cython
+files, and a symbol the buggy tree defines in one of them is as much a name of the tree as
+one it defines in a ``.py``. This is a *reporting* question — did the visible issue text name
+something the tree defines? — so the answer has to be about the tree, not about the subset of
+it :mod:`ast` happens to parse.
+"""
+
+TOP_LEVEL_DEF_RE = re.compile(
+    r"^(?:async[ \t]+)?def[ \t]+([A-Za-z_]\w*)"
+    r"|^class[ \t]+([A-Za-z_]\w*)"
+    r"|^([A-Za-z_]\w*)[ \t]*(?::[^=\n]*)?=(?!=)",
+    re.MULTILINE,
+)
+"""The three shapes that bind a name at module level: ``def``, ``class``, ``x =`` / ``x: T =``.
+
+Column 0 only, which is what "top level" means: a method of a class or a closure body is not a
+name of the tree in the sense §2.4.6 asks about. A regex rather than :mod:`ast` so one rule
+covers ``.py``, ``.pyi``, ``.pyx`` and ``.pxd`` alike. Its false positive is a binding written
+at column 0 *inside a string literal*, which can only matter if the issue text also names that
+identical token — and what this feeds is a flag the paper reports, never a selection.
+"""
+
 
 @dataclass
 class LeakRemoval:
@@ -391,6 +416,90 @@ def hidden_test_sources(oracle_tree: Path, nodeids: Sequence[str]) -> list[str]:
         except (OSError, UnicodeDecodeError):
             continue
     return sources
+
+
+# ---------------------------------------------------------------------------
+# the reporting flag — what the visible text names that the tree also defines (§2.4.6)
+# ---------------------------------------------------------------------------
+def _names_one_file(named: str, rel: str) -> bool:
+    """Do these two strings name the same file of the tree?
+
+    Exact match, or one is the other with extra leading directories — the shapes a report
+    uses when it quotes a path from its own machine. A bare ``mod.py`` is **not** a match for
+    ``pkg/mod.py``: a basename is not a repo path, and accepting it would make the flag fire
+    on nearly every report that quotes a traceback.
+    """
+    if named == rel:
+        return True
+    if "/" not in named:
+        return False
+    return named.endswith("/" + rel) or rel.endswith("/" + named)
+
+
+def top_level_names(source: str) -> set[str]:
+    """The names one file binds at module level (:data:`TOP_LEVEL_DEF_RE`)."""
+    names: set[str] = set()
+    for match in TOP_LEVEL_DEF_RE.finditer(source):
+        name = match.group(1) or match.group(2) or match.group(3)
+        if name:
+            names.add(name)
+    return names
+
+
+def tree_names_in_text(text: str, tree: Path) -> tuple[list[str], list[str]]:
+    """What the text names that the tree itself defines: repo paths, then top-level names.
+
+    [VANTA-WHY] A reporting fact about the prompt, and nothing else. A report that says
+    ``sanic/app.py`` or ``register_named_middleware`` has localised the bug for the Creator to
+    a degree ``localization_hit`` never credits it for — that metric is about where the patch
+    went, not about what the text already said — and the write-up has to be able to report how
+    often the visible text does the harness's localisation for it. So the answer is recorded
+    per bug in the record (§2.4.6) and read by **nothing** that builds a prompt, exactly like
+    ``issue_text_commit``.
+
+    It is computed over the text a run sends — the frozen report's gated section, title and
+    body, post-gate — and never over the comments: the default setting does not send those, so
+    a comment naming the file would be a fact about a prompt nobody sends (§2.4.4). The
+    ``tree`` is the buggy source the gate already reads, so the flag cannot disagree with the
+    text about which tree it is talking about.
+
+    A path is recorded when the tree contains a file for it (:func:`_names_one_file`), and a
+    name when some source file of the tree binds it at module level. Both lists are sorted and
+    hold the tokens *as the text writes them*, so the paper can quote the report's own words.
+    """
+    rel_paths: set[str] = set()
+    defined: set[str] = set()
+    for path in sorted(tree.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        rel = path.relative_to(tree).as_posix()
+        parts = rel.split("/")
+        if any(part in IGNORED_DIRS for part in parts[:-1]):
+            continue
+        if rel.endswith(IGNORED_SUFFIXES) or rel.endswith(IGNORED_NAMES):
+            continue
+        rel_paths.add(rel)
+        if path.suffix in SOURCE_SUFFIXES:
+            try:
+                source = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            defined |= top_level_names(source)
+
+    paths: set[str] = set()
+    symbols: set[str] = set()
+    for token, klass in tokenize(text):
+        if klass == "ident":
+            if token in defined:
+                symbols.add(token)
+        elif klass in ("path", "string"):
+            # A quoted path tokenizes as a string, not as a path: ``"pkg/mod.py"`` starts with
+            # a quote, so the path alternative cannot match at that position — which is how a
+            # report's own traceback writes it (§2.4.4).
+            named = token.strip("\"'") if klass == "string" else token
+            if any(_names_one_file(named, rel) for rel in rel_paths):
+                paths.add(named)
+    return sorted(paths), sorted(symbols)
 
 
 def gate_text(

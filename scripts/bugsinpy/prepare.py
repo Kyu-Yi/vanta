@@ -228,6 +228,31 @@ class BugPrep:
     Recorded even for a bug that is excluded (``issue_source=none``), because those are
     precisely the bugs whose only text would have been this message.
     """
+    issue_text_names_paths: list[str] = field(default_factory=list)
+    """§2.4.6 — repo file paths the **visible** issue text names, offline, for the paper only.
+
+    [VANTA-WHY] A report that says ``sanic/app.py`` has localised the bug for the Creator to a
+    degree the localization audit's hit rate never credits the text with — that metric is
+    about where the patch went. The write-up has to be able to say how often the text did the
+    harness's localisation itself, and the only place that fact lives is beside the text, which
+    is why it is recorded per bug rather than derived later from a prompt the repo cannot
+    rebuild.
+    Computed by :func:`issue.tree_names_in_text` over ``issue.text`` — the frozen report's
+    gated section, the only text a run sends — and never over the comments, which the default
+    setting does not send (§2.4.4). Read by **nothing** that builds a prompt: the prompt's
+    text is ``issue.text``, as for ``issue_text_commit`` above. The flag is "this list is
+    non-empty".
+    """
+    issue_text_names_symbols: list[str] = field(default_factory=list)
+    """§2.4.6 — top-level names the **visible** issue text names and the buggy tree defines.
+
+    [VANTA-WHY] The other half of the same reporting fact: a report that names
+    ``register_named_middleware`` has pointed at the fix's own function, and whether it did so
+    is a property of the prompt, not of the patch. A name counts when a source file of the
+    buggy tree binds it at module level (``def``/``class``/assignment, column 0) — the tree
+    the gate itself reads, so the flag and the text cannot disagree about which tree is meant.
+    Reporting only, and read by nothing that builds a prompt.
+    """
     deps: Optional[dict[str, Any]] = None
 
     @property
@@ -311,6 +336,8 @@ class BugPrep:
             "issue": self.issue.to_dict() if self.issue else None,
             "issue_source": self.issue_source,
             "issue_text_commit": self.issue_text_commit,
+            "issue_text_names_paths": sorted(self.issue_text_names_paths),
+            "issue_text_names_symbols": sorted(self.issue_text_names_symbols),
             "deps": self.deps,
         }
 
@@ -384,6 +411,12 @@ class BugPrep:
             issue_source=str(field_of(payload, "issue_source", owner=owner, where=where)),
             issue_text_commit=field_of(
                 payload, "issue_text_commit", owner=owner, where=where
+            ),
+            issue_text_names_paths=strings_of(
+                payload, "issue_text_names_paths", owner=owner, where=where
+            ),
+            issue_text_names_symbols=strings_of(
+                payload, "issue_text_names_symbols", owner=owner, where=where
             ),
             deps=field_of(payload, "deps", owner=owner, where=where),
         )
@@ -966,6 +999,13 @@ def build_issue(
         else (frozen.gate.reason or "the frozen issue report is not actionable"),
     )
     prep.issue_source = frozen.source
+    # §2.4.6, reporting only: what the text a run sends names that the buggy tree also defines.
+    # Read off ``issue.text`` — the gated section, and never the comments — so the flag is about
+    # the prompt the default setting sends. Recorded in both modes, like ``issue_text_commit``.
+    (
+        prep.issue_text_names_paths,
+        prep.issue_text_names_symbols,
+    ) = issue_mod.tree_names_in_text(prep.issue.text, prep.root / "src_buggy")
     if frozen.source == issue_source.SOURCE_NONE:
         # §2.4: no report means the bug has no text Vanta may read, and the commit message
         # is not a substitute for one. Excluded and counted, not handed a leak. It is not a
@@ -1007,6 +1047,9 @@ def write_issue_texts(batch_dir: Path, preps: list[BugPrep]) -> Path:
             f"- undeclared F2P (excluded, hidden from vanta_tree): {prep.f2p_undeclared}",
             f"- failure kinds: {prep.issue.failure_kinds}",
             f"- gate: {'ok' if prep.issue.ok else '**NEEDS DECISION**'}",
+            f"- names of the tree in the visible text (§2.4.6, reporting only): "
+            f"paths={prep.issue_text_names_paths or '[]'} "
+            f"symbols={prep.issue_text_names_symbols or '[]'}",
             "",
             "## Frozen text (post-leak-gate)",
             "",
@@ -1668,6 +1711,8 @@ def derive_verdict(prep: BugPrep) -> dict[str, Any]:
         "issue_text": issue_text,
         "issue_text_sha256": sha256_text(issue_text) if issue_text is not None else None,
         "issue_text_commit": prep.issue_text_commit,
+        "issue_text_names_paths": sorted(prep.issue_text_names_paths),
+        "issue_text_names_symbols": sorted(prep.issue_text_names_symbols),
         "issue_ok": bool(prep.issue and prep.issue.ok),
         "issue_needs_decision": (
             prep.issue.needs_decision

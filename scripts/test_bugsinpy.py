@@ -3741,6 +3741,118 @@ class TestFrozenIssueReport:
         assert source_mod.load_frozen(path).refrozen_at == again.refrozen_at
 
 
+class TestTheVisibleTextNamingTheTree:
+    """§2.4.6, reporting only: what the text a run sends names that the tree also defines.
+
+    Not the gate, and not a selection rule: a bug whose report names half the tree is selected
+    and graded exactly like one whose report names nothing. It is the write-up's evidence that
+    the visible text sometimes does the localisation the harness is about to ask the Creator
+    for — ``sanic/1``'s report names ``sanic/app.py`` and ``register_named_middleware`` — which
+    ``localization_hit`` cannot show, because that scores where the patch went.
+    """
+
+    def _tree(self, tmp_path):
+        root = tmp_path / "src_buggy"
+        write(
+            root / "pkg" / "mod.py",
+            "import os\n"
+            "\n"
+            "CONSTANT = 1\n"
+            "registry = {}\n"
+            "\n"
+            "\n"
+            "def parse_rows(text):\n"
+            "    def inner():\n"
+            "        return 1\n"
+            "\n"
+            "    return text.split('.')\n"
+            "\n"
+            "\n"
+            "class Widget:\n"
+            "    def render(self):\n"
+            "        return 2\n",
+        )
+        write(root / "pkg" / "other.py", "def other_thing(text):\n    return text\n")
+        write(
+            root / "pkg" / "fast.pyx",
+            "cdef int LIMIT = 4\n\n\ndef fast_rows(text):\n    return text\n",
+        )
+        write(root / "__pycache__" / "mod.cpython-38.py", "def cached():\n    return 1\n")
+        return root
+
+    def test_a_named_path_and_a_module_level_name_are_recorded(self, tmp_path):
+        paths, symbols = issue_mod.tree_names_in_text(
+            "`pkg/mod.py` is broken when parse_rows gets an empty string.",
+            self._tree(tmp_path),
+        )
+        assert paths == ["pkg/mod.py"]
+        assert symbols == ["parse_rows"]
+
+    def test_a_bare_basename_is_not_a_path_of_the_repo(self, tmp_path):
+        """``mod.py`` is a basename the reporter typed, not a path the repo has.
+
+        Accepting it would fire the flag on nearly every report that quotes a traceback, and
+        the flag's whole value is that it is rare enough to mean something.
+        """
+        paths, _ = issue_mod.tree_names_in_text(
+            "mod.py raises an error whenever the input has dots in it.",
+            self._tree(tmp_path),
+        )
+        assert paths == []
+
+    def test_a_quoted_path_counts_and_is_recorded_as_written(self, tmp_path):
+        """A path in a report's own traceback tokenizes as a string, not as a path."""
+        paths, symbols = issue_mod.tree_names_in_text(
+            'File "pkg/mod.py", line 3, in parse_rows',
+            self._tree(tmp_path),
+        )
+        assert paths == ["pkg/mod.py"]
+        assert symbols == ["parse_rows"]
+
+    def test_a_path_with_a_prefix_the_repo_does_not_have_still_counts(self, tmp_path):
+        """The reporter's own machine is not the repo root."""
+        paths, _ = issue_mod.tree_names_in_text(
+            "it fails at /home/me/pkg/mod.py for this input",
+            self._tree(tmp_path),
+        )
+        assert paths == ["home/me/pkg/mod.py"]
+
+    def test_a_method_or_a_closure_is_not_a_name_of_the_tree(self, tmp_path):
+        """Top level is what the tree defines at module level, and nothing deeper."""
+        _, symbols = issue_mod.tree_names_in_text(
+            "Widget.render and inner are both never called with the right thing.",
+            self._tree(tmp_path),
+        )
+        assert symbols == ["Widget"]
+
+    def test_a_cython_definition_is_a_name_of_the_tree(self, tmp_path):
+        """§1.6.8 counts ``.pyx`` as source; a name it defines is a name of the tree."""
+        _, symbols = issue_mod.tree_names_in_text(
+            "fast_rows returns the wrong rows for a large input.",
+            self._tree(tmp_path),
+        )
+        assert symbols == ["fast_rows"]
+
+    def test_an_ignored_directory_is_not_the_tree(self, tmp_path):
+        """The walk is the gate's own: what the gate does not read, the flag does not see."""
+        paths, symbols = issue_mod.tree_names_in_text(
+            "cached in __pycache__/mod.cpython-38.py is stale for this input.",
+            self._tree(tmp_path),
+        )
+        assert paths == []
+        assert symbols == []
+
+    def test_a_name_the_tree_defines_but_the_text_does_not_use_is_not_recorded(
+        self, tmp_path
+    ):
+        paths, symbols = issue_mod.tree_names_in_text(
+            "The dump is wrong whenever the input has two dots in it.",
+            self._tree(tmp_path),
+        )
+        assert paths == []
+        assert symbols == []
+
+
 class TestTheFreezeGatesTheText:
     """§2.4: the gate runs once, at freeze time, and its inputs come from git alone."""
 
@@ -3762,7 +3874,14 @@ class TestTheFreezeGatesTheText:
             test_cmd=["python", "-m", "pytest", "tests"],
         )
 
-    def _frozen(self, issues, *, files=("tests/test_demo.py",)):
+    def _frozen(
+        self,
+        issues,
+        *,
+        files=("tests/test_demo.py",),
+        body="The report body, which is long enough to be actionable for a Creator.",
+        comments=(),
+    ):
         report = source_mod.IssueReport(
             project="PySnooper",
             bug_id=3,
@@ -3770,7 +3889,8 @@ class TestTheFreezeGatesTheText:
             number=2,
             url="https://github.com/cool-RR/PySnooper/issues/2",
             title="Logging inside a generator",
-            body="The report body, which is long enough to be actionable for a Creator.",
+            body=body,
+            comments=list(comments),
             fetched_at="2026-10-25T06:00:00Z",
             fix_commit_date="2018-06-01T00:00:00Z",
         )
@@ -3781,6 +3901,13 @@ class TestTheFreezeGatesTheText:
             tree_sha256="a" * 64,
             answer_sha256="b" * 64,
             files=tuple(files),
+            hints=(
+                issue_mod.LeakResult(
+                    text=report.hints(), removals=[], ungated_prose=[], ok=True, reason=None
+                )
+                if report.hints()
+                else None
+            ),
         )
         return source_mod.write_frozen(
             source_mod.frozen_path(issues, "PySnooper", 3), report
@@ -4046,6 +4173,50 @@ class TestTheFreezeGatesTheText:
         assert prepare_mod.derive_verdict(prep)["issue_text_commit"] == "Fix the loader", (
             "the record the paper reads carries it"
         )
+
+    def test_the_flag_reads_the_visible_text_and_never_the_comments(
+        self, tmp_path, monkeypatch
+    ):
+        """§2.4.6, reporting only: what the text a run sends names of the buggy tree.
+
+        ``parse_rows`` and ``pkg/mod.py`` are in the report's body, and they are what is
+        recorded. The comments of the same report name ``other_thing`` and ``pkg/other.py``,
+        which the tree also defines and which the flag must not see: the default setting does
+        not send the comments, so counting them would describe a prompt nobody sends (§2.4.4).
+        """
+        monkeypatch.setattr(
+            issue_mod, "fix_commit_message", lambda repo, commit: "Fix the loader\n"
+        )
+        prep = self._prep(tmp_path, project="PySnooper", bug_id=3)
+        write(
+            prep.root / "src_buggy" / "pkg" / "other.py",
+            "def other_thing(text):\n    return text\n",
+        )
+        self._frozen(
+            tmp_path / "issues",
+            body="The report body names parse_rows in pkg/mod.py for this input.",
+            comments=[
+                source_mod.IssueComment(
+                    author="maintainer",
+                    created_at="2018-05-02T00:00:00Z",
+                    body="the cause is other_thing in pkg/other.py",
+                )
+            ],
+        )
+        frozen = prepare_mod.build_issue(
+            prep,
+            repo_cache=tmp_path,
+            issue_sources=self._sources(tmp_path),
+            github_url="https://github.com/cool-RR/PySnooper",
+            full=False,
+        )
+        assert frozen is not None and prep.issue is not None
+        assert "other_thing" not in prep.issue.text, "the comments are not the text"
+        assert prep.issue_text_names_paths == ["pkg/mod.py"]
+        assert prep.issue_text_names_symbols == ["parse_rows"]
+        verdict = prepare_mod.derive_verdict(prep)
+        assert verdict["issue_text_names_paths"] == ["pkg/mod.py"]
+        assert verdict["issue_text_names_symbols"] == ["parse_rows"]
 
     def test_a_refused_artifact_is_left_alone_and_the_reason_names_the_remedy(
         self, tmp_path, monkeypatch
@@ -4915,6 +5086,8 @@ class TestPrepareRunRecordContract:
             context=verdict,
             issue=issue,
             issue_text_commit="Fix the loader\n",
+            issue_text_names_paths=["pkg/mod.py"],
+            issue_text_names_symbols=["parse_rows"],
             deps=deps,
         )
         split, batch_dir, _ = self._write_batch(tmp_path, preps=[original])
@@ -4955,6 +5128,8 @@ class TestPrepareRunRecordContract:
         assert loaded.issue.needs_decision == issue.needs_decision
         assert loaded.issue.leak.removals == issue.leak.removals
         assert loaded.issue_text_commit == original.issue_text_commit
+        assert loaded.issue_text_names_paths == ["pkg/mod.py"]
+        assert loaded.issue_text_names_symbols == ["parse_rows"]
         assert loaded.context == verdict
         assert loaded.deps == deps
         assert loaded.runnable == original.runnable

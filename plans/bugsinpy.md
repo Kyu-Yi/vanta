@@ -1112,6 +1112,30 @@ inflated `localization_hit` — the counterfactual that justifies this section.
   `issue_text_commit`), and read by **nothing** that builds a prompt: the prompt's text is
   `issue.text`, the frozen report's gated section.
 
+**What the visible text names.** A second per-bug reporting fact is recorded beside it: the repo
+paths, and the top-level names the buggy tree defines, that the text a run sends itself names
+(`issue_text_names_paths`, `issue_text_names_symbols`). `sanic/1`'s report names `sanic/app.py`
+and `register_named_middleware` — the visible text has already done the localisation the harness
+is about to ask the Creator for, and `localization_hit` cannot see that, because it scores where
+the patch went and not what the prompt said. The write-up needs the rate.
+
+- Computed over `issue.text` — the frozen report's gated section, title and body, post-gate — and
+  **never** over the comments: the default setting does not send those, so a comment naming the
+  file would be a fact about a prompt nobody sends (§2.4.4).
+- The tree is the buggy source the gate already reads (`src_buggy`), so the flag cannot disagree
+  with the text about which tree is meant. A path counts when the tree contains a file for it; a
+  bare basename (`app.py`) does not, because a basename is not a repo path. A name counts when a
+  source file of the tree binds it at module level (`def`/`class`/assignment at column 0) —
+  `def foo` nested in a class is not a name of the tree in this sense — over `.py`, `.pyi`,
+  `.pyx` and `.pxd` alike, since `.pyx` is where pandas' and spaCy's bugs sometimes are.
+- Both lists hold the tokens **as the text writes them**, so the paper can quote the report's own
+  words, and both are sorted.
+- Recorded in **both** modes, like `issue_text_commit`, and read by **nothing** that builds a
+  prompt. It is never used in selection: a bug whose report names half the tree is selected, sized
+  and graded exactly like one whose report names nothing.
+- Surfaced in the hand-review artifact (`issue_texts/<slug>.md`), so the reviewer sees the claim
+  beside the text it was computed from.
+
 ---
 
 ## 3. Environments in Shuru

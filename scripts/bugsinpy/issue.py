@@ -393,13 +393,18 @@ def hidden_test_sources(oracle_tree: Path, nodeids: Sequence[str]) -> list[str]:
     return sources
 
 
-def leak_gate(
+def gate_text(
     text: str,
     *,
     answer_tokens: dict[str, int],
     tree_tokens: dict[str, int],
 ) -> LeakResult:
-    """Strip every answer-shaped token that exists only in the answer — and change nothing else.
+    """Replace every answer-shaped token that exists only in the answer — and change nothing else.
+
+    **The one substitution.** Both the text a run sends (:func:`leak_gate`) and the comments a
+    run does not (:func:`gate_hints`, §2.4.4) come through here, so "gated" means exactly one
+    thing in this harness: the tokens the answer and only the answer carries become
+    ``[redacted]``, and every replacement is recorded with its occurrence counts.
 
     [VANTA-WHY] The gate substitutes and never reformats. It used to end with
     ``re.sub(r"[ \\t]{2,}", " ", ...).strip()``, and that collapse turned the four-space
@@ -416,6 +421,10 @@ def leak_gate(
     normalisation anywhere on the way to the prompt is the line-ending fold, and it lives in
     one place — :func:`issue_source._canonical`, which is about *storing* the text, not about
     what the text says (§2.4.3, §2.4.4).
+
+    ``ok`` is ``True`` and ``reason`` is ``None`` — the absence of the question, not an answer
+    to it. Whether a text says enough to work from is asked once and only of the text a run
+    sends, which is why that question lives in :func:`leak_gate`.
     """
     leaks: dict[str, int] = {
         token: count
@@ -457,12 +466,62 @@ def leak_gate(
         out.append("[redacted]")
 
     out.append(text[cursor:])
-    cleaned = "".join(out)
-
-    ok, reason = is_actionable(cleaned)
     return LeakResult(
-        text=cleaned, removals=removals, ungated_prose=ungated, ok=ok, reason=reason
+        text="".join(out),
+        removals=removals,
+        ungated_prose=ungated,
+        ok=True,
+        reason=None,
     )
+
+
+def leak_gate(
+    text: str,
+    *,
+    answer_tokens: dict[str, int],
+    tree_tokens: dict[str, int],
+) -> LeakResult:
+    """The gate over the text a run sends: :func:`gate_text`, and then its verdict.
+
+    A report the gate has stripped down to nothing is not a prompt — it is a bug that would
+    spend an attempt on a text no Creator can work from — so this is the one call site that
+    asks :func:`is_actionable`, and its answer is what makes a bug a NEEDS DECISION rather
+    than a run. The comments of the same report are gated by :func:`gate_text` alone
+    (:func:`gate_hints`): they are never sent in the default setting, so there is no
+    attempt for them to waste and nothing to decide about them (§2.4.4).
+    """
+    gated = gate_text(text, answer_tokens=answer_tokens, tree_tokens=tree_tokens)
+    ok, reason = is_actionable(gated.text)
+    return LeakResult(
+        text=gated.text,
+        removals=gated.removals,
+        ungated_prose=gated.ungated_prose,
+        ok=ok,
+        reason=reason,
+    )
+
+
+def gate_hints(
+    text: str,
+    *,
+    answer_tokens: dict[str, int],
+    tree_tokens: dict[str, int],
+) -> LeakResult:
+    """The same substitution over a report's comments, and **no verdict about the result**.
+
+    [VANTA-WHY] The comments are SWE-bench's ``hints_text``: they were posted before the fix
+    and they frequently name it. ``matplotlib/1``'s carry a maintainer saying what the cause
+    was and a range in ``backend_agg.py``, which is the answer — so they are gated by the same
+    rule as the text a run sends, and then not sent (§2.4.4). A hint section that an ablation
+    later shows must not be able to carry what the default setting refuses, which is why the
+    gate runs here rather than being waived as "not shown, so not a risk".
+
+    The verdict is not asked: :func:`is_actionable` is about whether a text is worth spending
+    an attempt on, and a text nobody sends is never such a text. What is stored for this
+    section is the gated text and every substitution made in it, and not an ``ok``/``reason``
+    nobody asked for.
+    """
+    return gate_text(text, answer_tokens=answer_tokens, tree_tokens=tree_tokens)
 
 
 def is_actionable(text: str) -> tuple[bool, Optional[str]]:

@@ -64,6 +64,7 @@ from typing import Any, Iterable, Optional, Sequence
 from . import bake as bake_mod
 from . import compact as compact_mod
 from . import context as ctx_mod
+from . import issue_source
 from . import manifest as manifest_mod
 from . import oracle as oracle_mod
 from . import prepare as prepare_mod
@@ -1176,6 +1177,11 @@ def build_record(
         "config": job.config,
         "mode": job.mode,
         "seed": job.seed,
+        # §2.4.4 — whether this row's prompt carried the report's comments as well as its
+        # content. Recorded rather than inferred because the ablation's whole value is that
+        # its rows are comparable to the default ones, and a row that does not say which
+        # prompt it sent is a row nobody can put in the right arm afterwards.
+        "show_hints": job.show_hints,
         "session_id": outcome.session_id,
         # Two trees, two commits (§7.3). `vanta_build_commit` is what `build.rs` baked
         # into the binary at cargo build time and what `run.summary` reports;
@@ -1279,6 +1285,17 @@ class Job:
     Carried on the job so the row can state it without a second `git` call per
     row, which would let two rows of one batch disagree about which harness ran
     them."""
+    show_hints: bool = False
+    """Send the report's comments as well as its content — **off by default** (§2.4.4).
+
+    [VANTA-WHY] The comments are SWE-bench's ``hints_text`` and they name the answer often
+    enough that ``matplotlib/1``'s maintainer comment names a file and a line range. They
+    are gated and stored either way (``issue_source``), so this flag chooses only whether the
+    prompt carries them; it defaults off because the default setting has to be the one a
+    report that predates the fix supports, and a run that turns it on records that it did
+    (``build_record``) and takes its own job key (``manifest.job_key``), so the ablation
+    cannot be mistaken for the main result or resumed under its name.
+    """
 
     @property
     def key(self) -> str:
@@ -1289,6 +1306,7 @@ class Job:
             mode=self.mode,
             seed=self.seed,
             candidate=self.candidate.patch_sha256 if self.candidate else None,
+            show_hints=self.show_hints,
         )
 
     def label(self) -> str:
@@ -1356,6 +1374,29 @@ def python_version_of(paths: BatchPaths, checkpoint: str, disk_mb: int) -> str:
     return version
 
 
+def issue_text_for(prep: prepare_mod.BugPrep, *, show_hints: bool) -> str:
+    """The exact text written to ``issues/<slug>.txt``: the content, and the hints if asked.
+
+    [VANTA-WHY] With ``show_hints`` off — the default, and every row of the main evaluation —
+    the answer is ``prep.issue.text`` and nothing else: that string *is* the frozen artifact's
+    gated content section, and a run has to send it byte-for-byte (§2.4.3). The comments are
+    read here, from the same committed file whose hash a stage verified, rather than carried
+    through ``prepare.json``: under the default setting there is then no copy of them anywhere
+    on the path to a prompt, so "never shown" is a property of the code rather than of a flag
+    somebody has to keep set. A report with no comments, or a hints section the gate emptied,
+    leaves the text as it was — turning the ablation on cannot invent hints that do not exist.
+    """
+    text = prep.issue.text if prep.issue else ""
+    if not show_hints:
+        return text
+    frozen = issue_source.load_or_none(
+        issue_source.ISSUES_DIR, prep.bug.project, prep.bug.bug_id
+    )
+    if frozen is None or not frozen.hints:
+        return text
+    return f"{text}\n{frozen.hints}"
+
+
 def run_job(
     *,
     job: Job,
@@ -1378,7 +1419,7 @@ def run_job(
     prep = job.prep
     issue_path = paths.issues / f"{prep.slug}.txt"
     issue_path.parent.mkdir(parents=True, exist_ok=True)
-    issue_path.write_text(prep.issue.text if prep.issue else "", encoding="utf-8")
+    issue_path.write_text(issue_text_for(prep, show_hints=job.show_hints), encoding="utf-8")
     issue_sha256 = sha256_text(issue_path.read_text(encoding="utf-8"))
 
     log_path = paths.logs / f"{_stem(job.key)}.log"
@@ -1521,9 +1562,16 @@ def run_batch(
     vanta_bin: Path,
     max_attempts: int,
     disk_mb: int,
+    show_hints: bool = False,
     plan_only: bool = False,
 ) -> tuple[int, list[WaveResult]]:
-    """The whole batch: per wave, D13's four phases, then the wave-1 gate."""
+    """The whole batch: per wave, D13's four phases, then the wave-1 gate.
+
+    ``show_hints`` is the with-hints ablation's switch (§2.4.4) and is off for every batch a
+    verdict is meant to rest on: it sends the report's comments on top of its content, which
+    changes what the prompt is, and so changes the job key (``manifest.job_key``) and is
+    recorded on every row it touches.
+    """
     paths = BatchPaths.under(batch_dir)
     manifest = Manifest(batch_dir)
     # The harness's own revision, read once for the whole batch (§7.3). The binary's
@@ -1538,6 +1586,14 @@ def run_batch(
 
     plan = _render_schedule(batch_id, preps, entries, configs, seeds, waves)
     print(plan, flush=True)
+    if show_hints:
+        print(
+            "[prompt] --show-hints: every row's issue text is the report's content *plus* "
+            "its comments (§2.4.4). These rows take a `#hints` job key and record "
+            "show_hints=true; they are a separate arm and not comparable-by-name to a "
+            "default run.",
+            flush=True,
+        )
     if plan_only:
         return 0, []
 
@@ -1586,6 +1642,7 @@ def run_batch(
                                 checkpoint=checkpoint,
                                 python_version_pinned=entry["python_version"],
                                 harness=harness,
+                                show_hints=show_hints,
                             )
                         ]
                     else:
@@ -1603,6 +1660,7 @@ def run_batch(
                                 python_version_pinned=entry["python_version"],
                                 candidate=candidate,
                                 harness=harness,
+                                show_hints=show_hints,
                             )
                             for candidate in _review_candidates(
                                 batch_dir=batch_dir,
@@ -1613,6 +1671,7 @@ def run_batch(
                                 seed=seed,
                                 checkpoint=checkpoint,
                                 disk_mb=disk_mb,
+                                show_hints=show_hints,
                             )
                         ]
                     for job in jobs:
@@ -1660,6 +1719,7 @@ def _review_candidates(
     seed: int,
     checkpoint: str,
     disk_mb: int,
+    show_hints: bool = False,
 ) -> list[Candidate]:
     """The candidate set for one (bug, seed), from the repair rows already written.
 
@@ -1667,6 +1727,11 @@ def _review_candidates(
     it is the one field a caller could pass under a different name than the
     directory it writes into, and a lookup keyed on the wrong batch would silently
     find no repair rows and quietly shrink every review set to {dev fix, no-op}.
+
+    ``show_hints`` is threaded in for the same reason it is threaded into the job
+    list: it is part of the key (§2.4.4), so a with-hints batch's repair rows are
+    keyed ``…#hints`` and a lookup that left the flag out would find none of them
+    and silently shrink every review set.
     """
     records: list[dict[str, Any]] = []
     for config in configs:
@@ -1676,6 +1741,7 @@ def _review_candidates(
             config=config,
             mode=REPAIR,
             seed=seed,
+            show_hints=show_hints,
         )
         found = manifest.find(key)
         if found:

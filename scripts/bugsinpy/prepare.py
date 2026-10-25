@@ -804,7 +804,7 @@ def read_declared_test_files(fixed_dir: Path, files: Sequence[str]) -> list[str]
     return sources
 
 
-def freeze_gate(prep: BugPrep, raw: str) -> issue_source.GateRecord:
+def freeze_gate(prep: BugPrep, raw: str, hints: str) -> issue_source.GateRecord:
     """Gate the raw report at freeze time, from git-only inputs (§2.4).
 
     ``tree_tokens`` are the buggy commit's own source — the tree the report is *about*,
@@ -812,6 +812,11 @@ def freeze_gate(prep: BugPrep, raw: str) -> issue_source.GateRecord:
     declared test files' contents at the fixed commit. Neither needs a derivation, which
     is what lets the gate live in the one step that knows the report and never run again:
     measure-only, prepare and the run then read a single frozen text.
+
+    ``hints`` is the report's comments, gated by the *same* two token maps through
+    :func:`issue_mod.gate_hints` (§2.4.4): one set of answer tokens, one rule, applied to both
+    texts of one report. ``None`` when the report has no comments — a different fact from
+    comments the gate emptied, and one the record keeps distinct.
     """
     files = declared_test_files(prep.bug)
     tree_tokens = issue_mod.vanta_tree_token_counts(prep.root / "src_buggy")
@@ -825,6 +830,11 @@ def freeze_gate(prep: BugPrep, raw: str) -> issue_source.GateRecord:
         tree_sha256=issue_mod.token_counts_sha256(tree_tokens),
         answer_sha256=issue_mod.token_counts_sha256(answer_tokens),
         files=tuple(files),
+        hints=(
+            issue_mod.gate_hints(hints, answer_tokens=answer_tokens, tree_tokens=tree_tokens)
+            if hints
+            else None
+        ),
     )
 
 
@@ -935,7 +945,7 @@ def build_issue(
                 fix_commit_date=issue_mod.fix_commit_date(
                     repo_cache, prep.bug.fixed_commit
                 ),
-                gate=lambda raw: freeze_gate(prep, raw),
+                gate=lambda content, hints: freeze_gate(prep, content, hints),
                 refreeze=refreeze,
             )
         except issue_source.IssueSourceError as exc:

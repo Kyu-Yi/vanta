@@ -3196,21 +3196,31 @@ class TestFrozenIssueReport:
     """The artifact every stage reads, so the text is identical by construction."""
 
     @staticmethod
-    def _gate(raw):
+    def _gate(content, hints=""):
         """A gate record that removes nothing, so the round trip is about the file.
 
         The real gate's inputs and behaviour belong to ``prepare.freeze_gate`` and are
-        tested there; what this class is about is the three-section artifact and its two
-        hashes, and a passthrough keeps the comparison honest.
+        tested there; what this class is about is the five-section artifact and its four
+        hashes, and a passthrough keeps the comparison honest. It takes the report's *two*
+        texts — the content and the comments — because the freeze step does (§2.4.4): a
+        report with comments has a hints block in the gate record and one without has
+        ``None``, a difference the reader verifies rather than infers.
         """
-        ok, reason = issue_mod.is_actionable(raw)
+        ok, reason = issue_mod.is_actionable(content)
         return source_mod.GateRecord(
             leak=issue_mod.LeakResult(
-                text=raw, removals=[], ungated_prose=[], ok=ok, reason=reason
+                text=content, removals=[], ungated_prose=[], ok=ok, reason=reason
             ),
             tree_sha256="a" * 64,
             answer_sha256="b" * 64,
             files=("tests/test_pysnooper.py",),
+            hints=(
+                issue_mod.LeakResult(
+                    text=hints, removals=[], ungated_prose=[], ok=True, reason=None
+                )
+                if hints
+                else None
+            ),
         )
 
     @staticmethod
@@ -3224,6 +3234,13 @@ class TestFrozenIssueReport:
             tree_sha256="a" * 64,
             answer_sha256="b" * 64,
             files=("tests/test_pysnooper.py",),
+            hints=(
+                issue_mod.LeakResult(
+                    text=report.hints(), removals=[], ungated_prose=[], ok=True, reason=None
+                )
+                if report.hints()
+                else None
+            ),
         )
         return report
 
@@ -3247,7 +3264,7 @@ class TestFrozenIssueReport:
         base.update(over)
         report = source_mod.IssueReport(**base)
         if report.gate is None:
-            report.gate = self._gate(report.content())
+            report.gate = self._gate(report.content(), report.hints())
         return report
 
     def test_it_round_trips_and_carries_the_resolution(self, tmp_path):
@@ -3261,6 +3278,11 @@ class TestFrozenIssueReport:
         assert back.comments == report.comments
         assert back.content == report.content()
         assert back.content_sha256 == split_mod.sha256_text(report.content())
+        assert back.hints == report.hints()
+        assert back.raw_hints == report.hints()
+        assert back.hints_sha256 == split_mod.sha256_text(report.hints())
+        assert "any update?" in back.hints, "the comment is in the hints section"
+        assert "any update?" not in back.content, "…and not in the text a run sends (§2.4.4)"
 
     def test_the_raw_report_is_stored_beside_the_gated_text(self, tmp_path):
         """§2.4 item 3: the gate's removals are only legible next to what was removed."""
@@ -3273,6 +3295,9 @@ class TestFrozenIssueReport:
             tree_sha256="a" * 64,
             answer_sha256="b" * 64,
             files=("tests/test_pysnooper.py",),
+            hints=issue_mod.LeakResult(
+                text=raw.hints(), removals=[], ungated_prose=[], ok=True, reason=None
+            ),
         )
         back = source_mod.load_frozen(source_mod.write_frozen(tmp_path / "PySnooper_3.md", raw))
         assert back.raw == raw.content()
@@ -3286,16 +3311,15 @@ class TestFrozenIssueReport:
     def test_the_text_vanta_receives_names_no_gate_input_path(self, tmp_path):
         """§2.4 item 3: only the ``<!-- content -->`` section is the issue text.
 
-        The artifact carries four things — the header, the gate's record, the raw report
-        and the gated text — and exactly one of them is sent. The other three exist so a
-        reviewer can see what was removed and against which inputs, and two of those
-        inputs are *answer-side*: the hidden test files the gate counted tokens from
-        (``GateRecord.files``) and the tokens it stripped for occurring in the fix diff or
-        those files. A reader that took the file's text rather than its content section
-        would put both in the prompt, and no metric afterwards would show it. So the
-        assertion is over the gate's own inputs: every one of them is present in the
-        committed file (the record is honest) and absent from ``content`` (the prompt is
-        clean).
+        The artifact carries six things — the header, the gate's record, the raw report, the
+        gated text, the raw comments and the gated comments — and exactly one of them is sent.
+        The other five exist so a reviewer can see what was removed and against which inputs,
+        and two of those inputs are *answer-side*: the hidden test files the gate counted tokens
+        from (``GateRecord.files``) and the tokens it stripped for occurring in the fix diff or
+        those files. A reader that took the file's text rather than its content section would
+        put both in the prompt, and no metric afterwards would show it. So the assertion is
+        over the gate's own inputs: every one of them is present in the committed file (the
+        record is honest) and absent from ``content`` (the prompt is clean).
         """
         hidden = "pandas/tests/dtypes/test_dtypes.py"
         fix_file = "pandas/core/dtypes/common.py"
@@ -3346,7 +3370,12 @@ class TestFrozenIssueReport:
                 "text Vanta is given — only the content section may be sent"
             )
         assert back.content == gated
-        for marker in (source_mod.GATE_MARKER, source_mod.RAW_MARKER):
+        for marker in (
+            source_mod.GATE_MARKER,
+            source_mod.RAW_MARKER,
+            source_mod.RAW_HINTS_MARKER,
+            source_mod.HINTS_MARKER,
+        ):
             assert marker not in back.content
         assert "- gate-tree-sha256:" not in back.content
         assert gated in on_disk
@@ -3360,8 +3389,9 @@ class TestFrozenIssueReport:
         universal-newline ``read_text``, so every line had lost its ``\\r`` before hashing, and
         the file refused itself — five of the six dev bugs, with the header naming one hash and
         the reader computing another. Two things have to hold now, and this test is both: the
-        hashes are taken over the text *after* line endings are folded to ``\\n``, and the file
-        that lands on disk is that same LF-only text, so the bytes hashed are the bytes read.
+        hashes are taken over the text *after* line endings are folded to ``\\n`` — never over
+        the CRLF body the API returned — and the file that lands on disk is that same LF-only
+        text, so the bytes hashed are the bytes read.
         """
         crlf_body = "Steps to reproduce:\r\n\r\n1. call the helper\r\n2. read the column\r\n"
         report = self._report(
@@ -3392,7 +3422,7 @@ class TestFrozenIssueReport:
         )
         assert back.content_sha256 == split_mod.sha256_text(back.content)
         assert back.content_sha256 != split_mod.sha256_text(
-            report.content().replace("\n", "\r\n")
+            f"# {report.title}\n\n{crlf_body}"
         ), (
             "the hash is taken *after* the line endings are folded, so it is not the hash of "
             "the CRLF text the API returned — that is the value the first freeze wrote into "
@@ -3400,7 +3430,7 @@ class TestFrozenIssueReport:
         )
 
     def test_a_header_or_a_gate_edit_leaves_the_content_hash_alone(self, tmp_path):
-        """The three parts have three jobs, and the content hash answers for one of them (§2.4.3).
+        """The sections have different jobs, and the content hash answers for one of them (§2.4.3).
 
         Editing the header — provenance, not text — or the gate's record changes neither the
         content nor its hash, and reading the file still succeeds: those parts are not the
@@ -3509,20 +3539,83 @@ class TestFrozenIssueReport:
         path.write_text(
             head
             + raw_marker
-            + raw.replace("any update?", "here is the fix")
+            + raw.replace("pysnooper/pysnooper.py", "somewhere/else.py")
             + content_marker
             + content
         )
         with pytest.raises(source_mod.IssueSourceError, match="raw-sha256"):
             source_mod.load_frozen(path)
 
+    def test_an_edited_comment_is_refused_by_its_raw_hints_hash(self, tmp_path):
+        """The comments are a stored section too, and an edit to them is caught (§2.4.4).
+
+        The ablation arm that later shows the hints has to show the text this file recorded
+        and gated, not one somebody edited afterwards — so the raw-hints hash refuses a change
+        to the record of what was removed from the comments, and ``hints-sha256`` refuses a
+        change to the gated comments themselves. This is the first of the two.
+        """
+        report = self._report()
+        path = source_mod.write_frozen(tmp_path / "PySnooper_3.md", report)
+        head, raw_hints_marker, rest = path.read_text().partition(source_mod.RAW_HINTS_MARKER)
+        raw_hints, hints_marker, hints = rest.partition(source_mod.HINTS_MARKER)
+        path.write_text(
+            head
+            + raw_hints_marker
+            + raw_hints.replace("any update?", "here is the fix")
+            + hints_marker
+            + hints
+        )
+        with pytest.raises(source_mod.IssueSourceError, match="raw-hints-sha256"):
+            source_mod.load_frozen(path)
+
+    def test_an_edited_gated_comment_is_refused_by_its_hints_hash(self, tmp_path):
+        report = self._report()
+        path = source_mod.write_frozen(tmp_path / "PySnooper_3.md", report)
+        head, hints_marker, hints = path.read_text().partition(source_mod.HINTS_MARKER)
+        path.write_text(
+            head + hints_marker + hints.replace("any update?", "any update? ")
+        )
+        with pytest.raises(source_mod.IssueSourceError, match="hints-sha256"):
+            source_mod.load_frozen(path)
+
     def test_an_edited_gated_text_is_refused_by_its_content_hash(self, tmp_path):
         path = source_mod.write_frozen(tmp_path / "PySnooper_3.md", self._report())
         before, _marker, after = path.read_text().partition(source_mod.CONTENT_MARKER)
         path.write_text(
-            before + source_mod.CONTENT_MARKER + after.replace("any update?", "any update? ")
+            before
+            + source_mod.CONTENT_MARKER
+            + after.replace(
+                "Traceback (most recent call last)", "Traceback (most recent call last) "
+            )
         )
         with pytest.raises(source_mod.IssueSourceError, match="content-sha256"):
+            source_mod.load_frozen(path)
+
+    def test_a_report_with_comments_and_no_hints_block_is_refused(self, tmp_path):
+        """``comments-included`` and the gate's ``hints`` block have to agree (§2.4.4).
+
+        A file that says comments were included but carries no record of gating them is a file
+        whose hints section nothing vouches for — the ablation arm would be handing Vanta text
+        no gate ever saw. ``None`` (no comments resolved) and ``{}``-shaped (resolved, gate
+        found nothing) stay distinguishable, so the check is on absence alone.
+        """
+        path = source_mod.write_frozen(tmp_path / "PySnooper_3.md", self._report())
+        text = path.read_text(encoding="utf-8")
+        head, marker, rest = text.partition(source_mod.GATE_MARKER)
+        gate, raw_marker, tail = rest.partition(source_mod.RAW_MARKER)
+        payload = json.loads(gate)
+        payload["hints"] = None
+        path.write_text(
+            head
+            + marker
+            + "\n\n"
+            + json.dumps(payload, indent=2)
+            + "\n\n"
+            + raw_marker
+            + tail,
+            encoding="utf-8",
+        )
+        with pytest.raises(source_mod.IssueSourceError, match="hints block"):
             source_mod.load_frozen(path)
 
     def test_a_file_without_the_header_fields_is_refused(self, tmp_path):
@@ -3720,13 +3813,14 @@ class TestTheFreezeGatesTheText:
             ),
         )
         record = prepare_mod.freeze_gate(
-            prep, "The report says parse_with_dots is broken and it should not be.\n"
+            prep, "The report says parse_with_dots is broken and it should not be.\n", ""
         )
         assert "parse_with_dots" not in record.leak.text
         assert "[redacted]" in record.leak.text
         assert [r.token for r in record.leak.removals] == ["parse_with_dots"]
         assert record.files == ("tests/test_demo.py",)
         assert record.tree_sha256 != record.answer_sha256
+        assert record.hints is None, "a report with no comments has no hints to gate"
 
     def test_a_token_the_buggy_tree_carries_is_never_stripped(self, tmp_path):
         """The structural blind spot §2.4 exists for: a symbol the fix names *and* the
@@ -3734,10 +3828,39 @@ class TestTheFreezeGatesTheText:
         report and not the fix commit's message."""
         prep = self._prep(tmp_path, bug_patch="+    return parse_rows(text)\n")
         record = prepare_mod.freeze_gate(
-            prep, "The report says parse_rows is broken and it should not be.\n"
+            prep, "The report says parse_rows is broken and it should not be.\n", ""
         )
         assert "parse_rows" in record.leak.text
         assert record.leak.removals == []
+
+    def test_the_comments_are_gated_by_the_same_inputs_as_the_text(self, tmp_path):
+        """§2.4.4: one report, two texts, one rule and one set of answer tokens.
+
+        The comments are not sent by default, and they are still gated — a hints section an
+        ablation later shows must not be able to carry what the default setting refuses. So the
+        same token the content loses is redacted in the hints, with the removal recorded; the
+        section is gated by ``gate_text`` alone and carries no ``ok``/``reason``, because
+        whether a text is actionable is a question about a text somebody sends.
+        """
+        prep = self._prep(
+            tmp_path,
+            bug_patch=(
+                "diff --git a/pkg/mod.py b/pkg/mod.py\n"
+                "-    return text.split('.')\n"
+                "+    return parse_with_dots(text)\n"
+            ),
+        )
+        record = prepare_mod.freeze_gate(
+            prep,
+            "The report body, long enough to be actionable for a Creator.\n",
+            "### maintainer — 2018-05-02T00:00:00Z\n\n"
+            "the cause is parse_with_dots in pkg/mod.py.\n",
+        )
+        assert record.hints is not None
+        assert "parse_with_dots" not in record.hints.text
+        assert "[redacted]" in record.hints.text
+        assert [r.token for r in record.hints.removals] == ["parse_with_dots"]
+        assert record.hints.reason is None, "no verdict is asked about a text nobody sends"
 
     def test_the_frozen_report_keeps_the_reporters_traceback(self, tmp_path):
         """End to end through the freeze: the reporter's own traceback and code block reach
@@ -3762,6 +3885,7 @@ class TestTheFreezeGatesTheText:
             "```\n"
             "\n"
             "parse_with_dots should never be called for this input.\n",
+            "",
         )
         assert "Traceback (most recent call last)" in record.leak.text
         assert "```" in record.leak.text
@@ -3994,6 +4118,128 @@ class TestTheFreezeGatesTheText:
         assert "tests/test_other.py" in reason
         assert prepare_mod.GATE_DRIFT_REASON in reason
         assert "re-freeze" in reason
+
+
+class TestTheHintsAreKeptOutOfTheDefaultPrompt:
+    """§2.4.4: the comments are stored, gated, and sent by nothing unless asked.
+
+    ``matplotlib/1``'s comments name the cause and point at a file and a line range — the
+    answer. The default prompt is the report's title and body (SWE-bench's
+    ``problem_statement``), and the comments are ``hints_text``: a separate section of the
+    frozen file, read only when ``show_hints`` is on. What these tests pin is that the default
+    does not merely ignore them — it never opens the section they are in.
+    """
+
+    def _prep_with_issue(self, text="The report body, long enough to be actionable."):
+        return prep(
+            issue=issue_mod.IssueText(
+                text=text,
+                pre_gate=text,
+                leak=issue_mod.LeakResult(text=text),
+                failure_kinds=[],
+                ok=True,
+                needs_decision=None,
+            )
+        )
+
+    def _frozen(self, issues_dir, *, comments):
+        report = source_mod.IssueReport(
+            project="Demo",
+            bug_id=1,
+            source=source_mod.SOURCE_ISSUE,
+            number=2,
+            url="https://github.com/x/y/issues/2",
+            title="A title",
+            body="The report body, long enough to be actionable.",
+            comments=comments,
+            fetched_at="2026-10-25T06:00:00Z",
+            fix_commit_date="2020-01-02T00:00:00Z",
+        )
+        ok, reason = issue_mod.is_actionable(report.content())
+        report.gate = source_mod.GateRecord(
+            leak=issue_mod.LeakResult(
+                text=report.content(), removals=[], ungated_prose=[], ok=ok, reason=reason
+            ),
+            tree_sha256="a" * 64,
+            answer_sha256="b" * 64,
+            files=("tests/test_demo.py",),
+            hints=(
+                issue_mod.LeakResult(
+                    text=report.hints(), removals=[], ungated_prose=[], ok=True, reason=None
+                )
+                if report.hints()
+                else None
+            ),
+        )
+        return source_mod.write_frozen(
+            source_mod.frozen_path(issues_dir, "Demo", 1), report
+        )
+
+    @staticmethod
+    def _hints():
+        return [
+            source_mod.IssueComment(
+                author="maintainer",
+                created_at="2020-01-01T00:00:00Z",
+                body="the cause is parse_with_dots in pkg/mod.py",
+            )
+        ]
+
+    def test_the_default_text_is_the_content_section_and_nothing_else(
+        self, tmp_path, monkeypatch
+    ):
+        issues = tmp_path / "issues"
+        self._frozen(issues, comments=self._hints())
+        monkeypatch.setattr(source_mod, "ISSUES_DIR", issues)
+        bug_prep = self._prep_with_issue()
+        text = runner_mod.issue_text_for(bug_prep, show_hints=False)
+        assert text == bug_prep.issue.text, (
+            "the prompt is the frozen content section's gated text, byte-for-byte"
+        )
+        assert "the cause is parse_with_dots" not in text
+        assert "pkg/mod.py" not in text
+
+    def test_the_default_setting_never_reads_the_hints_at_all(self, monkeypatch):
+        """The guarantee is a property of the code, not of a flag somebody has to keep set.
+
+        With ``show_hints`` off, the frozen file is not even opened on this path — so there is
+        no route by which the comments could reach a prompt, however the file is written later.
+        """
+        monkeypatch.setattr(
+            source_mod,
+            "load_or_none",
+            lambda *args, **kwargs: pytest.fail(
+                "the default setting read the frozen file, so it could have carried the hints"
+            ),
+        )
+        bug_prep = self._prep_with_issue()
+        assert runner_mod.issue_text_for(bug_prep, show_hints=False) == bug_prep.issue.text
+
+    def test_the_ablation_appends_the_hints_the_committed_file_records(
+        self, tmp_path, monkeypatch
+    ):
+        """Turned on, the hints come from the *committed* file — the gated text, hashed on read.
+
+        Not from ``prepare.json``, so the ablation arm shows exactly what a reviewer saw and what
+        the section's own hash vouches for.
+        """
+        issues = tmp_path / "issues"
+        self._frozen(issues, comments=self._hints())
+        monkeypatch.setattr(source_mod, "ISSUES_DIR", issues)
+        bug_prep = self._prep_with_issue()
+        text = runner_mod.issue_text_for(bug_prep, show_hints=True)
+        assert text.startswith(bug_prep.issue.text)
+        assert "## Comments" in text
+        assert "the cause is parse_with_dots in pkg/mod.py" in text
+
+    def test_the_ablation_cannot_invent_hints_a_report_does_not_have(
+        self, tmp_path, monkeypatch
+    ):
+        issues = tmp_path / "issues"
+        self._frozen(issues, comments=[])
+        monkeypatch.setattr(source_mod, "ISSUES_DIR", issues)
+        bug_prep = self._prep_with_issue()
+        assert runner_mod.issue_text_for(bug_prep, show_hints=True) == bug_prep.issue.text
 
 
 # ============================================================================
@@ -16820,6 +17066,23 @@ class TestJobKey:
             candidate=candidate,
         )
 
+    def test_the_hints_ablation_gets_a_key_of_its_own(self):
+        """§2.4.4: the ablation is a different arm, so a resume must not confuse the two.
+
+        The key is the resume cursor. A with-hints row written under a default row's key would
+        let a resume skip one as the other — and the manifest would hold a row whose prompt
+        nobody can tell apart from the other arm's. The suffix is appended only when the flag is
+        set, so every key already written stays byte-identical.
+        """
+        plain = manifest_mod.job_key(
+            batch_id="b1", bug="Demo/1", config="vanta", mode="repair", seed=0
+        )
+        hinted = manifest_mod.job_key(
+            batch_id="b1", bug="Demo/1", config="vanta", mode="repair", seed=0, show_hints=True
+        )
+        assert plain == "b1#Demo/1#vanta#repair#0#"
+        assert hinted == plain + "#hints"
+
 
 class TestManifest:
     """Evidence is append-only; the cursor is the only thing that is rewritten (§7.3)."""
@@ -18090,6 +18353,7 @@ def _job(
     mode=runner_mod.REPAIR,
     candidate=None,
     harness=None,
+    show_hints=False,
 ) -> runner_mod.Job:
     return runner_mod.Job(
         batch_id="b1",
@@ -18109,6 +18373,7 @@ def _job(
         python_version_pinned="3.8.1",
         candidate=candidate,
         harness=harness,
+        show_hints=show_hints,
     )
 
 
@@ -18173,6 +18438,33 @@ class TestRunJob:
         assert record["sampling"]["source"] == split_mod.SAMPLING_POLICY
         assert record["artifacts"]["session_dir"] == "vanta_sessions/sess-1"
         assert record["oracle_reused"] is False
+
+    def test_the_row_says_which_prompt_arm_it_sent(self, tmp_path, monkeypatch):
+        """§2.4.4: ``show_hints`` is recorded per row, default off.
+
+        The ablation's whole value is that its rows are comparable to the default ones, and a
+        row that does not say whether its prompt carried the report's comments cannot be put in
+        the right arm afterwards. The default has to be the off value, so a row written before
+        this flag existed reads as a default row.
+        """
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        plain = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert plain["show_hints"] is False
+
+        hinted = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root"), show_hints=True),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert hinted["show_hints"] is True
 
     def test_the_row_names_the_binary_s_build_commit_and_the_harness_s_own(
         self, tmp_path, monkeypatch
@@ -18448,7 +18740,7 @@ class TestRunBatchLoop:
         monkeypatch.setattr(runner_mod, "run_job", self._stub(tmp_path, calls, leave_running=running))
         return preps, entries, split, calls, tmp_path / "batch"
 
-    def _run(self, preps, entries, split, batch_dir):
+    def _run(self, preps, entries, split, batch_dir, *, show_hints=False):
         return runner_mod.run_batch(
             batch_dir=batch_dir,
             batch_id="b1",
@@ -18460,6 +18752,7 @@ class TestRunBatchLoop:
             vanta_bin=Path("/nonexistent/vanta_m3"),
             max_attempts=4,
             disk_mb=8192,
+            show_hints=show_hints,
         )
 
     @staticmethod
@@ -18476,6 +18769,28 @@ class TestRunBatchLoop:
         self._run(preps, entries, split, batch_dir)
         assert calls, "the stub should have been called"
         assert {job.harness for job in calls} == {runner_mod.Revision("h" * 40, False)}
+
+    def test_the_hints_ablation_reaches_every_job_and_its_key(self, tmp_path, monkeypatch):
+        """§2.4.4: ``--show-hints`` is part of the job *and* of its cursor key, off by default.
+
+        The switch has to reach every job of the batch — repair and review alike — and it has to
+        be in the key rather than a note beside it: a with-hints row sharing a default row's key
+        would let a resume skip one as the other, and the manifest would hold a row whose prompt
+        nobody can put in the right arm.
+        """
+        preps, entries, split, plain, batch_dir = self._prepare(monkeypatch, tmp_path)
+        self._run(preps, entries, split, batch_dir)
+        assert plain, "the stub should have been called"
+        assert {job.show_hints for job in plain} == {False}, "the default is off"
+        assert not any(job.key.endswith("#hints") for job in plain)
+
+        preps, entries, split, hinted, _ = self._prepare(monkeypatch, tmp_path)
+        self._run(preps, entries, split, tmp_path / "batch-hints", show_hints=True)
+        assert {job.show_hints for job in hinted} == {True}
+        assert all(job.key.endswith("#hints") for job in hinted)
+        assert {job.key for job in hinted} == {job.key + "#hints" for job in plain}, (
+            "the two arms differ in the key and in nothing else"
+        )
 
     def test_the_harness_revision_is_read_before_the_first_phase_runs(
         self, tmp_path, monkeypatch

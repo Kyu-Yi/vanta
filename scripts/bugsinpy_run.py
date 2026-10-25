@@ -783,6 +783,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         vanta_bin=vanta_bin,
         max_attempts=args.max_attempts,
         disk_mb=args.disk_mb,
+        show_hints=args.show_hints,
         plan_only=args.plan,
     )
     if args.plan:
@@ -1085,6 +1086,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--plan",
         action="store_true",
         help="print the schedule (and the honest floor on review rows) and exit",
+    )
+    run.add_argument(
+        "--show-hints",
+        action="store_true",
+        help=(
+            "send each report's comments on top of its content (§2.4.4). Off by default and "
+            "off for every batch a verdict rests on: the comments are pre-fix hints_text and "
+            "they name the fix often enough that matplotlib/1's maintainer comment names a "
+            "file and a line range. Setting it is an ablation arm — the rows record "
+            "show_hints=true and take a `#hints` job key, so they can never be resumed as, or "
+            "compared by name to, the default run."
+        ),
     )
     run.set_defaults(func=cmd_run)
 

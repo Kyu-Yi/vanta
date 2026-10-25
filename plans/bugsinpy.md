@@ -899,23 +899,41 @@ cache, to a log, or into a cache key.
 #### 2.4.3 The frozen artifact — identical by construction
 
 `prepare` writes `plans/bugsinpy_issues/<project>_<bug>.md` and **commits it**. It carries the
-title, body and the issue's comments **up to the fix commit's date and never anything after it**.
-The cut is the point: the fix commit's date is the last moment at which the report says what the
-reporter knew; a comment posted after the fix can only be about the fix.
+title and body — the issue text proper — and, separately, the issue's comments **up to the fix
+commit's date and never anything after it**. The cut is the point: the fix commit's date is the
+last moment at which a comment says what the reporter knew; a comment posted after the fix can
+only be about the fix.
 
-The file has three sections behind one header, in this order:
+**The comments are hints and the title and body are the issue.** This is the SWE-bench
+convention and it is the right one on the merits: `problem_statement` is title + body, and a
+comment is a *hint* (`hints_text`), which SWE-bench does not show by default. The reason is
+concrete rather than conventional. On a real report a maintainer often arrives before the fix and
+names the cause — `matplotlib/1`'s comments name `backend_agg.py#L411-L421` and describe the
+defect in the maintainer's own words — and that is the answer, in the prompt, in prose the token
+gate cannot take back because every symbol in it is present in the buggy tree. So the comments are
+frozen, gated, and kept in their own section, and **the default setting never shows them**; only
+the explicit with-hints ablation does (§2.4.4).
 
-- `<!-- gate -->` — the gate record as JSON: the removals, their classes, and the ungated prose
-  (§2.4.4). Legible only next to what was removed, which is why the raw section exists.
-- `<!-- raw -->` — the report exactly as the API returned it, ungated.
-- `<!-- content -->` — the **gated** text, and the only section any stage reads.
+The file has five sections behind one header, in this order:
+
+- `<!-- gate -->` — the gate record as JSON: the removals, their classes, and the ungated prose for
+  **both** the content and the hints (§2.4.4). Legible only next to what was removed, which is why
+  the raw sections exist.
+- `<!-- raw -->` — the report's title and body exactly as the API returned them, ungated.
+- `<!-- content -->` — the **gated** title and body, and the only section the default setting reads.
+- `<!-- raw-hints -->` — the comments exactly as the API returned them, ungated.
+- `<!-- hints -->` — the **gated** comments. Frozen and hashed like everything else, and read by
+  nothing unless the with-hints ablation asks for it.
 
 The header carries `issue` (URL), `resolved` (`direct` / `via PR #N` / `none`), `fetched` (UTC),
 `fix-commit-date`, `comments-included`, then the gate's own provenance — `gate-tree-sha256`,
-`gate-answer-sha256`, `gate-removals` — and the pair the artifact is *for*: `raw-sha256` and
-`content-sha256`. The two `gate-*-sha256` lines make the freeze auditable: they are hashes of the
-gate's **inputs**, so a reader can tell which tree and which answer tokens produced the removals
-without re-deriving them.
+`gate-answer-sha256`, `gate-removals` — and the pairs the artifact is *for*: `raw-sha256` /
+`content-sha256` for the issue text and `raw-hints-sha256` / `hints-sha256` for the comments. The
+two `gate-*-sha256` lines make the freeze auditable: they are hashes of the gate's **inputs**, so a
+reader can tell which tree and which answer tokens produced the removals without re-deriving them.
+A report with no comments has empty `raw-hints` / `hints` sections and carries the hashes of the
+empty string; `comments-included` is `0`, and a file that says `0` while carrying a hints section
+is refused.
 
 `prepare`, the measure-only precheck and the run all read this file's `<!-- content -->` section
 rather than re-deriving a text. Identity is therefore **by construction**, not by convention or by
@@ -978,10 +996,31 @@ from, and the removals are the tokens that occurred in the fix diff or those fil
 took "the file's text" rather than its content section would put both in the prompt, and nothing in
 any metric afterwards would show it. So the assertion is not "the text looks clean" but "every path
 the gate counted answer tokens from is present in the committed file (the record is honest) and
-absent from `content` (the prompt is clean)", plus the header's own lines and the two other markers
+absent from `content` (the prompt is clean)", plus the header's own lines and the four other markers
 being absent from `content`. Read back, `FrozenIssue.content` is the *only* string `prepare` hands
 the selector and the run (`build_issue` sets `prep.issue.text` from it), so the test's subject and
 the prompt's are the same bytes.
+
+**The same claim is made about the hints, and it is made in the code rather than in a flag.**
+"Never shown by default" is not "shown only if a boolean is false": under the default setting
+`issue_text_for` returns `FrozenIssue.content` **before it looks at the hints at all**, so no copy
+of the comments exists anywhere on the path to a prompt. A test pins that by monkeypatching the
+module's own `load_or_none` to fail and asserting the default call still succeeds — a flag that
+merely gated the read would pass a weaker test and could be flipped by a caller. `show_hints` is
+recorded in the run provenance (`Job.show_hints`, the row's `show_hints`, `run --show-hints`) and
+is part of the job key, so the ablation's rows can never be confused with the main arm's on a
+resume.
+
+**The gate removes tokens and never reformats, and a test says so over a code block.** The report
+is the reporter's own text: a fenced block or an indented traceback in it is Python they pasted,
+and its indentation is a byte of the text. So the gated section is the raw section with
+`[redacted]` in place of the removed tokens and **nothing else changed** — no whitespace collapse,
+no re-wrapping, no trimming of runs of spaces — apart from the one line-end fold of §2.4.3
+(`\r` out, and a trailing `\n` normalised at the section's edge). The addendum's test freezes a
+body containing `    print('1')` inside a fence, reads the artifact back, and asserts the section
+is byte-identical; a second test does the same for an indented non-fenced body. A gate that
+collapsed runs of spaces would turn that line into `print('1')`, which is not Python, and the
+freeze would be destroying the evidence the bug is about.
 
 #### 2.4.4 The leak gate, now applied to the issue text — once, at freeze time
 
@@ -991,6 +1030,18 @@ the buggy tree, and record every removal. Applied to a real issue report the rul
 what it was written for — the reporter has not seen the fix, so a token they use that occurs nowhere
 in the buggy tree is genuinely suspicious, while a symbol that *is* in the tree is not removed,
 which is correct.
+
+**It runs twice per freeze, on the issue text and on the comments, and only the issue text gets a
+verdict.** `gate_text` is the substitution alone; `leak_gate` is `gate_text` plus the actionability
+check and runs on the title and body; `gate_hints` is `gate_text` and runs on the comments. The
+hints are gated for the same reason the text is — if the ablation shows them, they must not carry
+the answer's tokens — but they are **not** asked whether they are still actionable, because nothing
+sends them by default: a comment section the gate shredded is not a reason to drop a bug from the
+main evaluation, and refusing a bug for the state of a section the main evaluation never reads
+would be a rule about the wrong arm. The gate record consequently holds an optional `hints` block
+that reports removals and ungated prose and carries no `ok`/`reason`, and it is `None` for a report
+with no comments rather than an "empty and fine" object, so "there were no comments" and "the
+comments were gated and came out clean" stay distinguishable in the record.
 
 **It runs once, when the report is frozen, and its inputs come from `git` alone.** This is what
 lets measure-only and a full run agree. Measure-only has no `vanta_tree` — that tree is cut from the
@@ -1012,23 +1063,19 @@ a refusal naming any file outside that set, telling the reader to delete the art
 it against the oracle the batch derived. Silently re-gating would produce a second text for the same
 bug — exactly the drift §2.4.3 exists to prevent.
 
-**The gate removes tokens and never reformats, and a test says so over a code block.** The report
-is the reporter's own text: a fenced block or an indented traceback in it is Python they pasted,
-and its indentation is a byte of the text. So the gated section is the raw section with
-`[redacted]` in place of the removed tokens and **nothing else changed** — no whitespace collapse,
-no re-wrapping, no trimming of runs of spaces — apart from the one line-end fold of §2.4.3
-(`\r` out, and a trailing `\n` normalised at the section's edge). The addendum's test freezes a
-body containing `    print('1')` inside a fence, reads the artifact back, and asserts the section
-is byte-identical; a second test does the same for an indented non-fenced body. A gate that
-collapsed runs of spaces would turn that line into `print('1')`, which is not Python, and the
-freeze would be destroying the evidence the bug is about.
-
 **Reporter code blocks and tracebacks are kept, byte for byte.** They are legitimate report content
 and are exactly what §1.6.7's traceback and path signals are for — a real bug report that contains a
 traceback is the case localization is supposed to handle, not a case to sanitise away. Keeping them
 is a claim about bytes as well as about policy: the gate substitutes tokens and changes nothing
 else, so an indented block arrives in the prompt exactly as the reporter pasted it (§2.4.3, and the
 freeze-time test that asserts it).
+
+**The hints split is a provenance fact, not only a prompt fact.** `show_hints` is written into every
+run row and is part of the job key, so a with-hints run is a different arm with its own rows rather
+than the same rows with a different prompt — a resume cannot pair a hinted row with a plain one, and
+the paper's ablation is a set of rows it can identify. It is off for the main evaluation, and the
+selector's and the run's only source for the hints is the committed artifact's `<!-- hints -->`
+section: no stage re-derives them, so the ablation cannot show a comment the artifact does not hold.
 
 #### 2.4.5 What is dropped
 

@@ -76,14 +76,21 @@ FROZEN_HEADER_KEYS = (
     "gate-answer-sha256",
     "raw-sha256",
     "content-sha256",
+    "raw-hints-sha256",
+    "hints-sha256",
 )
 """Every header line :func:`load_frozen` needs before it will hand out a text.
 
 ``raw-sha256`` and ``content-sha256`` are the pair the artifact is *for*: the raw report
 is kept beside the gated text so a reader can see what the gate took out, and the gated
-hash is what every stage checks the file against. The two ``gate-*-sha256`` lines are the
-gate's *inputs*, not its output (§2.4): the token maps the freeze step computed from the
-buggy commit's source and from the fix diff plus the test files ``bug.info`` declares."""
+hash is what every stage checks the file against. ``raw-hints-sha256`` and ``hints-sha256``
+are the same pair for the comments (§2.4.4), and they are in this list rather than optional
+for a reason: the hints are an ablation arm, and an arm whose text is not covered by the
+hash is one a hand edit can move without the file refusing itself.
+
+The two ``gate-*-sha256`` lines are the gate's *inputs*, not its output (§2.4): the token
+maps the freeze step computed from the buggy commit's source and from the fix diff plus
+the test files ``bug.info`` declares."""
 
 SOURCE_ISSUE = "issue"
 SOURCE_VIA_PR = "via-pr"
@@ -412,6 +419,19 @@ class GateRecord:
     answer_sha256: str
     files: tuple[str, ...]
     """The test files the answer tokens came from — ``bug.info``'s declaration, resolved."""
+    hints: Optional["issue_mod.LeakResult"] = None
+    """The same gate over the report's **comments** — SWE-bench's ``hints_text`` (§2.4.4).
+
+    [VANTA-WHY] Stored, gated and **never sent in the default setting**. A comment posted
+    before the fix is under no obligation to avoid naming it, and on ``matplotlib/1`` one
+    does: a maintainer says what the cause was and points at ``backend_agg.py``'s line
+    range. That is the answer, and a report whose ``problem_statement`` is title-plus-body
+    cannot carry it — so the comments are a section of their own, gated by the same rule as
+    the text a run sends (:func:`issue_mod.gate_hints`) and read by nothing unless
+    ``show_hints`` turns them on, which is off and recorded per row (``runner.build_record``).
+    ``None`` means the report had no comments at all, which is different from comments that
+    gated to nothing.
+    """
 
 
 @dataclass
@@ -441,7 +461,13 @@ class IssueReport:
         return f"{self.project}_{self.bug_id}"
 
     def content(self) -> str:
-        """The frozen text: title, body and the included comments. Gated later, not here.
+        """The Vanta-visible text: the **title and the body**. Not the comments (§2.4.4).
+
+        [VANTA-WHY] This is SWE-bench's ``problem_statement``: the report as the person who
+        filed it stated the problem, before anyone who knew the answer had typed into the
+        thread. The comments are resolved with it and stored beside it, but they are
+        ``hints_text`` — kept out of the default setting precisely because a fix is often
+        named in them — and :meth:`hints` is where they go.
 
         **The reporter's own bytes.** Line endings folded to ``\\n`` and the newlines the
         framing adds at a part's edges dropped — :func:`_report_text`'s rule, and the only rule
@@ -459,12 +485,26 @@ class IssueReport:
         body = _report_text(self.body)
         if body:
             parts.append(body)
-        if self.comments:
-            parts.append("## Comments")
-            for comment in self.comments:
-                parts.append(f"### {comment.author} — {comment.created_at}")
-                parts.append(_report_text(comment.body))
         return "\n\n".join(parts) + "\n" if parts else ""
+
+    def hints(self) -> str:
+        """The comments up to the fix's date — gated, stored, and **never shown by default**.
+
+        Written the same way :meth:`content` is, so the two sections are gated, hashed and
+        round-tripped by one rule, and empty when the report carries no comments: an empty
+        hints section hashes to the empty string like an empty content section does, and the
+        reader that finds nothing after the hints marker is reading a report with none, not a
+        truncated file.
+        """
+        if not self.comments:
+            return ""
+        parts: list[str] = ["## Comments"]
+        for comment in self.comments:
+            parts.append(f"### {comment.author} — {comment.created_at}")
+            text = _report_text(comment.body)
+            if text:
+                parts.append(text)
+        return "\n\n".join(parts) + "\n"
 
     def resolved_as(self) -> str:
         if self.source == SOURCE_VIA_PR:
@@ -536,7 +576,7 @@ def resolve(
             via_pr=via_pr,
             url=issue.get("html_url") or f"https://github.com/{owner}/{repo}/issues/{number}",
             title=(issue.get("title") or "").strip(),
-            body=(issue.get("body") or "").strip(),
+            body=_report_text(issue.get("body") or ""),
             comments=comments,
             fetched_at=_utc_now(),
             fix_commit_date=fix_commit_date,
@@ -651,12 +691,20 @@ def frozen_path(issues_dir: Path, project: str, bug_id: int) -> Path:
 CONTENT_MARKER = "<!-- content -->"
 RAW_MARKER = "<!-- raw -->"
 GATE_MARKER = "<!-- gate -->"
-"""The frozen file's three sections, in this order, each introduced by its own line.
+HINTS_MARKER = "<!-- hints -->"
+RAW_HINTS_MARKER = "<!-- raw-hints -->"
+"""The frozen file's five sections, in this order, each introduced by its own line.
 
 Explicit marker lines rather than blank ones, because a ``none`` report's text is empty
 and a reader that split on "the first blank line after the header" could not tell that
 from a truncated file. The raw report comes before the gated text so that a human reading
-the committed artifact sees what the reporter wrote before seeing what the gate left."""
+the committed artifact sees what the reporter wrote before seeing what the gate left.
+
+[VANTA-WHY] ``raw-hints``/``hints`` are a second raw/gated pair, and they come last: what a
+stage reads is the content section, and a file whose later sections were cut off in a copy
+or a paste would lose only the section nothing sends. What they carry — the report's comments,
+gated by the same rule — is stored so a with-hints ablation is possible later, and is sent by
+nothing in the default setting."""
 
 
 def _report_text(value: str) -> str:
@@ -702,9 +750,9 @@ def _canonical(text: str) -> str:
     let a hand-edited artifact verify. ``test_an_edited_gated_text_is_refused_by_its_content_hash``
     is that byte, appended to the last line of a report, and the hash has to catch it.
 
-    This is a rule about the **file**, applied to every section. It is not a licence to
-    reformat: the gate substitutes tokens and changes nothing else (§2.4.4), so a section's
-    bytes are the reporter's own.
+    This is a rule about the **file**, applied to every section, and it is the *only* rule about
+    whitespace anywhere in this path. It is not a licence to reformat: the gate substitutes
+    tokens and changes nothing else (§2.4.4), so a section's bytes are the reporter's own.
     """
     folded = _report_text(text)
     return folded + "\n" if folded else ""
@@ -722,7 +770,7 @@ def _section(text: str, marker: str) -> tuple[str, str]:
 
 
 def render_frozen(report: IssueReport) -> str:
-    """The artifact's exact bytes: provenance, the gate's record, raw report, gated text.
+    """The artifact's exact bytes: provenance, the gate's record, raw/content, raw-hints/hints.
 
     [VANTA-WHY] The raw report is stored *beside* the gated text rather than instead of it.
     The gate's removals are only legible next to what was removed, and the paper's question
@@ -730,6 +778,12 @@ def render_frozen(report: IssueReport) -> str:
     — a question nobody can answer from a gate report that no longer has the text it gated.
     Nothing after the content marker is read by a stage: ``FrozenIssue.content`` is the
     gated text, and that is what ``prepare``, a measure-only run and the run all send.
+
+    The comments get their own raw/gated pair for the same reason and one more (§2.4.4):
+    they are ``hints_text``, they name the answer often enough that ``matplotlib/1``'s
+    maintainer comment names a file and a line range, and a section that is never sent still
+    has to be gated and hashed — otherwise the ablation arm that later shows it would be
+    showing text no gate ever saw.
     """
     if report.gate is None:
         raise IssueSourceError(
@@ -738,7 +792,9 @@ def render_frozen(report: IssueReport) -> str:
             "before writing it."
         )
     raw = report.content()
+    raw_hints = report.hints()
     gated = report.gate.leak.text
+    gated_hints = report.gate.hints.text if report.gate.hints else ""
     header = [
         f"# {report.project}/{report.bug_id} — the project's own issue report",
         "",
@@ -752,6 +808,8 @@ def render_frozen(report: IssueReport) -> str:
         f"- gate-removals: {len(report.gate.leak.removals)}",
         f"- raw-sha256: {sha256_text(_canonical(raw))}",
         f"- content-sha256: {sha256_text(_canonical(gated))}",
+        f"- raw-hints-sha256: {sha256_text(_canonical(raw_hints))}",
+        f"- hints-sha256: {sha256_text(_canonical(gated_hints))}",
     ]
     if report.refrozen_at:
         header.append(f"- refrozen: {report.refrozen_at}")
@@ -763,6 +821,16 @@ def render_frozen(report: IssueReport) -> str:
         "reason": report.gate.leak.reason,
         "removals": [removal.to_dict() for removal in report.gate.leak.removals],
         "ungated_prose": list(report.gate.leak.ungated_prose),
+        # No ``ok``/``reason`` for the hints: nobody asked whether they are actionable,
+        # because nothing sends them by default (§2.4.4). ``None`` — not ``{}`` — when the
+        # report had no comments, so "none resolved" and "resolved, gate found nothing"
+        # stay distinguishable in the record.
+        "hints": None
+        if report.gate.hints is None
+        else {
+            "removals": [removal.to_dict() for removal in report.gate.hints.removals],
+            "ungated_prose": list(report.gate.hints.ungated_prose),
+        },
     }
     parts = [
         "\n".join(header),
@@ -777,6 +845,12 @@ def render_frozen(report: IssueReport) -> str:
         CONTENT_MARKER,
         "",
         _canonical(gated),
+        RAW_HINTS_MARKER,
+        "",
+        _canonical(raw_hints),
+        HINTS_MARKER,
+        "",
+        _canonical(gated_hints),
     ]
     return "\n".join(parts) + "\n"
 
@@ -799,6 +873,14 @@ class FrozenIssue:
     content: str
     raw: str
     """What the reporter wrote, before the gate — never sent to Vanta."""
+    hints: str
+    """The gated comments — the section no stage sends unless ``show_hints`` is on (§2.4.4)."""
+    raw_hints: str
+    """The comments before the gate — the record of what was removed from ``hints``."""
+    hints_sha256: str
+    """The header's hash of ``hints``, verified on read like ``content_sha256``."""
+    hints_leak: "issue_mod.LeakResult"
+    """The gate's substitutions in the comments. Its ``ok``/``reason`` were never asked for."""
     gate: "issue_mod.LeakResult"
     """The gate's record: what it removed, and the text it left (``content``)."""
     gate_files: tuple[str, ...]
@@ -884,7 +966,10 @@ def parse_frozen(text: str, *, path: Path) -> FrozenIssue:
 
     Both hashes are taken over :func:`_canonical` of the parsed section, and the string handed
     out as ``content`` is that same canonical form — so "what is hashed" and "what Vanta is
-    given" are one object, and not two things that have to be kept in step.
+    given" are one object, and not two things that have to be kept in step. The comments are
+    parsed, hashed and verified the same way and handed out as ``hints``, which no stage reads
+    in the default setting (§2.4.4) — a section that is never sent still has to refuse an edit,
+    or the ablation arm would be an unreviewed text under a reviewed name.
     """
     target = Path(path)
     header, body = _header_block(text)
@@ -898,8 +983,12 @@ def parse_frozen(text: str, *, path: Path) -> FrozenIssue:
     _, after_gate = _section(body, GATE_MARKER)
     gate_section, after_raw = _section(after_gate, RAW_MARKER)
     raw_section, after_content = _section(after_raw, CONTENT_MARKER)
+    content_section, after_raw_hints = _section(after_content, RAW_HINTS_MARKER)
+    raw_hints_section, after_hints = _section(after_raw_hints, HINTS_MARKER)
     raw = _canonical(raw_section)
-    content = _canonical(after_content)
+    content = _canonical(content_section)
+    raw_hints = _canonical(raw_hints_section)
+    hints = _canonical(after_hints)
 
     if sha256_text(content) != header["content-sha256"]:
         raise IssueSourceError(
@@ -913,10 +1002,29 @@ def parse_frozen(text: str, *, path: Path) -> FrozenIssue:
             f"report hashes to {sha256_text(raw)} — the record of what the gate removed was "
             "edited after it was frozen"
         )
+    if sha256_text(hints) != header["hints-sha256"]:
+        raise IssueSourceError(
+            f"{target}: hints-sha256 in the header is {header['hints-sha256']}, but the "
+            f"hints hash to {sha256_text(hints)} — the comments were edited after the file "
+            "was frozen"
+        )
+    if sha256_text(raw_hints) != header["raw-hints-sha256"]:
+        raise IssueSourceError(
+            f"{target}: raw-hints-sha256 in the header is {header['raw-hints-sha256']}, but "
+            f"the raw comments hash to {sha256_text(raw_hints)} — the record of what the gate "
+            "removed from the comments was edited after the file was frozen"
+        )
     try:
         gate_payload = json.loads(_canonical(gate_section) or "{}")
     except ValueError as exc:
         raise IssueSourceError(f"{target}: the {GATE_MARKER} section is not JSON: {exc}") from exc
+    hints_payload = gate_payload.get("hints")
+    if hints_payload is None and header["comments-included"] != "0":
+        raise IssueSourceError(
+            f"{target}: the header says {header['comments-included']} comment(s) were "
+            "included, but the gate record carries no hints block — the file does not say "
+            "what was gated out of them"
+        )
     gate = issue_mod.LeakResult(
         text=content,
         removals=[
@@ -927,9 +1035,23 @@ def parse_frozen(text: str, *, path: Path) -> FrozenIssue:
         ok=bool(gate_payload.get("ok")),
         reason=gate_payload.get("reason"),
     )
+    hints_leak = issue_mod.LeakResult(
+        text=hints,
+        removals=[
+            issue_mod.LeakRemoval.from_dict(item, where=f"{target} gate hints removals[]")
+            for item in (hints_payload or {}).get("removals") or []
+        ],
+        ungated_prose=[str(word) for word in (hints_payload or {}).get("ungated_prose") or []],
+        # Not a verdict — see ``issue_mod.gate_hints``: the hints are never sent, so nobody
+        # asked whether they are worth sending. Reconstructed rather than stored so the file
+        # cannot appear to record an answer to a question that was never put.
+        ok=True,
+        reason=None,
+    )
 
     source, via_pr = _parse_resolved(header["resolved"])
-    title, body_text, comments = _parse_content(content)
+    title, body_text = _parse_content(content)
+    comments = _parse_hints(hints)
     return FrozenIssue(
         path=target,
         source=source,
@@ -944,6 +1066,10 @@ def parse_frozen(text: str, *, path: Path) -> FrozenIssue:
         comments=comments,
         content=content,
         raw=raw,
+        hints=hints,
+        raw_hints=raw_hints,
+        hints_sha256=header["hints-sha256"],
+        hints_leak=hints_leak,
         gate=gate,
         gate_files=tuple(str(name) for name in gate_payload.get("files") or []),
         gate_tree_sha256=header["gate-tree-sha256"],
@@ -968,25 +1094,37 @@ def _number_in_url(url: str) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
-def _parse_content(content: str) -> tuple[str, str, list[IssueComment]]:
-    """The inverse of :meth:`IssueReport.content`, so a frozen file round-trips."""
+def _parse_content(content: str) -> tuple[str, str]:
+    """The inverse of :meth:`IssueReport.content`: the title and the body, and nothing else.
+
+    No comment handling at all, deliberately. A report's body is free text a reporter typed,
+    and a line in it that happens to read ``## Comments`` is that reporter's line — the old
+    reader would have taken everything after it as the comment thread, which is a way for the
+    body's own bytes to be silently reclassified by their content. Now the split is by
+    *section* (the markers), not by a heading a body may or may not contain.
+    """
     title = ""
     body_lines: list[str] = []
+    for line in content.splitlines():
+        if line.startswith("# ") and not title:
+            title = line[2:].strip()
+            continue
+        body_lines.append(line)
+    return title, _report_text("\n".join(body_lines))
+
+
+def _parse_hints(hints: str) -> list[IssueComment]:
+    """The inverse of :meth:`IssueReport.hints`: the comments, read back in order.
+
+    The leading ``## Comments`` heading is dropped; each ``### author — created_at`` line
+    opens a comment and everything up to the next one is its body. An empty hints section is
+    a report with no comments, which is a fact about the report and not a truncated file —
+    the marker line itself is what says the section is there (:func:`_section`).
+    """
     comments: list[IssueComment] = []
     current: Optional[IssueComment] = None
     body_buf: list[str] = []
-    in_comments = False
-
-    for line in content.splitlines():
-        if not in_comments:
-            if line.strip() == "## Comments":
-                in_comments = True
-                continue
-            if line.startswith("# ") and not title:
-                title = line[2:].strip()
-                continue
-            body_lines.append(line)
-            continue
+    for line in hints.splitlines():
         if line.startswith("### ") and " — " in line:
             if current is not None:
                 comments.append(_with_body(current, body_buf))
@@ -998,7 +1136,7 @@ def _parse_content(content: str) -> tuple[str, str, list[IssueComment]]:
             body_buf.append(line)
     if current is not None:
         comments.append(_with_body(current, body_buf))
-    return title, _report_text("\n".join(body_lines)), comments
+    return comments
 
 
 def _with_body(comment: IssueComment, lines: Sequence[str]) -> IssueComment:
@@ -1023,7 +1161,7 @@ def ensure_frozen(
     github_url: str,
     message: str,
     fix_commit_date: str,
-    gate: Callable[[str], GateRecord],
+    gate: Callable[[str, str], GateRecord],
     refreeze: bool = False,
 ) -> FrozenIssue:
     """Read the frozen report, resolving and gating it once if it is not there yet.
@@ -1036,8 +1174,9 @@ def ensure_frozen(
     ``gate`` is the freeze step's other half and is supplied by the caller because its inputs
     are the caller's: the buggy commit's source and the fix diff are on the caller's disk,
     and neither the API client nor this module walks a tree (§2.4). It is called once, on the
-    raw report, and what it returns is stored beside the raw text — after that no stage gates
-    anything again, which is what "identical by construction" means here.
+    report's two texts — the content and the comments (§2.4.4) — and what it returns is stored
+    beside the raw text; after that no stage gates anything again, which is what "identical by
+    construction" means here.
 
     ``refreeze`` is the *only* way an existing artifact is ever replaced, and it can only be
     set by someone naming the bug on the command line (§2.4.3). A file that exists is
@@ -1059,7 +1198,7 @@ def ensure_frozen(
         message=message,
         fix_commit_date=fix_commit_date,
     )
-    report.gate = gate(report.content())
+    report.gate = gate(report.content(), report.hints())
     if target.is_file():
         report.refrozen_at = _utc_now()
     write_frozen(target, report)
@@ -1076,6 +1215,7 @@ __all__ = [
     "FROZEN_HEADER_KEYS",
     "GATE_MARKER",
     "GITHUB_API",
+    "HINTS_MARKER",
     "ISSUES_DIR",
     "GateRecord",
     "IssueComment",
@@ -1084,6 +1224,7 @@ __all__ = [
     "GitHubClient",
     "HttpResponse",
     "RAW_MARKER",
+    "RAW_HINTS_MARKER",
     "RefCandidate",
     "SOURCE_ISSUE",
     "SOURCE_NONE",

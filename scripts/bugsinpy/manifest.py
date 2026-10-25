@@ -45,6 +45,7 @@ def job_key(
     mode: str,
     seed: int,
     candidate: Optional[str] = None,
+    show_hints: bool = False,
 ) -> str:
     """The stable identity of one job, and therefore of one resume decision.
 
@@ -52,8 +53,16 @@ def job_key(
     review pass is one session *per candidate* (§7.1) — without it, the second
     candidate of a bug would shadow the first in ``state.json`` and be skipped on
     resume.
+
+    ``show_hints`` is appended only when it is set, because a row that sends the
+    report's comments is a run of a *different prompt* (§2.4.4): sharing a key with the
+    default row would let a resume skip one as though it were the other, which is the
+    conflation ``candidate`` is already here to prevent. A suffix rather than a seventh
+    column so that every key a default run has already written stays exactly as it was —
+    the with-hints ablation is additive, not a re-keying of the corpus.
     """
-    return "#".join([batch_id, bug, config, mode, str(seed), candidate or ""])
+    key = "#".join([batch_id, bug, config, mode, str(seed), candidate or ""])
+    return f"{key}#hints" if show_hints else key
 
 
 class Manifest:

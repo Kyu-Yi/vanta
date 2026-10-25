@@ -445,6 +445,20 @@ def precheck(
             f"{', '.join(selection.dropped_for_budget[:3])}); the run would be shown "
             "a smaller context than its ranking chose"
         )
+    if not selection.files:
+        # A selection with no file at all is a listing, not a context: the prompt
+        # would be the repository file tree — ``tree_count`` paths — and nothing
+        # else. That is what the second measure-only run measured for all 11 dev
+        # bugs, and why this reason exists: a listing always fits the budget, so
+        # the two checks above pass a bug that was never shown any source
+        # (`selected_bytes == tree_bytes` exactly, §1.6.3). A selection with no
+        # file is refused for the thing it is missing, not for its size.
+        reasons.append(
+            "no source selected: the selection carries no file at all — only the "
+            f"repository file tree ({selection.tree_count} path(s), "
+            f"{selection.tree_bytes} B). A listing of paths says where code is, not "
+            "what it does, so a role shown only that has no context to work from"
+        )
 
     return ContextVerdict(
         context_ok=not reasons,

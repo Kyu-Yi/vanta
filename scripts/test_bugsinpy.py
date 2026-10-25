@@ -2159,6 +2159,55 @@ class TestPrecheck:
         assert "pkg/core.py" in verdict.reasons[0]
         assert "smaller context than its ranking chose" in verdict.reasons[0]
 
+    def test_rejects_a_selection_that_is_only_the_file_tree(self):
+        """A selection with no file is a listing, not a context — and the budget
+        checks cannot see it: a listing always fits, which is how all 11 dev bugs
+        passed the second measure-only run with ``selected_bytes == tree_bytes``.
+        The gate refuses it for what it is missing, not for its size."""
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=200_000, n_ctx_source="test",
+            selection=selection(
+                files=[],
+                tree_count=9,
+                selected_bytes=204,
+                selected_tokens=51,
+                tree_bytes=204,
+                tree_tokens=51,
+                prompt_tokens_estimate=3_000,
+            ),
+        )
+        assert verdict.context_ok is False
+        assert verdict.reasons == [
+            "no source selected: the selection carries no file at all — only the "
+            "repository file tree (9 path(s), 204 B). A listing of paths says where "
+            "code is, not what it does, so a role shown only that has no context to "
+            "work from"
+        ], "the only thing wrong with this selection is that it holds no source"
+
+    def test_a_selection_with_one_file_is_not_refused_for_missing_source(self):
+        """The new reason is about the selection's shape, not a second budget
+        check: a selection that carries a file never trips it, whatever it costs."""
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=200_000, n_ctx_source="test",
+            selection=selection(prompt_tokens_estimate=1_000),
+        )
+        assert verdict.context_ok is True
+        assert not any(r.startswith("no source selected") for r in verdict.reasons)
+
+    def test_a_listing_over_budget_is_refused_for_both_reasons(self):
+        """When even the listing does not fit, both are true and both are said:
+        the size is a problem *and* there is no source in the prompt at all."""
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=131_072, n_ctx_source="test",
+            selection=selection(
+                files=[], tree_count=1_114, selected_bytes=45_118,
+                tree_bytes=45_118, prompt_tokens_estimate=200_000, fits=False,
+            ),
+        )
+        assert verdict.context_ok is False
+        kinds = {reason.split(":", 1)[0] for reason in verdict.reasons}
+        assert kinds == {"prompt_exceeds_budget", "no source selected"}
+
     def test_rejects_a_prompt_over_budget(self):
         verdict = ctx.precheck(
             Path("/nonexistent"), "", n_ctx=200_000, n_ctx_source="test",

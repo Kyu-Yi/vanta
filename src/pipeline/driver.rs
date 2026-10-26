@@ -2774,7 +2774,8 @@ pub async fn run(
             phase: "call.usage".to_string(),
             summary: format!(
                 "seq={} site={} round={} attempt={} prompt_tokens={} completion_tokens={} \
-                 total_tokens={} source={} seed={} finish_reason={} wall_ms={} truncated={}",
+                 total_tokens={} source={} seed={} seed_mechanism={} finish_reason={} wall_ms={} \
+                 truncated={}",
                 usage.seq,
                 usage.site,
                 // [VANTA-WHY] §14.12 — the round and the retry index travel with
@@ -2791,6 +2792,10 @@ pub async fn run(
                 // `VANTA_LLM_SEED` when a retry advanced it. Written per call so
                 // a truncated-and-retried call is reproducible after the fact.
                 token_value(usage.seed),
+                // [VANTA-WHY] §14.23 — how that seed reached the body, so a call
+                // made by a backend that cannot send one is distinguishable from
+                // a call that was simply never asked for a seed.
+                usage.seed_mechanism,
                 // [VANTA-WHY] §14.12 — the server's own word, verbatim. `unset`
                 // rather than a plausible-looking `stop`, which would be a claim
                 // the server never made.
@@ -2920,7 +2925,7 @@ pub async fn run(
         phase: "run.summary".to_string(),
         summary: format!(
             "attempts_run={} fixed_at_attempt_1={} final_decision={:?} \
-             config={} mode={} seed={} model={} top_p={} {} \
+             config={} mode={} seed={} seed_policy={} model={} top_p={} {} \
              llm_calls={} llm_calls_measured={} llm_prompt_tokens={} llm_completion_tokens={} \
              truncated_calls_creator={} truncated_calls_attacker={} \
              truncated_calls_intent_audit={} \
@@ -2940,6 +2945,11 @@ pub async fn run(
             config_name,
             run_mode,
             seed_value,
+            // [VANTA-WHY] §14.23 — the seed POLICY, not the seed. The offset is
+            // default-on, so a row's own `seed` cannot say whether its later rounds
+            // were independent draws; this field is what makes a pre-§14.23 row
+            // (which has no `seed_policy` at all) impossible to pool by accident.
+            crate::llm::SEED_POLICY,
             cfg.model_id,
             top_p_value,
             sampling_schedule_keys(),

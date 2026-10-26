@@ -181,6 +181,15 @@ pub struct CallUsage {
     /// fact: the sequence is a function of the pinned seed and the attempt
     /// index, and both are in the record.
     pub seed: Option<u64>,
+    /// How the seed reached (or did not reach) this call's body (§14.23).
+    ///
+    /// [VANTA-WHY] §14.23 — the same reason §14.21's knobs carry a mechanism: a
+    /// recorded value without one cannot be compared across backends. `llamacpp:seed`
+    /// — the body carried a `seed` key. `unset` — no seed was asked for, so the body
+    /// carried none (§4.4, D4's byte-identity rule). `unsupported` is reserved for a
+    /// backend whose API has no seed field: the local transport never emits it, and it
+    /// exists so a hosted run records a refusal rather than a silently missing key.
+    pub seed_mechanism: String,
     /// The server's own `finish_reason` for this call, verbatim (`stop`,
     /// `length`, …), `None` when it published none.
     ///
@@ -1682,6 +1691,16 @@ async fn post_chat_meta(
         total_tokens: measured_total,
         source: usage_source.to_string(),
         seed,
+        // [VANTA-WHY] §14.23 — the mechanism follows the value that is actually in the
+        // body, which is decided a few lines above: a `Some` seed was inserted as the
+        // `seed` key, and `None` means no key at all. Nothing here can disagree with
+        // what the request carried.
+        seed_mechanism: if seed.is_some() {
+            LLAMACPP_SEED_MECHANISM
+        } else {
+            UNSET_SEED_MECHANISM
+        }
+        .to_string(),
         finish_reason: streamed.finish_reason.clone(),
         wall_ms,
         truncated: streamed.finish_reason.as_deref() == Some("length"),
@@ -1819,19 +1838,59 @@ pub fn truncation_role(site: &str) -> &'static str {
     }
 }
 
+/// The mechanism strings the per-call `seed` record can carry (§14.23).
+///
+/// [VANTA-WHY] Kept as consts, not inlined: the value a row renders and the value a
+/// test asserts have to be the same string, and the §14.21 knobs already set the
+/// `backend:knob` spelling these follow.
+pub const LLAMACPP_SEED_MECHANISM: &str = "llamacpp:seed";
+pub const UNSET_SEED_MECHANISM: &str = "unset";
+
+/// The seed POLICY every run from §14.23 on applies, recorded in `run.summary` as
+/// `seed_policy` and in the manifest.
+///
+/// [VANTA-WHY] §14.23 — the offset is default-on, so a run's rows cannot say by
+/// themselves whether the review rounds were independent draws or deterministic
+/// duplicates. A row that predates this section has NO `seed_policy`, and the
+/// section's own note says which batches those are: the value here is what makes
+/// "before" and "after" impossible to pool by accident.
+pub const SEED_POLICY: &str = "per_round_offset";
+
+/// The `seed` one ROUND sends (§14.23).
+///
+/// [VANTA-WHY] §14.23 — the review loop re-asks the Attacker the same prompt once
+/// per round, and with ONE pinned seed every round sampled identically: round 2 was
+/// a deterministic duplicate of round 1, not a second, independent attack. Offsetting
+/// by the round index makes rounds 2..n independent draws from the same pinned
+/// baseline while keeping the run reproducible — the sequence is a function of
+/// `VANTA_LLM_SEED` and the round index, and both are recorded.
+///
+/// [VANTA-WHY] Round 1 sends the configured seed UNCHANGED, so a run that never
+/// reaches round 2 — and every single-round run — is byte-identical to one from
+/// before this existed. `round` is `FORENSICS_ROUND`, the 1-based attempt index the
+/// driver sets before any agent runs (`set_forensics_round`), and the same index the
+/// `call.usage` row records; it is 0 outside the pipeline, and 0 is treated like
+/// round 1 so the one-shot `post_chat` path is untouched.
+fn seed_for_round(configured: Option<u64>, round: u32) -> Option<u64> {
+    match configured {
+        Some(seed) if round > 1 => Some(seed.wrapping_add(u64::from(round - 1))),
+        other => other,
+    }
+}
+
 /// The `seed` one attempt sends (§14.5).
 ///
-/// [VANTA-WHY] Attempt 1 always sends the configured seed unchanged, so a call
-/// that never retries is byte-identical to one from before this offsetting
-/// existed.
+/// [VANTA-WHY] A call's FIRST attempt always sends its round's seed unchanged — and
+/// round 1's seed is the configured seed (§14.23) — so a call that never retries is
+/// byte-identical to one from before this per-attempt offsetting existed.
 ///
-/// [VANTA-WHY] A RETRY advances it by the attempt index, because the harness
-/// pins ONE seed per run: with the same seed and the same prompt, even a
+/// [VANTA-WHY] A RETRY advances it by the attempt index, because the harness pins
+/// ONE seed per round: with the same seed and the same prompt, even a
 /// temperature-0.2 retry can come back identical — and be cut off at the
 /// identical point — so the retry budget would be spent reproducing the same
 /// prefix. Advancing the seed keeps the run reproducible (the sequence is a
-/// function of the pinned seed and the attempt number, and both are recorded)
-/// while letting the retry actually differ.
+/// function of the pinned seed, the round and the attempt number, and all three
+/// are recorded) while letting the retry actually differ.
 ///
 /// [VANTA-WHY] A call PINNED at temperature 0.0 is greedy: its retries are
 /// deterministic whatever the seed says, so the seed is deliberately left alone
@@ -1959,7 +2018,17 @@ where
         if attempt > 1 {
             warn!(attempt, max_attempts, "retrying structured call");
         }
-        let attempt_seed = seed_for_attempt(cfg.seed, attempt, deterministic_temperature);
+        // [VANTA-WHY] §14.23 — the ROUND offset is applied first and the ATTEMPT
+        // offset on top of it, so the two sequences compose: round 1's first attempt
+        // is the pinned seed unchanged (byte-identical to before either existed),
+        // round 2 starts one past it, and a retry within either round advances by the
+        // retry index. `FORENSICS_ROUND` is the round the driver set for this attempt
+        // — the same index the `call.usage` row carries.
+        let attempt_seed = seed_for_attempt(
+            seed_for_round(cfg.seed, FORENSICS_ROUND.load(Ordering::Relaxed)),
+            attempt,
+            deterministic_temperature,
+        );
 
         let (raw, finish_reason) = match post_chat_meta(
             client,
@@ -2804,5 +2873,54 @@ mod _reasoning_control_tests {
         assert_eq!(reasoning_budget_text(), "unset");
         assert_eq!(reasoning_budget_mechanism(), "unset");
         assert_eq!(reasoning_effort_text(), "low");
+    }
+}
+
+// ============================================================================
+// PER-ROUND SEEDS (§14.23) — tests
+// ============================================================================
+//
+// [VANTA-WHY] `seed_for_round` is a pure function of its two arguments, so this
+// needs no global and cannot race the parallel harness. The const spellings are
+// pinned here too: the string a `call.usage` row renders and the string a batch
+// table groups by have to be the same literal.
+#[cfg(test)]
+mod _seed_round_tests {
+    use super::{
+        LLAMACPP_SEED_MECHANISM, SEED_POLICY, UNSET_SEED_MECHANISM, seed_for_round,
+    };
+
+    #[test]
+    fn round_one_is_unchanged_and_every_later_round_is_offset_by_its_index() {
+        // The record that tells a post-§14.23 row from a pre-§14.23 one, and the
+        // two mechanisms a row can name.
+        assert_eq!(SEED_POLICY, "per_round_offset");
+        assert_eq!(LLAMACPP_SEED_MECHANISM, "llamacpp:seed");
+        assert_eq!(UNSET_SEED_MECHANISM, "unset");
+
+        // (1) Round 1 sends the configured seed UNCHANGED, so a single-round run —
+        //     and every run that never reaches round 2 — is byte-identical to one
+        //     from before this offsetting existed.
+        assert_eq!(seed_for_round(Some(7), 1), Some(7));
+
+        // (2) Round `r` is the pinned seed plus `r - 1`, so rounds 2..n are distinct
+        //     draws from the same pinned baseline instead of deterministic copies.
+        assert_eq!(seed_for_round(Some(7), 2), Some(8));
+        assert_eq!(seed_for_round(Some(7), 3), Some(9));
+        assert_eq!(seed_for_round(Some(0), 5), Some(4));
+
+        // (3) Round 0 is the driver-less state (`post_chat`, the M0 spike,
+        //     bootstrap), and it must behave exactly like round 1 — otherwise a
+        //     one-shot caller would sample at a seed nobody asked for.
+        assert_eq!(seed_for_round(Some(7), 0), Some(7));
+
+        // (4) An unseeded run stays unseeded in every round: `None` means "send no
+        //     `seed` key at all" (§4.4), and no round may invent one.
+        assert_eq!(seed_for_round(None, 1), None);
+        assert_eq!(seed_for_round(None, 9), None);
+
+        // (5) The offset is wrapping, matching `seed_for_attempt`, so the largest
+        //     seed does not panic in debug around the round arithmetic.
+        assert_eq!(seed_for_round(Some(u64::MAX), 2), Some(0));
     }
 }

@@ -19631,6 +19631,41 @@ class TestRunJob:
         )
         assert plain["attacker_concise"] is None
 
+    def test_a_row_says_which_seed_policy_it_ran_under(self, tmp_path, monkeypatch):
+        """§14.23 — the seed policy is a recorded field, not an inference.
+
+        The per-round offset is DEFAULT-ON, so a row's own `seed` cannot say
+        whether its later review rounds were independent draws or deterministic
+        duplicates. `None` for a summary that predates the field: worse, a guess
+        at the new policy would silently pool such a row with one that ran under
+        it, which is exactly what the field exists to prevent.
+        """
+        base = _outcome(tmp_path)
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, summary=dict(base.summary, seed_policy="per_round_offset")
+            ),
+        )
+        offset = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert offset["seed_policy"] == "per_round_offset"
+        # The seed VALUE itself is untouched — it still comes from the job, and the
+        # policy field is purely additive (§14.23 keeps both).
+        assert offset["seed"] == 0
+
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        plain = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert plain["seed_policy"] is None
+
     def test_a_review_row_reuses_the_candidate_label_and_never_re_grades(
         self, tmp_path, monkeypatch
     ):

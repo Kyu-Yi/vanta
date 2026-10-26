@@ -1426,6 +1426,12 @@ def build_record(
         "config": job.config,
         "mode": job.mode,
         "seed": job.seed,
+        # §14.23 — how the pinned seed was turned into a per-round seed. Recorded
+        # because the offset is DEFAULT-ON: a row's own `seed` cannot say whether its
+        # later review rounds were independent draws or deterministic duplicates, so
+        # a row that predates §14.23 (no `seed_policy` at all) must never be pooled
+        # with one from after it. The pipeline's own spelling is kept.
+        "seed_policy": summary.get("seed_policy"),
         # §2.4.4 — whether this row's prompt carried the report's comments as well as its
         # content. Recorded rather than inferred because the ablation's whole value is that
         # its rows are comparable to the default ones, and a row that does not say which

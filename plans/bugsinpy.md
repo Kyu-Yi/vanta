@@ -6341,6 +6341,62 @@ reads `on`/`off` back and that a row predating the field comes back as `None` ra
 
 ---
 
+### 14.23 Per-round seeds — the review rounds are independent draws
+
+The review loop re-asks the Attacker the same prompt once per round. With **one** pinned
+`VANTA_LLM_SEED` every round sampled identically: round 2 was a deterministic duplicate of round 1, not a
+second, independent attack, so "the Attacker found nothing in round 2" was not evidence that a fresh
+look found nothing — it was the same look replayed. This is a correctness fix, not an ablation arm, so it
+is **default-on and has no switch**.
+
+**Round `r` sends `VANTA_LLM_SEED + (r - 1)`.** Round 1 sends the configured seed **unchanged**, so a run
+that never reaches round 2 — and every single-round run — is byte-identical to one from before this
+section existed. The offset composes with §14.5's per-attempt offset: `seed_for_round` runs first and
+`seed_for_attempt` advances the result by the retry index, so round 1's first attempt is the pinned seed,
+round 2 starts one past it, and a retry inside either round advances by the retry index. The round is
+`FORENSICS_ROUND`, the same 1-based attempt index the driver sets once per attempt
+(`set_forensics_round(attempt + 1)`) and the same index `call.usage` carries; it is 0 outside the
+pipeline, and 0 is treated exactly like round 1 so the one-shot `post_chat` path (`bootstrap_m1`, the M0
+spike) is untouched. `seed_for_round(Some(seed), r) = Some(seed.wrapping_add(r - 1))` for `r > 1`, else
+the seed unchanged; `None` stays `None` in every round, because an unseeded run asks for **no** `seed`
+key at all (§4.4, D4's byte-identity rule).
+
+**What the records carry.** Every `call.usage` row keeps its per-call `seed=` **and** gains
+`seed_mechanism=`, the same `backend:knob` spelling §14.21's knobs use: `llamacpp:seed` when the body
+carried a `seed` key, `unset` when none was asked for. `unsupported` is reserved for a hosted backend
+whose API has no seed field — the local transport never emits it, and it exists so a hosted run records a
+refusal rather than a silently missing key. `run.summary` gains `seed_policy=per_round_offset` and the
+manifest gains `seed_policy`, read back from the summary.
+
+**Rows from before and after this section must never be pooled.** The offset is default-on, so a row's
+own `seed=` value cannot say whether its later rounds were independent draws or duplicates of round 1.
+A row that predates §14.23 has no `seed_policy` at all, and the manifest carries that absence as `None`
+rather than a default — a fabricated `per_round_offset` would silently pool a fixed-seed row with an
+offset one. Specifically, the batches that ran under the **old (fixed-seed) policy** are `paper-off`,
+`smoke-pysnooper-3` and `smoke-sanic-1`: their rows must be read as fixed-seed regardless of what a
+later table's `seed_policy` column would imply, and they must not be mixed into an arm comparison with
+post-§14.23 runs.
+
+**Nothing here changes when `VANTA_LLM_SEED` is unset**, and round 1 is unchanged when it is set. The
+safety net is untouched: the output cap plus §14.13's nudged retry remains the bound (§14.21's budget and
+§14.20's per-site caps are separate knobs and are off by default).
+
+Tests: `src/llm/mod.rs::_seed_round_tests::round_one_is_unchanged_and_every_later_round_is_offset_by_its_index`
+pins the arithmetic (`r = 1` unchanged, `r = n` is seed + n − 1, round 0 like round 1, `None` stays
+`None`, wrapping at `u64::MAX`) and the three recorded spellings;
+`tests/m3_session_log.rs::unset_seed_leaves_request_bodies_unseeded_and_the_verdict_unchanged` runs a
+three-round attempt against the stub server and reads the `call.usage` rows rather than assuming them —
+the unseeded run adds no `seed` key in any round and records `seed=unset seed_mechanism=unset`, the
+seeded run reaches rounds 2 and 3 and each body carries exactly the seed its own row records
+(`4242`, `4243`, `4244`) with `seed_mechanism=llamacpp:seed`, both summaries record
+`seed_policy=per_round_offset`, and stripping the `seed` key makes each seeded body byte-identical to the
+unseeded one;
+`scripts/test_bugsinpy.py::TestRunJob::test_a_row_says_which_seed_policy_it_ran_under` asserts the
+manifest reads `seed_policy` back and that a row predating the field comes back as `None` rather than a
+default.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

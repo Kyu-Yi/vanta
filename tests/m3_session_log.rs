@@ -5133,7 +5133,7 @@ fn assert_schedule_matches_bodies(
 }
 
 /// `VANTA_LLM_SEED` must be invisible when unset and present in every chat body
-/// when set.
+/// when set, offset per review round.
 ///
 /// [VANTA-WHY] An unset seed has to leave the request body byte-for-byte what it
 /// was before the field existed: `"seed": null` would change what every server
@@ -5141,9 +5141,33 @@ fn assert_schedule_matches_bodies(
 /// measurement was taken under. A test cannot run the pre-seed binary, so the
 /// guard is twofold — no key at all when unset, exactly that key when set, and
 /// the two bodies equal once the key is removed.
+///
+/// [VANTA-WHY] §14.23 — with ONE pinned seed every review round sampled
+/// identically, so round 2 was a deterministic duplicate of round 1. The seed is
+/// now offset by the round index, which makes this the test that has to see MORE
+/// than one round: three rounds, so round 1 is the pinned seed unchanged (the
+/// byte-identity guarantee) and rounds 2 and 3 are pinned + 1 and pinned + 2. The
+/// `call.usage` rows are read rather than assumed, so each body is held to the
+/// seed its own row records and the row's `seed_mechanism` has to agree.
 #[test]
 fn unset_seed_leaves_request_bodies_unseeded_and_the_verdict_unchanged() {
     let _serial = serial_run();
+
+    // The `call.usage` rows, in call order, so they line up with the recorded
+    // bodies one-for-one: (round, seed, seed_mechanism).
+    let usage_rows = |workspace: &Path| -> Vec<(u32, String, String)> {
+        read_session_records(&find_session_log(workspace))
+            .iter()
+            .filter(|r| r.phase == "call.usage")
+            .map(|r| {
+                (
+                    summary_value(&r.summary, "round").parse().unwrap(),
+                    summary_value(&r.summary, "seed"),
+                    summary_value(&r.summary, "seed_mechanism"),
+                )
+            })
+            .collect()
+    };
 
     let plain = TempDir::new().unwrap();
     let (_repo, _issue, patch_path) = write_test_repo(plain.path(), PRESERVING_PATCH);
@@ -5164,6 +5188,25 @@ fn unset_seed_leaves_request_bodies_unseeded_and_the_verdict_unchanged() {
             "an unset VANTA_LLM_SEED must add NO seed key to the body; got: {body}"
         );
     }
+    // No round may invent a seed, and the mechanism has to say none was sent.
+    let plain_usage = usage_rows(plain.path());
+    assert_eq!(
+        plain_usage.len(),
+        plain_bodies.len(),
+        "one `call.usage` row per chat body"
+    );
+    for (round, seed, mechanism) in &plain_usage {
+        assert_eq!(
+            (seed.as_str(), mechanism.as_str()),
+            ("unset", "unset"),
+            "round {round} of an unseeded run must record no seed and no mechanism"
+        );
+    }
+    assert_eq!(
+        summary_value(&run_summary(plain.path()).summary, "seed_policy"),
+        "per_round_offset",
+        "a post-§14.23 run must name the seed policy the rounds ran under"
+    );
 
     let seeded = TempDir::new().unwrap();
     let (_repo, _issue, patch_path) = write_test_repo(seeded.path(), PRESERVING_PATCH);
@@ -5188,12 +5231,43 @@ fn unset_seed_leaves_request_bodies_unseeded_and_the_verdict_unchanged() {
         plain_bodies.len(),
         "the seed must not change how many calls the run makes"
     );
-    for body in &seeded_bodies {
-        assert!(
-            body.contains("\"seed\":4242"),
-            "a set VANTA_LLM_SEED must reach every chat body; got: {body}"
+    let seeded_usage = usage_rows(seeded.path());
+    assert_eq!(
+        seeded_usage.len(),
+        seeded_bodies.len(),
+        "one `call.usage` row per chat body"
+    );
+    // The offset is only exercised if the run really reached later rounds.
+    assert!(
+        seeded_usage.iter().any(|(round, ..)| *round == 2)
+            && seeded_usage.iter().any(|(round, ..)| *round == 3),
+        "the run must span rounds 1..3 for the offset to be measured; got {:?}",
+        seeded_usage.iter().map(|(round, ..)| *round).collect::<Vec<_>>()
+    );
+    assert_eq!(seeded_usage[0].0, 1, "the first call is in round 1");
+    // Round 1 sends the pinned seed UNCHANGED; round `r` sends pinned + `r - 1`.
+    for (round, seed, mechanism) in &seeded_usage {
+        let expected = (4242 + u64::from(round - 1)).to_string();
+        assert_eq!(
+            seed, &expected,
+            "round {round} must send the pinned seed plus the round offset"
+        );
+        assert_eq!(
+            mechanism, "llamacpp:seed",
+            "a seeded call must record the mechanism that carried the seed"
         );
     }
+    for (body, (round, seed, _)) in seeded_bodies.iter().zip(seeded_usage.iter()) {
+        assert!(
+            body.contains(&format!("\"seed\":{seed}")),
+            "the round {round} body must carry the seed its row records ({seed}); got: {body}"
+        );
+    }
+    assert_eq!(
+        summary_value(&run_summary(seeded.path()).summary, "seed_policy"),
+        "per_round_offset",
+        "the seeded run must name the same seed policy"
+    );
     // The ONLY difference the new field may introduce is the key itself.
     for (unseeded, seeded) in plain_bodies.iter().zip(seeded_bodies.iter()) {
         assert_eq!(

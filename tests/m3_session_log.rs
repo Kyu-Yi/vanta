@@ -77,6 +77,12 @@ enum StubBehaviour {
     /// Answer every chat call with HTTP 500, so the client's retry loop burns
     /// its attempts and the run ends as an infrastructure failure.
     Fail,
+    /// Answer every chat call with HTTP 401 whose body ECHOES the bearer token
+    /// the client sent — the shape a real provider uses when it rejects a key
+    /// ("Incorrect API key provided: sk-…"). This is the harshest case for the
+    /// redaction rule: the credential arrives inside a body that Vanta is about
+    /// to print, so a rule that only knew about variable NAMES would leak it.
+    EchoKeyUnauthorized,
 }
 
 struct StubLlmServer {
@@ -531,6 +537,41 @@ impl StubLlmServer {
 
                         if matches!(behaviour, StubBehaviour::Fail) {
                             let response = "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                            continue;
+                        }
+
+                        if matches!(behaviour, StubBehaviour::EchoKeyUnauthorized) {
+                            // The token is read out of the request HEADERS and put
+                            // into the body. Vanta must not print it: the message it
+                            // builds from this response reaches the session log and
+                            // stderr.
+                            let token = head
+                                .lines()
+                                .find_map(|line| {
+                                    line.strip_prefix("Authorization: Bearer ")
+                                        .or_else(|| line.strip_prefix("authorization: Bearer "))
+                                })
+                                .unwrap_or("<no authorization header>")
+                                .trim()
+                                .to_string();
+                            let body = serde_json::json!({
+                                "error": {
+                                    "message": format!(
+                                        "Incorrect API key provided: {token}. You can find \
+                                         your API key at https://platform.openai.com/account/api-keys"
+                                    ),
+                                    "type": "invalid_request_error",
+                                    "code": "invalid_api_key",
+                                }
+                            })
+                            .to_string();
+                            let response = format!(
+                                "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
                             let _ = stream.write_all(response.as_bytes());
                             let _ = stream.flush();
                             continue;
@@ -6792,5 +6833,141 @@ fn the_three_flags_on_do_not_turn_an_approval_into_a_needs_review() {
         summary_value(&summary, "needs_review_weak"),
         "[]",
         "an approval carries no weak failures; got {summary}"
+    );
+}
+
+// ============================================================================
+// Hosted OpenAI backend — §14.25: the API key reaches no file and no stream
+// ============================================================================
+
+/// Every regular file under `root`, depth-first and sorted, so a failure names a
+/// deterministic path and the sweep is reproducible.
+///
+/// [VANTA-WHY] The redaction tests below must sweep the WHOLE tree rather than a
+/// list of files written today. A list is a promise to update it whenever a new
+/// artifact appears, and the failure of that promise is silent: a run would
+/// start leaking through the file nobody remembered to add. Walking the tree
+/// makes "written by the run" the criterion, not "known to the test".
+fn files_under(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Whether `needle` occurs anywhere in `haystack`.
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+/// The API key must not reach any file a run writes, nor stdout, nor stderr —
+/// even when the provider ECHOES it back inside a rejected request's body.
+///
+/// [VANTA-WHY] A provider is free to quote the credential it just rejected back
+/// at the client ("Incorrect API key provided: sk-…"), and Vanta's own error
+/// path prints the provider's body to make the failure legible. So the leak this
+/// test hunts is not a careless `println!` of a variable — it is a *legitimate*
+/// message that happens to contain the secret, reaching the session log, the
+/// evidence bundle and the terminal. Redacting the variable NAME would not catch
+/// it; only redacting the VALUE does. The stub does the echoing for real (it
+/// reads the bearer token out of the request headers), so the run exercises the
+/// whole path rather than a hand-built error string.
+#[test]
+fn the_api_key_never_reaches_a_file_stream_or_record_when_the_provider_echoes_it() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start_streaming(
+        None,
+        SINGLE_BEHAVIOR_TEST,
+        StubBehaviour::EchoKeyUnauthorized,
+    );
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        // One attempt per call: the rejection is deterministic, so a retry adds
+        // nothing but time, and the run must reach its recorded failure fast.
+        &[("VANTA_LLM_RETRY_ATTEMPTS", "1")],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a rejected key is an infrastructure failure, not a verdict; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        server.request_count() >= 1,
+        "the run must actually have made a chat call for the echo path to be \
+         exercised; got {}",
+        server.request_count()
+    );
+
+    let key = TEST_API_KEY.as_bytes();
+
+    // (1) the two streams the run owns.
+    for (name, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        assert!(
+            !contains_bytes(bytes, key),
+            "the API key reached {name}:\n{}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+
+    // (2) every file the run wrote, whatever its name. The workspace is the
+    // run's CWD, so this covers the session log, the transitions store, the
+    // evidence bundle and any sandbox scratch files alike.
+    let files = files_under(workspace.path());
+    assert!(
+        !files.is_empty(),
+        "the sweep must not be vacuous — a run that wrote nothing would pass it \
+         for the wrong reason"
+    );
+    for path in &files {
+        let bytes = fs::read(path).unwrap();
+        assert!(
+            !contains_bytes(&bytes, key),
+            "the API key reached {}:\n{}",
+            path.display(),
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    // (3) the positive control. Without it the test would also pass if the echo
+    // path never ran — the assertion would be checking a message that was never
+    // built. The recorded failure must show the MARKER in the key's place and
+    // still name the status, so a reader can see the rejection happened.
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let infra = records
+        .iter()
+        .find(|r| r.phase == "run.infra_failure")
+        .expect("a rejected key must be recorded as a run.infra_failure row");
+    assert!(
+        infra.summary.contains("401"),
+        "the recorded failure must name the status the provider returned; got {}",
+        infra.summary
+    );
+    assert!(
+        infra.summary.contains("<redacted>"),
+        "the echoed credential must have been replaced by the marker, proving \
+         the message was built and redacted rather than never built; got {}",
+        infra.summary
     );
 }

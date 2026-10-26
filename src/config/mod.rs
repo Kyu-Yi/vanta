@@ -104,6 +104,84 @@ impl LlmBackend {
 }
 
 // ----------------------------------------------------------------------------
+// Secret redaction — ONE rule, applied wherever env values or headers are shown
+// ----------------------------------------------------------------------------
+//
+// [VANTA-WHY] A key is a bearer credential: anyone who reads it can spend on
+// the account, and it cannot be rotated out of an artifact that already
+// shipped. The week this was written the project gained a second provider, so
+// the rule stops being "remember not to print Vanta's key" and becomes a
+// mechanical one a reviewer can check:
+//
+//   * an environment variable whose NAME contains KEY, TOKEN, SECRET or
+//     PASSWORD — case-insensitively, as a substring — has a secret value, so its
+//     VALUE is never printed;
+//   * any token starting with `sk-` is a provider key, whoever printed it, so it
+//     is redacted even in text nobody expected to be a secret: a response body,
+//     a model's own output, an error string.
+//
+// [VANTA-WHY] The two halves are deliberately independent. The name rule covers
+// the key this process read; the `sk-` rule covers a key that arrived from
+// somewhere else and is being echoed back at us. Matching only names would miss
+// a key inside an error body; matching only `sk-` would miss a provider whose
+// keys do not carry that prefix.
+//
+// [VANTA-WHY] Redaction here PRESERVES the surrounding text, whitespace and
+// newlines. A helper that split on whitespace and rejoined would silently
+// reflow a model's raw output in the forensics files, and the artifacts whose
+// whole purpose is forensic fidelity are exactly where that must not happen.
+
+/// Substrings that mark an environment variable's NAME as carrying a secret.
+pub const SECRET_NAME_MARKERS: [&str; 4] = ["KEY", "TOKEN", "SECRET", "PASSWORD"];
+
+/// The token written in place of a redacted secret.
+pub const REDACTED: &str = "<redacted>";
+
+/// True when an environment variable's name marks its value as a secret.
+///
+/// Matched case-insensitively on the four substrings above, so
+/// `OPENAI_API_KEY`, `VANTA_API_KEY`, `GH_TOKEN`, `HF_TOKEN`,
+/// `CLIENT_SECRET` and `DB_PASSWORD` are all covered without a list that has to
+/// be extended for every new provider.
+pub fn is_secret_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SECRET_NAME_MARKERS.iter().any(|marker| upper.contains(marker))
+}
+
+/// Replace every `sk-…` token of more than 12 characters with `<redacted>`.
+///
+/// [VANTA-WHY] The 12-character floor is the same one the standalone probe
+/// script uses, and it exists so a harmless string that merely begins `sk-`
+/// (`sk-learn`, `sk-test`, a short path fragment) is not mangled. Real provider
+/// keys are far longer. Whitespace-delimited on purpose: the rule is about a
+/// credential, and a credential is never printed with spaces inside it.
+pub fn redact_secret(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // `i` is always on a char boundary: it starts at 0, and every branch
+        // below advances by a whole token that ends at whitespace, or by one
+        // whole UTF-8 character.
+        if text[i..].starts_with("sk-") {
+            let mut j = i;
+            while j < bytes.len() && !bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j - i > 12 {
+                out.push_str(REDACTED);
+                i = j;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().expect("i is a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+// ----------------------------------------------------------------------------
 // LlmConfig — every parameter for calling ANY LLM backend (local or remote)
 // ----------------------------------------------------------------------------
 //
@@ -172,8 +250,23 @@ pub struct LlmConfig {
     //
     // [PITFALL] Never store a literal API key in source code. Never commit a
     // file with a key to GitHub. The correct approach is (and will always be):
-    //   export VANTA_API_KEY='sk-ant-XXXX'   # shell env, per-session
+    //   export VANTA_API_KEY='sk-ant-XXXX'    # llamacpp / local proxy
+    //   export OPENAI_API_KEY='sk-XXXX'       # openai / hosted
     //   → code reads env::var() here
+    //
+    // [VANTA-WHY] WHICH variable is read depends on the backend, and that is
+    // deliberate rather than convenient:
+    //
+    //   llamacpp → `VANTA_API_KEY`, as before (a local server that wants a
+    //              token, or a proxy in front of one).
+    //   openai   → `OPENAI_API_KEY` ONLY, never `VANTA_API_KEY`.
+    //
+    // The hosted key must arrive under the provider's own name. `VANTA_API_KEY`
+    // is a name this project invented, which means it is a name this project
+    // documents, copies into batch commands and writes about — three more
+    // places for a hosted credential to be seen. `OPENAI_API_KEY` is the
+    // convention every OpenAI-compatible tool already agrees on, so the value
+    // never has to be relayed through a Vanta-specific spelling.
     pub api_key: Option<String>,
 
     // [SYNTAX] idle_timeout_secs: u64 = seconds with NO NEW TOKEN before the
@@ -321,10 +414,16 @@ impl Default for LlmConfig {
 // Use Display for that. Never Debug, since Debug would print the key literal.
 impl fmt::Display for LlmConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // [VANTA-WHY] The key is reported as PRESENT or ABSENT, and nothing
+        // else. The previous version printed the first and last four characters
+        // (`sk-a...ABCD`) as a "redacted" convenience for identifying which key
+        // was in force; eight characters of a bearer credential is not
+        // redaction, and the only thing a reader needs from this line is that
+        // auth is configured. `session.start` records the same fact as
+        // `api_key=set` for the same reason.
         let key_display = match &self.api_key {
-            Some(k) if k.len() >= 8 => format!("{}...{}", &k[..4], &k[k.len()-4..]),
-            Some(_)                 => "(< 8 chars, redacted)".to_string(),
-            None                    => "(not set — local / no-auth mode)".to_string(),
+            Some(_) => "(set — redacted)".to_string(),
+            None    => "(not set — local / no-auth mode)".to_string(),
         };
         write!(f,
             "LlmConfig:\n  \
@@ -376,7 +475,8 @@ impl LlmConfig {
     //   VANTA_LLM_BACKEND          | llamacpp | openai                 | llamacpp
     //   VANTA_LLM_BASE_URL         | HTTP endpoint /v1 prefix           | backend default
     //   VANTA_LLM_MODEL            | Model identifier string           | Qwen3.5-4B
-    //   VANTA_API_KEY              | Bearer token / API key (optional) | None
+    //   VANTA_API_KEY              | Bearer token (llamacpp backend)   | None
+    //   OPENAI_API_KEY             | Bearer token (openai backend)     | None
     //   VANTA_LLM_IDLE_TIMEOUT_SECS| Seconds with NO new token          | 180
     //   VANTA_LLM_MAX_SECS         | Overall backstop per LLM call      | 3600
     //   VANTA_LLM_CONTEXT_TOKENS   | Model context window (else /props) | unset
@@ -463,7 +563,21 @@ impl LlmConfig {
         }
 
         // ---- api_key override (OPTIONAL, None default) ---------------------
-        match env::var("VANTA_API_KEY") {
+        //
+        // [VANTA-WHY] The variable name is a function of the backend, and the
+        // two names do not fall back to one another. A local server keeps
+        // reading VANTA_API_KEY exactly as it always has; the hosted backend
+        // reads OPENAI_API_KEY and ONLY that. On openai, VANTA_API_KEY is not
+        // even looked at: a hosted credential that can be passed under a
+        // project-invented name is a credential this project will document,
+        // copy into batch commands and print the name of, which is a third and
+        // fourth place it can escape. `OPENAI_API_KEY` is the spelling every
+        // OpenAI-compatible tool already shares.
+        let key_env = match cfg.backend {
+            LlmBackend::Llamacpp => "VANTA_API_KEY",
+            LlmBackend::OpenAi => "OPENAI_API_KEY",
+        };
+        match env::var(key_env) {
             Ok(val) if !val.trim().is_empty() => {
                 cfg.api_key = Some(val.trim().to_string());
             }
@@ -475,8 +589,11 @@ impl LlmConfig {
             }
             Err(env::VarError::NotPresent) => { /* keep default None */ }
             Err(env::VarError::NotUnicode(_)) => {
-                return Err("CONFIG_ERROR: VANTA_API_KEY env var contained \
-                            non-UTF-8 bytes.".to_string());
+                // Names the variable, never the value: a VarError carries the
+                // bytes we refused, and those bytes are the secret.
+                return Err(format!(
+                    "CONFIG_ERROR: {key_env} env var contained non-UTF-8 bytes."
+                ));
             }
         }
 
@@ -665,30 +782,65 @@ mod tests {
 
     #[test]
     fn test_display_never_leaks_key() {
-        // Short key should be fully redacted (only "< 8 chars" message shown).
-        let short = LlmConfig {
-            api_key: Some("123".to_string()),
-            ..Default::default()
-        };
-        let disp = format!("{short}");
-        assert!(!disp.contains("123"), "short api key leaked into Display! {disp}");
+        // [VANTA-WHY] The Display impl now reports presence only. The old
+        // assertion here checked for a first-4/last-4 mask (`sk-a...ABCD`) —
+        // eight characters of a bearer credential printed as a convenience for
+        // "which key is this". That is not redaction, so the mask is gone and
+        // this test asserts the stronger property directly: NO prefix of the
+        // key survives in the banner.
+        for key in ["123", "sk-ant-12345678-ABCD", "sk-proj-0123456789abcdef"] {
+            let cfg = LlmConfig {
+                api_key: Some(key.to_string()),
+                ..Default::default()
+            };
+            let disp = format!("{cfg}");
+            assert!(!disp.contains(key), "api key leaked into Display! {disp}");
+            assert!(!disp.contains("sk-"), "key prefix leaked into Display! {disp}");
+            assert!(disp.contains("(set — redacted)"),
+                "a present key must still be reported as set: {disp}");
+        }
 
-        // Long key → only first 4 and last 4 chars shown.
-        let long = LlmConfig {
-            api_key: Some("sk-ant-12345678-ABCD".to_string()),
-            ..Default::default()
-        };
-        let disp = format!("{long}");
-        assert!( disp.contains("sk-a...ABCD"),
-            "expected truncated api key mask in Display, got: {disp}");
-        assert!(!disp.contains("12345678"),
-            "middle of api key leaked! {disp}");
-
-        // None → "(not set" message.
+        // None → the local / no-auth message, unchanged.
         let none = LlmConfig::default();
         let disp = format!("{none}");
         assert!(disp.contains("not set") || disp.contains("local"),
             "None api key should show local/not-set msg: {disp}");
+    }
+
+    #[test]
+    fn test_secret_env_name_rule() {
+        // The four markers, case-insensitively, as substrings — so a new
+        // provider's variable is covered without editing a list.
+        for name in ["OPENAI_API_KEY", "VANTA_API_KEY", "GH_TOKEN", "HF_TOKEN",
+                     "CLIENT_SECRET", "DB_PASSWORD", "openai_api_key", "My_Token"] {
+            assert!(is_secret_env_name(name), "{name} should be a secret name");
+        }
+        for name in ["VANTA_LLM_BACKEND", "VANTA_LLM_MODEL", "PATH", "HOME",
+                     "VANTA_LLM_BASE_URL"] {
+            assert!(!is_secret_env_name(name), "{name} should NOT be a secret name");
+        }
+    }
+
+    #[test]
+    fn test_redact_secret_value_rule() {
+        // A long `sk-` token is replaced, and the surrounding text — including
+        // newlines, which the forensics files depend on — is preserved exactly.
+        let body = "authorization: Bearer sk-proj-0123456789abcdef\n\
+                    {\"error\": {\"message\": \"bad key sk-ABCDEFGHIJKLMNOP\"}}";
+        let out = redact_secret(body);
+        assert!(!out.contains("0123456789abcdef"), "long sk- token survived: {out}");
+        assert!(!out.contains("ABCDEFGHIJKLMNOP"), "long sk- token survived: {out}");
+        assert_eq!(out.matches(REDACTED).count(), 2);
+        assert!(out.contains("authorization: Bearer "), "text was reflowed: {out}");
+        assert_eq!(out.lines().count(), body.lines().count());
+
+        // Anything at or below the 12-character floor is left alone: a real key
+        // is far longer, and mangling a harmless string is a worse failure than
+        // printing it. `sk-short` is 8 characters.
+        assert_eq!(redact_secret("pip install scikit-learn"), "pip install scikit-learn");
+        assert_eq!(redact_secret("sk-short"), "sk-short");
+        // Text with no secret at all is returned unchanged.
+        assert_eq!(redact_secret("nothing to see"), "nothing to see");
     }
 
     #[test]
@@ -789,9 +941,36 @@ mod tests {
         assert!(err.contains("llamacp"), "error must quote the bad value: {err}");
         assert!(err.contains("VANTA_LLM_BACKEND"), "error must name the variable: {err}");
 
+        // (7) the API key's variable follows the backend too, and the two names
+        // never cross over. Both are set to DIFFERENT values so a wrong read is
+        // visible rather than merely possible.
+        unsafe {
+            env::set_var("VANTA_LLM_BACKEND", "llamacpp");
+            env::set_var("VANTA_API_KEY", "llamacpp-sentinel-key");
+            env::set_var("OPENAI_API_KEY", "openai-sentinel-key");
+        }
+        let cfg = LlmConfig::from_env().unwrap();
+        assert_eq!(cfg.api_key.as_deref(), Some("llamacpp-sentinel-key"),
+            "the local backend must keep reading VANTA_API_KEY");
+
+        unsafe { env::set_var("VANTA_LLM_BACKEND", "openai"); }
+        let cfg = LlmConfig::from_env().unwrap();
+        assert_eq!(cfg.api_key.as_deref(), Some("openai-sentinel-key"),
+            "the hosted backend must read OPENAI_API_KEY");
+
+        // (8) on openai, VANTA_API_KEY alone must NOT authorise anything. A
+        // hosted credential that can travel under a project-invented spelling
+        // is one this project will document and echo back.
+        unsafe { env::remove_var("OPENAI_API_KEY"); }
+        let cfg = LlmConfig::from_env().unwrap();
+        assert_eq!(cfg.api_key, None,
+            "VANTA_API_KEY must be ignored on the openai backend");
+
         unsafe {
             env::remove_var("VANTA_LLM_BACKEND");
             env::remove_var("VANTA_LLM_BASE_URL");
+            env::remove_var("VANTA_API_KEY");
+            env::remove_var("OPENAI_API_KEY");
         }
     }
 }

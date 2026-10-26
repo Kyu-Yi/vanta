@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+from . import redact
+
 
 class ShuruError(RuntimeError):
     """The sandbox itself failed to start or to report a result."""
@@ -474,7 +476,14 @@ def run(
         # the command's, so a VM that cannot provide a tmpfs reports the start-up
         # check and not a test failure.
         [DEV_SHM_GUARD, f"cd {shlex.quote(guest_cwd)}"]
-        + ([f"export {k}={shlex.quote(v)}" for k, v in env.items()] if env else [])
+        # [VANTA-WHY] The `export` lines are part of the command string, and a
+        # command string is printed by `shuru` on failure and visible in `ps`.
+        # Redacting here means a secret-named variable — or an `sk-` token inside
+        # any value — can never reach either, whatever a future caller passes in
+        # `env`. Every dict passed today is a compiler/Python environment, so for
+        # them this is byte-for-byte a no-op.
+        + ([f"export {k}={shlex.quote(v)}"
+            for k, v in redact.redact_env(env).items()] if env else [])
         + [shlex.join(command)]
     )
 

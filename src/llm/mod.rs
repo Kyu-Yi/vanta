@@ -21,7 +21,7 @@
 //     |   (generic async retry)       →   REPROMPT tails. p=0.5 → 3 attm = 87.5%.
 // ============================================================================
 
-use crate::config::LlmConfig;
+use crate::config::{redact_secret, LlmConfig};
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -319,6 +319,12 @@ fn write_forensics_to(
         sanitize_tag(type_name)
     );
     let path = dir.join(filename);
+    // [VANTA-WHY] The one write site every forensics file goes through, and so
+    // the one place a credential inside a model's raw output can be stopped.
+    // Redaction here rather than at each caller: a caller added later inherits
+    // the rule instead of having to remember it. It is a no-op for content that
+    // carries no `sk-` token, which is every local run.
+    let content = redact_secret(content);
     match std::fs::write(&path, content) {
         Ok(_) => debug!(path = %path.display(), "forensics written"),
         Err(e) => warn!(err = %e, path = %path.display(), "forensics write failed"),
@@ -1621,10 +1627,20 @@ async fn post_chat_meta(
     if !status.is_success() {
         let code = status.as_u16();
         let txt = resp.text().await.unwrap_or_else(|_| String::from("<could not read body>"));
-        return Err(format!(
-            "HTTP ERROR {code} from {url}. Body snippet: {}",
-            &txt[..300.min(txt.len())]
-        ).into());
+        // [VANTA-WHY] The error body is the provider's text, and a provider is
+        // free to quote the credential it just rejected back at us
+        // ("Incorrect API key provided: sk-…"). Only the body is shown: the
+        // request headers are never formatted into this message, and the
+        // Authorization header is built with `set_sensitive(true)` besides, so
+        // reqwest will not log it either. `redact_secret` closes the remaining
+        // hole — a key echoed *inside* the body.
+        //
+        // `chars().take(300)` rather than `&txt[..300]`: the byte slice panics
+        // when byte 300 lands inside a multi-byte character, which turns "the
+        // provider returned an error" into "Vanta crashed".
+        let redacted = redact_secret(&txt);
+        let snippet: String = redacted.chars().take(300).collect();
+        return Err(format!("HTTP ERROR {code} from {url}. Body snippet: {snippet}").into());
     }
 
     let byte_stream = resp.bytes_stream();

@@ -54,6 +54,7 @@ from bugsinpy import manifest as manifest_mod  # noqa: E402
 from bugsinpy import oracle as oracle_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
 from bugsinpy import records as records_mod  # noqa: E402
+from bugsinpy import redact as redact_mod  # noqa: E402
 from bugsinpy import runner as runner_mod  # noqa: E402
 from bugsinpy import shuru as shuru_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
@@ -20448,3 +20449,175 @@ class TestExpectedErrorsExitCleanly:
             compact_mod.CompactError,
             records_mod.RecordError,
         }
+
+
+class TestSecretRedaction:
+    """The harness's copy of Vanta's redaction rule (``bugsinpy/redact.py``).
+
+    [WHY] A key that reaches a run log, a sandbox's ``export`` line or a bake
+    recipe is a published credential — the batch directories are artifacts. The
+    rule has two halves and the tests are split the same way, because the two
+    fail independently: a name list that stops at ``VANTA_API_KEY`` misses
+    ``OPENAI_API_KEY``, and a value rule that only looks at names misses a key
+    echoed back inside a provider's error body.
+    """
+
+    def test_the_name_rule_is_four_markers_anywhere_case_insensitively(self):
+        for name in (
+            "OPENAI_API_KEY",
+            "VANTA_API_KEY",
+            "GH_TOKEN",
+            "HF_TOKEN",
+            "CLIENT_SECRET",
+            "DB_PASSWORD",
+            "openai_api_key",
+            "My_Token",
+        ):
+            assert redact_mod.is_secret_env_name(name), name
+
+        for name in ("VANTA_LLM_BACKEND", "VANTA_LLM_MODEL", "PATH", "HOME",
+                     "VANTA_LLM_BASE_URL", "CC", "CXX"):
+            assert not redact_mod.is_secret_env_name(name), name
+
+    def test_the_value_rule_redacts_only_real_looking_keys(self):
+        body = (
+            "authorization: Bearer sk-proj-0123456789abcdef\n"
+            '{"error": {"message": "bad key sk-ABCDEFGHIJKLMNOP"}}'
+        )
+        out = redact_mod.redact_secret(body)
+
+        assert "0123456789abcdef" not in out
+        assert "ABCDEFGHIJKLMNOP" not in out
+        assert out.count(redact_mod.REDACTED) == 2
+        # Whitespace and line structure survive: these strings become log lines.
+        assert out.startswith("authorization: Bearer ")
+        assert out.count("\n") == body.count("\n")
+
+        # ``scikit-learn`` contains no ``sk-``; ``sk-short`` is under the floor.
+        assert redact_mod.redact_secret("pip install scikit-learn") == "pip install scikit-learn"
+        assert redact_mod.redact_secret("sk-short") == "sk-short"
+        assert redact_mod.redact_secret("nothing to see") == "nothing to see"
+
+    def test_the_threshold_matches_the_rust_side(self):
+        """12 is the floor on both sides; a drift here silently un-redacts one."""
+        assert redact_mod.MIN_SECRET_LEN == 12
+        boundary = "sk-" + "a" * 9  # exactly 12 characters → kept
+        assert redact_mod.redact_secret(boundary) == boundary
+        over = "sk-" + "a" * 10  # 13 characters → replaced
+        assert redact_mod.redact_secret(over) == redact_mod.REDACTED
+
+    def test_redact_env_keeps_the_name_and_drops_the_value(self):
+        env = {
+            "OPENAI_API_KEY": "sk-proj-0123456789abcdef",
+            "VANTA_API_KEY": "a-key-with-no-prefix-at-all",
+            "VANTA_LLM_MODEL": "gpt-6-luna",
+            "VANTA_LLM_BASE_URL": "https://api.openai.com/v1",
+            "GH_TOKEN": "ghp_notaskprefixhere",
+        }
+        safe = redact_mod.redact_env(env)
+
+        # Every name survives — that the key was set, and under which variable, is
+        # the fact a reader wants. (The old name-prefix filter made it vanish.)
+        assert set(safe) == set(env)
+        for name in ("OPENAI_API_KEY", "VANTA_API_KEY", "GH_TOKEN"):
+            assert safe[name] == redact_mod.REDACTED, name
+        # A non-secret entry is untouched.
+        assert safe["VANTA_LLM_MODEL"] == "gpt-6-luna"
+        assert safe["VANTA_LLM_BASE_URL"] == "https://api.openai.com/v1"
+        # ...and nothing from the original values survives anywhere.
+        joined = " ".join(safe.values())
+        for value in env.values():
+            assert value not in joined or value in ("gpt-6-luna", "https://api.openai.com/v1")
+
+    def test_a_secret_named_var_is_redacted_even_when_it_does_not_look_like_a_key(self):
+        """The value rule alone would print it: a key need not start with ``sk-``."""
+        safe = redact_mod.redact_env({"VANTA_API_KEY": "hunter2-but-a-real-credential"})
+        assert safe["VANTA_API_KEY"] == redact_mod.REDACTED
+
+    def test_the_run_log_env_header_redacts_by_rule(self):
+        env = {
+            "VANTA_API_KEY": "sk-proj-0123456789abcdef",
+            "VANTA_LLM_MODEL": "gpt-6-luna",
+            "VANTA_LLM_BACKEND": "openai",
+            # Not VANTA_-prefixed, so it must not be printed at all — but it must
+            # not be printed *because of the prefix*, not because of a list.
+            "OPENAI_API_KEY": "sk-proj-fedcba9876543210",
+            "PATH": "/usr/bin:/bin",
+        }
+        line = runner_mod.env_log_line(env)
+
+        assert line.startswith("# env: ")
+        assert "sk-proj-0123456789abcdef" not in line
+        assert "sk-proj-fedcba9876543210" not in line
+        assert "sk-" not in line
+        assert "VANTA_API_KEY=<redacted>" in line
+        assert "VANTA_LLM_MODEL=gpt-6-luna" in line
+        assert "OPENAI_API_KEY" not in line
+        assert "PATH" not in line
+        # One line, always: a newline here would break the header contract.
+        assert "\n" not in line
+
+    def test_the_sandbox_command_never_carries_a_secret(self, tmp_path, monkeypatch):
+        """The ``export`` lines are inside the argv, and an argv is printed by
+        ``shuru`` on failure and visible to anyone reading ``ps``."""
+        captured: list[list[str]] = []
+
+        class Done:
+            stdout = ""
+            stderr = ""
+            returncode = 0
+
+        def fake_run(args, **kwargs):
+            captured.append(list(args))
+            return Done()
+
+        monkeypatch.setattr(shuru_mod.subprocess, "run", fake_run)
+        # Pinned so the test does not depend on the `shuru` CLI being installed:
+        # this is a test of what the argv CONTAINS, not of the sandbox.
+        monkeypatch.setattr(shuru_mod, "_shuru_bin", lambda: "shuru")
+        host_root = Path.cwd()
+
+        shuru_mod.run(
+            checkpoint="cp",
+            host_root=host_root,
+            command=["python", "-c", "pass"],
+            disk_mb=1024,
+            env={
+                "OPENAI_API_KEY": "sk-proj-0123456789abcdef",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+        )
+
+        assert captured, "the command was never handed to subprocess.run"
+        argv = " ".join(captured[0])
+        assert "sk-proj-0123456789abcdef" not in argv
+        assert f"export OPENAI_API_KEY={shlex.quote(redact_mod.REDACTED)}" in argv
+        # The non-secret entry is still exported — this must not have blanked the
+        # whole environment.
+        assert "PYTHONDONTWRITEBYTECODE=1" in argv
+
+    def test_the_bake_recipe_never_carries_a_secret(self):
+        recipe = "\n".join(
+            bake_mod.build_env_lines(
+                {"CC": "gcc", "OPENAI_API_KEY": "sk-proj-0123456789abcdef"}
+            )
+        )
+        assert "sk-proj-0123456789abcdef" not in recipe
+        assert f"export OPENAI_API_KEY={shlex.quote(redact_mod.REDACTED)}" in recipe
+        # The compiler variables the layers are keyed on are untouched.
+        assert "export CC=gcc" in recipe
+
+    def test_the_compiler_environment_recipes_are_unchanged(self):
+        """[WHY] A layer's identity is its recipe, so redaction must be a NO-OP on
+        the environments the harness actually passes — otherwise every baked layer
+        would be a different layer and be rebuilt."""
+        env = dict(bake_mod.COMPILER_ENV)
+        assert env, "COMPILER_ENV must not be empty, or this test proves nothing"
+        lines = bake_mod.build_env_lines(env)
+        for name, value in env.items():
+            assert f"export {name}={shlex.quote(value)}" in lines, name
+        assert not any(redact_mod.REDACTED in line for line in lines), (
+            "redaction is not a no-op on COMPILER_ENV — every baked layer's recipe "
+            "just changed and would be rebuilt"
+        )
+

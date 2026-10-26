@@ -69,6 +69,7 @@ from . import manifest as manifest_mod
 from . import oracle as oracle_mod
 from . import prepare as prepare_mod
 from . import records as records_mod
+from . import redact as redact_mod
 from . import suite as suite_mod
 from . import trees as tree_mod
 from .manifest import DONE, FAILED, RUNNING, Manifest, job_key
@@ -371,6 +372,30 @@ def vanta_env(
     # minutes is one long sanic call, which is the unit the margin has to cover.
     env["VANTA_DEADLINE_SECS"] = str(RUN_TIMEOUT_SECS - DEADLINE_MARGIN_SECS)
     return env
+
+
+def env_log_line(env: Mapping[str, str]) -> str:
+    """The run log's ``# env:`` header — Vanta's own configuration, redacted.
+
+    [VANTA-WHY] The header is built from :func:`bugsinpy.redact.redact_env`, not
+    from a name-prefix exclusion. The previous form dropped ``VANTA_API_KEY`` by
+    NAME, which made the rule "the one variable we remembered to exclude": a new
+    credential under a new name (``OPENAI_API_KEY``, or a ``VANTA_``-prefixed
+    alias somebody adds later) would have been printed in full. Applying the rule
+    to the whole dict means any secret-named entry, and any ``sk-`` token inside
+    any value, comes out ``<redacted>`` — including one we have not invented yet.
+
+    The ``VANTA_`` prefix filter stays on top, because the line is meant to
+    describe *this harness's* configuration rather than dump the environment.
+
+    [VANTA-WHY] Redaction applies to the RECORD, never to the call. The env
+    handed to ``subprocess.run`` is the real one: the key has to survive to the
+    child, or the run cannot authenticate.
+    """
+    safe = redact_mod.redact_env(env)
+    return "# env: " + " ".join(
+        f"{k}={v}" for k, v in sorted(safe.items()) if k.startswith("VANTA_")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1298,10 +1323,7 @@ def invoke_vanta(
     exit_code: Optional[int] = None
     with open(log_path, "w", encoding="utf-8") as log:
         log.write("$ " + " ".join(argv) + "\n")
-        log.write("# env: " + " ".join(
-            f"{k}={v}" for k, v in sorted(env.items())
-            if k.startswith("VANTA_") and k not in {"VANTA_API_KEY"}
-        ) + "\n\n")
+        log.write(env_log_line(env) + "\n\n")
         log.flush()
         try:
             proc = subprocess.run(

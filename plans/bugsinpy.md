@@ -6459,6 +6459,113 @@ and leaning on `assert_eq!` on the whole `base_url` so "unchanged" is compared, 
 
 ---
 
+### 14.25 Hosted OpenAI backend, item 2 — the API key reaches no file and no stream
+
+The hosted backend introduces the first genuine secret this project handles. Everything §14.24 added is
+about *which* service is called; this section is about the credential that authenticates the call, and it
+is written before any request is made because a leak is not repairable after the fact: the session log,
+the transitions store, the evidence bundle and the manifest are the artifacts a paper is built from, and
+they are copied, published and archived. A key that reaches any one of them is a key that has to be
+rotated.
+
+**The property being enforced is "nothing that is WRITTEN or PRINTED contains the key".** Not "the
+variable that usually holds the key is treated carefully". The two are different, and the difference is
+the whole design: a provider is free to quote the credential it just rejected back at the client
+(`Incorrect API key provided: sk-…`), and Vanta's error path deliberately prints the provider's body so a
+failure is legible. That message is legitimate, useful, and contains the secret. A rule that only knew
+about variable names would pass it straight through, which is why the redaction rule has **two
+independent halves**:
+
+- **By name.** `config::is_secret_env_name` is true when the name contains `KEY`, `TOKEN`, `SECRET` or
+  `PASSWORD`, case-insensitively and anywhere in the string. `GITHUB_TOKEN`, `MY_SECRET`, `DB_PASSWORD`
+  and a lower-case `openai_api_key` are all secrets by this rule, which is the point: the rule must be
+  about what a name *means*, not about the four names this codebase happens to use today.
+- **By value.** `config::redact_secret` replaces every whitespace-delimited token that starts with `sk-`
+  and is **longer than 12 characters** with `<redacted>`. Twelve is a deliberate floor: it is short
+  enough that every real key qualifies by a wide margin, and long enough that the string `sk-` on its own
+  — which appears in this very document, in a comment, and in the test names — survives. The scan is
+  **whitespace-delimited, not punctuation-delimited**, so the trailing `.` a provider puts after the key
+  in its message is removed along with it.
+
+Both halves are implemented once, in `src/config/mod.rs`, and shared. The rule walks bytes rather than
+`chars`, because the value half must not care about encoding, and it **preserves the surrounding text
+exactly** — every other byte, and every newline, is copied through — so a redacted forensic file is still
+the same file, just with the secret's bytes replaced.
+
+**`OPENAI_API_KEY` is read only on the `openai` backend, and `VANTA_API_KEY` only on `llamacpp`.**
+`from_env` chooses the variable name from `cfg.backend`, which is why §14.24 made the backend a field
+first. The two names never cross over: reading `VANTA_API_KEY` on the hosted backend would mean a stray
+local-proxy variable silently authenticating a billed hosted run, and reading `OPENAI_API_KEY` on the
+local backend would mean an unrelated exported key travelling with a run that has no business holding it.
+A set-but-empty value is `None` rather than an empty bearer token; a non-UTF-8 value is a `CONFIG_ERROR`
+naming the variable. The key is **never** read from a `VANTA_`-prefixed variable, so `VANTA_API_KEY` is
+no longer consulted at all on `openai`.
+
+**Nothing that prints the config prints the key.** `LlmConfig`'s `Display` renders the credential as
+`(set — redacted)` / `(not set — local / no-auth mode)`; `session.start` records `api_key=set` / `none`
+and never the value. The manifest records neither. The `Authorization` header is built with
+`set_sensitive(true)`, so `reqwest` will not log it either even at trace level.
+
+**The HTTP error path is the sharp edge, and it is redacted at the source.** The non-success branch of
+`post_chat` prints the provider's body as a snippet. Two things were needed there:
+
+- `redact_secret` runs over the body **before** the snippet is built, so a key echoed inside the body
+  becomes `<redacted>` in the message that reaches `run.infra_failure`, the terminal and the log.
+- the snippet is taken with `chars().take(300)`, **not** `&txt[..300]`. The byte-slice form panics when
+  byte 300 lands inside a multi-byte character, which turns "the provider returned an error" into "Vanta
+  crashed" — a latent bug that had nothing to do with secrets, fixed here because this is the line that
+  was being rewritten. Only the body is ever formatted into the message; the request headers are never
+  interpolated.
+
+**Every forensics write goes through one function.** `write_forensics_to` redacts its content before
+`fs::write`, so a future call site inherits the rule instead of remembering it. Debug files are the
+artifacts most likely to be pasted into a bug report, and they hold raw model output; for a local run the
+call is a no-op, because a local server never sees a key.
+
+**The Python harness has its own copy of the rule, deliberately.** `scripts/bugsinpy/redact.py` mirrors
+both halves — same four markers, same `sk-`/12-character value rule, same `<redacted>` marker — because
+the harness writes its own logs and exports, sometimes before any Vanta process exists. The duplication
+is checked rather than hoped for: a Python test asserts the constant and the threshold match the Rust
+side, so the two cannot drift apart silently. One detail had to be written out explicitly: Python's
+`str.isspace()` is true for Unicode spaces while Rust's `u8::is_ascii_whitespace` is not, so the Python
+side carries an explicit `_ASCII_WHITESPACE` set instead of calling `str.isspace()`. Without it the two
+implementations would disagree on a body containing a non-breaking space.
+
+The harness sites that now redact:
+
+- `runner.env_log_line` — the run log's `# env:` header. The previous form dropped `VANTA_API_KEY` **by
+  name**, which made the rule "the one variable we remembered to exclude". Redacting the whole dict first
+  is strictly stronger: every secret-shaped variable is covered, including ones the harness has not been
+  taught about, and the entry keeps its NAME (`VANTA_API_KEY=<redacted>`) so the line still says a key was
+  present. Named as a function rather than inlined so it is directly testable.
+- `shuru.run`'s `export` lines — they are part of the command string, and a command string is printed by
+  `shuru` on failure and visible in `ps`.
+- `bake.build_env_lines` — the layer's recipe, which is written to a bake log and re-read as an artifact.
+  The redacted value keeps the same position and shape, which is what keeps the recipe byte-identical for
+  every `env` dict that holds no secret — and therefore keeps every baked layer's content hash unchanged.
+
+**Redaction applies to what is PRINTED, never to what is PASSED.** The environment handed to
+`subprocess.run` for `vanta_m3` is the real environment: that is the one place the key must survive, and
+the harness tests assert the distinction directly rather than assuming it.
+
+Tests: `src/config/mod.rs::tests::test_secret_env_name_rule`, `test_redact_secret_value_rule`,
+`test_display_never_leaks_key` (rewritten — its old form asserted the key's own characters, which only a
+leaking `Display` could satisfy) and `test_backend_selection_from_env` steps 7–8 (each backend reads its
+own variable with both set to *different* sentinels, so a wrong read is visible rather than merely
+possible; and `VANTA_API_KEY` alone authorises nothing on `openai`);
+`tests/m3_session_log.rs::the_api_key_never_reaches_a_file_stream_or_record_when_the_provider_echoes_it`
+— `StubBehaviour::EchoKeyUnauthorized` reads the bearer token out of the request headers and quotes it
+back inside an HTTP 401 body, the run is driven to its recorded `InfraFailure`, and the test then sweeps
+**stdout, stderr and every file under the workspace** asserting the sentinel never occurs. The sweep
+walks the tree rather than a list of known artifacts, so a file added later cannot be forgotten into a
+leak, and the test carries a positive control — the recorded failure must contain `401` *and* the
+`<redacted>` marker — so it cannot pass by never making a call;
+`scripts/test_bugsinpy.py::TestSecretRedaction` (nine tests) pins the name rule, the value rule, the
+12-character boundary, `redact_env`'s keep-the-name/drop-the-value shape, the run log's `# env:` header,
+the sandbox command, the bake recipe, and that a secret-free compiler environment's recipe is unchanged.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

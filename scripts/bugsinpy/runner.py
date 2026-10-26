@@ -1152,6 +1152,17 @@ def sampling_block(summary: dict[str, str]) -> dict[str, Any]:
             )
             if site and cap
         }
+    # §14.21 — the reasoning controls, at the same two levels §14.20 uses:
+    # `budget`/`effort` are what the run ASKED FOR (the switch, which identifies
+    # an ablation arm), and the `*_mechanism` fields name the transport that
+    # implemented each one. The mechanism is what makes the same arm comparable
+    # across backends — a hosted run records its own. `effort` here is the
+    # EFFECTIVE level and defaults to `low`, because the six call sites have sent
+    # `reasoning_effort: low` since v0.2; `None` means the record carried no such
+    # key at all (a pre-§14.21 summary). `unset` from the pipeline reads back as
+    # `None`, so a reader cannot mistake "no switch" for "a switch with no value".
+    budget_text = summary.get("reasoning_budget")
+    budget_mechanism = summary.get("reasoning_budget_mechanism")
     return {
         # The split's own constant, not a copied literal: the manifest must name the
         # same policy the committed design declares, or the provenance block would
@@ -1162,6 +1173,16 @@ def sampling_block(summary: dict[str, str]) -> dict[str, Any]:
             _number(penalty) if penalty and penalty != "unset" else None
         ),
         "max_tokens_overrides": overrides,
+        "reasoning": {
+            "budget": (
+                int(budget_text) if budget_text and budget_text != "unset" else None
+            ),
+            "budget_mechanism": (
+                budget_mechanism if budget_mechanism and budget_mechanism != "unset" else None
+            ),
+            "effort": summary.get("reasoning_effort"),
+            "effort_mechanism": summary.get("reasoning_effort_mechanism"),
+        },
         "server_top_p": _number(top_p) if top_p and top_p != "unset" else None,
         "server_top_p_note": (
             "unset — /props did not publish it"

@@ -6189,6 +6189,109 @@ asserts the manifest reads the asked-for caps as a site→int map and that an un
 
 ---
 
+### 14.21 `VANTA_REASONING_BUDGET` / `VANTA_REASONING_EFFORT` — one reasoning knob, every backend
+
+§14.20 caps how much a call may **emit**; it does not touch how much the model **thinks** before it starts
+emitting. `ornith-1.5-35b` is a hybrid-reasoning Qwen3-style model: it opens a thinking block, reasons
+inside it, closes it, and only then writes the answer. §14.13 measured the shape of the problem on the
+PySnooper/3 smoke — the model worked the answer out, wrote that it had ("my test can't run… Contradiction"),
+and then spent the same 32k cap a second time re-checking it — and §14.13's retry catches the cut-off but
+cannot stop the model choosing to spend the budget on re-checking in the first place. §14.20 lets an
+operator shorten the *answer* budget; it does not let them shorten the *thinking*.
+
+**The interface is provider-neutral; only the mechanism is local.** The user's requirement is explicit:
+the same pipeline will later run against Anthropic and OpenAI, where reasoning is hidden or cannot be
+continued, so every knob must mean the same thing on every backend. `VANTA_REASONING_BUDGET=<tokens>`
+and `VANTA_REASONING_EFFORT=<none|low|medium|high>`, each optional, are therefore *levels and budgets*,
+not transport fields: the four effort names are llama.cpp's own **and** OpenAI's `reasoning.effort`
+levels, so an arm that says `high` means the same thing on either transport. Each backend maps the pair to
+its own native control, and the run **records which mechanism actually implemented it** — that record is
+what makes two arms comparable across backends rather than merely similarly named.
+
+**The budget, and what it does *not* bound.** On llama.cpp the budget becomes one request field,
+`reasoning_budget_tokens` (mechanism `llamacpp:reasoning_budget_tokens`), applied by
+`llm::apply_reasoning_control` at the tail of `with_sampling` — the same place §14.20's output cap is
+applied, and for the same reason: a value the record names must be a value a body carried. It is **per
+thinking block, not per completion.** The server re-arms the budget with a fresh `remaining` on every new
+start tag (`common_reasoning_budget_accept`'s `REASONING_BUDGET_DONE` arm), so a model that closes its
+block and opens another gets the budget again; measured through the router at `127.0.0.1:8080`, a request
+with no budget produced **11,976** characters of reasoning and `finish_reason=length` at the 4,096-token
+completion cap in 45.4 s, while the same request with `reasoning_budget_tokens: 64` produced **219**
+characters and `finish_reason=stop` in 10.8 s — a 54.7× difference — and `reasoning_budget_tokens: 0` ended
+the block immediately (0 characters). This knob therefore **removes waste inside a call; it does not bound
+a call.** The output cap plus §14.13's nudged retry remains the bound, exactly as before, and nothing here
+changes either.
+
+**Why not force the block closed.** The server *can* shorten a block that is still `COUNTING`
+(`POST /v1/chat/completions/control` with `action: reasoning_end`, which needs `reasoning_control: true`
+on the original request), and a prefilled open `<think>` arms the budget because the server feeds all
+prompt tokens through the same sampler. Both are deliberately **not used**: neither can port to a hosted
+API, where reasoning is hidden and the answer cannot be pre-filled while extended thinking is on
+(OpenAI does not return reasoning tokens; Anthropic does not allow pre-filling the answer with thinking
+enabled). A design that depended on continuing a partial answer would be a design that only runs here.
+
+**The site allow-list is the Attacker's three calls, and only those.** `llm::REASONING_BUDGET_SITES` is
+`attacker_generate`, `attacker_revise`, `attacker_simplify` — the sites whose reasoning is the run-away
+§14.13 measured. The intent audit is pinned at temperature 0.0 and holds a measurement the design keeps
+fixed; the Creator is outside it too, because a patch reasoned about for fewer tokens is a different
+experiment, not the same one made cheaper. One variable (`VANTA_REASONING_BUDGET`), not one per site:
+the budget is a property of the arm, and the allow-list — not an operator's spelling — decides where it
+reaches.
+
+**The effort level replaces, it does not invent.** `ornith-1.5-35b`'s chat template declares
+`supports_reasoning_effort: false`, so the six call sites' hard-coded `"reasoning_effort": "low"` has been
+a no-op since v0.2. `apply_reasoning_control` therefore replaces an **existing** `reasoning_effort` key
+and never adds one to a site that had none, and the recorded mechanism is `llamacpp:noop` — the honest
+statement that this transport ignores the level. The default is unchanged and byte-identical: `low` is
+what the sites already send, which is why `run.summary`'s `reasoning_effort=` records the **effective**
+level and defaults to `low` rather than reading `unset` (that would describe a run that sent no effort at
+all, which no run does). Setting the switch to `low` is therefore indistinguishable from leaving it unset,
+which is the truth: the two send byte-identical bodies and implement them the same way.
+
+**Recorded at two levels, twice — switch and mechanism.** `run.summary` carries `reasoning_budget=`
+(the tokens asked for, or `unset`), `reasoning_budget_mechanism=` (`llamacpp:reasoning_budget_tokens`, or
+`unset`), `reasoning_effort=` (the effective level) and `reasoning_effort_mechanism=` (`llamacpp:noop`).
+No value contains a space, so all four survive the `rerun.rs`/`metrics.py` value-terminator rule whole.
+The manifest's `sampling.reasoning` block reads them back as `{budget, budget_mechanism, effort,
+effort_mechanism}`, mapping `unset` to `None` so a reader cannot mistake "no switch" for "a switch with no
+value".
+
+**A malformed or zero value fails the run before it spends an hour.** `env_reasoning_budget` errors on
+anything that is not a number of tokens, and `ReasoningEffort::parse` errors on anything that is not one
+of the four levels; both fail for `env_secs`'s reason — an ablation arm that ran at a level or budget
+nobody asked for is not the arm the operator compared against, and silently falling back would make the
+comparison meaningless. `VANTA_REASONING_BUDGET=0` is **rejected**, not honoured: zero is not "off"
+(unset is off), it is a model told to reason for no tokens at all, which measures nothing and silently
+changes what the arm means. An empty value is skipped, not an error, so a shell expanding an unset
+variable (`VANTA_REASONING_BUDGET=`) does not fail the run. `VANTA_REASONING_BUDGET` is unbounded above
+only by `u32`; the budget is enforced per block so an over-large value is simply inert, not a failure.
+
+**Nothing asked for is byte-identical to before.** With both switches unset, `apply_reasoning_control`
+touches nothing, so every request body and every record is what it was — the §4.2 property the whole
+comparison rests on. `reasoning_budget_message` is deliberately left unused: it is llama.cpp's
+continuation-hint field, and a hint is a mechanism-specific nudge that would change the bodies of an
+otherwise-default run.
+
+Tests: `src/llm/mod.rs::_reasoning_control_tests::the_reasoning_switches_reach_the_three_attacker_sites
+_and_nothing_else` asserts an unset pair leaves every site's body untouched and renders
+`unset`/`llamacpp:noop`, that a budget reaches exactly the three allow-listed sites with the effort key
+replaced only where a site already had one, that a site outside the allow-list is unmoved, and that the
+four recorded fields name both the switch and the mechanism — it is **one** test, like §14.16's, because
+the controls are process-globals and parallel tests that each set and clear them race;
+`tests/m3_session_log.rs::the_reasoning_budget_reaches_the_attacker_calls_and_leaves_a_default_run_alone`
+runs the control and the armed attempt end to end against the stub server — the control's record reads
+`unset`/`low`/`llamacpp:noop` and is held to `assert_schedule_matches_bodies` while no body carries a
+budget, the armed attempt's every allow-listed `attacker_*` body carries `reasoning_budget_tokens` and the
+`high` it was asked for while no body outside the allow-list carries a budget and no body is handed an
+effort it did not have — then asserts a non-number, a zero and an unknown effort level each fail with
+`CONFIG_ERROR` naming the switch **before any call is made**;
+`scripts/test_bugsinpy.py::TestSamplingBlock::test_the_reasoning_arm_is_read_from_the_record` asserts the
+manifest reads the switch and the mechanism back as a block and that an unset pair comes back as
+`{budget: None, budget_mechanism: None, effort: "low", effort_mechanism: "llamacpp:noop"}` — not a
+fabricated empty block, and not `effort: None`, which no real run emits.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

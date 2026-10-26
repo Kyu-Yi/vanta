@@ -826,6 +826,191 @@ pub fn sampling_pins_text(preset: SamplingPreset, site: &str) -> Vec<(&'static s
         .collect()
 }
 
+// ============================================================================
+// REASONING CONTROL — `VANTA_REASONING_BUDGET` / `VANTA_REASONING_EFFORT` (§14.21)
+// ============================================================================
+//
+// [VANTA-WHY] §14.13's output cap and its brief re-ask are a SAFETY NET: they
+// decide what to do with an answer that has already spent its whole budget
+// thinking. This is the control that acts earlier — it bounds the thinking
+// itself, so the call that would have burned 32,768 tokens re-deriving its own
+// plan does not get to.
+//
+// [VANTA-WHY] The interface is deliberately provider-neutral and deliberately
+// small: a TOKEN BUDGET and an EFFORT LEVEL, both optional, both meaning the same
+// thing whatever the transport. It is deliberately NOT "continue the answer from a
+// partial prefix", which is the one mechanism a hosted reasoning API cannot be
+// asked for — OpenAI does not hand back the reasoning tokens to continue from,
+// and Anthropic will not accept a prefilled assistant turn while extended
+// thinking is on — so a design that needed it could not port, and porting is the
+// point: the same arm has to be runnable against llama.cpp today and against a
+// hosted API later.
+//
+// [VANTA-WHY] Each backend implements the neutral pair its own way, which is why
+// the record carries the MECHANISM beside the request. `llamacpp:noop` for the
+// effort is the honest record of a knob that did nothing: llama.cpp's sampler has
+// no effort level, and this model's chat template declares
+// `supports_reasoning_effort: false`, so the six call sites' existing
+// `reasoning_effort: "low"` is sent and then ignored. Recording that as an applied
+// control would credit the run with an intervention it never made.
+//
+// [VANTA-WHY] The budget is PER THINKING BLOCK, not per completion, and the
+// record's mechanism says so. llama.cpp's `reasoning_budget_tokens` installs a
+// start/end-tag sampler that re-arms with a fresh window on every new start tag,
+// so a model that closes its thinking block and opens another gets the budget
+// again (measured through the router: 11,976 → 219 characters of reasoning with
+// the budget at 64, and a reopened block is armed afresh). Nothing here therefore
+// bounds a RESPONSE. The output cap plus §14.13's re-ask remains the bound on the
+// call, exactly as it was; this knob only removes waste inside it.
+
+/// The reasoning effort a run may ask for (§14.21).
+///
+/// [VANTA-WHY] The four names are llama.cpp's own — and the same four names
+/// OpenAI uses for `reasoning.effort` — so an arm that says `high` means the same
+/// thing on either transport and only the MECHANISM differs. `none` is a level,
+/// not the absence of the switch: unset is the absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    None,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    /// Parse `VANTA_REASONING_EFFORT`.
+    ///
+    /// [VANTA-WHY] An unparsable value is an error, never a fallback: this is an
+    /// ablation switch, and an arm that ran at a level nobody asked for is not
+    /// the arm the operator compared against.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "none" => Ok(Self::None),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => Err(format!(
+                "CONFIG_ERROR: VANTA_REASONING_EFFORT='{other}' is not a level \
+                 (expected none|low|medium|high)."
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+/// The sites a reasoning budget applies to (§14.21).
+///
+/// [VANTA-WHY] The Attacker's three call sites and nothing else: they are the
+/// ones whose reasoning is the run-away §14.13 measured. The intent audit is
+/// pinned at temperature 0.0 and a budget there would move a measurement the
+/// design holds fixed, and the Creator is outside it too — a patch reasoned about
+/// for fewer tokens is a different experiment, not the same one made cheaper.
+pub const REASONING_BUDGET_SITES: &[&str] =
+    &["attacker_generate", "attacker_revise", "attacker_simplify"];
+
+/// The requested budget, or `None` when `VANTA_REASONING_BUDGET` is unset.
+static REASONING_BUDGET: Mutex<Option<u32>> = Mutex::new(None);
+
+/// The requested effort, or `None` when `VANTA_REASONING_EFFORT` is unset.
+static REASONING_EFFORT: Mutex<Option<ReasoningEffort>> = Mutex::new(None);
+
+/// Ask for a reasoning budget of `tokens` per thinking block; `None` is off.
+pub fn set_reasoning_budget(tokens: Option<u32>) {
+    *REASONING_BUDGET.lock().unwrap() = tokens;
+}
+
+/// Ask for a reasoning effort level; `None` is off.
+pub fn set_reasoning_effort(effort: Option<ReasoningEffort>) {
+    *REASONING_EFFORT.lock().unwrap() = effort;
+}
+
+fn reasoning_budget() -> Option<u32> {
+    *REASONING_BUDGET.lock().unwrap()
+}
+
+fn reasoning_effort() -> Option<ReasoningEffort> {
+    *REASONING_EFFORT.lock().unwrap()
+}
+
+/// The budget `site`'s request body carries, or `None` (§14.21).
+fn budget_for_site(site: &str) -> Option<u32> {
+    if REASONING_BUDGET_SITES.contains(&site) {
+        reasoning_budget()
+    } else {
+        None
+    }
+}
+
+/// llama.cpp implements the budget with one request field, per thinking block.
+const LLAMACPP_BUDGET_MECHANISM: &str = "llamacpp:reasoning_budget_tokens";
+
+/// llama.cpp implements the effort level with nothing at all.
+const LLAMACPP_EFFORT_MECHANISM: &str = "llamacpp:noop";
+
+/// Apply the run's reasoning controls to ONE request body (§14.21).
+///
+/// [VANTA-WHY] Called at the tail of [`with_sampling`], and therefore on the body
+/// the server actually receives — the same place §14.20's output cap is applied,
+/// for the same reason: a value the record names must be a value a body carried.
+/// An unset switch touches nothing, so a default run's bodies are byte-identical
+/// to what they were before this existed.
+pub fn apply_reasoning_control(object: &mut serde_json::Map<String, Value>, site: &str) {
+    if let Some(tokens) = budget_for_site(site) {
+        object.insert("reasoning_budget_tokens".to_string(), json!(tokens));
+    }
+    // [VANTA-WHY] The effort REPLACES a key the call site already set; it does
+    // not invent one for a site that has none. The six call sites that carry
+    // `reasoning_effort` are the ones this knob is about, and a site that never
+    // asked for an effort must not be handed one by a run-level switch.
+    if let Some(effort) = reasoning_effort() {
+        if object.contains_key("reasoning_effort") {
+            object.insert("reasoning_effort".to_string(), json!(effort.name()));
+        }
+    }
+}
+
+/// The budget that was ASKED FOR, as `run.summary` records it (§14.21).
+pub fn reasoning_budget_text() -> String {
+    reasoning_budget()
+        .map(|tokens| tokens.to_string())
+        .unwrap_or_else(|| "unset".to_string())
+}
+
+/// The mechanism that implements the budget, or `unset` when nothing was asked.
+pub fn reasoning_budget_mechanism() -> &'static str {
+    if reasoning_budget().is_some() {
+        LLAMACPP_BUDGET_MECHANISM
+    } else {
+        "unset"
+    }
+}
+
+/// The effort a request body carries, as `run.summary` records it (§14.21).
+///
+/// [VANTA-WHY] The EFFECTIVE value, not the switch: the six call sites have
+/// hard-coded `low` since v0.2, so a field that read `unset` on a default run
+/// would describe a run that sent no effort at all. Setting the switch to `low`
+/// is therefore indistinguishable from leaving it unset — which is the truth,
+/// since the two send byte-identical bodies.
+pub fn reasoning_effort_text() -> String {
+    reasoning_effort()
+        .map(|effort| effort.name().to_string())
+        .unwrap_or_else(|| "low".to_string())
+}
+
+/// The mechanism that implements the effort level (§14.21).
+pub fn reasoning_effort_mechanism() -> &'static str {
+    LLAMACPP_EFFORT_MECHANISM
+}
+
 /// Merge the active preset's sampler pins for `site` into a call site's extras
 /// (§14.11).
 ///
@@ -846,6 +1031,10 @@ pub fn with_sampling(mut extras: Value, site: &str) -> Value {
             object.insert(key, value);
         }
     }
+    // [VANTA-WHY] §14.21 — the reasoning controls last, for §14.16's reason: they
+    // touch only a `reasoning_*` key and leave every sampler pin where it was.
+    // With both switches unset this call changes nothing.
+    apply_reasoning_control(object, site);
     extras
 }
 
@@ -2500,5 +2689,120 @@ mod _max_tokens_override_tests {
         set_max_tokens_overrides(Vec::new());
         assert_eq!(cap(SamplingPreset::Pinned, "attacker_revise"), Some(32768));
         assert_eq!(max_tokens_overrides_text(), "unset");
+    }
+}
+
+// ============================================================================
+// REASONING CONTROL (§14.21) — tests
+// ============================================================================
+//
+// [VANTA-WHY] One test, for the reason the block above is one test: both
+// `REASONING_BUDGET` and `REASONING_EFFORT` are process-globals and the harness
+// runs these in parallel threads, so two tests that each set and clear them race
+// and the failure reads as a broken control rather than a broken test. The switch
+// and the effort are owned here end to end and left cleared.
+#[cfg(test)]
+mod _reasoning_control_tests {
+    use super::{
+        REASONING_BUDGET_SITES, ReasoningEffort, SAMPLING_SCHEDULE, reasoning_budget_mechanism,
+        reasoning_budget_text, reasoning_effort_mechanism, reasoning_effort_text,
+        set_reasoning_budget, set_reasoning_effort, with_sampling,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn the_reasoning_switches_reach_the_three_attacker_sites_and_nothing_else() {
+        // The allow-list is the Attacker's three call sites and only those, in the
+        // schedule's own order: the audit holds a fixed measurement and the Creator
+        // is a different experiment, not the same one made cheaper.
+        assert_eq!(
+            REASONING_BUDGET_SITES,
+            &["attacker_generate", "attacker_revise", "attacker_simplify"]
+        );
+
+        // (1) The default and every run before §14.21: nothing asked for, so no body
+        //     carries a reasoning control at all and the record reads the two
+        //     mechanisms the transport has always used.
+        set_reasoning_budget(None);
+        set_reasoning_effort(None);
+        for (site, _, _) in SAMPLING_SCHEDULE {
+            let body = with_sampling(json!({"reasoning_effort": "low"}), site);
+            assert_eq!(
+                body.get("reasoning_budget_tokens"),
+                None,
+                "an unset budget must leave the body untouched ({site})"
+            );
+            assert_eq!(
+                body["reasoning_effort"],
+                json!("low"),
+                "an unset effort must not change the site's own level ({site})"
+            );
+        }
+        assert_eq!(reasoning_budget_text(), "unset");
+        assert_eq!(reasoning_budget_mechanism(), "unset");
+        // The EFFECTIVE effort, not the switch: `low` is what the six call sites
+        // send, so `unset` here would describe a run that sent no effort at all.
+        assert_eq!(reasoning_effort_text(), "low");
+        assert_eq!(reasoning_effort_mechanism(), "llamacpp:noop");
+
+        // (2) The budget arm reaches exactly the three allow-listed sites, and names
+        //     both the value it asked for and the mechanism that carried it.
+        set_reasoning_budget(Some(12000));
+        for (site, _, _) in SAMPLING_SCHEDULE {
+            let body = with_sampling(json!({}), site);
+            if REASONING_BUDGET_SITES.contains(site) {
+                assert_eq!(
+                    body["reasoning_budget_tokens"],
+                    json!(12000),
+                    "the budget must reach the request body ({site})"
+                );
+            } else {
+                assert_eq!(
+                    body.get("reasoning_budget_tokens"),
+                    None,
+                    "the budget must not reach a site outside the allow-list ({site})"
+                );
+            }
+        }
+        assert_eq!(reasoning_budget_text(), "12000");
+        assert_eq!(reasoning_budget_mechanism(), "llamacpp:reasoning_budget_tokens");
+
+        // (3) The effort REPLACES a key the call site already set and never invents
+        //     one for a site that had none — the six `low` call sites are the ones
+        //     this knob is about. The recorded mechanism says the transport ignores
+        //     the level (`llamacpp:noop`), which is the truth for this template.
+        set_reasoning_effort(Some(ReasoningEffort::High));
+        let pinned = with_sampling(json!({"reasoning_effort": "low"}), "attacker_revise");
+        assert_eq!(pinned["reasoning_effort"], json!("high"));
+        let invented = with_sampling(json!({}), "attacker_revise");
+        assert_eq!(
+            invented.get("reasoning_effort"),
+            None,
+            "the effort must not be invented for a site that never asked for one"
+        );
+        assert_eq!(reasoning_effort_text(), "high");
+        assert_eq!(reasoning_effort_mechanism(), "llamacpp:noop");
+
+        // `none` is a LEVEL, not the absence of the switch: it is a body that asks
+        // the backend to reason not at all, and the record must say so.
+        set_reasoning_effort(Some(ReasoningEffort::None));
+        assert_eq!(
+            with_sampling(json!({"reasoning_effort": "low"}), "attacker_revise")["reasoning_effort"],
+            json!("none")
+        );
+        assert_eq!(reasoning_effort_text(), "none");
+
+        // An unparsable level is an error, never a fallback: an ablation arm must run
+        // at the level it named, or the comparison means nothing.
+        assert!(ReasoningEffort::parse("bogus").is_err());
+        assert!(ReasoningEffort::parse("").is_err());
+        assert_eq!(ReasoningEffort::parse("medium").unwrap().name(), "medium");
+
+        // The cleared state this test has to leave behind.
+        set_reasoning_budget(None);
+        set_reasoning_effort(None);
+        assert_eq!(reasoning_budget_text(), "unset");
+        assert_eq!(reasoning_budget_mechanism(), "unset");
+        assert_eq!(reasoning_effort_text(), "low");
     }
 }

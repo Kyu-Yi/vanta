@@ -5760,6 +5760,192 @@ fn the_output_cap_override_replaces_one_sites_slot_and_only_that_site() {
     }
 }
 
+/// §14.21 — the reasoning controls reach the Attacker's calls and nothing else.
+///
+/// [VANTA-WHY] §14.13 measured a model that worked the answer out and then spent
+/// its whole output cap re-checking it. §14.20 caps the ANSWER; this caps the
+/// THINKING, on the three Attacker sites whose reasoning the run-away was in.
+/// The knob has to be true in three places at once: the allow-listed bodies carry
+/// the control, the sites outside the allow-list do not, and `run.summary` names
+/// both the switch and the mechanism that implemented it — the mechanism is what
+/// makes the same arm comparable with a hosted backend later. A malformed value,
+/// and a zero, must fail the run before it spends an hour generating, which is
+/// asserted on the exit code and the absence of any call. The control run is held
+/// to `assert_schedule_matches_bodies`, so the claim that an unset switch changes
+/// nothing is checked against the same ground truth every other sampling test uses.
+#[test]
+fn the_reasoning_budget_reaches_the_attacker_calls_and_leaves_a_default_run_alone() {
+    let _serial = serial_run();
+
+    // The budget the arm asks for — a plausible ceiling for one thinking block,
+    // nowhere near the model's own 32,768-token output cap — and the same number
+    // as `run.summary` renders it.
+    const ARM_BUDGET_TOKENS: u64 = 12000;
+    const ARM_BUDGET_TEXT: &str = "12000";
+
+    // (1) The control: nothing asked for. No body carries a reasoning budget, the
+    //     record reads the two mechanisms the transport has always used, and the
+    //     effective effort is the `low` the six call sites have always sent.
+    let control = TempDir::new().unwrap();
+    let (_repo, _issue, control_patch) = write_test_repo(control.path(), PRESERVING_PATCH);
+    let control_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let control_output =
+        run_patch_mode_with_output(control.path(), &control_patch, &control_server, 1, &[]);
+    assert_eq!(
+        control_output.status.code(),
+        Some(0),
+        "the switch is a reasoning choice and must not move the verdict; stdout:\n{}",
+        String::from_utf8_lossy(&control_output.stdout)
+    );
+    let control_summary = run_summary(control.path()).summary;
+    for (key, expected) in [
+        ("reasoning_budget", "unset"),
+        ("reasoning_budget_mechanism", "unset"),
+        // The EFFECTIVE level, not the switch: `unset` here would describe a run
+        // that sent no effort at all, and every run sends `low`.
+        ("reasoning_effort", "low"),
+        ("reasoning_effort_mechanism", "llamacpp:noop"),
+    ] {
+        assert_eq!(
+            summary_value(&control_summary, key),
+            expected,
+            "an unset reasoning switch must record `{key}={expected}`: {control_summary}"
+        );
+    }
+    for body in control_server.request_bodies() {
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+        assert_eq!(
+            value.get("reasoning_budget_tokens"),
+            None,
+            "an unset reasoning budget must leave every body untouched: {body}"
+        );
+    }
+    assert_schedule_matches_bodies(
+        control.path(),
+        &control_server,
+        vanta::llm::SamplingPreset::Pinned,
+    );
+
+    // (2) The arm: a budget and an effort. The three allow-listed sites carry the
+    //     budget; the audit and the Creator do not. Every body that carries an
+    //     effort level carries the one that was asked for, and no body is handed
+    //     one it did not have.
+    let arm = TempDir::new().unwrap();
+    let (_repo, _issue, arm_patch) = write_test_repo(arm.path(), PRESERVING_PATCH);
+    let arm_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let arm_output = run_patch_mode_with_output(
+        arm.path(),
+        &arm_patch,
+        &arm_server,
+        1,
+        &[
+            ("VANTA_REASONING_BUDGET", "12000"),
+            ("VANTA_REASONING_EFFORT", "high"),
+        ],
+    );
+    assert_eq!(
+        arm_output.status.code(),
+        Some(0),
+        "a reasoning budget must not move the verdict; stdout:\n{}",
+        String::from_utf8_lossy(&arm_output.stdout)
+    );
+    let arm_bodies = arm_server.request_bodies();
+    let arm_kinds = arm_server.request_kinds();
+    assert_eq!(arm_kinds.len(), arm_bodies.len(), "one kind per recorded body");
+    let mut budgeted_sites: Vec<String> = Vec::new();
+    let mut effort_sites: Vec<String> = Vec::new();
+    for (kind, body) in arm_kinds.iter().zip(arm_bodies.iter()) {
+        let site = SITE_FOR_KIND
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map(|(_, site)| *site)
+            .unwrap_or_else(|| panic!("stub saw an unmapped request kind `{kind}`"));
+        let value: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+        if vanta::llm::REASONING_BUDGET_SITES.contains(&site) {
+            assert_eq!(
+                value.get("reasoning_budget_tokens").and_then(|v| v.as_u64()),
+                Some(ARM_BUDGET_TOKENS),
+                "the `{kind}` body is an allow-listed site and must carry the budget: {body}"
+            );
+            budgeted_sites.push(site.to_string());
+        } else {
+            assert_eq!(
+                value.get("reasoning_budget_tokens"),
+                None,
+                "the `{kind}` body (`{site}`) is outside the allow-list and must not carry it: {body}"
+            );
+        }
+        match value.get("reasoning_effort") {
+            // A site that asked for an effort gets the one the run asked for…
+            Some(level) => {
+                assert_eq!(
+                    level, "high",
+                    "the `{kind}` body must carry the effort the run asked for: {body}"
+                );
+                effort_sites.push(site.to_string());
+            }
+            // …and a site that never asked for one is not handed one.
+            None => {}
+        }
+    }
+    assert!(
+        !budgeted_sites.is_empty(),
+        "the arm reached no allow-listed site, so it proves nothing about the budget"
+    );
+    assert!(
+        !effort_sites.is_empty(),
+        "the arm reached no site that carries an effort, so it proves nothing about the level"
+    );
+    let arm_summary = run_summary(arm.path()).summary;
+    for (key, expected) in [
+        ("reasoning_budget", ARM_BUDGET_TEXT),
+        (
+            "reasoning_budget_mechanism",
+            "llamacpp:reasoning_budget_tokens",
+        ),
+        ("reasoning_effort", "high"),
+        ("reasoning_effort_mechanism", "llamacpp:noop"),
+    ] {
+        assert_eq!(
+            summary_value(&arm_summary, key),
+            expected,
+            "the arm's record must name `{key}={expected}`: {arm_summary}"
+        );
+    }
+
+    // (3) A malformed value, a zero budget and an unknown level are each refused
+    //     before a single call is made.
+    for (name, value) in [
+        ("VANTA_REASONING_BUDGET", "12k"),
+        ("VANTA_REASONING_BUDGET", "0"),
+        ("VANTA_REASONING_EFFORT", "bogus"),
+    ] {
+        let bad = TempDir::new().unwrap();
+        let (_repo, _issue, bad_patch) = write_test_repo(bad.path(), PRESERVING_PATCH);
+        let bad_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+        let bad_output =
+            run_patch_mode_with_output(bad.path(), &bad_patch, &bad_server, 1, &[(name, value)]);
+        assert_eq!(
+            bad_output.status.code(),
+            Some(1),
+            "{name}={value} must fail the run; stdout:\n{}",
+            String::from_utf8_lossy(&bad_output.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&bad_output.stderr);
+        assert!(
+            stderr.contains("CONFIG_ERROR") && stderr.contains(name),
+            "{name}={value} must name the offending switch; stderr:\n{stderr}"
+        );
+        assert!(
+            bad_server.request_bodies().is_empty(),
+            "a refused config must fail BEFORE the first call, or the run has already \
+             spent an hour generating"
+        );
+    }
+}
+
 /// §4.3 token accounting: the numbers a cost table is built from are the
 /// SERVER's, recorded per call, and `run.summary` totals exactly those.
 ///

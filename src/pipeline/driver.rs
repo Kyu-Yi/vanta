@@ -255,6 +255,63 @@ fn env_max_tokens_overrides() -> Result<Vec<(&'static str, u32)>, String> {
     Ok(overrides)
 }
 
+/// Read the reasoning budget from `VANTA_REASONING_BUDGET` (§14.21).
+///
+/// [VANTA-WHY] §14.21 — one variable, not one per site: the budget is a property
+/// of the arm ("reason for at most N tokens per thinking block"), and the set of
+/// sites it reaches is the provider-neutral `REASONING_BUDGET_SITES` allow-list,
+/// not a spelling the operator can get wrong. Zero is rejected for §14.20's
+/// reason squared: a budget of zero is not "off" (unset is off), it is a model
+/// told to reason for no tokens at all, which measures nothing and silently
+/// changes what the arm means. A malformed value is an error, never "no switch".
+fn env_reasoning_budget() -> Result<Option<u32>, String> {
+    const NAME: &str = "VANTA_REASONING_BUDGET";
+    match std::env::var(NAME) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let tokens = trimmed.parse::<u32>().map_err(|_| {
+                format!("CONFIG_ERROR: {NAME}='{trimmed}' is not a number of tokens.")
+            })?;
+            if tokens == 0 {
+                return Err(format!(
+                    "CONFIG_ERROR: {NAME}=0 is not a budget; unset it to run without one."
+                ));
+            }
+            Ok(Some(tokens))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "CONFIG_ERROR: {NAME} env var contained non-UTF-8 bytes."
+        )),
+    }
+}
+
+/// Read the reasoning effort from `VANTA_REASONING_EFFORT` (§14.21).
+///
+/// [VANTA-WHY] §14.21 — the levels and the rejection of anything else live with
+/// the enum (`ReasoningEffort::parse`), so the string this accepts and the string
+/// a body carries are one definition. An unparsable level is an error for the
+/// same reason a bad budget is: an ablation arm must run at the level it named.
+fn env_reasoning_effort() -> Result<Option<crate::llm::ReasoningEffort>, String> {
+    const NAME: &str = "VANTA_REASONING_EFFORT";
+    match std::env::var(NAME) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            crate::llm::ReasoningEffort::parse(trimmed).map(Some)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "CONFIG_ERROR: {NAME} env var contained non-UTF-8 bytes."
+        )),
+    }
+}
+
 /// The `baseline` / `vanta` / `vanta_planner` name for a pair of switches.
 ///
 /// [VANTA-WHY] Deriving the name from the switches instead of taking a fourth
@@ -514,6 +571,26 @@ pub async fn run(
         println!(
             "  Output caps: {} (VANTA_MAX_TOKENS_<SITE>)",
             pairs.join(", ")
+        );
+    }
+    // [VANTA-WHY] §14.21 — the reasoning arm. Read and applied here, beside the
+    // other sampling switches and before the repo loads, so a malformed value
+    // stops the run before it spends an hour generating and so the controls are
+    // in place before the first request body is built. `None`/`None` — the
+    // default, and every run before this change — leaves every body untouched.
+    let reasoning_budget = env_reasoning_budget()?;
+    crate::llm::set_reasoning_budget(reasoning_budget);
+    let reasoning_effort = env_reasoning_effort()?;
+    crate::llm::set_reasoning_effort(reasoning_effort);
+    if reasoning_budget.is_some() || reasoning_effort.is_some() {
+        println!(
+            "  Reasoning: budget={} effort={} (mechanism {}, {}) \
+             — sites: {}",
+            crate::llm::reasoning_budget_text(),
+            crate::llm::reasoning_effort_text(),
+            crate::llm::reasoning_budget_mechanism(),
+            crate::llm::reasoning_effort_mechanism(),
+            crate::llm::REASONING_BUDGET_SITES.join(", ")
         );
     }
     if !attacker_enabled {
@@ -2844,6 +2921,8 @@ pub async fn run(
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              revise_budget_per_attempt={} revise_calls_used={} \
              deadline_secs={} stop_reason={} presence_penalty={} max_tokens_overrides={} \
+             reasoning_budget={} reasoning_budget_mechanism={} reasoning_effort={} \
+             reasoning_effort_mechanism={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
              commit={} dirty={} prompt_version={} prompt_hash={} context_selection={} \
              harness_error={}",
@@ -2921,6 +3000,19 @@ pub async fn run(
             // space that begins a lowercase `key=`, and `attacker_revise=12288,…`
             // therefore survives intact.
             crate::llm::max_tokens_overrides_text(),
+            // [VANTA-WHY] §14.21 — the reasoning arm, recorded at the two levels
+            // §14.20 established: the budget/effort that were ASKED FOR (the
+            // switch, which identifies the arm) and the mechanism each backend
+            // used to implement them, so an arm run here can be compared with the
+            // same arm run against a hosted API. `reasoning_effort` is the
+            // EFFECTIVE level and defaults to `low` — the six call sites have sent
+            // `low` since v0.2, so `unset` would describe a run that sent nothing.
+            // Neither value contains a space, so both survive the
+            // `rerun.rs`/`metrics.py` value-terminator rule intact.
+            crate::llm::reasoning_budget_text(),
+            crate::llm::reasoning_budget_mechanism(),
+            crate::llm::reasoning_effort_text(),
+            crate::llm::reasoning_effort_mechanism(),
             deciding_rule.as_deref().unwrap_or("none"),
             deciding_evidence.join(","),
             needs_review_weak.join(","),

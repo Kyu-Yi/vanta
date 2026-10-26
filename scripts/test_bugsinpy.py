@@ -18260,6 +18260,54 @@ class TestSamplingBlock:
             "attacker_simplify": 12288,
         }
 
+    def test_the_reasoning_arm_is_read_from_the_record(self):
+        """§14.21 — the reasoning switch and the mechanism that implemented it.
+
+        The switch names the arm; the mechanism is what makes the same arm
+        comparable across backends, so both are read back. `unset` is `None`:
+        a fabricated empty block would claim a run nobody made. `effort` is the
+        EFFECTIVE level and defaults to `low` in the pipeline, because the six
+        call sites have sent `reasoning_effort: low` since v0.2 — so the only
+        honest `None` for it is a summary that carried no such key at all.
+        """
+        # A pre-§14.21 summary carried none of these keys: nothing to claim.
+        assert runner_mod.sampling_block(runner_mod.parse_summary(self.SUMMARY))[
+            "reasoning"
+        ] == {
+            "budget": None,
+            "budget_mechanism": None,
+            "effort": None,
+            "effort_mechanism": None,
+        }
+
+        # An unset switch as the pipeline renders it: no budget, and the effort
+        # and mechanism a default run has always used.
+        default = runner_mod.parse_summary(
+            self.SUMMARY
+            + " reasoning_budget=unset reasoning_budget_mechanism=unset "
+            "reasoning_effort=low reasoning_effort_mechanism=llamacpp:noop"
+        )
+        assert runner_mod.sampling_block(default)["reasoning"] == {
+            "budget": None,
+            "budget_mechanism": None,
+            "effort": "low",
+            "effort_mechanism": "llamacpp:noop",
+        }
+
+        # The arm: the tokens asked for, and the mechanism each transport used.
+        armed = runner_mod.parse_summary(
+            self.SUMMARY
+            + " reasoning_budget=12000 "
+            "reasoning_budget_mechanism=llamacpp:reasoning_budget_tokens "
+            "reasoning_effort=high reasoning_effort_mechanism=llamacpp:noop"
+        )
+        assert runner_mod.sampling_block(armed)["reasoning"] == {
+            "budget": 12000,
+            "budget_mechanism": "llamacpp:reasoning_budget_tokens",
+            "effort": "high",
+            "effort_mechanism": "llamacpp:noop",
+        }
+
     def test_the_pinned_schedule_matches_the_pipeline_constant(self):
         """`SAMPLING_SCHEDULE` is the only definition of the per-call schedule (§4.3)."""
         text = (REPO_ROOT / "src" / "llm" / "mod.rs").read_text(encoding="utf-8")

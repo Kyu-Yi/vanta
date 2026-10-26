@@ -18207,6 +18207,37 @@ class TestSamplingBlock:
         block = runner_mod.sampling_block({})
         assert block["pinned"] == []
         assert block["server_top_p"] is None
+        assert block["presence_penalty"] is None
+
+    def test_the_presence_penalty_arm_is_read_from_the_record_not_guessed(self):
+        """§14.16 — zero and unset send the SAME bodies, so only the record tells them apart.
+
+        The two arms of the ablation are identical apart from this switch, and the
+        bodies they produce are byte-identical for `0.0` and for unset. A table that
+        read the pinned sites alone could not separate the control from the default
+        run, which is exactly the comparison the switch exists to make.
+        """
+        zero = runner_mod.parse_summary(self.SUMMARY + " presence_penalty=0.0")
+        assert runner_mod.sampling_block(zero)["presence_penalty"] == 0.0
+        assert runner_mod.sampling_block(zero)["pinned"] == [
+            {"site": "creator", "temperature": 0.1, "max_tokens": 32768},
+            {"site": "attacker_generate", "temperature": 0.2, "max_tokens": 32768},
+            {"site": "intent_audit", "temperature": 0.0, "max_tokens": 2048},
+        ], "a zero penalty pins nothing, so it may not appear among the sites"
+
+        armed = runner_mod.parse_summary(
+            self.SUMMARY + " presence_penalty=1.0 presence_penalty_creator=1.0"
+        )
+        block = runner_mod.sampling_block(armed)
+        assert block["presence_penalty"] == 1.0
+        by_site = {entry["site"]: entry for entry in block["pinned"]}
+        assert by_site["creator"]["presence_penalty"] == 1.0
+
+    def test_an_unset_presence_penalty_is_recorded_as_unset_not_as_zero(self):
+        """`unset` is not `0.0`: one names a switch nobody set, the other an arm that was run."""
+        block = runner_mod.sampling_block(runner_mod.parse_summary(self.SUMMARY))
+        assert block["presence_penalty"] is None
+        assert all("presence_penalty" not in entry for entry in block["pinned"])
 
     def test_the_pinned_schedule_matches_the_pipeline_constant(self):
         """`SAMPLING_SCHEDULE` is the only definition of the per-call schedule (§4.3)."""

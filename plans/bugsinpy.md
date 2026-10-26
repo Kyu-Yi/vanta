@@ -5848,6 +5848,69 @@ stopped itself" rather than a fabricated value.
 
 ---
 
+### 14.16 `VANTA_PRESENCE_PENALTY` — and why zero is not unset
+
+§14.13 stops a cut-off reply from being read and §14.14 stops a round from buying unlimited
+remediations, but neither addresses the *reason* the sanic calls ran away: the classification was (i),
+the same reasoning repeated. Nine of the thirteen `GeneratedTest_*_raw_response.txt` files were the same
+test rewritten 45–87 times, all ending at `===END_REASONING===` with empty CONTENT. A reply that repeats
+itself is not a reply that is wrong — it is a sampler left to its own devices on a prompt it has already
+finished. `presence_penalty` is the parameter that penalises tokens already present in the output, so it
+is the one knob pointed directly at that failure mode.
+
+**It is a switch, not a conclusion.** Whether a penalty stops the loops is an empirical question and the
+code cannot answer it — only a batch can. `VANTA_PRESENCE_PENALTY` exists so one arm of the batch can be
+run at `0` and another at `1.0` with everything else identical, and so the two arms stay differentiable
+afterwards. It is deliberately **not** wired into any preset: `VANTA_SAMPLING` chooses a whole sampler
+(temperature *and* the nucleus together), while this changes one parameter and leaves every other pin —
+including the preset's own — where it was.
+
+**It is an override, applied last.** `sampling_pin_table` builds the preset's pins and then replaces or
+inserts `presence_penalty`, so the key is the one thing that wins over both presets. Under `pinned` it
+inserts a key that was never there; under `coding` it **replaces** the preset's own `0.0` rather than
+sitting beside it, because two `presence_penalty` keys in one JSON object is the later one silently
+winning, and a recorded schedule that named both would describe a body nobody sent. It reaches every
+site, the auditor included — the repetition happens in the generative roles and the auditor reads their
+output, so an override that skipped a site would be a different experiment.
+
+**Zero inserts nothing, and that is the whole design.** `set_presence_penalty(Some(0.0))` and an unset
+switch both leave every request body with no `presence_penalty` key at all, so the control arm of the
+ablation is byte-identical to a default v0.2 run — which is what makes it a control — and
+`the_coding_preset_covers_every_site_including_the_auditor`'s "a pinned body carries no `presence_penalty`"
+still holds. The refusal to insert `0.0` is not tidiness: inserting it would change every body byte for a
+run that asked for the server's own behaviour, and the byte-identity of a default run is a §4.2 property
+the whole comparison rests on.
+
+**Which is exactly why the value is recorded at the RUN level too.** Zero and unset produce identical
+bodies, so the pinned-site schedule cannot tell the two arms apart; `run.summary` therefore carries
+`presence_penalty=` — `unset` when nobody set the switch, `0.0` when someone asked for zero, the value
+when someone asked for one. That is the same argument §14.15 makes about `deadline_secs`: record what was
+**asked for**, because what was **sent** cannot distinguish the arms. When the value is non-zero the
+per-site keys (`presence_penalty_creator=`, …) appear as well, through the same pin table the bodies are
+built from, so the record and the bodies cannot drift; the manifest's `sampling` block reads both
+(`sampling.presence_penalty`, and `presence_penalty` on each entry of `sampling.pinned`).
+
+**A malformed value fails the run before it spends an hour.** `env_float` errors on anything that is not
+a number and on non-UTF-8, exactly as `env_secs` does, because `VANTA_PRESENCE_PENALTY=high` read as "no
+override" would run an arm the operator did not ask for and compare it against the wrong baseline. An
+empty value is `None` — what a shell expanding an unset variable hands over — and is not a parse error.
+
+Tests: `src/llm/mod.rs::_presence_penalty_tests::zero_and_unset_pin_nothing_and_a_non_zero_pins_every_site`
+asserts the unset and zero cases insert no key (for text and for a real body), that `1.0` reaches every
+site in `SAMPLING_SCHEDULE`, that the coding preset keeps exactly one `presence_penalty` pin and that it
+is the override's, and that the preset's other keys are unmoved;
+`tests/m3_session_log.rs::the_presence_penalty_override_reaches_every_body_and_zero_reaches_none` runs
+both arms end to end against the stub server — the control's bodies contain no `presence_penalty` (with a
+non-empty-body guard, so the assertion cannot pass vacuously) while its `run.summary` reads `0.0`, and the
+armed run's every body carries `1.0` — then re-uses `assert_schedule_matches_bodies` so the override is
+held to the same body-versus-record guard as the presets;
+`scripts/test_bugsinpy.py::TestSamplingBlock::test_the_presence_penalty_arm_is_read_from_the_record_not_guessed`
+asserts the manifest reads `0.0` from the record and leaves the pinned sites clean, and
+`test_an_unset_presence_penalty_is_recorded_as_unset_not_as_zero` that `unset` comes back as `None` rather
+than a fabricated `0.0`.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

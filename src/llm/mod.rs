@@ -618,6 +618,53 @@ enum PinValue {
     Int(u32),
 }
 
+// ============================================================================
+// PRESENCE PENALTY OVERRIDE — `VANTA_PRESENCE_PENALTY` (§14.16)
+// ============================================================================
+//
+// [VANTA-WHY] The overnight batch's run-aways were not wrong answers; they were
+// the SAME answer, rewritten 45-87 times until `max_tokens` cut the stream
+// (§14.13's classification (i)). `presence_penalty` is the sampler parameter
+// that penalises tokens already present in the output, so it is the one knob
+// that addresses that failure mode directly — and whether it helps is an
+// empirical question, not a design one. This switch exists so the question can
+// be ANSWERED rather than argued: one batch arm with it at 0.0 and one at 1.0,
+// everything else identical.
+//
+// [VANTA-WHY] It is an OVERRIDE of the pin table, not a third preset. A preset
+// changes a whole sampler (temperature and the nucleus together); this changes
+// exactly one parameter and leaves every other pin — including the preset's own
+// — where it was. So it is applied AFTER the preset and replaces that one key.
+//
+// [VANTA-WHY] ZERO INSERTS NOTHING, which is what keeps the `pinned` preset
+// byte-identical to v0.2. `Some(0.0)` and "unset" both leave the request body
+// with no `presence_penalty` key at all, so `the_coding_preset_covers_every_site_including_the_auditor`'s
+// "a pinned body carries no `presence_penalty`" still holds, and a `coding` run
+// keeps the 0.0 it declares. That is also why the value is recorded at the RUN
+// level as well as per site: zero and unset produce identical bodies, so the
+// only way a batch table can tell those two arms apart is if `run.summary`
+// carries what was ASKED FOR, not just what was sent.
+
+/// The requested presence penalty, or `None` when the switch is unset. The RAW
+/// request: `Some(0.0)` is "asked for zero", which is not the same claim as
+/// "asked for nothing" even though the two produce the same bodies.
+static PRESENCE_PENALTY: Mutex<Option<f64>> = Mutex::new(None);
+
+/// Pin `presence_penalty` on every call site, or `None` to leave the pins alone.
+pub fn set_presence_penalty(value: Option<f64>) {
+    *PRESENCE_PENALTY.lock().unwrap() = value;
+}
+
+/// The presence penalty to pin, or `None` when there is nothing to pin. A zero
+/// is "no pin", because inserting `presence_penalty: 0.0` would change every
+/// body byte for a run that asked for the server's own behaviour.
+fn presence_penalty_override() -> Option<f64> {
+    PRESENCE_PENALTY
+        .lock()
+        .unwrap()
+        .filter(|penalty| *penalty != 0.0)
+}
+
 /// The sampler keys `site` pins under `preset`, in a fixed order.
 ///
 /// [VANTA-WHY] One table feeds both the request body ([`with_sampling`]) and the
@@ -641,6 +688,17 @@ fn sampling_pin_table(preset: SamplingPreset, site: &str) -> Vec<(&'static str, 
         pins.push(("top_k", PinValue::Int(CODING_TOP_K)));
         pins.push(("min_p", PinValue::Float(CODING_MIN_P)));
         pins.push(("presence_penalty", PinValue::Float(CODING_PRESENCE_PENALTY)));
+    }
+    // [VANTA-WHY] §14.16 — the measurement override, applied last so it is the
+    // one key that wins over both presets. It REPLACES the coding preset's own
+    // 0.0 rather than sitting beside it (two `presence_penalty` keys in one JSON
+    // object is the second one silently winning), and inserts the key under
+    // `pinned`, which otherwise carries none.
+    if let Some(penalty) = presence_penalty_override() {
+        match pins.iter_mut().find(|(key, _)| *key == "presence_penalty") {
+            Some(slot) => slot.1 = PinValue::Float(penalty),
+            None => pins.push(("presence_penalty", PinValue::Float(penalty))),
+        }
     }
     pins
 }
@@ -2126,5 +2184,117 @@ mod _deadline_tests {
         // the state this test must leave behind.
         set_deadline_secs(None);
         assert!(!deadline_past(), "disarming must return the run to 'no clock'");
+    }
+}
+
+// ============================================================================
+// §14.16 — the presence-penalty override's own switch
+// ============================================================================
+//
+// [VANTA-WHY] The override is a process-global, so this module owns it end to end
+// and leaves it cleared. The one hazard is a parallel test that builds a request
+// body: `with_sampling` is called at the five structured call sites, all of which
+// need a live server, so no unit test reaches them. The window is the length of
+// this test either way.
+#[cfg(test)]
+mod _presence_penalty_tests {
+    use super::{
+        SAMPLING_SCHEDULE, SamplingPreset, sampling_pins_text, set_presence_penalty,
+        with_sampling,
+    };
+    use serde_json::json;
+
+    /// The pinned `presence_penalty` for `site`, or `None` when the body carries
+    /// no such key — which is the claim "the pins were left alone".
+    fn pinned(preset: SamplingPreset, site: &str) -> Option<String> {
+        sampling_pins_text(preset, site)
+            .into_iter()
+            .find(|(key, _)| *key == "presence_penalty")
+            .map(|(_, value)| value)
+    }
+
+    #[test]
+    fn zero_and_unset_pin_nothing_and_a_non_zero_pins_every_site() {
+        // The default, and every run before §14.16.
+        set_presence_penalty(None);
+        for (site, ..) in SAMPLING_SCHEDULE {
+            assert_eq!(
+                pinned(SamplingPreset::Pinned, site),
+                None,
+                "an unset override must leave a pinned body byte-identical ({site})"
+            );
+            assert!(
+                with_sampling(json!({}), site)
+                    .get("presence_penalty")
+                    .is_none(),
+                "an unset override must insert no `presence_penalty` key ({site})"
+            );
+        }
+
+        // Zero is the measurement arm's control: it must pin nothing either, or
+        // the control's bodies would differ from the baseline's by one key.
+        set_presence_penalty(Some(0.0));
+        for (site, ..) in SAMPLING_SCHEDULE {
+            assert_eq!(
+                pinned(SamplingPreset::Pinned, site),
+                None,
+                "a zero override pins nothing — `0.0` is the server's own default \
+                 ({site})"
+            );
+        }
+
+        // A non-zero value pins EVERY site, the auditor included: the repetition
+        // happens in the generative roles and the auditor reads their output, so
+        // an override that skipped a site would be a different experiment.
+        set_presence_penalty(Some(1.0));
+        for (site, ..) in SAMPLING_SCHEDULE {
+            assert_eq!(
+                pinned(SamplingPreset::Pinned, site),
+                Some("1.0".to_string()),
+                "a non-zero override must reach every site ({site})"
+            );
+            assert_eq!(
+                with_sampling(json!({}), site)["presence_penalty"],
+                json!(1.0),
+                "the override must reach the request body itself ({site})"
+            );
+        }
+
+        // Under `coding` the override REPLACES the preset's own 0.0 rather than
+        // adding a second key: two `presence_penalty` keys in one object is the
+        // later one silently winning, and a record that named both would be a
+        // schedule nobody sent.
+        for (site, ..) in SAMPLING_SCHEDULE {
+            let text = sampling_pins_text(SamplingPreset::Coding, site);
+            assert_eq!(
+                text.iter().filter(|(key, _)| *key == "presence_penalty").count(),
+                1,
+                "the override must not duplicate the coding preset's key ({site})"
+            );
+            assert_eq!(
+                pinned(SamplingPreset::Coding, site),
+                Some("1.0".to_string()),
+                "the override must win over the coding preset's 0.0 ({site})"
+            );
+            // The preset's OTHER keys are untouched — this changes one parameter,
+            // it is not a third preset.
+            assert_eq!(
+                text.iter()
+                    .find(|(key, _)| *key == "temperature")
+                    .map(|(_, value)| value.as_str()),
+                Some("0.6"),
+                "the override must not move the preset's temperature ({site})"
+            );
+        }
+
+        // A cleared override leaves the coding preset's own 0.0 in place, which is
+        // the state this test must leave behind.
+        set_presence_penalty(None);
+        assert_eq!(
+            pinned(SamplingPreset::Coding, "creator"),
+            Some("0.0".to_string()),
+            "coding declares its own `presence_penalty`, override or not"
+        );
+        assert_eq!(pinned(SamplingPreset::Pinned, "creator"), None);
     }
 }

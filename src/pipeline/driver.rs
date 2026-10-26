@@ -184,6 +184,32 @@ fn env_secs(name: &str) -> Result<Option<u64>, String> {
     }
 }
 
+/// Read a floating-point number from the environment, or `None` when unset.
+///
+/// [VANTA-WHY] §14.16 — the same argument as `env_secs`: `VANTA_PRESENCE_PENALTY=high`
+/// read as "no override" would run an arm the operator did not ask for and
+/// silently compare it against the wrong baseline. An empty value is `None`,
+/// which is what a shell that expands an unset variable (`VANTA_X=`) hands over
+/// and must not become a parse error.
+fn env_float(name: &str) -> Result<Option<f64>, String> {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            trimmed
+                .parse::<f64>()
+                .map(Some)
+                .map_err(|_| format!("CONFIG_ERROR: {name}='{trimmed}' is not a number."))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "CONFIG_ERROR: {name} env var contained non-UTF-8 bytes."
+        )),
+    }
+}
+
 /// The `baseline` / `vanta` / `vanta_planner` name for a pair of switches.
 ///
 /// [VANTA-WHY] Deriving the name from the switches instead of taking a fourth
@@ -411,6 +437,19 @@ pub async fn run(
         println!(
             "  Deadline: the run will stop making LLM calls after {secs} s and end as NeedsReview \
              ({BUDGET_EXHAUSTED})"
+        );
+    }
+    // [VANTA-WHY] §14.16 — the presence-penalty arm. Set here so a malformed value
+    // fails the run before it spends an hour generating, and so the value reaches
+    // the pin table (and therefore every request body) before the first call. A
+    // zero pins nothing but is still RECORDED, because "asked for zero" and "asked
+    // for nothing" send identical bodies and a batch table has to tell them apart.
+    let presence_penalty = env_float("VANTA_PRESENCE_PENALTY")?;
+    crate::llm::set_presence_penalty(presence_penalty);
+    if let Some(penalty) = presence_penalty {
+        println!(
+            "  Presence penalty: every call site will pin presence_penalty={penalty:?} \
+             (VANTA_PRESENCE_PENALTY)"
         );
     }
     if !attacker_enabled {
@@ -2691,7 +2730,7 @@ pub async fn run(
              corroborate={} grounded_audit={} batch_audit={} \
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              revise_budget_per_attempt={} revise_calls_used={} \
-             deadline_secs={} stop_reason={} \
+             deadline_secs={} stop_reason={} presence_penalty={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
              commit={} dirty={} prompt_version={} prompt_hash={} context_selection={}",
             attempts_run,
@@ -2751,6 +2790,13 @@ pub async fn run(
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "unset".to_string()),
             stop_reason.unwrap_or("none"),
+            // [VANTA-WHY] §14.16 — the presence penalty that was ASKED FOR, not
+            // the one that was sent: zero and unset send identical bodies, so a
+            // comparison of the two arms can only be made from this field.
+            // `unset` is the default and every run before this one.
+            presence_penalty
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|| "unset".to_string()),
             deciding_rule.as_deref().unwrap_or("none"),
             deciding_evidence.join(","),
             needs_review_weak.join(","),

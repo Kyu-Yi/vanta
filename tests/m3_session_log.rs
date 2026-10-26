@@ -5481,6 +5481,104 @@ fn the_coding_preset_covers_every_site_including_the_auditor() {
     );
 }
 
+/// §14.16 — `VANTA_PRESENCE_PENALTY` reaches every body, and zero reaches none.
+///
+/// [VANTA-WHY] The overnight batch's run-aways were the SAME answer rewritten
+/// 45-87 times until `max_tokens` cut the stream, and `presence_penalty` is the
+/// sampler parameter that penalises tokens already emitted. Whether it helps is an
+/// experiment — one arm at 0.0 and one at 1.0 — and an experiment whose arms are
+/// not distinguishable afterwards is not one. Zero must therefore change NOTHING
+/// in the request bodies (or the control is not a control) while still being
+/// RECORDED, and a non-zero value must reach every site's body. Both halves are
+/// asserted here, against the bodies the server actually received.
+#[test]
+fn the_presence_penalty_override_reaches_every_body_and_zero_reaches_none() {
+    let _serial = serial_run();
+
+    // (1) The control: asked for zero. Bodies byte-identical, value on the record.
+    let control = TempDir::new().unwrap();
+    let (_repo, _issue, control_patch) = write_test_repo(control.path(), PRESERVING_PATCH);
+    let control_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let control_output = run_patch_mode_with_output(
+        control.path(),
+        &control_patch,
+        &control_server,
+        1,
+        &[("VANTA_PRESENCE_PENALTY", "0")],
+    );
+    assert_eq!(
+        control_output.status.code(),
+        Some(0),
+        "the override is a sampling choice and must not move the verdict; stdout:\n{}",
+        String::from_utf8_lossy(&control_output.stdout)
+    );
+    let control_bodies = control_server.request_bodies();
+    assert!(
+        !control_bodies.is_empty(),
+        "the control run must have made calls, or it proves nothing about them"
+    );
+    for body in &control_bodies {
+        assert!(
+            !body.contains("\"presence_penalty\""),
+            "a zero penalty must leave the body byte-identical to the default: {body}"
+        );
+    }
+    let control_summary = run_summary(control.path()).summary;
+    assert_eq!(
+        summary_value(&control_summary, "presence_penalty"),
+        "0.0",
+        "zero and unset send the same bodies, so the ONLY way a batch table can \
+         tell the two arms apart is this field; got {control_summary}"
+    );
+
+    // (2) The arm: asked for 1.0. Every site's body carries it, and the record
+    //     matches the bodies site by site (`assert_schedule_matches_bodies` is the
+    //     same guard the preset uses, so the override cannot drift from the pins).
+    let arm = TempDir::new().unwrap();
+    let (_repo, _issue, arm_patch) = write_test_repo(arm.path(), PRESERVING_PATCH);
+    let arm_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let arm_output = run_patch_mode_with_output(
+        arm.path(),
+        &arm_patch,
+        &arm_server,
+        1,
+        &[("VANTA_PRESENCE_PENALTY", "1.0")],
+    );
+    assert_eq!(
+        arm_output.status.code(),
+        Some(0),
+        "a penalised run of the same approving candidate is still the approval; \
+         stdout:\n{}",
+        String::from_utf8_lossy(&arm_output.stdout)
+    );
+    for body in arm_server.request_bodies() {
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+        assert_eq!(
+            value.get("presence_penalty").and_then(|v| v.as_f64()),
+            Some(1.0),
+            "every call site must carry the override, the auditor included: {body}"
+        );
+    }
+    let arm_summary = run_summary(arm.path()).summary;
+    assert_eq!(summary_value(&arm_summary, "presence_penalty"), "1.0");
+    for site in [
+        "creator",
+        "attacker_generate",
+        "attacker_revise",
+        "attacker_simplify",
+        "intent_audit",
+    ] {
+        assert_eq!(
+            summary_value(&arm_summary, &format!("presence_penalty_{site}")),
+            "1.0",
+            "the record is the schedule, so every site must be named even when this \
+             run never reached it: {arm_summary}"
+        );
+    }
+    assert_schedule_matches_bodies(arm.path(), &arm_server, vanta::llm::SamplingPreset::Pinned);
+}
+
 /// §4.3 token accounting: the numbers a cost table is built from are the
 /// SERVER's, recorded per call, and `run.summary` totals exactly those.
 ///

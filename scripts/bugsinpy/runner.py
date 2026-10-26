@@ -1125,13 +1125,27 @@ def sampling_block(summary: dict[str, str]) -> dict[str, Any]:
             sites.setdefault(key[len("temperature_"):], {})["temperature"] = _number(value)
         elif key.startswith("max_tokens_"):
             sites.setdefault(key[len("max_tokens_"):], {})["max_tokens"] = _number(value)
+        # §14.16 — the presence penalty is the one sampler key that can come from
+        # an ENV OVERRIDE rather than a preset, so it is read back per site the
+        # same way. It is present only when a non-zero penalty was pinned; a zero
+        # and an unset penalty send byte-identical bodies.
+        elif key.startswith("presence_penalty_"):
+            sites.setdefault(key[len("presence_penalty_"):], {})["presence_penalty"] = _number(value)
     top_p = summary.get("top_p")
+    # §14.16 — what `VANTA_PRESENCE_PENALTY` ASKED FOR, which `pinned` above can
+    # only show when it is non-zero: `0.0` and `unset` send the same bodies, so a
+    # table comparing the two arms of the ablation can only be cut from this
+    # field. `unset` means the switch was never set.
+    penalty = summary.get("presence_penalty")
     return {
         # The split's own constant, not a copied literal: the manifest must name the
         # same policy the committed design declares, or the provenance block would
         # describe a design nobody reviewed.
         "source": SAMPLING_POLICY,
         "pinned": [{"site": site, **values} for site, values in sites.items()],
+        "presence_penalty": (
+            _number(penalty) if penalty and penalty != "unset" else None
+        ),
         "server_top_p": _number(top_p) if top_p and top_p != "unset" else None,
         "server_top_p_note": (
             "unset — /props did not publish it"

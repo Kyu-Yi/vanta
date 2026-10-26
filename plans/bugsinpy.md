@@ -5726,6 +5726,56 @@ and `a_per_test_audit_cut_off_twice_takes_its_ordinary_unavailable_verdict` asse
 the give-up, with `truncated_calls_intent_audit` / `truncated_twice_calls` read back from
 `run.summary`. `scripts/test_bugsinpy.py::TestLlmBlock` asserts the manifest's `truncated_twice`.
 
+### 14.14 One attempt's revise+simplify calls share a budget
+
+§14.13 stops a *single* call from running away. This section bounds how many such calls a round is
+allowed to make at all, because the overnight run's cost was not one long call — it was many.
+
+**The per-test cap bounded one test and nothing bounded their product.** BATE sends a test back to the
+Attacker at most three times (`for revision in 0..=3`), which is a bound on *that test*. A round with
+three tests had nothing stopping it from spending nine Attacker calls, and the loop was worse than
+that: a revision returns a `GeneratedTest` and `run_bate` does **not** check the name it comes back
+with, so a revision that renames its test enters as a **brand-new test with a fresh three-revision
+budget**. That is the treadmill the batch measured — generate, get scrapped or audited, revise, and
+the renamed result gets its own turns — and on sanic, where every mismatch is `actual=Error` and BATE
+can never validate (`valid=0 scrapped=3 discard_rate_pct=100.0`), not one of those calls could have
+ended the loop by succeeding.
+
+**A budget counted per attempt, shared by every test in it.** `REVISE_BUDGET_PER_ATTEMPT = 4`. One
+`ReviseBudget` is created by the attempt loop and borrowed by BATE (`attacker_revise_test`) and by the
+Diagnostician's Unknown path (`attacker_simplify_test`), so revise and simplify draw on **one** counter
+with **one** ceiling. It is counted per attempt rather than per test precisely because renaming cannot
+escape it: the floor is the attempt, not the test's name. A unit is spent **before** the call is made,
+not after it returns, so "at most four" is true of calls *made* rather than calls that answered — a
+call that fails, truncates or comes back renamed has still been paid for.
+
+**When the budget is spent the test is scrapped, and the round keeps its other tests.** BATE sets the
+outstanding outcome to `BateOutcome::Mismatch(REVISE_BUDGET_EXHAUSTED)` —
+`revise_budget_exhausted` — and `break`s out of that test's revision loop; the round continues with
+whatever tests it has, and if none survive it falls back to the native suite exactly as it already
+does. The Diagnostician's Unknown path has no such reason to record, so a spent budget there is simply
+an `Err` from the simplification, which is the outcome that path already has when simplification fails:
+the Unknown stands and the test is quarantined. Neither path can produce a *stronger* outcome than the
+un-remediated one, so C2 is untouched.
+
+**The per-test cap of 3 stays.** It is still the tighter bound on any single test and still the
+behaviour `a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped` guards; the
+budget is the bound on the round, and it is what makes an *unbounded* number of tests safe (the fourth
+revision anywhere in the attempt is the attempt's last). The wall-clock deadline (§14.15) remains the
+outer bound: the budget caps calls, the deadline caps time, and a call that takes ten minutes is not
+made better by a call count.
+
+**Recorded, not inferred.** `bate.summary` and `attempt.summary` each carry `revise_budget=` (the cap)
+and `revise_calls_used=` (what this BATE round / this attempt actually spent); `run.summary` carries
+`revise_budget_per_attempt=` and `revise_calls_used=` summed over the run; the manifest's `llm` block
+reads both back, like every other §14.12 number, rather than recomputing them.
+
+Tests: `src/pipeline/mod.rs::the_revise_budget_hands_out_exactly_the_cap_and_then_nothing` asserts the
+counter grants exactly the cap, refuses the next request, and does not count the refusal as spent;
+`scripts/test_bugsinpy.py::TestLlmBlock::test_the_revise_budget_is_reported_beside_the_call_totals`
+asserts the manifest keys, and `test_a_summary_from_before_this_record_claims_nothing` that a summary
+written before this record reports `None` rather than a fabricated `0`.
+
 ---
 
 ## 15. Model screen

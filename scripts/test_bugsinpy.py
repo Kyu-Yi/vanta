@@ -18234,6 +18234,7 @@ class TestLlmBlock:
         "truncated_calls_creator=0 truncated_calls_attacker=1 truncated_calls_intent_audit=0 "
         "truncated_calls=1 completion_tokens_total=738 "
         "truncated_twice_calls=0 "
+        "revise_budget_per_attempt=4 revise_calls_used=2 "
         "llm_calls_site_creator=1 truncated_calls_site_creator=0 "
         "completion_tokens_site_creator=123 "
         "llm_calls_site_attacker_generate=2 truncated_calls_site_attacker_generate=1 "
@@ -18254,6 +18255,14 @@ class TestLlmBlock:
         # §14.5 item 2 — the subset of truncations that came back cut off BOTH
         # times, so the pipeline does not report it as a plain retryable run-away.
         assert block["truncated_twice"] == 0
+
+    def test_the_revise_budget_is_reported_beside_the_call_totals(self):
+        # §14.14 — the cap and the run's spend against it, read back rather than
+        # re-derived, so a manifest read later does not have to trust a constant
+        # that has since moved.
+        block = runner_mod.llm_block(runner_mod.parse_summary(self.SUMMARY))
+        assert block["revise_budget_per_attempt"] == 4
+        assert block["revise_calls_used"] == 2
 
     def test_the_roles_are_named_because_one_role_covers_three_call_sites(self):
         block = runner_mod.llm_block(runner_mod.parse_summary(self.SUMMARY))
@@ -18283,6 +18292,8 @@ class TestLlmBlock:
         assert block["calls"] is None
         assert block["truncated_calls"] is None
         assert block["truncated_twice"] is None
+        assert block["revise_budget_per_attempt"] is None
+        assert block["revise_calls_used"] is None
         assert block["truncated_calls_by_role"]["attacker"] is None
         assert block["by_site"] == {}
 

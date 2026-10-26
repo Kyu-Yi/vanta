@@ -13,6 +13,59 @@ pub mod governor;
 pub mod gatekeeper;
 pub mod rerun;
 
+/// The per-attempt ceiling on the Attacker's remediation calls — revise (BATE)
+/// and simplify (the Diagnostician's Unknown path) together (§14.14).
+///
+/// [VANTA-WHY] The per-test cap of 3 revisions bounds ONE test. Nothing bounded
+/// their product across a round: three tests each allowed three revisions is
+/// nine Attacker calls, and worse, a revision is free to return a renamed test
+/// (`run_bate` does not check the name), which then enters as a brand-new test
+/// with a fresh 3-revision budget. That is the treadmill the overnight run
+/// measured. This constant is the cap the round cannot escape by renaming,
+/// because it is counted per ATTEMPT and shared by every test in it; the
+/// wall-clock deadline (§14.15) is the outer bound.
+pub const REVISE_BUDGET_PER_ATTEMPT: u32 = 4;
+
+/// The scrap reason a test gets when the attempt's remediation budget is spent
+/// (§14.14).
+pub const REVISE_BUDGET_EXHAUSTED: &str = "revise_budget_exhausted";
+
+/// One attempt's shared Attacker remediation budget (§14.14).
+///
+/// [VANTA-WHY] Held by the attempt loop and borrowed by BATE and the
+/// Diagnostician, so "revise+simplify" is ONE counter with one ceiling. BATE
+/// spends a unit before each `attacker_revise_test`; the Diagnostician spends
+/// one before its Unknown-path `attacker_simplify_test`. When it is spent, BATE
+/// scraps the test as `revise_budget_exhausted` and the round continues with the
+/// tests it has, and the Diagnostician leaves the test's Unknown standing
+/// (exactly as a failed simplification would), so the outcome is never stronger
+/// than the un-remediated one.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReviseBudget {
+    used: u32,
+}
+
+impl ReviseBudget {
+    pub fn new() -> Self {
+        Self { used: 0 }
+    }
+
+    /// Spend one unit. Returns `false` when this attempt's budget is spent.
+    pub fn try_use(&mut self) -> bool {
+        if self.used < REVISE_BUDGET_PER_ATTEMPT {
+            self.used += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// How many remediation calls this attempt has made.
+    pub fn used(&self) -> u32 {
+        self.used
+    }
+}
+
 /// The prompt versions in force for this build, as one `session.start`-ready
 /// string.
 ///
@@ -127,5 +180,33 @@ mod tests {
                 "`{role}`'s hash must be 12 lowercase hex characters; got {hash:?}"
             );
         }
+    }
+
+    /// [VANTA-WHY] §14.14 — the budget's whole contract in one place: it hands
+    /// out exactly `REVISE_BUDGET_PER_ATTEMPT` units, it reports how many it has
+    /// handed out, and a ceiling of zero would hand out none. The revision
+    /// treadmill the overnight run measured was unbounded, so "exactly N, then
+    /// no" is the property the fix rests on; a total that could drift with the
+    /// number of tests is the bug, not a detail.
+    #[test]
+    fn the_revise_budget_hands_out_exactly_the_cap_and_then_nothing() {
+        let mut budget = ReviseBudget::new();
+        assert_eq!(budget.used(), 0);
+        for spent in 1..=REVISE_BUDGET_PER_ATTEMPT {
+            assert!(
+                budget.try_use(),
+                "unit {spent} of {REVISE_BUDGET_PER_ATTEMPT} must be granted"
+            );
+            assert_eq!(budget.used(), spent);
+        }
+        assert!(
+            !budget.try_use(),
+            "the budget must refuse past its cap, not extend it"
+        );
+        assert_eq!(
+            budget.used(),
+            REVISE_BUDGET_PER_ATTEMPT,
+            "a refused request must not be counted as spent"
+        );
     }
 }

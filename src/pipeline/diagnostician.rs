@@ -30,6 +30,8 @@ use crate::core::{FailureClass, TestResult};
 use crate::pipeline::bate::{BateOutcome, validate_test_against_baseline};
 use crate::pipeline::candidate::TestCommand;
 use crate::pipeline::harness::{self, TestExecutionDetails};
+use crate::pipeline::ReviseBudget;
+use crate::pipeline::REVISE_BUDGET_EXHAUSTED;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{debug, info, warn};
@@ -658,6 +660,13 @@ pub async fn diagnose_failure(
     original_source: &str,
     test_cmd: &TestCommand,
     bate_validated: bool,
+    // [VANTA-WHY] §14.14 — the attempt's SHARED Attacker remediation budget. The
+    // Unknown path below spends one unit before it asks the Attacker to simplify,
+    // so "revise+simplify" is one ceiling per attempt rather than two independent
+    // ones. When it is spent, the simplification is not made and the Unknown
+    // stands exactly as it would after a failed simplification — never a stronger
+    // verdict than the un-remediated one.
+    revise_budget: &mut ReviseBudget,
 ) -> DiagnosticResult {
     let force_unknown = std::env::var("VANTA_TEST_FORCE_UNKNOWN").ok().as_deref() == Some("1");
     // [VANTA-WHY] The FIRST classification sees the real execution: whether the
@@ -887,7 +896,22 @@ pub async fn diagnose_failure(
             // generic persistent Unknown.
             let mut scrap_note: Option<String> = None;
             tracing::info!(test = %test.test_name, "Unknown → asking Attacker to simplify");
-            match attacker_simplify_test(cfg, original_source, test).await {
+            // [VANTA-WHY] §14.14 — spend the attempt's shared budget BEFORE the
+            // call. When it is spent, the simplification is not made; the outcome
+            // is the same `Err` the path already has for a failed simplification,
+            // which leaves the Unknown standing (quarantine) rather than inventing
+            // a weaker-or-stronger verdict. The message names the reason so the
+            // record distinguishes "the budget ran out" from "the call broke".
+            let simplify_call = if revise_budget.try_use() {
+                attacker_simplify_test(cfg, original_source, test).await
+            } else {
+                Err(format!(
+                    "the attempt's revise+simplify budget is spent \
+                     ({REVISE_BUDGET_EXHAUSTED}) — not simplifying"
+                )
+                .into())
+            };
+            match simplify_call {
                 Ok(simplified) => {
                     // Step 3: run the simplified test.
                     let simp_result = harness::run_single_test_with_timeout(
@@ -1455,6 +1479,7 @@ mod tests {
             "",
             &TestCommand::default(),
             true,
+            &mut ReviseBudget::new(),
         )
         .await;
 
@@ -1500,6 +1525,7 @@ mod tests {
             "",
             &TestCommand::default(),
             true,
+            &mut ReviseBudget::new(),
         )
         .await;
 

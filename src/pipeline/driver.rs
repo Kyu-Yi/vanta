@@ -55,6 +55,7 @@ use crate::pipeline::harness::{self, TestExecutionDetails};
 use crate::pipeline::patch::{
     ApplyFailure, apply_patch_detailed, apply_patch_strict, patch_deleted_paths,
 };
+use crate::pipeline::{REVISE_BUDGET_PER_ATTEMPT, ReviseBudget};
 use crate::repo::Repo;
 use crate::session::{
     PatchAttemptId, SCHEMA_VERSION, SessionId, SessionLog, SessionRecord, TransitionRow,
@@ -792,8 +793,19 @@ pub async fn run(
     // this, a dead LLM call propagated with `?` and the process exited with a
     // stack-style error and NO final decision on disk — the run was unreadable.
     let mut infra_failure_error: Option<String> = None;
+    // [VANTA-WHY] §14.14 — the run's total Attacker remediation calls, summed
+    // over attempts from the per-attempt budget below. Reported in `run.summary`
+    // (and thus the manifest) beside the cap, so a reader can tell a run that
+    // never needed a revision from one that spent its budget.
+    let mut revise_calls_used_total: u32 = 0;
     let decision = loop {
         let attempt = governor.current_attempt();
+
+        // [VANTA-WHY] §14.14 — this ATTEMPT's shared revise+simplify budget. Fresh
+        // per attempt (a new round may revise again), shared by every test in it
+        // and by BATE and the Diagnostician, so the cap cannot be escaped by a
+        // revision that returns a renamed test.
+        let mut revise_budget = ReviseBudget::new();
 
         // [VANTA-WHY] `VANTA_PLANNER=on` is the third configuration in §4.2 and
         // it is a PLACEHOLDER: no planner half of the pipeline exists. It ends
@@ -1381,6 +1393,7 @@ pub async fn run(
                 &attacker_tests,
                 &test_cmd,
                 grounded_audit_enabled,
+                &mut revise_budget,
             )
             .await
         })
@@ -1408,11 +1421,18 @@ pub async fn run(
             test_id: None,
             phase: "bate.summary".to_string(),
             summary: format!(
-                "valid={} scrapped={} relabels={} discard_rate_pct={:.1}",
+                "valid={} scrapped={} relabels={} discard_rate_pct={:.1} \
+                 revise_budget={} revise_calls_used={}",
                 bate_report.valid_tests.len(),
                 bate_report.scrapped_tests.len(),
                 bate_relabels.len(),
-                discard_rate * 100.0
+                discard_rate * 100.0,
+                // [VANTA-WHY] §14.14 — the attempt's Attacker remediation cap and
+                // how much of it BATE has spent. A reader can tell a round that
+                // never revised (`0`) from one whose tests were scrapped because
+                // the budget ran out, without opening the scrap reasons.
+                REVISE_BUDGET_PER_ATTEMPT,
+                revise_budget.used(),
             ),
             timestamp: now_iso(),
             benchmark_instance: None,
@@ -1846,6 +1866,7 @@ pub async fn run(
                     // failing identically on the original and the patched tree is
                     // the evidence that the patch did not fix the bug.
                     true,
+                    &mut revise_budget,
                 )
                 .await;
                 println!(
@@ -2202,12 +2223,20 @@ pub async fn run(
             test_id: None,
             phase: "attempt.summary".to_string(),
             summary: format!(
-                "attempt={} decision={:?} valid_tests={} shared_tests={} all_passed={}{}",
+                "attempt={} decision={:?} valid_tests={} shared_tests={} all_passed={} \
+                 revise_budget={} revise_calls_used={}{}",
                 attempt + 1,
                 decision,
                 valid_tests.len(),
                 shared_tests.len(),
                 all_passed,
+                // [VANTA-WHY] §14.14 — the attempt's whole Attacker remediation
+                // spend (BATE's revisions + the Diagnostician's simplifications)
+                // against the cap. `bate.summary` reports the same counter at the
+                // point BATE finished; this is the end-of-attempt reading the run
+                // total is summed from.
+                REVISE_BUDGET_PER_ATTEMPT,
+                revise_budget.used(),
                 // [VANTA-WHY] Mark the attempt as censored in the durable log, not
                 // just on stderr. A run that only prints a warning today leaves M5
                 // with a run that stops partway through and no recorded reason.
@@ -2221,6 +2250,10 @@ pub async fn run(
             benchmark_instance: None,
             benchmark_label: None,
         })?;
+        // [VANTA-WHY] §14.14 — fold this attempt's spend into the run's total while
+        // the reading is in hand; the budget is reset at the top of the next
+        // attempt, so this is the only place it is observable.
+        revise_calls_used_total += revise_budget.used();
 
         match decision {
             GovernorDecision::AllTestsPassed => {
@@ -2543,6 +2576,7 @@ pub async fn run(
              truncated_calls={} truncated_twice_calls={} completion_tokens_total={} {} \
              corroborate={} grounded_audit={} batch_audit={} \
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
+             revise_budget_per_attempt={} revise_calls_used={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
              commit={} dirty={} prompt_version={} prompt_hash={} context_selection={}",
             attempts_run,
@@ -2586,6 +2620,13 @@ pub async fn run(
             flag_text(batch_audit_enabled),
             crate::agents::attacker::INTENT_AUDIT_BATCH_TOKENS_PER_TEST,
             token_value(batch_audit_max_tokens),
+            // [VANTA-WHY] §14.14 — the Attacker remediation cap and the run's
+            // total spend against it. Reported beside the §14.5 truncation counts
+            // because they are the two answers to "is the Attacker stuck?": a
+            // truncation says a call could not finish, this says the round kept
+            // asking.
+            REVISE_BUDGET_PER_ATTEMPT,
+            revise_calls_used_total,
             deciding_rule.as_deref().unwrap_or("none"),
             deciding_evidence.join(","),
             needs_review_weak.join(","),

@@ -24,6 +24,7 @@ use crate::config::LlmConfig;
 use crate::core::{TestIntent, TestResult};
 use crate::pipeline::candidate::TestCommand;
 use crate::pipeline::harness;
+use crate::pipeline::{REVISE_BUDGET_EXHAUSTED, ReviseBudget};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -242,6 +243,11 @@ pub fn mislabeled_reproduction_decision(
 /// audits this phase performs (the relabel question and the audit of a revised
 /// test). It only selects the auditor's prompt variant; with it `false` both calls
 /// are byte-identical to v0.2's.
+///
+/// [VANTA-WHY] §14.14 — `revise_budget` is the attempt's SHARED ceiling on
+/// Attacker remediation calls. It is borrowed rather than local so the
+/// Diagnostician's Unknown-path simplification draws from the same counter:
+/// "revise+simplify" is one budget per attempt, not two.
 pub async fn run_bate(
     cfg: &LlmConfig,
     issue_text: &str,
@@ -250,6 +256,7 @@ pub async fn run_bate(
     tests: &[GeneratedTest],
     test_cmd: &TestCommand,
     grounded_audit: bool,
+    revise_budget: &mut ReviseBudget,
 ) -> BateRun {
     let mut valid_tests: Vec<GeneratedTest> = Vec::new();
     let mut scrapped_tests: Vec<(String, String)> = Vec::new();
@@ -361,6 +368,25 @@ pub async fn run_bate(
                         }
                     }
                     if revision < 3 {
+                        // [VANTA-WHY] §14.14 — the attempt's SHARED revise+simplify
+                        // budget. The per-test cap (`revision < 3`) bounds one
+                        // test; this bounds the whole round, and a revision that
+                        // returns a RENAMED test cannot escape it, because the
+                        // counter belongs to the round and is not reset when the
+                        // name changes. Spending it BEFORE the call is what makes
+                        // "at most 4 revisions" true rather than "at most 4 that
+                        // returned". When it is spent the test is scrapped and the
+                        // round continues with the tests it has.
+                        if !revise_budget.try_use() {
+                            info!(
+                                test = %current_test.test_name,
+                                "BATE: the attempt's revise budget is spent — scrapping"
+                            );
+                            final_outcome = Some(BateOutcome::Mismatch(
+                                REVISE_BUDGET_EXHAUSTED.to_string(),
+                            ));
+                            break;
+                        }
                         info!(
                             test = %current_test.test_name,
                             revision = revision + 1,

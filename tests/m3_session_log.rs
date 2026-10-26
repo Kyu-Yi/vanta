@@ -1964,6 +1964,22 @@ fn a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped
         "a run that scraps its only test must record a 100%% discard rate; got {}",
         bate_summary.summary
     );
+    // [VANTA-WHY] §14.14 — the round's Attacker remediation budget must be on the
+    // record, not just enforced: the cap AND how much of it this round spent. The
+    // three revisions above are exactly the three this test just proved happened,
+    // so `revise_calls_used=3` is the receipt for them — a budget that was never
+    // spent, or one written down as the cap rather than the usage, would read
+    // differently here.
+    assert!(
+        bate_summary.summary.contains("revise_budget=4"),
+        "the BATE summary must record the attempt's revise budget; got {}",
+        bate_summary.summary
+    );
+    assert!(
+        bate_summary.summary.contains("revise_calls_used=3"),
+        "the BATE summary must record the three revisions this round spent; got {}",
+        bate_summary.summary
+    );
 }
 
 /// Regression guard for the oracle loophole: a patch must not be able to write

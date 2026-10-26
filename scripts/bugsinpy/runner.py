@@ -1149,6 +1149,14 @@ def llm_block(summary: dict[str, str]) -> dict[str, Any]:
     ``truncated_calls`` — two came back where one call gave up — and it is the
     number that says "this site cannot answer inside its cap", which is a
     different repair from "the model ran away once".
+
+    ``revise_budget_per_attempt`` / ``revise_calls_used`` are §14.14's ceiling on
+    the Attacker's remediation calls (revise in BATE plus simplify in the
+    Diagnostician) and the run's total spend against it. They sit here because
+    they are the other half of "is the Attacker stuck?": a truncation says one
+    call could not finish, the budget says the round kept asking. The cap is a
+    property of the design and is recorded per run so a manifest read years later
+    does not have to trust a constant that has since moved.
     """
     by_site: dict[str, dict[str, Any]] = {}
     for key, value in summary.items():
@@ -1174,6 +1182,8 @@ def llm_block(summary: dict[str, str]) -> dict[str, Any]:
             "attacker": _int(summary.get("truncated_calls_attacker")),
             "intent_audit": _int(summary.get("truncated_calls_intent_audit")),
         },
+        "revise_budget_per_attempt": _int(summary.get("revise_budget_per_attempt")),
+        "revise_calls_used": _int(summary.get("revise_calls_used")),
         "by_site": by_site,
     }
 

@@ -1128,6 +1128,48 @@ def sampling_block(summary: dict[str, str]) -> dict[str, Any]:
     }
 
 
+def llm_block(summary: dict[str, str]) -> dict[str, Any]:
+    """§14.12's per-run LLM cost block, read back from the pipeline's record.
+
+    The pipeline counts the calls it made while it makes them (one ``call.usage``
+    row per chat call); the harness only copies the totals. That is what makes a
+    batch table and a session log unable to disagree about what a run cost — the
+    alternative, recomputing from the log text, is what the runaway diagnosis
+    could not do: the plain log carried neither a completion count nor a
+    ``finish_reason``.
+
+    ``by_site`` is those same three facts at CALL-SITE granularity. It exists
+    beside ``truncated_calls_by_role`` because the Attacker's three sites are one
+    role: "the revisions all ran away" and "the first generation ran away" are
+    the same number per role and a different problem in fact.
+    """
+    by_site: dict[str, dict[str, Any]] = {}
+    for key, value in summary.items():
+        for prefix, field in (
+            ("llm_calls_site_", "calls"),
+            ("truncated_calls_site_", "truncated_calls"),
+            ("completion_tokens_site_", "completion_tokens"),
+        ):
+            if key.startswith(prefix):
+                by_site.setdefault(key[len(prefix):], {})[field] = _int(value)
+    return {
+        "calls": _int(summary.get("llm_calls")),
+        "calls_measured": _int(summary.get("llm_calls_measured")),
+        "prompt_tokens": _int(summary.get("llm_prompt_tokens")),
+        "completion_tokens_total": _int(summary.get("completion_tokens_total")),
+        "truncated_calls": _int(summary.get("truncated_calls")),
+        # §14.5's three reportable roles, spelled out rather than derived from
+        # the site map: the mapping site→role is the pipeline's
+        # (`llm::truncation_role`), and a second copy of it here could drift.
+        "truncated_calls_by_role": {
+            "creator": _int(summary.get("truncated_calls_creator")),
+            "attacker": _int(summary.get("truncated_calls_attacker")),
+            "intent_audit": _int(summary.get("truncated_calls_intent_audit")),
+        },
+        "by_site": by_site,
+    }
+
+
 def _number(value: Optional[str]) -> Any:
     if value is None:
         return None
@@ -1320,6 +1362,12 @@ def build_record(
         "vanta_build_dirty": _bool(summary.get("dirty")),
         "model": summary.get("model"),
         "sampling": sampling_block(summary),
+        # §14.12 — what the run's LLM calls actually cost, and how often the
+        # server cut one off at its output cap. Read back from `run.summary`, so a
+        # batch table can be cut by call site without opening a session log — and
+        # so a runaway is a number the manifest carries rather than a surprise
+        # found in a 2-hour log afterwards.
+        "llm": llm_block(summary),
         "checkpoint": job.checkpoint,
         # `python_version` is what the checkpoint ACTUALLY contains; the pinned one
         # is what BugsInPy's bug.info declares. §12.3 says they differ (3.8.20 vs

@@ -18226,6 +18226,62 @@ class TestSamplingBlock:
         ]
 
 
+class TestLlmBlock:
+    """§14.12's per-run LLM block: the pipeline's totals, copied not recomputed."""
+
+    SUMMARY = (
+        "llm_calls=6 llm_calls_measured=6 llm_prompt_tokens=4662 llm_completion_tokens=738 "
+        "truncated_calls_creator=0 truncated_calls_attacker=1 truncated_calls_intent_audit=0 "
+        "truncated_calls=1 completion_tokens_total=738 "
+        "llm_calls_site_creator=1 truncated_calls_site_creator=0 "
+        "completion_tokens_site_creator=123 "
+        "llm_calls_site_attacker_generate=2 truncated_calls_site_attacker_generate=1 "
+        "completion_tokens_site_attacker_generate=246 "
+        "llm_calls_site_attacker_revise=0 truncated_calls_site_attacker_revise=0 "
+        "completion_tokens_site_attacker_revise=unset "
+        "llm_calls_site_intent_audit=3 truncated_calls_site_intent_audit=0 "
+        "completion_tokens_site_intent_audit=369"
+    )
+
+    def test_the_totals_are_the_ones_the_pipeline_counted(self):
+        block = runner_mod.llm_block(runner_mod.parse_summary(self.SUMMARY))
+        assert block["calls"] == 6
+        assert block["calls_measured"] == 6
+        assert block["prompt_tokens"] == 4662
+        assert block["completion_tokens_total"] == 738
+        assert block["truncated_calls"] == 1
+
+    def test_the_roles_are_named_because_one_role_covers_three_call_sites(self):
+        block = runner_mod.llm_block(runner_mod.parse_summary(self.SUMMARY))
+        assert block["truncated_calls_by_role"] == {
+            "creator": 0,
+            "attacker": 1,
+            "intent_audit": 0,
+        }
+
+    def test_the_by_site_breakdown_keeps_the_three_facts_per_site(self):
+        block = runner_mod.llm_block(runner_mod.parse_summary(self.SUMMARY))
+        assert block["by_site"]["attacker_generate"] == {
+            "calls": 2,
+            "truncated_calls": 1,
+            "completion_tokens": 246,
+        }
+        # A site whose completions were never measured says so rather than claiming
+        # zero: `unset` and `0` are different facts about the same slot.
+        assert block["by_site"]["attacker_revise"] == {
+            "calls": 0,
+            "truncated_calls": 0,
+            "completion_tokens": None,
+        }
+
+    def test_a_summary_from_before_this_record_claims_nothing(self):
+        block = runner_mod.llm_block({})
+        assert block["calls"] is None
+        assert block["truncated_calls"] is None
+        assert block["truncated_calls_by_role"]["attacker"] is None
+        assert block["by_site"] == {}
+
+
 def _gate_row(
     *,
     bug: str = "Demo/1",

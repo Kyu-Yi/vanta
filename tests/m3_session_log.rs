@@ -5405,6 +5405,37 @@ fn token_accounting_records_the_servers_counts_per_call_and_a_run_total() {
         );
     }
 
+    // §14.12 — the round, the retry index, the server's own `finish_reason` and
+    // the wall time travel with EVERY call. The runaway diagnosis was made from a
+    // log that had the calls and none of these four: the round had to be
+    // reconstructed, the retries were invisible, and a 5-10 minute call left no
+    // time anywhere but a debug line nothing kept.
+    for usage in &usages {
+        assert!(
+            summary_value(&usage.summary, "round").parse::<u32>().unwrap_or(0) >= 1,
+            "every call in a run belongs to a round the driver set: {}",
+            usage.summary
+        );
+        assert_eq!(
+            summary_value(&usage.summary, "attempt"),
+            "1",
+            "this run retries nothing, so every call is attempt 1: {}",
+            usage.summary
+        );
+        assert_eq!(
+            summary_value(&usage.summary, "finish_reason"),
+            "unset",
+            "the stub publishes no finish_reason for a complete answer, and a \
+             plausible-looking `stop` would be a claim the server never made: {}",
+            usage.summary
+        );
+        assert!(
+            summary_value(&usage.summary, "wall_ms").parse::<u64>().is_ok(),
+            "the wall time must be recorded as whole milliseconds: {}",
+            usage.summary
+        );
+    }
+
     // `seq` is the only ordering key the rows carry — timestamps are wall-clock
     // and two calls can share a second — so it must be dense and increasing, or
     // the order of calls within a run is unrecoverable.
@@ -5442,6 +5473,49 @@ fn token_accounting_records_the_servers_counts_per_call_and_a_run_total() {
         summary_value(&summary, "llm_completion_tokens"),
         (123 * usages.len()).to_string(),
         "the run total must sum the server's completion counts"
+    );
+
+    // §14.12 — the same facts at the two granularities the runaway report needs:
+    // a run total, and every CALL SITE (the Attacker's three included, which the
+    // single `attacker` role merges by construction).
+    assert_eq!(
+        summary_value(&summary, "truncated_calls"),
+        "0",
+        "nothing was cut off in this run: {summary}"
+    );
+    assert_eq!(
+        summary_value(&summary, "completion_tokens_total"),
+        (123 * usages.len()).to_string(),
+        "the requested run-level completion total must equal the per-call sum: {summary}"
+    );
+
+    let mut per_site_calls = 0_u64;
+    for (site, _, _) in vanta::llm::SAMPLING_SCHEDULE {
+        let calls: u64 = summary_value(&summary, &format!("llm_calls_site_{site}"))
+            .parse()
+            .unwrap_or_else(|e| panic!("`llm_calls_site_{site}` must be a count ({e}): {summary}"));
+        // A site this run never reached is recorded as a ZERO, not omitted: a
+        // breakdown that silently drops a site makes "it never ran" and "the
+        // record forgot it" the same reading.
+        assert_eq!(
+            summary_value(&summary, &format!("truncated_calls_site_{site}")),
+            "0",
+            "nothing was cut off: {summary}"
+        );
+        // `unset` is the honest value for a site whose completions were never
+        // measured (an `estimate`-sourced row has no completion count at all).
+        let completions = summary_value(&summary, &format!("completion_tokens_site_{site}"));
+        assert!(
+            completions == "unset" || completions.parse::<u64>().is_ok(),
+            "`completion_tokens_site_{site}` must be a count or `unset`: {summary}"
+        );
+        per_site_calls += calls;
+    }
+    assert_eq!(
+        per_site_calls,
+        usages.len() as u64,
+        "the per-site breakdown must account for every call the run made, or a site \
+         is missing from the report: {summary}"
     );
 }
 

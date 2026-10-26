@@ -95,6 +95,25 @@ pub struct CallUsage {
     /// The call site, named exactly as in `SAMPLING_SCHEDULE` for the pipeline;
     /// the M0 spike names its own (it is not part of the schedule).
     pub site: String,
+    /// The pipeline round this call belongs to, 1-based, or 0 when no round was
+    /// ever set (the M0 spike). The driver sets it once per attempt via
+    /// `set_forensics_round(attempt + 1)`, so it is the same index the forensics
+    /// filenames carry.
+    ///
+    /// [VANTA-WHY] §14.12 — "the same question was asked four times in ONE
+    /// round" is only readable if the round travels with the call. Without it the
+    /// reader has to reconstruct the round from the driver's log, which is
+    /// exactly the reconstruction the runaway diagnosis could not do: the calls
+    /// were on disk but their round was not.
+    pub round: u32,
+    /// Which retry of `structured_call_with_retry` produced this row, 1-based.
+    ///
+    /// [VANTA-WHY] §14.12 — attempt 1 is the pinned request, every later attempt
+    /// is a retry. Two rows with the same `site` and `round` and different
+    /// `attempt` ARE the retry loop; that is the shape the runaway report needs
+    /// to see, and it cannot be inferred from `seq` alone because other sites
+    /// interleave.
+    pub attempt: u32,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
@@ -115,6 +134,22 @@ pub struct CallUsage {
     /// fact: the sequence is a function of the pinned seed and the attempt
     /// index, and both are in the record.
     pub seed: Option<u64>,
+    /// The server's own `finish_reason` for this call, verbatim (`stop`,
+    /// `length`, …), `None` when it published none.
+    ///
+    /// [VANTA-WHY] §14.12 — `length` is the FACT; `truncated` is that fact
+    /// interpreted. Kept verbatim beside it so a call that stopped for a reason
+    /// nobody anticipated is visible, instead of being silently binned as "not
+    /// truncated" — which is all a boolean on its own can do.
+    pub finish_reason: Option<String>,
+    /// Wall time for this call, request sent to the stream closing, in
+    /// milliseconds.
+    ///
+    /// [VANTA-WHY] §14.12 — the runaway is a story about TIME (5-10 minutes per
+    /// long call) as much as about tokens, and the only wall time that existed
+    /// was a `debug!` line nothing kept. Measured around the same `Instant` that
+    /// line used, so the record and the log can never disagree.
+    pub wall_ms: u64,
     /// Whether the server stopped this call at `max_tokens` (`finish_reason:
     /// "length"`).
     ///
@@ -977,6 +1012,8 @@ pub async fn post_chat(
         extra_fields,
         site,
         cfg.seed,
+        // Not in a retry loop: this call is attempt 1 by construction.
+        1,
     )
     .await
     .map(|(content, _finish_reason)| content)
@@ -1008,6 +1045,10 @@ async fn post_chat_meta(
     extra_fields: Value,
     site: &str,
     seed: Option<u64>,
+    // Which retry of `structured_call_with_retry` this is, so the accounting row
+    // can carry it (§14.12). `post_chat` — the one-shot wrapper the M0 spike and
+    // bootstrap use — has no retry loop and passes 1.
+    attempt: u32,
 ) -> Result<(String, Option<String>), Box<dyn Error + Send + Sync>> {
     let url = cfg.chat_completions_url();
 
@@ -1212,22 +1253,40 @@ async fn post_chat_meta(
         // Nothing from the server: record the estimate, but SAY it is one.
         None => (u64::from(estimate), "estimate"),
     };
+    // [VANTA-WHY] §14.12 — the wall time is measured ONCE, here, and both the
+    // record and the debug line below read this value: two `elapsed()` calls
+    // would give the log and the session row different numbers for the same call.
+    let wall_ms = t.elapsed().as_millis() as u64;
     let usage = CallUsage {
         seq: USAGE_SEQ.fetch_add(1, Ordering::Relaxed),
         site: site.to_string(),
+        // [VANTA-WHY] §14.12 — the round comes from the process-global the driver
+        // sets once per attempt BEFORE any agent runs (`set_forensics_round`), so
+        // it is the same index `write_forensics` puts in the filename. Read here
+        // rather than threaded through every agent: the round is a property of the
+        // run, not of the call, and an agent signature changed for bookkeeping is
+        // an agent signature that can change a verdict.
+        round: FORENSICS_ROUND.load(Ordering::Relaxed),
+        attempt,
         prompt_tokens: Some(prompt_tokens_recorded),
         completion_tokens: measured_completion,
         total_tokens: measured_total,
         source: usage_source.to_string(),
         seed,
+        finish_reason: streamed.finish_reason.clone(),
+        wall_ms,
         truncated: streamed.finish_reason.as_deref() == Some("length"),
     };
     debug!(
         site,
+        round = usage.round,
+        attempt,
         prompt_tokens = prompt_tokens_recorded,
         completion_tokens = ?measured_completion,
         token_source = usage_source,
         seed = ?seed,
+        finish_reason = streamed.finish_reason.as_deref().unwrap_or("unset"),
+        wall_ms,
         truncated = usage.truncated,
         "llm call token usage recorded"
     );
@@ -1250,10 +1309,9 @@ async fn post_chat_meta(
         content, reasoning
     );
 
-    let ms = t.elapsed().as_millis();
     debug!(
         status = status.as_u16(),
-        elapsed_ms = ms,
+        elapsed_ms = wall_ms,
         total_tokens = streamed.total_tokens.unwrap_or(0),
         finish_reason = streamed.finish_reason.as_deref().unwrap_or("unset"),
         "streamed chat completion complete"
@@ -1429,6 +1487,8 @@ where
             extras_for_attempt.clone(),
             site,
             attempt_seed,
+            // The retry index, so the row can say which attempt this was (§14.12).
+            attempt,
         )
         .await
         {

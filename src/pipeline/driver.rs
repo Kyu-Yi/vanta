@@ -244,6 +244,54 @@ fn truncation_counts(calls: &[crate::llm::CallUsage]) -> (u64, u64, u64) {
     counts
 }
 
+/// Per-call-SITE totals: calls, truncated calls and completion tokens (§14.12).
+///
+/// [VANTA-WHY] Roles (`llm::truncation_role`) answer "which AGENT ran away";
+/// sites answer "which of that agent's calls did". The Attacker alone has three
+/// sites, and a round whose revisions all run away is a different problem from
+/// one whose first generation did — a distinction the role split collapses by
+/// construction. Sites are reported in `SAMPLING_SCHEDULE` order and include the
+/// ones this run never reached, as a zero rather than a missing key: a breakdown
+/// that silently omits a site makes "it never ran" indistinguishable from "the
+/// record forgot it". A site outside the schedule (the M0 spike names its own)
+/// is reported too, for the same reason `truncation_counts` warns about one.
+///
+/// The completion sum excludes rows whose `source` is `estimate`, exactly as
+/// `token_totals` does: a per-site number that mixes a character-derived guess
+/// into a measurement is worse than an absent one.
+fn per_site_totals(
+    calls: &[crate::llm::CallUsage],
+) -> Vec<(String, u64, u64, Option<u64>)> {
+    let mut sites: Vec<&str> = crate::llm::SAMPLING_SCHEDULE
+        .iter()
+        .map(|(site, _, _)| *site)
+        .collect();
+    for call in calls {
+        if !sites.contains(&call.site.as_str()) {
+            sites.push(call.site.as_str());
+        }
+    }
+    sites
+        .into_iter()
+        .map(|site| {
+            let rows: Vec<&crate::llm::CallUsage> =
+                calls.iter().filter(|c| c.site == site).collect();
+            let truncated = rows.iter().filter(|c| c.truncated).count() as u64;
+            let completions: Vec<u64> = rows
+                .iter()
+                .filter(|c| c.source != "estimate")
+                .filter_map(|c| c.completion_tokens)
+                .collect();
+            let completion = if completions.is_empty() {
+                None
+            } else {
+                Some(completions.iter().sum())
+            };
+            (site.to_string(), rows.len() as u64, truncated, completion)
+        })
+        .collect()
+}
+
 /// Render the run's EFFECTIVE per-call-site sampling as `run.summary` keys.
 ///
 /// [VANTA-WHY] Underscores, not dots. `rerun.rs::summary_field` and
@@ -2292,10 +2340,16 @@ pub async fn run(
             test_id: None,
             phase: "call.usage".to_string(),
             summary: format!(
-                "seq={} site={} prompt_tokens={} completion_tokens={} total_tokens={} source={} \
-                 seed={} truncated={}",
+                "seq={} site={} round={} attempt={} prompt_tokens={} completion_tokens={} \
+                 total_tokens={} source={} seed={} finish_reason={} wall_ms={} truncated={}",
                 usage.seq,
                 usage.site,
+                // [VANTA-WHY] §14.12 — the round and the retry index travel with
+                // every call, because the runaway diagnosis could not tell "four
+                // attempts of one generation" from "four separate generations"
+                // without them: the log had the calls but not their round.
+                usage.round,
+                usage.attempt,
                 token_value(usage.prompt_tokens),
                 token_value(usage.completion_tokens),
                 token_value(usage.total_tokens),
@@ -2304,6 +2358,11 @@ pub async fn run(
                 // `VANTA_LLM_SEED` when a retry advanced it. Written per call so
                 // a truncated-and-retried call is reproducible after the fact.
                 token_value(usage.seed),
+                // [VANTA-WHY] §14.12 — the server's own word, verbatim. `unset`
+                // rather than a plausible-looking `stop`, which would be a claim
+                // the server never made.
+                usage.finish_reason.as_deref().unwrap_or("unset"),
+                usage.wall_ms,
                 usage.truncated,
             ),
             timestamp: now_iso(),
@@ -2324,6 +2383,22 @@ pub async fn run(
     // beside the split's results rather than buried per call site.
     let (truncated_creator, truncated_attacker, truncated_intent_audit) =
         truncation_counts(&call_usages);
+    // [VANTA-WHY] §14.12 — the run-level total and the per-SITE breakdown the
+    // role split cannot give. `truncated_total` is counted off the rows rather
+    // than summed from the three roles, so an off-schedule site cannot make the
+    // total disagree with the calls it summarises.
+    let truncated_total = call_usages.iter().filter(|c| c.truncated).count() as u64;
+    let per_site_keys = per_site_totals(&call_usages)
+        .iter()
+        .map(|(site, calls, truncated, completion)| {
+            format!(
+                "llm_calls_site_{site}={calls} truncated_calls_site_{site}={truncated} \
+                 completion_tokens_site_{site}={}",
+                token_value(*completion)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
 
     // ---- Provenance (plans/bugsinpy.md §4.4) ----
     // [VANTA-WHY] A session directory copied out of a batch has to be
@@ -2416,6 +2491,7 @@ pub async fn run(
              llm_calls={} llm_calls_measured={} llm_prompt_tokens={} llm_completion_tokens={} \
              truncated_calls_creator={} truncated_calls_attacker={} \
              truncated_calls_intent_audit={} \
+             truncated_calls={} completion_tokens_total={} {} \
              corroborate={} grounded_audit={} batch_audit={} \
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
@@ -2438,6 +2514,13 @@ pub async fn run(
             truncated_creator,
             truncated_attacker,
             truncated_intent_audit,
+            // [VANTA-WHY] §14.12 — the same three facts the role split reports,
+            // at the two granularities a runaway report needs: the run total, and
+            // every call site (including the Attacker's three, which the single
+            // `attacker` role deliberately merges).
+            truncated_total,
+            token_value(llm_completion_tokens),
+            per_site_keys,
             // [VANTA-WHY] §14.2/§14.4/§14.5 — the switches this run actually ran
             // under, and the corroboration that produced its verdict. A reader
             // must be able to tell a `Rejected` decided by rule (a) from one

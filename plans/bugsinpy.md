@@ -5607,6 +5607,70 @@ attribute the sampling change to the pipeline.
 
 ---
 
+### 14.12 Per-call LLM telemetry, and the per-site breakdown
+
+The overnight `paper-off` batch at `d258ce4` ran away and **could not be diagnosed from its own
+evidence**. 119 calls completed; 18 stopped at exactly `max_tokens = 32768` and another 32 ran
+10k–21k tokens, at 5–10 minutes each; `sanic/1`'s vanta repair was killed by the harness at exactly
+3 h with `no run.summary`. The session log held every call — and nothing that could tell the reads
+apart: **no round**, so "four retries of one generation" and "four separate generations" were the
+same four rows; **no `finish_reason`**, so a call cut off at the cap was indistinguishable from one
+that stopped by itself; **no wall time**, so the 5–10 minutes per long call existed only in a
+`debug!` line nothing kept. The INFO log could not substitute: it recorded no token counts. The
+diagnosis had to be rebuilt by hand from the llama-server log.
+
+This section is the evidence half of the fix. Every fact named above is now recorded where a reader
+of the batch already looks.
+
+**Per call, in the `call.usage` row of `{session_id}_session.jsonl`**, alongside the fields §14.5
+already put there (`seq`, `site`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `source`,
+`seed`, `truncated`):
+
+- **`round`** — the pipeline round, 1-based, from the process-global the driver sets once per
+  attempt (`set_forensics_round(attempt + 1)`), which is the *same* index the forensics filenames
+  carry. Read at the call rather than threaded through every agent signature: the round is a
+  property of the run, not of the call, and an agent signature changed for bookkeeping is an agent
+  signature that can change a verdict. `0` means no round was ever set (the M0 spike).
+- **`attempt`** — which retry of `structured_call_with_retry` produced the row, 1-based. Two rows
+  with the same `site` and `round` and different `attempt` **are** the retry loop; that shape
+  cannot be read off `seq` alone, because the sites interleave.
+- **`finish_reason`** — the server's own word, verbatim (`stop`, `length`, …), or `unset` when it
+  published none. `length` is the **fact**; `truncated` is that fact interpreted. Keeping both
+  means a call that stopped for a reason nobody anticipated stays visible instead of being binned
+  as "not truncated", which is all a boolean on its own can do.
+- **`wall_ms`** — request sent to stream closed, measured **once**, around the same `Instant` the
+  `debug!` line already used, so the record and the log can never disagree about the same call.
+
+**Per run, in `run.summary`:** `llm_calls`, `truncated_calls`, `completion_tokens_total`, and for
+every call site `llm_calls_site_<site>` / `truncated_calls_site_<site>` /
+`completion_tokens_site_<site>`. The **role** keys (`truncated_calls_creator`,
+`truncated_calls_attacker`, `truncated_calls_intent_audit`) stay exactly as they were and the site
+breakdown is **additive**: roles answer "which *agent* ran away", sites answer "which of that
+agent's calls did". The Attacker alone owns three sites, and a round whose revisions all run away
+is a different problem from one whose first generation did — a distinction the role split collapses
+by construction. Sites are reported in `SAMPLING_SCHEDULE` order and include the ones a run never
+reached, as a zero rather than a missing key, because a breakdown that silently omits a site makes
+"it never ran" indistinguishable from "the record forgot it"; a site outside the schedule (the M0
+spike names its own) is appended, for the same reason `truncation_counts` warns about one. The
+per-site completion sum **excludes rows whose `source` is `estimate`**, exactly as `token_totals`
+does — a per-site number that mixes a character-derived guess into a measurement is worse than an
+absent one — and `truncated_calls` is counted off the rows rather than summed from the three roles,
+so an off-schedule site cannot make the total disagree with the calls it summarises.
+
+**Per run, in the manifest row:** a new `llm` block carrying those totals, the role split
+(`truncated_calls_by_role`) and a `by_site` map. The harness **reads the summary back** rather than
+recomputing anything: the pipeline's numbers are the record of what it did, and a harness that
+derived its own would be a second opinion nobody asked for.
+
+`tests/m3_session_log.rs::token_accounting_records_the_servers_counts_per_call_and_a_run_total`
+asserts the per-call half (`round >= 1`, `attempt == 1`, `finish_reason == unset` on a complete
+reply, `wall_ms` present) and the per-run half (`truncated_calls == 0`,
+`completion_tokens_total` equal to the per-call total, and the per-site call counts summing to the
+call count), and `scripts/test_bugsinpy.py::TestLlmBlock` asserts the manifest block, including
+that a site the run never reached reports `completion_tokens: None` rather than `0`.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

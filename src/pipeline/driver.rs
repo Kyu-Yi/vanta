@@ -1146,20 +1146,69 @@ pub async fn run(
             })
             .await
             {
-                Ok(response) => response,
+                Ok(response) => Some(response),
+                // [VANTA-WHY] §14.5 item 2 — a generation the server cut off at
+                // `max_tokens` BOTH times it was asked (the request and the brief
+                // `answer directly` re-ask) is NOT an infrastructure failure. The
+                // run-away is the model spending its whole output cap on reasoning
+                // and emitting nothing, so it produces NO TEST from this call —
+                // which is a fact about the attack, not about the machine. Treating
+                // it as `InfraFailure` (exit 2) turned one run-away into a dead run
+                // AND blocked the wave gate (§14.7). With no test from this round
+                // `valid_tests` stays empty, so the attempt contributes no generated
+                // evidence: it either retries with an empty round (the Governor
+                // bounds the attempts, and repetition ends the run without an
+                // approval) or, when a shared set survives, runs the shared set
+                // alone. Either way this is never a stronger approval than the
+                // native suite alone would give (C2 untouched).
+                Err(error) if error.to_string().contains(crate::llm::TRUNCATED_OUTPUT_PREFIX) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Attacker generation was CUT OFF at max_tokens twice — this round \
+                         contributes NO test"
+                    );
+                    println!(
+                        "  ⚠ Attacker generation was cut off at max_tokens twice ({}): this round \
+                         contributes no test",
+                        crate::llm::TRUNCATED_TWICE_MARKER
+                    );
+                    session_log.append(SessionRecord {
+                        session_id: session_id.clone(),
+                        schema_version: Some(SCHEMA_VERSION),
+                        patch_attempt_id: Some(patch_attempt_id.clone()),
+                        testing_iteration_id: Some(testing_iteration_id.clone()),
+                        test_id: None,
+                        phase: "attacker.truncated".to_string(),
+                        summary: format!(
+                            "site=attacker_generate {} generated_tests=0 — the call was cut off at \
+                             max_tokens on both the request and the brief re-ask, so this round \
+                             contributes no test",
+                            crate::llm::TRUNCATED_TWICE_MARKER
+                        ),
+                        timestamp: now_iso(),
+                        benchmark_instance: None,
+                        benchmark_label: None,
+                    })?;
+                    None
+                }
                 Err(error) => {
                     infra_failure_error = Some(format!("Attacker LLM call failed: {error}"));
                     break GovernorDecision::InfraFailure;
                 }
             };
+            // How many tests the CALL returned, which is 0 when it was cut off
+            // twice and produced nothing.
+            let generated_from_call = attacker_response.as_ref().map_or(0, |r| r.tests.len());
             // [VANTA-WHY] A probe whose body is already in the shared set adds no
             // coverage: it will be BATE-validated and patched-run again, and the
             // comparison it produces is a self-transition. Identity is the
             // content-based `normalized_test_body_hash`, so a rename is still a
             // duplicate. The count of drops is logged per round — silently keeping
             // them would make a stalled Attacker look like a productive one.
-            let (generated_tests, dropped_duplicates) =
-                drop_shared_duplicates(&attacker_response.tests, &shared_tests);
+            let (generated_tests, dropped_duplicates) = match &attacker_response {
+                Some(response) => drop_shared_duplicates(&response.tests, &shared_tests),
+                None => (Vec::new(), Vec::new()),
+            };
             if !dropped_duplicates.is_empty() {
                 println!(
                     "  ⚠ Attacker repeated {} probe(s) already in the shared set: {:?}",
@@ -1177,7 +1226,7 @@ pub async fn run(
                 summary: format!(
                     "shared_set_size={} generated={} dropped_duplicates={} remaining={} dropped=[{}]",
                     shared_tests.len(),
-                    attacker_response.tests.len(),
+                    generated_from_call,
                     dropped_duplicates.len(),
                     generated_tests.len(),
                     dropped_duplicates.join(",")
@@ -1243,7 +1292,7 @@ pub async fn run(
             println!(
                 "  ✔ Attacker: {} tests ({} generated, {} duplicate(s) dropped, {} scrapped by the intent check)",
                 attacker_tests.len(),
-                attacker_response.tests.len(),
+                generated_from_call,
                 dropped_duplicates.len(),
                 intent_scrapped
             );
@@ -1259,7 +1308,7 @@ pub async fn run(
                 phase: "attacker.summary".to_string(),
                 summary: format!(
                     "generated_tests={} dropped_duplicates={} intent_scrapped={} relabels={} valid_tests={}",
-                    attacker_response.tests.len(),
+                    generated_from_call,
                     dropped_duplicates.len(),
                     intent_scrapped,
                     initial_relabels.len(),
@@ -2491,7 +2540,7 @@ pub async fn run(
              llm_calls={} llm_calls_measured={} llm_prompt_tokens={} llm_completion_tokens={} \
              truncated_calls_creator={} truncated_calls_attacker={} \
              truncated_calls_intent_audit={} \
-             truncated_calls={} completion_tokens_total={} {} \
+             truncated_calls={} truncated_twice_calls={} completion_tokens_total={} {} \
              corroborate={} grounded_audit={} batch_audit={} \
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
@@ -2519,6 +2568,11 @@ pub async fn run(
             // every call site (including the Attacker's three, which the single
             // `attacker` role deliberately merges).
             truncated_total,
+            // [VANTA-WHY] §14.5 item 2 — how many calls gave up because BOTH the
+            // request and the brief re-ask were cut off. A single truncation is a
+            // run-away; two in a row is a call this site cannot answer inside its
+            // cap, and the fix to look for is a smaller question, not a retry.
+            crate::llm::truncated_twice_calls(),
             token_value(llm_completion_tokens),
             per_site_keys,
             // [VANTA-WHY] §14.2/§14.4/§14.5 — the switches this run actually ran

@@ -1142,6 +1142,13 @@ def llm_block(summary: dict[str, str]) -> dict[str, Any]:
     beside ``truncated_calls_by_role`` because the Attacker's three sites are one
     role: "the revisions all ran away" and "the first generation ran away" are
     the same number per role and a different problem in fact.
+
+    ``truncated_twice`` is the subset of the truncations that were cut off BOTH
+    times the call asked (§14.5 item 2): the request, and the short ``answer
+    directly`` re-ask appended to it. It cannot be derived from
+    ``truncated_calls`` — two came back where one call gave up — and it is the
+    number that says "this site cannot answer inside its cap", which is a
+    different repair from "the model ran away once".
     """
     by_site: dict[str, dict[str, Any]] = {}
     for key, value in summary.items():
@@ -1158,6 +1165,7 @@ def llm_block(summary: dict[str, str]) -> dict[str, Any]:
         "prompt_tokens": _int(summary.get("llm_prompt_tokens")),
         "completion_tokens_total": _int(summary.get("completion_tokens_total")),
         "truncated_calls": _int(summary.get("truncated_calls")),
+        "truncated_twice": _int(summary.get("truncated_twice_calls")),
         # §14.5's three reportable roles, spelled out rather than derived from
         # the site map: the mapping site→role is the pipeline's
         # (`llm::truncation_role`), and a second copy of it here could drift.

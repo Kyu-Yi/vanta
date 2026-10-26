@@ -164,6 +164,15 @@ pub struct CallUsage {
 static CALL_USAGES: Mutex<Vec<CallUsage>> = Mutex::new(Vec::new());
 static USAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// How many calls have given up because BOTH the original request and the short
+/// re-ask that follows a cut-off were cut off themselves (§14.5, item 2).
+///
+/// [VANTA-WHY] The per-call rows cannot answer this: `truncated` is a fact about
+/// one HTTP call, while "cut off twice" is a fact about a `structured_call_with_retry`.
+/// A run-level counter is the smallest thing that makes the number reportable,
+/// and it is drained by the driver at the end of a run like the usage ledger.
+static TRUNCATED_TWICE: AtomicU64 = AtomicU64::new(0);
+
 fn call_usages() -> MutexGuard<'static, Vec<CallUsage>> {
     // A panic in another thread must not make token accounting fatal: the lock is
     // pushed to and drained, never held across an await, so the data behind a
@@ -188,6 +197,17 @@ pub fn drain_call_usages() -> Vec<CallUsage> {
 pub fn reset_call_usages() {
     call_usages().clear();
     USAGE_SEQ.store(0, Ordering::Relaxed);
+    TRUNCATED_TWICE.store(0, Ordering::Relaxed);
+}
+
+/// How many calls in this run were cut off at `max_tokens` twice, including the
+/// brief re-ask (§14.5, item 2). Read by the driver when it writes `run.summary`.
+pub fn truncated_twice_calls() -> u64 {
+    TRUNCATED_TWICE.load(Ordering::Relaxed)
+}
+
+fn note_truncated_twice() {
+    TRUNCATED_TWICE.fetch_add(1, Ordering::Relaxed);
 }
 
 fn debug_dir() -> Option<PathBuf> {
@@ -1351,6 +1371,48 @@ pub const TRUNCATED_OUTPUT_PREFIX: &str = "LLM response truncated at max_tokens"
 /// consumer does not have to re-spell the string.
 pub const PARSE_FAILURE_PREFIX: &str = "PARSE ERR";
 
+/// Marker `structured_call_with_retry` puts on a failure that was cut off at
+/// `max_tokens` BOTH times it was asked — the original request and the brief
+/// re-ask (§14.5, item 2).
+///
+/// [VANTA-WHY] A single cut-off is a fact about one generation; two in a row,
+/// with a shorter instruction in between, is the call saying it cannot answer
+/// this question inside its cap. That is a different fact from "the model
+/// answered and the answer was wrong", and the reader has to be able to count
+/// it, which is why the token is spelled out here rather than left implicit in
+/// the error text.
+pub const TRUNCATED_TWICE_MARKER: &str = "truncated_twice";
+
+/// The short fixed instruction appended to the request that follows a cut-off
+/// answer (§14.5, item 2).
+///
+/// [VANTA-WHY] A response stopped at `max_tokens` is never re-sent unchanged.
+/// The runaway this fixes is a model that spends the ENTIRE output cap inside
+/// its reasoning stream and never emits the JSON: re-sending the identical
+/// prompt asks the identical question, and on the pinned temperature of the
+/// auditor it reaches the identical prefix. The nudge changes the question
+/// instead — answer directly, reason briefly, emit the JSON — so the retry has
+/// something to change rather than another full-length generation to burn.
+pub const TRUNCATION_NUDGE: &str = "Your previous reply was CUT OFF at the output limit before it \
+finished, so it was discarded without being read. Answer the task directly: write at most three \
+short sentences of reasoning, then emit the required JSON object immediately. Do not restate the \
+task, do not repeat the reasoning, and do not explore alternatives — emit the JSON NOW.";
+
+/// Append `TRUNCATION_NUDGE` as a trailing user turn.
+///
+/// [VANTA-WHY] An EXTRA turn rather than a rewrite of the existing prompt: every
+/// call site builds its own messages through `build_messages`, and rewriting one
+/// of them here would either need every site to hand its prompt over again or
+/// would silently change the prefix a reader has already seen in the forensics.
+/// A trailing instruction is additive, so attempt 1 of every call — the only
+/// attempt a non-truncated run ever makes — is byte-identical to v0.2.
+fn append_truncation_nudge(messages: &mut Vec<Value>) {
+    messages.push(json!({
+        "role": "user",
+        "content": TRUNCATION_NUDGE,
+    }));
+}
+
 /// The role a call site's truncations are counted under (§14.5).
 ///
 /// [VANTA-WHY] The three roles the paper reports are `creator`, `attacker` and
@@ -1443,13 +1505,20 @@ where
     // exactly like an answer the model got wrong. Only the server's own
     // `finish_reason` separates the two, and the two have opposite remedies.
     let mut last_was_truncated = false;
-    // Whether the loop stopped ON a truncation (rather than exhausting its
-    // budget), so the final failure can say which of the two happened.
-    let mut stopped_on_truncation = false;
+    // [VANTA-WHY] §14.5 item 2 — how many completed attempts the server cut off
+    // at `max_tokens`. The FIRST one earns the brief re-ask below; the SECOND one
+    // is the call saying it cannot answer inside its cap, and ends the call.
+    let mut truncations = 0_u32;
+    // Whether the next request must carry `TRUNCATION_NUDGE`. Set by a cut-off
+    // and never cleared: a call site that has once spent its whole cap on
+    // reasoning gets the brief instruction on every later attempt too.
+    let mut nudge_next = false;
+    // Whether the call is giving up BECAUSE it was cut off twice (rather than
+    // because its attempt budget ran out), so the final failure can say which.
+    let mut truncated_twice = false;
     // Attempts that actually reached the parse step, so the failure can report
     // how many were spent rather than how many were allowed: a call that stops
-    // early (a cut-off answer at temperature 0.0) did not fail `max_attempts`
-    // times.
+    // early (a cut-off answer) did not fail `max_attempts` times.
     let mut attempts_made = 0_u32;
 
     // [VANTA-WHY] §14.5 — whether this call is PINNED at temperature 0.0, and
@@ -1459,13 +1528,9 @@ where
     // `post_chat`'s own body default, so a caller that sends no extras samples at
     // that default (0.2) and is NOT deterministic.
     //
-    // [VANTA-WHY] This is the scope of the fail-fast below. The "same request is
-    // cut off at the same point" argument holds only at temperature 0.0: the
-    // Creator and the Attacker run at 0.1-0.3, where a cut-off answer CAN come
-    // back different — and a model that spends the whole output cap on reasoning
-    // returns nothing parseable however many times it is asked, which is exactly
-    // the case a retry exists for. Applying the fail-fast to them turned one
-    // model run-away into a dead run.
+    // [VANTA-WHY] This is still the scope of `seed_for_attempt`'s "leave the seed
+    // alone" rule: a greedy retry is deterministic whatever the seed says, and
+    // the brief re-ask below is what changes that question anyway.
     let deterministic_temperature = extras_for_attempt
         .get("temperature")
         .and_then(Value::as_f64)
@@ -1473,8 +1538,14 @@ where
         <= 0.0;
 
     for attempt in 1..=max_attempts {
-        let messages = build_messages(attempt);
+        let mut messages = build_messages(attempt);
         attempts_made = attempt;
+        if nudge_next {
+            // [VANTA-WHY] §14.5 item 2 — a cut-off answer is never re-sent
+            // unchanged. The nudge makes the retry a DIFFERENT question, which is
+            // the only kind that can come back different on a pinned temperature.
+            append_truncation_nudge(&mut messages);
+        }
         if attempt > 1 {
             warn!(attempt, max_attempts, "retrying structured call");
         }
@@ -1522,18 +1593,58 @@ where
         // The stream completed, so it has an answer to judge: `length` here means
         // the answer was CUT OFF, not that it was wrong.
         last_was_truncated = finish_reason.as_deref() == Some("length");
-        if last_was_truncated {
-            warn!(
-                attempt,
-                "the server cut this answer off at max_tokens — it cannot be parsed as written"
-            );
-        }
 
         let type_name = std::any::type_name::<T>().split("::").last().unwrap_or("T");
 
         // [FORENSICS] Write the raw model response to disk before parsing,
         // so we can inspect exactly what the model returned if parsing fails.
+        // A cut-off answer is written here too: it is the evidence a runaway
+        // report is built from, and it must be on disk even though nothing below
+        // reads it.
         write_forensics(type_name, forensics_tag, attempt, "raw_response.txt", &raw);
+
+        // [VANTA-WHY] §14.5 item 2 — a reply the server stopped at `max_tokens` is
+        // NEVER handed to the parser. It is a prefix of the intended answer, so a
+        // parse that happens to succeed (the JSON landed before the cap did) would
+        // silently admit a half-written object and a parse that fails would bill
+        // the model for a mistake it did not make. The first cut-off earns a
+        // brief re-ask; the second ends the call with the site's ordinary failure
+        // value, which is what every caller already handles conservatively.
+        if last_was_truncated {
+            truncations += 1;
+            warn!(
+                attempt,
+                truncations,
+                "the server cut this answer off at max_tokens — it is NOT parsed, and the next \
+                 request carries a brief `answer directly` instruction"
+            );
+            last_err = Some(format!(
+                "attempt {attempt} TRUNCATED: the server stopped this answer at the request's \
+                 `max_tokens` cap (finish_reason=length), so the reply is a prefix of the intended \
+                 one and was not parsed"
+            ));
+            if truncations >= 2 {
+                // [VANTA-WHY] §14.5 item 2 — cut off twice, with a shorter
+                // instruction in between. Re-sending the identical request would
+                // spend another full-length generation to reach the same prefix,
+                // so the call gives up instead: this is the conservative failure
+                // value the step already has, and it is the same one everywhere.
+                truncated_twice = true;
+                note_truncated_twice();
+                warn!(
+                    site,
+                    attempt,
+                    "this call was cut off TWICE — giving up with the site's ordinary failure \
+                     value ({TRUNCATED_TWICE_MARKER})"
+                );
+                break;
+            }
+            nudge_next = true;
+            if attempt < max_attempts {
+                back_off(attempt).await;
+            }
+            continue;
+        }
 
         match parse_into_typed(&raw) {
             Ok(typed) => {
@@ -1550,30 +1661,13 @@ where
                     "attempt {attempt} PARSE ERR: {}\n  model-preview: {preview}",
                     parse_err
                 ));
-                // [VANTA-WHY] §14.5 — a CUT-OFF answer fails fast ONLY where a
-                // retry is provably deterministic: a call PINNED at temperature
-                // 0.0 samples greedily, so `max_tokens` being pinned per call
-                // site means the same request is cut off at the same point every
-                // time, and each retry is a full-length generation spent to
-                // reach the identical prefix. Failing here is what lets the
-                // callers that can ask a SMALLER question (the batched audit,
-                // one test per call) do it on the first attempt instead of the
-                // fourth.
-                //
-                // [VANTA-WHY] Above temperature 0.0 the same request CAN come
-                // back different — that is the whole reason the pipeline samples
-                // the Creator and Attacker at 0.1-0.3 — so a cut-off answer keeps
-                // its retries, with the seed advanced each time (see
-                // `seed_for_attempt`). A model that spends the entire output cap
-                // on reasoning and returns no content is precisely the transient
-                // failure a retry exists for; refusing to retry it turned one
-                // run-away into a dead run. A malformed answer that was NOT cut
-                // off is a different fact again — the model answered, and the
-                // answer was wrong — so it keeps its retries too.
-                if last_was_truncated && deterministic_temperature {
-                    stopped_on_truncation = true;
-                    break;
-                }
+                // [VANTA-WHY] §14.5 — a malformed answer that was NOT cut off is
+                // the model's own mistake, not the cap's: it kept its retries, in
+                // the v0.2 order, with the seed advanced each time (see
+                // `seed_for_attempt`) so a pinned seed cannot reproduce the same
+                // mistake forever. A CUT-OFF answer never reaches this arm at all
+                // (it is handled above), so the remedy the two need — a smaller
+                // question versus a correct one — can no longer be confused.
                 if attempt < max_attempts {
                     back_off(attempt).await;
                 }
@@ -1593,28 +1687,30 @@ where
     // asking a smaller question, which is exactly what the batched audit can do
     // (one test per call) and must do, instead of losing the whole round.
     if last_was_truncated {
-        let tail = if stopped_on_truncation {
-            "The call was NOT retried: `max_tokens` is pinned for this call site AND this call is \
-             pinned at temperature 0.0, so the same request is cut off at the same point every \
-             time. Ask for less, or raise the cap."
+        let tail = if truncated_twice {
+            "The answer was cut off TWICE — including once after being re-asked with a short \
+             `answer directly, keep the reasoning brief, emit the JSON` instruction — so the \
+             identical request is NOT re-sent: this call takes the conservative failure value its \
+             call site already has for a failed step. Ask for less, or raise the cap."
                 .to_string()
-        } else if attempts_made > 1 {
-            format!(
-                "This call site samples above temperature 0.0, so a retry can come back \
-                 different: each attempt advanced the seed by its attempt index, and both are \
-                 recorded with the call. {} retries were spent and the last attempt was cut off \
-                 as well. Ask for less, or raise the cap.",
-                attempts_made - 1
-            )
+        } else if nudge_next {
+            "The answer was cut off and the brief re-ask was NOT made: this call's attempt budget \
+             is one. Ask for less, or raise the cap."
+                .to_string()
         } else {
-            "This call site samples above temperature 0.0, so a retry could come back different, \
-             but no retry was made: the attempt budget is one. Ask for less, or raise the cap."
+            "The answer was cut off on the attempt that ended the call. Ask for less, or raise \
+             the cap."
                 .to_string()
+        };
+        let marker = if truncated_twice {
+            format!(" {TRUNCATED_TWICE_MARKER}")
+        } else {
+            String::new()
         };
         message.push_str(&format!(
             "\n{TRUNCATED_OUTPUT_PREFIX}: the server stopped this answer at the request's \
              `max_tokens` cap, so the reply is a prefix of the intended one and could not be \
-             parsed. {tail}"
+             parsed.{marker} {tail}"
         ));
     }
     Err(message.into())

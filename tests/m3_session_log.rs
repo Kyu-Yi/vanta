@@ -2525,11 +2525,20 @@ fn a_batch_the_auditor_cannot_answer_falls_back_to_the_single_call_failure_shape
 /// [VANTA-WHY] §14.5 — a batched answer the server CUT OFF at `max_tokens`
 /// (`finish_reason: "length"`) is the one batch failure the per-test path FIXES:
 /// the truncation is caused by asking for N answers in one capped generation, so
-/// re-asking the same batch cannot clear it, while one test per call is answered
-/// easily. The round must therefore keep the verdicts the flag-off run gets, and
-/// no record may say the audit was unavailable. The truncation is forced on the
-/// BATCH request only, so what the test measures is the fallback rather than an
-/// unanswerable round (the shape `a_batch_the_auditor_cannot_answer…` covers).
+/// one test per call is answered easily. The round must therefore keep the
+/// verdicts the flag-off run gets, and no record may say the audit was
+/// unavailable. The truncation is forced on the BATCH request only, so what the
+/// test measures is the fallback rather than an unanswerable round (the shape
+/// `a_batch_the_auditor_cannot_answer…` covers).
+///
+/// [VANTA-WHY] §14.5 item 2 — the fallback is reached after TWO batch calls, not
+/// one. A cut-off answer is never parsed and never re-sent unchanged: the batch
+/// is asked once more with the short `answer directly` instruction appended, and
+/// when THAT is cut off as well the call gives up with its ordinary failure value
+/// (here: the `truncated_fallback` transport, i.e. the per-test path). The two
+/// batch bodies are asserted to differ for exactly this reason — a pipeline that
+/// re-sent the identical request would still fall back, and would cost one more
+/// full-length generation to do it.
 #[test]
 fn a_batch_cut_off_at_the_cap_falls_back_to_per_test_audits_with_the_same_decisions() {
     let _serial = serial_run();
@@ -2582,30 +2591,46 @@ fn a_batch_cut_off_at_the_cap_falls_back_to_per_test_audits_with_the_same_decisi
         kinds_on,
         vec![
             "generate",
-            // the batch, ONCE: a cut-off answer is not retried, because the cap
-            // that cut it off is pinned and the next call would stop at the same
-            // point — three more full-length generations for nothing
+            // the batch: cut off at the cap, so it is NEVER parsed and never
+            // re-sent unchanged — the same round is asked again with a short
+            // `answer directly` instruction appended (§14.5 item 2)
+            "intent_audit",
+            // and that re-ask is cut off too, which is the batch saying it cannot
+            // answer inside its cap: the call gives up rather than spending the
+            // rest of the retry budget on full-length generations that stop at the
+            // same prefix
             "intent_audit",
             // then the fallback: one call per test, which is answered
             "intent_audit",
             "intent_audit",
             "intent_audit",
         ],
-        "a batch cut off at the cap must fall back after ONE call, to one audit call PER TEST, \
-         not after the retry budget and not to an unavailable verdict for the whole round"
+        "a batch cut off at the cap must be re-asked ONCE with the brief instruction and then fall \
+         back to one audit call PER TEST — not spend the retry budget on the identical request, \
+         and not demote the whole round"
     );
 
-    // Which call was which is the point: the batch carried the whole round ONCE,
-    // the fallback carried one test each. The two are not told apart by counting
-    // calls any more — a cut-off batch makes one call and a malformed one makes
-    // the whole budget — so the bodies pin the shapes and the record below names
-    // which event this was.
+    // Which call was which is the point: the two first audit calls carried the
+    // whole round (the request, then the brief re-ask), the fallback carried one
+    // test each.
     assert!(
         bodies_on[1].contains("TESTS TO AUDIT"),
         "the second audit call is the batch; got {}",
         bodies_on[1]
     );
-    for body in &bodies_on[2..] {
+    assert!(
+        bodies_on[2].contains("TESTS TO AUDIT")
+            && bodies_on[2].contains("CUT OFF at the output limit"),
+        "the batch's re-ask must be the SAME question with the brief instruction appended, never \
+         the identical request; got {}",
+        bodies_on[2]
+    );
+    assert!(
+        !bodies_on[1].contains("CUT OFF at the output limit"),
+        "the first batch request must be the pinned one, with no nudge; got {}",
+        bodies_on[1]
+    );
+    for body in &bodies_on[3..] {
         assert!(
             body.contains("TEST UNDER AUDIT") && !body.contains("TESTS TO AUDIT"),
             "the fallback audits one test per call; got {body}"
@@ -2654,21 +2679,26 @@ fn a_batch_cut_off_at_the_cap_falls_back_to_per_test_audits_with_the_same_decisi
 }
 
 /// [VANTA-WHY] §14.5 — a CUT-OFF answer at a call site that samples ABOVE
-/// temperature 0.0 must be RETRIED, not failed fast.
+/// temperature 0.0 must be RE-ASKED, not failed fast.
 ///
 /// A model can spend its whole output cap on reasoning and return no content at
 /// all — Ornith does exactly this on the Attacker — and at temperature 0.2 the
 /// next attempt is a different sample, which is precisely the remedy a retry is
 /// for. A fail-fast scoped to "any truncation" turns one model run-away into a
 /// dead run: `InfraFailure`, which in the BugsInPy harness BLOCKS the wave gate
-/// (§14.7). Hence the scope: fail fast only where a retry is provably
-/// deterministic.
+/// (§14.7). Hence the scope: re-ask once, never the identical request, and give up
+/// only if the re-ask is cut off too.
 ///
 /// [VANTA-WHY] The harness pins ONE seed per run, and the same seed with the
 /// same prompt can reproduce the identical cut-off prefix, so each retry
 /// advances the seed by its attempt index. The record has to say which seed each
 /// attempt ACTUALLY sent — `VANTA_LLM_SEED` alone no longer answers that — or a
 /// run with a retry cannot be reproduced after the fact.
+///
+/// [VANTA-WHY] The retry is also a DIFFERENT QUESTION: the brief `answer
+/// directly` instruction is appended (§14.5 item 2), because on a call site whose
+/// temperature is 0.0 the seed offset cannot change the answer and the nudge is
+/// the only thing that can.
 ///
 /// [VANTA-WHY] ONE round (`--max-attempts 1`), because the retry under test
 /// happens inside a round. In patch mode the Governor treats the cap as attack
@@ -2683,7 +2713,7 @@ fn a_batch_cut_off_at_the_cap_falls_back_to_per_test_audits_with_the_same_decisi
 /// that honest from the other side: a second cut-off anywhere in the run, in any
 /// round, would read 2 and fail.
 #[test]
-fn a_cut_off_attacker_answer_is_retried_and_recovers_on_the_next_attempt() {
+fn a_cut_off_attacker_answer_is_re_asked_and_recovers_on_the_next_attempt() {
     let _serial = serial_run();
 
     let run = |extra_env: &'static [(&'static str, &'static str)]| {
@@ -2773,6 +2803,23 @@ fn a_cut_off_attacker_answer_is_retried_and_recovers_on_the_next_attempt() {
         );
     }
 
+    // §14.5 item 2 — the re-ask is a DIFFERENT question: a cut-off answer is
+    // never re-sent unchanged, because the identical request on a pinned
+    // temperature reaches the identical cut-off point. It is the first generate
+    // body that must be free of the nudge, and the second that must carry it.
+    for (label, bodies) in [("unseeded", &bodies_plain), ("seeded", &bodies_seeded)] {
+        assert!(
+            !bodies[0].contains("CUT OFF at the output limit"),
+            "the first attempt is the pinned request, with no nudge ({label}); got {}",
+            bodies[0]
+        );
+        assert!(
+            bodies[1].contains("CUT OFF at the output limit"),
+            "the re-ask must carry the brief `answer directly` instruction ({label}); got {}",
+            bodies[1]
+        );
+    }
+
     // The record of what each attempt actually sent.
     let generate_rows = |usage: &[(String, String, String)]| -> Vec<(String, String)> {
         usage
@@ -2812,19 +2859,19 @@ fn a_cut_off_attacker_answer_is_retried_and_recovers_on_the_next_attempt() {
     }
 }
 
-/// [VANTA-WHY] §14.5 — the fail-fast stays where a retry is provably
-/// deterministic: a call PINNED at temperature 0.0. The per-test intent auditor
-/// is one, so a cut-off answer there must NOT be retried — re-sending the same
-/// question is another full generation that stops at the identical point. The
-/// retries that DO remain are for an answer the auditor got WRONG without being
-/// cut off, which is a different fact with a different remedy.
+/// [VANTA-WHY] §14.5 item 2 — a CUT-OFF answer is never re-sent unchanged, at
+/// ANY call site. The per-test intent auditor is pinned at temperature 0.0, so
+/// the identical request reaches the identical prefix; the retry therefore
+/// carries the short `answer directly` instruction, which is a DIFFERENT
+/// question and the only kind that can come back different on a greedy sampler.
+/// One truncation, one re-ask, and the round keeps the verdict it would have had.
 ///
-/// [VANTA-WHY] Failing fast must not turn the round into an infrastructure
-/// failure: the auditor's unavailable verdict is the ordinary safe shape
-/// (`issue_asks_for_behaviour = false`, the two `Option` fields UNKNOWN), which
-/// can demote or keep a test but can never manufacture a rejection.
+/// [VANTA-WHY] ONE round (`--max-attempts 1`), because the retry under test
+/// happens inside a round; at greater depth the Governor keeps attacking and the
+/// later rounds audit again, which would make the call count measure the depth
+/// policy instead of the retry.
 #[test]
-fn a_cut_off_per_test_audit_answer_is_not_retried() {
+fn a_cut_off_per_test_audit_answer_is_re_asked_once_with_the_brief_instruction() {
     let _serial = serial_run();
     let workspace = TempDir::new().unwrap();
     let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), PRESERVING_PATCH);
@@ -2833,21 +2880,36 @@ fn a_cut_off_per_test_audit_answer_is_not_retried() {
     // is touched, so the count below measures the retry loop and nothing else.
     server.truncate_next_calls(&["intent_audit"]);
 
-    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 3, &[]);
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
 
     let kinds = server.request_kinds();
     assert_eq!(
         kinds.iter().filter(|kind| *kind == "intent_audit").count(),
-        1,
-        "a cut-off answer on a call pinned at temperature 0.0 must fail fast — ONE call, not the \
-         retry budget; kinds={kinds:?}"
+        2,
+        "a cut-off answer must be re-asked exactly ONCE — not re-sent unchanged, and not repeated \
+         until the retry budget is gone; kinds={kinds:?}"
+    );
+
+    let bodies = server.request_bodies();
+    let audits: Vec<&String> = bodies
+        .iter()
+        .filter(|body| body.contains("TEST UNDER AUDIT"))
+        .collect();
+    assert!(
+        !audits[0].contains("CUT OFF at the output limit"),
+        "the first audit request must be the pinned one, with no nudge; got {}",
+        audits[0]
+    );
+    assert!(
+        audits[1].contains("CUT OFF at the output limit"),
+        "the re-ask must carry the brief instruction, so it is never the identical request; got {}",
+        audits[1]
     );
 
     assert_eq!(
         output.status.code(),
         Some(0),
-        "the auditor's unavailable verdict must leave the run at its ordinary verdict rather than \
-         ending it; stdout:\n{}",
+        "the recovered audit must leave the run at its ordinary verdict; stdout:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
 
@@ -2857,8 +2919,70 @@ fn a_cut_off_per_test_audit_answer_is_not_retried() {
         "the run-away must be counted against the auditor's role; got {summary}"
     );
     assert!(
+        summary.contains("truncated_twice_calls=0"),
+        "one truncation is not a double truncation; got {summary}"
+    );
+    assert!(
         summary.contains("truncated_calls_attacker=0") && summary.contains("truncated_calls_creator=0"),
         "only the auditor ran away in this run; got {summary}"
+    );
+}
+
+/// [VANTA-WHY] §14.5 item 2 — cut off TWICE, so the call gives up. The remedy for
+/// "this site cannot answer inside its cap" is a smaller question, not another
+/// full-length generation, so the pipeline stops after the brief re-ask and takes
+/// the conservative failure value the step ALREADY has. For the per-test auditor
+/// that value is its ordinary unavailable verdict — `issue_asks_for_behaviour =
+/// false`, the two `Option` fields UNKNOWN — which can demote or keep a test but
+/// can never manufacture a rejection, and it must not end the run.
+#[test]
+fn a_per_test_audit_cut_off_twice_takes_its_ordinary_unavailable_verdict() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    // BOTH requests of this one audit are cut off, so the call is given up on
+    // after the brief re-ask rather than retried a third time.
+    server.truncate_next_calls(&["intent_audit", "intent_audit"]);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+
+    let kinds = server.request_kinds();
+    assert_eq!(
+        kinds.iter().filter(|kind| *kind == "intent_audit").count(),
+        2,
+        "cut off twice must end the call after the brief re-ask — no third full-length \
+         generation; kinds={kinds:?}"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let checks: Vec<&String> = records
+        .iter()
+        .filter(|r| r.phase.starts_with("intent.check["))
+        .map(|r| &r.summary)
+        .collect();
+    assert!(
+        checks.iter().any(|s| s.contains("intent audit unavailable")),
+        "the auditor's ordinary conservative value must be what the double cut-off yields; got \
+         {checks:?}"
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an unavailable auditor must leave the run at its ordinary verdict rather than ending it; \
+         stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert!(
+        summary.contains("truncated_calls_intent_audit=2"),
+        "both cut-off requests are counted; got {summary}"
+    );
+    assert!(
+        summary.contains("truncated_twice_calls=1"),
+        "the run must report that ONE call was cut off twice; got {summary}"
     );
 }
 

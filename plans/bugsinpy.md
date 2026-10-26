@@ -5669,6 +5669,63 @@ reply, `wall_ms` present) and the per-run half (`truncated_calls == 0`,
 call count), and `scripts/test_bugsinpy.py::TestLlmBlock` asserts the manifest block, including
 that a site the run never reached reports `completion_tokens: None` rather than `0`.
 
+### 14.13 A cut-off reply is never read, and never re-asked unchanged
+
+§14.5 already treated a `finish_reason: "length"` answer as a fact about the reply and retried above
+temperature 0.0. This section is the other half: what the pipeline is allowed to *do* with a reply the
+server says it cut off — because the overnight run showed the old behaviour was still wrong in two
+ways.
+
+**A cut-off reply was parsed as if it were complete.** `structured_call_with_retry` handed the raw
+string to the parser regardless of `finish_reason`, so a reply that stopped mid-JSON was scored as a
+malformed answer and retried on *that* reading. On sanic every long reply ended at
+`===END_REASONING===` with empty CONTENT — the whole `max_tokens` window spent on a reasoning stream,
+none of it on the answer — so the parser was being asked to read a prefix. A cut-off reply is now
+**never** parsed: `finish_reason == "length"` short-circuits before `parse_into_typed`. The forensics
+`raw_response.txt` is still written first, so the raw reply is on disk exactly as before.
+
+**A retry re-sent the identical request.** At the pinned seed (§13) an unchanged request reproduces
+the unchanged prefix, so the retry was spent re-reaching the same cut-off. The request that follows a
+cut-off answer now carries a **trailing user turn** — `TRUNCATION_NUDGE` — asking the model to answer
+directly, keep its reasoning to at most three short sentences, and emit the JSON immediately instead
+of exploring alternatives. It is **additive**: the existing messages are untouched, so attempt 1 of
+every call — the only attempt a run that never truncates ever makes — is byte-identical to v0.2, and
+the pinned-preset tests stay green. Appending rather than rewriting is what makes that guarantee
+possible; rewriting the system prompt would have made a nudge a change to every call.
+
+**A call cut off twice gives up instead of looping.** If the brief re-ask is *also* cut off, the call
+stops immediately with the site's own conservative failure value — no third request — and the run
+counts it. `run.summary` gains `truncated_twice_calls=` (the count of calls cut off on both the
+request and the re-ask) and the manifest's `llm` block gains `truncated_twice`, read back from the
+summary like every other §14.12 number. The failure text carries the marker `truncated_twice` so a
+reader of the session log can tell a call that never produced an answer from one that produced a
+wrong one.
+
+**This supersedes the temperature-0.0 fail-fast.** §14.5 failed a cut-off auditor immediately because
+an identical retry reproduces an identical prefix — an argument about a *deterministic* call. The
+re-ask is no longer identical: it carries the nudge, so at 0.0 it can now produce a different answer,
+and one re-ask is worth making for every site. The auditor therefore makes one batched call, then one
+nudged batched call, then falls back to per test exactly as §14.5 already specified — the batched
+transport record `truncated_fallback` still names the round where the batch was cut off, and a
+per-test answer cut off twice takes its ordinary "audit unavailable" verdict rather than a third
+request.
+
+**A double-truncated Attacker generation is not an `InfraFailure`.** It used to map to `InfraFailure`
+(exit 2), which turned one run-away into a dead run *and* blocked the wave gate (§14.7). With no test
+from that call the round simply contributes nothing: the attempt either retries with an empty round
+(the Governor bounds the attempts) or runs the shared set alone, and a session row `attacker.truncated`
+records `generated_tests=0` with the reason. This is never a stronger approval than the native suite
+alone would give, so C2 is untouched.
+
+Tests: `tests/m3_session_log.rs::a_batch_cut_off_at_the_cap_falls_back_to_per_test_audits_with_the_same_decisions`
+now expects **two** batch calls (the pinned one, then the nudged one) before the per-test fallback,
+and asserts the nudge is absent from the first body and present in the second;
+`a_cut_off_attacker_answer_is_re_asked_and_recovers_on_the_next_attempt` asserts the same pair of
+bodies at the Attacker site; `a_cut_off_per_test_audit_answer_is_re_asked_once_with_the_brief_instruction`
+and `a_per_test_audit_cut_off_twice_takes_its_ordinary_unavailable_verdict` assert the one re-ask and
+the give-up, with `truncated_calls_intent_audit` / `truncated_twice_calls` read back from
+`run.summary`. `scripts/test_bugsinpy.py::TestLlmBlock` asserts the manifest's `truncated_twice`.
+
 ---
 
 ## 15. Model screen

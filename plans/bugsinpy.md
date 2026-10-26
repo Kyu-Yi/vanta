@@ -6053,6 +6053,75 @@ assertion while still pruning a directory the import chain needs.
 
 ---
 
+### 14.19 A broken environment is not a bad test: BATE stops instead of revising
+
+§14.18 removed the reason sanic's baselines were `Error`, and it is worth being explicit that it removed
+only one reason. The *class* it exposed is general: a generated test can come back `Error` without ever
+having been graded, and when that happens the Attacker is asked to repair something it did not break. The
+overnight sanic session spent two 32,768-token revise calls per test rewriting a file to fix a plugin
+import error — hours of model time producing no evidence, because the loop had no way to represent "the
+environment is broken".
+
+**What "never graded" means here, and how it is told apart.** `TestExecutionDetails` already carries the
+distinction `§14.17` renders: `report_path_exists == false` means pytest reached no verdict for the
+generated test — there is no usable `report.json`, or the test's nodeid is not in it. Combined with
+`result == Error` and `!timed_out`, that is "the test was never run to a verdict". Two of those three
+facts are essential and one is a trap:
+
+* A **timeout** sets `Error` and can leave no report, but it *did* run the test: it is a fact about the
+  test's runtime, and the Attacker can address it by writing a faster test. Excluded.
+* An **exception raised inside the test** also sets `Error`, but pytest writes a report whose nodeid is
+  the test's, so `report_path_exists` is `true`. That is the test's own fault. Excluded.
+* What remains is the pre-collection family: a `pytest11` plugin that fails to load, a `conftest.py` that
+  fails to import, a collection error. Those share one more property that separates the environment from
+  the test: **the output does not name the generated test file.** A collection error that names
+  `test_bate.py` is a syntax error or a bad import *in the test* — the Attacker's to fix, and it must
+  still be revised. A plugin load fails in `pytest_sanic/plugin.py` and never mentions `test_bate.py`.
+
+So `bate::harness_error` is `Some(evidence)` exactly when all four hold: `Error`, no timeout, no report
+for the generated test, and the output silent about `test_bate.py`. The filename is a named constant
+(`harness::BATE_TEST_FILE`) because the write and the question have to agree — if they drifted, a test
+whose own collection failed would be read as a broken environment and never revised. The evidence is
+rendered by `§14.17`'s `baseline_evidence`, so the record carries the same `verdict / exception /
+last lines` shape under the same 40-line cap.
+
+**Read from the last of the three baseline reruns, not the first.** `validate_with_retry` exists to absorb
+flakiness, and a single transient VM fault must not abort an attempt. A genuine broken environment
+reproduces across all three fresh VMs — the same reproducibility test `collapse_decision` already applies
+to the patched side — so the classification is made on the details `validate_with_retry` returned, after
+it has finished retrying.
+
+**The response is to stop, not to revise.** On `Some`, `run_bate` returns immediately with a
+`BateRun::harness_error` and does not touch the relabel or revise paths: every remaining test in the batch
+would fail identically (same interpreter, same plugins, same tree), so continuing would spend a revision
+budget per test to learn the same thing. The test is deliberately **not** added to `scrapped_tests` —
+reporting it as scrapped would blame the Attacker for the environment and inflate the discard rate with a
+non-test.
+
+The driver turns that into the existing terminal verdict `HarnessFailure` ("the setup, not the patch",
+which does not retry) and records it in three places:
+
+* a `bate.harness_error[<test>]` session row carrying the full evidence;
+* `run.summary`'s `harness_error=<test>` — `unset` on every run in which BATE reached verdicts, including
+  every run before this change. The value is sanitized to a single token because `run.summary` is parsed
+  as space-free `key=value` pairs (`SUMMARY_PAIR = (\S+)`) and a raw name containing a space would be
+  silently cut at the first one;
+* the manifest's `harness_error` field, beside `verdict: "HarnessFailure"`.
+
+The result is one legible row — `verdict=HarnessFailure`, `harness_error=<the test that surfaced it>`,
+`label=unobservable` (a `HarnessFailure` produces no patch, so the oracle has nothing to grade) — where
+before there was a trail of revisions and no record of why. Nothing about the approval/Governor/Gatekeeper
+logic or the `false_approval` labels changes; `HarnessFailure` is the verdict that already meant this.
+
+Tests: `bate::tests::a_plugin_that_fails_to_load_is_the_environment_not_the_test` uses the recorded sanic
+traceback verbatim in shape and asserts the evidence says "never graded" *and* names
+`ModuleNotFoundError`; `a_collection_error_that_names_the_generated_test_is_still_the_tests_own` pins the
+boundary the other way, so a syntax error in the Attacker's own file keeps its revision;
+`nothing_else_is_a_harness_error` pins a passing baseline, a failing assertion, a graded exception and a
+timeout as not-harness-errors, so the guard can only fire on the never-graded family.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

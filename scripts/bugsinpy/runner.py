@@ -1435,6 +1435,13 @@ def build_record(
         ),
         "candidate": job.candidate.as_dict() if job.candidate else None,
         "verdict": outcome.decision or None,
+        # §14.19 — which generated test's BATE baseline run died before pytest
+        # graded it, when the environment rather than the test was broken. A run
+        # that ends this way writes `verdict=HarnessFailure` and no patch, so its
+        # label is `unobservable`; this field is what says WHY, and turns the class
+        # into one row a batch table can count instead of a long trail of
+        # revisions. `unset` on every ordinary run.
+        "harness_error": summary.get("harness_error"),
         "exit_code": outcome.exit_code,
         "timed_out": outcome.timed_out,
         # §14.15 — why a run that stopped itself stopped. `budget_exhausted` is

@@ -881,6 +881,12 @@ pub async fn run(
     // harness's `timed_out` means the OPPOSITE thing — that Vanta was killed
     // before it could decide anything.
     let mut stop_reason: Option<&'static str> = None;
+    // [VANTA-WHY] §14.19 — the test whose BATE baseline run died before pytest
+    // graded it. Carried out of the loop so the terminal row can say WHY the run
+    // ended as `HarnessFailure` without the reader opening the session log, and so
+    // this class of bug is one legible manifest row rather than a long trail of
+    // revisions. `None` is every run in which the environment held.
+    let mut harness_error: Option<String> = None;
     let decision = 'attempts: loop {
         // [VANTA-WHY] §14.15 — the deadline is checked here as well as in the LLM
         // layer, and this is the check that turns "the calls stopped" into "the
@@ -1533,6 +1539,7 @@ pub async fn run(
         let valid_tests: Vec<GeneratedTest> = bate_run.valid_tests;
         let bate_relabels = bate_run.relabel_events;
         let bate_intent_checks = bate_run.intent_checks;
+        let bate_harness_error = bate_run.harness_error;
         let discard_rate = if attacker_tests.is_empty() {
             0.0
         } else {
@@ -1569,6 +1576,41 @@ pub async fn run(
             benchmark_instance: None,
             benchmark_label: None,
         })?;
+        // [VANTA-WHY] §14.19 — the environment, not the candidate. BATE stopped
+        // because no baseline run reached a verdict for the generated test at all
+        // (a plugin that fails to load, a `conftest.py` that fails to import, a
+        // collection error that names no generated test). Revising cannot help —
+        // the Attacker's file is not what broke — and continuing would run the
+        // patched suite against the same broken environment and read its silence
+        // as evidence. So the attempt ends here as `HarnessFailure`: the existing
+        // verdict for "the setup is broken, not the patch", which is terminal and
+        // therefore one row rather than a retry.
+        if let Some(broken) = bate_harness_error {
+            eprintln!(
+                "  ✖ BATE HARNESS ERROR: the baseline never reached a verdict for '{}' and the \
+                 failure is not the test's own. Stopping this attempt — the Attacker cannot fix \
+                 the environment.",
+                broken.test_name
+            );
+            session_log.append(SessionRecord {
+                session_id: session_id.clone(),
+                schema_version: Some(SCHEMA_VERSION),
+                patch_attempt_id: Some(patch_attempt_id.clone()),
+                testing_iteration_id: Some(testing_iteration_id.clone()),
+                test_id: Some(fresh_test_id()),
+                phase: format!("bate.harness_error[{}]", broken.test_name),
+                summary: broken.evidence.clone(),
+                timestamp: now_iso(),
+                benchmark_instance: None,
+                benchmark_label: None,
+            })?;
+            // [VANTA-WHY] `run.summary` is parsed as space-free `key=value` pairs
+            // (`SUMMARY_PAIR = (\S+)`), so a raw test name carrying a space would
+            // be silently cut at the first one. The name is sanitized into a
+            // single token; the untruncated evidence is the session row above.
+            harness_error = Some(broken.test_name.replace(char::is_whitespace, "_"));
+            break GovernorDecision::HarnessFailure;
+        }
         log_intent_checks(&mut session_log, &session_id, &patch_attempt_id, &testing_iteration_id, "attacker.revise", &bate_intent_checks)?;
         announce_ungrounded_scraps(&bate_intent_checks);
         // [VANTA-WHY] BATE's answers come AFTER a possible revision, so they
@@ -2739,7 +2781,8 @@ pub async fn run(
              revise_budget_per_attempt={} revise_calls_used={} \
              deadline_secs={} stop_reason={} presence_penalty={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
-             commit={} dirty={} prompt_version={} prompt_hash={} context_selection={}",
+             commit={} dirty={} prompt_version={} prompt_hash={} context_selection={} \
+             harness_error={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -2828,6 +2871,13 @@ pub async fn run(
             // `run.summary` alone can tell whether the bug's own file was in the
             // prompt without opening the session log.
             context_selection_line,
+            // [VANTA-WHY] §14.19 — which test's baseline died before pytest graded
+            // it, when the environment broke. `unset` is every run in which BATE
+            // reached verdicts, including every run before this change, so an
+            // unset value keeps the field byte-identical in meaning to its
+            // absence. The full evidence is the `bate.harness_error[…]` session
+            // row; this holds the space-free token the parser needs.
+            harness_error.as_deref().unwrap_or("unset"),
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),

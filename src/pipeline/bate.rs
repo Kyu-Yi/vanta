@@ -245,6 +245,69 @@ fn exception_line(tail: &[&str]) -> Option<String> {
 }
 
 // ============================================================================
+// harness_error — a baseline run that died before pytest graded the test (§14.19)
+// ============================================================================
+//
+// [VANTA-WHY] §14.19 — some failures are the ENVIRONMENT, not the test, and
+// revising the test cannot fix them. The overnight sanic session is the worked
+// example: `pytest_sanic` is a `pytest11` entry point, so pytest imported the
+// project under test while loading plugins, that import reached a module the
+// (then truncated) tree did not have, and pytest aborted in `_preparse` with a
+// plain traceback and exit 1. No `report.json` was ever written, so the
+// generated test was never graded — it came back `Error`, never `Failed` — and
+// BATE scrapped it, then handed it back for revision. The Attacker was asked to
+// fix a broken environment from inside a test file, twice per test, at 32k
+// tokens a call, and burned hours.
+//
+// [VANTA-WHY] The discriminator is two facts together, and both are needed:
+//   1. `report_path_exists == false` — pytest reached no verdict for the
+//      generated test. Combined with `result == Error` and `!timed_out`, this
+//      is "never graded": a timeout DID run the test, and a real exception
+//      inside the test leaves a report with its nodeid in it.
+//   2. The output does NOT name the generated test file. A collection error
+//      that names it is the test's own fault — a syntax error, a bad import in
+//      the test — and the Attacker CAN fix that, so it must still be revised.
+//      A plugin load or a `conftest.py` import error names other files, and the
+//      Attacker can do nothing about it.
+//
+// [VANTA-WHY] Read from the LAST of `validate_with_retry`'s attempts, not the
+// first: that function re-runs three times precisely so a one-off spawn failure
+// is absorbed. A transient VM fault must not abort the attempt, and a genuine
+// broken environment reproduces across all three.
+//
+// [VANTA-WHY] Why the output text is quoted into the record: the guard exists to
+// turn this class into one legible row, and "harness_error" alone would send the
+// reader back to the log to learn WHICH plugin or module failed.
+
+/// A baseline run that errored before pytest could grade the generated test.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessError {
+    /// The test whose baseline run surfaced it. Every test in the batch would
+    /// fail the same way, which is why BATE stops here rather than continuing.
+    pub test_name: String,
+    /// The tail of what pytest printed, bounded like §14.17's revise evidence.
+    pub evidence: String,
+}
+
+/// §14.19 — `Some(evidence)` when this baseline run never reached a verdict for
+/// the generated test and the failure is not the test's own doing.
+pub fn harness_error(details: &TestExecutionDetails) -> Option<String> {
+    if details.result != TestResult::Error || details.timed_out || details.report_path_exists {
+        return None;
+    }
+    let output = format!("{}\n{}", details.stdout, details.stderr);
+    if output.contains(harness::BATE_TEST_FILE) {
+        // The generated test file is named in the failure, so its own collection
+        // or import is what broke: the Attacker's problem, not the environment's.
+        return None;
+    }
+    // Reuse §14.17's renderer for the log tail, so the record carries the same
+    // "verdict / exception / last lines" shape the revise prompt would have
+    // seen, and is bounded by the same cap.
+    Some(baseline_evidence(details))
+}
+
+// ============================================================================
 // BateReport — summary of validating a batch of tests
 // ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +354,12 @@ pub struct BateRun {
     /// patch-blind intent audit ran on revised tests too — including a
     /// preservation revision the audit scrapped for contradicting the issue.
     pub intent_checks: Vec<IntentCheckRecord>,
+    /// [VANTA-WHY] §14.19 — `Some` when a baseline run died before pytest graded
+    /// the generated test, so this batch stopped here. It is NOT a scrap reason:
+    /// the tests were never judged, so reporting them as scrapped would blame the
+    /// Attacker for a broken environment and inflate the discard rate with a
+    /// non-test. The caller stops the attempt instead of revising.
+    pub harness_error: Option<HarnessError>,
 }
 
 /// What BATE should do with a BugReproduction test whose baseline mismatched.
@@ -416,6 +485,34 @@ pub async fn run_bate(
             )
             .await;
             let baseline_result = baseline.result.clone();
+
+            // [VANTA-WHY] §14.19 — the environment, not the test. Checked before
+            // the relabel and revise paths, because both of those hand the test
+            // back to the Attacker, and the Attacker cannot fix a plugin load or
+            // a `conftest.py` that fails to import. Every remaining test in the
+            // batch would fail identically (same interpreter, same plugins, same
+            // tree), so BATE stops for this attempt instead of spending a
+            // revision budget on each of them.
+            if let Some(evidence) = harness_error(&baseline) {
+                warn!(
+                    test = %current_test.test_name,
+                    "BATE: baseline never reached a verdict and the failure is not the test's \
+                     — stopping BATE for this attempt"
+                );
+                return BateRun {
+                    report: BateReport {
+                        valid_tests: valid_tests.iter().map(|t| t.test_name.clone()).collect(),
+                        scrapped_tests,
+                    },
+                    valid_tests,
+                    relabel_events,
+                    intent_checks,
+                    harness_error: Some(HarnessError {
+                        test_name: current_test.test_name.clone(),
+                        evidence,
+                    }),
+                };
+            }
 
             match outcome {
                 BateOutcome::Valid => {
@@ -610,6 +707,7 @@ pub async fn run_bate(
         valid_tests,
         relabel_events,
         intent_checks,
+        harness_error: None,
     }
 }
 
@@ -783,6 +881,85 @@ mod tests {
         assert!(
             evidence.contains("never graded"),
             "a test that was never graded must not be blamed on an exception: {evidence}"
+        );
+    }
+
+    // ---- §14.19: the environment vs the test ---------------------------------
+    //
+    // [VANTA-WHY] The recorded sanic failure, verbatim in shape: a `pytest11`
+    // plugin imports the project under test, the import reaches a module the tree
+    // does not have, and pytest aborts in `_preparse` — before collection, before
+    // any report. `test_bate.py` is nowhere in it.
+
+    const PLUGIN_LOAD_FAILURE: &str = "\
+Traceback (most recent call last):
+  File \"/opt/venv38/lib/python3.8/site-packages/_pytest/config/__init__.py\", line 890, in _preparse
+    self.pluginmanager.load_setuptools_entrypoints(\"pytest11\")
+  File \"/opt/venv38/lib/python3.8/site-packages/pluggy/manager.py\", line 299, in load_setuptools_entrypoints
+    plugin = ep.load()
+  File \"/opt/venv38/lib/python3.8/site-packages/pytest_sanic/plugin.py\", line 6, in <module>
+    from .utils import TestServer, TestClient
+  File \"/workspace/sanic/asgi.py\", line 26, in <module>
+    from sanic.websocket import WebSocketConnection
+ModuleNotFoundError: No module named 'sanic.websocket'
+";
+
+    #[test]
+    fn a_plugin_that_fails_to_load_is_the_environment_not_the_test() {
+        // `report_path_exists == false` + the output naming no generated test.
+        let mut ungraded = details(TestResult::Error, "", PLUGIN_LOAD_FAILURE);
+        ungraded.report_path_exists = false;
+
+        let evidence =
+            harness_error(&ungraded).expect("a plugin load failure is not the Attacker's to fix");
+        assert!(
+            evidence.contains("never graded"),
+            "the record must say the test was never judged: {evidence}"
+        );
+        assert!(
+            evidence.contains("ModuleNotFoundError"),
+            "the record must name what actually broke, or the reader is back in the log: {evidence}"
+        );
+    }
+
+    #[test]
+    fn a_collection_error_that_names_the_generated_test_is_still_the_tests_own() {
+        // The Attacker CAN fix a syntax error in its own file, so this must stay
+        // on the revise path even though nothing was graded.
+        let mut ungraded = details(
+            TestResult::Error,
+            "",
+            "ERROR collecting test_bate.py\n\
+             test_bate.py:2: in <module>\n\
+             import sanic\n\
+             E   SyntaxError: invalid syntax\n",
+        );
+        ungraded.report_path_exists = false;
+
+        assert!(
+            harness_error(&ungraded).is_none(),
+            "a failure that names the generated test is revisable, not a harness error"
+        );
+    }
+
+    #[test]
+    fn nothing_else_is_a_harness_error() {
+        // A graded verdict, however negative, is evidence about the test.
+        assert!(harness_error(&details(TestResult::Passed, "", "")).is_none());
+        assert!(harness_error(&details(TestResult::Failed, "assert 1 == 2", "")).is_none());
+        let mut graded_error = details(TestResult::Error, "Traceback...\nValueError: x", "");
+        graded_error.report_path_exists = true;
+        assert!(
+            harness_error(&graded_error).is_none(),
+            "an exception inside the test leaves a report for its nodeid: that is the test's own"
+        );
+        // A timeout DID run the test — it is slow, not ungraded.
+        let mut timed_out = details(TestResult::Error, "", "hung");
+        timed_out.report_path_exists = false;
+        timed_out.timed_out = true;
+        assert!(
+            harness_error(&timed_out).is_none(),
+            "a timeout is a verdict about the test's runtime, not a broken environment"
         );
     }
 

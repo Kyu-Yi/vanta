@@ -19467,6 +19467,54 @@ class TestRunJob:
         assert silent["stop_reason"] is None
         assert silent["deadline_secs"] is None
 
+    def test_a_row_says_which_test_died_with_the_environment_not_the_test(
+        self, tmp_path, monkeypatch
+    ):
+        """§14.19 — a broken environment is one labelled row, not a revision trail.
+
+        BATE stops when a baseline run never reached a verdict for the generated
+        test and the failure is not the test's own; the run ends
+        `HarnessFailure`, produces no patch, and carries the test that surfaced
+        it. Without the field the row would say only "unobservable", which is
+        also what a run that never got that far says.
+        """
+        base = _outcome(tmp_path)
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        broken_summary = dict(
+            base.summary,
+            final_decision="HarnessFailure",
+            harness_error="test_named_response_middleware_added_in_reverse",
+        )
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, decision="HarnessFailure", exit_code=1, summary=broken_summary
+            ),
+        )
+        broken = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert broken["verdict"] == "HarnessFailure"
+        assert broken["harness_error"] == "test_named_response_middleware_added_in_reverse"
+        # A `HarnessFailure` writes no patch, so the oracle grades nothing and the
+        # label is the existing "no verdict about the candidate" bucket.
+        assert broken["label"] == "unobservable"
+
+        # A summary from before the field existed says "no harness error" — never
+        # a guess at one.
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        plain = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert plain["harness_error"] is None
+
     def test_a_review_row_reuses_the_candidate_label_and_never_re_grades(
         self, tmp_path, monkeypatch
     ):

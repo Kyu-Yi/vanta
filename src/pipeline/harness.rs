@@ -160,6 +160,14 @@ pub async fn run_single_test(
         .result
 }
 
+/// [VANTA-WHY] §14.19 — the one filename a BATE baseline run writes the
+/// generated test to. Named rather than spelled inline twice because
+/// `bate::harness_error` asks "does the failure output name the generated
+/// test?", and that question and the write have to agree on the name: if they
+/// drifted, a test whose own collection failed would be classified as a broken
+/// environment and never revised.
+pub const BATE_TEST_FILE: &str = "test_bate.py";
+
 /// Run one test and keep the execution details for rerun diagnostics.
 pub async fn run_single_test_with_timeout(
     source_concat: &str,
@@ -173,8 +181,8 @@ pub async fn run_single_test_with_timeout(
     };
     let _ = write_source_files(sb.root(), source_concat);
     let _ = write_conftest(sb.root());
-    let _ = fs::write(sb.root().join("test_bate.py"), test_source);
-    let cmd = build_single_test_cmd(test_cmd, "test_bate.py");
+    let _ = fs::write(sb.root().join(BATE_TEST_FILE), test_source);
+    let cmd = build_single_test_cmd(test_cmd, BATE_TEST_FILE);
     let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
     let sandbox_root = sb.root().display().to_string();
     let exec = sb.execute(&cmd_refs, Path::new(""), timeout_secs).await;
@@ -183,7 +191,7 @@ pub async fn run_single_test_with_timeout(
             sb.root().join("report.json"),
             &e,
             Some(sandbox_root),
-            "test_bate.py",
+            BATE_TEST_FILE,
         ),
         Err(_) => TestExecutionDetails::infrastructure_error(),
     };

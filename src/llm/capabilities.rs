@@ -24,29 +24,39 @@
 //! a chance to change them. `post_chat_meta` branches on `cfg.is_openai()` and
 //! leaves a local body untouched, recording `requested == sent` instead.
 //!
-//! ## Where each drop comes from (checked against the OpenAI docs, 2026-10-26)
+//! ## Where each drop comes from (docs first, then the live probe, §14.34)
+//!
+//! The model pages gave a first list; `scripts/openai_probe.py` was then run by
+//! the operator against both ids on 2026-10-26, and it is what the constants
+//! below now quote. It did not contradict the docs — it SPLIT them, which is why
+//! there are two rejection lists rather than one:
 //!
 //! * `top_k`, `min_p` — llama.cpp sampler knobs. `docs/models/gpt-6-luna` and
 //!   `docs/models/gpt-6.1-sol` list no such parameter and the Chat Completions
 //!   reference defines neither. Sending one is a 400 at best.
 //! * `reasoning_budget_tokens` — llama.cpp's own extension. No OpenAI endpoint
 //!   defines it (§14.21's budget; §14.27 records the `unsupported` mechanism).
-//! * `temperature`, `top_p`, `logprobs`, `top_logprobs` — defined by Chat
-//!   Completions, and explicitly to be removed for a reasoning model:
-//!   `docs/models/gpt-6-luna` says *"`reasoning.effort` supports `none`, `low`,
-//!   `medium` (default), `high`, `xhigh`, and `max`"* and the sampling fields are
-//!   rejected while effort is anything but `none`. Vanta never runs these at
-//!   effort `none`, so this is an unconditional drop for the two known families.
-//! * `presence_penalty`, `frequency_penalty` — standard Chat Completions
-//!   parameters, also rejected by these reasoning models.
+//! * `top_p`, `logprobs`, `top_logprobs` — no such parameter on a reasoning
+//!   model. Measured for `top_p`: *"Unsupported parameter: 'top_p' is not
+//!   supported with this model."* — the provider's `unsupported_parameter`.
+//! * `temperature`, `presence_penalty`, `frequency_penalty` — the parameter
+//!   EXISTS and only its DEFAULT value is accepted. Measured for `temperature`,
+//!   sent at the `coding` preset's own `0.6`: *"does not support 0.6 with this
+//!   model. Only the default (1) value is supported."* — `unsupported_value`.
 //!
 //! `max_tokens` is not dropped but RENAMED: `max_completion_tokens` is the
-//! current field and the legacy spelling is the one that errors on a reasoning
-//! model. `seed` is KEPT — the Chat Completions reference defines it, and
-//! `system_fingerprint` is documented as its determinism companion. Nothing in
-//! the docs says these models ignore it; the live probe
-//! (`scripts/openai_probe.py`, the operator's call) is what would move it to
-//! `unsupported`.
+//! current field and the legacy spelling is the one these models reject — the
+//! probe confirmed it (`unsupported_parameter`, with the replacement named in the
+//! provider's own message). `seed` is KEPT, and the probe confirmed the key is
+//! accepted on both ids; that is evidence the field TRAVELS, not that one seed
+//! reproduces one completion, so `openai:seed` stays a best-effort claim.
+//!
+//! [VANTA-WHY] The second list has a consequence worth stating where the
+//! sampling surface is described, because it is invisible in the manifest: a
+//! HOSTED run samples at the provider's default temperature, not at the `coding`
+//! preset's `0.6` (`llm::CODING_TEMPERATURE`). Two rows differing only by backend
+//! are therefore not two draws from the same distribution, and a local-vs-API
+//! comparison has to say so rather than attribute the difference to the model.
 //!
 //! ## What is deliberately NOT modelled
 //!
@@ -59,6 +69,15 @@
 //! * **`stream` / `stream_options`.** Both list "Streaming: Supported" and the
 //!   Chat Completions reference defines `stream_options.include_usage` (the last
 //!   chunk carries `usage`, and is empty otherwise). No Responses API is needed.
+//!   The probe confirmed the whole path in one call — `status=200`, `[DONE]` seen,
+//!   and a usage block carrying `prompt_tokens`, `completion_tokens`, the nested
+//!   `cached_tokens` and `reasoning_tokens` — so §14.29's parse is reading fields
+//!   that really arrive rather than fields the docs promise.
+//! * **`prompt_cache_key`.** Not a field Vanta sends, and therefore not in the
+//!   table: caching is a PREFIX cache and needs no key (§14.32). Worth recording
+//!   that the probe sent one anyway, with `stream`, and got `200` — so the
+//!   parameter exists and is accepted if a future arm ever wants to separate two
+//!   prefixes that would otherwise share a cache.
 //!
 //! ## `reasoning_effort` (§14.28)
 //!
@@ -190,23 +209,75 @@ pub const NOT_A_CHAT_PARAMETER: &[(&str, &str)] = &[
     ),
 ];
 
-/// Fields the known GPT-6 families reject BECAUSE reasoning is on.
+/// Fields the known GPT-6 families have no parameter for, while reasoning is on.
+///
+/// [VANTA-WHY] Split from [`REJECTED_VALUE_WHILE_REASONING`] because the live
+/// probe came back with two DIFFERENT error codes for the two kinds (§14.34), and
+/// they are two different claims about the API rather than one:
+///
+/// * `unsupported_parameter` — the model has no such parameter. `top_p` answered
+///   *"Unsupported parameter: 'top_p' is not supported with this model."* There is
+///   no value to send, so nothing is lost by omitting the key.
+/// * `unsupported_value` — the parameter exists and only its DEFAULT value is
+///   accepted. `temperature` answered *"does not support 0.6 with this model. Only
+///   the default (1) value is supported."*
 ///
 /// [VANTA-WHY] Held separately from [`NOT_A_CHAT_PARAMETER`] because these ARE
 /// parameters of the API — they are withheld for a per-model reason, and so the
 /// `Unknown` family keeps them. Merging the two lists would make the table
 /// unable to represent "I do not know this model" as anything but "drop
 /// everything", which is the guess this table exists to avoid.
-pub const REJECTED_WHILE_REASONING: &[(&str, &str)] = &[
+pub const REJECTED_PARAMETER_WHILE_REASONING: &[(&str, &str)] = &[
+    (
+        "top_p",
+        "no such parameter while reasoning is on (unsupported_parameter)",
+    ),
+    // Unprobed: the probe sends no logprob request. Both models' pages remove the
+    // pair for a reasoning model, and Vanta sends neither, so the drop is safe
+    // whichever code the API would have returned.
+    (
+        "logprobs",
+        "no such parameter while reasoning is on (per the model pages; unprobed)",
+    ),
+    (
+        "top_logprobs",
+        "no such parameter while reasoning is on (per the model pages; unprobed)",
+    ),
+];
+
+/// Fields the known GPT-6 families accept only at their DEFAULT value, while
+/// reasoning is on.
+///
+/// [VANTA-WHY] This is where the probe corrected the table. `temperature` is not
+/// an unsupported parameter — it is an unsupported VALUE: *"Only the default (1)
+/// value is supported."* Vanta's `coding` preset pins `temperature = 0.6` on
+/// every site (`llm::CODING_TEMPERATURE`), which is exactly the value the probe
+/// sent and exactly the value that came back 400, so this list is the difference
+/// between every hosted call answering and every hosted call failing.
+pub const REJECTED_VALUE_WHILE_REASONING: &[(&str, &str)] = &[
     (
         "temperature",
-        "rejected while reasoning is on (Unsupported value: 'temperature')",
+        "only the default value is accepted while reasoning is on (unsupported_value)",
     ),
-    ("top_p", "rejected while reasoning is on"),
-    ("presence_penalty", "rejected while reasoning is on"),
-    ("frequency_penalty", "rejected while reasoning is on"),
-    ("logprobs", "rejected while reasoning is on"),
-    ("top_logprobs", "rejected while reasoning is on"),
+    // [VANTA-WHY] §14.34 — the probe DID send `presence_penalty`, at `0.0`, which
+    // is both the API's default and the value `llm::CODING_PRESENCE_PENALTY`
+    // pins, and got a `200`. That is deliberately not read as "accepted": the
+    // `temperature` rejection says these families take only a field's DEFAULT
+    // value, and the default is byte-equivalent to omitting the key, so the `200`
+    // is evidence about a body the pipeline could have sent with the key absent.
+    // `VANTA_PRESENCE_PENALTY` can pin any value, so the key stays dropped until a
+    // non-default value has been probed — dropping costs nothing a default-valued
+    // 200 could have bought.
+    (
+        "presence_penalty",
+        "only the default value is accepted while reasoning is on (probe: default-only, §14.34)",
+    ),
+    // Unprobed, and grouped here by the `presence_penalty` precedent rather than
+    // by a measurement: the same kind of sampler value, pinned by the same preset.
+    (
+        "frequency_penalty",
+        "only the default value is accepted while reasoning is on (per the model pages; unprobed)",
+    ),
 ];
 
 /// The llama.cpp spelling of the output cap, and the OpenAI one it becomes.
@@ -258,7 +329,8 @@ pub const SOL_EFFORT_LADDER: &[&str] = &["low", "medium", "high", "xhigh", "max"
 pub fn unsent_keys(family: OpenAiFamily) -> Vec<(&'static str, &'static str)> {
     let mut keys = NOT_A_CHAT_PARAMETER.to_vec();
     if family.rejects_sampling_while_reasoning() {
-        keys.extend_from_slice(REJECTED_WHILE_REASONING);
+        keys.extend_from_slice(REJECTED_PARAMETER_WHILE_REASONING);
+        keys.extend_from_slice(REJECTED_VALUE_WHILE_REASONING);
     }
     keys
 }
@@ -522,6 +594,55 @@ mod tests {
         assert_eq!(unknown, vec!["top_k", "min_p", "reasoning_budget_tokens"]);
     }
 
+    /// §14.34 — the live probe came back with two DIFFERENT error codes for the
+    /// two kinds of rejection, so the second half of [`unsent_keys`] is two lists
+    /// rather than one, and this pins which field is in which.
+    ///
+    /// [VANTA-WHY] The guard has to be able to FAIL: merging the two lists back
+    /// into one still drops the same nine keys and every other test here would
+    /// keep passing, while the table would stop being able to say WHY a field is
+    /// withheld — "this model has no such parameter" and "only the default value
+    /// is accepted" are different claims, and §14.34's hosted-sampling-default
+    /// consequence follows from the second one only.
+    #[test]
+    fn the_rejection_lists_split_by_error_code_and_do_not_overlap() {
+        let parameter: Vec<&str> = REJECTED_PARAMETER_WHILE_REASONING
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+        let value: Vec<&str> = REJECTED_VALUE_WHILE_REASONING
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+
+        // Probe-measured `unsupported_parameter`: no such parameter exists.
+        assert!(parameter.contains(&"top_p"), "probe: `top_p` → 400");
+        // Probe-measured `unsupported_value`: the parameter exists, only its
+        // default is accepted. `presence_penalty` sits here because its `200` at
+        // the default 0.0 is not evidence a non-default value would be accepted.
+        assert!(value.contains(&"temperature"), "probe: `temperature` → 400");
+        assert!(value.contains(&"presence_penalty"));
+        // A `not-a-parameter` knob is neither: it is not on the API at all.
+        for (key, _) in NOT_A_CHAT_PARAMETER {
+            assert!(!parameter.contains(key), "`{key}` is not a parameter");
+            assert!(!value.contains(key), "`{key}` is not a parameter");
+        }
+        // One field is in exactly one list: a key that is both would make the
+        // record's `why` depend on iteration order.
+        for key in &parameter {
+            assert!(!value.contains(key), "`{key}` is in both lists");
+        }
+
+        let luna: Vec<&str> = unsent_keys(OpenAiFamily::Gpt6Luna)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let mut expected: Vec<&str> = NOT_A_CHAT_PARAMETER.iter().map(|(key, _)| *key).collect();
+        expected.extend(parameter.iter().copied());
+        expected.extend(value.iter().copied());
+        assert_eq!(luna, expected);
+    }
+
     #[test]
     fn shaping_drops_the_unparameterized_keys_renames_the_cap_and_keeps_the_rest() {
         let mut body = a_llamacpp_shaped_body();
@@ -659,7 +780,7 @@ mod tests {
     fn the_service_tier_is_never_dropped_on_any_family() {
         // [VANTA-WHY] The guard has to be able to FAIL: if a later edit moved
         // `service_tier` into `NOT_A_CHAT_PARAMETER` (it is not a llama.cpp knob)
-        // or into `REJECTED_WHILE_REASONING` (both families document `flex`), a
+        // or into either rejection list (both families document `flex`), a
         // hosted run that asked for the half-price tier would silently be served
         // at full price while its record still said `flex`. That is the exact
         // shape of a wrong cost column.

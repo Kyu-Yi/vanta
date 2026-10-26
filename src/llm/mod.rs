@@ -2248,11 +2248,16 @@ pub const UNSET_SEED_MECHANISM: &str = "unset";
 /// reference names `system_fingerprint` as its determinism companion — nothing in
 /// the GPT-6 model docs says these models ignore it. So a seed that was inserted
 /// into the body is recorded as reaching the model, and the `unsupported`
-/// spelling stays reserved for the outcome it was written for. The live probe
-/// (`scripts/openai_probe.py`, the operator's call) is what would move this: if
-/// the provider accepts the key and the same seed does not reproduce the same
-/// completion, this constant becomes `openai:seed-ignored` and the shipped seed
-/// stops being a claim about sampling.
+/// spelling stays reserved for the outcome it was written for.
+///
+/// [VANTA-WHY] §14.34 — the live probe (`scripts/openai_probe.py`) has now run,
+/// and the provider ACCEPTED the key (`200`) on both `gpt-6-luna` and
+/// `gpt-6.1-sol`. That is evidence the field TRAVELS, which is what this constant
+/// claims — it is not evidence that one seed reproduces one completion, and the
+/// probe cannot produce that evidence from a single sample. So the value stays
+/// `openai:seed` (best effort, not a determinism claim); it becomes
+/// `openai:seed-ignored` only if a same-seed repeat is later shown to differ,
+/// which no run so far has tested.
 pub const OPENAI_SEED_MECHANISM: &str = "openai:seed";
 
 /// The seed POLICY every run from §14.23 on applies, recorded in `run.summary` as

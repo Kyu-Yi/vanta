@@ -6593,7 +6593,9 @@ nothing, renames nothing, and exists so that both branches return the same kind 
   per-model, an **`Unknown` family keeps them**: withholding a parameter is only right where the docs say
   to withhold it, and a model id this table has never heard of is not evidence that its model rejects
   anything. Filing these two lists together would have silently projected one model family's dialect onto
-  every future one.
+  every future one. *(Superseded by §14.34: the live probe split this single list into
+  `REJECTED_PARAMETER_WHILE_REASONING` and `REJECTED_VALUE_WHILE_REASONING` by the provider's `error.code`.
+  The same six keys are still dropped; only the reason is now two reasons.)*
 
 **`OpenAiFamily` is read from the model id, longest prefix first.** `gpt-6.1-sol` and `gpt-6-luna` are
 matched by prefix, with Sol checked first so a dated snapshot (`gpt-6.1-sol-2026-10-01`) lands on the
@@ -7200,6 +7202,68 @@ codebase's own comments already depend on — "one writer per file" and "one job
 of those assumptions is load-bearing for a guarantee a reviewer would otherwise believe still holds. The
 prerequisite for building item 9 is therefore not a pool; it is (1)(a) + (2) + (3) with tests that fail when
 two writers lose a key or a row, and those are worth their own items.
+
+---
+
+### 14.34 Hosted OpenAI backend — pinning the capability table from the live probe
+
+§14.26 wrote the capability table from the model pages and left two fields open on purpose: `seed` and
+`presence_penalty` were not documented either way, so the table guessed neither, and `scripts/openai_probe.py`
+was shipped to ask the API directly. It has now been run — by the operator, against both ids
+(`gpt-6-luna`, `gpt-6.1-sol`) on 2026-10-26, from `~/vanta-api` with the key read from `OPENAI_API_KEY`; the
+output is the operator's `~/luna-probe.log`. This section is what it settled. **It changes no field's fate**:
+the nine keys §14.26 dropped are still the nine keys dropped. What it changes is *why* the table can say so,
+and it is worth being plain about that — this commit is evidence, structure and documentation, not behaviour.
+
+**The probe SPLIT the second list; it did not contradict it.** §14.26 carried one list, "rejected while
+reasoning". The verdict table came back with two different `error.code`s for the two kinds of rejection, which
+are two different claims about the API:
+
+| error code | meaning | probed fields | Vanta's fields |
+|---|---|---|---|
+| `unsupported_parameter` | the model has no such parameter at all | `top_p` — *"Unsupported parameter: 'top_p' is not supported with this model."* | `top_p`, and (per the model pages, unprobed) `logprobs`, `top_logprobs` |
+| `unsupported_value` | the parameter exists and only its **default** value is accepted | `temperature` at `0.6` — *"does not support 0.6 with this model. Only the default (1) value is supported."* | `temperature`, `presence_penalty`, and (unprobed) `frequency_penalty` |
+
+`NOT_A_CHAT_PARAMETER` (`top_k`, `min_p`, `reasoning_budget_tokens`) is untouched and is a third kind still:
+those are llama.cpp knobs the endpoint does not define, so they are not on the API to reject. So the constants
+in `src/llm/capabilities.rs` are now three lists, and `unsent_keys` unions the first with the two rejections
+for a known family and keeps only the first for `Unknown` — an abstaining family must not be handed a drop list
+it has no evidence for.
+
+**`temperature` is the one that would have failed every call.** The probe sent it at `0.6`, which is exactly
+`llm::CODING_TEMPERATURE` — the value Vanta's `coding` preset pins on every site. `top_p` was sent at `0.9`,
+also a reject; the operator's instruction named only Sol, but **both** ids 400 on `temperature` and `top_p`, so
+the drop list is identical for the two known families. `max_tokens` behaves as §14.26 said: rejected by its own
+name, with `max_completion_tokens` named in the provider's message, so it stays a RENAME and not a drop.
+
+**`presence_penalty` stays dropped, and the probe cannot move it.** The probe sent it at `0.0` — the API's
+default *and* `llm::CODING_PRESENCE_PENALTY` — and got a `200`. That is not "accepted": the `temperature`
+rejection says these families take only a field's default value, and a default is byte-equivalent to omitting
+the key, so the `200` is evidence about a body the pipeline could have sent with the key absent.
+`VANTA_PRESENCE_PENALTY` can pin any value, and no probe has sent a non-default one, so the key stays dropped
+until one has. A default-valued `200` buys nothing a dropped key costs.
+
+**`seed` stays `openai:seed`, as a best-effort claim only.** The probe was accepted on both ids, so the field
+travels — which is what `OPENAI_SEED_MECHANISM` claims. It is *not* evidence that one seed reproduces one
+completion: that needs a same-seed repeat, and the probe is one sample per row. `src/llm/mod.rs` now records
+this instead of saying the probe "is what would move this"; the value becomes `openai:seed-ignored` only if a
+same-seed repeat is later shown to differ.
+
+**`service_tier=flex` is unchanged.** Luna answered `200`; Sol answered `429 flex_unavailable` — capacity
+pressure, not a rejection, and already the case §14.30's retry ladder treats as retryable (and not billed).
+Default tier is fine for the first hosted runs, so nothing moves here.
+
+**[VANTA-WHY] The consequence to carry into the local-vs-API comparison.** Because `temperature` is withheld,
+a HOSTED run samples at the **provider's default**, not at the `coding` preset's `0.6`. Two rows that differ
+only by backend are therefore not two draws from the same distribution, and a local-vs-API comparison has to
+say so rather than attribute the difference to the model. This is the reason the split is worth a structure at
+all: it is the `unsupported_value` half of the table that carries the consequence, and a single merged list
+would have hidden which half that is. The module doc and a new test,
+`the_rejection_lists_split_by_error_code_and_do_not_overlap`, pin the two lists apart so a later edit cannot
+quietly merge them back.
+
+§14.26's table description is superseded for the two rejection lists by this section; its `NOT_A_CHAT_PARAMETER`
+rows, its `max_tokens` rename and its per-family effort ladders are unchanged.
 
 ---
 

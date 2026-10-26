@@ -39,6 +39,13 @@
 use std::env;
 use std::fmt;
 
+// [VANTA-WHY] §14.31 — the tier enum lives with the price table it selects, so
+// the set of tiers a run may name and the set of tiers this project can price
+// are one definition. Re-declaring it here (or a bare String) would let the
+// config accept a tier the table has no row for, which is a cost column with a
+// hole in it.
+use crate::llm::pricing::ServiceTier;
+
 // ----------------------------------------------------------------------------
 // LlmBackend — WHICH OpenAI-compatible service the pipeline talks to
 // ----------------------------------------------------------------------------
@@ -326,6 +333,21 @@ pub struct LlmConfig {
     // already says without inventing a magic number that a stricter backend
     // might read as a real seed.
     pub seed: Option<u64>,
+
+    // [VANTA-WHY] §14.31 — the service tier the hosted backend is asked for,
+    // from VANTA_OPENAI_SERVICE_TIER. Not an Option: unlike a seed, a tier
+    // always exists on the hosted backend (its default IS the standard rates),
+    // so `None` would be a second way to spell `Standard` and an arm nobody
+    // could tell from the default one.
+    //
+    // [VANTA-WHY] It is a field of the LLM CONFIG rather than a run-level global
+    // (the way §14.21's reasoning knobs are) because it is a property of the
+    // transport and of the price, and both places that need it — the request
+    // body and the pricing call — already hold the config. Read ONLY on the
+    // openai backend, matching the rule the two API keys follow: the name says
+    // `OPENAI_`, so a local run does not look at it at all and its bodies cannot
+    // change because of it.
+    pub service_tier: ServiceTier,
 }
 
 // ----------------------------------------------------------------------------
@@ -393,6 +415,11 @@ impl Default for LlmConfig {
             // own default, which is what the existing baseline was measured
             // under. Set VANTA_LLM_SEED to pin one.
             seed: None,
+
+            // §14.31 — the standard rates are the default tier and the only one
+            // an unset/`default`/`auto` switch can mean. `Flex` is reachable
+            // only by asking for it, and only on the openai backend.
+            service_tier: ServiceTier::Standard,
         }
     }
 }
@@ -435,7 +462,8 @@ impl fmt::Display for LlmConfig {
             max_call       : {}s (backstop per call)\n  \
             retry_attempts : {}\n  \
             context_window : {}\n  \
-            seed           : {}",
+            seed           : {}\n  \
+            service_tier   : {}",
             self.backend.as_str(), self.base_url, self.model_id, key_display,
             self.idle_timeout_secs, self.max_call_secs, self.retry_attempts,
             match self.context_window_tokens {
@@ -453,6 +481,16 @@ impl fmt::Display for LlmConfig {
             match self.seed {
                 Some(v) => format!("{v} (VANTA_LLM_SEED)"),
                 None => "unset (server default)".to_string(),
+            },
+            // [VANTA-WHY] §14.31 — the tier, printed beside the endpoint for the
+            // same reason the seed is: `flex` and standard are 2x apart in money,
+            // so two runs that differ only here are different experiments. The
+            // local backend has no tier at all (`not_billed`), and saying
+            // `standard` there would imply it was served at somebody's rates.
+            match self.service_tier {
+                ServiceTier::Flex => "flex (VANTA_OPENAI_SERVICE_TIER)".to_string(),
+                _ if self.is_openai() => "default (standard rates)".to_string(),
+                _ => "n/a (local backend — not billed)".to_string(),
             }
         )
     }
@@ -482,6 +520,14 @@ impl LlmConfig {
     //   VANTA_LLM_CONTEXT_TOKENS   | Model context window (else /props) | unset
     //   VANTA_LLM_RETRY_ATTEMPTS   | structured_call retry budget       | 3
     //   VANTA_LLM_SEED             | Sampler seed (else server default) | unset
+    //   VANTA_OPENAI_SERVICE_TIER  | flex | default (openai backend)    | default
+    //
+    // VANTA_OPENAI_SERVICE_TIER is read ONLY on the openai backend, and only
+    // `flex` changes a request: it puts `service_tier: "flex"` in the body and
+    // prices the call from the half-rate row. `default` and unset send nothing.
+    // `auto` is accepted as a synonym for `default` (documented as the same
+    // rates); `priority` is refused, because this project has no price row for
+    // it and a cost column is the last place to guess.
     //
     // VANTA_LLM_BASE_URL's default depends on the backend: the llamacpp
     // default is the historical localhost:8080/v1 (unchanged), and the openai
@@ -594,6 +640,33 @@ impl LlmConfig {
                 return Err(format!(
                     "CONFIG_ERROR: {key_env} env var contained non-UTF-8 bytes."
                 ));
+            }
+        }
+
+        // ---- service_tier override (§14.31) --------------------------------
+        //
+        // [VANTA-WHY] Read only when the hosted backend is going to read it,
+        // exactly as the key above is read only under its own backend's name.
+        // A local run therefore cannot be changed by this variable at all — not
+        // its banner, not its bodies — which is what keeps "no new variable
+        // means byte-identical local requests" true rather than merely likely.
+        //
+        // [VANTA-WHY] A value that does not parse is an ERROR, never a fallback
+        // to standard: `flex` and the standard rates are 2x apart, so silently
+        // running the other arm would put a wrong number in the one column
+        // nobody can re-derive from the tokens afterwards.
+        if cfg.backend == LlmBackend::OpenAi {
+            match env::var("VANTA_OPENAI_SERVICE_TIER") {
+                Ok(val) if !val.trim().is_empty() => {
+                    cfg.service_tier = ServiceTier::parse(val.trim())?;
+                }
+                Ok(_) => { /* set but empty → the default tier */ }
+                Err(env::VarError::NotPresent) => { /* keep the default tier */ }
+                Err(env::VarError::NotUnicode(_)) => {
+                    return Err("CONFIG_ERROR: VANTA_OPENAI_SERVICE_TIER env var contained \
+                                non-UTF-8 bytes."
+                        .to_string());
+                }
             }
         }
 
@@ -717,6 +790,28 @@ impl LlmConfig {
     // answer "no" for a proxy and be wrong about a contract it never checked.
     pub fn is_openai(&self) -> bool {
         self.backend == LlmBackend::OpenAi
+    }
+
+    // ------------------------------------------------------------------------
+    // service_tier_text() — the tier as `call.usage` / `run.summary` spell it
+    // ------------------------------------------------------------------------
+    //
+    // [VANTA-WHY] §14.31 — one definition for the two records that must agree
+    // about it (the per-call row and the run summary), for the reason
+    // `reasoning_effort_text` is one definition: a row that said `flex` while
+    // the summary said `standard` would be a batch table disagreeing with itself
+    // about which price row priced the run.
+    //
+    // [VANTA-WHY] `unset` on the local backend, not `standard`: a llama.cpp
+    // server has no service tier and sells nothing, and the same row already
+    // says `cost_basis=not_billed`. Recording `standard` there would drop local
+    // runs into the hosted table's full-price bucket.
+    pub fn service_tier_text(&self) -> &'static str {
+        if self.is_openai() {
+            self.service_tier.name()
+        } else {
+            "unset"
+        }
     }
 
     // ------------------------------------------------------------------------

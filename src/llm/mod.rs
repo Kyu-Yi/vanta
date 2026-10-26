@@ -274,6 +274,18 @@ pub struct CallUsage {
     /// THIS call's temperature reach the model?". `run.summary` carries the
     /// model-level rule beside it, so the two levels are both readable.
     pub request_shape: ShapedBody,
+    /// The service tier this call was served on, as `run.summary` and the row
+    /// spell it: `standard`/`flex` on the hosted backend, `unset` on the local
+    /// one (§14.31).
+    ///
+    /// [VANTA-WHY] The name, not the enum, and `unset` rather than `standard`
+    /// for a local run — the same call `cost_basis` makes with `not_billed`. A
+    /// llama.cpp server has no tier and sells nothing, so recording `standard`
+    /// would put a local row in the batch table's full-price bucket. Carried per
+    /// call even though it is one value per run, because the row is where a
+    /// reader looks up what priced it and `cost_basis` is read from the same
+    /// place.
+    pub service_tier: String,
 }
 
 static CALL_USAGES: Mutex<Vec<CallUsage>> = Mutex::new(Vec::new());
@@ -1811,6 +1823,25 @@ async fn post_chat_meta(
     // two chances for the shaping record and the price record to describe
     // different models.
     let family = OpenAiFamily::from_model_id(&cfg.model_id);
+    // [VANTA-WHY] §14.31 — the service tier, when the run asked for `flex`.
+    // Inserted BEFORE the shaping branch for §14.23's reason (the seed does the
+    // same a few lines up): the record's `requested` list is the body as the
+    // caller built it, so a key added after shaping would appear in `sent` but
+    // not `requested` and `is_consistent` would have to be believed rather than
+    // checked.
+    //
+    // [VANTA-WHY] Only `flex` is inserted, and only on the hosted backend.
+    // `service_tier: "default"` is the API's own default, so sending it would be
+    // a body change that means nothing — and an explicit `default` arm would
+    // stop being byte-identical to an unset one, which is the property this
+    // switch must not cost. The local branch of this `if` never runs, so a
+    // llama.cpp body cannot gain the key.
+    if cfg.is_openai() && cfg.service_tier == pricing::ServiceTier::Flex {
+        full_body.insert(
+            capabilities::SERVICE_TIER_KEY.to_string(),
+            json!(cfg.service_tier.name()),
+        );
+    }
     let (full_body, request_shape) = if cfg.is_openai() {
         // [VANTA-WHY] §14.28 — the run's effort is passed IN rather than read by
         // the table, so "what did this run ask for?" is answered at the one call
@@ -1970,11 +2001,14 @@ async fn post_chat_meta(
     let (cost_usd, cost_basis) = if cfg.is_openai() {
         pricing::cost_for_family(
             family,
-            // §14.29 prices every call at the STANDARD rates. The tier that
-            // selects the `flex` row is read from `VANTA_OPENAI_SERVICE_TIER` in
-            // §14.30 (item 7); until then no run can ask for `flex`, so pricing
-            // at standard is the truth about the traffic, not a default.
-            pricing::ServiceTier::Standard,
+            // [VANTA-WHY] §14.31 — the tier THIS run asked for, read from the
+            // same config field that decided the body's `service_tier` key a few
+            // lines above. One source, so the row that prices a call and the
+            // request a provider served cannot describe two different arms;
+            // `flex` is documented at half the standard rates for the same
+            // tokens, so pricing a flex run at the standard row would over-report
+            // its cost by 2x.
+            cfg.service_tier,
             usage_source,
             measured_prompt,
             streamed.cached_tokens,
@@ -2038,6 +2072,13 @@ async fn post_chat_meta(
         truncated: streamed.finish_reason.as_deref() == Some("length"),
         // [VANTA-WHY] §14.26 — what this body asked for and what it carried.
         request_shape,
+        // [VANTA-WHY] §14.31 — the tier the PRICE ROW above was selected by,
+        // spelled by the same helper `run.summary` uses. On the local backend it
+        // is `unset`, because a llama.cpp server has no tier and the row's
+        // `not_billed` basis says the same thing about money; on the hosted
+        // backend it is exactly `cfg.service_tier`, i.e. the value that put the
+        // `service_tier` key into the body this call sent.
+        service_tier: cfg.service_tier_text().to_string(),
     };
     debug!(
         site,
@@ -2063,6 +2104,10 @@ async fn post_chat_meta(
         cached_tokens = ?usage.cached_tokens,
         reasoning_tokens = ?usage.reasoning_tokens,
         cost_basis = %usage.cost_basis,
+        // [VANTA-WHY] §14.31 — the tier, logged with the cost basis it selected:
+        // a `flex` run that came out priced at `.../standard/...` is a mistake
+        // worth seeing in the live log, not one to discover in a manifest.
+        service_tier = %usage.service_tier,
         // [VANTA-WHY] §14.26 — logged as well as recorded, so a hosted run that
         // is silently missing a field says so while it happens rather than only
         // in the session log afterwards.

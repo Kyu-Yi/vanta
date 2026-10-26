@@ -221,6 +221,23 @@ pub const OPENAI_OUTPUT_CAP_KEY: &str = "max_completion_tokens";
 /// onto two spellings of the same field.
 pub const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 
+/// The `service_tier` key, and the one value this project ever puts in it
+/// (§14.31).
+///
+/// [VANTA-WHY] Here rather than spelled at the insert site because this module is
+/// where "which fields does this family accept?" is answered, and `service_tier`
+/// is the one such field that is neither dropped nor renamed: Chat Completions
+/// defines it, both GPT-6 families document `flex`, and it changes the PRICE
+/// rather than the answer. So it is absent from [`unsent_keys`] on purpose, and
+/// the constant sits beside the two keys that ARE filtered so a reader can see
+/// the tier is the deliberate exception.
+///
+/// [VANTA-WHY] `default` and unset insert NOTHING — `service_tier: "default"` is
+/// the API's own default, so sending it would be a body change that means
+/// nothing and would stop an explicitly-`default` arm from being byte-identical
+/// to an unset one. Only `flex` is ever spelled into a body.
+pub const SERVICE_TIER_KEY: &str = "service_tier";
+
 /// Every level `VANTA_REASONING_EFFORT` may name — the UNION of the two ladders.
 ///
 /// [VANTA-WHY] Ordered as the model pages list them (cheapest first). `none` is
@@ -635,6 +652,37 @@ mod tests {
         );
         assert!(shaped.dropped.contains(&REASONING_EFFORT_KEY.to_string()));
         assert!(shaped.is_consistent());
+    }
+
+    /// §14.31 — the tier is the one body field that is filtered by NEITHER list.
+    #[test]
+    fn the_service_tier_is_never_dropped_on_any_family() {
+        // [VANTA-WHY] The guard has to be able to FAIL: if a later edit moved
+        // `service_tier` into `NOT_A_CHAT_PARAMETER` (it is not a llama.cpp knob)
+        // or into `REJECTED_WHILE_REASONING` (both families document `flex`), a
+        // hosted run that asked for the half-price tier would silently be served
+        // at full price while its record still said `flex`. That is the exact
+        // shape of a wrong cost column.
+        for family in [
+            OpenAiFamily::Gpt6Luna,
+            OpenAiFamily::Gpt61Sol,
+            OpenAiFamily::Unknown,
+        ] {
+            let mut body = a_llamacpp_shaped_body();
+            body.insert(SERVICE_TIER_KEY.to_string(), json!("flex"));
+            let shaped = shape_body_for_openai(&mut body, family, None);
+            assert!(
+                body.contains_key(SERVICE_TIER_KEY),
+                "`{SERVICE_TIER_KEY}` is a Chat Completions parameter: {body:?}"
+            );
+            assert!(
+                !shaped.dropped.contains(&SERVICE_TIER_KEY.to_string()),
+                "the tier must not be on the drop list: {shaped:?}"
+            );
+            assert!(shaped.requested.contains(&SERVICE_TIER_KEY.to_string()));
+            assert!(shaped.sent.contains(&SERVICE_TIER_KEY.to_string()));
+            assert!(shaped.is_consistent(), "record: {shaped:?}");
+        }
     }
 
     /// §14.28: the two ladders, spelled out here rather than read from the table

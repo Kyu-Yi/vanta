@@ -50,6 +50,18 @@
 //! a process on this machine — no tokens are sold. `not_billed` is recorded so a
 //! batch table can tell "zero because it was free" from "zero because the record
 //! forgot".
+//!
+//! ## The tier (§14.31)
+//!
+//! [VANTA-WHY] Every row here is a (family, tier) pair, so pricing a call needs
+//! the tier as much as it needs the model. The tier comes from the RUN's own
+//! configuration (`LlmConfig.service_tier`, read from
+//! `VANTA_OPENAI_SERVICE_TIER`), which is also the value that put
+//! `service_tier: "flex"` into the request body — one read, so the body a
+//! provider serves and the row that prices it cannot describe two different
+//! arms. A tier the table has no row for is not silently priced at the standard
+//! rates: [`price_row`] answers `None` and `cost_basis` says
+//! `unpriced_family`.
 
 use serde::{Deserialize, Serialize};
 
@@ -64,13 +76,22 @@ use crate::llm::capabilities::OpenAiFamily;
 pub const PRICE_TABLE_DATE: &str = "2026-10-26";
 pub const PRICE_TABLE_SOURCE: &str = "https://platform.openai.com/docs/pricing";
 
-/// Which service tier a request was served on (§14.30, item 7).
+/// Which service tier a request was served on (§14.31).
 ///
 /// [VANTA-WHY] A tier is a PRICE, not a queue: `flex` is documented at half the
 /// standard rates for exactly the same tokens, so the tier has to be known before
-/// a request is priced. Recording it per row (item 7) lets a batch table split
+/// a request is priced. Recording it per row (§14.31) lets a batch table split
 /// cheap-and-slow rows from full-price ones without re-deriving which requests
 /// asked for `flex`.
+///
+/// [VANTA-WHY] Two variants and not four. The API accepts `auto`, `default`,
+/// `flex` and `priority`, but only two of those are distinguishable in the
+/// record: `auto` and `default` are both "whatever the account's default rates
+/// are" (the standard rows), and `priority` has no price row in this table. A
+/// variant per accepted string would let a run record a tier no row can price,
+/// which is the `unpriced_family` hole one level down. `auto`/`default` collapse
+/// to [`Self::Standard`], and `priority` is refused at config time rather than
+/// recorded as something this table cannot cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServiceTier {
     /// `service_tier=default|auto` — the standard rates.
@@ -85,6 +106,27 @@ impl ServiceTier {
         match self {
             Self::Standard => "standard",
             Self::Flex => "flex",
+        }
+    }
+
+    /// Parse `VANTA_OPENAI_SERVICE_TIER`.
+    ///
+    /// [VANTA-WHY] Strict, like every other arm-defining switch in this project:
+    /// a tier that silently became `standard` would run the expensive arm while
+    /// the operator believed they had asked for the cheap one, and the cost
+    /// column — the one figure nobody can re-derive from the tokens afterwards —
+    /// would be wrong by 2x. `auto` is accepted and mapped to [`Self::Standard`]
+    /// because it is documented as the same rates, not a third price; `priority`
+    /// is rejected with the variable named, because this table has no row for it
+    /// and pricing it as `standard` would be a guess about money.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "flex" => Ok(Self::Flex),
+            "default" | "auto" => Ok(Self::Standard),
+            other => Err(format!(
+                "CONFIG_ERROR: VANTA_OPENAI_SERVICE_TIER='{other}' is not a service tier \
+                 (expected flex|default)."
+            )),
         }
     }
 }
@@ -383,5 +425,34 @@ mod tests {
         // 131072 is the window item 5's smoke run is launched with; the rule the
         // module note declines to model must not be reachable inside it.
         assert!(u64::from(131_072_u32) < LONG_CONTEXT_THRESHOLD_TOKENS);
+    }
+
+    /// §14.31 — the switch that selects the row, parsed strictly.
+    #[test]
+    fn the_tier_switch_is_strict_and_collapses_only_the_two_equal_prices() {
+        assert_eq!(ServiceTier::parse("flex"), Ok(ServiceTier::Flex));
+        assert_eq!(ServiceTier::parse("default"), Ok(ServiceTier::Standard));
+        // `auto` is documented as the account's own rates, i.e. the same rows as
+        // `default` — two spellings of one price, not a third tier.
+        assert_eq!(ServiceTier::parse("auto"), Ok(ServiceTier::Standard));
+        // Stray whitespace comes from the environment and is trimmed.
+        assert_eq!(ServiceTier::parse("  flex \n"), Ok(ServiceTier::Flex));
+
+        // [VANTA-WHY] `priority` is a real API value and is REFUSED here: the
+        // accepted set is the set this table can price, and a run that asked for
+        // priority would otherwise be recorded as standard while being billed
+        // something else. The error must name the variable so the operator knows
+        // which export to fix.
+        for bad in ["flexx", "FLEX", "priority", "", "fast"] {
+            let err = ServiceTier::parse(bad).unwrap_err();
+            assert!(
+                err.contains("VANTA_OPENAI_SERVICE_TIER"),
+                "the error must name the variable: {err}"
+            );
+            assert!(
+                err.starts_with("CONFIG_ERROR"),
+                "a bad arm switch is a config error, not a warning: {err}"
+            );
+        }
     }
 }

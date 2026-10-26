@@ -6940,6 +6940,15 @@ fn usage_details_and_cost_are_recorded_per_call_and_totalled() {
             "the row must say WHY there is no cost: {}",
             row.summary
         );
+        // §14.31 — the local backend names no tier, because none exists to name:
+        // `unset` here, never `standard`, which would claim a hosted arm the
+        // local run never had.
+        assert_eq!(
+            summary_value(&row.summary, "service_tier"),
+            "unset",
+            "a run nobody served must name no tier: {}",
+            row.summary
+        );
     }
     let local_summary = run_summary(local.path()).summary;
     assert_eq!(
@@ -6954,6 +6963,7 @@ fn usage_details_and_cost_are_recorded_per_call_and_totalled() {
     );
     assert_eq!(summary_value(&local_summary, "cost_usd"), "unset");
     assert_eq!(summary_value(&local_summary, "cost_basis"), "not_billed");
+    assert_eq!(summary_value(&local_summary, "service_tier"), "unset");
 
     // (2) Hosted: same stub, same numbers — now priced.
     let hosted = TempDir::new().unwrap();
@@ -7007,6 +7017,22 @@ fn usage_details_and_cost_are_recorded_per_call_and_totalled() {
             "gpt-6-luna/standard/2026-10-26",
             "the row must name the price row that produced the number: {row}"
         );
+        // §14.31 — `default` (and unset) is the API's own default and is never
+        // spelled, so the row names the STANDARD arm it was actually served on.
+        assert_eq!(
+            summary_value(row, "service_tier"),
+            "standard",
+            "an unset tier is served at the standard rates and must say so: {row}"
+        );
+    }
+    // §14.31 — and the byte-identity claim at the wire, not just in the record:
+    // a run that asked for no tier must not have `service_tier` in any body, or
+    // an explicitly-`default` arm would differ from an unset one for no reason.
+    for body in hosted_server.request_bodies() {
+        assert!(
+            !body.contains("service_tier"),
+            "the default arm must send no `service_tier` key: {body}"
+        );
     }
     let hosted_summary = run_summary(hosted.path()).summary;
     assert_eq!(
@@ -7026,6 +7052,101 @@ fn usage_details_and_cost_are_recorded_per_call_and_totalled() {
         summary_value(&hosted_summary, "cost_basis"),
         "gpt-6-luna/standard/2026-10-26"
     );
+    assert_eq!(summary_value(&hosted_summary, "service_tier"), "standard");
+}
+
+/// §14.31 — the tier a run asks for is the row that prices it, and the body it
+/// shaped.
+///
+/// [VANTA-WHY] What is asserted here is that one read of
+/// `VANTA_OPENAI_SERVICE_TIER` reaches BOTH consumers: the request body (so the
+/// provider actually serves the `flex` arm) and the price row (so the cost
+/// column prices the arm that was served). The failure this test makes
+/// impossible is a run that is served on `flex` — half price, best-effort
+/// capacity — while the manifest prices it at the standard rates, which would
+/// overstate a batch's spend by exactly 2x and look perfectly plausible.
+///
+/// The same stub and the same usage frame as the standard case, so the ONLY
+/// difference between `0.000111` and `0.000055` is the tier: billing the flex
+/// arm from the standard row cannot produce the flex string, and vice versa.
+#[test]
+fn a_flex_run_is_named_and_priced_from_its_own_row() {
+    let _serial = serial_run();
+
+    let workspace = TempDir::new().unwrap();
+    let (_repo, _issue, patch) = write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch,
+        &server,
+        3,
+        &[
+            ("VANTA_LLM_BACKEND", "openai"),
+            ("VANTA_LLM_MODEL", "gpt-6-luna"),
+            ("OPENAI_API_KEY", "sk-test-not-a-real-key"),
+            ("VANTA_LLM_CONTEXT_TOKENS", "131072"),
+            ("VANTA_OPENAI_SERVICE_TIER", "flex"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "choosing a slower, cheaper arm must not change the verdict; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // (1) The body: the arm has to be SPELLED for the provider to serve it.
+    let bodies = server.request_bodies();
+    assert!(!bodies.is_empty(), "the run must have called the model");
+    for body in &bodies {
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            value.as_object().unwrap().get("service_tier"),
+            Some(&serde_json::json!("flex")),
+            "a `flex` run must ask the provider for the flex arm: {body}"
+        );
+    }
+
+    // (2) The record: the row and the run both name the arm and its price.
+    let usages: Vec<String> = read_session_records(&find_session_log(workspace.path()))
+        .into_iter()
+        .filter(|record| record.phase == "call.usage")
+        .map(|record| record.summary)
+        .collect();
+    let calls = usages.len();
+    assert!(calls > 0, "a run that called the model must write `call.usage` rows");
+    for row in &usages {
+        // 777 prompt of which 314 were cached, 123 out, at Luna's FLEX rates —
+        // half of standard: 463×$0.05 + 314×$0.005 + 123×$0.25 per Mtok
+        //   = $0.00005547, which rounds to six decimals as below.
+        assert_eq!(
+            summary_value(row, "cost_usd"),
+            "0.000055",
+            "the flex arm must be billed from the flex row, not the standard one: {row}"
+        );
+        assert_eq!(
+            summary_value(row, "cost_basis"),
+            "gpt-6-luna/flex/2026-10-26",
+            "the row must name the arm it was priced on: {row}"
+        );
+        assert_eq!(
+            summary_value(row, "service_tier"),
+            "flex",
+            "the row must say which arm served it: {row}"
+        );
+    }
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(
+        summary_value(&summary, "cost_usd"),
+        format!("{:.6}", 0.00005547 * calls as f64),
+        "the run total must sum the flex rows it priced: {summary}"
+    );
+    assert_eq!(
+        summary_value(&summary, "cost_basis"),
+        "gpt-6-luna/flex/2026-10-26"
+    );
+    assert_eq!(summary_value(&summary, "service_tier"), "flex");
 }
 
 /// §14.30 — a provider that refuses a request because it is busy is re-asked the

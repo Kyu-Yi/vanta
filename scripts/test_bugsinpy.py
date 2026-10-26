@@ -18395,6 +18395,32 @@ class TestLlmBlock:
         assert block["cost_usd"] is None
         assert block["cost_basis"] == "not_billed"
 
+    def test_the_service_tier_is_copied_and_not_parsed_out_of_the_basis(self):
+        """§14.31 — the arm the run was served on, beside the row that priced it.
+
+        The basis already carries the tier (`gpt-6-luna/flex/2026-10-26`), but the
+        two are different claims and the block records both: the basis is the row
+        that produced the figure, the tier is what the run asked for. A batch table
+        grouped by arm must not have to split a formatted string to find it, and a
+        local run names no tier at all rather than guessing `standard`.
+        """
+        flex = runner_mod.llm_block(
+            runner_mod.parse_summary(
+                self.SUMMARY
+                + " cost_usd=0.000055 cost_basis=gpt-6-luna/flex/2026-10-26"
+                " service_tier=flex"
+            )
+        )
+        assert flex["service_tier"] == "flex"
+        assert flex["cost_basis"] == "gpt-6-luna/flex/2026-10-26"
+        local = runner_mod.llm_block(
+            runner_mod.parse_summary(
+                self.SUMMARY + " cost_usd=unset cost_basis=not_billed service_tier=unset"
+            )
+        )
+        assert local["service_tier"] == "unset"
+        assert local["cost_basis"] == "not_billed"
+
     def test_the_revise_budget_is_reported_beside_the_call_totals(self):
         # §14.14 — the cap and the run's spend against it, read back rather than
         # re-derived, so a manifest read later does not have to trust a constant
@@ -18441,6 +18467,9 @@ class TestLlmBlock:
         assert block["reasoning_tokens"] is None
         assert block["cost_usd"] is None
         assert block["cost_basis"] is None
+        # §14.31 — no tier was named either, so the block says nothing rather
+        # than defaulting a pre-§14.31 row to `standard`.
+        assert block["service_tier"] is None
         assert block["by_site"] == {}
 
 

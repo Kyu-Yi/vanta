@@ -6990,6 +6990,66 @@ than left for a reader to discover.
 
 ---
 
+### 14.31 Hosted OpenAI backend, item 7 — the service tier
+
+`VANTA_OPENAI_SERVICE_TIER=flex|default` (unset = `default`) chooses the arm a hosted run is served on, and
+gets recorded per row and priced from that arm's own row. The switch is one read of the run's config,
+`LlmConfig.service_tier`, and it feeds the **two** consumers that must agree: the request body builder and
+the pricing call. A run served on `flex` while priced at standard rates would overstate a batch's spend by
+exactly 2x and look perfectly plausible in the manifest, which is the failure this item is about.
+
+**The tier is a field of the config, not a run-level global.** Both consumers already hold `LlmConfig`
+(`post_chat_meta` shapes the body and prices the call), so a second store would be a second value that could
+disagree with the first. `LlmConfig::service_tier_text()` is the one spelling used by `call.usage` and
+`run.summary`: `standard`/`flex` on the hosted backend, `unset` on the local one — the local backend names
+no tier because none exists to name, mirroring `cost_basis=not_billed` (a `standard` there would claim a
+hosted arm the local run never had).
+
+**Two variants, not four, and the reason is the price table.** The API's own accepted values are
+`auto|default|flex|priority`. `auto` and `default` are documented at the same rates, so both parse to
+`ServiceTier::Standard`; `priority` is **refused at config time** (`CONFIG_ERROR`), because the table has no
+row for it and a cost column is the last place to invent a price. `ServiceTier::parse` is strict about the
+rest (`flex`, `FLEX`, `fast`, `""` all rejected), and the error names the variable.
+
+**Only `flex` is ever spelled into a body.** `service_tier: "default"` is the API's own default, so writing
+it would be a body change that means nothing and would make an explicitly-`default` arm differ from an unset
+one for no reason. The key is therefore inserted under `if cfg.is_openai() && cfg.service_tier == Flex`,
+which is also the **byte-identity guard**: a llama.cpp body cannot gain the key, so every local-body-pinning
+test still passes unchanged.
+
+**The key is deliberately on neither drop list.** `unsent_keys` is what a family must not be SENT, and
+`service_tier` is not that: Chat Completions defines it, both GPT-6 families document `flex`, and it changes
+the price rather than the answer. `capabilities::SERVICE_TIER_KEY` sits beside the filtered keys and
+`the_service_tier_is_never_dropped_on_any_family` pins that a dotted-in `flex` survives shaping on every
+family, including `Unknown`. (A `SERVICE_TIER_FLEX` value constant was written and then removed — the value
+comes from `cfg.service_tier.name()`, so a second copy could only drift.)
+
+**One row per (family, tier).** `PRICE_TABLE` already pairs each family with both arms (Luna `0.10/0.01/0.50`
+standard and `0.05/0.005/0.25` flex; Sol `2.00/0.10/10.00` and `1.00/0.05/5.00`), and `cost_for_family` now
+takes the run's tier, so `cost_basis` reads `gpt-6-luna/flex/2026-10-26` and points at the exact entry that
+produced the figure. A tier with no row is not silently priced at standard: `price_row` answers `None` and the
+basis says `unpriced_family`.
+
+**Tests.** `pricing::the_tier_switch_is_strict_and_collapses_only_the_two_equal_prices` pins the parse
+(`flex`/`default`/`auto` accepted, four bad arms refused with an error naming the variable and starting
+`CONFIG_ERROR`). `capabilities::the_service_tier_is_never_dropped_on_any_family` pins the key against both
+lists. `m3_session_log::a_flex_run_is_named_and_priced_from_its_own_row` runs the stub hosted as `gpt-6-luna`
+with `VANTA_OPENAI_SERVICE_TIER=flex` and asserts the arm is spoken in every body, that every `call.usage`
+row reads `cost_usd=0.000055 cost_basis=gpt-6-luna/flex/2026-10-26 service_tier=flex`, and that the run
+totals it — the same stub and usage frame as the standard case, so the only difference between `0.000111` and
+`0.000055` is the tier. `usage_details_and_cost_are_recorded_per_call_and_totalled` gained the other half of
+the pair: the local rows read `service_tier=unset`, the hosted rows `standard`, and **no** body from the
+unset arm contains the key. Python:
+`TestLlmBlock::test_the_service_tier_is_copied_and_not_parsed_out_of_the_basis` pins the manifest key, and the
+before-this-record case reads `None` rather than defaulting to `standard`.
+
+**What this section does not settle.** `priority` is refused rather than priced, and a live `flex` run was
+never made — `scripts/openai_probe.py` (the operator's standalone, run with the key loaded via
+`read -s OPENAI_API_KEY`) is where the real `service_tier` field, the busy-response body, and the 429
+`Retry-After` would be confirmed.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

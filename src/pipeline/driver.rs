@@ -2926,7 +2926,7 @@ pub async fn run(
                 "seq={} site={} round={} attempt={} prompt_tokens={} completion_tokens={} \
                  total_tokens={} source={} seed={} seed_mechanism={} finish_reason={} wall_ms={} \
                  truncated={} {} cached_tokens={} reasoning_tokens={} cost_usd={} cost_basis={} \
-                 provider_retries={}",
+                 provider_retries={} service_tier={}",
                 usage.seq,
                 usage.site,
                 // [VANTA-WHY] §14.12 — the round and the retry index travel with
@@ -2977,6 +2977,14 @@ pub async fn run(
                 // after the pre-existing keys so an older row's reader is
                 // unaffected.
                 usage.provider_retries,
+                // [VANTA-WHY] §14.31 — the tier the provider served this call
+                // on, beside the cost it produced and not far from it: the tier
+                // IS the price row, so a reader matching a cost against the
+                // table needs the two on one line. `unset` on the local backend
+                // (nothing was sold), `standard`/`flex` on the hosted one.
+                // Appended last so every key an older row carried keeps its
+                // position.
+                usage.service_tier,
             ),
             timestamp: now_iso(),
             benchmark_instance: None,
@@ -3133,6 +3141,7 @@ pub async fn run(
              deadline_secs={} stop_reason={} presence_penalty={} max_tokens_overrides={} \
              reasoning_budget={} reasoning_budget_mechanism={} reasoning_effort={} \
              reasoning_effort_mechanism={} \
+             service_tier={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
              commit={} dirty={} prompt_version={} prompt_hash={} context_selection={} \
              harness_error={}",
@@ -3257,6 +3266,12 @@ pub async fn run(
             crate::llm::reasoning_budget_mechanism(cfg.is_openai()),
             crate::llm::reasoning_effort_text(cfg.is_openai()),
             crate::llm::reasoning_effort_mechanism(cfg.is_openai()),
+            // [VANTA-WHY] §14.31 — the run-level tier, read once from the same
+            // config field that shaped every request body and priced every row,
+            // so the summary cannot disagree with either. `unset` on the local
+            // backend, where no tier exists to name. Appended after the
+            // pre-existing keys so an older row's reader is unaffected.
+            cfg.service_tier_text(),
             deciding_rule.as_deref().unwrap_or("none"),
             deciding_evidence.join(","),
             needs_review_weak.join(","),

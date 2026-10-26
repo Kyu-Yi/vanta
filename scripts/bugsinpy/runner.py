@@ -1276,6 +1276,14 @@ def llm_block(summary: dict[str, str]) -> dict[str, Any]:
     hardest. Beside ``truncated_calls`` because the two are the model's and the
     service's answers to the same question — "why was this call repeated?" —
     and a run that mixed them should not have to be inferred from a log.
+
+    ``service_tier`` is §14.31's arm: the tier the run was served on, which is
+    also the half of the price-table row name that ``cost_basis`` carries
+    (``gpt-6-luna/flex/2026-10-26``). Copied from the run-level summary rather
+    than parsed back out of ``cost_basis`` because the two are different claims
+    — the basis is the row that priced the run, the tier is what the run asked
+    for — and a batch grouped by arm should not have to split a formatted
+    string to find it.
     """
     by_site: dict[str, dict[str, Any]] = {}
     for key, value in summary.items():
@@ -1296,6 +1304,12 @@ def llm_block(summary: dict[str, str]) -> dict[str, Any]:
         "reasoning_tokens": _int(summary.get("llm_reasoning_tokens")),
         "cost_usd": _cost(summary.get("cost_usd")),
         "cost_basis": summary.get("cost_basis"),
+        # §14.31 — the tier the run was served on, beside the cost it selected.
+        # Copied from the run-level summary (`standard`/`flex` on the hosted
+        # backend, `unset` locally), not derived from `cost_basis`: the basis is
+        # a formatted row NAME and this is the arm the run asked for, and a
+        # reader grouping a batch by arm should not have to parse a string.
+        "service_tier": summary.get("service_tier"),
         "truncated_calls": _int(summary.get("truncated_calls")),
         "truncated_twice": _int(summary.get("truncated_twice_calls")),
         # §14.30 — the service's refusals, split by class, copied verbatim from

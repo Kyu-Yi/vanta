@@ -770,10 +770,16 @@ pub async fn run(
         test_id: None,
         phase: "session.start".to_string(),
         summary: format!(
-            "model={} model_version={} prompt_version={} prompt_hash={} provider={} api_key={} \
+            "model={} llm_backend={} model_version={} prompt_version={} prompt_hash={} provider={} api_key={} \
              vanta_version={} vanta_commit={} vanta_dirty={} tested_commit={} target_repo_dirty={} requested_backend={} actual_backend={} max_attempts={} \
              baseline_test_timeout_secs={} patched_test_timeout_secs={} deps_checkpoint={} deps_freeze={} test_cmd={} mode={} benchmark_instance={}",
             cfg.model_id,
+            // [VANTA-WHY] The backend is part of the run's identity, not a
+            // detail of its transport: a hosted row and a local row that shared
+            // a model string would otherwise be indistinguishable in the log,
+            // even though they reject different sampling fields, bill different
+            // amounts, and never probe the same endpoints.
+            cfg.backend.as_str(),
             std::env::var("VANTA_MODEL_VERSION").unwrap_or_else(|_| "unknown".into()),
             prompt_versions,
             crate::pipeline::prompt_hashes(),

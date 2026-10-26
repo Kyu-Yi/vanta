@@ -6397,6 +6397,68 @@ default.
 
 ---
 
+### 14.24 Hosted OpenAI backend, item 1 — backend selection and the /props skip
+
+Vanta has only ever talked to one service: a local `llama-server`, reached over the OpenAI-compatible
+`POST {base_url}/chat/completions`. That service has two properties the pipeline has silently depended on
+— it publishes its own `/props`, and it accepts the full sampling surface — and both are false of the
+hosted platform this section starts to support. The same pipeline must be able to run on the hosted
+models without the local path moving a single byte, so the choice of backend becomes an explicit,
+recorded fact rather than an assumption spread across the code.
+
+**`VANTA_LLM_BACKEND=llamacpp|openai`, default `llamacpp`.** Parsed first in `LlmConfig::from_env`,
+before anything that depends on it. The value is matched exactly: `llamacpp` or `openai`. An unknown
+value — `llama.cpp`, `OpenAI`, `llamacp`, the empty string — is a `CONFIG_ERROR` that quotes the
+offending value, never a fallback to the local backend. A silent fallback would be the worst possible
+failure for this feature: a run that asked for the hosted model and got the local one would write a
+manifest row whose model, cost and sampling columns all describe a different experiment.
+
+**`base_url`'s default is a function of the backend.** `LlmBackend::default_base_url()` returns
+`http://127.0.0.1:8080/v1` for `llamacpp` — the exact literal `Default::default()` used before this
+section — and `https://api.openai.com/v1` for `openai`. `from_env` sets `cfg.base_url` from the backend
+and then lets `VANTA_LLM_BASE_URL` override it, on either backend and with the same trailing-slash trim as
+before, so the variable still wins for a proxy, a region, or this project's own mock test server. Keeping
+the default next to the enum is what stops the pair from drifting; `Default for LlmConfig` now reads it
+from there too.
+
+**The backend is a field, not a guess about the URL.** `LlmConfig.backend` exists because the URL alone
+cannot answer "does this endpoint publish `/props`?", "does it reject `temperature`?" or "does a token
+cost money?" — and a proxy in front of `api.openai.com` would answer all three differently from a
+substring match on the host. `LlmConfig::is_openai()` is the single predicate every backend-dependent
+branch asks, so the question is asked one way in one place.
+
+**`/props` is skipped on `openai`, not attempted and failed.** Two call sites probe the server:
+
+- `llm::context_window_tokens` — on `openai` the probe is not made. `VANTA_LLM_CONTEXT_TOKENS` is taken
+  as-is, with no disagreement check (there is no server value to disagree with), and an unset value keeps
+  the existing `65536` backstop **with a louder warning**, because that number is far below a hosted
+  model's real window and a silently-too-small guard refuses prompts that would fit. The `OnceCell`
+  caching and the local three-way order (`VANTA_LLM_CONTEXT_TOKENS` → `/props` `n_ctx` → `65536`) are
+  untouched for `llamacpp`.
+- `llm::server_top_p_default` — returns `None` immediately. The manifest's `server_top_p_note` becomes the
+  honest "the backend has no /props" rather than the outcome of a 404 fetched on purpose.
+
+**`session.start` gains `llm_backend=`.** The token sits directly after `model=`, in the run-level record
+written before attempt 1. The backend is part of a run's identity: a hosted row and a local row that
+shared a model string would otherwise be indistinguishable in the log, even though they reject different
+sampling fields, bill different amounts and probe different endpoints. `LlmConfig`'s `Display` gains a
+matching `backend :` line, and its `context_window` line stops promising a `/props` fallback the hosted
+backend never makes.
+
+**Nothing here changes when `VANTA_LLM_BACKEND` is unset.** The default is `llamacpp`; the default
+`base_url`, the `/props` probe, the disagreement warning, the key handling and every request body are
+exactly as they were. `LlmConfig::default()` and `from_env()` with no new variables still produce the
+pre-§14.24 config field for field, which is the property the existing pinning tests already enforce.
+
+Tests: `src/config/mod.rs::tests::test_backend_enum_is_strict_and_round_trips` (exact accepted spellings;
+`llama.cpp`/`OpenAI`/`""` rejected; both default endpoints), `test_default_backend_is_llamacpp` (the
+default profile is unmoved), and `test_backend_selection_from_env` — **one** test, not six, because env
+vars are process-global and `cargo test` runs threads in parallel; it walks unset → `llamacpp` → `openai`
+→ explicit `VANTA_LLM_BASE_URL` override → trailing-slash trim → unknown value, asserting at each step
+and leaning on `assert_eq!` on the whole `base_url` so "unchanged" is compared, not eyeballed.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

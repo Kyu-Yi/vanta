@@ -40,6 +40,70 @@ use std::env;
 use std::fmt;
 
 // ----------------------------------------------------------------------------
+// LlmBackend — WHICH OpenAI-compatible service the pipeline talks to
+// ----------------------------------------------------------------------------
+//
+// [VANTA-WHY] The two backends speak the same wire protocol (POST
+// {base_url}/chat/completions) but are NOT interchangeable as experiments:
+//
+//   * llamacpp — a local llama-server. It publishes its own /props, it accepts
+//     the full sampling surface (temperature, top_p, top_k, min_p,
+//     presence_penalty, seed), and it never bills anything.
+//   * openai   — a hosted service. It has no /props, it rejects several
+//     sampling fields outright, and every token costs money that this run
+//     must be able to account for (see the price table and the spend cap).
+//
+// [VANTA-WHY] The DEFAULT is Llamacpp and the default is a hard promise: an
+// existing run that sets no new variable must send byte-identical request
+// bodies, probe /props exactly as before, and print the same banner. The
+// backend only changes when VANTA_LLM_BACKEND names another one, so "nothing
+// changes unless set" is an assertion the tests can enforce rather than a
+// hope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmBackend {
+    /// Local llama-server (Metal GPU, GGUF). The historical default.
+    Llamacpp,
+    /// Hosted OpenAI platform (or a compatible proxy that speaks its dialect).
+    OpenAi,
+}
+
+impl LlmBackend {
+    /// The exact strings VANTA_LLM_BACKEND accepts.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LlmBackend::Llamacpp => "llamacpp",
+            LlmBackend::OpenAi => "openai",
+        }
+    }
+
+    /// Parse a VANTA_LLM_BACKEND value. Strict on purpose: a typo like
+    /// "llamacp" must be an error, never a silent fallback to the local
+    /// backend — a hosted run that quietly became a local one would produce a
+    /// row whose model column lies.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "llamacpp" => Some(LlmBackend::Llamacpp),
+            "openai" => Some(LlmBackend::OpenAi),
+            _ => None,
+        }
+    }
+
+    /// The endpoint used when VANTA_LLM_BASE_URL says nothing.
+    ///
+    /// [VANTA-WHY] Kept here, next to the enum, so a backend and its default
+    /// endpoint cannot drift apart. For Llamacpp this is the exact value
+    /// `Default::default()` used before this enum existed (IPv4 literal, not
+    /// "localhost" — see the Default impl comment), which is what keeps an
+    /// unset backend byte-identical.
+    pub fn default_base_url(&self) -> &'static str {
+        match self {
+            LlmBackend::Llamacpp => "http://127.0.0.1:8080/v1",
+            LlmBackend::OpenAi => "https://api.openai.com/v1",
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
 // LlmConfig — every parameter for calling ANY LLM backend (local or remote)
 // ----------------------------------------------------------------------------
 //
@@ -61,6 +125,16 @@ use std::fmt;
 // ----------------------------------------------------------------------------
 #[derive(Debug, Clone, PartialEq)]
 pub struct LlmConfig {
+    // [SYNTAX] backend: LlmBackend = which service base_url points at.
+    //
+    // [VANTA-WHY] This is a FIELD, not a derived property of base_url, because
+    // the URL alone cannot answer "does this endpoint publish /props?", "does
+    // it reject temperature?" or "does a token cost money?". Deciding those by
+    // string-matching the host would make a proxy to api.openai.com behave like
+    // a local server. The backend names the CONTRACT; the URL is just where
+    // that contract lives today.
+    pub backend: LlmBackend,
+
     // [SYNTAX] base_url: String = HTTP scheme + host + port + API prefix.
     // [EXAMPLE] Default for local llama-server is "http://localhost:8080/v1".
     // [EXAMPLE] For OpenAI it's "https://api.openai.com/v1".
@@ -183,13 +257,18 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         LlmConfig {
+            // The local server is the default backend: every run that predates
+            // VANTA_LLM_BACKEND keeps its exact behaviour.
+            backend: LlmBackend::Llamacpp,
+
             // llama-server prints "listening on http://127.0.0.1:8080" (IPv4 literal,
             // NOT "localhost"). Using the IPv4 literal avoids:
             //   (a) reqwest's DNS resolver preferring IPv6 ::1 (which llama-server
             //       does NOT bind to by default, causing Connection refused)
             //   (b) /etc/hosts localhost aliases
             // The /v1 prefix is mandatory for OpenAI-compatible endpoints.
-            base_url: "http://127.0.0.1:8080/v1".to_string(),
+            // Taken from the backend so the pair cannot drift.
+            base_url: LlmBackend::Llamacpp.default_base_url().to_string(),
 
             // llama-server will use whatever model you passed with --model;
             // the model_id field in requests is validated but not strictly
@@ -249,6 +328,7 @@ impl fmt::Display for LlmConfig {
         };
         write!(f,
             "LlmConfig:\n  \
+            backend        : {}\n  \
             endpoint       : {}\n  \
             model          : {}\n  \
             api_key        : {}\n  \
@@ -257,10 +337,14 @@ impl fmt::Display for LlmConfig {
             retry_attempts : {}\n  \
             context_window : {}\n  \
             seed           : {}",
-            self.base_url, self.model_id, key_display,
+            self.backend.as_str(), self.base_url, self.model_id, key_display,
             self.idle_timeout_secs, self.max_call_secs, self.retry_attempts,
             match self.context_window_tokens {
                 Some(v) => format!("{v} (VANTA_LLM_CONTEXT_TOKENS)"),
+                // The openai backend has no /props to ask, so promising that
+                // fallback there would describe a request that is never made.
+                None if self.is_openai() =>
+                    "unset (openai: no /props — set VANTA_LLM_CONTEXT_TOKENS)".to_string(),
                 None => "auto (server /props, fallback 65536)".to_string(),
             },
             // [VANTA-WHY] Printed because a run's sampling is part of its
@@ -289,7 +373,8 @@ impl LlmConfig {
     //
     //   Variable name              | Purpose                           | Default
     //   ---------------------------+-----------------------------------+----------
-    //   VANTA_LLM_BASE_URL         | HTTP endpoint /v1 prefix           | localhost:8080/v1
+    //   VANTA_LLM_BACKEND          | llamacpp | openai                 | llamacpp
+    //   VANTA_LLM_BASE_URL         | HTTP endpoint /v1 prefix           | backend default
     //   VANTA_LLM_MODEL            | Model identifier string           | Qwen3.5-4B
     //   VANTA_API_KEY              | Bearer token / API key (optional) | None
     //   VANTA_LLM_IDLE_TIMEOUT_SECS| Seconds with NO new token          | 180
@@ -298,6 +383,11 @@ impl LlmConfig {
     //   VANTA_LLM_RETRY_ATTEMPTS   | structured_call retry budget       | 3
     //   VANTA_LLM_SEED             | Sampler seed (else server default) | unset
     //
+    // VANTA_LLM_BASE_URL's default depends on the backend: the llamacpp
+    // default is the historical localhost:8080/v1 (unchanged), and the openai
+    // default is https://api.openai.com/v1. Setting the variable explicitly
+    // still wins on either backend.
+    //
     // All of them are optional to set (defaults used). If any of them contain
     // non-UTF-8 bytes (shouldn't happen in normal shell use), we return Err
     // rather than silently continuing with malformed config.
@@ -305,6 +395,37 @@ impl LlmConfig {
     pub fn from_env() -> Result<Self, String> {
         // Start with defaults, then override field by field if env was set.
         let mut cfg = LlmConfig::default();
+
+        // ---- backend selection ---------------------------------------------
+        // FIRST, because the default base_url is a function of the backend
+        // (see below). Unknown values are an error, never a fallback: a run
+        // that asked for the hosted backend and silently got the local one
+        // would record a model and a cost that describe nothing.
+        match env::var("VANTA_LLM_BACKEND") {
+            Ok(val) if !val.trim().is_empty() => {
+                let raw = val.trim();
+                match LlmBackend::parse(raw) {
+                    Some(b) => cfg.backend = b,
+                    None => {
+                        return Err(format!(
+                            "CONFIG_ERROR: VANTA_LLM_BACKEND='{raw}' is not a known \
+                             backend. Expected 'llamacpp' or 'openai'."
+                        ));
+                    }
+                }
+            }
+            Ok(_) => { /* set but empty → keep the default backend */ }
+            Err(env::VarError::NotPresent) => { /* keep the default backend */ }
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err("CONFIG_ERROR: VANTA_LLM_BACKEND env var contained \
+                            non-UTF-8 bytes.".to_string());
+            }
+        }
+
+        // The backend's own default endpoint, in force until VANTA_LLM_BASE_URL
+        // overrides it below. For the default backend this is the same literal
+        // `Default::default()` always used, so an unset backend changes nothing.
+        cfg.base_url = cfg.backend.default_base_url().to_string();
 
         // ---- base_url override ---------------------------------------------
         // [SYNTAX] match env::var("NAME") { Ok(v) => ..., Err(e) => ... }
@@ -470,6 +591,18 @@ impl LlmConfig {
     }
 
     // ------------------------------------------------------------------------
+    // is_openai() — is the hosted backend selected?
+    // ------------------------------------------------------------------------
+    //
+    // [VANTA-WHY] One predicate, used everywhere the two backends differ, so
+    // the question "which backend is this?" is asked in exactly one way. A
+    // call site that instead tested `base_url.contains("openai.com")` would
+    // answer "no" for a proxy and be wrong about a contract it never checked.
+    pub fn is_openai(&self) -> bool {
+        self.backend == LlmBackend::OpenAi
+    }
+
+    // ------------------------------------------------------------------------
     // chat_completions_url() — helper: full POST URL for OpenAI-compatible endpoint
     // ------------------------------------------------------------------------
     //
@@ -579,6 +712,86 @@ mod tests {
         assert_eq!(cfg.context_window_tokens, Some(131_072));
         unsafe {
             env::remove_var("VANTA_LLM_CONTEXT_TOKENS");
+        }
+    }
+
+    #[test]
+    fn test_backend_enum_is_strict_and_round_trips() {
+        assert_eq!(LlmBackend::parse("llamacpp"), Some(LlmBackend::Llamacpp));
+        assert_eq!(LlmBackend::parse("openai"), Some(LlmBackend::OpenAi));
+        // Typos and case variants must NOT silently fall back to the local
+        // backend: a hosted run that became a local one records a lie.
+        assert_eq!(LlmBackend::parse("llama.cpp"), None);
+        assert_eq!(LlmBackend::parse("OpenAI"), None);
+        assert_eq!(LlmBackend::parse(""), None);
+        assert_eq!(LlmBackend::Llamacpp.as_str(), "llamacpp");
+        assert_eq!(LlmBackend::OpenAi.as_str(), "openai");
+        // Each backend carries its own default endpoint, so the pair cannot
+        // drift; the llamacpp one is the historical literal, unchanged.
+        assert_eq!(LlmBackend::Llamacpp.default_base_url(), "http://127.0.0.1:8080/v1");
+        assert_eq!(LlmBackend::OpenAi.default_base_url(), "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn test_default_backend_is_llamacpp() {
+        let d = LlmConfig::default();
+        assert_eq!(d.backend, LlmBackend::Llamacpp);
+        assert!(!d.is_openai());
+        assert_eq!(d.base_url, "http://127.0.0.1:8080/v1");
+    }
+
+    /// [VANTA-WHY] ONE test, not six, because environment variables are
+    /// process-global and `cargo test` runs these in parallel threads: six
+    /// separate tests that each set VANTA_LLM_BACKEND would race, and the
+    /// failure would depend on thread scheduling rather than on the code.
+    #[test]
+    fn test_backend_selection_from_env() {
+        unsafe {
+            env::remove_var("VANTA_LLM_BACKEND");
+            env::remove_var("VANTA_LLM_BASE_URL");
+        }
+
+        // (1) unset backend → the historical local endpoint, byte for byte.
+        let cfg = LlmConfig::from_env().unwrap();
+        assert_eq!(cfg.backend, LlmBackend::Llamacpp);
+        assert!(!cfg.is_openai());
+        assert_eq!(cfg.base_url, "http://127.0.0.1:8080/v1");
+
+        // (2) explicit "llamacpp" is indistinguishable from unset.
+        unsafe { env::set_var("VANTA_LLM_BACKEND", "llamacpp"); }
+        let cfg = LlmConfig::from_env().unwrap();
+        assert_eq!(cfg.backend, LlmBackend::Llamacpp);
+        assert_eq!(cfg.base_url, "http://127.0.0.1:8080/v1");
+
+        // (3) "openai" switches the DEFAULT endpoint to the hosted service.
+        unsafe { env::set_var("VANTA_LLM_BACKEND", "openai"); }
+        let cfg = LlmConfig::from_env().unwrap();
+        assert!(cfg.is_openai());
+        assert_eq!(cfg.base_url, "https://api.openai.com/v1");
+
+        // (4) an explicit VANTA_LLM_BASE_URL still wins on the hosted backend
+        // — a proxy, a region, or this project's own mock test server.
+        unsafe { env::set_var("VANTA_LLM_BASE_URL", "http://127.0.0.1:9999/v1"); }
+        let cfg = LlmConfig::from_env().unwrap();
+        assert!(cfg.is_openai());
+        assert_eq!(cfg.base_url, "http://127.0.0.1:9999/v1");
+
+        // (5) the trailing-slash trim still applies to the hosted endpoint.
+        unsafe { env::set_var("VANTA_LLM_BASE_URL", "https://api.openai.com/v1/"); }
+        let cfg = LlmConfig::from_env().unwrap();
+        assert_eq!(cfg.base_url, "https://api.openai.com/v1");
+        unsafe { env::remove_var("VANTA_LLM_BASE_URL"); }
+
+        // (6) an unknown value is an error that quotes it, rather than a
+        // silent fallback to the local backend.
+        unsafe { env::set_var("VANTA_LLM_BACKEND", "llamacp"); }
+        let err = LlmConfig::from_env().unwrap_err();
+        assert!(err.contains("llamacp"), "error must quote the bad value: {err}");
+        assert!(err.contains("VANTA_LLM_BACKEND"), "error must name the variable: {err}");
+
+        unsafe {
+            env::remove_var("VANTA_LLM_BACKEND");
+            env::remove_var("VANTA_LLM_BASE_URL");
         }
     }
 }

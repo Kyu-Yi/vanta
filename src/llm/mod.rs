@@ -1067,6 +1067,15 @@ pub fn with_sampling(mut extras: Value, site: &str) -> Value {
 /// the two facts separable in the record and neither a claim about a call it does
 /// not describe.
 pub async fn server_top_p_default(client: &reqwest::Client, cfg: &LlmConfig) -> Option<f64> {
+    // [VANTA-WHY] The hosted backend publishes no /props at all, so there is
+    // no "server default" to report. Returning None (leaving the manifest field
+    // null with its note) is the honest answer; fetching
+    // https://api.openai.com/props to get a 404 and then calling that None
+    // would be the same value for the price of a network call and a lie about
+    // where it came from.
+    if cfg.is_openai() {
+        return None;
+    }
     let body = fetch_props(client, cfg).await?;
     body["default_generation_settings"]["top_p"].as_f64()
 }
@@ -1076,9 +1085,35 @@ pub async fn server_top_p_default(client: &reqwest::Client, cfg: &LlmConfig) -> 
 /// Order: `VANTA_LLM_CONTEXT_TOKENS` if set (it wins, but a disagreement with
 /// the server is logged, because a stale override silently starves the guard),
 /// else the server's `/props` `n_ctx`, else 65536 with a warning.
+///
+/// [VANTA-WHY] On the openai backend the /props step does not exist, so the
+/// order collapses to "the configured value, else 65536 with a warning" — the
+/// probe is skipped rather than attempted. See the note in the body.
 pub async fn context_window_tokens(client: &reqwest::Client, cfg: &LlmConfig) -> u32 {
     *CONTEXT_WINDOW
         .get_or_init(|| async {
+            // [VANTA-WHY] The hosted backend has no /props, so the probe is
+            // SKIPPED rather than allowed to fail: asking
+            // https://api.openai.com/props would be a wasted round trip whose
+            // only outcome is the 404 the fallback already assumes. With
+            // nothing to reconcile, VANTA_LLM_CONTEXT_TOKENS is simply taken
+            // (item 1's rule), and an unset value keeps the same 65536 backstop
+            // the local path uses — loudly, because that number is far below a
+            // hosted model's real window and a silently-too-small guard would
+            // refuse prompts that fit.
+            if cfg.is_openai() {
+                return match cfg.context_window_tokens {
+                    Some(configured) => configured,
+                    None => {
+                        warn!(
+                            "VANTA_LLM_CONTEXT_TOKENS unset on the openai backend (no /props \
+                             to ask); falling back to 65536 — set VANTA_LLM_CONTEXT_TOKENS to \
+                             the hosted model's real window"
+                        );
+                        65_536
+                    }
+                };
+            }
             let probed = probe_server_context_window(client, cfg).await;
             match (cfg.context_window_tokens, probed) {
                 (Some(configured), Some(n_ctx)) => {

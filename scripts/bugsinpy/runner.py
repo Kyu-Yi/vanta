@@ -1264,6 +1264,18 @@ def llm_block(summary: dict[str, str]) -> dict[str, Any]:
     the rows that produced the figure (``gpt-6-luna/standard/2026-10-26``), so
     two rows priced from different dates are visible as such instead of being
     pooled silently.
+
+    ``provider_retries`` / ``provider_retries_rate_limit`` /
+    ``provider_retries_unavailable`` are §14.30's count of the times the
+    PROVIDER refused a request and it was re-sent, split into the two classes it
+    distinguishes (a rate-limit window rolling over, and ``flex`` capacity being
+    unavailable). They are copied from the run-level counters, not summed over
+    the ``call.usage`` rows, and that is deliberate: a call the provider kept
+    refusing past its retry budget never answered and therefore writes no row,
+    so a sum over the rows would under-report the runs that were throttled
+    hardest. Beside ``truncated_calls`` because the two are the model's and the
+    service's answers to the same question — "why was this call repeated?" —
+    and a run that mixed them should not have to be inferred from a log.
     """
     by_site: dict[str, dict[str, Any]] = {}
     for key, value in summary.items():
@@ -1286,6 +1298,12 @@ def llm_block(summary: dict[str, str]) -> dict[str, Any]:
         "cost_basis": summary.get("cost_basis"),
         "truncated_calls": _int(summary.get("truncated_calls")),
         "truncated_twice": _int(summary.get("truncated_twice_calls")),
+        # §14.30 — the service's refusals, split by class, copied verbatim from
+        # the run-level counters (see the docstring: a never-answered call writes
+        # no row, so these cannot be summed from `by_site`).
+        "provider_retries": _int(summary.get("provider_retries")),
+        "provider_retries_rate_limit": _int(summary.get("provider_retries_rate_limit")),
+        "provider_retries_unavailable": _int(summary.get("provider_retries_unavailable")),
         # §14.5's three reportable roles, spelled out rather than derived from
         # the site map: the mapping site→role is the pipeline's
         # (`llm::truncation_role`), and a second copy of it here could drift.

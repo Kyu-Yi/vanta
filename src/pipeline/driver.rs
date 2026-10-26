@@ -2925,7 +2925,8 @@ pub async fn run(
             summary: format!(
                 "seq={} site={} round={} attempt={} prompt_tokens={} completion_tokens={} \
                  total_tokens={} source={} seed={} seed_mechanism={} finish_reason={} wall_ms={} \
-                 truncated={} {} cached_tokens={} reasoning_tokens={} cost_usd={} cost_basis={}",
+                 truncated={} {} cached_tokens={} reasoning_tokens={} cost_usd={} cost_basis={} \
+                 provider_retries={}",
                 usage.seq,
                 usage.site,
                 // [VANTA-WHY] §14.12 — the round and the retry index travel with
@@ -2968,6 +2969,14 @@ pub async fn run(
                 token_value(usage.reasoning_tokens),
                 cost_value(usage.cost_usd),
                 usage.cost_basis,
+                // [VANTA-WHY] §14.30 — how many times the provider was asked
+                // again before it served THIS call, beside `attempt` and not
+                // inside it. A row with `attempt=1 provider_retries=2` is a call
+                // the service throttled twice and the model answered once; a row
+                // with `attempt=2 provider_retries=0` is the opposite. Appended
+                // after the pre-existing keys so an older row's reader is
+                // unaffected.
+                usage.provider_retries,
             ),
             timestamp: now_iso(),
             benchmark_instance: None,
@@ -3001,6 +3010,16 @@ pub async fn run(
     // than summed from the three roles, so an off-schedule site cannot make the
     // total disagree with the calls it summarises.
     let truncated_total = call_usages.iter().filter(|c| c.truncated).count() as u64;
+    // [VANTA-WHY] §14.30 — how often the PROVIDER, not the model, was asked again.
+    // Read from the run-level counters rather than summed over the rows, and that
+    // is the point: a call the provider kept refusing past `PROVIDER_RETRY_MAX`
+    // never answered, so it writes no `call.usage` row at all. Counting only the
+    // rows would under-report exactly the runs that were throttled hardest, which
+    // is the opposite of what a throttling count is for. The two classes are kept
+    // apart because they mean different things operationally (`rate_limit` is a
+    // window rolling over; `resource_unavailable` is `flex` capacity).
+    let (provider_retries, provider_retries_rate_limit, provider_retries_unavailable) =
+        crate::llm::provider_retry_counts();
     let per_site_keys = per_site_totals(&call_usages)
         .iter()
         .map(|(site, calls, truncated, completion)| {
@@ -3105,7 +3124,9 @@ pub async fn run(
              llm_cached_tokens={} llm_reasoning_tokens={} cost_usd={} cost_basis={} \
              truncated_calls_creator={} truncated_calls_attacker={} \
              truncated_calls_intent_audit={} \
-             truncated_calls={} truncated_twice_calls={} completion_tokens_total={} {} \
+             truncated_calls={} truncated_twice_calls={} \
+             provider_retries={} provider_retries_rate_limit={} provider_retries_unavailable={} \
+             completion_tokens_total={} {} \
              corroborate={} grounded_audit={} batch_audit={} attacker_concise={} \
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              revise_budget_per_attempt={} revise_calls_used={} \
@@ -3157,6 +3178,14 @@ pub async fn run(
             // run-away; two in a row is a call this site cannot answer inside its
             // cap, and the fix to look for is a smaller question, not a retry.
             crate::llm::truncated_twice_calls(),
+            // [VANTA-WHY] §14.30 — the provider-retry totals, deliberately beside
+            // the model's truncation counts: "the model could not finish" and "the
+            // service would not take the request" are the two reasons a call is
+            // repeated, and a run that mixed them should say so rather than leave
+            // a reader to guess which one a repeated call was.
+            provider_retries,
+            provider_retries_rate_limit,
+            provider_retries_unavailable,
             token_value(llm_completion_tokens),
             per_site_keys,
             // [VANTA-WHY] §14.2/§14.4/§14.5 — the switches this run actually ran

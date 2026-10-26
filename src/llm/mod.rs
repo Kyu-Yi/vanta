@@ -169,6 +169,16 @@ pub struct CallUsage {
     /// to see, and it cannot be inferred from `seq` alone because other sites
     /// interleave.
     pub attempt: u32,
+    /// How many times THIS call was re-sent because the PROVIDER refused it while
+    /// busy, rather than because the model answered badly (§14.30).
+    ///
+    /// [VANTA-WHY] A separate field from `attempt`, and that is the point: a 429
+    /// is the service saying "not now" about a request the model never saw, so
+    /// counting it into `attempt` would make a throttled call look like a model
+    /// that needed two tries — the one reading this row exists to make
+    /// impossible. The retries happen inside ONE attempt, against their own
+    /// budget, and this says how many.
+    pub provider_retries: u32,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
@@ -278,6 +288,26 @@ static USAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// and it is drained by the driver at the end of a run like the usage ledger.
 static TRUNCATED_TWICE: AtomicU64 = AtomicU64::new(0);
 
+/// How many times a call was re-sent because the PROVIDER was busy — a rate limit,
+/// or a `flex` tier with no capacity — rather than because the model's answer was
+/// wrong (§14.30, item 6).
+///
+/// [VANTA-WHY] Kept beside `TRUNCATED_TWICE` and for the same reason: the per-call
+/// rows can carry this for calls that ANSWERED (`provider_retries` on
+/// `CallUsage`), but a call whose provider never let it through writes no row at
+/// all, and its retries still happened. A run-level counter is the only place
+/// that number can live.
+static PROVIDER_RETRIES: AtomicU64 = AtomicU64::new(0);
+/// The same count, split by WHY the provider refused (§14.30).
+///
+/// [VANTA-WHY] The two are NOT the same operational fact: a rate limit means slow
+/// down, and `Resource Unavailable` on the flex tier means the cheap capacity
+/// this run asked for is gone. They are priced differently (`pricing::ServiceTier`)
+/// and the fix differs, so a report that folded them into one number could not
+/// tell which happened.
+static PROVIDER_RETRIES_RATE_LIMIT: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_RETRIES_UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
+
 fn call_usages() -> MutexGuard<'static, Vec<CallUsage>> {
     // A panic in another thread must not make token accounting fatal: the lock is
     // pushed to and drained, never held across an await, so the data behind a
@@ -303,6 +333,33 @@ pub fn reset_call_usages() {
     call_usages().clear();
     USAGE_SEQ.store(0, Ordering::Relaxed);
     TRUNCATED_TWICE.store(0, Ordering::Relaxed);
+    PROVIDER_RETRIES.store(0, Ordering::Relaxed);
+    PROVIDER_RETRIES_RATE_LIMIT.store(0, Ordering::Relaxed);
+    PROVIDER_RETRIES_UNAVAILABLE.store(0, Ordering::Relaxed);
+}
+
+/// How many times this run's calls were re-sent because the provider was busy,
+/// as `(total, rate_limit, resource_unavailable)` (§14.30).
+///
+/// [VANTA-WHY] `total` is counted here rather than summed from the per-call rows,
+/// and the two are deliberately not interchangeable: a call that never got an
+/// answer writes no row, so the rows would under-report exactly the runs that were
+/// throttled hardest. Read by the driver when it writes `run.summary`.
+pub fn provider_retry_counts() -> (u64, u64, u64) {
+    (
+        PROVIDER_RETRIES.load(Ordering::Relaxed),
+        PROVIDER_RETRIES_RATE_LIMIT.load(Ordering::Relaxed),
+        PROVIDER_RETRIES_UNAVAILABLE.load(Ordering::Relaxed),
+    )
+}
+
+fn note_provider_retry(class: ProviderRetryClass) {
+    PROVIDER_RETRIES.fetch_add(1, Ordering::Relaxed);
+    match class {
+        ProviderRetryClass::RateLimit => &PROVIDER_RETRIES_RATE_LIMIT,
+        ProviderRetryClass::ResourceUnavailable => &PROVIDER_RETRIES_UNAVAILABLE,
+    }
+    .fetch_add(1, Ordering::Relaxed);
 }
 
 /// How many calls in this run were cut off at `max_tokens` twice, including the
@@ -1808,46 +1865,16 @@ async fn post_chat_meta(
     }
 
     let t = Instant::now();
-    // The idle timeout covers the WAIT FOR HEADERS too: a server that accepts
-    // the connection and then says nothing is as dead as one that stops
-    // mid-stream. Dropping this future closes the socket.
-    let send_future = client.post(&url).json(&full_body).send();
-    let resp = match tokio::time::timeout(
-        Duration::from_secs(cfg.idle_timeout_secs),
-        send_future,
-    )
-    .await
-    {
-        Err(_elapsed) => {
-            return Err(format!(
-                "HTTP POST to {url} timed out: no response headers for {}s (VANTA_LLM_IDLE_TIMEOUT_SECS); connection dropped",
-                cfg.idle_timeout_secs
-            )
-            .into());
-        }
-        Ok(Err(e)) => return Err(format!("HTTP POST to {url} FAILED: {e}").into()),
-        Ok(Ok(resp)) => resp,
-    };
+    // [VANTA-WHY] §14.30 — the send is its own retry loop now: a provider that
+    // answers 429 is re-asked the SAME request against a budget that is not the
+    // model's, so a busy minute cannot spend an attempt that exists to let the
+    // model answer differently. `provider_retries` is what this call spent on
+    // that ladder, and it travels into the row below rather than only into the
+    // run's total, because "which call was throttled" is a fact about the call.
+    let (resp, provider_retries) =
+        send_with_provider_retries(client, cfg, &url, &full_body).await?;
 
     let status = resp.status();
-    if !status.is_success() {
-        let code = status.as_u16();
-        let txt = resp.text().await.unwrap_or_else(|_| String::from("<could not read body>"));
-        // [VANTA-WHY] The error body is the provider's text, and a provider is
-        // free to quote the credential it just rejected back at us
-        // ("Incorrect API key provided: sk-…"). Only the body is shown: the
-        // request headers are never formatted into this message, and the
-        // Authorization header is built with `set_sensitive(true)` besides, so
-        // reqwest will not log it either. `redact_secret` closes the remaining
-        // hole — a key echoed *inside* the body.
-        //
-        // `chars().take(300)` rather than `&txt[..300]`: the byte slice panics
-        // when byte 300 lands inside a multi-byte character, which turns "the
-        // provider returned an error" into "Vanta crashed".
-        let redacted = redact_secret(&txt);
-        let snippet: String = redacted.chars().take(300).collect();
-        return Err(format!("HTTP ERROR {code} from {url}. Body snippet: {snippet}").into());
-    }
 
     let byte_stream = resp.bytes_stream();
     let chunks: Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>> + Send>> = Box::pin(
@@ -1967,6 +1994,11 @@ async fn post_chat_meta(
         // an agent signature that can change a verdict.
         round: FORENSICS_ROUND.load(Ordering::Relaxed),
         attempt,
+        // [VANTA-WHY] §14.30 — how many times the provider was asked again before
+        // it served THIS call. A fact about the call, recorded beside `attempt` so
+        // a row that took a 429 on the way in is readable as such and cannot be
+        // mistaken for a model that needed two tries.
+        provider_retries,
         prompt_tokens: Some(prompt_tokens_recorded),
         completion_tokens: measured_completion,
         total_tokens: measured_total,
@@ -2011,6 +2043,11 @@ async fn post_chat_meta(
         site,
         round = usage.round,
         attempt,
+        // [VANTA-WHY] §14.30 — logged beside `attempt` so the two retry budgets are
+        // told apart in the live log too: a call that reports `attempt=1` with
+        // `provider_retries=2` was asked twice more because the service was busy,
+        // never because the model answered badly.
+        provider_retries,
         prompt_tokens = prompt_tokens_recorded,
         completion_tokens = ?measured_completion,
         token_source = usage_source,
@@ -2255,6 +2292,193 @@ async fn back_off(attempt: u32) {
         "backing off before the next attempt"
     );
     tokio::time::sleep(delay).await;
+}
+
+/// Why a provider refused a call while busy (§14.30, item 6).
+///
+/// [VANTA-WHY] The two are distinguished because the run's report has to be able
+/// to say which happened — a rate limit is this run going too fast, an
+/// unavailable `flex` tier is the cheap capacity being gone — and because the
+/// second is the failure mode §14.30's tier switch (`VANTA_OPENAI_SERVICE_TIER`,
+/// item 7) makes reachable. Both arrive as HTTP 429; only the body says which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderRetryClass {
+    /// A plain rate limit: too many requests per unit time.
+    RateLimit,
+    /// `429 Resource Unavailable` — the service tier this request asked for has
+    /// no capacity right now. The documented failure of `service_tier: flex`.
+    ResourceUnavailable,
+}
+
+impl ProviderRetryClass {
+    /// The class as the record spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::ResourceUnavailable => "resource_unavailable",
+        }
+    }
+}
+
+/// How many times one attempt re-sends a request a busy provider refused (§14.30).
+///
+/// [VANTA-WHY] Its own budget, separate from `max_attempts`: those attempts exist
+/// to let the MODEL answer differently, and a 429 is not an answer. Charging a
+/// throttle to the model's budget would let a busy minute turn a call that was
+/// never refused by the model into "the model failed twice". Four, with the
+/// ladder below, is under a minute of waiting — long enough to ride out the
+/// documented `flex` capacity blip, short enough that a provider that is really
+/// down still fails the call rather than the run's deadline (§14.15).
+pub const PROVIDER_RETRY_MAX: u32 = 4;
+const PROVIDER_RETRY_BACKOFF_BASE_MS: u64 = 1_000;
+const PROVIDER_RETRY_BACKOFF_MAX_MS: u64 = 30_000;
+
+/// The backoff before provider retry `retry` (1-based): 1s, 2s, 4s, 8s, 16s…
+///
+/// [VANTA-WHY] A LADDER, not a fixed pause, and a longer base than `back_off`'s
+/// 500 ms: a rate limit is a window that has to ROLL OVER, so retrying at the
+/// model-retry cadence would spend the whole budget inside one window and come
+/// back to the same 429. The `flex` blip is the same shape at a coarser scale.
+async fn provider_back_off(retry: u32) {
+    let shift = retry.saturating_sub(1).min(5);
+    let delay = Duration::from_millis(
+        (PROVIDER_RETRY_BACKOFF_BASE_MS << shift).min(PROVIDER_RETRY_BACKOFF_MAX_MS),
+    );
+    debug!(
+        retry,
+        delay_ms = delay.as_millis() as u64,
+        "backing off before re-sending to a busy provider"
+    );
+    tokio::time::sleep(delay).await;
+}
+
+/// The HTTP status in a `post_chat_meta` transport error, when it has one.
+///
+/// `None` for the two errors that never reached a status line — the header
+/// timeout and the connection failure — which are transport faults, not the
+/// provider declining, and must keep their existing treatment.
+fn http_status_code(err: &str) -> Option<u16> {
+    err.strip_prefix("HTTP ERROR ")?.split_whitespace().next()?.parse().ok()
+}
+
+/// Whether a transport error is the PROVIDER asking to be asked again later
+/// (§14.30).
+///
+/// [VANTA-WHY] Narrower than "any 5xx" ON PURPOSE. llama-server answers a
+/// request that does not fit its KV cache with a 5xx, and a retry of that is a
+/// second full generation onto the same full cache — the "Context size has been
+/// exceeded" cascade `back_off` exists to avoid. A 429 is the one status that
+/// means "the request was fine, the service was busy", which is why only it is
+/// retried here. `insufficient_quota` is excluded because it arrives as a 429
+/// too and is NOT transient: the account is out of credit, and four retries
+/// would only add a minute to a failure that waits for a human.
+pub fn provider_retry_class(err: &str) -> Option<ProviderRetryClass> {
+    if http_status_code(err)? != 429 {
+        return None;
+    }
+    if err.to_ascii_lowercase().contains("insufficient_quota") {
+        return None;
+    }
+    if err.to_ascii_lowercase().contains("resource unavailable") {
+        Some(ProviderRetryClass::ResourceUnavailable)
+    } else {
+        Some(ProviderRetryClass::RateLimit)
+    }
+}
+
+/// Whether a transport error is the PROVIDER asking to be asked again later,
+/// and this attempt still has budget to do so (§14.30).
+///
+/// [VANTA-WHY] The CLASS and the BUDGET are one decision, in one function,
+/// because they are checked at the same instant and a test must be able to
+/// assert the bound without waiting out the ladder: `Some(class)` is "back off
+/// and re-send", `None` is "return this error as the failure". Keeping the
+/// comparison here rather than inline in the loop is what makes
+/// "the ladder stops at exactly `PROVIDER_RETRY_MAX`" a statement a unit test
+/// can check.
+fn provider_retry_decision(err: &str, retries_so_far: u32) -> Option<ProviderRetryClass> {
+    match provider_retry_class(err) {
+        Some(class) if retries_so_far < PROVIDER_RETRY_MAX => Some(class),
+        _ => None,
+    }
+}
+
+/// POST the body, re-sending it while the provider is busy (§14.30).
+///
+/// Returns the successful response beside how many times the request was re-sent
+/// for it. Every non-429 failure — including a 429 past `PROVIDER_RETRY_MAX` —
+/// comes back as the same error the single-shot version produced, so the caller's
+/// existing handling (and the failure text a reader has seen before) is unchanged.
+async fn send_with_provider_retries(
+    client: &reqwest::Client,
+    cfg: &LlmConfig,
+    url: &str,
+    full_body: &Value,
+) -> Result<(reqwest::Response, u32), Box<dyn std::error::Error + Send + Sync>> {
+    let mut retries = 0_u32;
+    loop {
+        // The idle timeout covers the WAIT FOR HEADERS too: a server that accepts
+        // the connection and then says nothing is as dead as one that stops
+        // mid-stream. Dropping this future closes the socket.
+        let send_future = client.post(url).json(full_body).send();
+        let resp = match tokio::time::timeout(
+            Duration::from_secs(cfg.idle_timeout_secs),
+            send_future,
+        )
+        .await
+        {
+            Err(_elapsed) => {
+                return Err(format!(
+                    "HTTP POST to {url} timed out: no response headers for {}s (VANTA_LLM_IDLE_TIMEOUT_SECS); connection dropped",
+                    cfg.idle_timeout_secs
+                )
+                .into());
+            }
+            Ok(Err(e)) => return Err(format!("HTTP POST to {url} FAILED: {e}").into()),
+            Ok(Ok(resp)) => resp,
+        };
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok((resp, retries));
+        }
+        let code = status.as_u16();
+        let txt = resp.text().await.unwrap_or_else(|_| String::from("<could not read body>"));
+        // [VANTA-WHY] The error body is the provider's text, and a provider is
+        // free to quote the credential it just rejected back at us
+        // ("Incorrect API key provided: sk-…"). Only the body is shown: the
+        // request headers are never formatted into this message, and the
+        // Authorization header is built with `set_sensitive(true)` besides, so
+        // reqwest will not log it either. `redact_secret` closes the remaining
+        // hole — a key echoed *inside* the body.
+        //
+        // `chars().take(300)` rather than `&txt[..300]`: the byte slice panics
+        // when byte 300 lands inside a multi-byte character, which turns "the
+        // provider returned an error" into "Vanta crashed". Taken BEFORE the
+        // classification below so the string the classifier reads is the one a
+        // reader would see.
+        let redacted = redact_secret(&txt);
+        let snippet: String = redacted.chars().take(300).collect();
+        let err = format!("HTTP ERROR {code} from {url}. Body snippet: {snippet}");
+
+        match provider_retry_decision(&err, retries) {
+            Some(class) => {
+                retries += 1;
+                note_provider_retry(class);
+                warn!(
+                    code,
+                    class = class.name(),
+                    retries,
+                    max = PROVIDER_RETRY_MAX,
+                    "the provider refused this call while busy — backing off and re-sending the \
+                     SAME request (this is NOT a model retry)"
+                );
+                provider_back_off(retries).await;
+                continue;
+            }
+            None => return Err(err.into()),
+        }
+    }
 }
 
 pub async fn structured_call_with_retry<Fm, Fp, T>(
@@ -3282,5 +3506,81 @@ mod _seed_round_tests {
         // (5) The offset is wrapping, matching `seed_for_attempt`, so the largest
         //     seed does not panic in debug around the round arithmetic.
         assert_eq!(seed_for_round(Some(u64::MAX), 2), Some(0));
+    }
+}
+
+// [VANTA-WHY] §14.30 — the provider-retry DECISION, tested without the ladder.
+// The mocked server in `m3_session_log.rs` proves the re-send happens; what it
+// cannot cheaply prove is the BOUND, because reaching it means waiting out four
+// backoffs (1+2+4+8s). Factoring the class-plus-budget check out of the send loop
+// is what lets these assertions be instant and exhaustive: every status a
+// provider can answer with, and every point on the budget.
+#[cfg(test)]
+mod _provider_retry_tests {
+    use super::{
+        PROVIDER_RETRY_MAX, ProviderRetryClass, provider_retry_class, provider_retry_decision,
+    };
+
+    fn err(status: u16, body: &str) -> String {
+        format!("HTTP ERROR {status} from http://example.invalid/v1/chat/completions. Body snippet: {body}")
+    }
+
+    #[test]
+    fn only_a_429_the_service_asks_us_to_repeat_is_retried() {
+        // (1) A 429 is the one status that means "the request was fine, the service
+        //     was busy" — and it is retried, in both of its documented flavours.
+        assert!(matches!(
+            provider_retry_class(&err(429, "Rate limit reached for gpt-6-luna")),
+            Some(ProviderRetryClass::RateLimit)
+        ));
+        assert!(matches!(
+            provider_retry_class(&err(429, "Resource Unavailable: no capacity")),
+            Some(ProviderRetryClass::ResourceUnavailable)
+        ));
+
+        // (2) `insufficient_quota` arrives as a 429 and is NOT transient: the
+        //     account is out of credit, so four retries would only add a minute to
+        //     a failure that is waiting for a human.
+        assert!(
+            provider_retry_class(&err(429, "You exceeded your current quota: insufficient_quota")).is_none(),
+            "an out-of-credit 429 must not be retried"
+        );
+
+        // (3) Everything else keeps its existing treatment. The 5xx case is the
+        //     one that matters: llama-server answers an over-long prompt with a
+        //     5xx, and retrying that is a second full generation onto a full
+        //     KV cache — the cascade `back_off` exists to avoid.
+        for status in [400, 401, 404, 422, 500, 502, 503] {
+            assert!(
+                provider_retry_class(&err(status, "some provider text")).is_none(),
+                "only a 429 may be retried; {status} must not be"
+            );
+        }
+        // The two transport faults never reached a status line at all.
+        assert!(provider_retry_class("HTTP POST to http://x timed out: no response headers").is_none());
+        assert!(provider_retry_class("HTTP POST to http://x FAILED: connection refused").is_none());
+    }
+
+    #[test]
+    fn the_ladder_stops_at_exactly_the_budget() {
+        let busy = err(429, "Resource Unavailable");
+        // Every retry inside the budget is allowed...
+        for made in 0..PROVIDER_RETRY_MAX {
+            assert!(
+                matches!(
+                    provider_retry_decision(&busy, made),
+                    Some(ProviderRetryClass::ResourceUnavailable)
+                ),
+                "retry {made} is still within the budget"
+            );
+        }
+        // ...and the one that would exceed it is refused, so the call fails with
+        // the provider's own error rather than looping.
+        assert!(
+            provider_retry_decision(&busy, PROVIDER_RETRY_MAX).is_none(),
+            "the ladder must stop at PROVIDER_RETRY_MAX so a provider that is really down \
+             fails the call instead of running out the clock"
+        );
+        assert!(provider_retry_decision(&busy, PROVIDER_RETRY_MAX + 7).is_none());
     }
 }

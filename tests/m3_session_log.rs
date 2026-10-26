@@ -112,6 +112,16 @@ struct StubLlmServer {
     /// the temp-0.0 auditor (whose retries are deterministic) and wrong for a
     /// call site that is supposed to recover on the retry.
     truncate_next: Arc<Mutex<Vec<String>>>,
+    /// Request kinds still to be answered with a 429 "the provider is busy"
+    /// refusal, consumed one per matching request (§14.30).
+    ///
+    /// [VANTA-WHY] §14.30 — a ONE-SHOT refusal is what lets a test tell "the
+    /// caller re-sent the SAME request and the model answered once" from "the
+    /// caller counted a throttle as a model attempt and the model answered
+    /// twice". The body carries `Resource Unavailable`, which is the shape the
+    /// hosted API uses when a `flex` tier has no capacity, so the run records the
+    /// refusal under `resource_unavailable` rather than the generic rate limit.
+    busy_next: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
@@ -295,6 +305,7 @@ impl StubLlmServer {
         let disconnects = Arc::new(AtomicUsize::new(0));
         let truncate_batch_audit = Arc::new(AtomicBool::new(false));
         let truncate_next = Arc::new(Mutex::new(Vec::new()));
+        let busy_next = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let request_count_clone = Arc::clone(&request_count);
@@ -303,6 +314,7 @@ impl StubLlmServer {
         let disconnects_clone = Arc::clone(&disconnects);
         let truncate_batch_audit_clone = Arc::clone(&truncate_batch_audit);
         let truncate_next_clone = Arc::clone(&truncate_next);
+        let busy_next_clone = Arc::clone(&busy_next);
         let stop_clone = Arc::clone(&stop);
         // The Attacker has two call sites with different response shapes: a
         // generation call expects `{"tests":[...]}` (AttackerResponse), while a
@@ -446,6 +458,44 @@ impl StubLlmServer {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .push(body.to_string());
+                        // [VANTA-WHY] §14.30 — a ONE-SHOT "the provider is busy"
+                        // refusal, consumed per matching request. 429 with a
+                        // `Resource Unavailable` body is the documented answer when
+                        // a `flex` tier has no capacity, and it is answered here —
+                        // AFTER the kind is recorded, BEFORE any stream — because
+                        // the refusal happens before the model is reached: the
+                        // request never became an answer, which is exactly the
+                        // distinction the caller must keep.
+                        let busy_now = {
+                            let mut queued = busy_next_clone
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            match queued.iter().position(|kind| kind == request_kind) {
+                                Some(position) => {
+                                    queued.remove(position);
+                                    true
+                                }
+                                None => false,
+                            }
+                        };
+                        if busy_now {
+                            let refusal = serde_json::json!({
+                                "error": {
+                                    "message": "Resource Unavailable: the requested service tier has no capacity right now.",
+                                    "type": "server_error",
+                                    "code": "resource_unavailable",
+                                }
+                            })
+                            .to_string();
+                            let response = format!(
+                                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 1\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                refusal.len(),
+                                refusal
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                            continue;
+                        }
                         let default_single_test = || {
                             attacker_value
                                 .get("tests")
@@ -665,6 +715,7 @@ impl StubLlmServer {
             disconnects,
             truncate_batch_audit,
             truncate_next,
+            busy_next,
             stop,
             join: Some(join),
         }
@@ -683,6 +734,19 @@ impl StubLlmServer {
     fn truncate_next_calls(&self, kinds: &[&str]) {
         let mut queued = self
             .truncate_next
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queued.clear();
+        queued.extend(kinds.iter().map(|kind| kind.to_string()));
+    }
+
+    /// Refuse the next request of each named kind with a 429 `Resource
+    /// Unavailable` (stub kind labels: `creator`, `generate`, `revise`,
+    /// `simplify`, `intent_audit`), one refusal per entry, and answer every later
+    /// request normally (§14.30). Called after `start*`.
+    fn refuse_next_calls(&self, kinds: &[&str]) {
+        let mut queued = self
+            .busy_next
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         queued.clear();
@@ -6961,6 +7025,107 @@ fn usage_details_and_cost_are_recorded_per_call_and_totalled() {
     assert_eq!(
         summary_value(&hosted_summary, "cost_basis"),
         "gpt-6-luna/standard/2026-10-26"
+    );
+}
+
+/// §14.30 — a provider that refuses a request because it is busy is re-asked the
+/// SAME request, and that refusal is NOT charged to the model's attempt budget.
+///
+/// [VANTA-WHY] What is asserted here is the whole reason the provider got its own
+/// ladder: the run reaches the same verdict, the `creator` call succeeds on its
+/// FIRST model attempt (`attempt=1`) while recording `provider_retries=1`, and the
+/// run total names the refusal's class. A design that folded a 429 into `attempt`
+/// would show `attempt=2` on a call the model answered correctly the first time it
+/// was asked — a throttled run disguised as a model that needed two tries, which
+/// is the one reading this test exists to make impossible. The stub's body says
+/// `Resource Unavailable` (the `flex` capacity refusal), so the class asserted is
+/// `resource_unavailable` and a caller that reported everything as a rate limit
+/// fails here.
+#[test]
+fn a_busy_provider_is_re_asked_without_spending_a_model_attempt() {
+    let _serial = serial_run();
+
+    let workspace = TempDir::new().unwrap();
+    let (_repo, _issue, patch) = write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    // The FIRST Attacker generation request is refused; the re-send is answered
+    // normally. (Patch mode never calls the Creator, so the generation is the
+    // run's first chat call.)
+    server.refuse_next_calls(&["generate"]);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch,
+        &server,
+        3,
+        &[
+            ("VANTA_LLM_BACKEND", "openai"),
+            ("VANTA_LLM_MODEL", "gpt-6-luna"),
+            ("OPENAI_API_KEY", "sk-test-not-a-real-key"),
+            ("VANTA_LLM_CONTEXT_TOKENS", "131072"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a throttle the caller rode out must not change the verdict; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let kinds = server.request_kinds();
+    let generate_requests = kinds.iter().filter(|kind| kind.as_str() == "generate").count();
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let attacker_rows: Vec<&SessionRecord> = records
+        .iter()
+        .filter(|record| {
+            record.phase == "call.usage"
+                && summary_value(&record.summary, "site") == "attacker_generate"
+        })
+        .collect();
+    assert!(
+        !attacker_rows.is_empty(),
+        "the run must have generated tests; request kinds: {kinds:?}"
+    );
+    // The refusal was seen as a REQUEST — the stub answered nothing to it — so the
+    // generation appears one time MORE often than the model was asked about it.
+    assert_eq!(
+        generate_requests,
+        attacker_rows.len() + 1,
+        "the refused request must be re-sent and nothing else added; request kinds: {kinds:?}"
+    );
+
+    let throttled = attacker_rows
+        .iter()
+        .filter(|record| summary_value(&record.summary, "provider_retries") == "1")
+        .count();
+    assert_eq!(
+        throttled, 1,
+        "exactly one call must record the provider's refusal; request kinds: {kinds:?}"
+    );
+    for record in &attacker_rows {
+        assert_eq!(
+            summary_value(&record.summary, "attempt"),
+            "1",
+            "the throttle must not be charged to the model's attempt budget: {}",
+            record.summary
+        );
+    }
+
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(
+        summary_value(&summary, "provider_retries"),
+        "1",
+        "the run total must count the provider's refusal: {summary}"
+    );
+    assert_eq!(
+        summary_value(&summary, "provider_retries_unavailable"),
+        "1",
+        "the `Resource Unavailable` body is the flex class, not the generic rate limit: {summary}"
+    );
+    assert_eq!(
+        summary_value(&summary, "provider_retries_rate_limit"),
+        "0",
+        "a capacity refusal must not be reported as a rate limit: {summary}"
     );
 }
 

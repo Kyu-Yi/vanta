@@ -6916,6 +6916,80 @@ hosted run is priced on the `standard` row.
 
 ---
 
+### 14.30 Hosted OpenAI backend, item 6 — truncation kept, and a second retry budget
+
+§14.13's truncation rule is untouched by this item, and deliberately so: `finish_reason=length` still counts
+as truncated, the first cut-off still earns exactly one nudged re-ask, and the second still ends the call
+with the site's ordinary failure value (§14.5 item 2). What this section adds is the OTHER reason a request
+gets sent twice — the provider declining to serve it — and the whole point is that the two must never be
+added together.
+
+**The send is its own loop now.** `post_chat_meta` used to POST once and turn any non-2xx into an error;
+that block is now `send_with_provider_retries`, which returns the successful response *beside how many times
+it was re-sent for it*. The caller reads the status and consumes the byte stream as before — the function
+never reads a body on success, so a streaming call is not quietly buffered. Every non-retried failure comes
+back as the same `"HTTP ERROR {code} from {url}. Body snippet: {snippet}"` string the old block produced, so
+the failure text a reader has seen before, and the redaction it does, are unchanged: `redact_secret` still
+closes the hole where a provider echoes the credential back inside the body (the `EchoKeyUnauthorized` test
+still pins that), the snippet is still cut with `chars().take(300)` rather than a byte slice, and the request
+headers are still never formatted into the message.
+
+**Only a 429 is retried, and that is narrower than "any 5xx" on purpose.** llama-server answers a request
+that does not fit its KV cache with a 5xx, and re-sending that is a second full generation onto the same
+full cache — the "Context size has been exceeded" cascade `back_off` exists to avoid. A 429 is the one status
+that means *the request was fine, the service was busy*; it is the only class the provider is asking us to
+repeat. `insufficient_quota` also arrives as a 429 and is excluded, because it is **not** transient: the
+account is out of credit, and four retries would only add a minute to a failure that is waiting for a human.
+
+**The ladder, not a fixed pause.** `PROVIDER_RETRY_MAX = 4`, with `1s, 2s, 4s, 8s` between the attempts
+(`PROVIDER_RETRY_BACKOFF_BASE_MS = 1_000`, doubled by shift, capped at 30s). A rate limit is a
+window that has to ROLL OVER, so retrying at `back_off`'s 500 ms cadence would spend the whole budget inside
+one window and come back to the same 429; the `flex` capacity blip is the same shape at a coarser scale.
+Four is under a minute of waiting — long enough to ride out a blip, short enough that a provider that is
+really down still fails the call rather than the run's deadline (§14.15).
+
+**Its own budget, because a 429 is not an answer.** `max_attempts` exists to let the MODEL answer
+differently; a throttle is the service saying "not now" about a request the model never saw. Charging it to
+that budget would let a busy minute turn a call the model answered correctly on the first question into
+"the model failed twice" — the single reading this design exists to make impossible. The two counts are
+therefore separate all the way through: `CallUsage.provider_retries` sits beside `attempt` on the row, and a
+row reading `attempt=1 provider_retries=2` is a call the service throttled twice and the model answered
+once.
+
+**Two classes, counted separately, at both granularities.** `ProviderRetryClass` distinguishes
+`rate_limit` (the window rolled over) from `resource_unavailable` (the tier had no capacity — the documented
+`flex` answer), because they are different operational facts. Each is recorded on the call
+(`provider_retries=`) and on the run (`provider_retries=`, `provider_retries_rate_limit=`,
+`provider_retries_unavailable=`), and the Python `llm` block copies all four verbatim into the manifest row.
+The RUN-level counters are not a convenience: a call the provider kept refusing past `PROVIDER_RETRY_MAX`
+never answered, so it writes **no `call.usage` row at all**. Summing the rows would under-report exactly the
+runs that were throttled hardest, so the count that survives is the run's own
+(`crate::llm::provider_retry_counts()`), and `reset_call_usages` clears it with the rest.
+
+**The bound is a function, so it can be asserted instantly.** The class check and the budget check are one
+decision, `provider_retry_decision(err, retries_so_far)` — `Some(class)` is "back off and re-send", `None` is
+"return this error as the failure". Reaching the bound through the real loop means waiting out four
+backoffs, which no fast test should do; factoring the comparison out is what makes "the ladder stops at
+exactly `PROVIDER_RETRY_MAX`" a statement a unit test can check exhaustively.
+
+**Tests.** `llm::_provider_retry_tests` (two) pin the classification — both 429 flavours retried, an
+out-of-credit 429 not, `400/401/404/422/500/502/503` not, the two transport faults not — and the bound at
+every point on the budget. `m3_session_log::a_busy_provider_is_re_asked_without_spending_a_model_attempt`
+runs the stub hosted as `gpt-6-luna` with its FIRST generation request refused (a new stub capability,
+`refuse_next_calls`, answers a 429 whose body says `Resource Unavailable`) and asserts the run still reaches
+its verdict, that the generation was seen one time MORE often than the model was asked about it, that the
+model's attempt index on every `attacker_generate` row is still `1`, and that the run records
+`provider_retries=1`, `provider_retries_unavailable=1`, `provider_retries_rate_limit=0`.
+
+**What this section does not settle.** The ladder's shape and base are architecture, not measurement: no
+live 429 was observed while writing it, and the operator's `scripts/openai_probe.py` is what would show the
+real cadence. `retry-after` on the response is read by nobody — the ladder is fixed, so a provider asking
+for a longer wait than 8s is retried sooner than it asked; that is a deliberate simplification (a header
+that can say "wait an hour" is a header that can hold a run's deadline hostage) and it is named here rather
+than left for a reader to discover.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

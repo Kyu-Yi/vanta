@@ -3079,6 +3079,17 @@ fn a_per_test_audit_cut_off_twice_takes_its_ordinary_unavailable_verdict() {
 /// every call sends the pinned seed and nothing else. That is what keeps such a
 /// run byte-comparable with the v0.2 baseline the pilot is measured against, and
 /// what makes `truncated_calls_*` a proof that no offset ever applied.
+///
+/// §14.23 changed what the pinned seed means *between* rounds and deliberately
+/// left this test's point untouched *inside* one. The offset is now per ROUND —
+/// round `r` sends `VANTA_LLM_SEED + (r - 1)`, because the re-asked prompt is a
+/// fresh draw rather than a replay — while a retry inside a round remains the
+/// only thing that may move the seed further, and nothing was truncated here. So
+/// the assertion is per round instead of per run: every call in round `r` carries
+/// `4242 + (r - 1)`, all calls within that round carry the same value, and no
+/// call carries an offset past its own round. The rounds are read off the paired
+/// `call.usage` rows rather than inferred from a body's position, because the row
+/// is what records which round sent it.
 #[test]
 fn a_flag_off_run_without_truncation_never_moves_the_seed() {
     let _serial = serial_run();
@@ -3102,17 +3113,55 @@ fn a_flag_off_run_without_truncation_never_moves_the_seed() {
 
     let bodies = server.request_bodies();
     assert!(!bodies.is_empty(), "the run must have called the LLM");
-    for body in &bodies {
-        assert!(
-            body.contains("\"seed\":4242"),
-            "with nothing truncated every call is attempt 1, which sends the PINNED seed; got: \
-             {body}"
+
+    let rounds_and_seeds: Vec<(u32, String)> =
+        read_session_records(&find_session_log(workspace.path()))
+            .iter()
+            .filter(|record| record.phase == "call.usage")
+            .map(|record| {
+                (
+                    summary_value(&record.summary, "round").parse().unwrap(),
+                    summary_value(&record.summary, "seed"),
+                )
+            })
+            .collect();
+    assert_eq!(
+        rounds_and_seeds.len(),
+        bodies.len(),
+        "one `call.usage` row per chat body"
+    );
+
+    // `round` filled in call order, so a round seen twice must have sent the same
+    // seed both times — which is exactly the "never moves inside a round" half.
+    let mut per_round: Vec<(u32, String)> = Vec::new();
+    for (body, (round, seed)) in bodies.iter().zip(rounds_and_seeds.iter()) {
+        let expected = format!("{}", 4242_u64 + u64::from(round.saturating_sub(1)));
+        assert_eq!(
+            seed, &expected,
+            "round {round} must send the pinned seed advanced by its own index and nothing \
+             more (§14.23): with nothing truncated, no retry offset may apply"
         );
         assert!(
-            !body.contains("\"seed\":4243"),
-            "no call may carry the first offset when no retry happened; got: {body}"
+            body.contains(&format!("\"seed\":{expected}")),
+            "the round {round} body must carry the seed its own row records ({expected}); \
+             got: {body}"
         );
+        match per_round.iter().find(|(seen, _)| seen == round) {
+            Some((_, first)) => assert_eq!(
+                first, &expected,
+                "round {round} sent two different seeds — a per-CALL offset where §14.23 \
+                 sanctions only a per-round one"
+            ),
+            None => per_round.push((*round, expected)),
+        }
     }
+    // One round cannot tell a per-round offset from a fixed seed, so the guard has
+    // to have seen more than one or it asserts nothing.
+    assert!(
+        per_round.len() > 1,
+        "this run must span more than one round to mean anything; saw rounds {:?}",
+        per_round.iter().map(|(round, _)| *round).collect::<Vec<_>>()
+    );
 
     let summary = run_summary(workspace.path()).summary;
     for flag in ["corroborate=off", "grounded_audit=off", "batch_audit=off"] {

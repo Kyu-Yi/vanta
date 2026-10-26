@@ -6666,6 +6666,38 @@ run-level rule, including that `request_shape_not_sent` names every key in the d
 
 ---
 
+### 14.27 One test that §14.23 invalidated, corrected rather than deleted
+
+`tests/m3_session_log.rs::a_flag_off_run_without_truncation_never_moves_the_seed` was red at
+`c7a220d` (the §14.23 commit) and every commit after it, and it is corrected here without touching the
+behaviour it guards.
+
+**The failure was a stale assertion, not a regression.** The test's premise — stated in its own
+doc-comment as "the seed offsetting exists for RETRIES only" — was that a run with the §14 flags off and
+nothing truncated sends the *pinned* seed on **every** call. §14.23 deliberately replaced that rule with a
+**per-round** offset, `seed + (r - 1)`, so the second round's bodies legitimately carry `4243` and the
+test's `!body.contains("\"seed\":4243")` now asserts the opposite of the behaviour §14.23 was written to
+produce. §14.23 added a new test for the new rule and left this one asserting the old one, which is how a
+red suite survived three commits: the new test proved the offset works, and nothing proved the old test
+had been superseded. It was confirmed pre-existing before being touched — the test fails identically on
+`2328709` with the §14.26 work stashed, so no part of §14.26 is implicated.
+
+**What the test asserts now, and what it still refuses to.** The rule is read off the paired `call.usage`
+rows rather than inferred from a body's position: every call in round `r` must carry
+`4242 + (r − 1)` **and** every call within a round must carry the same value. The first half adopts
+§14.23; the second half is the test's original point, unchanged — with nothing truncated, no retry offset
+may apply, so a per-CALL offset inside a round still fails here. The old form could not express that
+distinction at all, which is why it had to be rewritten rather than renumbered. A floor is added so the
+guard cannot pass vacuously: the run must have spanned more than one round, because one round cannot tell
+a per-round offset from a fixed seed.
+
+**§14.23's behaviour is not touched.** `SEED_POLICY`, `seed_for_round`, `seed_for_attempt` and every
+recorded field are exactly as `c7a220d` left them; the only file this section changes is the test. That is
+also why it is a separate commit from §14.26: the item-3 work is a body-shaping change, and a test
+correction that happens to be discovered while running it is not part of it.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

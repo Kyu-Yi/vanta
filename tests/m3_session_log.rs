@@ -1980,6 +1980,37 @@ fn a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped
         "the BATE summary must record the three revisions this round spent; got {}",
         bate_summary.summary
     );
+
+    // [VANTA-WHY] §14.17 — the revise request must carry what the baseline
+    // ACTUALLY did, not just BATE's category. The stub's test passes on the
+    // original tree, so the honest account is "PASSED", and telling the model
+    // that is the difference between revising the test and guessing why it came
+    // back wrong: the overnight sanic session rewrote one test 45 times because
+    // "expects baseline=Failed but got Error" was all it ever saw.
+    let revise_bodies: Vec<String> = server
+        .request_kinds()
+        .into_iter()
+        .zip(server.request_bodies())
+        .filter(|(kind, _)| kind == "revise")
+        .map(|(_, body)| body)
+        .collect();
+    assert_eq!(
+        revise_bodies.len(),
+        3,
+        "the three revisions this test proves happened are the three bodies to inspect"
+    );
+    for body in revise_bodies {
+        assert!(
+            body.contains("WHAT THE BASELINE ACTUALLY DID"),
+            "the revise prompt must carry the run's own output, not only the mismatch \
+             category: {body}"
+        );
+        assert!(
+            body.contains("verdict: PASSED"),
+            "the baseline passed on the original tree, and that fact is exactly what \
+             the model has to be told: {body}"
+        );
+    }
 }
 
 /// Regression guard for the oracle loophole: a patch must not be able to write

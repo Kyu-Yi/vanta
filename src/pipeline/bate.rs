@@ -24,6 +24,7 @@ use crate::config::LlmConfig;
 use crate::core::{TestIntent, TestResult};
 use crate::pipeline::candidate::TestCommand;
 use crate::pipeline::harness;
+use crate::pipeline::harness::TestExecutionDetails;
 use crate::pipeline::{REVISE_BUDGET_EXHAUSTED, ReviseBudget};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -101,27 +102,37 @@ pub fn validate_test_against_baseline(
 // observable here, where the baseline actually ran. Reconstructing it from a
 // `Mismatch` would confuse "passed" with "errored", and an errored baseline must
 // not be relabelled into a preservation probe.
+/// [VANTA-WHY] §14.17 — the run returns the whole [`TestExecutionDetails`], not
+/// just the `TestResult`. BATE's revise step is the one place a test is handed
+/// back to the model with an account of what went wrong, and the account used to
+/// be the CLASSIFIED string alone ("expects baseline=Failed but got Error"). A
+/// model shown only the category cannot act on it: the overnight sanic session
+/// shows a test rewritten 45 times while the model guessed what "ERROR" meant,
+/// because the exception, its message and the traceback were thrown away here.
+/// Carrying the details keeps one runner for both the verdict and the evidence.
 pub async fn validate_with_retry<F, Fut>(
     test_name: &str,
     intent: &TestIntent,
     max_attempts: u32,
     mut run_fn: F,
-) -> (BateOutcome, TestResult)
+) -> (BateOutcome, TestExecutionDetails)
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = TestResult>,
+    Fut: std::future::Future<Output = TestExecutionDetails>,
 {
     let mut last_mismatch: Option<String> = None;
-    let mut last_actual = TestResult::Error;
+    // Only ever read when `max_attempts` is 0, which no caller passes.
+    let mut last_details = TestExecutionDetails::from_rerun(TestResult::Error);
 
     for attempt in 1..=max_attempts {
         debug!(test = test_name, attempt, max_attempts, "BATE retry loop: running baseline test");
         let actual = run_fn().await;
-        last_actual = actual.clone();
-        match validate_test_against_baseline(test_name, intent, actual) {
+        let result = actual.result.clone();
+        last_details = actual;
+        match validate_test_against_baseline(test_name, intent, result) {
             BateOutcome::Valid => {
                 info!(test = test_name, attempt, "BATE: test VALID on attempt {attempt}");
-                return (BateOutcome::Valid, last_actual);
+                return (BateOutcome::Valid, last_details);
             }
             BateOutcome::Mismatch(reason) => {
                 warn!(test = test_name, attempt, "BATE: mismatch on attempt {attempt}, retrying");
@@ -137,7 +148,100 @@ where
         max_attempts
     );
     warn!(test = test_name, max_attempts, "BATE: test SCRAPPED after {max_attempts} mismatches");
-    (BateOutcome::Mismatch(reason), last_actual)
+    (BateOutcome::Mismatch(reason), last_details)
+}
+
+// ============================================================================
+// baseline_evidence — what the baseline ACTUALLY did, for the revise prompt
+// ============================================================================
+//
+// [VANTA-WHY] §14.17 — BATE's mismatch reason is a CATEGORY ("got Error"); the
+// revise prompt needs the EVIDENCE. The overnight sanic session shows the model
+// guessing, over and over, why a test it wrote came back Error when the answer
+// was in the run's output all along: the exception, its message, and the frames
+// pytest printed. This renders exactly that, and nothing else — the model is
+// being told why its test failed, not given the repository's whole log.
+//
+// [VANTA-WHY] BOUNDED, for the same reason §14.13 is: a generated test can print
+// tens of thousands of lines (one sanic test did), and the remedy for "the model
+// cannot see the error" must not become "the model is buried in it". The tail is
+// the right end to keep: pytest prints the innermost frame last.
+
+/// The most lines a revise prompt's baseline evidence may carry, footer included.
+pub const REVISE_EVIDENCE_MAX_LINES: usize = 40;
+
+/// One compact, bounded account of what the baseline run actually did: the
+/// verdict in BATE's own terms, the exception line, and the tail of the last
+/// traceback. Used verbatim as the revise prompt's evidence block.
+pub fn baseline_evidence(details: &TestExecutionDetails) -> String {
+    let combined = format!("{}\n{}", details.stdout, details.stderr);
+    let lines: Vec<&str> = combined.lines().map(str::trim_end).collect();
+
+    // The LAST traceback is the failure the run ended on — an earlier one may be
+    // a captured log line or a warning's stack.
+    let start = lines
+        .iter()
+        .rposition(|line| line.trim_start().starts_with("Traceback (most recent call last)"))
+        .unwrap_or(0);
+    let tail: Vec<&str> = lines[start..]
+        .iter()
+        .copied()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    let mut out: Vec<String> = vec![format!("verdict: {}", verdict_label(details))];
+    if let Some(exception) = exception_line(&tail) {
+        out.push(format!("exception: {exception}"));
+    }
+    if !tail.is_empty() {
+        out.push("run output (last lines, most recent last):".to_string());
+        // The header lines count against the cap, so a 40-line slice is 40 lines.
+        let budget = REVISE_EVIDENCE_MAX_LINES.saturating_sub(out.len());
+        let from = tail.len().saturating_sub(budget);
+        out.extend(tail[from..].iter().map(|line| (*line).to_string()));
+    }
+    out.join("\n")
+}
+
+/// BATE's verdict in words a reader can act on, with the distinction it cares
+/// about: ERROR (the test never reached its assertions) is not FAILED (an
+/// assertion ran and did not hold).
+fn verdict_label(details: &TestExecutionDetails) -> &'static str {
+    match details.result {
+        TestResult::Passed => "PASSED (the test ran and every assertion held)",
+        TestResult::Failed => "FAILED (an assertion in the test did not hold)",
+        TestResult::Error if details.timed_out => {
+            "ERROR (the test timed out and never produced a verdict)"
+        }
+        TestResult::Error if !details.report_path_exists => {
+            "ERROR (the test was never graded: it failed to import or collect)"
+        }
+        TestResult::Error => {
+            "ERROR (the test raised an exception before its assertions completed)"
+        }
+    }
+}
+
+/// The exception line from a failure's tail, e.g. `AttributeError: 'NoneType'
+/// object has no attribute 'items'`.
+///
+/// [VANTA-WHY] The TYPE comes from `diagnostician::parse_failure_site`, the same
+/// locator the Diagnostician classifies with, so "what exception was that" has
+/// one answer in this codebase. A plain `assert` prints no type in its `E` lines,
+/// so the line is preferred by type and only then by pytest's own `E` marker.
+fn exception_line(tail: &[&str]) -> Option<String> {
+    let output = tail.join("\n");
+    let (_, _, exception_type) = crate::pipeline::diagnostician::parse_failure_site(&output);
+    if let Some(exception_type) = exception_type {
+        if let Some(line) = tail.iter().rev().find(|line| line.contains(&exception_type)) {
+            return Some(line.trim().to_string());
+        }
+    }
+    tail.iter().rev().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("E ")
+            .map(|rest| rest.trim().to_string())
+    })
 }
 
 // ============================================================================
@@ -287,7 +391,7 @@ pub async fn run_bate(
             let src = original_execution_source.to_string();
             let test_source = current_test.test_source.clone();
             let cmd_template = test_cmd.clone();
-            let (outcome, baseline_result) = validate_with_retry(
+            let (outcome, baseline) = validate_with_retry(
                 &current_test.test_name,
                 &current_test.intent,
                 3, // Layer 1: re-run in a fresh sandbox up to 3× for flakiness
@@ -295,10 +399,23 @@ pub async fn run_bate(
                     let src = src.clone();
                     let test_source = test_source.clone();
                     let cmd_template = cmd_template.clone();
-                    async move { harness::run_single_test(&src, &test_source, &cmd_template).await }
+                    // [VANTA-WHY] §14.17 — the DETAILED runner, not
+                    // `run_single_test`: the verdict is the same (the plain
+                    // wrapper is this call's `.result`), but the revise step
+                    // below needs the output the verdict was read from.
+                    async move {
+                        harness::run_single_test_with_timeout(
+                            &src,
+                            &test_source,
+                            &cmd_template,
+                            harness::test_timeout_secs(),
+                        )
+                        .await
+                    }
                 },
             )
             .await;
+            let baseline_result = baseline.result.clone();
 
             match outcome {
                 BateOutcome::Valid => {
@@ -398,6 +515,7 @@ pub async fn run_bate(
                             original_prompt_source,
                             &current_test,
                             &reason,
+                            &baseline_evidence(&baseline),
                         )
                         .await
                         {
@@ -548,12 +666,12 @@ mod tests {
             "flaky_fail",
             &TestIntent::BugReproduction,
             3,
-            || async { TestResult::Passed },
+            || async { TestExecutionDetails::from_rerun(TestResult::Passed) },
         )
         .await;
         assert!(matches!(outcome, BateOutcome::Mismatch(_)));
         assert_eq!(
-            last,
+            last.result,
             TestResult::Passed,
             "the observed baseline must ride along so BATE can tell 'passed' from 'errored'"
         );
@@ -572,15 +690,121 @@ mod tests {
                 let mut a = attempts.borrow_mut();
                 *a += 1;
                 if *a < 3 {
-                    TestResult::Passed // mismatch on attempts 1, 2
+                    TestExecutionDetails::from_rerun(TestResult::Passed) // mismatch on 1, 2
                 } else {
-                    TestResult::Failed // matches on attempt 3
+                    TestExecutionDetails::from_rerun(TestResult::Failed) // matches on 3
                 }
             },
         )
         .await;
         assert_eq!(outcome, BateOutcome::Valid);
         assert_eq!(*attempts.borrow(), 3);
+    }
+
+    // ---- §14.17: what the baseline ACTUALLY did, for the revise prompt --------
+    //
+    // [VANTA-WHY] The revise prompt used to carry only BATE's CATEGORY ("got
+    // Error") and the model guessed at the cause for 45 rewrites. These pin the
+    // evidence block: it must name the exception and the frames, and it must stay
+    // small enough that a runaway test cannot bury the message.
+
+    /// Details as the detailed runner would report them: a verdict plus the
+    /// streams it was read from.
+    fn details(result: TestResult, stdout: &str, stderr: &str) -> TestExecutionDetails {
+        TestExecutionDetails {
+            result,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code: Some(1),
+            timed_out: false,
+            report_path_exists: true,
+            sandbox_root: None,
+        }
+    }
+
+    #[test]
+    fn the_evidence_carries_the_exception_and_the_frames_the_model_used_to_guess_at() {
+        // The shape pytest prints for a test that raised: the location line, the
+        // traceback, and the short-summary line that repeats type and message.
+        let stdout = "=================== FAILURES ====================\n\
+                      ____________________ test_reverse_order ____________________\n\n\
+                      \x20   def test_reverse_order():\n\
+                      >       cart = make_cart(None)\n\n\
+                      tests/test_bate.py:4: \n\
+                      _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\n\
+                      value = None\n\n\
+                      \x20   def make_cart(value):\n\
+                      >       return value.items()\n\
+                      E       AttributeError: 'NoneType' object has no attribute 'items'\n\n\
+                      pkg/cart.py:88: AttributeError\n\
+                      =================== short test summary info ====================\n\
+                      FAILED test_bate.py::test_reverse_order - AttributeError: 'NoneType' \
+                      object has no attribute 'items'\n\
+                      ====================== 1 failed in 0.04s ======================\n";
+        let evidence = baseline_evidence(&details(TestResult::Error, stdout, ""));
+
+        assert!(
+            evidence.contains("verdict: ERROR (the test raised an exception"),
+            "an ERROR must not be reported as a FAILED assertion: {evidence}"
+        );
+        assert!(
+            evidence.contains(
+                "exception: FAILED test_bate.py::test_reverse_order - AttributeError: \
+                 'NoneType' object has no attribute 'items'"
+            ),
+            "the type AND the message must both be in front of the model: {evidence}"
+        );
+        assert!(
+            evidence.contains(">       return value.items()"),
+            "the innermost frame is what says WHICH call raised: {evidence}"
+        );
+    }
+
+    #[test]
+    fn a_passing_baseline_is_reported_as_passed_and_an_assertion_as_failed() {
+        assert!(
+            baseline_evidence(&details(TestResult::Passed, "", "")).starts_with("verdict: PASSED"),
+            "a preservation probe's passing baseline must read as a pass"
+        );
+        assert!(
+            baseline_evidence(&details(TestResult::Failed, "", "")).starts_with("verdict: FAILED"),
+            "a failing assertion is FAILED, which is not the same claim as ERROR"
+        );
+    }
+
+    #[test]
+    fn an_ungraded_error_is_told_apart_from_an_exception_the_test_raised() {
+        // `report_path_exists == false` means the generated test never got a
+        // verdict at all (import/collect failure) — the distinction that used to
+        // reach the model as the single word "Error".
+        let mut ungraded = details(TestResult::Error, "", "");
+        ungraded.report_path_exists = false;
+        let evidence = baseline_evidence(&ungraded);
+        assert!(
+            evidence.contains("never graded"),
+            "a test that was never graded must not be blamed on an exception: {evidence}"
+        );
+    }
+
+    #[test]
+    fn a_runaway_tests_output_is_cut_to_the_forty_lines_of_evidence() {
+        let mut stdout = String::from("Traceback (most recent call last):\n");
+        for i in 0..5_000 {
+            stdout.push_str(&format!("  File \"pkg/big.py\", line {i}, in f\n    step({i})\n"));
+        }
+        stdout.push_str("AssertionError: boom\n");
+        let evidence = baseline_evidence(&details(TestResult::Failed, &stdout, ""));
+
+        assert!(
+            evidence.lines().count() <= REVISE_EVIDENCE_MAX_LINES,
+            "the block claims to be bounded: {} lines",
+            evidence.lines().count()
+        );
+        assert!(
+            evidence.ends_with("AssertionError: boom"),
+            "the cap must keep the tail — the innermost failure is the last thing printed: \
+             {evidence}"
+        );
     }
 
     // ---- Fix 6: relabel before revise -----------------------------------------

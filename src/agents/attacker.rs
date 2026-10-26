@@ -403,6 +403,8 @@ pub async fn attacker_generate_tests(
 // a test rather than by a comment.
 pub const ATTACKER_REVISE_SYSTEM_PROMPT: &str = r#"You are Vanta Attacker. A test you wrote failed BATE (Baseline-Aware Test Evaluation). The test's actual result on the ORIGINAL (unpatched) code did not match its declared intent. Revise the test so its baseline result matches its intent.
 
+The user message carries WHAT THE BASELINE ACTUALLY DID: the verdict in BATE's own terms, the exception type and message, and the last traceback frames from the real run on the original code. Read it before you change anything — it says WHERE and WHY the test failed. Do not guess at the cause and do not rewrite the test from scratch on a hunch: a revision that repeats an earlier one has learned nothing from the output in front of you.
+
 YOU MUST output valid JSON. First char '{', last char '}'. No prose, no fences.
 
 Required JSON shape:
@@ -526,6 +528,7 @@ pub async fn attacker_revise_test(
     original_source: &str,
     prior_test: &GeneratedTest,
     mismatch_reason: &str,
+    baseline_evidence: &str,
 ) -> Result<GeneratedTest, Box<dyn Error + Send + Sync>> {
     info!(test_name = %prior_test.test_name, "attacker revise_test start");
 
@@ -538,6 +541,8 @@ pub async fn attacker_revise_test(
          ORIGINAL SOURCE:\n```\n{original_source}\n```\n\n\
          PRIOR TEST (failed BATE):\n- name: {name}\n- intent: {intent:?}\n- source:\n```python\n{source}\n```\n\n\
          BATE MISMATCH REASON:\n{reason}\n\n\
+         WHAT THE BASELINE ACTUALLY DID (the real run on the ORIGINAL code — read this, \
+         do not guess at it):\n{evidence}\n\n\
          Revise the test so its baseline result on the original source matches its declared intent. Expected values come from the issue and original code, never from the patch alone. Output JSON.",
         issue_text = issue_text,
         original_source = original_source,
@@ -545,6 +550,7 @@ pub async fn attacker_revise_test(
         intent = prior_test.intent,
         source = prior_test.test_source,
         reason = mismatch_reason,
+        evidence = baseline_evidence,
     );
 
     let sys_owned = system_prompt.to_string();

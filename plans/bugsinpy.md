@@ -5911,6 +5911,60 @@ than a fabricated `0.0`.
 
 ---
 
+### 14.17 The revise prompt gets the run's own output, not just BATE's category
+
+The follow-up scan of the sanic session (`e08ff93a`) found the single most expensive misunderstanding in
+the batch: nine of thirteen generated tests were **repetition loops**, and the worst of them
+(`reverse_order`, round 2 attempt 3) shows the model rewriting the same test over and over while it
+*guesses* why "BATE says ERROR". It was guessing because that is all it was given. `validate_with_retry`
+returned a `TestResult` and BATE's revise path passed on the CLASSIFIED string alone —
+`BATE mismatch: test 'x' intent=BugReproduction expects baseline=Failed but got Error.` The exception
+type, its message, and the traceback were read by the runner and then dropped on the floor: the model
+cannot act on a category.
+
+**The verdict and the evidence are now the same object.** Layer 1 of BATE runs through
+`harness::run_single_test_with_timeout`, which is *already* what `run_single_test` calls — the plain
+wrapper is literally that call's `.result` — so carrying [`TestExecutionDetails`] out of the retry loop
+adds no run and changes no verdict. `validate_with_retry` therefore returns the details, and the revise
+call passes `baseline_evidence(&details)` into the prompt as `WHAT THE BASELINE ACTUALLY DID`. One runner
+serves both the verdict and the account of it, so the account cannot describe a run that did not happen.
+
+**ERROR is not FAIL, and the block says which.** `TestResult` collapses two different failures into
+`Error`: a test that raised (import, collection, an exception mid-body) and one that was *never graded at
+all* (`report_path_exists == false`). Those want different revisions, so the evidence names them
+separately — and a baseline that simply PASSED says so, because "the test already holds on the original"
+is the whole of BATE's Finding-6 mismatch and the model has been guessing at it too. `timed_out` is named
+as its own case rather than being reported as a raised exception.
+
+**The exception's TYPE comes from the Diagnostician's locator.** `diagnostician::parse_failure_site` is
+already this codebase's answer to "what exception was that", and reusing it here keeps one definition
+instead of two — the evidence quotes the last line naming that type (pytest's short-summary line, which
+carries type *and* message), falling back to pytest's own `E`-prefixed line for a bare `assert`, whose
+output never names `AssertionError` in the traceback at all.
+
+**Bounded, like §14.13 and for the same reason.** One sanic test printed tens of thousands of lines, so
+the remedy for "the model cannot see the error" must not become "the model is buried in it":
+`REVISE_EVIDENCE_MAX_LINES = 40`, and the cap keeps the TAIL, because pytest prints the innermost frame —
+the frame that says which call raised — last. The header lines count against the cap, so a 40-line block
+is 40 lines.
+
+**The prompt says to read it.** The revise system prompt now states that the message carries the real run
+and that a revision must be driven by it rather than by a hunch: the sanic loop is what "rewrite it again
+and hope" costs. This changes the text the `attacker=` prompt-content hash covers, which is the point of
+recording that hash — the batch tables for runs before and after this commit are distinguishable.
+
+Tests: `src/pipeline/bate.rs::the_evidence_carries_the_exception_and_the_frames_the_model_used_to_guess_at`
+feeds a real pytest transcript and asserts the ERROR verdict, the type-and-message line and the innermost
+frame all reach the block; `a_passing_baseline_is_reported_as_passed_and_an_assertion_as_failed`,
+`an_ungraded_error_is_told_apart_from_an_exception_the_test_raised` and
+`a_runaway_tests_output_is_cut_to_the_forty_lines_of_evidence` (5,000 frames, asserting both the cap and
+that the tail survives) pin the three distinctions;
+`tests/m3_session_log.rs::a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped`
+now also inspects the three recorded `revise` bodies and requires each to carry the run's output and the
+truthful `PASSED` verdict its stub actually produces.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

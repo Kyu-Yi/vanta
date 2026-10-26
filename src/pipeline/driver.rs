@@ -44,7 +44,7 @@ use crate::core::{
 };
 use crate::llm::{build_reqwest_client, drain_call_usages, reset_call_usages, server_top_p_default};
 use crate::pipeline::bate::run_bate;
-use crate::pipeline::candidate::{CandidatePair, TestCommand};
+use crate::pipeline::candidate::TestCommand;
 use crate::pipeline::corroborate::{self, CorroborationInput, FailureEvidence};
 use crate::pipeline::diagnostician::diagnose_failure;
 use crate::pipeline::gatekeeper::{Gatekeeper, GatekeeperVerdict};
@@ -669,25 +669,28 @@ pub async fn run(
     // of the base commit. Not the same directory stashed and reverted." If
     // --original-tree is given, read original files from that clean worktree
     // instead of the (possibly edited) working tree.
-    let mut original_files: HashMap<String, String> = HashMap::new();
+    //
+    // [VANTA-WHY] §14.18 — this map is the FILESYSTEM every test run is executed
+    // against (BATE's baseline and every revision, the native suite, the graded
+    // patched tree, the dependency probe, the static pass), so it is the whole
+    // repo, not a budgeted excerpt of it. It used to be `repo.source_files` /
+    // `GitWorkingTreePair::original_files()` — the deterministic walk stopped at
+    // 64 KB per file and 256 KB in total and blind to non-source extensions.
+    // What that cost, and why both failures were silent, is written up in
+    // `repo::complete_tree_files`.
+    let execution_root: PathBuf = config
+        .original_tree
+        .clone()
+        .unwrap_or_else(|| config.repo_path.clone());
     if let Some(orig_tree) = &config.original_tree {
         println!("▌ Two-tree mode: original tree = {}", orig_tree.display());
-        let pair = crate::pipeline::candidate::GitWorkingTreePair::new(
-            orig_tree.clone(),
-            config.repo_path.clone(),
-            repo.issue_text.clone(),
-            test_cmd.clone(),
-        );
-        original_files = pair.original_files();
-        println!(
-            "  Loaded {} original files from worktree",
-            original_files.len()
-        );
-    } else {
-        for sf in &repo.source_files {
-            original_files.insert(sf.path.clone(), sf.contents.clone());
-        }
     }
+    let original_files = crate::repo::complete_tree_files(&execution_root);
+    println!(
+        "  Execution tree: {} files from {}",
+        original_files.len(),
+        execution_root.display()
+    );
 
     // ---- Governor + Gatekeeper ----
     let mut governor = Governor::new(config.max_attempts);
@@ -695,11 +698,10 @@ pub async fn run(
 
     // [VANTA-WHY] The tree the context selection reads. In two-tree mode the
     // patch applies to the original worktree, so that is the tree whose contents
-    // belong in the prompt; otherwise the repo path is both.
-    let context_root: PathBuf = config
-        .original_tree
-        .clone()
-        .unwrap_or_else(|| config.repo_path.clone());
+    // belong in the prompt; otherwise the repo path is both. It is the same tree
+    // the tests execute in — the prompt and the execution differ in what they
+    // SELECT from it, never in which tree it is.
+    let context_root: PathBuf = execution_root.clone();
     // [VANTA-WHY] The context selection for the roles that are shown source. In
     // review mode it is selected from the patch under review; in repair mode it is
     // ranked from the issue text. Both are functions of (tree, issue text,
@@ -1187,6 +1189,11 @@ pub async fn run(
         let _ = any_changed; // used implicitly via all_patch_failed
 
         // ---- Build source strings ----
+        // [VANTA-WHY] §14.18 — the concat the tests run in is now the whole
+        // repo, which is NOT what the prompt may contain. The prompt stays a
+        // selection; when a selection legitimately renders empty the fallback is
+        // still the capped dump it has always been, built from the same tree, so
+        // no prompt grows because the execution tree did.
         let original_concat = build_source_concat(&original_files);
         // [VANTA-WHY] The source the Attacker, the auditor, BATE and the
         // Diagnostician are shown. This used to be the capped dump (the first
@@ -1205,14 +1212,14 @@ pub async fn run(
             });
             let rendered = selection.render();
             if rendered.trim().is_empty() {
-                original_concat.clone()
+                capped_dump_concat(&execution_root)
             } else {
                 rendered
             }
         } else if let Some(selection) = &repair_selection {
             selection.render()
         } else {
-            original_concat.clone()
+            capped_dump_concat(&execution_root)
         };
 
         // ---- 3. Attacker ----
@@ -3125,6 +3132,23 @@ fn build_source_concat(files: &HashMap<String, String>) -> String {
         .map(|(path, contents)| format!("# FILE: {path}\n{contents}"))
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// The capped dump the PROMPT falls back to when a selection renders empty.
+///
+/// [VANTA-WHY] §14.18 — separated from the execution tree on purpose. The
+/// prompt budget and the tree tests run in are different questions: the tree
+/// has to be the whole repo (`repo::complete_tree_files`) or an import fails in
+/// a plugin, while a prompt that is handed every file of a large repo is a
+/// prompt that overflows. This fallback is byte-for-byte the dump the fallback
+/// has always been — `repo::capped_source_files` is the loader's original walk,
+/// applied to the same tree the prompt is about.
+fn capped_dump_concat(root: &Path) -> String {
+    let files: HashMap<String, String> = crate::repo::capped_source_files(root)
+        .into_iter()
+        .map(|sf| (sf.path, sf.contents))
+        .collect();
+    build_source_concat(&files)
 }
 
 // [VANTA-WHY] BATE validates the Attacker's declared intent against the

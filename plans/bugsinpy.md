@@ -5965,6 +5965,94 @@ truthful `PASSED` verdict its stub actually produces.
 
 ---
 
+### 14.18 The tree the tests run in is the repository, not the prompt's budget
+
+Every sanic test in the batches has been thrown away — all of them, on both days, and for a reason that
+had nothing to do with any model. The smoke run `runs/bugsinpy/smoke-sanic-1` (`a147e652`, HEAD `ff3def9`)
+is where it became readable, and §14.17 is what made it readable: the revise prompt carried the run's own
+output, so the sanic revise request showed `verdict: ERROR (the test was never graded: it failed to
+import or collect)` over a traceback that never mentions the generated test. The Attacker responded by
+spending 32,768 tokens twice trying to repair an environment error from inside a test, which is exactly
+what a model does when it is asked to fix something it cannot see the cause of.
+
+**What BATE recorded.** The chain is `pytest.py:101` → `_pytest/config/__init__.py:890`
+`self.pluginmanager.load_setuptools_entrypoints("pytest11")` (inside `_preparse`) → `pluggy/manager.py:299
+plugin = ep.load()` → `pytest_sanic/plugin.py:6 from .utils import TestServer, TestClient` →
+`pytest_sanic/utils.py:6 from sanic.server import serve, HttpProtocol` → `/workspace/sanic/__init__.py:2`
+→ `/workspace/sanic/app.py:18` → `/workspace/sanic/asgi.py:26 from sanic.websocket import
+WebSocketConnection` → `ModuleNotFoundError: No module named 'sanic.websocket'`. The entry point is
+loaded before anything is collected, so pytest aborted in `_preparse`, wrote **no** `report.json`, and
+every generated test came back `Error` — never `Failed`. BATE saw the same `expected=Failed actual=Error`
+three times (`Error` is not a baseline result a BugReproduction test can be revised into), scrapped the
+test, and sent it for a revision that could only make it worse. The `TypeError ... collections.deque` text
+in those two debug files is the **model's own speculation**; `deque + deque` is fine on Python 3.5+ and that
+exception never occurred.
+
+**The hypothesis was that we invoke pytest differently from the native suite. We do not.** Four probes in
+the same checkpoint (`vanta-bi-sanic-1`), mounting a tree at `/workspace`:
+
+| probe | tree | invocation | result |
+| --- | --- | --- | --- |
+| P1 | the capped subset | BATE's form (`python -m pytest -p no:cacheprovider test_run.py …`) | the recorded traceback, EXIT=1 |
+| P2 | the capped subset | the native form (`python -m pytest tests …`) | the **identical** traceback, EXIT=1 |
+| P3 | the full tree | BATE's form | `1 passed`, EXIT=0 |
+| P4 | the full tree | the native form | `1 failed, 634 passed, 2 error in 34.43s`, 637 tests in the report |
+
+Same cwd (`/workspace`), same `rootdir`, same inifile, same plugin set in both forms — because both run
+through the same transport. **The difference is the tree, not the invocation**, so "make BATE's match the
+native suite's" is satisfied by making *both* run in a complete tree, and `PYTEST_DISABLE_PLUGIN_AUTOLOAD`
+is not used: the native suite does not use it either, and disabling a plugin the repo's own layer is
+configured to load would be a second fiction rather than a fix.
+
+**Why the tree was not the repo.** `driver.rs` built the tree every test runs in — BATE's baseline and
+every revision, the native suite, the graded patched tree, the dependency probe, the static pass — from
+`repo.source_files` / `candidate::original_files()`, which is a deterministic walk stopped at 64 KB per
+file and **256 KB in total** and blind to any extension it does not call source. Its own log line says what
+that produced: `discovered source files file_count=57 total_bytes=262142`. Fifty-seven files *is* the
+first 262,142 bytes of sanic — it drops `sanic/websocket.py`, `sanic/worker.py` and **all of `tests/`**
+(the same run's context selection, which uses the cap-free walk, listed 116 candidate files and printed
+`sanic/websocket.py` in the prompt). So the prompt was shown a file the filesystem did not have.
+
+**There were two silent failures, not one.** The second is worse than the first: the native suite ran in
+the same truncated tree, died in the same `_preparse`, and produced no report — which the pipeline read as
+`Native: original ran=false (0 tests), patched ran=false (0 tests), 0 regression(s)`. `AllTestsPassed` on
+zero tests is not a pass of the repo's suite, it is the absence of one, and the run was APPROVED
+(`label: true_approval`) on that basis while the hidden test happened to pass anyway. Two independent
+things had to be wrong for sanic to look like a model problem: the graded tests were `Error` and the suite
+that would have contradicted the approval never ran.
+
+**The fix separates the two budgets.** They were never the same question. What the *prompt* may spend is a
+selection (§1.6.8 and the ranking); what the *tests* may see is a filesystem, and a filesystem cannot be a
+prefix — an import either resolves or it does not. So:
+
+* `repo::complete_tree_files(root)` is the **cap-free** walk (`context::walk_candidates`, the same
+  deterministic walk the context selection already uses — one implementation, two consumers). It is what
+  the driver now builds the execution tree from, and the run prints `Execution tree: N files from <root>`
+  so the number is checkable in the log instead of inferred.
+* `repo::capped_source_files(root)` keeps the loader's original capped walk for the callers that are
+  genuinely prompt-shaped: `Repo::load`'s Creator fallback and the import-path probe.
+* The prompt-side fallback for an empty selection is `capped_dump_concat`, byte-for-byte the dump it has
+  always been. **No prompt grows because the execution tree did.**
+
+Nothing about the verdict machinery changes: the approval/Governor/Gatekeeper logic, the `false_approval`
+labels, §14.13's truncation policy and §14.14's revise cap are untouched.
+
+**The residual limit is stated, not hidden.** The sandbox tree is materialised from a `# FILE: <path>`
+concat, which can only carry UTF-8 text, so a binary fixture (`tests/static/python.png`) still cannot
+reach the VM. That is a pre-existing property of the transport and it does not corrupt the native gate:
+original and patched are the same tree apart from the patch, so an error caused by an absent fixture is
+present on both sides and cancels in the regression diff. What the caps did *not* have was any such
+symmetry with reality — they removed a module the import chain needs, which no comparison can cancel.
+
+Tests: `src/repo/mod.rs::test_execution_tree_is_not_the_capped_prompt_dump` builds a repo large enough to
+spend the 256 KB budget and asserts both halves — the prompt dump omits the file, the execution tree
+carries it whole — which is the sanic/1 shape in one fixture;
+`test_execution_tree_reaches_directories_the_cap_front_never_reaches` spends the budget from a directory
+that sorts first and asserts `sanic/websocket.py` survives, so a future cap change cannot pass the byte
+assertion while still pruning a directory the import chain needs.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

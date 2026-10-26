@@ -18421,6 +18421,27 @@ class TestLlmBlock:
         assert local["service_tier"] == "unset"
         assert local["cost_basis"] == "not_billed"
 
+    def test_the_cache_hit_rate_is_a_float_and_none_when_no_rate_exists(self):
+        """§14.32 — a share a batch can average, with "no rate" kept apart from zero.
+
+        The pipeline writes `unset` when no rate exists at all and `0.0000` when a
+        cache was measured and served nothing; this block must not collapse the two
+        into one `None`, which would make "the provider told us nothing" read as
+        "the cache never hit" — the reading that would make a broken cache look fine.
+        """
+        block = runner_mod.llm_block(
+            runner_mod.parse_summary(self.SUMMARY + " llm_cache_hit_rate=0.4041")
+        )
+        assert block["cache_hit_rate"] == 0.4041
+        measured_zero = runner_mod.llm_block(
+            runner_mod.parse_summary(self.SUMMARY + " llm_cache_hit_rate=0.0000")
+        )
+        assert measured_zero["cache_hit_rate"] == 0.0
+        no_rate = runner_mod.llm_block(
+            runner_mod.parse_summary(self.SUMMARY + " llm_cache_hit_rate=unset")
+        )
+        assert no_rate["cache_hit_rate"] is None
+
     def test_the_revise_budget_is_reported_beside_the_call_totals(self):
         # §14.14 — the cap and the run's spend against it, read back rather than
         # re-derived, so a manifest read later does not have to trust a constant
@@ -18470,6 +18491,9 @@ class TestLlmBlock:
         # §14.31 — no tier was named either, so the block says nothing rather
         # than defaulting a pre-§14.31 row to `standard`.
         assert block["service_tier"] is None
+        # §14.32 — and no cache rate, for the same reason: a record that never
+        # measured a cache must not report one.
+        assert block["cache_hit_rate"] is None
         assert block["by_site"] == {}
 
 

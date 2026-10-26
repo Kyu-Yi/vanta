@@ -1284,6 +1284,16 @@ def llm_block(summary: dict[str, str]) -> dict[str, Any]:
     — the basis is the row that priced the run, the tier is what the run asked
     for — and a batch grouped by arm should not have to split a formatted
     string to find it.
+
+    ``cache_hit_rate`` is §14.32's share of the prompt the provider served from
+    its own cache, copied from ``run.summary``'s ``llm_cache_hit_rate`` (the
+    pipeline computes it from the two token totals it already records, so the
+    three numbers on that line agree by construction). It is a float or ``None``:
+    ``None`` is "no rate exists" — no call was measured, or no measured call
+    reported a cache read — and is NOT the same claim as ``0.0``, which is "the
+    cache was measured and served nothing". The row ALSO carries the raw
+    ``cached_tokens``, so a rate computed over a subset of calls can be checked
+    against the counts it came from.
     """
     by_site: dict[str, dict[str, Any]] = {}
     for key, value in summary.items():
@@ -1302,6 +1312,12 @@ def llm_block(summary: dict[str, str]) -> dict[str, Any]:
         # §14.29 — the money and the two non-token usage counts.
         "cached_tokens": _int(summary.get("llm_cached_tokens")),
         "reasoning_tokens": _int(summary.get("llm_reasoning_tokens")),
+        # §14.32 — the share of the prompt the server served from its own cache,
+        # copied from the run summary (the pipeline derives it from the two
+        # totals on the same line, so a reader dividing those two gets this
+        # value). `None` means no rate exists — nothing measured, or nothing
+        # reported a cache read — and is NOT the same claim as `0.0`.
+        "cache_hit_rate": _rate(summary.get("llm_cache_hit_rate")),
         "cost_usd": _cost(summary.get("cost_usd")),
         "cost_basis": summary.get("cost_basis"),
         # §14.31 — the tier the run was served on, beside the cost it selected.
@@ -1351,6 +1367,25 @@ def _cost(value: Optional[str]) -> Optional[float]:
     (``not_billed``, ``no_usage``, ``unpriced_family``), so mapping every
     non-number to ``None`` loses nothing a reader cannot get from the basis, and
     keeps ``None`` (= nothing priced) distinct from ``0.0`` (= priced, and free).
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _rate(value: Optional[str]) -> Optional[float]:
+    """§14.32 — a share is a float or ``None``, never the string ``unset``.
+
+    Same contract as ``_cost`` and for the same reason: a field a batch averages
+    or thresholds cannot carry a non-numeric token. The pipeline writes ``unset``
+    when no rate exists at all — nothing was measured, or nothing reported how
+    much came from cache — and ``0.0000`` when the server measured a cache and
+    served nothing from it. Collapsing both to ``None`` would erase that
+    difference, so the pipeline keeps it in the text and this only decides what a
+    reader can compute with.
     """
     if value is None:
         return None

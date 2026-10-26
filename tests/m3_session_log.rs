@@ -6704,6 +6704,196 @@ fn the_concise_switch_appends_the_sentence_to_the_generate_prompt_only() {
     );
 }
 
+/// §14.32 — the cacheable prefix leads every request and the variable tail trails it.
+///
+/// [VANTA-WHY] Hosted prompt caching is automatic and PREFIX-based: the provider
+/// only reuses a cached prefix when the tokens up to a point are byte-identical to
+/// a request it has already answered. That makes message ORDER the whole of item 8
+/// — a call site whose variable text (the attempt feedback, the test under
+/// revision) sat BEFORE the stable system prompt and repo context would re-bill the
+/// full prompt on every call and could never hit the cache. This test pins the order
+/// the call sites already produce, so a later edit that moves the nudge to the front
+/// fails here instead of silently doubling the bill, and it pins the property the
+/// cache actually keys on: a retry resends the stable messages UNCHANGED and appends
+/// the variable tail rather than rewriting any of them.
+///
+/// The bodies are decoded before they are inspected because `REPROMPT` and the
+/// truncation nudge arrive JSON-escaped in the raw text, where a substring test
+/// would still match a nudge nested inside the system prompt — the exact failure
+/// this test exists to catch.
+#[test]
+fn the_cacheable_prefix_leads_every_request_and_the_variable_tail_trails_it() {
+    let _serial = serial_run();
+
+    // §14.32 — the two literals an attempt-feedback turn opens with. `REPROMPT` is
+    // the per-site retry prompt; the cut-off nudge is the crate's own const, so the
+    // test reads the text that is sent rather than a copy of it.
+    let is_variable_tail = |content: &str| {
+        content.contains("REPROMPT") || content.contains(vanta::llm::TRUNCATION_NUDGE)
+    };
+
+    // A body's `(role, content)` messages, in the order the server received them.
+    let decoded = |body: &str| -> Vec<(String, String)> {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+        value["messages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("body must carry a messages array: {body}"))
+            .iter()
+            .map(|m| {
+                (
+                    m["role"].as_str().unwrap_or("").to_string(),
+                    m["content"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    };
+
+    // (1) A plain run: the stable system prompt leads every request, the user turn
+    //     it answers is last, and no attempt feedback is anywhere but the tail.
+    let plain = TempDir::new().unwrap();
+    let (_repo, _issue, plain_patch) = write_test_repo(plain.path(), PRESERVING_PATCH);
+    let plain_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let plain_output =
+        run_patch_mode_with_output(plain.path(), &plain_patch, &plain_server, 1, &[]);
+    assert_eq!(
+        plain_output.status.code(),
+        Some(0),
+        "the run under test must reach the reference approval; stdout:\n{}",
+        String::from_utf8_lossy(&plain_output.stdout)
+    );
+    let plain_kinds = plain_server.request_kinds();
+    let plain_bodies = plain_server.request_bodies();
+    assert_eq!(plain_kinds.len(), plain_bodies.len(), "one kind per recorded body");
+    assert!(
+        !plain_bodies.is_empty(),
+        "the run made no request, so its message order proves nothing"
+    );
+
+    // The system prompt each call site sends, so "the head of the prefix never
+    // moves" is checked per site rather than assumed from one body.
+    let mut system_by_kind: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (kind, body) in plain_kinds.iter().zip(plain_bodies.iter()) {
+        let msgs = decoded(body);
+        assert!(
+            !msgs.is_empty(),
+            "every request must carry at least the system prompt: {body}"
+        );
+        assert_eq!(
+            msgs[0].0, "system",
+            "the `{kind}` request must LEAD with the stable system prompt — a prefix cache \
+             can only match from the first token onward: {body}"
+        );
+        assert!(
+            !msgs[0].1.is_empty(),
+            "the leading system message must carry the stable prompt, not be empty: {body}"
+        );
+        assert_eq!(
+            msgs.last().unwrap().0,
+            "user",
+            "the `{kind}` request must END on the user turn the model answers: {body}"
+        );
+        for (i, (role, content)) in msgs.iter().enumerate() {
+            if is_variable_tail(content) {
+                assert_eq!(
+                    i,
+                    msgs.len() - 1,
+                    "variable attempt feedback in the `{kind}` request must TRAIL the stable \
+                     prefix, never sit inside it: {body}"
+                );
+                assert_ne!(
+                    *role, "system",
+                    "the `{kind}` attempt feedback belongs in a user turn, not in the stable \
+                     system prompt the cache keys on: {body}"
+                );
+            }
+        }
+        match system_by_kind.get(kind) {
+            None => {
+                system_by_kind.insert(kind.clone(), msgs[0].1.clone());
+            }
+            Some(first) => assert_eq!(
+                first, &msgs[0].1,
+                "two `{kind}` requests sent DIFFERENT system prompts, so the head of that call \
+                 site's cacheable prefix is not stable across the run"
+            ),
+        }
+    }
+
+    // (2) The retry path: a cut-off generation is re-asked with the SAME stable
+    //     messages and the nudge APPENDED, which is what lets the provider reuse
+    //     the prefix it has already cached instead of re-reading the whole prompt.
+    let retry = TempDir::new().unwrap();
+    let (_repo, _issue, retry_patch) = write_test_repo(retry.path(), PRESERVING_PATCH);
+    let retry_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    retry_server.truncate_next_calls(&["generate"]);
+    let retry_output =
+        run_patch_mode_with_output(retry.path(), &retry_patch, &retry_server, 1, &[]);
+    assert_eq!(
+        retry_output.status.code(),
+        Some(0),
+        "the cut-off generation must be retried and recover; stdout:\n{}",
+        String::from_utf8_lossy(&retry_output.stdout)
+    );
+    let retry_kinds = retry_server.request_kinds();
+    let retry_bodies = retry_server.request_bodies();
+    let generates: Vec<usize> = retry_kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| *k == "generate")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        generates.len(),
+        2,
+        "a single cut-off must be re-asked exactly once, so there are two generate bodies; \
+         got kinds {retry_kinds:?}"
+    );
+    let (first, second) = (generates[0], generates[1]);
+    let first_msgs = decoded(&retry_bodies[first]);
+    let second_msgs = decoded(&retry_bodies[second]);
+    assert_eq!(
+        first_msgs.len(),
+        2,
+        "the pinned first attempt is [system, user] with no nudge: {}",
+        retry_bodies[first]
+    );
+    assert!(
+        second_msgs.len() > first_msgs.len(),
+        "the re-ask must APPEND its feedback as extra turns rather than rewrite the prompt: {}",
+        retry_bodies[second]
+    );
+    assert_eq!(
+        &second_msgs[..2],
+        &first_msgs[..],
+        "the retry must resend the stable messages byte-for-byte, or the provider re-bills the \
+         whole prefix instead of reusing what it cached"
+    );
+    // Everything past the stable prefix is variable. This attempt carries TWO
+    // tails — the site's own attempt-#2 `REPROMPT` and §14.5's cut-off nudge —
+    // and both must sit after the unchanged prefix, in the order they were
+    // appended, or a later edit could bury one inside the cached head.
+    for (i, (role, content)) in second_msgs.iter().enumerate().skip(2) {
+        assert_eq!(
+            role, "user",
+            "every appended retry turn must be a user turn; message #{i} of the re-ask is not: {}",
+            retry_bodies[second]
+        );
+        assert!(
+            is_variable_tail(content),
+            "message #{i} of the re-ask sits after the stable prefix but is not variable \
+             feedback, so the stable run does not end where the tail begins: {}",
+            retry_bodies[second]
+        );
+    }
+    assert!(
+        second_msgs.last().unwrap().1.contains(vanta::llm::TRUNCATION_NUDGE),
+        "the cut-off nudge is appended last, after the attempt feedback: {}",
+        retry_bodies[second]
+    );
+}
+
 /// §4.3 token accounting: the numbers a cost table is built from are the
 /// SERVER's, recorded per call, and `run.summary` totals exactly those.
 ///
@@ -6964,6 +7154,13 @@ fn usage_details_and_cost_are_recorded_per_call_and_totalled() {
     assert_eq!(summary_value(&local_summary, "cost_usd"), "unset");
     assert_eq!(summary_value(&local_summary, "cost_basis"), "not_billed");
     assert_eq!(summary_value(&local_summary, "service_tier"), "unset");
+    // §14.32 — 314 cached of 777 prompt per call, so the run's share is the same
+    // number whatever the call count: the rate is token-weighted, not per-call.
+    assert_eq!(
+        summary_value(&local_summary, "llm_cache_hit_rate"),
+        "0.4041",
+        "the run's cache hit rate must be its measured cached/prompt share: {local_summary}"
+    );
 
     // (2) Hosted: same stub, same numbers — now priced.
     let hosted = TempDir::new().unwrap();
@@ -7053,6 +7250,13 @@ fn usage_details_and_cost_are_recorded_per_call_and_totalled() {
         "gpt-6-luna/standard/2026-10-26"
     );
     assert_eq!(summary_value(&hosted_summary, "service_tier"), "standard");
+    // §14.32 — the rate is a usage fact, not a hosted-only column: the same
+    // stub frame produces the same share on both backends.
+    assert_eq!(
+        summary_value(&hosted_summary, "llm_cache_hit_rate"),
+        summary_value(&local_summary, "llm_cache_hit_rate"),
+        "the backend must not change the cache hit rate the same usage frame implies"
+    );
 }
 
 /// §14.31 — the tier a run asks for is the row that prices it, and the body it

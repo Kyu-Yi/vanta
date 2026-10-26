@@ -7050,6 +7050,79 @@ never made — `scripts/openai_probe.py` (the operator's standalone, run with th
 
 ---
 
+### 14.32 Hosted OpenAI backend, item 8 — prompt caching
+### (the order was already right; what was missing was the measurement)
+
+Item 8 asked for the stable part of a request to come first and the variable part last, and offered a
+reordering if that was not already the case. **No reordering was needed, and this section is the record of why
+— because "we checked and changed nothing" is only a fact if the check is written down.**
+
+**The provider's cache is a prefix cache, so order is the whole item.** Caching on the hosted backend is
+automatic: a request reuses a cached prefix only when the tokens up to some point are byte-identical to a
+request the model has already answered. Two consequences decide what "correct order" means here. The **system
+prompt must be the first message** — a cache can only match from the first token forward, so anything that
+precedes it can never be reused. And the **longest possible stable run must be as early as possible**, because
+every variable token truncates the reusable prefix at that point. A call whose attempt feedback sat ahead of
+the repo context would re-bill the whole prompt on every retry and hit the cache on nothing.
+
+**The order was already correct at both levels.** At the message level, every call site builds
+`[system, user]` and *appends* its retry turn rather than rewriting either: `creator.rs:185-198`,
+`attacker.rs:399-412`, `605-618`, `676-689`, `1122`, `1687` all start from `json!({"role":"system", …})`, and
+the one non-`build_messages` tail — the §14.5 cut-off nudge — is
+`append_truncation_nudge` (`llm/mod.rs:2213-2218`), which pushes an extra `user` turn precisely so that
+"attempt 1 of every call … is byte-identical to v0.2". At the intra-message level the stable text leads too:
+the Creator's variable `PRIOR FEEDBACK` is pushed *after* the `ISSUE:` and `FILE:` blocks
+(`creator.rs:171-179`); the Attacker's revise turn carries the issue and original source *before* the prior
+test, mismatch reason and baseline evidence (`attacker.rs:586-601`); and the generate turn's variable
+`ALREADY IN THE SHARED TEST SET` section (`attacker.rs:293-320`, appended at `384-393`) follows the
+`PATCH:`/`ORIGINAL SOURCE:`/`ISSUE:` head. So the stable prefix is first and the variable tail is last
+because the builders are written that way, not because anything was moved.
+
+**Because nothing was moved, no before/after diff exists to show and the local bodies are unchanged by
+construction.** Item 8's "prove local bodies unchanged" is therefore discharged by the tests that already
+pin them — `the_concise_switch_appends_the_sentence_to_the_generate_prompt_only` and the §14.24–§14.31 body
+assertions all still pass on the untouched builders — plus the new ordering test below, which fails if a later
+edit reorders a request instead of appending to it.
+
+**What was actually missing was the measurement.** `CallUsage.cached_tokens` already comes from the server's
+`prompt_tokens_details.cached_tokens` (`llm/mod.rs:1504-1506`, §14.29), and stays `None` — not `0` — when the
+provider reports nothing, so "no cache reported" is never recorded as "cache missed". This item adds the
+run-level figure built from those rows: `run.summary` gained `llm_cache_hit_rate`, and the manifest's
+`llm_block` gained `cache_hit_rate` beside `cached_tokens`/`reasoning_tokens`.
+
+**The rate is token-weighted, not a mean of per-call rates.** `cache_hit_rate_value(cached, prompt)` in
+`driver.rs` is `cached / prompt` over the run's totals, rendered `{:.4}`. A mean of per-call rates would let a
+20-token call count as much as a 20,000-token one, which is the opposite of what a share of the bill measures.
+It answers `unset` in three cases and none of them is `0.0000`: nothing was measured (`cached` is `None`), the
+provider reported cached tokens but no prompt total to divide by, or the run's prompt total is zero. When only
+*some* calls reported a cached figure the rate is a **lower bound**, since the divisor is every prompt token
+the run sent — which is stated here rather than padded with an estimate. Python mirrors the distinction rather
+than collapsing it: `_rate` maps the string `unset` to `None`, so the manifest never carries a share that is
+really "unknown" as a float the reader would average.
+
+**Tests.** `driver.rs::the_cache_hit_rate_is_unset_when_no_rate_exists_and_never_a_guessed_zero` pins the five
+cases that matter (`Some(314)/777 → "0.4041"`, `Some(0)/777 → "0.0000"`, `None → "unset"`, `Some(0)/0 →
+"unset"`, `Some(500)/500 → "1.0000"`). `m3_session_log::the_cacheable_prefix_leads_every_request_and_the_variable_tail_trails_it`
+runs the stub twice: a plain run asserts that every request LEADS with a non-empty `system` message
+byte-identical across the run for its call site, that the last message is the `user` turn, and that no message
+but the last carries attempt feedback (checked on DECODED bodies, since an escaped `\n` would let a raw
+substring test match a nudge nested inside the system prompt); and a cut-off run asserts the retry's
+`[system, user]` prefix equals the first attempt's **element for element**, with every later message a
+variable `user` tail ending on §14.5's cut-off nudge — the exact property the provider's prefix cache keys
+on. (A cut-off retry turns out to carry **two** tails, the site's own attempt-#2 `REPROMPT` and the nudge, and
+the test pins both as trailing: the first draft asserted exactly one tail and the stub caught it.)
+`usage_details_and_cost_are_recorded_per_call_and_totalled` asserts the local summary reads
+`llm_cache_hit_rate=0.4041` and that the hosted summary equals the local value on the same stub usage frame.
+Python: `TestLlmBlock::test_the_cache_hit_rate_is_a_float_and_none_when_no_rate_exists` pins `0.4041 → 0.4041`,
+`"0.0000" → 0.0`, `"unset" → None`, and the before-this-record case reads `None`.
+
+**What this section does not settle.** No hosted run was made, so no *real* `cached_tokens` figure has been
+seen: the 1,024-token minimum for automatic caching, whether a cache key parameter exists, and what the
+provider actually reports for a reused prefix are still open, and `scripts/openai_probe.py` is where the
+operator confirms them with the key loaded via `read -s`.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

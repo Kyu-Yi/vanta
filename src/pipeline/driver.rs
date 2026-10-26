@@ -360,6 +360,33 @@ fn cost_value(value: Option<f64>) -> String {
     value.map(|v| format!("{v:.6}")).unwrap_or_else(|| "unset".to_string())
 }
 
+/// Render the run's cache hit rate (§14.32).
+///
+/// [VANTA-WHY] The rate is `cached / prompt` over the calls the server MEASURED,
+/// computed from the same two totals `run.summary` already carries
+/// (`llm_cached_tokens`, `llm_prompt_tokens`) so the three numbers on one line
+/// cannot disagree — a reader dividing them by hand gets this value back. It is
+/// token-WEIGHTED, not the mean of the per-call rates: a run whose first call is
+/// a 10k-token prompt and whose last is a 100-token one has a cache hit rate
+/// dominated by the call that actually spent the tokens.
+///
+/// [VANTA-WHY] `unset` in three cases, and they are all "no rate exists": no
+/// call was measured, no measured call reported cached tokens (the local server
+/// said nothing about caching), or the measured prompt total is zero (a
+/// division that would print `inf`/`NaN` into a `key=value` row). `0.0000` is
+/// the different claim that caching was measured and nothing was served from it.
+///
+/// [VANTA-WHY] A call that reported a prompt count but no cache detail
+/// contributes its prompt to the denominator, so the rate is a LOWER bound in
+/// that mixed case rather than an overstatement. That is the safe direction for
+/// a number a reader uses to decide whether prefix caching is working.
+fn cache_hit_rate_value(cached: Option<u64>, prompt: u64) -> String {
+    match cached {
+        Some(cached) if prompt > 0 => format!("{:.4}", cached as f64 / prompt as f64),
+        _ => "unset".to_string(),
+    }
+}
+
 /// Sum the server-measured token counts over one run's chat calls.
 ///
 /// [VANTA-WHY] Returns the call counts beside the sums, because a total over
@@ -3129,7 +3156,8 @@ pub async fn run(
             "attempts_run={} fixed_at_attempt_1={} final_decision={:?} \
              config={} mode={} seed={} seed_policy={} model={} top_p={} {} {} \
              llm_calls={} llm_calls_measured={} llm_prompt_tokens={} llm_completion_tokens={} \
-             llm_cached_tokens={} llm_reasoning_tokens={} cost_usd={} cost_basis={} \
+             llm_cached_tokens={} llm_reasoning_tokens={} llm_cache_hit_rate={} \
+             cost_usd={} cost_basis={} \
              truncated_calls_creator={} truncated_calls_attacker={} \
              truncated_calls_intent_audit={} \
              truncated_calls={} truncated_twice_calls={} \
@@ -3170,6 +3198,11 @@ pub async fn run(
             // `not_billed`, an unpriced family names itself), never `0`.
             token_value(llm_cached_tokens),
             token_value(llm_reasoning_tokens),
+            // [VANTA-WHY] §14.32 — the cache hit rate, derived from the two
+            // totals on this same line so the three cannot disagree. `unset`
+            // wherever no rate exists (nothing measured, nothing reported, or a
+            // zero prompt total), never `0.0000`.
+            cache_hit_rate_value(llm_cached_tokens, llm_prompt_tokens),
             cost_value(cost_usd),
             cost_basis,
             // [VANTA-WHY] §14.5 — how often a model ran away on each role in THIS
@@ -4671,10 +4704,10 @@ fn now_iso() -> String {
 mod tests {
     use super::{
         attempt_verdict, bate_baseline_concat, blocking_static_findings, build_source_concat,
-        collapse_decision, dependency_freeze_summary_value, harness_infrastructure_collapse,
-        modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
-        rejection_signal_message, render_committed_test_file,
-        require_clean_target_repo_for_open_pr, stamp_transition_row,
+        cache_hit_rate_value, collapse_decision, dependency_freeze_summary_value,
+        harness_infrastructure_collapse, modified_test_config_records,
+        patch_attempt_id_for_patch, record_new_static_findings, rejection_signal_message,
+        render_committed_test_file, require_clean_target_repo_for_open_pr, stamp_transition_row,
         stable_patch_fingerprint,
     };
     use crate::agents::attacker::GeneratedTest;
@@ -4683,6 +4716,24 @@ mod tests {
     use crate::pipeline::harness::StaticDiagnostic;
     use crate::session::{PatchAttemptId, SessionId};
     use std::collections::HashMap;
+
+    /// §14.32 — the rate, and the three "no rate exists" cases kept apart from a
+    /// measured zero.
+    #[test]
+    fn the_cache_hit_rate_is_unset_when_no_rate_exists_and_never_a_guessed_zero() {
+        // 314 of 777 is what the stub publishes; four decimals, fixed point, so
+        // two runs' rows compare as text and no `e` reaches a `key=value` row.
+        assert_eq!(cache_hit_rate_value(Some(314), 777), "0.4041");
+        // A measured zero IS a rate: the server said it served nothing from cache.
+        assert_eq!(cache_hit_rate_value(Some(0), 777), "0.0000");
+        // Nothing reported cached tokens at all (a server that says nothing about
+        // its cache) is NOT that claim.
+        assert_eq!(cache_hit_rate_value(None, 777), "unset");
+        // A zero prompt total would divide to `NaN`, which must never be printed.
+        assert_eq!(cache_hit_rate_value(Some(0), 0), "unset");
+        // A whole prompt served from cache is a rate of one, not a special case.
+        assert_eq!(cache_hit_rate_value(Some(500), 500), "1.0000");
+    }
 
     #[test]
     fn first_harness_collapse_retries_once() {

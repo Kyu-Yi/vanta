@@ -665,6 +665,90 @@ fn presence_penalty_override() -> Option<f64> {
         .filter(|penalty| *penalty != 0.0)
 }
 
+// ============================================================================
+// PER-SITE OUTPUT CAP OVERRIDE — `VANTA_MAX_TOKENS_<SITE>` (§14.20)
+// ============================================================================
+//
+// [VANTA-WHY] §14.14 caps how MANY revise/simplify calls one attempt may make;
+// this caps how LONG one may run. They answer the same question — "is the
+// Attacker stuck?" — from two sides, and a single revised test that spends
+// 32,768 tokens re-checking its own formatting is a run-away the call budget
+// cannot see, because it is one call.
+//
+// [VANTA-WHY] It is an OVERRIDE of the pin table, not a third preset, and it is
+// applied after the preset and after §14.16's presence penalty, for the same
+// reason: it changes exactly one key and leaves every other pin where it was. It
+// REPLACES the existing `max_tokens` slot rather than appending, because two
+// `max_tokens` keys in one JSON object is the second one silently winning and a
+// record that named both would describe a cap nobody sent.
+//
+// [VANTA-WHY] The value is recorded twice and the two records say different
+// things. The per-site `max_tokens_<site>` keys in `run.summary` come from the
+// same table the bodies are built from, so they carry the EFFECTIVE cap; the
+// run-level line below carries what was ASKED FOR, which is what identifies the
+// arm — a reader comparing two batch directories needs to see the switch, not
+// have to infer it from a number that happens to differ from the schedule.
+
+/// The requested per-site output caps, keyed by call site. Empty = nothing asked.
+///
+/// [VANTA-WHY] A `Vec` of the table's own `&'static str` site names rather than a
+/// `HashMap`: `HashMap::new` is not a constant function, so it cannot back a
+/// `static`, and the site list is five entries long — a linear scan here is not a
+/// cost worth a `LazyLock` for.
+static MAX_TOKENS_OVERRIDES: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
+
+/// The environment variable that carries `site`'s output cap (`VANTA_MAX_TOKENS_<SITE>`).
+///
+/// [VANTA-WHY] Derived from the site name rather than spelled at each site, so
+/// the switch and the table that applies it cannot drift: `attacker_revise`
+/// is `VANTA_MAX_TOKENS_ATTACKER_REVISE` and nothing else can be.
+pub fn max_tokens_env_var(site: &str) -> String {
+    format!("VANTA_MAX_TOKENS_{}", site.to_uppercase())
+}
+
+/// Pin `max_tokens` per call site. An empty list leaves the pins alone.
+pub fn set_max_tokens_overrides(overrides: Vec<(&'static str, u32)>) {
+    *MAX_TOKENS_OVERRIDES.lock().unwrap() = overrides;
+}
+
+/// The requested cap for `site`, or `None` when the schedule's value stands.
+///
+/// `None` is every run before §14.20 and every run without the switch, so the
+/// bodies those runs send are byte-identical to what they sent before it.
+fn max_tokens_override(site: &str) -> Option<u32> {
+    MAX_TOKENS_OVERRIDES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(name, _)| *name == site)
+        .map(|(_, cap)| *cap)
+}
+
+/// The overrides that were asked for, `site=cap` pairs in `SAMPLING_SCHEDULE` order.
+///
+/// [VANTA-WHY] Rendered in the schedule's own order rather than the order the
+/// environment happened to arrive in, so two arms of the same ablation render
+/// identically. `unset` is the absence of the switch, which is every run before
+/// §14.20 — never an empty string, which would be a claim that something was
+/// pinned.
+pub fn max_tokens_overrides_text() -> String {
+    let overrides = MAX_TOKENS_OVERRIDES.lock().unwrap();
+    let pairs: Vec<String> = SAMPLING_SCHEDULE
+        .iter()
+        .filter_map(|(site, ..)| {
+            overrides
+                .iter()
+                .find(|(name, _)| name == site)
+                .map(|(_, cap)| format!("{site}={cap}"))
+        })
+        .collect();
+    if pairs.is_empty() {
+        "unset".to_string()
+    } else {
+        pairs.join(",")
+    }
+}
+
 /// The sampler keys `site` pins under `preset`, in a fixed order.
 ///
 /// [VANTA-WHY] One table feeds both the request body ([`with_sampling`]) and the
@@ -698,6 +782,17 @@ fn sampling_pin_table(preset: SamplingPreset, site: &str) -> Vec<(&'static str, 
         match pins.iter_mut().find(|(key, _)| *key == "presence_penalty") {
             Some(slot) => slot.1 = PinValue::Float(penalty),
             None => pins.push(("presence_penalty", PinValue::Float(penalty))),
+        }
+    }
+    // [VANTA-WHY] §14.20 — the output-cap override, applied last for §14.16's
+    // reason and REPLACING the `max_tokens` slot the two builders above already
+    // put there. It never appends: a second `max_tokens` key would be silently
+    // won by whichever the JSON object kept, and the record would then name a cap
+    // no body carried.
+    if let Some(cap) = max_tokens_override(site) {
+        match pins.iter_mut().find(|(key, _)| *key == "max_tokens") {
+            Some(slot) => slot.1 = PinValue::Int(cap),
+            None => pins.push(("max_tokens", PinValue::Int(cap))),
         }
     }
     pins
@@ -2296,5 +2391,114 @@ mod _presence_penalty_tests {
             "coding declares its own `presence_penalty`, override or not"
         );
         assert_eq!(pinned(SamplingPreset::Pinned, "creator"), None);
+    }
+}
+
+// ============================================================================
+// §14.20 — the per-site output cap's own switch
+// ============================================================================
+//
+// [VANTA-WHY] One test, not four, for the reason the block above is one test:
+// `MAX_TOKENS_OVERRIDES` is a process-global and the harness runs these in
+// parallel threads, so two tests that each set and clear it race — the clearing
+// one wins the `max_tokens` slot out from under the asserting one and the
+// failure reads as a broken override rather than a broken test. The override is
+// owned here end to end and left cleared.
+#[cfg(test)]
+mod _max_tokens_override_tests {
+    use super::{
+        SAMPLING_SCHEDULE, SamplingPreset, max_tokens_env_var, max_tokens_overrides_text,
+        sampling_pins_text, set_max_tokens_overrides, with_sampling,
+    };
+    use serde_json::json;
+
+    /// The `max_tokens` a body would carry for `site`.
+    fn cap(preset: SamplingPreset, site: &str) -> Option<u32> {
+        sampling_pins_text(preset, site)
+            .into_iter()
+            .find(|(key, _)| *key == "max_tokens")
+            .map(|(_, value)| value.parse().expect("a max_tokens pin is an integer"))
+    }
+
+    #[test]
+    fn the_output_cap_override_replaces_one_slot_and_leaves_the_rest_on_the_schedule() {
+        // The switch is named after the site it caps, so it cannot be spelled for
+        // a site the pin table would panic on.
+        assert_eq!(
+            max_tokens_env_var("attacker_revise"),
+            "VANTA_MAX_TOKENS_ATTACKER_REVISE"
+        );
+        assert_eq!(max_tokens_env_var("creator"), "VANTA_MAX_TOKENS_CREATOR");
+
+        // (1) The default and every run before §14.20: nothing asked for, so every
+        //     body and every record stays on the schedule, byte for byte.
+        set_max_tokens_overrides(Vec::new());
+        for (site, _, scheduled) in SAMPLING_SCHEDULE {
+            assert_eq!(
+                cap(SamplingPreset::Pinned, site),
+                Some(*scheduled),
+                "an unset override must leave the schedule's cap ({site})"
+            );
+            assert_eq!(
+                with_sampling(json!({}), site)["max_tokens"],
+                json!(*scheduled),
+                "the unset body must carry the schedule's cap ({site})"
+            );
+        }
+        assert_eq!(max_tokens_overrides_text(), "unset");
+
+        // (2) The arm: two sites capped. The override REPLACES the `max_tokens`
+        //     slot rather than appending — a duplicate key is silently won by
+        //     whichever the object kept, and a record naming both would describe a
+        //     cap nobody sent — and it wins over the coding preset too.
+        set_max_tokens_overrides(vec![
+            ("attacker_revise", 12288),
+            ("attacker_simplify", 12288),
+        ]);
+        for preset in [SamplingPreset::Pinned, SamplingPreset::Coding] {
+            for site in ["attacker_revise", "attacker_simplify"] {
+                let text = sampling_pins_text(preset, site);
+                assert_eq!(
+                    text.iter().filter(|(key, _)| *key == "max_tokens").count(),
+                    1,
+                    "the override must not duplicate `max_tokens` ({site})"
+                );
+                assert_eq!(cap(preset, site), Some(12288), "({site})");
+                assert_eq!(
+                    with_sampling(json!({}), site)["max_tokens"],
+                    json!(12288),
+                    "the override must reach the request body itself ({site})"
+                );
+            }
+        }
+
+        // The three sites the switch does not name keep the schedule, so an arm
+        // that caps two sites leaves the others alone.
+        assert_eq!(cap(SamplingPreset::Pinned, "creator"), Some(32768));
+        assert_eq!(cap(SamplingPreset::Pinned, "attacker_generate"), Some(32768));
+        assert_eq!(cap(SamplingPreset::Pinned, "intent_audit"), Some(8192));
+
+        // The run-level line names what was ASKED FOR, in schedule order, which is
+        // what identifies the arm in a batch table.
+        assert_eq!(
+            max_tokens_overrides_text(),
+            "attacker_revise=12288,attacker_simplify=12288"
+        );
+
+        // (3) §14.20 must not be revise-only: the PySnooper smoke's round-2
+        //     `attacker_generate` spent its whole 32,768-token cap without
+        //     answering, so the first generation is addressable too.
+        set_max_tokens_overrides(vec![("attacker_generate", 16384)]);
+        assert_eq!(cap(SamplingPreset::Pinned, "attacker_generate"), Some(16384));
+        assert_eq!(
+            with_sampling(json!({}), "attacker_generate")["max_tokens"],
+            json!(16384)
+        );
+        assert_eq!(max_tokens_overrides_text(), "attacker_generate=16384");
+
+        // The cleared state this test has to leave behind.
+        set_max_tokens_overrides(Vec::new());
+        assert_eq!(cap(SamplingPreset::Pinned, "attacker_revise"), Some(32768));
+        assert_eq!(max_tokens_overrides_text(), "unset");
     }
 }

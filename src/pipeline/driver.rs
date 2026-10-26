@@ -210,6 +210,51 @@ fn env_float(name: &str) -> Result<Option<f64>, String> {
     }
 }
 
+/// Read the per-call-site output caps from `VANTA_MAX_TOKENS_<SITE>` (§14.20).
+///
+/// [VANTA-WHY] §14.20 — the switch is derived from the schedule `site` names, so
+/// the set of caps a run can ask for and the set of sites that exist cannot
+/// drift: `attacker_revise` is `VANTA_MAX_TOKENS_ATTACKER_REVISE` and there is no
+/// spelling for a site the pin table would panic on. A malformed value is an
+/// error for `env_secs`'s reason — `VANTA_MAX_TOKENS_ATTACKER_REVISE=12k` read as
+/// "no override" would run an arm the operator did not ask for and compare it
+/// against the wrong baseline. Zero is rejected rather than honoured: a cap of
+/// zero is a site that can emit nothing, which is a misconfiguration and never a
+/// measurement, and the operator who wants the schedule's value unset the var.
+///
+/// [VANTA-WHY] An empty value is skipped, not an error, for `env_float`'s reason:
+/// a shell expanding an unset variable (`VANTA_X=`) must not fail the run.
+fn env_max_tokens_overrides() -> Result<Vec<(&'static str, u32)>, String> {
+    let mut overrides = Vec::new();
+    for &(site, _, _) in crate::llm::SAMPLING_SCHEDULE {
+        let name = crate::llm::max_tokens_env_var(site);
+        match std::env::var(&name) {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let cap = trimmed.parse::<u32>().map_err(|_| {
+                    format!("CONFIG_ERROR: {name}='{trimmed}' is not a number of tokens.")
+                })?;
+                if cap == 0 {
+                    return Err(format!(
+                        "CONFIG_ERROR: {name}=0 would let `{site}` emit nothing; unset it instead."
+                    ));
+                }
+                overrides.push((site, cap));
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(format!(
+                    "CONFIG_ERROR: {name} env var contained non-UTF-8 bytes."
+                ));
+            }
+        }
+    }
+    Ok(overrides)
+}
+
 /// The `baseline` / `vanta` / `vanta_planner` name for a pair of switches.
 ///
 /// [VANTA-WHY] Deriving the name from the switches instead of taking a fourth
@@ -450,6 +495,25 @@ pub async fn run(
         println!(
             "  Presence penalty: every call site will pin presence_penalty={penalty:?} \
              (VANTA_PRESENCE_PENALTY)"
+        );
+    }
+    // [VANTA-WHY] §14.20 — the output-cap arm. Set here, before the repo is even
+    // loaded, for §14.16's reason: a malformed value must fail the run before it
+    // spends an hour generating, and the caps must reach the pin table (and
+    // therefore every request body) before the first call. An empty list is every
+    // run without the switch, and `set_max_tokens_overrides` with an empty list
+    // leaves `sampling_pin_table` exactly as it was, so those bodies stay
+    // byte-identical.
+    let max_tokens_overrides = env_max_tokens_overrides()?;
+    crate::llm::set_max_tokens_overrides(max_tokens_overrides.clone());
+    if !max_tokens_overrides.is_empty() {
+        let pairs: Vec<String> = max_tokens_overrides
+            .iter()
+            .map(|(site, cap)| format!("{site}={cap}"))
+            .collect();
+        println!(
+            "  Output caps: {} (VANTA_MAX_TOKENS_<SITE>)",
+            pairs.join(", ")
         );
     }
     if !attacker_enabled {
@@ -2779,7 +2843,7 @@ pub async fn run(
              corroborate={} grounded_audit={} batch_audit={} \
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              revise_budget_per_attempt={} revise_calls_used={} \
-             deadline_secs={} stop_reason={} presence_penalty={} \
+             deadline_secs={} stop_reason={} presence_penalty={} max_tokens_overrides={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
              commit={} dirty={} prompt_version={} prompt_hash={} context_selection={} \
              harness_error={}",
@@ -2847,6 +2911,16 @@ pub async fn run(
             presence_penalty
                 .map(|v| format!("{v:?}"))
                 .unwrap_or_else(|| "unset".to_string()),
+            // [VANTA-WHY] §14.20 — the output caps that were ASKED FOR, in the
+            // schedule's own order, `site=cap` pairs. The per-site
+            // `max_tokens_<site>` keys earlier on this line carry the EFFECTIVE
+            // cap each body was sent under; this field carries the switch, which
+            // is what identifies an ablation arm. `unset` is the default and
+            // every run before this change. The value holds no spaces — the
+            // parser in `rerun.rs`/`metrics.py` reads a value only up to the next
+            // space that begins a lowercase `key=`, and `attacker_revise=12288,…`
+            // therefore survives intact.
+            crate::llm::max_tokens_overrides_text(),
             deciding_rule.as_deref().unwrap_or("none"),
             deciding_evidence.join(","),
             needs_review_weak.join(","),

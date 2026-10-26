@@ -5610,6 +5610,156 @@ fn the_presence_penalty_override_reaches_every_body_and_zero_reaches_none() {
     assert_schedule_matches_bodies(arm.path(), &arm_server, vanta::llm::SamplingPreset::Pinned);
 }
 
+/// §14.20 — `VANTA_MAX_TOKENS_<SITE>` replaces one site's `max_tokens` slot.
+///
+/// [VANTA-WHY] A revised test that spends its whole 32,768-token cap re-checking
+/// its own formatting is a run-away §14.14's call budget cannot see, because it is
+/// ONE call. The switch is an ablation arm, so it has to be true in three places
+/// at once: each body carries the cap the record names for ITS OWN site, the sites
+/// the switch does not name keep the schedule, and `run.summary` names what was
+/// ASKED FOR — because a reader comparing batch directories needs the switch, not
+/// a number that happens to differ. A malformed value must fail the run before it
+/// spends an hour generating, which is asserted on the exit code and the absence
+/// of any call.
+#[test]
+fn the_output_cap_override_replaces_one_sites_slot_and_only_that_site() {
+    let _serial = serial_run();
+
+    // (1) The control: nothing asked for. Every body keeps the schedule's cap and
+    //     the record says so.
+    let control = TempDir::new().unwrap();
+    let (_repo, _issue, control_patch) = write_test_repo(control.path(), PRESERVING_PATCH);
+    let control_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let control_output =
+        run_patch_mode_with_output(control.path(), &control_patch, &control_server, 1, &[]);
+    assert_eq!(
+        control_output.status.code(),
+        Some(0),
+        "the switch is a sampling choice and must not move the verdict; stdout:\n{}",
+        String::from_utf8_lossy(&control_output.stdout)
+    );
+    let control_summary = run_summary(control.path()).summary;
+    assert_eq!(
+        summary_value(&control_summary, "max_tokens_overrides"),
+        "unset",
+        "an unset switch is not an empty pin; the record must say nobody asked: {control_summary}"
+    );
+    assert_schedule_matches_bodies(
+        control.path(),
+        &control_server,
+        vanta::llm::SamplingPreset::Pinned,
+    );
+
+    // (2) The arm: two sites capped. Each capped body carries 12288 and exactly
+    //     one `max_tokens` key, the other three sites keep the schedule, and the
+    //     run-level field names the switch in schedule order.
+    let arm = TempDir::new().unwrap();
+    let (_repo, _issue, arm_patch) = write_test_repo(arm.path(), PRESERVING_PATCH);
+    let arm_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let arm_output = run_patch_mode_with_output(
+        arm.path(),
+        &arm_patch,
+        &arm_server,
+        1,
+        &[
+            ("VANTA_MAX_TOKENS_ATTACKER_REVISE", "12288"),
+            ("VANTA_MAX_TOKENS_ATTACKER_SIMPLIFY", "12288"),
+        ],
+    );
+    assert_eq!(
+        arm_output.status.code(),
+        Some(0),
+        "a lower output cap on two remediation sites must leave the verdict alone; \
+         stdout:\n{}",
+        String::from_utf8_lossy(&arm_output.stdout)
+    );
+    let arm_bodies = arm_server.request_bodies();
+    let arm_kinds = arm_server.request_kinds();
+    assert_eq!(arm_kinds.len(), arm_bodies.len(), "one kind per recorded body");
+    assert!(
+        !arm_bodies.is_empty(),
+        "the arm must have made calls, or it proves nothing about them"
+    );
+    // [VANTA-WHY] §14.20 — the per-body check maps kind -> site -> the cap the
+    // RECORD names for that site, rather than against `sampling_pins_text`, whose
+    // ground truth is the PARENT's pin table and therefore cannot see an override
+    // the child read from the environment. `assert_schedule_matches_bodies` is
+    // deliberately not used on the arm for that reason: it would compare the
+    // child's 12288 against the parent's 32768 and report a broken override.
+    let arm_summary = run_summary(arm.path()).summary;
+    let expected_cap = |site: &str| -> u64 {
+        summary_value(&arm_summary, &format!("max_tokens_{site}"))
+            .parse()
+            .expect("every site's effective cap is recorded")
+    };
+    for (kind, body) in arm_kinds.iter().zip(arm_bodies.iter()) {
+        let site = SITE_FOR_KIND
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map(|(_, site)| *site)
+            .unwrap_or_else(|| panic!("stub saw an unmapped request kind `{kind}`"));
+        let value: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+        assert_eq!(
+            value.get("max_tokens").and_then(|v| v.as_u64()),
+            Some(expected_cap(site)),
+            "the `{kind}` body must carry the cap the record names for `{site}`: {body}"
+        );
+    }
+    assert_eq!(
+        summary_value(&arm_summary, "max_tokens_overrides"),
+        "attacker_revise=12288,attacker_simplify=12288",
+        "the run-level field is the switch itself, in schedule order; got {arm_summary}"
+    );
+    assert_eq!(
+        summary_value(&arm_summary, "max_tokens_attacker_revise"),
+        "12288"
+    );
+    assert_eq!(
+        summary_value(&arm_summary, "max_tokens_attacker_simplify"),
+        "12288"
+    );
+    for (site, scheduled) in [
+        ("creator", "32768"),
+        ("attacker_generate", "32768"),
+        ("intent_audit", "8192"),
+    ] {
+        assert_eq!(
+            summary_value(&arm_summary, &format!("max_tokens_{site}")),
+            scheduled,
+            "a site the switch does not name must keep the schedule: {arm_summary}"
+        );
+    }
+
+    // (3) Malformed and zero values are refused before a single call is made.
+    for (name, value) in [
+        ("VANTA_MAX_TOKENS_ATTACKER_REVISE", "12k"),
+        ("VANTA_MAX_TOKENS_ATTACKER_REVISE", "0"),
+    ] {
+        let bad = TempDir::new().unwrap();
+        let (_repo, _issue, bad_patch) = write_test_repo(bad.path(), PRESERVING_PATCH);
+        let bad_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+        let bad_output =
+            run_patch_mode_with_output(bad.path(), &bad_patch, &bad_server, 1, &[(name, value)]);
+        assert_eq!(
+            bad_output.status.code(),
+            Some(1),
+            "{name}={value} must fail the run; stdout:\n{}",
+            String::from_utf8_lossy(&bad_output.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&bad_output.stderr);
+        assert!(
+            stderr.contains("CONFIG_ERROR") && stderr.contains(name),
+            "{name}={value} must name the offending switch; stderr:\n{stderr}"
+        );
+        assert!(
+            bad_server.request_bodies().is_empty(),
+            "a refused config must fail BEFORE the first call, or the run has already \
+             spent an hour generating"
+        );
+    }
+}
+
 /// §4.3 token accounting: the numbers a cost table is built from are the
 /// SERVER's, recorded per call, and `run.summary` totals exactly those.
 ///

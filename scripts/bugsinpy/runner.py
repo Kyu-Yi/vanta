@@ -1137,6 +1137,21 @@ def sampling_block(summary: dict[str, str]) -> dict[str, Any]:
     # table comparing the two arms of the ablation can only be cut from this
     # field. `unset` means the switch was never set.
     penalty = summary.get("presence_penalty")
+    # §14.20 — what `VANTA_MAX_TOKENS_<SITE>` ASKED FOR, keyed by site. The
+    # per-site `max_tokens` values inside `pinned` above are the EFFECTIVE cap
+    # every body was sent under (the override already reached them); this is the
+    # switch itself, which is what identifies an ablation arm in a batch table.
+    # `unset` means the variable was never set, which is every run before §14.20.
+    overrides_text = summary.get("max_tokens_overrides")
+    overrides: Optional[dict[str, int]] = None
+    if overrides_text and overrides_text != "unset":
+        overrides = {
+            site: int(cap)
+            for site, _, cap in (
+                pair.partition("=") for pair in overrides_text.split(",")
+            )
+            if site and cap
+        }
     return {
         # The split's own constant, not a copied literal: the manifest must name the
         # same policy the committed design declares, or the provenance block would
@@ -1146,6 +1161,7 @@ def sampling_block(summary: dict[str, str]) -> dict[str, Any]:
         "presence_penalty": (
             _number(penalty) if penalty and penalty != "unset" else None
         ),
+        "max_tokens_overrides": overrides,
         "server_top_p": _number(top_p) if top_p and top_p != "unset" else None,
         "server_top_p_note": (
             "unset — /props did not publish it"

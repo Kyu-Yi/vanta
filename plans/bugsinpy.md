@@ -6122,6 +6122,73 @@ timeout as not-harness-errors, so the guard can only fire on the never-graded fa
 
 ---
 
+### 14.20 `VANTA_MAX_TOKENS_<SITE>` — capping one call without capping the run
+
+§14.14 caps how **many** revise and simplify calls one attempt may make; it cannot see how **long** one
+of them runs. The PySnooper/3 smoke's round-2 `attacker_generate` spent its whole 32,768-token cap without
+answering, and the sanic smoke's revise #1 did the same twice; a single call that spends the entire output
+budget re-checking its own formatting is a run-away the call budget cannot represent, because it is one
+call. The two knobs answer the same question — "is the Attacker stuck?" — from two sides, and a batch
+needs to measure the second one.
+
+**It is an override of the pin table, applied last.** `sampling_pin_table` builds the preset's pins and
+then **replaces** the `max_tokens` slot, exactly as §14.16 replaces `presence_penalty`. It never appends:
+two `max_tokens` keys in one JSON object is the later one silently winning, and a recorded schedule that
+named both would describe a cap nobody sent. Because the slot it replaces is the one the schedule put
+there, the switch **replaces the existing `max_tokens` slot** rather than adding a second source of truth
+— and because the pin table is the same table `with_sampling` fills bodies from and `sampling_pins_text`
+renders records from, the number in `run.summary` cannot drift from the number the body carried.
+
+**Every site is addressable, including the first generation.** The variable name is *derived* from the
+site's own name (`llm::max_tokens_env_var`), so the set of caps a run can ask for and the set of sites the
+pin table knows cannot drift: `attacker_revise` is `VANTA_MAX_TOKENS_ATTACKER_REVISE`, `attacker_generate`
+is `VANTA_MAX_TOKENS_ATTACKER_GENERATE`, and there is no spelling for a site the table would panic on.
+The user's brief names `attacker_revise`/`attacker_simplify` as the motivation, but the round-2
+`attacker_generate` in the smoke run is the same failure, so the switch is deliberately not revise-only.
+
+**Nothing asked for is byte-identical to before.** An empty override list leaves `sampling_pin_table`
+untouched, so every body and every record of a run without the switch is what it was — the §4.2 property
+the whole comparison rests on. `set_max_tokens_overrides(Vec::new())` is the default and every run before
+this change.
+
+**Recorded at two levels, and the two say different things.** The per-site `max_tokens_<site>` keys in
+`run.summary` come from the pin table itself, so they carry the **effective** cap every body was sent
+under (the override already reached them); the run-level `max_tokens_overrides=` field carries what was
+**asked for**, as `site=cap` pairs in `SAMPLING_SCHEDULE` order, or `unset`. A reader comparing two batch
+directories needs the switch, not a number that happens to differ — and rendering in the schedule's own
+order rather than the order the environment happened to arrive in keeps two arms of the same ablation
+identical. The value holds no space, so the parser in `rerun.rs`/`metrics.py` reads it whole: it ends a
+value only at a space that begins a lowercase `key=`, and `attacker_revise=12288,attacker_simplify=12288`
+has none. The manifest's `sampling` block reads both (`sampling.max_tokens_overrides`, and `max_tokens` on
+each entry of `sampling.pinned`).
+
+**A malformed value fails the run before it spends an hour.** `env_max_tokens_overrides` errors on
+anything that is not a number of tokens and on non-UTF-8, for `env_secs`'s reason: `VANTA_MAX_TOKENS_
+ATTACKER_REVISE=12k` read as "no override" would run an arm the operator did not ask for and compare it
+against the wrong baseline. **Zero is rejected rather than honoured**: a cap of zero is a site that can
+emit nothing, which is a misconfiguration and never a measurement — the operator who wants the schedule's
+value unsets the var. An empty value is skipped, not an error, so a shell expanding an unset variable
+(`VANTA_X=`) does not fail the run.
+
+Tests: `src/llm/mod.rs::_max_tokens_override_tests::the_output_cap_override_replaces_one_slot_and_leaves
+_the_rest_on_the_schedule` asserts an unset switch leaves every site's body and record on the schedule and
+renders `unset`, that a two-site arm reaches both `pinned` and `coding` bodies with exactly one
+`max_tokens` key, that the three sites it does not name are unmoved, and that `attacker_generate` is
+addressable — it is **one** test, like §14.16's, because the override is a process-global and parallel
+tests that each set and clear it race;
+`tests/m3_session_log.rs::the_output_cap_override_replaces_one_sites_slot_and_only_that_site` runs the
+control and the arm end to end against the stub server — the control's record reads `unset` and is held to
+`assert_schedule_matches_bodies`, the arm's record names the switch in schedule order, its unnamed sites
+keep the schedule, and each body is held to **the cap the record names for its own site** (`kind` →
+`SITE_FOR_KIND` → `max_tokens_<site>`, rather than `sampling_pins_text`, whose ground truth is the
+parent's table and so cannot see an override the child read from the environment) — then asserts a
+non-number and a zero both fail with `CONFIG_ERROR` naming the switch **before any call is made**;
+`scripts/test_bugsinpy.py::TestSamplingBlock::test_the_output_cap_arm_is_read_from_the_record_per_site`
+asserts the manifest reads the asked-for caps as a site→int map and that an unset switch comes back as
+`None`, not a fabricated empty map.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

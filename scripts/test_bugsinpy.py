@@ -18239,6 +18239,27 @@ class TestSamplingBlock:
         assert block["presence_penalty"] is None
         assert all("presence_penalty" not in entry for entry in block["pinned"])
 
+    def test_the_output_cap_arm_is_read_from_the_record_per_site(self):
+        """§14.20 — the asked-for caps, beside the EFFECTIVE ones the bodies carried.
+
+        The per-site `max_tokens` values in `pinned` are the cap each body was
+        sent under, which the override already changed; this field is the switch
+        itself, and only it names the arm. `unset` must stay distinct from a
+        switch that pinned nothing, because only one of those is an experiment.
+        """
+        assert runner_mod.sampling_block(
+            runner_mod.parse_summary(self.SUMMARY)
+        )["max_tokens_overrides"] is None
+
+        armed = runner_mod.parse_summary(
+            self.SUMMARY
+            + " max_tokens_overrides=attacker_revise=12288,attacker_simplify=12288"
+        )
+        assert runner_mod.sampling_block(armed)["max_tokens_overrides"] == {
+            "attacker_revise": 12288,
+            "attacker_simplify": 12288,
+        }
+
     def test_the_pinned_schedule_matches_the_pipeline_constant(self):
         """`SAMPLING_SCHEDULE` is the only definition of the per-call schedule (§4.3)."""
         text = (REPO_ROOT / "src" / "llm" / "mod.rs").read_text(encoding="utf-8")

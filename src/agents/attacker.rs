@@ -25,6 +25,7 @@ use crate::llm::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, trace, warn};
 
 // ============================================================================
@@ -319,6 +320,46 @@ fn already_probed_section(existing_tests: &[SharedProbe]) -> String {
 }
 
 // ============================================================================
+// VANTA_ATTACKER_CONCISE (§14.22) — one extra sentence, on the first request only
+// ============================================================================
+//
+// [VANTA-WHY] §14.13's measured run-away is a model that worked the answer out
+// and then spent the cap re-checking it. §14.20 caps the answer and §14.21 caps
+// the thinking; this is the cheapest possible attempt at the third cause — the
+// prompt never told the model that one check is enough. It is deliberately the
+// ATTACKER'S FIRST REQUEST and not the revise/simplify prompts: those are already
+// answering a specific BATE result, and a bare "do not re-check" there would tell
+// a revision not to look at the evidence §14.17 just gave it.
+//
+// [VANTA-WHY] The sentence is appended to the USER message, not to
+// `ATTACKER_SYSTEM_PROMPT`, so the §14.10-f prompt-content hash is unchanged by an
+// arm that only adds this sentence. That is deliberate and honest: the hash names
+// the SYSTEM prompts the run sent, and this arm sends the same ones. The arm is
+// still identifiable — `run.summary` records the switch and the manifest carries
+// it — so an ablation row can be assigned to the right arm, which is what the hash
+// is for.
+const ATTACKER_CONCISE_SUFFIX: &str = "\n\nOnce each test is written and checked once, output the JSON immediately; do not re-verify formatting.";
+
+/// Whether `VANTA_ATTACKER_CONCISE` asked for the shorter first prompt (§14.22).
+static ATTACKER_CONCISE: AtomicBool = AtomicBool::new(false);
+
+/// Set the §14.22 arm; `false` is the default and every run before it existed.
+pub fn set_attacker_concise(enabled: bool) {
+    ATTACKER_CONCISE.store(enabled, Ordering::SeqCst);
+}
+
+/// Whether the §14.22 sentence is appended to the first request's user message.
+pub fn attacker_concise() -> bool {
+    ATTACKER_CONCISE.load(Ordering::SeqCst)
+}
+
+/// The sentence the arm appends, exposed so a test can pin the text that is sent
+/// rather than a copy of it.
+pub fn attacker_concise_suffix() -> &'static str {
+    ATTACKER_CONCISE_SUFFIX
+}
+
+// ============================================================================
 // attacker_generate_tests() — call LLM, get typed AttackerResponse
 // ============================================================================
 pub async fn attacker_generate_tests(
@@ -341,8 +382,14 @@ pub async fn attacker_generate_tests(
     let already_probed = already_probed_section(&request.existing_tests);
 
     let user_prompt = format!(
-        "PATCH:\n```diff\n{}\n```\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nISSUE:\n{}{}\n\nWrite AttackerResponse JSON.",
-        request.patch_text, request.original_source, request.issue_text, already_probed
+        "PATCH:\n```diff\n{}\n```\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nISSUE:\n{}{}\n\nWrite AttackerResponse JSON.{}",
+        request.patch_text,
+        request.original_source,
+        request.issue_text,
+        already_probed,
+        // [VANTA-WHY] §14.22 — empty unless the arm is on, so every default run's
+        // first request body is byte-for-byte what it was before this existed.
+        if attacker_concise() { ATTACKER_CONCISE_SUFFIX } else { "" }
     );
 
     debug!(system_len = system_prompt.len(), user_len = user_prompt.len(), "attacker prompts built");
@@ -3817,5 +3864,33 @@ mod tests {
             crate::core::prompt_content_hash(&prompts),
             "the recorded attacker hash must be the hash of the prompts its call sites send"
         );
+    }
+
+    /// [VANTA-WHY] §14.22 — `VANTA_ATTACKER_CONCISE` is the one PROMPT arm, and
+    /// the single change that would quietly corrupt its accounting is the sentence
+    /// leaking into a system prompt: the §14.10-f `attacker=` hash is taken over
+    /// exactly the three system prompts, so a suffix that moved into one of them
+    /// would change the hash while `run.summary` still reported the switch — two
+    /// different sent texts sharing one recorded hash. So the sentence is pinned
+    /// here twice: it must be the exact text the arm appends, and it must NOT be a
+    /// substring of any prompt the hash covers. The arm rides the USER message by
+    /// design; this test is what keeps that true.
+    #[test]
+    fn the_concise_suffix_is_the_sentence_and_is_not_in_a_system_prompt() {
+        const SENTENCE: &str =
+            "Once each test is written and checked once, output the JSON immediately; do not re-verify formatting.";
+        let suffix = attacker_concise_suffix();
+        assert_eq!(
+            suffix,
+            format!("\n\n{SENTENCE}"),
+            "the arm's sentence is the text the model is sent; reword it here deliberately"
+        );
+        for (slot, prompt) in attacker_system_prompts().iter().enumerate() {
+            assert!(
+                !prompt.contains(SENTENCE),
+                "system prompt slot {slot} is covered by the attacker= hash; the §14.22 \
+                 sentence must ride the USER message, or the hash stops naming the prompts sent"
+            );
+        }
     }
 }

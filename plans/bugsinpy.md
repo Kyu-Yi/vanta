@@ -6292,6 +6292,55 @@ fabricated empty block, and not `effort: None`, which no real run emits.
 
 ---
 
+### 14.22 `VANTA_ATTACKER_CONCISE` — one sentence, on the first request only
+
+Optional, **off by default**. When `VANTA_ATTACKER_CONCISE=1` the Attacker's *first* request — the
+generation call, not the BATE-revision or the Unknown path — carries one extra sentence appended to its
+USER message:
+
+> Once each test is written and checked once, output the JSON immediately; do not re-verify formatting.
+
+[VANTA-WHY] §14.13's measured run-away is a model that worked the answer out and then spent the rest of
+its output cap re-checking it. §14.20 caps the ANSWER and §14.21 caps the THINKING; this is the cheapest
+attempt at the third cause, that the prompt never told the model one check is enough. It is deliberately
+the generate prompt and not `attacker_revise`/`attacker_simplify`: those prompts already answer a specific
+BATE result, and a bare "do not re-check" there would tell a revision not to read the evidence §14.17
+just handed it.
+
+**The sentence rides the USER message, not `ATTACKER_SYSTEM_PROMPT`.** The §14.10-f `attacker=` hash is
+taken over exactly the three system prompts, so appending to a system prompt would change the recorded
+hash for an arm that only adds a sentence — two different sent texts sharing one hash. Keeping it on the
+user message leaves the hash naming the system prompts the run actually sent; the arm is still
+identifiable because `run.summary` records the switch and the manifest carries it, which is what an
+ablation row needs.
+
+The switch is read with `env_flag` (`on|1|true|yes` / `off|0|false|no`; anything else is a
+`CONFIG_ERROR`, because `VANTA_ATTACKER_CONCISE=onf` quietly meaning "on" would mislabel the arm). It is a
+process-global `AtomicBool` in `agents::attacker` (`set_attacker_concise`/`attacker_concise`), and the
+suffix is exposed as `attacker_concise_suffix()` so a test pins the text that is SENT rather than a copy
+of it. `run.summary` gains `attacker_concise=on|off` beside the other rule switches (`flag_text`, §14.3),
+and the manifest's `attacker_concise` carries the pipeline's own spelling, so a row that predates the
+field is distinguishable from one that ran with it off.
+
+**Nothing here changes when the switch is unset.** The suffix is empty, so every default run's first
+request body is byte-for-byte what it was before this section existed, and the safety net is untouched:
+the output cap plus §14.13's nudged retry remains the bound, and the sentence is an instruction, not a
+mechanism.
+
+Tests: `src/agents/attacker.rs::tests::the_concise_suffix_is_the_sentence_and_is_not_in_a_system_prompt`
+pins the exact sentence and asserts it is **not** a substring of any prompt the `attacker=` hash covers,
+which is what keeps the sentence on the user message;
+`tests/m3_session_log.rs::the_concise_switch_appends_the_sentence_to_the_generate_prompt_only` runs the
+control and the armed attempt against the stub server — the control records `attacker_concise=off` and is
+held to `assert_schedule_matches_bodies` while no decoded USER message carries the sentence, the armed
+attempt's every `generate` body's USER message ends with the sentence and its SYSTEM message is free of
+it while no other call site's USER message carries it, and the switch changes neither the verdict nor
+which calls are made;
+`scripts/test_bugsinpy.py::TestRunJob::test_a_row_says_which_attacker_prompt_it_sent` asserts the manifest
+reads `on`/`off` back and that a row predating the field comes back as `None` rather than a default.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

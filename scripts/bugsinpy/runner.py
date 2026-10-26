@@ -1444,6 +1444,13 @@ def build_record(
         "vanta_build_dirty": _bool(summary.get("dirty")),
         "model": summary.get("model"),
         "sampling": sampling_block(summary),
+        # §14.22 — whether this row's ATTACKER prompt carried the extra
+        # "one check is enough" sentence. Recorded for `show_hints`'s reason: the
+        # attribution of an ablation row depends on knowing which prompt it sent,
+        # and a row that does not say cannot be put in the right arm afterwards.
+        # The pipeline's own spelling is kept (`on`/`off`, §14.3), so the manifest
+        # and the command that produced the run can be read against each other.
+        "attacker_concise": summary.get("attacker_concise"),
         # §14.12 — what the run's LLM calls actually cost, and how often the
         # server cut one off at its output cap. Read back from `run.summary`, so a
         # batch table can be cut by call site without opening a session log — and

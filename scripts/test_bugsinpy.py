@@ -19584,6 +19584,53 @@ class TestRunJob:
         )
         assert plain["harness_error"] is None
 
+    def test_a_row_says_which_attacker_prompt_it_sent(self, tmp_path, monkeypatch):
+        """§14.22 — the prompt arm is a recorded field, not an inference.
+
+        The sentence changes what the Attacker's first request asks for, so a row
+        cannot be assigned to the right arm of the ablation unless it states which
+        prompt it sent. `None` for a summary that predates the switch: a guess at
+        "off" would silently pool such a row with the control arm.
+        """
+        base = _outcome(tmp_path)
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, summary=dict(base.summary, attacker_concise="on")
+            ),
+        )
+        armed = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert armed["attacker_concise"] == "on"
+
+        # The pipeline's own spelling is kept, so the row and the command that
+        # produced it can be read against each other (§14.3).
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, summary=dict(base.summary, attacker_concise="off")
+            ),
+        )
+        control = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert control["attacker_concise"] == "off"
+
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        plain = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert plain["attacker_concise"] is None
+
     def test_a_review_row_reuses_the_candidate_label_and_never_re_grades(
         self, tmp_path, monkeypatch
     ):

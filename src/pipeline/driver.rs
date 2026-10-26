@@ -527,6 +527,14 @@ pub async fn run(
     let corroborate_enabled = env_flag("VANTA_CORROBORATE", false)?;
     let grounded_audit_enabled = env_flag("VANTA_GROUNDED_AUDIT", false)?;
     let batch_audit_enabled = env_flag("VANTA_BATCH_AUDIT", false)?;
+    // [VANTA-WHY] §14.22 — the one PROMPT switch in this list: it appends a
+    // sentence to the Attacker's first request telling the model that one check is
+    // enough. Default OFF, so the prompt every existing measurement was taken
+    // under is the prompt a run sends unless the arm is asked for explicitly, and
+    // it is recorded in `run.summary` so an ablation row states which prompt it
+    // sent.
+    let attacker_concise_enabled = env_flag("VANTA_ATTACKER_CONCISE", false)?;
+    crate::agents::attacker::set_attacker_concise(attacker_concise_enabled);
     // [VANTA-WHY] §14.15 — Vanta's own wall-clock deadline, in seconds from here.
     // Unset means no deadline, which is what every run before this did; the
     // harness sets it ten minutes short of its own `RUN_TIMEOUT_SECS` so a run
@@ -2917,7 +2925,7 @@ pub async fn run(
              truncated_calls_creator={} truncated_calls_attacker={} \
              truncated_calls_intent_audit={} \
              truncated_calls={} truncated_twice_calls={} completion_tokens_total={} {} \
-             corroborate={} grounded_audit={} batch_audit={} \
+             corroborate={} grounded_audit={} batch_audit={} attacker_concise={} \
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              revise_budget_per_attempt={} revise_calls_used={} \
              deadline_secs={} stop_reason={} presence_penalty={} max_tokens_overrides={} \
@@ -2965,6 +2973,11 @@ pub async fn run(
             flag_text(corroborate_enabled),
             flag_text(grounded_audit_enabled),
             flag_text(batch_audit_enabled),
+            // [VANTA-WHY] §14.22 — the prompt arm. Recorded beside the rule
+            // switches because it is the same kind of fact: which of two prompts
+            // this run sent, so an ablation row can be put in the right arm.
+            // `off` is the default and every run before this change.
+            flag_text(attacker_concise_enabled),
             crate::agents::attacker::INTENT_AUDIT_BATCH_TOKENS_PER_TEST,
             token_value(batch_audit_max_tokens),
             // [VANTA-WHY] §14.14 — the Attacker remediation cap and the run's

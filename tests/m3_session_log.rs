@@ -5946,6 +5946,140 @@ fn the_reasoning_budget_reaches_the_attacker_calls_and_leaves_a_default_run_alon
     }
 }
 
+/// §14.22 — `VANTA_ATTACKER_CONCISE` adds one sentence, to the generate prompt only.
+///
+/// [VANTA-WHY] §14.20 caps the ANSWER and §14.21 caps the THINKING; this is the one
+/// item that tries to remove the reason the model produced so much at all, so its
+/// claim is narrow and is checked narrowly. Three things have to hold at once: the
+/// sentence is on the generate prompt's USER message, no other call site carries it,
+/// and `run.summary` names which of the two prompts the run sent — that last field is
+/// how an ablation row is assigned to an arm after the fact. The SYSTEM message is
+/// asserted to be free of the sentence because the §14.10-f `attacker=` hash covers
+/// exactly the three system prompts; a suffix that leaked there would change the hash
+/// while the switch still reported itself. The control run is held to
+/// `assert_schedule_matches_bodies`, so "an unset switch changes nothing" is checked
+/// against the same ground truth every other sampling test uses.
+#[test]
+fn the_concise_switch_appends_the_sentence_to_the_generate_prompt_only() {
+    let _serial = serial_run();
+
+    // The text the arm appends, read from the crate rather than copied: the unit
+    // test in `agents::attacker` pins the literal, so this test can compare the
+    // bodies against the one accessor that produces the sent text.
+    let suffix = vanta::agents::attacker::attacker_concise_suffix();
+
+    // The decoded user message of a recorded body. Decoded, not raw: the suffix
+    // begins with two newlines, which a raw JSON body carries as the four
+    // characters `\n\n`, so a substring test on the raw text would silently pass.
+    let user_message = |body: &str| -> String {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+        value["messages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("body must carry a messages array: {body}"))
+            .iter()
+            .find(|m| m["role"] == "user")
+            .and_then(|m| m["content"].as_str())
+            .unwrap_or_else(|| panic!("body must carry a user message string: {body}"))
+            .to_string()
+    };
+
+    // (1) The control: the switch is off, which is every run before §14.22.
+    let control = TempDir::new().unwrap();
+    let (_repo, _issue, control_patch) = write_test_repo(control.path(), PRESERVING_PATCH);
+    let control_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let control_output =
+        run_patch_mode_with_output(control.path(), &control_patch, &control_server, 1, &[]);
+    assert_eq!(
+        control_output.status.code(),
+        Some(0),
+        "the switch is a prompt choice and must not move the verdict; stdout:\n{}",
+        String::from_utf8_lossy(&control_output.stdout)
+    );
+    assert_eq!(
+        summary_value(&run_summary(control.path()).summary, "attacker_concise"),
+        "off",
+        "an unset switch must record `attacker_concise=off`, the default prompt"
+    );
+    let control_kinds = control_server.request_kinds();
+    for (kind, body) in control_kinds.iter().zip(control_server.request_bodies()) {
+        assert!(
+            !user_message(&body).contains(suffix),
+            "the default run's `{kind}` USER message must not carry the §14.22 sentence: {body}"
+        );
+    }
+    assert_schedule_matches_bodies(
+        control.path(),
+        &control_server,
+        vanta::llm::SamplingPreset::Pinned,
+    );
+
+    // (2) The arm: the sentence rides the generate prompt's USER message and no
+    //     other call site's, and the SYSTEM text the §14.10-f hash covers is
+    //     untouched because the sentence never reaches it.
+    let arm = TempDir::new().unwrap();
+    let (_repo, _issue, arm_patch) = write_test_repo(arm.path(), PRESERVING_PATCH);
+    let arm_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let arm_output = run_patch_mode_with_output(
+        arm.path(),
+        &arm_patch,
+        &arm_server,
+        1,
+        &[("VANTA_ATTACKER_CONCISE", "1")],
+    );
+    assert_eq!(
+        arm_output.status.code(),
+        Some(0),
+        "the switch is a prompt choice and must not move the verdict; stdout:\n{}",
+        String::from_utf8_lossy(&arm_output.stdout)
+    );
+    assert_eq!(
+        summary_value(&run_summary(arm.path()).summary, "attacker_concise"),
+        "on",
+        "the arm must record `attacker_concise=on`, which is how a row is assigned to it"
+    );
+    let arm_kinds = arm_server.request_kinds();
+    let arm_bodies = arm_server.request_bodies();
+    assert_eq!(
+        arm_kinds, control_kinds,
+        "the switch is a prompt choice and must not change which calls are made"
+    );
+    assert_eq!(arm_kinds.len(), arm_bodies.len(), "one kind per recorded body");
+    let mut generate_bodies = 0usize;
+    for (kind, body) in arm_kinds.iter().zip(arm_bodies.iter()) {
+        let user = user_message(body);
+        if kind == "generate" {
+            generate_bodies += 1;
+            assert!(
+                user.ends_with(suffix),
+                "the `{kind}` USER message must end with the §14.22 sentence: {body}"
+            );
+            let value: serde_json::Value = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+            let system = value["messages"]
+                .as_array()
+                .and_then(|ms| ms.iter().find(|m| m["role"] == "system"))
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or_else(|| panic!("generate body must carry a system message: {body}"));
+            assert!(
+                !system.contains(suffix),
+                "the §14.22 sentence must ride the USER message, not the hashed SYSTEM \
+                 prompt, or the attacker= hash stops naming the prompts sent: {body}"
+            );
+        } else {
+            assert!(
+                !user.contains(suffix),
+                "only the generate prompt may carry the sentence; the `{kind}` body must \
+                 not, or the arm is not the narrow ablation it claims to be: {body}"
+            );
+        }
+    }
+    assert!(
+        generate_bodies > 0,
+        "the arm reached no generate call, so it proves nothing about the sentence"
+    );
+}
+
 /// §4.3 token accounting: the numbers a cost table is built from are the
 /// SERVER's, recorded per call, and `run.summary` totals exactly those.
 ///

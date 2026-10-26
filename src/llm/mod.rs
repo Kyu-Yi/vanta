@@ -34,9 +34,16 @@ use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 use tracing::{debug, info, trace, warn};
 
+// [VANTA-WHY] §14.26 — the per-model-family request dialects of the hosted
+// backend. A module rather than more of this file: it is a TABLE of documented
+// facts about somebody else's API, and the one question it answers ("what may
+// this model be sent?") has nothing to do with how a stream is reassembled.
+pub mod capabilities;
+
 // Re-export the agent response types so bootstrap can use them too.
 pub use crate::agents::attacker::{AttackerResponse, AttackerTestCase};
 pub use crate::agents::creator::CreatorResponse;
+pub use capabilities::{OpenAiFamily, ShapedBody};
 
 // ============================================================================
 // FORENSICS: write raw LLM responses + parsed JSON to disk for debugging
@@ -215,6 +222,17 @@ pub struct CallUsage {
     /// the calls the run already records cannot disagree with the run it
     /// describes.
     pub truncated: bool,
+    /// What this call's request ASKED FOR and what the body actually carried
+    /// (§14.26).
+    ///
+    /// [VANTA-WHY] Per call, not per run, because the answer is a property of
+    /// the body — the same model is sent different extras by different call
+    /// sites (the batch audit scales its own `max_tokens`, the coding preset
+    /// pins keys the pinned one does not). A run-level list would have to be the
+    /// union of every call's, and a union is exactly what cannot answer "did
+    /// THIS call's temperature reach the model?". `run.summary` carries the
+    /// model-level rule beside it, so the two levels are both readable.
+    pub request_shape: ShapedBody,
 }
 
 static CALL_USAGES: Mutex<Vec<CallUsage>> = Mutex::new(Vec::new());
@@ -1558,10 +1576,35 @@ async fn post_chat_meta(
     if let Some(seed) = seed {
         full_body.insert("seed".to_string(), json!(seed));
     }
-    let full_body = Value::Object(full_body);
+
+    // [VANTA-WHY] §14.26 — the output cap is read from the LLAMA.CPP spelling
+    // BEFORE the body is shaped, because shaping renames that key for OpenAI.
+    // Reading it after would silently fall back to 16384 on every hosted call:
+    // the pre-flight guard would compare the prompt against a cap no request
+    // carries, and a run whose call sites asked for 32768 would be refused (or
+    // admitted) on a number that was never real.
+    let requested_output_tokens = full_body
+        .get(capabilities::LLAMACPP_OUTPUT_CAP_KEY)
+        .and_then(Value::as_u64)
+        .unwrap_or(16_384) as u32;
+
+    // [VANTA-WHY] §14.26 — shape the body for the backend it is going to, ONCE,
+    // here, on the object that is about to be serialised. Two facts come out and
+    // both travel with the call: the body the server receives, and the record of
+    // what was asked for versus what was sent. The local path takes the
+    // `native` branch and is not touched at all — its bodies are pinned byte for
+    // byte by the harness, and a filter that runs on them is a chance to change
+    // them.
+    let (full_body, request_shape) = if cfg.is_openai() {
+        let family = OpenAiFamily::from_model_id(&cfg.model_id);
+        let shaped = capabilities::shape_body_for_openai(&mut full_body, family);
+        (Value::Object(full_body), shaped)
+    } else {
+        let shaped = ShapedBody::native(&full_body);
+        (Value::Object(full_body), shaped)
+    };
 
     let context_window = context_window_tokens(client, cfg).await;
-    let requested_output_tokens = full_body["max_tokens"].as_u64().unwrap_or(16_384) as u32;
     let prompt_render = render_messages_for_token_estimate(&messages);
     let estimate = conservative_token_estimate(&prompt_render);
     let mut prompt_tokens = estimate;
@@ -1746,8 +1789,18 @@ async fn post_chat_meta(
         // body, which is decided a few lines above: a `Some` seed was inserted as the
         // `seed` key, and `None` means no key at all. Nothing here can disagree with
         // what the request carried.
+        //
+        // [VANTA-WHY] §14.26 — the spelling is backend-dependent because the claim
+        // is: `llamacpp:seed` and `openai:seed` are two different statements about
+        // two different samplers, and a record that used one word for both could not
+        // be pooled across backends. `unset` stays shared — "no seed was asked for"
+        // means the same thing everywhere.
         seed_mechanism: if seed.is_some() {
-            LLAMACPP_SEED_MECHANISM
+            if cfg.is_openai() {
+                OPENAI_SEED_MECHANISM
+            } else {
+                LLAMACPP_SEED_MECHANISM
+            }
         } else {
             UNSET_SEED_MECHANISM
         }
@@ -1755,6 +1808,8 @@ async fn post_chat_meta(
         finish_reason: streamed.finish_reason.clone(),
         wall_ms,
         truncated: streamed.finish_reason.as_deref() == Some("length"),
+        // [VANTA-WHY] §14.26 — what this body asked for and what it carried.
+        request_shape,
     };
     debug!(
         site,
@@ -1767,6 +1822,10 @@ async fn post_chat_meta(
         finish_reason = streamed.finish_reason.as_deref().unwrap_or("unset"),
         wall_ms,
         truncated = usage.truncated,
+        // [VANTA-WHY] §14.26 — logged as well as recorded, so a hosted run that
+        // is silently missing a field says so while it happens rather than only
+        // in the session log afterwards.
+        dropped_fields = ?usage.request_shape.dropped,
         "llm call token usage recorded"
     );
     record_call_usage(usage);
@@ -1896,6 +1955,19 @@ pub fn truncation_role(site: &str) -> &'static str {
 /// `backend:knob` spelling these follow.
 pub const LLAMACPP_SEED_MECHANISM: &str = "llamacpp:seed";
 pub const UNSET_SEED_MECHANISM: &str = "unset";
+
+/// The mechanism a hosted `seed` records (§14.26).
+///
+/// [VANTA-WHY] `seed` is a documented Chat Completions parameter, and the
+/// reference names `system_fingerprint` as its determinism companion — nothing in
+/// the GPT-6 model docs says these models ignore it. So a seed that was inserted
+/// into the body is recorded as reaching the model, and the `unsupported`
+/// spelling stays reserved for the outcome it was written for. The live probe
+/// (`scripts/openai_probe.py`, the operator's call) is what would move this: if
+/// the provider accepts the key and the same seed does not reproduce the same
+/// completion, this constant becomes `openai:seed-ignored` and the shipped seed
+/// stops being a claim about sampling.
+pub const OPENAI_SEED_MECHANISM: &str = "openai:seed";
 
 /// The seed POLICY every run from §14.23 on applies, recorded in `run.summary` as
 /// `seed_policy` and in the manifest.

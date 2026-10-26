@@ -6566,6 +6566,106 @@ the sandbox command, the bake recipe, and that a secret-free compiler environmen
 
 ---
 
+### 14.26 Hosted OpenAI backend, item 3 — one capability table decides every request body
+
+§14.24 chose the service and §14.25 kept the credential out of the artifacts. This section is about the
+first thing that service actually sees: the request body. The local server accepts Vanta's whole sampling
+surface, so the pipeline has always built **one** body and sent it. The hosted models do not accept it —
+`temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty` and the logprob pair are rejected or are not
+Chat Completions parameters at all, and the output cap has a different spelling — so a body Vanta sends
+today would be a 400 on the first call of every run.
+
+**The fix is a rule, not a second body builder.** `src/llm/capabilities.rs` holds the claim "these models
+do not take this field" in one place, and a single function applies it. There is no `if backend ==
+openai` scattered through the call sites and no second code path that could drift from the first: the
+body is built exactly as before, and then — at the one moment it is about to be serialised — it is shaped
+if and only if the backend is hosted. The local path takes the table's `native` branch, which drops
+nothing, renames nothing, and exists so that both branches return the same kind of record.
+
+**Two lists, deliberately not one.** The split is the interesting part of the table:
+
+- `NOT_A_CHAT_PARAMETER` — `top_k`, `min_p`, `reasoning_budget_tokens`. These are **llama.cpp sampler
+  knobs**, not parameters of the Chat Completions API at all. They are unsendable to *any* hosted model,
+  so they are dropped for every family, `Unknown` included.
+- `REJECTED_WHILE_REASONING` — `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`,
+  `logprobs`, `top_logprobs`. These **are** API parameters; they are withheld for a per-model reason (the
+  models reject them while reasoning is on, as `Unsupported value: 'temperature'`). Because the reason is
+  per-model, an **`Unknown` family keeps them**: withholding a parameter is only right where the docs say
+  to withhold it, and a model id this table has never heard of is not evidence that its model rejects
+  anything. Filing these two lists together would have silently projected one model family's dialect onto
+  every future one.
+
+**`OpenAiFamily` is read from the model id, longest prefix first.** `gpt-6.1-sol` and `gpt-6-luna` are
+matched by prefix, with Sol checked first so a dated snapshot (`gpt-6.1-sol-2026-10-01`) lands on the
+right family instead of falling through to `gpt-6-luna`'s rule. A model id that matches neither is
+`Unknown`, which is a *named* state rather than a default — it has its own `name()` (`unknown`) and it is
+recorded as such, so a run against an unrecognised model is visible in the log instead of silently
+treated as Luna.
+
+**The cap is renamed, not dropped.** `max_tokens` → `max_completion_tokens`, and the rename is recorded
+as a rename. This is where a real bug was avoided rather than introduced: the pre-flight guard that
+compares the requested output cap against the context window reads that number out of the body, and
+shaping **moves** it to a new key. Reading the cap *after* shaping would have found nothing, taken the
+`16_384` default, and silently mis-guarded every hosted call — so the read now happens before the rename,
+and the ordering is commented as the reason.
+
+**What was asked for and what was sent are both on the record.** `ShapedBody` carries `requested`,
+`sent`, `dropped` and `renamed`, and it is attached to the `CallUsage` row for every call, so the
+per-call artifact answers both halves of the question. `ShapedBody::is_consistent` encodes the arithmetic
+that makes the record trustworthy — `requested − dropped + renamed == sent` — and the equality is what
+"nothing was dropped silently" means as a checkable statement. Because `serde_json` is compiled without
+`preserve_order`, the body is a `BTreeMap`, so these lists are sorted and stable across runs, which is
+what lets a byte-comparison of two rows mean something. `render()` produces one whitespace-safe fragment
+(`requested_fields=… sent_fields=… dropped_fields=… renamed_fields=…`, empty lists as `none`) because the
+`run.summary` reader splits on whitespace and a space inside a value would run on into the next key.
+
+`run.summary` gains the **run-level rule** beside the per-call detail: `request_shape_backend=`,
+`request_shape_family=`, `request_shape_not_sent=` and `request_shape_renamed=`, built by
+`driver::request_shape_rule`. A reader who sees `temperature` missing from a hosted body reads the reason
+off the run rather than guessing the pipeline lost it. The local backend writes
+`request_shape_not_sent=none request_shape_renamed=none` — explicitly, not by omission — so a local
+summary stays self-describing without its bodies changing at all.
+
+**The seed is sent, and its mechanism says which backend carried it.** `seed` is a documented Chat
+Completions parameter and nothing in these models' documentation says they ignore it, so it is not
+dropped; what changes is the recorded mechanism: `openai:seed` (`OPENAI_SEED_MECHANISM`) instead of
+`llamacpp:seed`. That is a placeholder with a named successor: the standalone probe
+(`scripts/openai_probe.py`, run by hand with the key loaded via `read -s`) is what would move the constant
+to `openai:seed-ignored` or `unsupported`, and until it has been run the record claims only what has been
+verified — that the parameter was sent.
+
+**One thing this section deliberately does not touch: `reasoning_effort`.** The six call sites still send
+the hard-coded `"low"` on both backends, exactly as before. Moving that to a validated, provider-defaulted
+value is item 4, and doing it here would have made two independent changes to the same bodies in one
+commit — with the byte-identity guard for the local path standing between them.
+
+Tests: `src/llm/capabilities.rs` — `the_family_is_read_from_the_model_id_and_the_longest_prefix_wins`,
+`the_two_known_families_drop_the_sampling_fields_and_an_unknown_one_keeps_them` (asserts
+`unsent_keys(Unknown)` is exactly the not-a-parameter list, so the per-model list cannot leak onto an
+unknown model), `shaping_drops_the_unparameterized_keys_renames_the_cap_and_keeps_the_rest` (asserts each
+surviving field by value, that both cap spellings cannot coexist, that `sent` equals the body's own keys,
+and that the rendered fragment is four `key=value` tokens with no space of its own),
+`a_body_that_asked_for_nothing_unusual_shapes_to_itself`,
+`the_native_record_says_requested_equals_sent_and_drops_nothing`, and
+`is_consistent_rejects_a_record_that_lost_a_key_silently` (a record whose `sent` is missing a key it
+never dropped must fail the arithmetic).
+
+`tests/m3_session_log.rs::the_hosted_backend_sends_only_the_fields_the_model_accepts` is the end-to-end
+half, and it is written to fail in both directions. Two runs of the same repo, patch and stub differ in
+one variable — the backend — under `VANTA_SAMPLING=coding`, so the local body carries the fullest sampler
+set the harness ever pins. The local bodies must still carry every one of those keys, and the cap under
+its llama.cpp spelling, or the test fails: that is the "the local path stays byte-identical" half, stated
+as an assertion rather than trusted. The hosted bodies must lose exactly the documented list, must carry
+`max_completion_tokens` and not `max_tokens`, and — the strongest form — their **key set must equal the
+local key set with the documented rule applied and nothing else**, so a filter that ate a field nobody
+listed fails here too. The dropped-name list is spelled out in the test rather than read from the
+capability table on purpose: a table that had drifted from the API documentation would otherwise keep
+passing against itself. The test then checks the per-call rows (`requested_fields` admitting a key
+`sent_fields` no longer has, `dropped_fields` naming it, `renamed_fields` recording the rename) and the
+run-level rule, including that `request_shape_not_sent` names every key in the dropped list.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

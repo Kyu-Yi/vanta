@@ -5319,6 +5319,253 @@ fn unset_seed_leaves_request_bodies_unseeded_and_the_verdict_unchanged() {
     }
 }
 
+/// §14.26: on the hosted backend, the sampler keys a llama.cpp body carries are
+/// DROPPED before the request leaves, the output cap is RENAMED to the spelling a
+/// reasoning model accepts, and every other field the body asked for still goes.
+///
+/// [VANTA-WHY] The two runs below differ in ONE variable — `VANTA_LLM_BACKEND`
+/// (plus the model id it names) — so the local run is the reference the hosted run
+/// is measured against, field by field. The requirement has two halves and this
+/// test is deliberately both: a hosted body must lose exactly the documented
+/// fields (item 3), and the LOCAL body must still carry every one of them, because
+/// "the local path stays byte-identical" is only true while nothing filters it.
+/// The dropped-name list is spelled out here rather than read from the capability
+/// table on purpose: a table that drifted from the API docs would otherwise keep
+/// passing against itself. The per-call rows must agree with the bodies, too —
+/// `requested_fields` admitting a key the `sent_fields` no longer has is the whole
+/// point of recording both.
+#[test]
+fn the_hosted_backend_sends_only_the_fields_the_model_accepts() {
+    let _serial = serial_run();
+
+    // The sampler keys `VANTA_SAMPLING=coding` pins at EVERY site (§14.11). The
+    // reference run needs the fullest sampler set the harness ever sends, because a
+    // body that never carried `top_k` could not prove a drop.
+    const SAMPLER_KEYS: &[&str] = &[
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+    ];
+    // The full documented drop list for these models, per the API reference: the
+    // four sampler values plus the two the harness can also send (`frequency_penalty`
+    // under a preset, `reasoning_budget_tokens` at the three budget sites) plus the
+    // logprob pair. The cap is not dropped — it is renamed — so it is listed apart.
+    const DROPPED_KEYS: &[&str] = &[
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "logprobs",
+        "top_logprobs",
+        "reasoning_budget_tokens",
+    ];
+    const RENAME: &str = "max_tokens->max_completion_tokens";
+
+    // (1) The local reference run.
+    let local = TempDir::new().unwrap();
+    let (_repo, _issue, local_patch) = write_test_repo(local.path(), PRESERVING_PATCH);
+    let local_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let local_output = run_patch_mode_with_output(
+        local.path(),
+        &local_patch,
+        &local_server,
+        3,
+        &[("VANTA_SAMPLING", "coding")],
+    );
+    assert_eq!(
+        local_output.status.code(),
+        Some(0),
+        "the reference run must be the approval; stdout:\n{}",
+        String::from_utf8_lossy(&local_output.stdout)
+    );
+    let local_bodies = local_server.request_bodies();
+    assert!(
+        !local_bodies.is_empty(),
+        "the reference run must have called the LLM"
+    );
+    for body in &local_bodies {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+        let object = value.as_object().expect("a chat body is a JSON object");
+        for key in SAMPLER_KEYS {
+            assert!(
+                object.contains_key(*key),
+                "the LOCAL `coding` body must still carry `{key}` — the local path is \
+                 not allowed to filter anything: {body}"
+            );
+        }
+        assert!(
+            object.contains_key("max_tokens"),
+            "the local body must keep the llama.cpp cap spelling: {body}"
+        );
+        assert!(
+            !object.contains_key("max_completion_tokens"),
+            "the llama.cpp body must never hear the hosted cap spelling: {body}"
+        );
+    }
+    // The local run's rule is "no filter", and it says so rather than staying
+    // silent — that is what makes a local summary self-describing.
+    let local_summary = run_summary(local.path()).summary;
+    assert_eq!(
+        summary_value(&local_summary, "request_shape_backend"),
+        "llamacpp"
+    );
+    assert_eq!(
+        summary_value(&local_summary, "request_shape_not_sent"),
+        "none",
+        "the local run drops nothing: {local_summary}"
+    );
+    assert_eq!(summary_value(&local_summary, "request_shape_renamed"), "none");
+
+    // (2) The hosted run: same repo, same patch, same stub — only the backend differs.
+    let hosted = TempDir::new().unwrap();
+    let (_repo, _issue, hosted_patch) = write_test_repo(hosted.path(), PRESERVING_PATCH);
+    let hosted_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let hosted_output = run_patch_mode_with_output(
+        hosted.path(),
+        &hosted_patch,
+        &hosted_server,
+        3,
+        &[
+            ("VANTA_SAMPLING", "coding"),
+            ("VANTA_LLM_BACKEND", "openai"),
+            ("VANTA_LLM_MODEL", "gpt-6-luna"),
+            ("OPENAI_API_KEY", "sk-test-not-a-real-key"),
+            ("VANTA_LLM_CONTEXT_TOKENS", "131072"),
+        ],
+    );
+    assert_eq!(
+        hosted_output.status.code(),
+        Some(0),
+        "shaping the request must not change the verdict — only the dialect; stdout:\n{}",
+        String::from_utf8_lossy(&hosted_output.stdout)
+    );
+    let hosted_bodies = hosted_server.request_bodies();
+    assert_eq!(
+        hosted_bodies.len(),
+        local_bodies.len(),
+        "shaping must not change how many calls the run makes"
+    );
+
+    for (local_body, hosted_body) in local_bodies.iter().zip(hosted_bodies.iter()) {
+        let local_value: serde_json::Value = serde_json::from_str(local_body).unwrap();
+        let hosted_value: serde_json::Value = serde_json::from_str(hosted_body).unwrap();
+        let local_object = local_value.as_object().unwrap();
+        let hosted_object = hosted_value.as_object().unwrap();
+
+        for key in DROPPED_KEYS {
+            assert!(
+                !hosted_object.contains_key(*key),
+                "the hosted body must not send `{key}`: {hosted_body}"
+            );
+        }
+        assert!(
+            hosted_object.contains_key("max_completion_tokens"),
+            "the hosted body must carry the cap under the name the model needs: {hosted_body}"
+        );
+        assert!(
+            !hosted_object.contains_key("max_tokens"),
+            "the legacy cap spelling is the one these models reject: {hosted_body}"
+        );
+
+        // The strongest form of "nothing else changed": rebuild the expected hosted
+        // key set by applying exactly the documented rule to the local body, and
+        // demand equality. A filter that ate a field nobody listed fails here, and
+        // so does one that forgot to rename the cap.
+        let mut expected: Vec<String> = local_object
+            .keys()
+            .filter(|key| !DROPPED_KEYS.contains(&key.as_str()))
+            .map(|key| {
+                if key == "max_tokens" {
+                    "max_completion_tokens".to_string()
+                } else {
+                    key.clone()
+                }
+            })
+            .collect();
+        expected.sort();
+        let mut actual: Vec<String> = hosted_object.keys().cloned().collect();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "the hosted body must differ from the local one by the documented rule and \
+             nothing else; local={local_body} hosted={hosted_body}"
+        );
+    }
+
+    // (3) Both sides of the question are on the per-call record.
+    let usage_rows: Vec<String> = read_session_records(&find_session_log(hosted.path()))
+        .into_iter()
+        .filter(|record| record.phase == "call.usage")
+        .map(|record| record.summary)
+        .collect();
+    assert_eq!(
+        usage_rows.len(),
+        hosted_bodies.len(),
+        "one `call.usage` row per chat body"
+    );
+    let split = |list: &str| -> Vec<String> { list.split(',').map(str::to_string).collect() };
+    for (index, row) in usage_rows.iter().enumerate() {
+        let requested = split(&summary_value(row, "requested_fields"));
+        let sent = split(&summary_value(row, "sent_fields"));
+        let dropped = split(&summary_value(row, "dropped_fields"));
+        for key in SAMPLER_KEYS {
+            assert!(
+                requested.contains(&key.to_string()),
+                "call {index}: the row must admit the body REQUESTED `{key}`: {row}"
+            );
+            assert!(
+                !sent.contains(&key.to_string()),
+                "call {index}: the row must not claim `{key}` was sent: {row}"
+            );
+            assert!(
+                dropped.contains(&key.to_string()),
+                "call {index}: the row must name `{key}` as dropped: {row}"
+            );
+        }
+        assert!(
+            sent.contains(&"max_completion_tokens".to_string()),
+            "call {index}: the record must show the renamed cap as sent: {row}"
+        );
+        assert!(
+            !sent.contains(&"max_tokens".to_string()),
+            "call {index}: the record must not show the legacy cap as sent: {row}"
+        );
+        assert_eq!(
+            summary_value(row, "renamed_fields"),
+            RENAME,
+            "call {index}: the rename must be recorded: {row}"
+        );
+    }
+
+    // (4) The run-level rule explains those rows, and names every dropped key.
+    let hosted_summary = run_summary(hosted.path()).summary;
+    assert_eq!(
+        summary_value(&hosted_summary, "request_shape_backend"),
+        "openai"
+    );
+    assert_eq!(
+        summary_value(&hosted_summary, "request_shape_family"),
+        "gpt-6-luna",
+        "the rule must name the family it was applied for: {hosted_summary}"
+    );
+    assert_eq!(
+        summary_value(&hosted_summary, "request_shape_renamed"),
+        RENAME
+    );
+    let not_sent = split(&summary_value(&hosted_summary, "request_shape_not_sent"));
+    for key in DROPPED_KEYS {
+        assert!(
+            not_sent.contains(&key.to_string()),
+            "run.summary must name `{key}` as not sent: {hosted_summary}"
+        );
+    }
+}
+
 /// §4.2 `baseline`: `VANTA_ATTACKER=off` skips the Attacker phase entirely, so
 /// the verdict comes from the repo's own suite and static analysis — and not one
 /// Attacker LLM call is made.

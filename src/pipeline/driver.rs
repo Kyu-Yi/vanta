@@ -471,6 +471,46 @@ fn sampling_schedule_keys() -> String {
     keys.join(" ")
 }
 
+/// The request-shaping rule this run's backend follows, in the same one-line
+/// `key=value` shape as [`sampling_schedule_keys`].
+///
+/// [VANTA-WHY] §14.26 — item 3 asks for what was REQUESTED and what was actually
+/// SENT to be recorded in `call.usage` and `run.summary`. The per-call rows carry
+/// the per-body detail (a body's own `requested_fields`/`sent_fields`); this is the
+/// run-level RULE that explains them, so a reader who sees `temperature` absent from
+/// a hosted body reads the reason off the run instead of guessing the pipeline lost
+/// it. The local backend has no such rule — it sends the body it built — and this
+/// line says so with `not_sent=none renamed=none` rather than staying silent, which
+/// is what keeps the local run's summary self-describing without changing its bodies.
+fn request_shape_rule(cfg: &LlmConfig) -> String {
+    let backend = cfg.backend.as_str();
+    if !cfg.is_openai() {
+        return format!(
+            "request_shape_backend={backend} request_shape_family=native \
+             request_shape_not_sent=none request_shape_renamed=none"
+        );
+    }
+    let family = crate::llm::capabilities::OpenAiFamily::from_model_id(&cfg.model_id);
+    // `unsent_keys` is a const table walked in a fixed order, so this list is stable
+    // across runs — the same reason the per-call `requested`/`sent` lists are.
+    let not_sent: Vec<&str> = crate::llm::capabilities::unsent_keys(family)
+        .into_iter()
+        .map(|(key, _why)| key)
+        .collect();
+    let not_sent = if not_sent.is_empty() {
+        "none".to_string()
+    } else {
+        not_sent.join(",")
+    };
+    format!(
+        "request_shape_backend={backend} request_shape_family={} \
+         request_shape_not_sent={not_sent} request_shape_renamed={}->{}",
+        family.name(),
+        crate::llm::capabilities::LLAMACPP_OUTPUT_CAP_KEY,
+        crate::llm::capabilities::OPENAI_OUTPUT_CAP_KEY,
+    )
+}
+
 /// Read the server's own `top_p` default for the provenance block.
 ///
 /// [VANTA-WHY] Bounded, unlike every other HTTP call in this file.
@@ -2781,7 +2821,7 @@ pub async fn run(
             summary: format!(
                 "seq={} site={} round={} attempt={} prompt_tokens={} completion_tokens={} \
                  total_tokens={} source={} seed={} seed_mechanism={} finish_reason={} wall_ms={} \
-                 truncated={}",
+                 truncated={} {}",
                 usage.seq,
                 usage.site,
                 // [VANTA-WHY] §14.12 — the round and the retry index travel with
@@ -2808,6 +2848,10 @@ pub async fn run(
                 usage.finish_reason.as_deref().unwrap_or("unset"),
                 usage.wall_ms,
                 usage.truncated,
+                // [VANTA-WHY] §14.26 — what the body asked for, what it carried,
+                // and what was removed or renamed on the way. Last, so every key
+                // this row carried before keeps its position.
+                usage.request_shape.render(),
             ),
             timestamp: now_iso(),
             benchmark_instance: None,
@@ -2931,7 +2975,7 @@ pub async fn run(
         phase: "run.summary".to_string(),
         summary: format!(
             "attempts_run={} fixed_at_attempt_1={} final_decision={:?} \
-             config={} mode={} seed={} seed_policy={} model={} top_p={} {} \
+             config={} mode={} seed={} seed_policy={} model={} top_p={} {} {} \
              llm_calls={} llm_calls_measured={} llm_prompt_tokens={} llm_completion_tokens={} \
              truncated_calls_creator={} truncated_calls_attacker={} \
              truncated_calls_intent_audit={} \
@@ -2959,6 +3003,7 @@ pub async fn run(
             cfg.model_id,
             top_p_value,
             sampling_schedule_keys(),
+            request_shape_rule(&cfg),
             llm_calls,
             llm_calls_measured,
             llm_prompt_tokens,

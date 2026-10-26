@@ -30,6 +30,16 @@ pub const REVISE_BUDGET_PER_ATTEMPT: u32 = 4;
 /// (§14.14).
 pub const REVISE_BUDGET_EXHAUSTED: &str = "revise_budget_exhausted";
 
+/// The `stop_reason` a run records when its own wall-clock deadline ended it
+/// (§14.15).
+///
+/// [VANTA-WHY] The harness reports `timed_out` when IT killed the process — a
+/// row with no `run.summary`, because the kill lands mid-work. This token is the
+/// other case: Vanta noticed its own deadline, stopped, and wrote the verdict
+/// down. A batch table that reads both must not average them together, so the
+/// two are recorded under different names rather than one `stopped=true`.
+pub const BUDGET_EXHAUSTED: &str = "budget_exhausted";
+
 /// One attempt's shared Attacker remediation budget (§14.14).
 ///
 /// [VANTA-WHY] Held by the attempt loop and borrowed by BATE and the

@@ -19150,6 +19150,20 @@ class TestVantaEnv:
         assert env["VANTA_LLM_BASE_URL"] == "http://127.0.0.1:8080"
         assert "VANTA_LLM_MODEL" not in env
 
+    def test_the_deadline_is_set_short_of_the_timeout_that_kills_the_process(self):
+        """§14.15 — the margin is the difference between a verdict and a corpse.
+
+        Past `RUN_TIMEOUT_SECS` the harness SIGKILLs a run mid-call and the row
+        has no `run.summary`; inside Vanta's own deadline the run stops between
+        calls and writes `final_decision` plus the reason. So the deadline must be
+        strictly smaller, and its size is a claim about the longest call the
+        marginal case has to survive.
+        """
+        env = self._env()
+        deadline = int(env["VANTA_DEADLINE_SECS"])
+        assert deadline == runner_mod.RUN_TIMEOUT_SECS - runner_mod.DEADLINE_MARGIN_SECS
+        assert 0 < deadline < runner_mod.RUN_TIMEOUT_SECS
+
 
 class TestPreflight:
     """Shuru mounts only paths inside the process CWD, so both guards are load-bearing."""
@@ -19377,6 +19391,50 @@ class TestRunJob:
         )
         assert record["harness_commit"] is None
         assert record["harness_dirty"] is None
+
+    def test_a_row_says_whether_the_run_stopped_itself_or_was_killed(
+        self, tmp_path, monkeypatch
+    ):
+        """§14.15 — `stop_reason` and `timed_out` are two different sentences.
+
+        A run Vanta ended on its own clock is a `NeedsReview` (exit 3) with a
+        `run.summary` on disk and `stop_reason=budget_exhausted`; a run the harness
+        killed is `timed_out` and usually has no `run.summary` at all. Pooling them
+        would read a verdict out of a corpse, so the row carries the reason and the
+        deadline it was measured against — and a summary from before the field
+        existed reads as "the run never stopped itself", not as a guess.
+        """
+        base = _outcome(tmp_path)
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+
+        stopped_summary = dict(base.summary, stop_reason="budget_exhausted", deadline_secs="10200")
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, decision="NeedsReview", exit_code=3, summary=stopped_summary
+            ),
+        )
+        stopped = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert stopped["stop_reason"] == "budget_exhausted"
+        assert stopped["deadline_secs"] == 10200
+        assert stopped["timed_out"] is False
+        assert stopped["verdict"] == "NeedsReview"
+
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        silent = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert silent["stop_reason"] is None
+        assert silent["deadline_secs"] is None
 
     def test_a_review_row_reuses_the_candidate_label_and_never_re_grades(
         self, tmp_path, monkeypatch

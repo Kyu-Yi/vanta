@@ -55,7 +55,7 @@ use crate::pipeline::harness::{self, TestExecutionDetails};
 use crate::pipeline::patch::{
     ApplyFailure, apply_patch_detailed, apply_patch_strict, patch_deleted_paths,
 };
-use crate::pipeline::{REVISE_BUDGET_PER_ATTEMPT, ReviseBudget};
+use crate::pipeline::{BUDGET_EXHAUSTED, REVISE_BUDGET_PER_ATTEMPT, ReviseBudget};
 use crate::repo::Repo;
 use crate::session::{
     PatchAttemptId, SCHEMA_VERSION, SessionId, SessionLog, SessionRecord, TransitionRow,
@@ -157,6 +157,27 @@ fn env_flag(name: &str, default: bool) -> Result<bool, String> {
             )),
         },
         Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "CONFIG_ERROR: {name} env var contained non-UTF-8 bytes."
+        )),
+    }
+}
+
+/// Read a whole number of SECONDS from the environment, or `None` when unset.
+///
+/// [VANTA-WHY] §14.15 — a malformed value is an error rather than a silent
+/// default: `VANTA_DEADLINE_SECS=1h` read as "no deadline" would give the
+/// operator the opposite of what they asked for, and the failure would show up
+/// hours later as a harness kill that looks like a machine fault.
+fn env_secs(name: &str) -> Result<Option<u64>, String> {
+    match std::env::var(name) {
+        Ok(raw) => raw.trim().parse::<u64>().map(Some).map_err(|_| {
+            format!(
+                "CONFIG_ERROR: {name}='{}' is not a number of seconds.",
+                raw.trim()
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(format!(
             "CONFIG_ERROR: {name} env var contained non-UTF-8 bytes."
         )),
@@ -378,6 +399,20 @@ pub async fn run(
     let corroborate_enabled = env_flag("VANTA_CORROBORATE", false)?;
     let grounded_audit_enabled = env_flag("VANTA_GROUNDED_AUDIT", false)?;
     let batch_audit_enabled = env_flag("VANTA_BATCH_AUDIT", false)?;
+    // [VANTA-WHY] §14.15 — Vanta's own wall-clock deadline, in seconds from here.
+    // Unset means no deadline, which is what every run before this did; the
+    // harness sets it ten minutes short of its own `RUN_TIMEOUT_SECS` so a run
+    // that would have been killed ends itself instead, with a verdict and a
+    // `run.summary` on disk. Armed in the LLM layer so it is checked before every
+    // call, including the ones inside BATE and the Diagnostician.
+    let deadline_secs = env_secs("VANTA_DEADLINE_SECS")?;
+    crate::llm::set_deadline_secs(deadline_secs);
+    if let Some(secs) = deadline_secs {
+        println!(
+            "  Deadline: the run will stop making LLM calls after {secs} s and end as NeedsReview \
+             ({BUDGET_EXHAUSTED})"
+        );
+    }
     if !attacker_enabled {
         println!(
             "▌ Config: {} — Attacker off (VANTA_ATTACKER=off): the repo's own suite and static \
@@ -798,7 +833,30 @@ pub async fn run(
     // (and thus the manifest) beside the cap, so a reader can tell a run that
     // never needed a revision from one that spent its budget.
     let mut revise_calls_used_total: u32 = 0;
-    let decision = loop {
+    // [VANTA-WHY] §14.15 — why the run stopped, when it stopped itself rather
+    // than reaching a verdict about the candidate. `None` is every ordinary
+    // outcome; `budget_exhausted` is the deadline above. Recorded in
+    // `run.summary` (and thus the manifest) under its own name, because the
+    // harness's `timed_out` means the OPPOSITE thing — that Vanta was killed
+    // before it could decide anything.
+    let mut stop_reason: Option<&'static str> = None;
+    let decision = 'attempts: loop {
+        // [VANTA-WHY] §14.15 — the deadline is checked here as well as in the LLM
+        // layer, and this is the check that turns "the calls stopped" into "the
+        // run stopped": a phase whose calls were refused would otherwise start
+        // another attempt — another Attacker round, another BATE pass, another
+        // native suite run — before anything noticed the clock. `NeedsReview`
+        // rather than a rejection, because the deadline is a fact about the run
+        // and not about the candidate: nothing has been shown to be wrong.
+        if crate::llm::deadline_past() {
+            stop_reason = Some(BUDGET_EXHAUSTED);
+            println!(
+                "\n  ⏱ Wall-clock deadline reached — stopping here and ending the run as \
+                 NeedsReview ({BUDGET_EXHAUSTED}); the candidate has been neither approved nor \
+                 rejected."
+            );
+            break 'attempts GovernorDecision::NeedsReview;
+        }
         let attempt = governor.current_attempt();
 
         // [VANTA-WHY] §14.14 — this ATTEMPT's shared revise+simplify budget. Fresh
@@ -867,6 +925,20 @@ pub async fn run(
             .await
             {
                 Ok(response) => response,
+                // [VANTA-WHY] §14.15 — a call the deadline refused is NOT an
+                // infrastructure failure. "The machine broke" and "the run ran out
+                // of clock" are opposite claims about the run, and the exit codes
+                // say so (2 versus 3), so the marker is matched before the arm
+                // that would otherwise blame the server.
+                Err(error) if error.to_string().contains(crate::llm::DEADLINE_EXCEEDED_MARKER) => {
+                    stop_reason = Some(BUDGET_EXHAUSTED);
+                    println!(
+                        "\n  ⏱ The wall-clock deadline passed before the Creator call — ending \
+                         the run as NeedsReview ({BUDGET_EXHAUSTED}), not as an infrastructure \
+                         failure."
+                    );
+                    break 'attempts GovernorDecision::NeedsReview;
+                }
                 Err(error) => {
                     infra_failure_error = Some(format!("Creator LLM call failed: {error}"));
                     break GovernorDecision::InfraFailure;
@@ -1202,6 +1274,19 @@ pub async fn run(
                         benchmark_label: None,
                     })?;
                     None
+                }
+                // [VANTA-WHY] §14.15 — the deadline's refusal, not the server's
+                // failure; see the Creator arm above for why the two must not be
+                // the same exit code. Placed AFTER the cut-off arm, so a genuinely
+                // truncated generation keeps its §14.5 treatment.
+                Err(error) if error.to_string().contains(crate::llm::DEADLINE_EXCEEDED_MARKER) => {
+                    stop_reason = Some(BUDGET_EXHAUSTED);
+                    println!(
+                        "\n  ⏱ The wall-clock deadline passed before the Attacker call — ending \
+                         the run as NeedsReview ({BUDGET_EXHAUSTED}); this round contributes no \
+                         test."
+                    );
+                    break 'attempts GovernorDecision::NeedsReview;
                 }
                 Err(error) => {
                     infra_failure_error = Some(format!("Attacker LLM call failed: {error}"));
@@ -2387,6 +2472,35 @@ pub async fn run(
         })?;
     }
 
+    // [VANTA-WHY] §14.15 — the run's own deadline gets the same treatment as an
+    // infrastructure failure: its own phase row, so the reason is a fact in the
+    // session log rather than something inferred from `final_decision=NeedsReview`
+    // plus an empty `needs_review_weak`. An ordinary `NeedsReview` names the weak
+    // failures that triggered it; this one has none to name, because nothing about
+    // the candidate was decided — which is exactly why it must say so itself.
+    if stop_reason == Some(BUDGET_EXHAUSTED) {
+        session_log.append(SessionRecord {
+            session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
+            patch_attempt_id: attempt_patch_ids.last().cloned(),
+            testing_iteration_id: None,
+            test_id: None,
+            phase: "run.budget_exhausted".to_string(),
+            summary: format!(
+                "final_decision=NeedsReview stop_reason={BUDGET_EXHAUSTED} \
+                 deadline_secs={} — the run's own wall clock ended it before it could decide \
+                 anything about the candidate; this is NOT the harness killing the process, which \
+                 is reported as `timed_out` and usually leaves no run.summary at all",
+                deadline_secs
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "unset".to_string())
+            ),
+            timestamp: now_iso(),
+            benchmark_instance: None,
+            benchmark_label: None,
+        })?;
+    }
+
     // [VANTA-WHY] "Fixed at attempt 1" is its own number, not a rate. A repair
     // that passes on the first candidate has no N→N+1 transition, so ECR/EIR
     // cannot see it by construction. Reporting it separately tells a reader what
@@ -2577,6 +2691,7 @@ pub async fn run(
              corroborate={} grounded_audit={} batch_audit={} \
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              revise_budget_per_attempt={} revise_calls_used={} \
+             deadline_secs={} stop_reason={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
              commit={} dirty={} prompt_version={} prompt_hash={} context_selection={}",
             attempts_run,
@@ -2627,6 +2742,15 @@ pub async fn run(
             // asking.
             REVISE_BUDGET_PER_ATTEMPT,
             revise_calls_used_total,
+            // [VANTA-WHY] §14.15 — the run's own deadline and why it stopped, when
+            // it stopped itself. `unset`/`none` is every run before this one and
+            // every run without `VANTA_DEADLINE_SECS`; `budget_exhausted` is the
+            // deadline firing, which is the one stop the harness's `timed_out`
+            // must not be confused with.
+            deadline_secs
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unset".to_string()),
+            stop_reason.unwrap_or("none"),
             deciding_rule.as_deref().unwrap_or("none"),
             deciding_evidence.join(","),
             needs_review_weak.join(","),

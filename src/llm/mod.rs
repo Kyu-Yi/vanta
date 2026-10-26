@@ -66,6 +66,53 @@ pub fn set_forensics_round(round: u32) {
 }
 
 // ============================================================================
+// RUN DEADLINE — Vanta's own wall clock (plans/bugsinpy.md §14.15)
+// ============================================================================
+//
+// [VANTA-WHY] The harness kills a run at `RUN_TIMEOUT_SECS`. Nothing Vanta did
+// ever ended a run on its own clock, so a run-away was stopped by `SIGKILL`
+// mid-call: the process died between the terminal decision and the write of
+// `run.summary`, and the batch recorded `no run.summary` — a row with no
+// verdict, no cost and no prompt provenance. The remedy cannot be a verdict
+// Vanta decides *after* being killed, so Vanta keeps its own deadline, set
+// short of the harness's, and ends itself as a RECORDED outcome instead.
+//
+// [VANTA-WHY] Armed in the LLM layer rather than threaded through every call
+// site: all five structured call sites converge on `structured_call_with_retry`,
+// so one check there is a check before EVERY call — including the ones inside
+// BATE and the Diagnostician, whose loops have no channel to the driver. A
+// refused call costs one string, not one HTTP request, so a phase that keeps
+// iterating after the deadline runs out of tests and exits at once instead of
+// spending another ten minutes per test.
+
+/// Marker `structured_call_with_retry` puts on a call it refused to make
+/// because the run's deadline had passed (§14.15).
+///
+/// [VANTA-WHY] The driver has to tell this apart from a transport error: a
+/// transport error is `InfraFailure` (exit 2, "the machine broke"), while a
+/// deadline is `budget_exhausted` (exit 3, "the run ran out of clock"). The two
+/// are opposite claims about the run, so the token is spelled out here rather
+/// than matched by a sentence the driver would have to re-spell.
+pub const DEADLINE_EXCEEDED_MARKER: &str = "deadline_exceeded";
+
+/// The instant the run must stop making calls, or `None` when unarmed.
+static DEADLINE_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Arm the run's deadline `secs` from now; `None` leaves it unarmed, which is
+/// the default and the behaviour of every run before §14.15.
+pub fn set_deadline_secs(secs: Option<u64>) {
+    *DEADLINE_AT.lock().unwrap() = secs.map(|s| Instant::now() + Duration::from_secs(s));
+}
+
+/// Whether the run's deadline has passed. Always `false` when none is armed.
+pub fn deadline_past() -> bool {
+    DEADLINE_AT
+        .lock()
+        .unwrap()
+        .map_or(false, |at| Instant::now() >= at)
+}
+
+// ============================================================================
 // TOKEN ACCOUNTING — what each chat call really cost
 // ============================================================================
 //
@@ -1538,6 +1585,27 @@ where
         <= 0.0;
 
     for attempt in 1..=max_attempts {
+        // [VANTA-WHY] §14.15 — the run's own wall clock, checked before EVERY
+        // request. This is the one place every structured call site passes
+        // through, so it is the one place a check is a check before all of them —
+        // including the calls BATE's revision loop and the Diagnostician's
+        // Unknown path make from inside loops the driver cannot see. Refusing
+        // here costs a string rather than a ten-minute generation, and the error
+        // carries `DEADLINE_EXCEEDED_MARKER` so the driver can end the run as
+        // `budget_exhausted` rather than blaming the machine.
+        if deadline_past() {
+            warn!(
+                site,
+                attempt,
+                "the run's wall-clock deadline has passed — refusing to start this call \
+                 ({DEADLINE_EXCEEDED_MARKER})"
+            );
+            return Err(format!(
+                "the run's wall-clock deadline (plans/bugsinpy.md §14.15) passed before this \
+                 `{site}` call could start, so it was never made ({DEADLINE_EXCEEDED_MARKER})"
+            )
+            .into());
+        }
         let mut messages = build_messages(attempt);
         attempts_made = attempt;
         if nudge_next {
@@ -2022,5 +2090,41 @@ mod _streaming_tests {
         assert_eq!(out.content, "hi");
         assert_eq!(out.prompt_tokens, Some(11));
         assert_eq!(out.total_tokens, Some(22));
+    }
+}
+
+// ============================================================================
+// §14.15 — the run deadline's own switch
+// ============================================================================
+//
+// [VANTA-WHY] The deadline is a process-global (there is one run per process), so
+// this module owns it end to end and leaves it disarmed. Nothing else arms it or
+// reads it outside `structured_call_with_retry`, which no unit test drives — it
+// needs a server — so the global is this module's alone even under the parallel
+// test harness.
+#[cfg(test)]
+mod _deadline_tests {
+    use super::{deadline_past, set_deadline_secs};
+
+    #[test]
+    fn an_unarmed_deadline_never_passes_and_an_armed_one_passes_when_it_is_due() {
+        // The default, and the behaviour of every run before §14.15: no clock.
+        set_deadline_secs(None);
+        assert!(!deadline_past(), "an unarmed deadline must never end a run");
+
+        // Armed an hour out, a call may still start.
+        set_deadline_secs(Some(3600));
+        assert!(!deadline_past(), "a deadline an hour away is not here yet");
+
+        // Armed zero seconds out it is due the instant it is set, so the very next
+        // call is refused. This is the point of the check being `>=` and not `>`:
+        // "no clock left" must refuse, not permit one more call.
+        set_deadline_secs(Some(0));
+        assert!(deadline_past(), "a deadline set at `now` must already be due");
+
+        // Disarming is total — a cleared deadline is a run with no clock, which is
+        // the state this test must leave behind.
+        set_deadline_secs(None);
+        assert!(!deadline_past(), "disarming must return the run to 'no clock'");
     }
 }

@@ -5778,6 +5778,76 @@ written before this record reports `None` rather than a fabricated `0`.
 
 ---
 
+### 14.15 Vanta's own wall clock — `budget_exhausted`, not `timed_out`
+
+§14.13 and §14.14 bound what a run is allowed to *spend*; this section bounds how long it may spend it.
+The overnight batch's sanic/1 row is the reason: `RUN_TIMEOUT_SECS` (3 h, §8.1's backstop) fired while
+the run was inside an Attacker revise call, the harness `SIGKILL`ed the process mid-call, and the artifact
+on disk was `no run.summary … (exit None)`. Both `run.summary` and every `call.usage` row are written in
+the terminal block, *after* the last call returns, so a process killed inside a call leaves a row with no
+verdict, no cost and no prompt provenance — nothing to grade and nothing to explain. The remedy cannot be
+a decision Vanta makes *after* being killed. It has to be a decision it makes *before*.
+
+**The deadline is armed in the LLM layer, and checked before every call.** All five structured call sites
+(`creator`, `attacker_generate`, `attacker_revise`, `attacker_simplify`, `intent_audit`) converge on
+`structured_call_with_retry`, so one check at the top of its attempt loop is a check before **every** call
+— including the calls made inside BATE and the Diagnostician, whose loops have no channel back to the
+driver. That placement is the point: the run-aways were *inside* those phases, and a check the driver
+could only make between phases would have arrived an hour late. A refused call returns an error carrying
+`llm::DEADLINE_EXCEEDED_MARKER` (`deadline_exceeded`) instead of making an HTTP request. It is a marker
+and not a sentence because the driver has to tell it apart from a transport error, and the two are
+opposite claims: a transport error is `InfraFailure` (exit 2, "the machine broke"), a deadline is
+"the run ran out of clock".
+
+**A call already in flight is not aborted.** The check is before a call, never during one, so the
+deadline is a bound on *starting* work plus one call. That is deliberate — killing a streaming completion
+in progress is how a run loses the answer it was about to record — and it is why the harness's own limit
+must be strictly larger than Vanta's. The two clocks are set to differ by exactly that one call:
+`runner.py` sets `VANTA_DEADLINE_SECS = RUN_TIMEOUT_SECS - DEADLINE_MARGIN_SECS`, with
+`DEADLINE_MARGIN_SECS = 10 * 60`, the length of the longest single call the batch measured on sanic's
+50–65k-token prompts, plus room for the terminal write.
+
+**The driver checks the same clock, and ends the run as a verdict.** `deadline_past()` is also read at
+the top of the attempt loop, because a phase whose calls were all refused would otherwise start another
+attempt — another Attacker round, another BATE pass, another native suite run — before anything noticed.
+The call-level check turns "the calls stopped" into "the calls failed"; this one turns it into "the run
+stopped". The decision is `NeedsReview` (exit 3), **not** a rejection: the deadline is a fact about the
+run, and nothing has been shown to be wrong with the candidate. Nothing about the approval logic, the
+Governor or the Gatekeeper is touched — the deadline only chooses *when* to stop, and the existing
+`NeedsReview` path (§14) supplies the rest.
+
+**`stop_reason=budget_exhausted` is a different word from `timed_out`, on purpose.** The harness's
+`timed_out` means Vanta was killed before it could decide anything and usually leaves no `run.summary` to
+read; `budget_exhausted` means Vanta noticed its own clock, stopped between calls and wrote the reason
+down. A table that pooled them would read a verdict out of a corpse — one row is a decision that exists
+and the other is a decision that does not — so they are never two spellings of one "stopped" outcome.
+The run writes its own phase row, `run.budget_exhausted`, carrying `final_decision=NeedsReview` and
+`stop_reason=budget_exhausted`; an ordinary `NeedsReview` names the weak failures that triggered it and
+this one has none to name, so without its own row it would be indistinguishable from an uncorroborated
+failure. `run.summary` gains `deadline_secs=` and `stop_reason=`, and the manifest reads both back
+(`stop_reason`, `deadline_secs`) rather than inferring them from `final_decision`.
+
+**Unset means no clock, byte for byte.** `set_deadline_secs(None)` leaves the deadline unarmed and
+`deadline_past()` returns `false` (`map_or(false, …)`), so every run made before this section behaves
+exactly as it did: no check refuses anything. `VANTA_DEADLINE_SECS` is therefore a switch the batch
+*always* sets and the library *never* requires.
+
+Tests: `src/llm/mod.rs::_deadline_tests::an_unarmed_deadline_never_passes_and_an_armed_one_passes_when_it_is_due`
+asserts the unarmed default never ends a run, that an hour out is not yet due, that a deadline set at
+`now` is already due (the `>=`, not `>`), and that disarming is total;
+`tests/m3_session_log.rs::a_run_that_exhausts_its_own_clock_ends_as_needs_review_and_says_why` arms
+`VANTA_DEADLINE_SECS=0`, asserts exit 3, asserts the stub server saw **zero** calls (refusing to start is
+the whole point), reads `stop_reason` / `deadline_secs` / `final_decision` back out of `run.summary`, and
+requires the `run.budget_exhausted` row — the last with a panic that lists the phases it did find, so an
+absent row fails loudly rather than passing on a `None` comparison;
+`scripts/test_bugsinpy.py::TestVantaEnv::test_the_deadline_is_set_short_of_the_timeout_that_kills_the_process`
+asserts the runner's margin is real (`0 < deadline < RUN_TIMEOUT_SECS`), and
+`TestRunJob::test_a_row_says_whether_the_run_stopped_itself_or_was_killed` asserts the manifest carries
+the reason beside `timed_out` — and that a summary from before this record reads as "the run never
+stopped itself" rather than a fabricated value.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

@@ -5814,6 +5814,84 @@ fn a_lone_uncorroborated_failure_ends_as_needs_review_with_exit_code_3() {
     );
 }
 
+/// §14.15 — a run that exhausts its OWN clock ends as a recorded verdict.
+///
+/// [VANTA-WHY] The overnight batch lost sanic/1 to the harness's 3 h SIGKILL: the
+/// process died between the terminal decision and the write of `run.summary`, so
+/// the row was `no run.summary` — no verdict, no cost, no prompt provenance. This
+/// run arms `VANTA_DEADLINE_SECS=0`, which makes the clock already past when the
+/// attempt loop begins, so Vanta must refuse to start any call, stop BETWEEN
+/// calls, and end as `NeedsReview` (exit 3) with `stop_reason=budget_exhausted` on
+/// disk. The distinction the row has to carry is the whole point of the item:
+/// `timed_out` says the run was killed before it could say anything, and this says
+/// the run had something to say and said it.
+#[test]
+fn a_run_that_exhausts_its_own_clock_ends_as_needs_review_and_says_why() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[("VANTA_DEADLINE_SECS", "0")],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a run out of clock is a NeedsReview — not an InfraFailure (2, the machine \
+         broke) and not a rejection (1, the candidate is wrong): {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        server.request_count(),
+        0,
+        "the deadline was already past when the loop began, so NO call may have been \
+         made: refusing to start is the entire point of checking before every call"
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(
+        summary_value(&summary, "stop_reason"),
+        "budget_exhausted",
+        "run.summary must say the run stopped itself; got {summary}"
+    );
+    assert_eq!(
+        summary_value(&summary, "deadline_secs"),
+        "0",
+        "the summary must record the deadline it was measured against; got {summary}"
+    );
+    assert!(
+        summary.contains("final_decision=NeedsReview"),
+        "the deadline is a fact about the run, not the candidate, so the verdict is \
+         NeedsReview; got {summary}"
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let budget_row = records
+        .iter()
+        .find(|r| r.phase == "run.budget_exhausted")
+        .unwrap_or_else(|| {
+            panic!(
+                "the run must explain why its own clock ended it, in its own row — \
+                 `NeedsReview` plus an empty `needs_review_weak` is indistinguishable \
+                 from an ordinary uncorroborated failure; phases: {:?}",
+                records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        budget_row.summary.contains("stop_reason=budget_exhausted")
+            && budget_row.summary.contains("final_decision=NeedsReview"),
+        "the row must carry both the verdict and the reason; got {}",
+        budget_row.summary
+    );
+}
+
 /// §14.2/§14.8 byte-compat: with the flag off the SAME fixture takes v0.2's path
 /// untouched — the rejection stands, nothing weak is recorded and no rule is
 /// named, because no rule ran.

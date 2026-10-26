@@ -94,6 +94,12 @@ whose HEAD was ``b2efa49``.
 # §8.1's worst single run is ~30 min for a vanta repair; 3 h is a backstop, not an
 # estimate. A run that hits it is a failure to report, not a result to grade.
 RUN_TIMEOUT_SECS = 3 * 60 * 60
+# §14.15 — how far short of `RUN_TIMEOUT_SECS` Vanta's own deadline is set. The
+# margin has to cover the longest single LLM call the harness expects (5-10
+# minutes on sanic's 50-65k-token prompts), because the deadline is checked
+# BEFORE each call: the call already in flight when the clock runs out still
+# finishes. Ten minutes is that call, plus the terminal write.
+DEADLINE_MARGIN_SECS = 10 * 60
 PROBE_TIMEOUT_SECS = 120
 ORACLE_TIMEOUT_SECS = 1800
 
@@ -357,6 +363,13 @@ def vanta_env(
     # Always set, including for seed 0: `VANTA_LLM_SEED=0` is a request to pin 0,
     # while an unset variable means "no seed key in the body" (§4.4, D4).
     env["VANTA_LLM_SEED"] = str(seed)
+    # §14.15 — Vanta's own deadline, set short of the timeout this module kills
+    # the process with. The margin is what makes the difference between the two
+    # outcomes: inside it Vanta notices the clock, stops between calls and writes
+    # `final_decision` + `run.summary`; past it the harness SIGKILLs mid-call and
+    # the row is the `no run.summary` shape the overnight batch produced. Ten
+    # minutes is one long sanic call, which is the unit the margin has to cover.
+    env["VANTA_DEADLINE_SECS"] = str(RUN_TIMEOUT_SECS - DEADLINE_MARGIN_SECS)
     return env
 
 
@@ -1410,6 +1423,15 @@ def build_record(
         "verdict": outcome.decision or None,
         "exit_code": outcome.exit_code,
         "timed_out": outcome.timed_out,
+        # §14.15 — why a run that stopped itself stopped. `budget_exhausted` is
+        # Vanta's OWN deadline firing, which ends the run as `NeedsReview` (exit 3)
+        # with `run.summary` and the reason on disk. It is deliberately a different
+        # field from `timed_out`, which is the harness killing the process: that
+        # row usually has no `run.summary` to read at all, and the two must never
+        # be pooled as one "stopped" outcome because they say opposite things —
+        # one is a verdict Vanta reached, the other is a verdict it never reached.
+        "stop_reason": summary.get("stop_reason"),
+        "deadline_secs": _int(summary.get("deadline_secs")),
         "attempts_run": _int(summary.get("attempts_run")),
         "fixed_at_attempt_1": _bool(summary.get("fixed_at_attempt_1")),
         # §1.6.2 item 5 — whether the run's own selection included a file the fix

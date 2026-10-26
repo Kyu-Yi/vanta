@@ -59,6 +59,29 @@
 //! * **`stream` / `stream_options`.** Both list "Streaming: Supported" and the
 //!   Chat Completions reference defines `stream_options.include_usage` (the last
 //!   chunk carries `usage`, and is empty otherwise). No Responses API is needed.
+//!
+//! ## `reasoning_effort` (§14.28)
+//!
+//! The effort levels are the one field whose accepted VALUES — not just whose
+//! presence — differ between the two families, so they are a per-family list
+//! rather than a shared constant. `docs/models/gpt-6-luna` gives the ladder as
+//! `none`, `low`, `medium` (default), `high`, `xhigh`, `max`;
+//! `docs/models/gpt-6.1-sol` gives `low`, `medium` (default), `high`, `xhigh`,
+//! `max` and rejects `none`/`minimal`. The union — the values
+//! `VANTA_REASONING_EFFORT` may name — is therefore six names, and each family
+//! is checked against its own five-or-six. `minimal` is NOT in the union: it
+//! appears in neither ladder, and inventing a level no doc lists is exactly the
+//! guess this table exists to avoid.
+//!
+//! [VANTA-WHY] The effort is handled HERE rather than at the call sites even
+//! though §14.21 put the budget there, because the two differ in kind: the
+//! budget is an ADDITION, so `apply_reasoning_control` inserting a key is enough
+//! for the local backend and the shaping table drops it for the hosted one. The
+//! effort is a SUBSTITUTION: all six call sites already hard-code
+//! `reasoning_effort: "low"`, and on a hosted model that value is a level nobody
+//! asked for. It has to be REMOVED when the run did not ask, and the removal has
+//! to happen on the same body the record describes — which is this module's
+//! choke point, not the six call sites.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -121,6 +144,28 @@ impl OpenAiFamily {
     pub fn rejects_sampling_while_reasoning(self) -> bool {
         matches!(self, Self::Gpt6Luna | Self::Gpt61Sol)
     }
+
+    /// The `reasoning_effort` values this family accepts, per its model page.
+    ///
+    /// [VANTA-WHY] `Unknown` answers the FULL union. The two directions of being
+    /// wrong are not symmetric here: an accepted-but-unlisted level is a level
+    /// the operator asked for and cannot run, while an unknown model refusing a
+    /// level would be this table vetoing a request on evidence it does not have.
+    /// The table abstains — it sends what was asked and lets the server answer.
+    pub fn accepted_efforts(self) -> &'static [&'static str] {
+        match self {
+            Self::Gpt6Luna => EFFORT_LADDER,
+            // Sol's page omits `none` (and rejects `minimal`), so the ladder
+            // shared with Luna has one name fewer.
+            Self::Gpt61Sol => SOL_EFFORT_LADDER,
+            Self::Unknown => EFFORT_LADDER,
+        }
+    }
+
+    /// Whether `level` is one of [`Self::accepted_efforts`].
+    pub fn accepts_effort(self, level: &str) -> bool {
+        self.accepted_efforts().contains(&level)
+    }
 }
 
 /// Fields that are not Chat Completions parameters at all, whatever the model.
@@ -168,6 +213,28 @@ pub const REJECTED_WHILE_REASONING: &[(&str, &str)] = &[
 pub const LLAMACPP_OUTPUT_CAP_KEY: &str = "max_tokens";
 pub const OPENAI_OUTPUT_CAP_KEY: &str = "max_completion_tokens";
 
+/// The `reasoning_effort` key, under the name both backends spell it (§14.28).
+///
+/// [VANTA-WHY] Shared by name on purpose: `llama.cpp` and OpenAI happen to agree
+/// on the spelling, which is why §14.21's switch could be provider-neutral in the
+/// first place. The constant exists so the drop and the replacement cannot drift
+/// onto two spellings of the same field.
+pub const REASONING_EFFORT_KEY: &str = "reasoning_effort";
+
+/// Every level `VANTA_REASONING_EFFORT` may name — the UNION of the two ladders.
+///
+/// [VANTA-WHY] Ordered as the model pages list them (cheapest first). `none` is
+/// here because Luna documents it; Sol's page does not, so the per-family list
+/// below is what decides whether a given model may be asked for it.
+pub const EFFORT_LADDER: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+
+/// [`EFFORT_LADDER`] without `none` — what `gpt-6.1-sol` accepts.
+///
+/// [VANTA-WHY] Spelled as a suffix rather than filtered at runtime, so the two
+/// lists are visible side by side in one file: the difference between the
+/// families is one name, and a reader has to be able to see that at a glance.
+pub const SOL_EFFORT_LADDER: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 /// Every field this table refuses to send to `family`, `(key, why)`, in a fixed
 /// order — the single source of truth `shape_body_for_openai` drops from and
 /// `run.summary` names.
@@ -177,6 +244,24 @@ pub fn unsent_keys(family: OpenAiFamily) -> Vec<(&'static str, &'static str)> {
         keys.extend_from_slice(REJECTED_WHILE_REASONING);
     }
     keys
+}
+
+/// Whether a run's requested effort survives shaping for `family` (§14.28).
+///
+/// [VANTA-WHY] The ONE predicate both halves of the §14.28 decision read: the
+/// per-body drop inside [`shape_body_for_openai`] and the run-level
+/// `request_shape_not_sent` list the driver writes. Written once because the two
+/// must agree — a run-level rule that named `reasoning_effort` while the body
+/// still carried it (or the reverse) is exactly the drift the request-shaping
+/// record exists to make impossible.
+///
+/// [VANTA-WHY] A level the family rejects and a level nobody asked for answer the
+/// same here on purpose: both mean "this body must not carry an effort". The
+/// first cannot reach a real run — the driver refuses it at start-up — but the
+/// predicate is shared with the run-level record, which must not depend on a
+/// check made somewhere else in the pipeline.
+pub fn keeps_effort(family: OpenAiFamily, requested_effort: Option<&str>) -> bool {
+    requested_effort.is_some_and(|level| family.accepts_effort(level))
 }
 
 /// What a request body asked for and what it actually carries (§14.26).
@@ -272,13 +357,23 @@ impl ShapedBody {
 }
 
 /// Rewrite a llama.cpp-shaped body into what `family`'s endpoint accepts, and
-/// report both sides (§14.26).
+/// report both sides (§14.26, §14.28).
 ///
-/// Drops every key of [`unsent_keys`] and renames `max_tokens` to
-/// `max_completion_tokens`. Nothing else is touched: the two known families
-/// accept every remaining field, and inventing further edits here would be this
-/// table guessing at behaviour no doc states.
-pub fn shape_body_for_openai(body: &mut Map<String, Value>, family: OpenAiFamily) -> ShapedBody {
+/// Drops every key of [`unsent_keys`], renames `max_tokens` to
+/// `max_completion_tokens`, and decides the `reasoning_effort` (§14.28).
+/// Nothing else is touched: the two known families accept every remaining field,
+/// and inventing further edits here would be this table guessing at behaviour no
+/// doc states.
+///
+/// `requested_effort` is the run's `VANTA_REASONING_EFFORT`, or `None` when the
+/// switch was unset. It is a parameter rather than a read of the llm module's
+/// global so the decision is visible at the call site and a test can exercise
+/// every combination without touching process state.
+pub fn shape_body_for_openai(
+    body: &mut Map<String, Value>,
+    family: OpenAiFamily,
+    requested_effort: Option<&str>,
+) -> ShapedBody {
     let requested: Vec<String> = body.keys().cloned().collect();
     let mut dropped = Vec::new();
     let mut renamed = Vec::new();
@@ -287,6 +382,22 @@ pub fn shape_body_for_openai(body: &mut Map<String, Value>, family: OpenAiFamily
         if body.remove(key).is_some() {
             dropped.push(key.to_string());
         }
+    }
+    // [VANTA-WHY] §14.28 — the call sites' `reasoning_effort: "low"` is a
+    // llama.cpp fact, not this run's request: it is sent because a local server
+    // ignores it (§14.21's `llamacpp:noop`), and on a hosted reasoning model it
+    // would be a real intervention nobody chose. So the field goes out ONLY when
+    // the run asked for a level this family accepts, and the value it carries is
+    // the one `apply_reasoning_control` substituted earlier in the same request.
+    //
+    // [VANTA-WHY] Refusing an accepted-but-unasked-for level and refusing a
+    // rejected one land in the SAME branch deliberately: both mean "this body
+    // must not carry an effort", and both are recorded as a drop. A level the
+    // family rejects is a `CONFIG_ERROR` at run start (driver), so a real run
+    // cannot reach that half — but a filter that would send it if it did is not
+    // a filter. The predicate is shared with the run-level rule (`keeps_effort`).
+    if !keeps_effort(family, requested_effort) && body.remove(REASONING_EFFORT_KEY).is_some() {
+        dropped.push(REASONING_EFFORT_KEY.to_string());
     }
     // [VANTA-WHY] `insert` onto the key we just removed, so the rename cannot
     // leave both spellings in one body — two output caps in one JSON object is
@@ -397,7 +508,9 @@ mod tests {
     #[test]
     fn shaping_drops_the_unparameterized_keys_renames_the_cap_and_keeps_the_rest() {
         let mut body = a_llamacpp_shaped_body();
-        let shaped = shape_body_for_openai(&mut body, OpenAiFamily::Gpt6Luna);
+        // The run asked for `low` — the level the body already carried — so the
+        // effort is kept (§14.28).
+        let shaped = shape_body_for_openai(&mut body, OpenAiFamily::Gpt6Luna, Some("low"));
 
         for key in ["top_k", "min_p", "temperature", "presence_penalty"] {
             assert!(
@@ -450,7 +563,7 @@ mod tests {
         // to remove and only the cap is renamed.
         let body = json!({"model": "gpt-6-luna", "max_tokens": 8192});
         let mut body = body.as_object().unwrap().clone();
-        let shaped = shape_body_for_openai(&mut body, OpenAiFamily::Gpt6Luna);
+        let shaped = shape_body_for_openai(&mut body, OpenAiFamily::Gpt6Luna, None);
         assert!(shaped.dropped.is_empty(), "nothing was there to drop");
         assert_eq!(
             shaped.renamed,
@@ -477,9 +590,92 @@ mod tests {
         // requested key that was never dropped is exactly the drift this field
         // exists to make impossible.
         let mut body = a_llamacpp_shaped_body();
-        let mut shaped = shape_body_for_openai(&mut body, OpenAiFamily::Gpt6Luna);
+        let mut shaped = shape_body_for_openai(&mut body, OpenAiFamily::Gpt6Luna, None);
         assert!(shaped.is_consistent());
         shaped.sent.push("a_key_no_body_carried".to_string());
         assert!(!shaped.is_consistent());
+    }
+
+    /// §14.28: the effort goes out only when the RUN asked for a level this
+    /// family accepts — the call sites' `low` is a llama.cpp fact.
+    #[test]
+    fn the_effort_is_dropped_unless_the_run_asked_for_a_level_that_is_accepted() {
+        // (a) The switch was unset: the call site's `low` must NOT reach a hosted
+        // model, and the drop must be on the record rather than silent.
+        let mut body = a_llamacpp_shaped_body();
+        let shaped = shape_body_for_openai(&mut body, OpenAiFamily::Gpt6Luna, None);
+        assert!(
+            !body.contains_key(REASONING_EFFORT_KEY),
+            "an unasked-for effort is a real intervention on a hosted model: {body:?}"
+        );
+        assert!(
+            shaped.dropped.contains(&REASONING_EFFORT_KEY.to_string()),
+            "the drop is a fact about the run and belongs on the record: {shaped:?}"
+        );
+        assert!(shaped.requested.contains(&REASONING_EFFORT_KEY.to_string()));
+        assert!(shaped.is_consistent());
+
+        // (b) The run asked, the family accepts: the level is kept as sent.
+        let mut body = a_llamacpp_shaped_body();
+        let shaped = shape_body_for_openai(&mut body, OpenAiFamily::Gpt6Luna, Some("high"));
+        assert!(body.contains_key(REASONING_EFFORT_KEY));
+        assert!(
+            !shaped.dropped.contains(&REASONING_EFFORT_KEY.to_string()),
+            "an accepted, asked-for level is not a drop: {shaped:?}"
+        );
+        assert!(shaped.is_consistent());
+
+        // (c) The run asked, the family rejects it. A real run fails at config
+        // time; the shaper must still refuse to send it.
+        let mut body = a_llamacpp_shaped_body();
+        let shaped = shape_body_for_openai(&mut body, OpenAiFamily::Gpt61Sol, Some("none"));
+        assert!(
+            !body.contains_key(REASONING_EFFORT_KEY),
+            "Sol rejects `none`: {body:?}"
+        );
+        assert!(shaped.dropped.contains(&REASONING_EFFORT_KEY.to_string()));
+        assert!(shaped.is_consistent());
+    }
+
+    /// §14.28: the two ladders, spelled out here rather than read from the table
+    /// so a drifted table cannot keep passing against itself.
+    #[test]
+    fn each_family_lists_its_own_effort_ladder_and_minimal_is_in_neither() {
+        for level in ["none", "low", "medium", "high", "xhigh", "max"] {
+            assert!(
+                OpenAiFamily::Gpt6Luna.accepts_effort(level),
+                "Luna documents `{level}`"
+            );
+        }
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(
+                OpenAiFamily::Gpt61Sol.accepts_effort(level),
+                "Sol documents `{level}`"
+            );
+        }
+        assert!(
+            !OpenAiFamily::Gpt61Sol.accepts_effort("none"),
+            "Sol's page omits `none`"
+        );
+        // `minimal` appears in neither ladder, so it is in neither enum nor
+        // accepted set — the union is the six names above and nothing more.
+        for family in [
+            OpenAiFamily::Gpt6Luna,
+            OpenAiFamily::Gpt61Sol,
+            OpenAiFamily::Unknown,
+        ] {
+            assert!(!family.accepts_effort("minimal"));
+            assert!(!family.accepts_effort(""));
+            assert!(!family.accepts_effort("LOW"), "levels are lower-case");
+        }
+        assert_eq!(EFFORT_LADDER.len(), 6);
+        assert_eq!(SOL_EFFORT_LADDER.len(), 5);
+        // The unknown family abstains: it accepts the whole union rather than
+        // vetoing a documented level on evidence it does not have.
+        assert_eq!(
+            OpenAiFamily::Unknown.accepted_efforts(),
+            EFFORT_LADDER,
+            "an unknown model must not be refused a level by this table"
+        );
     }
 }

@@ -896,18 +896,28 @@ pub fn sampling_pins_text(preset: SamplingPreset, site: &str) -> Vec<(&'static s
 // bounds a RESPONSE. The output cap plus §14.13's re-ask remains the bound on the
 // call, exactly as it was; this knob only removes waste inside it.
 
-/// The reasoning effort a run may ask for (§14.21).
+/// The reasoning effort a run may ask for (§14.21, §14.28).
 ///
-/// [VANTA-WHY] The four names are llama.cpp's own — and the same four names
-/// OpenAI uses for `reasoning.effort` — so an arm that says `high` means the same
-/// thing on either transport and only the MECHANISM differs. `none` is a level,
-/// not the absence of the switch: unset is the absence.
+/// [VANTA-WHY] The names are llama.cpp's own — and the same names OpenAI uses
+/// for `reasoning.effort` — so an arm that says `high` means the same thing on
+/// either transport and only the MECHANISM differs. `none` is a level, not the
+/// absence of the switch: unset is the absence.
+///
+/// [VANTA-WHY] §14.28 — six levels, not four. The hosted families document
+/// `xhigh` and `max` (`gpt-6-luna` and `gpt-6.1-sol` both list them), so an arm
+/// that cannot name them cannot run the top of the ladder this project is
+/// measuring. `minimal` is deliberately NOT here: neither model page lists it,
+/// and an enum is the wrong place to invent a level. Which of the six a given
+/// model may be asked for is a per-family fact and lives in
+/// [`capabilities::OpenAiFamily::accepted_efforts`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
     None,
     Low,
     Medium,
     High,
+    XHigh,
+    Max,
 }
 
 impl ReasoningEffort {
@@ -922,9 +932,11 @@ impl ReasoningEffort {
             "low" => Ok(Self::Low),
             "medium" => Ok(Self::Medium),
             "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::XHigh),
+            "max" => Ok(Self::Max),
             other => Err(format!(
                 "CONFIG_ERROR: VANTA_REASONING_EFFORT='{other}' is not a level \
-                 (expected none|low|medium|high)."
+                 (expected none|low|medium|high|xhigh|max)."
             )),
         }
     }
@@ -935,6 +947,8 @@ impl ReasoningEffort {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
         }
     }
 }
@@ -988,6 +1002,31 @@ const LLAMACPP_BUDGET_MECHANISM: &str = "llamacpp:reasoning_budget_tokens";
 /// llama.cpp implements the effort level with nothing at all.
 const LLAMACPP_EFFORT_MECHANISM: &str = "llamacpp:noop";
 
+/// OpenAI implements the effort with one request field, and it is not a no-op.
+///
+/// [VANTA-WHY] §14.28 — the hosted spelling has to be its own word because the
+/// two mechanisms are not the same claim: `llamacpp:noop` says "the level was
+/// sent and ignored", while this says "the level this run asked for is the level
+/// the model reasoned at". Pooling runs that recorded one word across both
+/// backends would credit the local arm with an intervention it never made.
+pub const OPENAI_EFFORT_MECHANISM: &str = "openai:reasoning_effort";
+
+/// The hosted backend has no equivalent of llama.cpp's token budget (§14.28).
+///
+/// [VANTA-WHY] `unsupported`, not `openai:...`: the request field is a llama.cpp
+/// extension, so the honest record of a budget on a hosted model is that the
+/// control was ASKED FOR and could not be expressed — the run is then visibly
+/// not the arm the operator set, instead of silently being a different one.
+pub const UNSUPPORTED_MECHANISM: &str = "unsupported";
+
+/// What `reasoning_effort` records when the hosted run asked for no level.
+///
+/// [VANTA-WHY] A word, not `unset`: the two are different facts. `unset` would
+/// say "no effort was in play", which is false — the model reasoned, at the
+/// level its provider chose. The word is also the one the `unset` mechanism
+/// pairs with, so a reader of one field can read the other.
+pub const PROVIDER_DEFAULT_EFFORT: &str = "provider_default";
+
 /// Apply the run's reasoning controls to ONE request body (§14.21).
 ///
 /// [VANTA-WHY] Called at the tail of [`with_sampling`], and therefore on the body
@@ -1018,9 +1057,19 @@ pub fn reasoning_budget_text() -> String {
 }
 
 /// The mechanism that implements the budget, or `unset` when nothing was asked.
-pub fn reasoning_budget_mechanism() -> &'static str {
+///
+/// [VANTA-WHY] §14.28 — backend-dependent, because the same switch means two
+/// different things: llama.cpp has a field for it, the hosted API does not.
+/// `unsupported` is the record of a control the run asked for and could not
+/// send; the body carries nothing either way, which is exactly why the field has
+/// to say so.
+pub fn reasoning_budget_mechanism(is_openai: bool) -> &'static str {
     if reasoning_budget().is_some() {
-        LLAMACPP_BUDGET_MECHANISM
+        if is_openai {
+            UNSUPPORTED_MECHANISM
+        } else {
+            LLAMACPP_BUDGET_MECHANISM
+        }
     } else {
         "unset"
     }
@@ -1029,19 +1078,59 @@ pub fn reasoning_budget_mechanism() -> &'static str {
 /// The effort a request body carries, as `run.summary` records it (§14.21).
 ///
 /// [VANTA-WHY] The EFFECTIVE value, not the switch: the six call sites have
-/// hard-coded `low` since v0.2, so a field that read `unset` on a default run
-/// would describe a run that sent no effort at all. Setting the switch to `low`
-/// is therefore indistinguishable from leaving it unset — which is the truth,
-/// since the two send byte-identical bodies.
-pub fn reasoning_effort_text() -> String {
-    reasoning_effort()
-        .map(|effort| effort.name().to_string())
-        .unwrap_or_else(|| "low".to_string())
+/// hard-coded `low` since v0.2, so a field that read `unset` on a default LOCAL
+/// run would describe a run that sent no effort at all. Setting the switch to
+/// `low` is therefore indistinguishable from leaving it unset — which is the
+/// truth, since the two send byte-identical bodies.
+///
+/// [VANTA-WHY] §14.28 — on the hosted backend the same unset switch is NOT `low`:
+/// the call sites' `low` is dropped before the request leaves (`capabilities`),
+/// so the model reasons at whatever its provider default is. Recording `low`
+/// there would name a level the model was never asked for, and
+/// `provider_default` is the fact. The two backends' default runs are different
+/// arms and the record has to be able to say so.
+pub fn reasoning_effort_text(is_openai: bool) -> String {
+    match reasoning_effort() {
+        Some(effort) => effort.name().to_string(),
+        None if is_openai => PROVIDER_DEFAULT_EFFORT.to_string(),
+        None => "low".to_string(),
+    }
 }
 
-/// The mechanism that implements the effort level (§14.21).
-pub fn reasoning_effort_mechanism() -> &'static str {
-    LLAMACPP_EFFORT_MECHANISM
+/// The mechanism that implements the effort level (§14.21, §14.28).
+///
+/// [VANTA-WHY] The LOCAL branch is unchanged and unconditional: a llama.cpp
+/// request carries an effort whatever the switch says (the six call sites
+/// hard-code `low`), and a llama.cpp server ignores the field, so the mechanism
+/// is `llamacpp:noop` for every local run — set or unset. Replacing that with
+/// `unset` on a default run would claim the field was absent, and it is not.
+///
+/// [VANTA-WHY] §14.28 — the hosted branch is the one that depends on the switch,
+/// because it is the one whose body depends on it: with the switch unset the
+/// shaper has removed the call sites' `low`, so no mechanism exists and the
+/// value field's `provider_default` says whose choice the level was.
+pub fn reasoning_effort_mechanism(is_openai: bool) -> &'static str {
+    if is_openai {
+        if reasoning_effort().is_none() {
+            "unset"
+        } else {
+            OPENAI_EFFORT_MECHANISM
+        }
+    } else {
+        LLAMACPP_EFFORT_MECHANISM
+    }
+}
+
+/// The effort level this run asked for, or `None` when the switch was unset
+/// (§14.28).
+///
+/// [VANTA-WHY] The one public way to ask, so that the two places that must agree
+/// read the same value: `post_chat_meta` hands it to the shaping table, and the
+/// driver hands it to the run-level `request_shape_not_sent` rule. Both then
+/// describe the same request, which is the only reason a record can be compared
+/// across the two.
+pub fn requested_effort() -> Option<&'static str> {
+    reasoning_effort().map(|effort| effort.name())
 }
 
 /// Merge the active preset's sampler pins for `site` into a call site's extras
@@ -1597,7 +1686,12 @@ async fn post_chat_meta(
     // them.
     let (full_body, request_shape) = if cfg.is_openai() {
         let family = OpenAiFamily::from_model_id(&cfg.model_id);
-        let shaped = capabilities::shape_body_for_openai(&mut full_body, family);
+        // [VANTA-WHY] §14.28 — the run's effort is passed IN rather than read by
+        // the table, so "what did this run ask for?" is answered at the one call
+        // site that has the run's configuration in hand, and the shaping function
+        // stays a pure function of (body, family, request).
+        let effort = requested_effort();
+        let shaped = capabilities::shape_body_for_openai(&mut full_body, family, effort);
         (Value::Object(full_body), shaped)
     } else {
         let shaped = ShapedBody::native(&full_body);
@@ -2896,7 +2990,8 @@ mod _max_tokens_override_tests {
 #[cfg(test)]
 mod _reasoning_control_tests {
     use super::{
-        REASONING_BUDGET_SITES, ReasoningEffort, SAMPLING_SCHEDULE, reasoning_budget_mechanism,
+        OPENAI_EFFORT_MECHANISM, PROVIDER_DEFAULT_EFFORT, REASONING_BUDGET_SITES, ReasoningEffort,
+        SAMPLING_SCHEDULE, UNSUPPORTED_MECHANISM, reasoning_budget_mechanism,
         reasoning_budget_text, reasoning_effort_mechanism, reasoning_effort_text,
         set_reasoning_budget, set_reasoning_effort, with_sampling,
     };
@@ -2931,11 +3026,20 @@ mod _reasoning_control_tests {
             );
         }
         assert_eq!(reasoning_budget_text(), "unset");
-        assert_eq!(reasoning_budget_mechanism(), "unset");
+        assert_eq!(reasoning_budget_mechanism(false), "unset");
         // The EFFECTIVE effort, not the switch: `low` is what the six call sites
         // send, so `unset` here would describe a run that sent no effort at all.
-        assert_eq!(reasoning_effort_text(), "low");
-        assert_eq!(reasoning_effort_mechanism(), "llamacpp:noop");
+        assert_eq!(reasoning_effort_text(false), "low");
+        assert_eq!(reasoning_effort_mechanism(false), "llamacpp:noop");
+        // §14.28 — the SAME unset switch on the hosted backend is a different
+        // arm: the call sites' `low` is dropped before the request leaves, so the
+        // model reasons at its provider's default and the record says so.
+        assert_eq!(
+            reasoning_effort_text(true),
+            PROVIDER_DEFAULT_EFFORT,
+            "the hosted default is the provider's choice, not `low`"
+        );
+        assert_eq!(reasoning_effort_mechanism(true), "unset");
 
         // (2) The budget arm reaches exactly the three allow-listed sites, and names
         //     both the value it asked for and the mechanism that carried it.
@@ -2957,7 +3061,15 @@ mod _reasoning_control_tests {
             }
         }
         assert_eq!(reasoning_budget_text(), "12000");
-        assert_eq!(reasoning_budget_mechanism(), "llamacpp:reasoning_budget_tokens");
+        assert_eq!(
+            reasoning_budget_mechanism(false),
+            "llamacpp:reasoning_budget_tokens"
+        );
+        // §14.28 — the hosted API defines no such field, so the same switch there
+        // records a control that could not be expressed. The body carries nothing
+        // either way, which is exactly why the mechanism has to say so.
+        assert_eq!(reasoning_budget_mechanism(true), UNSUPPORTED_MECHANISM);
+        assert_eq!(reasoning_budget_text(), "12000", "the ask is still recorded");
 
         // (3) The effort REPLACES a key the call site already set and never invents
         //     one for a site that had none — the six `low` call sites are the ones
@@ -2972,8 +3084,12 @@ mod _reasoning_control_tests {
             None,
             "the effort must not be invented for a site that never asked for one"
         );
-        assert_eq!(reasoning_effort_text(), "high");
-        assert_eq!(reasoning_effort_mechanism(), "llamacpp:noop");
+        assert_eq!(reasoning_effort_text(false), "high");
+        assert_eq!(reasoning_effort_mechanism(false), "llamacpp:noop");
+        // §14.28 — on the hosted backend the same ask IS the intervention, and
+        // the mechanism says which transport carried it.
+        assert_eq!(reasoning_effort_text(true), "high");
+        assert_eq!(reasoning_effort_mechanism(true), OPENAI_EFFORT_MECHANISM);
 
         // `none` is a LEVEL, not the absence of the switch: it is a body that asks
         // the backend to reason not at all, and the record must say so.
@@ -2982,20 +3098,31 @@ mod _reasoning_control_tests {
             with_sampling(json!({"reasoning_effort": "low"}), "attacker_revise")["reasoning_effort"],
             json!("none")
         );
-        assert_eq!(reasoning_effort_text(), "none");
+        assert_eq!(reasoning_effort_text(false), "none");
+        assert_eq!(reasoning_effort_text(true), "none");
 
         // An unparsable level is an error, never a fallback: an ablation arm must run
         // at the level it named, or the comparison means nothing.
         assert!(ReasoningEffort::parse("bogus").is_err());
         assert!(ReasoningEffort::parse("").is_err());
         assert_eq!(ReasoningEffort::parse("medium").unwrap().name(), "medium");
+        // §14.28 — the full documented ladder, and NOTHING beyond it: the two
+        // hosted families list `xhigh` and `max`, and neither lists `minimal`.
+        assert_eq!(ReasoningEffort::parse("xhigh").unwrap().name(), "xhigh");
+        assert_eq!(ReasoningEffort::parse("max").unwrap().name(), "max");
+        assert!(
+            ReasoningEffort::parse("minimal").is_err(),
+            "`minimal` is in neither model's ladder, so this enum must not invent it"
+        );
 
         // The cleared state this test has to leave behind.
         set_reasoning_budget(None);
         set_reasoning_effort(None);
         assert_eq!(reasoning_budget_text(), "unset");
-        assert_eq!(reasoning_budget_mechanism(), "unset");
-        assert_eq!(reasoning_effort_text(), "low");
+        assert_eq!(reasoning_budget_mechanism(false), "unset");
+        assert_eq!(reasoning_budget_mechanism(true), "unset");
+        assert_eq!(reasoning_effort_text(false), "low");
+        assert_eq!(reasoning_effort_mechanism(true), "unset");
     }
 }
 

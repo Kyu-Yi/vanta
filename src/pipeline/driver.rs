@@ -493,10 +493,19 @@ fn request_shape_rule(cfg: &LlmConfig) -> String {
     let family = crate::llm::capabilities::OpenAiFamily::from_model_id(&cfg.model_id);
     // `unsent_keys` is a const table walked in a fixed order, so this list is stable
     // across runs — the same reason the per-call `requested`/`sent` lists are.
-    let not_sent: Vec<&str> = crate::llm::capabilities::unsent_keys(family)
-        .into_iter()
-        .map(|(key, _why)| key)
-        .collect();
+    let mut unsent = crate::llm::capabilities::unsent_keys(family);
+    // [VANTA-WHY] §14.28 — the effort is not a property of the family the way the
+    // rows above are: it is dropped when THIS run asked for no level, so a default
+    // hosted run must name it here and a run that set `VANTA_REASONING_EFFORT` must
+    // not. The predicate is the shaper's own (`keeps_effort`), so the run-level
+    // rule and the bodies it describes cannot disagree about what went out.
+    if !crate::llm::capabilities::keeps_effort(family, crate::llm::requested_effort()) {
+        unsent.push((
+            crate::llm::capabilities::REASONING_EFFORT_KEY,
+            "no level requested by this run; the call sites' `low` is a llama.cpp fact (§14.28)",
+        ));
+    }
+    let not_sent: Vec<&str> = unsent.into_iter().map(|(key, _why)| key).collect();
     let not_sent = if not_sent.is_empty() {
         "none".to_string()
     } else {
@@ -629,15 +638,38 @@ pub async fn run(
     let reasoning_budget = env_reasoning_budget()?;
     crate::llm::set_reasoning_budget(reasoning_budget);
     let reasoning_effort = env_reasoning_effort()?;
+    // [VANTA-WHY] §14.28 — the effort is validated against the MODEL that will
+    // receive it, here, before the repo loads and before the first request is
+    // built. The two hosted families do not accept the same ladder (Sol rejects
+    // `none`), so a level that is legal in the abstract can be a 400 on this
+    // model; failing the run at config time is what keeps that from being
+    // discovered twenty minutes into a batch. The local backend has no ladder to
+    // check against — its knob is a no-op — so the switch is only validated when
+    // a hosted model is going to read it.
+    if let Some(effort) = reasoning_effort {
+        if cfg.is_openai() {
+            let family = crate::llm::capabilities::OpenAiFamily::from_model_id(&cfg.model_id);
+            if !family.accepts_effort(effort.name()) {
+                return Err(format!(
+                    "CONFIG_ERROR: VANTA_REASONING_EFFORT='{}' is not a level {} accepts \
+                     (expected one of {}).",
+                    effort.name(),
+                    family.name(),
+                    family.accepted_efforts().join("|"),
+                )
+                .into());
+            }
+        }
+    }
     crate::llm::set_reasoning_effort(reasoning_effort);
     if reasoning_budget.is_some() || reasoning_effort.is_some() {
         println!(
             "  Reasoning: budget={} effort={} (mechanism {}, {}) \
              — sites: {}",
             crate::llm::reasoning_budget_text(),
-            crate::llm::reasoning_effort_text(),
-            crate::llm::reasoning_budget_mechanism(),
-            crate::llm::reasoning_effort_mechanism(),
+            crate::llm::reasoning_effort_text(cfg.is_openai()),
+            crate::llm::reasoning_budget_mechanism(cfg.is_openai()),
+            crate::llm::reasoning_effort_mechanism(cfg.is_openai()),
             crate::llm::REASONING_BUDGET_SITES.join(", ")
         );
     }
@@ -3081,12 +3113,19 @@ pub async fn run(
             // same arm run against a hosted API. `reasoning_effort` is the
             // EFFECTIVE level and defaults to `low` — the six call sites have sent
             // `low` since v0.2, so `unset` would describe a run that sent nothing.
-            // Neither value contains a space, so both survive the
-            // `rerun.rs`/`metrics.py` value-terminator rule intact.
+            //
+            // [VANTA-WHY] §14.28 — both mechanisms are read per backend, and the
+            // hosted default is NOT `low`: with the switch unset the call sites'
+            // `low` never reaches a hosted model, so the honest value there is
+            // `provider_default` with an `unset` mechanism. On the local backend
+            // the same switch records `low` + `llamacpp:noop`, because the key is
+            // in the body and the server ignores it. Neither value contains a
+            // space, so both survive the `rerun.rs`/`metrics.py` value-terminator
+            // rule intact.
             crate::llm::reasoning_budget_text(),
-            crate::llm::reasoning_budget_mechanism(),
-            crate::llm::reasoning_effort_text(),
-            crate::llm::reasoning_effort_mechanism(),
+            crate::llm::reasoning_budget_mechanism(cfg.is_openai()),
+            crate::llm::reasoning_effort_text(cfg.is_openai()),
+            crate::llm::reasoning_effort_mechanism(cfg.is_openai()),
             deciding_rule.as_deref().unwrap_or("none"),
             deciding_evidence.join(","),
             needs_review_weak.join(","),

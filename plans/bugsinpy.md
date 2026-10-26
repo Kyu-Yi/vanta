@@ -6698,6 +6698,100 @@ correction that happens to be discovered while running it is not part of it.
 
 ---
 
+### 14.28 Hosted OpenAI backend, item 4 — the reasoning effort belongs to the run, not to the call site
+
+§14.26 gave the hosted backend one place to decide which FIELDS leave. This section is about the first
+field whose correct VALUE also depends on the run: `reasoning_effort`.
+
+**The call sites have hard-coded `low` since v0.2.** Every request Vanta builds carries
+`reasoning_effort: "low"` at the six sites that send one. On llama.cpp that is a no-op — the server defines
+no such knob, so the field is sent and ignored, which is the fact §14.21 recorded as the mechanism
+`llamacpp:noop`. On a hosted reasoning model the same field is not a no-op: it **is** the intervention.
+Leaving it in place would mean every hosted run silently reasons at whatever level six call sites happened
+to be written with — a configuration nobody chose, on the one backend where the level changes the output.
+
+**The rule is one line: the level goes out only when the run asked for one.** With `VANTA_REASONING_EFFORT`
+unset the field is removed and the model reasons at its provider default; with it set, that level goes out,
+after being checked against the model's own ladder.
+
+**Why the drop lives in the shaping table and not at the six call sites.** §14.21 put the reasoning BUDGET
+in `apply_reasoning_control` because the budget is an ADDITION: inserting a key is enough for the local
+backend, and §14.26's filter removes it for the hosted one. The effort is a SUBSTITUTION — six call sites
+already put a value there, and on a hosted model that value is a level nobody asked for — so it has to be
+REMOVED, and the removal has to happen on the same body the record describes. That body is the one
+`post_chat_meta` is about to serialise, which is exactly the choke point §14.26 already owns. A drop
+written at the call sites would be a seventh copy of the rule, and the one copy the record could not see.
+
+**One predicate, two readers.** `capabilities::keeps_effort(family, requested_effort)` is read by both the
+per-body drop in `shape_body_for_openai` and the run-level `request_shape_not_sent` rule in
+`request_shape_rule`. The sharing is the point: a run-level rule that named `reasoning_effort` while the
+body still carried it (or the reverse) is precisely the drift §14.26 exists to prevent. The rule answers
+"what did this run not send", so a default hosted run names the effort there and a run that set the switch
+does not. `post_chat_meta` and the driver reach the level through one public accessor, `requested_effort()`,
+so neither can describe a different request from the other.
+
+**Six names, and each family gets its own subset.** `gpt-6-luna`'s page gives the ladder as `none`, `low`,
+`medium` (default), `high`, `xhigh`, `max`; `gpt-6.1-sol`'s gives the same list without `none` (and rejects
+`minimal`). The union is `EFFORT_LADDER` — the six names `VANTA_REASONING_EFFORT` may say — and Sol's
+subset is `SOL_EFFORT_LADDER`, its five. `ReasoningEffort` therefore gained `XHigh` and `Max`, and
+`minimal` is deliberately NOT in it: the name appears in neither page, and an enum is the wrong place to
+invent a level. A level the run's model does not list is refused at start-up, before the repo is loaded:
+
+    CONFIG_ERROR: VANTA_REASONING_EFFORT='none' is not a level gpt-6.1-sol accepts (expected one of low|medium|high|xhigh|max).
+
+`Unknown` keeps the full union on purpose — the same asymmetry §14.26 chose for the sampling fields. An
+accepted-but-unlisted level is a level the operator asked for and cannot run; vetoing a request on evidence
+this table does not have is the guess it exists to avoid.
+
+**The record, backend by backend.** `reasoning_effort=` is the EFFECTIVE level and
+`reasoning_effort_mechanism=` names who implemented it:
+
+| run | body carries | `reasoning_effort=` | `reasoning_effort_mechanism=` |
+|---|---|---|---|
+| local, switch unset | `low` (the call sites') | `low` | `llamacpp:noop` |
+| local, switch set | the level | the level | `llamacpp:noop` |
+| hosted, switch unset | nothing | `provider_default` | `unset` |
+| hosted, switch set | the level | the level | `openai:reasoning_effort` |
+
+`provider_default` rather than `unset` in the value column: the hosted model still reasoned, at a level its
+provider chose, so a word meaning "no effort was in play" would be false.
+
+**The local mechanism was almost moved, and must not be.** The first cut of this item returned `unset`
+whenever the switch was unset, on both backends. That is wrong on one of them: a llama.cpp body carries an
+effort whether or not the switch was set, so `llamacpp:noop` — §14.21's reading — is the fact for every
+local run, and only the hosted branch may depend on the switch, because only the hosted branch's BODY
+depends on it. Two tests caught it, one in `llm::_reasoning_control_tests` and one in the m3 suite; the
+correction narrows the new branch and changes no existing reading.
+
+**A budget on a hosted model is `unsupported`, not dropped silently.** `VANTA_REASONING_BUDGET` sets a
+llama.cpp extension field, and no OpenAI endpoint defines it. §14.26 removes it from the body; this section
+gives the record a word for what happened, so `reasoning_budget_mechanism=unsupported` says the control was
+asked for and could not be expressed. Recording the llama.cpp mechanism while the body carried nothing
+would credit the run with an intervention it never made.
+
+**Byte-identity holds, and the test proves the drop rather than assuming it.** The local path still takes
+`ShapedBody::native` and never enters the shaper, so no local body changes and the tests that pin local
+bodies are untouched. The hosted-vs-local comparison in `m3_session_log` gained a POSITIVE CONTROL: the
+local reference body must contain `reasoning_effort`, because "the hosted body does not carry it" would
+otherwise be true of a run that never had one either.
+
+**Tests.** `capabilities::tests::the_effort_is_dropped_unless_the_run_asked_for_a_level_that_is_accepted`
+covers the three cases of the predicate (unset → dropped, accepted → kept, rejected → dropped), and
+`each_family_lists_its_own_effort_ladder_and_minimal_is_in_neither` spells both pages' ladders out by hand
+so the consts cannot drift from the docs. `llm::_reasoning_control_tests` pins the four-row table above,
+level by level and mechanism by mechanism, on both backends.
+`the_hosted_backend_sends_only_the_fields_the_model_accepts` runs the harness four more times: the
+body-level drop, the per-row `requested`/`sent`/`dropped` agreement, the refusal of `none` on Sol (exit 1,
+`CONFIG_ERROR`, the model named, not one call made) and the acceptance of the same `none` on Luna (exit 0,
+the level on the wire, `openai:reasoning_effort`, and a run-level rule that does NOT name the field).
+Neither half of that pair can pass for the wrong reason.
+
+**What this section does not settle.** No live call was made: the ladders, the acceptance rule and the
+`provider_default` reading all come from the model pages quoted in `capabilities.rs`. The operator's
+`scripts/openai_probe.py` — §14.26's open question on `seed`, unchanged — is what would falsify them.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

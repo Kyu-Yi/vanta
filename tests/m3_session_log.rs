@@ -5383,6 +5383,12 @@ fn unset_seed_leaves_request_bodies_unseeded_and_the_verdict_unchanged() {
 /// passing against itself. The per-call rows must agree with the bodies, too —
 /// `requested_fields` admitting a key the `sent_fields` no longer has is the whole
 /// point of recording both.
+///
+/// §14.28 adds a second question this test has to answer, because the effort is
+/// the one field whose correct VALUE is also per-model: a level a family does not
+/// list must stop the run before it starts, and the same level on a family that
+/// does list it must go out on the wire. Both halves run below, so neither the
+/// refusal nor the acceptance can pass for the wrong reason.
 #[test]
 fn the_hosted_backend_sends_only_the_fields_the_model_accepts() {
     let _serial = serial_run();
@@ -5401,6 +5407,10 @@ fn the_hosted_backend_sends_only_the_fields_the_model_accepts() {
     // four sampler values plus the two the harness can also send (`frequency_penalty`
     // under a preset, `reasoning_budget_tokens` at the three budget sites) plus the
     // logprob pair. The cap is not dropped — it is renamed — so it is listed apart.
+    //
+    // §14.28 adds `reasoning_effort` to this list: the call sites' hard-coded `low`
+    // is a llama.cpp fact, so with `VANTA_REASONING_EFFORT` unset — which is what
+    // this run is — the hosted body must not carry the field at all.
     const DROPPED_KEYS: &[&str] = &[
         "temperature",
         "top_p",
@@ -5411,6 +5421,7 @@ fn the_hosted_backend_sends_only_the_fields_the_model_accepts() {
         "logprobs",
         "top_logprobs",
         "reasoning_budget_tokens",
+        "reasoning_effort",
     ];
     const RENAME: &str = "max_tokens->max_completion_tokens";
 
@@ -5456,6 +5467,16 @@ fn the_hosted_backend_sends_only_the_fields_the_model_accepts() {
             "the llama.cpp body must never hear the hosted cap spelling: {body}"
         );
     }
+    // §14.28's host-side drop is only a fact about something that was there: the
+    // reference run must carry the call sites' own effort somewhere, or "the
+    // hosted body does not" would be true of a run that never had one either.
+    assert!(
+        local_bodies
+            .iter()
+            .any(|body| body.contains("reasoning_effort")),
+        "the LOCAL run must carry the sites' hard-coded effort, or §14.28's drop \
+         proves nothing: {local_bodies:?}"
+    );
     // The local run's rule is "no filter", and it says so rather than staying
     // silent — that is what makes a local summary self-describing.
     let local_summary = run_summary(local.path()).summary;
@@ -5611,6 +5632,113 @@ fn the_hosted_backend_sends_only_the_fields_the_model_accepts() {
         assert!(
             not_sent.contains(&key.to_string()),
             "run.summary must name `{key}` as not sent: {hosted_summary}"
+        );
+    }
+
+    // (5) §14.28 — the effort is checked against the MODEL, not against a fixed
+    //     list. `gpt-6.1-sol`'s page has no `none` and `gpt-6-luna`'s does, so the
+    //     SAME switch value has to be refused on one and run on the other. Both
+    //     halves are asserted, because a check that refused `none` for every model
+    //     would pass the refusal on its own.
+    let hosted_arm: &[(&str, &str)] = &[
+        ("VANTA_LLM_BACKEND", "openai"),
+        ("VANTA_LLM_CONTEXT_TOKENS", "131072"),
+        ("OPENAI_API_KEY", "sk-test-not-a-real-key"),
+        ("VANTA_REASONING_EFFORT", "none"),
+    ];
+    let mut sol_env: Vec<(&str, &str)> = hosted_arm.to_vec();
+    sol_env.push(("VANTA_LLM_MODEL", "gpt-6.1-sol"));
+    let refused = TempDir::new().unwrap();
+    let (_repo, _issue, refused_patch) = write_test_repo(refused.path(), PRESERVING_PATCH);
+    let refused_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let refused_output =
+        run_patch_mode_with_output(refused.path(), &refused_patch, &refused_server, 1, &sol_env);
+    assert_eq!(
+        refused_output.status.code(),
+        Some(1),
+        "an effort the run's model does not accept must fail the run; stdout:\n{}",
+        String::from_utf8_lossy(&refused_output.stdout)
+    );
+    let refused_stderr = String::from_utf8_lossy(&refused_output.stderr);
+    assert!(
+        refused_stderr.contains("CONFIG_ERROR") && refused_stderr.contains("none"),
+        "the refusal must name the level it refused; stderr:\n{refused_stderr}"
+    );
+    assert!(
+        refused_stderr.contains("gpt-6.1-sol"),
+        "the refusal must name the MODEL that does not accept the level — the ladder \
+         is per-family, so the reader has to be able to see which family said no; \
+         stderr:\n{refused_stderr}"
+    );
+    assert!(
+        refused_server.request_bodies().is_empty(),
+        "a refused config must fail BEFORE the first call, or the run has already \
+         spent an hour generating"
+    );
+
+    // The other half: the same `none` on the family whose page documents it.
+    let mut luna_env: Vec<(&str, &str)> = hosted_arm.to_vec();
+    luna_env.push(("VANTA_LLM_MODEL", "gpt-6-luna"));
+    let accepted = TempDir::new().unwrap();
+    let (_repo, _issue, accepted_patch) = write_test_repo(accepted.path(), PRESERVING_PATCH);
+    let accepted_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let accepted_output = run_patch_mode_with_output(
+        accepted.path(),
+        &accepted_patch,
+        &accepted_server,
+        3,
+        &luna_env,
+    );
+    assert_eq!(
+        accepted_output.status.code(),
+        Some(0),
+        "the same value on the family that documents it must run; stdout:\n{}",
+        String::from_utf8_lossy(&accepted_output.stdout)
+    );
+    assert!(
+        accepted_server.request_bodies().iter().any(|body| {
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| value.get("reasoning_effort").cloned())
+                == Some(serde_json::json!("none"))
+        }),
+        "a run that asked for `none` must SEND it to the model that accepts it: {:?}",
+        accepted_server.request_bodies()
+    );
+    let accepted_summary = run_summary(accepted.path()).summary;
+    assert_eq!(
+        summary_value(&accepted_summary, "reasoning_effort"),
+        "none",
+        "{accepted_summary}"
+    );
+    assert_eq!(
+        summary_value(&accepted_summary, "reasoning_effort_mechanism"),
+        "openai:reasoning_effort",
+        "an effort that went out is the hosted mechanism, not a no-op: {accepted_summary}"
+    );
+    // The run-level rule must not claim the field was withheld: this run sent it.
+    // That is the other direction of §14.28's one predicate, and the reason it is
+    // shared with the shaper rather than re-derived here.
+    let accepted_not_sent = summary_value(&accepted_summary, "request_shape_not_sent");
+    assert!(
+        !split(&accepted_not_sent)
+            .iter()
+            .any(|key| key == "reasoning_effort"),
+        "the run-level rule and the bodies must agree: {accepted_summary}"
+    );
+    let accepted_rows: Vec<String> = read_session_records(&find_session_log(accepted.path()))
+        .into_iter()
+        .filter(|record| record.phase == "call.usage")
+        .map(|record| record.summary)
+        .collect();
+    assert!(
+        !accepted_rows.is_empty(),
+        "the accepted run made no calls, so it proves nothing about the effort"
+    );
+    for row in &accepted_rows {
+        assert!(
+            split(&summary_value(row, "sent_fields")).contains(&"reasoning_effort".to_string()),
+            "a body that carries the effort must say so: {row}"
         );
     }
 }

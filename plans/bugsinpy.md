@@ -7123,6 +7123,86 @@ operator confirms them with the key loaded via `read -s`.
 
 ---
 
+### 14.33 Hosted OpenAI backend, item 9 — parallel bugs, design note only
+
+**No code, and `run` has no `--jobs` flag.** Item 9 said "if risky, stop at a design note", and this is that
+stop. The reason is not that N jobs is hard to *write* — it is a loop over a pool — but that three of the
+batch's guarantees are **read-modify-write agreements between processes**, and this window's own item 5 showed
+how expensive a wrong one is: on the hosted backend a lost write is money, not just time.
+
+**The hazard that changed with item 5.** `manifest.py` already documents the single-writer assumption as a
+*convenience*: "a job is idempotent — every Vanta run gets a fresh random session directory, so re-running
+costs time and cannot corrupt an earlier record." On the local backend that sentence is the whole story. On
+OpenAI, a re-run that should have been a skip now **bills the same prompt a second time** on a batch whose
+spend is being capped to the cent. The old failure mode of a lost cursor was "we pay in wall clock"; the new
+one is "we pay in dollars and the row is duplicated in the evidence". That is what makes parallelism a
+correctness change rather than a flag.
+
+**(1) `state.json` — atomic replace is not an atomic update.** `Manifest.mark()` reads the whole map, mutates
+one key, writes a temp file and `os.replace`s it (`manifest.py:120-131`). The replace is atomic, so no reader
+ever sees a torn file — but the *update* is not: two workers that both read state `S`, each add their own key,
+and each replace, leave one of the two keys on the floor. A lost `done` is the expensive one (the job re-runs
+and re-bills); a lost `running` is merely a stale cursor. The three ways out, cheapest first: **(a) the parent
+owns `state.json` and workers never touch it** — workers report completion over a queue and one process applies
+`mark()`; a crashed worker's job is still recovered because the manifest row and the session log are durable on
+their own; **(b)** per-worker shards (`state.<worker>.json`) unioned by the parent at resume, which trades one
+lost-update race for a merge format; **(c)** `fcntl.flock` around the read-modify-write, which is smallest but
+makes every `mark()` a lock and leaves the cap race below unsolved anyway. (a) is the one that also fixes (3).
+
+**(2) `manifest.jsonl` — the append is fine only if it stays one `write`.** The file is append-only and never
+rewritten, which is the right shape for `O_APPEND`; POSIX makes a single write to an `O_APPEND` descriptor
+atomic with respect to other appenders. The current `append()` uses `open(path, "a")` + `write` +
+close (`manifest.py:77-85`), and a buffered `write` of a long row is not guaranteed to be one syscall — so N
+writers could interleave *inside* a line and produce a row no parser can read. The fix is small and testable
+(a single `os.write` of the encoded line on an `O_APPEND` fd, with a test asserting one syscall per row) but it
+is a change to the file every existing batch's evidence depends on, so it belongs with (1), not bolted on
+beside it.
+
+**(3) The spend cap is a batch-level race, and it is the one that spends money.** `_spent_so_far` sums the
+rows on disk and the cap is checked *before* the next job starts (`runner.py:1967-1976`, `2176-2187`). The
+"finish the current row, start no new ones" rule is structural only because exactly one job can be in flight —
+§14.29's own note says the cap "refuses the *next* job, never an in-flight one". With N workers reading the
+same total, N jobs start together and the batch overshoots by up to `(N-1) × worst_row_cost`. Two honest
+answers, and they are not equivalent: **gate in the parent** (release a job only when `spent + worst_case_row <
+cap`, which turns the cap into a real bound and makes (1)(a) pay for itself twice), or **declare the bound and
+record it** — add `overshoot_bound_usd` to the `spend.json` payload so a batch that overshot says by how much
+instead of looking like a bug in the pricing. What is *not* acceptable is shipping `--jobs` while `spend.json`
+still implies a bound the code no longer honours.
+
+**(4) The sandbox is a shared machine, not a shared library.** Every job boots the repo in a `shuru` microVM,
+and `runs/bugsinpy/deps/*.preflight.json` is a real read-then-write path that already shows up in this
+project's sandbox errors. N concurrent jobs mean N microVMs (N× RAM, N× mounts, N× disk) and, worse than
+slowness, two jobs whose scratch paths collide on a *partial* write — one job's half-written preflight is
+another job's input. Per-job scratch derived from `job.key` (`forensics/<job.key>/…`,
+`deps/<job.key>.preflight.json`) is a prerequisite, and each job needs its own forensics directory for the
+same reason: `FORENSICS_ROUND` and the attempt-scoped forensics tags are process-global, so two runs sharing a
+tag would overwrite each other's `raw_response.txt`.
+
+**(5) Provider concurrency is a measurement question before it is a throughput question.** On llama.cpp the
+flag is refused outright (see below): one GPU serves one batch, and `--parallel` slots would change what the
+run measures, which is the same reason item 1 keeps the local path byte-identical. On OpenAI the provider
+absorbs the concurrency, but §14.30's retry ladder — `provider_retries`, the rate-limit and flex
+"resource unavailable" counts — now fires *because* of our own fan-out, so `provider_retries` stops being a
+property of the provider's day and becomes a property of `--jobs`. A paper column that compares retry counts
+across batches must therefore hold `--jobs` fixed, and the manifest should carry it (a `jobs` key beside
+`service_tier`) so a row cannot be assigned to the wrong arm after the fact.
+
+**Why the flag is hosted-only, stated as the rule the code would enforce.** `VANTA_LLM_BACKEND=openai` is a
+precondition, checked at startup and refused with a `CONFIG_ERROR` naming `--jobs` and the backend — the same
+fail-before-the-first-call shape as `ServiceTier::parse` (§14.31), because discovering that a 6-hour batch was
+serial after a token was spent is the thing that check exists to prevent. Default stays `1`, and `1` must be
+byte-identical to today: a `--jobs 1` run that differs from a run without the flag at all is a regression in
+disguise, so the pool would have to be a path that N=1 does not enter rather than a path that degenerates.
+
+**What this section intentionally does not do.** It does not add `--jobs`, does not change `Manifest`, and does
+not change `spend.json`. It also does not claim the four races are the only ones: it names the ones this
+codebase's own comments already depend on — "one writer per file" and "one job in flight at a time" — and each
+of those assumptions is load-bearing for a guarantee a reviewer would otherwise believe still holds. The
+prerequisite for building item 9 is therefore not a pool; it is (1)(a) + (2) + (3) with tests that fail when
+two writers lose a key or a row, and those are worth their own items.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

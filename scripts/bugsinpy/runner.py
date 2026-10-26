@@ -114,6 +114,12 @@ FAILED_PATCH = "failed_patch"
 # The most failed patches one bug may contribute to its review set (§7.1).
 MAX_POOLED_CANDIDATES = 2
 
+# §14.29 — where a batch that stopped at `VANTA_MAX_SPEND_USD` writes down why.
+# A file rather than only a print: the terminal scrolls away and a wrapper reads
+# the exit code, but whoever opens the directory later has to be able to tell a
+# batch that ran out of budget from one that finished.
+SPEND_CAP_NAME = "spend.json"
+
 SESSION_LINE = re.compile(r"▌ Session:\s*(\S+)")
 SUMMARY_PAIR = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(\S+)")
 
@@ -1246,6 +1252,18 @@ def llm_block(summary: dict[str, str]) -> dict[str, Any]:
     call could not finish, the budget says the round kept asking. The cap is a
     property of the design and is recorded per run so a manifest read years later
     does not have to trust a constant that has since moved.
+
+    ``cached_tokens`` / ``reasoning_tokens`` / ``cost_usd`` / ``cost_basis`` are
+    §14.29's usage facts that are not token counts, and the money. The pipeline
+    prices each call from its own versioned table (``llm::pricing``) and writes
+    the basis it used; the harness copies the number rather than re-pricing,
+    because a second price table here could disagree with the first and there
+    would be no way to tell which one a batch table used. ``cost_usd`` is a
+    float or ``None``: ``None`` is "nothing was priced" — a local run, which is
+    ``not_billed`` — and is NOT the same claim as ``0.0``. ``cost_basis`` names
+    the rows that produced the figure (``gpt-6-luna/standard/2026-10-26``), so
+    two rows priced from different dates are visible as such instead of being
+    pooled silently.
     """
     by_site: dict[str, dict[str, Any]] = {}
     for key, value in summary.items():
@@ -1261,6 +1279,11 @@ def llm_block(summary: dict[str, str]) -> dict[str, Any]:
         "calls_measured": _int(summary.get("llm_calls_measured")),
         "prompt_tokens": _int(summary.get("llm_prompt_tokens")),
         "completion_tokens_total": _int(summary.get("completion_tokens_total")),
+        # §14.29 — the money and the two non-token usage counts.
+        "cached_tokens": _int(summary.get("llm_cached_tokens")),
+        "reasoning_tokens": _int(summary.get("llm_reasoning_tokens")),
+        "cost_usd": _cost(summary.get("cost_usd")),
+        "cost_basis": summary.get("cost_basis"),
         "truncated_calls": _int(summary.get("truncated_calls")),
         "truncated_twice": _int(summary.get("truncated_twice_calls")),
         # §14.5's three reportable roles, spelled out rather than derived from
@@ -1285,6 +1308,24 @@ def _number(value: Optional[str]) -> Any:
     except ValueError:
         return value
     return int(parsed) if parsed.is_integer() and "." not in value else parsed
+
+
+def _cost(value: Optional[str]) -> Optional[float]:
+    """§14.29 — a cost is a float or ``None``, never the string ``unset``.
+
+    ``_number`` keeps a non-numeric token verbatim so a reader can see what the
+    pipeline actually wrote; a field a batch sums cannot do that. The pipeline
+    writes ``unset`` when nothing was priced and ``cost_basis`` says why
+    (``not_billed``, ``no_usage``, ``unpriced_family``), so mapping every
+    non-number to ``None`` loses nothing a reader cannot get from the basis, and
+    keeps ``None`` (= nothing priced) distinct from ``0.0`` (= priced, and free).
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 def invoke_vanta(
@@ -1856,6 +1897,75 @@ class WaveResult:
     caller can tell "the wave is short" from "the wave is broken"."""
 
 
+def _spent_so_far(manifest: Manifest) -> float:
+    """§14.29 — the batch's cost to date, summed from the rows already on disk.
+
+    Read from the manifest rather than carried in a local counter, because the
+    cap is a property of the *batch*: a resumed batch must not restart the
+    count, and the rows that spent the money are on disk, not in this process's
+    memory. A row that priced nothing contributes ``0.0`` — that is the local
+    backend, and every run before this change.
+    """
+    return sum(_row_cost(record) for record in manifest.records())
+
+
+def _row_cost(record: dict[str, Any]) -> float:
+    """One row's ``llm.cost_usd``, ``None`` read as zero (see :func:`_cost`)."""
+    llm = record.get("llm")
+    if not isinstance(llm, dict):
+        return 0.0
+    cost = llm.get("cost_usd")
+    return float(cost) if isinstance(cost, (int, float)) else 0.0
+
+
+def _record_spend_cap(
+    batch_dir: Path, cap_usd: float, spent_usd: float, job: Job
+) -> None:
+    """Stop at the batch's spend cap, and write down why (§14.29).
+
+    Printed AND written: a batch that stopped early has to be distinguishable
+    from one that finished, and the two readers who need to know look in
+    different places — the person watching the terminal, and whoever opens the
+    directory a week later. The exit code alone cannot say it, because 1 already
+    means "a bug failed the wave gate" and 2 "the harness broke".
+
+    The row that crossed the cap is already complete and on disk: the cap
+    refuses the *next* job, never an in-flight one, so no partial row is written
+    and "finish the current row" is structural rather than a promise. The
+    unstarted jobs keep no key in ``state.json``, so this is not a kill switch —
+    running the batch again without the variable picks up where it stopped.
+    """
+    payload = {
+        "schema": 1,
+        "reason": "spend_cap",
+        "cap_usd": cap_usd,
+        "spent_usd": round(spent_usd, 6),
+        "stopped_utc": utc_now(),
+        "first_unstarted_key": job.key,
+    }
+    path = batch_dir / SPEND_CAP_NAME
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    os.replace(tmp, path)
+    print(
+        f"\n=== spend cap reached: ${spent_usd:.6f} >= ${cap_usd:.6f} "
+        f"(VANTA_MAX_SPEND_USD) ===",
+        flush=True,
+    )
+    print(
+        f"  refusing to start {job.key}: the row that crossed the cap is complete, "
+        "every later job is unstarted.",
+        flush=True,
+    )
+    print(f"  reason recorded in {path}", flush=True)
+    print(
+        "  re-run this batch without VANTA_MAX_SPEND_USD to continue from here.",
+        flush=True,
+    )
+
+
 def run_batch(
     *,
     batch_dir: Path,
@@ -1870,6 +1980,7 @@ def run_batch(
     disk_mb: int,
     show_hints: bool = False,
     plan_only: bool = False,
+    max_spend_usd: Optional[float] = None,
 ) -> tuple[int, list[WaveResult]]:
     """The whole batch: per wave, D13's four phases, then the wave-1 gate.
 
@@ -1877,9 +1988,17 @@ def run_batch(
     verdict is meant to rest on: it sends the report's comments on top of its content, which
     changes what the prompt is, and so changes the job key (``manifest.job_key``) and is
     recorded on every row it touches.
+
+    ``max_spend_usd`` is §14.29's cap (``VANTA_MAX_SPEND_USD``), ``None`` for no cap. It is
+    checked BETWEEN jobs, against the cost of the rows already on disk: a job that would push
+    the batch past the cap is not started, and the count it is compared against includes rows
+    an earlier invocation of the same batch wrote, so a resume cannot double-spend.
     """
     paths = BatchPaths.under(batch_dir)
     manifest = Manifest(batch_dir)
+    # §14.29 — the batch's spend to date, from the rows already on disk (a resumed
+    # batch has some). `None` for a row that priced nothing.
+    spent = _spent_so_far(manifest)
     # The harness's own revision, read once for the whole batch (§7.3). The binary's
     # is read per row from `run.summary`, because it belongs to the binary and not to
     # this tree.
@@ -1987,6 +2106,14 @@ def run_batch(
                             if found:
                                 result.records.append(found)
                             continue
+                        # §14.29 — the spend cap is checked BEFORE the job starts,
+                        # never during one: the check is between rows, so the row
+                        # that crossed the cap is already complete and the rows
+                        # that follow it are never half-written. `>=` rather than
+                        # `>`: a batch that has reached its budget has spent it.
+                        if max_spend_usd is not None and spent >= max_spend_usd:
+                            _record_spend_cap(batch_dir, max_spend_usd, spent, job)
+                            return 1, results
                         record = run_job(
                             job=job,
                             paths=paths,
@@ -1998,6 +2125,7 @@ def run_batch(
                         )
                         if record:
                             result.records.append(record)
+                            spent += _row_cost(record)
                         else:
                             result.failed += 1
         results.append(result)

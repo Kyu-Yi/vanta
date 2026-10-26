@@ -6790,6 +6790,130 @@ Neither half of that pair can pass for the wrong reason.
 `provider_default` reading all come from the model pages quoted in `capabilities.rs`. The operator's
 `scripts/openai_probe.py` — §14.26's open question on `seed`, unchanged — is what would falsify them.
 
+### 14.29 Hosted OpenAI backend, item 5 — usage, cost, and a spend cap
+
+§14.26 shaped the request, §14.28 the effort. This section is about what comes BACK: the `usage` block a
+hosted model returns carries two counts a local server never sends — the share of the prompt served from
+cache and the share of the completion spent reasoning — and a backend that sells tokens turns all four
+counts into money. The item's second half is the money's safety net: a batch budget that stops the run.
+
+**The price table is one file, because two languages have to agree about it.** `src/llm/pricing.rs` holds
+every rate this project can cite, with `PRICE_TABLE_DATE = "2026-10-26"` and
+`PRICE_TABLE_SOURCE = "https://platform.openai.com/docs/pricing"` as constants, and four rows:
+
+| family | tier | in | cached in | out |
+|---|---|---|---|---|
+| `gpt-6-luna` | `standard` | 0.10 | 0.01 | 0.50 |
+| `gpt-6-luna` | `flex` | 0.05 | 0.005 | 0.25 |
+| `gpt-6.1-sol` | `standard` | 2.00 | 0.10 | 10.00 |
+| `gpt-6.1-sol` | `flex` | 1.00 | 0.05 | 5.00 |
+
+Rates are USD per 1,000,000 tokens. `flex` is exactly half of `standard` on every column, and a test
+asserts that relationship rather than the four literals twice: an edit that halves one column and not the
+other should fail as a INVARIANT, not as a number that happens to differ.
+
+**Every row carries its own provenance, and the provenance travels into the record.** `PriceRow` has
+`source: &'static str` and `date: &'static str` FIELDS, not a doc comment, so a test can assert them and
+`cost_basis` can name them. A priced call records `cost_basis=family/tier/date`, e.g.
+`gpt-6-luna/standard/2026-10-26`. The date is the point: a table of bare floats cannot be checked, and a
+price that moved under a reader would silently re-price a batch that already ran. A manifest row that names
+its basis points at the exact entry that produced its number, and a total built from two different price
+dates is visible rather than pooled (`cost_basis` on `run.summary` joins the DISTINCT bases the run's calls
+recorded, in first-seen order).
+
+**The arithmetic bills three things and deliberately not a fourth.** Uncached input is
+`prompt_tokens - cached_tokens`; cached input is `cached_tokens` at the cached rate; output is
+`completion_tokens`. `cached_tokens` is a SUBSET of `prompt_tokens` (the `usage` block nests it under
+`prompt_tokens_details`), so billing the prompt total at the input rate would charge the cached share at
+full price and delete the discount the column exists to express; a test pins the difference (`0.000111`
+for 777/314/123 on Luna standard, against `0.000139` if the cache were ignored). `reasoning_tokens` is a
+SUBSET of `completion_tokens` (nested under `completion_tokens_details`), so it is RECORDED and not billed
+again — billing it would charge the same tokens twice. The subtraction is `saturating_sub`, so a provider
+that ever reported more cached tokens than prompt tokens produces a wrong bill rather than a panic in
+debug and a wrap in release.
+
+**Two documented rules are named and NOT modelled.** Cache WRITES are documented at 1.25x the uncached
+input rate, but the `usage` block these endpoints return publishes no write count (there is no
+`cache_write_tokens` beside `cached_tokens`), so there is no measured quantity to multiply — a column no
+response can fill would be a number this table invented. The long-context reprice (an input past the
+model's own threshold re-prices the whole request) is likewise real, and `LONG_CONTEXT_THRESHOLD_TOKENS =
+272_000` records the threshold, but the source states the rule and not the repriced rates, and a cost
+column is the last place to guess. A run that crosses the threshold still records its `llm_prompt_tokens`,
+so the crossing is visible; item 5's smoke run (`VANTA_LLM_CONTEXT_TOKENS=131072`) sits well below it, and
+a test asserts that it does.
+
+**An unknown family is refused, not approximated.** `price_row` returns `None` for a `(family, tier)` pair
+the table has no evidence for, and the caller records `unpriced_family` rather than borrowing the nearest
+family's rate. Pricing an unknown model's tokens at Luna's rate would put a fabricated figure in a paper's
+cost column. `not_billed` is the local backend's basis — a llama.cpp server is a process on this machine
+and no tokens are sold — and `no_usage` is a call whose only prompt figure is the character-derived
+estimate, which carries the estimate's ~1.5x error (§4.3) and must not be priced as if it were measured.
+
+**Cost is `Option<f64>` end to end, and `unset` is not `0`.** `cost_value` renders six fixed decimals or
+the word `unset`; six decimals rather than `{}`'s shortest form because `metrics.py` reads summary values
+with `\S+` and a scientific-notation figure would be read as containing an `e`. The distinction is the
+section's central one: `unset` is a fact about the RECORD ("no number was computed") while `0.0` is a fact
+about the MONEY ("priced, and it came to nothing"), and a cost column that renders both as `0` cannot be
+audited. The Python side keeps the distinction rather than flattening it — `_cost` maps the string `unset`
+to `None`, and `_row_cost` reads `None` as zero only where a SUM requires a number.
+
+**The record grew four keys on each of its two writers, appended last.** `call.usage` gained
+`cached_tokens=`, `reasoning_tokens=`, `cost_usd=`, `cost_basis=` after `truncated=`/the request shape, and
+`run.summary` gained `llm_cached_tokens=`, `llm_reasoning_tokens=`, `cost_usd=`, `cost_basis=` after
+`llm_completion_tokens=`. Appended rather than interleaved so every key a row carried before keeps its
+position and an older reader is unaffected. `token_value`/`cost_value` render `unset` wherever nothing was
+measured, never `0`, for the reason above.
+
+**The run-level totals are summed from the rows, not re-derived.** `cost_and_detail_totals` adds the
+recorded `cost_usd` figures, sums the two details over the calls that REPORTED them, and joins the distinct
+bases — the same discipline `token_totals` already followed, and for the same reason: an aggregate that
+re-derives its inputs can disagree with the rows it summarises.
+
+**The Python side copies the number; it never re-prices.** `llm_block` reads `llm_cached_tokens` /
+`llm_reasoning_tokens` / `cost_usd` / `cost_basis` out of `run.summary` and into the manifest row verbatim.
+Recomputing a cost in Python would mean a second copy of the rate table in a second language, and the two
+could drift; the per-call token counts exist only in Rust, so Rust is where the money is computed and
+Python's job is to carry the result.
+
+**The spend cap lives in the batch loop, not in the model call.** `VANTA_MAX_SPEND_USD` (unset = no cap) is
+read at the CLI invocation by `max_spend_usd_from_env` — a typo, `0` or a negative figure is a
+`RunnerError` naming the variable, because a safety net that silently means "no cap" is not a safety net.
+`run_batch` takes the cap and, BEFORE each job, compares it against the batch's spend to date, summed by
+`_spent_so_far` from the `llm.cost_usd` of the rows already IN THE MANIFEST — so a resumed batch counts
+what an earlier invocation spent and a resume cannot double-spend. The check is BETWEEN jobs by
+construction:
+
+* the row that crossed the cap is already complete and written;
+* no later job is started, so none is half-written;
+* the comparison is `>=`, because a batch that has reached its budget has spent it.
+
+**Stopping is recorded where a later reader will find it.** `_record_spend_cap` writes
+`spend.json` into the batch directory (atomically, via a `.tmp` + `os.replace`) with
+`reason=spend_cap`, `cap_usd`, `spent_usd`, `stopped_utc` and `first_unstarted_key`, and prints the same
+three facts. A file as well as a print because the terminal scrolls away and a wrapper only reads the exit
+code, but whoever opens the directory later has to be able to tell a batch that ran out of budget from one
+that finished. The refused job is left with NO key in `state.json`, so re-running the same batch without
+the variable continues from that job rather than skipping it. The cap is a budget, not a kill switch: it
+never interrupts a call. A row that priced NOTHING (`cost_usd` absent — a local run, or a Python record
+from before this item) counts as zero and can never reach a cap, which a test pins so an unpriced batch
+cannot stop at a budget of a fraction of a cent.
+
+**Tests.** `pricing::tests` (nine) cover the table's provenance and the `cached < uncached` invariant,
+`flex == standard / 2` per column, the input rate on a million tokens, the cached-share discount, the
+oddity where cached exceeds prompt, the basis string, and both refusals (`estimate`, `unpriced_family`).
+`m3_session_log::usage_details_and_cost_are_recorded_per_call_and_totalled` runs the SAME stub twice —
+once local, once hosted as `gpt-6-luna` — and asserts the four `call.usage` keys, the local
+`unset`/`not_billed` rows, the hosted `0.000111` and `gpt-6-luna/standard/2026-10-26` basis, and the
+`run.summary` totals on both, so the local and hosted columns are compared on one server's numbers rather
+than two. `scripts/test_bugsinpy.py` adds the spend-cap pair (the row that crossed it stays, the next is
+refused and left resumable; a batch of unpriced rows never reaches a cap) and the env-var validation
+(`unset`/empty = no cap, a number = a float, four typos refused).
+
+**What this section does not settle.** No live call was made: the rates, the nested `usage` shape and the
+`flex` discount all come from the pricing page quoted in `pricing.rs`. The operator's
+`scripts/openai_probe.py` is what would falsify them — and, until item 7 lands the tier switch, every
+hosted run is priced on the `standard` row.
+
 ---
 
 ## 15. Model screen

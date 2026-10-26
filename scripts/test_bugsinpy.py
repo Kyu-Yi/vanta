@@ -18357,6 +18357,44 @@ class TestLlmBlock:
         # times, so the pipeline does not report it as a plain retryable run-away.
         assert block["truncated_twice"] == 0
 
+    def test_the_cost_and_the_non_token_details_are_copied_verbatim(self):
+        """§14.29 — the money, and the two usage details that are not token counts.
+
+        The pipeline priced the calls against its own versioned table and wrote the
+        basis it used; the harness copies both. It must NOT re-price: a second price
+        list here could disagree with the first, and nothing in the record would say
+        which one a batch table had used.
+        """
+        block = runner_mod.llm_block(
+            runner_mod.parse_summary(
+                self.SUMMARY
+                + " llm_cached_tokens=888 llm_reasoning_tokens=111 "
+                "cost_usd=1.234567 cost_basis=gpt-6-luna/standard/2026-10-26"
+            )
+        )
+        assert block["cached_tokens"] == 888
+        assert block["reasoning_tokens"] == 111
+        assert block["cost_usd"] == 1.234567
+        assert block["cost_basis"] == "gpt-6-luna/standard/2026-10-26"
+
+    def test_an_unpriced_run_is_none_and_not_zero(self):
+        """`unset` is "nothing was priced" — a local run — and zero is "priced, and free".
+
+        A batch table that summed these would be poisoned by the string `unset`, and a
+        `0.0` here would claim a local run had been priced and come to nothing.
+        """
+        block = runner_mod.llm_block(
+            runner_mod.parse_summary(
+                self.SUMMARY
+                + " llm_cached_tokens=unset llm_reasoning_tokens=unset "
+                "cost_usd=unset cost_basis=not_billed"
+            )
+        )
+        assert block["cached_tokens"] is None
+        assert block["reasoning_tokens"] is None
+        assert block["cost_usd"] is None
+        assert block["cost_basis"] == "not_billed"
+
     def test_the_revise_budget_is_reported_beside_the_call_totals(self):
         # §14.14 — the cap and the run's spend against it, read back rather than
         # re-derived, so a manifest read later does not have to trust a constant
@@ -18396,7 +18434,38 @@ class TestLlmBlock:
         assert block["revise_budget_per_attempt"] is None
         assert block["revise_calls_used"] is None
         assert block["truncated_calls_by_role"]["attacker"] is None
+        # §14.29 — a row written before this change has no cost and no details, and
+        # `None` is the honest reading: not priced, not measured. `cost_basis` is
+        # absent too, so it says nothing rather than naming a price row.
+        assert block["cached_tokens"] is None
+        assert block["reasoning_tokens"] is None
+        assert block["cost_usd"] is None
+        assert block["cost_basis"] is None
         assert block["by_site"] == {}
+
+
+class TestSpendCapFromTheEnvironment:
+    """§14.29 — `VANTA_MAX_SPEND_USD` is read at the invocation, not inside the loop.
+
+    Read by the CLI rather than by `run_batch` so a test that drives the batch loop
+    is never capped by whatever the developer happens to have exported: the cap is a
+    property of *this run of the batch command*, and the command is the CLI.
+    """
+
+    def test_unset_or_empty_means_no_cap(self):
+        assert run_mod.max_spend_usd_from_env({}) is None
+        assert run_mod.max_spend_usd_from_env({"VANTA_MAX_SPEND_USD": ""}) is None
+        assert run_mod.max_spend_usd_from_env({"VANTA_MAX_SPEND_USD": "  "}) is None
+
+    def test_a_number_comes_back_as_a_float(self):
+        assert run_mod.max_spend_usd_from_env({"VANTA_MAX_SPEND_USD": "2"}) == 2.0
+        assert run_mod.max_spend_usd_from_env({"VANTA_MAX_SPEND_USD": " 5.25 "}) == 5.25
+
+    @pytest.mark.parametrize("raw", ["two dollars", "0", "-1", "nan-ish"])
+    def test_a_typo_in_the_safety_net_is_refused_not_ignored(self, raw):
+        """A cap that silently became "no cap" is the failure this test prevents."""
+        with pytest.raises(runner_mod.RunnerError, match="VANTA_MAX_SPEND_USD"):
+            run_mod.max_spend_usd_from_env({"VANTA_MAX_SPEND_USD": raw})
 
 
 def _gate_row(
@@ -19898,7 +19967,7 @@ class TestRunBatchLoop:
         monkeypatch.setattr(runner_mod, "run_job", self._stub(tmp_path, calls, leave_running=running))
         return preps, entries, split, calls, tmp_path / "batch"
 
-    def _run(self, preps, entries, split, batch_dir, *, show_hints=False):
+    def _run(self, preps, entries, split, batch_dir, *, show_hints=False, max_spend_usd=None):
         return runner_mod.run_batch(
             batch_dir=batch_dir,
             batch_id="b1",
@@ -19911,6 +19980,7 @@ class TestRunBatchLoop:
             max_attempts=4,
             disk_mb=8192,
             show_hints=show_hints,
+            max_spend_usd=max_spend_usd,
         )
 
     @staticmethod
@@ -19927,6 +19997,102 @@ class TestRunBatchLoop:
         self._run(preps, entries, split, batch_dir)
         assert calls, "the stub should have been called"
         assert {job.harness for job in calls} == {runner_mod.Revision("h" * 40, False)}
+
+    # -- §14.29, the spend cap ---------------------------------------------
+    def _cost_stub(self, tmp_path, calls, *, cost_usd):
+        """A `run_job` whose rows carry a price, so the cap has a number to count."""
+
+        def stub(*, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version):
+            calls.append(job)
+            record = self._row(tmp_path, job)
+            record["llm"] = {"cost_usd": cost_usd, "cost_basis": "test/tier/2026-10-26"}
+            manifest.append(record)
+            manifest.mark(job.key, manifest_mod.DONE)
+            return record
+
+        return stub
+
+    def test_the_spend_cap_keeps_the_row_that_crossed_it_and_starts_no_more(
+        self, tmp_path, monkeypatch
+    ):
+        """§14.29 — the cap is checked BETWEEN jobs, and the reason is on disk.
+
+        The cap must not interrupt a job: the row that takes the batch over its
+        budget is already complete and priced, and every later row must be
+        *unstarted* rather than half-written. So the assertion is that the first
+        job of a two-job batch ran, the second did not, and the second still has
+        no key in the cursor — which is exactly what makes the stop resumable
+        rather than destructive.
+        """
+        monkeypatch.setattr(
+            runner_mod, "git_revision", lambda *a, **k: runner_mod.Revision("h" * 40, False)
+        )
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            runner_mod, "run_job", self._cost_stub(tmp_path, calls, cost_usd=0.75)
+        )
+
+        code, _results = self._run(preps, entries, split, batch_dir, max_spend_usd=0.5)
+
+        # The batch's first job costs $0.75, which is already past the $0.50 cap,
+        # so it runs and EVERY job after it is refused before it starts. The count
+        # is asserted rather than the job's identity because what is under test is
+        # the stop, not which job happens to be first.
+        assert len(calls) == 1, [job.label() for job in calls]
+        assert code == 1, "a batch that stopped at its cap must not report success"
+
+        spend = json.loads((batch_dir / runner_mod.SPEND_CAP_NAME).read_text(encoding="utf-8"))
+        assert spend["reason"] == "spend_cap"
+        assert spend["cap_usd"] == 0.5
+        assert spend["spent_usd"] == 0.75, "the row that crossed the cap is counted, not dropped"
+        assert spend["first_unstarted_key"] != calls[0].key
+
+        manifest = manifest_mod.Manifest(batch_dir)
+        assert not manifest.is_done(spend["first_unstarted_key"]), (
+            "the refused job must keep no `done` key, or the stop would be "
+            "indistinguishable from a completed batch"
+        )
+
+        # §14.29 — the cap is a budget, not a kill switch: running the same batch
+        # again without it reaches the job this run refused, and runs to the end.
+        spent_before = len(calls)
+        self._run(preps, entries, split, batch_dir)
+        assert len(calls) > spent_before, "the resume must start the refused job"
+        assert manifest.is_done(spend["first_unstarted_key"]), (
+            "the refused job is now the resumed run's first, and it must complete"
+        )
+
+    def test_a_row_that_priced_nothing_never_reaches_a_cap(self, tmp_path, monkeypatch):
+        """A local run is `unset`, read as zero — so it can never cross a cap by accident.
+
+        Every run before this change priced nothing at all (`cost_usd` absent, and
+        on the local backend `unset`), and the cap must leave those batches exactly
+        as they were: unset is "nothing was priced", which is not a spend. The
+        reference is the same batch run without a cap: the counts must agree, or
+        the cap changed a batch it had no priced row to stop.
+        """
+        monkeypatch.setattr(
+            runner_mod, "git_revision", lambda *a, **k: runner_mod.Revision("h" * 40, False)
+        )
+        preps, entries, split = self._fixture(tmp_path)
+        monkeypatch.setattr(runner_mod, "python_version_of", lambda *a, **k: "3.8.20")
+        monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kwargs: kwargs["candidate"])
+
+        # The default stub writes rows with no `llm` block at all: nothing priced.
+        capped_calls: list = []
+        monkeypatch.setattr(runner_mod, "run_job", self._stub(tmp_path, capped_calls))
+        capped_dir = tmp_path / "capped"
+        # A cap of a fraction of a cent: only a batch that priced nothing survives it.
+        self._run(preps, entries, split, capped_dir, max_spend_usd=0.000001)
+        assert capped_calls, "the batch should still run"
+        assert not (capped_dir / runner_mod.SPEND_CAP_NAME).exists()
+
+        ref_calls: list = []
+        monkeypatch.setattr(runner_mod, "run_job", self._stub(tmp_path, ref_calls))
+        self._run(preps, entries, split, tmp_path / "uncapped")
+        assert len(capped_calls) == len(ref_calls), (
+            "an unpriced batch must run exactly the jobs it runs without a cap"
+        )
 
     def test_the_hints_ablation_reaches_every_job_and_its_key(self, tmp_path, monkeypatch):
         """§2.4.4: ``--show-hints`` is part of the job *and* of its cursor key, off by default.

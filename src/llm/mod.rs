@@ -39,6 +39,7 @@ use tracing::{debug, info, trace, warn};
 // facts about somebody else's API, and the one question it answers ("what may
 // this model be sent?") has nothing to do with how a stream is reassembled.
 pub mod capabilities;
+pub mod pricing;
 
 // Re-export the agent response types so bootstrap can use them too.
 pub use crate::agents::attacker::{AttackerResponse, AttackerTestCase};
@@ -171,6 +172,36 @@ pub struct CallUsage {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    /// `usage.prompt_tokens_details.cached_tokens`, the subset of
+    /// `prompt_tokens` the provider served from its prompt cache (§14.29).
+    ///
+    /// [VANTA-WHY] Per CALL, not per run, because a cache hit is a property of
+    /// the prefix THIS body sent: the Creator, the Attacker's revise and the
+    /// batch audit send different stable prefixes, so a run-level hit rate would
+    /// average a warm site with a cold one and answer nothing. The hit RATE is
+    /// derived from these rows, never stored.
+    pub cached_tokens: Option<u64>,
+    /// `usage.completion_tokens_details.reasoning_tokens`, the subset of
+    /// `completion_tokens` spent thinking (§14.29).
+    pub reasoning_tokens: Option<u64>,
+    /// What this call cost in USD, `None` when no price applies — the local
+    /// backend sells nothing, a server that published no `usage` block has no
+    /// measured count to price, and a family this table cannot cite has no rate
+    /// (see `llm::pricing`).
+    ///
+    /// [VANTA-WHY] `Option<f64>`, never `0.0` for "unknown". A cost column that
+    /// renders "free" and "unpriced" as the same number cannot be summed, and the
+    /// batch table would silently under-report the one figure money was spent on.
+    pub cost_usd: Option<f64>,
+    /// How `cost_usd` was arrived at (§14.29): the price row's
+    /// `family/tier/date`, or one of `llm::pricing`'s refusal spellings
+    /// (`not_billed`, `no_usage`, `unpriced_family`).
+    ///
+    /// [VANTA-WHY] A cost without a basis is a number nobody can check, and the
+    /// price table is versioned precisely so that "which prices produced this?"
+    /// has an answer. Carried per call because a run's rows can differ: one call
+    /// can be priced while another fell back to the estimate.
+    pub cost_basis: String,
     /// Where the numbers came from: `server-usage` (the `usage` block that
     /// `stream_options.include_usage` asks for), `server-timings` (llama-server's
     /// own final-frame `timings`), or `estimate` (the server published neither,
@@ -1288,6 +1319,23 @@ struct StreamedCompletion {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    /// `usage.prompt_tokens_details.cached_tokens` — the share of `prompt_tokens`
+    /// the provider served from its prompt cache (§14.29).
+    ///
+    /// [VANTA-WHY] Kept BESIDE `prompt_tokens` rather than subtracted from it,
+    /// because the two are different facts: `prompt_tokens` is what the request
+    /// spent, and this is how much of it was cheap. A cost column needs the second
+    /// to apply the cached rate, and a cache diagnostic needs it to report a hit
+    /// RATE — neither recovers it from the first.
+    cached_tokens: Option<u64>,
+    /// `usage.completion_tokens_details.reasoning_tokens` — the share of
+    /// `completion_tokens` the model spent thinking (§14.29).
+    ///
+    /// [VANTA-WHY] A SUBSET of `completion_tokens`, not a sibling of it. Recorded
+    /// so a run can report how much of its output budget went to reasoning, which
+    /// is the measurable half of "the model ran away" (§14.5); it must never be
+    /// ADDED to the completion count, or the same tokens are billed twice.
+    reasoning_tokens: Option<u64>,
     /// From llama-server's own final frame, which carries `timings` whether or
     /// not the server honours `stream_options`. `prompt_n` is the number of
     /// prompt tokens it processed and `predicted_n` the number it generated.
@@ -1374,6 +1422,22 @@ fn consume_sse_event(event: &str, out: &mut StreamedCompletion) -> Result<bool, 
             }
             if let Some(total_tokens) = usage["total_tokens"].as_u64() {
                 out.total_tokens = Some(total_tokens);
+            }
+            // [VANTA-WHY] §14.29 — the two nested counts the hosted providers
+            // publish, read from the objects they actually arrive in.
+            // `cached_tokens` is the cheap share of the prompt and
+            // `reasoning_tokens` the thinking share of the completion; neither is
+            // a Chat Completions top-level field, so a flat read of the `usage`
+            // object would find nothing and silently record "no cache, no
+            // reasoning" for every hosted call. Absent keys stay absent: a
+            // provider that reports neither must not be recorded as reporting
+            // zero.
+            if let Some(cached) = usage["prompt_tokens_details"]["cached_tokens"].as_u64() {
+                out.cached_tokens = Some(cached);
+            }
+            if let Some(reasoning) = usage["completion_tokens_details"]["reasoning_tokens"].as_u64()
+            {
+                out.reasoning_tokens = Some(reasoning);
             }
         }
         // llama-server's non-OpenAI tail. Read even when `usage` arrived, as a
@@ -1684,8 +1748,13 @@ async fn post_chat_meta(
     // `native` branch and is not touched at all — its bodies are pinned byte for
     // byte by the harness, and a filter that runs on them is a chance to change
     // them.
+    // [VANTA-WHY] §14.29 — resolved ONCE, above the shaping branch, because two
+    // later decisions read it: what the body may carry (§14.26/§14.28) and what
+    // the call cost (§14.29). Computing it twice from the same model id would be
+    // two chances for the shaping record and the price record to describe
+    // different models.
+    let family = OpenAiFamily::from_model_id(&cfg.model_id);
     let (full_body, request_shape) = if cfg.is_openai() {
-        let family = OpenAiFamily::from_model_id(&cfg.model_id);
         // [VANTA-WHY] §14.28 — the run's effort is passed IN rather than read by
         // the table, so "what did this run ask for?" is answered at the one call
         // site that has the run's configuration in hand, and the shaping function
@@ -1863,6 +1932,30 @@ async fn post_chat_meta(
     // record and the debug line below read this value: two `elapsed()` calls
     // would give the log and the session row different numbers for the same call.
     let wall_ms = t.elapsed().as_millis() as u64;
+    // [VANTA-WHY] §14.29 — what this call cost and which price row said so.
+    // The local backend is refused by NAME rather than by a zero rate: no tokens
+    // are sold, and `not_billed` is a fact a batch table can report as such,
+    // while `0.0` would put a free local run and a wrongly-priced hosted one in
+    // the same column. The hosted branch lets `pricing` refuse for its own two
+    // reasons (`no_usage` for an estimate-sourced call, `unpriced_family` for a
+    // model this table has no rate for) instead of this call site guessing which
+    // one applies.
+    let (cost_usd, cost_basis) = if cfg.is_openai() {
+        pricing::cost_for_family(
+            family,
+            // §14.29 prices every call at the STANDARD rates. The tier that
+            // selects the `flex` row is read from `VANTA_OPENAI_SERVICE_TIER` in
+            // §14.30 (item 7); until then no run can ask for `flex`, so pricing
+            // at standard is the truth about the traffic, not a default.
+            pricing::ServiceTier::Standard,
+            usage_source,
+            measured_prompt,
+            streamed.cached_tokens,
+            measured_completion,
+        )
+    } else {
+        (None, pricing::COST_BASIS_NOT_BILLED.to_string())
+    };
     let usage = CallUsage {
         seq: USAGE_SEQ.fetch_add(1, Ordering::Relaxed),
         site: site.to_string(),
@@ -1877,6 +1970,15 @@ async fn post_chat_meta(
         prompt_tokens: Some(prompt_tokens_recorded),
         completion_tokens: measured_completion,
         total_tokens: measured_total,
+        // [VANTA-WHY] §14.29 — the two nested counts travel verbatim, `None` when
+        // the provider published neither. Nothing here subtracts `reasoning` from
+        // `completion` or `cached` from `prompt`: the recorded counts must be the
+        // server's own numbers, and the arithmetic that reads them is a billing
+        // concern, not a recording one.
+        cached_tokens: streamed.cached_tokens,
+        reasoning_tokens: streamed.reasoning_tokens,
+        cost_usd,
+        cost_basis,
         source: usage_source.to_string(),
         seed,
         // [VANTA-WHY] §14.23 — the mechanism follows the value that is actually in the
@@ -1916,6 +2018,14 @@ async fn post_chat_meta(
         finish_reason = streamed.finish_reason.as_deref().unwrap_or("unset"),
         wall_ms,
         truncated = usage.truncated,
+        // [VANTA-WHY] §14.29 — the cheap share of the prompt and the thinking
+        // share of the output, plus what the call cost and which price row said
+        // so. Logged beside the totals for §14.26's reason: a hosted run whose
+        // price basis came out `unpriced_family` should say so while it happens,
+        // not only in a session log somebody reads afterwards.
+        cached_tokens = ?usage.cached_tokens,
+        reasoning_tokens = ?usage.reasoning_tokens,
+        cost_basis = %usage.cost_basis,
         // [VANTA-WHY] §14.26 — logged as well as recorded, so a hosted run that
         // is silently missing a field says so while it happens rather than only
         // in the session log afterwards.

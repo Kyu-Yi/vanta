@@ -618,10 +618,31 @@ impl StubLlmServer {
                                 // anywhere but this frame. `completion_tokens`
                                 // is the field a streamed response omits unless
                                 // `stream_options.include_usage` was asked for.
+                                //
+                                // [VANTA-WHY] §14.29 — the NESTED details are
+                                // published here too, and are the shape the
+                                // hosted providers use: `cached_tokens` lives
+                                // under `prompt_tokens_details` and
+                                // `reasoning_tokens` under
+                                // `completion_tokens_details`, not at the top
+                                // level. 314 and 41 rather than round numbers,
+                                // and both strictly inside their parents (314 ≤
+                                // 777, 41 ≤ 123), because the arithmetic that
+                                // prices a call subtracts the cached part from
+                                // the prompt and must never be able to overbill.
+                                // A stub that only ever published the flat
+                                // counts would let a parser that never looked
+                                // into the nested objects pass.
                                 "usage": {
                                     "prompt_tokens": 777,
                                     "completion_tokens": 123,
-                                    "total_tokens": 900
+                                    "total_tokens": 900,
+                                    "prompt_tokens_details": {
+                                        "cached_tokens": 314
+                                    },
+                                    "completion_tokens_details": {
+                                        "reasoning_tokens": 41
+                                    }
                                 }
                             })
                         );
@@ -6794,6 +6815,152 @@ fn token_accounting_records_the_servers_counts_per_call_and_a_run_total() {
         usages.len() as u64,
         "the per-site breakdown must account for every call the run made, or a site \
          is missing from the report: {summary}"
+    );
+}
+
+/// §14.29 — the four usage facts a cost table cannot derive from the flat counts,
+/// per call and totalled on `run.summary`.
+///
+/// [VANTA-WHY] What is asserted here is: how much of the prompt the provider served
+/// from its cache, how much of the completion was reasoning, what the call cost, and
+/// — the part that makes a total trustworthy — which price row produced the number.
+/// The stub publishes the NESTED shape the hosted providers use
+/// (`prompt_tokens_details.cached_tokens` / `completion_tokens_details.reasoning_tokens`),
+/// so a parser that only read the top-level counts answers `unset` here and fails.
+///
+/// The same run is made twice, on the backend that bills and the one that does not,
+/// because two different claims have to stay apart: "the details were recorded" (both)
+/// and "the call was priced" (only the hosted one). A local run is `not_billed` with
+/// `cost_usd=unset` — never `0.000000`, which is the different claim that the call WAS
+/// priced and came to nothing.
+#[test]
+fn usage_details_and_cost_are_recorded_per_call_and_totalled() {
+    let _serial = serial_run();
+
+    // (1) Local: the details are recorded, the call is not billed.
+    let local = TempDir::new().unwrap();
+    let (_repo, _issue, local_patch) = write_test_repo(local.path(), PRESERVING_PATCH);
+    let local_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let local_status = run_patch_mode(local.path(), &local_patch, &local_server);
+    assert!(local_status.success(), "the reference run must reach a verdict");
+
+    let local_records = read_session_records(&find_session_log(local.path()));
+    let local_usages: Vec<&SessionRecord> = local_records
+        .iter()
+        .filter(|record| record.phase == "call.usage")
+        .collect();
+    let calls = local_usages.len();
+    assert!(calls > 0, "a run that called the model must write `call.usage` rows");
+    for row in &local_usages {
+        assert_eq!(
+            summary_value(&row.summary, "cached_tokens"),
+            "314",
+            "the nested `prompt_tokens_details.cached_tokens` must be recorded: {}",
+            row.summary
+        );
+        assert_eq!(
+            summary_value(&row.summary, "reasoning_tokens"),
+            "41",
+            "the nested `completion_tokens_details.reasoning_tokens` must be recorded: {}",
+            row.summary
+        );
+        assert_eq!(
+            summary_value(&row.summary, "cost_usd"),
+            "unset",
+            "a call nobody billed has no cost — `unset`, not `0.000000`: {}",
+            row.summary
+        );
+        assert_eq!(
+            summary_value(&row.summary, "cost_basis"),
+            "not_billed",
+            "the row must say WHY there is no cost: {}",
+            row.summary
+        );
+    }
+    let local_summary = run_summary(local.path()).summary;
+    assert_eq!(
+        summary_value(&local_summary, "llm_cached_tokens"),
+        (314 * calls).to_string(),
+        "the run total must sum the server's cached counts: {local_summary}"
+    );
+    assert_eq!(
+        summary_value(&local_summary, "llm_reasoning_tokens"),
+        (41 * calls).to_string(),
+        "the run total must sum the server's reasoning counts: {local_summary}"
+    );
+    assert_eq!(summary_value(&local_summary, "cost_usd"), "unset");
+    assert_eq!(summary_value(&local_summary, "cost_basis"), "not_billed");
+
+    // (2) Hosted: same stub, same numbers — now priced.
+    let hosted = TempDir::new().unwrap();
+    let (_repo, _issue, hosted_patch) = write_test_repo(hosted.path(), PRESERVING_PATCH);
+    let hosted_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let hosted_output = run_patch_mode_with_output(
+        hosted.path(),
+        &hosted_patch,
+        &hosted_server,
+        3,
+        &[
+            ("VANTA_LLM_BACKEND", "openai"),
+            ("VANTA_LLM_MODEL", "gpt-6-luna"),
+            ("OPENAI_API_KEY", "sk-test-not-a-real-key"),
+            ("VANTA_LLM_CONTEXT_TOKENS", "131072"),
+        ],
+    );
+    assert_eq!(
+        hosted_output.status.code(),
+        Some(0),
+        "pricing a call must not change the verdict — only what is recorded; stdout:\n{}",
+        String::from_utf8_lossy(&hosted_output.stdout)
+    );
+
+    let hosted_usages: Vec<String> = read_session_records(&find_session_log(hosted.path()))
+        .into_iter()
+        .filter(|record| record.phase == "call.usage")
+        .map(|record| record.summary)
+        .collect();
+    assert_eq!(
+        hosted_usages.len(),
+        calls,
+        "the backend must not change how many calls the run makes"
+    );
+    for row in &hosted_usages {
+        assert_eq!(summary_value(row, "cached_tokens"), "314");
+        assert_eq!(summary_value(row, "reasoning_tokens"), "41");
+        // 777 prompt of which 314 were cached, 123 out, at Luna's standard rates:
+        //   463 uncached × $0.10 + 314 cached × $0.01 + 123 out × $0.50, per Mtok
+        //   = $0.00011094, which rounds to six decimals as below.
+        // The literal is the whole point of the assertion: billing the cached 314 at
+        // the FULL input rate would give `0.000139`, so a price table that ignored
+        // the cache cannot produce this string.
+        assert_eq!(
+            summary_value(row, "cost_usd"),
+            "0.000111",
+            "the cached part of the prompt must be billed at the cached rate: {row}"
+        );
+        assert_eq!(
+            summary_value(row, "cost_basis"),
+            "gpt-6-luna/standard/2026-10-26",
+            "the row must name the price row that produced the number: {row}"
+        );
+    }
+    let hosted_summary = run_summary(hosted.path()).summary;
+    assert_eq!(
+        summary_value(&hosted_summary, "llm_cached_tokens"),
+        (314 * hosted_usages.len()).to_string()
+    );
+    assert_eq!(
+        summary_value(&hosted_summary, "llm_reasoning_tokens"),
+        (41 * hosted_usages.len()).to_string()
+    );
+    assert_eq!(
+        summary_value(&hosted_summary, "cost_usd"),
+        format!("{:.6}", 0.00011094 * hosted_usages.len() as f64),
+        "the run total must sum the calls it priced: {hosted_summary}"
+    );
+    assert_eq!(
+        summary_value(&hosted_summary, "cost_basis"),
+        "gpt-6-luna/standard/2026-10-26"
     );
 }
 

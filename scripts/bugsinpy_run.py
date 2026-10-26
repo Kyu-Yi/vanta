@@ -37,12 +37,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent
@@ -743,6 +744,32 @@ def select_preps(
     return chosen
 
 
+def max_spend_usd_from_env(env: Mapping[str, str]) -> Optional[float]:
+    """§14.29 — ``VANTA_MAX_SPEND_USD``: the batch's budget, or ``None`` for no cap.
+
+    Read here rather than inside ``run_batch`` so a test that drives the batch
+    loop cannot be capped by whatever the developer happens to have exported:
+    the cap belongs to the *invocation*, and this CLI is the invocation. Unset
+    or empty means no cap, which is how every batch before this change ran. A
+    value that is not a positive number is refused rather than ignored — a typo
+    in a safety net must not quietly remove the net.
+    """
+    raw = (env.get("VANTA_MAX_SPEND_USD") or "").strip()
+    if not raw:
+        return None
+    try:
+        cap = float(raw)
+    except ValueError:
+        raise runner_mod.RunnerError(
+            f"VANTA_MAX_SPEND_USD='{raw}' is not a number; unset it for no cap."
+        )
+    if not cap > 0:
+        raise runner_mod.RunnerError(
+            f"VANTA_MAX_SPEND_USD='{raw}' must be > 0; unset it for no cap."
+        )
+    return cap
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Run a prepared batch: repairs first, then both reviews, one job at a time.
 
@@ -774,6 +801,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     if stale_warning:
         print(f"WARNING: {stale_warning}", file=sys.stderr, flush=True)
 
+    # §14.29 — the batch's budget, if the caller set one. Announced before the
+    # first job so the number a run is capped at is on the record at the top of
+    # the log rather than only in the environment that invoked it.
+    max_spend_usd = max_spend_usd_from_env(os.environ)
+    if max_spend_usd is not None:
+        print(
+            f"[spend] VANTA_MAX_SPEND_USD=${max_spend_usd:g}: the batch stops before "
+            "the first job that would start once its rows' cost has reached this.",
+            flush=True,
+        )
+
     code, results = runner_mod.run_batch(
         batch_dir=batch_dir,
         batch_id=batch_dir.name,
@@ -787,6 +825,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         disk_mb=args.disk_mb,
         show_hints=args.show_hints,
         plan_only=args.plan,
+        max_spend_usd=max_spend_usd,
     )
     if args.plan:
         return EXIT_OK

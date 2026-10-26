@@ -344,6 +344,22 @@ fn token_value(value: Option<u64>) -> String {
     value.map(|v| v.to_string()).unwrap_or_else(|| "unset".to_string())
 }
 
+/// Render a USD amount for a record line (§14.29).
+///
+/// [VANTA-WHY] Six decimal places, always, and `unset` when there is no number.
+/// Six is what makes a single cheap Luna call (`$0.000012`) legible without a
+/// scientific-notation exponent, which `{}` on an `f64` would print and which
+/// `scripts/metrics.py::summary_field` would read as a value containing `e`.
+/// Fixed-point also means two runs' rows are comparable as text.
+///
+/// [VANTA-WHY] `unset` rather than `0.000000`: "this run cost nothing" and "no
+/// price applied to this run" are different claims — the local backend is the
+/// first, an unpriced model is the second — and a cost column that renders both
+/// as zero cannot be summed honestly.
+fn cost_value(value: Option<f64>) -> String {
+    value.map(|v| format!("{v:.6}")).unwrap_or_else(|| "unset".to_string())
+}
+
 /// Sum the server-measured token counts over one run's chat calls.
 ///
 /// [VANTA-WHY] Returns the call counts beside the sums, because a total over
@@ -364,6 +380,62 @@ fn token_totals(calls: &[crate::llm::CallUsage]) -> (usize, usize, u64, Option<u
         Some(completions.iter().sum())
     };
     (calls.len(), measured.len(), prompt, completion)
+}
+
+/// The run's spend, its two nested token details, and the bases that priced it
+/// (§14.29).
+///
+/// Returns `(cost_usd, cached_tokens, reasoning_tokens, cost_basis)`:
+///
+/// * `cost_usd` — the sum over the calls that WERE priced. `None` when none was:
+///   the local backend is `not_billed` and a hosted model with no price row is
+///   `unpriced_family`, and both are holes a batch table has to be able to see
+///   rather than a `0.0` it would silently average.
+/// * `cached_tokens` / `reasoning_tokens` — summed over the calls that REPORTED
+///   them, and `None` when no call in the run did. Same rule and same reason as
+///   `token_totals`'s completion sum: a `0` would claim the server said zero,
+///   and on a local run the server says nothing at all.
+/// * `cost_basis` — the DISTINCT bases the run's calls recorded, in first-seen
+///   order, joined by `,`; `none` when the run made no calls. A run whose rows
+///   disagree (one priced, one fallen back to the estimate) names both, because
+///   "which prices produced this total?" is exactly the question the versioned
+///   table exists to answer and a single basis would answer it wrongly.
+fn cost_and_detail_totals(
+    calls: &[crate::llm::CallUsage],
+) -> (Option<f64>, Option<u64>, Option<u64>, String) {
+    let measured: Vec<&crate::llm::CallUsage> =
+        calls.iter().filter(|c| c.source != "estimate").collect();
+    let costs: Vec<f64> = calls.iter().filter_map(|c| c.cost_usd).collect();
+    let cost = if costs.is_empty() {
+        None
+    } else {
+        Some(costs.iter().sum())
+    };
+    let sum_of = |pick: fn(&crate::llm::CallUsage) -> Option<u64>| -> Option<u64> {
+        let values: Vec<u64> = measured.iter().filter_map(|c| pick(c)).collect();
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().sum())
+        }
+    };
+    let mut bases: Vec<&str> = Vec::new();
+    for basis in calls.iter().map(|c| c.cost_basis.as_str()) {
+        if !bases.contains(&basis) {
+            bases.push(basis);
+        }
+    }
+    let basis_text = if bases.is_empty() {
+        "none".to_string()
+    } else {
+        bases.join(",")
+    };
+    (
+        cost,
+        sum_of(|c| c.cached_tokens),
+        sum_of(|c| c.reasoning_tokens),
+        basis_text,
+    )
 }
 
 /// Count the calls the server cut off at `max_tokens`, per role (§14.5).
@@ -2853,7 +2925,7 @@ pub async fn run(
             summary: format!(
                 "seq={} site={} round={} attempt={} prompt_tokens={} completion_tokens={} \
                  total_tokens={} source={} seed={} seed_mechanism={} finish_reason={} wall_ms={} \
-                 truncated={} {}",
+                 truncated={} {} cached_tokens={} reasoning_tokens={} cost_usd={} cost_basis={}",
                 usage.seq,
                 usage.site,
                 // [VANTA-WHY] §14.12 — the round and the retry index travel with
@@ -2881,9 +2953,21 @@ pub async fn run(
                 usage.wall_ms,
                 usage.truncated,
                 // [VANTA-WHY] §14.26 — what the body asked for, what it carried,
-                // and what was removed or renamed on the way. Last, so every key
-                // this row carried before keeps its position.
+                // and what was removed or renamed on the way. Last of the
+                // pre-§14.29 keys, so every key this row carried before keeps its
+                // position.
                 usage.request_shape.render(),
+                // [VANTA-WHY] §14.29 — the usage the server reported that is not
+                // a token count: how much of the prompt was served from cache,
+                // how much of the completion was reasoning, what those cost, and
+                // on what price basis. `unset` rather than `0` wherever the
+                // server did not publish the detail, so "not measured" cannot be
+                // pooled with "measured zero". Appended after the pre-existing
+                // keys so a reader of an older row is unaffected.
+                token_value(usage.cached_tokens),
+                token_value(usage.reasoning_tokens),
+                cost_value(usage.cost_usd),
+                usage.cost_basis,
             ),
             timestamp: now_iso(),
             benchmark_instance: None,
@@ -2892,6 +2976,15 @@ pub async fn run(
     }
     let (llm_calls, llm_calls_measured, llm_prompt_tokens, llm_completion_tokens) =
         token_totals(&call_usages);
+    // [VANTA-WHY] §14.29 — the run's cost and the two usage details that are not
+    // token counts. Summed from the rows the run already recorded, for the same
+    // reason `token_totals` is: an aggregate that re-derives its inputs can
+    // disagree with the rows it summarises. `cost_basis` names the price rows
+    // that produced the figure (`none` when the run made no call), so a total
+    // built from two different price dates is visible rather than silently
+    // pooled.
+    let (cost_usd, llm_cached_tokens, llm_reasoning_tokens, cost_basis) =
+        cost_and_detail_totals(&call_usages);
 
     // ---- Run-away (truncated) calls, per role (plans/bugsinpy.md §14.5) ----
     // [VANTA-WHY] A model that spends its whole output cap on reasoning and
@@ -3009,6 +3102,7 @@ pub async fn run(
             "attempts_run={} fixed_at_attempt_1={} final_decision={:?} \
              config={} mode={} seed={} seed_policy={} model={} top_p={} {} {} \
              llm_calls={} llm_calls_measured={} llm_prompt_tokens={} llm_completion_tokens={} \
+             llm_cached_tokens={} llm_reasoning_tokens={} cost_usd={} cost_basis={} \
              truncated_calls_creator={} truncated_calls_attacker={} \
              truncated_calls_intent_audit={} \
              truncated_calls={} truncated_twice_calls={} completion_tokens_total={} {} \
@@ -3040,6 +3134,14 @@ pub async fn run(
             llm_calls_measured,
             llm_prompt_tokens,
             token_value(llm_completion_tokens),
+            // [VANTA-WHY] §14.29 — the run's cached/reasoning tokens and its
+            // cost, with the price basis that produced them. `unset`/`none`
+            // wherever nothing was measured (the local backend is
+            // `not_billed`, an unpriced family names itself), never `0`.
+            token_value(llm_cached_tokens),
+            token_value(llm_reasoning_tokens),
+            cost_value(cost_usd),
+            cost_basis,
             // [VANTA-WHY] §14.5 — how often a model ran away on each role in THIS
             // run. A count, not a rate: the split's report pools it over runs.
             truncated_creator,

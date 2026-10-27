@@ -20020,7 +20020,8 @@ class TestRunBatchLoop:
         monkeypatch.setattr(runner_mod, "run_job", self._stub(tmp_path, calls, leave_running=running))
         return preps, entries, split, calls, tmp_path / "batch"
 
-    def _run(self, preps, entries, split, batch_dir, *, show_hints=False, max_spend_usd=None):
+    def _run(self, preps, entries, split, batch_dir, *, show_hints=False, max_spend_usd=None,
+             preflight=None):
         return runner_mod.run_batch(
             batch_dir=batch_dir,
             batch_id="b1",
@@ -20034,6 +20035,7 @@ class TestRunBatchLoop:
             disk_mb=8192,
             show_hints=show_hints,
             max_spend_usd=max_spend_usd,
+            preflight=preflight,
         )
 
     @staticmethod
@@ -20286,6 +20288,153 @@ class TestRunBatchLoop:
             self._run(preps, entries, split, batch_dir)
         assert calls == [], "the guard must fire before the first job"
         assert not (batch_dir / manifest_mod.MANIFEST_NAME).exists()
+
+    # -- item 14: the endpoint preflight, asked before every row ------------
+    def test_a_dead_endpoint_stops_the_batch_before_the_first_row(
+        self, tmp_path, monkeypatch
+    ):
+        """Acceptance (item 14): endpoint down → `model_unreachable`, zero rows.
+
+        The batch writes **no** failed rows for a model it could not reach, so the
+        refusal is raised before `run_job` — whose first act is to park the key
+        `running` in `state.json` — rather than turned into a row that says "failed".
+        """
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        reason = (
+            "no answer from http://127.0.0.1:1/v1/models "
+            "(<urlopen error [Errno 61] Connection refused>)"
+        )
+        with pytest.raises(runner_mod.RunnerError, match="model_unreachable"):
+            self._run(preps, entries, split, batch_dir, preflight=lambda: reason)
+        assert calls == [], "not one job may start against an unreachable model"
+        assert not (batch_dir / manifest_mod.MANIFEST_NAME).exists()
+        assert manifest_mod.Manifest(batch_dir).state() == {}
+
+    def test_a_live_endpoint_runs_the_batch_as_before(self, tmp_path, monkeypatch):
+        """Acceptance (item 14): endpoint up → runs as before.
+
+        Same fixture, same schedule and the same rows with the probe in place as
+        without it: the check is a gate, not a change to what a batch does.
+        """
+        preps, entries, split, probed, _ = self._prepare(monkeypatch, tmp_path)
+        code, _ = self._run(
+            preps, entries, split, tmp_path / "batch-probed", preflight=lambda: None
+        )
+        assert code == 0
+        assert probed, "the stub should have been called"
+
+        # A second batch directory: the same directory would resume from the first
+        # run's cursor and skip every row, which would compare nothing.
+        preps, entries, split, unprobed, _ = self._prepare(monkeypatch, tmp_path)
+        code, _ = self._run(preps, entries, split, tmp_path / "batch-plain")
+        assert code == 0
+        assert [job.key for job in probed] == [job.key for job in unprobed]
+
+    def test_the_endpoint_is_asked_again_before_every_row(self, tmp_path, monkeypatch):
+        """A model that goes away mid-batch stops it, at the row it went away before.
+
+        The rows before that point are already written — they ran against a live
+        endpoint — and the cursor is untouched, so the next `run` resumes here.
+        """
+        # The schedule first, from a batch allowed to finish: the check is that the
+        # flaky batch starts exactly the rows before the one it refused.
+        preps, entries, split, reference, _ = self._prepare(monkeypatch, tmp_path)
+        self._run(preps, entries, split, tmp_path / "batch-reference")
+        schedule = [job.key for job in reference]
+        assert len(schedule) > 2
+
+        preps, entries, split, calls, _ = self._prepare(monkeypatch, tmp_path)
+        asked: list[int] = []
+
+        def flaky() -> Optional[str]:
+            asked.append(len(asked))
+            return "gone" if len(asked) > 2 else None
+
+        with pytest.raises(runner_mod.RunnerError, match="model_unreachable: gone"):
+            self._run(preps, entries, split, tmp_path / "batch-flaky", preflight=flaky)
+        assert len(asked) == 3, "one ask per started row, and it stopped at the third"
+        assert [job.key for job in calls] == schedule[:2], "the third row never started"
+        assert not manifest_mod.Manifest(tmp_path / "batch-flaky").state().get(schedule[2])
+
+
+class TestModelEndpointPreflight:
+    """Item 14's resolution and classification, away from the batch loop.
+
+    The loop tests above pin the *refusal*; these pin the two things a silent bug
+    there would get wrong — which endpoint is asked, and which answers count as
+    "not there" — because probing the wrong endpoint looks exactly like a dead one.
+    """
+
+    def test_an_explicit_base_url_wins_and_loses_its_trailing_slash(self):
+        env = {"VANTA_LLM_BASE_URL": "http://host:9000/v1/", "VANTA_LLM_BACKEND": "openai"}
+        assert runner_mod.model_endpoint_base_url(env) == "http://host:9000/v1"
+
+    def test_an_empty_override_is_the_same_as_not_set(self):
+        assert (
+            runner_mod.model_endpoint_base_url({"VANTA_LLM_BASE_URL": "  "})
+            == "http://127.0.0.1:8080/v1"
+        )
+
+    def test_the_backend_picks_the_default_endpoint(self):
+        # The Rust resolves the same way; an `openai` run must not be probed
+        # against the local router just because it is the default backend.
+        assert (
+            runner_mod.model_endpoint_base_url({"VANTA_LLM_BACKEND": "openai"})
+            == "https://api.openai.com/v1"
+        )
+        assert runner_mod.model_endpoint_base_url({}) == "http://127.0.0.1:8080/v1"
+
+    def test_the_key_follows_the_backend_and_does_not_fall_back(self):
+        assert runner_mod._model_preflight_headers(
+            {"VANTA_LLM_BACKEND": "openai", "OPENAI_API_KEY": "sk-x"}
+        ) == {"Authorization": "Bearer sk-x"}
+        assert (
+            runner_mod._model_preflight_headers(
+                {"VANTA_LLM_BACKEND": "openai", "VANTA_API_KEY": "sk-y"}
+            )
+            == {}
+        ), "the hosted backend reads OPENAI_API_KEY only, as the Rust does"
+
+    def test_no_key_means_no_authorization_header(self):
+        assert runner_mod._model_preflight_headers({"VANTA_API_KEY": "  "}) == {}
+
+    def test_the_probe_gets_the_models_url_for_the_resolved_endpoint(self):
+        seen: dict = {}
+
+        def probe(url, headers, timeout):
+            seen["url"] = url
+            seen["headers"] = dict(headers)
+            return runner_mod.ProbeReply(status=200)
+
+        runner_mod.model_endpoint_preflight(
+            env={"VANTA_LLM_BASE_URL": "http://host:9/v1", "VANTA_API_KEY": "sk-x"},
+            probe=probe,
+        )
+        assert seen["url"] == "http://host:9/v1/models"
+        assert seen["headers"] == {"Authorization": "Bearer sk-x"}
+
+    def test_a_transport_failure_is_unreachable(self):
+        def probe(url, headers, timeout):
+            raise OSError("Connection refused")
+
+        reason = runner_mod.model_endpoint_preflight(env={}, probe=probe)
+        assert reason and "no answer from" in reason
+
+    def test_a_rejected_credential_is_unreachable_too(self):
+        def probe(url, headers, timeout):
+            return runner_mod.ProbeReply(status=401, detail="Unauthorized")
+
+        reason = runner_mod.model_endpoint_preflight(env={}, probe=probe)
+        assert reason and "401" in reason
+
+    def test_every_other_status_is_an_answer(self):
+        # Including 404: the endpoint is up and answering, so the batch runs and
+        # the rows fail on their own terms rather than being refused up front.
+        for status in (200, 404, 500):
+            def probe(url, headers, timeout, status=status):
+                return runner_mod.ProbeReply(status=status)
+
+            assert runner_mod.model_endpoint_preflight(env={}, probe=probe) is None
 
 
 class TestPythonVersionProbe:

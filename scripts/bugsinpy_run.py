@@ -778,6 +778,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     wrong directory would mount nothing and fail per job instead of once.
     """
     runner_mod.require_repo_cwd()
+    # Item 14 — the same shape, and the same reason, as the repo-root check above:
+    # a run against a model endpoint that is not there fails one job at a time, and
+    # the only cheap moment to say so is before the first one. `--plan` is exempt
+    # because printing the schedule sends no request, so it must not need one.
+    if not args.plan:
+        runner_mod.require_model_endpoint()
     split = load_split(args.split.resolve())
     batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
     bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
@@ -826,6 +832,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         show_hints=args.show_hints,
         plan_only=args.plan,
         max_spend_usd=max_spend_usd,
+        # Item 14's per-row half. `--plan` returns from `run_batch` before the loop,
+        # so passing the probe unconditionally cannot make a plan need an endpoint.
+        preflight=runner_mod.model_endpoint_preflight,
     )
     if args.plan:
         return EXIT_OK

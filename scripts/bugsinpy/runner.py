@@ -56,10 +56,12 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from . import bake as bake_mod
 from . import compact as compact_mod
@@ -171,6 +173,161 @@ def require_vanta_bin(path: Path) -> Path:
             "    cargo build --release --bin vanta_m3"
         )
     return path
+
+
+# ---- item 14: is the configured model endpoint actually there? -------------
+MODEL_UNREACHABLE = "model_unreachable"
+"""The one token a batch that cannot reach its model refuses with (item 14).
+
+[VANTA-WHY] A fixed token rather than a sentence, because this refusal has to be
+told apart from a wave gate, a spend cap and a crash by something that is not a
+human reading prose — a wrapper, or whoever opens the batch directory later. The
+sentence after the token is for the human.
+"""
+
+MODEL_PREFLIGHT_TIMEOUT_SECS = 10
+"""Seconds the tiny request may take before the endpoint counts as absent.
+
+Ten, not the 3h a job gets: this is a liveness question, and a request that has
+not been answered in ten seconds is a request that is not going to be. The
+endpoint is either on this host or on a service that answers a GET in
+milliseconds.
+"""
+
+BACKEND_DEFAULT_BASE_URLS = {
+    "llamacpp": "http://127.0.0.1:8080/v1",
+    "openai": "https://api.openai.com/v1",
+}
+"""Mirrors ``LlmBackend::default_base_url`` in ``src/config/mod.rs``.
+
+[VANTA-WHY] The preflight has to probe the endpoint the *run* will use. When
+``VANTA_LLM_BASE_URL`` is unset, that endpoint is the backend's default, and the
+two backends do not share one: a preflight hard-coded to ``127.0.0.1:8080`` would
+probe the local router while an ``openai`` run talked to the hosted service — a
+liveness check on an endpoint nobody was going to call.
+"""
+
+KEY_ENV_BY_BACKEND = {"llamacpp": "VANTA_API_KEY", "openai": "OPENAI_API_KEY"}
+"""Mirrors the key-name rule in ``LlmConfig::from_env`` — one name per backend.
+
+[VANTA-WHY] The two names deliberately do not fall back to one another in the
+Rust, and this copy must not either: on the openai backend the run reads
+``OPENAI_API_KEY`` and nothing else, so a probe that accepted either name could
+report the endpoint reachable with a credential the run will never send.
+"""
+
+
+@dataclass(frozen=True)
+class ProbeReply:
+    """What the endpoint answered. The status, and nothing the body contained.
+
+    [VANTA-WHY] The body is deliberately not kept. A response from this endpoint
+    can carry a provider error that echoes the credential back, and the preflight
+    is the one place a body arrives before any redaction runs. There is nothing in
+    it this needs: the status is the whole answer.
+    """
+
+    status: int
+    detail: str = ""
+
+
+def model_endpoint_base_url(env: Optional[Mapping[str, str]] = None) -> str:
+    """The endpoint a run would use, resolved the way the Rust resolves it.
+
+    ``VANTA_LLM_BASE_URL`` (trailing ``/`` trimmed) if it says anything, else the
+    configured backend's default. An empty or whitespace-only variable counts as
+    unset, exactly as in ``LlmConfig::from_env``.
+    """
+    environ = os.environ if env is None else env
+    explicit = (environ.get("VANTA_LLM_BASE_URL") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    backend = (environ.get("VANTA_LLM_BACKEND") or "").strip().lower()
+    return BACKEND_DEFAULT_BASE_URLS.get(backend, BACKEND_DEFAULT_BASE_URLS["llamacpp"])
+
+
+def _model_preflight_headers(env: Mapping[str, str]) -> dict[str, str]:
+    """The Authorization header, if the run would send one.
+
+    Read here and never printed: the value goes into the request the same way the
+    real run's would, and this function's callers keep it out of every message.
+    """
+    backend = (env.get("VANTA_LLM_BACKEND") or "").strip().lower()
+    key = (env.get(KEY_ENV_BY_BACKEND.get(backend, "VANTA_API_KEY")) or "").strip()
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+def _urllib_probe(url: str, headers: Mapping[str, str], timeout: float) -> ProbeReply:
+    """The real request: a GET that keeps the status and drops the body."""
+    request = urllib.request.Request(url, headers=dict(headers), method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return ProbeReply(status=int(response.status))
+    except urllib.error.HTTPError as exc:
+        # An HTTP error IS an answer — the endpoint is up and says so. Only a
+        # transport failure means it is not there.
+        return ProbeReply(status=int(exc.code), detail=str(exc.reason or ""))
+
+
+def model_endpoint_preflight(
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    probe: Optional[Callable[[str, Mapping[str, str], float], ProbeReply]] = None,
+) -> Optional[str]:
+    """One tiny request to the configured endpoint (item 14).
+
+    ``None`` when it answered, else a sentence saying why it did not.
+
+    [VANTA-WHY] The request is a ``GET {base_url}/models``, not a chat completion.
+    The batch asks this question once before it starts and once before every row,
+    so the request has to be one a run can afford to repeat: a completion costs
+    tokens on a billed backend and can take tens of seconds on a reasoning model,
+    and a preflight that added either to every row would be worse than the
+    overnight batch of failed rows it exists to prevent. ``/models`` is the one
+    endpoint the OpenAI protocol requires of both backends this project talks to
+    (the local llama.cpp router publishes it, and so does the hosted service), and
+    it answers reachability and credential validity in one round trip.
+
+    Failure means **the endpoint could not be reached**, or it answered 401/403 —
+    the credential the run would send is one it will not authenticate with. Any
+    other status is an answer, including a 404 from a server that publishes no
+    model list: the endpoint is there, so the batch proceeds and, if the endpoint
+    genuinely cannot serve, each row says so itself. Refusing on that 404 would
+    turn "runs as before" into "refuses to start" for an endpoint that was fine.
+    """
+    environ = os.environ if env is None else env
+    url = model_endpoint_base_url(environ) + "/models"
+    ask = probe or _urllib_probe
+    try:
+        reply = ask(url, _model_preflight_headers(environ), MODEL_PREFLIGHT_TIMEOUT_SECS)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return f"no answer from {url} ({exc})"
+    if reply.status in (401, 403):
+        return (
+            f"{url} answered HTTP {reply.status} — the endpoint is up but rejected "
+            "the credential, so every row would fail to authenticate"
+        )
+    return None
+
+
+def require_model_endpoint(
+    *,
+    preflight: Optional[Callable[[], Optional[str]]] = None,
+    before: Optional[str] = None,
+) -> None:
+    """Refuse the batch when the model endpoint does not answer (item 14).
+
+    Called once by ``run`` before the first job and once by :func:`run_batch`
+    before each row. A refusal is a `RunnerError`, so the CLI prints one sentence
+    and exits 2 — and because it is raised *before* ``run_job`` is called, no row
+    at all is written for a model the harness could not reach: not a failed row,
+    not a partial one.
+    """
+    reason = (preflight or model_endpoint_preflight)()
+    if not reason:
+        return
+    where = f" (before {before})" if before else ""
+    raise RunnerError(f"{MODEL_UNREACHABLE}: {reason}{where}")
 
 
 # ---------------------------------------------------------------------------
@@ -2048,6 +2205,7 @@ def run_batch(
     show_hints: bool = False,
     plan_only: bool = False,
     max_spend_usd: Optional[float] = None,
+    preflight: Optional[Callable[[], Optional[str]]] = None,
 ) -> tuple[int, list[WaveResult]]:
     """The whole batch: per wave, D13's four phases, then the wave-1 gate.
 
@@ -2060,6 +2218,14 @@ def run_batch(
     checked BETWEEN jobs, against the cost of the rows already on disk: a job that would push
     the batch past the cap is not started, and the count it is compared against includes rows
     an earlier invocation of the same batch wrote, so a resume cannot double-spend.
+
+    ``preflight`` is item 14's endpoint check, ``None`` for no per-row check. It is a
+    zero-argument callable returning ``None`` or a sentence saying why the endpoint did not
+    answer, and it is asked **before every row** — so an endpoint that goes away mid-batch
+    stops the batch instead of writing a failed row for every job left. ``run`` passes the
+    real probe; the default is ``None`` for the same reason ``max_spend_usd`` is read in the
+    CLI rather than here: the check belongs to the invocation, and a test that drives this
+    loop must not depend on whatever endpoint the developer happens to have running.
     """
     paths = BatchPaths.under(batch_dir)
     manifest = Manifest(batch_dir)
@@ -2181,6 +2347,15 @@ def run_batch(
                         if max_spend_usd is not None and spent >= max_spend_usd:
                             _record_spend_cap(batch_dir, max_spend_usd, spent, job)
                             return 1, results
+                        # Item 14 — before the row, not after it. Asked here rather
+                        # than inside `run_job` because the refusal has to leave no
+                        # trace at all: `run_job`'s first act is to mark the key
+                        # `running` in `state.json`, and a key parked there is a row
+                        # the next resume re-runs. Raising before the call means the
+                        # cursor never moves and the batch continues from here once
+                        # the endpoint is back.
+                        if preflight is not None:
+                            require_model_endpoint(preflight=preflight, before=job.key)
                         record = run_job(
                             job=job,
                             paths=paths,

@@ -30,8 +30,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agents::attacker::{
-    AttackerRequest, GeneratedTest, IntentCheckRecord, SharedProbe, attacker_generate_tests,
-    audit_tests_intent,
+    AttackerRequest, GeneratedTest, IntentCheckRecord, QuarantinedProbe, SharedProbe,
+    attacker_generate_tests, audit_tests_intent,
 };
 use crate::agents::creator::{
     CreatorRequest, SourceFile, creator_generate_patch, split_multi_file_patch,
@@ -46,7 +46,7 @@ use crate::llm::{build_reqwest_client, drain_call_usages, reset_call_usages, ser
 use crate::pipeline::bate::run_bate;
 use crate::pipeline::candidate::TestCommand;
 use crate::pipeline::corroborate::{self, CorroborationInput, FailureEvidence};
-use crate::pipeline::diagnostician::diagnose_failure;
+use crate::pipeline::diagnostician::{diagnose_failure, is_quarantined};
 use crate::pipeline::gatekeeper::{Gatekeeper, GatekeeperVerdict};
 use crate::pipeline::governor::{
     AttemptVerdict, Governor, GovernorMode, SharedObservation,
@@ -1224,6 +1224,13 @@ pub async fn run(
     // `Some(0)` at the first grounded-audited round.
     let mut grounded_scrapped_total: Option<usize> = None;
     let mut grounded_kept_by_issue_total: Option<usize> = None;
+    // [VANTA-WHY] M3 item 17 — every test the Diagnostician quarantined this run,
+    // in the order it was quarantined. A quarantined test is REMOVED from the
+    // shared set so it is not re-run next round, and its name + reason are handed
+    // to the Attacker (`AttackerRequest::quarantined_tests`) so it does not write
+    // it again. The accumulator is run-scoped, not attempt-scoped, because a
+    // quarantine is a durable fact about the probe: once removed, it stays out.
+    let mut quarantined: Vec<QuarantinedProbe> = Vec::new();
     let decision = 'attempts: loop {
         // [VANTA-WHY] §14.15 — the deadline is checked here as well as in the LLM
         // layer, and this is the check that turns "the calls stopped" into "the
@@ -1613,6 +1620,11 @@ pub async fn run(
                         test_source: t.test_source.clone(),
                     })
                     .collect(),
+                // [VANTA-WHY] M3 item 17 — tell the Attacker which probes were
+                // quarantined in an earlier round so it attacks somewhere new
+                // instead of re-deriving a test the Diagnostician already threw
+                // away. Empty on round 1 and whenever nothing was quarantined.
+                quarantined_tests: quarantined.clone(),
             };
             let attacker_response = match run_with_spinner("Attacker generating tests", async {
                 attacker_generate_tests(&cfg, &attacker_request).await
@@ -2364,6 +2376,11 @@ pub async fn run(
                 .unwrap_or_else(TestExecutionDetails::infrastructure_error);
             let result = execution.result.clone();
 
+            // [VANTA-WHY] M3 item 17 — the quarantine request for THIS test, if
+            // any. It is captured in its own slot because `diag` is consumed below
+            // (its payload moves into the per-test debug file) and the decision has
+            // to outlive it.
+            let mut quarantine: Option<QuarantinedProbe> = None;
             let failure_class = if result == TestResult::Passed {
                 None
             } else {
@@ -2398,6 +2415,16 @@ pub async fn run(
                     "    {} → {:?} ({:?})",
                     test.test_name, result, diag.failure_class
                 );
+                // [VANTA-WHY] M3 item 17 — the Diagnostician asks for a quarantine
+                // (a `TestDefect`, or a persistent `Unknown`) through the SAME
+                // payload `action` the Unknown arm has always written, and the one
+                // detector `is_quarantined` is what both classes pass through — so
+                // there is a single removal path rather than a second one for
+                // TestDefect. Read here, before the two fields below are consumed,
+                // because it borrows the whole `diag`.
+                let quarantined_now = is_quarantined(&diag);
+                let quarantine_reason = diag.reason.clone();
+                let quarantine_class = diag.failure_class.clone().unwrap_or(FailureClass::Unknown);
                 let safe_name = test
                     .test_name
                     .replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
@@ -2417,8 +2444,47 @@ pub async fn run(
                     }))
                     .unwrap(),
                 );
-                Some(diag.failure_class.unwrap_or(FailureClass::Unknown))
+                if quarantined_now {
+                    quarantine = Some(QuarantinedProbe {
+                        test_name: test.test_name.clone(),
+                        test_source: test.test_source.clone(),
+                        reason: quarantine_reason,
+                    });
+                }
+                Some(quarantine_class)
             };
+
+            // [VANTA-WHY] M3 item 17 — a quarantined test leaves the shared set and
+            // this attempt's evidence. It is not a finding about the candidate:
+            // folding it in would make every later round re-run and re-diagnose the
+            // same broken probe until the budget ran out (the 16 stalled
+            // `MaxAttemptsReached` rows), and leaving it in the evidence would let a
+            // probe the Diagnostician judged DEFECTIVE drive the Governor or the
+            // approval invariant. The name + reason go to the Attacker and onto the
+            // session log; the `continue` skips the observation and evidence pushes
+            // below.
+            if let Some(probe) = quarantine {
+                println!(
+                    "    ⛔ QUARANTINE: {} removed from the shared set — {}",
+                    probe.test_name, probe.reason
+                );
+                session_log.append(SessionRecord {
+                    session_id: session_id.clone(),
+                    schema_version: Some(SCHEMA_VERSION),
+                    patch_attempt_id: Some(patch_attempt_id.clone()),
+                    testing_iteration_id: Some(testing_iteration_id.clone()),
+                    test_id: None,
+                    phase: format!("quarantine[{}]", probe.test_name),
+                    summary: format!("reason={}", probe.reason),
+                    timestamp: now_iso(),
+                    benchmark_instance: None,
+                    benchmark_label: None,
+                })?;
+                if !quarantined.iter().any(|q| q.test_name == probe.test_name) {
+                    quarantined.push(probe);
+                }
+                continue;
+            }
 
             // [VANTA-WHY] Split this attempt's results into the carried-over
             // shared set (compared against the previous attempt) and the new
@@ -2518,11 +2584,20 @@ pub async fn run(
         // A censored attempt contributes no usable evidence, so it does not grow
         // the shared corpus either — the retry then behaves like a fresh attempt.
         if !harness_collapsed {
+            // [VANTA-WHY] M3 item 17 — a quarantined test is never folded into the
+            // shared set, so it is not re-counted next round. The `retain` below
+            // then removes any test quarantined THIS attempt that was already
+            // carried in the shared set (the `Unknown` class can quarantine a test
+            // that was admitted in an earlier round), so the removal holds for both
+            // classes and both directions.
             for t in &valid_tests {
-                if !shared_names.contains(&t.test_name) {
+                if !shared_names.contains(&t.test_name)
+                    && !quarantined.iter().any(|q| q.test_name == t.test_name)
+                {
                     shared_tests.push(t.clone());
                 }
             }
+            shared_tests.retain(|t| !quarantined.iter().any(|q| q.test_name == t.test_name));
         }
         // [VANTA-WHY] Persist the shared set to disk so a resumed run (or M5
         // re-analysis) replays the IDENTICAL tests. Spec §10 item 2.
@@ -2530,9 +2605,17 @@ pub async fn run(
             let _ = fs::write(&shared_tests_path, json);
         }
 
+        // [VANTA-WHY] M3 item 17 — a quarantined test's failure is a fact about
+        // the TEST, not the candidate, so it must not make the round read as "not
+        // all passed". Left in, it would spend another attack round on a probe the
+        // Diagnostician already discarded and stall the run at
+        // `MaxAttemptsReached` — the exact stall item 17 exists to remove. No test
+        // is dropped from `patched_results` itself (the run is already over); the
+        // filter is applied to the all-passed reading only.
         let all_passed = patched_results
-            .values()
-            .all(|details| details.result == TestResult::Passed);
+            .iter()
+            .filter(|(name, _)| !quarantined.iter().any(|q| &q.test_name == *name))
+            .all(|(_, details)| details.result == TestResult::Passed);
         // [VANTA-WHY] The Governor needs three-way evidence, not a bool. In review
         // mode a Logic failure is a REJECTION; an Infrastructure-only round is
         // not a finding at all and must never be reported as one.
@@ -3258,7 +3341,8 @@ pub async fn run(
              commit={} dirty={} prompt_version={} prompt_hash={} context_selection={} \
              harness_error={} \
              invariant_applied={} invariant_reason={} \
-             grounded_scrapped={} grounded_kept_by_issue={}",
+             grounded_scrapped={} grounded_kept_by_issue={} \
+             quarantine_count={} quarantined=[{}]",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -3435,6 +3519,19 @@ pub async fn run(
             invariant_reason,
             ledger_text(grounded_scrapped_total),
             ledger_text(grounded_kept_by_issue_total),
+            // [VANTA-WHY] M3 item 17 — the quarantine ledger: how many probes the
+            // Diagnostician removed from the shared set this run, and which ones.
+            // Names are space-free (pytest node ids), so the list survives the
+            // space-terminated `key=value` reader. The reason each was removed is
+            // the per-test `quarantine[<name>]` session row and the
+            // `attempt_*_diagnostic_<name>.json` debug artifact, both of which can
+            // hold free text the row cannot.
+            quarantined.len(),
+            quarantined
+                .iter()
+                .map(|q| q.test_name.clone())
+                .collect::<Vec<_>>()
+                .join(","),
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),

@@ -419,11 +419,13 @@ pub fn locate_fault(
         let reason = format!(
             "Failure located in the TEST's own object ({exception} at {site}) — the generated test \
              defined the type that broke, so the failure is a property of the test, not the patch. \
-             Sent back to the Attacker for revision."
+             Sent back to the Attacker for revision. The test is QUARANTINED: it is removed from \
+             the shared test set and the Attacker is told not to write it again."
         );
         return Some((
             reason,
             json!({
+                "action": QUARANTINE_ACTION,
                 "signal": "test_defect_test_defined_type",
                 "exception_type": exception_type,
                 "frame_file": frame_file,
@@ -440,11 +442,13 @@ pub fn locate_fault(
     let reason = format!(
         "Failure located in the TEST's own code ({exception} at {site}) — the generated test raised \
          it before the code under test could run, so the failure is a property of the test, not the \
-         patch. Sent back to the Attacker for revision."
+         patch. Sent back to the Attacker for revision. The test is QUARANTINED: it is removed from \
+         the shared test set and the Attacker is told not to write it again."
     );
     Some((
         reason,
         json!({
+            "action": QUARANTINE_ACTION,
             "signal": "test_defect_exception_in_test_file",
             "exception_type": exception_type,
             "frame_file": frame_file,
@@ -462,6 +466,33 @@ pub struct DiagnosticResult {
     pub reason: String,
     /// Optional structured payload (e.g. ruff diff, mypy errors).
     pub structured_payload: Option<serde_json::Value>,
+}
+
+/// M3 item 17 — the `structured_payload.action` value that marks a diagnostic as
+/// a QUARANTINE: the test is defective, so it is removed from the shared set and
+/// the Attacker is told not to write it again.
+///
+/// [VANTA-WHY] ONE token for both classes that quarantine — a persistent
+/// `Unknown` (the Step-4 arm below) and a `TestDefect` (both returns of
+/// `locate_fault`, and the patch-insensitivity probe) — so the driver has ONE
+/// detector, [`is_quarantined`]. This is the plan's "reuse the existing
+/// quarantine path" made literal: the `TestDefect` returns add this key to the
+/// payload the `Unknown` arm already wrote rather than introducing a second flag.
+pub const QUARANTINE_ACTION: &str = "quarantine";
+
+/// Whether this diagnostic asked for the test to be quarantined (§item 17).
+///
+/// [VANTA-WHY] Read from the payload, not from the `failure_class`: the two
+/// classes that quarantine (`Unknown`, `TestDefect`) say so through one field, so
+/// a caller cannot quarantine a class that did not ask for it and cannot miss a
+/// class that did.
+pub fn is_quarantined(result: &DiagnosticResult) -> bool {
+    result
+        .structured_payload
+        .as_ref()
+        .and_then(|payload| payload.get("action"))
+        .and_then(|action| action.as_str())
+        == Some(QUARANTINE_ACTION)
 }
 
 // ============================================================================
@@ -805,9 +836,12 @@ pub async fn diagnose_failure(
                             reason: format!(
                                 "Test fails identically on the unpatched tree ({exception} at \
                                  {site}) — patch-insensitive, so the failure is a property of the \
-                                 test, not the patch. Sent back to the Attacker for revision."
+                                 test, not the patch. Sent back to the Attacker for revision. The \
+                                 test is QUARANTINED: it is removed from the shared test set and \
+                                 the Attacker is told not to write it again."
                             ),
                             structured_payload: Some(json!({
+                                "action": QUARANTINE_ACTION,
                                 "signal": "patch_insensitive_failure",
                                 "exception_type": exception,
                                 "frame_file": file,
@@ -1025,7 +1059,7 @@ pub async fn diagnose_failure(
                     None => "Unknown persisted after rerun + simplification → QUARANTINED (Attacker-generated test). For repo/benchmark tests this would escalate to human review.".into(),
                 },
                 structured_payload: Some(serde_json::json!({
-                    "action": "quarantine",
+                    "action": QUARANTINE_ACTION,
                     "evidence_source": "AttackerGenerated",
                     "initial_sandbox_root": execution.sandbox_root,
                     "note": "ExistingRepositoryTest and BenchmarkOracle tests escalate to human review instead of quarantine",
@@ -1371,6 +1405,47 @@ mod tests {
         assert_eq!(located.1["signal"], json!("test_defect_test_defined_type"));
         assert_eq!(located.1["exception_type"], json!("AttributeError"));
         assert_eq!(located.1["frame_file"], json!("src/heretic/modifiers/abliteration.py"));
+    }
+
+    /// M3 item 17 — a `TestDefect` is marked for quarantine through the SAME
+    /// field the persistent-`Unknown` arm writes, so the driver's ONE detector
+    /// removes both classes from the shared set. Without the marker the plan's
+    /// defect stands: the defective probe is folded into the shared set and
+    /// fails every later round.
+    #[test]
+    fn a_test_defect_carries_the_quarantine_action() {
+        let execution = exec_at(
+            TestResult::Failed,
+            "test_run.py:9: AttributeError: 'FakeTensor' object has no attribute 'shape'\n",
+        );
+        let (reason, payload) =
+            locate_fault(&execution, "").expect("a fault in the test's own file");
+        assert_eq!(
+            payload["action"],
+            json!(QUARANTINE_ACTION),
+            "a TestDefect must ask for the quarantine; got {payload:?}"
+        );
+        let result = DiagnosticResult {
+            failure_class: Some(FailureClass::TestDefect),
+            reason,
+            structured_payload: Some(payload),
+        };
+        assert!(
+            is_quarantined(&result),
+            "the driver reads the payload through `is_quarantined`, not the failure class"
+        );
+    }
+
+    /// ...and the quarantine marker is not smeared over the failures that are
+    /// the patch's own business: a `Logic` verdict must keep counting.
+    #[test]
+    fn a_patch_caused_logic_failure_is_not_quarantined() {
+        let result = DiagnosticResult {
+            failure_class: Some(FailureClass::Logic),
+            reason: "the patch is wrong".into(),
+            structured_payload: None,
+        };
+        assert!(!is_quarantined(&result));
     }
 
     /// ...and a crash in the patch's own file on an object the test did NOT

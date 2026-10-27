@@ -81,7 +81,17 @@ use tracing::{debug, info, trace, warn};
 // ranks the tree and shows the selected files plus the repo's file tree instead
 // of the first ~262 KB in `read_dir` order. Which code a probe was written
 // against is part of the experiment's identity.
-pub const ATTACKER_PROMPT_VERSION: &str = "10.localized-source-context";
+//
+// [VANTA-WHY] Bumped for M3 item 17 (the quarantine). The round >= 2 USER prompt
+// gained a QUARANTINED TESTS section — the probes the Diagnostician classed a
+// `TestDefect` and removed from the shared set, with the reason each was
+// discarded, so the Attacker does not spend a slot re-deriving a probe that will
+// be discarded again. The SYSTEM text is unchanged (so `prompt_hashes`'s
+// `attacker=` slot does not move), but what the Attacker is told to attack is
+// not: a round-2 reply under this tag and one under `10.` are different
+// experiments. Item 1 shipped no bump because its change was code — the loosened
+// grounding rule in `apply_intent_verdict` — and left every prompt's text alone.
+pub const ATTACKER_PROMPT_VERSION: &str = "11.quarantined-tests";
 
 // ============================================================================
 // INTENT_AUDITOR_PROMPT_VERSION — the run-identity tag for the intent check
@@ -130,6 +140,14 @@ pub struct AttackerRequest {
     /// Probes already in the fixed shared set. Empty on round 1.
     #[serde(default)]
     pub existing_tests: Vec<SharedProbe>,
+    /// Probes quarantined in an EARLIER round (M3 item 17): the Diagnostician
+    /// classed each as a `TestDefect` (a fault in the test, not the patch), so it
+    /// was removed from the shared set and the Attacker is told not to write it
+    /// again. Empty on round 1. `#[serde(default)]` so a request built without it
+    /// (and any serialized request from before this field existed) reads as "none
+    /// quarantined" rather than failing to deserialize.
+    #[serde(default)]
+    pub quarantined_tests: Vec<QuarantinedProbe>,
 }
 
 /// One probe already in the shared set, as shown to the Attacker.
@@ -137,6 +155,20 @@ pub struct AttackerRequest {
 pub struct SharedProbe {
     pub test_name: String,
     pub test_source: String,
+}
+
+/// One probe the Diagnostician quarantined, as shown to the Attacker (§item 17).
+///
+/// [VANTA-WHY] Carries the `reason` and not just the name: a bare name in a "do
+/// not repeat" list is indistinguishable from the shared set's "already probed"
+/// list, and the point of the quarantine is that the probe was judged DEFECTIVE
+/// — the Attacker has to know it was discarded because the test was wrong, or it
+/// will re-derive the same broken probe from the same issue sentence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuarantinedProbe {
+    pub test_name: String,
+    pub test_source: String,
+    pub reason: String,
 }
 
 // ============================================================================
@@ -320,6 +352,39 @@ fn already_probed_section(existing_tests: &[SharedProbe]) -> String {
 }
 
 // ============================================================================
+// quarantined_section() — the §item 17 addendum to the Attacker's user prompt
+// ============================================================================
+//
+// [VANTA-WHY] A quarantined probe is REMOVED from the shared set, so it cannot
+// appear in `already_probed_section` and the Attacker would otherwise re-derive
+// it from the same issue sentence. This section is the other half of the
+// quarantine: the reason is carried beside the source, because "do not repeat
+// this" is only actionable when the model knows the probe was judged DEFECTIVE
+// (a fault in the test) rather than merely already-used.
+fn quarantined_section(quarantined: &[QuarantinedProbe]) -> String {
+    if quarantined.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from(
+        "\n\nQUARANTINED TESTS — DO NOT WRITE THESE AGAIN:\n\
+         The Diagnostician judged each test below to be DEFECTIVE (a fault in the test itself, \
+         not in the patch), so it was removed from the shared test set and will not run again. \
+         Writing one again spends a slot on a probe that will be discarded a second time.\n",
+    );
+    for probe in quarantined {
+        section.push_str(&format!(
+            "- {} (quarantine reason: {}):\n```\n{}\n```\n",
+            probe.test_name, probe.reason, probe.test_source
+        ));
+    }
+    section.push_str(
+        "Write a probe that is NOT one of these: a different input, boundary, branch or \
+         assertion the patch touches.\n",
+    );
+    section
+}
+
+// ============================================================================
 // VANTA_ATTACKER_CONCISE (§14.22) — one extra sentence, on the first request only
 // ============================================================================
 //
@@ -381,12 +446,20 @@ pub async fn attacker_generate_tests(
     // rule is qualified against the system prompt's TERMINAL FALLBACK.
     let already_probed = already_probed_section(&request.existing_tests);
 
+    // [VANTA-WHY] M3 item 17 — the quarantined probes, with the reason each was
+    // discarded. A quarantined probe is no longer in the shared set, so this is
+    // the ONLY channel that tells the Attacker not to write it again. Empty on
+    // round 1 and on any round that quarantined nothing, so a run with no
+    // quarantine sends the same body it always did plus one empty string.
+    let quarantined = quarantined_section(&request.quarantined_tests);
+
     let user_prompt = format!(
-        "PATCH:\n```diff\n{}\n```\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nISSUE:\n{}{}\n\nWrite AttackerResponse JSON.{}",
+        "PATCH:\n```diff\n{}\n```\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nISSUE:\n{}{}{}\n\nWrite AttackerResponse JSON.{}",
         request.patch_text,
         request.original_source,
         request.issue_text,
         already_probed,
+        quarantined,
         // [VANTA-WHY] §14.22 — empty unless the arm is on, so every default run's
         // first request body is byte-for-byte what it was before this existed.
         if attacker_concise() { ATTACKER_CONCISE_SUFFIX } else { "" }

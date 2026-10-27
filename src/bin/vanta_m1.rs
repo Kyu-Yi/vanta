@@ -98,6 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         issue_text: issue_text.clone(),
         // M1 is a single-shot demo: no previous rounds, no shared set.
         existing_tests: Vec::new(),
+        // M1 runs one round, so no probe can have been quarantined yet (§item 17).
+        quarantined_tests: Vec::new(),
     };
     let attacker_response: AttackerResponse =
         vanta::agents::attacker::attacker_generate_tests(&cfg, &attacker_request).await?;

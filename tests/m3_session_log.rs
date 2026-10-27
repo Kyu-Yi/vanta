@@ -3843,6 +3843,185 @@ fn a_simplified_test_that_dropped_its_assertion_does_not_erase_the_failure() {
     );
 }
 
+/// [VANTA-WHY] M3 item 17 — a `BugReproduction` probe whose OWN code crashes:
+/// `add(2, 3)` is an `int`, which has no `.nonexistent_attribute`. BATE admits it
+/// because it FAILS on the original tree, and the Diagnostician's `locate_fault`
+/// sees the innermost traceback frame inside the generated test's own file
+/// (`test_run.py`), so it classes the failure `TestDefect` — a fault in the test,
+/// not the patch. This is the 56eb4fd3 shape (a fake/typo in the test itself).
+const CRASHING_TEST_DEFECT: &str = r#"{"tests":[
+        {
+            "test_name":"test_defect_crashes_in_its_own_code",
+            "test_source":"from calc import add\n\ndef test_defect_crashes_in_its_own_code():\n    add(2, 3).nonexistent_attribute\n",
+            "intent":"BugReproduction",
+            "reason":"Fails on the original baseline, so BATE admits it.",
+            "issue_quote":"The issue expects a bug-reproduction probe asserting add(2, 3) == 6."
+        }
+    ]}"#;
+
+/// [VANTA-WHY] M3 item 17, acceptance 1 — a `TestDefect` is REMOVED from the
+/// shared set, recorded (name + reason), and its removal means no probe that
+/// expects the original to fail survives, so the terminal verdict is
+/// `NeedsReview(no_admitted_tests)`, never an approval. Before item 17 the
+/// defective probe was folded into the shared set with no removal path, so every
+/// later round re-ran and re-diagnosed the same broken probe.
+#[test]
+fn a_test_defect_is_quarantined_removed_from_the_shared_set_and_recorded() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(CRASHING_TEST_DEFECT);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "the only admitted probe was quarantined, so nothing that expects the \
+         original to fail survived — the verdict is NeedsReview, never an \
+         approval; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let debug_dir = workspace
+        .path()
+        .join("vanta_sessions")
+        .join(records[0].session_id.as_str())
+        .join("debug");
+
+    // The Diagnostician classed it TestDefect and asked for the quarantine
+    // through the SAME payload `action` the Unknown arm has always written.
+    let diagnostic = read_json(
+        &debug_dir.join("attempt_1_diagnostic_test_defect_crashes_in_its_own_code.json"),
+    );
+    assert!(
+        diagnostic["failure_class"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("TestDefect"),
+        "a crash inside the generated test's own file is a defect of the test, not \
+         of the patch; got {}",
+        diagnostic["failure_class"]
+    );
+    assert_eq!(
+        diagnostic["structured_payload"].get("action"),
+        Some(&serde_json::Value::String("quarantine".into())),
+        "a TestDefect must request the quarantine through the one shared action"
+    );
+
+    // It is recorded on the row by count and by name.
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(
+        summary_value(&summary, "quarantine_count"),
+        "1",
+        "got {summary}"
+    );
+    assert_eq!(
+        summary_value(&summary, "quarantined"),
+        "[test_defect_crashes_in_its_own_code]",
+        "the row must name the quarantined probe; got {summary}"
+    );
+
+    // It is recorded with its REASON on its own session row.
+    let quarantine_rows: Vec<&SessionRecord> = records
+        .iter()
+        .filter(|r| r.phase.starts_with("quarantine["))
+        .collect();
+    assert_eq!(quarantine_rows.len(), 1, "one row per quarantined probe");
+    assert_eq!(
+        quarantine_rows[0].phase,
+        "quarantine[test_defect_crashes_in_its_own_code]"
+    );
+    assert!(
+        quarantine_rows[0].summary.contains("QUARANTINED"),
+        "the row must carry WHY the probe was removed; got {}",
+        quarantine_rows[0].summary
+    );
+
+    // It is REMOVED from the shared set: the persisted set is empty, so the probe
+    // cannot be re-run next round.
+    let shared = read_json(&debug_dir.join("shared_tests.json"));
+    assert_eq!(
+        shared.as_array().map(|a| a.len()),
+        Some(0),
+        "a quarantined probe must not be folded into the shared set; got {shared}"
+    );
+
+    // Item 1's invariant then applies: the quarantined probe is not evidence, so
+    // no admitted test that ran expects the original tree to fail.
+    assert_eq!(summary_value(&summary, "invariant_applied"), "true");
+    assert_eq!(
+        summary_value(&summary, "invariant_reason"),
+        "no_admitted_tests",
+        "got {summary}"
+    );
+}
+
+/// [VANTA-WHY] M3 item 17, acceptance 2 — the stall. A static stub re-serves the
+/// SAME defective probe every round, so the only way the run can avoid
+/// re-counting it is if the quarantine really removed it. Before item 17 the
+/// probe entered the shared set and every round re-ran it, ending in
+/// `MaxAttemptsReached`; now each round starts from an empty shared set and the
+/// run ends `NeedsReview`, and a later round's Attacker prompt carries the
+/// quarantined probes so it is told not to write it again.
+#[test]
+fn a_quarantined_probe_is_not_re_counted_and_the_attacker_is_told() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(CRASHING_TEST_DEFECT);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 3, &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "three rounds of a quarantined-only set must end NeedsReview, NOT \
+         MaxAttemptsReached — that stall is what item 17 removes; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let attempt_summaries: Vec<&SessionRecord> = records
+        .iter()
+        .filter(|r| r.phase == "attempt.summary")
+        .collect();
+    assert_eq!(attempt_summaries.len(), 3, "all three rounds ran");
+    assert!(
+        attempt_summaries
+            .iter()
+            .all(|r| r.summary.contains("shared_tests=0")),
+        "the quarantined probe must never enter the shared set, so every round \
+         starts from an empty one; got {:?}",
+        attempt_summaries
+            .iter()
+            .map(|r| r.summary.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(
+        summary_value(&summary, "quarantine_count"),
+        "1",
+        "the same probe quarantined in each round is ONE quarantined probe; got {summary}"
+    );
+
+    // The Attacker is TOLD which probe was quarantined (and why), on the round
+    // that follows it.
+    let bodies = server.request_bodies();
+    assert!(
+        bodies
+            .iter()
+            .any(|b| b.contains("QUARANTINED TESTS — DO NOT WRITE THESE AGAIN")),
+        "a later round's Attacker prompt must carry the quarantined probes; got \
+         {} request bodies",
+        bodies.len()
+    );
+}
+
 #[test]
 fn a_network_failure_is_classified_infrastructure_not_logic() {
     let _serial = serial_run();

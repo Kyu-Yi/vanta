@@ -1198,6 +1198,44 @@ pub fn observe_quote_evidence(test: &GeneratedTest, issue_text: &str) -> QuoteEv
     }
 }
 
+/// M3 item 1 — does the ISSUE itself name what this test asserts?
+///
+/// [VANTA-WHY] This is the loosened grounding question, and it is answered from
+/// the issue and the test's OWN source, never from a candidate patch. Two
+/// deterministic facts, either of which grounds a reproduction test whose
+/// asserted values are not literally quoted:
+///   * (a) the verified `issue_quote` sits in the issue AND names a literal
+///     input the test asserts (`quote_in_issue && quote_names_asserted_input`,
+///     with at least one asserted input to name), or
+///   * (b) a literal the test's own `assert` statements pin appears in the issue
+///     — the issue states the symptom the test checks.
+/// Neither fact reads the patch, so the override in `apply_intent_verdict`
+/// cannot be steered by a candidate: the worst it can do is keep a probe the
+/// auditor asked to drop, and item 1's approval invariant bounds that.
+fn issue_names_what_the_test_asserts(
+    test: &GeneratedTest,
+    issue_text: &str,
+    evidence: &QuoteEvidence,
+) -> bool {
+    // (a) — a verified quote naming an asserted input. Guarded on a non-empty
+    // input set: with no asserted input there is nothing for the quote to name,
+    // and `quote_names_asserted_input` is vacuously true in that case.
+    if evidence.quote_in_issue
+        && evidence.quote_names_asserted_input
+        && !evidence.asserted_inputs.is_empty()
+    {
+        return true;
+    }
+
+    // (b) — the issue states a literal the test's asserts pin. Read off the
+    // assert lines only, so an input mentioned in the issue that the test merely
+    // passes (without asserting anything about it) does not ground it.
+    let normalized_issue = normalize_issue_text(issue_text);
+    asserted_contract_literals(&test.test_source)
+        .iter()
+        .any(|literal| quote_names_literal(&normalized_issue, literal))
+}
+
 /// How the intent audit routes one test, given the auditor's verdict.
 ///
 /// [VANTA-WHY] Item 6 — the whole routing is a pure function of the VERDICT, so
@@ -1328,6 +1366,35 @@ fn apply_intent_verdict(
 ) -> (Option<GeneratedTest>, Option<IntentRelabel>, Option<IntentCheckRecord>) {
     let evidence = observe_quote_evidence(test, issue_text);
 
+    // [VANTA-WHY] M3 item 1 — the grounding rule is LOOSENED here, in the one
+    // direction the plan allows. `ScrapUngrounded` was §14.4's fix for a test
+    // that reproduced a symptom AND laid an invented assertion on top; what the
+    // rule on Luna did instead was scrap every reproduction test whose asserted
+    // values were not literally quoted in the issue, and the review then
+    // approved a no-op on preservation tests alone (M3-plan §1.4, 12/12). The
+    // plan's loosening: a reproduction test is grounded when its asserted
+    // behaviour follows from the issue — the issue NAMES the input or the
+    // symptom — even when the exact values are not written out.
+    //
+    // [VANTA-WHY] Two deterministic facts settle "the issue names it", and
+    // neither is the model's opinion again:
+    //   * the verified `issue_quote` names a literal input the test asserts
+    //     (`quote_in_issue && quote_names_asserted_input`), or
+    //   * a literal the test's own `assert` statements pin is stated by the
+    //     issue (the issue names the symptom the test checks).
+    // Both are computed from the ISSUE, never from the patch, so the override
+    // cannot be steered by a candidate.
+    //
+    // [VANTA-WHY] The override runs in ONE direction only: it can KEEP a test
+    // the auditor asked to scrap, never scrap one it wanted kept. So a model
+    // that answers `assertions_grounded: false` too eagerly still cannot
+    // manufacture a rejection — the worst case is a probe kept that the audit
+    // would have dropped, and item 1's approval invariant bounds what keeping it
+    // can do. The records stay honest: `assertions_grounded` still carries the
+    // auditor's own answer, with `scrapped=false` and a reason naming the
+    // override.
+    let grounded_by_issue = issue_names_what_the_test_asserts(test, issue_text, &evidence);
+
     let record = |scrapped: bool, reason: String| IntentCheckRecord {
         test_name: test.test_name.clone(),
         declared_intent: test.intent.clone(),
@@ -1339,12 +1406,40 @@ fn apply_intent_verdict(
         evidence: evidence.clone(),
     };
 
-    match route_intent(&test.intent, &verdict, test.relabeled) {
-        IntentRouting::Keep => (
-            Some(test.clone()),
-            None,
-            Some(record(false, verdict.reason.clone())),
-        ),
+    // [VANTA-WHY] The routing is `route_intent`'s — unchanged — with item 1's
+    // one deterministic loosening applied to its single scrap arm. Nothing else
+    // is touched, so every other routing decision remains a pure function of the
+    // verdict and is tested as one.
+    let routing = route_intent(&test.intent, &verdict, test.relabeled);
+    let routing = if routing == IntentRouting::ScrapUngrounded && grounded_by_issue {
+        IntentRouting::Keep
+    } else {
+        routing
+    };
+
+    match routing {
+        IntentRouting::Keep => {
+            // [VANTA-WHY] When the override fired, the record must say so: the
+            // auditor's own `assertions_grounded=false` is kept on the record,
+            // and this reason is what tells a reader why the test was NOT
+            // scrapped despite it.
+            let reason = if grounded_by_issue && verdict.assertions_grounded == Some(false) {
+                format!(
+                    "assertions_grounded=false overridden: the issue itself names what this test \
+                     asserts ({}), so the assertion is grounded even though the exact value is not \
+                     quoted: {}",
+                    if evidence.asserted_inputs.is_empty() {
+                        "the asserted literal appears in the issue".to_string()
+                    } else {
+                        format!("asserted input(s) {}", evidence.asserted_inputs.join(", "))
+                    },
+                    verdict.reason
+                )
+            } else {
+                verdict.reason.clone()
+            };
+            (Some(test.clone()), None, Some(record(false, reason)))
+        }
 
         IntentRouting::PromoteToFeature => {
             // [VANTA-WHY] Item 6 — B v2's shape. The test declares preservation

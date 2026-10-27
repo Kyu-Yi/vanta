@@ -1213,6 +1213,17 @@ pub async fn run(
     // this class of bug is one legible manifest row rather than a long trail of
     // revisions. `None` is every run in which the environment held.
     let mut harness_error: Option<String> = None;
+    // [VANTA-WHY] M3 item 1 — the grounding rule's ledger for the run. The plan
+    // asks for the number of reproduction tests the rule scrapped per review;
+    // reporting the pair (scrapped, kept because the issue names what the test
+    // asserts) makes it readable as a before/after, which is the whole point of
+    // the loosening. `None` means NO grounded audit ran in this run
+    // (`VANTA_GROUNDED_AUDIT=off`), and it is written as `null` rather than `0`:
+    // `0` is a measurement ("the audit ran and scrapped nothing"), `null` is the
+    // absence of one, and a reader must not confuse the two. The slot becomes
+    // `Some(0)` at the first grounded-audited round.
+    let mut grounded_scrapped_total: Option<usize> = None;
+    let mut grounded_kept_by_issue_total: Option<usize> = None;
     let decision = 'attempts: loop {
         // [VANTA-WHY] §14.15 — the deadline is checked here as well as in the LLM
         // layer, and this is the check that turns "the calls stopped" into "the
@@ -1795,6 +1806,16 @@ pub async fn run(
             })?;
             log_intent_checks(&mut session_log, &session_id, &patch_attempt_id, &testing_iteration_id, "attacker.generate", &initial_intent_checks)?;
             announce_ungrounded_scraps(&initial_intent_checks);
+            let (scrapped, kept_by_issue) = grounding_counts(&initial_intent_checks);
+            // [VANTA-WHY] M3 item 1 — from here the ledger is a MEASUREMENT, not an
+            // absence: a grounded-audited round ran. Only with `VANTA_GROUNDED_AUDIT=on`
+            // is there a field for the auditor to answer, and `grounding_counts` reads
+            // nothing else, so the flag is the honest gate for "`Some` rather than
+            // `null`".
+            if grounded_audit_enabled {
+                *grounded_scrapped_total.get_or_insert(0) += scrapped;
+                *grounded_kept_by_issue_total.get_or_insert(0) += kept_by_issue;
+            }
             for check in &initial_intent_checks {
                 issue_requires_change_by_test
                     .insert(check.test_name.clone(), check.issue_requires_change);
@@ -1939,6 +1960,11 @@ pub async fn run(
         }
         log_intent_checks(&mut session_log, &session_id, &patch_attempt_id, &testing_iteration_id, "attacker.revise", &bate_intent_checks)?;
         announce_ungrounded_scraps(&bate_intent_checks);
+        let (scrapped, kept_by_issue) = grounding_counts(&bate_intent_checks);
+        if grounded_audit_enabled {
+            *grounded_scrapped_total.get_or_insert(0) += scrapped;
+            *grounded_kept_by_issue_total.get_or_insert(0) += kept_by_issue;
+        }
         // [VANTA-WHY] BATE's answers come AFTER a possible revision, so they
         // describe the test version that actually runs. They overwrite the
         // generation-time answers for the same name — the newer answer is the
@@ -2756,6 +2782,44 @@ pub async fn run(
 
         match decision {
             GovernorDecision::AllTestsPassed => {
+                // [VANTA-WHY] M3 item 1 — the approval invariant. §1.4's defect
+                // was 12/12 reviews approving a no-op: the grounded audit had
+                // scrapped every reproduction probe, the preservation probes all
+                // passed, and `AllTestsPassed` was read as "the candidate is
+                // good" when all it said was "nothing that survived disagrees".
+                // An approval must therefore rest on at least one admitted test
+                // that EXPECTS THE ORIGINAL TO FAIL — a `BugReproduction` or
+                // `FeatureAcceptance` probe that actually ran on the candidate —
+                // and the answer is `NeedsReview`, never `Approve`, when none
+                // did. `approval_invariant_status` is the one place that decides
+                // this, and `run.summary` reads the same function, so the verdict
+                // and the row cannot disagree. The gate is deliberately NOT
+                // conditioned on any §14 flag: turning the audits off must not be
+                // a way to buy back an approval.
+                let (applied, reason) =
+                    approval_invariant_status(governor_mode, attacker_enabled, &final_evidence);
+                if applied && reason != INVARIANT_SATISFIED {
+                    // [VANTA-WHY] M3 item 1 — the two withheld-approval reasons are
+                    // two different diagnoses, so they get two different sentences
+                    // and the recorded token is printed either way.
+                    let why = match reason {
+                        NO_ADMITTED_TESTS => {
+                            "no test was admitted, so an approval would rest on nothing at all"
+                        }
+                        _ => {
+                            "no admitted test that ran against the candidate expects the \
+                             original tree to fail (no BugReproduction or FeatureAcceptance probe \
+                             survived and executed), so every surviving test passing only says \
+                             the candidate broke nothing"
+                        }
+                    };
+                    println!("  ⚠ NEEDS REVIEW — {why}: {reason}");
+                    // The candidate is attached exactly as for the corroboration
+                    // `NeedsReview` above: the human needs the patch, and
+                    // `final.patch` is written for every terminal verdict.
+                    final_patched_files = Some(patched_files);
+                    break GovernorDecision::NeedsReview;
+                }
                 final_patched_files = Some(patched_files);
                 // Collect accepted tests (test sources) for the PR.
                 final_accepted_tests = Some(render_committed_test_file(&valid_tests));
@@ -3145,6 +3209,26 @@ pub async fn run(
         benchmark_instance: Some(config_name.to_string()),
         benchmark_label: None,
     })?;
+    // [VANTA-WHY] M3 item 1 — the approval invariant's own answer, carried on the
+    // row so the exemption is a recorded fact and not an inference from the
+    // flags. Computed from the same function the `AllTestsPassed` arm used, so
+    // the row and the verdict cannot disagree. A run that ended without an
+    // approval (`Rejected`/`MaxAttemptsReached`/`InfraFailure`/`HarnessFailure`)
+    // gave the invariant nothing to constrain — `invariant_applied=false` with
+    // `no_approval` says exactly that, rather than reporting a satisfied/not
+    // reading about a decision the run never made.
+    let (invariant_applied_here, invariant_reason_here) =
+        approval_invariant_status(governor_mode, attacker_enabled, &final_evidence);
+    let invariant_applied = invariant_applied_here
+        && matches!(
+            decision,
+            GovernorDecision::AllTestsPassed | GovernorDecision::NeedsReview
+        );
+    let invariant_reason = if invariant_applied_here && !invariant_applied {
+        "no_approval"
+    } else {
+        invariant_reason_here
+    };
     session_log.append(SessionRecord {
         session_id: session_id.clone(),
         schema_version: Some(SCHEMA_VERSION),
@@ -3172,7 +3256,9 @@ pub async fn run(
              service_tier={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
              commit={} dirty={} prompt_version={} prompt_hash={} context_selection={} \
-             harness_error={}",
+             harness_error={} \
+             invariant_applied={} invariant_reason={} \
+             grounded_scrapped={} grounded_kept_by_issue={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -3336,6 +3422,19 @@ pub async fn run(
             // absence. The full evidence is the `bate.harness_error[…]` session
             // row; this holds the space-free token the parser needs.
             harness_error.as_deref().unwrap_or("unset"),
+            // [VANTA-WHY] M3 item 1 — the approval invariant's answer and the
+            // grounding rule's ledger, appended after the pre-existing keys so an
+            // older row's reader is unaffected. `invariant_applied=false` with
+            // its reason names every configuration the gate does not constrain
+            // (a repair run, the Attacker-off `baseline` review, a review that
+            // ended without an approval); `grounded_scrapped` /
+            // `grounded_kept_by_issue` are the plan's per-review grounding
+            // report, split into what the rule removed and what item 1's
+            // loosening put back — and `null` when no grounded audit ran.
+            invariant_applied,
+            invariant_reason,
+            ledger_text(grounded_scrapped_total),
+            ledger_text(grounded_kept_by_issue_total),
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),
@@ -4596,6 +4695,127 @@ fn flag_text(enabled: bool) -> &'static str {
     if enabled { "on" } else { "off" }
 }
 
+/// M3 item 1 — the `NeedsReview` reason a withheld approval carries.
+///
+/// [VANTA-WHY] `run.summary` is parsed as space-free `key=value` pairs, so the
+/// reason has to be one token; these constants are the one place they are
+/// spelled, and both the console line and the row read them, so the printed
+/// reason and the recorded one cannot drift. There are two withheld-approval
+/// reasons because there are two distinct failures of evidence, and a reader
+/// triaging a row must be able to tell them apart:
+///   * `no_admitted_tests` — nothing was admitted at all, so the approval would
+///     rest on literally no test. Nothing ran, so there is no signal to reason
+///     about; the Attacker or the admission gate, not a weak probe, is what to
+///     look at.
+///   * `no_reproduction_evidence` — tests WERE admitted and ran, but none of
+///     them expects the original tree to fail. The candidate is unpinned: it
+///     broke nothing the surviving probes check, which a no-op also achieves.
+const NO_REPRODUCTION_EVIDENCE: &str = "no_reproduction_evidence";
+const NO_ADMITTED_TESTS: &str = "no_admitted_tests";
+
+/// The invariant's reason when an approval IS backed by the required evidence.
+const INVARIANT_SATISFIED: &str = "satisfied";
+
+/// Does any admitted test that RAN on the candidate expect the ORIGINAL tree to
+/// fail?
+///
+/// [VANTA-WHY] M3 item 1 — `BugReproduction` and `FeatureAcceptance` are the two
+/// intents whose BATE contract demands a failure on the unpatched tree
+/// (`bate::expected_baseline`), i.e. the two labels under which a PASSING
+/// candidate is evidence that the issue is fixed. `BehaviorPreservation` asserts
+/// the opposite — that nothing changed — so a set of preservation-only tests
+/// that all pass is exactly the shape a no-op produces, and it must not be
+/// enough to approve on. `evidence` is the attempt's graded run, so every entry
+/// here was executed against the candidate.
+fn expects_baseline_failure(evidence: &[TestEvidence]) -> bool {
+    evidence.iter().any(|e| {
+        matches!(
+            e.intent,
+            TestIntent::BugReproduction | TestIntent::FeatureAcceptance
+        )
+    })
+}
+
+/// M3 item 1 — is the approval invariant in force on this configuration, and if
+/// so does the attempt's evidence satisfy it?
+///
+/// [VANTA-WHY] Returns `(applied, reason)`. The invariant constrains only an
+/// APPROVAL, and only an approval Vanta could have backed with its own probes,
+/// so two configurations are recorded as exempt rather than silently skipped —
+/// a reader of the row must be able to see the gate was inapplicable, not infer
+/// it:
+///   * `not_review`  — a repair run. There is no review approval to constrain.
+///   * `attacker_off` — a REVIEW with no Attacker (the §4.2 `baseline` arm). No
+///     test was ever admitted, so the requirement could never be met and every
+///     baseline review would be withheld. `baseline` is the study's comparison
+///     arm and must stay byte-identical, so it is exempt by construction rather
+///     than by a value that could drift.
+/// With the invariant in force there are three answers: `satisfied` when at
+/// least one admitted test expects the original to fail, `no_reproduction_evidence`
+/// when tests ran but none of them does, and `no_admitted_tests` when nothing was
+/// admitted at all. The last two are different diagnoses and are recorded
+/// differently on purpose — see `NO_ADMITTED_TESTS`.
+fn approval_invariant_status(
+    mode: GovernorMode,
+    attacker_enabled: bool,
+    evidence: &[TestEvidence],
+) -> (bool, &'static str) {
+    if mode != GovernorMode::Review {
+        return (false, "not_review");
+    }
+    if !attacker_enabled {
+        return (false, "attacker_off");
+    }
+    if evidence.is_empty() {
+        return (true, NO_ADMITTED_TESTS);
+    }
+    (
+        true,
+        if expects_baseline_failure(evidence) {
+            INVARIANT_SATISFIED
+        } else {
+            NO_REPRODUCTION_EVIDENCE
+        },
+    )
+}
+
+/// M3 item 1 — renders a grounding-ledger slot for `run.summary`.
+///
+/// [VANTA-WHY] `null` is not `0`. The ledger is `None` exactly when no grounded
+/// audit ran (`VANTA_GROUNDED_AUDIT=off`), and writing `0` there would claim a
+/// measurement the run never made — indistinguishable from an audit that ran and
+/// found nothing to scrap. `run.summary` is space-free `key=value`, so the two
+/// cases have to be two tokens.
+fn ledger_text(value: Option<usize>) -> String {
+    match value {
+        Some(count) => count.to_string(),
+        None => "null".to_string(),
+    }
+}
+
+/// M3 item 1 — how the grounding rule treated this round's audits.
+///
+/// [VANTA-WHY] Returns `(scrapped, kept_by_issue)`. Every audit record whose
+/// `assertions_grounded` is an EXPLICIT `Some(false)` is exactly one of the two:
+/// `route_intent` sends a `BugReproduction` test with that answer to
+/// `ScrapUngrounded` unconditionally, and item 1's loosening either leaves it
+/// scrapped or turns it into `Keep` when the issue itself names what the test
+/// asserts. So the counts partition the set and neither can double-count the
+/// other. `None` records — the flag off, or a field the model omitted — are
+/// counted by neither, which is why a run with `VANTA_GROUNDED_AUDIT=off`
+/// reports `null` for both rather than `0`.
+fn grounding_counts(checks: &[IntentCheckRecord]) -> (usize, usize) {
+    let ungrounded = checks
+        .iter()
+        .filter(|c| c.assertions_grounded == Some(false))
+        .count();
+    let scrapped = checks
+        .iter()
+        .filter(|c| c.assertions_grounded == Some(false) && c.scrapped)
+        .count();
+    (scrapped, ungrounded - scrapped)
+}
+
 /// Print one line per §14.4 ungrounded scrap, with the auditor's reason.
 ///
 /// [VANTA-WHY] A scrap removes a rejection signal, so the one thing that must be
@@ -4703,15 +4923,19 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        attempt_verdict, bate_baseline_concat, blocking_static_findings, build_source_concat,
-        cache_hit_rate_value, collapse_decision, dependency_freeze_summary_value,
-        harness_infrastructure_collapse, modified_test_config_records,
-        patch_attempt_id_for_patch, record_new_static_findings, rejection_signal_message,
-        render_committed_test_file, require_clean_target_repo_for_open_pr, stamp_transition_row,
-        stable_patch_fingerprint,
+        approval_invariant_status, attempt_verdict, bate_baseline_concat, blocking_static_findings,
+        build_source_concat, cache_hit_rate_value, collapse_decision,
+        dependency_freeze_summary_value, harness_infrastructure_collapse, ledger_text,
+        modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
+        rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
+        stamp_transition_row, stable_patch_fingerprint, INVARIANT_SATISFIED,
+        NO_ADMITTED_TESTS, NO_REPRODUCTION_EVIDENCE,
     };
     use crate::agents::attacker::GeneratedTest;
-    use crate::core::{AttemptTransition, EvidenceSource, FailureClass, GovernorDecision, TestIntent, TestResult};
+    use crate::core::{
+        AttemptTransition, EvidenceSource, FailureClass, GovernorDecision, TestEvidence,
+        TestIntent, TestResult, VerificationOutcome,
+    };
     use crate::pipeline::governor::{AttemptVerdict, GovernorMode};
     use crate::pipeline::harness::StaticDiagnostic;
     use crate::session::{PatchAttemptId, SessionId};
@@ -5378,5 +5602,101 @@ mod tests {
             "a patch-modified test must never reach BATE's tree"
         );
         assert!(bate_tree.contains("assert double(2) == 4"));
+    }
+
+    /// One admitted, executed test with the intent under test.
+    fn evidence(name: &str, intent: TestIntent) -> TestEvidence {
+        TestEvidence {
+            test_name: name.to_string(),
+            outcome: VerificationOutcome::VerifiedWithinBounds,
+            failure_class: None,
+            structured_payload: None,
+            intent,
+            evidence_source: EvidenceSource::AttackerGenerated,
+        }
+    }
+
+    // [VANTA-WHY] M3 item 1 — "nothing was admitted" is its own withheld-approval
+    // answer, not a shade of "nothing pinned the candidate".
+    //
+    // [VANTA-WHY] This is the one answer the DRIVER cannot reach through an
+    // approval today: with the Attacker on, an attempt that admitted nothing
+    // (and has no shared set) is routed to `Inconclusive` by the pre-run guard
+    // before the graded run, so the `AllTestsPassed` arm is never reached with an
+    // empty evidence list; `run.summary` then records `no_approval`, because
+    // `MaxAttemptsReached` is not an approval for the invariant to constrain. The
+    // guard protects the VERDICT, not the ANSWER. The rule still has to answer for
+    // the empty set — it is what `run.summary` reads and what the quarantine path
+    // (item 17) will read when quarantine empties the shared set — so the answer
+    // is pinned here where it can be checked without a model.
+    #[test]
+    fn no_admitted_tests_is_a_distinct_withheld_approval_reason() {
+        assert_eq!(
+            approval_invariant_status(GovernorMode::Review, true, &[]),
+            (true, NO_ADMITTED_TESTS),
+            "zero admitted tests must withhold the approval with its own reason"
+        );
+        assert_ne!(
+            NO_ADMITTED_TESTS, NO_REPRODUCTION_EVIDENCE,
+            "the two withheld-approval reasons are different diagnoses and a reader \
+             triaging a row must be able to tell them apart"
+        );
+    }
+
+    // [VANTA-WHY] M3 item 1 — every answer the invariant can give, including the
+    // two configurations where it is INAPPLICABLE. An exemption has to be
+    // recorded with its reason rather than silently skipped, or a baseline row
+    // would be indistinguishable from a Vanta row that happened to be satisfied.
+    #[test]
+    fn the_approval_invariant_names_each_exemption_and_each_answer() {
+        // Exemptions: a repair run, and the Attacker-off `baseline` review.
+        assert_eq!(
+            approval_invariant_status(GovernorMode::Repair, true, &[]),
+            (false, "not_review")
+        );
+        assert_eq!(
+            approval_invariant_status(GovernorMode::Review, false, &[]),
+            (false, "attacker_off")
+        );
+        // In force and satisfied by a probe that expects the original to fail —
+        // under either label, because a feature-request issue is approvable too.
+        for intent in [TestIntent::BugReproduction, TestIntent::FeatureAcceptance] {
+            let label = format!("{intent:?}");
+            assert_eq!(
+                approval_invariant_status(
+                    GovernorMode::Review,
+                    true,
+                    &[evidence("t_pins", intent)],
+                ),
+                (true, INVARIANT_SATISFIED),
+                "{label} expects the original to fail, so it pins the candidate"
+            );
+        }
+        // In force and withheld: preservation-only evidence ran, so a passing set
+        // says only that the candidate broke nothing — which a no-op also achieves.
+        assert_eq!(
+            approval_invariant_status(
+                GovernorMode::Review,
+                true,
+                &[evidence("t_pres", TestIntent::BehaviorPreservation)],
+            ),
+            (true, NO_REPRODUCTION_EVIDENCE)
+        );
+    }
+
+    // [VANTA-WHY] M3 item 1 — the grounding ledger separates "the audit ran and
+    // found nothing" from "no audit ran". `run.summary` is space-free
+    // `key=value`, so the two cases have to be two tokens and `0` cannot stand in
+    // for the absence of a measurement.
+    #[test]
+    fn the_grounding_ledger_writes_null_when_no_audit_ran_and_a_count_when_one_did() {
+        assert_eq!(ledger_text(None), "null");
+        assert_eq!(ledger_text(Some(0)), "0");
+        assert_eq!(ledger_text(Some(7)), "7");
+        assert_ne!(
+            ledger_text(None),
+            ledger_text(Some(0)),
+            "an audit that ran and scrapped nothing is not the same row as one that never ran"
+        );
     }
 }

@@ -811,10 +811,6 @@ const SYNTAX_ERROR_PATCH: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.py\
 /// survives every round — this is that candidate.
 const PRESERVING_PATCH: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,3 @@\n def add(a, b):\n+    \"\"\"Return the sum of two numbers.\"\"\"\n     return a + b\n";
 
-/// The tree `PRESERVING_PATCH` produces from `write_test_repo`'s `calc.py`.
-const PRESERVING_PATCHED_SOURCE: &str =
-    "def add(a, b):\n    \"\"\"Return the sum of two numbers.\"\"\"\n    return a + b\n";
-
 const THREE_SIGNAL_TESTS: &str = r#"{"tests":[
         {
             "test_name":"test_bug_regression_signal",
@@ -993,19 +989,27 @@ const SINGLE_BUG_REPRODUCTION_TEST: &str = r#"{"tests":[
         }
     ]}"#;
 
-/// A round of two tests: a reproduction probe that pins a string the issue never
+/// A round of two tests: a reproduction probe that pins a value the issue never
 /// states, and a preservation probe that passes on the original tree.
 ///
 /// [VANTA-WHY] §14.4 — one answer is served to both tests, so this is what proves
 /// the mirror: the third question may scrap the REPRODUCTION probe, and it may
 /// never scrap the preservation probe, whatever the answer says.
+///
+/// [VANTA-WHY] M3 item 1 part 2 — the grounding rule was LOOSENED, so a probe that
+/// merely asserts a value the issue happens to name is now KEPT. To still exercise
+/// the `ScrapUngrounded` arm the probe must be ungrounded on BOTH grounded facts:
+/// its asserted literals (input `9`, `4` and expected `99`) appear NOWHERE in
+/// `TEST_ISSUE_TEXT`, and its `issue_quote` is the verbatim no-input sentence, so
+/// the quote is in the issue but names no asserted input. Either fact alone would
+/// ground it and the scrap would never fire.
 const UNGROUNDED_AND_PRESERVING_TESTS: &str = r#"{"tests":[
         {
             "test_name":"test_bug_reproduction_pins_invented_text",
-            "test_source":"from calc import add\n\ndef test_bug_reproduction_pins_invented_text():\n    assert add(2, 3) == 6\n    assert \"Starting var\" in str(add(2, 3))\n",
+            "test_source":"from calc import add\n\ndef test_bug_reproduction_pins_invented_text():\n    assert add(9, 4) == 99\n    assert \"Starting var\" in str(add(9, 4))\n",
             "intent":"BugReproduction",
             "reason":"Fails on the original baseline, so BATE admits it.",
-            "issue_quote":"The issue expects a bug-reproduction probe asserting add(2, 3) == 6."
+            "issue_quote":"Please fix that boundary bug without changing the existing behavior at the other thresholds."
         },
         {
             "test_name":"test_preserve_add_pair",
@@ -1053,6 +1057,72 @@ const PRESERVATION_PROBE_ASSERTING_THE_NEW_BEHAVIOUR: &str = r#"{"tests":[
 /// becomes 6, the value the issue asks for. It is a CORRECT patch, so a run that
 /// wrongly scrapped the probe would report a false rejection.
 const NEW_BEHAVIOUR_PATCH: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a + b\n+    return a + b + 1\n";
+
+/// The tree `NEW_BEHAVIOUR_PATCH` produces from `write_test_repo`'s `calc.py`.
+const NEW_BEHAVIOUR_PATCHED_SOURCE: &str = "def add(a, b):\n    return a + b + 1\n";
+
+/// A candidate that FIXES ONE boundary and leaves every other result alone.
+///
+/// [VANTA-WHY] M3 item 1 — the approval invariant requires an admitted test
+/// whose intent EXPECTS THE ORIGINAL TREE TO FAIL (BugReproduction or
+/// FeatureAcceptance) to have run against the candidate. A plumbing test that
+/// only observes the run (its records, its accounting, its request bodies) still
+/// needs a real approval, so its fixture needs an admitted reproduction probe —
+/// and such a probe only passes on the candidate if the candidate really changes
+/// the value it pins. `NEW_BEHAVIOUR_PATCH` changes every input; this one changes
+/// `add(2, 3)` to 6 (the value the issue names) and preserves `add` at every
+/// other input, which is what lets one fixture carry BOTH the reproduction probe
+/// and the behaviour-preservation probes that must still pass on the patched
+/// tree.
+const BOUNDARY_FIX_PATCH: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a + b\n+    return a + b if (a, b) != (2, 3) else 6\n";
+
+/// The tree `BOUNDARY_FIX_PATCH` produces from `write_test_repo`'s `calc.py`.
+const BOUNDARY_FIX_PATCHED_SOURCE: &str =
+    "def add(a, b):\n    return a + b if (a, b) != (2, 3) else 6\n";
+
+/// ONE round carrying BOTH kinds of admitted probe: a `BugReproduction` that pins
+/// the value the issue asks for at the boundary `BOUNDARY_FIX_PATCH` moves, and a
+/// `BehaviorPreservation` at an input the patch leaves alone.
+///
+/// [VANTA-WHY] M3 item 1 — the invariant is a floor, not a ban, and this pair is
+/// what proves the two halves cannot be confused: the preservation probe is
+/// admitted and passes, so it can neither satisfy the invariant nor be the reason
+/// the run fails; the reproduction probe passes only because the candidate really
+/// moved `add(2, 3)`, which is the evidence the invariant demands.
+const BOUNDARY_FIX_PROBES: &str = r#"{"tests":[
+        {
+            "test_name":"test_bug_reproduction_boundary",
+            "test_source":"from calc import add\n\ndef test_bug_reproduction_boundary():\n    assert add(2, 3) == 6\n",
+            "intent":"BugReproduction",
+            "reason":"Fails on the original baseline, so BATE admits it.",
+            "issue_quote":"The issue expects a bug-reproduction probe asserting add(2, 3) == 6."
+        },
+        {
+            "test_name":"test_preserve_other_input",
+            "test_source":"from calc import add\n\ndef test_preserve_other_input():\n    assert add(4, 5) == 9\n",
+            "intent":"BehaviorPreservation",
+            "reason":"Passes on the original tree and on a patch that only moves add(2, 3)."
+        }
+    ]}"#;
+
+/// ONE `BugReproduction` probe that carries NO `issue_quote` and asserts exactly
+/// the value the issue names.
+///
+/// [VANTA-WHY] M3 item 1 part 2 — the loosening is only real if it survives the
+/// case it was written for: an auditor that says `assertions_grounded=false` while
+/// the test's asserted contract IS named in the issue. Fact (a) (a quote in the
+/// issue naming an asserted input) cannot hold here, because there is no quote at
+/// all, so this probe is grounded by fact (b) alone — which is exactly the
+/// difference between the old rule and the new one, and the shape that lost 12 of
+/// 12 no-op approvals their only reproduction probe.
+const GROUNDED_SYMPTOM_PROBE: &str = r#"{"tests":[
+        {
+            "test_name":"test_bug_reproduction_no_quote",
+            "test_source":"from calc import add\n\ndef test_bug_reproduction_no_quote():\n    assert add(2, 3) == 6\n",
+            "intent":"BugReproduction",
+            "reason":"Fails on the original baseline, so BATE admits it."
+        }
+    ]}"#;
 
 /// A Creator patch that APPLIES cleanly but leaves the tree unimportable.
 ///
@@ -1355,12 +1425,15 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
     let workspace = TempDir::new().unwrap();
     // [VANTA-WHY] In review mode `--max-attempts` is ATTACK DEPTH, and a round
     // that finds a Logic failure ends the run at once. So a run that spans three
-    // rounds needs a candidate that SURVIVES every round — a behaviour-preserving
-    // patch and a preservation-only test set — not a bad patch that would be
-    // rejected on round 1.
+    // rounds needs a candidate that SURVIVES every round — and under item 1 it
+    // also needs an admitted probe whose intent EXPECTS the original tree to
+    // fail. One `BugReproduction` probe against a candidate that implements the
+    // behaviour it pins is both at once: it fails on the original tree, passes on
+    // every round's candidate, and the dedup drops the later copies so each round
+    // still runs exactly one probe.
     let (_repo_dir, _issue_path, patch_path) =
-        write_test_repo(workspace.path(), PRESERVING_PATCH);
-    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+        write_test_repo(workspace.path(), NEW_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
 
     let status = run_patch_mode(workspace.path(), &patch_path, &server);
 
@@ -1372,7 +1445,7 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
         server.request_count(),
         4,
         "one Attacker call per review round (3), plus the round-1 patch-blind intent \
-         audit of the preservation probe; rounds 2 and 3 generate the same probe, so \
+         audit of the reproduction probe; rounds 2 and 3 generate the same probe, so \
          the dedup drops it before there is anything left to audit"
     );
 
@@ -1471,7 +1544,7 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
     );
     assert_eq!(
         fs::read_to_string(debug_dir.join("attempt_1_patched_tree").join("calc.py")).unwrap(),
-        PRESERVING_PATCHED_SOURCE
+        NEW_BEHAVIOUR_PATCHED_SOURCE
     );
 
     // The structural checks above prove the tree is well-formed. These prove the
@@ -1491,7 +1564,7 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
     }
     assert!(
         patched_result_kinds.iter().all(|r| r == "Passed"),
-        "the behaviour-preserving candidate must yield Passed patched results — an Error means the \
+        "the surviving candidate must yield Passed patched results — an Error means the \
          harness failed to produce a runnable tree; got {patched_result_kinds:?}"
     );
 
@@ -1632,11 +1705,19 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
 /// duplicates are discarded automatically. This pins the other half of that
 /// promise: a round whose three Attacker tests are ALL duplicates of the shared
 /// set ends NORMALLY. Every duplicate is dropped before it is audited, the round
-/// still runs the shared set, and the run advances to the approval — no audit
-/// call is made for a round with nothing to audit, and nothing is an error.
+/// still runs the shared set, and the run advances to the end of the attack depth
+/// — no audit call is made for a round with nothing to audit, and nothing is an
+/// error.
 ///
 /// The fixture repeats the SAME three preservation probes every round, so from
 /// round 2 the shared set IS those three and every generated test is a duplicate.
+///
+/// [VANTA-WHY] M3 item 1 — the shared set is preservation-ONLY, so it contains no
+/// probe that expects the original tree to fail. The governor's own reading is
+/// still `AllTestsPassed` (nothing that survived disagrees), but the approval
+/// invariant turns that into `NeedsReview(no_reproduction_evidence)`: this is the
+/// exact no-op-plus-preservation shape that produced 12/12 spurious approvals in
+/// §1.4, and it must never approve again.
 #[test]
 fn a_round_of_all_duplicates_is_dropped_and_the_run_advances() {
     let _serial = serial_run();
@@ -1647,9 +1728,12 @@ fn a_round_of_all_duplicates_is_dropped_and_the_run_advances() {
 
     let status = run_patch_mode(workspace.path(), &patch_path, &server);
 
-    assert!(
-        status.success(),
-        "a round that only repeats the shared set is not an error: the candidate still passes"
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "the run must advance to the end of the attack depth and, because nothing \
+         that survived expects the original to fail, land on NeedsReview — never an \
+         error and never an approval"
     );
 
     // One generate call per round (3). The intent audit runs ONLY for round 1's
@@ -1722,8 +1806,10 @@ fn a_round_of_all_duplicates_is_dropped_and_the_run_advances() {
         "every audit record must belong to the round that generated its probes"
     );
 
-    // The run advances: three rounds ran, and the candidate is approved at the
-    // end of the attack depth rather than erroring out on a duplicate-only round.
+    // The run advances: three rounds ran and nothing errored out on a duplicate-only
+    // round. The governor's own reading of the last attempt is still the approval —
+    // `attempt.summary` is written BEFORE the item-1 invariant runs, so it records
+    // what the governor saw (nothing that survived disagrees).
     let attempt_summaries: Vec<&SessionRecord> = records
         .iter()
         .filter(|r| r.phase == "attempt.summary")
@@ -1735,18 +1821,193 @@ fn a_round_of_all_duplicates_is_dropped_and_the_run_advances() {
             .unwrap()
             .summary
             .contains("decision=AllTestsPassed"),
-        "the candidate must be approved at the end of the attack depth; got {}",
+        "the governor itself must still read the last attempt as a pass; got {}",
         attempt_summaries.last().unwrap().summary
     );
     assert!(
         !records.iter().any(|r| r.phase == "run.infra_failure"),
         "a duplicate-only round is normal, not an infrastructure failure"
     );
+    // [VANTA-WHY] M3 item 1 — the terminal verdict is NOT that approval. The
+    // surviving set is preservation-only, so no test expected the original to fail
+    // and the invariant overrides the governor: `NeedsReview` with the reason
+    // recorded on the row, so the verdict and the row can never disagree.
+    let summary = run_summary(workspace.path()).summary;
     assert!(
-        run_summary(workspace.path())
-            .summary
-            .contains("final_decision=AllTestsPassed"),
-        "the run's terminal decision must be the approval"
+        summary.contains("final_decision=NeedsReview"),
+        "no surviving test expects the original to fail, so the terminal decision \
+         must be NeedsReview, not the governor's approval; got {summary}"
+    );
+    assert_eq!(summary_value(&summary, "invariant_applied"), "true");
+    assert_eq!(
+        summary_value(&summary, "invariant_reason"),
+        "no_reproduction_evidence"
+    );
+}
+
+/// [VANTA-WHY] M3 item 1, acceptance 1 — the invariant is not a property of the
+/// three robustness switches. `corroborate`, `grounded audit` and `batch audit`
+/// decide how a round's tests are LABELLED; the invariant decides whether a label
+/// set is enough to approve. So one recorded test set that contains no probe
+/// expecting the original tree to fail must reach the same verdict in all EIGHT
+/// combinations — if any combination could still approve it, that combination is
+/// a hole in the fix.
+#[test]
+fn the_approval_invariant_holds_in_every_flag_combination() {
+    let _serial = serial_run();
+    // The recorded set is preservation-ONLY: it says the candidate broke nothing
+    // and says nothing at all about the issue being fixed. That is the shape the
+    // 12 rule-on false approvals were made of.
+    for corroborate in ["off", "on"] {
+        for grounded in ["off", "on"] {
+            for batch in ["off", "on"] {
+                let workspace = TempDir::new().unwrap();
+                let (_repo_dir, _issue_path, patch_path) =
+                    write_test_repo(workspace.path(), PRESERVING_PATCH);
+                // The batched transport reads one JSON entry per test; the
+                // per-test transport reads a single verdict object. Both answers
+                // say "keep the label", so the switch changes the transport and
+                // never the label this test is about.
+                let server = if batch == "on" {
+                    StubLlmServer::start_with_intent_audit(
+                        SINGLE_BEHAVIOR_TEST,
+                        r#"{"tests":[{"index":1,"issue_asks_for_behaviour":true,"assertions_grounded":true,"reason":"stub: keep the label"}]}"#,
+                    )
+                } else {
+                    StubLlmServer::start_with_intent_audit(
+                        SINGLE_BEHAVIOR_TEST,
+                        r#"{"issue_asks_for_behaviour":true,"assertions_grounded":true,"reason":"stub: keep the label"}"#,
+                    )
+                };
+
+                let output = run_patch_mode_with_output(
+                    workspace.path(),
+                    &patch_path,
+                    &server,
+                    1,
+                    &[
+                        ("VANTA_CORROBORATE", corroborate),
+                        ("VANTA_GROUNDED_AUDIT", grounded),
+                        ("VANTA_BATCH_AUDIT", batch),
+                    ],
+                );
+
+                let combination =
+                    format!("corroborate={corroborate} grounded_audit={grounded} batch_audit={batch}");
+                let summary = run_summary(workspace.path()).summary;
+                assert_eq!(
+                    output.status.code(),
+                    Some(3),
+                    "{combination}: a preservation-only set must never approve; stdout:\n{}\nsummary: {summary}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                assert!(
+                    summary.contains("final_decision=NeedsReview"),
+                    "{combination}: got {summary}"
+                );
+                assert_eq!(
+                    summary_value(&summary, "invariant_applied"),
+                    "true",
+                    "{combination}: the invariant was in force and the row must say so; got {summary}"
+                );
+                assert_eq!(
+                    summary_value(&summary, "invariant_reason"),
+                    "no_reproduction_evidence",
+                    "{combination}: got {summary}"
+                );
+            }
+        }
+    }
+}
+
+/// [VANTA-WHY] M3 item 1, acceptance 2 — the invariant is a floor, not a ban. A
+/// candidate that satisfies an admitted `BugReproduction` probe is still approved,
+/// and the round carries a `BehaviorPreservation` probe as well so the approval
+/// cannot be an artefact of an empty preservation side.
+#[test]
+fn a_surviving_reproduction_probe_still_approves() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), BOUNDARY_FIX_PATCH);
+    let server = StubLlmServer::start(BOUNDARY_FIX_PROBES);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a candidate that satisfies an admitted reproduction probe is the approval; \
+         stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert!(
+        summary.contains("final_decision=AllTestsPassed"),
+        "got {summary}"
+    );
+    assert_eq!(summary_value(&summary, "invariant_applied"), "true");
+    assert_eq!(
+        summary_value(&summary, "invariant_reason"),
+        "satisfied",
+        "the row must say the invariant was MET, not merely that it applied; got {summary}"
+    );
+
+    // The probe was satisfied by THIS candidate, so the tree on disk is the
+    // boundary fix — not the original and not some other candidate.
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let debug_dir = workspace
+        .path()
+        .join("vanta_sessions")
+        .join(records[0].session_id.as_str())
+        .join("debug");
+    assert_eq!(
+        fs::read_to_string(debug_dir.join("attempt_1_patched_tree").join("calc.py")).unwrap(),
+        BOUNDARY_FIX_PATCHED_SOURCE
+    );
+}
+
+/// [VANTA-WHY] M3 item 1, acceptance 3 — with every robustness switch off, the
+/// invariant must be the ONLY thing that can move a verdict, and it constrains
+/// approvals alone. A candidate an admitted reproduction probe catches is still a
+/// rejection, and the row records the invariant as in force but never consulted
+/// (`no_approval`) rather than reporting a satisfied/unsatisfied reading about a
+/// decision the run never made.
+#[test]
+fn flags_off_verdicts_are_unchanged_when_a_reproduction_probe_fails() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    // PRESERVING_PATCH is a no-op — `add(2, 3)` stays 5 — so the reproduction
+    // probe, which pins 6, must fail on the candidate.
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a candidate an admitted reproduction probe catches is still Rejected; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert!(
+        summary.contains("final_decision=Rejected"),
+        "got {summary}"
+    );
+    assert_eq!(
+        summary_value(&summary, "invariant_applied"),
+        "false",
+        "the invariant constrains an APPROVAL; a rejection must carry no satisfied/\
+         unsatisfied reading; got {summary}"
+    );
+    assert_eq!(
+        summary_value(&summary, "invariant_reason"),
+        "no_approval",
+        "got {summary}"
     );
 }
 
@@ -1822,11 +2083,13 @@ fn review_rounds_record_equal_patch_ids_on_every_row() {
     // [VANTA-WHY] In review mode a round that finds a Logic failure ends the run
     // (a rejection is terminal), so only a candidate that SURVIVES every round
     // reaches rounds 2 and 3 — and only a run that reaches them can record the
-    // 1->2 and 2->3 comparisons this test is about. A behaviour-preserving
-    // candidate plus a preservation-only probe is that candidate.
+    // 1->2 and 2->3 comparisons this test is about. The candidate that implements
+    // the bug-reproduction probe's pinned behaviour survives every round AND
+    // leaves one admitted probe that expects the original to fail, so the run is a
+    // genuine approval rather than the item-1 NeedsReview.
     let (_repo_dir, _issue_path, patch_path) =
-        write_test_repo(workspace.path(), PRESERVING_PATCH);
-    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+        write_test_repo(workspace.path(), NEW_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
 
     let status = run_patch_mode(workspace.path(), &patch_path, &server);
     assert!(
@@ -2891,8 +3154,8 @@ fn a_cut_off_attacker_answer_is_re_asked_and_recovers_on_the_next_attempt() {
 
     let run = |extra_env: &'static [(&'static str, &'static str)]| {
         let workspace = TempDir::new().unwrap();
-        let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), PRESERVING_PATCH);
-        let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+        let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), NEW_BEHAVIOUR_PATCH);
+        let server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
         // The FIRST generation is cut off at the cap; the retry is answered
         // normally, so "retried and recovered" is distinguishable from "gave up".
         server.truncate_next_calls(&["generate"]);
@@ -3047,8 +3310,8 @@ fn a_cut_off_attacker_answer_is_re_asked_and_recovers_on_the_next_attempt() {
 fn a_cut_off_per_test_audit_answer_is_re_asked_once_with_the_brief_instruction() {
     let _serial = serial_run();
     let workspace = TempDir::new().unwrap();
-    let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), PRESERVING_PATCH);
-    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), NEW_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     // The one per-test audit of this single-test round is cut off; no other kind
     // is touched, so the count below measures the retry loop and nothing else.
     server.truncate_next_calls(&["intent_audit"]);
@@ -3142,9 +3405,11 @@ fn a_per_test_audit_cut_off_twice_takes_its_ordinary_unavailable_verdict() {
 
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "an unavailable auditor must leave the run at its ordinary verdict rather than ending it; \
-         stdout:\n{}",
+        Some(3),
+        "an unavailable auditor must leave the run at its ordinary verdict rather than ending it: \
+         with the only probe demoted to preservation there is nothing left that expects the \
+         original to fail, so the ordinary verdict is the item-1 NeedsReview (3), NOT an \
+         infrastructure failure (2); stdout:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
 
@@ -3179,8 +3444,8 @@ fn a_per_test_audit_cut_off_twice_takes_its_ordinary_unavailable_verdict() {
 fn a_flag_off_run_without_truncation_never_moves_the_seed() {
     let _serial = serial_run();
     let workspace = TempDir::new().unwrap();
-    let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), PRESERVING_PATCH);
-    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), NEW_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
 
     let output = run_patch_mode_with_output(
         workspace.path(),
@@ -4235,6 +4500,13 @@ fn a_patch_that_deletes_the_test_file_has_it_restored_for_the_native_run() {
 
 /// A patch that only ADDS a new test file changes neither the source nor the
 /// baseline: it is reported as info and never counts toward approval.
+///
+/// [VANTA-WHY] M3 item 1 — because the source is untouched the candidate is a
+/// no-op, so the only probes that survive are preservation probes and the run's
+/// honest terminal verdict is `NeedsReview`. That does NOT weaken this test's
+/// subject: the added test file is still reported as info and still never counts
+/// toward the native baseline (the assertions below), it just can no longer buy an
+/// approval — which is exactly the defect item 1 closes.
 #[test]
 fn a_patch_added_test_file_is_information_not_baseline() {
     let _serial = serial_run();
@@ -4248,9 +4520,12 @@ fn a_patch_added_test_file_is_information_not_baseline() {
     let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
 
     let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
-    assert!(
-        output.status.success(),
-        "adding a test file must not change the verdict; stderr: {}",
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "adding a test file must not change the verdict: the source is a no-op, so \
+         nothing that survives expects the original to fail and the run lands on the \
+         item-1 NeedsReview; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -5345,8 +5620,8 @@ fn unset_seed_leaves_request_bodies_unseeded_and_the_verdict_unchanged() {
     };
 
     let plain = TempDir::new().unwrap();
-    let (_repo, _issue, patch_path) = write_test_repo(plain.path(), PRESERVING_PATCH);
-    let plain_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, patch_path) = write_test_repo(plain.path(), NEW_BEHAVIOUR_PATCH);
+    let plain_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let plain_output =
         run_patch_mode_with_output(plain.path(), &patch_path, &plain_server, 3, &[]);
     assert_eq!(
@@ -5384,8 +5659,8 @@ fn unset_seed_leaves_request_bodies_unseeded_and_the_verdict_unchanged() {
     );
 
     let seeded = TempDir::new().unwrap();
-    let (_repo, _issue, patch_path) = write_test_repo(seeded.path(), PRESERVING_PATCH);
-    let seeded_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, patch_path) = write_test_repo(seeded.path(), NEW_BEHAVIOUR_PATCH);
+    let seeded_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let seeded_output = run_patch_mode_with_output(
         seeded.path(),
         &patch_path,
@@ -5512,8 +5787,8 @@ fn the_hosted_backend_sends_only_the_fields_the_model_accepts() {
 
     // (1) The local reference run.
     let local = TempDir::new().unwrap();
-    let (_repo, _issue, local_patch) = write_test_repo(local.path(), PRESERVING_PATCH);
-    let local_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, local_patch) = write_test_repo(local.path(), NEW_BEHAVIOUR_PATCH);
+    let local_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let local_output = run_patch_mode_with_output(
         local.path(),
         &local_patch,
@@ -5578,8 +5853,8 @@ fn the_hosted_backend_sends_only_the_fields_the_model_accepts() {
 
     // (2) The hosted run: same repo, same patch, same stub — only the backend differs.
     let hosted = TempDir::new().unwrap();
-    let (_repo, _issue, hosted_patch) = write_test_repo(hosted.path(), PRESERVING_PATCH);
-    let hosted_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, hosted_patch) = write_test_repo(hosted.path(), NEW_BEHAVIOUR_PATCH);
+    let hosted_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let hosted_output = run_patch_mode_with_output(
         hosted.path(),
         &hosted_patch,
@@ -5733,9 +6008,15 @@ fn the_hosted_backend_sends_only_the_fields_the_model_accepts() {
     ];
     let mut sol_env: Vec<(&str, &str)> = hosted_arm.to_vec();
     sol_env.push(("VANTA_LLM_MODEL", "gpt-6.1-sol"));
+    // [VANTA-WHY] M3 item 1 — both halves share ONE fixture so the model is the
+    // only variable, and the fixture has to be one that can reach an approval:
+    // a behaviour-preserving candidate with preservation-only probes now lands on
+    // `NeedsReview(no_reproduction_evidence)`, and a test about the effort field
+    // must not be reading that verdict. `NEW_BEHAVIOUR_PATCH` + one admitted
+    // `BugReproduction` probe is the smallest fixture that still approves.
     let refused = TempDir::new().unwrap();
-    let (_repo, _issue, refused_patch) = write_test_repo(refused.path(), PRESERVING_PATCH);
-    let refused_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, refused_patch) = write_test_repo(refused.path(), NEW_BEHAVIOUR_PATCH);
+    let refused_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let refused_output =
         run_patch_mode_with_output(refused.path(), &refused_patch, &refused_server, 1, &sol_env);
     assert_eq!(
@@ -5765,8 +6046,8 @@ fn the_hosted_backend_sends_only_the_fields_the_model_accepts() {
     let mut luna_env: Vec<(&str, &str)> = hosted_arm.to_vec();
     luna_env.push(("VANTA_LLM_MODEL", "gpt-6-luna"));
     let accepted = TempDir::new().unwrap();
-    let (_repo, _issue, accepted_patch) = write_test_repo(accepted.path(), PRESERVING_PATCH);
-    let accepted_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, accepted_patch) = write_test_repo(accepted.path(), NEW_BEHAVIOUR_PATCH);
+    let accepted_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let accepted_output = run_patch_mode_with_output(
         accepted.path(),
         &accepted_patch,
@@ -5873,6 +6154,24 @@ fn attacker_off_makes_zero_attacker_calls_and_grades_on_native_and_static() {
         "the config is derived from the switches, so Attacker-off must record `baseline`; got {}",
         summary.summary
     );
+    // [VANTA-WHY] M3 item 1 — this is the exemption, asserted rather than assumed.
+    // The invariant requires an admitted test that expects the original to fail,
+    // and the Attacker-off arm admits no tests at all, so without the exemption
+    // every baseline review would be withheld and the study's comparison arm would
+    // stop being a comparison. The row records WHY it was not applied, so a reader
+    // sees a gate that was inapplicable rather than one that was skipped.
+    assert_eq!(
+        summary_value(&summary.summary, "invariant_applied"),
+        "false",
+        "the baseline arm is exempt from the approval invariant; got {}",
+        summary.summary
+    );
+    assert_eq!(
+        summary_value(&summary.summary, "invariant_reason"),
+        "attacker_off",
+        "the exemption must name itself; got {}",
+        summary.summary
+    );
 }
 
 /// §4.2 third configuration: `VANTA_PLANNER=on` is a PLACEHOLDER. It must end as
@@ -5948,8 +6247,8 @@ fn the_recorded_sampling_schedule_matches_the_request_bodies() {
     // (1) Review mode: no Creator call, but the Attacker's generate and the
     //     patch-blind intent audit both fire.
     let review = TempDir::new().unwrap();
-    let (_repo, _issue, patch_path) = write_test_repo(review.path(), PRESERVING_PATCH);
-    let review_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, patch_path) = write_test_repo(review.path(), NEW_BEHAVIOUR_PATCH);
+    let review_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let status = run_patch_mode(review.path(), &patch_path, &review_server);
     assert!(status.success(), "the reference run must reach a verdict");
     let checked =
@@ -6006,8 +6305,8 @@ fn the_coding_preset_covers_every_site_including_the_auditor() {
     // (1) A `pinned` run, to pin what the auditor must NOT do: 0.0 and none of the
     //     coding keys.
     let plain = TempDir::new().unwrap();
-    let (_repo, _issue, plain_patch) = write_test_repo(plain.path(), PRESERVING_PATCH);
-    let plain_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, plain_patch) = write_test_repo(plain.path(), NEW_BEHAVIOUR_PATCH);
+    let plain_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let plain_output = run_patch_mode_with_output(plain.path(), &plain_patch, &plain_server, 3, &[]);
     assert_eq!(
         plain_output.status.code(),
@@ -6052,8 +6351,8 @@ fn the_coding_preset_covers_every_site_including_the_auditor() {
 
     // (2) The coding run.
     let workspace = TempDir::new().unwrap();
-    let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), PRESERVING_PATCH);
-    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), NEW_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let output = run_patch_mode_with_output(
         workspace.path(),
         &patch_path,
@@ -6152,8 +6451,8 @@ fn the_presence_penalty_override_reaches_every_body_and_zero_reaches_none() {
 
     // (1) The control: asked for zero. Bodies byte-identical, value on the record.
     let control = TempDir::new().unwrap();
-    let (_repo, _issue, control_patch) = write_test_repo(control.path(), PRESERVING_PATCH);
-    let control_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, control_patch) = write_test_repo(control.path(), NEW_BEHAVIOUR_PATCH);
+    let control_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let control_output = run_patch_mode_with_output(
         control.path(),
         &control_patch,
@@ -6190,8 +6489,8 @@ fn the_presence_penalty_override_reaches_every_body_and_zero_reaches_none() {
     //     matches the bodies site by site (`assert_schedule_matches_bodies` is the
     //     same guard the preset uses, so the override cannot drift from the pins).
     let arm = TempDir::new().unwrap();
-    let (_repo, _issue, arm_patch) = write_test_repo(arm.path(), PRESERVING_PATCH);
-    let arm_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, arm_patch) = write_test_repo(arm.path(), NEW_BEHAVIOUR_PATCH);
+    let arm_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let arm_output = run_patch_mode_with_output(
         arm.path(),
         &arm_patch,
@@ -6252,8 +6551,8 @@ fn the_output_cap_override_replaces_one_sites_slot_and_only_that_site() {
     // (1) The control: nothing asked for. Every body keeps the schedule's cap and
     //     the record says so.
     let control = TempDir::new().unwrap();
-    let (_repo, _issue, control_patch) = write_test_repo(control.path(), PRESERVING_PATCH);
-    let control_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, control_patch) = write_test_repo(control.path(), NEW_BEHAVIOUR_PATCH);
+    let control_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let control_output =
         run_patch_mode_with_output(control.path(), &control_patch, &control_server, 1, &[]);
     assert_eq!(
@@ -6278,8 +6577,8 @@ fn the_output_cap_override_replaces_one_sites_slot_and_only_that_site() {
     //     one `max_tokens` key, the other three sites keep the schedule, and the
     //     run-level field names the switch in schedule order.
     let arm = TempDir::new().unwrap();
-    let (_repo, _issue, arm_patch) = write_test_repo(arm.path(), PRESERVING_PATCH);
-    let arm_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, arm_patch) = write_test_repo(arm.path(), NEW_BEHAVIOUR_PATCH);
+    let arm_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let arm_output = run_patch_mode_with_output(
         arm.path(),
         &arm_patch,
@@ -6411,8 +6710,8 @@ fn the_reasoning_budget_reaches_the_attacker_calls_and_leaves_a_default_run_alon
     //     record reads the two mechanisms the transport has always used, and the
     //     effective effort is the `low` the six call sites have always sent.
     let control = TempDir::new().unwrap();
-    let (_repo, _issue, control_patch) = write_test_repo(control.path(), PRESERVING_PATCH);
-    let control_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, control_patch) = write_test_repo(control.path(), NEW_BEHAVIOUR_PATCH);
+    let control_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let control_output =
         run_patch_mode_with_output(control.path(), &control_patch, &control_server, 1, &[]);
     assert_eq!(
@@ -6456,8 +6755,8 @@ fn the_reasoning_budget_reaches_the_attacker_calls_and_leaves_a_default_run_alon
     //     effort level carries the one that was asked for, and no body is handed
     //     one it did not have.
     let arm = TempDir::new().unwrap();
-    let (_repo, _issue, arm_patch) = write_test_repo(arm.path(), PRESERVING_PATCH);
-    let arm_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, arm_patch) = write_test_repo(arm.path(), NEW_BEHAVIOUR_PATCH);
+    let arm_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let arm_output = run_patch_mode_with_output(
         arm.path(),
         &arm_patch,
@@ -6610,8 +6909,8 @@ fn the_concise_switch_appends_the_sentence_to_the_generate_prompt_only() {
 
     // (1) The control: the switch is off, which is every run before §14.22.
     let control = TempDir::new().unwrap();
-    let (_repo, _issue, control_patch) = write_test_repo(control.path(), PRESERVING_PATCH);
-    let control_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, control_patch) = write_test_repo(control.path(), NEW_BEHAVIOUR_PATCH);
+    let control_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let control_output =
         run_patch_mode_with_output(control.path(), &control_patch, &control_server, 1, &[]);
     assert_eq!(
@@ -6642,8 +6941,8 @@ fn the_concise_switch_appends_the_sentence_to_the_generate_prompt_only() {
     //     other call site's, and the SYSTEM text the §14.10-f hash covers is
     //     untouched because the sentence never reaches it.
     let arm = TempDir::new().unwrap();
-    let (_repo, _issue, arm_patch) = write_test_repo(arm.path(), PRESERVING_PATCH);
-    let arm_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, arm_patch) = write_test_repo(arm.path(), NEW_BEHAVIOUR_PATCH);
+    let arm_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let arm_output = run_patch_mode_with_output(
         arm.path(),
         &arm_patch,
@@ -6752,8 +7051,8 @@ fn the_cacheable_prefix_leads_every_request_and_the_variable_tail_trails_it() {
     // (1) A plain run: the stable system prompt leads every request, the user turn
     //     it answers is last, and no attempt feedback is anywhere but the tail.
     let plain = TempDir::new().unwrap();
-    let (_repo, _issue, plain_patch) = write_test_repo(plain.path(), PRESERVING_PATCH);
-    let plain_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, plain_patch) = write_test_repo(plain.path(), NEW_BEHAVIOUR_PATCH);
+    let plain_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let plain_output =
         run_patch_mode_with_output(plain.path(), &plain_patch, &plain_server, 1, &[]);
     assert_eq!(
@@ -6825,8 +7124,8 @@ fn the_cacheable_prefix_leads_every_request_and_the_variable_tail_trails_it() {
     //     messages and the nudge APPENDED, which is what lets the provider reuse
     //     the prefix it has already cached instead of re-reading the whole prompt.
     let retry = TempDir::new().unwrap();
-    let (_repo, _issue, retry_patch) = write_test_repo(retry.path(), PRESERVING_PATCH);
-    let retry_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, retry_patch) = write_test_repo(retry.path(), NEW_BEHAVIOUR_PATCH);
+    let retry_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     retry_server.truncate_next_calls(&["generate"]);
     let retry_output =
         run_patch_mode_with_output(retry.path(), &retry_patch, &retry_server, 1, &[]);
@@ -6909,8 +7208,8 @@ fn token_accounting_records_the_servers_counts_per_call_and_a_run_total() {
     let _serial = serial_run();
 
     let workspace = TempDir::new().unwrap();
-    let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), PRESERVING_PATCH);
-    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, patch_path) = write_test_repo(workspace.path(), NEW_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let status = run_patch_mode(workspace.path(), &patch_path, &server);
     assert!(status.success(), "the reference run must reach a verdict");
 
@@ -7093,8 +7392,8 @@ fn usage_details_and_cost_are_recorded_per_call_and_totalled() {
 
     // (1) Local: the details are recorded, the call is not billed.
     let local = TempDir::new().unwrap();
-    let (_repo, _issue, local_patch) = write_test_repo(local.path(), PRESERVING_PATCH);
-    let local_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, local_patch) = write_test_repo(local.path(), NEW_BEHAVIOUR_PATCH);
+    let local_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let local_status = run_patch_mode(local.path(), &local_patch, &local_server);
     assert!(local_status.success(), "the reference run must reach a verdict");
 
@@ -7164,8 +7463,8 @@ fn usage_details_and_cost_are_recorded_per_call_and_totalled() {
 
     // (2) Hosted: same stub, same numbers — now priced.
     let hosted = TempDir::new().unwrap();
-    let (_repo, _issue, hosted_patch) = write_test_repo(hosted.path(), PRESERVING_PATCH);
-    let hosted_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, hosted_patch) = write_test_repo(hosted.path(), NEW_BEHAVIOUR_PATCH);
+    let hosted_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let hosted_output = run_patch_mode_with_output(
         hosted.path(),
         &hosted_patch,
@@ -7278,8 +7577,8 @@ fn a_flex_run_is_named_and_priced_from_its_own_row() {
     let _serial = serial_run();
 
     let workspace = TempDir::new().unwrap();
-    let (_repo, _issue, patch) = write_test_repo(workspace.path(), PRESERVING_PATCH);
-    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, patch) = write_test_repo(workspace.path(), NEW_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     let output = run_patch_mode_with_output(
         workspace.path(),
         &patch,
@@ -7371,8 +7670,8 @@ fn a_busy_provider_is_re_asked_without_spending_a_model_attempt() {
     let _serial = serial_run();
 
     let workspace = TempDir::new().unwrap();
-    let (_repo, _issue, patch) = write_test_repo(workspace.path(), PRESERVING_PATCH);
-    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let (_repo, _issue, patch) = write_test_repo(workspace.path(), NEW_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
     // The FIRST Attacker generation request is refused; the re-send is answered
     // normally. (Patch mode never calls the Creator, so the generation is the
     // run's first chat call.)
@@ -7858,20 +8157,79 @@ fn the_grounded_audit_scraps_an_ungrounded_reproduction_probe_and_never_a_preser
     );
 }
 
+/// [VANTA-WHY] M3 item 1 part 2, acceptance 4 — the loosening is what keeps an
+/// ungrounded-on-paper answer from discarding the only signal against a candidate.
+/// The auditor says `assertions_grounded=false`, the probe quotes nothing at all,
+/// and the run STILL keeps it, because the issue itself names the value the probe
+/// asserts. A rule that scrapped on the auditor's word alone is exactly the rule
+/// that produced the 12/12 no-op approvals, so the ledger has to show the scrap it
+/// did NOT make.
+#[test]
+fn a_reproduction_probe_that_asserts_the_issues_symptom_is_grounded() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), NEW_BEHAVIOUR_PATCH);
+    let server = StubLlmServer::start_with_intent_audit(
+        GROUNDED_SYMPTOM_PROBE,
+        r#"{"issue_asks_for_behaviour":true,"assertions_grounded":false,"reason":"stub: pins a value the issue never states"}"#,
+    );
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[("VANTA_GROUNDED_AUDIT", "on")],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("UNGROUNDED: test_bug_reproduction_no_quote scrapped"),
+        "a probe whose asserted contract the issue names is grounded, so the \
+         auditor's `assertions_grounded=false` may not scrap it; got {stdout}"
+    );
+    // Keeping the probe is what makes the candidate approvable: it is the one
+    // admitted test that expects the original tree to fail.
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the kept probe must carry the approval; stdout:\n{stdout}"
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(
+        summary_value(&summary, "grounded_scrapped"),
+        "0",
+        "nothing may be scrapped on this answer; got {summary}"
+    );
+    assert_eq!(
+        summary_value(&summary, "grounded_kept_by_issue"),
+        "1",
+        "the ledger must count the probe the issue itself grounded; got {summary}"
+    );
+    assert_eq!(summary_value(&summary, "invariant_reason"), "satisfied");
+}
+
 /// §14.8's positive guard: with all three flags on, a correct patch is still
 /// APPROVED. Corroboration exists to remove false rejects, so the failure it
 /// must not introduce is a false `NeedsReview` — an approval turned into
 /// "a human should look" would be the same wrong label, one step safer.
+///
+/// [VANTA-WHY] M3 item 1 — the approval now has to REST on something: the candidate
+/// implements a bug-reproduction probe's pinned behaviour, so one admitted probe
+/// that expects the original to fail survives and passes. Without that, the
+/// three switches would not be the reason the run lands on NeedsReview and this
+/// guard would be measuring item 1 instead of §14.8.
 #[test]
 fn the_three_flags_on_do_not_turn_an_approval_into_a_needs_review() {
     let _serial = serial_run();
     let workspace = TempDir::new().unwrap();
     let (_repo_dir, _issue_path, patch_path) =
-        write_test_repo(workspace.path(), PRESERVING_PATCH);
+        write_test_repo(workspace.path(), NEW_BEHAVIOUR_PATCH);
     // The batched transport needs a batched answer; the single-test shape would
     // fail the whole batch and take the unavailable-audit path instead.
     let server = StubLlmServer::start_with_intent_audit(
-        SINGLE_BEHAVIOR_TEST,
+        SINGLE_BUG_REPRODUCTION_TEST,
         r#"{"tests":[{"index":1,"issue_asks_for_behaviour":true,"assertions_grounded":true,"reason":"stub: keep the label"}]}"#,
     );
 

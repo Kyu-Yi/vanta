@@ -344,6 +344,49 @@ fn token_value(value: Option<u64>) -> String {
     value.map(|v| v.to_string()).unwrap_or_else(|| "unset".to_string())
 }
 
+/// Render a USD amount for a record line (§14.29).
+///
+/// [VANTA-WHY] Six decimal places, always, and `unset` when there is no number.
+/// Six is what makes a single cheap Luna call (`$0.000012`) legible without a
+/// scientific-notation exponent, which `{}` on an `f64` would print and which
+/// `scripts/metrics.py::summary_field` would read as a value containing `e`.
+/// Fixed-point also means two runs' rows are comparable as text.
+///
+/// [VANTA-WHY] `unset` rather than `0.000000`: "this run cost nothing" and "no
+/// price applied to this run" are different claims — the local backend is the
+/// first, an unpriced model is the second — and a cost column that renders both
+/// as zero cannot be summed honestly.
+fn cost_value(value: Option<f64>) -> String {
+    value.map(|v| format!("{v:.6}")).unwrap_or_else(|| "unset".to_string())
+}
+
+/// Render the run's cache hit rate (§14.32).
+///
+/// [VANTA-WHY] The rate is `cached / prompt` over the calls the server MEASURED,
+/// computed from the same two totals `run.summary` already carries
+/// (`llm_cached_tokens`, `llm_prompt_tokens`) so the three numbers on one line
+/// cannot disagree — a reader dividing them by hand gets this value back. It is
+/// token-WEIGHTED, not the mean of the per-call rates: a run whose first call is
+/// a 10k-token prompt and whose last is a 100-token one has a cache hit rate
+/// dominated by the call that actually spent the tokens.
+///
+/// [VANTA-WHY] `unset` in three cases, and they are all "no rate exists": no
+/// call was measured, no measured call reported cached tokens (the local server
+/// said nothing about caching), or the measured prompt total is zero (a
+/// division that would print `inf`/`NaN` into a `key=value` row). `0.0000` is
+/// the different claim that caching was measured and nothing was served from it.
+///
+/// [VANTA-WHY] A call that reported a prompt count but no cache detail
+/// contributes its prompt to the denominator, so the rate is a LOWER bound in
+/// that mixed case rather than an overstatement. That is the safe direction for
+/// a number a reader uses to decide whether prefix caching is working.
+fn cache_hit_rate_value(cached: Option<u64>, prompt: u64) -> String {
+    match cached {
+        Some(cached) if prompt > 0 => format!("{:.4}", cached as f64 / prompt as f64),
+        _ => "unset".to_string(),
+    }
+}
+
 /// Sum the server-measured token counts over one run's chat calls.
 ///
 /// [VANTA-WHY] Returns the call counts beside the sums, because a total over
@@ -364,6 +407,62 @@ fn token_totals(calls: &[crate::llm::CallUsage]) -> (usize, usize, u64, Option<u
         Some(completions.iter().sum())
     };
     (calls.len(), measured.len(), prompt, completion)
+}
+
+/// The run's spend, its two nested token details, and the bases that priced it
+/// (§14.29).
+///
+/// Returns `(cost_usd, cached_tokens, reasoning_tokens, cost_basis)`:
+///
+/// * `cost_usd` — the sum over the calls that WERE priced. `None` when none was:
+///   the local backend is `not_billed` and a hosted model with no price row is
+///   `unpriced_family`, and both are holes a batch table has to be able to see
+///   rather than a `0.0` it would silently average.
+/// * `cached_tokens` / `reasoning_tokens` — summed over the calls that REPORTED
+///   them, and `None` when no call in the run did. Same rule and same reason as
+///   `token_totals`'s completion sum: a `0` would claim the server said zero,
+///   and on a local run the server says nothing at all.
+/// * `cost_basis` — the DISTINCT bases the run's calls recorded, in first-seen
+///   order, joined by `,`; `none` when the run made no calls. A run whose rows
+///   disagree (one priced, one fallen back to the estimate) names both, because
+///   "which prices produced this total?" is exactly the question the versioned
+///   table exists to answer and a single basis would answer it wrongly.
+fn cost_and_detail_totals(
+    calls: &[crate::llm::CallUsage],
+) -> (Option<f64>, Option<u64>, Option<u64>, String) {
+    let measured: Vec<&crate::llm::CallUsage> =
+        calls.iter().filter(|c| c.source != "estimate").collect();
+    let costs: Vec<f64> = calls.iter().filter_map(|c| c.cost_usd).collect();
+    let cost = if costs.is_empty() {
+        None
+    } else {
+        Some(costs.iter().sum())
+    };
+    let sum_of = |pick: fn(&crate::llm::CallUsage) -> Option<u64>| -> Option<u64> {
+        let values: Vec<u64> = measured.iter().filter_map(|c| pick(c)).collect();
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().sum())
+        }
+    };
+    let mut bases: Vec<&str> = Vec::new();
+    for basis in calls.iter().map(|c| c.cost_basis.as_str()) {
+        if !bases.contains(&basis) {
+            bases.push(basis);
+        }
+    }
+    let basis_text = if bases.is_empty() {
+        "none".to_string()
+    } else {
+        bases.join(",")
+    };
+    (
+        cost,
+        sum_of(|c| c.cached_tokens),
+        sum_of(|c| c.reasoning_tokens),
+        basis_text,
+    )
 }
 
 /// Count the calls the server cut off at `max_tokens`, per role (§14.5).
@@ -469,6 +568,55 @@ fn sampling_schedule_keys() -> String {
         }
     }
     keys.join(" ")
+}
+
+/// The request-shaping rule this run's backend follows, in the same one-line
+/// `key=value` shape as [`sampling_schedule_keys`].
+///
+/// [VANTA-WHY] §14.26 — item 3 asks for what was REQUESTED and what was actually
+/// SENT to be recorded in `call.usage` and `run.summary`. The per-call rows carry
+/// the per-body detail (a body's own `requested_fields`/`sent_fields`); this is the
+/// run-level RULE that explains them, so a reader who sees `temperature` absent from
+/// a hosted body reads the reason off the run instead of guessing the pipeline lost
+/// it. The local backend has no such rule — it sends the body it built — and this
+/// line says so with `not_sent=none renamed=none` rather than staying silent, which
+/// is what keeps the local run's summary self-describing without changing its bodies.
+fn request_shape_rule(cfg: &LlmConfig) -> String {
+    let backend = cfg.backend.as_str();
+    if !cfg.is_openai() {
+        return format!(
+            "request_shape_backend={backend} request_shape_family=native \
+             request_shape_not_sent=none request_shape_renamed=none"
+        );
+    }
+    let family = crate::llm::capabilities::OpenAiFamily::from_model_id(&cfg.model_id);
+    // `unsent_keys` is a const table walked in a fixed order, so this list is stable
+    // across runs — the same reason the per-call `requested`/`sent` lists are.
+    let mut unsent = crate::llm::capabilities::unsent_keys(family);
+    // [VANTA-WHY] §14.28 — the effort is not a property of the family the way the
+    // rows above are: it is dropped when THIS run asked for no level, so a default
+    // hosted run must name it here and a run that set `VANTA_REASONING_EFFORT` must
+    // not. The predicate is the shaper's own (`keeps_effort`), so the run-level
+    // rule and the bodies it describes cannot disagree about what went out.
+    if !crate::llm::capabilities::keeps_effort(family, crate::llm::requested_effort()) {
+        unsent.push((
+            crate::llm::capabilities::REASONING_EFFORT_KEY,
+            "no level requested by this run; the call sites' `low` is a llama.cpp fact (§14.28)",
+        ));
+    }
+    let not_sent: Vec<&str> = unsent.into_iter().map(|(key, _why)| key).collect();
+    let not_sent = if not_sent.is_empty() {
+        "none".to_string()
+    } else {
+        not_sent.join(",")
+    };
+    format!(
+        "request_shape_backend={backend} request_shape_family={} \
+         request_shape_not_sent={not_sent} request_shape_renamed={}->{}",
+        family.name(),
+        crate::llm::capabilities::LLAMACPP_OUTPUT_CAP_KEY,
+        crate::llm::capabilities::OPENAI_OUTPUT_CAP_KEY,
+    )
 }
 
 /// Read the server's own `top_p` default for the provenance block.
@@ -589,15 +737,38 @@ pub async fn run(
     let reasoning_budget = env_reasoning_budget()?;
     crate::llm::set_reasoning_budget(reasoning_budget);
     let reasoning_effort = env_reasoning_effort()?;
+    // [VANTA-WHY] §14.28 — the effort is validated against the MODEL that will
+    // receive it, here, before the repo loads and before the first request is
+    // built. The two hosted families do not accept the same ladder (Sol rejects
+    // `none`), so a level that is legal in the abstract can be a 400 on this
+    // model; failing the run at config time is what keeps that from being
+    // discovered twenty minutes into a batch. The local backend has no ladder to
+    // check against — its knob is a no-op — so the switch is only validated when
+    // a hosted model is going to read it.
+    if let Some(effort) = reasoning_effort {
+        if cfg.is_openai() {
+            let family = crate::llm::capabilities::OpenAiFamily::from_model_id(&cfg.model_id);
+            if !family.accepts_effort(effort.name()) {
+                return Err(format!(
+                    "CONFIG_ERROR: VANTA_REASONING_EFFORT='{}' is not a level {} accepts \
+                     (expected one of {}).",
+                    effort.name(),
+                    family.name(),
+                    family.accepted_efforts().join("|"),
+                )
+                .into());
+            }
+        }
+    }
     crate::llm::set_reasoning_effort(reasoning_effort);
     if reasoning_budget.is_some() || reasoning_effort.is_some() {
         println!(
             "  Reasoning: budget={} effort={} (mechanism {}, {}) \
              — sites: {}",
             crate::llm::reasoning_budget_text(),
-            crate::llm::reasoning_effort_text(),
-            crate::llm::reasoning_budget_mechanism(),
-            crate::llm::reasoning_effort_mechanism(),
+            crate::llm::reasoning_effort_text(cfg.is_openai()),
+            crate::llm::reasoning_budget_mechanism(cfg.is_openai()),
+            crate::llm::reasoning_effort_mechanism(cfg.is_openai()),
             crate::llm::REASONING_BUDGET_SITES.join(", ")
         );
     }
@@ -770,10 +941,16 @@ pub async fn run(
         test_id: None,
         phase: "session.start".to_string(),
         summary: format!(
-            "model={} model_version={} prompt_version={} prompt_hash={} provider={} api_key={} \
+            "model={} llm_backend={} model_version={} prompt_version={} prompt_hash={} provider={} api_key={} \
              vanta_version={} vanta_commit={} vanta_dirty={} tested_commit={} target_repo_dirty={} requested_backend={} actual_backend={} max_attempts={} \
              baseline_test_timeout_secs={} patched_test_timeout_secs={} deps_checkpoint={} deps_freeze={} test_cmd={} mode={} benchmark_instance={}",
             cfg.model_id,
+            // [VANTA-WHY] The backend is part of the run's identity, not a
+            // detail of its transport: a hosted row and a local row that shared
+            // a model string would otherwise be indistinguishable in the log,
+            // even though they reject different sampling fields, bill different
+            // amounts, and never probe the same endpoints.
+            cfg.backend.as_str(),
             std::env::var("VANTA_MODEL_VERSION").unwrap_or_else(|_| "unknown".into()),
             prompt_versions,
             crate::pipeline::prompt_hashes(),
@@ -2775,7 +2952,8 @@ pub async fn run(
             summary: format!(
                 "seq={} site={} round={} attempt={} prompt_tokens={} completion_tokens={} \
                  total_tokens={} source={} seed={} seed_mechanism={} finish_reason={} wall_ms={} \
-                 truncated={}",
+                 truncated={} {} cached_tokens={} reasoning_tokens={} cost_usd={} cost_basis={} \
+                 provider_retries={} service_tier={}",
                 usage.seq,
                 usage.site,
                 // [VANTA-WHY] §14.12 — the round and the retry index travel with
@@ -2802,6 +2980,38 @@ pub async fn run(
                 usage.finish_reason.as_deref().unwrap_or("unset"),
                 usage.wall_ms,
                 usage.truncated,
+                // [VANTA-WHY] §14.26 — what the body asked for, what it carried,
+                // and what was removed or renamed on the way. Last of the
+                // pre-§14.29 keys, so every key this row carried before keeps its
+                // position.
+                usage.request_shape.render(),
+                // [VANTA-WHY] §14.29 — the usage the server reported that is not
+                // a token count: how much of the prompt was served from cache,
+                // how much of the completion was reasoning, what those cost, and
+                // on what price basis. `unset` rather than `0` wherever the
+                // server did not publish the detail, so "not measured" cannot be
+                // pooled with "measured zero". Appended after the pre-existing
+                // keys so a reader of an older row is unaffected.
+                token_value(usage.cached_tokens),
+                token_value(usage.reasoning_tokens),
+                cost_value(usage.cost_usd),
+                usage.cost_basis,
+                // [VANTA-WHY] §14.30 — how many times the provider was asked
+                // again before it served THIS call, beside `attempt` and not
+                // inside it. A row with `attempt=1 provider_retries=2` is a call
+                // the service throttled twice and the model answered once; a row
+                // with `attempt=2 provider_retries=0` is the opposite. Appended
+                // after the pre-existing keys so an older row's reader is
+                // unaffected.
+                usage.provider_retries,
+                // [VANTA-WHY] §14.31 — the tier the provider served this call
+                // on, beside the cost it produced and not far from it: the tier
+                // IS the price row, so a reader matching a cost against the
+                // table needs the two on one line. `unset` on the local backend
+                // (nothing was sold), `standard`/`flex` on the hosted one.
+                // Appended last so every key an older row carried keeps its
+                // position.
+                usage.service_tier,
             ),
             timestamp: now_iso(),
             benchmark_instance: None,
@@ -2810,6 +3020,15 @@ pub async fn run(
     }
     let (llm_calls, llm_calls_measured, llm_prompt_tokens, llm_completion_tokens) =
         token_totals(&call_usages);
+    // [VANTA-WHY] §14.29 — the run's cost and the two usage details that are not
+    // token counts. Summed from the rows the run already recorded, for the same
+    // reason `token_totals` is: an aggregate that re-derives its inputs can
+    // disagree with the rows it summarises. `cost_basis` names the price rows
+    // that produced the figure (`none` when the run made no call), so a total
+    // built from two different price dates is visible rather than silently
+    // pooled.
+    let (cost_usd, llm_cached_tokens, llm_reasoning_tokens, cost_basis) =
+        cost_and_detail_totals(&call_usages);
 
     // ---- Run-away (truncated) calls, per role (plans/bugsinpy.md §14.5) ----
     // [VANTA-WHY] A model that spends its whole output cap on reasoning and
@@ -2826,6 +3045,16 @@ pub async fn run(
     // than summed from the three roles, so an off-schedule site cannot make the
     // total disagree with the calls it summarises.
     let truncated_total = call_usages.iter().filter(|c| c.truncated).count() as u64;
+    // [VANTA-WHY] §14.30 — how often the PROVIDER, not the model, was asked again.
+    // Read from the run-level counters rather than summed over the rows, and that
+    // is the point: a call the provider kept refusing past `PROVIDER_RETRY_MAX`
+    // never answered, so it writes no `call.usage` row at all. Counting only the
+    // rows would under-report exactly the runs that were throttled hardest, which
+    // is the opposite of what a throttling count is for. The two classes are kept
+    // apart because they mean different things operationally (`rate_limit` is a
+    // window rolling over; `resource_unavailable` is `flex` capacity).
+    let (provider_retries, provider_retries_rate_limit, provider_retries_unavailable) =
+        crate::llm::provider_retry_counts();
     let per_site_keys = per_site_totals(&call_usages)
         .iter()
         .map(|(site, calls, truncated, completion)| {
@@ -2925,17 +3154,22 @@ pub async fn run(
         phase: "run.summary".to_string(),
         summary: format!(
             "attempts_run={} fixed_at_attempt_1={} final_decision={:?} \
-             config={} mode={} seed={} seed_policy={} model={} top_p={} {} \
+             config={} mode={} seed={} seed_policy={} model={} top_p={} {} {} \
              llm_calls={} llm_calls_measured={} llm_prompt_tokens={} llm_completion_tokens={} \
+             llm_cached_tokens={} llm_reasoning_tokens={} llm_cache_hit_rate={} \
+             cost_usd={} cost_basis={} \
              truncated_calls_creator={} truncated_calls_attacker={} \
              truncated_calls_intent_audit={} \
-             truncated_calls={} truncated_twice_calls={} completion_tokens_total={} {} \
+             truncated_calls={} truncated_twice_calls={} \
+             provider_retries={} provider_retries_rate_limit={} provider_retries_unavailable={} \
+             completion_tokens_total={} {} \
              corroborate={} grounded_audit={} batch_audit={} attacker_concise={} \
              batch_audit_tokens_per_test={} batch_audit_max_tokens={} \
              revise_budget_per_attempt={} revise_calls_used={} \
              deadline_secs={} stop_reason={} presence_penalty={} max_tokens_overrides={} \
              reasoning_budget={} reasoning_budget_mechanism={} reasoning_effort={} \
              reasoning_effort_mechanism={} \
+             service_tier={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
              commit={} dirty={} prompt_version={} prompt_hash={} context_selection={} \
              harness_error={}",
@@ -2953,10 +3187,24 @@ pub async fn run(
             cfg.model_id,
             top_p_value,
             sampling_schedule_keys(),
+            request_shape_rule(&cfg),
             llm_calls,
             llm_calls_measured,
             llm_prompt_tokens,
             token_value(llm_completion_tokens),
+            // [VANTA-WHY] §14.29 — the run's cached/reasoning tokens and its
+            // cost, with the price basis that produced them. `unset`/`none`
+            // wherever nothing was measured (the local backend is
+            // `not_billed`, an unpriced family names itself), never `0`.
+            token_value(llm_cached_tokens),
+            token_value(llm_reasoning_tokens),
+            // [VANTA-WHY] §14.32 — the cache hit rate, derived from the two
+            // totals on this same line so the three cannot disagree. `unset`
+            // wherever no rate exists (nothing measured, nothing reported, or a
+            // zero prompt total), never `0.0000`.
+            cache_hit_rate_value(llm_cached_tokens, llm_prompt_tokens),
+            cost_value(cost_usd),
+            cost_basis,
             // [VANTA-WHY] §14.5 — how often a model ran away on each role in THIS
             // run. A count, not a rate: the split's report pools it over runs.
             truncated_creator,
@@ -2972,6 +3220,14 @@ pub async fn run(
             // run-away; two in a row is a call this site cannot answer inside its
             // cap, and the fix to look for is a smaller question, not a retry.
             crate::llm::truncated_twice_calls(),
+            // [VANTA-WHY] §14.30 — the provider-retry totals, deliberately beside
+            // the model's truncation counts: "the model could not finish" and "the
+            // service would not take the request" are the two reasons a call is
+            // repeated, and a run that mixed them should say so rather than leave
+            // a reader to guess which one a repeated call was.
+            provider_retries,
+            provider_retries_rate_limit,
+            provider_retries_unavailable,
             token_value(llm_completion_tokens),
             per_site_keys,
             // [VANTA-WHY] §14.2/§14.4/§14.5 — the switches this run actually ran
@@ -3030,12 +3286,25 @@ pub async fn run(
             // same arm run against a hosted API. `reasoning_effort` is the
             // EFFECTIVE level and defaults to `low` — the six call sites have sent
             // `low` since v0.2, so `unset` would describe a run that sent nothing.
-            // Neither value contains a space, so both survive the
-            // `rerun.rs`/`metrics.py` value-terminator rule intact.
+            //
+            // [VANTA-WHY] §14.28 — both mechanisms are read per backend, and the
+            // hosted default is NOT `low`: with the switch unset the call sites'
+            // `low` never reaches a hosted model, so the honest value there is
+            // `provider_default` with an `unset` mechanism. On the local backend
+            // the same switch records `low` + `llamacpp:noop`, because the key is
+            // in the body and the server ignores it. Neither value contains a
+            // space, so both survive the `rerun.rs`/`metrics.py` value-terminator
+            // rule intact.
             crate::llm::reasoning_budget_text(),
-            crate::llm::reasoning_budget_mechanism(),
-            crate::llm::reasoning_effort_text(),
-            crate::llm::reasoning_effort_mechanism(),
+            crate::llm::reasoning_budget_mechanism(cfg.is_openai()),
+            crate::llm::reasoning_effort_text(cfg.is_openai()),
+            crate::llm::reasoning_effort_mechanism(cfg.is_openai()),
+            // [VANTA-WHY] §14.31 — the run-level tier, read once from the same
+            // config field that shaped every request body and priced every row,
+            // so the summary cannot disagree with either. `unset` on the local
+            // backend, where no tier exists to name. Appended after the
+            // pre-existing keys so an older row's reader is unaffected.
+            cfg.service_tier_text(),
             deciding_rule.as_deref().unwrap_or("none"),
             deciding_evidence.join(","),
             needs_review_weak.join(","),
@@ -4435,10 +4704,10 @@ fn now_iso() -> String {
 mod tests {
     use super::{
         attempt_verdict, bate_baseline_concat, blocking_static_findings, build_source_concat,
-        collapse_decision, dependency_freeze_summary_value, harness_infrastructure_collapse,
-        modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
-        rejection_signal_message, render_committed_test_file,
-        require_clean_target_repo_for_open_pr, stamp_transition_row,
+        cache_hit_rate_value, collapse_decision, dependency_freeze_summary_value,
+        harness_infrastructure_collapse, modified_test_config_records,
+        patch_attempt_id_for_patch, record_new_static_findings, rejection_signal_message,
+        render_committed_test_file, require_clean_target_repo_for_open_pr, stamp_transition_row,
         stable_patch_fingerprint,
     };
     use crate::agents::attacker::GeneratedTest;
@@ -4447,6 +4716,24 @@ mod tests {
     use crate::pipeline::harness::StaticDiagnostic;
     use crate::session::{PatchAttemptId, SessionId};
     use std::collections::HashMap;
+
+    /// §14.32 — the rate, and the three "no rate exists" cases kept apart from a
+    /// measured zero.
+    #[test]
+    fn the_cache_hit_rate_is_unset_when_no_rate_exists_and_never_a_guessed_zero() {
+        // 314 of 777 is what the stub publishes; four decimals, fixed point, so
+        // two runs' rows compare as text and no `e` reaches a `key=value` row.
+        assert_eq!(cache_hit_rate_value(Some(314), 777), "0.4041");
+        // A measured zero IS a rate: the server said it served nothing from cache.
+        assert_eq!(cache_hit_rate_value(Some(0), 777), "0.0000");
+        // Nothing reported cached tokens at all (a server that says nothing about
+        // its cache) is NOT that claim.
+        assert_eq!(cache_hit_rate_value(None, 777), "unset");
+        // A zero prompt total would divide to `NaN`, which must never be printed.
+        assert_eq!(cache_hit_rate_value(Some(0), 0), "unset");
+        // A whole prompt served from cache is a rate of one, not a special case.
+        assert_eq!(cache_hit_rate_value(Some(500), 500), "1.0000");
+    }
 
     #[test]
     fn first_harness_collapse_retries_once() {

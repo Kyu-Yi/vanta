@@ -6397,6 +6397,876 @@ default.
 
 ---
 
+### 14.24 Hosted OpenAI backend, item 1 — backend selection and the /props skip
+
+Vanta has only ever talked to one service: a local `llama-server`, reached over the OpenAI-compatible
+`POST {base_url}/chat/completions`. That service has two properties the pipeline has silently depended on
+— it publishes its own `/props`, and it accepts the full sampling surface — and both are false of the
+hosted platform this section starts to support. The same pipeline must be able to run on the hosted
+models without the local path moving a single byte, so the choice of backend becomes an explicit,
+recorded fact rather than an assumption spread across the code.
+
+**`VANTA_LLM_BACKEND=llamacpp|openai`, default `llamacpp`.** Parsed first in `LlmConfig::from_env`,
+before anything that depends on it. The value is matched exactly: `llamacpp` or `openai`. An unknown
+value — `llama.cpp`, `OpenAI`, `llamacp`, the empty string — is a `CONFIG_ERROR` that quotes the
+offending value, never a fallback to the local backend. A silent fallback would be the worst possible
+failure for this feature: a run that asked for the hosted model and got the local one would write a
+manifest row whose model, cost and sampling columns all describe a different experiment.
+
+**`base_url`'s default is a function of the backend.** `LlmBackend::default_base_url()` returns
+`http://127.0.0.1:8080/v1` for `llamacpp` — the exact literal `Default::default()` used before this
+section — and `https://api.openai.com/v1` for `openai`. `from_env` sets `cfg.base_url` from the backend
+and then lets `VANTA_LLM_BASE_URL` override it, on either backend and with the same trailing-slash trim as
+before, so the variable still wins for a proxy, a region, or this project's own mock test server. Keeping
+the default next to the enum is what stops the pair from drifting; `Default for LlmConfig` now reads it
+from there too.
+
+**The backend is a field, not a guess about the URL.** `LlmConfig.backend` exists because the URL alone
+cannot answer "does this endpoint publish `/props`?", "does it reject `temperature`?" or "does a token
+cost money?" — and a proxy in front of `api.openai.com` would answer all three differently from a
+substring match on the host. `LlmConfig::is_openai()` is the single predicate every backend-dependent
+branch asks, so the question is asked one way in one place.
+
+**`/props` is skipped on `openai`, not attempted and failed.** Two call sites probe the server:
+
+- `llm::context_window_tokens` — on `openai` the probe is not made. `VANTA_LLM_CONTEXT_TOKENS` is taken
+  as-is, with no disagreement check (there is no server value to disagree with), and an unset value keeps
+  the existing `65536` backstop **with a louder warning**, because that number is far below a hosted
+  model's real window and a silently-too-small guard refuses prompts that would fit. The `OnceCell`
+  caching and the local three-way order (`VANTA_LLM_CONTEXT_TOKENS` → `/props` `n_ctx` → `65536`) are
+  untouched for `llamacpp`.
+- `llm::server_top_p_default` — returns `None` immediately. The manifest's `server_top_p_note` becomes the
+  honest "the backend has no /props" rather than the outcome of a 404 fetched on purpose.
+
+**`session.start` gains `llm_backend=`.** The token sits directly after `model=`, in the run-level record
+written before attempt 1. The backend is part of a run's identity: a hosted row and a local row that
+shared a model string would otherwise be indistinguishable in the log, even though they reject different
+sampling fields, bill different amounts and probe different endpoints. `LlmConfig`'s `Display` gains a
+matching `backend :` line, and its `context_window` line stops promising a `/props` fallback the hosted
+backend never makes.
+
+**Nothing here changes when `VANTA_LLM_BACKEND` is unset.** The default is `llamacpp`; the default
+`base_url`, the `/props` probe, the disagreement warning, the key handling and every request body are
+exactly as they were. `LlmConfig::default()` and `from_env()` with no new variables still produce the
+pre-§14.24 config field for field, which is the property the existing pinning tests already enforce.
+
+Tests: `src/config/mod.rs::tests::test_backend_enum_is_strict_and_round_trips` (exact accepted spellings;
+`llama.cpp`/`OpenAI`/`""` rejected; both default endpoints), `test_default_backend_is_llamacpp` (the
+default profile is unmoved), and `test_backend_selection_from_env` — **one** test, not six, because env
+vars are process-global and `cargo test` runs threads in parallel; it walks unset → `llamacpp` → `openai`
+→ explicit `VANTA_LLM_BASE_URL` override → trailing-slash trim → unknown value, asserting at each step
+and leaning on `assert_eq!` on the whole `base_url` so "unchanged" is compared, not eyeballed.
+
+---
+
+### 14.25 Hosted OpenAI backend, item 2 — the API key reaches no file and no stream
+
+The hosted backend introduces the first genuine secret this project handles. Everything §14.24 added is
+about *which* service is called; this section is about the credential that authenticates the call, and it
+is written before any request is made because a leak is not repairable after the fact: the session log,
+the transitions store, the evidence bundle and the manifest are the artifacts a paper is built from, and
+they are copied, published and archived. A key that reaches any one of them is a key that has to be
+rotated.
+
+**The property being enforced is "nothing that is WRITTEN or PRINTED contains the key".** Not "the
+variable that usually holds the key is treated carefully". The two are different, and the difference is
+the whole design: a provider is free to quote the credential it just rejected back at the client
+(`Incorrect API key provided: sk-…`), and Vanta's error path deliberately prints the provider's body so a
+failure is legible. That message is legitimate, useful, and contains the secret. A rule that only knew
+about variable names would pass it straight through, which is why the redaction rule has **two
+independent halves**:
+
+- **By name.** `config::is_secret_env_name` is true when the name contains `KEY`, `TOKEN`, `SECRET` or
+  `PASSWORD`, case-insensitively and anywhere in the string. `GITHUB_TOKEN`, `MY_SECRET`, `DB_PASSWORD`
+  and a lower-case `openai_api_key` are all secrets by this rule, which is the point: the rule must be
+  about what a name *means*, not about the four names this codebase happens to use today.
+- **By value.** `config::redact_secret` replaces every whitespace-delimited token that starts with `sk-`
+  and is **longer than 12 characters** with `<redacted>`. Twelve is a deliberate floor: it is short
+  enough that every real key qualifies by a wide margin, and long enough that the string `sk-` on its own
+  — which appears in this very document, in a comment, and in the test names — survives. The scan is
+  **whitespace-delimited, not punctuation-delimited**, so the trailing `.` a provider puts after the key
+  in its message is removed along with it.
+
+Both halves are implemented once, in `src/config/mod.rs`, and shared. The rule walks bytes rather than
+`chars`, because the value half must not care about encoding, and it **preserves the surrounding text
+exactly** — every other byte, and every newline, is copied through — so a redacted forensic file is still
+the same file, just with the secret's bytes replaced.
+
+**`OPENAI_API_KEY` is read only on the `openai` backend, and `VANTA_API_KEY` only on `llamacpp`.**
+`from_env` chooses the variable name from `cfg.backend`, which is why §14.24 made the backend a field
+first. The two names never cross over: reading `VANTA_API_KEY` on the hosted backend would mean a stray
+local-proxy variable silently authenticating a billed hosted run, and reading `OPENAI_API_KEY` on the
+local backend would mean an unrelated exported key travelling with a run that has no business holding it.
+A set-but-empty value is `None` rather than an empty bearer token; a non-UTF-8 value is a `CONFIG_ERROR`
+naming the variable. The key is **never** read from a `VANTA_`-prefixed variable, so `VANTA_API_KEY` is
+no longer consulted at all on `openai`.
+
+**Nothing that prints the config prints the key.** `LlmConfig`'s `Display` renders the credential as
+`(set — redacted)` / `(not set — local / no-auth mode)`; `session.start` records `api_key=set` / `none`
+and never the value. The manifest records neither. The `Authorization` header is built with
+`set_sensitive(true)`, so `reqwest` will not log it either even at trace level.
+
+**The HTTP error path is the sharp edge, and it is redacted at the source.** The non-success branch of
+`post_chat` prints the provider's body as a snippet. Two things were needed there:
+
+- `redact_secret` runs over the body **before** the snippet is built, so a key echoed inside the body
+  becomes `<redacted>` in the message that reaches `run.infra_failure`, the terminal and the log.
+- the snippet is taken with `chars().take(300)`, **not** `&txt[..300]`. The byte-slice form panics when
+  byte 300 lands inside a multi-byte character, which turns "the provider returned an error" into "Vanta
+  crashed" — a latent bug that had nothing to do with secrets, fixed here because this is the line that
+  was being rewritten. Only the body is ever formatted into the message; the request headers are never
+  interpolated.
+
+**Every forensics write goes through one function.** `write_forensics_to` redacts its content before
+`fs::write`, so a future call site inherits the rule instead of remembering it. Debug files are the
+artifacts most likely to be pasted into a bug report, and they hold raw model output; for a local run the
+call is a no-op, because a local server never sees a key.
+
+**The Python harness has its own copy of the rule, deliberately.** `scripts/bugsinpy/redact.py` mirrors
+both halves — same four markers, same `sk-`/12-character value rule, same `<redacted>` marker — because
+the harness writes its own logs and exports, sometimes before any Vanta process exists. The duplication
+is checked rather than hoped for: a Python test asserts the constant and the threshold match the Rust
+side, so the two cannot drift apart silently. One detail had to be written out explicitly: Python's
+`str.isspace()` is true for Unicode spaces while Rust's `u8::is_ascii_whitespace` is not, so the Python
+side carries an explicit `_ASCII_WHITESPACE` set instead of calling `str.isspace()`. Without it the two
+implementations would disagree on a body containing a non-breaking space.
+
+The harness sites that now redact:
+
+- `runner.env_log_line` — the run log's `# env:` header. The previous form dropped `VANTA_API_KEY` **by
+  name**, which made the rule "the one variable we remembered to exclude". Redacting the whole dict first
+  is strictly stronger: every secret-shaped variable is covered, including ones the harness has not been
+  taught about, and the entry keeps its NAME (`VANTA_API_KEY=<redacted>`) so the line still says a key was
+  present. Named as a function rather than inlined so it is directly testable.
+- `shuru.run`'s `export` lines — they are part of the command string, and a command string is printed by
+  `shuru` on failure and visible in `ps`.
+- `bake.build_env_lines` — the layer's recipe, which is written to a bake log and re-read as an artifact.
+  The redacted value keeps the same position and shape, which is what keeps the recipe byte-identical for
+  every `env` dict that holds no secret — and therefore keeps every baked layer's content hash unchanged.
+
+**Redaction applies to what is PRINTED, never to what is PASSED.** The environment handed to
+`subprocess.run` for `vanta_m3` is the real environment: that is the one place the key must survive, and
+the harness tests assert the distinction directly rather than assuming it.
+
+Tests: `src/config/mod.rs::tests::test_secret_env_name_rule`, `test_redact_secret_value_rule`,
+`test_display_never_leaks_key` (rewritten — its old form asserted the key's own characters, which only a
+leaking `Display` could satisfy) and `test_backend_selection_from_env` steps 7–8 (each backend reads its
+own variable with both set to *different* sentinels, so a wrong read is visible rather than merely
+possible; and `VANTA_API_KEY` alone authorises nothing on `openai`);
+`tests/m3_session_log.rs::the_api_key_never_reaches_a_file_stream_or_record_when_the_provider_echoes_it`
+— `StubBehaviour::EchoKeyUnauthorized` reads the bearer token out of the request headers and quotes it
+back inside an HTTP 401 body, the run is driven to its recorded `InfraFailure`, and the test then sweeps
+**stdout, stderr and every file under the workspace** asserting the sentinel never occurs. The sweep
+walks the tree rather than a list of known artifacts, so a file added later cannot be forgotten into a
+leak, and the test carries a positive control — the recorded failure must contain `401` *and* the
+`<redacted>` marker — so it cannot pass by never making a call;
+`scripts/test_bugsinpy.py::TestSecretRedaction` (nine tests) pins the name rule, the value rule, the
+12-character boundary, `redact_env`'s keep-the-name/drop-the-value shape, the run log's `# env:` header,
+the sandbox command, the bake recipe, and that a secret-free compiler environment's recipe is unchanged.
+
+---
+
+### 14.26 Hosted OpenAI backend, item 3 — one capability table decides every request body
+
+§14.24 chose the service and §14.25 kept the credential out of the artifacts. This section is about the
+first thing that service actually sees: the request body. The local server accepts Vanta's whole sampling
+surface, so the pipeline has always built **one** body and sent it. The hosted models do not accept it —
+`temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty` and the logprob pair are rejected or are not
+Chat Completions parameters at all, and the output cap has a different spelling — so a body Vanta sends
+today would be a 400 on the first call of every run.
+
+**The fix is a rule, not a second body builder.** `src/llm/capabilities.rs` holds the claim "these models
+do not take this field" in one place, and a single function applies it. There is no `if backend ==
+openai` scattered through the call sites and no second code path that could drift from the first: the
+body is built exactly as before, and then — at the one moment it is about to be serialised — it is shaped
+if and only if the backend is hosted. The local path takes the table's `native` branch, which drops
+nothing, renames nothing, and exists so that both branches return the same kind of record.
+
+**Two lists, deliberately not one.** The split is the interesting part of the table:
+
+- `NOT_A_CHAT_PARAMETER` — `top_k`, `min_p`, `reasoning_budget_tokens`. These are **llama.cpp sampler
+  knobs**, not parameters of the Chat Completions API at all. They are unsendable to *any* hosted model,
+  so they are dropped for every family, `Unknown` included.
+- `REJECTED_WHILE_REASONING` — `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`,
+  `logprobs`, `top_logprobs`. These **are** API parameters; they are withheld for a per-model reason (the
+  models reject them while reasoning is on, as `Unsupported value: 'temperature'`). Because the reason is
+  per-model, an **`Unknown` family keeps them**: withholding a parameter is only right where the docs say
+  to withhold it, and a model id this table has never heard of is not evidence that its model rejects
+  anything. Filing these two lists together would have silently projected one model family's dialect onto
+  every future one. *(Superseded by §14.34: the live probe split this single list into
+  `REJECTED_PARAMETER_WHILE_REASONING` and `REJECTED_VALUE_WHILE_REASONING` by the provider's `error.code`.
+  The same six keys are still dropped; only the reason is now two reasons.)*
+
+**`OpenAiFamily` is read from the model id, longest prefix first.** `gpt-6.1-sol` and `gpt-6-luna` are
+matched by prefix, with Sol checked first so a dated snapshot (`gpt-6.1-sol-2026-10-01`) lands on the
+right family instead of falling through to `gpt-6-luna`'s rule. A model id that matches neither is
+`Unknown`, which is a *named* state rather than a default — it has its own `name()` (`unknown`) and it is
+recorded as such, so a run against an unrecognised model is visible in the log instead of silently
+treated as Luna.
+
+**The cap is renamed, not dropped.** `max_tokens` → `max_completion_tokens`, and the rename is recorded
+as a rename. This is where a real bug was avoided rather than introduced: the pre-flight guard that
+compares the requested output cap against the context window reads that number out of the body, and
+shaping **moves** it to a new key. Reading the cap *after* shaping would have found nothing, taken the
+`16_384` default, and silently mis-guarded every hosted call — so the read now happens before the rename,
+and the ordering is commented as the reason.
+
+**What was asked for and what was sent are both on the record.** `ShapedBody` carries `requested`,
+`sent`, `dropped` and `renamed`, and it is attached to the `CallUsage` row for every call, so the
+per-call artifact answers both halves of the question. `ShapedBody::is_consistent` encodes the arithmetic
+that makes the record trustworthy — `requested − dropped + renamed == sent` — and the equality is what
+"nothing was dropped silently" means as a checkable statement. Because `serde_json` is compiled without
+`preserve_order`, the body is a `BTreeMap`, so these lists are sorted and stable across runs, which is
+what lets a byte-comparison of two rows mean something. `render()` produces one whitespace-safe fragment
+(`requested_fields=… sent_fields=… dropped_fields=… renamed_fields=…`, empty lists as `none`) because the
+`run.summary` reader splits on whitespace and a space inside a value would run on into the next key.
+
+`run.summary` gains the **run-level rule** beside the per-call detail: `request_shape_backend=`,
+`request_shape_family=`, `request_shape_not_sent=` and `request_shape_renamed=`, built by
+`driver::request_shape_rule`. A reader who sees `temperature` missing from a hosted body reads the reason
+off the run rather than guessing the pipeline lost it. The local backend writes
+`request_shape_not_sent=none request_shape_renamed=none` — explicitly, not by omission — so a local
+summary stays self-describing without its bodies changing at all.
+
+**The seed is sent, and its mechanism says which backend carried it.** `seed` is a documented Chat
+Completions parameter and nothing in these models' documentation says they ignore it, so it is not
+dropped; what changes is the recorded mechanism: `openai:seed` (`OPENAI_SEED_MECHANISM`) instead of
+`llamacpp:seed`. That is a placeholder with a named successor: the standalone probe
+(`scripts/openai_probe.py`, run by hand with the key loaded via `read -s`) is what would move the constant
+to `openai:seed-ignored` or `unsupported`, and until it has been run the record claims only what has been
+verified — that the parameter was sent.
+
+**One thing this section deliberately does not touch: `reasoning_effort`.** The six call sites still send
+the hard-coded `"low"` on both backends, exactly as before. Moving that to a validated, provider-defaulted
+value is item 4, and doing it here would have made two independent changes to the same bodies in one
+commit — with the byte-identity guard for the local path standing between them.
+
+Tests: `src/llm/capabilities.rs` — `the_family_is_read_from_the_model_id_and_the_longest_prefix_wins`,
+`the_two_known_families_drop_the_sampling_fields_and_an_unknown_one_keeps_them` (asserts
+`unsent_keys(Unknown)` is exactly the not-a-parameter list, so the per-model list cannot leak onto an
+unknown model), `shaping_drops_the_unparameterized_keys_renames_the_cap_and_keeps_the_rest` (asserts each
+surviving field by value, that both cap spellings cannot coexist, that `sent` equals the body's own keys,
+and that the rendered fragment is four `key=value` tokens with no space of its own),
+`a_body_that_asked_for_nothing_unusual_shapes_to_itself`,
+`the_native_record_says_requested_equals_sent_and_drops_nothing`, and
+`is_consistent_rejects_a_record_that_lost_a_key_silently` (a record whose `sent` is missing a key it
+never dropped must fail the arithmetic).
+
+`tests/m3_session_log.rs::the_hosted_backend_sends_only_the_fields_the_model_accepts` is the end-to-end
+half, and it is written to fail in both directions. Two runs of the same repo, patch and stub differ in
+one variable — the backend — under `VANTA_SAMPLING=coding`, so the local body carries the fullest sampler
+set the harness ever pins. The local bodies must still carry every one of those keys, and the cap under
+its llama.cpp spelling, or the test fails: that is the "the local path stays byte-identical" half, stated
+as an assertion rather than trusted. The hosted bodies must lose exactly the documented list, must carry
+`max_completion_tokens` and not `max_tokens`, and — the strongest form — their **key set must equal the
+local key set with the documented rule applied and nothing else**, so a filter that ate a field nobody
+listed fails here too. The dropped-name list is spelled out in the test rather than read from the
+capability table on purpose: a table that had drifted from the API documentation would otherwise keep
+passing against itself. The test then checks the per-call rows (`requested_fields` admitting a key
+`sent_fields` no longer has, `dropped_fields` naming it, `renamed_fields` recording the rename) and the
+run-level rule, including that `request_shape_not_sent` names every key in the dropped list.
+
+---
+
+### 14.27 One test that §14.23 invalidated, corrected rather than deleted
+
+`tests/m3_session_log.rs::a_flag_off_run_without_truncation_never_moves_the_seed` was red at
+`c7a220d` (the §14.23 commit) and every commit after it, and it is corrected here without touching the
+behaviour it guards.
+
+**The failure was a stale assertion, not a regression.** The test's premise — stated in its own
+doc-comment as "the seed offsetting exists for RETRIES only" — was that a run with the §14 flags off and
+nothing truncated sends the *pinned* seed on **every** call. §14.23 deliberately replaced that rule with a
+**per-round** offset, `seed + (r - 1)`, so the second round's bodies legitimately carry `4243` and the
+test's `!body.contains("\"seed\":4243")` now asserts the opposite of the behaviour §14.23 was written to
+produce. §14.23 added a new test for the new rule and left this one asserting the old one, which is how a
+red suite survived three commits: the new test proved the offset works, and nothing proved the old test
+had been superseded. It was confirmed pre-existing before being touched — the test fails identically on
+`2328709` with the §14.26 work stashed, so no part of §14.26 is implicated.
+
+**What the test asserts now, and what it still refuses to.** The rule is read off the paired `call.usage`
+rows rather than inferred from a body's position: every call in round `r` must carry
+`4242 + (r − 1)` **and** every call within a round must carry the same value. The first half adopts
+§14.23; the second half is the test's original point, unchanged — with nothing truncated, no retry offset
+may apply, so a per-CALL offset inside a round still fails here. The old form could not express that
+distinction at all, which is why it had to be rewritten rather than renumbered. A floor is added so the
+guard cannot pass vacuously: the run must have spanned more than one round, because one round cannot tell
+a per-round offset from a fixed seed.
+
+**§14.23's behaviour is not touched.** `SEED_POLICY`, `seed_for_round`, `seed_for_attempt` and every
+recorded field are exactly as `c7a220d` left them; the only file this section changes is the test. That is
+also why it is a separate commit from §14.26: the item-3 work is a body-shaping change, and a test
+correction that happens to be discovered while running it is not part of it.
+
+---
+
+### 14.28 Hosted OpenAI backend, item 4 — the reasoning effort belongs to the run, not to the call site
+
+§14.26 gave the hosted backend one place to decide which FIELDS leave. This section is about the first
+field whose correct VALUE also depends on the run: `reasoning_effort`.
+
+**The call sites have hard-coded `low` since v0.2.** Every request Vanta builds carries
+`reasoning_effort: "low"` at the six sites that send one. On llama.cpp that is a no-op — the server defines
+no such knob, so the field is sent and ignored, which is the fact §14.21 recorded as the mechanism
+`llamacpp:noop`. On a hosted reasoning model the same field is not a no-op: it **is** the intervention.
+Leaving it in place would mean every hosted run silently reasons at whatever level six call sites happened
+to be written with — a configuration nobody chose, on the one backend where the level changes the output.
+
+**The rule is one line: the level goes out only when the run asked for one.** With `VANTA_REASONING_EFFORT`
+unset the field is removed and the model reasons at its provider default; with it set, that level goes out,
+after being checked against the model's own ladder.
+
+**Why the drop lives in the shaping table and not at the six call sites.** §14.21 put the reasoning BUDGET
+in `apply_reasoning_control` because the budget is an ADDITION: inserting a key is enough for the local
+backend, and §14.26's filter removes it for the hosted one. The effort is a SUBSTITUTION — six call sites
+already put a value there, and on a hosted model that value is a level nobody asked for — so it has to be
+REMOVED, and the removal has to happen on the same body the record describes. That body is the one
+`post_chat_meta` is about to serialise, which is exactly the choke point §14.26 already owns. A drop
+written at the call sites would be a seventh copy of the rule, and the one copy the record could not see.
+
+**One predicate, two readers.** `capabilities::keeps_effort(family, requested_effort)` is read by both the
+per-body drop in `shape_body_for_openai` and the run-level `request_shape_not_sent` rule in
+`request_shape_rule`. The sharing is the point: a run-level rule that named `reasoning_effort` while the
+body still carried it (or the reverse) is precisely the drift §14.26 exists to prevent. The rule answers
+"what did this run not send", so a default hosted run names the effort there and a run that set the switch
+does not. `post_chat_meta` and the driver reach the level through one public accessor, `requested_effort()`,
+so neither can describe a different request from the other.
+
+**Six names, and each family gets its own subset.** `gpt-6-luna`'s page gives the ladder as `none`, `low`,
+`medium` (default), `high`, `xhigh`, `max`; `gpt-6.1-sol`'s gives the same list without `none` (and rejects
+`minimal`). The union is `EFFORT_LADDER` — the six names `VANTA_REASONING_EFFORT` may say — and Sol's
+subset is `SOL_EFFORT_LADDER`, its five. `ReasoningEffort` therefore gained `XHigh` and `Max`, and
+`minimal` is deliberately NOT in it: the name appears in neither page, and an enum is the wrong place to
+invent a level. A level the run's model does not list is refused at start-up, before the repo is loaded:
+
+    CONFIG_ERROR: VANTA_REASONING_EFFORT='none' is not a level gpt-6.1-sol accepts (expected one of low|medium|high|xhigh|max).
+
+`Unknown` keeps the full union on purpose — the same asymmetry §14.26 chose for the sampling fields. An
+accepted-but-unlisted level is a level the operator asked for and cannot run; vetoing a request on evidence
+this table does not have is the guess it exists to avoid.
+
+**The record, backend by backend.** `reasoning_effort=` is the EFFECTIVE level and
+`reasoning_effort_mechanism=` names who implemented it:
+
+| run | body carries | `reasoning_effort=` | `reasoning_effort_mechanism=` |
+|---|---|---|---|
+| local, switch unset | `low` (the call sites') | `low` | `llamacpp:noop` |
+| local, switch set | the level | the level | `llamacpp:noop` |
+| hosted, switch unset | nothing | `provider_default` | `unset` |
+| hosted, switch set | the level | the level | `openai:reasoning_effort` |
+
+`provider_default` rather than `unset` in the value column: the hosted model still reasoned, at a level its
+provider chose, so a word meaning "no effort was in play" would be false.
+
+**The local mechanism was almost moved, and must not be.** The first cut of this item returned `unset`
+whenever the switch was unset, on both backends. That is wrong on one of them: a llama.cpp body carries an
+effort whether or not the switch was set, so `llamacpp:noop` — §14.21's reading — is the fact for every
+local run, and only the hosted branch may depend on the switch, because only the hosted branch's BODY
+depends on it. Two tests caught it, one in `llm::_reasoning_control_tests` and one in the m3 suite; the
+correction narrows the new branch and changes no existing reading.
+
+**A budget on a hosted model is `unsupported`, not dropped silently.** `VANTA_REASONING_BUDGET` sets a
+llama.cpp extension field, and no OpenAI endpoint defines it. §14.26 removes it from the body; this section
+gives the record a word for what happened, so `reasoning_budget_mechanism=unsupported` says the control was
+asked for and could not be expressed. Recording the llama.cpp mechanism while the body carried nothing
+would credit the run with an intervention it never made.
+
+**Byte-identity holds, and the test proves the drop rather than assuming it.** The local path still takes
+`ShapedBody::native` and never enters the shaper, so no local body changes and the tests that pin local
+bodies are untouched. The hosted-vs-local comparison in `m3_session_log` gained a POSITIVE CONTROL: the
+local reference body must contain `reasoning_effort`, because "the hosted body does not carry it" would
+otherwise be true of a run that never had one either.
+
+**Tests.** `capabilities::tests::the_effort_is_dropped_unless_the_run_asked_for_a_level_that_is_accepted`
+covers the three cases of the predicate (unset → dropped, accepted → kept, rejected → dropped), and
+`each_family_lists_its_own_effort_ladder_and_minimal_is_in_neither` spells both pages' ladders out by hand
+so the consts cannot drift from the docs. `llm::_reasoning_control_tests` pins the four-row table above,
+level by level and mechanism by mechanism, on both backends.
+`the_hosted_backend_sends_only_the_fields_the_model_accepts` runs the harness four more times: the
+body-level drop, the per-row `requested`/`sent`/`dropped` agreement, the refusal of `none` on Sol (exit 1,
+`CONFIG_ERROR`, the model named, not one call made) and the acceptance of the same `none` on Luna (exit 0,
+the level on the wire, `openai:reasoning_effort`, and a run-level rule that does NOT name the field).
+Neither half of that pair can pass for the wrong reason.
+
+**What this section does not settle.** No live call was made: the ladders, the acceptance rule and the
+`provider_default` reading all come from the model pages quoted in `capabilities.rs`. The operator's
+`scripts/openai_probe.py` — §14.26's open question on `seed`, unchanged — is what would falsify them.
+
+### 14.29 Hosted OpenAI backend, item 5 — usage, cost, and a spend cap
+
+§14.26 shaped the request, §14.28 the effort. This section is about what comes BACK: the `usage` block a
+hosted model returns carries two counts a local server never sends — the share of the prompt served from
+cache and the share of the completion spent reasoning — and a backend that sells tokens turns all four
+counts into money. The item's second half is the money's safety net: a batch budget that stops the run.
+
+**The price table is one file, because two languages have to agree about it.** `src/llm/pricing.rs` holds
+every rate this project can cite, with `PRICE_TABLE_DATE = "2026-10-26"` and
+`PRICE_TABLE_SOURCE = "https://platform.openai.com/docs/pricing"` as constants, and four rows:
+
+| family | tier | in | cached in | out |
+|---|---|---|---|---|
+| `gpt-6-luna` | `standard` | 0.10 | 0.01 | 0.50 |
+| `gpt-6-luna` | `flex` | 0.05 | 0.005 | 0.25 |
+| `gpt-6.1-sol` | `standard` | 2.00 | 0.10 | 10.00 |
+| `gpt-6.1-sol` | `flex` | 1.00 | 0.05 | 5.00 |
+
+Rates are USD per 1,000,000 tokens. `flex` is exactly half of `standard` on every column, and a test
+asserts that relationship rather than the four literals twice: an edit that halves one column and not the
+other should fail as a INVARIANT, not as a number that happens to differ.
+
+**Every row carries its own provenance, and the provenance travels into the record.** `PriceRow` has
+`source: &'static str` and `date: &'static str` FIELDS, not a doc comment, so a test can assert them and
+`cost_basis` can name them. A priced call records `cost_basis=family/tier/date`, e.g.
+`gpt-6-luna/standard/2026-10-26`. The date is the point: a table of bare floats cannot be checked, and a
+price that moved under a reader would silently re-price a batch that already ran. A manifest row that names
+its basis points at the exact entry that produced its number, and a total built from two different price
+dates is visible rather than pooled (`cost_basis` on `run.summary` joins the DISTINCT bases the run's calls
+recorded, in first-seen order).
+
+**The arithmetic bills three things and deliberately not a fourth.** Uncached input is
+`prompt_tokens - cached_tokens`; cached input is `cached_tokens` at the cached rate; output is
+`completion_tokens`. `cached_tokens` is a SUBSET of `prompt_tokens` (the `usage` block nests it under
+`prompt_tokens_details`), so billing the prompt total at the input rate would charge the cached share at
+full price and delete the discount the column exists to express; a test pins the difference (`0.000111`
+for 777/314/123 on Luna standard, against `0.000139` if the cache were ignored). `reasoning_tokens` is a
+SUBSET of `completion_tokens` (nested under `completion_tokens_details`), so it is RECORDED and not billed
+again — billing it would charge the same tokens twice. The subtraction is `saturating_sub`, so a provider
+that ever reported more cached tokens than prompt tokens produces a wrong bill rather than a panic in
+debug and a wrap in release.
+
+**Two documented rules are named and NOT modelled.** Cache WRITES are documented at 1.25x the uncached
+input rate, but the `usage` block these endpoints return publishes no write count (there is no
+`cache_write_tokens` beside `cached_tokens`), so there is no measured quantity to multiply — a column no
+response can fill would be a number this table invented. The long-context reprice (an input past the
+model's own threshold re-prices the whole request) is likewise real, and `LONG_CONTEXT_THRESHOLD_TOKENS =
+272_000` records the threshold, but the source states the rule and not the repriced rates, and a cost
+column is the last place to guess. A run that crosses the threshold still records its `llm_prompt_tokens`,
+so the crossing is visible; item 5's smoke run (`VANTA_LLM_CONTEXT_TOKENS=131072`) sits well below it, and
+a test asserts that it does.
+
+**An unknown family is refused, not approximated.** `price_row` returns `None` for a `(family, tier)` pair
+the table has no evidence for, and the caller records `unpriced_family` rather than borrowing the nearest
+family's rate. Pricing an unknown model's tokens at Luna's rate would put a fabricated figure in a paper's
+cost column. `not_billed` is the local backend's basis — a llama.cpp server is a process on this machine
+and no tokens are sold — and `no_usage` is a call whose only prompt figure is the character-derived
+estimate, which carries the estimate's ~1.5x error (§4.3) and must not be priced as if it were measured.
+
+**Cost is `Option<f64>` end to end, and `unset` is not `0`.** `cost_value` renders six fixed decimals or
+the word `unset`; six decimals rather than `{}`'s shortest form because `metrics.py` reads summary values
+with `\S+` and a scientific-notation figure would be read as containing an `e`. The distinction is the
+section's central one: `unset` is a fact about the RECORD ("no number was computed") while `0.0` is a fact
+about the MONEY ("priced, and it came to nothing"), and a cost column that renders both as `0` cannot be
+audited. The Python side keeps the distinction rather than flattening it — `_cost` maps the string `unset`
+to `None`, and `_row_cost` reads `None` as zero only where a SUM requires a number.
+
+**The record grew four keys on each of its two writers, appended last.** `call.usage` gained
+`cached_tokens=`, `reasoning_tokens=`, `cost_usd=`, `cost_basis=` after `truncated=`/the request shape, and
+`run.summary` gained `llm_cached_tokens=`, `llm_reasoning_tokens=`, `cost_usd=`, `cost_basis=` after
+`llm_completion_tokens=`. Appended rather than interleaved so every key a row carried before keeps its
+position and an older reader is unaffected. `token_value`/`cost_value` render `unset` wherever nothing was
+measured, never `0`, for the reason above.
+
+**The run-level totals are summed from the rows, not re-derived.** `cost_and_detail_totals` adds the
+recorded `cost_usd` figures, sums the two details over the calls that REPORTED them, and joins the distinct
+bases — the same discipline `token_totals` already followed, and for the same reason: an aggregate that
+re-derives its inputs can disagree with the rows it summarises.
+
+**The Python side copies the number; it never re-prices.** `llm_block` reads `llm_cached_tokens` /
+`llm_reasoning_tokens` / `cost_usd` / `cost_basis` out of `run.summary` and into the manifest row verbatim.
+Recomputing a cost in Python would mean a second copy of the rate table in a second language, and the two
+could drift; the per-call token counts exist only in Rust, so Rust is where the money is computed and
+Python's job is to carry the result.
+
+**The spend cap lives in the batch loop, not in the model call.** `VANTA_MAX_SPEND_USD` (unset = no cap) is
+read at the CLI invocation by `max_spend_usd_from_env` — a typo, `0` or a negative figure is a
+`RunnerError` naming the variable, because a safety net that silently means "no cap" is not a safety net.
+`run_batch` takes the cap and, BEFORE each job, compares it against the batch's spend to date, summed by
+`_spent_so_far` from the `llm.cost_usd` of the rows already IN THE MANIFEST — so a resumed batch counts
+what an earlier invocation spent and a resume cannot double-spend. The check is BETWEEN jobs by
+construction:
+
+* the row that crossed the cap is already complete and written;
+* no later job is started, so none is half-written;
+* the comparison is `>=`, because a batch that has reached its budget has spent it.
+
+**Stopping is recorded where a later reader will find it.** `_record_spend_cap` writes
+`spend.json` into the batch directory (atomically, via a `.tmp` + `os.replace`) with
+`reason=spend_cap`, `cap_usd`, `spent_usd`, `stopped_utc` and `first_unstarted_key`, and prints the same
+three facts. A file as well as a print because the terminal scrolls away and a wrapper only reads the exit
+code, but whoever opens the directory later has to be able to tell a batch that ran out of budget from one
+that finished. The refused job is left with NO key in `state.json`, so re-running the same batch without
+the variable continues from that job rather than skipping it. The cap is a budget, not a kill switch: it
+never interrupts a call. A row that priced NOTHING (`cost_usd` absent — a local run, or a Python record
+from before this item) counts as zero and can never reach a cap, which a test pins so an unpriced batch
+cannot stop at a budget of a fraction of a cent.
+
+**Tests.** `pricing::tests` (nine) cover the table's provenance and the `cached < uncached` invariant,
+`flex == standard / 2` per column, the input rate on a million tokens, the cached-share discount, the
+oddity where cached exceeds prompt, the basis string, and both refusals (`estimate`, `unpriced_family`).
+`m3_session_log::usage_details_and_cost_are_recorded_per_call_and_totalled` runs the SAME stub twice —
+once local, once hosted as `gpt-6-luna` — and asserts the four `call.usage` keys, the local
+`unset`/`not_billed` rows, the hosted `0.000111` and `gpt-6-luna/standard/2026-10-26` basis, and the
+`run.summary` totals on both, so the local and hosted columns are compared on one server's numbers rather
+than two. `scripts/test_bugsinpy.py` adds the spend-cap pair (the row that crossed it stays, the next is
+refused and left resumable; a batch of unpriced rows never reaches a cap) and the env-var validation
+(`unset`/empty = no cap, a number = a float, four typos refused).
+
+**What this section does not settle.** No live call was made: the rates, the nested `usage` shape and the
+`flex` discount all come from the pricing page quoted in `pricing.rs`. The operator's
+`scripts/openai_probe.py` is what would falsify them — and, until item 7 lands the tier switch, every
+hosted run is priced on the `standard` row.
+
+---
+
+### 14.30 Hosted OpenAI backend, item 6 — truncation kept, and a second retry budget
+
+§14.13's truncation rule is untouched by this item, and deliberately so: `finish_reason=length` still counts
+as truncated, the first cut-off still earns exactly one nudged re-ask, and the second still ends the call
+with the site's ordinary failure value (§14.5 item 2). What this section adds is the OTHER reason a request
+gets sent twice — the provider declining to serve it — and the whole point is that the two must never be
+added together.
+
+**The send is its own loop now.** `post_chat_meta` used to POST once and turn any non-2xx into an error;
+that block is now `send_with_provider_retries`, which returns the successful response *beside how many times
+it was re-sent for it*. The caller reads the status and consumes the byte stream as before — the function
+never reads a body on success, so a streaming call is not quietly buffered. Every non-retried failure comes
+back as the same `"HTTP ERROR {code} from {url}. Body snippet: {snippet}"` string the old block produced, so
+the failure text a reader has seen before, and the redaction it does, are unchanged: `redact_secret` still
+closes the hole where a provider echoes the credential back inside the body (the `EchoKeyUnauthorized` test
+still pins that), the snippet is still cut with `chars().take(300)` rather than a byte slice, and the request
+headers are still never formatted into the message.
+
+**Only a 429 is retried, and that is narrower than "any 5xx" on purpose.** llama-server answers a request
+that does not fit its KV cache with a 5xx, and re-sending that is a second full generation onto the same
+full cache — the "Context size has been exceeded" cascade `back_off` exists to avoid. A 429 is the one status
+that means *the request was fine, the service was busy*; it is the only class the provider is asking us to
+repeat. `insufficient_quota` also arrives as a 429 and is excluded, because it is **not** transient: the
+account is out of credit, and four retries would only add a minute to a failure that is waiting for a human.
+
+**The ladder, not a fixed pause.** `PROVIDER_RETRY_MAX = 4`, with `1s, 2s, 4s, 8s` between the attempts
+(`PROVIDER_RETRY_BACKOFF_BASE_MS = 1_000`, doubled by shift, capped at 30s). A rate limit is a
+window that has to ROLL OVER, so retrying at `back_off`'s 500 ms cadence would spend the whole budget inside
+one window and come back to the same 429; the `flex` capacity blip is the same shape at a coarser scale.
+Four is under a minute of waiting — long enough to ride out a blip, short enough that a provider that is
+really down still fails the call rather than the run's deadline (§14.15).
+
+**Its own budget, because a 429 is not an answer.** `max_attempts` exists to let the MODEL answer
+differently; a throttle is the service saying "not now" about a request the model never saw. Charging it to
+that budget would let a busy minute turn a call the model answered correctly on the first question into
+"the model failed twice" — the single reading this design exists to make impossible. The two counts are
+therefore separate all the way through: `CallUsage.provider_retries` sits beside `attempt` on the row, and a
+row reading `attempt=1 provider_retries=2` is a call the service throttled twice and the model answered
+once.
+
+**Two classes, counted separately, at both granularities.** `ProviderRetryClass` distinguishes
+`rate_limit` (the window rolled over) from `resource_unavailable` (the tier had no capacity — the documented
+`flex` answer), because they are different operational facts. Each is recorded on the call
+(`provider_retries=`) and on the run (`provider_retries=`, `provider_retries_rate_limit=`,
+`provider_retries_unavailable=`), and the Python `llm` block copies all four verbatim into the manifest row.
+The RUN-level counters are not a convenience: a call the provider kept refusing past `PROVIDER_RETRY_MAX`
+never answered, so it writes **no `call.usage` row at all**. Summing the rows would under-report exactly the
+runs that were throttled hardest, so the count that survives is the run's own
+(`crate::llm::provider_retry_counts()`), and `reset_call_usages` clears it with the rest.
+
+**The bound is a function, so it can be asserted instantly.** The class check and the budget check are one
+decision, `provider_retry_decision(err, retries_so_far)` — `Some(class)` is "back off and re-send", `None` is
+"return this error as the failure". Reaching the bound through the real loop means waiting out four
+backoffs, which no fast test should do; factoring the comparison out is what makes "the ladder stops at
+exactly `PROVIDER_RETRY_MAX`" a statement a unit test can check exhaustively.
+
+**Tests.** `llm::_provider_retry_tests` (two) pin the classification — both 429 flavours retried, an
+out-of-credit 429 not, `400/401/404/422/500/502/503` not, the two transport faults not — and the bound at
+every point on the budget. `m3_session_log::a_busy_provider_is_re_asked_without_spending_a_model_attempt`
+runs the stub hosted as `gpt-6-luna` with its FIRST generation request refused (a new stub capability,
+`refuse_next_calls`, answers a 429 whose body says `Resource Unavailable`) and asserts the run still reaches
+its verdict, that the generation was seen one time MORE often than the model was asked about it, that the
+model's attempt index on every `attacker_generate` row is still `1`, and that the run records
+`provider_retries=1`, `provider_retries_unavailable=1`, `provider_retries_rate_limit=0`.
+
+**What this section does not settle.** The ladder's shape and base are architecture, not measurement: no
+live 429 was observed while writing it, and the operator's `scripts/openai_probe.py` is what would show the
+real cadence. `retry-after` on the response is read by nobody — the ladder is fixed, so a provider asking
+for a longer wait than 8s is retried sooner than it asked; that is a deliberate simplification (a header
+that can say "wait an hour" is a header that can hold a run's deadline hostage) and it is named here rather
+than left for a reader to discover.
+
+---
+
+### 14.31 Hosted OpenAI backend, item 7 — the service tier
+
+`VANTA_OPENAI_SERVICE_TIER=flex|default` (unset = `default`) chooses the arm a hosted run is served on, and
+gets recorded per row and priced from that arm's own row. The switch is one read of the run's config,
+`LlmConfig.service_tier`, and it feeds the **two** consumers that must agree: the request body builder and
+the pricing call. A run served on `flex` while priced at standard rates would overstate a batch's spend by
+exactly 2x and look perfectly plausible in the manifest, which is the failure this item is about.
+
+**The tier is a field of the config, not a run-level global.** Both consumers already hold `LlmConfig`
+(`post_chat_meta` shapes the body and prices the call), so a second store would be a second value that could
+disagree with the first. `LlmConfig::service_tier_text()` is the one spelling used by `call.usage` and
+`run.summary`: `standard`/`flex` on the hosted backend, `unset` on the local one — the local backend names
+no tier because none exists to name, mirroring `cost_basis=not_billed` (a `standard` there would claim a
+hosted arm the local run never had).
+
+**Two variants, not four, and the reason is the price table.** The API's own accepted values are
+`auto|default|flex|priority`. `auto` and `default` are documented at the same rates, so both parse to
+`ServiceTier::Standard`; `priority` is **refused at config time** (`CONFIG_ERROR`), because the table has no
+row for it and a cost column is the last place to invent a price. `ServiceTier::parse` is strict about the
+rest (`flex`, `FLEX`, `fast`, `""` all rejected), and the error names the variable.
+
+**Only `flex` is ever spelled into a body.** `service_tier: "default"` is the API's own default, so writing
+it would be a body change that means nothing and would make an explicitly-`default` arm differ from an unset
+one for no reason. The key is therefore inserted under `if cfg.is_openai() && cfg.service_tier == Flex`,
+which is also the **byte-identity guard**: a llama.cpp body cannot gain the key, so every local-body-pinning
+test still passes unchanged.
+
+**The key is deliberately on neither drop list.** `unsent_keys` is what a family must not be SENT, and
+`service_tier` is not that: Chat Completions defines it, both GPT-6 families document `flex`, and it changes
+the price rather than the answer. `capabilities::SERVICE_TIER_KEY` sits beside the filtered keys and
+`the_service_tier_is_never_dropped_on_any_family` pins that a dotted-in `flex` survives shaping on every
+family, including `Unknown`. (A `SERVICE_TIER_FLEX` value constant was written and then removed — the value
+comes from `cfg.service_tier.name()`, so a second copy could only drift.)
+
+**One row per (family, tier).** `PRICE_TABLE` already pairs each family with both arms (Luna `0.10/0.01/0.50`
+standard and `0.05/0.005/0.25` flex; Sol `2.00/0.10/10.00` and `1.00/0.05/5.00`), and `cost_for_family` now
+takes the run's tier, so `cost_basis` reads `gpt-6-luna/flex/2026-10-26` and points at the exact entry that
+produced the figure. A tier with no row is not silently priced at standard: `price_row` answers `None` and the
+basis says `unpriced_family`.
+
+**Tests.** `pricing::the_tier_switch_is_strict_and_collapses_only_the_two_equal_prices` pins the parse
+(`flex`/`default`/`auto` accepted, four bad arms refused with an error naming the variable and starting
+`CONFIG_ERROR`). `capabilities::the_service_tier_is_never_dropped_on_any_family` pins the key against both
+lists. `m3_session_log::a_flex_run_is_named_and_priced_from_its_own_row` runs the stub hosted as `gpt-6-luna`
+with `VANTA_OPENAI_SERVICE_TIER=flex` and asserts the arm is spoken in every body, that every `call.usage`
+row reads `cost_usd=0.000055 cost_basis=gpt-6-luna/flex/2026-10-26 service_tier=flex`, and that the run
+totals it — the same stub and usage frame as the standard case, so the only difference between `0.000111` and
+`0.000055` is the tier. `usage_details_and_cost_are_recorded_per_call_and_totalled` gained the other half of
+the pair: the local rows read `service_tier=unset`, the hosted rows `standard`, and **no** body from the
+unset arm contains the key. Python:
+`TestLlmBlock::test_the_service_tier_is_copied_and_not_parsed_out_of_the_basis` pins the manifest key, and the
+before-this-record case reads `None` rather than defaulting to `standard`.
+
+**What this section does not settle.** `priority` is refused rather than priced, and a live `flex` run was
+never made — `scripts/openai_probe.py` (the operator's standalone, run with the key loaded via
+`read -s OPENAI_API_KEY`) is where the real `service_tier` field, the busy-response body, and the 429
+`Retry-After` would be confirmed.
+
+---
+
+### 14.32 Hosted OpenAI backend, item 8 — prompt caching
+### (the order was already right; what was missing was the measurement)
+
+Item 8 asked for the stable part of a request to come first and the variable part last, and offered a
+reordering if that was not already the case. **No reordering was needed, and this section is the record of why
+— because "we checked and changed nothing" is only a fact if the check is written down.**
+
+**The provider's cache is a prefix cache, so order is the whole item.** Caching on the hosted backend is
+automatic: a request reuses a cached prefix only when the tokens up to some point are byte-identical to a
+request the model has already answered. Two consequences decide what "correct order" means here. The **system
+prompt must be the first message** — a cache can only match from the first token forward, so anything that
+precedes it can never be reused. And the **longest possible stable run must be as early as possible**, because
+every variable token truncates the reusable prefix at that point. A call whose attempt feedback sat ahead of
+the repo context would re-bill the whole prompt on every retry and hit the cache on nothing.
+
+**The order was already correct at both levels.** At the message level, every call site builds
+`[system, user]` and *appends* its retry turn rather than rewriting either: `creator.rs:185-198`,
+`attacker.rs:399-412`, `605-618`, `676-689`, `1122`, `1687` all start from `json!({"role":"system", …})`, and
+the one non-`build_messages` tail — the §14.5 cut-off nudge — is
+`append_truncation_nudge` (`llm/mod.rs:2213-2218`), which pushes an extra `user` turn precisely so that
+"attempt 1 of every call … is byte-identical to v0.2". At the intra-message level the stable text leads too:
+the Creator's variable `PRIOR FEEDBACK` is pushed *after* the `ISSUE:` and `FILE:` blocks
+(`creator.rs:171-179`); the Attacker's revise turn carries the issue and original source *before* the prior
+test, mismatch reason and baseline evidence (`attacker.rs:586-601`); and the generate turn's variable
+`ALREADY IN THE SHARED TEST SET` section (`attacker.rs:293-320`, appended at `384-393`) follows the
+`PATCH:`/`ORIGINAL SOURCE:`/`ISSUE:` head. So the stable prefix is first and the variable tail is last
+because the builders are written that way, not because anything was moved.
+
+**Because nothing was moved, no before/after diff exists to show and the local bodies are unchanged by
+construction.** Item 8's "prove local bodies unchanged" is therefore discharged by the tests that already
+pin them — `the_concise_switch_appends_the_sentence_to_the_generate_prompt_only` and the §14.24–§14.31 body
+assertions all still pass on the untouched builders — plus the new ordering test below, which fails if a later
+edit reorders a request instead of appending to it.
+
+**What was actually missing was the measurement.** `CallUsage.cached_tokens` already comes from the server's
+`prompt_tokens_details.cached_tokens` (`llm/mod.rs:1504-1506`, §14.29), and stays `None` — not `0` — when the
+provider reports nothing, so "no cache reported" is never recorded as "cache missed". This item adds the
+run-level figure built from those rows: `run.summary` gained `llm_cache_hit_rate`, and the manifest's
+`llm_block` gained `cache_hit_rate` beside `cached_tokens`/`reasoning_tokens`.
+
+**The rate is token-weighted, not a mean of per-call rates.** `cache_hit_rate_value(cached, prompt)` in
+`driver.rs` is `cached / prompt` over the run's totals, rendered `{:.4}`. A mean of per-call rates would let a
+20-token call count as much as a 20,000-token one, which is the opposite of what a share of the bill measures.
+It answers `unset` in three cases and none of them is `0.0000`: nothing was measured (`cached` is `None`), the
+provider reported cached tokens but no prompt total to divide by, or the run's prompt total is zero. When only
+*some* calls reported a cached figure the rate is a **lower bound**, since the divisor is every prompt token
+the run sent — which is stated here rather than padded with an estimate. Python mirrors the distinction rather
+than collapsing it: `_rate` maps the string `unset` to `None`, so the manifest never carries a share that is
+really "unknown" as a float the reader would average.
+
+**Tests.** `driver.rs::the_cache_hit_rate_is_unset_when_no_rate_exists_and_never_a_guessed_zero` pins the five
+cases that matter (`Some(314)/777 → "0.4041"`, `Some(0)/777 → "0.0000"`, `None → "unset"`, `Some(0)/0 →
+"unset"`, `Some(500)/500 → "1.0000"`). `m3_session_log::the_cacheable_prefix_leads_every_request_and_the_variable_tail_trails_it`
+runs the stub twice: a plain run asserts that every request LEADS with a non-empty `system` message
+byte-identical across the run for its call site, that the last message is the `user` turn, and that no message
+but the last carries attempt feedback (checked on DECODED bodies, since an escaped `\n` would let a raw
+substring test match a nudge nested inside the system prompt); and a cut-off run asserts the retry's
+`[system, user]` prefix equals the first attempt's **element for element**, with every later message a
+variable `user` tail ending on §14.5's cut-off nudge — the exact property the provider's prefix cache keys
+on. (A cut-off retry turns out to carry **two** tails, the site's own attempt-#2 `REPROMPT` and the nudge, and
+the test pins both as trailing: the first draft asserted exactly one tail and the stub caught it.)
+`usage_details_and_cost_are_recorded_per_call_and_totalled` asserts the local summary reads
+`llm_cache_hit_rate=0.4041` and that the hosted summary equals the local value on the same stub usage frame.
+Python: `TestLlmBlock::test_the_cache_hit_rate_is_a_float_and_none_when_no_rate_exists` pins `0.4041 → 0.4041`,
+`"0.0000" → 0.0`, `"unset" → None`, and the before-this-record case reads `None`.
+
+**What this section does not settle.** No hosted run was made, so no *real* `cached_tokens` figure has been
+seen: the 1,024-token minimum for automatic caching, whether a cache key parameter exists, and what the
+provider actually reports for a reused prefix are still open, and `scripts/openai_probe.py` is where the
+operator confirms them with the key loaded via `read -s`.
+
+---
+
+### 14.33 Hosted OpenAI backend, item 9 — parallel bugs, design note only
+
+**No code, and `run` has no `--jobs` flag.** Item 9 said "if risky, stop at a design note", and this is that
+stop. The reason is not that N jobs is hard to *write* — it is a loop over a pool — but that three of the
+batch's guarantees are **read-modify-write agreements between processes**, and this window's own item 5 showed
+how expensive a wrong one is: on the hosted backend a lost write is money, not just time.
+
+**The hazard that changed with item 5.** `manifest.py` already documents the single-writer assumption as a
+*convenience*: "a job is idempotent — every Vanta run gets a fresh random session directory, so re-running
+costs time and cannot corrupt an earlier record." On the local backend that sentence is the whole story. On
+OpenAI, a re-run that should have been a skip now **bills the same prompt a second time** on a batch whose
+spend is being capped to the cent. The old failure mode of a lost cursor was "we pay in wall clock"; the new
+one is "we pay in dollars and the row is duplicated in the evidence". That is what makes parallelism a
+correctness change rather than a flag.
+
+**(1) `state.json` — atomic replace is not an atomic update.** `Manifest.mark()` reads the whole map, mutates
+one key, writes a temp file and `os.replace`s it (`manifest.py:120-131`). The replace is atomic, so no reader
+ever sees a torn file — but the *update* is not: two workers that both read state `S`, each add their own key,
+and each replace, leave one of the two keys on the floor. A lost `done` is the expensive one (the job re-runs
+and re-bills); a lost `running` is merely a stale cursor. The three ways out, cheapest first: **(a) the parent
+owns `state.json` and workers never touch it** — workers report completion over a queue and one process applies
+`mark()`; a crashed worker's job is still recovered because the manifest row and the session log are durable on
+their own; **(b)** per-worker shards (`state.<worker>.json`) unioned by the parent at resume, which trades one
+lost-update race for a merge format; **(c)** `fcntl.flock` around the read-modify-write, which is smallest but
+makes every `mark()` a lock and leaves the cap race below unsolved anyway. (a) is the one that also fixes (3).
+
+**(2) `manifest.jsonl` — the append is fine only if it stays one `write`.** The file is append-only and never
+rewritten, which is the right shape for `O_APPEND`; POSIX makes a single write to an `O_APPEND` descriptor
+atomic with respect to other appenders. The current `append()` uses `open(path, "a")` + `write` +
+close (`manifest.py:77-85`), and a buffered `write` of a long row is not guaranteed to be one syscall — so N
+writers could interleave *inside* a line and produce a row no parser can read. The fix is small and testable
+(a single `os.write` of the encoded line on an `O_APPEND` fd, with a test asserting one syscall per row) but it
+is a change to the file every existing batch's evidence depends on, so it belongs with (1), not bolted on
+beside it.
+
+**(3) The spend cap is a batch-level race, and it is the one that spends money.** `_spent_so_far` sums the
+rows on disk and the cap is checked *before* the next job starts (`runner.py:1967-1976`, `2176-2187`). The
+"finish the current row, start no new ones" rule is structural only because exactly one job can be in flight —
+§14.29's own note says the cap "refuses the *next* job, never an in-flight one". With N workers reading the
+same total, N jobs start together and the batch overshoots by up to `(N-1) × worst_row_cost`. Two honest
+answers, and they are not equivalent: **gate in the parent** (release a job only when `spent + worst_case_row <
+cap`, which turns the cap into a real bound and makes (1)(a) pay for itself twice), or **declare the bound and
+record it** — add `overshoot_bound_usd` to the `spend.json` payload so a batch that overshot says by how much
+instead of looking like a bug in the pricing. What is *not* acceptable is shipping `--jobs` while `spend.json`
+still implies a bound the code no longer honours.
+
+**(4) The sandbox is a shared machine, not a shared library.** Every job boots the repo in a `shuru` microVM,
+and `runs/bugsinpy/deps/*.preflight.json` is a real read-then-write path that already shows up in this
+project's sandbox errors. N concurrent jobs mean N microVMs (N× RAM, N× mounts, N× disk) and, worse than
+slowness, two jobs whose scratch paths collide on a *partial* write — one job's half-written preflight is
+another job's input. Per-job scratch derived from `job.key` (`forensics/<job.key>/…`,
+`deps/<job.key>.preflight.json`) is a prerequisite, and each job needs its own forensics directory for the
+same reason: `FORENSICS_ROUND` and the attempt-scoped forensics tags are process-global, so two runs sharing a
+tag would overwrite each other's `raw_response.txt`.
+
+**(5) Provider concurrency is a measurement question before it is a throughput question.** On llama.cpp the
+flag is refused outright (see below): one GPU serves one batch, and `--parallel` slots would change what the
+run measures, which is the same reason item 1 keeps the local path byte-identical. On OpenAI the provider
+absorbs the concurrency, but §14.30's retry ladder — `provider_retries`, the rate-limit and flex
+"resource unavailable" counts — now fires *because* of our own fan-out, so `provider_retries` stops being a
+property of the provider's day and becomes a property of `--jobs`. A paper column that compares retry counts
+across batches must therefore hold `--jobs` fixed, and the manifest should carry it (a `jobs` key beside
+`service_tier`) so a row cannot be assigned to the wrong arm after the fact.
+
+**Why the flag is hosted-only, stated as the rule the code would enforce.** `VANTA_LLM_BACKEND=openai` is a
+precondition, checked at startup and refused with a `CONFIG_ERROR` naming `--jobs` and the backend — the same
+fail-before-the-first-call shape as `ServiceTier::parse` (§14.31), because discovering that a 6-hour batch was
+serial after a token was spent is the thing that check exists to prevent. Default stays `1`, and `1` must be
+byte-identical to today: a `--jobs 1` run that differs from a run without the flag at all is a regression in
+disguise, so the pool would have to be a path that N=1 does not enter rather than a path that degenerates.
+
+**What this section intentionally does not do.** It does not add `--jobs`, does not change `Manifest`, and does
+not change `spend.json`. It also does not claim the four races are the only ones: it names the ones this
+codebase's own comments already depend on — "one writer per file" and "one job in flight at a time" — and each
+of those assumptions is load-bearing for a guarantee a reviewer would otherwise believe still holds. The
+prerequisite for building item 9 is therefore not a pool; it is (1)(a) + (2) + (3) with tests that fail when
+two writers lose a key or a row, and those are worth their own items.
+
+---
+
+### 14.34 Hosted OpenAI backend — pinning the capability table from the live probe
+
+§14.26 wrote the capability table from the model pages and left two fields open on purpose: `seed` and
+`presence_penalty` were not documented either way, so the table guessed neither, and `scripts/openai_probe.py`
+was shipped to ask the API directly. It has now been run — by the operator, against both ids
+(`gpt-6-luna`, `gpt-6.1-sol`) on 2026-10-26, from `~/vanta-api` with the key read from `OPENAI_API_KEY`; the
+output is the operator's `~/luna-probe.log`. This section is what it settled. **It changes no field's fate**:
+the nine keys §14.26 dropped are still the nine keys dropped. What it changes is *why* the table can say so,
+and it is worth being plain about that — this commit is evidence, structure and documentation, not behaviour.
+
+**The probe SPLIT the second list; it did not contradict it.** §14.26 carried one list, "rejected while
+reasoning". The verdict table came back with two different `error.code`s for the two kinds of rejection, which
+are two different claims about the API:
+
+| error code | meaning | probed fields | Vanta's fields |
+|---|---|---|---|
+| `unsupported_parameter` | the model has no such parameter at all | `top_p` — *"Unsupported parameter: 'top_p' is not supported with this model."* | `top_p`, and (per the model pages, unprobed) `logprobs`, `top_logprobs` |
+| `unsupported_value` | the parameter exists and only its **default** value is accepted | `temperature` at `0.6` — *"does not support 0.6 with this model. Only the default (1) value is supported."* | `temperature`, `presence_penalty`, and (unprobed) `frequency_penalty` |
+
+`NOT_A_CHAT_PARAMETER` (`top_k`, `min_p`, `reasoning_budget_tokens`) is untouched and is a third kind still:
+those are llama.cpp knobs the endpoint does not define, so they are not on the API to reject. So the constants
+in `src/llm/capabilities.rs` are now three lists, and `unsent_keys` unions the first with the two rejections
+for a known family and keeps only the first for `Unknown` — an abstaining family must not be handed a drop list
+it has no evidence for.
+
+**`temperature` is the one that would have failed every call.** The probe sent it at `0.6`, which is exactly
+`llm::CODING_TEMPERATURE` — the value Vanta's `coding` preset pins on every site. `top_p` was sent at `0.9`,
+also a reject; the operator's instruction named only Sol, but **both** ids 400 on `temperature` and `top_p`, so
+the drop list is identical for the two known families. `max_tokens` behaves as §14.26 said: rejected by its own
+name, with `max_completion_tokens` named in the provider's message, so it stays a RENAME and not a drop.
+
+**`presence_penalty` stays dropped, and the probe cannot move it.** The probe sent it at `0.0` — the API's
+default *and* `llm::CODING_PRESENCE_PENALTY` — and got a `200`. That is not "accepted": the `temperature`
+rejection says these families take only a field's default value, and a default is byte-equivalent to omitting
+the key, so the `200` is evidence about a body the pipeline could have sent with the key absent.
+`VANTA_PRESENCE_PENALTY` can pin any value, and no probe has sent a non-default one, so the key stays dropped
+until one has. A default-valued `200` buys nothing a dropped key costs.
+
+**`seed` stays `openai:seed`, as a best-effort claim only.** The probe was accepted on both ids, so the field
+travels — which is what `OPENAI_SEED_MECHANISM` claims. It is *not* evidence that one seed reproduces one
+completion: that needs a same-seed repeat, and the probe is one sample per row. `src/llm/mod.rs` now records
+this instead of saying the probe "is what would move this"; the value becomes `openai:seed-ignored` only if a
+same-seed repeat is later shown to differ.
+
+**`service_tier=flex` is unchanged.** Luna answered `200`; Sol answered `429 flex_unavailable` — capacity
+pressure, not a rejection, and already the case §14.30's retry ladder treats as retryable (and not billed).
+Default tier is fine for the first hosted runs, so nothing moves here.
+
+**[VANTA-WHY] The consequence to carry into the local-vs-API comparison.** Because `temperature` is withheld,
+a HOSTED run samples at the **provider's default**, not at the `coding` preset's `0.6`. Two rows that differ
+only by backend are therefore not two draws from the same distribution, and a local-vs-API comparison has to
+say so rather than attribute the difference to the model. This is the reason the split is worth a structure at
+all: it is the `unsupported_value` half of the table that carries the consequence, and a single merged list
+would have hidden which half that is. The module doc and a new test,
+`the_rejection_lists_split_by_error_code_and_do_not_overlap`, pin the two lists apart so a later edit cannot
+quietly merge them back.
+
+§14.26's table description is superseded for the two rejection lists by this section; its `NOT_A_CHAT_PARAMETER`
+rows, its `max_tokens` rename and its per-family effort ladders are unchanged.
+
+---
+
 ## 15. Model screen
 
 Vanta's LLM calls are served locally by `llama-server`. Before committing a model to the BugsInPy

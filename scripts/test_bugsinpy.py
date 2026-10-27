@@ -54,6 +54,7 @@ from bugsinpy import manifest as manifest_mod  # noqa: E402
 from bugsinpy import oracle as oracle_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
 from bugsinpy import records as records_mod  # noqa: E402
+from bugsinpy import redact as redact_mod  # noqa: E402
 from bugsinpy import runner as runner_mod  # noqa: E402
 from bugsinpy import shuru as shuru_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
@@ -18356,6 +18357,91 @@ class TestLlmBlock:
         # times, so the pipeline does not report it as a plain retryable run-away.
         assert block["truncated_twice"] == 0
 
+    def test_the_cost_and_the_non_token_details_are_copied_verbatim(self):
+        """§14.29 — the money, and the two usage details that are not token counts.
+
+        The pipeline priced the calls against its own versioned table and wrote the
+        basis it used; the harness copies both. It must NOT re-price: a second price
+        list here could disagree with the first, and nothing in the record would say
+        which one a batch table had used.
+        """
+        block = runner_mod.llm_block(
+            runner_mod.parse_summary(
+                self.SUMMARY
+                + " llm_cached_tokens=888 llm_reasoning_tokens=111 "
+                "cost_usd=1.234567 cost_basis=gpt-6-luna/standard/2026-10-26"
+            )
+        )
+        assert block["cached_tokens"] == 888
+        assert block["reasoning_tokens"] == 111
+        assert block["cost_usd"] == 1.234567
+        assert block["cost_basis"] == "gpt-6-luna/standard/2026-10-26"
+
+    def test_an_unpriced_run_is_none_and_not_zero(self):
+        """`unset` is "nothing was priced" — a local run — and zero is "priced, and free".
+
+        A batch table that summed these would be poisoned by the string `unset`, and a
+        `0.0` here would claim a local run had been priced and come to nothing.
+        """
+        block = runner_mod.llm_block(
+            runner_mod.parse_summary(
+                self.SUMMARY
+                + " llm_cached_tokens=unset llm_reasoning_tokens=unset "
+                "cost_usd=unset cost_basis=not_billed"
+            )
+        )
+        assert block["cached_tokens"] is None
+        assert block["reasoning_tokens"] is None
+        assert block["cost_usd"] is None
+        assert block["cost_basis"] == "not_billed"
+
+    def test_the_service_tier_is_copied_and_not_parsed_out_of_the_basis(self):
+        """§14.31 — the arm the run was served on, beside the row that priced it.
+
+        The basis already carries the tier (`gpt-6-luna/flex/2026-10-26`), but the
+        two are different claims and the block records both: the basis is the row
+        that produced the figure, the tier is what the run asked for. A batch table
+        grouped by arm must not have to split a formatted string to find it, and a
+        local run names no tier at all rather than guessing `standard`.
+        """
+        flex = runner_mod.llm_block(
+            runner_mod.parse_summary(
+                self.SUMMARY
+                + " cost_usd=0.000055 cost_basis=gpt-6-luna/flex/2026-10-26"
+                " service_tier=flex"
+            )
+        )
+        assert flex["service_tier"] == "flex"
+        assert flex["cost_basis"] == "gpt-6-luna/flex/2026-10-26"
+        local = runner_mod.llm_block(
+            runner_mod.parse_summary(
+                self.SUMMARY + " cost_usd=unset cost_basis=not_billed service_tier=unset"
+            )
+        )
+        assert local["service_tier"] == "unset"
+        assert local["cost_basis"] == "not_billed"
+
+    def test_the_cache_hit_rate_is_a_float_and_none_when_no_rate_exists(self):
+        """§14.32 — a share a batch can average, with "no rate" kept apart from zero.
+
+        The pipeline writes `unset` when no rate exists at all and `0.0000` when a
+        cache was measured and served nothing; this block must not collapse the two
+        into one `None`, which would make "the provider told us nothing" read as
+        "the cache never hit" — the reading that would make a broken cache look fine.
+        """
+        block = runner_mod.llm_block(
+            runner_mod.parse_summary(self.SUMMARY + " llm_cache_hit_rate=0.4041")
+        )
+        assert block["cache_hit_rate"] == 0.4041
+        measured_zero = runner_mod.llm_block(
+            runner_mod.parse_summary(self.SUMMARY + " llm_cache_hit_rate=0.0000")
+        )
+        assert measured_zero["cache_hit_rate"] == 0.0
+        no_rate = runner_mod.llm_block(
+            runner_mod.parse_summary(self.SUMMARY + " llm_cache_hit_rate=unset")
+        )
+        assert no_rate["cache_hit_rate"] is None
+
     def test_the_revise_budget_is_reported_beside_the_call_totals(self):
         # §14.14 — the cap and the run's spend against it, read back rather than
         # re-derived, so a manifest read later does not have to trust a constant
@@ -18395,7 +18481,44 @@ class TestLlmBlock:
         assert block["revise_budget_per_attempt"] is None
         assert block["revise_calls_used"] is None
         assert block["truncated_calls_by_role"]["attacker"] is None
+        # §14.29 — a row written before this change has no cost and no details, and
+        # `None` is the honest reading: not priced, not measured. `cost_basis` is
+        # absent too, so it says nothing rather than naming a price row.
+        assert block["cached_tokens"] is None
+        assert block["reasoning_tokens"] is None
+        assert block["cost_usd"] is None
+        assert block["cost_basis"] is None
+        # §14.31 — no tier was named either, so the block says nothing rather
+        # than defaulting a pre-§14.31 row to `standard`.
+        assert block["service_tier"] is None
+        # §14.32 — and no cache rate, for the same reason: a record that never
+        # measured a cache must not report one.
+        assert block["cache_hit_rate"] is None
         assert block["by_site"] == {}
+
+
+class TestSpendCapFromTheEnvironment:
+    """§14.29 — `VANTA_MAX_SPEND_USD` is read at the invocation, not inside the loop.
+
+    Read by the CLI rather than by `run_batch` so a test that drives the batch loop
+    is never capped by whatever the developer happens to have exported: the cap is a
+    property of *this run of the batch command*, and the command is the CLI.
+    """
+
+    def test_unset_or_empty_means_no_cap(self):
+        assert run_mod.max_spend_usd_from_env({}) is None
+        assert run_mod.max_spend_usd_from_env({"VANTA_MAX_SPEND_USD": ""}) is None
+        assert run_mod.max_spend_usd_from_env({"VANTA_MAX_SPEND_USD": "  "}) is None
+
+    def test_a_number_comes_back_as_a_float(self):
+        assert run_mod.max_spend_usd_from_env({"VANTA_MAX_SPEND_USD": "2"}) == 2.0
+        assert run_mod.max_spend_usd_from_env({"VANTA_MAX_SPEND_USD": " 5.25 "}) == 5.25
+
+    @pytest.mark.parametrize("raw", ["two dollars", "0", "-1", "nan-ish"])
+    def test_a_typo_in_the_safety_net_is_refused_not_ignored(self, raw):
+        """A cap that silently became "no cap" is the failure this test prevents."""
+        with pytest.raises(runner_mod.RunnerError, match="VANTA_MAX_SPEND_USD"):
+            run_mod.max_spend_usd_from_env({"VANTA_MAX_SPEND_USD": raw})
 
 
 def _gate_row(
@@ -19897,7 +20020,7 @@ class TestRunBatchLoop:
         monkeypatch.setattr(runner_mod, "run_job", self._stub(tmp_path, calls, leave_running=running))
         return preps, entries, split, calls, tmp_path / "batch"
 
-    def _run(self, preps, entries, split, batch_dir, *, show_hints=False):
+    def _run(self, preps, entries, split, batch_dir, *, show_hints=False, max_spend_usd=None):
         return runner_mod.run_batch(
             batch_dir=batch_dir,
             batch_id="b1",
@@ -19910,6 +20033,7 @@ class TestRunBatchLoop:
             max_attempts=4,
             disk_mb=8192,
             show_hints=show_hints,
+            max_spend_usd=max_spend_usd,
         )
 
     @staticmethod
@@ -19926,6 +20050,102 @@ class TestRunBatchLoop:
         self._run(preps, entries, split, batch_dir)
         assert calls, "the stub should have been called"
         assert {job.harness for job in calls} == {runner_mod.Revision("h" * 40, False)}
+
+    # -- §14.29, the spend cap ---------------------------------------------
+    def _cost_stub(self, tmp_path, calls, *, cost_usd):
+        """A `run_job` whose rows carry a price, so the cap has a number to count."""
+
+        def stub(*, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version):
+            calls.append(job)
+            record = self._row(tmp_path, job)
+            record["llm"] = {"cost_usd": cost_usd, "cost_basis": "test/tier/2026-10-26"}
+            manifest.append(record)
+            manifest.mark(job.key, manifest_mod.DONE)
+            return record
+
+        return stub
+
+    def test_the_spend_cap_keeps_the_row_that_crossed_it_and_starts_no_more(
+        self, tmp_path, monkeypatch
+    ):
+        """§14.29 — the cap is checked BETWEEN jobs, and the reason is on disk.
+
+        The cap must not interrupt a job: the row that takes the batch over its
+        budget is already complete and priced, and every later row must be
+        *unstarted* rather than half-written. So the assertion is that the first
+        job of a two-job batch ran, the second did not, and the second still has
+        no key in the cursor — which is exactly what makes the stop resumable
+        rather than destructive.
+        """
+        monkeypatch.setattr(
+            runner_mod, "git_revision", lambda *a, **k: runner_mod.Revision("h" * 40, False)
+        )
+        preps, entries, split, calls, batch_dir = self._prepare(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            runner_mod, "run_job", self._cost_stub(tmp_path, calls, cost_usd=0.75)
+        )
+
+        code, _results = self._run(preps, entries, split, batch_dir, max_spend_usd=0.5)
+
+        # The batch's first job costs $0.75, which is already past the $0.50 cap,
+        # so it runs and EVERY job after it is refused before it starts. The count
+        # is asserted rather than the job's identity because what is under test is
+        # the stop, not which job happens to be first.
+        assert len(calls) == 1, [job.label() for job in calls]
+        assert code == 1, "a batch that stopped at its cap must not report success"
+
+        spend = json.loads((batch_dir / runner_mod.SPEND_CAP_NAME).read_text(encoding="utf-8"))
+        assert spend["reason"] == "spend_cap"
+        assert spend["cap_usd"] == 0.5
+        assert spend["spent_usd"] == 0.75, "the row that crossed the cap is counted, not dropped"
+        assert spend["first_unstarted_key"] != calls[0].key
+
+        manifest = manifest_mod.Manifest(batch_dir)
+        assert not manifest.is_done(spend["first_unstarted_key"]), (
+            "the refused job must keep no `done` key, or the stop would be "
+            "indistinguishable from a completed batch"
+        )
+
+        # §14.29 — the cap is a budget, not a kill switch: running the same batch
+        # again without it reaches the job this run refused, and runs to the end.
+        spent_before = len(calls)
+        self._run(preps, entries, split, batch_dir)
+        assert len(calls) > spent_before, "the resume must start the refused job"
+        assert manifest.is_done(spend["first_unstarted_key"]), (
+            "the refused job is now the resumed run's first, and it must complete"
+        )
+
+    def test_a_row_that_priced_nothing_never_reaches_a_cap(self, tmp_path, monkeypatch):
+        """A local run is `unset`, read as zero — so it can never cross a cap by accident.
+
+        Every run before this change priced nothing at all (`cost_usd` absent, and
+        on the local backend `unset`), and the cap must leave those batches exactly
+        as they were: unset is "nothing was priced", which is not a spend. The
+        reference is the same batch run without a cap: the counts must agree, or
+        the cap changed a batch it had no priced row to stop.
+        """
+        monkeypatch.setattr(
+            runner_mod, "git_revision", lambda *a, **k: runner_mod.Revision("h" * 40, False)
+        )
+        preps, entries, split = self._fixture(tmp_path)
+        monkeypatch.setattr(runner_mod, "python_version_of", lambda *a, **k: "3.8.20")
+        monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kwargs: kwargs["candidate"])
+
+        # The default stub writes rows with no `llm` block at all: nothing priced.
+        capped_calls: list = []
+        monkeypatch.setattr(runner_mod, "run_job", self._stub(tmp_path, capped_calls))
+        capped_dir = tmp_path / "capped"
+        # A cap of a fraction of a cent: only a batch that priced nothing survives it.
+        self._run(preps, entries, split, capped_dir, max_spend_usd=0.000001)
+        assert capped_calls, "the batch should still run"
+        assert not (capped_dir / runner_mod.SPEND_CAP_NAME).exists()
+
+        ref_calls: list = []
+        monkeypatch.setattr(runner_mod, "run_job", self._stub(tmp_path, ref_calls))
+        self._run(preps, entries, split, tmp_path / "uncapped")
+        assert len(capped_calls) == len(ref_calls), (
+            "an unpriced batch must run exactly the jobs it runs without a cap"
+        )
 
     def test_the_hints_ablation_reaches_every_job_and_its_key(self, tmp_path, monkeypatch):
         """§2.4.4: ``--show-hints`` is part of the job *and* of its cursor key, off by default.
@@ -20448,3 +20668,175 @@ class TestExpectedErrorsExitCleanly:
             compact_mod.CompactError,
             records_mod.RecordError,
         }
+
+
+class TestSecretRedaction:
+    """The harness's copy of Vanta's redaction rule (``bugsinpy/redact.py``).
+
+    [WHY] A key that reaches a run log, a sandbox's ``export`` line or a bake
+    recipe is a published credential — the batch directories are artifacts. The
+    rule has two halves and the tests are split the same way, because the two
+    fail independently: a name list that stops at ``VANTA_API_KEY`` misses
+    ``OPENAI_API_KEY``, and a value rule that only looks at names misses a key
+    echoed back inside a provider's error body.
+    """
+
+    def test_the_name_rule_is_four_markers_anywhere_case_insensitively(self):
+        for name in (
+            "OPENAI_API_KEY",
+            "VANTA_API_KEY",
+            "GH_TOKEN",
+            "HF_TOKEN",
+            "CLIENT_SECRET",
+            "DB_PASSWORD",
+            "openai_api_key",
+            "My_Token",
+        ):
+            assert redact_mod.is_secret_env_name(name), name
+
+        for name in ("VANTA_LLM_BACKEND", "VANTA_LLM_MODEL", "PATH", "HOME",
+                     "VANTA_LLM_BASE_URL", "CC", "CXX"):
+            assert not redact_mod.is_secret_env_name(name), name
+
+    def test_the_value_rule_redacts_only_real_looking_keys(self):
+        body = (
+            "authorization: Bearer sk-proj-0123456789abcdef\n"
+            '{"error": {"message": "bad key sk-ABCDEFGHIJKLMNOP"}}'
+        )
+        out = redact_mod.redact_secret(body)
+
+        assert "0123456789abcdef" not in out
+        assert "ABCDEFGHIJKLMNOP" not in out
+        assert out.count(redact_mod.REDACTED) == 2
+        # Whitespace and line structure survive: these strings become log lines.
+        assert out.startswith("authorization: Bearer ")
+        assert out.count("\n") == body.count("\n")
+
+        # ``scikit-learn`` contains no ``sk-``; ``sk-short`` is under the floor.
+        assert redact_mod.redact_secret("pip install scikit-learn") == "pip install scikit-learn"
+        assert redact_mod.redact_secret("sk-short") == "sk-short"
+        assert redact_mod.redact_secret("nothing to see") == "nothing to see"
+
+    def test_the_threshold_matches_the_rust_side(self):
+        """12 is the floor on both sides; a drift here silently un-redacts one."""
+        assert redact_mod.MIN_SECRET_LEN == 12
+        boundary = "sk-" + "a" * 9  # exactly 12 characters → kept
+        assert redact_mod.redact_secret(boundary) == boundary
+        over = "sk-" + "a" * 10  # 13 characters → replaced
+        assert redact_mod.redact_secret(over) == redact_mod.REDACTED
+
+    def test_redact_env_keeps_the_name_and_drops_the_value(self):
+        env = {
+            "OPENAI_API_KEY": "sk-proj-0123456789abcdef",
+            "VANTA_API_KEY": "a-key-with-no-prefix-at-all",
+            "VANTA_LLM_MODEL": "gpt-6-luna",
+            "VANTA_LLM_BASE_URL": "https://api.openai.com/v1",
+            "GH_TOKEN": "ghp_notaskprefixhere",
+        }
+        safe = redact_mod.redact_env(env)
+
+        # Every name survives — that the key was set, and under which variable, is
+        # the fact a reader wants. (The old name-prefix filter made it vanish.)
+        assert set(safe) == set(env)
+        for name in ("OPENAI_API_KEY", "VANTA_API_KEY", "GH_TOKEN"):
+            assert safe[name] == redact_mod.REDACTED, name
+        # A non-secret entry is untouched.
+        assert safe["VANTA_LLM_MODEL"] == "gpt-6-luna"
+        assert safe["VANTA_LLM_BASE_URL"] == "https://api.openai.com/v1"
+        # ...and nothing from the original values survives anywhere.
+        joined = " ".join(safe.values())
+        for value in env.values():
+            assert value not in joined or value in ("gpt-6-luna", "https://api.openai.com/v1")
+
+    def test_a_secret_named_var_is_redacted_even_when_it_does_not_look_like_a_key(self):
+        """The value rule alone would print it: a key need not start with ``sk-``."""
+        safe = redact_mod.redact_env({"VANTA_API_KEY": "hunter2-but-a-real-credential"})
+        assert safe["VANTA_API_KEY"] == redact_mod.REDACTED
+
+    def test_the_run_log_env_header_redacts_by_rule(self):
+        env = {
+            "VANTA_API_KEY": "sk-proj-0123456789abcdef",
+            "VANTA_LLM_MODEL": "gpt-6-luna",
+            "VANTA_LLM_BACKEND": "openai",
+            # Not VANTA_-prefixed, so it must not be printed at all — but it must
+            # not be printed *because of the prefix*, not because of a list.
+            "OPENAI_API_KEY": "sk-proj-fedcba9876543210",
+            "PATH": "/usr/bin:/bin",
+        }
+        line = runner_mod.env_log_line(env)
+
+        assert line.startswith("# env: ")
+        assert "sk-proj-0123456789abcdef" not in line
+        assert "sk-proj-fedcba9876543210" not in line
+        assert "sk-" not in line
+        assert "VANTA_API_KEY=<redacted>" in line
+        assert "VANTA_LLM_MODEL=gpt-6-luna" in line
+        assert "OPENAI_API_KEY" not in line
+        assert "PATH" not in line
+        # One line, always: a newline here would break the header contract.
+        assert "\n" not in line
+
+    def test_the_sandbox_command_never_carries_a_secret(self, tmp_path, monkeypatch):
+        """The ``export`` lines are inside the argv, and an argv is printed by
+        ``shuru`` on failure and visible to anyone reading ``ps``."""
+        captured: list[list[str]] = []
+
+        class Done:
+            stdout = ""
+            stderr = ""
+            returncode = 0
+
+        def fake_run(args, **kwargs):
+            captured.append(list(args))
+            return Done()
+
+        monkeypatch.setattr(shuru_mod.subprocess, "run", fake_run)
+        # Pinned so the test does not depend on the `shuru` CLI being installed:
+        # this is a test of what the argv CONTAINS, not of the sandbox.
+        monkeypatch.setattr(shuru_mod, "_shuru_bin", lambda: "shuru")
+        host_root = Path.cwd()
+
+        shuru_mod.run(
+            checkpoint="cp",
+            host_root=host_root,
+            command=["python", "-c", "pass"],
+            disk_mb=1024,
+            env={
+                "OPENAI_API_KEY": "sk-proj-0123456789abcdef",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+        )
+
+        assert captured, "the command was never handed to subprocess.run"
+        argv = " ".join(captured[0])
+        assert "sk-proj-0123456789abcdef" not in argv
+        assert f"export OPENAI_API_KEY={shlex.quote(redact_mod.REDACTED)}" in argv
+        # The non-secret entry is still exported — this must not have blanked the
+        # whole environment.
+        assert "PYTHONDONTWRITEBYTECODE=1" in argv
+
+    def test_the_bake_recipe_never_carries_a_secret(self):
+        recipe = "\n".join(
+            bake_mod.build_env_lines(
+                {"CC": "gcc", "OPENAI_API_KEY": "sk-proj-0123456789abcdef"}
+            )
+        )
+        assert "sk-proj-0123456789abcdef" not in recipe
+        assert f"export OPENAI_API_KEY={shlex.quote(redact_mod.REDACTED)}" in recipe
+        # The compiler variables the layers are keyed on are untouched.
+        assert "export CC=gcc" in recipe
+
+    def test_the_compiler_environment_recipes_are_unchanged(self):
+        """[WHY] A layer's identity is its recipe, so redaction must be a NO-OP on
+        the environments the harness actually passes — otherwise every baked layer
+        would be a different layer and be rebuilt."""
+        env = dict(bake_mod.COMPILER_ENV)
+        assert env, "COMPILER_ENV must not be empty, or this test proves nothing"
+        lines = bake_mod.build_env_lines(env)
+        for name, value in env.items():
+            assert f"export {name}={shlex.quote(value)}" in lines, name
+        assert not any(redact_mod.REDACTED in line for line in lines), (
+            "redaction is not a no-op on COMPILER_ENV — every baked layer's recipe "
+            "just changed and would be rebuilt"
+        )
+

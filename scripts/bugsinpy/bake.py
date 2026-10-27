@@ -65,6 +65,7 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 from .bugsinpy_meta import read_metadata_text
+from . import redact as redact_mod
 from . import suite as suite_mod
 from . import trees as tree_mod
 from .shuru import (
@@ -1361,7 +1362,17 @@ def build_env_lines(env: Mapping[str, str]) -> list[str]:
         )
     return [
         _sysconfig_probe(),
-        *[f"export {name}={shlex.quote(value)}" for name, value in env.items()],
+        *[f"export {name}={shlex.quote(value)}"
+          # [VANTA-WHY] These lines are the layer's recipe, and a recipe is
+          # written to a bake log and re-read as an artifact. The compiler
+          # environment carries no secret today, so this changes nothing for the
+          # layers that exist; it is here so that "a secret can never enter a
+          # recipe" is a property of the writer rather than of every caller's
+          # ability to remember. Keeping the redacted value in the SAME position
+          # and shape is what keeps the recipe byte-identical for `env` dicts
+          # that hold no secret — and therefore keeps every baked layer's
+          # content hash unchanged.
+          for name, value in redact_mod.redact_env(env).items()],
         *wrapper,
         _build_env_assert(env),
         # Asserted, not merely filtered for: `env | grep` *drops* a variable that is

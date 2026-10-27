@@ -77,6 +77,12 @@ enum StubBehaviour {
     /// Answer every chat call with HTTP 500, so the client's retry loop burns
     /// its attempts and the run ends as an infrastructure failure.
     Fail,
+    /// Answer every chat call with HTTP 401 whose body ECHOES the bearer token
+    /// the client sent — the shape a real provider uses when it rejects a key
+    /// ("Incorrect API key provided: sk-…"). This is the harshest case for the
+    /// redaction rule: the credential arrives inside a body that Vanta is about
+    /// to print, so a rule that only knew about variable NAMES would leak it.
+    EchoKeyUnauthorized,
 }
 
 struct StubLlmServer {
@@ -106,6 +112,16 @@ struct StubLlmServer {
     /// the temp-0.0 auditor (whose retries are deterministic) and wrong for a
     /// call site that is supposed to recover on the retry.
     truncate_next: Arc<Mutex<Vec<String>>>,
+    /// Request kinds still to be answered with a 429 "the provider is busy"
+    /// refusal, consumed one per matching request (§14.30).
+    ///
+    /// [VANTA-WHY] §14.30 — a ONE-SHOT refusal is what lets a test tell "the
+    /// caller re-sent the SAME request and the model answered once" from "the
+    /// caller counted a throttle as a model attempt and the model answered
+    /// twice". The body carries `Resource Unavailable`, which is the shape the
+    /// hosted API uses when a `flex` tier has no capacity, so the run records the
+    /// refusal under `resource_unavailable` rather than the generic rate limit.
+    busy_next: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
@@ -289,6 +305,7 @@ impl StubLlmServer {
         let disconnects = Arc::new(AtomicUsize::new(0));
         let truncate_batch_audit = Arc::new(AtomicBool::new(false));
         let truncate_next = Arc::new(Mutex::new(Vec::new()));
+        let busy_next = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let request_count_clone = Arc::clone(&request_count);
@@ -297,6 +314,7 @@ impl StubLlmServer {
         let disconnects_clone = Arc::clone(&disconnects);
         let truncate_batch_audit_clone = Arc::clone(&truncate_batch_audit);
         let truncate_next_clone = Arc::clone(&truncate_next);
+        let busy_next_clone = Arc::clone(&busy_next);
         let stop_clone = Arc::clone(&stop);
         // The Attacker has two call sites with different response shapes: a
         // generation call expects `{"tests":[...]}` (AttackerResponse), while a
@@ -440,6 +458,44 @@ impl StubLlmServer {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .push(body.to_string());
+                        // [VANTA-WHY] §14.30 — a ONE-SHOT "the provider is busy"
+                        // refusal, consumed per matching request. 429 with a
+                        // `Resource Unavailable` body is the documented answer when
+                        // a `flex` tier has no capacity, and it is answered here —
+                        // AFTER the kind is recorded, BEFORE any stream — because
+                        // the refusal happens before the model is reached: the
+                        // request never became an answer, which is exactly the
+                        // distinction the caller must keep.
+                        let busy_now = {
+                            let mut queued = busy_next_clone
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            match queued.iter().position(|kind| kind == request_kind) {
+                                Some(position) => {
+                                    queued.remove(position);
+                                    true
+                                }
+                                None => false,
+                            }
+                        };
+                        if busy_now {
+                            let refusal = serde_json::json!({
+                                "error": {
+                                    "message": "Resource Unavailable: the requested service tier has no capacity right now.",
+                                    "type": "server_error",
+                                    "code": "resource_unavailable",
+                                }
+                            })
+                            .to_string();
+                            let response = format!(
+                                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 1\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                refusal.len(),
+                                refusal
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                            continue;
+                        }
                         let default_single_test = || {
                             attacker_value
                                 .get("tests")
@@ -536,6 +592,41 @@ impl StubLlmServer {
                             continue;
                         }
 
+                        if matches!(behaviour, StubBehaviour::EchoKeyUnauthorized) {
+                            // The token is read out of the request HEADERS and put
+                            // into the body. Vanta must not print it: the message it
+                            // builds from this response reaches the session log and
+                            // stderr.
+                            let token = head
+                                .lines()
+                                .find_map(|line| {
+                                    line.strip_prefix("Authorization: Bearer ")
+                                        .or_else(|| line.strip_prefix("authorization: Bearer "))
+                                })
+                                .unwrap_or("<no authorization header>")
+                                .trim()
+                                .to_string();
+                            let body = serde_json::json!({
+                                "error": {
+                                    "message": format!(
+                                        "Incorrect API key provided: {token}. You can find \
+                                         your API key at https://platform.openai.com/account/api-keys"
+                                    ),
+                                    "type": "invalid_request_error",
+                                    "code": "invalid_api_key",
+                                }
+                            })
+                            .to_string();
+                            let response = format!(
+                                "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                            continue;
+                        }
+
                         let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
                         let token_frame = format!(
                             "data: {}\n\n",
@@ -577,10 +668,31 @@ impl StubLlmServer {
                                 // anywhere but this frame. `completion_tokens`
                                 // is the field a streamed response omits unless
                                 // `stream_options.include_usage` was asked for.
+                                //
+                                // [VANTA-WHY] §14.29 — the NESTED details are
+                                // published here too, and are the shape the
+                                // hosted providers use: `cached_tokens` lives
+                                // under `prompt_tokens_details` and
+                                // `reasoning_tokens` under
+                                // `completion_tokens_details`, not at the top
+                                // level. 314 and 41 rather than round numbers,
+                                // and both strictly inside their parents (314 ≤
+                                // 777, 41 ≤ 123), because the arithmetic that
+                                // prices a call subtracts the cached part from
+                                // the prompt and must never be able to overbill.
+                                // A stub that only ever published the flat
+                                // counts would let a parser that never looked
+                                // into the nested objects pass.
                                 "usage": {
                                     "prompt_tokens": 777,
                                     "completion_tokens": 123,
-                                    "total_tokens": 900
+                                    "total_tokens": 900,
+                                    "prompt_tokens_details": {
+                                        "cached_tokens": 314
+                                    },
+                                    "completion_tokens_details": {
+                                        "reasoning_tokens": 41
+                                    }
                                 }
                             })
                         );
@@ -603,6 +715,7 @@ impl StubLlmServer {
             disconnects,
             truncate_batch_audit,
             truncate_next,
+            busy_next,
             stop,
             join: Some(join),
         }
@@ -621,6 +734,19 @@ impl StubLlmServer {
     fn truncate_next_calls(&self, kinds: &[&str]) {
         let mut queued = self
             .truncate_next
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queued.clear();
+        queued.extend(kinds.iter().map(|kind| kind.to_string()));
+    }
+
+    /// Refuse the next request of each named kind with a 429 `Resource
+    /// Unavailable` (stub kind labels: `creator`, `generate`, `revise`,
+    /// `simplify`, `intent_audit`), one refusal per entry, and answer every later
+    /// request normally (§14.30). Called after `start*`.
+    fn refuse_next_calls(&self, kinds: &[&str]) {
+        let mut queued = self
+            .busy_next
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         queued.clear();
@@ -3038,6 +3164,17 @@ fn a_per_test_audit_cut_off_twice_takes_its_ordinary_unavailable_verdict() {
 /// every call sends the pinned seed and nothing else. That is what keeps such a
 /// run byte-comparable with the v0.2 baseline the pilot is measured against, and
 /// what makes `truncated_calls_*` a proof that no offset ever applied.
+///
+/// §14.23 changed what the pinned seed means *between* rounds and deliberately
+/// left this test's point untouched *inside* one. The offset is now per ROUND —
+/// round `r` sends `VANTA_LLM_SEED + (r - 1)`, because the re-asked prompt is a
+/// fresh draw rather than a replay — while a retry inside a round remains the
+/// only thing that may move the seed further, and nothing was truncated here. So
+/// the assertion is per round instead of per run: every call in round `r` carries
+/// `4242 + (r - 1)`, all calls within that round carry the same value, and no
+/// call carries an offset past its own round. The rounds are read off the paired
+/// `call.usage` rows rather than inferred from a body's position, because the row
+/// is what records which round sent it.
 #[test]
 fn a_flag_off_run_without_truncation_never_moves_the_seed() {
     let _serial = serial_run();
@@ -3061,17 +3198,55 @@ fn a_flag_off_run_without_truncation_never_moves_the_seed() {
 
     let bodies = server.request_bodies();
     assert!(!bodies.is_empty(), "the run must have called the LLM");
-    for body in &bodies {
-        assert!(
-            body.contains("\"seed\":4242"),
-            "with nothing truncated every call is attempt 1, which sends the PINNED seed; got: \
-             {body}"
+
+    let rounds_and_seeds: Vec<(u32, String)> =
+        read_session_records(&find_session_log(workspace.path()))
+            .iter()
+            .filter(|record| record.phase == "call.usage")
+            .map(|record| {
+                (
+                    summary_value(&record.summary, "round").parse().unwrap(),
+                    summary_value(&record.summary, "seed"),
+                )
+            })
+            .collect();
+    assert_eq!(
+        rounds_and_seeds.len(),
+        bodies.len(),
+        "one `call.usage` row per chat body"
+    );
+
+    // `round` filled in call order, so a round seen twice must have sent the same
+    // seed both times — which is exactly the "never moves inside a round" half.
+    let mut per_round: Vec<(u32, String)> = Vec::new();
+    for (body, (round, seed)) in bodies.iter().zip(rounds_and_seeds.iter()) {
+        let expected = format!("{}", 4242_u64 + u64::from(round.saturating_sub(1)));
+        assert_eq!(
+            seed, &expected,
+            "round {round} must send the pinned seed advanced by its own index and nothing \
+             more (§14.23): with nothing truncated, no retry offset may apply"
         );
         assert!(
-            !body.contains("\"seed\":4243"),
-            "no call may carry the first offset when no retry happened; got: {body}"
+            body.contains(&format!("\"seed\":{expected}")),
+            "the round {round} body must carry the seed its own row records ({expected}); \
+             got: {body}"
         );
+        match per_round.iter().find(|(seen, _)| seen == round) {
+            Some((_, first)) => assert_eq!(
+                first, &expected,
+                "round {round} sent two different seeds — a per-CALL offset where §14.23 \
+                 sanctions only a per-round one"
+            ),
+            None => per_round.push((*round, expected)),
+        }
     }
+    // One round cannot tell a per-round offset from a fixed seed, so the guard has
+    // to have seen more than one or it asserts nothing.
+    assert!(
+        per_round.len() > 1,
+        "this run must span more than one round to mean anything; saw rounds {:?}",
+        per_round.iter().map(|(round, _)| *round).collect::<Vec<_>>()
+    );
 
     let summary = run_summary(workspace.path()).summary;
     for flag in ["corroborate=off", "grounded_audit=off", "batch_audit=off"] {
@@ -5278,6 +5453,381 @@ fn unset_seed_leaves_request_bodies_unseeded_and_the_verdict_unchanged() {
     }
 }
 
+/// §14.26: on the hosted backend, the sampler keys a llama.cpp body carries are
+/// DROPPED before the request leaves, the output cap is RENAMED to the spelling a
+/// reasoning model accepts, and every other field the body asked for still goes.
+///
+/// [VANTA-WHY] The two runs below differ in ONE variable — `VANTA_LLM_BACKEND`
+/// (plus the model id it names) — so the local run is the reference the hosted run
+/// is measured against, field by field. The requirement has two halves and this
+/// test is deliberately both: a hosted body must lose exactly the documented
+/// fields (item 3), and the LOCAL body must still carry every one of them, because
+/// "the local path stays byte-identical" is only true while nothing filters it.
+/// The dropped-name list is spelled out here rather than read from the capability
+/// table on purpose: a table that drifted from the API docs would otherwise keep
+/// passing against itself. The per-call rows must agree with the bodies, too —
+/// `requested_fields` admitting a key the `sent_fields` no longer has is the whole
+/// point of recording both.
+///
+/// §14.28 adds a second question this test has to answer, because the effort is
+/// the one field whose correct VALUE is also per-model: a level a family does not
+/// list must stop the run before it starts, and the same level on a family that
+/// does list it must go out on the wire. Both halves run below, so neither the
+/// refusal nor the acceptance can pass for the wrong reason.
+#[test]
+fn the_hosted_backend_sends_only_the_fields_the_model_accepts() {
+    let _serial = serial_run();
+
+    // The sampler keys `VANTA_SAMPLING=coding` pins at EVERY site (§14.11). The
+    // reference run needs the fullest sampler set the harness ever sends, because a
+    // body that never carried `top_k` could not prove a drop.
+    const SAMPLER_KEYS: &[&str] = &[
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+    ];
+    // The full documented drop list for these models, per the API reference: the
+    // four sampler values plus the two the harness can also send (`frequency_penalty`
+    // under a preset, `reasoning_budget_tokens` at the three budget sites) plus the
+    // logprob pair. The cap is not dropped — it is renamed — so it is listed apart.
+    //
+    // §14.28 adds `reasoning_effort` to this list: the call sites' hard-coded `low`
+    // is a llama.cpp fact, so with `VANTA_REASONING_EFFORT` unset — which is what
+    // this run is — the hosted body must not carry the field at all.
+    const DROPPED_KEYS: &[&str] = &[
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "logprobs",
+        "top_logprobs",
+        "reasoning_budget_tokens",
+        "reasoning_effort",
+    ];
+    const RENAME: &str = "max_tokens->max_completion_tokens";
+
+    // (1) The local reference run.
+    let local = TempDir::new().unwrap();
+    let (_repo, _issue, local_patch) = write_test_repo(local.path(), PRESERVING_PATCH);
+    let local_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let local_output = run_patch_mode_with_output(
+        local.path(),
+        &local_patch,
+        &local_server,
+        3,
+        &[("VANTA_SAMPLING", "coding")],
+    );
+    assert_eq!(
+        local_output.status.code(),
+        Some(0),
+        "the reference run must be the approval; stdout:\n{}",
+        String::from_utf8_lossy(&local_output.stdout)
+    );
+    let local_bodies = local_server.request_bodies();
+    assert!(
+        !local_bodies.is_empty(),
+        "the reference run must have called the LLM"
+    );
+    for body in &local_bodies {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+        let object = value.as_object().expect("a chat body is a JSON object");
+        for key in SAMPLER_KEYS {
+            assert!(
+                object.contains_key(*key),
+                "the LOCAL `coding` body must still carry `{key}` — the local path is \
+                 not allowed to filter anything: {body}"
+            );
+        }
+        assert!(
+            object.contains_key("max_tokens"),
+            "the local body must keep the llama.cpp cap spelling: {body}"
+        );
+        assert!(
+            !object.contains_key("max_completion_tokens"),
+            "the llama.cpp body must never hear the hosted cap spelling: {body}"
+        );
+    }
+    // §14.28's host-side drop is only a fact about something that was there: the
+    // reference run must carry the call sites' own effort somewhere, or "the
+    // hosted body does not" would be true of a run that never had one either.
+    assert!(
+        local_bodies
+            .iter()
+            .any(|body| body.contains("reasoning_effort")),
+        "the LOCAL run must carry the sites' hard-coded effort, or §14.28's drop \
+         proves nothing: {local_bodies:?}"
+    );
+    // The local run's rule is "no filter", and it says so rather than staying
+    // silent — that is what makes a local summary self-describing.
+    let local_summary = run_summary(local.path()).summary;
+    assert_eq!(
+        summary_value(&local_summary, "request_shape_backend"),
+        "llamacpp"
+    );
+    assert_eq!(
+        summary_value(&local_summary, "request_shape_not_sent"),
+        "none",
+        "the local run drops nothing: {local_summary}"
+    );
+    assert_eq!(summary_value(&local_summary, "request_shape_renamed"), "none");
+
+    // (2) The hosted run: same repo, same patch, same stub — only the backend differs.
+    let hosted = TempDir::new().unwrap();
+    let (_repo, _issue, hosted_patch) = write_test_repo(hosted.path(), PRESERVING_PATCH);
+    let hosted_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let hosted_output = run_patch_mode_with_output(
+        hosted.path(),
+        &hosted_patch,
+        &hosted_server,
+        3,
+        &[
+            ("VANTA_SAMPLING", "coding"),
+            ("VANTA_LLM_BACKEND", "openai"),
+            ("VANTA_LLM_MODEL", "gpt-6-luna"),
+            ("OPENAI_API_KEY", "sk-test-not-a-real-key"),
+            ("VANTA_LLM_CONTEXT_TOKENS", "131072"),
+        ],
+    );
+    assert_eq!(
+        hosted_output.status.code(),
+        Some(0),
+        "shaping the request must not change the verdict — only the dialect; stdout:\n{}",
+        String::from_utf8_lossy(&hosted_output.stdout)
+    );
+    let hosted_bodies = hosted_server.request_bodies();
+    assert_eq!(
+        hosted_bodies.len(),
+        local_bodies.len(),
+        "shaping must not change how many calls the run makes"
+    );
+
+    for (local_body, hosted_body) in local_bodies.iter().zip(hosted_bodies.iter()) {
+        let local_value: serde_json::Value = serde_json::from_str(local_body).unwrap();
+        let hosted_value: serde_json::Value = serde_json::from_str(hosted_body).unwrap();
+        let local_object = local_value.as_object().unwrap();
+        let hosted_object = hosted_value.as_object().unwrap();
+
+        for key in DROPPED_KEYS {
+            assert!(
+                !hosted_object.contains_key(*key),
+                "the hosted body must not send `{key}`: {hosted_body}"
+            );
+        }
+        assert!(
+            hosted_object.contains_key("max_completion_tokens"),
+            "the hosted body must carry the cap under the name the model needs: {hosted_body}"
+        );
+        assert!(
+            !hosted_object.contains_key("max_tokens"),
+            "the legacy cap spelling is the one these models reject: {hosted_body}"
+        );
+
+        // The strongest form of "nothing else changed": rebuild the expected hosted
+        // key set by applying exactly the documented rule to the local body, and
+        // demand equality. A filter that ate a field nobody listed fails here, and
+        // so does one that forgot to rename the cap.
+        let mut expected: Vec<String> = local_object
+            .keys()
+            .filter(|key| !DROPPED_KEYS.contains(&key.as_str()))
+            .map(|key| {
+                if key == "max_tokens" {
+                    "max_completion_tokens".to_string()
+                } else {
+                    key.clone()
+                }
+            })
+            .collect();
+        expected.sort();
+        let mut actual: Vec<String> = hosted_object.keys().cloned().collect();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "the hosted body must differ from the local one by the documented rule and \
+             nothing else; local={local_body} hosted={hosted_body}"
+        );
+    }
+
+    // (3) Both sides of the question are on the per-call record.
+    let usage_rows: Vec<String> = read_session_records(&find_session_log(hosted.path()))
+        .into_iter()
+        .filter(|record| record.phase == "call.usage")
+        .map(|record| record.summary)
+        .collect();
+    assert_eq!(
+        usage_rows.len(),
+        hosted_bodies.len(),
+        "one `call.usage` row per chat body"
+    );
+    let split = |list: &str| -> Vec<String> { list.split(',').map(str::to_string).collect() };
+    for (index, row) in usage_rows.iter().enumerate() {
+        let requested = split(&summary_value(row, "requested_fields"));
+        let sent = split(&summary_value(row, "sent_fields"));
+        let dropped = split(&summary_value(row, "dropped_fields"));
+        for key in SAMPLER_KEYS {
+            assert!(
+                requested.contains(&key.to_string()),
+                "call {index}: the row must admit the body REQUESTED `{key}`: {row}"
+            );
+            assert!(
+                !sent.contains(&key.to_string()),
+                "call {index}: the row must not claim `{key}` was sent: {row}"
+            );
+            assert!(
+                dropped.contains(&key.to_string()),
+                "call {index}: the row must name `{key}` as dropped: {row}"
+            );
+        }
+        assert!(
+            sent.contains(&"max_completion_tokens".to_string()),
+            "call {index}: the record must show the renamed cap as sent: {row}"
+        );
+        assert!(
+            !sent.contains(&"max_tokens".to_string()),
+            "call {index}: the record must not show the legacy cap as sent: {row}"
+        );
+        assert_eq!(
+            summary_value(row, "renamed_fields"),
+            RENAME,
+            "call {index}: the rename must be recorded: {row}"
+        );
+    }
+
+    // (4) The run-level rule explains those rows, and names every dropped key.
+    let hosted_summary = run_summary(hosted.path()).summary;
+    assert_eq!(
+        summary_value(&hosted_summary, "request_shape_backend"),
+        "openai"
+    );
+    assert_eq!(
+        summary_value(&hosted_summary, "request_shape_family"),
+        "gpt-6-luna",
+        "the rule must name the family it was applied for: {hosted_summary}"
+    );
+    assert_eq!(
+        summary_value(&hosted_summary, "request_shape_renamed"),
+        RENAME
+    );
+    let not_sent = split(&summary_value(&hosted_summary, "request_shape_not_sent"));
+    for key in DROPPED_KEYS {
+        assert!(
+            not_sent.contains(&key.to_string()),
+            "run.summary must name `{key}` as not sent: {hosted_summary}"
+        );
+    }
+
+    // (5) §14.28 — the effort is checked against the MODEL, not against a fixed
+    //     list. `gpt-6.1-sol`'s page has no `none` and `gpt-6-luna`'s does, so the
+    //     SAME switch value has to be refused on one and run on the other. Both
+    //     halves are asserted, because a check that refused `none` for every model
+    //     would pass the refusal on its own.
+    let hosted_arm: &[(&str, &str)] = &[
+        ("VANTA_LLM_BACKEND", "openai"),
+        ("VANTA_LLM_CONTEXT_TOKENS", "131072"),
+        ("OPENAI_API_KEY", "sk-test-not-a-real-key"),
+        ("VANTA_REASONING_EFFORT", "none"),
+    ];
+    let mut sol_env: Vec<(&str, &str)> = hosted_arm.to_vec();
+    sol_env.push(("VANTA_LLM_MODEL", "gpt-6.1-sol"));
+    let refused = TempDir::new().unwrap();
+    let (_repo, _issue, refused_patch) = write_test_repo(refused.path(), PRESERVING_PATCH);
+    let refused_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let refused_output =
+        run_patch_mode_with_output(refused.path(), &refused_patch, &refused_server, 1, &sol_env);
+    assert_eq!(
+        refused_output.status.code(),
+        Some(1),
+        "an effort the run's model does not accept must fail the run; stdout:\n{}",
+        String::from_utf8_lossy(&refused_output.stdout)
+    );
+    let refused_stderr = String::from_utf8_lossy(&refused_output.stderr);
+    assert!(
+        refused_stderr.contains("CONFIG_ERROR") && refused_stderr.contains("none"),
+        "the refusal must name the level it refused; stderr:\n{refused_stderr}"
+    );
+    assert!(
+        refused_stderr.contains("gpt-6.1-sol"),
+        "the refusal must name the MODEL that does not accept the level — the ladder \
+         is per-family, so the reader has to be able to see which family said no; \
+         stderr:\n{refused_stderr}"
+    );
+    assert!(
+        refused_server.request_bodies().is_empty(),
+        "a refused config must fail BEFORE the first call, or the run has already \
+         spent an hour generating"
+    );
+
+    // The other half: the same `none` on the family whose page documents it.
+    let mut luna_env: Vec<(&str, &str)> = hosted_arm.to_vec();
+    luna_env.push(("VANTA_LLM_MODEL", "gpt-6-luna"));
+    let accepted = TempDir::new().unwrap();
+    let (_repo, _issue, accepted_patch) = write_test_repo(accepted.path(), PRESERVING_PATCH);
+    let accepted_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let accepted_output = run_patch_mode_with_output(
+        accepted.path(),
+        &accepted_patch,
+        &accepted_server,
+        3,
+        &luna_env,
+    );
+    assert_eq!(
+        accepted_output.status.code(),
+        Some(0),
+        "the same value on the family that documents it must run; stdout:\n{}",
+        String::from_utf8_lossy(&accepted_output.stdout)
+    );
+    assert!(
+        accepted_server.request_bodies().iter().any(|body| {
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| value.get("reasoning_effort").cloned())
+                == Some(serde_json::json!("none"))
+        }),
+        "a run that asked for `none` must SEND it to the model that accepts it: {:?}",
+        accepted_server.request_bodies()
+    );
+    let accepted_summary = run_summary(accepted.path()).summary;
+    assert_eq!(
+        summary_value(&accepted_summary, "reasoning_effort"),
+        "none",
+        "{accepted_summary}"
+    );
+    assert_eq!(
+        summary_value(&accepted_summary, "reasoning_effort_mechanism"),
+        "openai:reasoning_effort",
+        "an effort that went out is the hosted mechanism, not a no-op: {accepted_summary}"
+    );
+    // The run-level rule must not claim the field was withheld: this run sent it.
+    // That is the other direction of §14.28's one predicate, and the reason it is
+    // shared with the shaper rather than re-derived here.
+    let accepted_not_sent = summary_value(&accepted_summary, "request_shape_not_sent");
+    assert!(
+        !split(&accepted_not_sent)
+            .iter()
+            .any(|key| key == "reasoning_effort"),
+        "the run-level rule and the bodies must agree: {accepted_summary}"
+    );
+    let accepted_rows: Vec<String> = read_session_records(&find_session_log(accepted.path()))
+        .into_iter()
+        .filter(|record| record.phase == "call.usage")
+        .map(|record| record.summary)
+        .collect();
+    assert!(
+        !accepted_rows.is_empty(),
+        "the accepted run made no calls, so it proves nothing about the effort"
+    );
+    for row in &accepted_rows {
+        assert!(
+            split(&summary_value(row, "sent_fields")).contains(&"reasoning_effort".to_string()),
+            "a body that carries the effort must say so: {row}"
+        );
+    }
+}
+
 /// §4.2 `baseline`: `VANTA_ATTACKER=off` skips the Attacker phase entirely, so
 /// the verdict comes from the repo's own suite and static analysis — and not one
 /// Attacker LLM call is made.
@@ -6154,6 +6704,196 @@ fn the_concise_switch_appends_the_sentence_to_the_generate_prompt_only() {
     );
 }
 
+/// §14.32 — the cacheable prefix leads every request and the variable tail trails it.
+///
+/// [VANTA-WHY] Hosted prompt caching is automatic and PREFIX-based: the provider
+/// only reuses a cached prefix when the tokens up to a point are byte-identical to
+/// a request it has already answered. That makes message ORDER the whole of item 8
+/// — a call site whose variable text (the attempt feedback, the test under
+/// revision) sat BEFORE the stable system prompt and repo context would re-bill the
+/// full prompt on every call and could never hit the cache. This test pins the order
+/// the call sites already produce, so a later edit that moves the nudge to the front
+/// fails here instead of silently doubling the bill, and it pins the property the
+/// cache actually keys on: a retry resends the stable messages UNCHANGED and appends
+/// the variable tail rather than rewriting any of them.
+///
+/// The bodies are decoded before they are inspected because `REPROMPT` and the
+/// truncation nudge arrive JSON-escaped in the raw text, where a substring test
+/// would still match a nudge nested inside the system prompt — the exact failure
+/// this test exists to catch.
+#[test]
+fn the_cacheable_prefix_leads_every_request_and_the_variable_tail_trails_it() {
+    let _serial = serial_run();
+
+    // §14.32 — the two literals an attempt-feedback turn opens with. `REPROMPT` is
+    // the per-site retry prompt; the cut-off nudge is the crate's own const, so the
+    // test reads the text that is sent rather than a copy of it.
+    let is_variable_tail = |content: &str| {
+        content.contains("REPROMPT") || content.contains(vanta::llm::TRUNCATION_NUDGE)
+    };
+
+    // A body's `(role, content)` messages, in the order the server received them.
+    let decoded = |body: &str| -> Vec<(String, String)> {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+        value["messages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("body must carry a messages array: {body}"))
+            .iter()
+            .map(|m| {
+                (
+                    m["role"].as_str().unwrap_or("").to_string(),
+                    m["content"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    };
+
+    // (1) A plain run: the stable system prompt leads every request, the user turn
+    //     it answers is last, and no attempt feedback is anywhere but the tail.
+    let plain = TempDir::new().unwrap();
+    let (_repo, _issue, plain_patch) = write_test_repo(plain.path(), PRESERVING_PATCH);
+    let plain_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let plain_output =
+        run_patch_mode_with_output(plain.path(), &plain_patch, &plain_server, 1, &[]);
+    assert_eq!(
+        plain_output.status.code(),
+        Some(0),
+        "the run under test must reach the reference approval; stdout:\n{}",
+        String::from_utf8_lossy(&plain_output.stdout)
+    );
+    let plain_kinds = plain_server.request_kinds();
+    let plain_bodies = plain_server.request_bodies();
+    assert_eq!(plain_kinds.len(), plain_bodies.len(), "one kind per recorded body");
+    assert!(
+        !plain_bodies.is_empty(),
+        "the run made no request, so its message order proves nothing"
+    );
+
+    // The system prompt each call site sends, so "the head of the prefix never
+    // moves" is checked per site rather than assumed from one body.
+    let mut system_by_kind: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (kind, body) in plain_kinds.iter().zip(plain_bodies.iter()) {
+        let msgs = decoded(body);
+        assert!(
+            !msgs.is_empty(),
+            "every request must carry at least the system prompt: {body}"
+        );
+        assert_eq!(
+            msgs[0].0, "system",
+            "the `{kind}` request must LEAD with the stable system prompt — a prefix cache \
+             can only match from the first token onward: {body}"
+        );
+        assert!(
+            !msgs[0].1.is_empty(),
+            "the leading system message must carry the stable prompt, not be empty: {body}"
+        );
+        assert_eq!(
+            msgs.last().unwrap().0,
+            "user",
+            "the `{kind}` request must END on the user turn the model answers: {body}"
+        );
+        for (i, (role, content)) in msgs.iter().enumerate() {
+            if is_variable_tail(content) {
+                assert_eq!(
+                    i,
+                    msgs.len() - 1,
+                    "variable attempt feedback in the `{kind}` request must TRAIL the stable \
+                     prefix, never sit inside it: {body}"
+                );
+                assert_ne!(
+                    *role, "system",
+                    "the `{kind}` attempt feedback belongs in a user turn, not in the stable \
+                     system prompt the cache keys on: {body}"
+                );
+            }
+        }
+        match system_by_kind.get(kind) {
+            None => {
+                system_by_kind.insert(kind.clone(), msgs[0].1.clone());
+            }
+            Some(first) => assert_eq!(
+                first, &msgs[0].1,
+                "two `{kind}` requests sent DIFFERENT system prompts, so the head of that call \
+                 site's cacheable prefix is not stable across the run"
+            ),
+        }
+    }
+
+    // (2) The retry path: a cut-off generation is re-asked with the SAME stable
+    //     messages and the nudge APPENDED, which is what lets the provider reuse
+    //     the prefix it has already cached instead of re-reading the whole prompt.
+    let retry = TempDir::new().unwrap();
+    let (_repo, _issue, retry_patch) = write_test_repo(retry.path(), PRESERVING_PATCH);
+    let retry_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    retry_server.truncate_next_calls(&["generate"]);
+    let retry_output =
+        run_patch_mode_with_output(retry.path(), &retry_patch, &retry_server, 1, &[]);
+    assert_eq!(
+        retry_output.status.code(),
+        Some(0),
+        "the cut-off generation must be retried and recover; stdout:\n{}",
+        String::from_utf8_lossy(&retry_output.stdout)
+    );
+    let retry_kinds = retry_server.request_kinds();
+    let retry_bodies = retry_server.request_bodies();
+    let generates: Vec<usize> = retry_kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| *k == "generate")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        generates.len(),
+        2,
+        "a single cut-off must be re-asked exactly once, so there are two generate bodies; \
+         got kinds {retry_kinds:?}"
+    );
+    let (first, second) = (generates[0], generates[1]);
+    let first_msgs = decoded(&retry_bodies[first]);
+    let second_msgs = decoded(&retry_bodies[second]);
+    assert_eq!(
+        first_msgs.len(),
+        2,
+        "the pinned first attempt is [system, user] with no nudge: {}",
+        retry_bodies[first]
+    );
+    assert!(
+        second_msgs.len() > first_msgs.len(),
+        "the re-ask must APPEND its feedback as extra turns rather than rewrite the prompt: {}",
+        retry_bodies[second]
+    );
+    assert_eq!(
+        &second_msgs[..2],
+        &first_msgs[..],
+        "the retry must resend the stable messages byte-for-byte, or the provider re-bills the \
+         whole prefix instead of reusing what it cached"
+    );
+    // Everything past the stable prefix is variable. This attempt carries TWO
+    // tails — the site's own attempt-#2 `REPROMPT` and §14.5's cut-off nudge —
+    // and both must sit after the unchanged prefix, in the order they were
+    // appended, or a later edit could bury one inside the cached head.
+    for (i, (role, content)) in second_msgs.iter().enumerate().skip(2) {
+        assert_eq!(
+            role, "user",
+            "every appended retry turn must be a user turn; message #{i} of the re-ask is not: {}",
+            retry_bodies[second]
+        );
+        assert!(
+            is_variable_tail(content),
+            "message #{i} of the re-ask sits after the stable prefix but is not variable \
+             feedback, so the stable run does not end where the tail begins: {}",
+            retry_bodies[second]
+        );
+    }
+    assert!(
+        second_msgs.last().unwrap().1.contains(vanta::llm::TRUNCATION_NUDGE),
+        "the cut-off nudge is appended last, after the attempt feedback: {}",
+        retry_bodies[second]
+    );
+}
+
 /// §4.3 token accounting: the numbers a cost table is built from are the
 /// SERVER's, recorded per call, and `run.summary` totals exactly those.
 ///
@@ -6329,6 +7069,388 @@ fn token_accounting_records_the_servers_counts_per_call_and_a_run_total() {
         usages.len() as u64,
         "the per-site breakdown must account for every call the run made, or a site \
          is missing from the report: {summary}"
+    );
+}
+
+/// §14.29 — the four usage facts a cost table cannot derive from the flat counts,
+/// per call and totalled on `run.summary`.
+///
+/// [VANTA-WHY] What is asserted here is: how much of the prompt the provider served
+/// from its cache, how much of the completion was reasoning, what the call cost, and
+/// — the part that makes a total trustworthy — which price row produced the number.
+/// The stub publishes the NESTED shape the hosted providers use
+/// (`prompt_tokens_details.cached_tokens` / `completion_tokens_details.reasoning_tokens`),
+/// so a parser that only read the top-level counts answers `unset` here and fails.
+///
+/// The same run is made twice, on the backend that bills and the one that does not,
+/// because two different claims have to stay apart: "the details were recorded" (both)
+/// and "the call was priced" (only the hosted one). A local run is `not_billed` with
+/// `cost_usd=unset` — never `0.000000`, which is the different claim that the call WAS
+/// priced and came to nothing.
+#[test]
+fn usage_details_and_cost_are_recorded_per_call_and_totalled() {
+    let _serial = serial_run();
+
+    // (1) Local: the details are recorded, the call is not billed.
+    let local = TempDir::new().unwrap();
+    let (_repo, _issue, local_patch) = write_test_repo(local.path(), PRESERVING_PATCH);
+    let local_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let local_status = run_patch_mode(local.path(), &local_patch, &local_server);
+    assert!(local_status.success(), "the reference run must reach a verdict");
+
+    let local_records = read_session_records(&find_session_log(local.path()));
+    let local_usages: Vec<&SessionRecord> = local_records
+        .iter()
+        .filter(|record| record.phase == "call.usage")
+        .collect();
+    let calls = local_usages.len();
+    assert!(calls > 0, "a run that called the model must write `call.usage` rows");
+    for row in &local_usages {
+        assert_eq!(
+            summary_value(&row.summary, "cached_tokens"),
+            "314",
+            "the nested `prompt_tokens_details.cached_tokens` must be recorded: {}",
+            row.summary
+        );
+        assert_eq!(
+            summary_value(&row.summary, "reasoning_tokens"),
+            "41",
+            "the nested `completion_tokens_details.reasoning_tokens` must be recorded: {}",
+            row.summary
+        );
+        assert_eq!(
+            summary_value(&row.summary, "cost_usd"),
+            "unset",
+            "a call nobody billed has no cost — `unset`, not `0.000000`: {}",
+            row.summary
+        );
+        assert_eq!(
+            summary_value(&row.summary, "cost_basis"),
+            "not_billed",
+            "the row must say WHY there is no cost: {}",
+            row.summary
+        );
+        // §14.31 — the local backend names no tier, because none exists to name:
+        // `unset` here, never `standard`, which would claim a hosted arm the
+        // local run never had.
+        assert_eq!(
+            summary_value(&row.summary, "service_tier"),
+            "unset",
+            "a run nobody served must name no tier: {}",
+            row.summary
+        );
+    }
+    let local_summary = run_summary(local.path()).summary;
+    assert_eq!(
+        summary_value(&local_summary, "llm_cached_tokens"),
+        (314 * calls).to_string(),
+        "the run total must sum the server's cached counts: {local_summary}"
+    );
+    assert_eq!(
+        summary_value(&local_summary, "llm_reasoning_tokens"),
+        (41 * calls).to_string(),
+        "the run total must sum the server's reasoning counts: {local_summary}"
+    );
+    assert_eq!(summary_value(&local_summary, "cost_usd"), "unset");
+    assert_eq!(summary_value(&local_summary, "cost_basis"), "not_billed");
+    assert_eq!(summary_value(&local_summary, "service_tier"), "unset");
+    // §14.32 — 314 cached of 777 prompt per call, so the run's share is the same
+    // number whatever the call count: the rate is token-weighted, not per-call.
+    assert_eq!(
+        summary_value(&local_summary, "llm_cache_hit_rate"),
+        "0.4041",
+        "the run's cache hit rate must be its measured cached/prompt share: {local_summary}"
+    );
+
+    // (2) Hosted: same stub, same numbers — now priced.
+    let hosted = TempDir::new().unwrap();
+    let (_repo, _issue, hosted_patch) = write_test_repo(hosted.path(), PRESERVING_PATCH);
+    let hosted_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let hosted_output = run_patch_mode_with_output(
+        hosted.path(),
+        &hosted_patch,
+        &hosted_server,
+        3,
+        &[
+            ("VANTA_LLM_BACKEND", "openai"),
+            ("VANTA_LLM_MODEL", "gpt-6-luna"),
+            ("OPENAI_API_KEY", "sk-test-not-a-real-key"),
+            ("VANTA_LLM_CONTEXT_TOKENS", "131072"),
+        ],
+    );
+    assert_eq!(
+        hosted_output.status.code(),
+        Some(0),
+        "pricing a call must not change the verdict — only what is recorded; stdout:\n{}",
+        String::from_utf8_lossy(&hosted_output.stdout)
+    );
+
+    let hosted_usages: Vec<String> = read_session_records(&find_session_log(hosted.path()))
+        .into_iter()
+        .filter(|record| record.phase == "call.usage")
+        .map(|record| record.summary)
+        .collect();
+    assert_eq!(
+        hosted_usages.len(),
+        calls,
+        "the backend must not change how many calls the run makes"
+    );
+    for row in &hosted_usages {
+        assert_eq!(summary_value(row, "cached_tokens"), "314");
+        assert_eq!(summary_value(row, "reasoning_tokens"), "41");
+        // 777 prompt of which 314 were cached, 123 out, at Luna's standard rates:
+        //   463 uncached × $0.10 + 314 cached × $0.01 + 123 out × $0.50, per Mtok
+        //   = $0.00011094, which rounds to six decimals as below.
+        // The literal is the whole point of the assertion: billing the cached 314 at
+        // the FULL input rate would give `0.000139`, so a price table that ignored
+        // the cache cannot produce this string.
+        assert_eq!(
+            summary_value(row, "cost_usd"),
+            "0.000111",
+            "the cached part of the prompt must be billed at the cached rate: {row}"
+        );
+        assert_eq!(
+            summary_value(row, "cost_basis"),
+            "gpt-6-luna/standard/2026-10-26",
+            "the row must name the price row that produced the number: {row}"
+        );
+        // §14.31 — `default` (and unset) is the API's own default and is never
+        // spelled, so the row names the STANDARD arm it was actually served on.
+        assert_eq!(
+            summary_value(row, "service_tier"),
+            "standard",
+            "an unset tier is served at the standard rates and must say so: {row}"
+        );
+    }
+    // §14.31 — and the byte-identity claim at the wire, not just in the record:
+    // a run that asked for no tier must not have `service_tier` in any body, or
+    // an explicitly-`default` arm would differ from an unset one for no reason.
+    for body in hosted_server.request_bodies() {
+        assert!(
+            !body.contains("service_tier"),
+            "the default arm must send no `service_tier` key: {body}"
+        );
+    }
+    let hosted_summary = run_summary(hosted.path()).summary;
+    assert_eq!(
+        summary_value(&hosted_summary, "llm_cached_tokens"),
+        (314 * hosted_usages.len()).to_string()
+    );
+    assert_eq!(
+        summary_value(&hosted_summary, "llm_reasoning_tokens"),
+        (41 * hosted_usages.len()).to_string()
+    );
+    assert_eq!(
+        summary_value(&hosted_summary, "cost_usd"),
+        format!("{:.6}", 0.00011094 * hosted_usages.len() as f64),
+        "the run total must sum the calls it priced: {hosted_summary}"
+    );
+    assert_eq!(
+        summary_value(&hosted_summary, "cost_basis"),
+        "gpt-6-luna/standard/2026-10-26"
+    );
+    assert_eq!(summary_value(&hosted_summary, "service_tier"), "standard");
+    // §14.32 — the rate is a usage fact, not a hosted-only column: the same
+    // stub frame produces the same share on both backends.
+    assert_eq!(
+        summary_value(&hosted_summary, "llm_cache_hit_rate"),
+        summary_value(&local_summary, "llm_cache_hit_rate"),
+        "the backend must not change the cache hit rate the same usage frame implies"
+    );
+}
+
+/// §14.31 — the tier a run asks for is the row that prices it, and the body it
+/// shaped.
+///
+/// [VANTA-WHY] What is asserted here is that one read of
+/// `VANTA_OPENAI_SERVICE_TIER` reaches BOTH consumers: the request body (so the
+/// provider actually serves the `flex` arm) and the price row (so the cost
+/// column prices the arm that was served). The failure this test makes
+/// impossible is a run that is served on `flex` — half price, best-effort
+/// capacity — while the manifest prices it at the standard rates, which would
+/// overstate a batch's spend by exactly 2x and look perfectly plausible.
+///
+/// The same stub and the same usage frame as the standard case, so the ONLY
+/// difference between `0.000111` and `0.000055` is the tier: billing the flex
+/// arm from the standard row cannot produce the flex string, and vice versa.
+#[test]
+fn a_flex_run_is_named_and_priced_from_its_own_row() {
+    let _serial = serial_run();
+
+    let workspace = TempDir::new().unwrap();
+    let (_repo, _issue, patch) = write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch,
+        &server,
+        3,
+        &[
+            ("VANTA_LLM_BACKEND", "openai"),
+            ("VANTA_LLM_MODEL", "gpt-6-luna"),
+            ("OPENAI_API_KEY", "sk-test-not-a-real-key"),
+            ("VANTA_LLM_CONTEXT_TOKENS", "131072"),
+            ("VANTA_OPENAI_SERVICE_TIER", "flex"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "choosing a slower, cheaper arm must not change the verdict; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // (1) The body: the arm has to be SPELLED for the provider to serve it.
+    let bodies = server.request_bodies();
+    assert!(!bodies.is_empty(), "the run must have called the model");
+    for body in &bodies {
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            value.as_object().unwrap().get("service_tier"),
+            Some(&serde_json::json!("flex")),
+            "a `flex` run must ask the provider for the flex arm: {body}"
+        );
+    }
+
+    // (2) The record: the row and the run both name the arm and its price.
+    let usages: Vec<String> = read_session_records(&find_session_log(workspace.path()))
+        .into_iter()
+        .filter(|record| record.phase == "call.usage")
+        .map(|record| record.summary)
+        .collect();
+    let calls = usages.len();
+    assert!(calls > 0, "a run that called the model must write `call.usage` rows");
+    for row in &usages {
+        // 777 prompt of which 314 were cached, 123 out, at Luna's FLEX rates —
+        // half of standard: 463×$0.05 + 314×$0.005 + 123×$0.25 per Mtok
+        //   = $0.00005547, which rounds to six decimals as below.
+        assert_eq!(
+            summary_value(row, "cost_usd"),
+            "0.000055",
+            "the flex arm must be billed from the flex row, not the standard one: {row}"
+        );
+        assert_eq!(
+            summary_value(row, "cost_basis"),
+            "gpt-6-luna/flex/2026-10-26",
+            "the row must name the arm it was priced on: {row}"
+        );
+        assert_eq!(
+            summary_value(row, "service_tier"),
+            "flex",
+            "the row must say which arm served it: {row}"
+        );
+    }
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(
+        summary_value(&summary, "cost_usd"),
+        format!("{:.6}", 0.00005547 * calls as f64),
+        "the run total must sum the flex rows it priced: {summary}"
+    );
+    assert_eq!(
+        summary_value(&summary, "cost_basis"),
+        "gpt-6-luna/flex/2026-10-26"
+    );
+    assert_eq!(summary_value(&summary, "service_tier"), "flex");
+}
+
+/// §14.30 — a provider that refuses a request because it is busy is re-asked the
+/// SAME request, and that refusal is NOT charged to the model's attempt budget.
+///
+/// [VANTA-WHY] What is asserted here is the whole reason the provider got its own
+/// ladder: the run reaches the same verdict, the `creator` call succeeds on its
+/// FIRST model attempt (`attempt=1`) while recording `provider_retries=1`, and the
+/// run total names the refusal's class. A design that folded a 429 into `attempt`
+/// would show `attempt=2` on a call the model answered correctly the first time it
+/// was asked — a throttled run disguised as a model that needed two tries, which
+/// is the one reading this test exists to make impossible. The stub's body says
+/// `Resource Unavailable` (the `flex` capacity refusal), so the class asserted is
+/// `resource_unavailable` and a caller that reported everything as a rate limit
+/// fails here.
+#[test]
+fn a_busy_provider_is_re_asked_without_spending_a_model_attempt() {
+    let _serial = serial_run();
+
+    let workspace = TempDir::new().unwrap();
+    let (_repo, _issue, patch) = write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    // The FIRST Attacker generation request is refused; the re-send is answered
+    // normally. (Patch mode never calls the Creator, so the generation is the
+    // run's first chat call.)
+    server.refuse_next_calls(&["generate"]);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch,
+        &server,
+        3,
+        &[
+            ("VANTA_LLM_BACKEND", "openai"),
+            ("VANTA_LLM_MODEL", "gpt-6-luna"),
+            ("OPENAI_API_KEY", "sk-test-not-a-real-key"),
+            ("VANTA_LLM_CONTEXT_TOKENS", "131072"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a throttle the caller rode out must not change the verdict; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let kinds = server.request_kinds();
+    let generate_requests = kinds.iter().filter(|kind| kind.as_str() == "generate").count();
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let attacker_rows: Vec<&SessionRecord> = records
+        .iter()
+        .filter(|record| {
+            record.phase == "call.usage"
+                && summary_value(&record.summary, "site") == "attacker_generate"
+        })
+        .collect();
+    assert!(
+        !attacker_rows.is_empty(),
+        "the run must have generated tests; request kinds: {kinds:?}"
+    );
+    // The refusal was seen as a REQUEST — the stub answered nothing to it — so the
+    // generation appears one time MORE often than the model was asked about it.
+    assert_eq!(
+        generate_requests,
+        attacker_rows.len() + 1,
+        "the refused request must be re-sent and nothing else added; request kinds: {kinds:?}"
+    );
+
+    let throttled = attacker_rows
+        .iter()
+        .filter(|record| summary_value(&record.summary, "provider_retries") == "1")
+        .count();
+    assert_eq!(
+        throttled, 1,
+        "exactly one call must record the provider's refusal; request kinds: {kinds:?}"
+    );
+    for record in &attacker_rows {
+        assert_eq!(
+            summary_value(&record.summary, "attempt"),
+            "1",
+            "the throttle must not be charged to the model's attempt budget: {}",
+            record.summary
+        );
+    }
+
+    let summary = run_summary(workspace.path()).summary;
+    assert_eq!(
+        summary_value(&summary, "provider_retries"),
+        "1",
+        "the run total must count the provider's refusal: {summary}"
+    );
+    assert_eq!(
+        summary_value(&summary, "provider_retries_unavailable"),
+        "1",
+        "the `Resource Unavailable` body is the flex class, not the generic rate limit: {summary}"
+    );
+    assert_eq!(
+        summary_value(&summary, "provider_retries_rate_limit"),
+        "0",
+        "a capacity refusal must not be reported as a rate limit: {summary}"
     );
 }
 
@@ -6792,5 +7914,141 @@ fn the_three_flags_on_do_not_turn_an_approval_into_a_needs_review() {
         summary_value(&summary, "needs_review_weak"),
         "[]",
         "an approval carries no weak failures; got {summary}"
+    );
+}
+
+// ============================================================================
+// Hosted OpenAI backend — §14.25: the API key reaches no file and no stream
+// ============================================================================
+
+/// Every regular file under `root`, depth-first and sorted, so a failure names a
+/// deterministic path and the sweep is reproducible.
+///
+/// [VANTA-WHY] The redaction tests below must sweep the WHOLE tree rather than a
+/// list of files written today. A list is a promise to update it whenever a new
+/// artifact appears, and the failure of that promise is silent: a run would
+/// start leaking through the file nobody remembered to add. Walking the tree
+/// makes "written by the run" the criterion, not "known to the test".
+fn files_under(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Whether `needle` occurs anywhere in `haystack`.
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+/// The API key must not reach any file a run writes, nor stdout, nor stderr —
+/// even when the provider ECHOES it back inside a rejected request's body.
+///
+/// [VANTA-WHY] A provider is free to quote the credential it just rejected back
+/// at the client ("Incorrect API key provided: sk-…"), and Vanta's own error
+/// path prints the provider's body to make the failure legible. So the leak this
+/// test hunts is not a careless `println!` of a variable — it is a *legitimate*
+/// message that happens to contain the secret, reaching the session log, the
+/// evidence bundle and the terminal. Redacting the variable NAME would not catch
+/// it; only redacting the VALUE does. The stub does the echoing for real (it
+/// reads the bearer token out of the request headers), so the run exercises the
+/// whole path rather than a hand-built error string.
+#[test]
+fn the_api_key_never_reaches_a_file_stream_or_record_when_the_provider_echoes_it() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), PRESERVING_PATCH);
+    let server = StubLlmServer::start_streaming(
+        None,
+        SINGLE_BEHAVIOR_TEST,
+        StubBehaviour::EchoKeyUnauthorized,
+    );
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        // One attempt per call: the rejection is deterministic, so a retry adds
+        // nothing but time, and the run must reach its recorded failure fast.
+        &[("VANTA_LLM_RETRY_ATTEMPTS", "1")],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a rejected key is an infrastructure failure, not a verdict; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        server.request_count() >= 1,
+        "the run must actually have made a chat call for the echo path to be \
+         exercised; got {}",
+        server.request_count()
+    );
+
+    let key = TEST_API_KEY.as_bytes();
+
+    // (1) the two streams the run owns.
+    for (name, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        assert!(
+            !contains_bytes(bytes, key),
+            "the API key reached {name}:\n{}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+
+    // (2) every file the run wrote, whatever its name. The workspace is the
+    // run's CWD, so this covers the session log, the transitions store, the
+    // evidence bundle and any sandbox scratch files alike.
+    let files = files_under(workspace.path());
+    assert!(
+        !files.is_empty(),
+        "the sweep must not be vacuous — a run that wrote nothing would pass it \
+         for the wrong reason"
+    );
+    for path in &files {
+        let bytes = fs::read(path).unwrap();
+        assert!(
+            !contains_bytes(&bytes, key),
+            "the API key reached {}:\n{}",
+            path.display(),
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    // (3) the positive control. Without it the test would also pass if the echo
+    // path never ran — the assertion would be checking a message that was never
+    // built. The recorded failure must show the MARKER in the key's place and
+    // still name the status, so a reader can see the rejection happened.
+    let records = read_session_records(&find_session_log(workspace.path()));
+    let infra = records
+        .iter()
+        .find(|r| r.phase == "run.infra_failure")
+        .expect("a rejected key must be recorded as a run.infra_failure row");
+    assert!(
+        infra.summary.contains("401"),
+        "the recorded failure must name the status the provider returned; got {}",
+        infra.summary
+    );
+    assert!(
+        infra.summary.contains("<redacted>"),
+        "the echoed credential must have been replaced by the marker, proving \
+         the message was built and redacted rather than never built; got {}",
+        infra.summary
     );
 }

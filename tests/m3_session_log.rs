@@ -1124,6 +1124,24 @@ const GROUNDED_SYMPTOM_PROBE: &str = r#"{"tests":[
         }
     ]}"#;
 
+/// ONE `BugReproduction` probe that FAILS on the original tree (where `add(2, 3)`
+/// is 5, not the 6 it pins), so BATE admits it.
+///
+/// [VANTA-WHY] Item 18 — this is the paused-Luna shape
+/// (`test_path_output_does_not_raise_nameerror`): a probe that describes the
+/// reported symptom, DECLARED as `BugReproduction`, about which the auditor
+/// contradicts itself — `issue_asks_for_behaviour=false` while its own reason says
+/// the issue requires the current behaviour to change.
+const SELF_CONTRADICTED_REPRODUCTION_PROBE: &str = r#"{"tests":[
+        {
+            "test_name":"test_add_pair_reports_six",
+            "test_source":"from calc import add\n\ndef test_add_pair_reports_six():\n    assert add(2, 3) == 6\n",
+            "intent":"BugReproduction",
+            "reason":"Fails on the original tree, so BATE admits it.",
+            "issue_quote":"The issue expects a bug-reproduction probe asserting add(2, 3) == 6."
+        }
+    ]}"#;
+
 /// A Creator patch that APPLIES cleanly but leaves the tree unimportable.
 ///
 /// [VANTA-WHY] It has to be a real unified diff. The Creator's patch goes
@@ -2732,6 +2750,113 @@ fn a_preservation_probe_the_issue_asks_for_is_promoted_not_scrapped() {
             .map(|r| r.summary.as_str())
             .collect::<Vec<_>>()
     );
+}
+
+/// [VANTA-WHY] Item 18 — the auditor must not be able to relabel a probe out of
+/// its own contradiction.
+///
+/// The paused-Luna run answered this shape with `issue_asks_for_behaviour=false`
+/// and, in the very same reason, "the issue asks to use the defined output path,
+/// so it requires changing the current NameError behavior rather than preserving
+/// it" — the issue REQUIRES the bug's behaviour to change, which is exactly what a
+/// `BugReproduction` probe is for. Reading the first answer alone demoted the
+/// probe to `BehaviorPreservation`, so the review lost its rejection signal and
+/// the demotion was counted as a relabel in `attacker.summary` (`relabels=1`)
+/// instead. The two answers are now read together: the DECLARED label survives,
+/// no relabel is emitted at all, and the probe is counted by BATE — the phase
+/// that holds the baseline evidence — in `bate.summary`. Nothing is relabelled
+/// away before the tree can speak.
+#[test]
+fn a_probe_the_auditor_contradicts_itself_about_keeps_its_label_and_bate_counts_it() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), BOUNDARY_FIX_PATCH);
+    // The self-contradicting verdict in the log's own shape: the reason says the
+    // issue requires the behaviour to change while Q1 says it was never asked for.
+    let server = StubLlmServer::start_with_intent_audit(
+        SELF_CONTRADICTED_REPRODUCTION_PROBE,
+        r#"{"issue_asks_for_behaviour":false,"issue_requires_change":true,"reason":"the issue asks to use the defined output path, so it requires changing the current behavior rather than preserving it"}"#,
+    );
+
+    let output = run_patch_mode_with_output(workspace.path(), &patch_path, &server, 1, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the probe reproduces the reported bug and the candidate fixes it, so the \
+         auditor's contradiction must not cost the review its evidence; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+
+    // The decision itself: the declared label was KEPT, and BOTH answers are on
+    // the record, so a reader can see the contradiction rather than a demotion.
+    let check = records
+        .iter()
+        .find(|r| r.phase == "intent.check[test_add_pair_reports_six]")
+        .unwrap_or_else(|| {
+            panic!(
+                "the session log must carry the verdict for the contradicted probe; got {:?}",
+                records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        check.summary.contains("declared=BugReproduction")
+            && check.summary.contains("issue_asks_for_behaviour=false")
+            && check.summary.contains("issue_requires_change=true")
+            && check.summary.contains("scrapped=false"),
+        "the audit must keep the declared label and record both answers; got {}",
+        check.summary
+    );
+
+    // No relabel in either direction: the label was right, so nothing is emitted.
+    assert!(
+        !records
+            .iter()
+            .any(|r| r.phase.starts_with("attacker.relabel[")),
+        "a probe whose declared label is kept must not be recorded as relabelled; got {:?}",
+        records
+            .iter()
+            .filter(|r| r.phase.starts_with("attacker.relabel["))
+            .map(|r| r.phase.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    // The count it must NOT be in any more: the demotion used to be logged as an
+    // Attacker relabel, which is how a lost reproduction probe looked harmless.
+    let attacker_summary = records
+        .iter()
+        .find(|r| r.phase == "attacker.summary")
+        .expect("the Attacker summary row must exist");
+    assert!(
+        attacker_summary.summary.contains("relabels=0")
+            && attacker_summary.summary.contains("intent_scrapped=0")
+            && attacker_summary.summary.contains("valid_tests=1"),
+        "the probe must survive the audit UNCHANGED, not as a relabel; got {}",
+        attacker_summary.summary
+    );
+
+    // ...and the count it IS in: BATE is the phase with the baseline evidence, so
+    // its summary is where an admitted probe is accounted.
+    let bate_summary = records
+        .iter()
+        .find(|r| r.phase == "bate.summary")
+        .expect("the BATE summary row must exist");
+    assert!(
+        bate_summary.summary.contains("valid=1")
+            && bate_summary.summary.contains("scrapped=0")
+            && bate_summary.summary.contains("relabels=0"),
+        "the kept probe must be counted by BATE as an admitted test; got {}",
+        bate_summary.summary
+    );
+
+    let summary = run_summary(workspace.path()).summary;
+    assert!(
+        summary.contains("final_decision=AllTestsPassed"),
+        "got {summary}"
+    );
+    assert_eq!(summary_value(&summary, "invariant_reason"), "satisfied");
 }
 
 /// [VANTA-WHY] §14.5 — the batched audit is a TRANSPORT change. The same round,

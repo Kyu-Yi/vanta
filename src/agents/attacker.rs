@@ -1322,6 +1322,16 @@ fn issue_names_what_the_test_asserts(
 ///   - `FeatureAcceptance`→`BehaviorPreservation` (demotion) is safe because
 ///     BATE then demands the test PASS on the original.
 /// A relabel is never driven by a BATE result — only by what the ISSUE asks for.
+///
+/// [VANTA-WHY] Item 18 — the demotion is NOT taken when the auditor answers the
+/// two questions inconsistently: `issue_asks_for_behaviour = false` together with
+/// `issue_requires_change = true`. That pair means the issue requires the
+/// behaviour at the asserted input to CHANGE, i.e. the test describes the
+/// reported bug, and the "the issue does not ask for it" answer is the
+/// contradiction. Demoting there relabels a reproduction probe as a preservation
+/// probe and throws the review's rejection signal away, so the DECLARED label is
+/// kept and the test is left to prove itself against the original tree in BATE.
+/// An UNKNOWN `issue_requires_change` (`None`) keeps the fail-closed demotion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IntentRouting {
     /// The declared label survives.
@@ -1331,9 +1341,11 @@ pub(crate) enum IntentRouting {
     /// acceptance test for the new behaviour rather than a preservation probe.
     PromoteToFeature,
     /// Non-preservation → BehaviorPreservation. The issue does not ask for the
-    /// asserted behaviour, so the only honest label left is "this is behaviour
-    /// the original already has". An auditor that cannot answer takes this path:
-    /// an unverified non-preservation label must not stand.
+    /// asserted behaviour and does NOT require it to change, so the only honest
+    /// label left is "this is behaviour the original already has". An auditor that
+    /// cannot answer takes this path: an unverified non-preservation label must
+    /// not stand. NOT taken when the auditor also says the issue requires the
+    /// asserted behaviour to change (item 18) — see `route_intent`.
     DemoteToPreservation,
     /// BehaviorPreservation + the issue REQUIRES the asserted behaviour to
     /// change. The test contradicts the issue and no honest label remains.
@@ -1385,7 +1397,19 @@ pub(crate) fn route_intent(
             }
         }
         _ => {
-            if verdict.issue_asks_for_behaviour {
+            // [VANTA-WHY] Item 18 — the two answers are read TOGETHER. A single
+            // `issue_asks_for_behaviour = false` used to be enough to demote a
+            // BugReproduction/FeatureAcceptance test, and the Luna logs show what
+            // that cost: the auditor's own reason said the issue requires the
+            // current behaviour to change — the test describes exactly the
+            // reported bug — while this answer relabelled it as a preservation
+            // probe and the review lost its rejection signal. When the auditor
+            // contradicts itself that way, the DECLARED label is the honest one,
+            // and keeping it can only make the test harder to admit: a
+            // non-preservation label must still prove itself against the original
+            // tree in BATE (`expected_baseline`). An UNKNOWN answer (`None`)
+            // keeps the old fail-closed demotion.
+            if verdict.issue_asks_for_behaviour || verdict.issue_requires_change == Some(true) {
                 IntentRouting::Keep
             } else {
                 IntentRouting::DemoteToPreservation
@@ -2382,6 +2406,62 @@ mod tests {
         assert_eq!(
             route_intent(&TestIntent::FeatureAcceptance, &verdict(true, None), true),
             IntentRouting::Keep
+        );
+    }
+
+    // ---- item 18: the auditor's self-contradicting verdict ------------------
+
+    /// [VANTA-WHY] Item 18 — the paused-Luna shape, verbatim: the probe
+    /// `test_path_output_does_not_raise_nameerror` DECLARED `BugReproduction`, and
+    /// the auditor answered `issue_asks_for_behaviour=false` while its own reason
+    /// said the issue REQUIRES the current behaviour to change ("The issue asks to
+    /// use the defined output path, so it requires changing the current NameError
+    /// behavior rather than preserving it"). Reading the first answer alone
+    /// demoted a reproduction probe to `BehaviorPreservation` — that is, it
+    /// relabelled the test that describes the reported bug as a test that asserts
+    /// the bug is ABSENT, and the review lost its rejection signal. The two
+    /// answers are read together, and the declared label is kept.
+    #[test]
+    fn a_reproduction_probe_the_auditor_contradicts_itself_about_keeps_its_label() {
+        assert_eq!(
+            route_intent(
+                &TestIntent::BugReproduction,
+                &verdict(false, Some(true)),
+                false
+            ),
+            IntentRouting::Keep
+        );
+        assert_eq!(
+            route_intent(
+                &TestIntent::FeatureAcceptance,
+                &verdict(false, Some(true)),
+                false
+            ),
+            IntentRouting::Keep
+        );
+    }
+
+    /// The complement, so item 18 cannot be read as "stop demoting": a
+    /// self-consistent verdict that the issue preserves the behaviour still
+    /// demotes, and an UNKNOWN `issue_requires_change` still fails closed. Only
+    /// the CONTRADICTION is rescued.
+    #[test]
+    fn a_self_consistent_or_unknown_verdict_still_demotes() {
+        assert_eq!(
+            route_intent(
+                &TestIntent::BugReproduction,
+                &verdict(false, Some(false)),
+                false
+            ),
+            IntentRouting::DemoteToPreservation
+        );
+        assert_eq!(
+            route_intent(
+                &TestIntent::BugReproduction,
+                &verdict(false, None),
+                false
+            ),
+            IntentRouting::DemoteToPreservation
         );
     }
 

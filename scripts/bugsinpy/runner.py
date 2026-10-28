@@ -2256,7 +2256,7 @@ def run_batch(
     seeds: Sequence[int],
     waves: Sequence[int],
     vanta_bin: Path,
-    max_attempts: int,
+    max_attempts: Optional[int] = None,
     disk_mb: int,
     show_hints: bool = False,
     plan_only: bool = False,
@@ -2279,9 +2279,15 @@ def run_batch(
     zero-argument callable returning ``None`` or a sentence saying why the endpoint did not
     answer, and it is asked **before every row** — so an endpoint that goes away mid-batch
     stops the batch instead of writing a failed row for every job left. ``run`` passes the
-    real probe; the default is ``None`` for the same reason ``max_spend_usd`` is read in the
-    CLI rather than here: the check belongs to the invocation, and a test that drives this
+    real probe; the default is ``None`` for the same reason ``max_spend_usd`` is read in
+    the CLI rather than here: the check belongs to the invocation, and a test that drives this
     loop must not depend on whatever endpoint the developer happens to have running.
+
+    ``max_attempts`` is the invocation's ``--max-attempts``, or ``None`` when the flag was
+    NOT given. An arm that pins a budget owns it (B0 *is* "one Creator call"), so with no
+    flag the harness states the pin and records it, and an explicit flag that contradicts
+    it is refused by :func:`_require_arm_budget` before the schedule is printed. Every
+    other arm runs what the invocation asked for, or the binary's own default.
     """
     paths = BatchPaths.under(batch_dir)
     manifest = Manifest(batch_dir)
@@ -2297,6 +2303,9 @@ def run_batch(
     # names the placeholder must not start at all (§4.4).
     spellings = list(split.configs)
     _require_arm_list(spellings)
+    # M3 item 11 — refuse an explicit `--max-attempts` a pinned arm contradicts,
+    # before the schedule is printed and before any VM boots.
+    _require_arm_budget(spellings, max_attempts)
     # D13's order, mode-major, derived from the spellings themselves, so every repair
     # pass precedes every review pass by construction. The `config` column of a
     # phase's rows is the spelling's config value (`baseline` for both `b1` and
@@ -2433,11 +2442,12 @@ def run_batch(
                             manifest=manifest,
                             vanta_bin=vanta_bin,
                             # The arm owns the budget, not the invocation: B0 is
-                            # "one Creator call, no feedback" (§M3 item 11) and a
-                            # `--max-attempts 4` on the command line must not turn it
-                            # into a different arm. Every other arm runs what the
-                            # invocation asked for.
-                            max_attempts=arms_mod.arm_max_attempts(arm, max_attempts),
+                            # "one Creator call, no feedback" (§M3 item 11), so a
+                            # pinned arm states its budget here and an explicit
+                            # `--max-attempts` that disagrees was already refused
+                            # by `_require_arm_budget`. Every other arm runs what
+                            # the invocation asked for, or the binary's default.
+                            max_attempts=_arm_attempt_budget(arm, max_attempts),
                             disk_mb=disk_mb,
                             python_version=checkpoint_pythons.get(checkpoint, ""),
                         )
@@ -2538,6 +2548,30 @@ def _require_arm_list(spellings: Sequence[str]) -> None:
         arms_mod.resolve_configs(spellings)
     except arms_mod.ArmError as exc:
         raise RunnerError(str(exc)) from exc
+
+
+def _arm_attempt_budget(arm: str, requested: Optional[int]) -> int:
+    """The attempt budget one arm runs with, or a refusal (→ :func:`arms.arm_attempts`)."""
+    try:
+        return arms_mod.arm_attempts(arm, requested)
+    except arms_mod.ArmError as exc:
+        raise RunnerError(str(exc)) from exc
+
+
+def _require_arm_budget(spellings: Sequence[str], requested: Optional[int]) -> None:
+    """Refuse an explicit ``--max-attempts`` that contradicts a pinned arm.
+
+    [VANTA-WHY] M3 item 11 — B0's budget is 1 because that IS the arm ("one Creator
+    call, no feedback"), so the harness **pins** it rather than letting the
+    invocation decide. This is the pre-launch half of "refuse inconsistent
+    combinations": a flag that disagrees is refused here, before the schedule is
+    printed and before any VM boots. With no flag there is nothing to refuse — the
+    arm's own budget is used and recorded on the row.
+    """
+    if requested is None:
+        return
+    for mode, written in arms_mod.phases_for(spellings):
+        _arm_attempt_budget(arms_mod.arm_for(written, mode), requested)
 
 
 def wave_gate_failures(records: Sequence[dict[str, Any]]) -> list[str]:

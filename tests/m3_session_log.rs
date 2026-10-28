@@ -6478,6 +6478,123 @@ fn attacker_off_makes_zero_attacker_calls_and_grades_on_native_and_static() {
     );
 }
 
+/// M3 item 11 `b0`: the single-shot floor — one Creator call, no feedback round,
+/// no Attacker, graded by the same oracle as every other arm.
+///
+/// [VANTA-WHY] B0 and B1 (`baseline`) are the SAME switch pair — Attacker off,
+/// Planner off, BATE on — and differ ONLY in the attempt budget (one vs the
+/// default), which `pipeline::driver::benchmark_config_name` cannot see. So the
+/// harness states the name (`VANTA_ARM`), and the `arm` column is the only thing
+/// on a row that tells a one-shot B0 row from a four-attempt baseline row. If the
+/// two pooled, the floor of the fix-rate curve would be an average of two
+/// different arms.
+#[test]
+fn b0_is_one_creator_call_graded_with_no_attacker_and_no_feedback() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    // A real native suite, so the approval rests on a test that actually ran
+    // rather than on a vacuously-empty one.
+    let (_repo_dir, _issue_path, _patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        PRESERVING_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    // ONE Creator answer that keeps the tree's behaviour: the native suite still
+    // passes and static analysis is clean, so the one attempt is graded and
+    // approved rather than run out of budget.
+    let script = serde_json::json!([
+        {
+            "patch_text": PRESERVING_PATCH,
+            "explanation": "document add without changing behaviour",
+            "files_touched": ["calc.py"],
+            "confidence": 0.9
+        }
+    ])
+    .to_string();
+    // A stub that WOULD answer an Attacker call: if one is made, this test sees it.
+    let server = StubLlmServer::start_with_creator_script(&script, SINGLE_BEHAVIOR_TEST);
+
+    let output = run_creator_mode_with_output(
+        workspace.path(),
+        &server,
+        1,
+        &[("VANTA_ARM", "b0"), ("VANTA_ATTACKER", "off")],
+    );
+
+    assert!(
+        output.status.success(),
+        "B0's one attempt reaches a clean patch, so the run is graded and approved; \
+         stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // Exactly one Creator call and nothing else: no Attacker generation, no
+    // revision, no batched intent audit, and no SECOND Creator call — a
+    // one-attempt run has no feedback round to feed.
+    assert_eq!(
+        server.request_kinds(),
+        vec!["creator".to_string()],
+        "B0 is exactly one Creator call; any other kind is a phase the arm must not run; \
+         kinds={:?}",
+        server.request_kinds()
+    );
+
+    let summary = run_summary(workspace.path());
+    assert_eq!(
+        summary_value(&summary.summary, "config"),
+        "b0",
+        "B0's row records its own config, not the switch-derived `baseline`; got {}",
+        summary.summary
+    );
+    assert_eq!(
+        summary_value(&summary.summary, "arm"),
+        "b0",
+        "the arm column is what tells a one-shot B0 row from a four-attempt baseline \
+         row — they share every switch; got {}",
+        summary.summary
+    );
+    assert_eq!(
+        summary_value(&summary.summary, "attempts_run"),
+        "1",
+        "a one-attempt run must record the one attempt it made; got {}",
+        summary.summary
+    );
+    assert_eq!(
+        summary_value(&summary.summary, "final_decision"),
+        "AllTestsPassed",
+        "B0 is graded by the same oracle as any arm — a clean patch on the native \
+         suite is the approval, not an exemption; got {}",
+        summary.summary
+    );
+    // B0 runs in repair mode (`--patch` absent), so item 1's approval invariant is
+    // inapplicable for the same reason any repair run's is — recorded, not assumed.
+    assert_eq!(
+        summary_value(&summary.summary, "invariant_applied"),
+        "false",
+        "a repair run has no review approval for the invariant to constrain; got {}",
+        summary.summary
+    );
+    assert_eq!(
+        summary_value(&summary.summary, "invariant_reason"),
+        "not_review",
+        "the exemption must name itself; got {}",
+        summary.summary
+    );
+    // The budget the arm PINS is the budget the row carries: `session.start`
+    // records `--max-attempts`, so the 1 is a recorded fact, not a re-derivation
+    // from the arm's name.
+    let start = read_session_records(&find_session_log(workspace.path()))
+        .into_iter()
+        .find(|record| record.phase == "session.start")
+        .expect("every run writes a session.start row");
+    assert_eq!(
+        summary_value(&start.summary, "max_attempts"),
+        "1",
+        "the attempt budget the arm pins must be on the row; got {}",
+        start.summary
+    );
+}
+
 /// §4.2 third configuration: `VANTA_PLANNER=on` is a PLACEHOLDER. It must end as
 /// an explicit `InfraFailure` instead of a fabricated result, and it must not do
 /// any work — no LLM call, no verdict about a candidate.

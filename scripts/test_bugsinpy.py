@@ -20234,10 +20234,40 @@ class TestArms:
             arms_mod.arm_for("suite", "repair")
 
     def test_b0_pins_one_attempt_and_the_others_take_the_invocation_s(self):
-        """B0's budget is what the arm IS (M3 item 11), not a parameter."""
-        assert arms_mod.arm_max_attempts("b0", 4) == 1
-        assert arms_mod.arm_max_attempts("b1", 4) == 4
-        assert arms_mod.arm_max_attempts("b3", 7) == 7
+        """B0's budget is what the arm IS (M3 item 11), not a parameter.
+
+        With no ``--max-attempts`` the harness *states* the pin rather than inferring
+        it; with the flag, an arm that pins nothing runs the flag; and a flag that
+        contradicts a pin is refused rather than silently overridden.
+        """
+        # No flag: the pinned arm states 1, every other arm takes the binary's own.
+        assert arms_mod.arm_attempts("b0", None) == 1
+        assert arms_mod.arm_attempts("b1", None) == arms_mod.DEFAULT_ATTEMPTS
+        # Flag given: obeyed wherever the arm pins nothing.
+        assert arms_mod.arm_attempts("b1", 4) == 4
+        assert arms_mod.arm_attempts("b3", 7) == 7
+        # The pin is not overridable — and B0 with its own budget is fine.
+        assert arms_mod.arm_attempts("b0", 1) == 1
+        with pytest.raises(arms_mod.ArmError, match="pins --max-attempts 1"):
+            arms_mod.arm_attempts("b0", 4)
+
+    def test_b0_is_a_repair_split_of_one_phase(self):
+        """B0 (M3 item 11) is selectable exactly like any other arm: a split naming it
+        schedules one repair pass and nothing else."""
+        assert arms_mod.phases_for(["b0"]) == [(runner_mod.REPAIR, "b0")]
+        runner_mod._require_arm_list(["b0"])
+        # No flag: the pre-launch budget check has nothing to refuse.
+        runner_mod._require_arm_budget(["b0"], None)
+
+    def test_an_explicit_contradicting_budget_is_refused_before_launch(self):
+        """M3 item 11 — the harness refuses, before the schedule is printed, an explicit
+        ``--max-attempts`` a pinned arm contradicts. It is not silently pinned."""
+        with pytest.raises(runner_mod.RunnerError, match="pins --max-attempts 1"):
+            runner_mod._require_arm_budget(["b0"], 4)
+        # The pin's own value, and every unpinned arm list, pass unchanged.
+        runner_mod._require_arm_budget(["b0"], 1)
+        runner_mod._require_arm_budget(["baseline", "vanta"], 4)
+        runner_mod._require_arm_budget(["b1", "b2", "b3", "suite"], 9)
 
     def test_two_spellings_under_one_config_are_refused(self):
         with pytest.raises(arms_mod.ArmError, match="share a job key"):
@@ -20980,6 +21010,7 @@ class TestRunBatchLoop:
             "bug": job.bug,
             "wave": job.wave,
             "config": job.config,
+            "arm": job.arm,
             "mode": job.mode,
             "seed": job.seed,
             "checkpoint": job.checkpoint,
@@ -21014,7 +21045,7 @@ class TestRunBatchLoop:
         return preps, entries, split, calls, tmp_path / "batch"
 
     def _run(self, preps, entries, split, batch_dir, *, show_hints=False, max_spend_usd=None,
-             preflight=None):
+             preflight=None, max_attempts=4):
         return runner_mod.run_batch(
             batch_dir=batch_dir,
             batch_id="b1",
@@ -21024,7 +21055,7 @@ class TestRunBatchLoop:
             seeds=[0],
             waves=[1],
             vanta_bin=Path("/nonexistent/vanta_m3"),
-            max_attempts=4,
+            max_attempts=max_attempts,
             disk_mb=8192,
             show_hints=show_hints,
             max_spend_usd=max_spend_usd,
@@ -21034,6 +21065,40 @@ class TestRunBatchLoop:
     @staticmethod
     def _reviews(calls):
         return [job for job in calls if job.mode == runner_mod.REVIEW]
+
+    # -- M3 item 11: a pinned arm owns its budget ---------------------------
+    def test_a_b0_split_runs_one_attempt_and_the_row_says_so(self, tmp_path, monkeypatch):
+        """With no `--max-attempts` the harness *states* B0's 1 and passes it to the
+        binary, and the row keeps both `config=b0` and `arm=b0`."""
+        preps, entries, split = self._fixture(tmp_path, configs=("b0",))
+        budgets: list = []
+        monkeypatch.setattr(runner_mod, "python_version_of", lambda *a, **k: "3.8.20")
+        monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kwargs: kwargs["candidate"])
+
+        def stub(*, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version):
+            budgets.append((job.arm, max_attempts))
+            record = self._row(tmp_path, job)
+            manifest.append(record)
+            manifest.mark(job.key, manifest_mod.DONE)
+            return record
+
+        monkeypatch.setattr(runner_mod, "run_job", stub)
+        self._run(preps, entries, split, tmp_path / "batch", max_attempts=None)
+        assert budgets, "the stub should have been called"
+        assert set(budgets) == {("b0", 1)}
+        rows = manifest_mod.Manifest(tmp_path / "batch").records()
+        assert {row["config"] for row in rows} == {"b0"}
+        assert {row["arm"] for row in rows} == {"b0"}
+
+    def test_a_b0_split_refuses_an_explicit_four_attempt_flag(self, tmp_path, monkeypatch):
+        """An explicit contradicting flag stops the batch before the schedule is printed
+        and before any job runs, so no VM boots and no row is written."""
+        preps, entries, split, calls, batch_dir = self._prepare(
+            monkeypatch, tmp_path, configs=("b0",)
+        )
+        with pytest.raises(runner_mod.RunnerError, match="pins --max-attempts 1"):
+            self._run(preps, entries, split, batch_dir, max_attempts=4)
+        assert calls == []
 
     def test_every_job_carries_the_batch_s_harness_revision(self, tmp_path, monkeypatch):
         """Read once, at the start: rows of one batch must not disagree about which

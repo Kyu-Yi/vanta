@@ -1121,8 +1121,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--max-attempts",
         type=int,
-        default=4,
-        help="Vanta's repair budget per run (default: 4, the binary's own)",
+        default=None,
+        help=(
+            "Vanta's repair budget per run (default: 4, the binary's own). An arm "
+            "that pins a budget owns it: B0 is one Creator call, so it runs 1 "
+            "whether or not the flag is given, and an explicit different value is "
+            "refused before the batch starts."
+        ),
     )
     run.add_argument(
         "--disk-mb",

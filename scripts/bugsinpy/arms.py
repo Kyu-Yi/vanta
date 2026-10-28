@@ -50,6 +50,12 @@ from typing import Any, Mapping, Optional, Sequence
 REPAIR = "repair"
 REVIEW = "review"
 
+DEFAULT_ATTEMPTS = 4
+"""The binary's own ``--max-attempts`` (``driver.rs``'s default).
+
+Used when the harness is invoked without the flag and the arm pins no budget; an
+arm that pins one never reaches this."""
+
 
 class ArmError(RuntimeError):
     """The registry cannot answer: an unknown name, or a combination it refuses."""
@@ -179,10 +185,26 @@ def arm_for_config(config: str) -> Arm:
     return ARMS[arm_for(config, sorted(modes_of(config))[0])]
 
 
-def arm_max_attempts(name: str, default: int) -> int:
-    """The attempt budget one arm runs with: its pin, or the invocation's own."""
+def arm_attempts(name: str, requested: Optional[int]) -> int:
+    """The attempt budget one arm runs with, or a refusal.
+
+    ``requested`` is the invocation's ``--max-attempts``, or ``None`` when the flag
+    was NOT given. An arm that pins a budget owns it: B0 *is* "one Creator call, no
+    feedback" (M3 plan item 11), so with no flag the harness **states** the 1 rather
+    than inferring it — and an explicit flag that contradicts the pin is refused
+    rather than silently overridden, so a caller who typed ``--max-attempts 4`` is
+    never handed a one-shot under a four-attempt banner.
+    """
     pinned = arm(name).max_attempts
-    return default if pinned is None else pinned
+    if pinned is None:
+        return DEFAULT_ATTEMPTS if requested is None else requested
+    if requested is not None and requested != pinned:
+        raise ArmError(
+            f"arm {name!r} pins --max-attempts {pinned} (that is what the arm IS), "
+            f"but --max-attempts {requested} was given; drop the flag or name a "
+            "different arm"
+        )
+    return pinned
 
 
 def resolve_configs(spellings: Sequence[str]) -> list[str]:

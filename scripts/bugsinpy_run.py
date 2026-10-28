@@ -56,6 +56,7 @@ from bugsinpy import context as context_mod  # noqa: E402
 from bugsinpy import issue as issue_mod  # noqa: E402
 from bugsinpy import issue_source  # noqa: E402
 from bugsinpy import manifest as manifest_mod  # noqa: E402
+from bugsinpy import mutants as mutants_mod  # noqa: E402
 from bugsinpy import oracle as oracle_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
 from bugsinpy import records as records_mod  # noqa: E402
@@ -81,6 +82,7 @@ EXPECTED_ERRORS = (
     issue_mod.IssueError,
     compact_mod.CompactError,
     records_mod.RecordError,
+    mutants_mod.MutantError,
 )
 """Every failure the harness raises on purpose, and the reason the CLI prints them.
 
@@ -862,6 +864,51 @@ def cmd_run(args: argparse.Namespace) -> int:
     return code
 
 
+def cmd_pool(args: argparse.Namespace) -> int:
+    """Item 5 — write and hash-lock each bug's reference-fix mutant pool.
+
+    Repo-root check first, for the same reason every other stage does it: the whole
+    preflight and grading run in Shuru, whose mount rule needs every tree inside the
+    process CWD. ``--plan`` needs neither a VM nor a checkpoint — the candidates are
+    a pure function of the reference fix — so it is exempt from the endpoint check
+    the run stage does, and it boots nothing.
+    """
+    if not args.mutants:
+        raise mutants_mod.MutantError(
+            "`pool` owns two files. `--mutants` writes the reference-fix mutant pool "
+            "(pool/<bug>.mutants.json, item 5); the assembled review pool "
+            "(pool/<bug>.json) that reviews read is item 6's. This command writes the "
+            "mutants file — pass --mutants."
+        )
+    runner_mod.require_repo_cwd()
+    split = load_split(args.split.resolve())
+    batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
+    bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
+    batch = runner_mod.load_prepared(
+        batch_dir=batch_dir, split=split, bugsinpy_root=bugsinpy_root
+    )
+    waves = parse_waves(args.waves)
+    selected = select_preps(batch.preps, only=args.only, waves=waves)
+
+    if args.plan:
+        for prep in selected:
+            for line in mutants_mod.plan_lines(prep):
+                print(line)
+        return EXIT_OK
+
+    for index, prep in enumerate(selected, start=1):
+        checkpoint = str(batch.entries[prep.key]["checkpoint"])
+        print(f"[{index}/{len(selected)}] {prep.key} — grading mutants in Shuru…", flush=True)
+        result = mutants_mod.run_mutants(
+            prep=prep,
+            batch_dir=batch_dir,
+            checkpoint=checkpoint,
+            disk_mb=args.disk_mb,
+        )
+        print(mutants_mod.render_pool_line(prep, result), flush=True)
+    return EXIT_OK
+
+
 def cmd_localize(args: argparse.Namespace) -> int:
     """Ranking quality on the dev split, from evidence already on disk (§1.6.5, §1.6.11).
 
@@ -1156,6 +1203,52 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.set_defaults(func=cmd_run)
+
+    pool = sub.add_parser(
+        "pool",
+        help=(
+            "write and hash-lock each bug's reference-fix mutant pool "
+            "(pool/<bug>.mutants.json, item 5); grading runs in Shuru"
+        ),
+    )
+    pool.add_argument("--split", type=Path, default=DEFAULT_SPLIT)
+    pool.add_argument(
+        "--batch",
+        type=Path,
+        required=True,
+        help="a prepared batch directory — it holds the oracle trees the pool grades against",
+    )
+    pool.add_argument(
+        "--mutants",
+        action="store_true",
+        help=(
+            "write the reference-fix mutant pool (pool/<bug>.mutants.json, item 5). "
+            "The assembled review pool (pool/<bug>.json) is item 6's."
+        ),
+    )
+    pool.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="PROJECT/BUG",
+        help="pool only these bugs (repeatable)",
+    )
+    pool.add_argument("--waves", default="", help="comma-separated wave numbers")
+    pool.add_argument(
+        "--disk-mb",
+        type=int,
+        default=prepare_mod.DISK_MB,
+        help=(
+            "shuru disk in MB for every VM this stage boots; the default matches "
+            f"the suites prepare ran ({prepare_mod.DISK_MB})"
+        ),
+    )
+    pool.add_argument(
+        "--plan",
+        action="store_true",
+        help="print each bug's candidate counts and first mutants in sort order, and exit",
+    )
+    pool.set_defaults(func=cmd_pool)
 
     rep = sub.add_parser(
         "report",

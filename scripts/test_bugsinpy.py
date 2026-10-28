@@ -52,6 +52,7 @@ from bugsinpy import context as ctx  # noqa: E402
 from bugsinpy import issue as issue_mod  # noqa: E402
 from bugsinpy import issue_source as source_mod  # noqa: E402
 from bugsinpy import manifest as manifest_mod  # noqa: E402
+from bugsinpy import mutants as mutants_mod  # noqa: E402
 from bugsinpy import oracle as oracle_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
 from bugsinpy import records as records_mod  # noqa: E402
@@ -21982,6 +21983,7 @@ class TestExpectedErrorsExitCleanly:
             issue_mod.IssueError,
             compact_mod.CompactError,
             records_mod.RecordError,
+            mutants_mod.MutantError,
         }
 
 
@@ -22154,4 +22156,671 @@ class TestSecretRedaction:
             "redaction is not a no-op on COMPILER_ENV — every baked layer's recipe "
             "just changed and would be rebuilt"
         )
+
+
+# ============================================================================
+# mutants.py — the reference-fix mutant pool (item 5, no VM)
+# ============================================================================
+# A review row is scored against a "known-bad" patch, so the pool is the answer
+# key for §5.4. Four rules here fail silently and each one produces a *number*
+# instead of an error: a mutant that is still a real fix left in the pool scores
+# every review row against a correct patch; a syntax-error mutant pads the pool
+# with a patch no reviewer can be credited for finding; an order that depends on
+# anything but the diff makes the pool unreproducible run to run; and an unbounded
+# grading loop turns one unlucky bug into hours of VM time.
+_SRC = (
+    "diff --git a/pkg/mod.py b/pkg/mod.py\n"
+    "index 1111111..2222222 100644\n"
+    "--- a/pkg/mod.py\n"
+    "+++ b/pkg/mod.py\n"
+    "@@ -1,4 +1,4 @@\n"
+    " import os\n"
+    " \n"
+    "-x = 1\n"
+    "+limit = 3\n"
+    " \n"
+    "@@ -10,2 +10,2 @@ def f(a):\n"
+    " def f(a):\n"
+    "-    return a < 3\n"
+    "+    return a <= limit and a != 0\n"
+    "diff --git a/pkg/other.py b/pkg/other.py\n"
+    "--- a/pkg/other.py\n"
+    "+++ b/pkg/other.py\n"
+    "@@ -1,2 +1,3 @@\n"
+    " names = []\n"
+    "+names.append('x')\n"
+    " \n"
+)
+
+
+def _one_line_diff(old: str, new: str, *, rel: str = "pkg/mod.py") -> str:
+    return (
+        f"diff --git a/{rel} b/{rel}\n"
+        f"--- a/{rel}\n"
+        f"+++ b/{rel}\n"
+        "@@ -1,1 +1,1 @@\n"
+        f"-{old}\n"
+        f"+{new}\n"
+    )
+
+
+def _added_lines(diff_text: str) -> list[str]:
+    """The content of every added line in a diff, without the leading ``+``."""
+    return [
+        line[1:]
+        for line in diff_text.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+
+
+def _accept_all(mutant) -> "mutants_mod.Preflight":
+    return mutants_mod.Preflight(applied=True, compiled=True)
+
+
+def _grade_bad(mutant) -> oracle_mod.OracleResult:
+    return oracle_mod.OracleResult(apply_ok=True, hidden_pass=False, patch_good=False)
+
+
+def _grade_good(mutant) -> oracle_mod.OracleResult:
+    return oracle_mod.OracleResult(apply_ok=True, hidden_pass=True, patch_good=True)
+
+
+def _mutant(text: str | None = None) -> mutants_mod.Mutant:
+    text = text if text is not None else _one_line_diff("a", "b")
+    return mutants_mod.Mutant(
+        operator="condition_flip",
+        priority=2,
+        text=text,
+        sha256=split_mod.sha256_text(text),
+    )
+
+
+class TestMutantDiff:
+    """``parse_diff`` / ``render_diff`` — an operator changes one line and re-renders."""
+
+    def test_an_unmutated_diff_round_trips_byte_for_byte(self):
+        """The renderer recomputes every ``@@`` header from the body, and
+        ``git apply`` runs without ``--recount``: if this arithmetic disagreed with
+        git's, every mutant of the bug would be discarded as *unappliable* rather
+        than graded, and the pool would be empty for the wrong reason."""
+        assert mutants_mod.render_diff(mutants_mod.parse_diff(_SRC)) == _SRC
+
+    def test_a_deleted_line_is_recounted_and_the_next_new_start_shifts(self):
+        text = (
+            "diff --git a/pkg/m.py b/pkg/m.py\n"
+            "--- a/pkg/m.py\n"
+            "+++ b/pkg/m.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " a\n"
+            "+b\n"
+            " c\n"
+            "@@ -20,1 +21,1 @@\n"
+            " d\n"
+        )
+        sections = mutants_mod.parse_diff(text)
+        del sections[0].hunks[0].body[1]  # the "+b"
+        rendered = mutants_mod.render_diff(sections)
+        assert "@@ -1,2 +1,2 @@" in rendered
+        assert "@@ -20,1 +20,1 @@" in rendered
+
+    def test_a_preamble_line_does_not_take_the_pool_down(self):
+        """A stray leading blank line is kept rather than refused — a whole bug's
+        pool must not vanish because one line of the diff was not a hunk header."""
+        sections = mutants_mod.parse_diff("\n" + _SRC)
+        assert len(sections) == 3
+        assert sections[0].header == [""]
+        assert sum(len(section.hunks) for section in sections) == 3
+
+
+class TestMutantOperators:
+    """Each operator, on a diff where its rule has exactly one thing to do."""
+
+    def test_hunk_drop_makes_one_candidate_per_hunk_of_a_multi_hunk_fix(self):
+        out = mutants_mod.hunk_drop(_SRC)
+        assert len(out) == 3  # three hunks, each dropped in its own candidate
+
+    def test_hunk_drop_of_a_one_hunk_fix_yields_nothing(self):
+        """A fix with one hunk has no partial version to drop to."""
+        assert mutants_mod.hunk_drop(_one_line_diff("a", "b")) == []
+
+    def test_a_dropped_hunk_takes_an_empty_file_section_with_it(self):
+        out = mutants_mod.hunk_drop(_SRC)
+        sole = [text for text in out if "pkg/other.py" not in text]
+        assert len(sole) == 1  # dropping other.py's only hunk prunes the section
+        assert sole[0].count("diff --git ") == 1
+
+    def test_condition_flip_swaps_a_comparison(self):
+        out = mutants_mod.condition_flip(_one_line_diff("if a > b:", "if a < 3:"))
+        flipped = {_added_lines(text)[0] for text in out}
+        assert "if a <= 3:" in flipped
+        assert "not if a < 3:" in flipped
+        # Only added lines are touched: the removed line is copied verbatim.
+        assert all("-if a > b:" in text for text in out)
+
+    def test_condition_flip_swaps_and_or_and_equality(self):
+        out = mutants_mod.condition_flip(_one_line_diff("pass", "return a == b and c"))
+        flipped = {_added_lines(text)[0] for text in out}
+        assert "return a != b and c" in flipped
+        assert "return a == b or c" in flipped
+
+    def test_condition_flip_adds_and_removes_a_leading_not(self):
+        added = {
+            _added_lines(text)[0]
+            for text in mutants_mod.condition_flip(_one_line_diff("pass", "x"))
+        }
+        assert "not x" in added
+        removed = {
+            _added_lines(text)[0]
+            for text in mutants_mod.condition_flip(_one_line_diff("pass", "not x"))
+        }
+        assert "x" in removed
+
+    def test_boundary_shift_moves_an_integer_both_ways(self):
+        out = mutants_mod.boundary_shift(_one_line_diff("pass", "x = 1"))
+        assert sorted(_added_lines(text)[0] for text in out) == ["x = 0", "x = 2"]
+
+    def test_boundary_shift_ignores_a_digit_in_an_identifier_or_a_float(self):
+        out = mutants_mod.boundary_shift(_one_line_diff("pass", "x1 = 5 and 1.5"))
+        assert sorted(_added_lines(text)[0] for text in out) == [
+            "x1 = 4 and 1.5",
+            "x1 = 6 and 1.5",
+        ]
+
+    def test_boundary_shift_moves_a_len_boundary(self):
+        out = mutants_mod.boundary_shift(_one_line_diff("pass", "if len(items):"))
+        assert [_added_lines(text)[0] for text in out] == ["if len(items) - 1:"]
+
+    def test_statement_deletion_drops_one_line_and_leaves_a_comment(self):
+        text = (
+            "diff --git a/pkg/m.py b/pkg/m.py\n"
+            "--- a/pkg/m.py\n"
+            "+++ b/pkg/m.py\n"
+            "@@ -1,3 +1,5 @@\n"
+            " import os\n"
+            "+pass\n"
+            "+# a comment\n"
+            "-import sys\n"
+            "+import re\n"
+            " \n"
+        )
+        out = mutants_mod.statement_deletion(text)
+        assert len(out) == 2  # "+pass" and "+import re"; the comment is not deleted
+        deleted = {
+            frozenset(set(_added_lines(text)) - set(_added_lines(mutant)))
+            for mutant in out
+        }
+        assert deleted == {frozenset({"pass"}), frozenset({"import re"})}
+        # Deleting an added line drops the hunk's new count by one, recomputed.
+        assert all("@@ -1,3 +1,4 @@" in mutant for mutant in out)
+
+
+class TestMutantRegistry:
+    """The one place an operator's name and priority live."""
+
+    def test_the_registry_is_the_spec_order(self):
+        assert mutants_mod.OPERATOR_NAMES == (
+            "hunk_drop",
+            "condition_flip",
+            "boundary_shift",
+            "statement_deletion",
+        )
+        assert [op.priority for op in mutants_mod.OPERATORS] == [1, 2, 3, 4]
+        assert (
+            mutants_mod.OPERATOR_ORDER
+            == "hunk_drop>condition_flip>boundary_shift>statement_deletion"
+        )
+        assert mutants_mod.SORT_KEY == "(operator_priority, sha256)"
+
+    def test_the_caps_are_the_frozen_values(self):
+        assert mutants_mod.MAX_MUTANTS == 3
+        assert mutants_mod.GRADE_CAP == 12
+
+
+class TestMutantGeneration:
+    def test_every_operator_is_reported_before_the_dedup(self):
+        candidates = mutants_mod.generate(_SRC)
+        assert set(candidates.per_operator) == set(mutants_mod.OPERATOR_NAMES)
+        assert all(count > 0 for count in candidates.per_operator.values())
+
+    def test_no_two_candidates_are_the_same_diff(self):
+        candidates = mutants_mod.generate(_SRC)
+        hashes = [mutant.sha256 for mutant in candidates.mutants]
+        assert len(set(hashes)) == len(hashes)
+
+    def test_two_operators_making_the_same_diff_count_once(self, monkeypatch):
+        """The same patch graded twice is one experiment counted twice — and could
+        put one patch in the pool under two names."""
+        same = _one_line_diff("a", "b")
+        monkeypatch.setattr(
+            mutants_mod,
+            "OPERATORS",
+            (
+                mutants_mod.Operator("one", 1, lambda text: [same]),
+                mutants_mod.Operator("two", 2, lambda text: [same]),
+            ),
+        )
+        candidates = mutants_mod.generate(_one_line_diff("a", "c"))
+        assert len(candidates.mutants) == 1
+        assert candidates.per_operator == {"one": 1, "two": 1}
+
+    def test_the_name_is_the_kind_and_a_hash_prefix(self):
+        mutant = mutants_mod.generate(_SRC).mutants[0]
+        assert mutant.name == f"mutant-{mutant.sha256[:12]}"
+
+
+class TestMutantSelection:
+    """``(operator priority, sha256)`` order, preflight, grade, keep ≤3 bad."""
+
+    def _ordered(self, candidates):
+        return sorted(
+            candidates.mutants, key=lambda mutant: (mutant.priority, mutant.sha256)
+        )
+
+    def test_selection_is_the_first_three_bad_in_sort_order(self):
+        candidates = mutants_mod.generate(_SRC)
+        expected = self._ordered(candidates)[:3]
+        selected = mutants_mod.select(
+            candidates=candidates, preflight_fn=_accept_all, grade_fn=_grade_bad
+        )
+        assert [mutant.sha256 for mutant, _ in selected.entries] == [
+            mutant.sha256 for mutant in expected
+        ]
+        assert selected.tally.selected == 3
+        assert selected.tally.graded == 3
+        assert selected.tally.cap_hit is False
+
+    def test_the_whole_order_is_priority_before_hash(self):
+        ordered = self._ordered(mutants_mod.generate(_SRC))
+        priorities = [mutant.priority for mutant in ordered]
+        assert priorities == sorted(priorities)
+        within_first = [mutant.sha256 for mutant in ordered if mutant.priority == 1]
+        assert within_first == sorted(within_first)
+
+    def test_the_order_does_not_depend_on_the_order_the_operators_ran(self):
+        candidates = mutants_mod.generate(_SRC)
+        first = mutants_mod.select(
+            candidates=candidates, preflight_fn=_accept_all, grade_fn=_grade_bad
+        )
+        reversed_input = mutants_mod.Candidates(
+            mutants=list(reversed(candidates.mutants)),
+            per_operator=candidates.per_operator,
+        )
+        second = mutants_mod.select(
+            candidates=reversed_input, preflight_fn=_accept_all, grade_fn=_grade_bad
+        )
+        assert [mutant.sha256 for mutant, _ in first.entries] == [
+            mutant.sha256 for mutant, _ in second.entries
+        ]
+
+    def test_a_mutant_that_still_passes_the_oracle_is_dropped_as_equivalent(self):
+        candidates = mutants_mod.generate(_SRC)
+        ordered = self._ordered(candidates)
+        equivalent = ordered[0].sha256
+
+        def grade(mutant):
+            return _grade_good(mutant) if mutant.sha256 == equivalent else _grade_bad(mutant)
+
+        selected = mutants_mod.select(
+            candidates=candidates, preflight_fn=_accept_all, grade_fn=grade
+        )
+        assert selected.tally.equivalent == 1
+        assert equivalent not in [mutant.sha256 for mutant, _ in selected.entries]
+        assert [mutant.sha256 for mutant, _ in selected.entries] == [
+            mutant.sha256 for mutant in ordered[1:4]
+        ]
+
+    def test_a_mutant_that_does_not_apply_is_counted_and_never_graded(self):
+        candidates = mutants_mod.generate(_SRC)
+        ordered = self._ordered(candidates)
+        broken = ordered[0].sha256
+        graded: list[str] = []
+
+        def grade(mutant):
+            graded.append(mutant.sha256)
+            return _grade_bad(mutant)
+
+        def preflight(mutant):
+            if mutant.sha256 == broken:
+                return mutants_mod.Preflight(
+                    applied=False, compiled=False, detail="error: patch does not apply"
+                )
+            return _accept_all(mutant)
+
+        selected = mutants_mod.select(
+            candidates=candidates, preflight_fn=preflight, grade_fn=grade
+        )
+        assert selected.tally.did_not_apply == 1
+        assert broken not in graded
+        assert [mutant.sha256 for mutant, _ in selected.entries] == [
+            mutant.sha256 for mutant in ordered[1:4]
+        ]
+
+    def test_a_mutant_that_does_not_compile_is_counted_and_never_graded(self):
+        candidates = mutants_mod.generate(_SRC)
+        ordered = self._ordered(candidates)
+        broken = ordered[0].sha256
+        graded: list[str] = []
+
+        def grade(mutant):
+            graded.append(mutant.sha256)
+            return _grade_bad(mutant)
+
+        def preflight(mutant):
+            if mutant.sha256 == broken:
+                return mutants_mod.Preflight(
+                    applied=True, compiled=False, detail="SyntaxError: invalid syntax"
+                )
+            return _accept_all(mutant)
+
+        selected = mutants_mod.select(
+            candidates=candidates, preflight_fn=preflight, grade_fn=grade
+        )
+        assert selected.tally.did_not_compile == 1
+        assert broken not in graded
+
+    def test_the_grading_cap_bounds_a_bug_that_only_yields_equivalents(self):
+        selected = mutants_mod.select(
+            candidates=mutants_mod.generate(_SRC),
+            preflight_fn=_accept_all,
+            grade_fn=_grade_good,
+            grade_cap=2,
+        )
+        assert selected.tally.graded == 2
+        assert selected.tally.cap_hit is True
+        assert selected.entries == []
+
+    def test_the_cap_is_recorded_even_when_it_stops_a_run_that_was_finding_bad(self):
+        selected = mutants_mod.select(
+            candidates=mutants_mod.generate(_SRC),
+            preflight_fn=_accept_all,
+            grade_fn=_grade_bad,
+            max_mutants=5,
+            grade_cap=2,
+        )
+        assert selected.tally.graded == 2
+        assert selected.tally.selected == 2
+        assert selected.tally.cap_hit is True
+
+    def test_a_bug_that_finds_three_before_the_cap_does_not_hit_it(self):
+        selected = mutants_mod.select(
+            candidates=mutants_mod.generate(_SRC),
+            preflight_fn=_accept_all,
+            grade_fn=_grade_bad,
+        )
+        assert selected.tally.cap_hit is False
+        assert selected.tally.graded == 3
+
+
+class TestMutantPreflight:
+    """The Shuru step — apply, **then** ``py_compile`` — wired to recorders only."""
+
+    @pytest.fixture
+    def wired(self, monkeypatch, tmp_path):
+        calls: dict = {"runs": [], "copies": []}
+
+        def fake_copy(src, dest):
+            calls["copies"].append((src, dest))
+            dest.mkdir(parents=True, exist_ok=True)
+
+        def fake_apply(**kwargs):
+            calls["apply"] = kwargs
+            return True, "applied"
+
+        def fake_run(**kwargs):
+            calls["runs"].append(kwargs)
+            return calls["result"]
+
+        monkeypatch.setattr(tree_mod, "copy_tree", fake_copy)
+        monkeypatch.setattr(suite_mod, "git_apply_patch", fake_apply)
+        monkeypatch.setattr(shuru_mod, "run", fake_run)
+        calls["result"] = shuru_mod.ExecResult(
+            stdout="", stderr="", exit_code=0, timed_out=False
+        )
+        return calls
+
+    def _preflight(self, wired, tmp_path, *, text=None, prep_over=None):
+        mutant = _mutant(text)
+        patch = write(tmp_path / "mutant.patch", mutant.text)
+        result = mutants_mod.preflight(
+            prep=oracle_prep(**(prep_over or {})),
+            batch_dir=tmp_path / "batch",
+            checkpoint="vanta-bi-Demo-1",
+            mutant=mutant,
+            patch_path=patch,
+            disk_mb=16384,
+        )
+        return result, mutant
+
+    def test_the_mutant_is_applied_to_a_copy_of_oracle_tree(self, wired, tmp_path):
+        result, mutant = self._preflight(wired, tmp_path)
+        src, dest = wired["copies"][0]
+        assert src == Path("/nonexistent/worktrees/Demo_1/oracle_tree")
+        assert dest == (
+            tmp_path / "batch" / "oracle_work" / f"Demo_1__pre-{mutant.sha256[:12]}"
+        )
+        assert wired["apply"]["drop_test_hunks"] is True
+        assert result.applied is True and result.compiled is True
+
+    def test_py_compile_runs_inside_the_checkpoint_on_the_changed_files(self, wired, tmp_path):
+        _, mutant = self._preflight(wired, tmp_path)
+        run = wired["runs"][0]
+        assert run["command"] == ["python", "-m", "py_compile", "pkg/mod.py"]
+        assert run["checkpoint"] == "vanta-bi-Demo-1"
+        assert run["guest_cwd"] == (
+            "/workspace/oracle_work/" + wired["copies"][0][1].name
+        )
+
+    def test_the_interpreter_is_the_one_the_project_runs_on(self, wired, tmp_path):
+        """``py_compile`` must use the project's interpreter: the version decides
+        what parses, so the wrong one would call a valid mutant a syntax error."""
+        self._preflight(
+            wired,
+            tmp_path,
+            prep_over={"test_cmd": ["python3.8", "-m", "pytest", "tests"]},
+        )
+        assert wired["runs"][0]["command"][0] == "python3.8"
+
+    def test_a_mutant_that_does_not_apply_is_never_compiled(self, wired, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            suite_mod,
+            "git_apply_patch",
+            lambda **kwargs: (False, "error: patch does not apply"),
+        )
+        result, _ = self._preflight(wired, tmp_path)
+        assert result.applied is False and result.compiled is False
+        assert "does not apply" in result.detail
+        assert wired["runs"] == []
+
+    def test_a_mutant_that_does_not_compile_is_reported_with_its_output(self, wired, tmp_path):
+        wired["result"] = shuru_mod.ExecResult(
+            stdout="", stderr="SyntaxError: invalid syntax", exit_code=1, timed_out=False
+        )
+        result, _ = self._preflight(wired, tmp_path)
+        assert result.applied is True
+        assert result.compiled is False
+        assert "SyntaxError" in result.detail
+
+    def test_a_diff_that_changes_no_python_is_compiled_trivially(self, wired, tmp_path):
+        result, _ = self._preflight(
+            wired, tmp_path, text=_one_line_diff("a", "b", rel="pkg/data.txt")
+        )
+        assert result.applied is True and result.compiled is True
+        assert wired["runs"] == []
+
+
+class TestMutantPoolArtifact:
+    """The locked file: a ``- key: value`` header, a marker, then the JSON body."""
+
+    def _entries(self) -> list[mutants_mod.PoolEntry]:
+        return [
+            mutants_mod.PoolEntry(
+                kind="mutant",
+                operator="hunk_drop",
+                patch_sha256="a" * 64,
+                source="mutant:hunk_drop",
+                patch_path="/batch/candidates/Demo_1/mutant-aaaaaaaaaaaa.patch",
+                oracle="bad",
+            ),
+            mutants_mod.PoolEntry(
+                kind="mutant",
+                operator="condition_flip",
+                patch_sha256="b" * 64,
+                source="mutant:condition_flip",
+                patch_path="/batch/candidates/Demo_1/mutant-bbbbbbbbbbbb.patch",
+                oracle="bad",
+            ),
+        ]
+
+    def _tally(self) -> mutants_mod.Tally:
+        return mutants_mod.Tally(
+            per_operator={
+                "hunk_drop": 3,
+                "condition_flip": 6,
+                "boundary_shift": 4,
+                "statement_deletion": 3,
+            },
+            did_not_apply=1,
+            did_not_compile=2,
+            graded=5,
+            equivalent=1,
+            selected=2,
+            cap_hit=False,
+        )
+
+    def _render(self) -> str:
+        return mutants_mod.render_pool(
+            prep=oracle_prep(),
+            source_sha256="c" * 64,
+            tally=self._tally(),
+            entries=self._entries(),
+        )
+
+    def test_the_header_carries_the_frozen_generator_config_and_the_tally(self):
+        text = self._render()
+        assert "- schema: 1" in text
+        assert "- bug: Demo/1" in text
+        assert f"- bug-patch-sha256: {'c' * 64}" in text
+        assert "- operators: hunk_drop>condition_flip>boundary_shift>statement_deletion" in text
+        assert "- sort-key: (operator_priority, sha256)" in text
+        assert "- max-mutants: 3" in text
+        assert "- grade-cap: 12" in text
+        assert (
+            "- generated: hunk_drop=3 condition_flip=6 boundary_shift=4 "
+            "statement_deletion=3" in text
+        )
+        assert "- did-not-apply: 1" in text
+        assert "- did-not-compile: 2" in text
+        assert "- graded: 5" in text
+        assert "- equivalent: 1" in text
+        assert "- selected: 2" in text
+        assert "- cap-hit: false" in text
+        assert mutants_mod.MUTANTS_MARKER in text
+
+    def test_every_entry_records_kind_operator_hash_and_label(self, tmp_path):
+        path = mutants_mod.write_pool(
+            mutants_mod.pool_path(tmp_path / "batch", oracle_prep()),
+            prep=oracle_prep(),
+            source_sha256="c" * 64,
+            tally=self._tally(),
+            entries=self._entries(),
+        )
+        pool = mutants_mod.load_pool(path)
+        assert pool.bug == "Demo/1"
+        assert pool.bug_patch_sha256 == "c" * 64
+        assert pool.operators == mutants_mod.OPERATOR_ORDER
+        assert pool.max_mutants == 3 and pool.grade_cap == 12
+        assert pool.tally.per_operator["condition_flip"] == 6
+        assert pool.tally.selected == 2 and pool.tally.cap_hit is False
+        assert re.fullmatch(r"[0-9a-f]{64}", pool.content_sha256)
+        assert [
+            (entry.kind, entry.operator, entry.patch_sha256, entry.oracle)
+            for entry in pool.entries
+        ] == [
+            ("mutant", "hunk_drop", "a" * 64, "bad"),
+            ("mutant", "condition_flip", "b" * 64, "bad"),
+        ]
+
+    def test_a_body_edited_after_it_was_frozen_is_refused(self, tmp_path):
+        path = mutants_mod.write_pool(
+            mutants_mod.pool_path(tmp_path / "batch", oracle_prep()),
+            prep=oracle_prep(),
+            source_sha256="c" * 64,
+            tally=self._tally(),
+            entries=self._entries(),
+        )
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text.replace('"oracle": "bad"', '"oracle": "good"', 1), encoding="utf-8")
+        with pytest.raises(mutants_mod.MutantError, match="edited after it was frozen"):
+            mutants_mod.load_pool(path)
+
+    def test_a_missing_header_field_is_refused(self):
+        stripped = self._render().replace("- sort-key: (operator_priority, sha256)\n", "")
+        with pytest.raises(mutants_mod.MutantError, match="sort-key"):
+            mutants_mod.parse_pool(stripped, path=Path("x"))
+
+    def test_a_file_without_the_marker_is_refused(self):
+        stripped = self._render().replace(mutants_mod.MUTANTS_MARKER + "\n", "")
+        with pytest.raises(mutants_mod.MutantError, match="is not a file this reader may use"):
+            mutants_mod.parse_pool(stripped, path=Path("x"))
+
+
+class TestRunMutants:
+    """The whole of item 5 for one bug, with the VM replaced by injected functions."""
+
+    def test_the_pool_file_is_written_and_locked_with_the_selected_rows(self, tmp_path):
+        source = _SRC
+        result = mutants_mod.run_mutants(
+            prep=oracle_prep(bug=bug_info(bug_patch_txt=source)),
+            batch_dir=tmp_path / "batch",
+            checkpoint="vanta-bi-Demo-1",
+            disk_mb=16384,
+            preflight_fn=_accept_all,
+            grade_fn=_grade_bad,
+        )
+        assert result.path == tmp_path / "batch" / "pool" / "Demo_1.mutants.json"
+        assert result.source_sha256 == split_mod.sha256_text(source)
+        pool = mutants_mod.load_pool(result.path)
+        assert pool.bug == "Demo/1"
+        assert pool.bug_patch_sha256 == split_mod.sha256_text(source)
+        assert pool.tally.selected == 3
+        assert [entry.kind for entry in pool.entries] == ["mutant"] * 3
+        assert all(entry.operator in mutants_mod.OPERATOR_NAMES for entry in pool.entries)
+        assert all(entry.oracle == "bad" for entry in pool.entries)
+        assert len({entry.patch_sha256 for entry in pool.entries}) == 3
+        assert all(entry.patch_path.endswith(".patch") for entry in pool.entries)
+
+    def test_plan_names_the_candidates_in_sort_order_without_a_vm(self):
+        prep = oracle_prep(bug=bug_info(bug_patch_txt=_SRC))
+        lines = mutants_mod.plan_lines(prep)
+        assert lines[0].startswith("Demo/1: ")
+        assert "grade-cap 12" in lines[0]
+        assert len(lines) == 1 + mutants_mod.MAX_MUTANTS
+        ordered = sorted(
+            mutants_mod.generate(_SRC).mutants,
+            key=lambda mutant: (mutant.priority, mutant.sha256),
+        )
+        assert [
+            f"{mutant.priority} {mutant.operator} {mutant.name}"
+            for mutant in ordered[: mutants_mod.MAX_MUTANTS]
+        ] == [line.strip() for line in lines[1:]]
+
+
+class TestPoolCommand:
+    """The CLI owns two pool files; ``--mutants`` is the one this item writes."""
+
+    def test_pool_without_the_mutants_flag_refuses_before_touching_anything(
+        self, tmp_path, capsys
+    ):
+        code = run_mod.main(["pool", "--batch", str(tmp_path)])
+        captured = capsys.readouterr()
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert "--mutants" in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_the_pool_subcommand_defaults_to_the_preparers_disk_size(self):
+        args = run_mod.build_parser().parse_args(["pool", "--batch", "b", "--mutants"])
+        assert args.mutants is True
+        assert args.disk_mb == prepare_mod.DISK_MB
+        assert args.plan is False
+        assert args.func is run_mod.cmd_pool
 

@@ -509,6 +509,9 @@ SDIST_SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
     # `[compiler, "-c", source, "-o", target]` + that spec's flags/macros/include); there
     # is no libraries=/library_dirs=/pkg-config call, and the two Extensions it hands to
     # distutils are blis/cy.c and blis/py.c with extra_compile_args=["-std=c99"]
+    # -- "no system package" and *not* "it builds here": the entry says nothing about
+    # which <platform> the sdist carries a spec for, and the pinned 0.4.1 carries the
+    # x86-64 one. See UNBUILDABLE_ON_PLATFORM below; measured on spacy/4's bake.
     "brotli": (),  # vendored c/; <vector> is libstdc++, which g++ brings
     "cffi": ("libffi-dev",),
     "cftime": (),  # cftime/_cftime.pyx only (numpy's headers); udunits is named in its
@@ -688,6 +691,19 @@ class PlatformLimit:
 
 
 UNBUILDABLE_ON_PLATFORM: Mapping[str, tuple[PlatformLimit, ...]] = {
+    "blis": (
+        PlatformLimit(
+            "this sdist builds the vendored BLIS C from its own per-platform build "
+            "spec, and 0.4.1 carries the x86-64 one: setup.py compiles "
+            "blis/_src/kernels/zen/1/bli_amaxv_zen_int.c with "
+            "``-mavx2 -mfma -mfpmath=sse -march=core-avx2`` and includes "
+            "``include/linux-x86_64``, and this image is aarch64, whose gcc rejects "
+            "those options ('unrecognized command-line option') before anything is "
+            "linked. No SDIST_SYSTEM_PACKAGES entry can change which architecture's "
+            "spec the build selects, so a header would not close it",
+            bound=SpecifierSet("==0.4.1"),
+        ),
+    ),
     "cryptography": (
         PlatformLimit(
             "its sdist builds the C bindings against OpenSSL's headers, and every "

@@ -81,6 +81,18 @@
       "reason": "The module is PyDispatcher's, and PyDispatcher's own metadata says so: the 2.0.5 sdist's `PyDispatcher.egg-info/top_level.txt` names the top-level module `pydispatch`, and every file it ships is `pydispatch/*.py`. scrapy pins the distribution in the same breath as it imports the module -- `setup.py` line 71 `PyDispatcher>=2.0.5` and BugsInPy's `requirements.txt` line 30 `PyDispatcher==2.0.5`, against `from pydispatch import dispatcher` -- so the mapping adds no package: `pydispatcher` is already a pin of the layer, and the entry only makes the import-to-distribution lookup agree with the pin that was already there. Both canonicalisations are real PyPI projects and only one of them provides the module the tests import; canonicalising the module name cannot tell them apart, which is what the table is for.",
       "decided_by": "user review, 2026-10-28",
       "rule": "Keyed by the import spelling, like `mysql.connector` and `google.protobuf`, and applied by the closure rather than to a named bug. The mapped name is one the layer already pins, so the closure never walks the abandoned `pydispatch` project's metadata and installs nothing new: a layer whose requirements already declare `PyDispatcher` is unchanged, and the only difference is that the closure no longer resolves the import to `pydispatch==1.1.0` in its place."
+    },
+    {
+      "change": "spacy/4 is excluded: it cannot be baked on this image. Its layer installs `blis==0.4.1` (spacy's `thinc` pin), whose `setup.py` compiles the vendored BLIS C from the per-platform build spec the sdist carries, and 0.4.1 carries the x86-64 one -- `gcc -c .../blis/_src/kernels/zen/1/bli_amaxv_zen_int.c ... -O3 -mavx2 -mfma -mfpmath=sse -march=core-avx2 -fPIC -std=c99 ... -Iinclude/linux-x86_64 -I.../blis/_src/include/linux-x86_64`. This image is aarch64, so gcc answers `unrecognized command-line option '-mavx2'` (the same for `-mfma` and `-mfpmath=sse`), `setup.py` line 201's `build_object` raises `CalledProcessError`, and pip ends with `ERROR: Failed building wheel for blis`.",
+      "reason": "Item 4's rule is that a bug which cannot pass both gates after a reasonable attempt is excluded with its reason recorded, and both gates are unreachable here: a layer whose build fails is deleted and `prepare` refuses it, so the bug has no tree to derive an oracle from. The fix is not a system package, which is why none was added: blis `0.4.1` needs no library at all, it needs an architecture the sdist has no build spec for, and `SDIST_SYSTEM_PACKAGES` cannot express that. Recorded in that table's companion instead, `bake.UNBUILDABLE_ON_PLATFORM['blis']` bounded to `==0.4.1`, so `--preflight-only` reports the pin by name rather than letting a bake spend a cycle rediscovering it. Measured on `runs/bugsinpy/bake-logs/vanta-bi-spacy-4.log` (the `bake_reserves.sh` run); the seven spacy/4 `SDIST_SYSTEM_PACKAGES` reviews of item 4 stand as written, because each is a statement about which Debian packages the build needs and `()` is still the right answer to that.",
+      "decided_by": "user review, 2026-10-28",
+      "rule": "The pre-registered exclusion rule of item 4, applied mechanically: a bug is excluded only when it still fails after a reasonable attempt, and the fail is recorded here with the evidence. The bug stays in `bugs` as a reserve rather than being silently dropped, so a reader can see it was considered and why it is not in the runnable set; `plans/private/prepare_dev_split.sh` leaves it out of the prepare batch for the same reason. Nothing else changes -- the five pilots are unaffected, and the substitution pool is the three reserves that still bake."
+    },
+    {
+      "change": "scrapy/1 is excluded: it cannot be baked on this image either. Its layer's install of the tree's own requirements reaches `cryptography<1.2,>=1.1.1`, pip resolves `cryptography-1.1.2`, and that sdist's C bindings are compiled against OpenSSL's headers -- `build/temp.linux-aarch64-3.8/_openssl.c` fails with dozens of `conflicting types for 'PEM_write_bio_PrivateKey'` / `'X509_dup'` / `'BIO_new'` errors against `/usr/include/openssl/ssl.h` and with `macro \"SSL_library_init\" passed 1 arguments, but takes just 0`. The 13 sdists that the item-4 preflight reported as unreviewed (`twisted`, `leveldb`, `accesscontrol`, `acquisition`, `btrees`, `extensionclass`, `persistence`, `persistent`, `zodbpickle`, `zope-container`, `zope-i18nmessageid`, `zope-proxy`, `zope-security`) all built successfully in the same bake; `cryptography` is the only failure.",
+      "reason": "No `SDIST_SYSTEM_PACKAGES` entry can close it: every `cryptography` release below 35 builds against OpenSSL 1.1 headers, this image is trixie (OpenSSL 3.x) and carries no 1.1 headers, and a header package that does not exist cannot be named. The table already says exactly this -- `bake.UNBUILDABLE_ON_PLATFORM['cryptography']`, bound `<35` -- which is why nothing was added. The pin is not one the closure walked, so the preflight could not classify it (the pinned `cryptography` versions of other layers are reported as unbuildable by name; scrapy/1's arrives through a declared range at install time), and the bake is the measurement that found it: `runs/bugsinpy/bake-logs/vanta-bi-scrapy-1.log`.",
+      "decided_by": "user review, 2026-10-28",
+      "rule": "Same rule and same treatment as spacy/4 above, after the timebox Nathan set on this bug (the 13 unreviewed sdists plus `cryptography`, judged together against the cited-build-file requirement): the sdists need no entry because the bake shows they build, and `cryptography` needs none because no entry would help. The bug stays in `bugs` as a reserve and is left out of the prepare batch, so the exclusion is visible in the split rather than inferred from a missing row."
     }
   ],
   "bugs": [
@@ -259,7 +271,7 @@
       "checkpoint": "vanta-bi-scrapy-1",
       "wave": 1,
       "role": "reserve",
-      "notes": "Round-robin pass 1, scrapy. Reserve #1: the substitution pool starts with another project's first bug, so promoting it keeps the dev set at five distinct projects."
+      "notes": "Round-robin pass 1, scrapy. Reserve #1: the substitution pool starts with another project's first bug, so promoting it keeps the dev set at five distinct projects. EXCLUDED 2026-10-28 -- its layer cannot be baked on this image (`cryptography<1.2,>=1.1.1` builds against OpenSSL 1.1 headers, trixie has 3.x); reason and evidence in `reviewed_changes`, and it is not in the runnable set."
     },
     {
       "project": "spacy",
@@ -288,7 +300,7 @@
       "checkpoint": "vanta-bi-spacy-4",
       "wave": 1,
       "role": "reserve",
-      "notes": "Round-robin pass 1, spacy. Reserve #2. spacy has exactly one py3.8 bug in the corpus, so this project cannot supply a second candidate."
+      "notes": "Round-robin pass 1, spacy. Reserve #2. spacy has exactly one py3.8 bug in the corpus, so this project cannot supply a second candidate. EXCLUDED 2026-10-28 -- its layer cannot be baked on this image (`blis==0.4.1` compiles with the x86-64 build spec the sdist carries; aarch64 gcc rejects `-mavx2`); reason and evidence in `reviewed_changes`, and it is not in the runnable set."
     },
     {
       "project": "fastapi",

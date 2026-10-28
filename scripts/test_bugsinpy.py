@@ -5925,6 +5925,22 @@ class TestBake:
         assert late.covers("44.0.0") and "Rust" in late.reason
         assert not late.covers("2.9.2")
 
+    def test_the_pinned_blis_is_a_platform_limit_and_not_a_header_gap(self):
+        """spacy/4's bake, read as a review: the sdist's spec is the wrong architecture.
+
+        ``blis==0.4.1`` is in ``SDIST_SYSTEM_PACKAGES`` as an empty tuple — "it needs
+        no Debian package", which is true and not the same claim as "it builds here".
+        Its vendored C is compiled with the x86-64 build spec the sdist carries
+        (``-mavx2 -mfma -mfpmath=sse -march=core-avx2``, ``-Iinclude/linux-x86_64``),
+        so on the aarch64 image gcc answers ``unrecognized command-line option``. The
+        two tables answer different questions and this pins which one answers for 0.4.1.
+        """
+        limit = bake_mod.UNBUILDABLE_ON_PLATFORM["blis"][0]
+        assert limit.covers("0.4.1"), "the release spacy/4 pins"
+        assert not limit.covers("0.9.1"), "a version outside the bound is not judged"
+        assert "-mavx2" in limit.reason and "aarch64" in limit.reason
+        assert "SDIST_SYSTEM_PACKAGES" in limit.reason, "a header is not the answer"
+
     def test_a_limit_with_no_bound_covers_every_release(self):
         """The seeded entries answer for every release, which is what "no bound" means."""
         seeded = bake_mod.UNBUILDABLE_ON_PLATFORM["pyarrow"][0]

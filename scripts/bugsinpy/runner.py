@@ -554,6 +554,12 @@ def vanta_env(
     # `benchmark_config_name` cannot name them; the binary records this value
     # verbatim and refuses it if the switches or the budget contradict it.
     env["VANTA_ARM"] = entry.name
+    # [VANTA-WHY] M3 item 7 — the judge switch, set from the SAME entry as the arm
+    # name so the two cannot disagree: the binary refuses a stated `VANTA_ARM` whose
+    # judge setting contradicts `VANTA_JUDGE`. `off` is the binary's own default and
+    # the setting every arm before the judge had, so a non-judge arm sends exactly
+    # the value it sent before this key existed.
+    env["VANTA_JUDGE"] = entry.judge or "off"
     # Always set, including for seed 0: `VANTA_LLM_SEED=0` is a request to pin 0,
     # while an unset variable means "no seed key in the body" (§4.4, D4).
     env["VANTA_LLM_SEED"] = str(seed)
@@ -1698,14 +1704,28 @@ def label_for(verdict: str, oracle: oracle_mod.OracleResult) -> str:
     A verdict outside the three that produce a patch has no label of its own; its
     row carries the censor, so it lands on ``unobservable`` through the
     ``apply_ok`` branch rather than through a fabricated name.
+
+    [VANTA-WHY] M3 item 7 — the judge arm's readable verdicts are scored EXACTLY as
+    the test-driven arm's, so a judge row and the ``vanta`` row for the same candidate
+    pair by label: ``JudgeApproved`` is an approval and lands on
+    ``true_approval``/``false_approval`` like ``AllTestsPassed``; ``JudgeRejected`` is a
+    rejection and lands on ``false_reject``/``true_reject`` like ``Rejected``.
+
+    [VANTA-WHY] M3 item 7 — ``JudgeFailed`` (the judge answered and its answer was
+    unreadable after the one retry) is its OWN label, checked BEFORE the ``apply_ok``
+    branch: no patch is attached to that row, so routing it through ``apply_ok`` would
+    report the censor's ``unobservable`` and hide the judge failure. It is deliberately
+    NOT ``infra_failure``: the machine was fine and the call succeeded.
     """
     if verdict == "InfraFailure":
         return "infra_failure"
+    if verdict == "JudgeFailed":
+        return "judge_failed"
     if not oracle.apply_ok:
         return "unobservable"
-    if verdict == "AllTestsPassed":
+    if verdict in ("AllTestsPassed", "JudgeApproved"):
         return "true_approval" if oracle.patch_good else "false_approval"
-    if verdict == "Rejected":
+    if verdict in ("Rejected", "JudgeRejected"):
         return "false_reject" if oracle.patch_good else "true_reject"
     if verdict == "NeedsReview":
         # [WHY] §14.6: a refusal to decide is scored as itself, never as one of

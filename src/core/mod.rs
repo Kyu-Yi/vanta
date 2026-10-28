@@ -896,6 +896,33 @@ pub enum GovernorDecision {
     // unresolved run. It has its own exit code (3) so a caller can tell "a
     // human should look" from "no".
     NeedsReview,
+    // [VANTA-WHY] M3 item 7 — the judge arms' positive verdict: one model call
+    // read the issue, the SAME selected context the B3 arm would have seen, and
+    // the candidate diff (plus the native suite's result under `judge+suite`),
+    // and answered that the patch resolves the issue. Deliberately NOT
+    // `AllTestsPassed`: that token claims a test ran and passed, and under the
+    // judge no generated test ran at all — reading it as one would make a
+    // verdict with no execution behind it indistinguishable from one with the
+    // whole adversarial pipeline behind it, in the session log, in `metrics.py`
+    // and in the approval-invariant checks. The harness maps it onto the same
+    // TA/FA label `AllTestsPassed` gets, so a judge row still pairs with a Vanta
+    // row on the same candidate.
+    JudgeApproved,
+    // [VANTA-WHY] M3 item 7 — the judge decided the candidate does NOT resolve
+    // the issue. Same argument in the other direction: `Rejected` claims a test
+    // observed a failure, and no test did here. Mapped onto the TR/FR labels for
+    // pairing, recorded under its own token so the log says which mechanism
+    // reached the verdict.
+    JudgeRejected,
+    // [VANTA-WHY] M3 item 7 — the judge answered with something unusable (an
+    // unknown `verdict`, or JSON that would not parse) on BOTH the call and its
+    // one retry, so there is no verdict at all. Its own token because it is none
+    // of the neighbouring outcomes: not an approval and not a rejection (the
+    // model did not decide), and not `InfraFailure` (the machine answered
+    // perfectly well — it answered with text nobody can read as a verdict). It
+    // gets its own exit code (4) and its own harness bucket (`judge_failed`),
+    // and is never folded into `NeedsReview`, `Rejected` or `InfraFailure`.
+    JudgeFailed,
     // [VANTA-WHY] An LLM call failed for every attempt the retry loop was
     // allowed. This says NOTHING about the candidate: the model never produced an
     // answer, so there is no evidence for or against the patch. It exists so the

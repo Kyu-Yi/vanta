@@ -18859,6 +18859,18 @@ class TestLabelFor:
             ("NeedsReview", True, False, "needs_review_on_bad"),
             ("InfraFailure", False, False, "infra_failure"),
             ("InfraFailure", True, True, "infra_failure"),
+            # M3 item 7 — the judge arm's readable verdicts are scored EXACTLY as
+            # the test-driven arm's, so a judge row and the `vanta` row for the same
+            # candidate pair by label.
+            ("JudgeApproved", True, True, "true_approval"),
+            ("JudgeApproved", True, False, "false_approval"),
+            ("JudgeRejected", True, True, "false_reject"),
+            ("JudgeRejected", True, False, "true_reject"),
+            # A judge failure is its own label, checked BEFORE the censor: no patch
+            # is attached to that row, so it must never fall through to
+            # `unobservable` (nor to `infra_failure` — the call itself succeeded).
+            ("JudgeFailed", True, True, "judge_failed"),
+            ("JudgeFailed", False, False, "judge_failed"),
             # The censor wins over the verdict: a patch that never applied told us
             # nothing, so it cannot become a `true_reject` for Vanta (§5.2 step 2).
             ("Rejected", False, True, "unobservable"),
@@ -18893,6 +18905,41 @@ class TestLabelFor:
         }
         assert refusal == {"needs_review_on_good", "needs_review_on_bad"}
         assert refusal.isdisjoint(decided)
+
+    def test_a_judge_failure_is_its_own_label_not_a_refusal_nor_infra(self):
+        """M3 item 7 — the machine was fine and the call succeeded; only the answer
+        was unreadable. Folding it into a refusal or an infra failure would report a
+        verdict the judge never reached."""
+        decided = {"infra_failure", "unobservable"} | {
+            runner_mod.label_for(v, oracle_mod.OracleResult(apply_ok=True, patch_good=g))
+            for v in ("AllTestsPassed", "Rejected", "NeedsReview", "MaxAttemptsReached")
+            for g in (True, False)
+        }
+        for oracle in (
+            oracle_mod.OracleResult(apply_ok=True, patch_good=True),
+            oracle_mod.OracleResult(apply_ok=True, patch_good=False),
+            oracle_mod.OracleResult(apply_ok=False, patch_good=False),
+        ):
+            assert runner_mod.label_for("JudgeFailed", oracle) == "judge_failed"
+        assert "judge_failed" not in decided
+
+    def test_the_judge_pairing_labels_are_the_vanta_labels(self):
+        """M3 item 7 — a judge row and the ``vanta`` row it is compared with must land
+        on the SAME label for the same verdict shape, or the pair cannot be scored."""
+        good = oracle_mod.OracleResult(apply_ok=True, patch_good=True)
+        bad = oracle_mod.OracleResult(apply_ok=True, patch_good=False)
+        assert runner_mod.label_for("JudgeApproved", good) == runner_mod.label_for(
+            "AllTestsPassed", good
+        )
+        assert runner_mod.label_for("JudgeApproved", bad) == runner_mod.label_for(
+            "AllTestsPassed", bad
+        )
+        assert runner_mod.label_for("JudgeRejected", good) == runner_mod.label_for(
+            "Rejected", good
+        )
+        assert runner_mod.label_for("JudgeRejected", bad) == runner_mod.label_for(
+            "Rejected", bad
+        )
 
     def test_a_censored_oracle_states_its_reason(self):
         bug_prep = prep(fail_to_pass=["tests/test_a.py::test_b", "tests/test_a.py::test_a"])
@@ -20160,7 +20207,8 @@ class TestArms:
         r"attacker:\s*(?P<attacker>true|false),\s*"
         r"planner:\s*(?P<planner>true|false),\s*"
         r"bate:\s*(?P<bate>true|false),\s*"
-        r"max_attempts:\s*(?P<max>Some\(\d+\)|None),",
+        r"max_attempts:\s*(?P<max>Some\(\d+\)|None),\s*"
+        r'judge:\s*(?P<judge>Some\("[^"]+"\)|None),',
         re.DOTALL,
     )
 
@@ -20173,6 +20221,7 @@ class TestArms:
         parsed = {}
         for spec in self._ARM_SPEC.finditer(block.group("body")):
             max_attempts = spec.group("max")
+            judge = spec.group("judge")
             parsed[spec.group("name")] = arms_mod.Arm(
                 name=spec.group("name"),
                 config=spec.group("config"),
@@ -20183,18 +20232,20 @@ class TestArms:
                 max_attempts=(
                     None if max_attempts == "None" else int(max_attempts[5:-1])
                 ),
+                judge=None if judge == "None" else judge[6:-2],
             )
         assert set(parsed) == set(arms_mod.ARMS), (
             f"the Rust table names {sorted(parsed)}, the registry {sorted(arms_mod.ARMS)}"
         )
         for name, rust in parsed.items():
             python = arms_mod.ARMS[name]
-            assert (rust.config, rust.attacker, rust.planner, rust.bate, rust.max_attempts) == (
+            assert (rust.config, rust.attacker, rust.planner, rust.bate, rust.max_attempts, rust.judge) == (
                 python.config,
                 python.attacker,
                 python.planner,
                 python.bate,
                 python.max_attempts,
+                python.judge,
             ), f"arm {name!r} disagrees between arms.py and driver.rs"
 
     def test_the_two_arms_of_one_spelling_agree_about_the_switches(self):
@@ -20258,6 +20309,45 @@ class TestArms:
         runner_mod._require_arm_list(["b0"])
         # No flag: the pre-launch budget check has nothing to refuse.
         runner_mod._require_arm_budget(["b0"], None)
+
+    def test_the_judge_arms_are_review_only_attacker_off_and_pinned(self):
+        """M3 item 7 — a judge row is compared with a B3 row, so it must differ from
+        one only in what decides: nothing is generated (no Attacker), it is a review
+        (it decides a candidate), and it pins one attempt because "one call per
+        verdict" is what the arm IS, exactly as B0's budget is."""
+        for name, mode in (("judge", "plain"), ("judge+suite", "suite")):
+            entry = arms_mod.ARMS[name]
+            assert entry.modes == ("review",)
+            assert entry.attacker is False
+            assert entry.bate is True
+            assert entry.judge == mode
+            assert entry.config == name
+            assert arms_mod.config_of(name) == name
+            assert arms_mod.arm_attempts(name, None) == 1
+            assert arms_mod.arm_attempts(name, 1) == 1
+            with pytest.raises(arms_mod.ArmError, match="does not run"):
+                arms_mod.arm_for(name, "repair")
+        with pytest.raises(arms_mod.ArmError, match="pins --max-attempts 1"):
+            arms_mod.arm_attempts("judge", 4)
+        # A split naming a judge arm schedules exactly one review pass.
+        assert arms_mod.phases_for(["judge"]) == [(runner_mod.REVIEW, "judge")]
+        assert arms_mod.phases_for(["judge+suite"]) == [(runner_mod.REVIEW, "judge+suite")]
+        runner_mod._require_arm_list(["judge", "judge+suite"])
+
+    def test_a_judge_row_shares_the_candidate_identity_of_the_vanta_row_it_pairs_with(self):
+        """M3 item 7 — the judge is scored against B3, so for one bug, seed and
+        candidate the two job keys must differ in the config column and NOWHERE else;
+        otherwise the pairing at analysis time would find no counterpart."""
+        def columns(config):
+            return manifest_mod.job_key(
+                batch_id="b1", bug="Demo/1", config=config, mode="review", seed=0,
+                candidate="dev",
+            ).split("#")
+
+        judge = columns(arms_mod.config_of("judge"))
+        vanta = columns(arms_mod.config_of("b3"))
+        assert judge[2] == "judge" and vanta[2] == "vanta"
+        assert judge[:2] + judge[3:] == vanta[:2] + vanta[3:]
 
     def test_an_explicit_contradicting_budget_is_refused_before_launch(self):
         """M3 item 11 — the harness refuses, before the schedule is printed, an explicit
@@ -20357,6 +20447,17 @@ class TestVantaEnv:
         assert self._env(arm="b0")["VANTA_ARM"] == "b0"
         # `b1` and `suite` share `config=baseline` but are two arms.
         assert self._env(arm="b1")["VANTA_ATTACKER"] == self._env(arm="suite")["VANTA_ATTACKER"]
+
+    def test_the_judge_switch_is_stated_in_the_environment(self):
+        """M3 item 7 — the value is what the binary refuses a stated ``VANTA_ARM``
+        against, so it must be on every invocation: the arm's own judge mode for a
+        judge arm, and ``off`` for every arm that predates the judge."""
+        assert self._env(arm="judge")["VANTA_JUDGE"] == "plain"
+        assert self._env(arm="judge+suite")["VANTA_JUDGE"] == "suite"
+        for arm in ("b0", "b1", "b2", "b3", "suite"):
+            assert self._env(arm=arm)["VANTA_JUDGE"] == "off"
+        assert self._env(arm="judge")["VANTA_ARM"] == "judge"
+        assert self._env(arm="judge+suite")["VANTA_ARM"] == "judge+suite"
 
     def test_the_planner_placeholder_is_not_a_registered_arm(self):
         """§4.4's placeholder is addressable but has no arm, so no run can carry it."""

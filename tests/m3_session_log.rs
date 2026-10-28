@@ -262,6 +262,7 @@ impl StubLlmServer {
             on_request,
             abort_at,
             intent_audit_response_json,
+            None,
             StubBehaviour::Normal,
         )
     }
@@ -281,7 +282,26 @@ impl StubLlmServer {
             None,
             None,
             None,
+            None,
             behaviour,
+        )
+    }
+
+    /// As `start`, but a judge call is answered with a scripted verdict body
+    /// instead of the default approval (M3 item 7). The answer is served
+    /// VERBATIM, so a test can script prose the judge parser cannot read — the
+    /// retry-then-`JudgeFailed` path — as well as a real verdict object.
+    fn start_with_judge(judge_response_json: &str) -> Self {
+        Self::start_scripted_impl(
+            None,
+            SINGLE_BEHAVIOR_TEST,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(judge_response_json),
+            StubBehaviour::Normal,
         )
     }
 
@@ -293,6 +313,7 @@ impl StubLlmServer {
         on_request: Option<Box<dyn Fn(usize) + Send>>,
         abort_at: Option<usize>,
         intent_audit_response_json: Option<&str>,
+        judge_response_json: Option<&str>,
         behaviour: StubBehaviour,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -334,6 +355,11 @@ impl StubLlmServer {
             creator_response_json.map(|json| serde_json::from_str(json).unwrap());
         let intent_audit_value: Option<serde_json::Value> =
             intent_audit_response_json.map(|json| serde_json::from_str(json).unwrap());
+        // [VANTA-WHY] M3 item 7 — a STRING, not a parsed `Value`: a judge answer is
+        // served verbatim so a test can script prose the judge parser cannot read
+        // (the retry-then-`JudgeFailed` path), which is not valid JSON at all and so
+        // could not round-trip through `serde_json::Value`.
+        let judge_answer: Option<String> = judge_response_json.map(|json| json.to_string());
 
         let join = thread::spawn(move || {
             // How many Creator calls have been answered, so a scripted array of
@@ -447,6 +473,8 @@ impl StubLlmServer {
                             "revise"
                         } else if body.contains("UNKNOWN result") {
                             "simplify"
+                        } else if body.contains("You are Vanta Judge.") {
+                            "judge"
                         } else {
                             "other"
                         };
@@ -537,6 +565,17 @@ impl StubLlmServer {
                             revise_value.clone().unwrap_or_else(default_single_test)
                         } else if request_kind == "simplify" {
                             simplify_value.clone().unwrap_or_else(default_single_test)
+                        } else if request_kind == "judge" {
+                            // [VANTA-WHY] M3 item 7 — the judge answers with a verdict
+                            // JSON. The default APPROVES, so the ordinary "does the judge
+                            // arm run at all" test reaches a terminal verdict without
+                            // scripting; a test that wants the reject or the unreadable
+                            // path scripts the answer (raw, see `judge_answer`).
+                            serde_json::json!({
+                                "verdict": "approve",
+                                "confidence": 0.8,
+                                "reason": "stub default: the patch resolves the issue",
+                            })
                         } else {
                             default_single_test()
                         };
@@ -574,7 +613,19 @@ impl StubLlmServer {
                                 None => false,
                             }
                         };
-                        let (content_text, finish_reason) = if cut_off_batch {
+                        // [VANTA-WHY] M3 item 7 — a scripted judge answer is served
+                        // RAW, not re-serialized from a `Value`: the unreadable-answer
+                        // test needs the model's prose to reach the judge parser
+                        // verbatim, and wrapping it in a JSON string would hand the
+                        // parser escaped quotes instead of prose.
+                        let judge_raw = if request_kind == "judge" {
+                            judge_answer.clone()
+                        } else {
+                            None
+                        };
+                        let (content_text, finish_reason) = if let Some(raw) = judge_raw {
+                            (raw, None)
+                        } else if cut_off_batch {
                             (
                                 TRUNCATED_BATCH_AUDIT_ANSWER.to_string(),
                                 Some("length"),
@@ -1172,6 +1223,24 @@ const NATIVE_REPO_TEST: &str =
 
 /// Leaves `add` alone and breaks `scale`, so only the repo's own suite can see it.
 const NATIVE_BREAKING_PATCH: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -5,2 +5,2 @@\n def scale(x, factor):\n-    return x * factor\n+    return x * factor + 1\n";
+
+// ---------------------------------------------------------------------------
+// M3 item 7 — the judge arm's scripted verdicts
+// ---------------------------------------------------------------------------
+
+/// A judge verdict that APPROVES the candidate, as the judge's own schema asks.
+/// Served verbatim by `StubLlmServer::start_with_judge`.
+const JUDGE_APPROVE_ANSWER: &str =
+    r#"{"verdict":"approve","confidence":0.9,"reason":"the diff implements what the issue asks"}"#;
+
+/// A judge verdict that REJECTS the candidate.
+const JUDGE_REJECT_ANSWER: &str =
+    r#"{"verdict":"reject","confidence":0.8,"reason":"the diff leaves the reported bug in place"}"#;
+
+/// Prose the judge parser cannot read as a verdict — not JSON at all, so after
+/// the one retry the run ends as `JudgeFailed`. Served RAW (unnormalised), which
+/// is why `start_with_judge` takes a string rather than a `serde_json::Value`.
+const JUDGE_UNREADABLE_ANSWER: &str = "I am sorry, I cannot decide from this diff.";
 
 
 fn metric_row_from_observed_outcome(
@@ -5759,6 +5828,7 @@ const SITE_FOR_KIND: &[(&str, &str)] = &[
     ("revise", "attacker_revise"),
     ("simplify", "attacker_simplify"),
     ("intent_audit", "intent_audit"),
+    ("judge", "judge"),
 ];
 
 /// The one `run.summary` record a terminal run must write.
@@ -5820,7 +5890,21 @@ fn assert_schedule_matches_bodies(
         preset.name(),
         "run.summary must name the active sampling preset (§14.11)"
     );
+    // [VANTA-WHY] M3 item 7 — `driver::sampling_schedule_keys` emits the `judge`
+    // site's pins ONLY on a judge arm's row, because only a judge arm has a judge
+    // call to pin. This guard must gate the same one site the same way: demanding
+    // `temperature_judge` on a `vanta` or `baseline` row would assert a key the
+    // driver deliberately withholds, and the whole point of the gate is that a
+    // non-judge `run.summary` stays byte-identical to what it was before the judge
+    // existed. Every OTHER site is still required on every row, judge or not.
+    let judge_arm = matches!(
+        summary_value(&summary, "arm").as_str(),
+        "judge" | "judge+suite"
+    );
     for (site, ..) in vanta::llm::SAMPLING_SCHEDULE {
+        if *site == "judge" && !judge_arm {
+            continue;
+        }
         for (key, value) in vanta::llm::sampling_pins_text(preset, site) {
             assert_eq!(
                 summary_value(&summary, &format!("{key}_{site}")),
@@ -6593,6 +6677,510 @@ fn b0_is_one_creator_call_graded_with_no_attacker_and_no_feedback() {
         "the attempt budget the arm pins must be on the row; got {}",
         start.summary
     );
+}
+
+/// M3 item 7 — the PLAIN judge is exactly ONE model call, with no Attacker, no
+/// audit and no sandbox run.
+///
+/// [VANTA-WHY] The arm's whole claim is "one call per verdict, no tool use, no
+/// execution" (M3-plan item 7). Each half of that is a thing that could be
+/// silently false: an extra Attacker call would make the judge a hybrid nobody
+/// declared, and any graded/audited phase would mean the answer rested on
+/// something other than the model's reading of the diff. The phases are absent
+/// rather than run-and-emptied for the same reason item 8 skips the Attacker — a
+/// `native_suite.summary` row saying `total=0` would assert the suite ran and
+/// found nothing, which is a different fact from "the suite did not run".
+#[test]
+fn the_plain_judge_is_one_call_and_runs_no_attacker_and_no_sandbox() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    // A real native suite is present, so if the judge wrongly ran it, this test
+    // sees the phases — the plain judge must not.
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        PRESERVING_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start_with_judge(JUDGE_APPROVE_ANSWER);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[
+            ("VANTA_ARM", "judge"),
+            ("VANTA_JUDGE", "plain"),
+            ("VANTA_ATTACKER", "off"),
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "an approving judge is the arm's own success and exit code 0; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        server.request_kinds(),
+        vec!["judge".to_string()],
+        "the plain judge is exactly ONE model call — no Attacker generation, no \
+         intent audit, no revision; kinds={:?}",
+        server.request_kinds()
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    assert!(
+        records.iter().any(|record| record.phase == "run.judge"),
+        "the judge's own verdict and reasoning must be on their own row"
+    );
+    for absent in [
+        "attacker.summary",
+        "bate.summary",
+        "native_suite.summary",
+        "attempt.summary",
+        "intent.audit_batch",
+    ] {
+        assert!(
+            !records.iter().any(|record| record.phase == absent),
+            "a plain-judge run must NOT write `{absent}` — the phase is skipped, not \
+             run-and-emptied"
+        );
+    }
+
+    // The plain judge is shown no suite result; that is `judge+suite`'s whole
+    // difference, so its absence here is the fact that keeps the two arms apart.
+    let body = server.request_bodies().into_iter().next().unwrap();
+    assert!(
+        !body.contains("NATIVE TEST SUITE RESULT"),
+        "the plain judge must be shown no suite result: {body}"
+    );
+
+    let summary = run_summary(workspace.path());
+    assert_eq!(summary_value(&summary.summary, "arm"), "judge");
+    assert_eq!(summary_value(&summary.summary, "config"), "judge");
+    assert_eq!(
+        summary_value(&summary.summary, "final_decision"),
+        "JudgeApproved",
+        "the judge's verdict is its OWN token, so the log says which mechanism \
+         reached the answer; got {}",
+        summary.summary
+    );
+    // The judge's own pin and its call count live on the row, and the recorded
+    // schedule is the one the body carried (`assert_schedule_matches_bodies`).
+    assert_eq!(summary_value(&summary.summary, "temperature_judge"), "0.2");
+    assert_eq!(summary_value(&summary.summary, "max_tokens_judge"), "32768");
+    assert_eq!(summary_value(&summary.summary, "llm_calls_site_judge"), "1");
+    assert_eq!(summary_value(&summary.summary, "judge_prompt_version"), "1");
+    let checked = assert_schedule_matches_bodies(
+        workspace.path(),
+        &server,
+        vanta::llm::SamplingPreset::Pinned,
+    );
+    assert!(
+        checked.iter().any(|site| site == "judge"),
+        "the judge body must have been cross-checked against its recorded pins; \
+         checked={checked:?}"
+    );
+}
+
+/// M3 item 7 — a judge REJECTION is its own decision token, its own exit code,
+/// and attaches the candidate it rejected.
+///
+/// [VANTA-WHY] `JudgeRejected` is deliberately not `Rejected`: `runner.label_for`
+/// folds both into the same TA/FA/TR/FR labels so a judge row pairs with the
+/// `vanta` row for the same candidate, but the SESSION must still say that the
+/// answer came from a single model call rather than from the adversarial loop.
+/// The exit code is the same as `Rejected` (1), because a rejection is a verdict
+/// and not a failure of the run.
+#[test]
+fn a_judge_rejection_exits_one_and_records_its_own_verdict() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        PRESERVING_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start_with_judge(JUDGE_REJECT_ANSWER);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[
+            ("VANTA_ARM", "judge"),
+            ("VANTA_JUDGE", "plain"),
+            ("VANTA_ATTACKER", "off"),
+        ],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a judge rejection is the arm's own verdict and exit code 1, like `Rejected`; \
+         stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(server.request_kinds(), vec!["judge".to_string()]);
+
+    let summary = run_summary(workspace.path());
+    assert_eq!(
+        summary_value(&summary.summary, "final_decision"),
+        "JudgeRejected",
+        "the rejection must be recorded under the JUDGE's token, not `Rejected`; got {}",
+        summary.summary
+    );
+    let judge_row = read_session_records(&find_session_log(workspace.path()))
+        .into_iter()
+        .find(|record| record.phase == "run.judge")
+        .expect("a verdict writes a run.judge row");
+    assert_eq!(summary_value(&judge_row.summary, "judge_verdict"), "reject");
+    assert!(
+        judge_row.summary.contains("leaves the reported bug"),
+        "the model's own reason must be recorded, not just the verdict: {}",
+        judge_row.summary
+    );
+}
+
+/// M3 item 7 — `judge+suite` is the SAME one call, but the model is shown the
+/// repo's own suite's result on the candidate: the pass/fail summary AND the
+/// failing tests.
+///
+/// [VANTA-WHY] The arm exists to answer one question — does seeing what the tests
+/// said change the judge's verdict? — and it can only answer it if what the model
+/// is SHOWN is the same evidence the test-driven arm acts on: the summary AND the
+/// failing test with its output, not a single bit. A prompt carrying only
+/// "failed" would be a different experiment wearing this arm's name.
+#[test]
+fn the_judge_suite_arm_shows_the_model_the_failing_tests_and_the_summary() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    // The patch breaks `scale`, which the repo's own test pins — so the native
+    // suite the judge is shown FAILS, with a named failing test.
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        NATIVE_BREAKING_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start_with_judge(JUDGE_APPROVE_ANSWER);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[
+            ("VANTA_ARM", "judge+suite"),
+            ("VANTA_JUDGE", "suite"),
+            ("VANTA_ATTACKER", "off"),
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "the suite result does not move THIS stub's verdict, so the run still \
+         approves; stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        server.request_kinds(),
+        vec!["judge".to_string()],
+        "`judge+suite` is still ONE model call — the suite is run locally, not asked of \
+         the model; kinds={:?}",
+        server.request_kinds()
+    );
+
+    let body = server.request_bodies().into_iter().next().unwrap();
+    assert!(
+        body.contains("NATIVE TEST SUITE RESULT ON THE CANDIDATE"),
+        "the suite result must be in the judge's prompt: {body}"
+    );
+    assert!(
+        body.contains("ran=true") && body.contains("failed=1"),
+        "the prompt must carry the pass/fail SUMMARY, not just a failing test: {body}"
+    );
+    assert!(
+        body.contains("test_scale_doubles"),
+        "the prompt must NAME the failing test, so the model sees what broke: {body}"
+    );
+
+    let summary = run_summary(workspace.path());
+    assert_eq!(summary_value(&summary.summary, "arm"), "judge+suite");
+    assert_eq!(summary_value(&summary.summary, "config"), "judge+suite");
+    assert_eq!(summary_value(&summary.summary, "llm_calls_site_judge"), "1");
+}
+
+/// M3 item 7 — an answer the judge cannot read is retried ONCE, then ends the run
+/// as `JudgeFailed` with its own exit code 4 — never `InfraFailure`, never a
+/// rejection.
+///
+/// [VANTA-WHY] "The machine is broken" and "the model said something we cannot
+/// read as a verdict" are opposite facts: the first is retried as infrastructure
+/// and reported as `infra_failure`, the second is this arm's own outcome and must
+/// not be. The exit code (4) is what lets the harness map it to `judge_failed`
+/// without treating it as an infra fault.
+#[test]
+fn an_unreadable_judge_answer_is_retried_once_then_fails_with_exit_four() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) = write_test_repo_with(
+        workspace.path(),
+        NATIVE_REPO_SOURCE,
+        PRESERVING_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let server = StubLlmServer::start_with_judge(JUDGE_UNREADABLE_ANSWER);
+
+    let output = run_patch_mode_with_output(
+        workspace.path(),
+        &patch_path,
+        &server,
+        1,
+        &[
+            ("VANTA_ARM", "judge"),
+            ("VANTA_JUDGE", "plain"),
+            ("VANTA_ATTACKER", "off"),
+        ],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "a readable machine and an unreadable answer is `JudgeFailed` (exit 4), its \
+         own code — never `InfraFailure` (2); stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        server.request_kinds(),
+        vec!["judge".to_string(), "judge".to_string()],
+        "the plan fixes the judge at one call plus ONE retry on malformed JSON, and \
+         nothing more; kinds={:?}",
+        server.request_kinds()
+    );
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    assert!(
+        records.iter().any(|record| record.phase == "run.judge_failed"),
+        "the reason the answer could not be read must be on its own row"
+    );
+    assert!(
+        !records.iter().any(|record| record.phase == "run.judge"),
+        "there was no verdict, so there must be no `run.judge` row claiming one"
+    );
+    let summary = run_summary(workspace.path());
+    assert_eq!(
+        summary_value(&summary.summary, "final_decision"),
+        "JudgeFailed",
+        "an unreadable answer is its own outcome, never folded into a rejection; got {}",
+        summary.summary
+    );
+}
+
+/// M3 item 7 — the OTHER half of the judge-site gate: a `run.summary` from a row
+/// that is not a judge arm must carry NONE of the judge's keys.
+///
+/// [VANTA-WHY] `driver::sampling_schedule_keys` withholds the `judge` site's pins
+/// and `judge_prompt_keys` withholds the prompt hash on a non-judge row, so a
+/// non-judge `run.summary` stays byte-identical to what it was before the judge
+/// existed. An absence is only a guarantee if something asserts it: a gate that
+/// starts emitting a key by accident would otherwise pass every existing test.
+/// The positive half (a judge row DOES carry them, with the right values) is
+/// asserted alongside so the pair cannot drift into "never emitted at all".
+fn assert_no_judge_keys(summary: &str, arm: &str) {
+    for judge_key in [
+        "temperature_judge",
+        "max_tokens_judge",
+        "llm_calls_site_judge",
+        "judge_prompt_version",
+        "judge_prompt_hash",
+    ] {
+        assert!(
+            !summary.contains(&format!("{judge_key}=")),
+            "the `{arm}` row must carry no `{judge_key}` — the judge's keys are gated \
+             to a judge arm and a non-judge row must stay byte-identical to before they \
+             existed; got {summary}"
+        );
+    }
+}
+
+/// M3 item 7 — the judge's keys appear ONLY on a judge row.
+///
+/// [VANTA-WHY] The `judge` call site was added to `SAMPLING_SCHEDULE`, so its
+/// pins are gated to a judge arm's row rather than emitted on every row — the
+/// same shape the judge's prompt hash uses. A non-judge `run.summary` must stay
+/// byte-identical to what it was before the judge existed, which means it must
+/// carry NO judge key at all while still carrying every pre-existing site's
+/// (zeroed where the arm never reached it) — the gate suppresses a placeholder
+/// for a site the arm never reaches, never a call that really happened.
+///
+/// The gate is asserted on EVERY non-judge arm the study runs (`baseline`,
+/// `vanta`, `b0`, `b2`), not just one: they reach the summary by different paths,
+/// and a gate that holds for one is not evidence it holds for the others.
+#[test]
+fn the_judge_keys_appear_only_on_a_judge_row() {
+    let _serial = serial_run();
+
+    // (1a) Non-judge REVIEW arms — the review baseline and the default `vanta`.
+    let baseline = TempDir::new().unwrap();
+    let (_repo, _issue, baseline_patch) = write_test_repo_with(
+        baseline.path(),
+        NATIVE_REPO_SOURCE,
+        PRESERVING_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let baseline_server = StubLlmServer::start(SINGLE_BEHAVIOR_TEST);
+    let baseline_output = run_patch_mode_with_output(
+        baseline.path(),
+        &baseline_patch,
+        &baseline_server,
+        1,
+        &[("VANTA_ATTACKER", "off")],
+    );
+    assert!(
+        baseline_output.status.success(),
+        "the review baseline still approves; stdout:\n{}",
+        String::from_utf8_lossy(&baseline_output.stdout)
+    );
+    let baseline_summary = run_summary(baseline.path()).summary;
+    assert_eq!(summary_value(&baseline_summary, "arm"), "baseline");
+    assert_eq!(
+        summary_value(&baseline_summary, "temperature_attacker_generate"),
+        "0.2",
+        "every pre-existing site keeps its pin on a non-judge row; got {baseline_summary}"
+    );
+    assert_eq!(
+        summary_value(&baseline_summary, "llm_calls_site_attacker_generate"),
+        "0",
+        "the arm never reached the Attacker, so its call count is a recorded zero — \
+         the placeholder that says the site exists and was not used; got {baseline_summary}"
+    );
+    assert_no_judge_keys(&baseline_summary, "baseline");
+
+    let vanta = TempDir::new().unwrap();
+    let (_repo, _issue, vanta_patch) = write_test_repo(vanta.path(), NEW_BEHAVIOUR_PATCH);
+    let vanta_server = StubLlmServer::start(SINGLE_BUG_REPRODUCTION_TEST);
+    let vanta_status = run_patch_mode(vanta.path(), &vanta_patch, &vanta_server);
+    assert!(
+        vanta_status.success(),
+        "the default vanta run must reach a verdict"
+    );
+    let vanta_summary = run_summary(vanta.path()).summary;
+    assert_eq!(summary_value(&vanta_summary, "arm"), "vanta");
+    assert_eq!(
+        summary_value(&vanta_summary, "temperature_attacker_generate"),
+        "0.2",
+        "the pre-existing sites keep their pins on a `vanta` row; got {vanta_summary}"
+    );
+    assert_no_judge_keys(&vanta_summary, "vanta");
+
+    // (1b) Non-judge REPAIR arms — `b0` (one Creator call) and `b2` (Attacker on,
+    //      BATE bypassed). Both reach `run.summary` through the repair pipeline.
+    let creator_script = serde_json::json!([
+        {
+            "patch_text": PRESERVING_PATCH,
+            "explanation": "document add without changing behaviour",
+            "files_touched": ["calc.py"],
+            "confidence": 0.9
+        }
+    ])
+    .to_string();
+
+    for (arm, envs) in [
+        ("b0", vec![("VANTA_ARM", "b0"), ("VANTA_ATTACKER", "off")]),
+        ("b2", vec![("VANTA_ARM", "b2"), ("VANTA_BATE", "off")]),
+    ] {
+        let workspace = TempDir::new().unwrap();
+        let (_repo, _issue, _patch) = write_test_repo_with(
+            workspace.path(),
+            NATIVE_REPO_SOURCE,
+            PRESERVING_PATCH,
+            Some(NATIVE_REPO_TEST),
+        );
+        let server = StubLlmServer::start_with_creator_script(&creator_script, SINGLE_BEHAVIOR_TEST);
+        let output =
+            run_creator_mode_with_output(workspace.path(), &server, 1, &envs);
+        let summary = run_summary(workspace.path()).summary;
+        assert_eq!(
+            summary_value(&summary, "arm"),
+            arm,
+            "the repair arm's row must name itself; stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_no_judge_keys(&summary, arm);
+    }
+
+    // (2) A judge row: the same pre-existing sites AND the judge's own keys.
+    let judged = TempDir::new().unwrap();
+    let (_repo, _issue, judge_patch) = write_test_repo_with(
+        judged.path(),
+        NATIVE_REPO_SOURCE,
+        PRESERVING_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let judge_server = StubLlmServer::start_with_judge(JUDGE_APPROVE_ANSWER);
+    let judge_output = run_patch_mode_with_output(
+        judged.path(),
+        &judge_patch,
+        &judge_server,
+        1,
+        &[
+            ("VANTA_ARM", "judge"),
+            ("VANTA_JUDGE", "plain"),
+            ("VANTA_ATTACKER", "off"),
+        ],
+    );
+    assert!(
+        judge_output.status.success(),
+        "the judge approves; stdout:\n{}",
+        String::from_utf8_lossy(&judge_output.stdout)
+    );
+    let judge_summary = run_summary(judged.path()).summary;
+    assert_eq!(summary_value(&judge_summary, "temperature_judge"), "0.2");
+    assert_eq!(summary_value(&judge_summary, "max_tokens_judge"), "32768");
+    assert_eq!(summary_value(&judge_summary, "llm_calls_site_judge"), "1");
+    assert_eq!(summary_value(&judge_summary, "judge_prompt_version"), "1");
+    assert_eq!(
+        summary_value(&judge_summary, "temperature_attacker_generate"),
+        "0.2",
+        "a judge row still names every pre-existing site; only the judge site is \
+         gated, and only in the non-judge direction; got {judge_summary}"
+    );
+
+    // (3) The `judge+suite` arm carries the same judge keys.
+    let judged_suite = TempDir::new().unwrap();
+    let (_repo, _issue, suite_patch) = write_test_repo_with(
+        judged_suite.path(),
+        NATIVE_REPO_SOURCE,
+        PRESERVING_PATCH,
+        Some(NATIVE_REPO_TEST),
+    );
+    let suite_server = StubLlmServer::start_with_judge(JUDGE_APPROVE_ANSWER);
+    let suite_output = run_patch_mode_with_output(
+        judged_suite.path(),
+        &suite_patch,
+        &suite_server,
+        1,
+        &[
+            ("VANTA_ARM", "judge+suite"),
+            ("VANTA_JUDGE", "suite"),
+            ("VANTA_ATTACKER", "off"),
+        ],
+    );
+    assert!(
+        suite_output.status.success(),
+        "the judge+suite arm approves; stdout:\n{}",
+        String::from_utf8_lossy(&suite_output.stdout)
+    );
+    let suite_summary = run_summary(judged_suite.path()).summary;
+    assert_eq!(summary_value(&suite_summary, "arm"), "judge+suite");
+    assert_eq!(summary_value(&suite_summary, "temperature_judge"), "0.2");
+    assert_eq!(summary_value(&suite_summary, "max_tokens_judge"), "32768");
+    assert_eq!(summary_value(&suite_summary, "llm_calls_site_judge"), "1");
+    assert_eq!(summary_value(&suite_summary, "judge_prompt_version"), "1");
 }
 
 /// §4.2 third configuration: `VANTA_PLANNER=on` is a PLACEHOLDER. It must end as
@@ -7762,8 +8350,22 @@ fn token_accounting_records_the_servers_counts_per_call_and_a_run_total() {
         "the requested run-level completion total must equal the per-call sum: {summary}"
     );
 
+    // [VANTA-WHY] M3 item 7 — `judge` is a site in `SAMPLING_SCHEDULE`, but its
+    // keys are gated to a judge arm's row (`driver::sampling_schedule_keys`), so
+    // this `vanta` row carries no `llm_calls_site_judge` to read. Skipping that
+    // ONE site, and only on a non-judge arm, is the same gate
+    // `assert_schedule_matches_bodies` applies; every other site keeps exactly
+    // the assertions below, and `assert_no_judge_keys` (after the loop) forbids
+    // the judge's keys rather than merely not asking for them.
+    let judge_arm = matches!(
+        summary_value(&summary, "arm").as_str(),
+        "judge" | "judge+suite"
+    );
     let mut per_site_calls = 0_u64;
     for (site, _, _) in vanta::llm::SAMPLING_SCHEDULE {
+        if *site == "judge" && !judge_arm {
+            continue;
+        }
         let calls: u64 = summary_value(&summary, &format!("llm_calls_site_{site}"))
             .parse()
             .unwrap_or_else(|e| panic!("`llm_calls_site_{site}` must be a count ({e}): {summary}"));
@@ -7790,6 +8392,12 @@ fn token_accounting_records_the_servers_counts_per_call_and_a_run_total() {
         "the per-site breakdown must account for every call the run made, or a site \
          is missing from the report: {summary}"
     );
+    // [VANTA-WHY] M3 item 7 — the gate above must be a gate, not a softened
+    // assertion: this `vanta` row must carry NO judge key, because a non-judge
+    // `run.summary` is byte-identical to what it was before the judge existed.
+    // (The full absence/presence matrix on every arm is asserted by
+    // `the_judge_keys_appear_only_on_a_judge_row`.)
+    assert_no_judge_keys(&summary, &summary_value(&summary, "arm"));
 }
 
 /// §14.29 — the four usage facts a cost table cannot derive from the flat counts,

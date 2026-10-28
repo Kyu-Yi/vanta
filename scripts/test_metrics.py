@@ -524,6 +524,159 @@ def test_infra_failure_is_counted_on_its_own_line(tmp_path):
 
 
 # ============================================================================
+# JudgeFailed is its own bucket, never a refusal nor an infra fault
+# ============================================================================
+
+
+def test_judge_failed_gets_its_own_bucket_whatever_the_label(tmp_path):
+    """M3 item 7 — the judge's call succeeded; only its answer was unreadable.
+
+    [WHY] `infra_failure` would blame the harness for a call that returned, and
+    `needs_review_*` would credit the run with a deliberate refusal it never
+    made. The run reached no verdict about the candidate, so it is counted alone.
+    """
+    write_session(tmp_path, "judgefail", decision="JudgeFailed", schema_version=1)
+    data = metrics.load_session(str(tmp_path), "judgefail")
+
+    for label in (True, False, None):
+        verdict = metrics.classify(data, label)
+        assert verdict.bucket == metrics.JUDGE_FAILED, label
+        assert verdict.bucket not in (
+            metrics.INFRA_FAILURE,
+            metrics.NEEDS_REVIEW_ON_BAD,
+            metrics.NEEDS_REVIEW_ON_GOOD,
+            metrics.NEEDS_REVIEW_UNLABELED,
+            metrics.UNDETERMINED,
+            metrics.FALSE_APPROVAL,
+            metrics.TRUE_APPROVAL,
+            metrics.APPROVED_UNLABELED,
+        ), label
+
+
+def test_judge_failed_is_counted_on_its_own_line(tmp_path):
+    """The judge failure must not be summed into any approval, reject or infra count.
+
+    [WHY] It is counted, but on its own line and OUTSIDE ``BUCKET_ORDER``: a line for
+    it in every report would change the table of every batch already on disk, and
+    those rows have no judge.
+    """
+    write_session(tmp_path, "judgefail", decision="JudgeFailed", schema_version=1)
+    verdicts = [
+        metrics.classify(metrics.load_session(str(tmp_path), "judgefail"), known_bad=True)
+    ]
+    table = metrics.render_table(verdicts)
+
+    assert metrics.JUDGE_FAILED not in metrics.BUCKET_ORDER
+    assert re.search(r"judge_failed\s+1", table), table
+    assert re.search(r"infra_failure\s+0", table), table
+    assert re.search(r"needs_review_on_bad\s+0", table), table
+    assert re.search(r"false_approval\s+0", table), table
+    assert re.search(r"scored rejections\s+0", table), table
+
+
+def test_a_batch_with_no_judge_prints_no_judge_line(tmp_path):
+    """[WHY] M3 item 7 — the judge's count line must not appear for a batch that
+    predates it, or every recorded table would be a different table."""
+    write_session(tmp_path, "catch", decision="Rejected", schema_version=1)
+    write_reruns(tmp_path, "catch", [signal(True)])
+    write_session(tmp_path, "approved", decision="AllTestsPassed", schema_version=1)
+    verdicts = [
+        metrics.classify(metrics.load_session(str(tmp_path), sid), None)
+        for sid in ("catch", "approved")
+    ]
+    table = metrics.render_table(verdicts)
+
+    assert metrics.JUDGE_FAILED not in table, table
+    assert "judge_failed" not in table, table
+
+
+def test_a_judge_failure_states_its_reason(tmp_path):
+    write_session(tmp_path, "judgefail", decision="JudgeFailed", schema_version=1)
+    verdict = metrics.classify(
+        metrics.load_session(str(tmp_path), "judgefail"), None
+    )
+
+    assert verdict.bucket == metrics.JUDGE_FAILED
+    assert "unreadable" in verdict.explanation
+
+
+def test_a_judge_approval_is_bucketed_as_an_approval(tmp_path):
+    """M3 item 7 — the judge's readable verdicts score as the test-driven arm's do."""
+    write_session(tmp_path, "judge-approve", decision="JudgeApproved", schema_version=1)
+    approve = metrics.load_session(str(tmp_path), "judge-approve")
+
+    assert metrics.classify(approve, False).bucket == metrics.TRUE_APPROVAL
+    assert metrics.classify(approve, True).bucket == metrics.FALSE_APPROVAL
+    assert metrics.classify(approve, None).bucket == metrics.APPROVED_UNLABELED
+
+
+def test_a_judge_rejection_of_a_bad_patch_is_a_true_catch_never_spurious(tmp_path):
+    """M3 item 7 — the judge produces no rejecting signals, so the signal-evidence
+    test can never fire for it. Its verdict IS the decision.
+
+    [WHY] `spurious_reject` means "the run rejected while every signal failed to
+    discriminate" — a claim about signals a judge row does not have. Bucketing a
+    judge rejection there would report the judge as a failed measurement.
+    """
+    write_session(tmp_path, "judge-reject", decision="JudgeRejected", schema_version=1)
+    data = metrics.load_session(str(tmp_path), "judge-reject")
+
+    verdict = metrics.classify(data, True)
+    assert verdict.bucket == metrics.TRUE_CATCH
+    assert verdict.bucket != metrics.SPURIOUS_REJECT
+    assert verdict.signals_total == 0, "a judge row has no signals to check"
+    assert metrics.classify(data, False).bucket == metrics.FALSE_REJECT
+    # An unlabelled judge rejection still claims nothing.
+    assert metrics.classify(data, None).bucket == metrics.UNDETERMINED
+
+
+def test_a_judge_error_is_not_a_spurious_reject(tmp_path):
+    """The shared rejection arm must not leak the signal test onto judge tokens."""
+    write_session(tmp_path, "judge-reject", decision="JudgeRejected", schema_version=1)
+    write_session(tmp_path, "plain-reject", decision="Rejected", schema_version=1)
+    write_reruns(tmp_path, "plain-reject", [signal(False)])
+    judge = metrics.classify(metrics.load_session(str(tmp_path), "judge-reject"), True)
+    plain = metrics.classify(metrics.load_session(str(tmp_path), "plain-reject"), True)
+
+    assert judge.bucket == metrics.TRUE_CATCH
+    assert plain.bucket == metrics.SPURIOUS_REJECT
+
+
+def test_judge_and_vanta_rows_never_share_a_pooled_bucket_table(tmp_path):
+    """[WHY] M3 item 7 — `arm` is a provenance axis, so the judge arm's rows can
+    never be pooled with the evidence buckets of the arm they are compared with."""
+    write_provenance_session(
+        tmp_path,
+        "judge-row",
+        provenance_summary("JudgeRejected", config="judge", arm="judge"),
+    )
+    write_provenance_session(
+        tmp_path,
+        "vanta-row",
+        provenance_summary("Rejected", config="vanta", arm="b3"),
+    )
+    write_reruns(tmp_path, "vanta-row", [signal(True)])
+
+    groups, facts = groups_and_facts(
+        tmp_path,
+        labels={"judge-row": True, "vanta-row": True},
+        rows=[manifest_row("judge-row"), manifest_row("vanta-row")],
+    )
+    tables = {
+        group.provenance["arm"]: metrics.pooled_metrics(group, facts)
+        for group in groups
+    }
+
+    assert set(tables) == {"judge", "b3"}
+    assert tables["judge"].buckets[metrics.TRUE_CATCH] == 1
+    assert tables["judge"].buckets[metrics.SPURIOUS_REJECT] == 0
+    assert tables["b3"].buckets[metrics.TRUE_CATCH] == 1
+    # One judge row, one Vanta row: neither table holds the other's rows.
+    assert tables["judge"].runs == 1
+    assert tables["b3"].runs == 1
+
+
+# ============================================================================
 # NeedsReview is a refusal to decide: its own buckets, never a decision
 # ============================================================================
 

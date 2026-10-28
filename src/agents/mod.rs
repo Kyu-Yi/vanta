@@ -12,3 +12,7 @@
 
 pub mod attacker;
 pub mod creator;
+// [VANTA-WHY] M3 item 7 — the judge arm's one-call verdict. Declared beside the
+// two adversarial agents because it is the third "role that reads the issue and
+// the code"; its prompt version and content hash are recorded on judge rows only.
+pub mod judge;

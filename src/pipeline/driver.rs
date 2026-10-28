@@ -37,6 +37,7 @@ use crate::agents::creator::{
     CreatorRequest, SourceFile, creator_generate_patch, split_multi_file_patch,
     split_patch_into_files,
 };
+use crate::agents::judge::{JudgeError, JudgeRequest, JudgeVerdict, judge_candidate};
 use crate::config::LlmConfig;
 use crate::core::{
     AttemptTransition, EvidenceSource, FailureClass, GovernorDecision, TestEvidence, TestIntent,
@@ -374,6 +375,13 @@ struct ArmSpec {
     bate: bool,
     /// The attempt budget this arm pins, or `None` for the invocation's own.
     max_attempts: Option<u32>,
+    /// [VANTA-WHY] M3 item 7 — the judge mode this arm runs under, or `None` for a
+    /// non-judge arm. `Some("plain")`/`Some("suite")` is the `VANTA_JUDGE` value the
+    /// arm IS, so `resolve_arm` can refuse a stated name whose judge setting
+    /// disagrees — exactly as it refuses a contradicting `--max-attempts`. The
+    /// setting is a switch, not a mode, so it lives here rather than in `arms.py`'s
+    /// `modes` (which is the harness's repair/review split).
+    judge: Option<&'static str>,
 }
 
 const ARMS: &[ArmSpec] = &[
@@ -385,6 +393,7 @@ const ARMS: &[ArmSpec] = &[
         planner: false,
         bate: true,
         max_attempts: Some(1),
+        judge: None,
     },
     // B1 — today's `baseline` repair.
     ArmSpec {
@@ -394,6 +403,7 @@ const ARMS: &[ArmSpec] = &[
         planner: false,
         bate: true,
         max_attempts: None,
+        judge: None,
     },
     // M3 item 8 — B2: the Attacker runs, BATE does not admit-test.
     ArmSpec {
@@ -403,6 +413,7 @@ const ARMS: &[ArmSpec] = &[
         planner: false,
         bate: false,
         max_attempts: None,
+        judge: None,
     },
     // B3 — today's `vanta`, both modes.
     ArmSpec {
@@ -412,6 +423,7 @@ const ARMS: &[ArmSpec] = &[
         planner: false,
         bate: true,
         max_attempts: None,
+        judge: None,
     },
     // The review half of today's `baseline`: attacker off, reviewing a candidate.
     ArmSpec {
@@ -421,6 +433,30 @@ const ARMS: &[ArmSpec] = &[
         planner: false,
         bate: true,
         max_attempts: None,
+        judge: None,
+    },
+    // M3 item 7 — the judge: ONE model call decides the candidate. Review-only and
+    // attacker-off (nothing is generated), and it pins `--max-attempts 1` for the
+    // same reason B0 does: "one call per verdict" is what the arm IS.
+    ArmSpec {
+        name: "judge",
+        config: "judge",
+        attacker: false,
+        planner: false,
+        bate: true,
+        max_attempts: Some(1),
+        judge: Some("plain"),
+    },
+    // M3 item 7 — the judge WITH the native suite's result on the candidate folded
+    // into its prompt. Same one call; the only difference is what the call is shown.
+    ArmSpec {
+        name: "judge+suite",
+        config: "judge+suite",
+        attacker: false,
+        planner: false,
+        bate: true,
+        max_attempts: Some(1),
+        judge: Some("suite"),
     },
 ];
 
@@ -431,6 +467,11 @@ struct ResolvedArm {
     name: String,
     /// What `run.summary` records as `config` — the split's own column.
     config: String,
+    /// [VANTA-WHY] M3 item 7 — `Some("plain"|"suite")` when the arm is a judge arm.
+    /// Drives the judge branch and the arm-gating of the `judge` sampling keys, both
+    /// of which read the RESOLVED arm rather than the raw environment, so the record
+    /// cannot describe a different judge setting from the one that ran.
+    judge: Option<&'static str>,
 }
 
 impl ResolvedArm {
@@ -440,6 +481,7 @@ impl ResolvedArm {
         Self {
             config: name.clone(),
             name,
+            judge: None,
         }
     }
 }
@@ -450,6 +492,29 @@ fn on_off(value: bool) -> &'static str {
         "on"
     } else {
         "off"
+    }
+}
+
+/// Read `VANTA_JUDGE` (`off|plain|suite`), or `None` when the judge is off.
+///
+/// [VANTA-WHY] M3 item 7 — a THREE-valued switch, so it is read here rather than
+/// through `env_flag` (which knows only on/off). `off` and an absent/empty var are
+/// both "no judge", matching `env_arm`'s reading of an empty value as "no
+/// statement" so a shell that expands an unset variable does not fail the run.
+fn env_judge() -> Result<Option<&'static str>, String> {
+    match std::env::var("VANTA_JUDGE") {
+        Ok(raw) => match raw.trim() {
+            "" | "off" => Ok(None),
+            "plain" => Ok(Some("plain")),
+            "suite" => Ok(Some("suite")),
+            other => Err(format!(
+                "CONFIG_ERROR: VANTA_JUDGE='{other}' is not a judge mode (expected off|plain|suite)."
+            )),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(
+            "CONFIG_ERROR: VANTA_JUDGE env var contained non-UTF-8 bytes.".to_string(),
+        ),
     }
 }
 
@@ -491,8 +556,20 @@ fn resolve_arm(
     planner: bool,
     bate: bool,
     max_attempts: u32,
+    judge: Option<&str>,
 ) -> Result<ResolvedArm, String> {
     let Some(name) = stated else {
+        // [VANTA-WHY] M3 item 7 — a judge run MUST state its arm. The
+        // switch-derived name has no judge in it (`judge` off is `baseline`), so
+        // inferring one would record a judge verdict under the arm it is being
+        // compared against — the one thing the experiment must not do.
+        if let Some(mode) = judge {
+            return Err(format!(
+                "CONFIG_ERROR: VANTA_JUDGE='{mode}' needs VANTA_ARM to name the arm \
+                 (judge or judge+suite); a judge verdict must not be recorded under a \
+                 switch-derived name."
+            ));
+        }
         return Ok(ResolvedArm::from_switches(attacker, planner, bate));
     };
     let Some(spec) = ARMS.iter().find(|spec| spec.name == name) else {
@@ -523,9 +600,25 @@ fn resolve_arm(
             ));
         }
     }
+    // [VANTA-WHY] M3 item 7 — the judge switch and the stated arm must agree, in
+    // BOTH directions: a judge arm with `VANTA_JUDGE=off` would run the whole
+    // adversarial pipeline under a name that claims a one-call verdict, and a
+    // non-judge arm with `VANTA_JUDGE=plain` would record judge semantics for a
+    // run that never called the judge. `judge` arrives already normalised by
+    // `env_judge` (`None` for off/absent), so the comparison needs no second
+    // reading of the variable — one reader, one meaning.
+    if spec.judge != judge {
+        return Err(format!(
+            "CONFIG_ERROR: VANTA_ARM='{name}' disagrees with VANTA_JUDGE: the arm is \
+             judge={}, but VANTA_JUDGE={}.",
+            spec.judge.unwrap_or("off"),
+            judge.unwrap_or("off")
+        ));
+    }
     Ok(ResolvedArm {
         name: spec.name.to_string(),
         config: spec.config.to_string(),
+        judge: spec.judge,
     })
 }
 
@@ -709,12 +802,21 @@ fn truncation_counts(calls: &[crate::llm::CallUsage]) -> (u64, u64, u64) {
 /// The completion sum excludes rows whose `source` is `estimate`, exactly as
 /// `token_totals` does: a per-site number that mixes a character-derived guess
 /// into a measurement is worse than an absent one.
+///
+/// [VANTA-WHY] M3 item 7 — `judge_arm` gates ONE site: the `judge` site's
+/// zero-row placeholder is emitted only on a judge ARM's row. Every pre-existing
+/// site is still emitted on every row (b0/b1 included), so no non-judge
+/// `run.summary` changes. A judge call actually MADE by some other arm would
+/// still be reported by the loop below — the gate suppresses the placeholder for
+/// a site the arm never reaches, never a call that really happened.
 fn per_site_totals(
     calls: &[crate::llm::CallUsage],
+    judge_arm: bool,
 ) -> Vec<(String, u64, u64, Option<u64>)> {
     let mut sites: Vec<&str> = crate::llm::SAMPLING_SCHEDULE
         .iter()
         .map(|(site, _, _)| *site)
+        .filter(|site| judge_arm || !is_judge_site(site))
         .collect();
     for call in calls {
         if !sites.contains(&call.site.as_str()) {
@@ -760,15 +862,99 @@ fn per_site_totals(
 /// first, and the per-role keys come from `llm::sampling_pins_text`, the same
 /// table the request bodies are built from, so the record cannot drift from the
 /// sampling that actually happened.
-fn sampling_schedule_keys() -> String {
+///
+/// [VANTA-WHY] M3 item 7 — the `judge` site's `temperature_judge` /
+/// `max_tokens_judge` keys are emitted only on a judge ARM's row, because only a
+/// judge arm has a judge call to pin. Every other site keeps being emitted on
+/// every row (b0/b1 included), so a non-judge `run.summary` is byte-identical to
+/// what it was before the judge existed — the same reason `per_site_totals`
+/// takes the same flag.
+fn sampling_schedule_keys(judge_arm: bool) -> String {
     let preset = crate::llm::sampling_preset();
     let mut keys = vec![format!("sampling_preset={}", preset.name())];
     for (site, _, _) in crate::llm::SAMPLING_SCHEDULE {
+        if is_judge_site(site) && !judge_arm {
+            continue;
+        }
         for (key, value) in crate::llm::sampling_pins_text(preset, site) {
             keys.push(format!("{key}_{site}={value}"));
         }
     }
     keys.join(" ")
+}
+
+/// Is this call SITE the judge's own (M3 item 7)?
+///
+/// [VANTA-WHY] The judge is the only site an ARM adds or removes, so the two
+/// places that describe a run's sampling and spend key their arm-gating on this
+/// one predicate rather than on a string literal apiece — one spelling of "the
+/// judge site", so the schedule entry, the pins and the row cannot disagree.
+fn is_judge_site(site: &str) -> bool {
+    site == "judge"
+}
+
+/// Render the JUDGE prompt's provenance as `run.summary` keys (M3 item 7).
+///
+/// [VANTA-WHY] M3 item 7 — the plan requires the judge's prompt text to be
+/// versioned and hashed like every other prompt, and the decision is that those
+/// keys appear ONLY on a judge arm's row. The judge prompt is not one of the
+/// prompts every run sends, so it cannot go in `prompt_versions()` /
+/// `prompt_hashes()`, which every row — `session.start` included — carries: that
+/// would claim every run sent a judge prompt. This returns the EMPTY string for a
+/// non-judge row and a LEADING-SPACE-prefixed string for a judge row, so it can be
+/// spliced in right after `prompt_hash=` and a non-judge `run.summary` stays
+/// byte-identical to what it was before the judge existed.
+fn judge_prompt_keys(judge_arm: bool) -> String {
+    if !judge_arm {
+        return String::new();
+    }
+    let hash = crate::core::prompt_content_hash(&[crate::agents::judge::JUDGE_SYSTEM_PROMPT]);
+    format!(
+        " judge_prompt_version={} judge_prompt_hash={}",
+        crate::agents::judge::JUDGE_PROMPT_VERSION,
+        hash
+    )
+}
+
+/// Render the repo's own suite's result on the candidate for the `judge+suite`
+/// prompt (M3 item 7).
+///
+/// [VANTA-WHY] `judge+suite`'s ONLY difference from `judge` is that the model is
+/// shown what the repo's tests said about the candidate, so what it is shown has
+/// to be the facts the test-driven arm acts on: the pass/fail summary AND the
+/// failing tests with their own output, not just a bit. A suite that did not run
+/// says so — `ran=false` with the stderr tail — because "no failing tests" and
+/// "nothing ran" are opposite readings of an empty report, and a judge shown the
+/// second as the first would approve on evidence that does not exist.
+fn render_judge_suite_result(report: &harness::NativeSuiteReport) -> String {
+    if !report.ran {
+        let tail = report.stderr_tail.trim();
+        return format!(
+            "ran=false exit_code={:?} stderr_tail={}",
+            report.exit_code,
+            if tail.is_empty() { "(empty)" } else { tail }
+        );
+    }
+    let total = report.tests.len();
+    let failures: Vec<&(String, TestResult)> = report
+        .tests
+        .iter()
+        .filter(|(_, result)| *result != TestResult::Passed)
+        .collect();
+    let mut out = format!(
+        "ran=true total={total} passed={} failed={} exit_code={:?}",
+        total - failures.len(),
+        failures.len(),
+        report.exit_code
+    );
+    for (nodeid, result) in failures {
+        out.push_str(&format!("\n- {nodeid} [{result:?}]"));
+        if let Some(output) = report.failure_output(nodeid) {
+            out.push_str("\n    ");
+            out.push_str(&output.replace('\n', "\n    "));
+        }
+    }
+    out
 }
 
 /// The request-shaping rule this run's backend follows, in the same one-line
@@ -885,12 +1071,19 @@ pub async fn run(
     // call is made. An absent `VANTA_ARM` is a hand-run binary and resolves to the
     // switch-derived name exactly as every run before this change did.
     let stated_arm = env_arm()?;
+    // [VANTA-WHY] M3 item 7 — the judge setting (`VANTA_JUDGE=off|plain|suite`),
+    // read here with the arm so a stated arm and a stated judge mode cannot
+    // disagree: `resolve_arm` refuses the pair rather than recording a verdict
+    // under a name the judge setting contradicts. Absent/`off` is `None`, which
+    // is every non-judge arm and every run before this change.
+    let judge = env_judge()?;
     let resolved_arm = resolve_arm(
         stated_arm.as_deref(),
         attacker_enabled,
         planner_enabled,
         bate_enabled,
         config.max_attempts,
+        judge,
     )?;
     // [VANTA-WHY] §14.2/§14.4/§14.5 — the three robustness switches. All
     // default OFF so v0.2 behaves exactly as before until they are flipped, and
@@ -1423,6 +1616,17 @@ pub async fn run(
     // this, a dead LLM call propagated with `?` and the process exited with a
     // stack-style error and NO final decision on disk — the run was unreadable.
     let mut infra_failure_error: Option<String> = None;
+    // [VANTA-WHY] M3 item 7 — the judge's own failure text, carried out of the
+    // loop so a `JudgeFailed` run writes it to the session log. Deliberately NOT
+    // `infra_failure_error`: the machine was fine and the call was made — what
+    // came back could not be read as a verdict after the one retry — so this must
+    // not be reported, retried or counted as infrastructure. The raw answer
+    // itself is already on disk in the forensics file.
+    let mut judge_failed_error: Option<String> = None;
+    // [VANTA-WHY] M3 item 7 — the judge's verdict and reasoning, carried out of
+    // the loop for the `run.judge` provenance row. `None` on every non-judge arm,
+    // so that row exists only where a judge actually ran.
+    let mut judge_outcome: Option<(bool, f64, String)> = None;
     // [VANTA-WHY] §14.14 — the run's total Attacker remediation calls, summed
     // over attempts from the per-attempt budget below. Reported in `run.summary`
     // (and thus the manifest) beside the cap, so a reader can tell a run that
@@ -1799,6 +2003,99 @@ pub async fn run(
         } else {
             capped_dump_concat(&execution_root)
         };
+
+        // ---- 2b. JUDGE (M3 item 7) ----
+        // [VANTA-WHY] A judge arm answers the review question with ONE model call
+        // instead of the adversarial loop: the Attacker, BATE, the Diagnostician,
+        // the graded run, the native gate and static analysis are all SKIPPED, and
+        // skipped rather than run-and-emptied for the same reason item 8 skips the
+        // Attacker — an `attacker.summary` row saying `generated_tests=0` would
+        // assert the Attacker ran and found nothing. This is also why the branch is
+        // HERE rather than beside the decision machinery: a plain judge must not
+        // run the sandbox at all, so nothing that spawns one may come first.
+        //
+        // The judge is shown exactly what the test-driven review arm's roles are
+        // shown (`prompt_source_concat`, the `select_review_prompt` selection under
+        // the same budget), so item 7's fairness rule holds by construction rather
+        // than by two selections that happen to agree.
+        if let Some(judge_mode) = resolved_arm.judge {
+            let suite_result = if judge_mode == "suite" {
+                // [VANTA-WHY] The candidate graded with the ORIGINAL tests, as the
+                // test-driven arm's native gate does: a patch must not grade itself.
+                let native_tree = harness::native_tree_with_original_tests(
+                    &original_files,
+                    &patched_files,
+                    &patch_deleted_paths(&patch_text),
+                );
+                let judge_patched_concat = build_source_concat(&native_tree.files);
+                println!("\n▌ JUDGE: running the repo's own suite on the candidate...");
+                let report = run_with_spinner("Running the native suite for the judge", async {
+                    harness::run_native_suite(&judge_patched_concat, &test_cmd).await
+                })
+                .await;
+                Some(render_judge_suite_result(&report))
+            } else {
+                None
+            };
+            let request = JudgeRequest {
+                issue_text: repo.issue_text.clone(),
+                context: prompt_source_concat.clone(),
+                candidate_diff: patch_text.clone(),
+                suite_result,
+            };
+            println!("\n▌ JUDGE phase ({judge_mode}): one call per verdict, no Attacker...");
+            let outcome = run_with_spinner("Judge deciding the candidate", async {
+                judge_candidate(&cfg, &request).await
+            })
+            .await;
+            let decision = match outcome {
+                Ok(response) => {
+                    let approved = response.verdict == JudgeVerdict::Approve;
+                    println!(
+                        "  ⚖ JUDGE: {} (confidence={:.2}) — {}",
+                        if approved { "approve" } else { "reject" },
+                        response.confidence,
+                        response.reason
+                    );
+                    judge_outcome = Some((approved, response.confidence, response.reason));
+                    if approved {
+                        GovernorDecision::JudgeApproved
+                    } else {
+                        GovernorDecision::JudgeRejected
+                    }
+                }
+                Err(JudgeError::Malformed(message)) => {
+                    // [VANTA-WHY] The machine was fine and the call was made; what
+                    // came back could not be read as a verdict after the one retry.
+                    // That is this arm's own outcome — its own exit code (4) and its
+                    // own bucket — and deliberately NOT `InfraFailure`, which would
+                    // report a broken candidate as a broken server (and be retried
+                    // as one). The raw answer is in the forensics file.
+                    println!(
+                        "  ✖ JUDGE FAILED — the judge did not return a readable verdict after \
+                         the one retry (the raw answer is in the forensics file); this is a \
+                         recorded judge failure, not an infrastructure fault"
+                    );
+                    judge_failed_error = Some(message);
+                    GovernorDecision::JudgeFailed
+                }
+                Err(JudgeError::Call(message)) => {
+                    infra_failure_error = Some(format!("Judge LLM call failed: {message}"));
+                    GovernorDecision::InfraFailure
+                }
+            };
+            // [VANTA-WHY] A verdict about the candidate attaches it, exactly as
+            // `Rejected` does: `final.patch` is written for every terminal verdict
+            // and the oracle that labels the row needs the diff. `JudgeFailed` had
+            // no verdict, so it attaches nothing.
+            if matches!(
+                decision,
+                GovernorDecision::JudgeApproved | GovernorDecision::JudgeRejected
+            ) {
+                final_patched_files = Some(patched_files);
+            }
+            break 'attempts decision;
+        }
 
         // ---- 3. Attacker ----
         // [VANTA-WHY] `VANTA_ATTACKER=off` (the `baseline` configuration,
@@ -3142,8 +3439,13 @@ pub async fn run(
                 // and the row cannot disagree. The gate is deliberately NOT
                 // conditioned on any §14 flag: turning the audits off must not be
                 // a way to buy back an approval.
-                let (applied, reason) =
-                    approval_invariant_status(governor_mode, attacker_enabled, bate_enabled, &final_evidence);
+                let (applied, reason) = approval_invariant_status(
+                    governor_mode,
+                    attacker_enabled,
+                    bate_enabled,
+                    resolved_arm.judge.is_some(),
+                    &final_evidence,
+                );
                 if applied && reason != INVARIANT_SATISFIED {
                     // [VANTA-WHY] M3 item 1 — the two withheld-approval reasons are
                     // two different diagnoses, so they get two different sentences
@@ -3193,6 +3495,27 @@ pub async fn run(
                 // — but it never reaches the Gatekeeper, because "needs review"
                 // is not the Gatekeeper's `Approved`.
                 final_patched_files = Some(patched_files);
+                break decision;
+            }
+            GovernorDecision::JudgeApproved | GovernorDecision::JudgeRejected => {
+                // [VANTA-WHY] M3 item 7. A judge arm breaks out of the loop at
+                // step 2b, before the machinery this match belongs to, so this arm
+                // is the record of what a judge verdict MEANS rather than a path
+                // today's arms take. It is written to be correct on its own — a
+                // verdict about the candidate attaches it, exactly as `Rejected`
+                // and `NeedsReview` do, because `final.patch` is what the oracle
+                // labels the row from — so a future path that routes a judge
+                // verdict through here cannot silently lose the candidate.
+                final_patched_files = Some(patched_files);
+                break decision;
+            }
+            GovernorDecision::JudgeFailed => {
+                // [VANTA-WHY] M3 item 7. The judge answered and its answer could
+                // not be read as a verdict after the one retry: this arm's own
+                // outcome (exit code 4, its own `judge_failed` bucket), never
+                // folded into `NeedsReview`, `Rejected` or `InfraFailure`. No
+                // verdict was reached, so nothing is attached; the raw answer is in
+                // the forensics file.
                 break decision;
             }
             GovernorDecision::PatchApplicationFailed => {
@@ -3318,6 +3641,75 @@ pub async fn run(
                 deadline_secs
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unset".to_string())
+            ),
+            timestamp: now_iso(),
+            benchmark_instance: None,
+            benchmark_label: None,
+        })?;
+    }
+
+    // [VANTA-WHY] M3 item 7 — the judge arm's verdict on its own phase row. The
+    // verdict and its reasoning are the ONLY things a judge run concludes, and the
+    // `JudgeApproved`/`JudgeRejected` decision token says which mechanism reached
+    // an answer but not WHICH answer the model gave or why: `runner.label_for`
+    // folds both tokens into the same TA/FA/TR/FR labels the test-driven arm uses
+    // (so the per-candidate pairing the plan asks for works), which would
+    // otherwise leave the judge's OWN words nowhere. `confidence` is the model's
+    // number, recorded verbatim. This row exists only where a judge actually ran
+    // (`judge_outcome` is `None` on every other arm), so no non-judge session
+    // gains a row.
+    if let Some((approved, confidence, reason)) = &judge_outcome {
+        let one_line = reason
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        session_log.append(SessionRecord {
+            session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
+            patch_attempt_id: attempt_patch_ids.last().cloned(),
+            testing_iteration_id: None,
+            test_id: None,
+            phase: "run.judge".to_string(),
+            summary: format!(
+                "judge_verdict={} judge_confidence={:.2} judge_reason={}",
+                if *approved { "approve" } else { "reject" },
+                confidence,
+                one_line.chars().take(1000).collect::<String>()
+            ),
+            timestamp: now_iso(),
+            benchmark_instance: None,
+            benchmark_label: None,
+        })?;
+    }
+
+    // [VANTA-WHY] M3 item 7 — a `JudgeFailed` run records WHY the judge's answer
+    // could not be read after the one retry, exactly as `run.infra_failure` does
+    // for a dead call: the reason is a fact in the log rather than something a
+    // reader infers from `final_decision=JudgeFailed` alone. It is deliberately
+    // its OWN phase, not `run.infra_failure`: the machine was fine and the call
+    // was made, so this must not be read, retried or counted as infrastructure,
+    // and its exit code (4) is the arm's own. The raw answer is in the forensics
+    // file; this carries the parse/truncation diagnosis.
+    if let Some(error) = &judge_failed_error {
+        println!("  ✖ JUDGE FAILED: {error}");
+        let one_line = error
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        session_log.append(SessionRecord {
+            session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
+            patch_attempt_id: attempt_patch_ids.last().cloned(),
+            testing_iteration_id: None,
+            test_id: None,
+            phase: "run.judge_failed".to_string(),
+            summary: format!(
+                "final_decision=JudgeFailed error={}",
+                one_line.chars().take(1000).collect::<String>()
             ),
             timestamp: now_iso(),
             benchmark_instance: None,
@@ -3465,7 +3857,7 @@ pub async fn run(
     // window rolling over; `resource_unavailable` is `flex` capacity).
     let (provider_retries, provider_retries_rate_limit, provider_retries_unavailable) =
         crate::llm::provider_retry_counts();
-    let per_site_keys = per_site_totals(&call_usages)
+    let per_site_keys = per_site_totals(&call_usages, resolved_arm.judge.is_some())
         .iter()
         .map(|(site, calls, truncated, completion)| {
             format!(
@@ -3569,7 +3961,13 @@ pub async fn run(
     // `no_approval` says exactly that, rather than reporting a satisfied/not
     // reading about a decision the run never made.
     let (invariant_applied_here, invariant_reason_here) =
-        approval_invariant_status(governor_mode, attacker_enabled, bate_enabled, &final_evidence);
+        approval_invariant_status(
+            governor_mode,
+            attacker_enabled,
+            bate_enabled,
+            resolved_arm.judge.is_some(),
+            &final_evidence,
+        );
     let invariant_applied = invariant_applied_here
         && matches!(
             decision,
@@ -3606,7 +4004,7 @@ pub async fn run(
              reasoning_effort_mechanism={} \
              service_tier={} \
              deciding_rule={} deciding_evidence=[{}] needs_review_weak=[{}] \
-             commit={} dirty={} prompt_version={} prompt_hash={} context_selection={} \
+             commit={} dirty={} prompt_version={} prompt_hash={}{} context_selection={} \
              harness_error={} \
              invariant_applied={} invariant_reason={} \
              grounded_scrapped={} grounded_kept_by_issue={} \
@@ -3625,7 +4023,7 @@ pub async fn run(
             crate::llm::SEED_POLICY,
             cfg.model_id,
             top_p_value,
-            sampling_schedule_keys(),
+            sampling_schedule_keys(resolved_arm.judge.is_some()),
             request_shape_rule(&cfg),
             llm_calls,
             llm_calls_measured,
@@ -3763,6 +4161,12 @@ pub async fn run(
             // exact text each role sends, so a wording change shows up in the log
             // whether or not anyone remembered the label.
             crate::pipeline::prompt_hashes(),
+            // [VANTA-WHY] M3 item 7 — the JUDGE prompt's own version and content
+            // hash, spliced in immediately after the pipeline prompt provenance.
+            // Only a judge arm has a judge prompt to name, so this renders the
+            // empty string on every other row (the leading space lives inside the
+            // helper) and every non-judge `run.summary` stays byte-identical.
+            judge_prompt_keys(resolved_arm.judge.is_some()),
             // [VANTA-WHY] §1.6.2 item 4 — the same provenance the `context.select`
             // row carries, folded into the terminal row so a reader of
             // `run.summary` alone can tell whether the bug's own file was in the
@@ -5078,6 +5482,9 @@ fn flag_text(enabled: bool) -> &'static str {
 ///     broke nothing the surviving probes check, which a no-op also achieves.
 const NO_REPRODUCTION_EVIDENCE: &str = "no_reproduction_evidence";
 const NO_ADMITTED_TESTS: &str = "no_admitted_tests";
+/// M3 item 7 — the invariant's reason on a judge arm: no test runs, so the
+/// approval-evidence requirement is inapplicable rather than unmet.
+const JUDGE_ARM: &str = "judge_arm";
 
 /// The invariant's reason when an approval IS backed by the required evidence.
 const INVARIANT_SATISFIED: &str = "satisfied";
@@ -5122,6 +5529,11 @@ fn expects_baseline_failure(evidence: &[TestEvidence]) -> bool {
 ///     B2 review whose probes are all mislabelled would be withheld for a reason
 ///     that is the arm's whole design, not a defect in the candidate. Exempt by
 ///     construction for the same reason `attacker_off` is — see M3 item 8.
+///   * `judge_arm` — the M3 item 7 judge arms. They run no test at all (the whole
+///     point of the arm is a verdict from reading, not from evidence), so the
+///     requirement is inapplicable rather than unmet, and reporting it as
+///     `attacker_off` would name the wrong cause: the judge does not lack an
+///     Attacker, it IS the alternative to one.
 /// With the invariant in force there are three answers: `satisfied` when at
 /// least one admitted test expects the original to fail, `no_reproduction_evidence`
 /// when tests ran but none of them does, and `no_admitted_tests` when nothing was
@@ -5132,14 +5544,24 @@ fn expects_baseline_failure(evidence: &[TestEvidence]) -> bool {
 /// `attacker_off`, so an existing arm's reason is untouched: a repair run is
 /// still `not_review` (it has no approval for the invariant to constrain,
 /// whatever the BATE switch says) and a baseline review is still `attacker_off`.
+///
+/// [VANTA-WHY] M3 item 7 — `judge_arm` is checked SECOND, right after
+/// `not_review` and BEFORE `attacker_off`. A judge review has the Attacker off,
+/// so without this ordering it would be recorded as `attacker_off` like
+/// `baseline`; the ordering is what keeps the two distinguishable, and it cannot
+/// change an existing arm's reason because no arm before item 7 sets it.
 fn approval_invariant_status(
     mode: GovernorMode,
     attacker_enabled: bool,
     bate_enabled: bool,
+    judge_arm: bool,
     evidence: &[TestEvidence],
 ) -> (bool, &'static str) {
     if mode != GovernorMode::Review {
         return (false, "not_review");
+    }
+    if judge_arm {
+        return (false, JUDGE_ARM);
     }
     if !attacker_enabled {
         return (false, "attacker_off");
@@ -5312,7 +5734,7 @@ mod tests {
         modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
         resolve_arm, stamp_transition_row, stable_patch_fingerprint, ARMS, INVARIANT_SATISFIED,
-        NO_ADMITTED_TESTS, NO_REPRODUCTION_EVIDENCE,
+        JUDGE_ARM, NO_ADMITTED_TESTS, NO_REPRODUCTION_EVIDENCE,
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{
@@ -6015,7 +6437,7 @@ mod tests {
     #[test]
     fn no_admitted_tests_is_a_distinct_withheld_approval_reason() {
         assert_eq!(
-            approval_invariant_status(GovernorMode::Review, true, true, &[]),
+            approval_invariant_status(GovernorMode::Review, true, true, false, &[]),
             (true, NO_ADMITTED_TESTS),
             "zero admitted tests must withhold the approval with its own reason"
         );
@@ -6039,11 +6461,11 @@ mod tests {
     fn the_approval_invariant_names_each_exemption_and_each_answer() {
         // Exemptions: a repair run, and the Attacker-off `baseline` review.
         assert_eq!(
-            approval_invariant_status(GovernorMode::Repair, true, true, &[]),
+            approval_invariant_status(GovernorMode::Repair, true, true, false, &[]),
             (false, "not_review")
         );
         assert_eq!(
-            approval_invariant_status(GovernorMode::Review, false, true, &[]),
+            approval_invariant_status(GovernorMode::Review, false, true, false, &[]),
             (false, "attacker_off")
         );
         // In force and satisfied by a probe that expects the original to fail —
@@ -6055,6 +6477,7 @@ mod tests {
                     GovernorMode::Review,
                     true,
                     true,
+                    false,
                     &[evidence("t_pins", intent)],
                 ),
                 (true, INVARIANT_SATISFIED),
@@ -6068,6 +6491,7 @@ mod tests {
                 GovernorMode::Review,
                 true,
                 true,
+                false,
                 &[evidence("t_pres", TestIntent::BehaviorPreservation)],
             ),
             (true, NO_REPRODUCTION_EVIDENCE)
@@ -6087,6 +6511,7 @@ mod tests {
                 GovernorMode::Review,
                 true,
                 false,
+                false,
                 &[evidence("t_pins", TestIntent::BugReproduction)],
             ),
             (false, "b2_arm"),
@@ -6094,20 +6519,46 @@ mod tests {
              inapplicable — and it must say so, not read as satisfied"
         );
         assert_eq!(
-            approval_invariant_status(GovernorMode::Review, true, false, &[]),
+            approval_invariant_status(GovernorMode::Review, true, false, false, &[]),
             (false, "b2_arm"),
             "the exemption is a property of the arm, not of the evidence it happens to hold"
         );
         // The two pre-existing exemptions keep precedence over the new one.
         assert_eq!(
-            approval_invariant_status(GovernorMode::Repair, true, false, &[]),
+            approval_invariant_status(GovernorMode::Repair, true, false, false, &[]),
             (false, "not_review"),
             "B2 does not make a repair run into a review"
         );
         assert_eq!(
-            approval_invariant_status(GovernorMode::Review, false, false, &[]),
+            approval_invariant_status(GovernorMode::Review, false, false, false, &[]),
             (false, "attacker_off"),
             "with no Attacker there is no B2 intake either; the arm is `baseline`"
+        );
+    }
+
+    // [VANTA-WHY] M3 item 7 — a judge review reaches its verdict with NO
+    // adversarial test at all, so the approval invariant has nothing to
+    // constrain: it is exempt under its OWN reason, `judge_arm`, not `attacker_off`
+    // (an arm that never runs the Attacker at all) and not a bare `no_approval`
+    // (a run that ended without an approval). A reader must be able to tell a
+    // judge row from those, and the pre-existing exemptions must still win where
+    // they apply, so a judge-shaped REPAIR run is `not_review`.
+    #[test]
+    fn the_judge_arm_is_exempt_from_the_invariant_with_its_own_reason() {
+        assert_eq!(
+            approval_invariant_status(GovernorMode::Review, false, true, true, &[]),
+            (false, JUDGE_ARM),
+            "a judge review runs no adversarial test, so the invariant is inapplicable — \
+             and it must say so under its own reason, not read as satisfied"
+        );
+        assert_ne!(
+            JUDGE_ARM, "attacker_off",
+            "a judge arm is not the Attacker-off `baseline`; the two must be distinguishable"
+        );
+        assert_eq!(
+            approval_invariant_status(GovernorMode::Repair, false, true, true, &[]),
+            (false, "not_review"),
+            "a repair run is exempt as a repair run, judge arm or not"
         );
     }
 
@@ -6169,15 +6620,15 @@ mod tests {
         // The invariant fields are unchanged at the default switch too: every
         // pre-change answer still answers the same way.
         assert_eq!(
-            approval_invariant_status(GovernorMode::Review, true, bate_enabled, &[]),
+            approval_invariant_status(GovernorMode::Review, true, bate_enabled, false, &[]),
             (true, NO_ADMITTED_TESTS)
         );
         assert_eq!(
-            approval_invariant_status(GovernorMode::Repair, true, bate_enabled, &[]),
+            approval_invariant_status(GovernorMode::Repair, true, bate_enabled, false, &[]),
             (false, "not_review")
         );
         assert_eq!(
-            approval_invariant_status(GovernorMode::Review, false, bate_enabled, &[]),
+            approval_invariant_status(GovernorMode::Review, false, bate_enabled, false, &[]),
             (false, "attacker_off")
         );
         assert_eq!(
@@ -6185,6 +6636,7 @@ mod tests {
                 GovernorMode::Review,
                 true,
                 bate_enabled,
+                false,
                 &[evidence("t_pins", TestIntent::BugReproduction)],
             ),
             (true, INVARIANT_SATISFIED)
@@ -6194,6 +6646,7 @@ mod tests {
                 GovernorMode::Review,
                 true,
                 bate_enabled,
+                false,
                 &[evidence("t_pres", TestIntent::BehaviorPreservation)],
             ),
             (true, NO_REPRODUCTION_EVIDENCE)
@@ -6262,7 +6715,8 @@ mod tests {
         for attacker in [false, true] {
             for planner in [false, true] {
                 for bate in [false, true] {
-                    let resolved = resolve_arm(None, attacker, planner, bate, 4).unwrap();
+                    let resolved =
+                        resolve_arm(None, attacker, planner, bate, 4, None).unwrap();
                     let pre = benchmark_config_name(attacker, planner, bate);
                     assert_eq!(
                         resolved.name, pre,
@@ -6295,6 +6749,7 @@ mod tests {
                 spec.planner,
                 spec.bate,
                 budget,
+                spec.judge,
             )
             .unwrap_or_else(|e| panic!("arm '{}' must resolve: {e}", spec.name));
             assert_eq!(resolved.name, spec.name);
@@ -6306,15 +6761,21 @@ mod tests {
         }
         // The two legacy arms keep the config name every row on disk already has.
         assert_eq!(
-            resolve_arm(Some("b1"), false, false, true, 4).unwrap().config,
+            resolve_arm(Some("b1"), false, false, true, 4, None)
+                .unwrap()
+                .config,
             "baseline"
         );
         assert_eq!(
-            resolve_arm(Some("b3"), true, false, true, 4).unwrap().config,
+            resolve_arm(Some("b3"), true, false, true, 4, None)
+                .unwrap()
+                .config,
             "vanta"
         );
         assert_eq!(
-            resolve_arm(Some("b0"), false, false, true, 1).unwrap().config,
+            resolve_arm(Some("b0"), false, false, true, 1, None)
+                .unwrap()
+                .config,
             "b0"
         );
     }
@@ -6326,7 +6787,7 @@ mod tests {
     fn a_stated_arm_that_contradicts_the_switches_or_budget_is_refused() {
         // Unknown name: refused, and the sentence lists the known arms. The list
         // holds ARM names, so `baseline` (a config, not an arm) must not appear in it.
-        let error = resolve_arm(Some("nope"), false, false, true, 4)
+        let error = resolve_arm(Some("nope"), false, false, true, 4, None)
             .expect_err("an unknown arm name must not fall back to the switches");
         assert!(
             error.contains("CONFIG_ERROR")
@@ -6341,7 +6802,7 @@ mod tests {
         );
 
         // Switch disagreement: `b2` is attacker=on, bate=off; the switches say otherwise.
-        let error = resolve_arm(Some("b2"), true, false, true, 4)
+        let error = resolve_arm(Some("b2"), true, false, true, 4, None)
             .expect_err("VANTA_ARM must not disagree with the switches");
         assert!(
             error.contains("CONFIG_ERROR")
@@ -6350,10 +6811,10 @@ mod tests {
             "got: {error}"
         );
         // `b1` is attacker=off; asking for it with the Attacker on is the same fault.
-        assert!(resolve_arm(Some("b1"), true, false, true, 4).is_err());
+        assert!(resolve_arm(Some("b1"), true, false, true, 4, None).is_err());
 
         // Budget: `b0` IS one Creator call, so a four-attempt invocation is not b0.
-        let error = resolve_arm(Some("b0"), false, false, true, 4)
+        let error = resolve_arm(Some("b0"), false, false, true, 4, None)
             .expect_err("b0 pins its attempt budget and the invocation must not override it");
         assert!(
             error.contains("CONFIG_ERROR")
@@ -6362,9 +6823,30 @@ mod tests {
             "got: {error}"
         );
         // The budget the arm pins is accepted.
-        assert!(resolve_arm(Some("b0"), false, false, true, 1).is_ok());
+        assert!(resolve_arm(Some("b0"), false, false, true, 1, None).is_ok());
         // An arm with no pinned budget takes the invocation's own.
-        assert!(resolve_arm(Some("b1"), false, false, true, 4).is_ok());
+        assert!(resolve_arm(Some("b1"), false, false, true, 4, None).is_ok());
+
+        // [VANTA-WHY] M3 item 7 — a judge setting is a STATEMENT like the arm name
+        // is: it needs an arm to hang off, and the arm it names must agree with it.
+        assert!(resolve_arm(Some("judge"), false, false, true, 1, Some("plain")).is_ok());
+        assert!(resolve_arm(Some("judge+suite"), false, false, true, 1, Some("suite")).is_ok());
+        // A judge mode with no arm would be recorded under a switch-derived name.
+        let error = resolve_arm(None, false, false, true, 4, Some("plain"))
+            .expect_err("a judge mode must not be recorded under a switch-derived arm");
+        assert!(
+            error.contains("CONFIG_ERROR") && error.contains("VANTA_JUDGE='plain'"),
+            "got: {error}"
+        );
+        // The arm and the setting must agree in both directions.
+        let error = resolve_arm(Some("judge"), false, false, true, 1, Some("suite"))
+            .expect_err("VANTA_ARM/VANTA_JUDGE must agree");
+        assert!(
+            error.contains("CONFIG_ERROR") && error.contains("disagrees"),
+            "got: {error}"
+        );
+        // A non-judge arm with a judge mode set is the same fault.
+        assert!(resolve_arm(Some("b1"), false, false, true, 4, Some("plain")).is_err());
     }
 
     // [VANTA-WHY] M3 item 1 — the grounding ledger separates "the audit ran and

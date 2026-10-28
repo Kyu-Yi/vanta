@@ -96,6 +96,18 @@ class Arm:
     11), not a parameter a caller may vary. Every other arm runs the ``--max-attempts``
     the invocation asked for, which is 4 — the binary's own default."""
 
+    judge: Optional[str] = None
+    """M3 item 7 — the ``VANTA_JUDGE`` setting this arm runs, or ``None`` for the off
+    judge every non-judge arm has.
+
+    ``"plain"`` is one model call on the issue, the context selection and the
+    candidate diff; ``"suite"`` is the same call with the repo's own suite's result on
+    the candidate folded in. It is a SWITCH value rather than a mode, which is why it
+    lives here beside the other switch settings rather than in ``modes``: the
+    repair/review split is the harness's, and both judge arms are review-only. The
+    driver records it and refuses a stated ``VANTA_ARM`` whose entry disagrees, so a
+    run cannot be configured as one judge and recorded as another."""
+
 
 ARMS: dict[str, Arm] = {
     arm.name: arm
@@ -110,6 +122,13 @@ ARMS: dict[str, Arm] = {
         Arm("b3", "vanta", (REPAIR, REVIEW), True, False, True, None),
         # The review half of today's `baseline`: attacker off, reviewing a candidate.
         Arm("suite", "baseline", (REVIEW,), False, False, True, None),
+        # M3 item 7 — the judge: ONE model call decides the candidate, no Attacker
+        # and no sandbox run. Review-only and one attempt, for the same reason B0
+        # pins one: "one call per verdict" IS the arm.
+        Arm("judge", "judge", (REVIEW,), False, False, True, 1, judge="plain"),
+        # M3 item 7 — `judge+suite`: the same one call, shown the native suite's
+        # result on the candidate (which tests failed, with the pass/fail summary).
+        Arm("judge+suite", "judge+suite", (REVIEW,), False, False, True, 1, judge="suite"),
     )
 }
 
@@ -121,6 +140,8 @@ _SPELLINGS: dict[str, dict[str, str]] = {
     "b3": {REPAIR: "b3", REVIEW: "b3"},
     "b0": {REPAIR: "b0"},
     "b2": {REPAIR: "b2", REVIEW: "b2"},
+    "judge": {REVIEW: "judge"},
+    "judge+suite": {REVIEW: "judge+suite"},
 }
 
 CONFIGS: tuple[str, ...] = tuple(_SPELLINGS)

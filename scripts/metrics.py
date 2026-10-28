@@ -60,6 +60,15 @@ infra_failure      The run ended because an LLM call failed for every attempt
                    approval, a rejection, nor an "unresolved" budget exhaustion —
                    it is a property of the harness, not of the model. Counted on
                    its own so it can never inflate or deflate any other bucket.
+judge_failed       The judge arm's model call was made and answered, but the
+                   answer could not be read as a verdict after the one retry
+                   (`final_decision=JudgeFailed`). [WHY] Its own bucket, never
+                   folded into `needs_review_unlabeled` (the run did not refuse —
+                   it failed to produce a readable answer) nor into
+                   `infra_failure` (the machine was fine and the call succeeded).
+                   The judge's verdicts that ARE readable are scored in the
+                   approval/rejection buckets, so this counts only the calls the
+                   arm could not turn into a verdict.
 
 Pooled, per config
 ------------------
@@ -68,6 +77,26 @@ metrics, computed inside each §4.4 provenance group and printed with that group
 axes beside them — never averaged across groups, because two runs whose config,
 seed, model, sampling schedule or build commit differ are two experiments. That
 section is additive: no bucket, and no existing line of output, changes.
+
+M3 item 7 — the judge arms, and what this module is NOT for
+-----------------------------------------------------------
+`judge` and `judge+suite` state a verdict instead of running tests, so this module
+scores them verdict-only: `JudgeApproved` joins the approval arm and `JudgeRejected`
+the rejection arm, and a judge rejection of a patch labelled known-bad is a
+`true_catch` — never `spurious_reject`, which claims every rejecting SIGNAL failed
+to discriminate, a statement about signals a judge row does not have. Because `arm`
+is one of the §4.4 axes, judge rows and Vanta rows always group apart and never
+share a pooled bucket table.
+
+[WHY] This module is the LEGACY pooled view, kept for the arms that produce signals.
+The comparison the item-7 study actually asks for — judge against the B3 arm it is
+run at the same model, effort, context budget and seed as — is a PAIRING, and the
+labels it pairs on come from ``runner.label_for`` at analysis time (M3 item 12),
+where a judge row and its B3 counterpart carry the same TA/FA/TR/FR label under the
+same candidate key. Read this module for the wave's own counts; read the pairing for
+the item-7 result. `judge_failed` is counted here — on its own line, and only for a
+batch that has one — but is deliberately not part of ``BUCKET_ORDER``, so no batch
+recorded before the judge existed prints a different table than it did before.
 """
 
 from __future__ import annotations
@@ -94,11 +123,22 @@ NEEDS_REVIEW_ON_GOOD = "needs_review_on_good"
 NEEDS_REVIEW_ON_BAD = "needs_review_on_bad"
 NEEDS_REVIEW_UNLABELED = "needs_review_unlabeled"
 INFRA_FAILURE = "infra_failure"
+JUDGE_FAILED = "judge_failed"
 
 # [WHY] `AllTestsPassed` alone. `MaxAttemptsReached` used to live here and was
 # bucketed as an approval; it is the opposite — the Creator exhausted the budget
 # without an approved patch (see the `unresolved` bucket).
-APPROVED_DECISIONS = {"AllTestsPassed"}
+# [WHY] M3 item 7 — `JudgeApproved` joins it. The judge states a verdict instead of
+# running tests, but it is the same verdict: an approval is scored against the
+# ground-truth label exactly as `AllTestsPassed` is. `JudgeFailed` is deliberately
+# NOT here (it approves nothing — see `JUDGE_FAILED`), and neither is
+# `JudgeRejected` (the set below).
+APPROVED_DECISIONS = {"AllTestsPassed", "JudgeApproved"}
+# [WHY] M3 item 7 — the rejection arm's two tokens. `JudgeRejected` is the same
+# verdict as `Rejected` for the ground-truth label, so it is bucketed by the same
+# arm rather than a parallel one; the arms differ only in whether a rejecting
+# SIGNAL exists to re-run (see `classify`).
+REJECTED_DECISIONS = {"Rejected", "JudgeRejected"}
 UNRESOLVED_DECISIONS = {"MaxAttemptsReached"}
 # [WHY] §14's refusal to decide. Kept in its own set, never merged into
 # APPROVED_DECISIONS, UNRESOLVED_DECISIONS or the `Rejected` arm: the run did not
@@ -111,6 +151,12 @@ NEEDS_REVIEW_DECISIONS = {"NeedsReview"}
 # into APPROVED_DECISIONS or UNRESOLVED_DECISIONS: the run produced no verdict
 # about the candidate at all.
 INFRA_FAILURE_DECISIONS = {"InfraFailure"}
+# [WHY] M3 item 7 — the judge's call succeeded but its answer could not be read as
+# a verdict after the one retry. Kept in its own set, never merged into
+# NEEDS_REVIEW_DECISIONS (the run did not refuse; it failed to answer) or
+# INFRA_FAILURE_DECISIONS (the harness was fine). The judge's readable verdicts
+# are `JudgeApproved`/`JudgeRejected`, which join the approval/rejection arms above.
+JUDGE_FAILED_DECISIONS = {"JudgeFailed"}
 
 # [WHY] The order every bucket is reported in, and the reason it is one tuple
 # rather than a literal in each renderer: a bucket that exists in `classify` but
@@ -133,6 +179,10 @@ BUCKET_ORDER = (
     APPROVED_UNLABELED,
     INFRA_FAILURE,
 )
+# [WHY] M3 item 7 — `judge_failed` is deliberately NOT in this tuple. It is a bucket
+# a verdict can land in, but a line for it in every report would change the output of
+# every batch already on disk, and those rows have no judge. It is counted on its own
+# line, and only for a batch that has one (see `render_table`).
 
 
 # ============================================================================
@@ -495,6 +545,11 @@ class Verdict:
             return "refused to decide; no ground-truth label, so nothing is claimed"
         if self.bucket == INFRA_FAILURE:
             return "LLM call failed after its retries (not a verdict about the candidate)"
+        if self.bucket == JUDGE_FAILED:
+            return (
+                "judge answered but the verdict was unreadable after the one retry "
+                "(not a verdict about the candidate)"
+            )
         return "approved, no ground-truth label"
 
 
@@ -514,13 +569,23 @@ def classify(
     deciding = [s for s in signals if s.get("discriminates") is True]
     undecidable = [s for s in signals if s.get("discriminates") is None]
 
-    if decision == "Rejected":
+    if decision in REJECTED_DECISIONS:
         if known_bad is False:
             # [WHY] The label decides, not the discrimination table. When the
             # candidate IS the known-good code (B v2 applies the fixed patch),
             # every signal fires on the good tree too, so no signal can ever
             # discriminate — the table would call a wrong rejection "spurious".
             bucket = FALSE_REJECT
+        elif decision == "JudgeRejected" and known_bad is True:
+            # [WHY] M3 item 7 — the judge produces no rejecting signals (no
+            # Attacker), so the signal-evidence test can never fire for it. Its
+            # verdict IS the decision, and the plan scores it as the test-driven
+            # arm's is scored: a rejection of a patch labelled known-bad is a
+            # catch. It is never `spurious_reject`, a word that claims the run
+            # rejected while every signal failed to discriminate — a statement
+            # about signals a judge row does not have. An unlabelled judge
+            # rejection still claims nothing and falls through to `undetermined`.
+            bucket = TRUE_CATCH
         elif deciding:
             bucket = TRUE_CATCH
         elif signals and not undecidable:
@@ -543,6 +608,14 @@ def classify(
         # about the model, so it must be neither approval, rejection, nor the
         # budget-exhausted `unresolved`. It goes in its own bucket.
         bucket = INFRA_FAILURE
+    elif decision in JUDGE_FAILED_DECISIONS:
+        # [WHY] M3 item 7 — the judge arm made its call and the answer could not be
+        # read as a verdict after the one retry. Checked BEFORE the labelled-approval
+        # and fallthrough arms for the same reason as `InfraFailure`: it is not a
+        # claim about the model (it never produced a readable verdict) and not a
+        # refusal (`NeedsReview`), so it must be neither an approval, a rejection,
+        # nor `needs_review_*`. It goes in its own bucket.
+        bucket = JUDGE_FAILED
     elif decision in NEEDS_REVIEW_DECISIONS:
         # [WHY] §14.6: the loop declined to decide because no rule corroborated a
         # rejection. Checked BEFORE the labelled-approval and fallthrough arms —
@@ -610,13 +683,20 @@ def render_table(verdicts: list[Verdict]) -> str:
     for bucket in BUCKET_ORDER:
         count = sum(1 for verdict in verdicts if verdict.bucket == bucket)
         lines.append(f"  {bucket:<{bucket_width}} {count}")
+    # [VANTA-WHY] M3 item 7 — `judge_failed` is not in BUCKET_ORDER (its line would
+    # change every batch's output), so it is counted on its own line, and only when
+    # the batch has one. A judge that answered unreadably is a fact about the run, so
+    # it must be visible; a batch with no judge must not grow a line for it.
+    judge_failed = sum(1 for v in verdicts if v.bucket == JUDGE_FAILED)
+    if judge_failed:
+        lines.append(f"  {JUDGE_FAILED:<{bucket_width}} {judge_failed}")
     lines.append("")
     scored = sum(
         1
         for v in verdicts
         if v.bucket in (TRUE_CATCH, SPURIOUS_REJECT, FALSE_REJECT)
     )
-    seen = sum(1 for v in verdicts if v.decision == "Rejected")
+    seen = sum(1 for v in verdicts if v.decision in REJECTED_DECISIONS)
     lines.append(f"  {'scored rejections':<18} {scored}")
     lines.append(f"  {'rejections seen':<18} {seen}")
     return "\n".join(lines)

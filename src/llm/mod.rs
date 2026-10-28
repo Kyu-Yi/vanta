@@ -673,6 +673,18 @@ pub const SAMPLING_SCHEDULE: &[(&str, f64, u32)] = &[
     ("attacker_revise", 0.3, 32768),
     ("attacker_simplify", 0.3, 32768),
     ("intent_audit", 0.0, 8192),
+    // [VANTA-WHY] M3 item 7 — the judge's one call. Its temperature matches the
+    // `attacker_generate` site, which is the arm the judge is compared with
+    // (plans/M3-plan.md item 7's fairness rule: "same model, reasoning effort,
+    // context selection and budget, and seed policy as the B3 arm"), so under
+    // both presets the judge samples exactly as that arm's Attacker does. The
+    // cap is the schedule's own 32,768: a verdict JSON is small, but the answer
+    // is reasoned about before it is written, so the cap must not be the thing
+    // that truncates the reasoning. The values are recorded only on judge rows —
+    // `driver::sampling_schedule_keys` emits this site's keys only when the
+    // run's arm is a judge arm — so every pre-existing `run.summary` is
+    // byte-identical.
+    ("judge", 0.2, 32768),
 ];
 
 /// The `coding` preset's sampler pins, for EVERY site including the auditor (§14.11).

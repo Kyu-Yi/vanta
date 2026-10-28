@@ -672,21 +672,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await?;
 
     // Exit codes: 0 = approved, 2 = infrastructure failure, 3 = needs review,
-    // 1 = any other negative verdict. [VANTA-WHY] An InfraFailure is not a
-    // verdict about the candidate at all — no Attacker test ever judged the
-    // patch — so it must be distinguishable from a plain rejection by whatever
-    // script drives this binary. It also gets its own exit code so a harness can
-    // retry the target without mistaking it for a clean "no".
+    // 4 = judge failure, 1 = any other negative verdict. [VANTA-WHY] An
+    // InfraFailure is not a verdict about the candidate at all — no Attacker
+    // test ever judged the patch — so it must be distinguishable from a plain
+    // rejection by whatever script drives this binary. It also gets its own exit
+    // code so a harness can retry the target without mistaking it for a clean
+    // "no".
     //
     // [VANTA-WHY] §14.3. `NeedsReview` gets code 3 for the same reason: it is
     // neither the approval (0) nor a rejection (1). A harness that treated it as
     // a rejection would count an uncorroborated failure as a false reject, which
     // is exactly the mislabel this change exists to remove — so it must be its
     // own outcome on the process boundary too, not folded into `_`.
+    //
+    // [VANTA-WHY] M3 item 7. The judge arms reuse the verdict conventions the
+    // harness already reads: `JudgeApproved` is the approval (0), exactly as the
+    // `AllTestsPassed` it is labelled onto, and `JudgeRejected` is the rejection
+    // (1), exactly as the `Rejected` it is labelled onto — so no caller's
+    // approve/reject reading changes just because the verdict came from the judge
+    // rather than from a test. `JudgeFailed` gets its OWN code (4): the model
+    // answered with something nobody can read as a verdict, which is neither an
+    // approval, a rejection, nor an infrastructure fault (the machine worked
+    // fine), so a harness must be able to tell it apart — the decision doc
+    // records that it must not be retried as infrastructure nor counted as a
+    // harness error.
     match decision {
         GovernorDecision::AllTestsPassed => Ok(()),
+        GovernorDecision::JudgeApproved => Ok(()),
         GovernorDecision::InfraFailure => std::process::exit(2),
         GovernorDecision::NeedsReview => std::process::exit(3),
+        GovernorDecision::JudgeFailed => std::process::exit(4),
         _ => std::process::exit(1),
     }
 }

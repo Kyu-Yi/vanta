@@ -157,6 +157,33 @@ class SelectedFile:
         )
 
 
+@dataclass
+class DroppedFile:
+    """One candidate the ranking chose and the budget could not fit — not even as a path.
+
+    §1.6.2 item 6, relaxed by M3 item 2: a selection that had to drop its *tail* is
+    allowed when the file the ranking put first went in full, so what a row has to
+    say is not only *how many* files were left out but *how much source* — ``bytes``
+    is the file's own size, the source the budget could not take. It is not a framed
+    length, because nothing was framed: the candidate was dropped before any form
+    fitted it.
+    """
+
+    path: str
+    bytes: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"path": self.path, "bytes": self.bytes}
+
+    @classmethod
+    def from_dict(cls, payload: object, *, where: str = "") -> "DroppedFile":
+        owner = cls.__name__
+        return cls(
+            path=str(field_of(payload, "path", owner=owner, where=where)),
+            bytes=int(field_of(payload, "bytes", owner=owner, where=where)),
+        )
+
+
 def rules_of(payload: object) -> dict[str, str]:
     """``payload["rules"]`` as ``{signal: rule}``, or ``{}`` when it is absent.
 
@@ -290,7 +317,11 @@ class Selection:
     selected_tokens: int = 0
     tree_bytes: int = 0
     tree_tokens: int = 0
-    dropped_for_budget: list[str] = field(default_factory=list)
+    #: §1.6.2 item 6 — the candidates the ranking chose and the budget could not
+    #: fit even as a path, each with the source bytes it would have cost. The gate
+    #: reads this list (M3 item 2) and the prepare row records it as
+    #: ``selection_dropped``.
+    dropped_for_budget: list[DroppedFile] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
     #: §1.6.7 — what the reading found in the issue text, per signal. Report only.
     #: ``None`` means the report did not record it (written before §1.6.7), which is
@@ -314,7 +345,7 @@ class Selection:
             "selected_tokens": self.selected_tokens,
             "tree_bytes": self.tree_bytes,
             "tree_tokens": self.tree_tokens,
-            "dropped_for_budget": list(self.dropped_for_budget),
+            "dropped_for_budget": [drop.to_dict() for drop in self.dropped_for_budget],
             "skipped": [{"path": path, "reason": reason} for path, reason in self.skipped],
             "signals": self.signals.to_dict() if self.signals else None,
             "issue_tokens": self.issue_tokens,
@@ -335,6 +366,15 @@ class Selection:
         if not isinstance(skipped, list):
             raise RecordError(
                 f"{owner} in {where}: field 'skipped' is {type(skipped).__name__}, not a list"
+            )
+        # Required and shape-checked rather than tolerated: the gate decides on this
+        # list (M3 item 2), so a selector that answered with bare paths is a reader
+        # that cannot judge, not a report to open leniently.
+        dropped = field_of(payload, "dropped_for_budget", owner=owner, where=where)
+        if not isinstance(dropped, list):
+            raise RecordError(
+                f"{owner} in {where}: field 'dropped_for_budget' is "
+                f"{type(dropped).__name__}, not a list"
             )
         return cls(
             role=str(field_of(payload, "role", owner=owner, where=where)),
@@ -357,9 +397,10 @@ class Selection:
             ),
             tree_bytes=int(field_of(payload, "tree_bytes", owner=owner, where=where)),
             tree_tokens=int(field_of(payload, "tree_tokens", owner=owner, where=where)),
-            dropped_for_budget=strings_of(
-                payload, "dropped_for_budget", owner=owner, where=where
-            ),
+            dropped_for_budget=[
+                DroppedFile.from_dict(item, where=f"{where} dropped_for_budget[]")
+                for item in dropped
+            ],
             skipped=[
                 (
                     str(field_of(item, "path", owner=owner, where=where)),
@@ -380,6 +421,19 @@ class Selection:
             ),
             fits=bool(field_of(payload, "fits", owner=owner, where=where)),
         )
+
+    def top_ranked_file(self) -> Optional[SelectedFile]:
+        """The file the ranking put first, or ``None`` when the selection carries none.
+
+        [VANTA-WHY] §1.6.9 makes ``files`` score order (``rank == index + 1``), so the
+        first entry *is* the top one — and the invariant the M3 item-2 gate rests on is
+        that a drop can never take that file while leaving a later one in: the fill
+        walks in score order and its remaining budget only ever falls, so the file it
+        prices first is the one with the most room to fit. ``None`` therefore means
+        exactly one thing — the top-ranked candidate was itself dropped — and the gate
+        reads it as the case it must still refuse.
+        """
+        return self.files[0] if self.files else None
 
 
 def select_context(
@@ -581,18 +635,33 @@ def precheck(
             f"{CHAT_OVERHEAD_TOKENS} overhead − {margin} margin)"
         )
     if selection.dropped_for_budget:
-        # Not the old whole-repo truncation: this is the selection itself failing
-        # to fit, which means even an outline of a file the ranking chose was left
-        # out. The bug's own file is exactly what a ranking puts first, so this is
-        # the case where a run would be shown a different prompt from the one the
-        # ranking decided on.
-        reasons.append(
-            "selection_dropped_for_budget: "
-            f"{len(selection.dropped_for_budget)} selected file(s) did not fit the "
-            f"{budget} tok budget even as an outline (e.g. "
-            f"{', '.join(selection.dropped_for_budget[:3])}); the run would be shown "
-            "a smaller context than its ranking chose"
-        )
+        # M3 item 2 relaxes the old blanket refusal. A selection that had to drop
+        # candidates is now sanctioned, provided the file the localiser ranked first
+        # went in full: the drops are the ranking's *tail*, recorded on the row as
+        # `selection_dropped`, and a run shown that prompt is shown the context the
+        # ranking decided on plus what it could not afford.
+        #
+        # [VANTA-WHY] What is still refused is the one case the relaxation does not
+        # cover: the top-ranked file itself did not fit. `files[0]` is the test, and
+        # it is sound because of the fill's own order (§1.6.9): it walks in score
+        # order with a budget that only falls, so a file is shown `full` only if
+        # nothing before it was dropped — a first file that is `full` therefore
+        # *proves* the drop took the tail, while a first file that is absent or only
+        # an outline is the ranking's own first file failing to fit.
+        top = selection.top_ranked_file()
+        if top is None or top.shown != "full":
+            which = (
+                "the file the localiser ranked first was dropped entirely"
+                if top is None
+                else f"the file the localiser ranked first (`{top.path}`) is only an "
+                f"{top.shown}"
+            )
+            reasons.append(
+                f"selection_dropped_for_budget: {which}, so it was not included in "
+                f"full — {len(selection.dropped_for_budget)} selected file(s) did not "
+                f"fit the {budget} tok budget; the run would be shown a smaller "
+                "context than its ranking chose"
+            )
     if not selection.grounded:
         # [VANTA-WHY] The verdict is the SELECTOR's own answer (§1.6.10):
         # `grounded` is the selector's reason vocabulary asking whether any

@@ -1381,7 +1381,7 @@ def _context_record(prep: BugPrep) -> dict[str, Any]:
             "tree_count": None,
             "selected_files": [],
             "issue_signals": None,
-            "dropped_for_budget": [],
+            "selection_dropped": [],
             "pruned_count": None,
             # Never empty for the same reason the table never prints the verdict
             # alone: a `not_measured` row whose `reasons` is `[]` is the hole a
@@ -1421,7 +1421,7 @@ def _context_record(prep: BugPrep) -> dict[str, Any]:
         "n_ctx_source": verdict.n_ctx_source,
         # The selection itself, straight from the run's own selector: how many bytes
         # and files went in, how big the tree listing was, which candidates the
-        # ranking chose but the budget could not fit (`dropped_for_budget`) and how
+        # ranking chose but the budget could not fit (`selection_dropped`) and how
         # many paths the walk pruned. `files_eligible`/`files_skipped_*` are gone
         # with the capped walk they described (§1.6.2).
         "mode": selection.mode,
@@ -1441,7 +1441,12 @@ def _context_record(prep: BugPrep) -> dict[str, Any]:
         # report written before the selector recorded the extraction: "found
         # nothing" and "not recorded" are different findings.
         "issue_signals": selection.signals.to_dict() if selection.signals else None,
-        "dropped_for_budget": list(selection.dropped_for_budget),
+        # M3 item 2 — the candidates the ranking chose and the budget could not fit
+        # even as a path: `path` plus the source `bytes` it would have cost, so a row
+        # says how much *source* was left out and not only how many files. The gate
+        # sanctions these drops when the file the ranking put first went in full, so
+        # this record is what makes that verdict auditable from the report alone.
+        "selection_dropped": [drop.to_dict() for drop in selection.dropped_for_budget],
         "pruned_count": len(selection.skipped),
         "reasons": verdict.reasons,
     }
@@ -1582,7 +1587,7 @@ def render_signals(preps: list[BugPrep]) -> str:
             lines += [
                 "",
                 f"{len(selection.dropped_for_budget)} selected file(s) the budget could "
-                "not take — see `dropped_for_budget` in `context_report.json`.",
+                "not take — see `selection_dropped` in `context_report.json`.",
             ]
         lines += ["", "---", ""]
     return "\n".join(lines)

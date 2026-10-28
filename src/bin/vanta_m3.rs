@@ -331,7 +331,7 @@ struct SelectContextReport<'a> {
     tree_count: usize,
     tree_bytes: usize,
     tree_tokens: u32,
-    dropped_for_budget: &'a [String],
+    dropped_for_budget: &'a [vanta::context::DroppedFile],
     skipped: &'a [vanta::context::SkipRecord],
     /// What the reading found, per signal (§1.6.7) — not what it reached.
     signals: IssueSignals,

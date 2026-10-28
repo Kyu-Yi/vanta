@@ -2014,7 +2014,24 @@ class TestContextReport:
         assert bug["prompt_tokens_real"] != bug["estimated_prompt_tokens"]
 
     def test_a_reject_carries_its_reasons(self, tmp_path):
-        verdict = self._verdict(dropped_for_budget=["pkg/core.py"])
+        # M3 item 2: a drop is refused only when the file the ranking put first
+        # itself did not fit. Here the top file is only an outline, so the run
+        # would be shown less of it than the ranking decided.
+        verdict = self._verdict(
+            files=[
+                ctx.SelectedFile(
+                    path="pkg/core.py",
+                    score=42,
+                    reasons=["path"],
+                    rules={"path": "exact"},
+                    bytes=700,
+                    tokens=175,
+                    shown="outline",
+                    rank=1,
+                )
+            ],
+            dropped_for_budget=[ctx.DroppedFile(path="pkg/huge.py", bytes=9_000)],
+        )
         assert verdict.context_ok is False
         report = json.loads(
             prepare_mod.write_context_report(
@@ -2024,8 +2041,25 @@ class TestContextReport:
         bug = report["bugs"][0]
         assert bug["verdict"] == "reject"
         assert bug["reasons"] == verdict.reasons
-        assert "dropped_for_budget" in bug["reasons"][0]
-        assert bug["dropped_for_budget"] == ["pkg/core.py"]
+        assert bug["reasons"][0].startswith("selection_dropped_for_budget")
+        assert bug["selection_dropped"] == [{"path": "pkg/huge.py", "bytes": 9_000}]
+
+    def test_the_row_records_what_was_dropped(self, tmp_path):
+        """M3 item 2: the relaxed gate sanctions a drop, so the row has to say what
+        was dropped — each path with the source bytes it would have cost — or the
+        sanction would not be auditable from the report alone."""
+        verdict = self._verdict(
+            dropped_for_budget=[ctx.DroppedFile(path="pkg/huge.py", bytes=9_000)]
+        )
+        assert verdict.context_ok is True, verdict.reasons
+        report = json.loads(
+            prepare_mod.write_context_report(
+                tmp_path, [prep(context=verdict)]
+            ).read_text(encoding="utf-8")
+        )
+        bug = report["bugs"][0]
+        assert bug["verdict"] == "ok"
+        assert bug["selection_dropped"] == [{"path": "pkg/huge.py", "bytes": 9_000}]
 
     def test_the_report_names_every_selected_file_and_why(self, tmp_path):
         """Item 4: a count is not auditable. Each selected file carries its score,
@@ -2268,7 +2302,7 @@ class TestSelectContext:
         "selected_tokens": 175,
         "tree_bytes": 40,
         "tree_tokens": 10,
-        "dropped_for_budget": ["pkg/huge.py"],
+        "dropped_for_budget": [{"path": "pkg/huge.py", "bytes": 4_096}],
         "skipped": [{"path": "vendor/x.py", "reason": "vendored"}],
         "signals": {
             "paths": ["pkg/core.py"],
@@ -2303,7 +2337,7 @@ class TestSelectContext:
         assert got.files[0].rules == {"path": "exact", "traceback": "basename"}
         assert got.files[0].rank == 1
         assert got.skipped == [("vendor/x.py", "vendored")]
-        assert got.dropped_for_budget == ["pkg/huge.py"]
+        assert got.dropped_for_budget == [ctx.DroppedFile(path="pkg/huge.py", bytes=4_096)]
         assert got.signals is not None
         assert got.signals.paths == ["pkg/core.py"]
         assert got.signals.traceback_files == ["pkg/other.py"]
@@ -2456,19 +2490,70 @@ class TestPrecheck:
         assert verdict.reasons == []
         assert verdict.budget_tokens == ctx.budget_tokens(65536)[0]
 
-    def test_rejects_a_selection_that_dropped_a_ranked_file(self):
-        """Not the old whole-repo truncation: this is the ranking's own top file
-        failing to fit even as an outline, so the run would be shown less than the
-        ranking chose."""
+    def test_accepts_a_selection_that_dropped_its_tail(self):
+        """M3 item 2: a selection that had to drop candidates for budget is
+        allowed, provided the file the localiser ranked first is included in full.
+
+        The drops are the ranking's tail — the budget ran out below the top — and
+        they are recorded on the row (`selection_dropped`), not refused. The
+        fixture's first file is `pkg/core.py`, shown `full`.
+        """
         verdict = ctx.precheck(
             Path("/nonexistent"), "", n_ctx=200_000, n_ctx_source="test",
-            selection=selection(dropped_for_budget=["pkg/core.py"]),
+            selection=selection(
+                dropped_for_budget=[
+                    ctx.DroppedFile(path="pkg/tail_a.py", bytes=40_000),
+                    ctx.DroppedFile(path="pkg/tail_b.py", bytes=12_000),
+                ],
+            ),
+        )
+        assert verdict.context_ok is True, verdict.reasons
+        assert verdict.reasons == []
+
+    def test_rejects_a_selection_whose_top_ranked_file_could_not_fit(self):
+        """M3 item 2: the one case the relaxation does not cover. The ranking's own
+        first file fitted only as an outline (or not at all), so the run would be
+        shown less of the file the ranking put first than the ranking decided."""
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=200_000, n_ctx_source="test",
+            selection=selection(
+                files=[
+                    ctx.SelectedFile(
+                        path="pkg/huge.py",
+                        score=99,
+                        reasons=["path"],
+                        rules={"path": "exact"},
+                        bytes=900,
+                        tokens=225,
+                        shown="outline",
+                        rank=1,
+                    )
+                ],
+                dropped_for_budget=[ctx.DroppedFile(path="pkg/core.py", bytes=700)],
+            ),
         )
         assert verdict.context_ok is False
         assert len(verdict.reasons) == 1
         assert verdict.reasons[0].startswith("selection_dropped_for_budget")
-        assert "pkg/core.py" in verdict.reasons[0]
+        assert "pkg/huge.py" in verdict.reasons[0]
         assert "smaller context than its ranking chose" in verdict.reasons[0]
+
+    def test_rejects_a_selection_whose_top_ranked_file_was_dropped_entirely(self):
+        """The other shape of the same failure: the ranking's first file did not
+        fit even as a path, so `files` carries none of it."""
+        verdict = ctx.precheck(
+            Path("/nonexistent"), "", n_ctx=200_000, n_ctx_source="test",
+            selection=selection(
+                files=[],
+                dropped_for_budget=[ctx.DroppedFile(path="pkg/core.py", bytes=700)],
+            ),
+        )
+        assert verdict.context_ok is False
+        kinds = {reason.split(":", 1)[0] for reason in verdict.reasons}
+        # `files=[]` also trips the grounding check — a selection with no file is a
+        # listing — and both findings are true of this row, so both are named.
+        assert "selection_dropped_for_budget" in kinds
+        assert any("dropped entirely" in reason for reason in verdict.reasons)
 
     def test_rejects_a_selection_that_is_only_the_file_tree(self):
         """A selection with no file is a listing, not a context — and the budget

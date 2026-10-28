@@ -619,6 +619,24 @@ impl SelectedFile {
     }
 }
 
+/// One candidate the ranking chose and the budget could not fit — not even as a
+/// bare path (§1.6.2 item 6, M3 item 2).
+///
+/// [VANTA-WHY] The size travels with the path because "how many files were
+/// dropped" is not the question a row has to answer. A selection that had to drop
+/// its *tail* is sanctioned, provided the file the ranking put first went in full
+/// (M3 item 2); what a reader then needs to know is how much *source* the budget
+/// left out, and this is the only place that knows it: the candidate was read to
+/// be ranked, and the harness never walks the tree (§1.6.2 item 5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DroppedFile {
+    pub path: String,
+    /// The file's own source bytes — what its body would have cost had it fitted.
+    /// It is the source's size and not a framed length, because nothing was framed:
+    /// the file was dropped before any form fitted it.
+    pub bytes: usize,
+}
+
 /// A complete context selection for one role.
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextSelection {
@@ -632,8 +650,9 @@ pub struct ContextSelection {
     pub tree_bytes: usize,
     pub tree_tokens: u32,
     pub files: Vec<SelectedFile>,
-    /// Candidates dropped because even their outline did not fit the budget.
-    pub dropped_for_budget: Vec<String>,
+    /// Candidates the ranking chose and the budget could not fit even as a path,
+    /// each with the source size it would have cost (M3 item 2).
+    pub dropped_for_budget: Vec<DroppedFile>,
     pub skipped: Vec<SkipRecord>,
 }
 
@@ -1958,7 +1977,7 @@ fn fill(
         .saturating_sub(tree_tokens)
         .saturating_sub(reserved_tokens);
     let mut files: Vec<SelectedFile> = Vec::new();
-    let mut dropped_for_budget: Vec<String> = Vec::new();
+    let mut dropped_for_budget: Vec<DroppedFile> = Vec::new();
     let mut total_bytes: usize = 0;
     let mut total_tokens: u32 = 0;
 
@@ -2059,8 +2078,13 @@ fn fill(
             // a budget already spent to the last few tokens to reach this — the tree
             // listing plus every richer form above it — and everything named here
             // travels to the model as a path in that listing regardless, so a drop
-            // costs the file's *source*, never its existence (§1.6.2 item 4).
-            dropped_for_budget.push(path);
+            // costs the file's *source*, never its existence (§1.6.2 item 4). The
+            // source's own size travels with the path so a row can say how much was
+            // left out, not only how many files (M3 item 2).
+            dropped_for_budget.push(DroppedFile {
+                path,
+                bytes: candidate.contents.len(),
+            });
             continue;
         }
 
@@ -3612,7 +3636,14 @@ mod tests {
             "the listing left no room for a body, got {:?}",
             paths(&short)
         );
-        assert_eq!(short.dropped_for_budget, vec!["pkg/target.py"]);
+        assert_eq!(
+            short.dropped_for_budget,
+            vec![DroppedFile {
+                path: "pkg/target.py".to_string(),
+                bytes: target.len(),
+            }],
+            "the dropped file is named with the source bytes the budget left out"
+        );
         assert!(
             prompt_tokens_estimate(&short, estimate_tokens(issue.len())) <= short.budget_tokens,
             "the whole prompt never exceeds the budget, however large the listing"
@@ -3686,8 +3717,64 @@ mod tests {
         );
         assert_eq!(
             selection.dropped_for_budget,
-            vec!["pkg/core.py"],
+            vec![DroppedFile {
+                path: "pkg/core.py".to_string(),
+                bytes: "def frobnicate(value):\n    return value\n".len(),
+            }],
             "the dropped file is named, so the gate can refuse the bug for the right reason"
+        );
+    }
+
+    /// [VANTA-WHY] M3 item 2 — a selection that spends its budget on the file the
+    /// issue names and drops the *tail* records both halves: the top-ranked file
+    /// went in full, and the candidate the budget could not take is named with the
+    /// source bytes it would have cost. That pair is what lets the gate sanction a
+    /// drop — the bug's own file is in the prompt — without the row hiding how much
+    /// source was left out.
+    ///
+    /// It also pins the invariant the gate's rule rests on: a drop cannot take the
+    /// ranking's *first* file while leaving a later one in, because the fill walks
+    /// in score order and its remaining budget only ever falls. When any file is
+    /// included, `files[0]` is therefore the one the ranking put first.
+    #[test]
+    fn a_drop_takes_the_tail_and_names_it_with_its_bytes() {
+        let a = "def a():\n    return 1\n";
+        // Many definitions, so the outline is large and a path is the only form the
+        // budget could have afforded it — which is what makes the drop a drop.
+        let b: String = (0..40)
+            .map(|n| format!("def beta_{n}():\n    \"\"\"Doc.\"\"\"\n    return 2\n"))
+            .collect();
+        let candidates = vec![candidate("pkg/a.py", a), candidate("pkg/b.py", &b)];
+        // Both are named by path, so both rank; the tie is broken by path, so `a` is
+        // first — the file the ranking put first.
+        let issue = "pkg/a.py and pkg/b.py both matter.\n";
+
+        let tree = "# REPOSITORY FILES (paths only)\n".len()
+            + "pkg/a.py\n".len()
+            + "pkg/b.py\n".len();
+        // Room for the whole prompt up to `a` in full and `b`'s path, one token
+        // short of that path: `b` is the tail the budget cannot take at all.
+        let budget = reserved_prompt_tokens(estimate_tokens(issue.len()))
+            + estimate_tokens(tree)
+            + estimate_tokens(framed_len("pkg/a.py", a))
+            + estimate_tokens(framed_len("pkg/b.py", &path_only_body()))
+            - 1;
+
+        let selection = select_repair_context(&candidates, issue, "creator", budget);
+
+        assert_eq!(paths(&selection), vec!["pkg/a.py"]);
+        assert_eq!(
+            selection.files[0].shown,
+            ShownMode::Full,
+            "the file the ranking put first goes in whole"
+        );
+        assert_eq!(
+            selection.dropped_for_budget,
+            vec![DroppedFile {
+                path: "pkg/b.py".to_string(),
+                bytes: b.len(),
+            }],
+            "the drop takes the tail and is named with the source bytes it cost"
         );
     }
 

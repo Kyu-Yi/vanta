@@ -898,11 +898,19 @@ def derive_hidden(
     prep.f2p_undeclared = undeclared
     prep.f2p_undeclared_reason = UNDECLARED_F2P_REASON if undeclared else ""
 
-    if not prep.fail_to_pass:
+    # [VANTA-WHY] The oracle is :attr:`BugPrep.hidden_nodeids` — the declared
+    # ``FAIL_TO_PASS`` *plus* the recorded collect-flips (item 3) — so "no oracle to
+    # grade against" means *neither*, not merely an empty ``FAIL_TO_PASS``. Keying on
+    # ``fail_to_pass`` alone refused fastapi/1, whose BugsInPy ``FAIL_TO_PASS`` is empty
+    # yet whose collect-flip nodeids (``tests/test_skip_defaults.py``, a file that errors
+    # at import on the buggy source and collects cleanly on the fixed one) *are* a real
+    # oracle: the same set ``grade``/``selfcheck_dev_fix`` grade. Firing the gate there
+    # reported "no oracle" about a bug that had one.
+    if not prep.hidden_nodeids:
         prep.gate_failures.append(
             "empty FAIL_TO_PASS: no test BugsInPy declares for this bug flips between the "
-            "buggy source and the fixed commit's tests, so there is no oracle to grade "
-            "against"
+            "buggy source and the fixed commit's tests, and no collect-flip oracle was "
+            "recorded, so there is no oracle to grade against"
         )
 
     fixed_only = sorted(f_after - f_buggy_pre)

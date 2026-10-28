@@ -1481,6 +1481,38 @@ class TestDeclaredFailToPass:
         assert bug_prep.f2p_undeclared == sorted(flipping)
         assert any("empty FAIL_TO_PASS" in f for f in bug_prep.gate_failures)
 
+    def test_a_collect_flip_oracle_is_not_overruled_by_an_empty_fail_to_pass(
+        self, tmp_path, monkeypatch
+    ):
+        """fastapi/1's shape: no declared ``FAIL_TO_PASS``, but item 3's collect-flip
+        nodeids *are* the oracle, so "there is no oracle to grade against" is false.
+
+        The gate used to key on ``fail_to_pass`` alone, so it refused the very bug the
+        collect-flip rule was added to help: the oracle it claimed was missing is exactly
+        what ``grade``/``selfcheck_dev_fix`` grade (``BugPrep.hidden_nodeids``).
+        """
+        bug = bug_info(test_file="tests/test_pysnooper.py")
+        flipping = {"tests/test_extras/test_new.py::test_new": "failed"}
+        green = {nodeid: "passed" for nodeid in flipping}
+        self._patched_suites(
+            monkeypatch,
+            {
+                "src_buggy": self._pair(flipping),
+                "oracle_tree": self._pair(flipping),
+                "src_fixed": self._pair(green),
+            },
+        )
+        bug_prep = prep(bug=bug, root=tmp_path / "batch" / "worktrees" / "Demo_1")
+        bug_prep.collect_flip_nodeids = ["tests/test_skip_defaults.py::test_return_defaults"]
+
+        prepare_mod.derive_hidden(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", collected=set()
+        )
+
+        assert bug_prep.fail_to_pass == []
+        assert bug_prep.hidden_nodeids == ["tests/test_skip_defaults.py::test_return_defaults"]
+        assert not any("empty FAIL_TO_PASS" in f for f in bug_prep.gate_failures)
+
     # ---- a skip is never the pass half of the flip (§3.2) -----------------
     def test_a_graded_test_that_skips_on_the_fixed_commit_fails_the_gate(
         self, tmp_path, monkeypatch
@@ -17707,6 +17739,54 @@ class TestSandboxEnvReachesEveryRun:
 
         assert seen["collect"]["extra_env"] is None
         assert seen["probe"]["extra_env"] is None
+
+    @staticmethod
+    def _grade_runs(tmp_path, monkeypatch, prep_over=None):
+        """``oracle.grade`` with the VM replaced, returning the two run kwargs."""
+        runs: list = []
+        monkeypatch.setattr(
+            tree_mod, "copy_tree", lambda src, dest: dest.mkdir(parents=True, exist_ok=True)
+        )
+        monkeypatch.setattr(suite_mod, "git_apply_patch", lambda **kwargs: (True, "applied"))
+        monkeypatch.setattr(
+            suite_mod,
+            "run_suite_twice",
+            lambda **kwargs: runs.append(kwargs)
+            or suite_pair({"tests/test_demo.py::test_fix": "passed"}),
+        )
+        oracle_mod.grade(
+            prep=oracle_prep(**(prep_over or {})),
+            batch_dir=tmp_path / "batch",
+            checkpoint="chk",
+            patch_path=write(tmp_path / "final.patch", "diff --git a/x b/x\n"),
+            label="sess1",
+            disk_mb=1024,
+        )
+        return runs
+
+    def test_the_oracle_grading_runs_thread_the_recorded_env(self, tmp_path, monkeypatch):
+        """The two ``oracle.grade`` runs, not only ``derive_hidden``'s oracle run.
+
+        [VANTA-WHY] Measured on fastapi/2: ``derive_hidden``'s oracle run passed this env
+        and measured 775/776 passed, but the grading runs did not, so the identical tree
+        aborted with 44 ``ModuleNotFoundError``s from ``docs_src`` — pytest exited 2 with 0
+        tests collected and the hidden nodeid read ``absent``, grading a good developer fix
+        ``bad``. Omitting it in one place and not the other was the whole difference between
+        measuring and grading the same bytes.
+        """
+        runs = self._grade_runs(
+            tmp_path, monkeypatch, {"sandbox_env": {"PYTHONPATH": "./docs_src"}}
+        )
+        assert len(runs) == 2
+        assert all(run["extra_env"] == {"PYTHONPATH": "./docs_src"} for run in runs)
+
+    def test_the_oracle_grading_runs_pass_none_without_a_recorded_env(
+        self, tmp_path, monkeypatch
+    ):
+        """The unchanged case: no recorded rule, no injected environment."""
+        runs = self._grade_runs(tmp_path, monkeypatch)
+        assert len(runs) == 2
+        assert all(run["extra_env"] is None for run in runs)
 
     def test_collect_only_merges_the_extra_env_over_its_own(self, monkeypatch):
         seen: dict = {}

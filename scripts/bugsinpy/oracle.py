@@ -229,6 +229,16 @@ def grade(
         result.oracle_secs = time.monotonic() - started
         return result
 
+    # [VANTA-WHY] ``extra_env`` is threaded here for the same reason every other
+    # suite call in ``prepare`` threads it: the recorded per-project ``sandbox_env``
+    # rule (fastapi's ``PYTHONPATH=./docs_src``) has to reach *every* run of the row,
+    # the grading runs included, or the row is graded in an environment that cannot
+    # even import its own test files. ``derive_hidden``'s oracle run passes it and
+    # measured fastapi/2 as 775/776 passed; dropping it here made the same tree abort
+    # with 44 ``ModuleNotFoundError``s and 0 tests collected, so every hidden nodeid
+    # read ``absent`` and a good developer fix graded ``bad``. Omitting it was the
+    # only asymmetry between "measuring" and "grading" the identical tree.
+    sandbox_env = prep.sandbox_env or None
     hidden_pair = suite_mod.run_suite_twice(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
@@ -237,6 +247,7 @@ def grade(
         report_rel_stem=f"reports/{prep.slug}-{_safe(label)}-hidden",
         disk_mb=disk_mb,
         timeout_secs=timeout_secs,
+        extra_env=sandbox_env,
     )
     patched_pair = suite_mod.run_suite_twice(
         checkpoint=checkpoint,
@@ -246,6 +257,7 @@ def grade(
         report_rel_stem=f"reports/{prep.slug}-{_safe(label)}-patched",
         disk_mb=disk_mb,
         timeout_secs=timeout_secs,
+        extra_env=sandbox_env,
     )
 
     if not (hidden_pair.first.report_found or hidden_pair.second.report_found):

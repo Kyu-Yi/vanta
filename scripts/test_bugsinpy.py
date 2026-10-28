@@ -37,6 +37,7 @@ import zipfile
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -51,9 +52,11 @@ from bugsinpy import compact as compact_mod  # noqa: E402
 from bugsinpy import context as ctx  # noqa: E402
 from bugsinpy import issue as issue_mod  # noqa: E402
 from bugsinpy import issue_source as source_mod  # noqa: E402
+from bugsinpy import locked as locked_mod  # noqa: E402
 from bugsinpy import manifest as manifest_mod  # noqa: E402
 from bugsinpy import mutants as mutants_mod  # noqa: E402
 from bugsinpy import oracle as oracle_mod  # noqa: E402
+from bugsinpy import pool as pool_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
 from bugsinpy import records as records_mod  # noqa: E402
 from bugsinpy import redact as redact_mod  # noqa: E402
@@ -22764,6 +22767,64 @@ class TestMutantPoolArtifact:
             mutants_mod.parse_pool(stripped, path=Path("x"))
 
 
+class TestTheLockIsOneImplementation:
+    """The shared lock renders both artifacts to their pre-refactor bytes (item 6, Q3).
+
+    [VANTA-WHY] ``locked.py`` replaces two copies of the same
+    header + marker + body + sha256 form with one. The risk a refactor of a *format*
+    runs is silent: a byte-level change would leave the harness working while every
+    artifact frozen before it stopped verifying, and nothing in a normal run reads an
+    old file. So the two hashes were taken **before** the refactor, on the item-5 tree
+    (``62a03f6``), and are pinned here — a change to the rendering fails a test rather
+    than surfacing one stage later against a committed file no reader will accept.
+    """
+
+    # Captured with ``render_frozen``/``render_pool`` on 62a03f6, before locked.py.
+    FROZEN_SHA256 = "37341bd4975941b2b04417ee55e79d26f87678c84efc4100aa6aea5e609fccae"
+    FROZEN_BYTES = 1369
+    POOL_SHA256 = "469f291a92671b590c2c940452ff1e772a14d5cc3ec0e362cba126c99edd040f"
+    POOL_BYTES = 1194
+
+    def test_the_frozen_report_renders_to_its_pre_refactor_bytes(self, tmp_path):
+        report = TestFrozenIssueReport()._report()
+        text = source_mod.render_frozen(report)
+        assert len(text.encode("utf-8")) == self.FROZEN_BYTES
+        assert split_mod.sha256_text(text) == self.FROZEN_SHA256
+        # Written through the wrapper, the file holds exactly those bytes…
+        path = source_mod.write_frozen(tmp_path / "PySnooper_3.md", report)
+        assert path.read_bytes() == text.encode("utf-8")
+        # …and still verifies: a file frozen before the refactor is read by it.
+        assert source_mod.load_frozen(path).content_sha256 == split_mod.sha256_text(
+            report.content()
+        )
+        assert source_mod.parse_frozen(text, path=path).content == report.content()
+
+    def test_the_mutants_pool_renders_to_its_pre_refactor_bytes(self, tmp_path):
+        artifact = TestMutantPoolArtifact()
+        text = artifact._render()
+        assert len(text.encode("utf-8")) == self.POOL_BYTES
+        assert split_mod.sha256_text(text) == self.POOL_SHA256
+        path = mutants_mod.write_pool(
+            mutants_mod.pool_path(tmp_path / "batch", oracle_prep()),
+            prep=oracle_prep(),
+            source_sha256="c" * 64,
+            tally=artifact._tally(),
+            entries=artifact._entries(),
+        )
+        assert path.read_bytes() == text.encode("utf-8")
+        assert mutants_mod.load_pool(path).entries == artifact._entries()
+
+    def test_the_wrappers_delegate_to_the_one_rule(self):
+        """One implementation, not three that happen to agree today."""
+        for value in ("", "  \n", "a\r\nb\r\n", "\n\nx\n\n", "no trailing newline"):
+            assert source_mod._canonical(value) == locked_mod.canonical(value)
+            assert mutants_mod._canonical_body(value) == locked_mod.canonical(value)
+            assert source_mod._report_text(value) == locked_mod.fold(value)
+        block = "# t\n\n- a: 1\n- b: 2\n\nbody\n"
+        assert source_mod._header_block(block) == locked_mod.header_block(block)
+        assert mutants_mod._header_block(block) == locked_mod.header_block(block)
+
+
 class TestRunMutants:
     """The whole of item 5 for one bug, with the VM replaced by injected functions."""
 
@@ -22823,4 +22884,1001 @@ class TestPoolCommand:
         assert args.disk_mb == prepare_mod.DISK_MB
         assert args.plan is False
         assert args.func is run_mod.cmd_pool
+
+    def test_the_build_form_parses_tags_out_and_rebuild(self):
+        """``--build`` is item 6's write: tagged batches, a required ``--out``, ``--rebuild``."""
+        args = run_mod.build_parser().parse_args(
+            [
+                "pool",
+                "--build",
+                "--out",
+                "o",
+                "--batch",
+                "repair=b1",
+                "--batch",
+                "weak=b2",
+                "--rebuild",
+            ]
+        )
+        assert args.build is True and args.mutants is False
+        assert args.batch == ["repair=b1", "weak=b2"]
+        assert args.out == Path("o")
+        assert args.rebuild is True
+        assert args.func is run_mod.cmd_pool
+
+
+# ============================================================================
+# pool.py — the assembled review pool (item 6, no VM)
+# ============================================================================
+# A review row is scored against a pool of "known-bad" patches, so this file is
+# the *source* side of §5.4: the Creator's own failed attempts, harvested from
+# every finished repair batch. Five rules here fail silently and each one puts a
+# number on disk where a reader expects a fact: reading only the final attempt
+# (the interesting wrong answers are the early ones); treating a compacted
+# attempt as gone (most sessions are compacted); normalising in a way that no
+# longer applies (every candidate graded against a tree the oracle never built);
+# an order that depends on the filesystem (the pool is unreproducible run to
+# run); and an untagged batch (a source nobody can name). Every test below pins
+# one of them.
+def _attempt_row(**over) -> dict:
+    """A manifest row for one repair job, as ``harvest_batch`` reads it."""
+    row = {
+        "mode": "repair",
+        "bug": "Demo/1",
+        "session_id": "sid",
+        "attempts_run": 1,
+        "arm": "b0",
+        "artifacts": {},
+    }
+    row.update(over)
+    return row
+
+
+def _pool_prep(tmp_path: Path, **over) -> prepare_mod.BugPrep:
+    """A prep whose trees are real: ``vanta_tree`` for the no-op floor, roots for harvest."""
+    root = tmp_path / "worktrees" / "Demo_1"
+    write(root / "vanta_tree" / "pkg" / "mod.py", "one = 1\nsecond = 2\n")
+    return oracle_prep(root=root, **over)
+
+
+def _harvested(text: str, *, attempt: int, tag: str = "repair", model: str = "b0",
+               run: str = "sid") -> pool_mod.HarvestedAttempt:
+    return pool_mod.HarvestedAttempt(
+        slug="Demo_1",
+        attempt=attempt,
+        patch_text=text,
+        origin=pool_mod.SNAPSHOT,
+        tag=tag,
+        source_model=model,
+        source_run_id=run,
+    )
+
+
+def _cand(digest: str, *, tag: str = "repair", priority: int = 1, model: str = "m",
+          run: str = "sid", attempt: int = 1) -> pool_mod.PatchCandidate:
+    """A candidate distinguished by its normalised hash (what the order keys on)."""
+    text = _one_line_diff("a", digest[:8])
+    return pool_mod.PatchCandidate(
+        text=text,
+        normalized=pool_mod.normalize(text),
+        normalized_sha256=digest,
+        tag=tag,
+        priority=priority,
+        source_model=model,
+        source_run_id=run,
+        attempt=attempt,
+    )
+
+
+def _pool_bad(candidate) -> oracle_mod.OracleResult:
+    return oracle_mod.OracleResult(apply_ok=True, hidden_pass=False, patch_good=False)
+
+
+def _pool_good(candidate) -> oracle_mod.OracleResult:
+    return oracle_mod.OracleResult(apply_ok=True, hidden_pass=True, patch_good=True)
+
+
+def _frozen_mutants(batch_dir: Path, prep: prepare_mod.BugPrep, entries=None) -> Path:
+    """A real, frozen item-5 pool for a bug — the referent item 6 names by hash."""
+    entries = entries or [
+        mutants_mod.PoolEntry(
+            kind="mutant",
+            operator="hunk_drop",
+            patch_sha256="a" * 64,
+            source="mutant:hunk_drop",
+            patch_path=str(batch_dir / "candidates" / prep.slug / "mutant-aaaaaaaaaaaa.patch"),
+            oracle="bad",
+        )
+    ]
+    return mutants_mod.write_pool(
+        mutants_mod.pool_path(batch_dir, prep),
+        prep=prep,
+        source_sha256="c" * 64,
+        tally=mutants_mod.Tally(
+            per_operator={"hunk_drop": 3},
+            did_not_apply=0,
+            did_not_compile=0,
+            graded=1,
+            equivalent=0,
+            selected=1,
+            cap_hit=False,
+        ),
+        entries=entries,
+    )
+
+
+def _mutants_ref(mutants_file: Path, *, count: int | None = None) -> pool_mod.MutantsRef:
+    frozen = mutants_mod.load_pool(mutants_file)
+    return pool_mod.MutantsRef(
+        path=str(mutants_file),
+        content_sha256=frozen.content_sha256,
+        count=len(frozen.entries) if count is None else count,
+    )
+
+
+# A real change and a hunk that only moves whitespace or only rewrites a comment:
+# the two cosmetic shapes `normalize` has to drop without touching the real one.
+_WHITESPACE_HUNK = "@@ -20,1 +20,1 @@\n-y  =  1\n+y = 1\n"
+_COMMENT_HUNK = "@@ -30,1 +30,1 @@\n-# old note\n+# new note\n"
+
+
+def _with_hunk(extra_pattern: str, *, rel: str = "pkg/mod.py") -> str:
+    """A real one-line change plus an extra hunk, to prove the real one survives."""
+    return _only_hunk("@@ -1,1 +1,1 @@\n-a\n+b\n" + extra_pattern, rel=rel)
+
+
+def _only_hunk(pattern: str, *, rel: str = "pkg/mod.py") -> str:
+    """A diff whose whole content is the given hunks — the shape a drop can empty."""
+    return (
+        f"diff --git a/{rel} b/{rel}\n"
+        f"--- a/{rel}\n"
+        f"+++ b/{rel}\n"
+        + pattern
+    )
+
+
+class TestPoolTags:
+    """The tag vocabulary is one table: the order, the refusals and the entry label."""
+
+    def test_the_registry_is_the_spec_order(self):
+        assert pool_mod.tag_names() == ("repair", "weak", "leaderboard")
+        assert [tag.priority for tag in pool_mod.SOURCE_TAGS] == [1, 2, 3]
+        assert pool_mod.TAG_ORDER == "repair>weak>leaderboard"
+        assert pool_mod.SORT_KEY == "(source_priority, sha256)"
+
+    def test_a_tagged_batch_parses_to_its_tag_and_path(self):
+        assert pool_mod.parse_batch_argument("repair=/tmp/b1") == ("repair", Path("/tmp/b1"))
+
+    def test_an_untagged_batch_is_refused(self):
+        """A bare DIR would be a source nobody can name, answered by flag order."""
+        with pytest.raises(pool_mod.PoolError, match="has no source tag"):
+            pool_mod.parse_batch_argument("/tmp/b1")
+
+    def test_an_unknown_tag_is_refused(self):
+        with pytest.raises(pool_mod.PoolError, match="unknown source tag"):
+            pool_mod.parse_batch_argument("silly=/tmp/b1")
+        with pytest.raises(pool_mod.PoolError, match="unknown source tag"):
+            pool_mod.tag_for("silly")
+
+    def test_the_same_tag_may_be_repeated_and_priority_is_the_registrys(self):
+        assert pool_mod.priority_of(["weak", "repair", "repair"]) == ["repair", "weak"]
+        assert pool_mod.priority_of([]) == []
+
+    def test_a_candidate_records_its_source_tag(self):
+        candidate = _cand("0" * 64, tag="weak", priority=2, model="ornith", run="w1")
+        assert candidate.tag == "weak"
+        entry = pool_mod.entry_for_model(
+            candidate, _pool_bad(candidate), patch_path=Path("/o/c.patch"), base=Path("/o")
+        )
+        assert entry.patch_source == "weak"
+        assert entry.source_model == "ornith"
+        assert entry.source_run_id == "w1"
+        assert entry.kind == pool_mod.FAILED_MODEL
+
+    def test_a_good_candidate_becomes_a_model_good_entry(self):
+        candidate = _cand("0" * 64)
+        entry = pool_mod.entry_for_model(
+            candidate, _pool_good(candidate), patch_path=Path("/o/c.patch"), base=Path("/o")
+        )
+        assert entry.kind == pool_mod.MODEL_GOOD
+        assert entry.oracle == "good"
+
+
+class TestPoolNormalisation:
+    """``normalize`` — cosmetic hunks dropped, positions sorted, and it still applies."""
+
+    def test_exact_duplicates_normalise_the_same_way(self):
+        text = _one_line_diff("a", "b")
+        assert pool_mod.normalize(text) == pool_mod.normalize(text)
+
+    def test_a_whitespace_only_hunk_is_dropped(self):
+        normalized = pool_mod.normalize(_with_hunk(_WHITESPACE_HUNK))
+        assert "y  =  1" not in normalized
+        assert "+b" in normalized
+
+    def test_a_comment_only_hunk_is_dropped(self):
+        normalized = pool_mod.normalize(_with_hunk(_COMMENT_HUNK))
+        assert "# old note" not in normalized
+        assert "+b" in normalized
+
+    def test_two_cosmetic_variants_share_one_normalised_hash(self):
+        real = _one_line_diff("a", "b")
+        with_comment = _with_hunk(_COMMENT_HUNK)
+        with_whitespace = _with_hunk(_WHITESPACE_HUNK)
+        assert pool_mod.normalized_sha256(with_comment) == pool_mod.normalized_sha256(real)
+        assert pool_mod.normalized_sha256(with_whitespace) == pool_mod.normalized_sha256(real)
+
+    def test_files_are_sorted_by_their_b_path(self):
+        text = (
+            "diff --git a/pkg/z.py b/pkg/z.py\n"
+            "--- a/pkg/z.py\n"
+            "+++ b/pkg/z.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-z\n"
+            "+Z\n"
+            "diff --git a/pkg/a.py b/pkg/a.py\n"
+            "--- a/pkg/a.py\n"
+            "+++ b/pkg/a.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-a\n"
+            "+A\n"
+        )
+        normalized = pool_mod.normalize(text)
+        assert normalized.index("b/pkg/a.py") < normalized.index("b/pkg/z.py")
+
+    def test_hunks_are_sorted_by_position_not_by_hash(self):
+        """A hash order would scatter a file's hunks into an order ``git apply`` refuses."""
+        text = (
+            "diff --git a/pkg/mod.py b/pkg/mod.py\n"
+            "--- a/pkg/mod.py\n"
+            "+++ b/pkg/mod.py\n"
+            "@@ -40,1 +40,1 @@\n"
+            "-late\n"
+            "+LATE\n"
+            "@@ -2,1 +2,1 @@\n"
+            "-early\n"
+            "+EARLY\n"
+        )
+        normalized = pool_mod.normalize(text)
+        assert normalized.index("EARLY") < normalized.index("LATE")
+        assert normalized.index("@@ -2,1 +2,1 @@") < normalized.index("@@ -40,1 +40,1 @@")
+
+    def test_a_normalised_diff_still_applies_and_rebuilds_the_tree(self, tmp_path):
+        """The point of sorting by position: the normalised diff is the thing applied."""
+        base = tmp_path / "vanta_clean"
+        tree = tmp_path / "attempt"
+        write(base / "pkg" / "a.py", "x = 1\n")
+        write(base / "pkg" / "b.py", "y = 1\n")
+        write(tree / "pkg" / "a.py", "x = 2\n")
+        write(tree / "pkg" / "b.py", "y = 2\n")
+        snapshot = compact_mod.tree_diff(base, tree)
+        normalized = pool_mod.normalize(snapshot)
+        rebuilt = compact_mod.reconstruct(base, normalized, tmp_path / "rebuilt")
+        assert (rebuilt / "pkg" / "a.py").read_text() == "x = 2\n"
+        assert (rebuilt / "pkg" / "b.py").read_text() == "y = 2\n"
+
+    def test_a_patch_that_normalises_to_nothing_is_the_noop_shape(self):
+        """Only a diff left with no real hunk is the floor's shape; one real hunk is not."""
+        assert pool_mod.is_noop(_only_hunk(_WHITESPACE_HUNK)) is True
+        assert pool_mod.is_noop(_only_hunk(_COMMENT_HUNK)) is True
+        assert pool_mod.is_noop(_with_hunk(_WHITESPACE_HUNK)) is False
+        assert pool_mod.is_noop(_one_line_diff("a", "b")) is False
+
+
+class TestPoolHarvest:
+    """Every attempt of every repair row — snapshot, compacted, or the last one's final.patch."""
+
+    def _harvest(self, tmp_path, *, records, preps, tag="repair"):
+        batch_dir = tmp_path / "batch"
+        manifest = manifest_mod.Manifest(batch_dir)
+        for record in records:
+            manifest.append(record)
+        return pool_mod.harvest_batch(
+            tag=tag,
+            batch_dir=batch_dir,
+            sessions_dir=tmp_path / "vanta_sessions",
+            preps=preps,
+            manifest=manifest,
+        )
+
+    def _tree(self, tmp_path, prep, *, name="attempt_1_patched_tree", body="one = 1\nsecond = 22\n"):
+        base = prep.root / "vanta_clean"
+        write(base / "pkg" / "mod.py", "one = 1\nsecond = 2\n")
+        tree = tmp_path / "vanta_sessions" / "sid" / "debug" / name
+        write(tree / "pkg" / "mod.py", body)
+        return base, tree
+
+    def test_a_snapshot_tree_is_diffed_against_the_sanitized_base(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        self._tree(tmp_path, prep)
+        harvest = self._harvest(
+            tmp_path, records=[_attempt_row()], preps={prep.key: prep}
+        )
+        assert len(harvest.attempts) == 1
+        attempt = harvest.attempts[0]
+        assert attempt.origin == pool_mod.SNAPSHOT
+        assert attempt.attempt == 1
+        assert attempt.slug == prep.slug
+        assert "second = 22" in attempt.patch_text
+        assert harvest.missing == []
+        assert harvest.not_reviewable == 0
+
+    def test_a_compacted_attempt_reconstructs_the_same_normalised_diff(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        base, tree = self._tree(tmp_path, prep)
+        snapshot = compact_mod.tree_diff(base, tree)
+        # Replace the tree with the compacted pair, exactly as compaction leaves it.
+        import shutil
+
+        shutil.rmtree(tree)
+        write(tree.parent / f"{tree.name}.diff", snapshot)
+        write(
+            tree.parent / f"{tree.name}.hashes.json",
+            json.dumps({"schema_version": 1, "diff_sha256": split_mod.sha256_text(snapshot)}),
+        )
+        harvest = self._harvest(
+            tmp_path, records=[_attempt_row()], preps={prep.key: prep}
+        )
+        assert len(harvest.attempts) == 1
+        attempt = harvest.attempts[0]
+        assert attempt.origin == pool_mod.COMPACTED
+        assert pool_mod.normalize(attempt.patch_text) == pool_mod.normalize(snapshot)
+
+    def test_a_tampered_compacted_diff_is_recorded_as_missing_snapshot(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        base, tree = self._tree(tmp_path, prep)
+        snapshot = compact_mod.tree_diff(base, tree)
+        import shutil
+
+        shutil.rmtree(tree)
+        write(tree.parent / f"{tree.name}.diff", snapshot)
+        write(
+            tree.parent / f"{tree.name}.hashes.json",
+            json.dumps({"schema_version": 1, "diff_sha256": "0" * 64}),
+        )
+        harvest = self._harvest(
+            tmp_path, records=[_attempt_row()], preps={prep.key: prep}
+        )
+        assert harvest.attempts == []
+        assert len(harvest.missing) == 1
+        assert "hashes to" in harvest.missing[0].reason
+
+    def test_first_and_last_states_are_recorded_for_a_missing_compacted_pair(self, tmp_path):
+        """One half on disk is not a snapshot — the pair has to be there."""
+        prep = _pool_prep(tmp_path)
+        debug = tmp_path / "vanta_sessions" / "sid" / "debug"
+        write(debug / "attempt_1_patched_tree.diff", _one_line_diff("a", "b"))
+        harvest = self._harvest(
+            tmp_path, records=[_attempt_row()], preps={prep.key: prep}
+        )
+        assert harvest.attempts == []
+        assert "not both present" in harvest.missing[0].reason
+
+    def test_missing_attempts_are_recorded_and_never_guessed(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        self._tree(tmp_path, prep, name="attempt_3_patched_tree")
+        harvest = self._harvest(
+            tmp_path, records=[_attempt_row(attempts_run=3)], preps={prep.key: prep}
+        )
+        assert [attempt.attempt for attempt in harvest.attempts] == [3]
+        assert [gone.attempt for gone in harvest.missing] == [1, 2]
+        assert all("no snapshot" in gone.reason for gone in harvest.missing)
+
+    def test_only_the_last_attempt_falls_back_to_final_patch(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        final = write(tmp_path / "final.patch", _one_line_diff("a", "b"))
+        harvest = self._harvest(
+            tmp_path,
+            records=[_attempt_row(attempts_run=2, artifacts={"final_patch": str(final)})],
+            preps={prep.key: prep},
+        )
+        assert [(attempt.attempt, attempt.origin) for attempt in harvest.attempts] == [
+            (2, pool_mod.FINAL_PATCH)
+        ]
+        assert [gone.attempt for gone in harvest.missing] == [1]
+        assert "final.patch" not in harvest.missing[0].reason
+
+    def test_test_file_hunks_are_dropped_exactly_as_the_grader_drops_them(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        base = prep.root / "vanta_clean"
+        tree = tmp_path / "vanta_sessions" / "sid" / "debug" / "attempt_1_patched_tree"
+        write(base / "pkg" / "mod.py", "one = 1\n")
+        write(base / "tests" / "test_demo.py", "def test_fix():\n    assert 1\n")
+        write(tree / "pkg" / "mod.py", "one = 2\n")
+        write(tree / "tests" / "test_demo.py", "def test_fix():\n    assert 2\n")
+        harvest = self._harvest(
+            tmp_path, records=[_attempt_row()], preps={prep.key: prep}
+        )
+        assert len(harvest.attempts) == 1
+        text = harvest.attempts[0].patch_text
+        assert "tests/test_demo.py" not in text
+        assert "pkg/mod.py" in text
+
+    def test_a_patch_that_is_only_test_hunks_is_not_reviewable(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        base = prep.root / "vanta_clean"
+        tree = tmp_path / "vanta_sessions" / "sid" / "debug" / "attempt_1_patched_tree"
+        write(base / "tests" / "test_demo.py", "def test_fix():\n    assert 1\n")
+        write(tree / "tests" / "test_demo.py", "def test_fix():\n    assert 2\n")
+        harvest = self._harvest(
+            tmp_path, records=[_attempt_row()], preps={prep.key: prep}
+        )
+        assert harvest.attempts == []
+        assert harvest.not_reviewable == 1
+
+    def test_only_repair_rows_are_harvested(self, tmp_path):
+        """A review row's candidate is not a Creator attempt — it is what is measured."""
+        prep = _pool_prep(tmp_path)
+        self._tree(tmp_path, prep)
+        harvest = self._harvest(
+            tmp_path,
+            records=[
+                _attempt_row(mode="review", session_id="rev", attempts_run=9),
+                _attempt_row(),
+            ],
+            preps={prep.key: prep},
+        )
+        assert {attempt.source_run_id for attempt in harvest.attempts} == {"sid"}
+        assert harvest.missing == []
+
+    def test_the_recorded_model_is_the_repair_arm(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        self._tree(tmp_path, prep)
+        harvest = self._harvest(
+            tmp_path, records=[_attempt_row(arm="b2")], preps={prep.key: prep}
+        )
+        assert harvest.attempts[0].source_model == "b2"
+
+
+class TestPoolDedupe:
+    """One candidate per normalised diff, and the duplicates are counted, not dropped."""
+
+    def test_attempts_are_deduplicated_by_normalised_hash(self):
+        real = _one_line_diff("a", "b")
+        candidates, duplicates = pool_mod.dedupe(
+            [
+                _harvested(real, attempt=1),
+                _harvested(real, attempt=2),
+                _harvested(_with_hunk(_COMMENT_HUNK), attempt=3),
+            ]
+        )
+        assert len(candidates) == 1
+        assert duplicates == 2
+
+    def test_a_patch_that_normalises_to_nothing_is_counted_a_duplicate(self):
+        candidates, duplicates = pool_mod.dedupe(
+            [
+                _harvested(_only_hunk(_WHITESPACE_HUNK), attempt=1),
+                _harvested(_only_hunk(_COMMENT_HUNK), attempt=2),
+            ]
+        )
+        assert candidates == []
+        assert duplicates == 2
+
+    def test_the_candidates_come_back_in_order_key_order(self):
+        candidates, _ = pool_mod.dedupe(
+            [
+                _harvested(_one_line_diff("a", "b"), attempt=1, tag="weak"),
+                _harvested(_one_line_diff("a", "c"), attempt=2, tag="repair"),
+            ]
+        )
+        assert [candidate.tag for candidate in candidates] == ["repair", "weak"]
+
+
+class TestPoolSelect:
+    """``(tag priority, sha256)`` order, grade through the seam, keep ≤2 bad and ≤2 good."""
+
+    def test_the_kept_lists_are_capped_at_two_each(self):
+        """A pool of a dozen ``model_good`` entries behind ``bad: 2 good: 2`` is a lie."""
+        candidates = [_cand(f"{index:064d}") for index in range(5)]
+        selected = pool_mod.select(
+            candidates=candidates, grade_fn=_pool_good, reference_sha256="none", tally=pool_mod.Tally()
+        )
+        assert len(selected.good) == 2
+        assert selected.tally.good == 2
+        assert selected.tally.graded == 5  # the search kept looking; the side stayed capped
+
+    def test_grading_stops_once_both_sides_are_full(self):
+        candidates = [_cand(f"{index:064d}") for index in range(6)]
+
+        def grade(candidate):
+            return _pool_bad(candidate) if int(candidate.normalized_sha256) % 2 == 0 else _pool_good(candidate)
+
+        selected = pool_mod.select(
+            candidates=candidates, grade_fn=grade, reference_sha256="none", tally=pool_mod.Tally()
+        )
+        assert selected.tally.graded == 4
+        assert len(selected.bad) == 2 and len(selected.good) == 2
+
+    def test_a_candidate_equal_to_the_reference_is_neither_bad_nor_good(self):
+        reference = "f" * 64
+        candidates = [_cand("0" * 64), _cand(reference)]
+        selected = pool_mod.select(
+            candidates=candidates, grade_fn=_pool_bad, reference_sha256=reference, tally=pool_mod.Tally()
+        )
+        assert selected.tally.equivalent == 1
+        assert selected.tally.graded == 1  # the equivalent did not spend budget
+
+    def test_the_cap_is_recorded_even_when_it_stops_a_finding_run(self):
+        candidates = [_cand(f"{index:064d}") for index in range(5)]
+        selected = pool_mod.select(
+            candidates=candidates,
+            grade_fn=_pool_bad,
+            reference_sha256="none",
+            tally=pool_mod.Tally(),
+            grade_cap=2,
+        )
+        assert selected.tally.graded == 2
+        assert selected.tally.cap_reached is True
+        assert len(selected.bad) == 2
+
+    def test_the_grading_order_is_tag_priority_then_hash(self):
+        seen: list[str] = []
+
+        def grade(candidate):
+            seen.append(candidate.tag)
+            return _pool_bad(candidate)
+
+        candidates = [
+            _cand("0" * 64, tag="weak", priority=2),
+            _cand("f" * 64, tag="repair", priority=1),
+        ]
+        pool_mod.select(
+            candidates=candidates,
+            grade_fn=grade,
+            reference_sha256="none",
+            tally=pool_mod.Tally(),
+            max_bad=2,
+            max_good=0,
+        )
+        assert seen == ["repair", "weak"]
+
+    def test_the_order_does_not_depend_on_the_input_order(self):
+        candidates = [_cand(f"{index:064d}") for index in range(4)]
+        first = pool_mod.select(
+            candidates=candidates, grade_fn=_pool_bad, reference_sha256="none", tally=pool_mod.Tally()
+        )
+        second = pool_mod.select(
+            candidates=list(reversed(candidates)),
+            grade_fn=_pool_bad,
+            reference_sha256="none",
+            tally=pool_mod.Tally(),
+        )
+        assert [c.normalized_sha256 for c, _ in first.bad] == [
+            c.normalized_sha256 for c, _ in second.bad
+        ]
+
+
+class TestPoolArtifact:
+    """The locked file: item 5's mutants referenced by hash, and every entry's provenance."""
+
+    def _entries(self) -> list[pool_mod.PoolEntry]:
+        return [
+            pool_mod.PoolEntry(
+                kind=pool_mod.DEV_FIX,
+                patch_source=pool_mod.REFERENCE_SOURCE,
+                source_model=pool_mod.REFERENCE_SOURCE,
+                source_run_id=None,
+                patch_sha256="1" * 64,
+                patch_path="../candidates/Demo_1/dev_fix-111111111111.patch",
+                oracle="good",
+            ),
+            pool_mod.PoolEntry(
+                kind=pool_mod.FAILED_MODEL,
+                patch_source="repair",
+                source_model="b0",
+                source_run_id="sess-1",
+                patch_sha256="2" * 64,
+                patch_path="../candidates/Demo_1/failed_model-222222222222.patch",
+                oracle="bad",
+                attempt=2,
+            ),
+        ]
+
+    def test_the_header_carries_the_reference_and_the_tally(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        mutants_file = _frozen_mutants(tmp_path / "batch", prep)
+        text = pool_mod.render_pool(
+            prep=prep,
+            mutants=_mutants_ref(mutants_file),
+            reference_sha256="r" * 64,
+            noop_sha256="n" * 64,
+            tally=pool_mod.Tally(graded=3, bad=1, good=1, equivalent=1, cap_reached=False,
+                                 missing_snapshot=2, not_reviewable=1, failed_keys=4),
+            entries=self._entries(),
+            sources=["repair", "weak"],
+        )
+        assert "- schema: 1" in text
+        assert "- bug: Demo/1" in text
+        assert f"- mutants-sha256: {mutants_mod.load_pool(mutants_file).content_sha256}" in text
+        assert "- mutants-count: 1" in text
+        assert f"- reference-sha256: {'r' * 64}" in text
+        assert f"- noop-sha256: {'n' * 64}" in text
+        assert "- sort-key: (source_priority, sha256)" in text
+        assert "- grade-cap: 24" in text
+        assert "- sources: repair weak" in text
+        assert "- failed-keys: 4" in text
+        assert "- previous-sha256: null" in text
+        assert pool_mod.POOL_MARKER in text
+
+    def test_the_pool_round_trips_and_verifies_both_files(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        mutants_file = _frozen_mutants(tmp_path / "batch", prep)
+        path = pool_mod.write_pool(
+            pool_mod.pool_path(tmp_path / "out", prep),
+            prep=prep,
+            mutants=_mutants_ref(mutants_file),
+            reference_sha256="r" * 64,
+            noop_sha256="n" * 64,
+            tally=pool_mod.Tally(graded=3, bad=1, good=1),
+            entries=self._entries(),
+            sources=["repair"],
+        )
+        pool = pool_mod.load_pool(path)
+        assert pool.bug == "Demo/1"
+        assert pool.tally.graded == 3 and pool.tally.bad == 1 and pool.tally.good == 1
+        assert pool.reference_sha256 == "r" * 64 and pool.noop_sha256 == "n" * 64
+        assert [entry.kind for entry in pool.entries] == [pool_mod.DEV_FIX, pool_mod.FAILED_MODEL]
+        assert pool.entries[1].patch_source == "repair"
+        assert pool.entries[1].source_model == "b0"
+        assert pool.entries[1].source_run_id == "sess-1"
+        assert pool.entries[1].attempt == 2
+        # Item 5's file is expanded into the union, referenced not copied.
+        assert [entry.kind for entry in pool.mutants_entries] == ["mutant"]
+        assert [entry.kind for entry in pool.union()] == ["mutant", pool_mod.DEV_FIX, pool_mod.FAILED_MODEL]
+        assert re.fullmatch(r"[0-9a-f]{64}", pool.content_sha256)
+
+    def test_a_changed_mutants_file_is_refused(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        mutants_file = _frozen_mutants(tmp_path / "batch", prep)
+        path = pool_mod.write_pool(
+            pool_mod.pool_path(tmp_path / "out", prep),
+            prep=prep,
+            mutants=_mutants_ref(mutants_file),
+            reference_sha256="r" * 64,
+            noop_sha256="n" * 64,
+            tally=pool_mod.Tally(),
+            entries=[],
+            sources=["repair"],
+        )
+        # Regenerate the referent with a different entry set — a valid file, a new hash.
+        _frozen_mutants(
+            tmp_path / "batch",
+            prep,
+            entries=[
+                mutants_mod.PoolEntry(
+                    kind="mutant",
+                    operator="boundary_shift",
+                    patch_sha256="b" * 64,
+                    source="mutant:boundary_shift",
+                    patch_path=str(tmp_path / "batch" / "candidates" / prep.slug / "m.patch"),
+                    oracle="bad",
+                )
+            ],
+        )
+        with pytest.raises(pool_mod.PoolError, match="changed after this pool was built"):
+            pool_mod.load_pool(path)
+
+    def test_a_body_edited_after_it_was_frozen_is_refused(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        mutants_file = _frozen_mutants(tmp_path / "batch", prep)
+        path = pool_mod.write_pool(
+            pool_mod.pool_path(tmp_path / "out", prep),
+            prep=prep,
+            mutants=_mutants_ref(mutants_file),
+            reference_sha256="r" * 64,
+            noop_sha256="n" * 64,
+            tally=pool_mod.Tally(),
+            entries=self._entries(),
+            sources=["repair"],
+        )
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text.replace('"oracle": "bad"', '"oracle": "good"', 1), encoding="utf-8")
+        with pytest.raises(pool_mod.PoolError, match="edited after it was frozen"):
+            pool_mod.load_pool(path)
+
+    def test_a_missing_header_field_is_refused(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        mutants_file = _frozen_mutants(tmp_path / "batch", prep)
+        text = pool_mod.render_pool(
+            prep=prep,
+            mutants=_mutants_ref(mutants_file),
+            reference_sha256="r" * 64,
+            noop_sha256="n" * 64,
+            tally=pool_mod.Tally(),
+            entries=[],
+            sources=["repair"],
+        )
+        stripped = text.replace("- sort-key: (source_priority, sha256)\n", "")
+        with pytest.raises(pool_mod.PoolError, match="sort-key"):
+            pool_mod.parse_pool(stripped, path=tmp_path / "out" / "pool" / "Demo_1.json")
+
+    def test_the_mutants_count_is_verified(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        mutants_file = _frozen_mutants(tmp_path / "batch", prep)
+        text = pool_mod.render_pool(
+            prep=prep,
+            mutants=_mutants_ref(mutants_file, count=99),
+            reference_sha256="r" * 64,
+            noop_sha256="n" * 64,
+            tally=pool_mod.Tally(),
+            entries=[],
+            sources=["repair"],
+        )
+        with pytest.raises(pool_mod.PoolError, match="not the frozen 99"):
+            pool_mod.parse_pool(text, path=tmp_path / "out" / "pool" / "Demo_1.json")
+
+    def test_a_file_without_the_marker_is_refused(self, tmp_path):
+        prep = _pool_prep(tmp_path)
+        mutants_file = _frozen_mutants(tmp_path / "batch", prep)
+        text = pool_mod.render_pool(
+            prep=prep,
+            mutants=_mutants_ref(mutants_file),
+            reference_sha256="r" * 64,
+            noop_sha256="n" * 64,
+            tally=pool_mod.Tally(),
+            entries=[],
+            sources=["repair"],
+        ).replace(pool_mod.POOL_MARKER + "\n", "")
+        with pytest.raises(pool_mod.PoolError, match="is not a file this reader may use"):
+            pool_mod.parse_pool(text, path=tmp_path / "out" / "pool" / "Demo_1.json")
+
+
+class TestRunPool:
+    """The whole of item 6 for one bug, with the VM replaced by an injected grader."""
+
+    def _setup(self, tmp_path):
+        prep = _pool_prep(tmp_path, bug=bug_info(bug_patch_txt=_SRC))
+        mutants_file = _frozen_mutants(tmp_path / "batch", prep)
+        return prep, mutants_file
+
+    def _harvests(self, tmp_path, *, bad_text: str, good_text: str):
+        return [
+            pool_mod.Harvest(
+                tag="repair",
+                priority=1,
+                batch_dir=tmp_path / "batch",
+                attempts=[
+                    _harvested(bad_text, attempt=1),
+                    _harvested(good_text, attempt=2),
+                ],
+            )
+        ]
+
+    def _grade(self, *, bad_digests):
+        def grade(candidate):
+            if candidate.tag == pool_mod.REFERENCE_SOURCE:
+                return _pool_good(candidate)
+            if candidate.tag == pool_mod.NOOP_SOURCE:
+                return _pool_bad(candidate)
+            return _pool_bad(candidate) if candidate.normalized_sha256 in bad_digests else _pool_good(candidate)
+
+        return grade
+
+    def _run(self, tmp_path, prep, mutants_file, harvests, grade, **over):
+        return pool_mod.run_pool(
+            prep=prep,
+            out_dir=tmp_path / "out",
+            harvests=harvests,
+            mutants_file=mutants_file,
+            checkpoint="vanta-bi-Demo-1",
+            grade_batch_dir=tmp_path / "batch",
+            disk_mb=16384,
+            grade_fn=grade,
+            **over,
+        )
+
+    def test_the_pool_is_written_and_locked_with_every_kind(self, tmp_path):
+        prep, mutants_file = self._setup(tmp_path)
+        bad_text = _one_line_diff("a", "b")
+        good_text = _one_line_diff("a", "c")
+        bad_digests = {pool_mod.normalized_sha256(bad_text)}
+        result = self._run(
+            tmp_path,
+            prep,
+            mutants_file,
+            self._harvests(tmp_path, bad_text=bad_text, good_text=good_text),
+            self._grade(bad_digests=bad_digests),
+        )
+        assert result.path == pool_mod.pool_path(tmp_path / "out", prep)
+        pool = pool_mod.load_pool(result.path)
+        assert [entry.kind for entry in pool.entries] == [
+            pool_mod.DEV_FIX,
+            pool_mod.NOOP,
+            pool_mod.FAILED_MODEL,
+            pool_mod.MODEL_GOOD,
+        ]
+        failed = next(entry for entry in pool.entries if entry.kind == pool_mod.FAILED_MODEL)
+        assert failed.patch_source == "repair"
+        assert failed.source_model == "b0"
+        assert failed.source_run_id == "sid"
+        assert failed.oracle == "bad"
+        assert pool.tally.graded == 2 and pool.tally.bad == 1 and pool.tally.good == 1
+        assert pool.sources == ["repair"]
+        assert pool.mutants.content_sha256 == mutants_mod.load_pool(mutants_file).content_sha256
+        assert [entry.kind for entry in pool.mutants_entries] == ["mutant"]
+
+    def test_no_failed_patch_is_recorded_not_padded(self, tmp_path):
+        prep, mutants_file = self._setup(tmp_path)
+        harvests = self._harvests(
+            tmp_path, bad_text=_one_line_diff("a", "b"), good_text=_one_line_diff("a", "c")
+        )
+        result = self._run(
+            tmp_path, prep, mutants_file, harvests, self._grade(bad_digests=set())
+        )
+        pool = pool_mod.load_pool(result.path)
+        assert pool.tally.bad == 0
+        assert pool_mod.FAILED_MODEL not in [entry.kind for entry in pool.entries]
+
+    def test_the_failed_keys_count_reaches_the_header(self, tmp_path):
+        prep, mutants_file = self._setup(tmp_path)
+        harvests = self._harvests(
+            tmp_path, bad_text=_one_line_diff("a", "b"), good_text=_one_line_diff("a", "c")
+        )
+        result = self._run(
+            tmp_path,
+            prep,
+            mutants_file,
+            harvests,
+            self._grade(bad_digests=set()),
+            failed_keys=3,
+        )
+        assert pool_mod.load_pool(result.path).tally.failed_keys == 3
+
+    def test_an_existing_locked_pool_is_not_overwritten_without_rebuild(self, tmp_path):
+        prep, mutants_file = self._setup(tmp_path)
+        harvests = self._harvests(
+            tmp_path, bad_text=_one_line_diff("a", "b"), good_text=_one_line_diff("a", "c")
+        )
+        grade = self._grade(bad_digests=set())
+        self._run(tmp_path, prep, mutants_file, harvests, grade)
+        with pytest.raises(pool_mod.PoolError, match="already exists"):
+            self._run(tmp_path, prep, mutants_file, harvests, grade)
+
+    def test_rebuild_records_the_replaced_files_hash(self, tmp_path):
+        prep, mutants_file = self._setup(tmp_path)
+        harvests = self._harvests(
+            tmp_path, bad_text=_one_line_diff("a", "b"), good_text=_one_line_diff("a", "c")
+        )
+        grade = self._grade(bad_digests=set())
+        first = self._run(tmp_path, prep, mutants_file, harvests, grade)
+        first_sha = pool_mod.load_pool(first.path).content_sha256
+        second = self._run(tmp_path, prep, mutants_file, harvests, grade, rebuild=True)
+        assert pool_mod.load_pool(second.path).previous_sha256 == first_sha
+
+    def test_plan_lists_the_candidates_without_a_vm(self, tmp_path):
+        prep, _ = self._setup(tmp_path)
+        harvests = self._harvests(
+            tmp_path, bad_text=_one_line_diff("a", "b"), good_text=_one_line_diff("a", "c")
+        )
+        lines = pool_mod.plan_lines(prep, harvests=harvests)
+        assert lines[0].startswith("Demo/1: 2 attempts from repair")
+        assert "grade-cap 24" in lines[0]
+        assert any("repair" in line for line in lines[1:])
+
+
+class TestPoolFailedKeys:
+    """``failed-keys`` is this bug's count, read from its position in the job key."""
+
+    def test_only_this_bugs_failed_jobs_are_counted(self):
+        state = {
+            "b1#Demo/1#vanta#repair#0#": manifest_mod.FAILED,
+            "b1#Demo/1#vanta#repair#1#": manifest_mod.DONE,
+            "b1#Demo/2#vanta#repair#0#": manifest_mod.RUNNING,
+            "b2#Demo/2#vanta#repair#0#": manifest_mod.FAILED,
+        }
+        assert pool_mod.failed_keys_for(state, "Demo/1") == 1
+        assert pool_mod.failed_keys_for(state, "Demo/2") == 1
+        assert pool_mod.failed_keys_for(state, "Demo/3") == 0
+
+    def test_a_bug_whose_name_is_a_prefix_of_another_is_not_a_match(self):
+        state = {
+            "b1#Demo/11#vanta#repair#0#": manifest_mod.FAILED,
+            "Demo/1#Repair#vanta#repair#0#": manifest_mod.FAILED,  # bug in the batch field
+        }
+        assert pool_mod.failed_keys_for(state, "Demo/1") == 0
+
+
+class TestPoolBuildCommand:
+    """The CLI: ``--build`` refuses before it reads a batch when it cannot proceed."""
+
+    def test_build_without_out_refuses(self, capsys):
+        code = run_mod.main(["pool", "--build", "--batch", "repair=/tmp/x"])
+        err = capsys.readouterr().err
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert "--out" in err
+        assert "Traceback" not in err
+
+    def test_an_untagged_batch_is_refused(self, tmp_path, capsys):
+        code = run_mod.main(
+            ["pool", "--build", "--out", str(tmp_path), "--batch", str(tmp_path)]
+        )
+        err = capsys.readouterr().err
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert "no source tag" in err
+
+    def test_an_unknown_tag_is_refused(self, tmp_path, capsys):
+        code = run_mod.main(
+            ["pool", "--build", "--out", str(tmp_path), "--batch", f"silly={tmp_path}"]
+        )
+        err = capsys.readouterr().err
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert "unknown source tag" in err
+
+    def test_both_flags_at_once_are_refused(self, tmp_path, capsys):
+        code = run_mod.main(
+            [
+                "pool",
+                "--mutants",
+                "--build",
+                "--out",
+                str(tmp_path),
+                "--batch",
+                f"repair={tmp_path}",
+            ]
+        )
+        err = capsys.readouterr().err
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert "not both" in err
+
+    def test_a_running_batch_is_refused_before_any_tree_is_loaded(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The check covers every listed batch, and it precedes ``load_prepared``."""
+        first = tmp_path / "b1"
+        second = tmp_path / "b2"
+        manifest_mod.Manifest(first).mark("b1#Demo/1#vanta#repair#0#", manifest_mod.DONE)
+        manifest_mod.Manifest(second).mark("b2#Demo/2#vanta#repair#0#", manifest_mod.RUNNING)
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+
+        def explode(**kwargs):
+            raise AssertionError("load_prepared must not run while a batch is running")
+
+        monkeypatch.setattr(runner_mod, "load_prepared", explode)
+        code = run_mod.main(
+            [
+                "pool",
+                "--build",
+                "--out",
+                str(tmp_path / "out"),
+                "--batch",
+                f"repair={first}",
+                "--batch",
+                f"repair={second}",
+            ]
+        )
+        err = capsys.readouterr().err
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert "still has 1 running job" in err
+        assert "b2" in err
+
+    def test_a_finished_batch_proceeds_past_the_check(self, tmp_path, monkeypatch):
+        batch = tmp_path / "b1"
+        manifest_mod.Manifest(batch).mark("b1#Demo/1#vanta#repair#0#", manifest_mod.DONE)
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        monkeypatch.setattr(
+            runner_mod,
+            "load_prepared",
+            lambda **kwargs: SimpleNamespace(preps=[], entries={}),
+        )
+        monkeypatch.setattr(
+            run_mod, "load_split", lambda path: SimpleNamespace(bugsinpy_root="runs/bugsinpy")
+        )
+        # Nothing selected: the point of the test is that a *finished* batch reaches
+        # the selection at all, not that the selection is non-empty (`select_preps`
+        # refuses an empty one, which would mask the running-batch check).
+        monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])
+        code = run_mod.main(
+            [
+                "pool",
+                "--build",
+                "--out",
+                str(tmp_path / "out"),
+                "--batch",
+                f"repair={batch}",
+            ]
+        )
+        assert code == run_mod.EXIT_OK
 

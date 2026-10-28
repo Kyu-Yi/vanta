@@ -58,6 +58,7 @@ from bugsinpy import issue_source  # noqa: E402
 from bugsinpy import manifest as manifest_mod  # noqa: E402
 from bugsinpy import mutants as mutants_mod  # noqa: E402
 from bugsinpy import oracle as oracle_mod  # noqa: E402
+from bugsinpy import pool as pool_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
 from bugsinpy import records as records_mod  # noqa: E402
 from bugsinpy import runner as runner_mod  # noqa: E402
@@ -83,6 +84,7 @@ EXPECTED_ERRORS = (
     compact_mod.CompactError,
     records_mod.RecordError,
     mutants_mod.MutantError,
+    pool_mod.PoolError,
 )
 """Every failure the harness raises on purpose, and the reason the CLI prints them.
 
@@ -865,6 +867,30 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_pool(args: argparse.Namespace) -> int:
+    """`pool` owns two files; dispatch to the one this invocation named.
+
+    Item 5's mutants file (``pool/<bug>.mutants.json``) is written by ``--mutants``;
+    item 6's assembled review pool (``pool/<bug>.json``) — the file reviews read —
+    is written by ``--build``. Exactly one is required, so a reader can never
+    mistake which of the two a command produced.
+    """
+    if args.mutants and args.build:
+        raise pool_mod.PoolError(
+            "`pool` writes one file at a time: pass --mutants (item 5, the mutant "
+            "pool) or --build (item 6, the assembled pool), not both."
+        )
+    if args.mutants:
+        return cmd_pool_mutants(args)
+    if args.build:
+        return cmd_pool_build(args)
+    raise pool_mod.PoolError(
+        "`pool` owns two files. `--mutants` writes the reference-fix mutant pool "
+        "(pool/<bug>.mutants.json, item 5); `--build` writes the assembled review "
+        "pool (pool/<bug>.json, item 6) that reviews read. Pass exactly one."
+    )
+
+
+def cmd_pool_mutants(args: argparse.Namespace) -> int:
     """Item 5 — write and hash-lock each bug's reference-fix mutant pool.
 
     Repo-root check first, for the same reason every other stage does it: the whole
@@ -873,16 +899,25 @@ def cmd_pool(args: argparse.Namespace) -> int:
     a pure function of the reference fix — so it is exempt from the endpoint check
     the run stage does, and it boots nothing.
     """
-    if not args.mutants:
+    if len(args.batch) != 1:
         raise mutants_mod.MutantError(
-            "`pool` owns two files. `--mutants` writes the reference-fix mutant pool "
-            "(pool/<bug>.mutants.json, item 5); the assembled review pool "
-            "(pool/<bug>.json) that reviews read is item 6's. This command writes the "
-            "mutants file — pass --mutants."
+            f"`pool --mutants` writes one batch's pool and takes exactly one --batch; "
+            f"got {len(args.batch)}."
+        )
+    value = args.batch[0]
+    if "=" in value:
+        raise mutants_mod.MutantError(
+            f"`--mutants` takes a bare `--batch DIR`, not a tag ({value!r}): its source "
+            "is the reference fix, not a harvested batch. Tags are for `--build`."
+        )
+    if args.rebuild:
+        raise mutants_mod.MutantError(
+            "`--rebuild` belongs to `--build` (item 6); the mutants file is rewritten "
+            "in place each time item 5 runs."
         )
     runner_mod.require_repo_cwd()
     split = load_split(args.split.resolve())
-    batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
+    batch_dir = runner_mod.require_batch_dir(Path(value).resolve())
     bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
     batch = runner_mod.load_prepared(
         batch_dir=batch_dir, split=split, bugsinpy_root=bugsinpy_root
@@ -906,6 +941,156 @@ def cmd_pool(args: argparse.Namespace) -> int:
             disk_mb=args.disk_mb,
         )
         print(mutants_mod.render_pool_line(prep, result), flush=True)
+    return EXIT_OK
+
+
+def _pool_harvests(
+    key: str, batches: list[dict[str, Any]], sessions: Path
+) -> list[pool_mod.Harvest]:
+    """Each tagged batch's Creator attempts for one bug, in the order listed."""
+    harvests: list[pool_mod.Harvest] = []
+    for entry in batches:
+        prep = entry["preps"].get(key)
+        if prep is None:
+            continue
+        harvests.append(
+            pool_mod.harvest_batch(
+                tag=entry["tag"],
+                batch_dir=entry["dir"],
+                sessions_dir=sessions,
+                # Restricting the prep map to this one bug is what scopes the harvest
+                # (and its `not_reviewable` count) to the bug being built; a record for
+                # another bug is skipped by `harvest_batch` itself.
+                preps={key: prep},
+                manifest=entry["manifest"],
+            )
+        )
+    return harvests
+
+
+def cmd_pool_build(args: argparse.Namespace) -> int:
+    """Item 6 — assemble, grade and hash-lock the review pool reviews read.
+
+    Every listed batch is read through its own manifest (the row's ``session_id``,
+    the ``artifacts.final_patch`` and the run's attempt count) and its own prepared
+    trees (the per-attempt snapshots are diffed against that batch's ``vanta_clean``).
+    The pool is written under ``--out``, which has no default: it spans several
+    batches and arms and must not live inside whichever batch is listed first. A
+    batch still running is refused — the pool is built after every repair batch has
+    finished.
+    """
+    if args.out is None:
+        raise pool_mod.PoolError(
+            "`pool --build` needs `--out DIR`, and it has no default: the pool spans "
+            "several batches and arms and must not live inside whichever batch is "
+            "listed first. Nothing was read."
+        )
+    if not args.batch:
+        raise pool_mod.PoolError(
+            "`pool --build` needs at least one `--batch TAG=DIR` (TAG one of "
+            f"{pool_mod.TAG_ORDER})."
+        )
+    pairs = [pool_mod.parse_batch_argument(value) for value in args.batch]
+    runner_mod.require_repo_cwd()
+    split = load_split(args.split.resolve())
+    bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
+    out_dir = args.out.resolve()
+    sessions = runner_mod.sessions_dir()
+
+    # Every listed batch's cursor is read before *any* prepared tree is loaded: the
+    # rule is "the repair batches have finished", and a batch that is still running
+    # has to refuse the build without half-reading the corpus the rule is about.
+    located: list[tuple[str, Path]] = [
+        (tag, runner_mod.require_batch_dir(raw.resolve())) for tag, raw in pairs
+    ]
+    still_running: list[str] = []
+    for _, batch_dir in located:
+        state = manifest_mod.Manifest(batch_dir).state()
+        running = sorted(key for key, value in state.items() if value == manifest_mod.RUNNING)
+        if running:
+            shown = ", ".join(running[:4]) + ("…" if len(running) > 4 else "")
+            still_running.append(
+                f"{batch_dir} still has {len(running)} running job(s) ({shown})"
+            )
+    if still_running:
+        raise pool_mod.PoolError(
+            f"refusing to build {out_dir}: " + "; ".join(still_running) + ". The pool "
+            "is built once every repair batch has finished; re-run when their "
+            "state.json shows none running."
+        )
+
+    batches: list[dict[str, Any]] = []
+    for tag, batch_dir in located:
+        manifest = manifest_mod.Manifest(batch_dir)
+        state = manifest.state()
+        batch = runner_mod.load_prepared(
+            batch_dir=batch_dir, split=split, bugsinpy_root=bugsinpy_root
+        )
+        preps = {prep.key: prep for prep in batch.preps}
+        batches.append(
+            {
+                "tag": tag,
+                "dir": batch_dir,
+                "batch": batch,
+                "preps": preps,
+                "manifest": manifest,
+                "failed": sorted(key for key, value in state.items() if value == manifest_mod.FAILED),
+            }
+        )
+
+    # One representative prep per bug, in the first batch's file order — the split is
+    # the same in every batch, so a bug's prep differs only in its batch-relative root.
+    representative: dict[str, prepare_mod.BugPrep] = {}
+    for entry in batches:
+        for prep in entry["batch"].preps:
+            representative.setdefault(prep.key, prep)
+    preps_in_order = [representative[prep.key] for prep in batches[0]["batch"].preps]
+    waves = parse_waves(args.waves)
+    selected = select_preps(preps_in_order, only=args.only, waves=waves)
+
+    failed_keys = sum(len(entry["failed"]) for entry in batches)
+    if failed_keys:
+        print(
+            f"note: {failed_keys} failed job(s) across the listed batches carry no "
+            "patch to harvest; they are counted in the pool's header, not treated as "
+            "an error.",
+            file=sys.stderr,
+        )
+
+    if args.plan:
+        for prep in selected:
+            for line in pool_mod.plan_lines(
+                prep, harvests=_pool_harvests(prep.key, batches, sessions)
+            ):
+                print(line)
+        return EXIT_OK
+
+    for index, prep in enumerate(selected, start=1):
+        home = next(entry for entry in batches if prep.key in entry["preps"])
+        checkpoint = str(home["batch"].entries[prep.key]["checkpoint"])
+        mutants_file = home["dir"] / pool_mod.POOL_DIRNAME / f"{prep.slug}.mutants.json"
+        # The header's `failed-keys` is this bug's own count, summed over every
+        # listed batch — the batch-wide total above is only the note to the operator.
+        bug_failed = sum(
+            pool_mod.failed_keys_for(entry["manifest"].state(), prep.key)
+            for entry in batches
+        )
+        print(
+            f"[{index}/{len(selected)}] {prep.key} — grading the pool in Shuru…",
+            flush=True,
+        )
+        result = pool_mod.run_pool(
+            prep=home["preps"][prep.key],
+            out_dir=out_dir,
+            harvests=_pool_harvests(prep.key, batches, sessions),
+            mutants_file=mutants_file,
+            checkpoint=checkpoint,
+            grade_batch_dir=home["dir"],
+            disk_mb=args.disk_mb,
+            rebuild=args.rebuild,
+            failed_keys=bug_failed,
+        )
+        print(pool_mod.render_pool_line(prep, result), flush=True)
     return EXIT_OK
 
 
@@ -1207,23 +1392,55 @@ def build_parser() -> argparse.ArgumentParser:
     pool = sub.add_parser(
         "pool",
         help=(
-            "write and hash-lock each bug's reference-fix mutant pool "
-            "(pool/<bug>.mutants.json, item 5); grading runs in Shuru"
+            "write and hash-lock a pool: `--mutants` the reference-fix mutant pool "
+            "(item 5), `--build` the assembled review pool reviews read (item 6); "
+            "grading runs in Shuru"
         ),
     )
     pool.add_argument("--split", type=Path, default=DEFAULT_SPLIT)
     pool.add_argument(
         "--batch",
-        type=Path,
-        required=True,
-        help="a prepared batch directory — it holds the oracle trees the pool grades against",
+        action="append",
+        default=[],
+        metavar="[TAG=]DIR",
+        help=(
+            "a prepared batch directory (repeatable). `--mutants`: a bare DIR, exactly "
+            "one. `--build`: TAG=DIR, at least one, TAG one of "
+            f"{pool_mod.TAG_ORDER}, all sharing the priority order left to right"
+        ),
     )
     pool.add_argument(
         "--mutants",
         action="store_true",
         help=(
             "write the reference-fix mutant pool (pool/<bug>.mutants.json, item 5). "
-            "The assembled review pool (pool/<bug>.json) is item 6's."
+            "The assembled review pool (pool/<bug>.json) is written by --build."
+        ),
+    )
+    pool.add_argument(
+        "--build",
+        action="store_true",
+        help=(
+            "assemble, grade and hash-lock the review pool (pool/<bug>.json, item 6) "
+            "from every tagged batch's Creator attempts; needs --out"
+        ),
+    )
+    pool.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help=(
+            "where --build writes pool/<bug>.json (required for --build, no default): "
+            "the pool spans several batches, so it does not live inside any of them"
+        ),
+    )
+    pool.add_argument(
+        "--rebuild",
+        action="store_true",
+        help=(
+            "with --build: replace an existing locked pool/<bug>.json, recording the "
+            "replaced file's hash as `previous-sha256`. Without it an existing pool is "
+            "never overwritten."
         ),
     )
     pool.add_argument(
@@ -1246,7 +1463,10 @@ def build_parser() -> argparse.ArgumentParser:
     pool.add_argument(
         "--plan",
         action="store_true",
-        help="print each bug's candidate counts and first mutants in sort order, and exit",
+        help=(
+            "print each bug's candidate counts and the first candidates in sort order "
+            "(for --build: per tagged batch's attempts), and exit; no VM"
+        ),
     )
     pool.set_defaults(func=cmd_pool)
 

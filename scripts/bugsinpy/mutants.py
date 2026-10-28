@@ -55,6 +55,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
+from . import locked
 from . import oracle as oracle_mod
 from . import runner as runner_mod
 from . import shuru as shuru_mod
@@ -644,42 +645,22 @@ class MutantPool:
 def _canonical_body(body: str) -> str:
     """The one form the JSON body takes — in the file and in the hash of it.
 
-    Line endings folded, the framing's edge blank lines dropped, exactly one
-    trailing newline. The same rule ``issue_source._canonical`` applies, for the
-    same reason: the writer hashes the bytes it writes and the reader hashes the
-    bytes it reads, so an artifact that was edited — even by one byte — cannot
-    verify.
+    The same rule ``issue_source._canonical`` applies, for the same reason: the
+    writer hashes the bytes it writes and the reader hashes the bytes it reads, so
+    an artifact that was edited — even by one byte — cannot verify. The rule lives
+    in :func:`locked.canonical`.
     """
-    folded = body.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
-    return folded + "\n" if folded else ""
+    return locked.canonical(body)
 
 
 def _header_block(text: str) -> tuple[dict[str, str], str]:
     """``(header, the rest)`` — the ``- key: value`` lines, up to the first blank line."""
-    lines = text.splitlines(keepends=True)
-    header: dict[str, str] = {}
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        if line.startswith("- ") and ":" in line:
-            key, _, value = line[2:].partition(":")
-            header[key.strip()] = value.strip()
-        elif header and not line.strip():
-            index += 1
-            break
-        index += 1
-    return header, "".join(lines[index:])
+    return locked.header_block(text)
 
 
 def _section(text: str, marker: str) -> tuple[str, str]:
     """``(before, after)`` the first line equal to ``marker``, that line dropped."""
-    lines = text.splitlines(keepends=True)
-    for index, line in enumerate(lines):
-        if line.strip() == marker:
-            return "".join(lines[:index]), "".join(lines[index + 1 :])
-    raise MutantError(
-        f"the pool file has no {marker} line — it is not a file this reader may use"
-    )
+    return locked.section(text, marker, error=MutantError, what="pool file")
 
 
 def render_pool(
@@ -737,7 +718,8 @@ def write_pool(
 
     Verifying before writing mirrors ``issue_source.write_frozen``: an artifact its
     own reader refuses is impossible to create rather than merely detectable, and
-    no file is left behind when the two disagree.
+    no file is left behind when the two disagree. The sequence is
+    :func:`locked.write`.
     """
     target = Path(path)
     text = render_pool(
@@ -748,34 +730,26 @@ def write_pool(
         max_mutants=max_mutants,
         grade_cap=grade_cap,
     )
-    parse_pool(text, path=target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("w", encoding="utf-8", newline="") as handle:
-        handle.write(text)
-    return target
+    return locked.write(target, text, verify=parse_pool)
 
 
 def load_pool(path: Path) -> MutantPool:
     """Read a locked pool file from disk, and verify it (:func:`parse_pool`)."""
-    target = Path(path)
-    try:
-        with target.open("r", encoding="utf-8", newline="") as handle:
-            text = handle.read()
-    except OSError as exc:
-        raise MutantError(f"cannot read the mutant pool {target}: {exc}") from exc
-    return parse_pool(text, path=target)
+    return locked.load(path, parse=parse_pool, error=MutantError, what="mutant pool")
 
 
 def parse_pool(text: str, *, path: Path) -> MutantPool:
     """Verify and read the artifact's text — the one parser, for writer and reader."""
     target = Path(path)
     header, body_text = _header_block(text)
-    for key in _REQUIRED_HEADER_KEYS:
-        if key not in header:
-            raise MutantError(
-                f"{target}: the header has no {key!r} line; a pool file that cannot "
-                "say what it came from is not one the reader may use"
-            )
+    locked.require_keys(
+        header,
+        _REQUIRED_HEADER_KEYS,
+        path=target,
+        error=MutantError,
+        what="pool file",
+        why="say what it came from",
+    )
     _, after = _section(body_text, MUTANTS_MARKER)
     body = _canonical_body(after)
     actual = sha256_text(body)

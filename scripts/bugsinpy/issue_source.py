@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
 from . import issue as issue_mod
+from . import locked
 from .records import RecordError
 from .split import sha256_text
 
@@ -718,8 +719,12 @@ def _report_text(value: str) -> str:
     the leading indentation of a body that opens with a code block, and a code block is Python
     the reporter pasted: ``sanic/1``'s ``    print('1')`` is a different statement as
     `` print('1')`` (§2.4.4).
+
+    The rule itself lives in :func:`locked.fold`; this name is kept because the
+    reporter's own text is what several call sites (:meth:`IssueComment`) and
+    ``test_bugsinpy`` reach for.
     """
-    return value.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    return locked.fold(value)
 
 
 def _canonical(text: str) -> str:
@@ -753,20 +758,16 @@ def _canonical(text: str) -> str:
     This is a rule about the **file**, applied to every section, and it is the *only* rule about
     whitespace anywhere in this path. It is not a licence to reformat: the gate substitutes
     tokens and changes nothing else (§2.4.4), so a section's bytes are the reporter's own.
+
+    The rule lives in :func:`locked.canonical`; the name is kept because
+    ``test_bugsinpy`` reaches for it directly.
     """
-    folded = _report_text(text)
-    return folded + "\n" if folded else ""
+    return locked.canonical(text)
 
 
 def _section(text: str, marker: str) -> tuple[str, str]:
     """``(before, after)`` the first line equal to ``marker``, that line dropped."""
-    lines = text.splitlines(keepends=True)
-    for index, line in enumerate(lines):
-        if line.strip() == marker:
-            return "".join(lines[:index]), "".join(lines[index + 1 :])
-    raise IssueSourceError(
-        f"the frozen report has no {marker} line — it is not a file this reader may use"
-    )
+    return locked.section(text, marker, error=IssueSourceError, what="frozen report")
 
 
 def render_frozen(report: IssueReport) -> str:
@@ -914,45 +915,20 @@ def write_frozen(path: Path, report: IssueReport) -> Path:
     ``newline=""`` because the bytes this writes are the bytes ``load_frozen`` hashes: a
     platform that translated ``\\n`` on the way out would put the hashes off by one byte per
     line, which is the same defect through a different door (§2.4.3).
+
+    The render → verify → write sequence is :func:`locked.write`.
     """
-    target = Path(path)
-    text = render_frozen(report)
-    parse_frozen(text, path=target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("w", encoding="utf-8", newline="") as handle:
-        handle.write(text)
-    return target
+    return locked.write(Path(path), render_frozen(report), verify=parse_frozen)
 
 
 def _header_block(text: str) -> tuple[dict[str, str], str]:
     """``(header, the rest)`` — the ``- key: value`` lines, up to the first blank line."""
-    lines = text.splitlines(keepends=True)
-    header: dict[str, str] = {}
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        if line.startswith("- ") and ":" in line:
-            key, _, value = line[2:].partition(":")
-            header[key.strip()] = value.strip()
-        elif header and not line.strip():
-            index += 1
-            break
-        index += 1
-    return header, "".join(lines[index:])
+    return locked.header_block(text)
 
 
 def load_frozen(path: Path) -> FrozenIssue:
     """Read a frozen artifact from disk, and verify it (:func:`parse_frozen`)."""
-    target = Path(path)
-    try:
-        # ``newline=""``: no translation in either direction, so the bytes hashed are the
-        # bytes written. Reading with universal newlines is what let this reader lose one
-        # ``\\r`` per line that the writer had hashed (§2.4.3).
-        with target.open("r", encoding="utf-8", newline="") as handle:
-            text = handle.read()
-    except OSError as exc:
-        raise IssueSourceError(f"cannot read the frozen issue report {target}: {exc}") from exc
-    return parse_frozen(text, path=target)
+    return locked.load(path, parse=parse_frozen, error=IssueSourceError, what="frozen issue report")
 
 
 def parse_frozen(text: str, *, path: Path) -> FrozenIssue:
@@ -973,12 +949,14 @@ def parse_frozen(text: str, *, path: Path) -> FrozenIssue:
     """
     target = Path(path)
     header, body = _header_block(text)
-    for key in FROZEN_HEADER_KEYS:
-        if key not in header:
-            raise IssueSourceError(
-                f"{target}: the header has no {key!r} line; a frozen report that cannot "
-                "say how it was resolved and gated is not one the reader may use"
-            )
+    locked.require_keys(
+        header,
+        FROZEN_HEADER_KEYS,
+        path=target,
+        error=IssueSourceError,
+        what="frozen report",
+        why="say how it was resolved and gated",
+    )
 
     _, after_gate = _section(body, GATE_MARKER)
     gate_section, after_raw = _section(after_gate, RAW_MARKER)

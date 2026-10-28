@@ -21560,6 +21560,13 @@ class TestExpectedErrorsExitCleanly:
             raise ctx.ContextError("no explicit window source: export VANTA_LLM_CONTEXT_TOKENS")
 
         monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        # Item 14's preflight asks the model endpoint in `cmd_run`, *before*
+        # `load_split`, so it is stubbed here for the same reason the repo-root
+        # check above is: this test is about how a refusal is printed, and a unit
+        # test must not need a live endpoint to reach the refusal it is about.
+        # `run`'s preflight call takes no injection point — that is the point of
+        # it — so the stub replaces the name `cmd_run` resolves.
+        monkeypatch.setattr(runner_mod, "require_model_endpoint", lambda **kwargs: None)
         monkeypatch.setattr(run_mod, "load_split", boom)
 
         code = run_mod.main(["run", "--batch", str(tmp_path)])

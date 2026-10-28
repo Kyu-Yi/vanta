@@ -684,8 +684,17 @@ def render_metrics(verdicts: list[Verdict]) -> str:
 # beside it rather than omitted, because "pooled 40 %" with no interval at all
 # would read as a measurement it is not.
 
-PROVENANCE_KEYS = ("config", "mode", "seed", "model", "top_p", "commit", "dirty")
-"""The named §4.4 axes, in the order they are keyed and printed."""
+PROVENANCE_KEYS = ("config", "arm", "mode", "seed", "model", "top_p", "commit", "dirty")
+"""The named §4.4 axes, in the order they are keyed and printed.
+
+[WHY] ``arm`` was added by M3 item 8's follow-up. It sits beside ``config`` because
+the two answer different questions: ``config`` is the split's own column (``baseline``
+/ ``vanta``), which two arms can share — ``b1`` and ``suite`` are both
+``config=baseline`` — while ``arm`` is the canonical condition
+(``b0``/``b1``/``b2``/``b3``/``suite``). A session written before the field existed
+reads ``unset`` here, exactly like any other unrecorded axis, so it groups apart from
+one that recorded its arm rather than being pooled with it under a guessed name.
+"""
 
 PROVENANCE_UNKNOWN = "unset"
 """What an axis reads as when `run.summary` did not record it.

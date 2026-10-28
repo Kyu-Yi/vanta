@@ -20,6 +20,8 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from . import arms as arms_mod
+
 SCHEMA_VERSION = 1
 
 TOP_LEVEL_KEYS = frozenset(
@@ -169,7 +171,16 @@ DERIVED_BUG_KEYS = frozenset(
 
 BUG_KEYS = DECLARED_BUG_KEYS | OPTIONAL_DECLARED_BUG_KEYS | DERIVED_BUG_KEYS
 
-CONFIGS = ("baseline", "vanta")  # `vanta_planner` is addressable but not implemented (§4.2)
+CONFIGS = arms_mod.CONFIGS
+"""What a split's ``configs`` list may write — every arm spelling (§4.2).
+
+[VANTA-WHY] M3 item 8 follow-up — read from ``arms.py`` rather than spelled out here,
+so a new arm is added in one place. The list mixes the legacy names (``baseline``,
+``vanta``) with the canonical arm names (``b0``, ``b1``, ``b2``, ``b3``, ``suite``);
+``runner._require_arm_list`` refuses two spellings that normalise to one config, and
+``vanta_planner`` stays absent on purpose: it is §4.4's placeholder, whose runs return
+``InfraFailure``, so naming it is refused here rather than run.
+"""
 ROLES = ("pilot", "reserve")
 
 SAMPLING_POLICY = "pinned_per_call_plus_server_top_p"

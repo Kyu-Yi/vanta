@@ -65,6 +65,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from . import bake as bake_mod
 from . import compact as compact_mod
+from . import arms as arms_mod
 from . import context as ctx_mod
 from . import issue_source
 from . import manifest as manifest_mod
@@ -106,8 +107,10 @@ DEADLINE_MARGIN_SECS = 10 * 60
 PROBE_TIMEOUT_SECS = 120
 ORACLE_TIMEOUT_SECS = 1800
 
-REPAIR = "repair"
-REVIEW = "review"
+# The harness's two modes. Defined in the arm registry, which is keyed by them, and
+# re-exported here because this module and the split's vocabulary share them.
+REPAIR = arms_mod.REPAIR
+REVIEW = arms_mod.REVIEW
 
 DEV_FIX = "dev_fix"
 NOOP = "noop"
@@ -125,10 +128,12 @@ SPEND_CAP_NAME = "spend.json"
 SESSION_LINE = re.compile(r"▌ Session:\s*(\S+)")
 SUMMARY_PAIR = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(\S+)")
 
-PHASES: tuple[tuple[str, str], ...] = ((REPAIR, "baseline"), (REPAIR, "vanta"),
-                                      (REVIEW, "baseline"), (REVIEW, "vanta"))
-"""D13's order, spelled out. The config column is the split's own vocabulary; the
-two are pinned together by :func:`config_switches`."""
+# [VANTA-WHY] The schedule used to be a module-level ``PHASES`` constant, spelled out
+# for §7.1's two configs and checked against the split's list at every batch start. It
+# is now derived (``arms.phases_for``) from the split's own spellings, because M3 item
+# 11 adds a repair-only arm (B0) that no four-element constant can express — and a
+# derived order cannot drift from the list it came from, which is the only thing the
+# old ``PHASES != expected`` check existed to catch.
 
 
 class RunnerError(RuntimeError):
@@ -490,19 +495,26 @@ def config_switches(config: str) -> tuple[bool, bool]:
     the pipeline writes into ``run.summary`` names a config, and the manifest
     copies it. Deriving the *env* from the same switch pair is what keeps the two
     from being able to disagree.
+
+    [VANTA-WHY] M3 item 11 — the pair is read from ``arms.py`` rather than from three
+    ``if``s here, so a new arm is added in one place. ``vanta_planner`` keeps its own
+    answer: §4.4's placeholder is addressable but is deliberately NOT a registered
+    arm, because every run of it returns ``InfraFailure``.
     """
-    if config == "baseline":
-        return False, False
-    if config == "vanta":
-        return True, False
     if config == "vanta_planner":
         return True, True
-    raise RunnerError(f"unknown config {config!r}; expected baseline, vanta, vanta_planner")
+    try:
+        entry = arms_mod.arm_for_config(config)
+    except arms_mod.ArmError as exc:
+        raise RunnerError(
+            f"unknown config {config!r}; expected one of {list(arms_mod.CONFIGS)}"
+        ) from exc
+    return entry.attacker, entry.planner
 
 
 def vanta_env(
     *,
-    config: str,
+    arm: str,
     seed: int,
     checkpoint: str,
     disk_mb: int,
@@ -514,16 +526,34 @@ def vanta_env(
     — is inherited from the caller: the harness must not invent a model, and a
     copied value in this file would be one more thing that can drift from what
     actually ran.
+
+    [VANTA-WHY] Every switch, the attempt budget's owner and the arm name come from
+    ONE ``arms.py`` entry, so a run cannot be configured as one arm and recorded as
+    another. That is the whole of "the harness refuses before launching": there is no
+    combination here for it to get wrong.
     """
+    try:
+        entry = arms_mod.arm(arm)
+    except arms_mod.ArmError as exc:
+        raise RunnerError(str(exc)) from exc
     env = dict(os.environ if base is None else base)
-    attacker, planner = config_switches(config)
     env["VANTA_SANDBOX_BACKEND"] = "shuru"
     env["VANTA_SHURU_CHECKPOINT"] = checkpoint
     env["VANTA_SHURU_DISK_MB"] = str(disk_mb)
     # See the module docstring: the self-heal needs network the VM does not have.
     env["VANTA_SHURU_AUTO_DEPS"] = "0"
-    env["VANTA_ATTACKER"] = "on" if attacker else "off"
-    env["VANTA_PLANNER"] = "on" if planner else "off"
+    env["VANTA_ATTACKER"] = "on" if entry.attacker else "off"
+    env["VANTA_PLANNER"] = "on" if entry.planner else "off"
+    # [VANTA-WHY] M3 item 8 — the B2 switch, set from the same entry as the arm name
+    # so the two cannot disagree. `on` is both the binary's own default and the
+    # setting every existing measurement was taken under, so a legacy arm sends
+    # exactly the value it sent before this key existed.
+    env["VANTA_BATE"] = "on" if entry.bate else "off"
+    # [VANTA-WHY] M3 item 11 — the arm name, STATED rather than inferred. `b0` and
+    # `baseline` are the same switch pair and differ only in `--max-attempts`, so
+    # `benchmark_config_name` cannot name them; the binary records this value
+    # verbatim and refuses it if the switches or the budget contradict it.
+    env["VANTA_ARM"] = entry.name
     # Always set, including for seed 0: `VANTA_LLM_SEED=0` is a request to pin 0,
     # while an unset variable means "no seed key in the body" (§4.4, D4).
     env["VANTA_LLM_SEED"] = str(seed)
@@ -1717,6 +1747,12 @@ def build_record(
         "wave": job.wave,
         "bug": job.bug,
         "config": job.config,
+        # [VANTA-WHY] M3 item 8 follow-up — the arm's canonical name, next to the
+        # config it is part of the key of. `config` keeps its legacy value so every
+        # job key and every existing script is untouched; `arm` is what analysis
+        # groups by, and what a reader of one row needs to know which experimental
+        # condition produced it (`b1` and `suite` are both `config=baseline`).
+        "arm": job.arm,
         "mode": job.mode,
         "seed": job.seed,
         # §14.23 — how the pinned seed was turned into a per-round seed. Recorded
@@ -1852,6 +1888,17 @@ class Job:
     prep: prepare_mod.BugPrep
     entry: dict[str, Any]
     config: str
+    arm: str
+    """The canonical arm name this job runs (§4.2, ``arms.py``).
+
+    [VANTA-WHY] M3 item 8 follow-up — ``config`` is the split's own column and stays
+    ``baseline``/``vanta`` for the legacy arms so a job key on disk still resumes;
+    ``arm`` is the arm's canonical name (``b1``/``suite``/``b3``/``b0``/``b2``), which
+    is what analysis groups by. The two are not the same field for that reason: the
+    key may not change, the arm must be nameable. It is ALSO what the harness passes
+    as ``VANTA_ARM``, so the row's arm and the arm the binary ran are one value read
+    from one place (``arms.py``).
+    """
     mode: str
     seed: int
     checkpoint: str
@@ -2001,7 +2048,7 @@ def run_job(
 
     log_path = paths.logs / f"{_stem(job.key)}.log"
     env = vanta_env(
-        config=job.config,
+        arm=job.arm,
         seed=job.seed,
         checkpoint=job.checkpoint,
         disk_mb=disk_mb,
@@ -2102,6 +2149,9 @@ def _append_failure(paths: BatchPaths, job: Job, outcome: SessionOutcome) -> Non
         "key": job.key,
         "bug": job.bug,
         "config": job.config,
+        # The arm, for the same reason the row carries it: a failure record has to be
+        # attributable to the experimental condition that produced it.
+        "arm": job.arm,
         "mode": job.mode,
         "seed": job.seed,
         "session_id": outcome.session_id,
@@ -2242,13 +2292,26 @@ def run_batch(
     # is read per row from `run.summary`, because it belongs to the binary and not to
     # this tree.
     harness = git_revision()
-    # Not filtered down to the two known names: a filter here would drop
-    # `vanta_planner` before the guard could refuse it, and a split that names the
-    # placeholder must not start at all (§4.4).
-    configs = list(split.configs)
-    _require_phase_order(configs)
+    # The split's own spellings, NOT filtered down to a known list: a filter here
+    # would drop `vanta_planner` before the guard could refuse it, and a split that
+    # names the placeholder must not start at all (§4.4).
+    spellings = list(split.configs)
+    _require_arm_list(spellings)
+    # D13's order, mode-major, derived from the spellings themselves, so every repair
+    # pass precedes every review pass by construction. The `config` column of a
+    # phase's rows is the spelling's config value (`baseline` for both `b1` and
+    # `suite`), which is what keeps a legacy job key byte-identical.
+    phases = arms_mod.phases_for(spellings)
+    # The config values whose repair rows a review pass may pool (§7.1): every
+    # spelling that runs a repair at all, minus the review-only ones. A repair-only
+    # arm contributes a candidate set; `suite` (review-only) contributes none.
+    repair_configs = [
+        arms_mod.config_of(written)
+        for written in spellings
+        if REPAIR in arms_mod.modes_of(written)
+    ]
 
-    plan = _render_schedule(batch_id, preps, entries, configs, seeds, waves)
+    plan = _render_schedule(batch_id, preps, entries, spellings, seeds, waves)
     print(plan, flush=True)
     if show_hints:
         print(
@@ -2285,9 +2348,9 @@ def run_batch(
             continue
         print(f"\n=== wave {wave}: {len(wave_preps)} bug(s) ===", flush=True)
         result = WaveResult(wave=wave)
-        for mode, config in PHASES:
-            if config not in configs:
-                continue
+        for mode, written in phases:
+            config = arms_mod.config_of(written)
+            arm = arms_mod.arm_for(written, mode)
             for prep in wave_preps:
                 entry = entries[prep.key]
                 checkpoint = entry["checkpoint"]
@@ -2301,6 +2364,7 @@ def run_batch(
                                 prep=prep,
                                 entry=entry,
                                 config=config,
+                                arm=arm,
                                 mode=REPAIR,
                                 seed=seed,
                                 checkpoint=checkpoint,
@@ -2318,6 +2382,7 @@ def run_batch(
                                 prep=prep,
                                 entry=entry,
                                 config=config,
+                                arm=arm,
                                 mode=REVIEW,
                                 seed=seed,
                                 checkpoint=checkpoint,
@@ -2331,7 +2396,7 @@ def run_batch(
                                 batch_id=batch_id,
                                 manifest=manifest,
                                 prep=prep,
-                                configs=configs,
+                                configs=repair_configs,
                                 seed=seed,
                                 checkpoint=checkpoint,
                                 disk_mb=disk_mb,
@@ -2367,7 +2432,12 @@ def run_batch(
                             paths=paths,
                             manifest=manifest,
                             vanta_bin=vanta_bin,
-                            max_attempts=max_attempts,
+                            # The arm owns the budget, not the invocation: B0 is
+                            # "one Creator call, no feedback" (§M3 item 11) and a
+                            # `--max-attempts 4` on the command line must not turn it
+                            # into a different arm. Every other arm runs what the
+                            # invocation asked for.
+                            max_attempts=arms_mod.arm_max_attempts(arm, max_attempts),
                             disk_mb=disk_mb,
                             python_version=checkpoint_pythons.get(checkpoint, ""),
                         )
@@ -2437,40 +2507,37 @@ def _review_candidates(
     )
 
 
-REVIEW_CONFIGS = ("baseline", "vanta")
-"""The pair §7.1 reviews, in the order the phases run.
+def _require_arm_list(spellings: Sequence[str]) -> None:
+    """Refuse a split whose arm list cannot be scheduled, or names the placeholder.
 
-``vanta_planner`` is deliberately absent: it is the §4.4 placeholder whose review
-feedback comes from native+static only and whose runs return ``InfraFailure``, so a
-split containing it cannot produce a third arm — only rows that fail the wave gate.
-"""
+    [VANTA-WHY] M3 item 8 follow-up — this used to require exactly
+    ``["baseline", "vanta"]``, because §7.1's study had two arms and a review row
+    whose counterpart was missing could not be paired. The pairing check is now an
+    **analysis**-time property, checked by candidate key over the rows a batch
+    wrote, so ANY arm list is allowed to run; what stays here is the set of
+    refusals that are facts about the list itself rather than about pairing:
 
+    * an unknown spelling (a typo must not quietly run a smaller study),
+    * two spellings that normalise to ONE config — ``baseline`` and ``suite``, say.
+      The job key has no arm column (``manifest.job_key``), so the second arm would
+      be skipped as the first on a resume and the manifest would hold one
+      experiment's row under the other's name,
+    * ``vanta_planner``, §4.4's placeholder, whose runs return ``InfraFailure``.
 
-def _require_phase_order(configs: Sequence[str]) -> None:
-    """Refuse any config list but §7.1's pair, and refuse a reordered phase list.
-
-    Two different mistakes land here and they need different sentences. A config
-    list that is not exactly ``["baseline", "vanta"]`` is not a scheduling problem:
-    the study has no third arm, and a review row with one config missing cannot be
-    paired, so the batch must not start at all. A ``PHASES`` that no longer puts
-    every repair before every review is a scheduling bug. Both are fatal, and
-    neither is a preference — which is why this raises instead of reordering.
+    Repairs-before-reviews is deliberately NOT checked here: :func:`arms.phases_for`
+    builds the order mode-major, so the schedule and this list cannot disagree — the
+    old ``PHASES != expected`` comparison has nothing left to catch.
     """
-    if list(configs) != list(REVIEW_CONFIGS):
-        raise RunnerError(
-            f"split configs must be exactly {list(REVIEW_CONFIGS)} for paired review "
-            f"(got {list(configs)}); vanta_planner is a placeholder that returns "
-            "InfraFailure and must not be in a run split"
-        )
-    expected = [(REPAIR, config) for config in configs] + [
-        (REVIEW, config) for config in configs
-    ]
-    if list(PHASES) != expected:
-        raise RunnerError(
-            f"PHASES {PHASES} no longer matches {expected}: §7.1/D13 requires every "
-            "repair pass to precede every review pass, and that ordering is a "
-            "correctness property, not a preference"
-        )
+    for written in spellings:
+        if written == "vanta_planner":
+            raise RunnerError(
+                "vanta_planner is a placeholder that returns InfraFailure and must "
+                "not be in a run split"
+            )
+    try:
+        arms_mod.resolve_configs(spellings)
+    except arms_mod.ArmError as exc:
+        raise RunnerError(str(exc)) from exc
 
 
 def wave_gate_failures(records: Sequence[dict[str, Any]]) -> list[str]:
@@ -2518,22 +2585,13 @@ def wave_gate_failures(records: Sequence[dict[str, Any]]) -> list[str]:
         noop = kinds.get(NOOP)
         if noop is not None and noop["oracle"].get("patch_good"):
             problems.append(f"{bug}: the no-op floor graded patch_good=true")
-    # §8.2: "paired vanta rows exist". Both configs review one set at one seed, so
-    # a review row with no counterpart is not a pairing the study can use — and the
-    # asymmetry would silently halve a comparison instead of failing.
-    paired = {
-        (record["bug"], record["seed"], record["candidate"]["normalized_sha256"], record["config"])
-        for record in records
-        if record["mode"] == REVIEW and record.get("candidate")
-    }
-    configs = {config for _, _, _, config in paired}
-    for bug, seed, normalized, config in sorted(paired):
-        for other in sorted(configs - {config}):
-            if (bug, seed, normalized, other) not in paired:
-                problems.append(
-                    f"{bug} seed={seed} candidate={normalized[:12]}: {config} has a "
-                    f"review row but {other} does not — the pair is incomplete"
-                )
+    # [VANTA-WHY] M3 item 8 follow-up — §8.2's "paired vanta rows exist" is NOT
+    # checked here any more. The check was "both configs review one set at one seed",
+    # which a repair-only arm (B0) cannot satisfy and which an arbitrary arm list has
+    # no fixed pair to test against. It moved to ANALYSIS time, where the rows on
+    # disk are grouped by candidate key and a missing counterpart is visible on the
+    # number it would have changed — the wave gate must not stop a wave for running
+    # an arm list the split declared on purpose.
     return problems
 
 
@@ -2541,7 +2599,7 @@ def _render_schedule(
     batch_id: str,
     preps: Sequence[prepare_mod.BugPrep],
     entries: dict[str, dict[str, Any]],
-    configs: Sequence[str],
+    spellings: Sequence[str],
     seeds: Sequence[int],
     waves: Sequence[int],
 ) -> str:
@@ -2550,10 +2608,18 @@ def _render_schedule(
     The review row count is a **floor**, not a prediction: the pooled failed
     patches do not exist until the repairs ran, so the set printed here is
     {developer fix, no-op} and the real one is 2–4 per bug (§7.1).
+
+    [VANTA-WHY] The row counts come from :func:`arms.phases_for`, not from the
+    config list's length: a repair-only arm (B0) contributes a repair row and no
+    review row, and a count derived from ``len(configs)`` would print a review
+    figure for a phase the split does not run.
     """
+    phases = arms_mod.phases_for(spellings)
+    repairs = sum(1 for mode, _ in phases if mode == REPAIR)
+    reviews = sum(1 for mode, _ in phases if mode == REVIEW)
     lines = [
         f"batch {batch_id}",
-        f"order: {' → '.join(f'{mode} {config}' for mode, config in PHASES if config in configs)}",
+        f"order: {' → '.join(f'{mode} {written}' for mode, written in phases)}",
         "",
         "| wave | bug | checkpoint | py (pinned) | repair rows | review rows (floor) |",
         "|---|---|---|---|---|---|",
@@ -2564,8 +2630,8 @@ def _render_schedule(
             if prep.wave != wave:
                 continue
             entry = entries[prep.key]
-            repair = len(configs) * len(seeds)
-            review = len(configs) * 2 * len(seeds)
+            repair = repairs * len(seeds)
+            review = reviews * 2 * len(seeds)
             total += repair + review
             lines.append(
                 f"| {wave} | {prep.key} | {entry['checkpoint']} | "
@@ -2726,6 +2792,10 @@ def write_labels(records: Iterable[dict[str, Any]], path: Path) -> Path:
             "known_bad": not bool(candidate["oracle"].get("patch_good")),
             "bug": record["bug"],
             "config": record["config"],
+            # [VANTA-WHY] M3 item 8 follow-up — the arm, backfilled for a row written
+            # before the field existed (`arms.row_arm`), so a label file keys an old
+            # row and a new one by the same condition.
+            "arm": arms_mod.row_arm(record),
             "mode": record["mode"],
             "kind": candidate["kind"],
             "source": candidate["source"],
@@ -2741,11 +2811,20 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     Both commits are axes: a row produced by the harness at HEAD *and* the rows
     produced by a binary built three commits earlier are two different provenance
     claims, and pooling them would report one number for two experiments.
+
+    [VANTA-WHY] M3 item 8 follow-up — the arm is an axis too. It is redundant with
+    ``(config, mode)`` for every legacy row (``b1``/``suite``/``b3`` are a function
+    of exactly those two), so adding it does not move a single legacy group; it is
+    what separates two arms that share a config once the registry grows one
+    (``b1`` and ``suite`` already share ``baseline``, and M3.5's ``b3-v2-*`` arms
+    share ``vanta``). A row written before the field existed is backfilled from its
+    own ``(mode, config)`` (:func:`arms.row_arm`), so old and new rows group alike.
     """
     groups: dict[tuple, dict[str, Any]] = {}
     for record in records:
         key = (
             record.get("config"),
+            arms_mod.row_arm(record),
             record.get("mode"),
             record.get("seed"),
             record.get("model"),
@@ -2756,6 +2835,7 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
             key,
             {
                 "config": record.get("config"),
+                "arm": arms_mod.row_arm(record),
                 "mode": record.get("mode"),
                 "seed": record.get("seed"),
                 "model": record.get("model"),
@@ -2784,9 +2864,9 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 def render_digest(payload: dict[str, Any]) -> str:
     lines = [
-        f"{'config':<10} {'mode':<8} {'seed':>4} {'model':<18} {'harness':<10} "
+        f"{'config':<10} {'arm':<7} {'mode':<8} {'seed':>4} {'model':<18} {'harness':<10} "
         f"{'build':<10} {'runs':>5}  labels  localization",
-        "-" * 122,
+        "-" * 130,
     ]
     for group in payload.get("groups", []):
         harness = str(group.get("harness_commit") or "")[:9]
@@ -2798,7 +2878,8 @@ def render_digest(payload: dict[str, Any]) -> str:
             f"{key}={loc.get(key, 0)}" for key in ("hit", "miss", "unknown")
         )
         lines.append(
-            f"{str(group['config']):<10} {str(group['mode']):<8} {str(group['seed']):>4} "
+            f"{str(group['config']):<10} {str(group.get('arm') or ''):<7} "
+            f"{str(group['mode']):<8} {str(group['seed']):>4} "
             f"{model:<18} {harness:<10} {build:<10} {group['runs']:>5}  {labels}  "
             f"{localization}"
         )

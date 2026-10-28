@@ -44,6 +44,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+from bugsinpy import arms as arms_mod  # noqa: E402
 from bugsinpy import bake as bake_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
 from bugsinpy import compact as compact_mod  # noqa: E402
@@ -19383,8 +19384,11 @@ class TestWaveGate:
         problems = runner_mod.wave_gate_failures(rows)
         assert any("no-op floor graded patch_good=true" in problem for problem in problems)
 
-    def test_a_review_row_without_its_counterpart_is_an_incomplete_pair(self):
-        """The comparison is the point: a lone row silently halves it instead of failing."""
+    def test_a_lone_review_row_is_not_a_gate_failure(self):
+        """[VANTA-WHY] M3 item 8 follow-up — §8.2's "paired rows exist" check moved to
+        ANALYSIS time (grouped by candidate key over the rows on disk). The gate must
+        not stop a wave for running an arm list the split declared on purpose: B0 is
+        repair-only and could never produce a counterpart."""
         rows = [
             row
             for row in _healthy_wave()
@@ -19394,10 +19398,9 @@ class TestWaveGate:
                 and row["candidate"]["kind"] == runner_mod.DEV_FIX
             )
         ]
-        problems = runner_mod.wave_gate_failures(rows)
-        assert any("the pair is incomplete" in problem for problem in problems)
+        assert runner_mod.wave_gate_failures(rows) == []
 
-    def test_repair_rows_alone_do_not_trip_the_pairing_check(self):
+    def test_repair_rows_alone_do_not_trip_the_gate(self):
         """There is no candidate to pair before the review passes run."""
         rows = [_gate_row(config=config, mode="repair") for config in ("baseline", "vanta")]
         assert runner_mod.wave_gate_failures(rows) == []
@@ -19483,9 +19486,16 @@ class TestDigestAndLabels:
         assert set(labels) == {"sess-2", "sess-3"}
         assert labels["sess-2"] == {
             "known_bad": False, "bug": "Demo/1", "config": "vanta",
+            # [VANTA-WHY] M3 item 8 follow-up — the arm is backfilled for a row that
+            # carries none (`arms.row_arm`), so an old label file and a new one key
+            # the same condition.
+            "arm": "b3",
             "mode": "review", "kind": "dev_fix", "source": "dev",
         }
         assert labels["sess-3"]["known_bad"] is True
+        assert labels["sess-3"]["arm"] == "suite", (
+            "a review row under `baseline` is the `suite` arm, not `b1`"
+        )
 
     def test_a_row_without_a_session_is_not_labelled(self, tmp_path):
         rows = [dict(self.ROWS[1], session_id=None)]
@@ -19511,6 +19521,19 @@ class TestDigestAndLabels:
     def test_the_model_is_one_of_the_grouping_axes(self):
         other = dict(self.ROWS[0], model="gemma-3-12b")
         assert len(runner_mod.digest(self.ROWS + [other])["groups"]) == 4
+
+    def test_the_arm_is_one_of_the_grouping_axes(self):
+        """[VANTA-WHY] M3 item 8 follow-up — two arms under ONE config must not pool.
+        `b1` and `suite` already share `baseline`; M3.5's `b3-v2-*` arms share `vanta`,
+        which this row's config is."""
+        other = dict(self.ROWS[0], arm="b3-v1")
+        payload = runner_mod.digest(self.ROWS + [other])
+        assert len(payload["groups"]) == 4
+        arms = {group["arm"] for group in payload["groups"]}
+        assert arms == {"b3", "suite", "b3-v1"}
+        # The backfilled arm of a row that carries none is the registry's answer.
+        assert arms_mod.row_arm(self.ROWS[0]) == "b3"
+        assert arms_mod.row_arm(self.ROWS[2]) == "suite"
 
     def test_two_builds_of_vanta_do_not_share_a_group(self):
         other = dict(self.ROWS[0], vanta_build_commit="e" * 40)
@@ -20057,57 +20080,230 @@ class TestStaleBinary:
 
 
 class TestPhaseOrder:
-    """D13: repairs first, then both reviews. The ordering is a correctness property."""
+    """D13: repairs first, then reviews. The ordering is a correctness property.
 
-    def test_the_declared_order_is_repairs_then_reviews(self):
-        assert runner_mod.PHASES == (
+    [VANTA-WHY] M3 item 8 follow-up — the order is no longer a constant checked
+    against the split; it is DERIVED from the split's own arm list
+    (``arms.phases_for``, mode-major), so a schedule and the list it describes
+    cannot disagree. What this class pins now is that derivation plus the refusals
+    that ARE facts about the list (an unknown spelling, the ``vanta_planner``
+    placeholder, two spellings under one config).
+    """
+
+    def test_the_legacy_split_schedules_repairs_then_reviews(self):
+        assert arms_mod.phases_for(["baseline", "vanta"]) == [
             ("repair", "baseline"),
             ("repair", "vanta"),
             ("review", "baseline"),
             ("review", "vanta"),
-        )
+        ]
 
-    def test_the_split_s_own_configs_match_it(self):
-        runner_mod._require_phase_order(["baseline", "vanta"])
+    def test_every_repair_pass_precedes_every_review_pass_for_any_arm_list(self):
+        """The ordering is a property of the derivation, not of one known list."""
+        phases = arms_mod.phases_for(["vanta", "b0", "baseline"])
+        modes = [mode for mode, _ in phases]
+        assert modes == ["repair"] * 3 + ["review"] * 2
+        # The review halves keep the split's own order, so a config's rows do not
+        # move relative to each other when an arm is added ahead of it.
+        assert [written for mode, written in phases if mode == "review"] == [
+            "vanta",
+            "baseline",
+        ]
+
+    def test_the_split_s_own_configs_are_accepted(self):
+        runner_mod._require_arm_list(["baseline", "vanta"])
+
+    def test_any_arm_list_is_allowed_to_run(self):
+        """[VANTA-WHY] Pairing moved to analysis time, so B0 (repair-only) can run."""
+        runner_mod._require_arm_list(["b0"])
+        runner_mod._require_arm_list(["b1", "b2", "b3"])
+        runner_mod._require_arm_list(["suite"])
 
     def test_naming_the_planner_placeholder_is_refused(self):
         """`vanta_planner` is a §4.4 placeholder: it would only add InfraFailure rows."""
         with pytest.raises(runner_mod.RunnerError) as caught:
-            runner_mod._require_phase_order(["baseline", "vanta", "vanta_planner"])
-        message = str(caught.value)
-        assert "split configs must be exactly ['baseline', 'vanta'] for paired review" in message
-        assert "got ['baseline', 'vanta', 'vanta_planner']" in message
-        assert "vanta_planner is a placeholder that returns InfraFailure" in message
-        assert "must not be in a run split" in message
+            runner_mod._require_arm_list(["baseline", "vanta", "vanta_planner"])
+        assert "vanta_planner is a placeholder that returns InfraFailure" in str(caught.value)
+        assert "must not be in a run split" in str(caught.value)
 
-    def test_the_message_is_about_the_config_list_not_about_the_ordering(self):
-        """A one-config split cannot produce paired rows, so the sentence must say so."""
-        with pytest.raises(runner_mod.RunnerError, match="must be exactly"):
-            runner_mod._require_phase_order(["vanta"])
+    def test_an_unknown_spelling_is_refused(self):
+        """A typo must not quietly run a smaller study."""
+        with pytest.raises(runner_mod.RunnerError, match="unknown config"):
+            runner_mod._require_arm_list(["baseline", "turbo"])
 
-    def test_a_reordered_schedule_is_refused_rather_than_run(self, monkeypatch):
-        monkeypatch.setattr(
-            runner_mod,
-            "PHASES",
-            (
-                ("review", "baseline"),
-                ("repair", "baseline"),
-                ("review", "vanta"),
-                ("repair", "vanta"),
-            ),
+    def test_two_spellings_under_one_config_are_refused(self):
+        """[VANTA-WHY] The job key has no arm column, so the second arm would be
+        skipped as the first on a resume and the manifest would hold one
+        experiment's row under the other's name."""
+        with pytest.raises(runner_mod.RunnerError, match="share a job key"):
+            runner_mod._require_arm_list(["baseline", "suite"])
+        with pytest.raises(runner_mod.RunnerError, match="share a job key"):
+            runner_mod._require_arm_list(["b1", "baseline"])
+
+
+class TestArms:
+    """The arm registry — one table for every arm, and its mirror in ``driver.rs``.
+
+    [VANTA-WHY] M3 item 8 follow-up — ``arms.py`` is the source of truth; the Rust
+    ``ARMS`` array exists only so the binary can refuse a stated arm before it spends
+    a budget. These tests pin the two together and pin the rules a split depends on:
+    which modes an arm runs, which config its rows carry, and what an old row's arm
+    backfills to.
+    """
+
+    # The canonical-name/config pairs the Rust array must reproduce exactly.
+    _ARMS_BLOCK = re.compile(r"const ARMS: &\[ArmSpec\] = &\[(?P<body>.*?)\n\];", re.DOTALL)
+    _ARM_SPEC = re.compile(
+        r"ArmSpec\s*\{\s*"
+        r'name:\s*"(?P<name>[^"]+)",\s*'
+        r'config:\s*"(?P<config>[^"]+)",\s*'
+        r"attacker:\s*(?P<attacker>true|false),\s*"
+        r"planner:\s*(?P<planner>true|false),\s*"
+        r"bate:\s*(?P<bate>true|false),\s*"
+        r"max_attempts:\s*(?P<max>Some\(\d+\)|None),",
+        re.DOTALL,
+    )
+
+    def test_the_rust_table_matches_the_python_registry(self):
+        """A hand-edit on one side must not make the arm a run *recorded* differ from
+        the arm it *executed*."""
+        source = (REPO_ROOT / "src" / "pipeline" / "driver.rs").read_text(encoding="utf-8")
+        block = self._ARMS_BLOCK.search(source)
+        assert block is not None, "driver.rs must define `const ARMS: &[ArmSpec]`"
+        parsed = {}
+        for spec in self._ARM_SPEC.finditer(block.group("body")):
+            max_attempts = spec.group("max")
+            parsed[spec.group("name")] = arms_mod.Arm(
+                name=spec.group("name"),
+                config=spec.group("config"),
+                modes=(),  # modes are a harness concept; the binary never reads them
+                attacker=spec.group("attacker") == "true",
+                planner=spec.group("planner") == "true",
+                bate=spec.group("bate") == "true",
+                max_attempts=(
+                    None if max_attempts == "None" else int(max_attempts[5:-1])
+                ),
+            )
+        assert set(parsed) == set(arms_mod.ARMS), (
+            f"the Rust table names {sorted(parsed)}, the registry {sorted(arms_mod.ARMS)}"
         )
-        with pytest.raises(runner_mod.RunnerError, match="correctness property"):
-            runner_mod._require_phase_order(["baseline", "vanta"])
+        for name, rust in parsed.items():
+            python = arms_mod.ARMS[name]
+            assert (rust.config, rust.attacker, rust.planner, rust.bate, rust.max_attempts) == (
+                python.config,
+                python.attacker,
+                python.planner,
+                python.bate,
+                python.max_attempts,
+            ), f"arm {name!r} disagrees between arms.py and driver.rs"
 
-    def test_the_paired_configs_are_the_two_the_design_names(self):
-        assert runner_mod.REVIEW_CONFIGS == ("baseline", "vanta")
+    def test_the_two_arms_of_one_spelling_agree_about_the_switches(self):
+        """``baseline`` is one spelling over two arms; ``arm_for_config`` answers from
+        the first. That is only sound if the two send the same switches."""
+        arms = arms_mod.modes_of("baseline").values()
+        signatures = {
+            (arms_mod.ARMS[name].attacker, arms_mod.ARMS[name].planner, arms_mod.ARMS[name].bate)
+            for name in arms
+        }
+        assert len(signatures) == 1
+
+    def test_every_arm_is_selectable_and_carries_its_config(self):
+        for name, entry in arms_mod.ARMS.items():
+            assert arms_mod.arm(name) is entry
+            assert entry.name == name
+            assert entry.config
+            assert entry.modes, f"arm {name!r} must run at least one mode"
+
+    def test_an_unknown_arm_name_fails_loudly(self):
+        with pytest.raises(arms_mod.ArmError, match="unknown arm"):
+            arms_mod.arm("turbo")
+        with pytest.raises(arms_mod.ArmError, match="unknown config"):
+            arms_mod.modes_of("turbo")
+
+    def test_a_repair_only_arm_refuses_a_review(self):
+        """B0 and B1 are repair arms: a review row of either would be byte-identical to
+        a ``suite`` row (the Attacker is off in all three)."""
+        for name in ("b0", "b1"):
+            assert "review" not in arms_mod.modes_of(name)
+            with pytest.raises(arms_mod.ArmError, match="does not run"):
+                arms_mod.arm_for(name, "review")
+
+    def test_a_review_only_arm_refuses_a_repair(self):
+        assert "repair" not in arms_mod.modes_of("suite")
+        with pytest.raises(arms_mod.ArmError, match="does not run"):
+            arms_mod.arm_for("suite", "repair")
+
+    def test_b0_pins_one_attempt_and_the_others_take_the_invocation_s(self):
+        """B0's budget is what the arm IS (M3 item 11), not a parameter."""
+        assert arms_mod.arm_max_attempts("b0", 4) == 1
+        assert arms_mod.arm_max_attempts("b1", 4) == 4
+        assert arms_mod.arm_max_attempts("b3", 7) == 7
+
+    def test_two_spellings_under_one_config_are_refused(self):
+        with pytest.raises(arms_mod.ArmError, match="share a job key"):
+            arms_mod.resolve_configs(["baseline", "suite"])
+        assert arms_mod.resolve_configs(["baseline", "vanta"]) == ["baseline", "vanta"]
+
+    def test_a_legacy_key_is_unchanged_by_the_registry(self):
+        """Legacy batches resume: the key is built from ``config``, never from ``arm``."""
+        cases = (
+            ("baseline", "repair", "b1#Demo/1#baseline#repair#0#"),
+            ("baseline", "review", "b1#Demo/1#baseline#review#0#"),
+            ("vanta", "repair", "b1#Demo/1#vanta#repair#0#"),
+            ("vanta", "review", "b1#Demo/1#vanta#review#0#"),
+        )
+        for written, mode, expected in cases:
+            assert (
+                manifest_mod.job_key(
+                    batch_id="b1",
+                    bug="Demo/1",
+                    config=arms_mod.config_of(written),
+                    mode=mode,
+                    seed=0,
+                )
+                == expected
+            )
+
+    def test_an_alias_normalises_to_the_legacy_job_key(self):
+        """``b1``/``b3``/``suite`` are spellings of the legacy configs, so a split that
+        writes one produces the key an already-recorded batch was written under."""
+        for alias, mode, legacy in (
+            ("b1", "repair", "baseline"),
+            ("b3", "repair", "vanta"),
+            ("suite", "review", "baseline"),
+        ):
+            assert arms_mod.config_of(alias) == legacy
+            assert manifest_mod.job_key(
+                batch_id="b1", bug="Demo/1", config=arms_mod.config_of(alias),
+                mode=mode, seed=0,
+            ) == manifest_mod.job_key(
+                batch_id="b1", bug="Demo/1", config=legacy, mode=mode, seed=0,
+            )
+
+    def test_the_backfill_matches_the_mode_config_mapping(self):
+        """A row written before the ``arm`` column existed groups under the same arm as
+        a new one, so one experiment is never split into a recorded and an unrecorded
+        half."""
+        assert arms_mod.arm_of("repair", "baseline") == "b1"
+        assert arms_mod.arm_of("review", "baseline") == "suite"
+        assert arms_mod.arm_of("repair", "vanta") == "b3"
+        assert arms_mod.arm_of("review", "vanta") == "b3"
+        # An arm added after the legacy pair carries its own name in both modes.
+        assert arms_mod.arm_of("repair", "b2") == "b2"
+        assert arms_mod.arm_of("review", "b2") == "b2"
+        # A pair no entry describes is its own arm — never an invented canonical name.
+        assert arms_mod.arm_of("repair", "vanta_planner") == "vanta_planner"
+        # A row that carries the field keeps it verbatim.
+        assert arms_mod.row_arm({"arm": "b0", "mode": "repair", "config": "b0"}) == "b0"
+        assert arms_mod.row_arm({"mode": "review", "config": "baseline"}) == "suite"
+        assert arms_mod.row_arm({"arm": "", "mode": "repair", "config": "vanta"}) == "b3"
 
 
 class TestVantaEnv:
-    """§7.4's controlled environment, derived from the same switch pair the record names."""
+    """§7.4's controlled environment, derived from ONE arm entry (§4.2, ``arms.py``)."""
 
     def _env(self, **over):
-        args = dict(config="vanta", seed=0, checkpoint="chk", disk_mb=8192, base={})
+        args = dict(arm="b3", seed=0, checkpoint="chk", disk_mb=8192, base={})
         args.update(over)
         return runner_mod.vanta_env(**args)
 
@@ -20119,12 +20315,30 @@ class TestVantaEnv:
             runner_mod.config_switches("turbo")
 
     def test_the_baseline_turns_the_attacker_off(self):
-        assert self._env(config="baseline")["VANTA_ATTACKER"] == "off"
-        assert self._env(config="vanta")["VANTA_ATTACKER"] == "on"
+        assert self._env(arm="b1")["VANTA_ATTACKER"] == "off"
+        assert self._env(arm="b3")["VANTA_ATTACKER"] == "on"
 
-    def test_the_planner_placeholder_stays_off(self):
-        assert self._env(config="vanta_planner")["VANTA_PLANNER"] == "on"
-        assert self._env(config="vanta")["VANTA_PLANNER"] == "off"
+    def test_the_arm_name_is_stated_in_the_environment(self):
+        """[VANTA-WHY] M3 item 8 follow-up — the value is what the binary records as
+        ``arm`` and what it refuses the switches against, so it must be on every
+        invocation and must be the arm's canonical name."""
+        assert self._env(arm="b1")["VANTA_ARM"] == "b1"
+        assert self._env(arm="suite")["VANTA_ARM"] == "suite"
+        assert self._env(arm="b0")["VANTA_ARM"] == "b0"
+        # `b1` and `suite` share `config=baseline` but are two arms.
+        assert self._env(arm="b1")["VANTA_ATTACKER"] == self._env(arm="suite")["VANTA_ATTACKER"]
+
+    def test_the_planner_placeholder_is_not_a_registered_arm(self):
+        """§4.4's placeholder is addressable but has no arm, so no run can carry it."""
+        assert runner_mod.config_switches("vanta_planner") == (True, True)
+        with pytest.raises(runner_mod.RunnerError, match="unknown arm"):
+            self._env(arm="vanta_planner")
+
+    def test_a_b2_row_sends_the_bate_switch_off(self):
+        """M3 item 8 — B2 is the arm with the Attacker and without BATE."""
+        assert self._env(arm="b2")["VANTA_ATTACKER"] == "on"
+        assert self._env(arm="b2")["VANTA_BATE"] == "off"
+        assert self._env(arm="b3")["VANTA_BATE"] == "on"
 
     def test_seed_zero_is_still_sent_as_a_seed(self):
         """Unset means "no seed key in the body"; 0 is a request to pin 0 (§4.4)."""
@@ -20227,11 +20441,18 @@ def _job(
     bug_prep,
     *,
     config="vanta",
+    arm=None,
     mode=runner_mod.REPAIR,
     candidate=None,
     harness=None,
     show_hints=False,
 ) -> runner_mod.Job:
+    # [VANTA-WHY] M3 item 8 follow-up — `arm` is its own field now (the row records
+    # both `config` and `arm`), so a helper that named only the config would have to
+    # guess the arm. The default is the registry's own backfill of the pair, which is
+    # what the harness derives for a legacy config.
+    if arm is None:
+        arm = arms_mod.arm_of(mode, config)
     return runner_mod.Job(
         batch_id="b1",
         wave=1,
@@ -20244,6 +20465,7 @@ def _job(
             "checkpoint": "chk",
         },
         config=config,
+        arm=arm,
         mode=mode,
         seed=0,
         checkpoint="chk",

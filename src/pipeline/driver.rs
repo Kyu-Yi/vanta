@@ -349,6 +349,186 @@ fn benchmark_config_name(
     }
 }
 
+/// One arm's definition — the Rust mirror of `scripts/bugsinpy/arms.py::ARMS`.
+///
+/// [VANTA-WHY] M3 item 8 follow-up — the harness STATES the arm rather than letting
+/// the switches imply it, because two arms can share a switch pair: `b0` and
+/// `baseline` are both "attacker off, planner off, BATE on" and differ ONLY in the
+/// attempt budget, which `benchmark_config_name` cannot see. The stated name is what
+/// `run.summary` records as `arm`, and this table is what checks the statement.
+///
+/// It is duplicated here rather than only in Python because the binary is also run by
+/// hand (no harness, no `VANTA_ARM`), and because the refusal has to happen in the
+/// process that is about to spend the budget rather than only in its caller. The
+/// Python table is the source of truth; `scripts/test_bugsinpy.py::TestArms` parses
+/// this array and fails if the two disagree, so a hand-edit on one side cannot
+/// silently make the arm a run recorded different from the arm it executed.
+struct ArmSpec {
+    name: &'static str,
+    /// The `config` column value the arm's rows carry. The legacy arms keep the name
+    /// every row already on disk carries, so their sessions read unchanged and their
+    /// job keys stay byte-identical (the key is built from `config`, never `arm`).
+    config: &'static str,
+    attacker: bool,
+    planner: bool,
+    bate: bool,
+    /// The attempt budget this arm pins, or `None` for the invocation's own.
+    max_attempts: Option<u32>,
+}
+
+const ARMS: &[ArmSpec] = &[
+    // M3 item 11 — B0: one Creator call, no feedback, no Attacker.
+    ArmSpec {
+        name: "b0",
+        config: "b0",
+        attacker: false,
+        planner: false,
+        bate: true,
+        max_attempts: Some(1),
+    },
+    // B1 — today's `baseline` repair.
+    ArmSpec {
+        name: "b1",
+        config: "baseline",
+        attacker: false,
+        planner: false,
+        bate: true,
+        max_attempts: None,
+    },
+    // M3 item 8 — B2: the Attacker runs, BATE does not admit-test.
+    ArmSpec {
+        name: "b2",
+        config: "b2",
+        attacker: true,
+        planner: false,
+        bate: false,
+        max_attempts: None,
+    },
+    // B3 — today's `vanta`, both modes.
+    ArmSpec {
+        name: "b3",
+        config: "vanta",
+        attacker: true,
+        planner: false,
+        bate: true,
+        max_attempts: None,
+    },
+    // The review half of today's `baseline`: attacker off, reviewing a candidate.
+    ArmSpec {
+        name: "suite",
+        config: "baseline",
+        attacker: false,
+        planner: false,
+        bate: true,
+        max_attempts: None,
+    },
+];
+
+/// The arm a run is executing: the name it records and the `config` it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedArm {
+    /// What `run.summary` records as `arm`, and what the harness passed as `VANTA_ARM`.
+    name: String,
+    /// What `run.summary` records as `config` — the split's own column.
+    config: String,
+}
+
+impl ResolvedArm {
+    /// The pre-`VANTA_ARM` answer: name and config both derived from the switches.
+    fn from_switches(attacker: bool, planner: bool, bate: bool) -> Self {
+        let name = benchmark_config_name(attacker, planner, bate).to_string();
+        Self {
+            config: name.clone(),
+            name,
+        }
+    }
+}
+
+/// `on`/`off` for a switch, so a refusal sentence reads like the vars it names.
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+/// Read `VANTA_ARM`, or `None` when it is absent or empty.
+///
+/// [VANTA-WHY] An empty value is "no statement", not a name: a shell that expands an
+/// unset variable (`VANTA_ARM=`) hands over an empty string, and treating it as a
+/// stated-but-unknown arm would fail a run the operator configured correctly. This is
+/// the same reading `env_float` gives an empty value.
+fn env_arm() -> Result<Option<String>, String> {
+    match std::env::var("VANTA_ARM") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(
+            "CONFIG_ERROR: VANTA_ARM env var contained non-UTF-8 bytes.".to_string(),
+        ),
+    }
+}
+
+/// Resolve the run's arm, refusing a stated name the switches or budget contradict.
+///
+/// [VANTA-WHY] M3 item 8 follow-up — the driver's half of "the harness refuses before
+/// launching". The harness builds every switch, the arm name and the budget from ONE
+/// `arms.py` entry, so it cannot produce an inconsistent combination; this check is
+/// what catches a hand-run binary, a wrapper that exported the switches itself, or a
+/// `--max-attempts` that would silently redefine an arm (`b0` is one Creator call, not
+/// one attempt of four). A refusal here happens before the repo is loaded, so a
+/// contradiction costs nothing.
+fn resolve_arm(
+    stated: Option<&str>,
+    attacker: bool,
+    planner: bool,
+    bate: bool,
+    max_attempts: u32,
+) -> Result<ResolvedArm, String> {
+    let Some(name) = stated else {
+        return Ok(ResolvedArm::from_switches(attacker, planner, bate));
+    };
+    let Some(spec) = ARMS.iter().find(|spec| spec.name == name) else {
+        let known: Vec<&str> = ARMS.iter().map(|spec| spec.name).collect();
+        return Err(format!(
+            "CONFIG_ERROR: VANTA_ARM='{name}' is not a known arm (expected one of {}).",
+            known.join(", ")
+        ));
+    };
+    if spec.attacker != attacker || spec.planner != planner || spec.bate != bate {
+        return Err(format!(
+            "CONFIG_ERROR: VANTA_ARM='{name}' disagrees with the switches: the arm is \
+             attacker={} planner={} bate={}, but VANTA_ATTACKER={} VANTA_PLANNER={} \
+             VANTA_BATE={}.",
+            on_off(spec.attacker),
+            on_off(spec.planner),
+            on_off(spec.bate),
+            on_off(attacker),
+            on_off(planner),
+            on_off(bate),
+        ));
+    }
+    if let Some(pinned) = spec.max_attempts {
+        if max_attempts != pinned {
+            return Err(format!(
+                "CONFIG_ERROR: VANTA_ARM='{name}' pins --max-attempts {pinned} (that is \
+                 what the arm IS), but the invocation asked for {max_attempts}."
+            ));
+        }
+    }
+    Ok(ResolvedArm {
+        name: spec.name.to_string(),
+        config: spec.config.to_string(),
+    })
+}
+
 /// Render one effective sampling value for the `run.summary` provenance keys.
 ///
 /// [VANTA-WHY] `unset` (not `null`, not a plausible default) is what an absent
@@ -696,6 +876,22 @@ pub async fn run(
     // why the default is `on` and an absent var means "BATE ran" (a default-ON
     // switch is the shape that keeps every existing arm byte-identical).
     let bate_enabled = env_flag("VANTA_BATE", true)?;
+    // [VANTA-WHY] M3 item 8 follow-up — the arm, STATED by the harness (`VANTA_ARM`)
+    // rather than inferred from the switches. `b0` and `baseline` are the same switch
+    // pair and differ only in the attempt budget, so `benchmark_config_name` cannot
+    // name them apart; the stated name is what `run.summary` records as `arm`. Read
+    // here, with the switches, so a name that contradicts them — or a `--max-attempts`
+    // that would redefine the arm — fails before the repo is loaded and before any
+    // call is made. An absent `VANTA_ARM` is a hand-run binary and resolves to the
+    // switch-derived name exactly as every run before this change did.
+    let stated_arm = env_arm()?;
+    let resolved_arm = resolve_arm(
+        stated_arm.as_deref(),
+        attacker_enabled,
+        planner_enabled,
+        bate_enabled,
+        config.max_attempts,
+    )?;
     // [VANTA-WHY] §14.2/§14.4/§14.5 — the three robustness switches. All
     // default OFF so v0.2 behaves exactly as before until they are flipped, and
     // the values are written into `run.summary` so a session's artifacts state
@@ -804,9 +1000,9 @@ pub async fn run(
     }
     if !attacker_enabled {
         println!(
-            "▌ Config: {} — Attacker off (VANTA_ATTACKER=off): the repo's own suite and static \
+            "▌ Arm: {} — Attacker off (VANTA_ATTACKER=off): the repo's own suite and static \
              analysis are the whole question.",
-            benchmark_config_name(attacker_enabled, planner_enabled, bate_enabled)
+            resolved_arm.name
         );
     }
 
@@ -3288,10 +3484,14 @@ pub async fn run(
     // into the batch manifest (§7.3), and `metrics.py` groups by them (§9.1), so
     // any table can be cut by config × seed × model without re-running.
     //
-    // [VANTA-WHY] `config` is DERIVED from the two switches rather than read
-    // from a fourth env var, so the config the record claims cannot disagree
-    // with the config the run executed (§4.2 defines the three configurations as
-    // exactly these switch settings — one definition, `benchmark_config_name`).
+    // [VANTA-WHY] `config` is the resolved ARM's config, and `arm` is the resolved
+    // arm's name. Before item 8's follow-up `config` was derived from the switches
+    // alone; it is now taken from the arm the harness STATED (`VANTA_ARM`), because
+    // `b0` and `baseline` are the SAME switch pair and differ only in the attempt
+    // budget — `benchmark_config_name` cannot tell them apart. The two can never
+    // disagree with the run: `resolve_arm` refuses a stated name whose switches or
+    // budget contradict it, and an absent `VANTA_ARM` (a hand-run binary) resolves to
+    // exactly the switch-derived name, so those runs record what they always did.
     //
     // [VANTA-WHY] The sampling record is the REAL per-call schedule, not a
     // run-level scalar. The harness pins `temperature` and `max_tokens` per call
@@ -3310,7 +3510,8 @@ pub async fn run(
     // inherits. `seed` is what the HARNESS asked for. `unset` means the server
     // did not publish the key — never a plausible-looking default, which would be
     // a fabricated claim about a sampler nobody pinned.
-    let config_name = benchmark_config_name(attacker_enabled, planner_enabled, bate_enabled);
+    let config_name = resolved_arm.config.as_str();
+    let arm_name = resolved_arm.name.as_str();
     let top_p_value = sampling_value(server_top_p_for_provenance(&cfg).await);
     let seed_value = cfg
         .seed
@@ -3388,7 +3589,7 @@ pub async fn run(
         phase: "run.summary".to_string(),
         summary: format!(
             "attempts_run={} fixed_at_attempt_1={} final_decision={:?} \
-             config={} mode={} seed={} seed_policy={} model={} top_p={} {} {} \
+             config={} arm={} mode={} seed={} seed_policy={} model={} top_p={} {} {} \
              llm_calls={} llm_calls_measured={} llm_prompt_tokens={} llm_completion_tokens={} \
              llm_cached_tokens={} llm_reasoning_tokens={} llm_cache_hit_rate={} \
              cost_usd={} cost_basis={} \
@@ -3414,6 +3615,7 @@ pub async fn run(
             fixed_at_attempt_1,
             decision,
             config_name,
+            arm_name,
             run_mode,
             seed_value,
             // [VANTA-WHY] §14.23 — the seed POLICY, not the seed. The offset is
@@ -5105,10 +5307,11 @@ mod tests {
         approval_invariant_status, attempt_verdict, bate_baseline_concat, benchmark_config_name,
         blocking_static_findings,
         build_source_concat, cache_hit_rate_value, collapse_decision,
-        dependency_freeze_summary_value, env_flag, harness_infrastructure_collapse, ledger_text,
+        dependency_freeze_summary_value, env_arm, env_flag, harness_infrastructure_collapse,
+        ledger_text,
         modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
-        stamp_transition_row, stable_patch_fingerprint, INVARIANT_SATISFIED,
+        resolve_arm, stamp_transition_row, stable_patch_fingerprint, ARMS, INVARIANT_SATISFIED,
         NO_ADMITTED_TESTS, NO_REPRODUCTION_EVIDENCE,
     };
     use crate::agents::attacker::GeneratedTest;
@@ -6032,6 +6235,136 @@ mod tests {
             Some(value) => unsafe { std::env::set_var("VANTA_BATE", value) },
             None => unsafe { std::env::remove_var("VANTA_BATE") },
         }
+    }
+
+    // [VANTA-WHY] M3 item 8 follow-up — `VANTA_ARM` is the arm the harness STATED,
+    // and an ABSENT one is a hand-run binary: it must resolve to exactly the
+    // switch-derived name and config every run before the var recorded, or an
+    // ordinary `vanta_m3` invocation would start writing a different `arm` than
+    // before.
+    #[test]
+    fn an_absent_arm_var_resolves_to_the_switch_derived_name() {
+        let previous = std::env::var("VANTA_ARM").ok();
+
+        unsafe { std::env::remove_var("VANTA_ARM") };
+        assert_eq!(
+            env_arm().unwrap(),
+            None,
+            "an absent VANTA_ARM is 'no statement', not an unknown arm"
+        );
+        // An empty value is the same statement: a shell expanding an unset var
+        // (`VANTA_ARM=`) must not turn a correct invocation into a refusal.
+        unsafe { std::env::set_var("VANTA_ARM", "") };
+        assert_eq!(env_arm().unwrap(), None, "an empty VANTA_ARM is no statement");
+        unsafe { std::env::set_var("VANTA_ARM", "  ") };
+        assert_eq!(env_arm().unwrap(), None, "whitespace is no statement either");
+
+        for attacker in [false, true] {
+            for planner in [false, true] {
+                for bate in [false, true] {
+                    let resolved = resolve_arm(None, attacker, planner, bate, 4).unwrap();
+                    let pre = benchmark_config_name(attacker, planner, bate);
+                    assert_eq!(
+                        resolved.name, pre,
+                        "attacker={attacker} planner={planner} bate={bate}: a hand-run \
+                         binary must record the arm it always recorded"
+                    );
+                    assert_eq!(
+                        resolved.config, pre,
+                        "and the same value in the config column"
+                    );
+                }
+            }
+        }
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("VANTA_ARM", value) },
+            None => unsafe { std::env::remove_var("VANTA_ARM") },
+        }
+    }
+
+    // [VANTA-WHY] M3 item 8 follow-up — a stated arm carries its own config, which
+    // is what lets `b0` and `baseline` (the SAME switch pair) be told apart on disk.
+    #[test]
+    fn every_stated_arm_resolves_to_its_own_config() {
+        for spec in ARMS {
+            let budget = spec.max_attempts.unwrap_or(4);
+            let resolved = resolve_arm(
+                Some(spec.name),
+                spec.attacker,
+                spec.planner,
+                spec.bate,
+                budget,
+            )
+            .unwrap_or_else(|e| panic!("arm '{}' must resolve: {e}", spec.name));
+            assert_eq!(resolved.name, spec.name);
+            assert_eq!(
+                resolved.config, spec.config,
+                "arm '{}' must carry its own config value",
+                spec.name
+            );
+        }
+        // The two legacy arms keep the config name every row on disk already has.
+        assert_eq!(
+            resolve_arm(Some("b1"), false, false, true, 4).unwrap().config,
+            "baseline"
+        );
+        assert_eq!(
+            resolve_arm(Some("b3"), true, false, true, 4).unwrap().config,
+            "vanta"
+        );
+        assert_eq!(
+            resolve_arm(Some("b0"), false, false, true, 1).unwrap().config,
+            "b0"
+        );
+    }
+
+    // [VANTA-WHY] M3 item 8 follow-up — the driver's half of "the harness refuses
+    // before launching". A name that disagrees with the switches, or a budget that
+    // would silently redefine an arm, is a `CONFIG_ERROR` before the repo is loaded.
+    #[test]
+    fn a_stated_arm_that_contradicts_the_switches_or_budget_is_refused() {
+        // Unknown name: refused, and the sentence lists the known arms. The list
+        // holds ARM names, so `baseline` (a config, not an arm) must not appear in it.
+        let error = resolve_arm(Some("nope"), false, false, true, 4)
+            .expect_err("an unknown arm name must not fall back to the switches");
+        assert!(
+            error.contains("CONFIG_ERROR")
+                && error.contains("VANTA_ARM='nope'")
+                && error.contains("b0")
+                && !error.contains("baseline"),
+            "the refusal must name the class, the stated name and the known arms, got: {error}"
+        );
+        assert!(
+            error.contains("b3") && error.contains("suite"),
+            "every known arm must be listed, got: {error}"
+        );
+
+        // Switch disagreement: `b2` is attacker=on, bate=off; the switches say otherwise.
+        let error = resolve_arm(Some("b2"), true, false, true, 4)
+            .expect_err("VANTA_ARM must not disagree with the switches");
+        assert!(
+            error.contains("CONFIG_ERROR")
+                && error.contains("VANTA_ARM='b2'")
+                && error.contains("disagrees with the switches"),
+            "got: {error}"
+        );
+        // `b1` is attacker=off; asking for it with the Attacker on is the same fault.
+        assert!(resolve_arm(Some("b1"), true, false, true, 4).is_err());
+
+        // Budget: `b0` IS one Creator call, so a four-attempt invocation is not b0.
+        let error = resolve_arm(Some("b0"), false, false, true, 4)
+            .expect_err("b0 pins its attempt budget and the invocation must not override it");
+        assert!(
+            error.contains("CONFIG_ERROR")
+                && error.contains("VANTA_ARM='b0'")
+                && error.contains("--max-attempts 1"),
+            "got: {error}"
+        );
+        // The budget the arm pins is accepted.
+        assert!(resolve_arm(Some("b0"), false, false, true, 1).is_ok());
+        // An arm with no pinned budget takes the invocation's own.
+        assert!(resolve_arm(Some("b1"), false, false, true, 4).is_ok());
     }
 
     // [VANTA-WHY] M3 item 1 — the grounding ledger separates "the audit ran and

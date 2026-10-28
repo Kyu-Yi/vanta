@@ -698,6 +698,7 @@ def provenance_summary(
     decision: str = "Rejected",
     *,
     config: str = "vanta",
+    arm: str = "b3",
     mode: str = "repair",
     seed: str = "0",
     model: str = "qwen3-4b",
@@ -708,10 +709,15 @@ def provenance_summary(
         "sampling_preset=default temperature_creator=0.1 max_tokens_creator=32768"
     ),
 ) -> str:
-    """A `run.summary` line carrying the §4.4 provenance keys, as driver.rs writes it."""
+    """A `run.summary` line carrying the §4.4 provenance keys, as driver.rs writes it.
+
+    [WHY] `arm` sits between `config` and `mode` because that is where `driver.rs`
+    writes it (M3 item 8's follow-up); a fixture in another order would still satisfy
+    the reader and quietly stop representing the real line.
+    """
     return (
         f"attempts_run=1 fixed_at_attempt_1=false final_decision={decision} "
-        f"config={config} mode={mode} seed={seed} model={model} top_p={top_p} "
+        f"config={config} arm={arm} mode={mode} seed={seed} model={model} top_p={top_p} "
         f"{sampling} commit={commit} dirty={dirty}"
     )
 
@@ -850,6 +856,23 @@ def test_a_different_seed_or_schedule_is_a_different_group(tmp_path):
     assert len(groups) == 3
     sizes = sorted(len(group.verdicts) for group in groups)
     assert sizes == [1, 1, 1]
+
+
+def test_the_arm_is_a_provenance_axis(tmp_path):
+    """[WHY] M3 item 8 follow-up — two arms under ONE config must not pool.
+
+    `b1` and `suite` already share `baseline`; M3.5's `b3-v2-*` arms share `vanta`.
+    Grouping by `config` alone would report one number for two experiments, which is
+    the failure the extra axis exists to prevent.
+    """
+    assert "arm" in metrics.PROVENANCE_KEYS
+    write_provenance_session(tmp_path, "a", provenance_summary(config="vanta", arm="b3"))
+    write_provenance_session(tmp_path, "b", provenance_summary(config="vanta", arm="b3-v1"))
+
+    groups, _ = groups_and_facts(tmp_path)
+    assert len(groups) == 2
+    assert {group.provenance["config"] for group in groups} == {"vanta"}
+    assert {group.provenance["arm"] for group in groups} == {"b3", "b3-v1"}
 
 
 def test_pooled_metrics_use_each_metrics_own_denominator(tmp_path):

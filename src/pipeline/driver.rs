@@ -316,17 +316,34 @@ fn env_reasoning_effort() -> Result<Option<crate::llm::ReasoningEffort>, String>
     }
 }
 
-/// The `baseline` / `vanta` / `vanta_planner` name for a pair of switches.
+/// The `baseline` / `vanta` / `vanta_planner` / `b2` name for a set of switches.
 ///
 /// [VANTA-WHY] Deriving the name from the switches instead of taking a fourth
 /// env var means the config a session records CANNOT disagree with the config
 /// it ran: §4.2 defines the three configurations as exactly these switch
 /// settings, so this is the single definition of the mapping.
-fn benchmark_config_name(attacker_enabled: bool, planner_enabled: bool) -> &'static str {
+///
+/// [VANTA-WHY] M3 item 8 — `b2` is the paper's second adversarial arm: the
+/// Attacker runs but BATE is bypassed (`VANTA_BATE=off`), so every generated
+/// test is admitted regardless of declared intent or baseline behaviour. It is
+/// derived here, not from a fourth env var, for the same reason as the rest:
+/// the recorded arm name is then a function of the switches that actually ran.
+/// The check is nested inside the Attacker-on branch and AFTER the planner, so
+/// `baseline` (no Attacker — no adversarial intake to withhold) and
+/// `vanta_planner` are untouched by the new switch and stay byte-identical.
+fn benchmark_config_name(
+    attacker_enabled: bool,
+    planner_enabled: bool,
+    bate_enabled: bool,
+) -> &'static str {
     if planner_enabled {
         "vanta_planner"
     } else if attacker_enabled {
-        "vanta"
+        if bate_enabled {
+            "vanta"
+        } else {
+            "b2"
+        }
     } else {
         "baseline"
     }
@@ -670,6 +687,15 @@ pub async fn run(
     // to the configuration.
     let attacker_enabled = env_flag("VANTA_ATTACKER", true)?;
     let planner_enabled = env_flag("VANTA_PLANNER", false)?;
+    // [VANTA-WHY] M3 item 8 — the B2 arm's switch, read here with the other two
+    // so the arm name and the code path cannot disagree. `VANTA_BATE=on` (the
+    // default) is the run every existing measurement was taken under: BATE
+    // validates each Attacker test before it may reject. `off` is the paper's
+    // B2 arm — adversarial tests admitted with NO baseline validation and NO
+    // intent audit — and is the only setting that changes behaviour, which is
+    // why the default is `on` and an absent var means "BATE ran" (a default-ON
+    // switch is the shape that keeps every existing arm byte-identical).
+    let bate_enabled = env_flag("VANTA_BATE", true)?;
     // [VANTA-WHY] §14.2/§14.4/§14.5 — the three robustness switches. All
     // default OFF so v0.2 behaves exactly as before until they are flipped, and
     // the values are written into `run.summary` so a session's artifacts state
@@ -780,7 +806,7 @@ pub async fn run(
         println!(
             "▌ Config: {} — Attacker off (VANTA_ATTACKER=off): the repo's own suite and static \
              analysis are the whole question.",
-            benchmark_config_name(attacker_enabled, planner_enabled)
+            benchmark_config_name(attacker_enabled, planner_enabled, bate_enabled)
         );
     }
 
@@ -1746,26 +1772,44 @@ pub async fn run(
             // "FeatureAcceptance" and then pass its own acceptance test. The
             // quote-substring evidence is recorded, but the audit decides.
             //
+            // [VANTA-WHY] M3 item 8 — under B2 (`VANTA_BATE=off`) this audit is
+            // SKIPPED entirely, not merely weakened: the arm is defined as
+            // adversarial tests admitted "regardless of declared intent", and this
+            // is the patch-blind intent-admission gate (`route_intent`'s scrap/
+            // demote) that a B2 run must not apply. The Attacker still generated
+            // `generated_tests`; with no audit they enter BATE unmodified, so the
+            // only filter between the model and the patched run is the mechanical
+            // duplicate drop above. Skipping (rather than auditing and ignoring the
+            // answer) is what makes "no intent-check records" true and keeps the
+            // flag-off log identical to the pre-item-8 one.
+            //
             // [VANTA-WHY] §14.5 — the cap the batched call is about to be given,
             // recorded here rather than read back from the audit, because the
             // audit's answer is exactly what a truncated batch fails to produce.
-            // The value is the one `attacker_check_intent_batch` will send.
-            if batch_audit_enabled {
+            // The value is the one `attacker_check_intent_batch` will send. Gated
+            // on `bate_enabled` too: with no intent audit there is no batched call
+            // to cap, and writing the cap anyway would claim a call the run never
+            // made.
+            if bate_enabled && batch_audit_enabled {
                 let cap = crate::agents::attacker::intent_audit_batch_max_tokens(
                     generated_tests.len(),
                 );
                 batch_audit_max_tokens = Some(batch_audit_max_tokens.map_or(cap, |m| m.max(cap)));
             }
             let (attacker_tests, initial_relabels, initial_intent_checks, batch_audit_transport) =
-                audit_tests_intent(
-                    &cfg,
-                    &repo.issue_text,
-                    &prompt_source_concat,
-                    &generated_tests,
-                    grounded_audit_enabled,
-                    batch_audit_enabled,
-                )
-                .await;
+                if bate_enabled {
+                    audit_tests_intent(
+                        &cfg,
+                        &repo.issue_text,
+                        &prompt_source_concat,
+                        &generated_tests,
+                        grounded_audit_enabled,
+                        batch_audit_enabled,
+                    )
+                    .await
+                } else {
+                    (generated_tests.clone(), Vec::new(), Vec::new(), None)
+                };
             // [VANTA-WHY] §14.5 — what the batched call DID, recorded once per
             // round and only when such a call was made: `Some` here is exactly
             // "a batched call happened", so the flag-off log is unchanged. A
@@ -1830,7 +1874,15 @@ pub async fn run(
             // is there a field for the auditor to answer, and `grounding_counts` reads
             // nothing else, so the flag is the honest gate for "`Some` rather than
             // `null`".
-            if grounded_audit_enabled {
+            //
+            // [VANTA-WHY] M3 item 8 — `bate_enabled` is the second half of that
+            // gate: under B2 the intent audit (which is the only thing that
+            // populates `initial_intent_checks`) never ran, so there is no
+            // measurement to record and the ledger must stay `null` even if
+            // `VANTA_GROUNDED_AUDIT=on`. Writing `0` would claim an audit that found
+            // nothing, which is exactly the absence-vs-zero confusion `ledger_text`
+            // exists to prevent.
+            if bate_enabled && grounded_audit_enabled {
                 *grounded_scrapped_total.get_or_insert(0) += scrapped;
                 *grounded_kept_by_issue_total.get_or_insert(0) += kept_by_issue;
             }
@@ -1885,6 +1937,14 @@ pub async fn run(
         // patch would make a correct probe look wrong. This is also why BATE
         // needs no sanitizing of its own: it never receives a patch-added
         // `conftest.py` or an edited test in the first place.
+        //
+        // [VANTA-WHY] M3 item 8 — `admit_all` is `VANTA_BATE=off` (the B2 arm).
+        // The bypass is expressed as an argument to `run_bate` rather than a
+        // second path around it, so BATE stays the ONE place that decides
+        // admission: a pass-through there still produces the `bate.summary` row
+        // every existing arm writes (valid=N, scrapped=0), and the flag-off call
+        // is byte-identical because `admit_all` is `false` whenever the switch is
+        // unset.
         println!("\n▌ BATE: validating tests against baseline...");
         let bate_run = run_with_spinner("BATE validating tests against baseline", async {
             run_bate(
@@ -1895,6 +1955,7 @@ pub async fn run(
                 &attacker_tests,
                 &test_cmd,
                 grounded_audit_enabled,
+                !bate_enabled,
                 &mut revise_budget,
             )
             .await
@@ -2886,7 +2947,7 @@ pub async fn run(
                 // conditioned on any §14 flag: turning the audits off must not be
                 // a way to buy back an approval.
                 let (applied, reason) =
-                    approval_invariant_status(governor_mode, attacker_enabled, &final_evidence);
+                    approval_invariant_status(governor_mode, attacker_enabled, bate_enabled, &final_evidence);
                 if applied && reason != INVARIANT_SATISFIED {
                     // [VANTA-WHY] M3 item 1 — the two withheld-approval reasons are
                     // two different diagnoses, so they get two different sentences
@@ -3249,7 +3310,7 @@ pub async fn run(
     // inherits. `seed` is what the HARNESS asked for. `unset` means the server
     // did not publish the key — never a plausible-looking default, which would be
     // a fabricated claim about a sampler nobody pinned.
-    let config_name = benchmark_config_name(attacker_enabled, planner_enabled);
+    let config_name = benchmark_config_name(attacker_enabled, planner_enabled, bate_enabled);
     let top_p_value = sampling_value(server_top_p_for_provenance(&cfg).await);
     let seed_value = cfg
         .seed
@@ -3307,7 +3368,7 @@ pub async fn run(
     // `no_approval` says exactly that, rather than reporting a satisfied/not
     // reading about a decision the run never made.
     let (invariant_applied_here, invariant_reason_here) =
-        approval_invariant_status(governor_mode, attacker_enabled, &final_evidence);
+        approval_invariant_status(governor_mode, attacker_enabled, bate_enabled, &final_evidence);
     let invariant_applied = invariant_applied_here
         && matches!(
             decision,
@@ -4853,14 +4914,26 @@ fn expects_baseline_failure(evidence: &[TestEvidence]) -> bool {
 ///     baseline review would be withheld. `baseline` is the study's comparison
 ///     arm and must stay byte-identical, so it is exempt by construction rather
 ///     than by a value that could drift.
+///   * `b2_arm` — a REVIEW under the B2 arm (`VANTA_BATE=off`). B2 admits every
+///     Attacker test regardless of declared intent, so "at least one admitted
+///     test expects the original to fail" is not a property of its intake: a
+///     B2 review whose probes are all mislabelled would be withheld for a reason
+///     that is the arm's whole design, not a defect in the candidate. Exempt by
+///     construction for the same reason `attacker_off` is — see M3 item 8.
 /// With the invariant in force there are three answers: `satisfied` when at
 /// least one admitted test expects the original to fail, `no_reproduction_evidence`
 /// when tests ran but none of them does, and `no_admitted_tests` when nothing was
 /// admitted at all. The last two are different diagnoses and are recorded
 /// differently on purpose — see `NO_ADMITTED_TESTS`.
+///
+/// [VANTA-WHY] M3 item 8 — the B2 exemption is checked AFTER `not_review` and
+/// `attacker_off`, so an existing arm's reason is untouched: a repair run is
+/// still `not_review` (it has no approval for the invariant to constrain,
+/// whatever the BATE switch says) and a baseline review is still `attacker_off`.
 fn approval_invariant_status(
     mode: GovernorMode,
     attacker_enabled: bool,
+    bate_enabled: bool,
     evidence: &[TestEvidence],
 ) -> (bool, &'static str) {
     if mode != GovernorMode::Review {
@@ -4868,6 +4941,9 @@ fn approval_invariant_status(
     }
     if !attacker_enabled {
         return (false, "attacker_off");
+    }
+    if !bate_enabled {
+        return (false, "b2_arm");
     }
     if evidence.is_empty() {
         return (true, NO_ADMITTED_TESTS);
@@ -5026,9 +5102,10 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        approval_invariant_status, attempt_verdict, bate_baseline_concat, blocking_static_findings,
+        approval_invariant_status, attempt_verdict, bate_baseline_concat, benchmark_config_name,
+        blocking_static_findings,
         build_source_concat, cache_hit_rate_value, collapse_decision,
-        dependency_freeze_summary_value, harness_infrastructure_collapse, ledger_text,
+        dependency_freeze_summary_value, env_flag, harness_infrastructure_collapse, ledger_text,
         modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
         stamp_transition_row, stable_patch_fingerprint, INVARIANT_SATISFIED,
@@ -5735,7 +5812,7 @@ mod tests {
     #[test]
     fn no_admitted_tests_is_a_distinct_withheld_approval_reason() {
         assert_eq!(
-            approval_invariant_status(GovernorMode::Review, true, &[]),
+            approval_invariant_status(GovernorMode::Review, true, true, &[]),
             (true, NO_ADMITTED_TESTS),
             "zero admitted tests must withhold the approval with its own reason"
         );
@@ -5747,18 +5824,23 @@ mod tests {
     }
 
     // [VANTA-WHY] M3 item 1 — every answer the invariant can give, including the
-    // two configurations where it is INAPPLICABLE. An exemption has to be
+    // configurations where it is INAPPLICABLE. An exemption has to be
     // recorded with its reason rather than silently skipped, or a baseline row
     // would be indistinguishable from a Vanta row that happened to be satisfied.
+    //
+    // [VANTA-WHY] M3 item 8 — `bate_enabled` is threaded through so a B2 row can
+    // carry its own exemption, and the existing reasons are pinned here at
+    // `bate_enabled = true` (the only value an existing arm ever has, since the
+    // switch defaults on) to prove the new one did not shift them.
     #[test]
     fn the_approval_invariant_names_each_exemption_and_each_answer() {
         // Exemptions: a repair run, and the Attacker-off `baseline` review.
         assert_eq!(
-            approval_invariant_status(GovernorMode::Repair, true, &[]),
+            approval_invariant_status(GovernorMode::Repair, true, true, &[]),
             (false, "not_review")
         );
         assert_eq!(
-            approval_invariant_status(GovernorMode::Review, false, &[]),
+            approval_invariant_status(GovernorMode::Review, false, true, &[]),
             (false, "attacker_off")
         );
         // In force and satisfied by a probe that expects the original to fail —
@@ -5768,6 +5850,7 @@ mod tests {
             assert_eq!(
                 approval_invariant_status(
                     GovernorMode::Review,
+                    true,
                     true,
                     &[evidence("t_pins", intent)],
                 ),
@@ -5781,10 +5864,174 @@ mod tests {
             approval_invariant_status(
                 GovernorMode::Review,
                 true,
+                true,
                 &[evidence("t_pres", TestIntent::BehaviorPreservation)],
             ),
             (true, NO_REPRODUCTION_EVIDENCE)
         );
+    }
+
+    // [VANTA-WHY] M3 item 8 — the B2 arm is its OWN exemption with its own
+    // reason, not `attacker_off`: the Attacker DID run there, it is the
+    // admission gate that was removed. A reader must be able to tell a B2 row
+    // from a `baseline` review, and `b2_arm` is what says so. The `not_review`
+    // and `attacker_off` exemptions still win where they apply, so a B2 repair
+    // run is `not_review` and a B2-shaped `baseline` is `attacker_off`.
+    #[test]
+    fn the_b2_arm_is_exempt_from_the_invariant_with_its_own_reason() {
+        assert_eq!(
+            approval_invariant_status(
+                GovernorMode::Review,
+                true,
+                false,
+                &[evidence("t_pins", TestIntent::BugReproduction)],
+            ),
+            (false, "b2_arm"),
+            "a B2 review admits every probe regardless of intent, so the invariant is \
+             inapplicable — and it must say so, not read as satisfied"
+        );
+        assert_eq!(
+            approval_invariant_status(GovernorMode::Review, true, false, &[]),
+            (false, "b2_arm"),
+            "the exemption is a property of the arm, not of the evidence it happens to hold"
+        );
+        // The two pre-existing exemptions keep precedence over the new one.
+        assert_eq!(
+            approval_invariant_status(GovernorMode::Repair, true, false, &[]),
+            (false, "not_review"),
+            "B2 does not make a repair run into a review"
+        );
+        assert_eq!(
+            approval_invariant_status(GovernorMode::Review, false, false, &[]),
+            (false, "attacker_off"),
+            "with no Attacker there is no B2 intake either; the arm is `baseline`"
+        );
+    }
+
+    // [VANTA-WHY] M3 item 8 — the arm-name mapping. `b2` exists so a B2 row can
+    // never be mistaken for a `vanta` row, and every other name is unchanged:
+    // the new switch only ever fires inside the Attacker-on, non-planner branch,
+    // so `vanta_planner` (planner wins first) and `baseline` (no Attacker) are
+    // byte-identical to their pre-item-8 spellings.
+    #[test]
+    fn the_b2_arm_name_fires_only_for_attacker_on_with_bate_off() {
+        // Attacker on, BATE off, planner off → the new arm.
+        assert_eq!(benchmark_config_name(true, false, false), "b2");
+        // Every other combination keeps the pre-item-8 name.
+        assert_eq!(benchmark_config_name(true, false, true), "vanta");
+        assert_eq!(benchmark_config_name(true, true, true), "vanta_planner");
+        assert_eq!(benchmark_config_name(false, false, true), "baseline");
+        // With BATE off, the planner and the no-Attacker arm are still themselves:
+        // the switch cannot rename a configuration the Attacker does not touch,
+        // and it cannot outrank the planner.
+        assert_eq!(benchmark_config_name(true, true, false), "vanta_planner");
+        assert_eq!(benchmark_config_name(false, false, false), "baseline");
+        assert_eq!(benchmark_config_name(false, true, false), "vanta_planner");
+    }
+
+    // [VANTA-WHY] M3 item 8 — "new behaviour is OFF by default" has to be a
+    // property of the code, not a hope. The pre-item-8 mapping is re-stated here
+    // as a fixture and compared against the live one at the value an unset
+    // switch produces, so a later edit that renamed an existing arm (or made
+    // `b2` win over the planner) fails this test rather than the next batch.
+    #[test]
+    fn an_unset_bate_switch_reproduces_the_pre_item_8_arm_name_and_invariant() {
+        fn pre_item_8_config_name(attacker: bool, planner: bool) -> &'static str {
+            if planner {
+                "vanta_planner"
+            } else if attacker {
+                "vanta"
+            } else {
+                "baseline"
+            }
+        }
+
+        // An absent switch is the documented default ON, not an error.
+        let previous = std::env::var("VANTA_BATE").ok();
+        unsafe { std::env::remove_var("VANTA_BATE") };
+        let bate_enabled =
+            env_flag("VANTA_BATE", true).expect("an absent VANTA_BATE is the default, not an error");
+
+        for attacker in [false, true] {
+            for planner in [false, true] {
+                assert_eq!(
+                    benchmark_config_name(attacker, planner, bate_enabled),
+                    pre_item_8_config_name(attacker, planner),
+                    "attacker={attacker} planner={planner}: an unset VANTA_BATE must \
+                     not rename any existing arm"
+                );
+            }
+        }
+
+        // The invariant fields are unchanged at the default switch too: every
+        // pre-change answer still answers the same way.
+        assert_eq!(
+            approval_invariant_status(GovernorMode::Review, true, bate_enabled, &[]),
+            (true, NO_ADMITTED_TESTS)
+        );
+        assert_eq!(
+            approval_invariant_status(GovernorMode::Repair, true, bate_enabled, &[]),
+            (false, "not_review")
+        );
+        assert_eq!(
+            approval_invariant_status(GovernorMode::Review, false, bate_enabled, &[]),
+            (false, "attacker_off")
+        );
+        assert_eq!(
+            approval_invariant_status(
+                GovernorMode::Review,
+                true,
+                bate_enabled,
+                &[evidence("t_pins", TestIntent::BugReproduction)],
+            ),
+            (true, INVARIANT_SATISFIED)
+        );
+        assert_eq!(
+            approval_invariant_status(
+                GovernorMode::Review,
+                true,
+                bate_enabled,
+                &[evidence("t_pres", TestIntent::BehaviorPreservation)],
+            ),
+            (true, NO_REPRODUCTION_EVIDENCE)
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("VANTA_BATE", value) },
+            None => unsafe { std::env::remove_var("VANTA_BATE") },
+        }
+    }
+
+    // [VANTA-WHY] M3 item 8 — `VANTA_BATE` is read with `env_flag` like every
+    // other switch, so an unrecognised value is a `CONFIG_ERROR` and never a
+    // silent default: `VANTA_BATE=maybe` quietly meaning "on" would record a
+    // `vanta` row for a run the operator asked to be `b2`.
+    #[test]
+    fn the_bate_switch_is_strict_and_defaults_on() {
+        let previous = std::env::var("VANTA_BATE").ok();
+
+        unsafe { std::env::remove_var("VANTA_BATE") };
+        assert_eq!(
+            env_flag("VANTA_BATE", true).unwrap(),
+            true,
+            "an absent VANTA_BATE is the default (BATE on), which keeps every existing arm"
+        );
+
+        unsafe { std::env::set_var("VANTA_BATE", "off") };
+        assert_eq!(env_flag("VANTA_BATE", true).unwrap(), false);
+
+        unsafe { std::env::set_var("VANTA_BATE", "maybe") };
+        let error = env_flag("VANTA_BATE", true)
+            .expect_err("an unrecognised switch value must never be a silent default");
+        assert!(
+            error.contains("CONFIG_ERROR") && error.contains("VANTA_BATE"),
+            "the error must name the switch and the class, got: {error}"
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("VANTA_BATE", value) },
+            None => unsafe { std::env::remove_var("VANTA_BATE") },
+        }
     }
 
     // [VANTA-WHY] M3 item 1 — the grounding ledger separates "the audit ran and

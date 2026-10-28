@@ -429,8 +429,32 @@ pub async fn run_bate(
     tests: &[GeneratedTest],
     test_cmd: &TestCommand,
     grounded_audit: bool,
+    admit_all: bool,
     revise_budget: &mut ReviseBudget,
 ) -> BateRun {
+    // [VANTA-WHY] M3 item 8 — the B2 arm. `admit_all` is `VANTA_BATE=off`: the
+    // whole phase is a pass-through, so this returns BEFORE any baseline run,
+    // any revision, any relabel and any intent audit. Every test enters exactly
+    // as the Attacker wrote it (no revision, no intent change), `scrapped_tests`
+    // is empty and no record is produced. This is the arm's definition: in
+    // review every Attacker test is admitted regardless of declared intent or
+    // baseline behaviour, so the callers' existing "any failing admitted test
+    // rejects / is feedback" rule applies without a second admission path. The
+    // `report` still names every test as valid so the `bate.summary` row is
+    // well-formed (valid=N, scrapped=0).
+    if admit_all {
+        return BateRun {
+            report: BateReport {
+                valid_tests: tests.iter().map(|t| t.test_name.clone()).collect(),
+                scrapped_tests: Vec::new(),
+            },
+            valid_tests: tests.to_vec(),
+            relabel_events: Vec::new(),
+            intent_checks: Vec::new(),
+            harness_error: None,
+        };
+    }
+
     let mut valid_tests: Vec<GeneratedTest> = Vec::new();
     let mut scrapped_tests: Vec<(String, String)> = Vec::new();
     let mut relabel_events: Vec<IntentRelabel> = Vec::new();
@@ -1060,5 +1084,111 @@ ModuleNotFoundError: No module named 'sanic.websocket'
             MislabeledReproductionOutcome::Revise,
             "a dropped field is unknown, not an explicit preservation answer"
         );
+    }
+
+    // ---- M3 item 8: the B2 arm's BATE bypass (VANTA_BATE=off) ----------------
+    //
+    // [VANTA-WHY] The arm is DEFINED as adversarial tests with no baseline
+    // validation and no intent audit, so the bypass has to admit every test
+    // byte-for-byte and produce none of the phase's byproducts. This is checked
+    // here, in-process, with `admit_all = true`; the base_url points at a closed
+    // port so a regression that let the pass-through fall into the real loop
+    // would fail the test (the baseline run would error) instead of passing
+    // silently. That substitutes for a model backend: the pass-through must not
+    // reach the network at all, which is stronger than answering a stub.
+
+    fn generated(name: &str, intent: TestIntent) -> GeneratedTest {
+        GeneratedTest {
+            test_name: name.to_string(),
+            test_source: format!("def {name}():\n    assert True\n"),
+            intent,
+            reason: "unit test fixture".to_string(),
+            issue_quote: None,
+            relabeled: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn admit_all_admits_every_attacker_test_unvalidated() {
+        let mut cfg = LlmConfig::default();
+        // Port 1 is never listening: if the bypass were broken and the phase ran
+        // a baseline, it would be an error here rather than a silent pass.
+        cfg.base_url = "http://127.0.0.1:1/v1".to_string();
+        let mut budget = ReviseBudget::new();
+        // Three tests that the REAL BATE would treat three different ways: a
+        // reproduction that must fail on the baseline, a preservation that must
+        // pass, and a feature-acceptance that must fail. The bypass must admit
+        // all three without judging any of them.
+        let tests = vec![
+            generated("t_repro", TestIntent::BugReproduction),
+            generated("t_pres", TestIntent::BehaviorPreservation),
+            generated("t_feature", TestIntent::FeatureAcceptance),
+        ];
+        let cmd = TestCommand::new("pytest", vec!["-q".to_string()]);
+
+        let run = run_bate(
+            &cfg,
+            "the issue",
+            "original execution source",
+            "original prompt source",
+            &tests,
+            &cmd,
+            false,
+            true, // admit_all — VANTA_BATE=off
+            &mut budget,
+        )
+        .await;
+
+        assert_eq!(
+            run.valid_tests, tests,
+            "every Attacker test must be admitted byte-for-byte, in order, with its \
+             declared intent untouched"
+        );
+        assert_eq!(run.report.valid_tests.len(), tests.len());
+        assert!(
+            run.report.scrapped_tests.is_empty(),
+            "B2 admits regardless of baseline behaviour, so nothing is scrapped"
+        );
+        assert!(
+            run.relabel_events.is_empty(),
+            "B2 performs no intent relabel — the arm has no intent admission"
+        );
+        assert!(
+            run.intent_checks.is_empty(),
+            "B2 runs no intent audit, so it records no intent-check row"
+        );
+        assert!(run.harness_error.is_none());
+        assert_eq!(
+            budget.used(),
+            0,
+            "the pass-through must not spend the attempt's revise budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn admit_all_is_a_pass_through_that_touches_nothing() {
+        // An empty batch is the boundary: the pass-through must still be
+        // well-formed (and, with no tests, identical to the empty loop's output).
+        let cfg = LlmConfig::default();
+        let mut budget = ReviseBudget::new();
+        let cmd = TestCommand::new("pytest", Vec::new());
+        let run = run_bate(
+            &cfg,
+            "issue",
+            "src",
+            "prompt",
+            &[],
+            &cmd,
+            true,
+            true,
+            &mut budget,
+        )
+        .await;
+        assert!(run.valid_tests.is_empty());
+        assert!(run.report.scrapped_tests.is_empty());
+        assert!(run.report.valid_tests.is_empty());
+        assert!(run.relabel_events.is_empty());
+        assert!(run.intent_checks.is_empty());
+        assert!(run.harness_error.is_none());
     }
 }

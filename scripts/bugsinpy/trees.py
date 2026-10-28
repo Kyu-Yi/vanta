@@ -385,6 +385,7 @@ def strip_hidden_tests(
     tree_dir: Path,
     hidden_nodeids: Iterable[str],
     collected_by_file: dict[str, set[str]],
+    delete_files: Iterable[str] = (),
 ) -> StripReport:
     """Remove the hidden tests from ``tree_dir``, in place.
 
@@ -396,11 +397,26 @@ def strip_hidden_tests(
     did not name *all* of its collected nodeids is recorded in
     ``partially_hidden_functions``, so the shrunken native suite is explainable
     from the split instead of quietly smaller than ``FAIL_TO_PASS`` implies.
+
+    ``delete_files`` names files to remove whole whatever the collected set says.
+    That is the collect-flip shape: the file raises at import on the buggy source,
+    so the oracle's collection run never saw a single nodeid in it (that *is* the
+    flip), and the "everything collected here is hidden" test cannot fire on an
+    empty collected set. Every test such a file carries is oracle material by
+    construction, and leaving it in place would leave a module that dies at import
+    in the tree the Creator reads and in the native baseline's suite.
     """
     report = StripReport()
     by_file: dict[str, list[str]] = {}
     for nodeid in hidden_nodeids:
         by_file.setdefault(nodeid_file(nodeid), []).append(nodeid)
+
+    for rel in sorted({str(rel) for rel in delete_files}):
+        path = tree_dir / rel
+        if path.is_file():
+            path.unlink()
+            report.deleted_files.append(rel)
+            report.removed_nodeids.extend(by_file.pop(rel, []))
 
     for rel, nodeids in sorted(by_file.items()):
         path = tree_dir / rel

@@ -92,8 +92,50 @@ fi"#;
 /// A newline rather than ``&&`` between the two, because the guard ends in an
 /// ``if`` block: the command's exit status has to be the command's, and an
 /// ``&&``-chain makes every failure look like the chain's.
-fn guest_inner_command(guest_cwd: &str, cmd: &[&str]) -> String {
-    format!("{DEV_SHM_GUARD}\ncd {guest_cwd} && {command}", command = cmd.join(" "))
+///
+/// ``env`` is the run's recorded ``sandbox_env`` (e.g. ``PYTHONPATH=./docs_src``,
+/// the import path fastapi's own ``scripts/test.sh`` exports). Each pair becomes
+/// its own ``export K=<value>`` line between the guard and the ``cd`` — newline
+/// separated for the same reason as above, so a failed export cannot swallow the
+/// command. An empty ``env`` reproduces the previous line exactly, which is what
+/// a run that never passed the flag gets.
+fn guest_inner_command(guest_cwd: &str, cmd: &[&str], env: &[(String, String)]) -> String {
+    let mut exports = String::new();
+    for (key, value) in env {
+        exports.push_str(&format!("export {key}={}\n", shell_quote_value(value)));
+    }
+    format!(
+        "{DEV_SHM_GUARD}\n{exports}cd {guest_cwd} && {command}",
+        command = cmd.join(" ")
+    )
+}
+
+/// Shell-quote one exported value.
+///
+/// [VANTA-WHY] The value is single-quoted with embedded single quotes escaped
+/// (``'\''``) so a value with whitespace or shell metacharacters cannot break out
+/// of the ``export`` line. A plain token (letters, digits, and the path-safe
+/// punctuation this rule actually uses) is emitted unchanged, so the common
+/// ``PYTHONPATH=./docs_src`` reads as it was written.
+fn shell_quote_value(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '/' | '.' | '_' | '-' | ':' | '=' | '+' | ',' | '@')
+        });
+    if plain {
+        return value.to_string();
+    }
+    let mut out = String::from("'");
+    for c in value.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 pub struct RepoCheckpoint {
@@ -503,6 +545,7 @@ impl SandboxBackend for ShuruBackend {
         cmd: &[&str],
         cwd: &Path,
         timeout_secs: u64,
+        env: &[(String, String)],
     ) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>> {
         if cmd.is_empty() {
             return Err("execute: empty command".into());
@@ -526,7 +569,7 @@ impl SandboxBackend for ShuruBackend {
         // every boot (guest_inner_command): this is the single path
         // ``src/pipeline/harness.rs`` runs third-party code through, and a mount does
         // not persist in a checkpoint, so it cannot be folded into the layer.
-        let inner_cmd = guest_inner_command(&guest_cwd, cmd);
+        let inner_cmd = guest_inner_command(&guest_cwd, cmd, env);
         let cmd_str = cmd.join(" ");
         debug!(cmd = %cmd_str, guest_cwd = %guest_cwd, timeout_secs, "shuru exec");
 
@@ -634,7 +677,7 @@ mod tests {
 
     #[test]
     fn every_sandboxed_command_runs_the_guard_first() {
-        let inner = guest_inner_command("/workspace", &["python", "-m", "pytest"]);
+        let inner = guest_inner_command("/workspace", &["python", "-m", "pytest"], &[]);
         // First, so a VM that cannot provide a semaphore fails before the command
         // rather than inside it.
         assert!(inner.starts_with(DEV_SHM_GUARD));
@@ -646,7 +689,31 @@ mod tests {
     fn the_guard_does_not_swallow_the_command_or_its_status() {
         // A newline, not `&&`: the guard ends in an `if` block, and chaining it with
         // `&&` would make every failure read as the chain's.
-        let inner = guest_inner_command("/workspace/x", &["sh", "-c", "exit 3"]);
+        let inner = guest_inner_command("/workspace/x", &["sh", "-c", "exit 3"], &[]);
         assert_eq!(inner, format!("{DEV_SHM_GUARD}\ncd /workspace/x && sh -c exit 3"));
+    }
+
+    // [VANTA-WHY] The recorded `sandbox_env` has to reach the guest line without
+    // touching the case that never passes the flag: an empty env must reproduce
+    // the previous command byte-for-byte, or a run that set nothing would still
+    // change the command it shipped.
+
+    #[test]
+    fn an_empty_env_reproduces_the_old_guest_line_exactly() {
+        assert_eq!(
+            guest_inner_command("/workspace/t", &["python", "-m", "pytest"], &[]),
+            format!("{DEV_SHM_GUARD}\ncd /workspace/t && python -m pytest")
+        );
+    }
+
+    #[test]
+    fn a_recorded_env_becomes_an_export_before_the_command() {
+        let inner = guest_inner_command(
+            "/workspace/t",
+            &["python", "-m", "pytest"],
+            &[("PYTHONPATH".to_string(), "./docs_src".to_string())],
+        );
+        assert!(inner.contains("export PYTHONPATH=./docs_src"));
+        assert!(inner.ends_with("cd /workspace/t && python -m pytest"));
     }
 }

@@ -64,6 +64,9 @@ struct CliArgs {
     /// Explicit test command (Spec §7: "Require explicit --test-cmd, pytest as
     /// fallback. Do not infer."). e.g. "pytest tests/ -q".
     test_cmd: Option<String>,
+    /// Environment injected into every sandbox command of the run, from
+    /// `--sandbox-env KEY=VALUE` (repeatable). Only `PYTHONPATH` is allowed.
+    sandbox_env: Vec<(String, String)>,
     /// Path to a clean original tree (git worktree of the base commit) for
     /// Mode B. If set, BATE runs against this tree instead of the in-memory
     /// original files. Spec §7: "both trees present simultaneously".
@@ -110,6 +113,7 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
     let mut open_pr = false;
     let mut patch_path: Option<PathBuf> = None;
     let mut test_cmd: Option<String> = None;
+    let mut sandbox_env: Vec<(String, String)> = Vec::new();
     let mut original_tree: Option<PathBuf> = None;
     let mut rerun_signals: Option<String> = None;
     let mut good_tree: Option<PathBuf> = None;
@@ -169,6 +173,15 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
                     return Err("--test-cmd requires a command".to_string());
                 }
                 test_cmd = Some(args[i].clone());
+            }
+            "--sandbox-env" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--sandbox-env requires KEY=VALUE".to_string());
+                }
+                let pair = vanta::sandbox::parse_sandbox_env(&args[i])
+                    .map_err(|e| format!("--sandbox-env: {e}"))?;
+                sandbox_env.push(pair);
             }
             "--original-tree" => {
                 i += 1;
@@ -264,6 +277,7 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
         open_pr,
         patch_path,
         test_cmd,
+        sandbox_env,
         original_tree,
         rerun_signals,
         good_tree,
@@ -464,6 +478,7 @@ fn print_help() {
          --open-pr              Open a GitHub PR after Gatekeeper approval\n    \
          --patch, -p PATH       Verify an EXISTING patch (skip Creator, run Attacker+BATE on this diff)\n    \
          --test-cmd CMD         Test command (default: 'python3 -m pytest'). e.g. 'pytest tests/ -q'\n    \
+         --sandbox-env K=V     Inject K=V into every sandbox command of the run (repeatable). PYTHONPATH only; refused for any other key\n    \
          --original-tree PATH   Clean original tree (git worktree of base commit) for Mode B two-tree mode\n    \
          --rerun-signals ID     Re-run session ID's review-mode rejection signals against --good-tree (writes vanta_sessions/ID_signal_reruns.json; no --repo needed)\n    \
          --good-tree PATH       Known-good source: a directory, or a patch file applied onto --base-tree\n    \
@@ -651,6 +666,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         open_pr: cli.open_pr,
         patch_path: cli.patch_path,
         test_cmd: cli.test_cmd,
+        sandbox_env: cli.sandbox_env,
         original_tree: cli.original_tree,
     })
     .await?;

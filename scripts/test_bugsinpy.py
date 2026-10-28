@@ -1212,6 +1212,43 @@ class TestStripHiddenTests:
         assert not (tmp_path / rel).exists()
         assert report.deleted_files == [rel]
 
+    def test_a_collect_flip_file_is_deleted_even_with_no_nodeids(self, tmp_path):
+        """§3.4: a collect-flip file collected **nothing** on the buggy tree.
+
+        [VANTA-WHY] That is the whole shape of the case: the file raises at import,
+        so pytest never lists a nodeid in it, and the "every collected test here is
+        hidden" rule below can never fire on an empty set. Without ``delete_files``
+        the file — which *is* the answer on the fixed source — stays in the tree the
+        Creator reads.
+        """
+        rel = "tests/test_skip_defaults.py"
+        write(tmp_path / rel, "import fastapi\n\ndef test_skip():\n    assert True\n")
+        kept = "tests/test_other.py"
+        write(tmp_path / kept, "def test_kept():\n    assert True\n")
+
+        report = tree_mod.strip_hidden_tests(
+            tmp_path,
+            [],
+            {kept: {f"{kept}::test_kept"}},
+            delete_files=[rel],
+        )
+
+        assert not (tmp_path / rel).exists()
+        assert (tmp_path / kept).is_file()
+        assert report.deleted_files == [rel]
+        assert report.removed_nodeids == []
+
+    def test_a_delete_file_that_is_not_there_is_skipped_not_fatal(self, tmp_path):
+        """The collect-flip record is per bug and the strip runs once per bug; a
+        missing file must not turn a recorded rule into a crash."""
+        kept = "tests/test_other.py"
+        write(tmp_path / kept, "def test_kept():\n    assert True\n")
+        report = tree_mod.strip_hidden_tests(
+            tmp_path, [], {kept: {f"{kept}::test_kept"}}, delete_files=["tests/gone.py"]
+        )
+        assert report.deleted_files == []
+        assert (tmp_path / kept).is_file()
+
     def test_fully_hidden_function_is_not_reported_as_partial(self, tmp_path):
         rel = "tests/test_x.py"
         write(tmp_path / rel, self.PARAM)
@@ -5410,6 +5447,14 @@ class TestPrepareRunRecordContract:
             native_skips_fixed=1,
             hidden_files_deleted=["tests/test_hidden.py"],
             partially_hidden_functions=["hidden_fn"],
+            sandbox_env={"PYTHONPATH": "./docs_src"},
+            hidden_by_collect_flip={
+                "tests/test_skip_defaults.py": (
+                    "TypeError: get() got an unexpected keyword argument "
+                    "'response_model_exclude_defaults'"
+                )
+            },
+            collect_flip_nodeids=["tests/test_skip_defaults.py::test_skip_defaults"],
             gate_failures=[],
             context=verdict,
             issue=issue,
@@ -5457,6 +5502,14 @@ class TestPrepareRunRecordContract:
         assert loaded.native_skips_fixed == 1
         assert loaded.hidden_files_deleted == original.hidden_files_deleted
         assert loaded.partially_hidden_functions == original.partially_hidden_functions
+        # §3.4: the recorded suite environment and the collect-flip record, which the
+        # oracle, the strip and the run all read back off this same row.
+        assert loaded.sandbox_env == {"PYTHONPATH": "./docs_src"}
+        assert loaded.hidden_by_collect_flip == original.hidden_by_collect_flip
+        assert loaded.collect_flip_nodeids == sorted(original.collect_flip_nodeids)
+        assert loaded.hidden_nodeids == sorted(
+            [*original.fail_to_pass, *original.collect_flip_nodeids]
+        )
         assert loaded.gate_failures == original.gate_failures
         # The pair the crash was about, and the two that were never restored at all.
         assert loaded.issue == issue
@@ -16791,6 +16844,11 @@ class TestDepGate:
             raise suite_mod.SuiteError("pytest collected nothing (exit 2)")
 
         monkeypatch.setattr(suite_mod, "collect_only", boom)
+        # The second reading (§3.4) is reached, finds no flip, and keeps the refusal —
+        # injected so the test never boots a VM to discover that.
+        monkeypatch.setattr(
+            prepare_mod, "detect_collect_flip", lambda prep, **kwargs: ({}, [], {})
+        )
         monkeypatch.setattr(
             suite_mod, "import_probe", lambda **kwargs: pytest.fail("probe ran anyway")
         )
@@ -17224,6 +17282,433 @@ class TestCollectedOrRaise:
         excerpt = suite_mod.failure_excerpt(output)
         assert excerpt.count("\n") == 26, "25 lines plus the '… N more' line"
         assert "more" in excerpt
+
+
+class TestParseCollectionErrors:
+    """``parse_collection_errors`` — which *files* a collection run could not import.
+
+    [VANTA-WHY] The collect-flip rule (§3.4) is a statement about files, not about
+    test outcomes: a file that errors here and collects cleanly on the fixed tree is
+    the oracle, and a file that errors on both trees is a broken environment. So the
+    reader has to name the file and carry pytest's own line for the error — the
+    distinction the rule is built on is invisible if all we keep is "collection
+    failed".
+    """
+
+    # The shape measured on fastapi/1, verbatim in layout: the ERRORS heading names
+    # the file, and the ``E`` line underneath is pytest's own one-line statement.
+    FASTAPI = (
+        "shuru: booting VM…\n"
+        "collected 458 items / 1 error\n\n"
+        "==================================== ERRORS ====================================\n"
+        "_____________ ERROR collecting tests/test_skip_defaults.py _____________\n"
+        "TypeError while importing test module 'tests/test_skip_defaults.py'.\n"
+        "Traceback:\n"
+        "  /usr/lib/python3.8/importlib/__init__.py:127: in import_module\n"
+        "E   TypeError: get() got an unexpected keyword argument "
+        "'response_model_exclude_defaults'\n"
+        "ERROR tests/test_skip_defaults.py\n"
+        "!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!\n"
+        "458 tests collected, 1 error in 0.61s\n"
+    )
+
+    def test_the_heading_names_the_file_and_the_e_line_is_the_error(self):
+        errors = suite_mod.parse_collection_errors(self.FASTAPI)
+        assert list(errors) == ["tests/test_skip_defaults.py"]
+        assert errors["tests/test_skip_defaults.py"] == (
+            "TypeError: get() got an unexpected keyword argument "
+            "'response_model_exclude_defaults'"
+        )
+
+    def test_the_short_summary_line_is_the_fallback_when_the_heading_is_absent(self):
+        """An older pytest prints only ``ERROR tests/test_x.py``; the file is still named."""
+        errors = suite_mod.parse_collection_errors(
+            "collected 0 items / 1 error\n\nERROR tests/test_x.py\n"
+        )
+        assert errors == {"tests/test_x.py": ""}
+
+    def test_every_errored_file_is_reported_not_just_the_first(self):
+        output = (
+            "==================================== ERRORS ====================================\n"
+            "_______ ERROR collecting tests/test_a.py _______\n"
+            "E   ImportError: cannot import name 'a'\n"
+            "_______ ERROR collecting tests/test_b.py _______\n"
+            "E   ModuleNotFoundError: No module named 'b'\n"
+            "ERROR tests/test_a.py\n"
+            "ERROR tests/test_b.py\n"
+        )
+        errors = suite_mod.parse_collection_errors(output)
+        assert errors == {
+            "tests/test_a.py": "ImportError: cannot import name 'a'",
+            "tests/test_b.py": "ModuleNotFoundError: No module named 'b'",
+        }
+
+    def test_the_e_line_wins_over_the_bare_summary_line(self):
+        """``setdefault``: the summary is a name without a cause, the heading has both."""
+        output = (
+            "ERROR tests/test_x.py\n"
+            "_______ ERROR collecting tests/test_x.py _______\n"
+            "E   TypeError: boom\n"
+        )
+        assert suite_mod.parse_collection_errors(output) == {
+            "tests/test_x.py": "TypeError: boom"
+        }
+
+    def test_a_clean_run_reports_no_files(self):
+        output = "collected 12 items\n\n12 tests collected in 0.05s\n"
+        assert suite_mod.parse_collection_errors(output) == {}
+
+    def test_an_e_line_with_no_heading_names_no_file(self):
+        """The rule keys on the *file*, so a bare ``E`` line attributes to nothing."""
+        assert suite_mod.parse_collection_errors(
+            "Traceback:\nE   ValueError: real\n"
+        ) == {}
+
+    def test_the_richer_reading_keeps_a_file_whose_error_the_gate_loses(self):
+        """``collected_or_raise`` reads one error; the rule needs *every* one.
+
+        [VANTA-WHY] ``--continue-on-collection-errors`` is what makes the whole map
+        visible, and the gate must not pass on a tree that still has an *unexplained*
+        error in it — so the reader the rule runs on has to be the exhaustive one.
+        """
+        output = (
+            "_______ ERROR collecting tests/test_a.py _______\n"
+            "E   ImportError: a\n"
+            "_______ ERROR collecting tests/test_b.py _______\n"
+            "E   ImportError: b\n"
+        )
+        assert len(suite_mod.parse_collection_errors(output)) == 2
+
+
+class TestCollectFlip:
+    """§3.4 — a file that errors on the buggy source and collects on the fixed one.
+
+    [VANTA-WHY] The synthetic two-file fixture below is the rule's whole shape: one
+    file errors on the buggy tree and collects on the fixed tree (the flip — the
+    oracle), the other errors on both (a broken layer). Only the first may be hidden.
+    """
+
+    @staticmethod
+    def _prep(tmp_path: Path) -> prepare_mod.BugPrep:
+        return prep(root=tmp_path / "batch" / "worktrees" / "Demo_1")
+
+    @staticmethod
+    def _report(nodeids, errors):
+        return suite_mod.CollectionReport(
+            nodeids=set(nodeids), errors=dict(errors), exit_code=2, output=""
+        )
+
+    def _collect_report(self, monkeypatch, seen, *, buggy_errors, fixed):
+        def fake(**kwargs):
+            seen.append(kwargs)
+            if kwargs["tree_rel"].endswith("src_fixed"):
+                return fixed
+            return self._report([], buggy_errors)
+
+        monkeypatch.setattr(suite_mod, "collect_report", fake)
+
+    def test_a_file_that_errors_on_buggy_and_collects_on_fixed_is_the_flip(
+        self, tmp_path, monkeypatch
+    ):
+        seen: list = []
+        flip = suite_mod.CollectionReport(
+            nodeids={"tests/test_flip.py::test_a"}, errors={}, exit_code=0, output=""
+        )
+        self._collect_report(
+            monkeypatch,
+            seen,
+            buggy_errors={
+                "tests/test_flip.py": "TypeError: get() got an unexpected keyword argument",
+                "tests/test_broken.py": "ModuleNotFoundError: No module named 'gone'",
+            },
+            fixed=flip,
+        )
+
+        bug_prep = self._prep(tmp_path)
+        flips, nodeids, errors = prepare_mod.detect_collect_flip(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch"
+        )
+
+        assert flips == {
+            "tests/test_flip.py": "TypeError: get() got an unexpected keyword argument"
+        }
+        assert nodeids == ["tests/test_flip.py::test_a"]
+        assert errors == {
+            "tests/test_flip.py": "TypeError: get() got an unexpected keyword argument",
+            "tests/test_broken.py": "ModuleNotFoundError: No module named 'gone'",
+        }, "the caller needs every buggy-tree error to prove the flips explain them all"
+        assert [call["tree_rel"] for call in seen] == [
+            "worktrees/Demo_1/oracle_tree",
+            "worktrees/Demo_1/src_fixed",
+        ]
+
+    def test_a_file_that_errors_on_both_trees_is_not_hidden(self, tmp_path, monkeypatch):
+        """A missing dependency is not an oracle; hiding it would grade a broken bug."""
+        seen: list = []
+        self._collect_report(
+            monkeypatch,
+            seen,
+            buggy_errors={"tests/test_broken.py": "ModuleNotFoundError: gone"},
+            fixed=self._report([], {"tests/test_broken.py": "ModuleNotFoundError: gone"}),
+        )
+
+        flips, nodeids, errors = prepare_mod.detect_collect_flip(
+            self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch"
+        )
+
+        assert flips == {}
+        assert nodeids == []
+        assert errors == {"tests/test_broken.py": "ModuleNotFoundError: gone"}
+
+    def test_a_clean_buggy_collection_never_asks_the_fixed_tree(self, tmp_path, monkeypatch):
+        seen: list = []
+        self._collect_report(
+            monkeypatch, seen, buggy_errors={}, fixed=self._report([], {})
+        )
+
+        flips, nodeids, errors = prepare_mod.detect_collect_flip(
+            self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch"
+        )
+
+        assert (flips, nodeids, errors) == ({}, [], {})
+        assert len(seen) == 1, "the fixed tree is only collected once there is an error"
+
+    def test_a_flip_the_fixed_tree_cannot_see_is_not_a_flip(self, tmp_path, monkeypatch):
+        """The buggy error named a file the fixed tree does not carry or cannot collect."""
+        seen: list = []
+        self._collect_report(
+            monkeypatch,
+            seen,
+            buggy_errors={"tests/test_gone.py": "ImportError: a"},
+            fixed=self._report([], {}),
+        )
+        flips, nodeids, errors = prepare_mod.detect_collect_flip(
+            self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch"
+        )
+        assert flips == {}
+        assert errors == {"tests/test_gone.py": "ImportError: a"}
+
+
+class TestCollectFlipGate:
+    """``check_deps``'s second reading: the recorded flip makes the gate pass cleanly."""
+
+    @staticmethod
+    def _prep(tmp_path: Path) -> prepare_mod.BugPrep:
+        return prep(root=tmp_path / "batch" / "worktrees" / "Demo_1")
+
+    def _deps(self) -> dict:
+        return {"import_name": "pysnooper"}
+
+    def test_the_gate_re_runs_with_the_flips_ignored_and_records_them(
+        self, tmp_path, monkeypatch
+    ):
+        calls: list = []
+
+        def strict(**kwargs):
+            calls.append(kwargs)
+            if "ignore" not in kwargs or not kwargs["ignore"]:
+                raise suite_mod.SuiteError("pytest collected nothing (exit 2)")
+            return {"tests/test_kept.py::test_a"}
+
+        monkeypatch.setattr(suite_mod, "collect_only", strict)
+        monkeypatch.setattr(
+            suite_mod,
+            "import_probe",
+            lambda **kwargs: (
+                "/workspace/worktrees/Demo_1/oracle_tree/pysnooper/__init__.py"
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod,
+            "detect_collect_flip",
+            lambda prep, **kwargs: (
+                {"tests/test_flip.py": "TypeError: boom"},
+                ["tests/test_flip.py::test_a"],
+                {"tests/test_flip.py": "TypeError: boom"},
+            ),
+        )
+
+        bug_prep = self._prep(tmp_path)
+        nodeids = prepare_mod.check_deps(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", deps=self._deps()
+        )
+
+        assert nodeids == {"tests/test_kept.py::test_a"}
+        assert len(calls) == 2, "the gate ran strict, then re-ran with the flip set aside"
+        assert "ignore" not in calls[0], "the strict gate sets nothing aside"
+        assert calls[1]["ignore"] == ["tests/test_flip.py"], (
+            "the pass must come from a clean run with the flip set aside, not a filter"
+        )
+        assert bug_prep.hidden_by_collect_flip == {"tests/test_flip.py": "TypeError: boom"}
+        assert bug_prep.collect_flip_nodeids == ["tests/test_flip.py::test_a"]
+        assert bug_prep.hidden_nodeids == sorted(
+            [*bug_prep.fail_to_pass, "tests/test_flip.py::test_a"]
+        )
+
+    def test_an_unexplained_error_keeps_the_refusal(self, tmp_path, monkeypatch):
+        """One flipper and one real breakage: hiding both would grade a broken bug."""
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: (_ for _ in ()).throw(
+                suite_mod.SuiteError("pytest collected nothing (exit 2)")
+            ),
+        )
+
+        def flips(prep, **kwargs):
+            return (
+                {"tests/test_flip.py": "TypeError: boom"},
+                ["tests/test_flip.py::test_a"],
+                {
+                    "tests/test_flip.py": "TypeError: boom",
+                    "tests/test_broken.py": "ModuleNotFoundError: gone",
+                },
+            )
+
+        monkeypatch.setattr(prepare_mod, "detect_collect_flip", flips)
+        monkeypatch.setattr(
+            suite_mod, "import_probe", lambda **kwargs: pytest.fail("probe ran anyway")
+        )
+
+        with pytest.raises(suite_mod.SuiteError, match="^deps: collection failed:"):
+            prepare_mod.check_deps(
+                self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
+                deps=self._deps(),
+            )
+
+    def test_a_collection_error_with_no_flip_still_refuses(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: (_ for _ in ()).throw(
+                suite_mod.SuiteError("pytest collected nothing (exit 2)")
+            ),
+        )
+        monkeypatch.setattr(
+            prepare_mod, "detect_collect_flip", lambda prep, **kwargs: ({}, [], {})
+        )
+        monkeypatch.setattr(
+            suite_mod, "import_probe", lambda **kwargs: pytest.fail("probe ran anyway")
+        )
+
+        with pytest.raises(suite_mod.SuiteError, match="^deps: collection failed:"):
+            prepare_mod.check_deps(
+                self._prep(tmp_path), checkpoint="chk", batch_dir=tmp_path / "batch",
+                deps=self._deps(),
+            )
+
+
+class TestSandboxEnvReachesEveryRun:
+    """§3.4 — one recorded ``sandbox_env``, threaded into every run of the row.
+
+    [VANTA-WHY] The rule is only a rule if it is applied *everywhere*: a bug whose
+    tests import from ``docs_src`` has to see that path in the two gates, the three
+    derivation runs, the stripped baseline, the oracle **and** Vanta's own suites. A
+    value applied in one place and not another is exactly how the import-path class of
+    failure came back as "the gate passed but the run died".
+    """
+
+    def test_the_gate_threads_the_recorded_env_into_both_checks(self, tmp_path, monkeypatch):
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: seen.update(collect=kwargs) or {"tests/x.py::t"},
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "import_probe",
+            lambda **kwargs: seen.update(probe=kwargs)
+            or "/workspace/worktrees/Demo_1/oracle_tree/pysnooper/__init__.py",
+        )
+
+        bug_prep = prep(
+            root=tmp_path / "batch" / "worktrees" / "Demo_1",
+            sandbox_env={"PYTHONPATH": "./docs_src"},
+        )
+        prepare_mod.check_deps(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch",
+            deps={"import_name": "pysnooper"},
+        )
+
+        assert seen["collect"]["extra_env"] == {"PYTHONPATH": "./docs_src"}
+        assert seen["probe"]["extra_env"] == {"PYTHONPATH": "./docs_src"}
+
+    def test_a_run_without_a_recorded_env_passes_none(self, tmp_path, monkeypatch):
+        """The unchanged case: no recorded rule, no injected environment."""
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod, "collect_only", lambda **kwargs: seen.update(collect=kwargs) or set()
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "import_probe",
+            lambda **kwargs: seen.update(probe=kwargs)
+            or "/workspace/worktrees/Demo_1/oracle_tree/pysnooper/__init__.py",
+        )
+
+        prepare_mod.check_deps(
+            prep(root=tmp_path / "batch" / "worktrees" / "Demo_1"),
+            checkpoint="chk", batch_dir=tmp_path / "batch",
+            deps={"import_name": "pysnooper"},
+        )
+
+        assert seen["collect"]["extra_env"] is None
+        assert seen["probe"]["extra_env"] is None
+
+    def test_collect_only_merges_the_extra_env_over_its_own(self, monkeypatch):
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod.shuru,
+            "run",
+            lambda **kwargs: seen.update(kwargs)
+            or shuru_mod.ExecResult(
+                stdout="tests/x.py::t\n", stderr="", exit_code=0, timed_out=False
+            ),
+        )
+        suite_mod.collect_only(
+            checkpoint="chk", batch_dir=Path("/tmp/b"), tree_rel="w/Demo_1/oracle_tree",
+            test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
+            extra_env={"PYTHONPATH": "./docs_src"},
+        )
+        assert seen["env"]["PYTHONPATH"] == "./docs_src"
+        assert seen["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+
+    def test_collect_only_ignores_the_recorded_flip_files(self, monkeypatch):
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod.shuru,
+            "run",
+            lambda **kwargs: seen.update(kwargs)
+            or shuru_mod.ExecResult(
+                stdout="tests/x.py::t\n", stderr="", exit_code=0, timed_out=False
+            ),
+        )
+        suite_mod.collect_only(
+            checkpoint="chk", batch_dir=Path("/tmp/b"), tree_rel="w/Demo_1/oracle_tree",
+            test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
+            ignore=["tests/test_flip.py"],
+        )
+        assert "--ignore=tests/test_flip.py" in seen["command"][2]
+
+    def test_collect_report_keeps_going_past_the_first_error(self, monkeypatch):
+        """The exhaustive reading the rule needs — a gate run would stop at one."""
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod.shuru,
+            "run",
+            lambda **kwargs: seen.update(kwargs)
+            or shuru_mod.ExecResult(
+                stdout="tests/x.py::t\n", stderr="", exit_code=2, timed_out=False
+            ),
+        )
+        report = suite_mod.collect_report(
+            checkpoint="chk", batch_dir=Path("/tmp/b"), tree_rel="w/Demo_1/oracle_tree",
+            test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
+        )
+        assert "--continue-on-collection-errors" in seen["command"][2]
+        assert report.nodeids == {"tests/x.py::t"}
+        assert report.exit_code == 2
 
 
 # ============================================================================
@@ -17931,6 +18416,59 @@ class TestVantaTestCmd:
     def test_a_command_that_is_nothing_but_report_flags_is_an_error(self):
         with pytest.raises(runner_mod.RunnerError, match="empty"):
             runner_mod.vanta_test_cmd(["--json-report-file={report}"])
+
+
+class TestInvokeVantaCarriesTheRecordedSandboxEnv:
+    """§3.4 — the recorded ``sandbox_env`` reaches Vanta's own runs as ``--sandbox-env``.
+
+    [VANTA-WHY] The value is never typed per bug in the harness: it is read off the
+    row's ``sandbox_env`` (itself the split's per-project rule). Passing it as a flag
+    rather than folding it into ``--test-cmd`` is forced by the contract Vanta's own
+    command line has — ``TestCommand::from_shell`` splits on whitespace with no
+    quoting, and ``vanta_test_cmd`` refuses a token containing whitespace — so a
+    ``PYTHONPATH=… python -m pytest`` prefix could not be expressed.
+    """
+
+    @staticmethod
+    def _run(tmp_path, monkeypatch, **over):
+        import types
+
+        monkeypatch.setattr(
+            runner_mod.subprocess,
+            "run",
+            lambda *a, **kw: types.SimpleNamespace(returncode=0),
+        )
+        log_path = tmp_path / "vanta.log"
+        bug_prep = prep(
+            root=tmp_path / "root",
+            test_cmd=["python", "-m", "pytest", "tests", "--json-report-file={report}"],
+            **over,
+        )
+        runner_mod.invoke_vanta(
+            vanta_bin=tmp_path / "vanta_m3",
+            prep=bug_prep,
+            issue_path=tmp_path / "issue.md",
+            env={"PATH": "/usr/bin"},
+            log_path=log_path,
+            max_attempts=2,
+        )
+        return log_path.read_text(encoding="utf-8")
+
+    def test_the_flag_is_passed_once_per_recorded_key(self, tmp_path, monkeypatch):
+        text = self._run(
+            tmp_path, monkeypatch, sandbox_env={"PYTHONPATH": "./docs_src"}
+        )
+        assert "--sandbox-env PYTHONPATH=./docs_src" in text
+        assert text.index("--max-attempts 2") < text.index("--sandbox-env"), (
+            "the flag is appended after the fixed arguments, one per recorded key"
+        )
+
+    def test_a_bug_with_no_recorded_env_is_invoked_exactly_as_before(
+        self, tmp_path, monkeypatch
+    ):
+        text = self._run(tmp_path, monkeypatch)
+        assert "--sandbox-env" not in text
+        assert "--test-cmd python -m pytest tests" in text
 
 
 class TestNormalizedDiff:

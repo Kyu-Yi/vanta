@@ -86,6 +86,7 @@ impl SandboxBackend for SubprocessBackend {
         cmd: &[&str],
         cwd: &Path,
         timeout_secs: u64,
+        env: &[(String, String)],
     ) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>> {
         if cmd.is_empty() {
             return Err("execute: empty command".into());
@@ -125,6 +126,14 @@ impl SandboxBackend for SubprocessBackend {
         command.env_remove("HTTPS_PROXY");
         command.env("no_proxy", "*");
         command.env("NO_PROXY", "*");
+
+        // [VANTA-WHY] Extra environment from the run's recorded rule (e.g.
+        // `PYTHONPATH=./docs_src`), so the project's own import path reaches
+        // every command. The default is empty, which leaves the invocation
+        // byte-identical to a run that never set this flag.
+        for (key, value) in env {
+            command.env(key, value);
+        }
 
         // [VANTA-WHY] Memory limit enforced at process level (optional).
         // pre_exec runs in the forked child BEFORE exec, so setrlimit applies

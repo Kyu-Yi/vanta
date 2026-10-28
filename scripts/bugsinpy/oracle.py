@@ -186,9 +186,14 @@ def grade(
     deleting it here would move a disk problem onto the correctness path.
     """
     started = time.monotonic()
-    result = OracleResult(apply_ok=False, hidden_nodeids=sorted(prep.fail_to_pass))
+    # §3.4: ``hidden_nodeids`` is the declared ``FAIL_TO_PASS`` **plus** the recorded
+    # collect-flips — the files that do not collect on the buggy source at all, so
+    # they appear in no BugsInPy list yet are exactly the fail→pass flips the oracle
+    # is for. Read through the one property so the oracle, the strip and the record
+    # cannot disagree about what is hidden.
+    result = OracleResult(apply_ok=False, hidden_nodeids=prep.hidden_nodeids)
 
-    hidden_nodeids = sorted(prep.fail_to_pass)
+    hidden_nodeids = prep.hidden_nodeids
     if not hidden_nodeids:
         result.error = "no FAIL_TO_PASS nodeids: this bug has no oracle to grade against"
         result.oracle_secs = time.monotonic() - started
@@ -300,7 +305,7 @@ def grade_dev_fix(
     """
     stem = f"{SELFCHECK_DIR}/{prep.slug}-{DEV_FIX_STEM}"
     patch_path = batch_dir / f"{stem}.patch"
-    result = OracleResult(apply_ok=False, hidden_nodeids=sorted(prep.fail_to_pass))
+    result = OracleResult(apply_ok=False, hidden_nodeids=prep.hidden_nodeids)
 
     text = suite_mod.drop_test_file_hunks(prep.bug.bug_patch_txt)
     if not text.strip():

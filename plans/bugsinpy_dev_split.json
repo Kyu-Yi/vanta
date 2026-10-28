@@ -62,6 +62,18 @@
       "reason": "The module is `mysql.connector`, which is mysql-connector-python's, not the virtual `mysql` package's, and the reviewed table is keyed by the import spelling precisely so the dotted name is matched before its top-level one (`google.protobuf` is the same case). mysql-connector-python also resolves to an installable release under the same date rule: the newest release on or before 2019-05-15 that PyPI still carries is 8.0.5 (2017-11-20), which has a `py2.py3-none-any` wheel -- pure Python, so no build and no system library. Nothing else in either tree imports the plain `mysql` name.",
       "decided_by": "user review, 2026-10-24",
       "rule": "Pinned by the same date rule as every other dependency -- the newest release on or before the fixed commit's date -- and installed from the wheel it publishes for any platform. The mapping is a decision recorded in the protocol, not a guess in the harness: a module whose top-level word happens to name an unrelated PyPI project is exactly what the table is for."
+    },
+    {
+      "change": "fastapi bugs carry `sandbox_env: {\"PYTHONPATH\": \"./docs_src\"}`. It is the project's own suite environment, not a harness invention: fastapi's `scripts/test.sh` at both commits begins `export PYTHONPATH=./docs_src` before `pytest --cov=... tests`. Without it, 250-odd tests under `tests/test_tutorial/**` die at collection with `ModuleNotFoundError: No module named 'additional_responses'`, because they import a module the tree ships in `docs_src/` rather than a distribution.",
+      "reason": "The rule is the project's, so it belongs in the split and not in pipeline code that would have to name a bug id. Recording it per bug is how this file, which is a list of bugs, can carry a per-project fact; the value is read from the project's own test script at the bug's commit.",
+      "decided_by": "user review, 2026-10-28",
+      "rule": "A project that puts a directory of importable modules on `PYTHONPATH` in its own checked-in test script declares `sandbox_env` on each of its bugs in this split, with the path exactly as the script writes it. The harness applies it to every run of that bug -- baseline gates, native suite, generated tests, oracle -- through `--sandbox-env`, which accepts `PYTHONPATH` and refuses every other key. The tree the Creator and the Attacker read is not touched: no `conftest.py` and no other harness-made file is written into the repo, so what they see is exactly what the benchmark ships."
+    },
+    {
+      "change": "A fixed-commit test file that fails to collect on the buggy source but collects cleanly on the fixed source is treated as hidden oracle: removed from the visible suite, added to FAIL_TO_PASS, and recorded on the bug's prepare record as `hidden_by_collect_flip` with the error type. Measured on fastapi/1: the fix rewrites `tests/test_skip_defaults.py`, whose fixed version declares an endpoint with `response_model_exclude_defaults=True` at module level, so on the buggy source the module raises `TypeError: get() got an unexpected keyword argument 'response_model_exclude_defaults'` and pytest exits 2 with the whole `tests` directory uncollected.",
+      "reason": "Design section 4 (oracle and blinding) says the system sees the fixed commit's tests minus the tests that flip from failing to passing, and those hidden tests are the oracle. A module-level import error on the buggy tree that disappears after the fix is exactly such a flip; BugsInPy's recorded list simply does not name it. Left alone it is not conservative -- it is a collection error that costs the bug its whole suite.",
+      "decided_by": "user review, 2026-10-28",
+      "rule": "During `prepare`, each fixed-commit test file is collected on the buggy source and on the fixed tree inside the sandbox. A file that errors on the buggy source **and** collects cleanly on the fixed tree qualifies; a file that errors on both is a real environment problem and is not hidden. Qualifying nodeids come from the fixed tree and join FAIL_TO_PASS, so both gates keep their meaning: they fail on the buggy source and pass on the fixed one. The count of dev bugs this rule touches is read from the per-bug `hidden_by_collect_flip` records, so it is visible in the paper as a harness rule rather than a silent change."
     }
   ],
   "bugs": [
@@ -92,6 +104,9 @@
       "checkpoint": "vanta-bi-fastapi-1",
       "wave": 1,
       "role": "pilot",
+      "sandbox_env": {
+        "PYTHONPATH": "./docs_src"
+      },
       "notes": "Round-robin pass 1, fastapi. First py3.8 bug in the project."
     },
     {
@@ -295,6 +310,9 @@
       "checkpoint": "vanta-bi-fastapi-2",
       "wave": 1,
       "role": "reserve",
+      "sandbox_env": {
+        "PYTHONPATH": "./docs_src"
+      },
       "notes": "Round-robin pass 2, fastapi. Reserve #3, the first second-bug depth: used if fastapi/1 fails a gate."
     },
     {

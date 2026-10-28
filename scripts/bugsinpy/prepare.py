@@ -176,6 +176,19 @@ class BugPrep:
     wave: int
     test_cmd: list[str]
     prepare_mode: str = FULL
+    sandbox_env: dict[str, str] = field(default_factory=dict)
+    """§3.4 — the project's own suite environment, as the split declares it.
+
+    [VANTA-WHY] Recorded on the row because it is a fact about the *run*, not about
+    the bug: fastapi's ``scripts/test.sh`` exports ``PYTHONPATH=./docs_src`` and its
+    tests import ``additional_responses`` out of the tree's own ``docs_src``, so
+    every suite this bug runs — the two gates, the three derivation runs, the
+    stripped baseline and the oracle — has to run with that path, and they only do
+    if one recorded value is threaded into all of them. The alternative — a
+    ``conftest.py`` written into the tree — was rejected: the tree the Attacker and
+    the Creator read has to be exactly what the benchmark ships. Empty for every bug
+    that does not declare one, which is the whole corpus but fastapi's.
+    """
     test_paths: list[str] = field(default_factory=list)
     fail_to_pass: list[str] = field(default_factory=list)
     f2p_undeclared: list[str] = field(default_factory=list)
@@ -202,6 +215,33 @@ class BugPrep:
     """
     hidden_files_deleted: list[str] = field(default_factory=list)
     partially_hidden_functions: list[str] = field(default_factory=list)
+    hidden_by_collect_flip: dict[str, str] = field(default_factory=dict)
+    """§3.4 — fixed-commit test files that error on the buggy tree and collect on the fixed one.
+
+    Keys are the files, values are pytest's own line for the error on the buggy tree
+    (``TypeError: get() got an unexpected keyword argument…``). A file in here is
+    hidden oracle, not a broken environment: its module-level import raises on the
+    buggy source and succeeds on the fixed one, which is precisely the fail-to-pass
+    flip the design's oracle is made of (M3-plan §4) — BugsInPy's recorded list just
+    does not name it. A file that errors on *both* trees is a real environment
+    problem and is deliberately absent here; see :func:`detect_collect_flip`.
+
+    [VANTA-WHY] Recorded as a file→error map rather than folded into
+    ``fail_to_pass``: ``check_gate_drift`` refuses an oracle nodeid whose file the
+    frozen issue report never gated, and this file is not one BugsInPy *declares*
+    (``bug.info``'s ``test_file``), so folding it in would refuse every bug the rule
+    helps. The nodeids it contributes to grading are recorded separately, in
+    :attr:`collect_flip_nodeids`.
+    """
+    collect_flip_nodeids: list[str] = field(default_factory=list)
+    """§3.4 — the collected nodeids of :attr:`hidden_by_collect_flip`'s files, on the fixed tree.
+
+    The oracle grades these (:attr:`hidden_nodeids`) and the strip removes them from
+    the tree Vanta reads. Kept as its own field rather than merged into
+    ``fail_to_pass`` for the drift-check reason above, and recorded rather than
+    re-derived because re-deriving needs two suite runs inside a VM — grading must
+    not have to re-measure what prepare already measured.
+    """
     gate_failures: list[str] = field(default_factory=list)
     context: Optional[ctx.ContextVerdict] = None
     issue: Optional[issue_mod.IssueText] = None
@@ -282,6 +322,19 @@ class BugPrep:
         return self.key.replace("/", "_")
 
     @property
+    def hidden_nodeids(self) -> list[str]:
+        """Everything the oracle grades: the declared ``FAIL_TO_PASS`` **plus** the collect-flips.
+
+        [VANTA-WHY] One definition, so the oracle, the strip and the record cannot
+        disagree about what is hidden. The collect-flip nodeids are graded exactly
+        like ``fail_to_pass`` — the design's oracle *is* "the tests that fail on the
+        buggy source and pass on the fixed one" (M3-plan §4) — but they are a
+        separate list on the record because they are not *declared* by BugsInPy, and
+        :func:`check_gate_drift` must keep reading only the declared set.
+        """
+        return sorted(set(self.fail_to_pass) | set(self.collect_flip_nodeids))
+
+    @property
     def runnable(self) -> bool:
         return (
             self.prepare_mode == FULL
@@ -334,6 +387,7 @@ class BugPrep:
             "role": self.role,
             "wave": self.wave,
             "prepare_mode": self.prepare_mode,
+            "sandbox_env": self.sandbox_env,
             "runnable": self.runnable,
             "test_paths": self.test_paths,
             "fail_to_pass": sorted(self.fail_to_pass),
@@ -348,6 +402,8 @@ class BugPrep:
             "native_skips_fixed": self.native_skips_fixed,
             "hidden_files_deleted": self.hidden_files_deleted,
             "partially_hidden_functions": self.partially_hidden_functions,
+            "hidden_by_collect_flip": self.hidden_by_collect_flip,
+            "collect_flip_nodeids": sorted(self.collect_flip_nodeids),
             "gate_failures": self.gate_failures,
             "context": self.context.to_dict() if self.context else None,
             "issue": self.issue.to_dict() if self.issue else None,
@@ -388,6 +444,7 @@ class BugPrep:
             role=str(field_of(payload, "role", owner=owner, where=where)),
             wave=int(field_of(payload, "wave", owner=owner, where=where)),
             prepare_mode=str(field_of(payload, "prepare_mode", owner=owner, where=where)),
+            sandbox_env=map_of(payload, "sandbox_env", owner=owner, where=where),
             test_paths=strings_of(payload, "test_paths", owner=owner, where=where),
             fail_to_pass=strings_of(payload, "fail_to_pass", owner=owner, where=where),
             f2p_undeclared=strings_of(payload, "f2p_undeclared", owner=owner, where=where),
@@ -418,6 +475,12 @@ class BugPrep:
             ),
             partially_hidden_functions=strings_of(
                 payload, "partially_hidden_functions", owner=owner, where=where
+            ),
+            hidden_by_collect_flip=map_of(
+                payload, "hidden_by_collect_flip", owner=owner, where=where
+            ),
+            collect_flip_nodeids=strings_of(
+                payload, "collect_flip_nodeids", owner=owner, where=where
             ),
             gate_failures=strings_of(payload, "gate_failures", owner=owner, where=where),
             context=None
@@ -480,10 +543,13 @@ def check_deps(
     message sent a debugging session after the wrong suspect.
 
     Both checks run inside the finished per-bug layer and both run the way the
-    suites run — same interpreter, same cwd, same (absent) ``PYTHONPATH``, same
-    pytest entry point:
+    suites run — same interpreter, same cwd, the bug's recorded ``sandbox_env``
+    (nothing, for every bug but fastapi's), same pytest entry point:
 
-    (a) the oracle tree's tests collect, with no collection error;
+    (a) the oracle tree's tests collect, with no collection error — except that a
+        collection error which is a recorded *collect-flip* is set aside and the
+        gate is re-run with ``--ignore`` over it (:func:`detect_collect_flip`), so
+        the pass is still a clean exit and not a filtered error list;
     (b) the project's own package imports **from the tree under test**, not from
         site-packages, where a ``setup.py install`` would have left a frozen copy
         that makes every patch grade the same.
@@ -494,6 +560,7 @@ def check_deps(
     """
     module = str(deps["import_name"])
     tree_rel = _rel(prep, "oracle_tree")
+    env = prep.sandbox_env or None
 
     try:
         nodeids = suite_mod.collect_only(
@@ -502,9 +569,12 @@ def check_deps(
             tree_rel=tree_rel,
             test_cmd=prep.test_cmd,
             disk_mb=DISK_MB,
+            extra_env=env,
         )
     except suite_mod.SuiteError as exc:
-        raise suite_mod.SuiteError(f"deps: collection failed: {exc}") from exc
+        nodeids = _collect_flip_or_raise(
+            prep, exc, checkpoint=checkpoint, batch_dir=batch_dir, env=env
+        )
 
     try:
         where = suite_mod.import_probe(
@@ -514,6 +584,7 @@ def check_deps(
             test_cmd=prep.test_cmd,
             module=module,
             disk_mb=DISK_MB,
+            extra_env=env,
         )
     except suite_mod.SuiteError as exc:
         raise suite_mod.SuiteError(
@@ -527,6 +598,118 @@ def check_deps(
             f"loaded {where}, which is not under {root}"
         )
     return nodeids
+
+
+def _collect_flip_or_raise(
+    prep: BugPrep,
+    refusal: suite_mod.SuiteError,
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    env: Optional[dict[str, str]],
+) -> set[str]:
+    """The collect gate's second reading: the error is a collect-flip, so re-run.
+
+    [VANTA-WHY] Only when the strict gate has *already* refused does this run, and
+    its answer is only accepted when it explains the whole refusal: every file that
+    errored on the buggy tree must be a file that collects cleanly on the fixed one,
+    and there must be at least one. Anything else — an error on both trees, an error
+    on a tree the fix does not touch enough to clear, a collection that errors with
+    no file named — keeps the refusal, because those are the shapes of a genuinely
+    broken environment and hiding one would grade a bug against tests it does not
+    have.
+
+    The gate is then re-run for real, with ``--ignore`` over the flipped files, so
+    what passes is a clean collection rather than a filtered error list.
+    """
+    flips, nodeids, errors = detect_collect_flip(
+        prep, checkpoint=checkpoint, batch_dir=batch_dir, env=env
+    )
+    unexplained = {file: err for file, err in errors.items() if file not in flips}
+    if not flips or unexplained:
+        raise suite_mod.SuiteError(f"deps: collection failed: {refusal}") from refusal
+
+    prep.hidden_by_collect_flip = flips
+    prep.collect_flip_nodeids = nodeids
+    return suite_mod.collect_only(
+        checkpoint=checkpoint,
+        batch_dir=batch_dir,
+        tree_rel=_rel(prep, "oracle_tree"),
+        test_cmd=prep.test_cmd,
+        disk_mb=DISK_MB,
+        extra_env=env,
+        ignore=sorted(flips),
+    )
+
+
+def detect_collect_flip(
+    prep: BugPrep,
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    env: Optional[dict[str, str]] = None,
+) -> tuple[dict[str, str], list[str], dict[str, str]]:
+    """Fixed-commit test files that error on the buggy source and collect on the fixed one.
+
+    Returns ``(flips, nodeids, errors)``: ``flips`` is pytest's own line for each
+    qualifying file's buggy-tree collection error, ``nodeids`` is what those files
+    collect on the fixed tree, and ``errors`` is *every* file that errored on the
+    buggy tree — so a caller can prove the flips explain the whole failure rather
+    than a part of it.
+
+    [VANTA-WHY] The rule, and why it is a harness rule rather than a fastapi hack
+    (M3-plan §4). The design's oracle is "the fixed commit's tests minus the tests
+    that flip from failing to passing" — the flipping ones are hidden, and the
+    system sees the rest. A test module that raises at import on the buggy source and
+    imports cleanly on the fixed one *is* such a flip: it fails on the buggy tree (it
+    cannot even be collected) and passes on the fixed tree, so it is answer material.
+    BugsInPy's recorded list simply does not name it, because that list is a
+    declaration and not a derivation. Measured on ``fastapi/1``: the fix's
+    ``tests/test_skip_defaults.py`` imports at module level with a route kwarg the
+    buggy source rejects, so the oracle tree's collection ends in
+    ``TypeError: get() got an unexpected keyword argument
+    'response_model_exclude_defaults'`` — an error the gate would otherwise read as a
+    broken environment.
+
+    A file that errors on *both* trees is not a flip and must not be hidden: that is
+    a dependency or an interpreter the layer is missing, and hiding it would make the
+    bug look gradable while its suite is broken. So both trees are collected, under
+    the same interpreter, cwd and recorded ``sandbox_env``, and only the files that
+    are clean on the fixed tree qualify.
+
+    Costs two collection runs, and only on the path where the strict gate has
+    already refused, so a bug with a healthy suite never pays for it.
+    """
+    env = env if env is not None else (prep.sandbox_env or None)
+    buggy = suite_mod.collect_report(
+        checkpoint=checkpoint,
+        batch_dir=batch_dir,
+        tree_rel=_rel(prep, "oracle_tree"),
+        test_cmd=prep.test_cmd,
+        disk_mb=DISK_MB,
+        extra_env=env,
+    )
+    if not buggy.errors:
+        return {}, [], {}
+
+    fixed = suite_mod.collect_report(
+        checkpoint=checkpoint,
+        batch_dir=batch_dir,
+        tree_rel=_rel(prep, "src_fixed"),
+        test_cmd=prep.test_cmd,
+        disk_mb=DISK_MB,
+        extra_env=env,
+    )
+    fixed_by_file = suite_mod.collect_by_file(sorted(fixed.nodeids))
+    flips = {
+        file: buggy.errors[file]
+        for file in sorted(buggy.errors)
+        if file in fixed_by_file and file not in fixed.errors
+    }
+    nodeids = sorted(
+        nodeid for file in flips for nodeid in fixed_by_file.get(file, set())
+    )
+    return flips, nodeids, buggy.errors
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +871,7 @@ def derive_hidden(
             tree_rel=_rel(prep, "oracle_tree"),
             test_cmd=prep.test_cmd,
             disk_mb=DISK_MB,
+            extra_env=prep.sandbox_env or None,
         )
 
     buggy = _suite(checkpoint, batch_dir, prep, "src_buggy", "src_buggy")
@@ -814,6 +998,7 @@ def _suite(
         test_cmd=prep.test_cmd,
         report_rel_stem=f"reports/{prep.slug}-{stem_suffix}",
         disk_mb=DISK_MB,
+        extra_env=prep.sandbox_env or None,
     )
 
 
@@ -823,12 +1008,16 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> No
     The pre-strip collected set is what decides "this file is entirely hidden" in
     the stripper, so it is read from the oracle run's report rather than guessed.
 
-    [VANTA-WHY] The hidden set is ``FAIL_TO_PASS`` *plus* the undeclared flippers. A
-    test the creator can read but the oracle does not grade is worse than either: the
-    creator can spend a round satisfying it, and the native baseline can mark a patch a
-    regression for failing a test BugsInPy never runs. Removing it from
-    ``oracle_tree``'s derivative is what excludes it from the PASS_TO_PASS suite, since
-    the suite is whatever the tree collects.
+    [VANTA-WHY] The hidden set is ``FAIL_TO_PASS`` *plus* the undeclared flippers
+    *plus* the collect-flips. A test the creator can read but the oracle does not
+    grade is worse than either: the creator can spend a round satisfying it, and the
+    native baseline can mark a patch a regression for failing a test BugsInPy never
+    runs. Removing it from ``oracle_tree``'s derivative is what excludes it from the
+    PASS_TO_PASS suite, since the suite is whatever the tree collects. The
+    collect-flips are hidden for the stronger reason: their file does not even
+    collect on the buggy source, and the oracle grades them
+    (:attr:`BugPrep.hidden_nodeids`) — so the tree the Creator reads must not carry
+    them, or the answer is in the tree.
     """
     oracle = prep.root / "oracle_tree"
     vanta = prep.root / "vanta_tree"
@@ -849,8 +1038,9 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> No
     try:
         strip = tree_mod.strip_hidden_tests(
             vanta,
-            [*prep.fail_to_pass, *prep.f2p_undeclared],
+            [*prep.fail_to_pass, *prep.f2p_undeclared, *prep.collect_flip_nodeids],
             collected_by_file,
+            delete_files=sorted(prep.hidden_by_collect_flip),
         )
     except tree_mod.StripError as exc:
         prep.gate_failures.append(f"hidden-test strip failed: {exc}")
@@ -877,14 +1067,17 @@ def selfcheck_dev_fix(prep: BugPrep, *, batch_dir: Path, checkpoint: str) -> boo
     ``runner.grade_candidate`` leaves implicit when it grades a candidate, so the two
     gradings of the same bytes answer the same question.
 
-    A bug with no ``FAIL_TO_PASS`` is passed through: the derivation has already gated
-    it, and there is no oracle for this check to grade against.
+    A bug with nothing hidden is passed through: the derivation has already gated it,
+    and there is no oracle for this check to grade against. "Nothing hidden" means
+    :attr:`BugPrep.hidden_nodeids` — the declared ``FAIL_TO_PASS`` *plus* the recorded
+    collect-flips — because that is exactly what ``grade``/``grade_dev_fix`` grade, and
+    the two have to answer the same question about the same bytes.
     """
     # Deferred: ``oracle`` imports ``BugPrep`` from this module, so a module-level
     # import here would close the cycle before ``BugPrep`` exists.
     from . import oracle as oracle_mod
 
-    if not prep.fail_to_pass:
+    if not prep.hidden_nodeids:
         return True
 
     result = oracle_mod.grade_dev_fix(
@@ -1790,6 +1983,11 @@ def prepare_one(
         wave=int(entry["wave"]),
         test_cmd=[str(part) for part in entry["test_cmd"]],
         prepare_mode=FULL if full else MEASURE_ONLY,
+        # §3.4 — the project's own suite environment. Declared on the split entry
+        # (``sandbox_env``) and only read here, so the value is never typed per bug
+        # in pipeline code: whatever the split records is what every run of this row
+        # gets. Empty for every bug but fastapi's.
+        sandbox_env={str(k): str(v) for k, v in (entry.get("sandbox_env") or {}).items()},
     )
 
     mismatches = check_declared(entry, bug)
@@ -1971,6 +2169,8 @@ def derive_verdict(prep: BugPrep) -> dict[str, Any]:
         "native_skips_fixed": prep.native_skips_fixed,
         "hidden_files_deleted": prep.hidden_files_deleted,
         "partially_hidden_functions": prep.partially_hidden_functions,
+        "hidden_by_collect_flip": prep.hidden_by_collect_flip,
+        "collect_flip_nodeids": sorted(prep.collect_flip_nodeids),
         "gate_failures": prep.gate_failures,
         "prompt_tokens_estimate": prep.context.estimated_prompt_tokens
         if prep.context

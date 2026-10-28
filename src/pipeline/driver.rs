@@ -83,6 +83,10 @@ pub struct RunConfig {
     /// Explicit test command (Spec §7: "Require explicit --test-cmd, pytest as
     /// fallback. Do not infer."). e.g. "pytest tests/ -q".
     pub test_cmd: Option<String>,
+    /// Environment injected into every sandbox command of this run, from the
+    /// harness's recorded per-project rule (e.g. `PYTHONPATH=./docs_src`).
+    /// Empty in the normal case.
+    pub sandbox_env: Vec<(String, String)>,
     /// Path to a clean original tree (git worktree of the base commit) for
     /// two-tree mode. If set, BATE runs against this tree instead of the
     /// in-memory original files. Spec §7: "both trees present simultaneously".
@@ -817,7 +821,8 @@ pub async fn run(
     let test_cmd: TestCommand = match &config.test_cmd {
         Some(s) => TestCommand::from_shell(s),
         None => TestCommand::default(),
-    };
+    }
+    .with_env(config.sandbox_env.clone());
     println!(
         "▌ Test command: {} {}",
         test_cmd.program,
@@ -943,7 +948,7 @@ pub async fn run(
         summary: format!(
             "model={} llm_backend={} model_version={} prompt_version={} prompt_hash={} provider={} api_key={} \
              vanta_version={} vanta_commit={} vanta_dirty={} tested_commit={} target_repo_dirty={} requested_backend={} actual_backend={} max_attempts={} \
-             baseline_test_timeout_secs={} patched_test_timeout_secs={} deps_checkpoint={} deps_freeze={} test_cmd={} mode={} benchmark_instance={}",
+             baseline_test_timeout_secs={} patched_test_timeout_secs={} deps_checkpoint={} deps_freeze={} test_cmd={} mode={} benchmark_instance={} sandbox_env={:?}",
             cfg.model_id,
             // [VANTA-WHY] The backend is part of the run's identity, not a
             // detail of its transport: a hosted row and a local row that shared
@@ -973,6 +978,7 @@ pub async fn run(
             format!("{} {}", test_cmd.program, test_cmd.args.join(" ")),
             run_mode,
             "none",
+            config.sandbox_env,
         ),
         timestamp: now_iso(),
         benchmark_instance: None,

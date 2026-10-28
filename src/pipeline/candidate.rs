@@ -53,6 +53,10 @@ use crate::repo::Repo;
 pub struct TestCommand {
     pub program: String,
     pub args: Vec<String>,
+    /// Environment every run of this command needs, from the run's recorded
+    /// `sandbox_env` (e.g. `PYTHONPATH=./docs_src`). Empty in the normal case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<(String, String)>,
 }
 
 impl TestCommand {
@@ -61,6 +65,7 @@ impl TestCommand {
         Self {
             program: program.into(),
             args,
+            env: Vec::new(),
         }
     }
 
@@ -75,7 +80,15 @@ impl TestCommand {
         Self {
             program: parts[0].clone(),
             args: parts[1..].to_vec(),
+            env: Vec::new(),
         }
+    }
+
+    /// Attach the run's recorded environment to this command, so it travels with
+    /// the command into every harness run.
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
+        self
     }
 
     /// The full command as a vec (program first), suitable for sandbox.execute.

@@ -231,6 +231,11 @@ pub async fn rerun_signals(
     }
 
     // ---- 8. The test command to re-run with ----
+    // [VANTA-WHY] A re-run of a session that used a recorded `sandbox_env` cannot
+    // reconstruct it from this path: the env is written into the `session.start`
+    // summary as a rendered `sandbox_env=[...]` string, not read back as a value
+    // here. So the re-run reproduces the command but NOT that import path, and the
+    // command's env stays empty.
     let (test_cmd_text, test_cmd) = match test_cmd_str {
         Some(s) => (s.clone(), TestCommand::from_shell(&s)),
         None => {

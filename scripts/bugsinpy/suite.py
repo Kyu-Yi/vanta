@@ -192,16 +192,26 @@ def run_suite_twice(
     return pair
 
 
-def collect_command(test_cmd: Sequence[str]) -> list[str]:
+def collect_command(
+    test_cmd: Sequence[str], ignore: Sequence[str] = ()
+) -> list[str]:
     """``test_cmd`` reduced to a collection-only run — the collectability gate (§3.4).
 
     Split out of ``collect_only`` because the bake needs the *same* command: the
     per-bug layer's collect check must not be a second interpretation of
     ``test_cmd`` that can drift from the one prepare runs.
+
+    ``ignore`` names test files the gate is to set aside — the recorded
+    collect-flip files (see :func:`prepare.detect_collect_flip`), whose module-level
+    import error on the buggy tree *is* the oracle rather than a broken environment.
+    ``pytest --ignore`` keeps the file out of collection entirely, so the gate's pass
+    is proven by a clean exit rather than inferred from a filtered error list.
     """
     return [
         str(part) for part in test_cmd if not str(part).startswith("--json-report")
-    ] + ["--collect-only", "-q", "-p", "no:cacheprovider"]
+    ] + ["--collect-only", "-q", "-p", "no:cacheprovider"] + [
+        f"--ignore={path}" for path in ignore
+    ]
 
 
 def parse_collected(stdout: str) -> set[str]:
@@ -212,6 +222,55 @@ def parse_collected(stdout: str) -> set[str]:
         if "::" in line and " " not in line:
             nodeids.add(line)
     return nodeids
+
+
+_COLLECT_ERROR_HEADER = re.compile(r"ERROR collecting (\S+)")
+"""pytest's per-file collection-error heading, from its ``ERRORS`` section.
+
+[VANTA-WHY] Read from the heading rather than from the short-summary line: only the
+heading is followed by the traceback, and the traceback's own ``E   …`` line is the
+*error type* the collect-flip record has to name. The short summary (``ERROR
+tests/test_x.py``) is matched as the fallback below, so a pytest whose heading
+format moved still yields the file, just without the type.
+"""
+
+_COLLECT_ERROR_TEXT = re.compile(r"^E\s+(\S.*)$")
+"""The ``E   ImportError: …`` line — pytest's own one-line statement of the error."""
+
+_COLLECT_ERROR_SUMMARY = re.compile(r"^ERROR\s+(\S+\.py)\b")
+"""The short-summary ``ERROR tests/test_x.py`` line — the fallback, and the only
+form available on a pytest old enough to omit the heading."""
+
+
+def parse_collection_errors(output: str) -> dict[str, str]:
+    """A collection run's output → ``{test file: the error's own line}``.
+
+    [VANTA-WHY] The collect-flip rule (§3.4) is a statement about *which* files
+    error: a file that errors here and collects cleanly on the fixed tree is the
+    oracle, and a file that errors on both trees is a broken environment. A reader
+    that returned only "there were errors" cannot tell those apart, and one that
+    returned only the first (which is what :func:`collected_or_raise` deliberately
+    does for the gate) cannot see a second hidden file. So this returns the whole
+    map, file → error, and leaves the judgement to the caller.
+    """
+    errors: dict[str, str] = {}
+    current: Optional[str] = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        heading = _COLLECT_ERROR_HEADER.search(line)
+        if heading:
+            current = heading.group(1)
+            continue
+        if current is None or current in errors:
+            continue
+        text = _COLLECT_ERROR_TEXT.match(line)
+        if text:
+            errors[current] = text.group(1).strip()
+    for raw in output.splitlines():
+        summary = _COLLECT_ERROR_SUMMARY.match(raw.strip())
+        if summary:
+            errors.setdefault(summary.group(1).split("::", 1)[0], "")
+    return errors
 
 
 _ERROR_LINE = re.compile(
@@ -277,6 +336,75 @@ def guest_tree_root(tree_rel: str) -> str:
     directory the suite ran in.
     """
     return f"/workspace/{tree_rel}"
+
+
+@dataclass
+class CollectionReport:
+    """A collection run, with its errors kept rather than raised on (§3.4).
+
+    ``nodeids`` is :func:`parse_collected`'s output and ``errors`` is
+    :func:`parse_collection_errors`'s — the *whole* error map, not the first error.
+    ``exit_code`` and ``output`` are kept so a caller that does decide to refuse can
+    still report what pytest said, exactly as :func:`collected_or_raise` does.
+    """
+
+    nodeids: set[str] = field(default_factory=set)
+    errors: dict[str, str] = field(default_factory=dict)
+    exit_code: Optional[int] = None
+    output: str = ""
+
+
+def collect_report(
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    tree_rel: str,
+    test_cmd: Sequence[str],
+    disk_mb: int,
+    timeout_secs: int = 600,
+    extra_env: Optional[dict[str, str]] = None,
+) -> CollectionReport:
+    """Collect the whole suite, reporting every error instead of stopping at one.
+
+    [VANTA-WHY] ``--continue-on-collection-errors`` is what makes this the right
+    reader for the collect-flip rule and the wrong one for the gate. The gate must
+    stop at the first error (§3.4, :func:`collected_or_raise`): a suite that does not
+    collect is not the suite the oracle grades, and passing on a partial collection
+    would grade a bug against tests it does not have. The collect-flip rule asks the
+    opposite question — "are *all* of this tree's collection errors files that
+    collect cleanly on the fixed tree?" — and a run that stopped at the first error
+    could not answer it for a tree with two.
+
+    Runs under the same interpreter, cwd and recorded ``sandbox_env`` as the graded
+    suites, for the same reason :func:`collect_only` does (§3.4).
+    """
+    env = {"PYTHONDONTWRITEBYTECODE": "1"}
+    if extra_env:
+        env.update(extra_env)
+    result = shuru.run(
+        checkpoint=checkpoint,
+        host_root=batch_dir,
+        command=[
+            "sh",
+            "-c",
+            _shell_quote(
+                collect_command(test_cmd) + ["--continue-on-collection-errors"]
+            ),
+        ],
+        disk_mb=disk_mb,
+        guest_cwd=guest_tree_root(tree_rel),
+        timeout_secs=timeout_secs,
+        env=env,
+    )
+    output = f"{result.stdout}\n{result.stderr}"
+    report = CollectionReport(
+        nodeids=parse_collected(result.stdout),
+        errors=parse_collection_errors(output),
+        exit_code=result.exit_code,
+        output=output,
+    )
+    _clean_tree_noise(batch_dir / tree_rel)
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +494,8 @@ def collect_only(
     test_cmd: Sequence[str],
     disk_mb: int,
     timeout_secs: int = 600,
+    extra_env: Optional[dict[str, str]] = None,
+    ignore: Sequence[str] = (),
 ) -> set[str]:
     """``pytest --collect-only -q`` — the collectability gate (§3.4).
 
@@ -374,15 +504,33 @@ def collect_only(
     ``unittest.TestCase`` subclasses, ``unittest``'s own runner does not produce
     a JSON report we can read. If a bug does not collect here it is rejected from
     the split rather than run and failed.
+
+    ``extra_env`` is the run's recorded ``sandbox_env`` (the project's own suite
+    environment, e.g. ``PYTHONPATH=./docs_src`` for fastapi). It is passed so the
+    gate collects under the *same* import path the graded suites run under: a gate
+    that collected without it would reject a bug whose tests the full suite can
+    run, and a gate that added import paths the suite does not have would accept
+    one whose suite then dies on ``ModuleNotFoundError``.
+
+    ``ignore`` names the recorded collect-flip files, and it is the *only* reason
+    this gate may pass on a tree that has a collection error. It is not a filter
+    over the error list: ``--ignore`` keeps those files out of collection
+    altogether, so the exit is genuinely 0 and ``collected_or_raise`` still holds
+    its full meaning. The caller has already proved, on both trees, that each
+    ignored file errors on the buggy source and collects cleanly on the fixed one
+    (:func:`prepare.detect_collect_flip`) — that error *is* the oracle there.
     """
+    env = {"PYTHONDONTWRITEBYTECODE": "1"}
+    if extra_env:
+        env.update(extra_env)
     result = shuru.run(
         checkpoint=checkpoint,
         host_root=batch_dir,
-        command=["sh", "-c", _shell_quote(collect_command(test_cmd))],
+        command=["sh", "-c", _shell_quote(collect_command(test_cmd, ignore))],
         disk_mb=disk_mb,
         guest_cwd=guest_tree_root(tree_rel),
         timeout_secs=timeout_secs,
-        env={"PYTHONDONTWRITEBYTECODE": "1"},
+        env=env,
     )
     nodeids = collected_or_raise(
         parse_collected(result.stdout),
@@ -402,18 +550,22 @@ def import_probe(
     module: str,
     disk_mb: int,
     timeout_secs: int = 300,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> str:
     """``import <module>; print(<module>.__file__)``, run exactly as the suites run.
 
     [VANTA-WHY] The suites run ``python -m pytest`` with their cwd set to the tree
-    root and no ``PYTHONPATH``, so the tree reaches ``sys.path`` through ``python
-    -m``'s CWD prepend and nothing else. This probe reuses that invocation — same
-    interpreter (``test_cmd[0]``), same cwd, same env, no ``PYTHONPATH``. A probe
-    that set ``PYTHONPATH`` would prove an import path the suites do not have, and
-    one that ran the module the suite does not import could pass while the suite
-    still died on ``ModuleNotFoundError``. The version installed in site-packages
-    is exactly what this must catch: a buggy copy there would be imported instead
-    of the graded tree, and every patch would then grade the same.
+    root and the run's own environment — the interpreter's CWD prepend plus the
+    recorded ``sandbox_env`` and nothing else. This probe reuses that invocation —
+    same interpreter (``test_cmd[0]``), same cwd, same env, same ``extra_env`` — so
+    it can never prove an import path the suites do not have. When ``extra_env`` is
+    empty (the normal case) that is exactly "cwd and no ``PYTHONPATH``"; when the
+    bug's project does declare one (fastapi's ``PYTHONPATH=./docs_src``), the probe
+    sets the same value the suite does, because the suite's import path *is* the
+    thing being checked. A probe that ran the module the suite does not import could
+    pass while the suite still died on ``ModuleNotFoundError``. The version installed
+    in site-packages is exactly what this must catch: a buggy copy there would be
+    imported instead of the graded tree, and every patch would then grade the same.
 
     Returns the path the interpreter actually loaded.
     """
@@ -424,6 +576,9 @@ def import_probe(
         )
     python = str(test_cmd[0]) if test_cmd else "python"
     code = f"import {module} as _vanta_probe; print(_vanta_probe.__file__)"
+    env = {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"}
+    if extra_env:
+        env.update(extra_env)
     result = shuru.run(
         checkpoint=checkpoint,
         host_root=batch_dir,
@@ -431,7 +586,7 @@ def import_probe(
         disk_mb=disk_mb,
         guest_cwd=guest_tree_root(tree_rel),
         timeout_secs=timeout_secs,
-        env={"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"},
+        env=env,
     )
     where = next(
         (line.strip() for line in reversed(result.stdout.splitlines()) if line.strip()),

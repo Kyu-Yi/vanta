@@ -97,7 +97,7 @@ DECLARED_BUG_KEYS = frozenset(
     }
 )
 
-OPTIONAL_DECLARED_BUG_KEYS = frozenset({"import_package"})
+OPTIONAL_DECLARED_BUG_KEYS = frozenset({"import_package", "sandbox_env"})
 """Declared keys a bug may carry but need not.
 
 [VANTA-WHY] ``import_package`` is the last-resort override for the import name the
@@ -107,6 +107,27 @@ route is the metadata itself: requiring it of every bug would put a redundant gu
 next to a fact for all of them. A bug that sets it records the reason in the split's
 ``reviewed_changes``, the same way every other departure from the first-authored
 protocol is recorded.
+
+[VANTA-WHY] ``sandbox_env`` is the project's own statement of the environment its
+suite runs in, recorded rather than hard-coded: fastapi's ``scripts/test.sh`` exports
+``PYTHONPATH=./docs_src`` and ~250 of its tests import a module the tree ships in that
+directory (``from additional_responses.tutorial001 import app``), so without it the
+suites die at collection with ``ModuleNotFoundError`` and the bug reads as a broken
+tree. It is per bug in this file because the file is a list of bugs — the rule is the
+*project's*, and a bug of a project that declares one carries it. The one alternative
+that would have kept the tree free of harness-made files was a ``conftest.py`` written
+into the repo, and it was rejected: the tree the Attacker and the Creator read must be
+exactly what the benchmark ships.
+"""
+
+SANDBOX_ENV_KEYS = frozenset({"PYTHONPATH"})
+"""The keys ``sandbox_env`` may set, and nothing else.
+
+[VANTA-WHY] The allow-list *is* the rule. ``PYTHONPATH`` is what the projects declare
+for themselves; a general "set any variable" channel through the split would be a way
+to change the environment the graded tests run in, which is the measurement, without
+it showing up as a decision about the bug. A bug that needs another key is a change to
+this set and to the split's ``reviewed_changes``, not a quiet value in a bug entry.
 """
 
 # Written back by ``prepare``. Nothing here may be hand-edited into the file
@@ -128,6 +149,8 @@ DERIVED_BUG_KEYS = frozenset(
         "native_skips_fixed",
         "hidden_files_deleted",
         "partially_hidden_functions",
+        "hidden_by_collect_flip",
+        "collect_flip_nodeids",
         "gate_failures",
         "prompt_tokens_estimate",
         "context_ok",
@@ -448,6 +471,27 @@ def _validate_bug(entry: Any, where: str, index: int, seen: set[str]) -> None:
             f"{tag}: import_package must be a non-empty string — it is the module the "
             "import-path check loads, and an empty one would be a guess"
         )
+
+    env = entry.get("sandbox_env")
+    if env is not None:
+        if not isinstance(env, dict) or not env:
+            raise SplitError(
+                f"{tag}: sandbox_env must be a non-empty object of KEY=VALUE strings — "
+                "the project's own suite environment, or nothing at all; an empty one "
+                "would record a rule that says nothing"
+            )
+        for key, value in env.items():
+            if key not in SANDBOX_ENV_KEYS:
+                raise SplitError(
+                    f"{tag}: sandbox_env key {key!r} is not allowed — the only key a "
+                    f"bug may set is {sorted(SANDBOX_ENV_KEYS)}, because a general "
+                    "environment channel would change what the graded tests run in"
+                )
+            if not isinstance(value, str) or not value.strip():
+                raise SplitError(
+                    f"{tag}: sandbox_env[{key!r}] must be a non-empty string — an empty "
+                    "value would put an empty entry on PYTHONPATH, which is not a path"
+                )
 
     # Derived fields, when present, must be self-consistent.
     issue = entry.get("issue_text")

@@ -56,6 +56,44 @@ pub fn backend_kind_label(kind: SandboxKind) -> &'static str {
     }
 }
 
+/// The complete set of environment keys `--sandbox-env` is allowed to inject.
+///
+/// [VANTA-WHY] The allow-list *is* the feature. A recorded per-project rule has
+/// to be able to put the project's own import path in front of the baseline
+/// gates, the native suite, the generated tests and the oracle — e.g. fastapi's
+/// own `scripts/test.sh` exports `PYTHONPATH=./docs_src`, and the same import
+/// path must be visible to every one of those runs. A general "set any
+/// variable" flag would instead be an env-injection channel across the sandbox
+/// boundary, which is exactly what this flag refuses to be: only the keys named
+/// here may cross.
+pub const ALLOWED_SANDBOX_ENV_KEYS: &[&str] = &["PYTHONPATH"];
+
+/// Parse one `--sandbox-env KEY=VALUE` specification.
+///
+/// [VANTA-WHY] The value comes only from the harness's recorded per-project
+/// rule — it is never typed per bug — so the parser's whole job is to refuse to
+/// grow into an env channel. The key must name a member of
+/// `ALLOWED_SANDBOX_ENV_KEYS` (a rejected key is the flag refusing to be a
+/// general env channel: the error names both the offending key and the allowed
+/// set), and the value must be non-empty after trimming. The split is on the
+/// FIRST `=`, so a value may itself contain `=`.
+pub fn parse_sandbox_env(spec: &str) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
+    let Some((key, value)) = spec.split_once('=') else {
+        return Err(format!("sandbox env {spec:?} is not KEY=VALUE (no '=')").into());
+    };
+    if key.is_empty() || !ALLOWED_SANDBOX_ENV_KEYS.contains(&key) {
+        return Err(format!(
+            "sandbox env key {key:?} is not allowed; allowed keys: {}",
+            ALLOWED_SANDBOX_ENV_KEYS.join(", ")
+        )
+        .into());
+    }
+    if value.trim().is_empty() {
+        return Err(format!("sandbox env {key} has an empty value").into());
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
 /// The sandbox kind this process will actually use: the env preference, with
 /// `auto` resolved through the shuru availability + boot test.
 pub async fn actual_backend_kind() -> Result<SandboxKind, Box<dyn Error + Send + Sync>> {
@@ -271,10 +309,11 @@ impl Backend {
         cmd: &[&str],
         cwd: &std::path::Path,
         timeout_secs: u64,
+        env: &[(String, String)],
     ) -> Result<ExecutionResult, Box<dyn Error + Send + Sync>> {
         match self {
-            Backend::Subprocess(b) => b.execute(cmd, cwd, timeout_secs).await,
-            Backend::Shuru(b) => b.execute(cmd, cwd, timeout_secs).await,
+            Backend::Subprocess(b) => b.execute(cmd, cwd, timeout_secs, env).await,
+            Backend::Shuru(b) => b.execute(cmd, cwd, timeout_secs, env).await,
         }
     }
 
@@ -329,5 +368,38 @@ mod tests {
         unsafe {
             std::env::remove_var("VANTA_SANDBOX_BACKEND");
         }
+    }
+
+    #[test]
+    fn parse_sandbox_env_accepts_the_recorded_import_path() {
+        assert_eq!(
+            parse_sandbox_env("PYTHONPATH=./docs_src").unwrap(),
+            ("PYTHONPATH".to_string(), "./docs_src".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_sandbox_env_rejects_a_key_the_boundary_must_not_carry() {
+        let err = parse_sandbox_env("PATH=/x").unwrap_err().to_string();
+        assert!(err.contains("PATH"));
+        assert!(err.contains("PYTHONPATH"));
+    }
+
+    #[test]
+    fn parse_sandbox_env_rejects_an_empty_value() {
+        assert!(parse_sandbox_env("PYTHONPATH=").is_err());
+    }
+
+    #[test]
+    fn parse_sandbox_env_rejects_a_missing_separator() {
+        assert!(parse_sandbox_env("PYTHONPATH").is_err());
+    }
+
+    #[test]
+    fn parse_sandbox_env_splits_on_the_first_equals_only() {
+        assert_eq!(
+            parse_sandbox_env("PYTHONPATH=./docs_src=./other").unwrap(),
+            ("PYTHONPATH".to_string(), "./docs_src=./other".to_string())
+        );
     }
 }

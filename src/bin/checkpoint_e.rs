@@ -66,7 +66,7 @@ def test_empty_cart():
     // ---- Run pytest with --json-report ----
     // [SYNTAX] cmd slice: [program, arg1, arg2, ...]. cwd is sandbox root.
     let cmd = ["python3", "-m", "pytest", "--json-report", "--json-report-file=report.json", "-q"];
-    let result = sb.execute(&cmd, Path::new(""), 30).await?;
+    let result = sb.execute(&cmd, Path::new(""), 30, &[]).await?;
 
     println!("\n▌ pytest exit_code={:?}, wall_time={}ms, timed_out={}",
         result.exit_code, result.wall_time_ms, result.timed_out);

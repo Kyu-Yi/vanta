@@ -820,7 +820,7 @@ def censored_oracle(prep: prepare_mod.BugPrep, reason: str) -> oracle_mod.Oracle
     return oracle_mod.OracleResult(
         apply_ok=False,
         apply_detail=reason,
-        hidden_nodeids=sorted(prep.fail_to_pass),
+        hidden_nodeids=prep.hidden_nodeids,
         error=reason,
     )
 
@@ -1578,6 +1578,12 @@ def invoke_vanta(
         "--test-cmd", vanta_test_cmd(prep.test_cmd),
         "--max-attempts", str(max_attempts),
     ]
+    # §3.4 — the row's recorded suite environment, handed to every run of this bug
+    # so Vanta's own suites see the same import path the preparation gates did.
+    # One flag per key, the value never typed per bug: it comes from the split's
+    # ``sandbox_env`` rule, and the binary refuses any key outside its allow-list.
+    for key, value in sorted(prep.sandbox_env.items()):
+        argv += ["--sandbox-env", f"{key}={value}"]
     if candidate is not None:
         argv += ["--patch", str(candidate.patch_path)]
 

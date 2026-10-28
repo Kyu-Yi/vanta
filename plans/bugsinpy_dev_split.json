@@ -37,7 +37,8 @@
     "pylab": "matplotlib",
     "mpl_toolkits": "matplotlib",
     "pkg_resources": "setuptools",
-    "psycopg2": "psycopg2-binary"
+    "psycopg2": "psycopg2-binary",
+    "pydispatch": "PyDispatcher"
   },
   "reviewed_changes": [
     {
@@ -74,6 +75,12 @@
       "reason": "Design section 4 (oracle and blinding) says the system sees the fixed commit's tests minus the tests that flip from failing to passing, and those hidden tests are the oracle. A module-level import error on the buggy tree that disappears after the fix is exactly such a flip; BugsInPy's recorded list simply does not name it. Left alone it is not conservative -- it is a collection error that costs the bug its whole suite.",
       "decided_by": "user review, 2026-10-28",
       "rule": "During `prepare`, each fixed-commit test file is collected on the buggy source and on the fixed tree inside the sandbox. A file that errors on the buggy source **and** collects cleanly on the fixed tree qualifies; a file that errors on both is a real environment problem and is not hidden. Qualifying nodeids come from the fixed tree and join FAIL_TO_PASS, so both gates keep their meaning: they fail on the buggy source and pass on the fixed one. The count of dev bugs this rule touches is read from the per-bug `hidden_by_collect_flip` records, so it is visible in the paper as a harness rule rather than a silent change."
+    },
+    {
+      "change": "`module_distributions` maps `pydispatch` -> `PyDispatcher`. The closure reaches `import pydispatch` from scrapy/1's test side (`tests/test_engine.py` line 25) and from scrapy's own source (`scrapy/signalmanager.py` line 1; `scrapy/utils/signal.py` lines 8 and 10), and the fallback -- the module name canonicalised to itself -- is a *different* PyPI project: `pydispatch` 1.0.3/1.1.0, an abandoned upload of a different codebase whose 1.1.0 metadata declares the single requirement `r`. The closure walked off to that requirement, `https://pypi.org/pypi/r/json` answered HTTP 404, and scrapy/1 came back from the five-reserve preflight flagged `BakeError: cannot read release dates for 'r'`.",
+      "reason": "The module is PyDispatcher's, and PyDispatcher's own metadata says so: the 2.0.5 sdist's `PyDispatcher.egg-info/top_level.txt` names the top-level module `pydispatch`, and every file it ships is `pydispatch/*.py`. scrapy pins the distribution in the same breath as it imports the module -- `setup.py` line 71 `PyDispatcher>=2.0.5` and BugsInPy's `requirements.txt` line 30 `PyDispatcher==2.0.5`, against `from pydispatch import dispatcher` -- so the mapping adds no package: `pydispatcher` is already a pin of the layer, and the entry only makes the import-to-distribution lookup agree with the pin that was already there. Both canonicalisations are real PyPI projects and only one of them provides the module the tests import; canonicalising the module name cannot tell them apart, which is what the table is for.",
+      "decided_by": "user review, 2026-10-28",
+      "rule": "Keyed by the import spelling, like `mysql.connector` and `google.protobuf`, and applied by the closure rather than to a named bug. The mapped name is one the layer already pins, so the closure never walks the abandoned `pydispatch` project's metadata and installs nothing new: a layer whose requirements already declare `PyDispatcher` is unchanged, and the only difference is that the closure no longer resolves the import to `pydispatch==1.1.0` in its place."
     }
   ],
   "bugs": [

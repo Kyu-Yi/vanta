@@ -318,8 +318,17 @@ class TestSplit:
         """
         split = load_split(SPLIT_PATH)
         changes = split.data["reviewed_changes"]
-        assert len(changes) == 7
-        excluded, promoted, removed, dropped, development, mapped, mysql_mapped = changes
+        assert len(changes) == 8
+        (
+            excluded,
+            promoted,
+            removed,
+            dropped,
+            development,
+            mapped,
+            mysql_mapped,
+            pydispatch_mapped,
+        ) = changes
         assert "PySnooper/1" in excluded["change"]
         assert "Python-2-only" in excluded["reason"]
 
@@ -376,6 +385,20 @@ class TestSplit:
         assert "virtual package" in mysql_mapped["change"]
         assert "date rule" in mysql_mapped["rule"]
         assert "measurements" not in mysql_mapped
+
+        # The eighth is the same kind of reviewed mapping, but for the case where
+        # the fallback's canonicalised name *is* a published distribution: two PyPI
+        # projects answer to `pydispatch`, so no refusal fires and the closure walks
+        # the wrong one's bogus requirement. The reviewer names the distribution the
+        # module actually comes from.
+        assert "pydispatch" in pydispatch_mapped["change"]
+        assert "PyDispatcher" in pydispatch_mapped["change"]
+        assert "Two PyPI projects answer to that word" in pydispatch_mapped["change"]
+        assert "requirement `r`" in pydispatch_mapped["change"]
+        assert "HTTP 404" in pydispatch_mapped["change"]
+        assert "Keyed by the import spelling" in pydispatch_mapped["rule"]
+        assert "applied by the closure" in pydispatch_mapped["rule"]
+        assert "measurements" not in pydispatch_mapped
 
     def test_reviewed_change_validates(self):
         data = split_data(
@@ -543,6 +566,12 @@ class TestSplit:
         table maps it to ``psycopg2-binary``, with the reason and the pin rule in
         ``reviewed_changes``. Until that was recorded the closure stopped the bug that
         reaches the module, which was the intended behaviour.
+
+        ``pydispatch`` is the same shape with the guess left *unrefused*: canonicalising
+        the module name resolves it to ``pydispatch``, which is a real but unrelated
+        PyPI project, so no refusal fires and the closure walks that project's bogus
+        declaration instead. The table maps it to the distribution that actually
+        provides the module, ``PyDispatcher``.
         """
         required = {
             "PIL": "Pillow",
@@ -567,6 +596,7 @@ class TestSplit:
             "mpl_toolkits": "matplotlib",
             "pkg_resources": "setuptools",
             "psycopg2": "psycopg2-binary",
+            "pydispatch": "PyDispatcher",
         }
         dev = load_split(DEV_SPLIT_PATH).module_distributions()
         evaluation = load_split(SPLIT_PATH).module_distributions()
@@ -14966,6 +14996,28 @@ class TestTestImportClosure:
         )
         with pytest.raises(bake_mod.BakeError, match="module_distributions"):
             bake_mod.module_distribution("PIL", distributions={})
+
+    def test_the_two_pypi_projects_named_pydispatch_are_told_apart_by_the_table(self):
+        """scrapy/1's regression: the module name canonicalises to the *other* project.
+
+        [VANTA-WHY] ``import pydispatch`` is PyDispatcher's module — the 2.0.5 sdist's
+        ``PyDispatcher.egg-info/top_level.txt`` names the top-level module ``pydispatch``,
+        and scrapy pins ``PyDispatcher==2.0.5`` while its own source does ``from
+        pydispatch import dispatcher``. But ``pydispatch`` is also a PyPI project of its
+        own: an abandoned upload of a different codebase whose 1.1.0 metadata declares the
+        single requirement ``r``. Without the reviewed entry the closure resolves the
+        import to that project, walks the requirement and stops the bake on a 404 from
+        ``https://pypi.org/pypi/r/json`` — no refusal fires, because the guessed name
+        *is* a published distribution. The entry resolves it to the distribution the
+        split already pins, and the closure never fetches ``r``.
+        """
+        assert bake_mod.module_distribution("pydispatch", distributions={}) == "pydispatch"
+        assert (
+            bake_mod.module_distribution(
+                "pydispatch", distributions={"pydispatch": "PyDispatcher"}
+            )
+            == "pydispatcher"
+        )
 
     def test_a_module_whose_name_cannot_be_a_distribution_is_its_interpreters(self):
         """``_csv`` is CPython's own module, so nothing is installed for it.

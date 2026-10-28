@@ -504,11 +504,19 @@ SDIST_SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
     # include of a header the archive does not carry.
     "asyncpg": (),  # Cython pgproto only; no libpq, no external header
     "bcrypt": ("libffi-dev",),
+    "blis": (),  # setup.py's ExtensionBuilder compiles the vendored blis/_src C itself,
+    # from the sdist's own blis/_src/make/<platform>.jsonl (build_object is
+    # `[compiler, "-c", source, "-o", target]` + that spec's flags/macros/include); there
+    # is no libraries=/library_dirs=/pkg-config call, and the two Extensions it hands to
+    # distutils are blis/cy.c and blis/py.c with extra_compile_args=["-std=c99"]
     "brotli": (),  # vendored c/; <vector> is libstdc++, which g++ brings
     "cffi": ("libffi-dev",),
     "cftime": (),  # cftime/_cftime.pyx only (numpy's headers); udunits is named in its
     # docstrings and nowhere else, and there is no site.cfg to point a build at one
     "coverage": (),  # coverage/ctracer/* only, all in the sdist
+    "cymem": (),  # setup.py's link_options["other"] == [] (line 35); its only Extension is
+    # Extension(mod_name, [mod_path], language="c++", include_dirs=include_dirs) with
+    # include_dirs == [get_python_inc(plat_specific=True)], and there is no libraries=
     "cython": (),  # its own setup.py names no library; Demos/ and docs/ do
     "distlib": (),  # PC/launcher.c is the Windows launcher, never built here
     "fastparquet": (),  # speedups.pyx/.c; numpy's headers, CPython's own, and omp.h —
@@ -524,12 +532,20 @@ SDIST_SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
     ),  # setupext.py: FreeType via pkg-config 'freetype2' and Png via 'libpng', both
     # default_libraries=[..., deplib('z')] — and get_pkg_config() is what locates them
     "multidict": (),  # multidict/_multidict.c + _multilib/*.h only
+    "murmurhash": (),  # setup.py's link_options["other"] == [] (lines 976-977); its only
+    # Extension's sources are mrmr.cpp + murmurhash/MurmurHash2.cpp + MurmurHash3.cpp and
+    # its include_dirs are get_python_inc(plat_specific=True) + murmurhash/include — all
+    # of them in the sdist; no libraries=
     "numpy": (),  # bundled f2c lapack_lite; get_info('lapack_opt', 0) falls back
     "numexpr": (),  # setup.py's libraries=/library_dirs= are inside the MKL branch
     # guarded by os.path.exists('site.cfg') — the sdist ships only site.cfg.example —
     # so the extension that gets built is the other one, whose libraries=['m']
     "peewee": ("libsqlite3-dev",),  # setup.py libraries=['sqlite3'] (optional ext)
     "pillow": ("libjpeg-dev",),
+    "preshed": (),  # setup.py's link_options["other"] == [] (line 205), cymem's shape
+    # exactly: Extension(mod_name, [mod_path], language="c++", include_dirs=include_dirs)
+    # with include_dirs == [get_python_inc(plat_specific=True)]; its only other entry,
+    # include/msvc9, is appended under msvc9, and no Extension names a library
     "psutil": (),  # its libraries= are devstat/kvm/kstat/perfstat — all non-Linux
     "psycopg2": ("libpq-dev",),
     "psycopg2-binary": ("libpq-dev",),
@@ -537,13 +553,27 @@ SDIST_SYSTEM_PACKAGES: Mapping[str, tuple[str, ...]] = {
     "pycryptodome": (),  # setup.py's get_libraries returns [] on purpose ("avoid linking
     # Python's dynamic library"), and every include it adds is src/ or src/libtom/ —
     # vendored — besides the compiler's own intrinsics headers
+    "pyrsistent": (),  # setup.py's extensions are Extension('pvectorc',
+    # sources=['pvectorcmodule.c']) and nothing else, so the one compiled source is in
+    # the sdist; its custom_build_ext deliberately tolerates a failed build ("Allow C
+    # extension building to fail"), so the extension is an optimisation here
     "pyyaml": ("libyaml-dev",),  # setup.py libraries=['yaml'] for ext/_yaml.pyx
     "regex": (),  # regex_2/ and regex_3/ are in the sdist
     "ruamel-yaml-clib": (),  # libs come from its own ext_modules; it lists none
     "scikit-learn": ("gfortran", "libopenblas-dev", "liblapack-dev"),
     "scipy": ("gfortran", "libopenblas-dev", "liblapack-dev"),
     "sqlalchemy": (),  # cextension/{processors,resultproxy,utils}.c only
+    "srsly": (),  # setup.py's LINK_OPTIONS["other"] == ["-lstdc++", "-lm"] (line 1156) —
+    # the toolchain's, as for ujson; the msgpack Extensions take include_dirs =
+    # get_python_inc + "." + include/, and the srsly.ujson.ujson one compiles
+    # srsly/ujson/*.c + srsly/ujson/lib/*.c with include_dirs=["./srsly/ujson",
+    # "./srsly/ujson/lib"] — all of it in the sdist; its darwin-only -Wl,-rpath branch
+    # does not apply on linux/aarch64
     "statsmodels": ("gfortran", "libopenblas-dev", "liblapack-dev"),
+    "thinc": (),  # setup.py's LINK_OPTIONS["other"] == [] (line 424), and its
+    # include_dirs are get_python_inc(plat_specific=True) + the sdist's own include/; the
+    # -lc++/-nodefaultlibs lines it appends are inside an is_new_osx() branch, so they do
+    # not apply on linux/aarch64; its extra Extension is thinc/extra/wrapt/_wrappers.c
     "thrift": (),  # src/ext/{module,types,binary,compact}.cpp and every header they
     # include (ext/{types,binary,compact,protocol}.h, ext/endian.h, ext/protocol.tcc) are
     # in the sdist, and setup.py's include_dirs=['src'] names the archive itself: measured,

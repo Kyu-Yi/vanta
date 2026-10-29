@@ -2717,6 +2717,19 @@ class PreparedBatch:
     n_ctx_source: Optional[str]
 
 
+def recorded_split_path(batch_dir: Path) -> Optional[Path]:
+    """The split a batch was prepared with, as its ``prepare.json`` recorded it.
+
+    ``prepare`` writes the split path it read (``_prepare_payload``'s ``split``),
+    so a later stage given no ``--split`` can resolve the *same* split the batch's
+    preps were derived from, instead of a default that may not even name the same
+    bugs (#E). ``None`` when the batch predates the field or carries no
+    ``prepare.json`` — the caller then keeps whatever default it had.
+    """
+    raw = _read_json(batch_dir / "prepare.json").get("split")
+    return Path(str(raw)) if raw else None
+
+
 def load_prepared(
     *,
     batch_dir: Path,

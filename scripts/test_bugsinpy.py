@@ -23925,6 +23925,80 @@ class TestPoolFailedKeys:
         assert pool_mod.failed_keys_for(state, "Demo/1") == 0
 
 
+class TestPoolSplitResolution:
+    """#E: a `pool` stage reads the split its batches were *prepared* with.
+
+    Omitting ``--split`` used to fall back to a default split that need not name the
+    batch's bugs, and the mismatch surfaced much later as the bare "prepare.json
+    names sanic/1, which the split does not".
+    """
+
+    def _args(self, split):
+        return SimpleNamespace(split=split)
+
+    def test_an_omitted_split_reads_the_batch_s_recorded_one(self, tmp_path, monkeypatch):
+        recorded = tmp_path / "recorded.json"
+        monkeypatch.setattr(runner_mod, "recorded_split_path", lambda batch: recorded)
+        seen: list = []
+        monkeypatch.setattr(run_mod, "load_split", lambda path: seen.append(path) or "SPLIT")
+
+        result = run_mod._resolve_pool_split(self._args(None), [tmp_path])
+
+        assert result == "SPLIT"
+        assert seen == [recorded.resolve()]
+
+    def test_a_given_split_that_disagrees_with_the_record_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            runner_mod, "recorded_split_path", lambda batch: tmp_path / "recorded.json"
+        )
+        monkeypatch.setattr(run_mod, "load_split", lambda path: "SPLIT")
+
+        with pytest.raises(pool_mod.PoolError, match="disagrees"):
+            run_mod._resolve_pool_split(self._args(tmp_path / "other.json"), [tmp_path])
+
+    def test_a_given_split_that_agrees_proceeds(self, tmp_path, monkeypatch):
+        same = tmp_path / "same.json"
+        monkeypatch.setattr(runner_mod, "recorded_split_path", lambda batch: same)
+        seen: list = []
+        monkeypatch.setattr(run_mod, "load_split", lambda path: seen.append(path) or "SPLIT")
+
+        assert run_mod._resolve_pool_split(self._args(same), [tmp_path]) == "SPLIT"
+        assert seen == [same.resolve()]
+
+    def test_an_omitted_split_with_no_record_falls_back_to_the_default(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(runner_mod, "recorded_split_path", lambda batch: None)
+        seen: list = []
+        monkeypatch.setattr(run_mod, "load_split", lambda path: seen.append(path) or "SPLIT")
+
+        assert run_mod._resolve_pool_split(self._args(None), [tmp_path]) == "SPLIT"
+        assert seen == [run_mod.DEFAULT_SPLIT]
+
+    def test_two_batches_with_different_splits_are_refused(self, tmp_path, monkeypatch):
+        paths = {
+            tmp_path / "a": tmp_path / "one.json",
+            tmp_path / "b": tmp_path / "two.json",
+        }
+        monkeypatch.setattr(runner_mod, "recorded_split_path", lambda batch: paths[batch])
+
+        with pytest.raises(pool_mod.PoolError, match="different splits"):
+            run_mod._resolve_pool_split(self._args(None), [tmp_path / "a", tmp_path / "b"])
+
+    def test_the_reader_returns_none_when_prepare_json_records_no_split(
+        self, tmp_path
+    ):
+        """A batch from before the field was recorded leaves the caller its default."""
+        write(tmp_path / "prepare.json", json.dumps({"bugs": []}))
+        assert runner_mod.recorded_split_path(tmp_path) is None
+
+    def test_the_reader_returns_the_recorded_split_path(self, tmp_path):
+        write(tmp_path / "prepare.json", json.dumps({"split": "/abs/the.json"}))
+        assert runner_mod.recorded_split_path(tmp_path) == Path("/abs/the.json")
+
+
 class TestPoolBuildCommand:
     """The CLI: ``--build`` refuses before it reads a batch when it cannot proceed."""
 

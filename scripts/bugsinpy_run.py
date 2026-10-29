@@ -866,6 +866,40 @@ def cmd_run(args: argparse.Namespace) -> int:
     return code
 
 
+def _resolve_pool_split(args: argparse.Namespace, batch_dirs: Sequence[Path]) -> Split:
+    """The split a ``pool`` invocation reads, resolving an omitted ``--split`` (#E).
+
+    A ``pool`` stage reads *prepared* batches, so it has to read the split those
+    batches were prepared with. Falling back to a default split when ``--split`` is
+    omitted is what produced the bare "prepare.json names sanic/1, which the split
+    does not" — the default happened not to name the batch's bugs. So:
+    an omitted ``--split`` means "the batch's own recorded split"; a *given*
+    ``--split`` must agree with that record, or the invocation is refused before
+    anything is graded. A batch from before the field was recorded (``None``) leaves
+    the caller with its default, exactly as before.
+    """
+    recorded = {batch: runner_mod.recorded_split_path(batch) for batch in batch_dirs}
+    if args.split is not None:
+        given = args.split.resolve()
+        for batch_dir, path in recorded.items():
+            if path is not None and path.resolve() != given:
+                raise pool_mod.PoolError(
+                    f"`--split {args.split}` disagrees with the split {path} that "
+                    f"{batch_dir / 'prepare.json'} was prepared with. Omit --split to "
+                    "use the batch's own, or pass that recorded path."
+                )
+        return load_split(given)
+    distinct = {path.resolve() for path in recorded.values() if path is not None}
+    if len(distinct) > 1:
+        raise pool_mod.PoolError(
+            "`--split` was omitted and the listed batches were prepared with "
+            "different splits: " + ", ".join(sorted(str(path) for path in distinct)) + "."
+        )
+    if distinct:
+        return load_split(distinct.pop())
+    return load_split(DEFAULT_SPLIT)
+
+
 def cmd_pool(args: argparse.Namespace) -> int:
     """`pool` owns two files; dispatch to the one this invocation named.
 
@@ -916,8 +950,8 @@ def cmd_pool_mutants(args: argparse.Namespace) -> int:
             "in place each time item 5 runs."
         )
     runner_mod.require_repo_cwd()
-    split = load_split(args.split.resolve())
     batch_dir = runner_mod.require_batch_dir(Path(value).resolve())
+    split = _resolve_pool_split(args, [batch_dir])
     bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
     batch = runner_mod.load_prepared(
         batch_dir=batch_dir, split=split, bugsinpy_root=bugsinpy_root
@@ -992,8 +1026,6 @@ def cmd_pool_build(args: argparse.Namespace) -> int:
         )
     pairs = [pool_mod.parse_batch_argument(value) for value in args.batch]
     runner_mod.require_repo_cwd()
-    split = load_split(args.split.resolve())
-    bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
     out_dir = args.out.resolve()
     sessions = runner_mod.sessions_dir()
 
@@ -1018,6 +1050,12 @@ def cmd_pool_build(args: argparse.Namespace) -> int:
             "is built once every repair batch has finished; re-run when their "
             "state.json shows none running."
         )
+
+    # The split is resolved from the batches themselves when `--split` is omitted (#E),
+    # so it is read *after* they are located and refused-on-running. Nothing is graded
+    # before this point.
+    split = _resolve_pool_split(args, [batch_dir for _, batch_dir in located])
+    bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
 
     batches: list[dict[str, Any]] = []
     for tag, batch_dir in located:
@@ -1397,7 +1435,16 @@ def build_parser() -> argparse.ArgumentParser:
             "grading runs in Shuru"
         ),
     )
-    pool.add_argument("--split", type=Path, default=DEFAULT_SPLIT)
+    pool.add_argument(
+        "--split",
+        type=Path,
+        default=None,
+        help=(
+            "the split to read the batches with. Omit it and each batch's own "
+            "recorded split (its prepare.json) is used; a value that disagrees with "
+            "that record is refused (#E)"
+        ),
+    )
     pool.add_argument(
         "--batch",
         action="append",

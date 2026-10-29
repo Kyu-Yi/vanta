@@ -100,7 +100,7 @@ DECLARED_BUG_KEYS = frozenset(
 )
 
 OPTIONAL_DECLARED_BUG_KEYS = frozenset(
-    {"import_package", "sandbox_env", "build_env", "build_files"}
+    {"import_package", "sandbox_env", "build_env", "build_files", "vm_memory_mb"}
 )
 """Declared keys a bug may carry but need not.
 
@@ -151,6 +151,28 @@ read; the tree stays exactly what the benchmark ships, for the reason ``sandbox_
 records. It is a map because a build may read more than one file, and the values are the
 contents verbatim. A bug that declares one records the reason in the split's
 ``reviewed_changes``.
+
+[VANTA-WHY] ``vm_memory_mb`` is the VM's memory in megabytes, for a project whose
+whole suite does not fit the default a run VM boots with. pandas/1 is the case: on the
+default 2048 MB the graded run of its suite is SIGKILLed mid-run by the kernel — measured
+as exit 137 after 245 s at about 61 % with no pytest report written at all — which the
+harness now refuses as a killed run rather than reading the absent report as an empty
+oracle (``prepare.UNMEASURED_RUN_REASON``). It is a separate key from ``sandbox_env``
+because it changes the VM's *size* rather than the environment the graded tests run in,
+and it is per project for the same reason the others are: it is a fact about the project's
+suite, not about the bug. A larger VM lowers how many VMs fit in parallel on one host, so
+the number is recorded on the row — where the M4 queue reads it — rather than assumed. A
+bug that declares one records the reason in the split's ``reviewed_changes``.
+"""
+
+VM_MEMORY_MB_MIN = 2048
+"""The size a bug's ``vm_memory_mb`` must *exceed*.
+
+[VANTA-WHY] This is the size a run VM boots at anyway (``shuru.DEFAULT_RUN_MEMORY_MB``,
+which is shuru's own default). A bug that records this or less is asking for a VM no
+bigger than the one it already gets, and the value that carries information is always
+*more* — so a number at or below this is a mistake rather than a rule, and it is refused
+here rather than quietly accepted as a declaration that changes nothing.
 """
 
 SANDBOX_ENV_KEYS = frozenset({"PYTHONPATH", "MPLBACKEND"})
@@ -554,6 +576,21 @@ def _validate_bug(entry: Any, where: str, index: int, seen: set[str]) -> None:
             f"{tag}: import_package must be a non-empty string — it is the module the "
             "import-path check loads, and an empty one would be a guess"
         )
+
+    memory = entry.get("vm_memory_mb")
+    if memory is not None:
+        if isinstance(memory, bool) or not isinstance(memory, int):
+            raise SplitError(
+                f"{tag}: vm_memory_mb must be an integer number of megabytes — it is "
+                "passed straight to shuru's --memory, and a value that is not a number "
+                "cannot size a VM"
+            )
+        if memory <= VM_MEMORY_MB_MIN:
+            raise SplitError(
+                f"{tag}: vm_memory_mb {memory} does not exceed the {VM_MEMORY_MB_MIN} MB "
+                "a run VM boots at anyway — a recorded size has to be larger than the "
+                "default, or it declares something that is already true"
+            )
 
     env = entry.get("sandbox_env")
     if env is not None:

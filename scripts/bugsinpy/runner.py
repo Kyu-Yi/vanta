@@ -518,6 +518,7 @@ def vanta_env(
     seed: int,
     checkpoint: str,
     disk_mb: int,
+    memory_mb: Optional[int] = None,
     base: Optional[dict[str, str]] = None,
 ) -> dict[str, str]:
     """The controlled environment for one ``vanta_m3`` invocation (§7.4).
@@ -540,6 +541,13 @@ def vanta_env(
     env["VANTA_SANDBOX_BACKEND"] = "shuru"
     env["VANTA_SHURU_CHECKPOINT"] = checkpoint
     env["VANTA_SHURU_DISK_MB"] = str(disk_mb)
+    # §3.4 — the row's recorded per-project VM memory, handed to the binary so the
+    # sandbox ``vanta_m3`` boots for its own suite runs is the same size the preparation
+    # gates ran in. ``VANTA_SHURU_MEMORY_MB`` unset (the normal case, and every bug that
+    # records no size) leaves ``src/sandbox/shuru.rs`` at shuru's own default, so the
+    # binary's argv is what it was before this key existed.
+    if memory_mb is not None:
+        env["VANTA_SHURU_MEMORY_MB"] = str(memory_mb)
     # See the module docstring: the self-heal needs network the VM does not have.
     env["VANTA_SHURU_AUTO_DEPS"] = "0"
     env["VANTA_ATTACKER"] = "on" if entry.attacker else "off"
@@ -2072,6 +2080,7 @@ def run_job(
         seed=job.seed,
         checkpoint=job.checkpoint,
         disk_mb=disk_mb,
+        memory_mb=prep.vm_memory_mb,
     )
     outcome = invoke_vanta(
         vanta_bin=vanta_bin,

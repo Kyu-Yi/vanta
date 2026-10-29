@@ -233,6 +233,7 @@ def grade(
         patch_path=patch_path,
         disk_mb=disk_mb,
         drop_test_hunks=True,
+        memory_mb=prep.vm_memory_mb,
         timeout_secs=APPLY_TIMEOUT_SECS,
     )
     result.apply_ok = apply_ok
@@ -266,6 +267,7 @@ def grade(
         disk_mb=disk_mb,
         timeout_secs=timeout_secs,
         extra_env=sandbox_env,
+        memory_mb=prep.vm_memory_mb,
     )
     patched_pair = suite_mod.run_suite_twice(
         checkpoint=checkpoint,
@@ -276,6 +278,7 @@ def grade(
         disk_mb=disk_mb,
         timeout_secs=timeout_secs,
         extra_env=sandbox_env,
+        memory_mb=prep.vm_memory_mb,
     )
 
     if not (hidden_pair.first.report_found or hidden_pair.second.report_found):

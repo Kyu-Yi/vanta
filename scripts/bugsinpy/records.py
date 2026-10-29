@@ -24,7 +24,7 @@ cannot say which file it was reading, and that is the first thing a reader needs
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 
 class RecordError(ValueError):
@@ -90,3 +90,23 @@ def map_of(payload: Any, key: str, *, owner: str, where: str = "") -> dict[str, 
             f"{type(value).__name__}, not a mapping"
         )
     return {str(k): str(v) for k, v in value.items()}
+
+
+def memory_of(payload: Any, key: str, *, owner: str, where: str = "") -> Optional[int]:
+    """``payload[key]`` as a positive integer number of megabytes, or ``None``.
+
+    The reader for ``vm_memory_mb``: the row's recorded per-project VM size. ``None`` is
+    a measurement's absence, not a missing field — it says "this row records no size, so
+    the VM boots at the harness's default", and it is written as ``null`` rather than
+    omitted so the round trip is exact. A bool is refused even though ``bool`` is an
+    ``int`` in Python: ``true`` would otherwise pass as 1 MB.
+    """
+    value = field_of(payload, key, owner=owner, where=where)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise RecordError(
+            f"{_origin(owner, where)}: field {key!r} is {value!r}, not a positive "
+            "integer number of megabytes (or null for a row that records none)"
+        )
+    return value

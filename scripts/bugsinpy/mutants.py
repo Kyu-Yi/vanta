@@ -572,6 +572,7 @@ def preflight(
         patch_path=patch_path,
         disk_mb=disk_mb,
         drop_test_hunks=True,
+        memory_mb=prep.vm_memory_mb,
         timeout_secs=apply_timeout_secs,
     )
     if not applied:
@@ -585,6 +586,7 @@ def preflight(
         host_root=batch_dir,
         command=[_interpreter(prep.test_cmd), "-m", "py_compile", *files],
         disk_mb=disk_mb,
+        memory_mb=prep.vm_memory_mb,
         guest_cwd=f"/workspace/{work_rel}",
         timeout_secs=compile_timeout_secs,
     )

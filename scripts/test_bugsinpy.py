@@ -751,6 +751,55 @@ class TestSplit:
                 )
             )
 
+    def test_vm_memory_mb_is_an_optional_declared_key(self):
+        """The VM's memory, carried only by a bug whose graded run is killed for it (§3.4).
+
+        [VANTA-WHY] A bug that records none boots at shuru's own default and sends no
+        ``--memory``, so its argv is byte-for-byte what it was before this key existed.
+        pandas/1 is the case that records one: its whole-suite run was killed at 2048 MB
+        with the ``--json-report`` document never written. The value is validated when
+        present, and unknown keys are still an error, so the shape stays closed.
+        """
+        assert split_mod.validate(split_data()) is None
+        assert (
+            split_mod.validate(split_data(bugs=[bug_entry(vm_memory_mb=8192)])) is None
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("8192", id="a-string"),
+            pytest.param(8192.0, id="a-float"),
+            pytest.param(True, id="a-bool"),
+        ],
+    )
+    def test_vm_memory_mb_must_be_an_integer(self, value):
+        with pytest.raises(SplitError, match="vm_memory_mb"):
+            split_mod.validate(split_data(bugs=[bug_entry(vm_memory_mb=value)]))
+
+    def test_an_explicit_null_records_no_size(self):
+        """``null`` and the key's absence are the same declaration: no recorded size."""
+        assert split_mod.validate(split_data(bugs=[bug_entry(vm_memory_mb=None)])) is None
+
+    def test_vm_memory_mb_must_exceed_the_default_a_run_vm_boots_at(self):
+        """A size at or below the default declares something already true (§3.4).
+
+        [VANTA-WHY] The run VM already boots at ``shuru.DEFAULT_RUN_MEMORY_MB``; a
+        recorded value that does not exceed it would be silently inert protocol, which
+        is what this validation exists to prevent.
+        """
+        assert split_mod.SANDBOX_ENV_KEYS == {"PYTHONPATH", "MPLBACKEND"}  # unchanged
+        assert split_mod.VM_MEMORY_MB_MIN == shuru_mod.DEFAULT_RUN_MEMORY_MB == 2048
+        assert (
+            split_mod.validate(
+                split_data(bugs=[bug_entry(vm_memory_mb=split_mod.VM_MEMORY_MB_MIN + 1)])
+            )
+            is None
+        )
+        for value in (split_mod.VM_MEMORY_MB_MIN, 1024, 0, -1):
+            with pytest.raises(SplitError, match="exceed"):
+                split_mod.validate(split_data(bugs=[bug_entry(vm_memory_mb=value)]))
+
     def test_unknown_top_level_key_is_an_error(self):
         with pytest.raises(SplitError, match="unknown top-level keys"):
             split_mod.validate(split_data(seed=0))  # typo for `seeds`
@@ -5595,6 +5644,46 @@ class TestShuruVmSizing:
         assert f"export {shuru_mod.BUILD_JOB_ENV}=2" in args[args.index("--") + 3]
 
 
+class TestShuruRunMemory:
+    """The memory a *run* VM boots with is the row's, and absent for every other bug (§3.4).
+
+    [WHY] ``run`` builds a one-off VM per suite run. A bug whose row records
+    ``vm_memory_mb`` -- pandas/1, whose whole-suite run was killed at the default --
+    has to reach *every* VM it boots, and a bug whose row records none must send no
+    ``--memory`` at all so its argv is exactly what it was before the key existed.
+    """
+
+    def _argv(self, monkeypatch, **over):
+        seen: dict = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        monkeypatch.setattr(shuru_mod, "_shuru_bin", lambda: "/usr/bin/shuru")
+        monkeypatch.setattr(shuru_mod.subprocess, "run", fake_run)
+        args = dict(
+            checkpoint="vanta-bi-Demo-1",
+            host_root=Path.cwd(),
+            command=["python", "-m", "pytest", "tests"],
+            disk_mb=8192,
+        )
+        args.update(over)
+        result = shuru_mod.run(**args)
+        assert result.ok
+        return seen["args"]
+
+    def test_the_recorded_size_reaches_the_run_vm(self, monkeypatch):
+        argv = self._argv(monkeypatch, memory_mb=8192)
+        assert argv[argv.index("--memory") + 1] == "8192"
+
+    def test_no_recorded_size_sends_no_memory_flag(self, monkeypatch):
+        """The default case: byte-identical argv, shuru boots its own size."""
+        argv = self._argv(monkeypatch)
+        assert "--memory" not in argv
+        assert shuru_mod.DEFAULT_RUN_MEMORY_MB == 2048, "shuru's own run default"
+
+
 # ============================================================================
 # suite.py — command construction and report reading (no VM)
 # ============================================================================
@@ -6026,6 +6115,47 @@ class TestPrepareInvariants:
         assert (tmp_path / "batch" / "issue_texts" / "Demo_1.md").is_file()
 
 
+class TestMemoryOf:
+    """``records.memory_of`` reads a recorded MB size, or ``None`` for a row with none.
+
+    [VANTA-WHY] The reader is strict the way the other record helpers are: a value
+    that cannot size a VM is a :class:`RecordError` naming the field, not a silently
+    coerced number. ``None`` is a measurement's *absence* -- a row that records no
+    size -- and is not the same as a missing field.
+    """
+
+    @staticmethod
+    def _read(payload):
+        return records_mod.memory_of(payload, "vm_memory_mb", owner="BugPrep")
+
+    def test_a_positive_integer_is_the_size(self):
+        assert self._read({"vm_memory_mb": 8192}) == 8192
+
+    def test_an_explicit_null_records_no_size(self):
+        assert self._read({"vm_memory_mb": None}) is None
+
+    def test_a_missing_field_is_an_error(self):
+        """The writer always writes the key (``null`` when a row records no size), so a
+        stored row that lacks it was written by a different harness — a loud error, not
+        a silent ``None``."""
+        with pytest.raises(records_mod.RecordError, match="missing field 'vm_memory_mb'"):
+            self._read({})
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(True, id="a-bool-is-not-a-number-of-megabytes"),
+            pytest.param(0, id="zero"),
+            pytest.param(-1, id="negative"),
+            pytest.param("8192", id="a-string"),
+            pytest.param(8192.0, id="a-float"),
+        ],
+    )
+    def test_a_value_that_cannot_size_a_vm_is_refused(self, value):
+        with pytest.raises(records_mod.RecordError, match="vm_memory_mb"):
+            self._read({"vm_memory_mb": value})
+
+
 class TestPrepareRunRecordContract:
     """``prepare.json`` has one writer and one reader, and they cannot drift.
 
@@ -6135,6 +6265,7 @@ class TestPrepareRunRecordContract:
             sandbox_env={"PYTHONPATH": "./docs_src"},
             build_env={"CFLAGS": "-Wno-error=array-bounds"},
             build_files={"vanta-build.cfg": "[libs]\nsystem_freetype = True\n"},
+            vm_memory_mb=8192,
             hidden_by_collect_flip={
                 "tests/test_skip_defaults.py": (
                     "TypeError: get() got an unexpected keyword argument "
@@ -6205,6 +6336,9 @@ class TestPrepareRunRecordContract:
         assert loaded.build_files == {
             "vanta-build.cfg": "[libs]\nsystem_freetype = True\n"
         }
+        # §3.4: the VM's memory, read on every run of the row -- the deps gate, the
+        # oracle's grading runs and the ``vanta_m3`` sandbox -- off this same row.
+        assert loaded.vm_memory_mb == 8192
         assert loaded.hidden_by_collect_flip == original.hidden_by_collect_flip
         assert loaded.collect_flip_nodeids == sorted(original.collect_flip_nodeids)
         assert loaded.hidden_nodeids == sorted(
@@ -21277,6 +21411,17 @@ class TestVantaEnv:
         env = self._env(base={"VANTA_LLM_BASE_URL": "http://127.0.0.1:8080"})
         assert env["VANTA_LLM_BASE_URL"] == "http://127.0.0.1:8080"
         assert "VANTA_LLM_MODEL" not in env
+
+    def test_the_rows_vm_memory_reaches_the_sandbox(self):
+        """§3.4 — a row that records a size sets ``VANTA_SHURU_MEMORY_MB``; a row that
+        records none omits it, so ``shuru.rs`` keeps shuru's own run default.
+
+        [VANTA-WHY] The value is the row's (``prepare.vm_memory_mb``), threaded through
+        the harness's own environment rather than a CLI knob, because the split entry --
+        not the command line -- is what declares a per-project fact.
+        """
+        assert "VANTA_SHURU_MEMORY_MB" not in self._env()
+        assert self._env(memory_mb=8192)["VANTA_SHURU_MEMORY_MB"] == "8192"
 
     def test_the_deadline_is_set_short_of_the_timeout_that_kills_the_process(self):
         """§14.15 — the margin is the difference between a verdict and a corpse.

@@ -152,6 +152,14 @@ pub struct ShuruBackend {
     pub root: PathBuf,
     checkpoint: String,
     disk_mb: u64,
+    // [VANTA-WHY] The VM's memory, from VANTA_SHURU_MEMORY_MB. None — the value
+    // every caller leaves unset — passes no --memory, so the boot line is exactly
+    // what it was before this field existed and shuru picks its own default
+    // (2048 MB). The harness sets it only for a project whose suite cannot fit that
+    // default (the split's recorded `vm_memory_mb`), through `runner.vanta_env`, so
+    // the sandbox the pipeline runs third-party code in is the same size the
+    // preparation gates measured the bug in.
+    memory_mb: Option<u64>,
 }
 
 impl ShuruBackend {
@@ -520,6 +528,17 @@ impl SandboxBackend for ShuruBackend {
             .unwrap_or(DEFAULT_DISK_MB)
             .max(DEFAULT_DISK_MB);
 
+        // Resolve the VM's memory. Unset — the normal case — passes no --memory and
+        // lets shuru choose its own default. `runner.vanta_env` sets
+        // VANTA_SHURU_MEMORY_MB from the row's recorded per-project `vm_memory_mb`, so
+        // the sandbox the pipeline runs third-party code in matches the size the
+        // preparation gates measured the bug in. A value at or below shuru's default is
+        // refused by the split's validator, so a parsed value here is always meaningful.
+        let memory_mb = std::env::var("VANTA_SHURU_MEMORY_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|mb| *mb > 0);
+
         // Ensure the python checkpoint exists. Create it if missing.
         if !Self::checkpoint_exists(&checkpoint) {
             info!(checkpoint = %checkpoint, "python checkpoint not found — creating (one-time)");
@@ -537,7 +556,7 @@ impl SandboxBackend for ShuruBackend {
         let temp_dir = TempDir::new_in(&cwd)?;
         let root = temp_dir.path().to_path_buf();
         info!(root = %root.display(), checkpoint = %checkpoint, disk_mb, "shuru backend spawned");
-        Ok(Self { temp_dir, root, checkpoint, disk_mb })
+        Ok(Self { temp_dir, root, checkpoint, disk_mb, memory_mb })
     }
 
     async fn execute(
@@ -575,30 +594,36 @@ impl SandboxBackend for ShuruBackend {
 
         let start = Instant::now();
 
-        // [SYNTAX] shuru run --from CHECKPOINT --disk-size SIZE --mount HOST:GUEST:rw --allow-host-writes -- <command>
+        // [SYNTAX] shuru run --from CHECKPOINT --disk-size SIZE [--memory MB] --mount HOST:GUEST:rw --allow-host-writes -- <command>
         // --from starts from the checkpoint so python3/pytest/ruff/mypy (and any
         //   auto-installed repo deps) are available.
         // --disk-size must be >= the checkpoint's base image size, else shuru errors
         //   with "--disk-size 4096MB is smaller than the base image (8192MB)".
         //   self.disk_mb tracks the size the selected checkpoint was created with.
+        // --memory is present only when the harness recorded a size for this bug
+        //   (self.memory_mb). A bigger VM lowers how many VMs fit in parallel, so an
+        //   unrecorded bug sends no flag and boots shuru's own default.
         // :rw allows the VM to write back to the host dir (for report.json).
         let disk = self.disk_mb.to_string();
+        let memory = self.memory_mb.map(|mb| mb.to_string());
+        let mount = format!("{host_root}:{guest_mount}:rw");
+        let mut args: Vec<&str> = vec!["run", "--from", &self.checkpoint, "--disk-size", &disk];
+        if let Some(mem) = memory.as_deref() {
+            args.push("--memory");
+            args.push(mem);
+        }
+        args.extend_from_slice(&[
+            "--mount",
+            &mount,
+            "--allow-host-writes",
+            "--",
+            "sh",
+            "-c",
+            &inner_cmd,
+        ]);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            tokio::process::Command::new("shuru")
-                .args([
-                    "run",
-                    "--from", &self.checkpoint,
-                    "--disk-size", &disk,
-                    "--mount",
-                    &format!("{host_root}:{guest_mount}:rw"),
-                    "--allow-host-writes",
-                    "--",
-                    "sh",
-                    "-c",
-                    &inner_cmd,
-                ])
-                .output(),
+            tokio::process::Command::new("shuru").args(&args).output(),
         )
         .await;
 

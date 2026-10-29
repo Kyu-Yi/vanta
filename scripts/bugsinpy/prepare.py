@@ -37,7 +37,7 @@ from .bugsinpy_meta import (
     load_bug_info,
     project_github_url,
 )
-from .records import field_of, map_of, strings_of
+from .records import field_of, map_of, memory_of, strings_of
 from .split import Split, sha256_file, sha256_text
 
 DISK_MB = 16384
@@ -235,6 +235,23 @@ class BugPrep:
     Recorded on the row for the same reason :attr:`build_env` is — it is a fact about how
     the project builds on this image, not about the bug. Empty for every bug that does
     not declare one, which is the whole corpus but matplotlib's.
+    """
+    vm_memory_mb: Optional[int] = None
+    """§3.4 — the VM's memory in MB for every run of this bug, as the split declares it.
+
+    [VANTA-WHY] Recorded on the row for the reason :attr:`sandbox_env` is: it is a fact
+    about the *run*, not about the bug. A Shuru VM boots at shuru's default 2048 MB, and
+    pandas/1's whole suite plus the in-memory ``--json-report`` document exceeds it: the
+    graded run is SIGKILLed mid-suite (measured: exit 137 after 245 s at ~61 %, no report
+    written), which the run-state reader now reports as a killed run rather than as an
+    empty oracle. One recorded value has to reach *every* VM this bug boots — the deps
+    gate, the collect-flip readers, the in-place build, the three derivation runs, the
+    stripped baseline and the oracle's two grading runs, and the ``vanta_m3`` run's own
+    sandbox — or the bug is measured under one memory and graded under another. ``None``
+    for every bug that does not declare one, which is the whole corpus but pandas's, and
+    ``None`` sends no ``--memory`` at all so those bugs' argv is byte-for-byte what it
+    was before this key existed. A larger VM lowers how many VMs fit in parallel, so the
+    number is recorded here — on the row the M4 queue reads — rather than assumed.
     """
     test_paths: list[str] = field(default_factory=list)
     fail_to_pass: list[str] = field(default_factory=list)
@@ -437,6 +454,7 @@ class BugPrep:
             "sandbox_env": self.sandbox_env,
             "build_env": self.build_env,
             "build_files": self.build_files,
+            "vm_memory_mb": self.vm_memory_mb,
             "runnable": self.runnable,
             "test_paths": self.test_paths,
             "fail_to_pass": sorted(self.fail_to_pass),
@@ -498,6 +516,7 @@ class BugPrep:
             sandbox_env=map_of(payload, "sandbox_env", owner=owner, where=where),
             build_env=map_of(payload, "build_env", owner=owner, where=where),
             build_files=map_of(payload, "build_files", owner=owner, where=where),
+            vm_memory_mb=memory_of(payload, "vm_memory_mb", owner=owner, where=where),
             test_paths=strings_of(payload, "test_paths", owner=owner, where=where),
             fail_to_pass=strings_of(payload, "fail_to_pass", owner=owner, where=where),
             f2p_undeclared=strings_of(payload, "f2p_undeclared", owner=owner, where=where),
@@ -665,6 +684,7 @@ def check_deps(
             test_cmd=prep.test_cmd,
             disk_mb=DISK_MB,
             extra_env=env,
+            memory_mb=prep.vm_memory_mb,
         )
     except suite_mod.SuiteError as exc:
         nodeids = _collect_flip_or_raise(
@@ -680,6 +700,7 @@ def check_deps(
             module=module,
             disk_mb=DISK_MB,
             extra_env=env,
+            memory_mb=prep.vm_memory_mb,
         )
     except suite_mod.SuiteError as exc:
         raise suite_mod.SuiteError(
@@ -734,6 +755,7 @@ def _collect_flip_or_raise(
         disk_mb=DISK_MB,
         extra_env=env,
         ignore=sorted(flips),
+        memory_mb=prep.vm_memory_mb,
     )
 
 
@@ -783,6 +805,7 @@ def detect_collect_flip(
         test_cmd=prep.test_cmd,
         disk_mb=DISK_MB,
         extra_env=env,
+        memory_mb=prep.vm_memory_mb,
     )
     if not buggy.errors:
         return {}, [], {}
@@ -794,6 +817,7 @@ def detect_collect_flip(
         test_cmd=prep.test_cmd,
         disk_mb=DISK_MB,
         extra_env=env,
+        memory_mb=prep.vm_memory_mb,
     )
     fixed_by_file = suite_mod.collect_by_file(sorted(fixed.nodeids))
     flips = {
@@ -903,6 +927,7 @@ def build_trees_in_place(
             setup_args=setup_args,
             disk_mb=DISK_MB,
             env=env,
+            memory_mb=prep.vm_memory_mb,
         )
         prep.builds[tree_name] = f"built: {command}"
 
@@ -1029,6 +1054,7 @@ def derive_hidden(
             test_cmd=prep.test_cmd,
             disk_mb=DISK_MB,
             extra_env=prep.sandbox_env or None,
+            memory_mb=prep.vm_memory_mb,
         )
 
     buggy = _suite(checkpoint, batch_dir, prep, "src_buggy", "src_buggy")
@@ -1188,6 +1214,7 @@ def _suite(
         report_rel_stem=f"reports/{prep.slug}-{stem_suffix}",
         disk_mb=DISK_MB,
         extra_env=prep.sandbox_env or None,
+        memory_mb=prep.vm_memory_mb,
     )
 
 
@@ -2152,6 +2179,18 @@ def check_build_declared(entry: dict[str, Any], bug: BugInfo, *, repo: Path) -> 
     ]
 
 
+def _memory_entry(entry: dict[str, Any]) -> Optional[int]:
+    """The split entry's ``vm_memory_mb``, or ``None``.
+
+    Bare on purpose: :func:`split._validate_bug` owns the rule (a positive integer of
+    megabytes, or absent), so a second interpretation of the same declaration here could
+    disagree with the one the split was checked against. The value is only narrowed to
+    the type the field declares.
+    """
+    value = entry.get("vm_memory_mb")
+    return None if value is None else int(value)
+
+
 def prepare_one(
     entry: dict[str, Any],
     *,
@@ -2207,6 +2246,12 @@ def prepare_one(
         # same way: the split records the contents once, and the row carries them to
         # the point where the build writes them beside the trees.
         build_files={str(k): str(v) for k, v in (entry.get("build_files") or {}).items()},
+        # §3.4 — the VM's memory (``vm_memory_mb``), read here the same way: the split
+        # records the size once, and every VM this row boots — the gates, the derivation
+        # runs, the build, the oracle and the ``vanta_m3`` sandbox — is sized from the row
+        # rather than from a harness literal. ``None`` for a bug that records none, which
+        # sends no ``--memory`` and boots shuru's own default.
+        vm_memory_mb=_memory_entry(entry),
     )
 
     mismatches = check_declared(entry, bug)

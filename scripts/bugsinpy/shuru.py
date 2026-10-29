@@ -22,8 +22,10 @@ whole wave.
 
 One thing is deliberately **not** mirrored: the VM's size. ``shuru.rs`` passes no
 ``--cpus``/``--memory`` and so boots whatever shuru defaults to (2 CPUs, 2048 MB), which
-is enough to run a suite and not enough to build one; a bake asks for
-:data:`DEFAULT_CPUS`/:data:`DEFAULT_MEMORY_MB` instead.
+is enough to run a suite and not enough to build one or to hold a large suite's report;
+a bake asks for :data:`DEFAULT_CPUS`/:data:`DEFAULT_MEMORY_MB`, and :func:`run` takes the
+row's recorded per-project ``vm_memory_mb`` (:data:`run`'s ``memory_mb``) so a project
+whose suite cannot fit in the default is sized for it.
 """
 
 from __future__ import annotations
@@ -432,12 +434,27 @@ def checkpoint_create(
     return result
 
 
+DEFAULT_RUN_MEMORY_MB = 2048
+"""The memory a *run* VM boots with when its row records none.
+
+[VANTA-WHY] This is shuru's own default (measured in the boot line of every run:
+``shuru: booting VM (2cpus, 2048MB RAM, 16384MB disk)``), restated here so the number a
+row has to beat to mean anything is written down in one place. It is enough to run an
+ordinary suite; it is **not** enough for pandas, whose whole suite plus the in-memory
+``--json-report`` document exceeds it and is SIGKILLed mid-run (measured: exit 137 after
+245 s at ~61 %, no report written). A row that records ``vm_memory_mb`` passes it through
+(:func:`run`'s ``memory_mb``); a row that records none sends no ``--memory`` at all, so
+its argv is byte-for-byte what it was before this parameter existed.
+"""
+
+
 def run(
     *,
     checkpoint: str,
     host_root: Path,
     command: Sequence[str],
     disk_mb: int,
+    memory_mb: Optional[int] = None,
     guest_cwd: str = "/workspace",
     timeout_secs: int = 900,
     allow_host_writes: bool = True,
@@ -448,6 +465,14 @@ def run(
     ``host_root`` must be inside the process CWD (Shuru's mount rule). It appears
     inside the VM as ``/workspace``, so the harness keeps its trees under
     ``runs/bugsinpy/`` and addresses them as ``/workspace/<batch>/worktrees/...``.
+
+    ``memory_mb`` is the row's recorded per-project VM memory (``vm_memory_mb``), passed
+    straight to shuru's ``--memory``. ``None`` — every bug that records none — adds no
+    flag, so the VM boots at shuru's default (:data:`DEFAULT_RUN_MEMORY_MB`). The size is
+    the row's rather than this function's for the reason a bake's is
+    (:data:`DEFAULT_MEMORY_MB`): it is a fact about the project's suite, not about the
+    harness, and a larger VM lowers how many VMs fit in parallel — so it is recorded on
+    the row for a scheduler to read rather than assumed here.
     """
     host_root = host_root.resolve()
     cwd = Path.cwd().resolve()
@@ -494,6 +519,13 @@ def run(
         checkpoint,
         "--disk-size",
         str(disk_mb),
+    ]
+    # §3.4 — the row's recorded per-project VM memory. Absent for every bug that
+    # records none, so the argv of those bugs is unchanged (shuru boots its own
+    # default). Present exactly when a project's suite cannot fit that default.
+    if memory_mb is not None:
+        args += ["--memory", str(memory_mb)]
+    args += [
         "--mount",
         f"{host_root}:/workspace:rw",
     ]

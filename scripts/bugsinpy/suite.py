@@ -168,6 +168,7 @@ def run_suite_twice(
     disk_mb: int,
     timeout_secs: int = 1800,
     extra_env: Optional[dict[str, str]] = None,
+    memory_mb: Optional[int] = None,
 ) -> SuitePair:
     """Run ``test_cmd`` twice inside the checkpoint and diff the two reports."""
     reports_dir = batch_dir / "reports"
@@ -200,6 +201,7 @@ def run_suite_twice(
         host_root=batch_dir,
         command=["sh", "-c", script],
         disk_mb=disk_mb,
+        memory_mb=memory_mb,
         guest_cwd=guest_tree_root(tree_rel),
         timeout_secs=timeout_secs,
         env=env,
@@ -384,6 +386,7 @@ def collect_report(
     disk_mb: int,
     timeout_secs: int = 600,
     extra_env: Optional[dict[str, str]] = None,
+    memory_mb: Optional[int] = None,
 ) -> CollectionReport:
     """Collect the whole suite, reporting every error instead of stopping at one.
 
@@ -413,6 +416,7 @@ def collect_report(
             ),
         ],
         disk_mb=disk_mb,
+        memory_mb=memory_mb,
         guest_cwd=guest_tree_root(tree_rel),
         timeout_secs=timeout_secs,
         env=env,
@@ -454,6 +458,7 @@ def build_tree_in_place(
     disk_mb: int,
     env: Optional[Mapping[str, str]] = None,
     timeout_secs: int = DEFAULT_BUILD_TIMEOUT_SECS,
+    memory_mb: Optional[int] = None,
 ) -> None:
     """``python setup.py <setup_args>`` in the tree, inside the layer's VM.
 
@@ -490,6 +495,7 @@ def build_tree_in_place(
         host_root=batch_dir,
         command=["sh", "-c", _shell_quote(command)],
         disk_mb=disk_mb,
+        memory_mb=memory_mb,
         guest_cwd=guest_tree_root(tree_rel),
         timeout_secs=timeout_secs,
         env=env_full,
@@ -517,6 +523,7 @@ def collect_only(
     timeout_secs: int = 600,
     extra_env: Optional[dict[str, str]] = None,
     ignore: Sequence[str] = (),
+    memory_mb: Optional[int] = None,
 ) -> set[str]:
     """``pytest --collect-only -q`` — the collectability gate (§3.4).
 
@@ -549,6 +556,7 @@ def collect_only(
         host_root=batch_dir,
         command=["sh", "-c", _shell_quote(collect_command(test_cmd, ignore))],
         disk_mb=disk_mb,
+        memory_mb=memory_mb,
         guest_cwd=guest_tree_root(tree_rel),
         timeout_secs=timeout_secs,
         env=env,
@@ -572,6 +580,7 @@ def import_probe(
     disk_mb: int,
     timeout_secs: int = 300,
     extra_env: Optional[dict[str, str]] = None,
+    memory_mb: Optional[int] = None,
 ) -> str:
     """``import <module>; print(<module>.__file__)``, run exactly as the suites run.
 
@@ -605,6 +614,7 @@ def import_probe(
         host_root=batch_dir,
         command=["sh", "-c", _shell_quote([python, "-c", code])],
         disk_mb=disk_mb,
+        memory_mb=memory_mb,
         guest_cwd=guest_tree_root(tree_rel),
         timeout_secs=timeout_secs,
         env=env,
@@ -773,6 +783,7 @@ def git_apply_patch(
     patch_path: Path,
     disk_mb: int,
     drop_test_hunks: bool,
+    memory_mb: Optional[int] = None,
     timeout_secs: int = 300,
 ) -> tuple[bool, str]:
     """Apply a patch inside the VM. Strict — no fuzzy fallback (§5.2).
@@ -796,6 +807,7 @@ def git_apply_patch(
         host_root=batch_dir,
         command=["git", "apply", "--verbose", f"/workspace/{staged.relative_to(batch_dir)}"],
         disk_mb=disk_mb,
+        memory_mb=memory_mb,
         guest_cwd=f"/workspace/{tree_rel}",
         timeout_secs=timeout_secs,
     )

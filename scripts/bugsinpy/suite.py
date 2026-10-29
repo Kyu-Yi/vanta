@@ -826,7 +826,23 @@ def _exit_code(stdout: str, suffix: str) -> Optional[int]:
 
 
 def _clean_tree_noise(tree: Path) -> None:
-    for name in ("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"):
+    """Remove the caches a suite run leaves in ``tree``.
+
+    ``.hypothesis`` is hypothesis's example database. It is a *runtime* artefact of
+    the run, not part of the project, and pandas/1's suite writes 145 example files
+    into whichever tree it ran in — so a tree left uncleaned carries them into every
+    copy taken from it (and into the tree the Creator reads). Removing it here is the
+    same rule as ``__pycache__``/``.pytest_cache``: a run's leavings are not the tree.
+    Called *after* both runs of a pair (:func:`run_suite_twice`), so the second run
+    still sees the first run's database.
+    """
+    for name in (
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".hypothesis",
+    ):
         shutil.rmtree(tree / name, ignore_errors=True)
 
 

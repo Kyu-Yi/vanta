@@ -359,10 +359,19 @@ def test_paths_from_fix(bug: BugInfo, fixed_dir: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 # the leak guard
 # ---------------------------------------------------------------------------
-_NOISE_DIRS = frozenset({".git", "__pycache__", ".pytest_cache", ".mypy_cache"})
+_NOISE_DIRS = frozenset(
+    {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".hypothesis"}
+)
 """Directories whose contents are never compared. ``.git`` because the two trees
 are two *clones* of the same repository and their object stores and refs differ by
-construction, not by the bug; the caches because nothing in them is source."""
+construction, not by the bug; the caches because nothing in them is source.
+
+``.hypothesis`` is hypothesis's example database — a runtime cache written by the
+suite itself (``<tree>/.hypothesis/examples/<hash>/<hash>``), the same kind of
+artefact as ``.pytest_cache``. It appears only in the tree a suite has already run
+in (``oracle_tree`` when its run pollutes it, and so in the ``vanta_tree`` copied
+from it), never in ``src_buggy`` — so without this it is exactly the shape the leak
+guard exists to name, and it names 145 files of it for pandas/1."""
 
 
 def _source_files(root: Path) -> dict[str, str]:

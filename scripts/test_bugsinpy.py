@@ -1523,6 +1523,21 @@ class TestLeakedSource:
         write(tree / "pkg" / "__pycache__" / "demo.cpython-38.pyc", "junk")
         assert tree_mod.leaked_source(buggy, tree) == []
 
+    def test_the_hypothesis_database_is_not_source(self, tmp_path):
+        """The shape pandas/1 hit: the suite's own example database, 145 files of it.
+
+        ``<tree>/.hypothesis/examples/<hash>/<hash>`` is written by the run, not by
+        the commit, so it exists only in the tree a suite has already run in. Reading
+        it as source is what made the guard name the bug's own suite output.
+        """
+        buggy = tmp_path / "buggy"
+        tree = tmp_path / "tree"
+        write(buggy / "demo.py", "x = 1\n")
+        write(tree / "demo.py", "x = 1\n")
+        write(tree / ".hypothesis" / "examples" / "17ca9e36" / "3b3f4fd6", "")
+        write(buggy / ".hypothesis" / "examples" / "aaaa" / "bbbb", "")
+        assert tree_mod.leaked_source(buggy, tree) == []
+
 
 class TestBuildTreesRefusesALeakedOracle:
     """The permanent guard, at the one place both trees are composed."""
@@ -5979,6 +5994,27 @@ class TestSuitePair:
         pair = self._pair({"a": "failed"}, {"a": "error"})
         assert pair.stable_failures == set()
         assert pair.stable_collected == set()
+
+
+class TestCleanTreeNoise:
+    """A run's leavings are not the tree: the caches are removed after each pair."""
+
+    def test_the_hypothesis_database_is_removed(self, tmp_path):
+        tree = tmp_path / "tree"
+        write(tree / "demo.py", "x = 1\n")
+        write(tree / ".hypothesis" / "examples" / "17ca9e36" / "3b3f4fd6", "")
+        write(tree / ".pytest_cache" / "CACHEDIR.TAG", "")
+        suite_mod._clean_tree_noise(tree)
+        assert not (tree / ".hypothesis").exists()
+        assert not (tree / ".pytest_cache").exists()
+        # The tree's own source is untouched.
+        assert (tree / "demo.py").read_text(encoding="utf-8") == "x = 1\n"
+
+    def test_a_tree_without_caches_is_left_alone(self, tmp_path):
+        tree = tmp_path / "tree"
+        write(tree / "demo.py", "x = 1\n")
+        suite_mod._clean_tree_noise(tree)
+        assert (tree / "demo.py").exists()
 
 
 class TestDropTestFileHunks:

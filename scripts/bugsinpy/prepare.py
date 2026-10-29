@@ -175,6 +175,23 @@ class BugPrep:
     role: str
     wave: int
     test_cmd: list[str]
+    native_test_paths: list[str] = field(default_factory=list)
+    """The path arguments inside ``test_cmd`` that make it the *native* suite — the
+    split's ``native_test_paths`` (``tests``, ``spacy/tests``, ``lib/matplotlib/tests``).
+
+    [VANTA-WHY] This is **not** :attr:`test_paths`, and the difference is
+    load-bearing. ``test_paths`` is what Vanta takes from the fixed commit: hundreds
+    of *file* paths under the test directory. This is the one directory argument the
+    native command carries. The hidden run is built by replacing this argument with
+    the oracle's nodeids (``oracle.hidden_command``), so handing that function the
+    fix-side list instead leaves the directory in place — the "hidden" run then
+    collects the whole native suite beside the nodeids, and any unrelated collection
+    error in it aborts the session, so every hidden nodeid reads ``absent`` and the
+    patch is graded ``bad`` for a reason that has nothing to do with the patch. That
+    is what gate B measured on fastapi/2. Injected from the split the way
+    ``test_cmd`` is, rather than read back from ``prepare.json``, so a batch written
+    before this field existed still resolves it.
+    """
     prepare_mode: str = FULL
     sandbox_env: dict[str, str] = field(default_factory=dict)
     """§3.4 — the project's own suite environment, as the split declares it.
@@ -423,13 +440,14 @@ class BugPrep:
         bug: BugInfo,
         root: Path,
         test_cmd: Sequence[str],
+        native_test_paths: Sequence[str],
         where: str = "",
     ) -> "BugPrep":
         """Rebuild a prep from :meth:`to_dict`, or a :class:`RecordError` naming the field.
 
-        Three fields are injected rather than read: ``bug``, ``root`` and
-        ``test_cmd`` are not properties ``prepare`` recorded, they come from the
-        BugsInPy metadata, the batch directory and the reviewed split — which is
+        Four fields are injected rather than read: ``bug``, ``root``, ``test_cmd`` and
+        ``native_test_paths`` are not properties ``prepare`` recorded, they come from
+        the BugsInPy metadata, the batch directory and the reviewed split — which is
         also why the runner re-reads ``bug.info`` on the way in. Every field
         ``prepare.json`` *does* carry is required, so a reader that fell behind the
         writer fails with the field's name instead of a constructor ``TypeError``.
@@ -441,6 +459,7 @@ class BugPrep:
             bug=bug,
             root=root,
             test_cmd=[str(part) for part in test_cmd],
+            native_test_paths=[str(part) for part in native_test_paths],
             role=str(field_of(payload, "role", owner=owner, where=where)),
             wave=int(field_of(payload, "wave", owner=owner, where=where)),
             prepare_mode=str(field_of(payload, "prepare_mode", owner=owner, where=where)),
@@ -1990,6 +2009,10 @@ def prepare_one(
         role=entry.get("role", "pilot"),
         wave=int(entry["wave"]),
         test_cmd=[str(part) for part in entry["test_cmd"]],
+        # §3.4 — the path arguments of that command, so the hidden run can replace
+        # the *native suite* with the oracle's nodeids rather than collect it beside
+        # them. Read from the split, which is where the command itself comes from.
+        native_test_paths=[str(part) for part in entry["native_test_paths"]],
         prepare_mode=FULL if full else MEASURE_ONLY,
         # §3.4 — the project's own suite environment. Declared on the split entry
         # (``sandbox_env``) and only read here, so the value is never typed per bug

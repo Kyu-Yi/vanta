@@ -2767,6 +2767,7 @@ def load_prepared(
                 bug=bug,
                 root=batch_dir / "worktrees" / f"{project}_{bug_id}",
                 test_cmd=[str(part) for part in entry["test_cmd"]],
+                native_test_paths=[str(part) for part in entry["native_test_paths"]],
                 where=f"{key} of batch {batch_dir}",
             )
         except records_mod.RecordError as exc:

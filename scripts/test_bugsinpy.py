@@ -5537,7 +5537,7 @@ class TestPrepareRunRecordContract:
                 "vanta_tree": prepare_mod.VANTA_TREE_INHERITANCE,
             },
         )
-        split, batch_dir, _ = self._write_batch(tmp_path, preps=[original])
+        split, batch_dir, manifest = self._write_batch(tmp_path, preps=[original])
         batch = self._load(monkeypatch, split, batch_dir, tmp_path)
 
         assert batch.n_ctx == 131_072
@@ -5545,13 +5545,20 @@ class TestPrepareRunRecordContract:
         assert len(batch.preps) == 1
         loaded = batch.preps[0]
 
-        # Injected rather than stored: the metadata, the batch directory and the
-        # reviewed split's own command.
+        # Injected rather than stored: the metadata, the batch directory, and the
+        # reviewed split's own command together with its path arguments.
         assert loaded.bug == original.bug
         assert loaded.root == batch_dir / "worktrees" / "Demo_1"
         assert loaded.test_cmd == [
             "python", "-m", "pytest", "tests", "--json-report-file={report}"
         ]
+        # §3.4: the path argument the hidden run replaces. Injected from the split,
+        # not stored: the row carries no such key, so the value can only have come
+        # from the split's own entry — which is what keeps a batch written before
+        # this field existed resolvable.
+        assert loaded.native_test_paths == ["tests"]
+        assert original.native_test_paths == []
+        assert "native_test_paths" not in manifest["bugs"][0]
 
         assert loaded.role == original.role
         assert loaded.wave == original.wave
@@ -17905,6 +17912,10 @@ def oracle_prep(**over) -> prepare_mod.BugPrep:
             "--json-report-file={report}",
         ],
         test_paths=["tests"],
+        # The *native* path arguments of ``test_cmd`` — what the hidden run replaces
+        # with the oracle's nodeids. Distinct from ``test_paths`` above, which is the
+        # fix-side *file* list; passing that one instead leaves ``tests`` in place.
+        native_test_paths=["tests"],
         fail_to_pass=["tests/test_demo.py::test_fix"],
         native_failure_baseline=["tests/test_demo.py::test_known_broken"],
     )
@@ -17956,9 +17967,63 @@ class TestOracleHiddenCommand:
         assert "tqdm/tests" not in cmd
         assert cmd[3] == "tqdm/tests/tests_contrib.py::test_x"
 
-    def test_no_nodeids_leaves_the_flags(self):
+    def test_no_nodeids_leaves_the_command_whole(self):
+        """Nothing takes the path argument's place, so it stays: dropping it would run
+        pytest from the rootdir — a second, silent reading of the native command."""
         cmd = oracle_mod.hidden_command(["python", "-m", "pytest", "tests"], ["tests"], [])
-        assert cmd == ["python", "-m", "pytest"]
+        assert cmd == ["python", "-m", "pytest", "tests"]
+
+    def test_the_fix_side_file_list_does_not_replace_the_native_path(self):
+        """The distinction this rule turns on, as an executable statement.
+
+        ``BugPrep.test_paths`` is the fix-side list of *files*; the native command
+        carries a *directory*. Handing the fix-side list to this rule drops nothing,
+        which is the bug gate B measured on fastapi/2 — so the two lists are passed
+        here as they really are, and the directory still goes.
+        """
+        fix_side = ["tests/__init__.py", "tests/main.py", "tests/test_ws_router.py"]
+        # ``tests`` survives *and* the nodeid is inserted beside it, so pytest is
+        # asked for the whole directory as well — the run is no longer hidden.
+        assert oracle_mod.hidden_command(
+            ["python", "-m", "pytest", "tests", "-p", "no:cacheprovider"],
+            fix_side,
+            ["tests/test_ws_router.py::test_x"],
+        ) == [
+            "python",
+            "-m",
+            "pytest",
+            "tests/test_ws_router.py::test_x",
+            "tests",
+            "-p",
+            "no:cacheprovider",
+        ]
+        assert oracle_mod.hidden_command(
+            ["python", "-m", "pytest", "tests", "-p", "no:cacheprovider"],
+            ["tests"],
+            ["tests/test_ws_router.py::test_x"],
+        ) == ["python", "-m", "pytest", "tests/test_ws_router.py::test_x", "-p", "no:cacheprovider"]
+
+
+class TestSplitNativeTestPaths:
+    """The split's ``native_test_paths`` must be arguments of its own ``test_cmd``.
+
+    [VANTA-WHY] This is the precondition the hidden-oracle rule rests on: a native
+    path that the command does not carry cannot be replaced, so the hidden run would
+    silently collect the whole native suite again — the failure mode that read as
+    ``absent``. Checked against the two committed splits rather than only against a
+    fixture, because it is the *file* that can drift.
+    """
+
+    @pytest.mark.parametrize("path", [SPLIT_PATH, DEV_SPLIT_PATH])
+    def test_every_native_path_is_an_argument_of_its_own_command(self, path):
+        split = split_mod.load_split(path)
+        assert split.bugs, f"{path} has no bugs"
+        for entry in split.bugs:
+            missing = [p for p in entry["native_test_paths"] if p not in entry["test_cmd"]]
+            assert not missing, (
+                f"{entry['project']}/{entry['bug_id']}: native_test_paths {missing} are "
+                f"not arguments of test_cmd {entry['test_cmd']}"
+            )
 
 
 class TestOracleScore:
@@ -18128,6 +18193,34 @@ class TestOracleGrade:
         self._grade(wired, tmp_path)
         hidden = next(r for r in wired["runs"] if r["report_rel_stem"].endswith("-hidden"))
         assert "tests/test_demo.py::test_fix" in hidden["test_cmd"]
+        assert "tests" not in hidden["test_cmd"]
+
+    def test_a_collect_flip_oracle_is_graded_with_no_declared_fail_to_pass(
+        self, wired, tmp_path
+    ):
+        """fastapi/1's shape, end to end: the oracle is the collect-flip nodeids.
+
+        [VANTA-WHY] BugsInPy declares no ``FAIL_TO_PASS`` for fastapi/1, yet the bug
+        has an oracle — ``tests/test_skip_defaults.py`` errors at import on the buggy
+        source and collects cleanly on the fixed one, so it is a fail→pass flip the
+        declaration simply does not name. The rule that grades it is
+        ``BugPrep.hidden_nodeids`` (declared F2P ∪ collect-flips), and ``grade`` reads
+        it through that one property, so the collect-flip is graded exactly like a
+        declared F2P and the bug is not refused as "no oracle". Generic, not a
+        fastapi special case: nothing below names fastapi.
+        """
+        flip = "tests/test_skip_defaults.py::test_return_defaults"
+        wired["hidden_pair"] = suite_pair({flip: "passed"})
+        result = self._grade(
+            wired,
+            tmp_path,
+            prep_over={"fail_to_pass": [], "collect_flip_nodeids": [flip]},
+        )
+        assert result.hidden_nodeids == [flip]
+        assert result.hidden_pass is True
+        assert result.patch_good is True
+        hidden = next(r for r in wired["runs"] if r["report_rel_stem"].endswith("-hidden"))
+        assert flip in hidden["test_cmd"]
         assert "tests" not in hidden["test_cmd"]
 
     def test_a_failing_hidden_test_makes_a_bad_patch(self, wired, tmp_path):

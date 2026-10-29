@@ -105,21 +105,36 @@ class OracleError(RuntimeError):
 # ---------------------------------------------------------------------------
 def hidden_command(
     test_cmd: Sequence[str],
-    test_paths: Sequence[str],
+    native_test_paths: Sequence[str],
     nodeids: Sequence[str],
 ) -> list[str]:
-    """``pytest <nodeids> …`` — the directory argument is replaced, flags are kept.
+    """``pytest <nodeids> …`` — the native path argument is replaced, flags are kept.
 
-    ``test_cmd`` runs the *whole* suite (``python -m pytest tests -p no:cacheprovider
-    --json-report …``); the directory argument is exactly what makes it whole, so it
-    is dropped and the ``FAIL_TO_PASS`` nodeids take its place. The flags stay, and
-    the ``{report}`` placeholder is substituted later by ``suite.build_command`` as
-    usual, so one report parser covers both kinds of run.
+    ``test_cmd`` runs the *native* suite (``python -m pytest tests -p no:cacheprovider
+    --json-report …``); its path arguments are exactly what make it whole, so they are
+    dropped and the hidden nodeids take their place. The flags stay, and the
+    ``{report}`` placeholder is substituted later by ``suite.build_command`` as usual,
+    so one report parser covers both kinds of run.
+
+    [VANTA-WHY] ``native_test_paths`` is the split's recorded list of *those path
+    arguments* — **not** ``BugPrep.test_paths``, which is the fix-side statement of
+    which files Vanta takes from the fixed commit. The two are different lists, and
+    passing the fix-side one here (which is what this function used to be handed)
+    drops nothing at all for the corpus's commands, because those name a directory
+    (``tests``) while the fix-side list names files inside it. The hidden run then
+    collects the whole native suite *beside* the nodeids: it is no longer a hidden
+    run, it costs a full suite twice, and a single unrelated collection error in the
+    native tree interrupts the session, so every hidden nodeid reads ``absent`` and a
+    good patch is graded ``bad``. That is exactly what gate B measured on fastapi/2 —
+    467 collected, 0 run, 90 ``ModuleNotFoundError`` collectors, nodeid ``absent``.
     """
-    paths = {str(p) for p in test_paths}
+    paths = {str(p) for p in native_test_paths}
     kept = [str(part) for part in test_cmd if str(part) not in paths]
     if not nodeids:
-        return kept
+        # Nothing to take the path argument's place, so the command stays whole —
+        # dropping the path and running from the rootdir instead would be a second,
+        # silent interpretation of a command that is not this function's to rewrite.
+        return [str(part) for part in test_cmd]
     # The nodeids go immediately after the runner, so pytest receives them as
     # positional arguments whatever the flag order is. Keying on the *runner token*
     # rather than on "the first flag" matters: ``-m`` is a flag as well, and
@@ -243,7 +258,10 @@ def grade(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
         tree_rel=work_rel,
-        test_cmd=hidden_command(prep.test_cmd, prep.test_paths, hidden_nodeids),
+        # The *native* path arguments (the split's ``native_test_paths``), never
+        # ``prep.test_paths`` — see :func:`hidden_command` for what handing it the
+        # fix-side list costs.
+        test_cmd=hidden_command(prep.test_cmd, prep.native_test_paths, hidden_nodeids),
         report_rel_stem=f"reports/{prep.slug}-{_safe(label)}-hidden",
         disk_mb=disk_mb,
         timeout_secs=timeout_secs,

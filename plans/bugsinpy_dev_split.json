@@ -93,6 +93,12 @@
       "reason": "No `SDIST_SYSTEM_PACKAGES` entry can close it: every `cryptography` release below 35 builds against OpenSSL 1.1 headers, this image is trixie (OpenSSL 3.x) and carries no 1.1 headers, and a header package that does not exist cannot be named. The table already says exactly this -- `bake.UNBUILDABLE_ON_PLATFORM['cryptography']`, bound `<35` -- which is why nothing was added. The pin is not one the closure walked, so the preflight could not classify it (the pinned `cryptography` versions of other layers are reported as unbuildable by name; scrapy/1's arrives through a declared range at install time), and the bake is the measurement that found it: `runs/bugsinpy/bake-logs/vanta-bi-scrapy-1.log`.",
       "decided_by": "user review, 2026-10-28",
       "rule": "Same rule and same treatment as spacy/4 above, after the timebox Nathan set on this bug (the 13 unreviewed sdists plus `cryptography`, judged together against the cited-build-file requirement): the sdists need no entry because the bake shows they build, and `cryptography` needs none because no entry would help. The bug stays in `bugs` as a reserve and is left out of the prepare batch, so the exclusion is visible in the split rather than inferred from a missing row."
+    },
+    {
+      "change": "pandas/1 carries `build_env: {\"CFLAGS\": \"-Wno-error=array-bounds\"}`. Its `setup.py` appends `-Werror` to every compile on a non-Windows platform (line 437; removed only when numpy < 1.16, and the layer's numpy is 1.18.4), and the layer's GCC 14 promotes `src/parser/tokenizer.c:1764`'s negative-index idiom to `error: array subscript 309 is above array bounds of 'double[309]'`, so `python setup.py build_ext --inplace` exits 1 and the oracle tree dies in the build -- reported by the gate as a compiler diagnostic that has nothing to do with the bug.",
+      "reason": "The demotion is the project's own idiom, not the harness's: the same `setup.py` (line 459) appends `-Wno-error=deprecated-declarations` for Python 3.8, and the layer's own era rule demotes its six GCC-14 promotions the same way (`bake._ERA_WARNING_FLAGS`, `-Wno-error=` rather than `-Wno=`) so the diagnostics stay visible while they stop being fatal. The alternative the item offered -- `-Wno-error` through the `/opt/vanta-cc` wrapper -- was not taken because the wrapper is the layer's, not the bug's, and would demote every warning of every project.",
+      "decided_by": "user review, 2026-10-29",
+      "rule": "A project that compiles with `-Werror` against sources written for an older toolchain declares `build_env` with the demotion its own `setup.py` would have written. Only `CFLAGS` may be named, and its value is added to whatever the layer already sets for that variable, so the era's warning demotions and the stdint include survive; the rule is read by `prepare`'s in-place build of all three trees and by nothing else, so it cannot change what the graded tests observe. GCC documents that a more specific `-Wno-error=<name>` has priority over a bare `-Werror` independently of their position on the command line, which is what makes the token effective from `CFLAGS` while the build passes `-Werror` of its own accord. The bake's dropped pins (pyarrow, numba, llvmlite) are not changed by this entry: the graded nodeid imports none of them and nothing that reaches them (checked, not assumed), so the drop stays inert for this bug."
     }
   ],
   "bugs": [
@@ -213,6 +219,9 @@
       "checkpoint": "vanta-bi-pandas-1",
       "wave": 1,
       "role": "pilot",
+      "build_env": {
+        "CFLAGS": "-Wno-error=array-bounds"
+      },
       "notes": "Round-robin pass 1, pandas. First py3.8 bug in the project."
     },
     {

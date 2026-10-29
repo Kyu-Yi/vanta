@@ -628,6 +628,57 @@ class TestSplit:
         with pytest.raises(SplitError, match="import_package"):
             split_mod.validate(split_data(bugs=[bug_entry(import_package=1)]))
 
+    def test_build_env_is_an_optional_declared_key(self):
+        """The project's own build rule, carried only by a bug whose build needs it (§3.4).
+
+        [VANTA-WHY] ``build_env`` reaches the in-place build and nothing else, so it
+        cannot change what the graded tests observe; it is validated when present, its
+        allow-list is the rule, and unknown keys are still an error, so the shape stays
+        closed.
+        """
+        assert split_mod.validate(split_data()) is None
+        assert (
+            split_mod.validate(
+                split_data(
+                    bugs=[
+                        bug_entry(
+                            needs_build=True,
+                            build_env={"CFLAGS": "-Wno-error=array-bounds"},
+                        )
+                    ]
+                )
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param({}, id="empty"),
+            pytest.param("CFLAGS=-Wno-error=array-bounds", id="not-an-object"),
+            pytest.param({"CFLAGS": "  "}, id="blank-value"),
+            pytest.param({"CFLAGS": 1}, id="not-a-string"),
+            pytest.param({"LDFLAGS": "-static"}, id="key-outside-the-allow-list"),
+        ],
+    )
+    def test_build_env_is_validated_when_present(self, value):
+        with pytest.raises(SplitError, match="build_env"):
+            split_mod.validate(split_data(bugs=[bug_entry(needs_build=True, build_env=value)]))
+
+    def test_a_build_rule_a_bug_never_reaches_is_refused(self):
+        """``build_env`` is read by the in-place build, which a build-free bug skips.
+
+        [VANTA-WHY] A rule declared on a bug that never builds is a rule that can never
+        apply, and silently inert protocol is what the split's validation exists to
+        prevent — ``needs_build`` is the same fact the build itself is keyed on.
+        """
+        with pytest.raises(SplitError, match="needs_build"):
+            split_mod.validate(
+                split_data(
+                    bugs=[bug_entry(build_env={"CFLAGS": "-Wno-error=array-bounds"})]
+                )
+            )
+
     def test_unknown_top_level_key_is_an_error(self):
         with pytest.raises(SplitError, match="unknown top-level keys"):
             split_mod.validate(split_data(seed=0))  # typo for `seeds`

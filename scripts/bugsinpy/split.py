@@ -99,7 +99,7 @@ DECLARED_BUG_KEYS = frozenset(
     }
 )
 
-OPTIONAL_DECLARED_BUG_KEYS = frozenset({"import_package", "sandbox_env"})
+OPTIONAL_DECLARED_BUG_KEYS = frozenset({"import_package", "sandbox_env", "build_env"})
 """Declared keys a bug may carry but need not.
 
 [VANTA-WHY] ``import_package`` is the last-resort override for the import name the
@@ -120,6 +120,21 @@ tree. It is per bug in this file because the file is a list of bugs — the rule
 that would have kept the tree free of harness-made files was a ``conftest.py`` written
 into the repo, and it was rejected: the tree the Attacker and the Creator read must be
 exactly what the benchmark ships.
+
+[VANTA-WHY] ``build_env`` is the project's own build rule, for a tree whose ``setup.py``
+compiles with ``-Werror`` against sources written for an older toolchain. pandas/1 is the
+case: ``setup.py`` appends ``-Werror`` to every compile (removed only when numpy < 1.16,
+and the layer's numpy is 1.18.4), and GCC 14 promotes ``tokenizer.c``'s negative-index
+idiom to ``error: array subscript 309 is above array bounds of 'double[309]'``, so the
+tree dies in ``build_ext`` and the gate reports a compiler diagnostic that is not the
+bug. The demotion is that project's own idiom — the same ``setup.py`` appends
+``-Wno-error=deprecated-declarations`` for Python 3.8 — and it is per project for the
+same reason ``sandbox_env`` is: it is a fact about how the project builds on this image,
+not about the bug. It is a *separate* key from ``sandbox_env`` because it reaches the
+build and nothing else: ``sandbox_env`` is the environment the graded tests run in, which
+is the measurement, whereas this one is read by ``prepare``'s in-place build (§3.4) and
+by nothing that grades a patch. A bug that declares one records the reason in the split's
+``reviewed_changes``, like every other departure from the first-authored protocol.
 """
 
 SANDBOX_ENV_KEYS = frozenset({"PYTHONPATH"})
@@ -130,6 +145,23 @@ for themselves; a general "set any variable" channel through the split would be 
 to change the environment the graded tests run in, which is the measurement, without
 it showing up as a decision about the bug. A bug that needs another key is a change to
 this set and to the split's ``reviewed_changes``, not a quiet value in a bug entry.
+"""
+
+BUILD_ENV_KEYS = frozenset({"CFLAGS"})
+"""The variables ``build_env`` may add to, and nothing else.
+
+[VANTA-WHY] The allow-list *is* the rule, for the reason :data:`SANDBOX_ENV_KEYS`
+records: a general channel through the split would be a way to change how the tree is
+compiled — ``CC``, ``LDSHARED``, ``PYTHONPATH`` — without it showing up as a decision
+about the bug. ``CFLAGS`` is the variable to name because the layer already sets it
+(``bake.COMPILER_ENV``: the era's warning demotions and the stdint include), so a rule
+that writes it *adds* its token to a value that is already there rather than putting it
+in that value's place, and because it is the one the build's own configuration reads for
+both the compile and the link line. A build's own ``-Werror`` lands after it on the
+command line; GCC documents that a more specific ``-Wno-error=<name>`` has priority over
+a bare ``-Werror`` independently of their position. A bug that needs another variable is
+a change to this set and to the split's ``reviewed_changes``, not a quiet value in a bug
+entry.
 """
 
 # Written back by ``prepare``. Nothing here may be hand-edited into the file
@@ -502,6 +534,35 @@ def _validate_bug(entry: Any, where: str, index: int, seen: set[str]) -> None:
                 raise SplitError(
                     f"{tag}: sandbox_env[{key!r}] must be a non-empty string — an empty "
                     "value would put an empty entry on PYTHONPATH, which is not a path"
+                )
+
+    build = entry.get("build_env")
+    if build is not None:
+        if not isinstance(build, dict) or not build:
+            raise SplitError(
+                f"{tag}: build_env must be a non-empty object of NAME=VALUE strings — "
+                "the project's own build rule, or nothing at all; an empty one would "
+                "record a rule that says nothing"
+            )
+        if not entry["needs_build"]:
+            raise SplitError(
+                f"{tag}: build_env is declared but needs_build is false — the rule is "
+                "read by the in-place build (§3.4), which a bug that needs no build "
+                "never reaches, so this entry would be a rule that can never apply"
+            )
+        for name, value in build.items():
+            if name not in BUILD_ENV_KEYS:
+                raise SplitError(
+                    f"{tag}: build_env key {name!r} is not allowed — the variables a "
+                    f"bug may add to are {sorted(BUILD_ENV_KEYS)}, because a general "
+                    "channel would be a way to change how the tree is compiled without "
+                    "it showing up as a decision about the bug"
+                )
+            if not isinstance(value, str) or not value.strip():
+                raise SplitError(
+                    f"{tag}: build_env[{name!r}] must be a non-empty string — the value "
+                    "is added to whatever the layer already sets for that variable, and "
+                    "an empty one declares nothing"
                 )
 
     # Derived fields, when present, must be self-consistent.

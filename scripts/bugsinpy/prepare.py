@@ -206,6 +206,21 @@ class BugPrep:
     the Creator read has to be exactly what the benchmark ships. Empty for every bug
     that does not declare one, which is the whole corpus but fastapi's.
     """
+    build_env: dict[str, str] = field(default_factory=dict)
+    """§3.4 — the project's own build rule, added to the compiler's environment.
+
+    [VANTA-WHY] Recorded on the row for the same reason :attr:`sandbox_env` is: it is a
+    fact about the *run*, not about the bug. pandas' ``setup.py`` passes ``-Werror`` and
+    GCC 14 makes ``tokenizer.c``'s negative-index idiom fatal, so every tree this bug
+    builds dies in ``build_ext`` with a compiler diagnostic that is not the bug, and the
+    one recorded token has to reach all three builds or none of them. The value is
+    *added* to whatever ``bake.build_env_for`` already sets for that variable, so a rule
+    cannot drop the era's warning demotions or the stdint include by putting itself in
+    their place. It is read by the in-place build and by nothing else — it is not put on
+    the environment any suite runs in — so it cannot change what the graded tests
+    observe. Empty for every bug that does not declare one, which is the whole corpus
+    but pandas's.
+    """
     test_paths: list[str] = field(default_factory=list)
     fail_to_pass: list[str] = field(default_factory=list)
     f2p_undeclared: list[str] = field(default_factory=list)
@@ -405,6 +420,7 @@ class BugPrep:
             "wave": self.wave,
             "prepare_mode": self.prepare_mode,
             "sandbox_env": self.sandbox_env,
+            "build_env": self.build_env,
             "runnable": self.runnable,
             "test_paths": self.test_paths,
             "fail_to_pass": sorted(self.fail_to_pass),
@@ -464,6 +480,7 @@ class BugPrep:
             wave=int(field_of(payload, "wave", owner=owner, where=where)),
             prepare_mode=str(field_of(payload, "prepare_mode", owner=owner, where=where)),
             sandbox_env=map_of(payload, "sandbox_env", owner=owner, where=where),
+            build_env=map_of(payload, "build_env", owner=owner, where=where),
             test_paths=strings_of(payload, "test_paths", owner=owner, where=where),
             fail_to_pass=strings_of(payload, "fail_to_pass", owner=owner, where=where),
             f2p_undeclared=strings_of(payload, "f2p_undeclared", owner=owner, where=where),
@@ -780,8 +797,8 @@ def build_trees_in_place(
     tree: one function answers "does this need a build" (§3.2), and a second
     interpretation of it here could disagree with the one the split was checked
     against. The command follows the rule's own trigger (:func:`setup_args_for`) and the
-    environment is the layer's (``bake.build_env_for``), for the reason
-    ``suite.build_tree_in_place`` records.
+    environment is the layer's (``bake.build_env_for``) with the project's own
+    ``build_env`` added to it, for the reason ``suite.build_tree_in_place`` records.
 
     Only ``full`` prepares reach this — it is called after ``load_deps`` and before the
     dependency gate — so a measure-only run never pays a compiler.
@@ -796,6 +813,15 @@ def build_trees_in_place(
         return
 
     env = dict(bake_mod.build_env_for(bake_mod.minor_version(prep.bug.python_version)))
+    if prep.build_env:
+        # §3.4 — the project's own build rule, added to whatever the layer set rather
+        # than put in its place: the layer's ``CFLAGS`` carry the era's warning
+        # demotions and the stdint include, and a rule that replaced them would change
+        # the build in ways it does not declare. Sorted, so the same split produces the
+        # same command line.
+        for name, value in sorted(prep.build_env.items()):
+            layer_value = env.get(name, "")
+            env[name] = f"{layer_value} {value}".strip() if layer_value else value
     setup_args = setup_args_for(prep.bug.pythonpath)
     command = f"python setup.py {' '.join(setup_args)}"
     for tree_name in BUILD_TREES:
@@ -2019,6 +2045,10 @@ def prepare_one(
         # in pipeline code: whatever the split records is what every run of this row
         # gets. Empty for every bug but fastapi's.
         sandbox_env={str(k): str(v) for k, v in (entry.get("sandbox_env") or {}).items()},
+        # §3.4 — the project's own build rule (``build_env``), read here in the same
+        # way and for the same reason: the split records it once, and every tree this
+        # row builds gets it from the row rather than from a pipeline literal.
+        build_env={str(k): str(v) for k, v in (entry.get("build_env") or {}).items()},
     )
 
     mismatches = check_declared(entry, bug)

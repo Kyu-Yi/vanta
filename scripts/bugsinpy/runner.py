@@ -1628,6 +1628,13 @@ def invoke_vanta(
     # ``sandbox_env`` rule, and the binary refuses any key outside its allow-list.
     for key, value in sorted(prep.sandbox_env.items()):
         argv += ["--sandbox-env", f"{key}={value}"]
+    # §3.4 — the row's recorded pre-compile rule, handed to every suite run of this
+    # bug so Vanta's OWN runs meet the same compile ordering the preparation gates
+    # did. Without it matplotlib/1's in-session suites die on a compile-time warning
+    # its pytest configuration escalates to a SyntaxError, which is an environment
+    # failure the row would be blamed for. One flag per file, in the split's order.
+    for path in prep.precompile:
+        argv += ["--precompile", path]
     if candidate is not None:
         argv += ["--patch", str(candidate.patch_path)]
 

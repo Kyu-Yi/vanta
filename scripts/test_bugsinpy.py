@@ -19651,6 +19651,66 @@ class TestInvokeVantaCarriesTheRecordedSandboxEnv:
         assert "--test-cmd python -m pytest tests" in text
 
 
+class TestInvokeVantaCarriesTheRecordedPrecompileRule:
+    """item L — the recorded ``precompile`` rule reaches Vanta's own runs as ``--precompile``.
+
+    [VANTA-WHY] The harness's own suites (the native suite, the BATE baseline, the
+    patched suite) are built inside the Rust pipeline, so a rule that only reached
+    the harness's Python-side VM runs would leave every Vanta row of matplotlib/1
+    compiling ``lib/matplotlib/widgets.py`` under pytest's filters and dying on the
+    warning the project escalates to a ``SyntaxError`` — an environment failure the
+    row would be blamed for. One flag per recorded file, in the split's order, and
+    nothing at all for a bug that records no rule.
+    """
+
+    @staticmethod
+    def _run(tmp_path, monkeypatch, **over):
+        import types
+
+        monkeypatch.setattr(
+            runner_mod.subprocess,
+            "run",
+            lambda *a, **kw: types.SimpleNamespace(returncode=0),
+        )
+        log_path = tmp_path / "vanta.log"
+        bug_prep = prep(
+            root=tmp_path / "root",
+            test_cmd=["python", "-m", "pytest", "tests", "--json-report-file={report}"],
+            **over,
+        )
+        runner_mod.invoke_vanta(
+            vanta_bin=tmp_path / "vanta_m3",
+            prep=bug_prep,
+            issue_path=tmp_path / "issue.md",
+            env={"PATH": "/usr/bin"},
+            log_path=log_path,
+            max_attempts=2,
+        )
+        return log_path.read_text(encoding="utf-8")
+
+    def test_the_flag_is_passed_once_per_recorded_file(self, tmp_path, monkeypatch):
+        text = self._run(
+            tmp_path,
+            monkeypatch,
+            precompile=["lib/matplotlib/widgets.py", "lib/matplotlib/other.py"],
+        )
+        assert "--precompile lib/matplotlib/widgets.py" in text
+        assert "--precompile lib/matplotlib/other.py" in text
+        assert text.index("--precompile lib/matplotlib/widgets.py") < text.index(
+            "--precompile lib/matplotlib/other.py"
+        ), "the rule keeps the order the split recorded"
+        assert text.index("--max-attempts 2") < text.index("--precompile"), (
+            "the flag is appended after the fixed arguments, one per recorded file"
+        )
+
+    def test_a_bug_with_no_recorded_rule_is_invoked_exactly_as_before(
+        self, tmp_path, monkeypatch
+    ):
+        text = self._run(tmp_path, monkeypatch)
+        assert "--precompile" not in text
+        assert "--test-cmd python -m pytest tests" in text
+
+
 class TestNormalizedDiff:
     """§7.1's dedup key: two patches that produce the same tree are one candidate."""
 

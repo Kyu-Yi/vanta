@@ -69,6 +69,15 @@ struct CliArgs {
     /// allow-list (`PYTHONPATH`, `MPLBACKEND`) are accepted; any other key is
     /// refused rather than quietly injected.
     sandbox_env: Vec<(String, String)>,
+    /// Tree-relative `.py` files byte-compiled before every suite run, from
+    /// `--precompile PATH` (repeatable). This is the harness's recorded
+    /// per-project rule (item L), handed to the run so Vanta's OWN suite runs
+    /// meet the same compile ordering the preparation gates did — matplotlib's
+    /// pytest configuration escalates the invalid-escape warning that file
+    /// raises at compile time into a `SyntaxError`, which kills collection. A
+    /// path outside the tree, a backslash, a `..` step or a non-`.py` name is
+    /// refused rather than compiled.
+    precompile: Vec<String>,
     /// Path to a clean original tree (git worktree of the base commit) for
     /// Mode B. If set, BATE runs against this tree instead of the in-memory
     /// original files. Spec §7: "both trees present simultaneously".
@@ -116,6 +125,7 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
     let mut patch_path: Option<PathBuf> = None;
     let mut test_cmd: Option<String> = None;
     let mut sandbox_env: Vec<(String, String)> = Vec::new();
+    let mut precompile: Vec<String> = Vec::new();
     let mut original_tree: Option<PathBuf> = None;
     let mut rerun_signals: Option<String> = None;
     let mut good_tree: Option<PathBuf> = None;
@@ -184,6 +194,15 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
                 let pair = vanta::sandbox::parse_sandbox_env(&args[i])
                     .map_err(|e| format!("--sandbox-env: {e}"))?;
                 sandbox_env.push(pair);
+            }
+            "--precompile" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--precompile requires a tree-relative .py path".to_string());
+                }
+                let path = vanta::sandbox::parse_precompile_path(&args[i])
+                    .map_err(|e| format!("--precompile: {e}"))?;
+                precompile.push(path);
             }
             "--original-tree" => {
                 i += 1;
@@ -280,6 +299,7 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
         patch_path,
         test_cmd,
         sandbox_env,
+        precompile,
         original_tree,
         rerun_signals,
         good_tree,
@@ -481,6 +501,7 @@ fn print_help() {
          --patch, -p PATH       Verify an EXISTING patch (skip Creator, run Attacker+BATE on this diff)\n    \
          --test-cmd CMD         Test command (default: 'python3 -m pytest'). e.g. 'pytest tests/ -q'\n    \
          --sandbox-env K=V     Inject K=V into every sandbox command of the run (repeatable). PYTHONPATH or MPLBACKEND only; refused for any other key\n    \
+         --precompile PATH      Byte-compile PATH (tree-relative .py) in every suite VM before the test command runs (repeatable). A path outside the tree, a .py-less name or a non-.py file is refused\n    \
          --original-tree PATH   Clean original tree (git worktree of base commit) for Mode B two-tree mode\n    \
          --rerun-signals ID     Re-run session ID's review-mode rejection signals against --good-tree (writes vanta_sessions/ID_signal_reruns.json; no --repo needed)\n    \
          --good-tree PATH       Known-good source: a directory, or a patch file applied onto --base-tree\n    \
@@ -607,6 +628,57 @@ mod tests {
         ]))
         .is_err());
     }
+
+    /// [VANTA-WHY] The recorded pre-compile rule has to reach the run the same
+    /// way `--sandbox-env` does: one flag per file, the list arriving in the
+    /// order the split recorded it (so a run's argv is a readable record of the
+    /// rule it was given).
+    #[test]
+    fn the_precompile_flag_is_repeatable_and_keeps_its_order() {
+        let cli = parse_args_from(&args(&[
+            "--repo", "tree",
+            "--precompile", "lib/matplotlib/widgets.py",
+            "--precompile", "lib/matplotlib/other.py",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cli.precompile,
+            vec![
+                "lib/matplotlib/widgets.py".to_string(),
+                "lib/matplotlib/other.py".to_string(),
+            ]
+        );
+    }
+
+    /// The rule is a path the compile step has to be able to honour. Every one of
+    /// these would either compile something the benchmark does not ship or fail
+    /// silently inside the VM, so each is refused at the flag rather than passed
+    /// through — the same shape of refusal `--sandbox-env` makes about keys.
+    #[test]
+    fn the_precompile_flag_refuses_a_path_it_could_not_compile() {
+        for path in [
+            "/etc/passwd.py",
+            "../outside.py",
+            "lib/../../outside.py",
+            "lib\\matplotlib\\widgets.py",
+            "lib/matplotlib/widgets.txt",
+            "lib/matplotlib",
+            "",
+        ] {
+            let error = match parse_args_from(&args(&["--repo", "tree", "--precompile", path])) {
+                Ok(_) => panic!("--precompile {path:?} must be refused"),
+                Err(error) => error,
+            };
+            assert!(
+                error.starts_with("--precompile:"),
+                "{path:?} must be refused with the flag named; got: {error}"
+            );
+        }
+        // A run that records nothing is still valid and carries no rule, so the
+        // invocation is exactly the one that predates the flag.
+        let cli = parse_args_from(&args(&["--repo", "tree"])).unwrap();
+        assert!(cli.precompile.is_empty());
+    }
 }
 
 
@@ -669,6 +741,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         patch_path: cli.patch_path,
         test_cmd: cli.test_cmd,
         sandbox_env: cli.sandbox_env,
+        precompile: cli.precompile,
         original_tree: cli.original_tree,
     })
     .await?;

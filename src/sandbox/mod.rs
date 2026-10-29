@@ -99,6 +99,77 @@ pub fn parse_sandbox_env(spec: &str) -> Result<(String, String), Box<dyn Error +
     Ok((key.to_string(), value.to_string()))
 }
 
+/// Parse one `--precompile PATH` specification: a tree-relative `.py` path.
+///
+/// [VANTA-WHY] The rule is the split's recorded per-project one, never typed per
+/// bug, so this parser's job is to refuse a path the compile step could not
+/// honour — the same shape of refusal `parse_sandbox_env` makes about keys. The
+/// rules mirror the split's own validator (`scripts/bugsinpy/split.py`) so a row
+/// that passed the split cannot fail here: non-empty, no absolute path, no
+/// backslash, no `..` component, and `.py`. A path that named a file outside the
+/// tree would compile something the benchmark does not ship; one the compiler
+/// cannot parse (a directory, a non-Python file) would fail silently, and the
+/// failure the rule exists to prevent would come back disguised as a suite error.
+pub fn parse_precompile_path(spec: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let path = spec.trim();
+    if path.is_empty() {
+        return Err("precompile path is empty".into());
+    }
+    if path.starts_with('/') || path.contains('\\') || path.split('/').any(|part| part == "..") {
+        return Err(format!(
+            "precompile path {spec:?} must be tree-relative with no directory step"
+        )
+        .into());
+    }
+    if !path.ends_with(".py") {
+        return Err(format!("precompile path {spec:?} must name a .py file").into());
+    }
+    Ok(path.to_string())
+}
+
+/// The pre-compile argv for a suite command: `<cmd[0]> -m compileall -q -f <files>`.
+///
+/// [VANTA-WHY] This is the in-session half of the harness's recorded `precompile`
+/// rule (matplotlib/1: `lib/matplotlib/widgets.py`). Its whole job is ordering:
+/// an invalid escape sequence is reported while the module is *compiled*, and
+/// matplotlib's pytest configuration escalates warnings to errors, so the first
+/// import of that module during collection dies as `SyntaxError`. Compiling first
+/// leaves a valid `.pyc`, and nothing is compiled under pytest's filters at all.
+///
+/// Three choices are load-bearing and are the same three the Python harness's
+/// `suite.precompile_lines` makes, so both halves of one rule behave identically:
+///
+/// * the interpreter is `cmd[0]` — the one about to run the tests. A `.pyc` is
+///   only read by the interpreter whose magic number it carries, so compiling
+///   with any other interpreter would leave a file the tests ignore and the
+///   warning would fire exactly as before.
+/// * `-f` forces the write. `compileall` otherwise skips a file whose `.pyc`
+///   already records the source's mtime, and that check is second-resolution on
+///   the mtime alone — a patch applied in the same second as the previous compile
+///   would leave a stale `.pyc` and the warning would come back.
+/// * the backends run it as its own line, not `&&`-chained to the command: a
+///   compile that failed must not take the test report with it. The shell
+///   continues, the suite reports the compile error itself as a collection
+///   failure, and the gate reads the honest message instead of "no report at all".
+///
+/// Empty `precompile` returns an empty argv, so a bug without the rule runs
+/// exactly the command it ran before the rule existed.
+pub fn precompile_argv(cmd: &[&str], precompile: &[String]) -> Vec<String> {
+    if precompile.is_empty() {
+        return Vec::new();
+    }
+    let python = cmd.first().copied().unwrap_or("python3");
+    let mut argv: Vec<String> = vec![
+        python.to_string(),
+        "-m".to_string(),
+        "compileall".to_string(),
+        "-q".to_string(),
+        "-f".to_string(),
+    ];
+    argv.extend(precompile.iter().cloned());
+    argv
+}
+
 /// The sandbox kind this process will actually use: the env preference, with
 /// `auto` resolved through the shuru availability + boot test.
 pub async fn actual_backend_kind() -> Result<SandboxKind, Box<dyn Error + Send + Sync>> {
@@ -315,10 +386,11 @@ impl Backend {
         cwd: &std::path::Path,
         timeout_secs: u64,
         env: &[(String, String)],
+        precompile: &[String],
     ) -> Result<ExecutionResult, Box<dyn Error + Send + Sync>> {
         match self {
-            Backend::Subprocess(b) => b.execute(cmd, cwd, timeout_secs, env).await,
-            Backend::Shuru(b) => b.execute(cmd, cwd, timeout_secs, env).await,
+            Backend::Subprocess(b) => b.execute(cmd, cwd, timeout_secs, env, precompile).await,
+            Backend::Shuru(b) => b.execute(cmd, cwd, timeout_secs, env, precompile).await,
         }
     }
 

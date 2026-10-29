@@ -145,6 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         patch_path: cli.patch_path,
         test_cmd: cli.test_cmd,
         sandbox_env: Vec::new(),
+        precompile: Vec::new(),
         original_tree: cli.original_tree,
     })
     .await?;

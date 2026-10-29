@@ -57,6 +57,15 @@ pub struct TestCommand {
     /// `sandbox_env` (e.g. `PYTHONPATH=./docs_src`). Empty in the normal case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<(String, String)>,
+    /// The run's recorded per-project pre-compile rule: tree-relative `.py`
+    /// files every suite VM byte-compiles, with this command's interpreter and
+    /// in this command's tree, BEFORE the command runs (item L; matplotlib/1
+    /// records `lib/matplotlib/widgets.py`). Empty in the normal case, and an
+    /// empty rule leaves every invocation byte-identical to a run that never
+    /// carried one. The rule travels with the command into every sandbox run
+    /// exactly as `env` does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub precompile: Vec<String>,
 }
 
 impl TestCommand {
@@ -66,6 +75,7 @@ impl TestCommand {
             program: program.into(),
             args,
             env: Vec::new(),
+            precompile: Vec::new(),
         }
     }
 
@@ -81,6 +91,7 @@ impl TestCommand {
             program: parts[0].clone(),
             args: parts[1..].to_vec(),
             env: Vec::new(),
+            precompile: Vec::new(),
         }
     }
 
@@ -88,6 +99,13 @@ impl TestCommand {
     /// the command into every harness run.
     pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Attach the run's recorded pre-compile rule to this command, so it travels
+    /// with the command into every sandbox run the same way `with_env` does.
+    pub fn with_precompile(mut self, precompile: Vec<String>) -> Self {
+        self.precompile = precompile;
         self
     }
 

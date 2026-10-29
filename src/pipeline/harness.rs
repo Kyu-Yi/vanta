@@ -104,7 +104,13 @@ pub async fn run_tests_parallel_detailed(
             let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
             let sandbox_root = sb.root().display().to_string();
             let exec = sb
-                .execute(&cmd_refs, Path::new(""), patched_test_timeout_secs(), &cmd_template.env)
+                .execute(
+                    &cmd_refs,
+                    Path::new(""),
+                    patched_test_timeout_secs(),
+                    &cmd_template.env,
+                    &cmd_template.precompile,
+                )
                 .await;
             let result = match exec {
                 Ok(e) => parse_pytest_report_detailed(
@@ -185,7 +191,15 @@ pub async fn run_single_test_with_timeout(
     let cmd = build_single_test_cmd(test_cmd, BATE_TEST_FILE);
     let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
     let sandbox_root = sb.root().display().to_string();
-    let exec = sb.execute(&cmd_refs, Path::new(""), timeout_secs, &test_cmd.env).await;
+    let exec = sb
+        .execute(
+            &cmd_refs,
+            Path::new(""),
+            timeout_secs,
+            &test_cmd.env,
+            &test_cmd.precompile,
+        )
+        .await;
     let result = match exec {
         Ok(e) => parse_pytest_report_detailed(
             sb.root().join("report.json"),
@@ -320,7 +334,13 @@ pub async fn run_native_suite(source: &str, test_cmd: &TestCommand) -> NativeSui
     cmd.push("-q".to_string());
     let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
     let exec = sb
-        .execute(&cmd_refs, Path::new(""), test_timeout_secs(), &test_cmd.env)
+        .execute(
+            &cmd_refs,
+            Path::new(""),
+            test_timeout_secs(),
+            &test_cmd.env,
+            &test_cmd.precompile,
+        )
         .await;
     let report = match exec {
         Ok(e) => parse_native_report(&sb.root().join("report.json"), &e),
@@ -1132,7 +1152,14 @@ pub async fn run_static(
     let ruff_py = static_tool_runner(&project_py, "ruff");
     let mut ruff_argv = vec![ruff_py.as_str()];
     ruff_argv.extend_from_slice(RUFF_ARGS);
-    let (ruff, ruff_raw) = match sb.execute(&ruff_argv, Path::new(""), 30, &test_cmd.env).await {
+    // [VANTA-WHY] The recorded pre-compile rule is deliberately NOT passed to the
+    // static tools: it is a step for the runs of the test command whose report is
+    // read as evidence, and ruff/mypy are neither. An empty slice is what a run
+    // without the rule already sent.
+    let (ruff, ruff_raw) = match sb
+        .execute(&ruff_argv, Path::new(""), 30, &test_cmd.env, &[])
+        .await
+    {
         Ok(r) => {
             let raw = format!("{}\n{}", r.stdout, r.stderr);
             let findings = raw
@@ -1158,6 +1185,7 @@ pub async fn run_static(
             Path::new(""),
             60,
             &test_cmd.env,
+            &[],
         )
         .await
     {
@@ -1467,7 +1495,9 @@ pub async fn probe_missing_modules(
     cmd.push("--collect-only".to_string());
     cmd.push("-q".to_string());
     let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-    let output = sb.execute(&refs, Path::new(""), 120, &test_cmd.env).await;
+    let output = sb
+        .execute(&refs, Path::new(""), 120, &test_cmd.env, &test_cmd.precompile)
+        .await;
     sb.destroy();
     match output {
         Ok(e) => {

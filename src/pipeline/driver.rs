@@ -88,6 +88,11 @@ pub struct RunConfig {
     /// harness's recorded per-project rule (e.g. `PYTHONPATH=./docs_src`).
     /// Empty in the normal case.
     pub sandbox_env: Vec<(String, String)>,
+    /// The harness's recorded per-project pre-compile rule: tree-relative `.py`
+    /// files every suite VM byte-compiles before the test command runs (item L).
+    /// Empty in the normal case, and an empty rule leaves every run exactly as
+    /// it was.
+    pub precompile: Vec<String>,
     /// Path to a clean original tree (git worktree of the base commit) for
     /// two-tree mode. If set, BATE runs against this tree instead of the
     /// in-memory original files. Spec §7: "both trees present simultaneously".
@@ -1237,7 +1242,8 @@ pub async fn run(
         Some(s) => TestCommand::from_shell(s),
         None => TestCommand::default(),
     }
-    .with_env(config.sandbox_env.clone());
+    .with_env(config.sandbox_env.clone())
+    .with_precompile(config.precompile.clone());
     println!(
         "▌ Test command: {} {}",
         test_cmd.program,

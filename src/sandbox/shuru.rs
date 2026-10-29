@@ -99,13 +99,36 @@ fi"#;
 /// separated for the same reason as above, so a failed export cannot swallow the
 /// command. An empty ``env`` reproduces the previous line exactly, which is what
 /// a run that never passed the flag gets.
-fn guest_inner_command(guest_cwd: &str, cmd: &[&str], env: &[(String, String)]) -> String {
+///
+/// ``precompile`` is the run's recorded per-project pre-compile rule. When it is
+/// not empty, one ``<cmd[0]> -m compileall -q -f <files>`` line runs after the
+/// ``cd`` and before the command, in the same tree and under the same
+/// interpreter — see :func:`crate::sandbox::precompile_argv` for why. It is its
+/// own line rather than an ``&&``-chain for the same reason the guard is: a
+/// compile that failed must not take the test report with it. The exit status
+/// the script reports is still the command's, because the command is last. An
+/// empty ``precompile`` reproduces the previous line exactly.
+fn guest_inner_command(
+    guest_cwd: &str,
+    cmd: &[&str],
+    env: &[(String, String)],
+    precompile: &[String],
+) -> String {
     let mut exports = String::new();
     for (key, value) in env {
         exports.push_str(&format!("export {key}={}\n", shell_quote_value(value)));
     }
+    let pre = crate::sandbox::precompile_argv(cmd, precompile);
+    if pre.is_empty() {
+        return format!(
+            "{DEV_SHM_GUARD}\n{exports}cd {guest_cwd} && {command}",
+            command = cmd.join(" ")
+        );
+    }
+    let pre_line: Vec<String> = pre.iter().map(|arg| shell_quote_value(arg)).collect();
     format!(
-        "{DEV_SHM_GUARD}\n{exports}cd {guest_cwd} && {command}",
+        "{DEV_SHM_GUARD}\n{exports}cd {guest_cwd}\n{pre}\n{command}",
+        pre = pre_line.join(" "),
         command = cmd.join(" ")
     )
 }
@@ -565,6 +588,7 @@ impl SandboxBackend for ShuruBackend {
         cwd: &Path,
         timeout_secs: u64,
         env: &[(String, String)],
+        precompile: &[String],
     ) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>> {
         if cmd.is_empty() {
             return Err("execute: empty command".into());
@@ -588,7 +612,7 @@ impl SandboxBackend for ShuruBackend {
         // every boot (guest_inner_command): this is the single path
         // ``src/pipeline/harness.rs`` runs third-party code through, and a mount does
         // not persist in a checkpoint, so it cannot be folded into the layer.
-        let inner_cmd = guest_inner_command(&guest_cwd, cmd, env);
+        let inner_cmd = guest_inner_command(&guest_cwd, cmd, env, precompile);
         let cmd_str = cmd.join(" ");
         debug!(cmd = %cmd_str, guest_cwd = %guest_cwd, timeout_secs, "shuru exec");
 
@@ -702,7 +726,7 @@ mod tests {
 
     #[test]
     fn every_sandboxed_command_runs_the_guard_first() {
-        let inner = guest_inner_command("/workspace", &["python", "-m", "pytest"], &[]);
+        let inner = guest_inner_command("/workspace", &["python", "-m", "pytest"], &[], &[]);
         // First, so a VM that cannot provide a semaphore fails before the command
         // rather than inside it.
         assert!(inner.starts_with(DEV_SHM_GUARD));
@@ -714,7 +738,7 @@ mod tests {
     fn the_guard_does_not_swallow_the_command_or_its_status() {
         // A newline, not `&&`: the guard ends in an `if` block, and chaining it with
         // `&&` would make every failure read as the chain's.
-        let inner = guest_inner_command("/workspace/x", &["sh", "-c", "exit 3"], &[]);
+        let inner = guest_inner_command("/workspace/x", &["sh", "-c", "exit 3"], &[], &[]);
         assert_eq!(inner, format!("{DEV_SHM_GUARD}\ncd /workspace/x && sh -c exit 3"));
     }
 
@@ -726,7 +750,7 @@ mod tests {
     #[test]
     fn an_empty_env_reproduces_the_old_guest_line_exactly() {
         assert_eq!(
-            guest_inner_command("/workspace/t", &["python", "-m", "pytest"], &[]),
+            guest_inner_command("/workspace/t", &["python", "-m", "pytest"], &[], &[]),
             format!("{DEV_SHM_GUARD}\ncd /workspace/t && python -m pytest")
         );
     }
@@ -737,8 +761,47 @@ mod tests {
             "/workspace/t",
             &["python", "-m", "pytest"],
             &[("PYTHONPATH".to_string(), "./docs_src".to_string())],
+            &[],
         );
         assert!(inner.contains("export PYTHONPATH=./docs_src"));
         assert!(inner.ends_with("cd /workspace/t && python -m pytest"));
+    }
+
+    // [VANTA-WHY] The recorded `precompile` rule (item L) has to reach the guest
+    // line the same way `sandbox_env` does, or the in-session suite runs of
+    // matplotlib/1 die on the compile-time warning the rule exists to disarm. The
+    // assertions below are the three load-bearing choices: same interpreter as the
+    // command, the forcing `-f`, and its own line rather than an `&&`-chain.
+
+    #[test]
+    fn an_empty_precompile_reproduces_the_old_guest_line_exactly() {
+        assert_eq!(
+            guest_inner_command("/workspace/t", &["python3", "-m", "pytest"], &[], &[]),
+            format!("{DEV_SHM_GUARD}\ncd /workspace/t && python3 -m pytest")
+        );
+    }
+
+    #[test]
+    fn a_recorded_precompile_compiles_before_the_command_with_its_interpreter() {
+        let inner = guest_inner_command(
+            "/workspace/t",
+            &["python3", "-m", "pytest"],
+            &[],
+            &["lib/matplotlib/widgets.py".to_string()],
+        );
+        let lines: Vec<&str> = inner.lines().collect();
+        let cd = lines.iter().position(|l| *l == "cd /workspace/t").unwrap();
+        let pre = lines
+            .iter()
+            .position(|l| *l == "python3 -m compileall -q -f lib/matplotlib/widgets.py")
+            .unwrap();
+        // Its own line, after the `cd` (so the path is tree-relative) and before the
+        // command (so nothing is compiled under pytest's filters) …
+        assert!(cd < pre);
+        // … and last, so the script's exit status is still the command's, and a
+        // failed compile cannot take the test report with it.
+        assert_eq!(*lines.last().unwrap(), "python3 -m pytest");
+        // Not `&&`-chained to the command.
+        assert!(!inner.contains("compileall -q -f lib/matplotlib/widgets.py &&"));
     }
 }

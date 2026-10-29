@@ -353,10 +353,8 @@ def _attempt_total(record: Mapping[str, Any], debug_dir: Path) -> int:
     return max(run, _highest_attempt(debug_dir))
 
 
-def _read_compacted(
-    diff_path: Path, hashes_path: Path
-) -> tuple[Optional[str], Optional[str]]:
-    """``(diff text, reason)`` — the compacted snapshot, used only if it verifies."""
+def _read_compacted(diff_path: Path, hashes_path: Path) -> tuple[Optional[str], Optional[str]]:
+    """``(diff text, reason)`` — the compacted diff, used only if its own hash verifies."""
     try:
         payload = json.loads(hashes_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -376,6 +374,77 @@ def _read_compacted(
     return text, None
 
 
+DELETED_FILE_MARKER = "deleted file mode"
+"""The one line that marks a section as a deletion — text and binary alike.
+
+``git diff`` prints it for a deleted text file *and* for a deleted binary one,
+whose body is ``Binary files … differ`` with no ``+++ /dev/null`` line for a path
+test to key on. Matching this line is what makes the filter total.
+"""
+
+
+def _covered_paths(debug_dir: Path, tree_name: str) -> Optional[set[str]]:
+    """The files a snapshot tree *covers* — the manifest Vanta wrote beside it.
+
+    ``harness::write_tree_snapshot`` is handed the driver's ``# FILE:``
+    concatenation, so the tree holds **only the tracked source files**, and it
+    records ``{paths, file_count}`` next to them. Diffing that partial tree against
+    the full sanitized base reports every *other* base file — ``.git/``, ``LICENSE``,
+    ``README.md`` — as deleted, and applying that diff to the grading tree stops at
+    the first one (``error: invalid path '.git/HEAD'``): a real attempt read as an
+    unobservable grade. ``None`` when the manifest is absent (a session from before
+    it was recorded), which leaves :func:`drop_base_only_deletions` with no scope and
+    so keeps every section — the old behaviour, since without a scope the spurious
+    deletions cannot be told from the real ones.
+    """
+    manifest = debug_dir / f"{tree_name}_manifest.json"
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    paths = payload.get("paths")
+    if not isinstance(paths, list):
+        return None
+    return {str(path) for path in paths}
+
+
+def _section_path_of(line: str) -> Optional[str]:
+    match = _DIFF_GIT_RE.match(line)
+    return match.group("b") if match else None
+
+
+def drop_base_only_deletions(diff_text: str, covered: Optional[set[str]]) -> str:
+    """Drop the sections that delete a file the snapshot never covered.
+
+    [VANTA-WHY] The test is on the **path**, not on "this is a deletion". A snapshot
+    genuinely omits a tracked file when the attempt deleted it, and that deletion is
+    a real part of the patch; what is never real is a deletion of a path the
+    snapshot's manifest never listed, because those files were absent from the tree
+    from the start rather than removed by the patch. ``covered is None`` keeps every
+    section — the old behaviour — because without a scope nothing can be told apart.
+    """
+    if covered is None:
+        return diff_text
+    kept: list[str] = []
+    path: Optional[str] = None
+    skipping = False
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            path = _section_path_of(line)
+            skipping = False
+            kept.append(line)
+            continue
+        if not skipping and line.startswith(DELETED_FILE_MARKER):
+            if path is not None and path not in covered:
+                # The section's only kept line so far is its `diff --git` header.
+                kept.pop()
+                skipping = True
+                continue
+        if not skipping:
+            kept.append(line)
+    return "".join(kept)
+
+
 def attempt_patch(
     *, debug_dir: Path, base_tree: Path, attempt: int
 ) -> tuple[Optional[str], Optional[str], str]:
@@ -386,18 +455,28 @@ def attempt_patch(
     with a diff pinned by its own hash (read it, verify it, use it as a full
     snapshot); or it is gone. The third case is **never** guessed here — the
     caller may fall back to ``final.patch``, and only for the last attempt.
+
+    Both surviving cases pass through :func:`drop_base_only_deletions` (#F bug 2):
+    the tree is partial, so the raw diff carries a deletion for every base file the
+    snapshot never held, and `git apply` refuses the whole patch at the first of
+    them.
     """
     tree = debug_dir / f"attempt_{attempt}_patched_tree"
     if tree.is_dir():
         try:
-            return compact_mod.tree_diff(base_tree, tree), None, SNAPSHOT
+            text = compact_mod.tree_diff(base_tree, tree)
         except compact_mod.CompactError as exc:
             return None, f"the snapshot tree could not be diffed: {exc}", ""
+        return drop_base_only_deletions(text, _covered_paths(debug_dir, tree.name)), None, SNAPSHOT
     diff_path = debug_dir / f"{tree.name}.diff"
     hashes_path = debug_dir / f"{tree.name}.hashes.json"
     if diff_path.is_file() and hashes_path.is_file():
         text, reason = _read_compacted(diff_path, hashes_path)
-        return (text, None, COMPACTED) if text is not None else (None, reason, "")
+        if text is None:
+            return None, reason, ""
+        # The manifest outlives the tree it describes (compaction removes only the
+        # tree), so the covered set is read the same way in both cases.
+        return drop_base_only_deletions(text, _covered_paths(debug_dir, tree.name)), None, COMPACTED
     if diff_path.is_file() or hashes_path.is_file():
         return None, "the compacted .diff and .hashes.json are not both present", ""
     return None, "no snapshot tree and no compacted .diff/.hashes.json", ""
@@ -567,6 +646,13 @@ class Tally:
     equivalent: int = 0
     cap_reached: bool = False
     failed_keys: int = 0
+    unobservable: int = 0
+    """Graded candidates whose patch would not apply (``label_input`` =
+    ``unobservable``). Censored, not failed (§5.2 step 2): neither ``bad`` nor
+    ``good``, so they are counted here and excluded from selection entirely."""
+    unobservable_reasons: list[dict[str, Any]] = field(default_factory=list)
+    """One record per unobservable grade — its hash, provenance and why it did not
+    apply — so the count can be read back with the reason that produced it."""
 
 
 def dedupe(attempts: Sequence[HarvestedAttempt]) -> tuple[list[PatchCandidate], int]:
@@ -625,6 +711,13 @@ def select(
     candidate that reproduces the reference fix is counted ``equivalent`` and does
     not spend budget — it is neither bad nor model-written-good.
 
+    An ``unobservable`` grade (#F bug 1) is counted and **dropped**, exactly as the
+    mutants pool drops a candidate that will not apply: it is a fact about the patch
+    artifact, not about the patch's behaviour, so it may be neither ``bad`` nor
+    ``good``, and keeping it would put a patch no reviewer can be scored on into a
+    pool every review row is measured against. The search keeps spending its budget
+    (``graded`` counts it) until the cap or a full pair of sides stops it.
+
     [VANTA-WHY] "Keep at most two of each side" is a **cap on the kept lists**, not
     only a stop condition. The two sides fill at different speeds: a bug whose
     Creator usually works produces good patches long after its two bad ones, and
@@ -648,6 +741,19 @@ def select(
             continue
         tally.graded += 1
         result = grade_fn(candidate)
+        if result.label_input == "unobservable":
+            tally.unobservable += 1
+            tally.unobservable_reasons.append(
+                {
+                    "patch_sha256": sha256_text(candidate.text),
+                    "patch_source": candidate.tag,
+                    "attempt": candidate.attempt,
+                    "reason": result.apply_detail
+                    or result.error
+                    or "the patch did not apply to the grading tree",
+                }
+            )
+            continue
         if result.patch_good:
             if len(good) < max_good:
                 good.append((candidate, result))
@@ -729,6 +835,7 @@ _REQUIRED_HEADER_KEYS = (
     "bad",
     "good",
     "equivalent",
+    "unobservable",
     "cap-reached",
     "missing-snapshot",
     "not-reviewable",
@@ -755,6 +862,30 @@ def _optional_sha(value: Optional[str]) -> str:
     return value if value else "null"
 
 
+def _verified_body(text: str, target: Path) -> tuple[dict[str, str], str]:
+    """``(header, canonical body)`` — after the body is checked against its header hash.
+
+    The one place the lock's content check lives: :func:`parse_pool` runs it and
+    keeps going, :func:`previous_pool_sha256` runs it and stops at the hash.
+    """
+    header, body_text = _header_block(text)
+    _, after = _section(body_text, POOL_MARKER)
+    body = _canonical_body(after)
+    recorded = header.get("content-sha256")
+    if not recorded:
+        raise PoolError(
+            f"{target}: the header has no 'content-sha256' line, so the file's bytes "
+            "cannot be checked against what it says it is"
+        )
+    actual = sha256_text(body)
+    if actual != recorded:
+        raise PoolError(
+            f"{target}: content-sha256 in the header is {recorded}, but the body "
+            f"hashes to {actual} — the file was edited after it was frozen"
+        )
+    return header, body
+
+
 def render_pool(
     *,
     prep: BugPrep,
@@ -776,6 +907,7 @@ def render_pool(
                 "count": mutants.count,
             },
             "entries": [_entry_dict(entry) for entry in entries],
+            "unobservable": list(tally.unobservable_reasons),
         },
         indent=2,
         ensure_ascii=False,
@@ -798,6 +930,7 @@ def render_pool(
         f"- bad: {tally.bad}",
         f"- good: {tally.good}",
         f"- equivalent: {tally.equivalent}",
+        f"- unobservable: {tally.unobservable}",
         f"- cap-reached: {'true' if tally.cap_reached else 'false'}",
         f"- missing-snapshot: {tally.missing_snapshot}",
         f"- not-reviewable: {tally.not_reviewable}",
@@ -892,10 +1025,31 @@ def load_pool(path: Path) -> PoolFile:
     return locked.load(path, parse=parse_pool, error=PoolError, what="assembled pool")
 
 
+def previous_pool_sha256(path: Path) -> str:
+    """The ``content-sha256`` of the pool file a ``--rebuild`` is about to replace.
+
+    [VANTA-WHY] Read with the **body check alone**, not through :func:`parse_pool`:
+    a rebuild exists to replace a file an *older build* wrote, and that file may be
+    missing a header key this version added (``unobservable``). Imposing the current
+    key set on the file being replaced would make ``--rebuild`` refuse exactly the
+    files it is for. The hash it returns is still the hash of the bytes on disk, and
+    the body is still verified against it, so a file edited after it was frozen
+    cannot be silently replaced.
+    """
+    target = Path(path)
+    try:
+        with target.open("r", encoding="utf-8", newline="") as handle:
+            text = handle.read()
+    except OSError as exc:
+        raise PoolError(f"cannot read the pool file {target} to rebuild it: {exc}") from exc
+    header, _ = _verified_body(text, target)
+    return header["content-sha256"]
+
+
 def parse_pool(text: str, *, path: Path) -> PoolFile:
     """Verify and read the artifact's text — the one parser, for writer and reader."""
     target = Path(path)
-    header, body_text = _header_block(text)
+    header, body = _verified_body(text, target)
     locked.require_keys(
         header,
         _REQUIRED_HEADER_KEYS,
@@ -904,14 +1058,6 @@ def parse_pool(text: str, *, path: Path) -> PoolFile:
         what="pool file",
         why="say what it came from and what it holds",
     )
-    _, after = _section(body_text, POOL_MARKER)
-    body = _canonical_body(after)
-    actual = sha256_text(body)
-    if actual != header["content-sha256"]:
-        raise PoolError(
-            f"{target}: content-sha256 in the header is {header['content-sha256']}, but "
-            f"the body hashes to {actual} — the file was edited after it was frozen"
-        )
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
@@ -936,6 +1082,12 @@ def parse_pool(text: str, *, path: Path) -> PoolFile:
                 f"{value!r} — the two halves of the mutants reference disagree"
             )
     entries = [_entry_from(raw) for raw in payload.get("entries", [])]
+    raw_unobservable = payload.get("unobservable")
+    unobservable_reasons = (
+        [dict(item) for item in raw_unobservable if isinstance(item, dict)]
+        if isinstance(raw_unobservable, list)
+        else []
+    )
     mutants_entries = _verify_mutants(target, mutants)
     previous = header["previous-sha256"]
     return PoolFile(
@@ -951,6 +1103,8 @@ def parse_pool(text: str, *, path: Path) -> PoolFile:
             bad=_int_of(header["bad"]),
             good=_int_of(header["good"]),
             equivalent=_int_of(header["equivalent"]),
+            unobservable=_int_of(header["unobservable"]),
+            unobservable_reasons=unobservable_reasons,
             cap_reached=header["cap-reached"].strip().lower() in ("true", "1", "yes"),
             missing_snapshot=_int_of(header["missing-snapshot"]),
             not_reviewable=_int_of(header["not-reviewable"]),
@@ -1155,7 +1309,10 @@ def run_pool(
                 "review; rebuilding it re-labels candidates that reviews already scored. "
                 "Pass --rebuild to replace it (the replaced file's hash is recorded)."
             )
-        previous_sha256 = load_pool(target).content_sha256
+        # Read the header hash *without* the full key check: an older build could
+        # have written this file before ``unobservable`` existed, and a rebuild that
+        # refuses to replace the file it was asked to replace is useless (#F).
+        previous_sha256 = previous_pool_sha256(target)
 
     # Built exactly as `candidate_set` builds them (`runner.py`), so a review reads
     # one floor and one fix, not two spellings.
@@ -1287,6 +1444,7 @@ def render_pool_line(prep: BugPrep, result: PoolResult) -> str:
         f"not-reviewable {tally.not_reviewable} · duplicates {tally.duplicates} · "
         f"candidates {tally.candidates} · graded {tally.graded} · bad {tally.bad} · "
         f"good {tally.good} · equivalent {tally.equivalent} · "
+        f"unobservable {tally.unobservable} · "
         f"cap-reached {'true' if tally.cap_reached else 'false'} · {result.path}"
     )
 

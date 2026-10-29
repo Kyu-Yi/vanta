@@ -22978,6 +22978,13 @@ def _pool_good(candidate) -> oracle_mod.OracleResult:
     return oracle_mod.OracleResult(apply_ok=True, hidden_pass=True, patch_good=True)
 
 
+def _pool_unobservable(candidate) -> oracle_mod.OracleResult:
+    """A patch the grading tree refused — the §5.2 censor, not a failed model patch."""
+    return oracle_mod.OracleResult(
+        apply_ok=False, apply_detail="error: invalid path '.git/HEAD'"
+    )
+
+
 def _frozen_mutants(batch_dir: Path, prep: prepare_mod.BugPrep, entries=None) -> Path:
     """A real, frozen item-5 pool for a bug — the referent item 6 names by hash."""
     entries = entries or [
@@ -23206,7 +23213,16 @@ class TestPoolHarvest:
     def test_a_compacted_attempt_reconstructs_the_same_normalised_diff(self, tmp_path):
         prep = _pool_prep(tmp_path)
         base, tree = self._tree(tmp_path, prep)
+        # A tracked file the snapshot never held: diffing the partial tree against the
+        # full base reports it as deleted, and that spurious section is what `git apply`
+        # refuses in the grading tree (#F bug 2). The manifest is the covered set.
+        write(base / "README.md", "# demo\n")
+        write(
+            tree.parent / f"{tree.name}_manifest.json",
+            json.dumps({"file_count": 1, "paths": ["pkg/mod.py"]}),
+        )
         snapshot = compact_mod.tree_diff(base, tree)
+        assert "deleted file mode" in snapshot  # the spurious section is really there
         # Replace the tree with the compacted pair, exactly as compaction leaves it.
         import shutil
 
@@ -23222,7 +23238,12 @@ class TestPoolHarvest:
         assert len(harvest.attempts) == 1
         attempt = harvest.attempts[0]
         assert attempt.origin == pool_mod.COMPACTED
-        assert pool_mod.normalize(attempt.patch_text) == pool_mod.normalize(snapshot)
+        # The base-only deletion is dropped; what is left is the one real section.
+        assert "deleted file mode" not in attempt.patch_text
+        assert "README.md" not in attempt.patch_text
+        assert attempt.patch_text.count("diff --git") == 1
+        assert "pkg/mod.py" in attempt.patch_text
+        assert "second = 22" in attempt.patch_text
 
     def test_a_tampered_compacted_diff_is_recorded_as_missing_snapshot(self, tmp_path):
         prep = _pool_prep(tmp_path)
@@ -23328,6 +23349,42 @@ class TestPoolHarvest:
             tmp_path, records=[_attempt_row(arm="b2")], preps={prep.key: prep}
         )
         assert harvest.attempts[0].source_model == "b2"
+
+    def test_a_reconstructed_attempt_drops_the_bases_deletions_like_final_patch(self, tmp_path):
+        """#F bug 2: the snapshot holds only the tracked files, so the raw diff reads
+        the base's *other* files (``.git/``, ``README.md``) as deleted and ``git apply``
+        refuses it (``invalid path '.git/HEAD'``) — a real attempt graded unobservable.
+        The covered set, read from the manifest beside the tree, drops exactly those
+        sections, leaving the change ``final.patch`` records.
+        """
+        prep = _pool_prep(tmp_path)
+        base = prep.root / "vanta_clean"
+        write(base / "pkg" / "mod.py", "one = 1\nsecond = 2\n")
+        write(base / ".git" / "HEAD", "ref: refs/heads/main\n")
+        write(base / "README.md", "demo\n")
+        debug = tmp_path / "vanta_sessions" / "sid" / "debug"
+        tree = debug / "attempt_1_patched_tree"
+        write(tree / "pkg" / "mod.py", "one = 1\nsecond = 22\n")
+        write(
+            debug / "attempt_1_patched_tree_manifest.json",
+            json.dumps({"file_count": 1, "paths": ["pkg/mod.py"]}),
+        )
+        # `final.patch` is the same change against a base the extra files never had.
+        covered_only = tmp_path / "covered"
+        write(covered_only / "pkg" / "mod.py", "one = 1\nsecond = 2\n")
+        final_text = compact_mod.tree_diff(covered_only, tree)
+        final = write(tmp_path / "final.patch", final_text)
+        harvest = self._harvest(
+            tmp_path,
+            records=[_attempt_row(attempts_run=2, artifacts={"final_patch": str(final)})],
+            preps={prep.key: prep},
+        )
+        reconstructed = next(attempt for attempt in harvest.attempts if attempt.attempt == 1)
+        assert reconstructed.origin == pool_mod.SNAPSHOT
+        assert ".git/HEAD" not in reconstructed.patch_text
+        assert "README.md" not in reconstructed.patch_text
+        assert "deleted file mode" not in reconstructed.patch_text
+        assert reconstructed.patch_text == final_text
 
 
 class TestPoolDedupe:
@@ -23447,6 +23504,49 @@ class TestPoolSelect:
         assert [c.normalized_sha256 for c, _ in first.bad] == [
             c.normalized_sha256 for c, _ in second.bad
         ]
+
+    def test_an_unobservable_grade_is_never_selected_as_bad_or_good(self):
+        """#F bug 1: a patch that will not apply is censored (§5.2), not a failed model patch."""
+        candidates = [_cand(f"{index:064d}") for index in range(3)]
+
+        def grade(candidate):
+            if candidate.normalized_sha256 == "0" * 64:
+                return _pool_unobservable(candidate)
+            return _pool_bad(candidate)
+
+        selected = pool_mod.select(
+            candidates=candidates, grade_fn=grade, reference_sha256="none", tally=pool_mod.Tally()
+        )
+        # The censored candidate is neither kept nor counted against either side…
+        assert all(result.label_input != "unobservable" for _, result in selected.bad + selected.good)
+        assert [c.normalized_sha256 for c, _ in selected.bad] == [
+            f"{1:064d}",
+            f"{2:064d}",
+        ]
+        assert selected.good == []
+        # …but it is counted, with a reason, and it spent budget: the search kept
+        # looking and still found both bad candidates behind it.
+        assert selected.tally.unobservable == 1
+        assert selected.tally.graded == 3
+        assert selected.tally.bad == 2
+        (reason,) = selected.tally.unobservable_reasons
+        assert reason["patch_sha256"] == pool_mod.sha256_text(candidates[0].text)
+        assert reason["patch_source"] == "repair"
+        assert reason["attempt"] == 1
+        assert reason["reason"] == "error: invalid path '.git/HEAD'"
+
+    def test_a_pool_of_only_unobservable_grades_selects_nothing(self):
+        """No gradable candidate means an empty pool, never a side padded with censored patches."""
+        candidates = [_cand(f"{index:064d}") for index in range(3)]
+        selected = pool_mod.select(
+            candidates=candidates,
+            grade_fn=_pool_unobservable,
+            reference_sha256="none",
+            tally=pool_mod.Tally(),
+        )
+        assert selected.bad == [] and selected.good == []
+        assert selected.tally.unobservable == 3
+        assert selected.tally.graded == 3
 
 
 class TestPoolArtifact:
@@ -23592,6 +23692,52 @@ class TestPoolArtifact:
         stripped = text.replace("- sort-key: (source_priority, sha256)\n", "")
         with pytest.raises(pool_mod.PoolError, match="sort-key"):
             pool_mod.parse_pool(stripped, path=tmp_path / "out" / "pool" / "Demo_1.json")
+
+    def test_the_unobservable_count_and_reasons_round_trip(self, tmp_path):
+        """#F bug 1: the censor is recorded per bug, with the reason that produced it."""
+        prep = _pool_prep(tmp_path)
+        mutants_file = _frozen_mutants(tmp_path / "batch", prep)
+        reason = {
+            "patch_sha256": "3" * 64,
+            "patch_source": "repair",
+            "attempt": 1,
+            "reason": "error: invalid path '.git/HEAD'",
+        }
+        path = pool_mod.write_pool(
+            pool_mod.pool_path(tmp_path / "out", prep),
+            prep=prep,
+            mutants=_mutants_ref(mutants_file),
+            reference_sha256="r" * 64,
+            noop_sha256="n" * 64,
+            tally=pool_mod.Tally(graded=3, bad=2, unobservable=1, unobservable_reasons=[reason]),
+            entries=self._entries(),
+            sources=["repair"],
+        )
+        assert "- unobservable: 1" in path.read_text(encoding="utf-8")
+        pool = pool_mod.load_pool(path)
+        assert pool.tally.unobservable == 1
+        assert pool.tally.unobservable_reasons == [reason]
+
+    def test_a_pool_written_before_unobservable_can_still_be_rebuilt(self, tmp_path):
+        """#F: `--rebuild` must read the hash of a file an older build wrote, which predates
+        the ``unobservable`` key — the full reader would refuse the very file it replaces."""
+        prep = _pool_prep(tmp_path)
+        mutants_file = _frozen_mutants(tmp_path / "batch", prep)
+        path = pool_mod.write_pool(
+            pool_mod.pool_path(tmp_path / "out", prep),
+            prep=prep,
+            mutants=_mutants_ref(mutants_file),
+            reference_sha256="r" * 64,
+            noop_sha256="n" * 64,
+            tally=pool_mod.Tally(),
+            entries=[],
+            sources=["repair"],
+        )
+        legacy = path.read_text(encoding="utf-8").replace("- unobservable: 0\n", "")
+        path.write_text(legacy, encoding="utf-8")
+        with pytest.raises(pool_mod.PoolError, match="unobservable"):
+            pool_mod.load_pool(path)
+        assert re.fullmatch(r"[0-9a-f]{64}", pool_mod.previous_pool_sha256(path))
 
     def test_the_mutants_count_is_verified(self, tmp_path):
         prep = _pool_prep(tmp_path)

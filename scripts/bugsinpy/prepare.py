@@ -958,6 +958,48 @@ def graded_skip_failure(
     return f"{GRADED_SKIP_REASON} Measured: {'; '.join(measured)}"
 
 
+UNMEASURED_RUN_REASON = (
+    "a graded suite run produced no report the harness could read, so the sets derived "
+    "from it are empty for a reason that is not the project's tests. Each tree is run "
+    "twice and every set is measured from those two runs (§1.3 step 3) — preexisting "
+    "failures from the buggy commit, FAIL_TO_PASS from F_before \\ F_after, the relaxed "
+    "fixed-tree gate from F_after — so a run that was killed, hit the cap, or left a "
+    "report nothing can read measured nothing, and an oracle derived from it would be an "
+    "oracle about the run rather than about the bug. pandas/1 was refused as having "
+    "\"no oracle\" when its whole pandas/tests run had in fact been killed by the OOM "
+    "killer at ~61 % in a 2048 MB VM. The state of each run is named below"
+)
+"""Why an unmeasured suite run is a gate failure — see :func:`unmeasured_run_failure`."""
+
+
+def unmeasured_run_failure(
+    runs: Sequence[tuple[str, suite_mod.SuitePair]],
+) -> str:
+    """The gate reason when a graded run is not a measurement, or ``""``.
+
+    [VANTA-WHY] The report's absence is evidence, and this is where it is read. The
+    alternative — trusting the empty sets the husk leaves behind — is worse than a
+    refusal in both directions, because it is *silent*: a killed oracle run reads as
+    "no FAIL_TO_PASS", and a killed **fixed** run reads as "the fix makes everything the
+    buggy commit failed pass", which is a fabricated oracle that would grade every
+    candidate wrong. The reason names the tree, the pass and the state, so the reader
+    knows which of the runs to re-run rather than which test to look at.
+
+    Reads :func:`suite.run_state` per run, so the vocabulary — ``killed (exit 137,
+    likely out of memory)``, ``timed out (hit the cap)``, ``exited N without a report``,
+    ``report unreadable (…)`` — is stated once, in the module that owns the runs.
+    """
+    unmeasured: list[str] = []
+    for label, pair in runs:
+        for index, run in ((1, pair.first), (2, pair.second)):
+            state = suite_mod.run_state(run)
+            if state:
+                unmeasured.append(f"{label}, run {index}: {state}")
+    if not unmeasured:
+        return ""
+    return f"{UNMEASURED_RUN_REASON}. Runs: {'; '.join(unmeasured)}"
+
+
 def skip_count(pair: suite_mod.SuitePair) -> int:
     """How many nodeids this run stably recorded as ``skipped``.
 
@@ -1013,6 +1055,21 @@ def derive_hidden(
     prep.f2p_undeclared = undeclared
     prep.f2p_undeclared_reason = UNDECLARED_F2P_REASON if undeclared else ""
 
+    # Read before any gate that reads the sets above. A run that is not a measurement
+    # makes every one of those sets empty for a reason that is not the project's tests,
+    # so the gates below would be statements about the run rather than about the bug —
+    # and the "no oracle" one, the sharpest of them, was measured saying exactly that
+    # about pandas/1 while its suite had been killed (J).
+    unmeasured = unmeasured_run_failure(
+        (
+            ("the buggy commit", buggy),
+            ("the oracle tree", before),
+            ("the fixed commit", after),
+        )
+    )
+    if unmeasured:
+        prep.gate_failures.append(unmeasured)
+
     # [VANTA-WHY] The oracle is :attr:`BugPrep.hidden_nodeids` — the declared
     # ``FAIL_TO_PASS`` *plus* the recorded collect-flips (item 3) — so "no oracle to
     # grade against" means *neither*, not merely an empty ``FAIL_TO_PASS``. Keying on
@@ -1021,15 +1078,24 @@ def derive_hidden(
     # at import on the buggy source and collects cleanly on the fixed one) *are* a real
     # oracle: the same set ``grade``/``selfcheck_dev_fix`` grade. Firing the gate there
     # reported "no oracle" about a bug that had one.
-    if not prep.hidden_nodeids:
+    #
+    # Not fired when a run was unmeasured: an empty ``hidden_nodeids`` then says the runs
+    # produced nothing, not that the tests do not flip, and :func:`unmeasured_run_failure`
+    # has already said which run and how. A reason that named the wrong cause is worse
+    # than no reason — it sends the reader to the test instead of to the run.
+    if not prep.hidden_nodeids and not unmeasured:
         prep.gate_failures.append(
             "empty FAIL_TO_PASS: no test BugsInPy declares for this bug flips between the "
             "buggy source and the fixed commit's tests, and no collect-flip oracle was "
             "recorded, so there is no oracle to grade against"
         )
 
+    # Same reason, same suppression: ``F_after \\ F_buggy_pre`` is only a statement about
+    # the fixed tree when both trees were measured. With the buggy run unmeasured,
+    # ``f_buggy_pre`` is empty and this gate would report the whole fixed failure set as a
+    # native regression the bug does not have.
     fixed_only = sorted(f_after - f_buggy_pre)
-    if fixed_only:
+    if fixed_only and not unmeasured:
         prep.gate_failures.append(
             "the fixed tree fails tests the buggy tree does not — the relaxed fixed-tree "
             f"gate (F_after \\ F_buggy_pre == empty) is violated: {fixed_only}"
@@ -1182,6 +1248,15 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> No
         return
 
     after_strip = _suite(checkpoint, batch_dir, prep, "vanta_tree", "vanta")
+    # The same rule as ``derive_hidden``'s, on the fifth graded run. The baseline below
+    # is measured from it, and an unmeasured run leaves it empty — which reads as "the
+    # tree is natively green" and would clear every candidate of every regression. Left
+    # as it is (``native_green_on_vanta_tree`` stays ``False``) rather than written,
+    # because a value derived from a run that measured nothing is a false green.
+    unmeasured = unmeasured_run_failure((("the vanta tree", after_strip),))
+    if unmeasured:
+        prep.gate_failures.append(unmeasured)
+        return
     prep.native_failure_baseline = sorted(after_strip.stable_failures)
     prep.pass_to_pass_count = len(after_strip.stable_collected) - len(
         prep.native_failure_baseline

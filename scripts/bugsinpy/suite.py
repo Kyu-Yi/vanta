@@ -40,6 +40,18 @@ the same report, counts it as not passing. Named once here so the two readers ca
 disagree about which string they mean.
 """
 
+SIGKILL_EXIT = 137
+"""``128 + 9`` — the shell's code for a process the kernel ended with ``SIGKILL``.
+
+[VANTA-WHY] This is how a suite killed for memory ends. The kernel's OOM killer sends
+the signal, and the code is what the wrapper's ``set +e`` script records
+(:func:`_exit_code`), so the state survives the kill and can be named *without* booting
+anything. Measured on pandas/1: the whole ``pandas/tests`` run in a 2048 MB VM was
+killed at ~61 % and the harness read the empty report as "there is no oracle".
+pytest's own exit codes stop at 5, so 137 can only have come from a signal — which is
+what makes "likely out of memory" a reading of the evidence rather than a guess.
+"""
+
 
 class SuiteError(RuntimeError):
     """The suite could not be run or its report could not be read."""
@@ -55,6 +67,15 @@ class SuiteRun:
     stdout_tail: str = ""
     stderr_tail: str = ""
     report_found: bool = False
+    report_error: str = ""
+    """Why an existing report file could not be read, or ``""``.
+
+    [VANTA-WHY] A report that is *there* and unreadable is a third state, not a missing
+    one: ``_load_run`` used to let :func:`parse_report` raise on it, which turned a
+    truncated or corrupt JSON — the shape a killed, mid-write run leaves — into an
+    exception out of the whole bug rather than a named refusal. Kept as text so the
+    reason can quote what the reader said.
+    """
 
     @property
     def failures(self) -> set[str]:
@@ -674,9 +695,48 @@ def _load_run(report: Path, result: shuru.ExecResult, *, suffix: str) -> SuiteRu
         stderr_tail=result.stderr[-2000:],
     )
     if report.is_file():
-        run.outcomes = parse_report(report)
-        run.report_found = True
+        try:
+            run.outcomes = parse_report(report)
+        except SuiteError as exc:
+            # Reported, not raised: the file exists and cannot be read, which is a state
+            # the run's own reader has to name (`run_state`) rather than an exception
+            # that escapes the bug. See `SuiteRun.report_error`.
+            run.report_error = str(exc)
+        else:
+            run.report_found = True
     return run
+
+
+def run_state(run: SuiteRun) -> Optional[str]:
+    """Why ``run`` is not a measurement, or ``None`` when it is one.
+
+    [VANTA-WHY] A :class:`SuiteRun` with no report has empty ``outcomes``, so every set
+    derived from it — :attr:`failures`, the ``F_before \\ F_after`` flip, the
+    pre-existing-failure baseline — is empty for a reason that has nothing to do with
+    the project's tests. Read as data, that emptiness says "no test fails". Measured on
+    pandas/1: the harness refused the bug as having "no oracle" when its suite had in
+    fact been killed by the OOM killer at ~61 %. A run that was killed, hit the cap, or
+    left a report nothing can read measured nothing — the report's *absence* is itself
+    the measurement, and `prepare` refuses the bug with this reason instead of deriving
+    an oracle from the husk.
+
+    The ending comes first, because the ending is what explains the report:
+    ``timed_out`` and :data:`SIGKILL_EXIT` are the two ways a run is stopped before it
+    can write one. A readable report beside a ``SIGKILL`` is still refused: pytest-json-report
+    writes at session end, so a killed pytest cannot have produced it, and pytest's own
+    codes stop at 5 — the file would be a stale one, not this run's.
+    """
+    if run.timed_out:
+        return "timed out (hit the cap)"
+    if run.exit_code == SIGKILL_EXIT:
+        return f"killed (exit {SIGKILL_EXIT}, likely out of memory)"
+    if run.report_error:
+        return f"report unreadable ({run.report_error})"
+    if run.report_found:
+        return None
+    if run.exit_code is None:
+        return "wrote neither a report nor an exit status"
+    return f"exited {run.exit_code} without a report"
 
 
 def _exit_code(stdout: str, suffix: str) -> Optional[int]:

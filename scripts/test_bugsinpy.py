@@ -2048,6 +2048,195 @@ class TestDeclaredFailToPass:
         assert seen["tree_name"] == "vanta_tree"
 
 
+class TestUnmeasuredRunRefusal:
+    """A graded suite run that measured nothing refuses the bug, naming the run and its
+    state (J).
+
+    [VANTA-WHY] The harness used to derive an oracle from the empty sets a killed run
+    leaves behind, and it printed a reason about the *tests*. Measured on pandas/1: refused
+    as "empty FAIL_TO_PASS: no test BugsInPy declares for this bug flips between the buggy
+    source and the fixed commit's tests" when its whole ``pandas/tests`` run had in fact
+    been killed by the OOM killer at ~61 % in a 2048 MB VM. The stricter half is the one
+    that was silent: with the **fixed** run killed, ``F_before \\ F_after`` is the whole
+    buggy failure set, so the run *fabricates* a FAIL_TO_PASS and the bug passes — every
+    candidate then graded against an oracle that is not the bug's. Both are refused here.
+
+    The bugs that already pass (sanic/1, PySnooper/3, fastapi/1, fastapi/2) all have full
+    report pairs — one ``SuiteRun`` per pass per tree, each with ``report_found`` true — so
+    :func:`suite.run_state` is ``None`` for every one of their runs and their prepare
+    outcome cannot move. The measured case below is that statement as an assertion.
+    """
+
+    @staticmethod
+    def _measured(failures: dict[str, str]) -> suite_mod.SuitePair:
+        run = suite_mod.SuiteRun(outcomes=dict(failures), exit_code=0, report_found=True)
+        return suite_mod.compare_runs(run, run)
+
+    @staticmethod
+    def _broken(**run_kwargs) -> suite_mod.SuitePair:
+        """A pair both of whose runs are in the same non-measured state."""
+        run = suite_mod.SuiteRun(**run_kwargs)
+        return suite_mod.compare_runs(run, run)
+
+    @staticmethod
+    def _derive(tmp_path, monkeypatch, pairs) -> prepare_mod.BugPrep:
+        monkeypatch.setattr(
+            prepare_mod,
+            "_suite",
+            lambda checkpoint, batch_dir, prep, tree_name, stem_suffix: pairs[tree_name],
+        )
+        bug_prep = prep(
+            bug=bug_info(test_file="tests/test_demo.py"),
+            root=tmp_path / "batch" / "worktrees" / "Demo_1",
+        )
+        prepare_mod.derive_hidden(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch", collected=set()
+        )
+        return bug_prep
+
+    def test_a_killed_run_names_every_tree_and_both_passes(self, tmp_path, monkeypatch):
+        killed = self._broken(exit_code=suite_mod.SIGKILL_EXIT)
+        bug_prep = self._derive(
+            tmp_path,
+            monkeypatch,
+            {"src_buggy": killed, "oracle_tree": killed, "src_fixed": killed},
+        )
+
+        assert len(bug_prep.gate_failures) == 1
+        reason = bug_prep.gate_failures[0]
+        assert "killed (exit 137, likely out of memory)" in reason
+        for tree in ("the buggy commit", "the oracle tree", "the fixed commit"):
+            assert f"{tree}, run 1" in reason and f"{tree}, run 2" in reason
+        assert not any("empty FAIL_TO_PASS" in f for f in bug_prep.gate_failures), (
+            "the reason has to be the run's state, not a claim about the project's tests"
+        )
+
+    def test_a_timed_out_run_names_the_cap(self, tmp_path, monkeypatch):
+        bug_prep = self._derive(
+            tmp_path,
+            monkeypatch,
+            {
+                "src_buggy": self._broken(timed_out=True),
+                "oracle_tree": self._measured({}),
+                "src_fixed": self._measured({}),
+            },
+        )
+
+        assert len(bug_prep.gate_failures) == 1
+        assert "the buggy commit, run 1: timed out (hit the cap)" in bug_prep.gate_failures[0]
+
+    def test_a_report_less_run_names_its_exit_code(self, tmp_path, monkeypatch):
+        bug_prep = self._derive(
+            tmp_path,
+            monkeypatch,
+            {
+                "src_buggy": self._measured({}),
+                "oracle_tree": self._broken(exit_code=4),
+                "src_fixed": self._measured({}),
+            },
+        )
+
+        assert len(bug_prep.gate_failures) == 1
+        assert "the oracle tree, run 1: exited 4 without a report" in bug_prep.gate_failures[0]
+
+    def test_an_unreadable_report_refuses_in_the_readers_own_words(
+        self, tmp_path, monkeypatch
+    ):
+        bug_prep = self._derive(
+            tmp_path,
+            monkeypatch,
+            {
+                "src_buggy": self._measured({}),
+                "oracle_tree": self._measured({}),
+                "src_fixed": self._broken(exit_code=0, report_error="cannot read pytest report r: boom"),
+            },
+        )
+
+        assert "report unreadable (cannot read pytest report r: boom)" in bug_prep.gate_failures[0]
+
+    def test_a_killed_fixed_run_does_not_fabricate_an_oracle(self, tmp_path, monkeypatch):
+        """The silent half: an empty ``f_after`` makes every buggy failure a "flip"."""
+        bug_prep = self._derive(
+            tmp_path,
+            monkeypatch,
+            {
+                "src_buggy": self._measured({"tests/test_demo.py::test_a": "failed"}),
+                "oracle_tree": self._measured({"tests/test_demo.py::test_a": "failed"}),
+                "src_fixed": self._broken(exit_code=suite_mod.SIGKILL_EXIT),
+            },
+        )
+
+        # The fabricated derivation is visible — and it is exactly why the gate fires.
+        assert bug_prep.fail_to_pass == ["tests/test_demo.py::test_a"]
+        assert len(bug_prep.gate_failures) == 1
+        assert "the fixed commit, run 1: killed (exit 137, likely out of memory)" in (
+            bug_prep.gate_failures[0]
+        )
+
+    def test_a_measured_derivation_is_unaffected(self, tmp_path, monkeypatch):
+        """The four code-11 bugs that pass have full report pairs, so nothing moves."""
+        bug_prep = self._derive(
+            tmp_path,
+            monkeypatch,
+            {
+                "src_buggy": self._measured({"tests/test_demo.py::test_a": "failed"}),
+                "oracle_tree": self._measured({"tests/test_demo.py::test_a": "failed"}),
+                "src_fixed": self._measured({"tests/test_demo.py::test_a": "passed"}),
+            },
+        )
+
+        assert bug_prep.gate_failures == []
+        assert bug_prep.fail_to_pass == ["tests/test_demo.py::test_a"]
+
+    def test_a_genuinely_empty_flip_still_says_no_oracle(self, tmp_path, monkeypatch):
+        """The empty-oracle reason is kept for the case it was written for."""
+        bug_prep = self._derive(
+            tmp_path,
+            monkeypatch,
+            {
+                "src_buggy": self._measured({}),
+                "oracle_tree": self._measured({}),
+                "src_fixed": self._measured({}),
+            },
+        )
+
+        assert any("empty FAIL_TO_PASS" in f for f in bug_prep.gate_failures)
+        assert not any("killed" in f or "without a report" in f for f in bug_prep.gate_failures)
+
+    def test_the_post_strip_run_is_checked_too(self, tmp_path, monkeypatch):
+        """``native_failure_baseline`` is measured from the fifth run.
+
+        Empty reads as "the tree is natively green", which would clear every candidate of
+        every regression — the false-green direction of the same defect.
+        """
+        root = tmp_path / "batch" / "worktrees" / "Demo_1"
+        write(root / "oracle_tree" / "tests" / "test_demo.py", "def test_a():\n    assert 1\n")
+        monkeypatch.setattr(prepare_mod, "_read_report", lambda batch_dir, stem: {"tests": []})
+        monkeypatch.setattr(
+            prepare_mod,
+            "_suite",
+            lambda *args, **kwargs: self._broken(exit_code=suite_mod.SIGKILL_EXIT),
+        )
+        bug_prep = prep(
+            root=root,
+            test_paths=["tests"],
+            fail_to_pass=["tests/test_demo.py::test_a"],
+        )
+
+        prepare_mod.strip_and_baseline(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch"
+        )
+
+        assert any(
+            "the vanta tree, run 1: killed (exit 137, likely out of memory)" in f
+            for f in bug_prep.gate_failures
+        )
+        assert bug_prep.native_failure_baseline == []
+        assert bug_prep.native_green_on_vanta_tree is False, (
+            "an unmeasured baseline must not be written as a green tree"
+        )
+
+
 # ============================================================================
 # context.py — the gate measures the run's own selection, not a mirror of it
 # ============================================================================
@@ -5489,6 +5678,103 @@ class TestSuiteReport:
             suite_mod.report_tests("passed")
         with pytest.raises(suite_mod.SuiteError, match="`tests` is a str"):
             suite_mod.report_tests({"tests": "nope"})
+
+
+class TestRunState:
+    """A run that measured nothing says which kind of nothing it is (J).
+
+    [VANTA-WHY] This is the reader ``prepare`` refuses a bug with. Each state calls for a
+    different response — a killed run wants memory or a smaller target, a timed-out run
+    wants the cap, an unreadable report wants the plugin, a plain exit without a report
+    wants the command — so a single "no report" string would leave the reader guessing,
+    which is exactly what happened: pandas/1's killed suite was reported as "empty
+    FAIL_TO_PASS: no test BugsInPy declares for this bug flips", a statement about the
+    project's tests. Nothing read these fields at all.
+    """
+
+    @staticmethod
+    def _result(**over) -> shuru_mod.ExecResult:
+        base = dict(stdout="", stderr="", exit_code=0, timed_out=False)
+        base.update(over)
+        return shuru_mod.ExecResult(**base)
+
+    def test_a_measured_run_has_no_state(self):
+        assert (
+            suite_mod.run_state(suite_mod.SuiteRun(exit_code=0, report_found=True)) is None
+        )
+
+    def test_a_measured_run_that_failed_is_still_measured(self):
+        """pytest's own exit code is 1 for failing tests — the report is the measurement."""
+        run = suite_mod.SuiteRun(
+            outcomes={"tests/test_a.py::test_b": "failed"}, exit_code=1, report_found=True
+        )
+        assert suite_mod.run_state(run) is None
+
+    def test_a_killed_run_names_the_signal_and_the_likely_cause(self):
+        assert (
+            suite_mod.run_state(suite_mod.SuiteRun(exit_code=suite_mod.SIGKILL_EXIT))
+            == "killed (exit 137, likely out of memory)"
+        )
+
+    def test_a_kill_outranks_the_missing_report_it_causes(self):
+        """The kill is the cause; "no report" would name the symptom (pandas/1)."""
+        assert suite_mod.run_state(suite_mod.SuiteRun(exit_code=137)).startswith("killed")
+
+    def test_a_readable_report_beside_a_kill_is_still_refused(self):
+        """pytest-json-report writes at session end, so a killed pytest cannot have
+        written it, and pytest's exit codes stop at 5 — the file would be a stale one."""
+        run = suite_mod.SuiteRun(
+            outcomes={"tests/test_a.py::test_b": "passed"},
+            exit_code=suite_mod.SIGKILL_EXIT,
+            report_found=True,
+        )
+        assert suite_mod.run_state(run).startswith("killed")
+
+    def test_a_timed_out_run_names_the_cap(self):
+        assert (
+            suite_mod.run_state(suite_mod.SuiteRun(exit_code=None, timed_out=True))
+            == "timed out (hit the cap)"
+        )
+
+    def test_a_run_that_exited_without_a_report_names_the_code(self):
+        assert (
+            suite_mod.run_state(suite_mod.SuiteRun(exit_code=4))
+            == "exited 4 without a report"
+        )
+
+    def test_a_run_that_left_neither_a_code_nor_a_report(self):
+        assert (
+            suite_mod.run_state(suite_mod.SuiteRun())
+            == "wrote neither a report nor an exit status"
+        )
+
+    def test_an_unreadable_report_is_named_and_quoted(self):
+        run = suite_mod.SuiteRun(exit_code=0, report_error="cannot read pytest report x: boom")
+        assert suite_mod.run_state(run) == "report unreadable (cannot read pytest report x: boom)"
+
+    def test_an_existing_report_that_cannot_be_read_is_a_state_not_an_exception(
+        self, tmp_path
+    ):
+        """A truncated report is the shape a killed mid-write run leaves.
+
+        ``_load_run`` used to let ``parse_report`` raise on it, which turned one bad file
+        into an exception out of the whole bug instead of a named refusal.
+        """
+        path = write(tmp_path / "r.json", json.dumps("passed"))
+        run = suite_mod._load_run(path, self._result(stdout="__VANTA_EXIT_1__=0"), suffix="1")
+
+        assert run.report_found is False
+        assert "cannot read" in run.report_error
+        assert suite_mod.run_state(run).startswith("report unreadable (")
+
+    def test_a_report_that_reads_sets_report_found(self, tmp_path):
+        entries = [{"nodeid": "tests/test_a.py::test_b", "outcome": "passed"}]
+        path = write(tmp_path / "r.json", json.dumps({"tests": entries}))
+        run = suite_mod._load_run(path, self._result(stdout="__VANTA_EXIT_1__=0"), suffix="1")
+
+        assert run.report_found is True
+        assert run.report_error == ""
+        assert suite_mod.run_state(run) is None
 
 
 class TestSuitePair:

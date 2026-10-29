@@ -1439,7 +1439,11 @@ class TestTestsInsideThePackageTreeSplit:
         assert (dest / "pandas" / "tests" / "dtypes" / "test_dtypes.py").read_text() == (
             "def test_new():\n    pass\n"
         ), "the fixed commit's test files are the point of the split"
-        assert tree_mod.leaked_source(buggy, dest) == []
+        assert tree_mod.leaked_source(
+            buggy,
+            dest,
+            ["pandas/core/common.py", "pandas/tests/dtypes/test_dtypes.py"],
+        ) == []
 
     def test_the_fixed_tests_helper_inside_the_package_still_comes_along(self, tmp_path):
         """Narrowing the rule must not cost the helper the fixed tests import."""
@@ -1464,7 +1468,13 @@ class TestTestsInsideThePackageTreeSplit:
 
 
 class TestLeakedSource:
-    """``prepare``'s check that a tree is the buggy source plus the fixed tests."""
+    """``prepare``'s check that a tree is the buggy source plus the fixed tests.
+
+    The comparison is over the paths git *tracks* in the buggy or fixed commit (item
+    N), so every case here names the tracked set explicitly — that is the git
+    ``ls-tree`` the guard is handed, and it is what makes a generated file in the
+    tree invisible to the guard rather than a name on a noise list.
+    """
 
     def test_a_clean_tree_reports_nothing(self, tmp_path):
         buggy = tmp_path / "buggy"
@@ -1474,14 +1484,16 @@ class TestLeakedSource:
         # Test files are *supposed* to differ: the fixed commit's tests are the split.
         write(buggy / "tests" / "test_demo.py", "def test_old():\n    pass\n")
         write(tree / "tests" / "test_demo.py", "def test_new():\n    pass\n")
-        assert tree_mod.leaked_source(buggy, tree) == []
+        assert tree_mod.leaked_source(
+            buggy, tree, ["demo.py", "tests/test_demo.py"]
+        ) == []
 
     def test_a_rewritten_source_file_is_named(self, tmp_path):
         buggy = tmp_path / "buggy"
         tree = tmp_path / "tree"
         write(buggy / "demo.py", "x = 1\n")
         write(tree / "demo.py", "x = 2\n")
-        assert tree_mod.leaked_source(buggy, tree) == ["demo.py"]
+        assert tree_mod.leaked_source(buggy, tree, ["demo.py"]) == ["demo.py"]
 
     def test_a_source_file_only_the_fix_has_is_named(self, tmp_path):
         buggy = tmp_path / "buggy"
@@ -1489,7 +1501,9 @@ class TestLeakedSource:
         write(buggy / "demo.py", "x = 1\n")
         write(tree / "demo.py", "x = 1\n")
         write(tree / "pkg" / "new_module.py", "y = 1\n")
-        assert tree_mod.leaked_source(buggy, tree) == ["pkg/new_module.py"]
+        assert tree_mod.leaked_source(
+            buggy, tree, ["demo.py", "pkg/new_module.py"]
+        ) == ["pkg/new_module.py"]
 
     def test_a_source_file_the_tree_lost_is_named(self, tmp_path):
         buggy = tmp_path / "buggy"
@@ -1497,7 +1511,9 @@ class TestLeakedSource:
         write(buggy / "demo.py", "x = 1\n")
         write(tree / "demo.py", "x = 1\n")
         write(buggy / "pkg" / "gone.py", "y = 1\n")
-        assert tree_mod.leaked_source(buggy, tree) == ["pkg/gone.py"]
+        assert tree_mod.leaked_source(
+            buggy, tree, ["demo.py", "pkg/gone.py"]
+        ) == ["pkg/gone.py"]
 
     def test_test_side_data_may_differ(self, tmp_path):
         """A fixture, a golden file, a helper package: test material, not source."""
@@ -1509,10 +1525,41 @@ class TestLeakedSource:
         write(tree / "tests" / "data" / "golden.json", '{"a": 1}\n')
         write(buggy / "tests" / "mini_toolbox" / "__init__.py", "V = 1\n")
         write(tree / "tests" / "mini_toolbox" / "__init__.py", "V = 2\n")
-        assert tree_mod.leaked_source(buggy, tree) == []
+        assert tree_mod.leaked_source(
+            buggy,
+            tree,
+            ["demo.py", "tests/data/golden.json", "tests/mini_toolbox/__init__.py"],
+        ) == []
 
-    def test_git_and_caches_are_not_compared(self, tmp_path):
-        """Two clones of one repository never agree about ``.git``; it is not source."""
+    def test_build_output_and_in_place_extensions_are_not_source(self, tmp_path):
+        """The shape pandas/1 and matplotlib/1 were refused on: the project's own build.
+
+        ``build/temp…/<name>.o``, ``build/lib…/<name>.so``, an in-place extension and
+        an ``.egg-info`` directory are all written into the tree by the build and the
+        suite, and none of them is tracked. They differ between the buggy checkout and
+        the tree (different timestamps, different paths baked in), which is exactly the
+        shape a filesystem walk reads as a leak and a git-tracked comparison cannot:
+        git lists none of these, so there is nothing to compare and nothing to name.
+        """
+        buggy = tmp_path / "buggy"
+        tree = tmp_path / "tree"
+        write(buggy / "pkg" / "mod.py", "x = 1\n")
+        write(tree / "pkg" / "mod.py", "x = 1\n")
+        write(
+            tree / "build" / "temp.linux-aarch64-3.8" / "pkg" / "mod.o",
+            "\x7fELF object file\n",
+        )
+        write(
+            tree / "build" / "lib.linux-aarch64-3.8" / "pkg" / "mod.so",
+            "\x7fELF shared object\n",
+        )
+        write(tree / "pkg" / "mod.cpython-38-aarch64-linux-gnu.so", "\x7fELF\n")
+        write(tree / "pkg.egg-info" / "PKG-INFO", "Name: pkg\n")
+        assert tree_mod.leaked_source(buggy, tree, ["pkg/mod.py", "setup.py"]) == []
+
+    def test_generated_files_are_ignored_by_construction_not_by_name(self, tmp_path):
+        """A file the guard would once have named is invisible because git does not
+        track it — the noise list is no longer what keeps it out."""
         buggy = tmp_path / "buggy"
         tree = tmp_path / "tree"
         write(buggy / "demo.py", "x = 1\n")
@@ -1521,14 +1568,14 @@ class TestLeakedSource:
         write(tree / ".git" / "HEAD", "ref: refs/heads/other\n")
         write(buggy / "__pycache__" / "demo.cpython-38.pyc", "")
         write(tree / "pkg" / "__pycache__" / "demo.cpython-38.pyc", "junk")
-        assert tree_mod.leaked_source(buggy, tree) == []
+        assert tree_mod.leaked_source(buggy, tree, ["demo.py"]) == []
 
     def test_the_hypothesis_database_is_not_source(self, tmp_path):
         """The shape pandas/1 hit: the suite's own example database, 145 files of it.
 
         ``<tree>/.hypothesis/examples/<hash>/<hash>`` is written by the run, not by
-        the commit, so it exists only in the tree a suite has already run in. Reading
-        it as source is what made the guard name the bug's own suite output.
+        the commit, so it is not tracked either — and it is not ``src_buggy``'s
+        because no suite has run there.
         """
         buggy = tmp_path / "buggy"
         tree = tmp_path / "tree"
@@ -1536,14 +1583,58 @@ class TestLeakedSource:
         write(tree / "demo.py", "x = 1\n")
         write(tree / ".hypothesis" / "examples" / "17ca9e36" / "3b3f4fd6", "")
         write(buggy / ".hypothesis" / "examples" / "aaaa" / "bbbb", "")
-        assert tree_mod.leaked_source(buggy, tree) == []
+        assert tree_mod.leaked_source(buggy, tree, ["demo.py"]) == []
+
+
+class TestTrackedPaths:
+    """The guard's candidate set comes from git, not from a walk of the filesystem."""
+
+    def test_it_is_the_union_of_both_commits(self, tmp_path):
+        """A path tracked in the buggy *or* fixed commit is a candidate.
+
+        The fixed commit is in the union for the added source file: a path the fix
+        creates is tracked in the fixed commit alone, and leaving it out would let an
+        added fixed source file sit in the tree unnamed.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        tree_mod._git(["init", "--quiet"], cwd=repo)
+        tree_mod._git(["config", "user.email", "t@example.com"], cwd=repo)
+        tree_mod._git(["config", "user.name", "T"], cwd=repo)
+        write(repo / "pkg" / "mod.py", "VALUE = 'buggy'\n")
+        write(repo / "pkg" / "tests" / "test_x.py", "def test_x():\n    pass\n")
+        tree_mod._git(["add", "-A"], cwd=repo)
+        tree_mod._git(["commit", "--quiet", "-m", "buggy"], cwd=repo)
+        buggy_commit = tree_mod._git(["rev-parse", "HEAD"], cwd=repo).strip()
+        write(repo / "pkg" / "mod.py", "VALUE = 'fixed'\n")
+        write(repo / "pkg" / "added.py", "NEW = 1\n")
+        tree_mod._git(["add", "-A"], cwd=repo)
+        tree_mod._git(["commit", "--quiet", "-m", "fixed"], cwd=repo)
+        fixed_commit = tree_mod._git(["rev-parse", "HEAD"], cwd=repo).strip()
+
+        src_buggy = tmp_path / "src_buggy"
+        src_fixed = tmp_path / "src_fixed"
+        tree_mod.export_tree(repo, buggy_commit, src_buggy)
+        tree_mod.export_tree(repo, fixed_commit, src_fixed)
+
+        assert tree_mod.tracked_paths([src_buggy, src_fixed]) == {
+            "pkg/mod.py",
+            "pkg/tests/test_x.py",
+            "pkg/added.py",
+        }
 
 
 class TestBuildTreesRefusesALeakedOracle:
     """The permanent guard, at the one place both trees are composed."""
 
     def _sources(self, tmp_path, monkeypatch):
-        """A buggy and a fixed commit, as two directories a fake ``export_tree`` copies."""
+        """A buggy and a fixed commit, as two directories a fake ``export_tree`` copies.
+
+        ``tracked_paths`` is faked too: the sources here are copied by ``export_tree``
+        rather than checked out by git, so there is no repository to ``ls-tree``. The
+        set is what a git repository of these two commits would report — the buggy
+        commit's ``pkg/mod.py`` and the fixed commit's ``pkg/added.py`` and test file.
+        """
         buggy = tmp_path / "cache" / "buggy"
         fixed = tmp_path / "cache" / "fixed"
         write(buggy / "pkg" / "mod.py", "VALUE = 'buggy'\n")
@@ -1556,6 +1647,11 @@ class TestBuildTreesRefusesALeakedOracle:
             "export_tree",
             lambda repo, commit, dest: tree_mod.copy_tree(by_commit[commit], dest),
         )
+        monkeypatch.setattr(
+            tree_mod,
+            "tracked_paths",
+            lambda checkouts: {"pkg/mod.py", "pkg/tests/test_x.py", "pkg/added.py"},
+        )
         return bug, buggy
 
     def test_the_narrowed_rule_composes_a_tree_with_no_leak(self, tmp_path, monkeypatch):
@@ -1564,7 +1660,9 @@ class TestBuildTreesRefusesALeakedOracle:
 
         test_paths = prepare_mod.build_trees(bug, tmp_path / "cache", root)
 
-        assert tree_mod.leaked_source(buggy, root / "oracle_tree") == []
+        assert tree_mod.leaked_source(
+            buggy, root / "oracle_tree", ["pkg/mod.py", "pkg/tests/test_x.py"]
+        ) == []
         assert "pkg/tests/test_x.py" in test_paths
 
     def test_the_first_component_rule_is_refused(self, tmp_path, monkeypatch):
@@ -2134,6 +2232,13 @@ class TestDeclaredFailToPass:
             return suite_mod.compare_runs(run, run)
 
         monkeypatch.setattr(prepare_mod, "_suite", fake_suite)
+        # No repository here, so the guard's candidate set is declared directly; both
+        # paths are test-side, which the guard exempts anyway.
+        monkeypatch.setattr(
+            tree_mod,
+            "tracked_paths",
+            lambda checkouts: {declared_file, undeclared_file},
+        )
         bug_prep = prep(
             root=root,
             test_paths=["tests"],
@@ -2314,7 +2419,10 @@ class TestUnmeasuredRunRefusal:
         """``native_failure_baseline`` is measured from the fifth run.
 
         Empty reads as "the tree is natively green", which would clear every candidate of
-        every regression — the false-green direction of the same defect.
+        every regression — the false-green direction of the same defect. The refusal is
+        reported to the caller (``False``) as well as recorded, so ``prepare_one`` does
+        not run the developer-fix self-check against a baseline that was never written
+        (J's principle).
         """
         root = tmp_path / "batch" / "worktrees" / "Demo_1"
         write(root / "oracle_tree" / "tests" / "test_demo.py", "def test_a():\n    assert 1\n")
@@ -2324,16 +2432,22 @@ class TestUnmeasuredRunRefusal:
             "_suite",
             lambda *args, **kwargs: self._broken(exit_code=suite_mod.SIGKILL_EXIT),
         )
+        # No repository here, so the guard's candidate set is declared directly. Only a
+        # test-side path, which the guard exempts — this test is about the run.
+        monkeypatch.setattr(
+            tree_mod, "tracked_paths", lambda checkouts: {"tests/test_demo.py"}
+        )
         bug_prep = prep(
             root=root,
             test_paths=["tests"],
             fail_to_pass=["tests/test_demo.py::test_a"],
         )
 
-        prepare_mod.strip_and_baseline(
+        recorded = prepare_mod.strip_and_baseline(
             bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch"
         )
 
+        assert recorded is False, "an unmeasured baseline must not be reported as recorded"
         assert any(
             "the vanta tree, run 1: killed (exit 137, likely out of memory)" in f
             for f in bug_prep.gate_failures
@@ -19418,6 +19532,11 @@ class TestDevFixSelfCheck:
         assert source.index("derive_hidden(") < source.index("check_gate_drift(")
         assert source.index("check_gate_drift(") < source.index("strip_and_baseline(")
         assert source.index("strip_and_baseline(") < source.index("selfcheck_dev_fix(")
+        # J's principle: the self-check grades against ``native_failure_baseline``, so a
+        # ``strip_and_baseline`` that refused (and returned before writing it) must not
+        # fall through to it — the guard has to sit between the two calls.
+        assert source.index("if not baseline_recorded:") < source.index("selfcheck_dev_fix(")
+        assert source.index("strip_and_baseline(") < source.index("if not baseline_recorded:")
         # §3.4: the build needs the layer (the toolchain and the compiler environment)
         # and has to precede the gate that imports the tree — a project whose package
         # has C extensions is not importable until its own setup.py has run.

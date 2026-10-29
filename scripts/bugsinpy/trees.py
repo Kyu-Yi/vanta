@@ -362,35 +362,57 @@ def test_paths_from_fix(bug: BugInfo, fixed_dir: Path) -> list[str]:
 _NOISE_DIRS = frozenset(
     {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".hypothesis"}
 )
-"""Directories whose contents are never compared. ``.git`` because the two trees
-are two *clones* of the same repository and their object stores and refs differ by
-construction, not by the bug; the caches because nothing in them is source.
+"""Directories whose contents are never compared.
 
-``.hypothesis`` is hypothesis's example database — a runtime cache written by the
-suite itself (``<tree>/.hypothesis/examples/<hash>/<hash>``), the same kind of
-artefact as ``.pytest_cache``. It appears only in the tree a suite has already run
-in (``oracle_tree`` when its run pollutes it, and so in the ``vanta_tree`` copied
-from it), never in ``src_buggy`` — so without this it is exactly the shape the leak
-guard exists to name, and it names 145 files of it for pandas/1."""
+Kept after the guard moved to git-tracked paths (item N), and it is now inert for
+every real project: ``git ls-tree`` never lists a path under ``.git`` or
+``__pycache__``, and a repository that tracks a file under a cache-named directory
+is committing a cache — the wrong thing to treat as source either way. ``.hypothesis``
+is hypothesis's example database, a runtime cache the suite writes into the tree it
+runs in, and it is the shape that made this list necessary; it stays here so that a
+project which *does* track one is still handled the same way it was before.
 
-
-def _source_files(root: Path) -> dict[str, str]:
-    """``{relative path: sha256}`` for every non-test-side file in ``root``."""
-    digests: dict[str, str] = {}
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(root).as_posix()
-        if any(part in _NOISE_DIRS for part in rel.split("/")):
-            continue
-        if is_test_side(rel):
-            continue
-        digests[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return digests
+The generated files the guard exists to ignore — ``build/**``, ``*.o``, ``*.so``,
+in-place extensions, ``*.egg-info`` — are not on this list, and must not be. They are
+ignored because git does not track them (:func:`tracked_paths`), so the guard has no
+noise list to grow as a project's build output changes."""
 
 
-def leaked_source(buggy_dir: Path, tree_dir: Path) -> list[str]:
-    """Source files where ``tree_dir`` is not the buggy commit's tree.
+def tracked_paths(checkouts: Iterable[Path]) -> set[str]:
+    """Every path git tracks in ``checkouts``, unioned, read from each one's ``HEAD``.
+
+    [VANTA-WHY] This is the candidate set the leak guard compares, and it is derived
+    from git rather than from a walk of the filesystem on purpose. A project with C
+    extensions leaves build output in the tree in place — ``build/temp…/<name>.o``,
+    ``build/lib…/<name>.so``, an in-place extension, ``*.egg-info``, a cache — and none
+    of it is tracked, so a filesystem walk finds files that differ between the buggy
+    commit and the tree for a reason that has nothing to do with the fix, and the guard
+    names the project's own build as a source leak. pandas/1 (100 ``.o`` files) and
+    matplotlib/1 (1338 ``.so`` files) were both refused that way.
+
+    ``src_buggy`` is exported at the buggy commit and ``src_fixed`` at the fixed one, so
+    their union is exactly "tracked in the buggy or fixed commit". The fixed commit is
+    in the union and not only the buggy one because a source file the fix *added* is
+    tracked in the fixed commit alone: leaving it out would let an added fixed source
+    file sit in the tree unnamed.
+    """
+    tracked: set[str] = set()
+    for checkout in checkouts:
+        tracked.update(list_files_at(checkout, "HEAD"))
+    return tracked
+
+
+def _digest(path: Path) -> Optional[str]:
+    """``sha256`` of ``path``'s bytes, or ``None`` when it is not a regular file."""
+    if not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def leaked_source(
+    buggy_dir: Path, tree_dir: Path, tracked: Iterable[str]
+) -> list[str]:
+    """Tracked source files where ``tree_dir`` is not the buggy commit's tree.
 
     [VANTA-WHY] Empty is the invariant, and it is the whole point of the tree
     split: the tree Vanta reads and the tree the oracle grades must carry the
@@ -400,6 +422,12 @@ def leaked_source(buggy_dir: Path, tree_dir: Path) -> list[str]:
     against source that is already fixed, which is why the symptom shows up as an
     empty ``FAIL_TO_PASS`` rather than as an obvious corruption.
 
+    Only the paths git tracks in the buggy or fixed commit (``tracked``, from
+    :func:`tracked_paths`) are compared, so a generated file the build or the suite
+    leaves in the tree — ``build/**``, ``*.o``, ``*.so``, an in-place extension,
+    ``*.egg-info``, a cache — is ignored *by construction*: the guard cannot name a
+    path git does not track.
+
     Compared by content rather than by mtime and both directions at once: a source
     file the fix *added* leaks exactly as much as one it rewrote, and neither
     ``git status`` inside one tree nor a diff against the other commit catches a
@@ -408,10 +436,12 @@ def leaked_source(buggy_dir: Path, tree_dir: Path) -> list[str]:
     the thing that is *supposed* to be there — ``tests/data/golden.json`` as much
     as ``tests/test_x.py``.
     """
-    buggy = _source_files(buggy_dir)
-    tree = _source_files(tree_dir)
     return sorted(
-        rel for rel in set(buggy) | set(tree) if buggy.get(rel) != tree.get(rel)
+        rel
+        for rel in set(tracked)
+        if not is_test_side(rel)
+        and not any(part in _NOISE_DIRS for part in rel.split("/"))
+        and _digest(buggy_dir / rel) != _digest(tree_dir / rel)
     )
 
 

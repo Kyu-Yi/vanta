@@ -599,7 +599,11 @@ class BugPrep:
 # tree construction
 # ---------------------------------------------------------------------------
 def source_leak(
-    bug: BugInfo, tree_name: str, buggy_dir: Path, tree_dir: Path
+    bug: BugInfo,
+    tree_name: str,
+    buggy_dir: Path,
+    tree_dir: Path,
+    tracked: set[str],
 ) -> Optional[str]:
     """The refusal text when ``tree_dir`` carries the fixed commit's source, else ``None``.
 
@@ -617,9 +621,13 @@ def source_leak(
     Compared against the buggy commit rather than against the fixed one: the
     invariant is "the tree the oracle and the Creator read is the buggy source plus
     the fixed tests", and the buggy tree is the only side of the comparison that is
-    defined without the split rule being right.
+    defined without the split rule being right. Only the paths git tracks in the buggy
+    or fixed commit (``tracked``, from :func:`trees.tracked_paths`) are candidates, so
+    the build output a project with C extensions leaves in place — ``build/**``,
+    ``*.o``, ``*.so``, an in-place extension, ``*.egg-info``, a cache — is ignored by
+    construction rather than named as a leak (item N).
     """
-    leaked = tree_mod.leaked_source(buggy_dir, tree_dir)
+    leaked = tree_mod.leaked_source(buggy_dir, tree_dir, tracked)
     if not leaked:
         return None
     shown = ", ".join(leaked[:5])
@@ -649,7 +657,13 @@ def build_trees(bug: BugInfo, repo_cache: Path, bug_root: Path) -> list[str]:
     tree_mod.compose_vanta_tree(
         bug_root / "src_buggy", bug_root / "src_fixed", bug_root / "oracle_tree", test_paths
     )
-    leak = source_leak(bug, "oracle_tree", bug_root / "src_buggy", bug_root / "oracle_tree")
+    leak = source_leak(
+        bug,
+        "oracle_tree",
+        bug_root / "src_buggy",
+        bug_root / "oracle_tree",
+        tree_mod.tracked_paths([bug_root / "src_buggy", bug_root / "src_fixed"]),
+    )
     if leak:
         raise tree_mod.TreeError(leak)
     return test_paths
@@ -1244,8 +1258,15 @@ def _suite(
     )
 
 
-def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> None:
+def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bool:
     """Cut ``vanta_tree``/``vanta_clean`` from ``oracle_tree`` and re-run the suite.
+
+    Returns whether the native baseline was recorded. ``False`` means this step
+    refused (a strip that could not be done, a source leak, or a run that measured
+    nothing) and returned before ``native_failure_baseline`` was written; the caller
+    must refuse the bug rather than run the developer-fix self-check, which grades
+    against that baseline (J's principle — a gate must not run on a baseline an
+    earlier step never recorded).
 
     The pre-strip collected set is what decides "this file is entirely hidden" in
     the stripper, so it is read from the oracle run's report rather than guessed.
@@ -1286,7 +1307,7 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> No
         )
     except tree_mod.StripError as exc:
         prep.gate_failures.append(f"hidden-test strip failed: {exc}")
-        return
+        return False
 
     prep.hidden_files_deleted = strip.deleted_files
     prep.partially_hidden_functions = strip.partially_hidden_functions
@@ -1295,10 +1316,16 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> No
     # Creator is actually given. `vanta_tree` is a copy of the *already checked*
     # oracle tree, so this can only fire on the strip — which is exactly the step
     # that edits source files in place and the one that must not quietly damage one.
-    leak = source_leak(prep.bug, "vanta_tree", prep.root / "src_buggy", vanta)
+    leak = source_leak(
+        prep.bug,
+        "vanta_tree",
+        prep.root / "src_buggy",
+        vanta,
+        tree_mod.tracked_paths([prep.root / "src_buggy", prep.root / "src_fixed"]),
+    )
     if leak:
         prep.gate_failures.append(leak)
-        return
+        return False
 
     after_strip = _suite(checkpoint, batch_dir, prep, "vanta_tree", "vanta")
     # The same rule as ``derive_hidden``'s, on the fifth graded run. The baseline below
@@ -1309,7 +1336,7 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> No
     unmeasured = unmeasured_run_failure((("the vanta tree", after_strip),))
     if unmeasured:
         prep.gate_failures.append(unmeasured)
-        return
+        return False
     prep.native_failure_baseline = sorted(after_strip.stable_failures)
     prep.pass_to_pass_count = len(after_strip.stable_collected) - len(
         prep.native_failure_baseline
@@ -1317,6 +1344,7 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> No
     prep.native_green_on_vanta_tree = not prep.native_failure_baseline
 
     tree_mod.copy_tree(vanta, prep.root / "vanta_clean")
+    return True
 
 
 def selfcheck_dev_fix(prep: BugPrep, *, batch_dir: Path, checkpoint: str) -> bool:
@@ -2424,9 +2452,21 @@ def prepare_one(
             return prep
 
     try:
-        strip_and_baseline(prep, checkpoint=checkpoint, batch_dir=batch_dir)
+        baseline_recorded = strip_and_baseline(
+            prep, checkpoint=checkpoint, batch_dir=batch_dir
+        )
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(f"post-strip suite run failed: {exc}")
+        note_drops()
+        return prep
+    if not baseline_recorded:
+        # ``strip_and_baseline`` refused — a source leak, a strip that could not be
+        # done, or a run that measured nothing — and returned before the baseline was
+        # written. The self-check below grades the developer fix against that baseline,
+        # so running it now would compare a real patch against an *empty* one and read
+        # every patched failure as a regression: a verdict invented from evidence an
+        # earlier step never produced. Refuse instead (J's principle). The reason is
+        # already recorded by the step that refused, so nothing is added here.
         note_drops()
         return prep
     note_drops()

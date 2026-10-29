@@ -1175,6 +1175,49 @@ class TestTestPathsFromFix:
         ]
 
 
+class TestTestDirsFromFix:
+    """Which directory a fix-side test path is synced *from*, whole."""
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            ("tests/test_x.py", ["tests"]),
+            ("tests/rules/test_x.py", ["tests"]),
+            ("test/server_test.py", ["test"]),
+            ("test/contrib/beam_dataflow_test.py", ["test"]),
+            ("conftest.py", []),
+            ("test_x.py", []),
+        ],
+    )
+    def test_test_package_at_the_top(self, path, expected):
+        assert tree_mod.test_dirs_from_fix([path]) == expected
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            # The defect: `path.split("/")[0]` names the *source root* here, and the
+            # oracle_tree/vanta_tree then carry the fixed commit's source.
+            ("pandas/tests/dtypes/test_dtypes.py", ["pandas/tests"]),
+            ("lib/matplotlib/tests/test_bbox_tight.py", ["lib/matplotlib/tests"]),
+            ("tqdm/tests/tests_contrib.py", ["tqdm/tests"]),
+            ("spacy/tests/regression/test_issue4665.py", ["spacy/tests"]),
+        ],
+    )
+    def test_tests_inside_the_package_do_not_name_the_package(self, path, expected):
+        assert tree_mod.test_dirs_from_fix([path]) == expected
+
+    def test_a_module_with_no_test_directory_falls_back_to_its_own_directory(self):
+        """"Narrowest" is the fallback, and `prepare` refuses if that is still source."""
+        assert tree_mod.test_dirs_from_fix(["pkg/tests_helpers/test_x.py"]) == [
+            "pkg/tests_helpers"
+        ]
+
+    def test_unions_the_directories_of_every_path(self):
+        assert tree_mod.test_dirs_from_fix(
+            ["tests/test_a.py", "pandas/tests/test_b.py"]
+        ) == ["pandas/tests", "tests"]
+
+
 class TestNodeIds:
     @pytest.mark.parametrize(
         "nodeid,chain",
@@ -1272,6 +1315,172 @@ class TestComposeVantaTree:
         assert "def test_kept" in text
         assert "test_hidden_f2p" not in text, "the F2P test must not survive by name"
         assert "F2P-BODY-MARKER" not in text, "nor may its body appear anywhere"
+
+
+class TestTestsInsideThePackageTreeSplit:
+    """The leak: a tree whose tests live inside the package directory.
+
+    The rule that named the "test directory" off ``path.split("/")[0]`` named the
+    *source root* for such a tree, so the fixed commit's source was copied over the
+    buggy one — in the tree the Creator reads and in the oracle. pandas/1 and
+    matplotlib/1 were prepared that way, and both reported an empty
+    ``FAIL_TO_PASS`` rather than a leaked tree.
+    """
+
+    def test_the_fixed_source_does_not_reach_the_tree(self, tmp_path):
+        buggy = tmp_path / "buggy"
+        fixed = tmp_path / "fixed"
+        write(buggy / "pandas" / "core" / "common.py", "EXCLUDED = ('period',)\n")
+        write(buggy / "pandas" / "tests" / "dtypes" / "test_dtypes.py", "def test_old():\n    pass\n")
+        write(fixed / "pandas" / "core" / "common.py", "EXCLUDED = ('period', 'categorical')\n")
+        write(fixed / "pandas" / "tests" / "dtypes" / "test_dtypes.py", "def test_new():\n    pass\n")
+        bug = bug_info(test_file="pandas/tests/dtypes/test_dtypes.py", bug_patch_txt="")
+
+        test_paths = tree_mod.test_paths_from_fix(bug, fixed)
+
+        assert "pandas/core/common.py" not in test_paths, "the fix is not a test file"
+        dest = tmp_path / "oracle_tree"
+        tree_mod.compose_vanta_tree(buggy, fixed, dest, test_paths)
+        assert (dest / "pandas" / "core" / "common.py").read_text() == (
+            "EXCLUDED = ('period',)\n"
+        ), "the tree must carry the buggy source, not the fix"
+        assert (dest / "pandas" / "tests" / "dtypes" / "test_dtypes.py").read_text() == (
+            "def test_new():\n    pass\n"
+        ), "the fixed commit's test files are the point of the split"
+        assert tree_mod.leaked_source(buggy, dest) == []
+
+    def test_the_fixed_tests_helper_inside_the_package_still_comes_along(self, tmp_path):
+        """Narrowing the rule must not cost the helper the fixed tests import."""
+        buggy = tmp_path / "buggy"
+        fixed = tmp_path / "fixed"
+        write(buggy / "pandas" / "core" / "common.py", "x = 1\n")
+        write(buggy / "pandas" / "tests" / "dtypes" / "test_dtypes.py", "def test_old():\n    pass\n")
+        write(fixed / "pandas" / "core" / "common.py", "x = 2\n")
+        write(fixed / "pandas" / "tests" / "__init__.py", "")
+        write(fixed / "pandas" / "tests" / "dtypes" / "helpers.py", "HELPER = 1\n")
+        write(fixed / "pandas" / "tests" / "dtypes" / "test_dtypes.py", "def test_new():\n    pass\n")
+        bug = bug_info(test_file="pandas/tests/dtypes/test_dtypes.py", bug_patch_txt="")
+
+        dest = tmp_path / "oracle_tree"
+        tree_mod.compose_vanta_tree(
+            buggy, fixed, dest, tree_mod.test_paths_from_fix(bug, fixed)
+        )
+
+        assert (dest / "pandas" / "tests" / "dtypes" / "helpers.py").is_file()
+        assert (dest / "pandas" / "tests" / "__init__.py").is_file()
+        assert (dest / "pandas" / "core" / "common.py").read_text() == "x = 1\n"
+
+
+class TestLeakedSource:
+    """``prepare``'s check that a tree is the buggy source plus the fixed tests."""
+
+    def test_a_clean_tree_reports_nothing(self, tmp_path):
+        buggy = tmp_path / "buggy"
+        tree = tmp_path / "tree"
+        write(buggy / "demo.py", "x = 1\n")
+        write(tree / "demo.py", "x = 1\n")
+        # Test files are *supposed* to differ: the fixed commit's tests are the split.
+        write(buggy / "tests" / "test_demo.py", "def test_old():\n    pass\n")
+        write(tree / "tests" / "test_demo.py", "def test_new():\n    pass\n")
+        assert tree_mod.leaked_source(buggy, tree) == []
+
+    def test_a_rewritten_source_file_is_named(self, tmp_path):
+        buggy = tmp_path / "buggy"
+        tree = tmp_path / "tree"
+        write(buggy / "demo.py", "x = 1\n")
+        write(tree / "demo.py", "x = 2\n")
+        assert tree_mod.leaked_source(buggy, tree) == ["demo.py"]
+
+    def test_a_source_file_only_the_fix_has_is_named(self, tmp_path):
+        buggy = tmp_path / "buggy"
+        tree = tmp_path / "tree"
+        write(buggy / "demo.py", "x = 1\n")
+        write(tree / "demo.py", "x = 1\n")
+        write(tree / "pkg" / "new_module.py", "y = 1\n")
+        assert tree_mod.leaked_source(buggy, tree) == ["pkg/new_module.py"]
+
+    def test_a_source_file_the_tree_lost_is_named(self, tmp_path):
+        buggy = tmp_path / "buggy"
+        tree = tmp_path / "tree"
+        write(buggy / "demo.py", "x = 1\n")
+        write(tree / "demo.py", "x = 1\n")
+        write(buggy / "pkg" / "gone.py", "y = 1\n")
+        assert tree_mod.leaked_source(buggy, tree) == ["pkg/gone.py"]
+
+    def test_test_side_data_may_differ(self, tmp_path):
+        """A fixture, a golden file, a helper package: test material, not source."""
+        buggy = tmp_path / "buggy"
+        tree = tmp_path / "tree"
+        write(buggy / "demo.py", "x = 1\n")
+        write(tree / "demo.py", "x = 1\n")
+        write(buggy / "tests" / "data" / "golden.json", "{}\n")
+        write(tree / "tests" / "data" / "golden.json", '{"a": 1}\n')
+        write(buggy / "tests" / "mini_toolbox" / "__init__.py", "V = 1\n")
+        write(tree / "tests" / "mini_toolbox" / "__init__.py", "V = 2\n")
+        assert tree_mod.leaked_source(buggy, tree) == []
+
+    def test_git_and_caches_are_not_compared(self, tmp_path):
+        """Two clones of one repository never agree about ``.git``; it is not source."""
+        buggy = tmp_path / "buggy"
+        tree = tmp_path / "tree"
+        write(buggy / "demo.py", "x = 1\n")
+        write(tree / "demo.py", "x = 1\n")
+        write(buggy / ".git" / "HEAD", "ref: refs/heads/main\n")
+        write(tree / ".git" / "HEAD", "ref: refs/heads/other\n")
+        write(buggy / "__pycache__" / "demo.cpython-38.pyc", "")
+        write(tree / "pkg" / "__pycache__" / "demo.cpython-38.pyc", "junk")
+        assert tree_mod.leaked_source(buggy, tree) == []
+
+
+class TestBuildTreesRefusesALeakedOracle:
+    """The permanent guard, at the one place both trees are composed."""
+
+    def _sources(self, tmp_path, monkeypatch):
+        """A buggy and a fixed commit, as two directories a fake ``export_tree`` copies."""
+        buggy = tmp_path / "cache" / "buggy"
+        fixed = tmp_path / "cache" / "fixed"
+        write(buggy / "pkg" / "mod.py", "VALUE = 'buggy'\n")
+        write(fixed / "pkg" / "mod.py", "VALUE = 'fixed'\n")
+        write(fixed / "pkg" / "tests" / "test_x.py", "def test_x():\n    pass\n")
+        bug = bug_info(test_file="pkg/tests/test_x.py", bug_patch_txt="")
+        by_commit = {bug.buggy_commit: buggy, bug.fixed_commit: fixed}
+        monkeypatch.setattr(
+            tree_mod,
+            "export_tree",
+            lambda repo, commit, dest: tree_mod.copy_tree(by_commit[commit], dest),
+        )
+        return bug, buggy
+
+    def test_the_narrowed_rule_composes_a_tree_with_no_leak(self, tmp_path, monkeypatch):
+        bug, buggy = self._sources(tmp_path, monkeypatch)
+        root = tmp_path / "root"
+
+        test_paths = prepare_mod.build_trees(bug, tmp_path / "cache", root)
+
+        assert tree_mod.leaked_source(buggy, root / "oracle_tree") == []
+        assert "pkg/tests/test_x.py" in test_paths
+
+    def test_the_first_component_rule_is_refused(self, tmp_path, monkeypatch):
+        """With the defect reintroduced, the guard refuses instead of leaking.
+
+        The refusal is the point: the failure mode being guarded against is a tree
+        that prepares *successfully* and reports an empty ``FAIL_TO_PASS``.
+        """
+        bug, _ = self._sources(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            tree_mod,
+            "test_dirs_from_fix",
+            lambda paths: sorted({p.split("/")[0] for p in paths if "/" in p}),
+        )
+        root = tmp_path / "root"
+
+        with pytest.raises(tree_mod.TreeError) as excinfo:
+            prepare_mod.build_trees(bug, tmp_path / "cache", root)
+
+        message = str(excinfo.value)
+        assert "source leak" in message
+        assert "Demo/1" in message
+        assert "pkg/mod.py" in message
 
 
 class TestStripHiddenTests:

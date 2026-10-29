@@ -560,8 +560,47 @@ class BugPrep:
 # ---------------------------------------------------------------------------
 # tree construction
 # ---------------------------------------------------------------------------
+def source_leak(
+    bug: BugInfo, tree_name: str, buggy_dir: Path, tree_dir: Path
+) -> Optional[str]:
+    """The refusal text when ``tree_dir`` carries the fixed commit's source, else ``None``.
+
+    [VANTA-WHY] The permanent guard on the tree split (§1.2). ``test_paths_from_fix``
+    decides *which* files come from the fixed commit, and that decision has been
+    wrong once in a way nothing noticed: the rule that named the test directory off
+    the path's first component made it the project's whole source root for any tree
+    whose tests live inside the package (``pandas/tests``, ``lib/matplotlib/tests``),
+    so the fix itself was copied over the buggy source. The bug then reported an
+    empty ``FAIL_TO_PASS`` — a *plausible* verdict that pointed at the oracle, not
+    at the tree, and the leak was invisible from every artefact the batch wrote.
+    A rule that can be wrong silently needs a check that cannot: this one compares
+    the tree against ``src_buggy`` by content and refuses the bug, naming the files.
+
+    Compared against the buggy commit rather than against the fixed one: the
+    invariant is "the tree the oracle and the Creator read is the buggy source plus
+    the fixed tests", and the buggy tree is the only side of the comparison that is
+    defined without the split rule being right.
+    """
+    leaked = tree_mod.leaked_source(buggy_dir, tree_dir)
+    if not leaked:
+        return None
+    shown = ", ".join(leaked[:5])
+    more = f" (+{len(leaked) - 5} more)" if len(leaked) > 5 else ""
+    return (
+        f"source leak: {bug.key} {tree_name} carries the fixed commit's source "
+        f"outside test files — {len(leaked)} file(s): {shown}{more}. The tree the "
+        "Creator reads and the tree the oracle grades must carry the buggy commit's "
+        "source with only the fixed commit's test files taken from the fix (§1.2); "
+        "refusing rather than preparing a bug whose answer is already in its tree."
+    )
+
+
 def build_trees(bug: BugInfo, repo_cache: Path, bug_root: Path) -> list[str]:
-    """Materialise ``src_buggy``, ``src_fixed`` and the pre-strip ``oracle_tree``."""
+    """Materialise ``src_buggy``, ``src_fixed`` and the pre-strip ``oracle_tree``.
+
+    Refuses the bug (``TreeError``) if ``oracle_tree`` carries the fixed commit's
+    source anywhere outside test files — see :func:`source_leak`.
+    """
     bug_root.mkdir(parents=True, exist_ok=True)
     tree_mod.export_tree(repo_cache, bug.buggy_commit, bug_root / "src_buggy")
     tree_mod.export_tree(repo_cache, bug.fixed_commit, bug_root / "src_fixed")
@@ -572,6 +611,9 @@ def build_trees(bug: BugInfo, repo_cache: Path, bug_root: Path) -> list[str]:
     tree_mod.compose_vanta_tree(
         bug_root / "src_buggy", bug_root / "src_fixed", bug_root / "oracle_tree", test_paths
     )
+    leak = source_leak(bug, "oracle_tree", bug_root / "src_buggy", bug_root / "oracle_tree")
+    if leak:
+        raise tree_mod.TreeError(leak)
     return test_paths
 
 
@@ -1129,6 +1171,15 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> No
 
     prep.hidden_files_deleted = strip.deleted_files
     prep.partially_hidden_functions = strip.partially_hidden_functions
+
+    # The same guard as `build_trees` runs on `oracle_tree`, applied to the tree the
+    # Creator is actually given. `vanta_tree` is a copy of the *already checked*
+    # oracle tree, so this can only fire on the strip — which is exactly the step
+    # that edits source files in place and the one that must not quietly damage one.
+    leak = source_leak(prep.bug, "vanta_tree", prep.root / "src_buggy", vanta)
+    if leak:
+        prep.gate_failures.append(leak)
+        return
 
     after_strip = _suite(checkpoint, batch_dir, prep, "vanta_tree", "vanta")
     prep.native_failure_baseline = sorted(after_strip.stable_failures)

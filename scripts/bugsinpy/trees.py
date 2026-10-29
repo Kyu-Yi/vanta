@@ -27,6 +27,7 @@ git and filesystem work on the host; every suite run happens in Shuru (§suite.p
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 import shutil
 import subprocess
@@ -155,6 +156,22 @@ def is_test_path(path: str) -> bool:
     return any(part in ("test", "tests") for part in parts)
 
 
+def is_test_side(path: str) -> bool:
+    """Everything the fix-side copy may legitimately bring into the tree.
+
+    [VANTA-WHY] A superset of :func:`is_test_path`, for the same reason the third
+    source of :func:`test_paths_from_fix` is a whole directory: a test package is
+    not only its ``.py`` modules. ``tests/data/golden.json``, a fixture image, a
+    ``tests/__init__.py`` — none of them is a test *module*, all of them are test
+    material the fixed commit may have changed, and all of them live under a
+    directory named ``test``/``tests``. So the question "may this path come from
+    the fixed commit?" is asked of the whole path, not of the file name.
+    """
+    if is_test_path(path):
+        return True
+    return any(part in ("test", "tests") for part in path.split("/")[:-1])
+
+
 @dataclass
 class PatchPaths:
     """File paths a unified diff touches, split three ways."""
@@ -244,18 +261,51 @@ def parse_patch(patch_text: str) -> ParsedPatch:
 
 
 def test_dirs_from_fix(test_paths: Iterable[str]) -> list[str]:
-    """The top-level directories the fix-side test paths live in.
+    """The directories the fix-side test paths are synced from, whole.
 
-    [VANTA-WHY] The top-level directory, not the module's own directory. Helpers
-    are placed beside the test *package*, not beside the test module:
-    ``tests/rules/test_x.py`` imports ``tests.utils``. Syncing only
-    ``tests/rules`` would leave that import broken.
+    [VANTA-WHY] The **outermost** path component named ``test``/``tests``, and not
+    ``path.split("/")[0]``. The two agree only when the test package is the
+    repository's first component, which is the common layout but not the rule: for
+    ``pandas/tests/dtypes/test_dtypes.py`` the first component is ``pandas`` and for
+    ``lib/matplotlib/tests/test_bbox_tight.py`` it is ``lib``, so the "test
+    directory" that rule names is the project's **whole source root**, and
+    :func:`compose_vanta_tree` copies the FIXED commit's source over the buggy one.
+    The consequence is worse than a wrong directory: the fix itself lands in the
+    tree Vanta reads (leakage — the answer is in the tree) and in ``oracle_tree``
+    (the oracle's ``F_before`` is measured against already-fixed source, comes out
+    empty, and the bug reads as "the declared test does not flip"). pandas/1 and
+    matplotlib/1 were both prepared that way.
+
+    The outermost and not the module's own directory: helpers live beside the test
+    *package*, not beside the test module — ``tests/rules/test_x.py`` imports
+    ``tests.utils``, so syncing ``tests/rules`` alone would leave that import
+    broken. Syncing ``tests`` whole is also what keeps the test *data* a test
+    package carries (``tests/data/golden.json``) out of the leak question: those
+    files are not test modules by name, and only the directory rule brings them.
+
+    A path with no ``test``/``tests`` component falls back to the module's own
+    directory — the narrowest reading, since a test module usually sits beside the
+    helpers it imports. That fallback can still name a source root (a tree that
+    keeps ``pkg/test_x.py`` with no test directory at all), and the honest answer
+    there is not a cleverer guess but :func:`leaked_source`: ``prepare`` refuses
+    such a tree loudly instead of leaking the fix into it.
     """
     dirs = set()
     for path in test_paths:
         parts = path.split("/")
-        if len(parts) > 1:
-            dirs.add(parts[0])
+        if len(parts) < 2:
+            # A test module at the repository root has no directory to sync; the
+            # module itself is already named by the first two sources.
+            continue
+        ancestor = None
+        for index, part in enumerate(parts[:-1]):
+            if part in ("test", "tests"):
+                ancestor = index
+                break
+        if ancestor is None:
+            dirs.add("/".join(parts[:-1]))
+        else:
+            dirs.add("/".join(parts[: ancestor + 1]))
     return sorted(dirs)
 
 
@@ -269,8 +319,8 @@ def test_paths_from_fix(bug: BugInfo, fixed_dir: Path) -> list[str]:
     * ``bug.info``'s ``test_file``, which is BugsInPy's own statement of where the
       bug-revealing test lives — it is authoritative even if the patch's diff
       header is unusual;
-    * every file under the top-level test directory each of those paths lives in,
-      read from ``fixed_dir``.
+    * every file under the test directory each of those paths lives in
+      (:func:`test_dirs_from_fix`), read from ``fixed_dir``.
 
     [VANTA-WHY] The third source is not tidiness, it is the difference between a
     tree that can be collected and one that cannot. The first two sources name test
@@ -304,6 +354,56 @@ def test_paths_from_fix(bug: BugInfo, fixed_dir: Path) -> list[str]:
             if file.is_file():
                 paths.add(file.relative_to(fixed_dir).as_posix())
     return sorted(paths)
+
+
+# ---------------------------------------------------------------------------
+# the leak guard
+# ---------------------------------------------------------------------------
+_NOISE_DIRS = frozenset({".git", "__pycache__", ".pytest_cache", ".mypy_cache"})
+"""Directories whose contents are never compared. ``.git`` because the two trees
+are two *clones* of the same repository and their object stores and refs differ by
+construction, not by the bug; the caches because nothing in them is source."""
+
+
+def _source_files(root: Path) -> dict[str, str]:
+    """``{relative path: sha256}`` for every non-test-side file in ``root``."""
+    digests: dict[str, str] = {}
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        if any(part in _NOISE_DIRS for part in rel.split("/")):
+            continue
+        if is_test_side(rel):
+            continue
+        digests[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digests
+
+
+def leaked_source(buggy_dir: Path, tree_dir: Path) -> list[str]:
+    """Source files where ``tree_dir`` is not the buggy commit's tree.
+
+    [VANTA-WHY] Empty is the invariant, and it is the whole point of the tree
+    split: the tree Vanta reads and the tree the oracle grades must carry the
+    **buggy commit's source** and only the fixed commit's *tests* (§1.2). A tree
+    that carries fixed source is two failures at once — the answer is in the tree
+    the Creator can read, and the oracle's "failures before the fix" are measured
+    against source that is already fixed, which is why the symptom shows up as an
+    empty ``FAIL_TO_PASS`` rather than as an obvious corruption.
+
+    Compared by content rather than by mtime and both directions at once: a source
+    file the fix *added* leaks exactly as much as one it rewrote, and neither
+    ``git status`` inside one tree nor a diff against the other commit catches a
+    file whose content the copy silently replaced. Test-side paths
+    (:func:`is_test_side`) are exempt because the fixed commit's test material is
+    the thing that is *supposed* to be there — ``tests/data/golden.json`` as much
+    as ``tests/test_x.py``.
+    """
+    buggy = _source_files(buggy_dir)
+    tree = _source_files(tree_dir)
+    return sorted(
+        rel for rel in set(buggy) | set(tree) if buggy.get(rel) != tree.get(rel)
+    )
 
 
 # ---------------------------------------------------------------------------

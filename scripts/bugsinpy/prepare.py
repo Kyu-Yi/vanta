@@ -253,6 +253,23 @@ class BugPrep:
     was before this key existed. A larger VM lowers how many VMs fit in parallel, so the
     number is recorded here — on the row the M4 queue reads — rather than assumed.
     """
+    precompile: list[str] = field(default_factory=list)
+    """§3.4 — the files every suite run of this bug byte-compiles before pytest.
+
+    [VANTA-WHY] Recorded on the row for the reason :attr:`sandbox_env` is: it is a fact
+    about the project's *test configuration*, not about the bug. matplotlib/1's pytest
+    config escalates warnings to errors, and CPython 3.8 warns while compiling
+    ``lib/matplotlib/widgets.py`` — an invalid escape sequence in a docstring — so the
+    first import of that module during collection dies as ``SyntaxError`` and the gate
+    reads a broken environment. Compiling the file first leaves a valid ``.pyc`` and
+    nothing is compiled under pytest's filters. One recorded list has to reach *every*
+    suite this bug runs — the deps gate's collect and import probe, the collect-flip
+    readers, the three derivation runs, the stripped baseline and the oracle's two
+    grading runs — or the bug is measured with the step and graded without it. Empty for
+    every bug that does not declare one, which is the whole corpus but matplotlib's, and
+    an empty list adds no line at all to the run script, so every other bug's script is
+    byte-for-byte what it was before this key existed.
+    """
     test_paths: list[str] = field(default_factory=list)
     fail_to_pass: list[str] = field(default_factory=list)
     f2p_undeclared: list[str] = field(default_factory=list)
@@ -455,6 +472,7 @@ class BugPrep:
             "build_env": self.build_env,
             "build_files": self.build_files,
             "vm_memory_mb": self.vm_memory_mb,
+            "precompile": list(self.precompile),
             "runnable": self.runnable,
             "test_paths": self.test_paths,
             "fail_to_pass": sorted(self.fail_to_pass),
@@ -517,6 +535,7 @@ class BugPrep:
             build_env=map_of(payload, "build_env", owner=owner, where=where),
             build_files=map_of(payload, "build_files", owner=owner, where=where),
             vm_memory_mb=memory_of(payload, "vm_memory_mb", owner=owner, where=where),
+            precompile=strings_of(payload, "precompile", owner=owner, where=where),
             test_paths=strings_of(payload, "test_paths", owner=owner, where=where),
             fail_to_pass=strings_of(payload, "fail_to_pass", owner=owner, where=where),
             f2p_undeclared=strings_of(payload, "f2p_undeclared", owner=owner, where=where),
@@ -685,6 +704,7 @@ def check_deps(
             disk_mb=DISK_MB,
             extra_env=env,
             memory_mb=prep.vm_memory_mb,
+            precompile=prep.precompile,
         )
     except suite_mod.SuiteError as exc:
         nodeids = _collect_flip_or_raise(
@@ -701,6 +721,7 @@ def check_deps(
             disk_mb=DISK_MB,
             extra_env=env,
             memory_mb=prep.vm_memory_mb,
+            precompile=prep.precompile,
         )
     except suite_mod.SuiteError as exc:
         raise suite_mod.SuiteError(
@@ -756,6 +777,7 @@ def _collect_flip_or_raise(
         extra_env=env,
         ignore=sorted(flips),
         memory_mb=prep.vm_memory_mb,
+        precompile=prep.precompile,
     )
 
 
@@ -806,6 +828,7 @@ def detect_collect_flip(
         disk_mb=DISK_MB,
         extra_env=env,
         memory_mb=prep.vm_memory_mb,
+        precompile=prep.precompile,
     )
     if not buggy.errors:
         return {}, [], {}
@@ -818,6 +841,7 @@ def detect_collect_flip(
         disk_mb=DISK_MB,
         extra_env=env,
         memory_mb=prep.vm_memory_mb,
+        precompile=prep.precompile,
     )
     fixed_by_file = suite_mod.collect_by_file(sorted(fixed.nodeids))
     flips = {
@@ -1055,6 +1079,7 @@ def derive_hidden(
             disk_mb=DISK_MB,
             extra_env=prep.sandbox_env or None,
             memory_mb=prep.vm_memory_mb,
+            precompile=prep.precompile,
         )
 
     buggy = _suite(checkpoint, batch_dir, prep, "src_buggy", "src_buggy")
@@ -1215,6 +1240,7 @@ def _suite(
         disk_mb=DISK_MB,
         extra_env=prep.sandbox_env or None,
         memory_mb=prep.vm_memory_mb,
+        precompile=prep.precompile,
     )
 
 
@@ -2191,6 +2217,17 @@ def _memory_entry(entry: dict[str, Any]) -> Optional[int]:
     return None if value is None else int(value)
 
 
+def _precompile_entry(entry: dict[str, Any]) -> list[str]:
+    """The split entry's ``precompile`` files, or an empty list.
+
+    Bare on purpose, for the reason :func:`_memory_entry` is: :func:`split._validate_bug`
+    owns the rule (tree-relative ``.py`` paths, no directory step), so a second
+    interpretation of the same declaration here could disagree with the one the split
+    was checked against. The value is only narrowed to the type the field declares.
+    """
+    return [str(path) for path in (entry.get("precompile") or [])]
+
+
 def prepare_one(
     entry: dict[str, Any],
     *,
@@ -2252,6 +2289,13 @@ def prepare_one(
         # rather than from a harness literal. ``None`` for a bug that records none, which
         # sends no ``--memory`` and boots shuru's own default.
         vm_memory_mb=_memory_entry(entry),
+        # §3.4 — the files every suite run byte-compiles before pytest
+        # (``precompile``), read here the same way: the split records the rule once,
+        # and every suite this row runs — the deps gate, the collect-flip readers, the
+        # derivation runs, the stripped baseline and the oracle's grading runs — gets
+        # it from the row rather than from a pipeline literal. Empty for a bug that
+        # records none, which adds no line to the run script.
+        precompile=_precompile_entry(entry),
     )
 
     mismatches = check_declared(entry, bug)

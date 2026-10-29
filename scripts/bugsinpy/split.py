@@ -100,7 +100,14 @@ DECLARED_BUG_KEYS = frozenset(
 )
 
 OPTIONAL_DECLARED_BUG_KEYS = frozenset(
-    {"import_package", "sandbox_env", "build_env", "build_files", "vm_memory_mb"}
+    {
+        "import_package",
+        "sandbox_env",
+        "build_env",
+        "build_files",
+        "vm_memory_mb",
+        "precompile",
+    }
 )
 """Declared keys a bug may carry but need not.
 
@@ -163,6 +170,27 @@ and it is per project for the same reason the others are: it is a fact about the
 suite, not about the bug. A larger VM lowers how many VMs fit in parallel on one host, so
 the number is recorded on the row — where the M4 queue reads it — rather than assumed. A
 bug that declares one records the reason in the split's ``reviewed_changes``.
+
+[VANTA-WHY] ``precompile`` is the list of the project's own files that every suite run
+must byte-compile **before pytest starts**, with the interpreter that is about to run
+pytest. matplotlib/1 is the case: its pytest configuration escalates warnings to errors
+(``filterwarnings = error``), and CPython 3.8 emits an ``invalid escape sequence``
+warning while *compiling* ``lib/matplotlib/widgets.py`` (line 1924, inside the docstring
+opened at 1911) — so the first import of that module during collection turns a warning
+about a docstring into ``SyntaxError`` and the gate reads a broken environment. Compiling
+the file first leaves a valid ``.pyc`` beside it, the module is then loaded from bytecode
+and nothing is compiled under pytest's filters at all. A whole-tree scan of the fixed
+commit found **one** such warning, so the rule is one file and is not a general "compile
+the tree" switch.
+
+[VANTA-WHY] It is a *step*, not a value written into a tree once. A one-time ``.pyc`` goes
+stale the moment a Creator patch edits that file (the import machinery validates the
+``.pyc`` against the source's mtime), and the ``SyntaxError`` comes straight back — so the
+step runs inside every VM run of the row, after the patch that run is measuring and before
+its pytest, exactly as :attr:`sandbox_env` and :attr:`vm_memory_mb` reach every run. It is
+per project for the same reason those are: it is a fact about the project's test
+configuration, not about the bug. A bug that declares one records the reason in the
+split's ``reviewed_changes``.
 """
 
 VM_MEMORY_MB_MIN = 2048
@@ -676,6 +704,31 @@ def _validate_bug(entry: Any, where: str, index: int, seen: set[str]) -> None:
                 raise SplitError(
                     f"{tag}: build_files[{name!r}] must be a non-empty string — the "
                     "contents are written verbatim, and an empty file declares nothing"
+                )
+
+    precompile = entry.get("precompile")
+    if precompile is not None:
+        if not isinstance(precompile, list) or not precompile:
+            raise SplitError(
+                f"{tag}: precompile must be a non-empty list of tree-relative file "
+                "paths — the files an early compile has to leave bytecode for, or "
+                "nothing at all; an empty list would record a step that does nothing"
+            )
+        for path in precompile:
+            if (
+                not isinstance(path, str)
+                or not path.strip()
+                or path.startswith("/")
+                or "\\" in path
+                or ".." in path.split("/")
+                or not path.endswith(".py")
+            ):
+                raise SplitError(
+                    f"{tag}: precompile entry {path!r} must be a tree-relative .py path "
+                    "with no directory step — it is compiled from the tree root inside "
+                    "the VM, in every run of this bug, so a path that could name a file "
+                    "outside the tree (or a path the compiler cannot parse) would either "
+                    "compile something the benchmark does not ship or fail silently"
                 )
 
     # Derived fields, when present, must be self-consistent.

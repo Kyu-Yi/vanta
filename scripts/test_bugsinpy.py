@@ -800,6 +800,49 @@ class TestSplit:
             with pytest.raises(SplitError, match="exceed"):
                 split_mod.validate(split_data(bugs=[bug_entry(vm_memory_mb=value)]))
 
+    def test_precompile_is_an_optional_declared_key(self):
+        """The files an early compile leaves bytecode for, carried per bug (§3.4).
+
+        [VANTA-WHY] A bug that records none compiles nothing, so its run script is
+        byte-for-byte what it was before this key existed. matplotlib/1 is the case
+        that records one: its pytest config escalates warnings to errors, so the
+        compile-time ``invalid escape sequence \\s`` warning becomes a collection-time
+        ``SyntaxError``.
+        """
+        assert split_mod.validate(split_data()) is None
+        assert (
+            split_mod.validate(
+                split_data(bugs=[bug_entry(precompile=["lib/matplotlib/widgets.py"])])
+            )
+            is None
+        )
+
+    def test_an_explicit_null_precompiles_nothing(self):
+        """``null`` and the key's absence are the same declaration: no step at all."""
+        assert split_mod.validate(split_data(bugs=[bug_entry(precompile=None)])) is None
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param([], id="an-empty-list"),
+            pytest.param("lib/matplotlib/widgets.py", id="a-bare-string"),
+            pytest.param(["/etc/passwd.py"], id="an-absolute-path"),
+            pytest.param(["../outside.py"], id="a-parent-step"),
+            pytest.param(["pkg\\mod.py"], id="a-backslash"),
+            pytest.param(["pkg/mod.txt"], id="not-a-python-file"),
+            pytest.param([""], id="an-empty-entry"),
+        ],
+    )
+    def test_precompile_refuses_a_declaration_that_cannot_name_a_shipped_file(self, value):
+        """The step compiles from the tree root in every run, so the shape is closed.
+
+        An empty list would record a step that does nothing; a path outside the tree
+        would compile something the benchmark does not ship; a non-``.py`` path is
+        something the compiler cannot parse.
+        """
+        with pytest.raises(SplitError, match="precompile"):
+            split_mod.validate(split_data(bugs=[bug_entry(precompile=value)]))
+
     def test_unknown_top_level_key_is_an_error(self):
         with pytest.raises(SplitError, match="unknown top-level keys"):
             split_mod.validate(split_data(seed=0))  # typo for `seeds`
@@ -5700,6 +5743,46 @@ class TestSuiteCommand:
             suite_mod.build_command(["python", "-m", "pytest", "tests"], "/workspace/r.json")
 
 
+class TestPrecompileLines:
+    """The step that runs before pytest in *every* VM run of a bug with the rule (§3.4).
+
+    [VANTA-WHY] matplotlib/1 is the case: ``filterwarnings = error`` turns the
+    compile-time ``invalid escape sequence \\s`` warning into a collection-time
+    ``SyntaxError``, so the file has to be byte-compiled before pytest installs its
+    filters. Three things are load-bearing and each has a test: the interpreter is
+    the one about to run pytest (``test_cmd[0]``, because a ``.pyc`` is only read by
+    the interpreter whose magic number it carries), the compile is *forced* (``-f``,
+    because compileall's own skip is second-resolution on the source mtime), and a
+    bug with no rule gets *no lines at all* so its run script is unchanged.
+    """
+
+    def test_the_line_compiles_the_named_files_with_the_pytest_interpreter(self):
+        lines = suite_mod.precompile_lines(
+            ["lib/matplotlib/widgets.py"],
+            ["/opt/py38/bin/python", "-m", "pytest", "lib/matplotlib/tests"],
+        )
+        assert lines == [
+            "/opt/py38/bin/python -m compileall -q -f lib/matplotlib/widgets.py"
+        ]
+
+    def test_the_compile_is_forced(self):
+        line = suite_mod.precompile_lines(
+            ["pkg/mod.py"], ["python", "-m", "pytest", "t"]
+        )[0]
+        assert "-f" in line.split()
+
+    def test_a_row_without_the_rule_adds_no_line(self):
+        """Byte-for-byte: a bug that records nothing runs exactly the old script."""
+        assert suite_mod.precompile_lines([], ["python", "-m", "pytest", "t"]) == []
+        assert suite_mod.precompile_lines((), ["python", "-m", "pytest", "t"]) == []
+
+    def test_a_path_that_needs_quoting_is_quoted(self):
+        line = suite_mod.precompile_lines(
+            ["pkg/a b.py"], ["python", "-m", "pytest", "t"]
+        )[0]
+        assert "'pkg/a b.py'" in line
+
+
 class TestSuiteReport:
     """The reader must handle both plugin schemas, because which one is written
     depends on the bug's own pytest pin (§3.2): 0.1/0.2 write a flat list, 0.3+
@@ -6115,6 +6198,26 @@ class TestPrepareInvariants:
         assert (tmp_path / "batch" / "issue_texts" / "Demo_1.md").is_file()
 
 
+class TestPrecompileEntry:
+    """``prepare._precompile_entry`` reads the split entry's files, or nothing.
+
+    [VANTA-WHY] Bare on purpose, like :func:`prepare._memory_entry`:
+    ``split._validate_bug`` owns the rule (tree-relative ``.py`` paths, no directory
+    step), so this reader only narrows the value to the type the field declares. A
+    second interpretation here could disagree with the one the split was checked
+    against.
+    """
+
+    def test_it_reads_the_entrys_files(self):
+        assert prepare_mod._precompile_entry(
+            {"precompile": ["lib/matplotlib/widgets.py"]}
+        ) == ["lib/matplotlib/widgets.py"]
+
+    def test_a_row_without_the_key_precompiles_nothing(self):
+        assert prepare_mod._precompile_entry({}) == []
+        assert prepare_mod._precompile_entry({"precompile": None}) == []
+
+
 class TestMemoryOf:
     """``records.memory_of`` reads a recorded MB size, or ``None`` for a row with none.
 
@@ -6266,6 +6369,7 @@ class TestPrepareRunRecordContract:
             build_env={"CFLAGS": "-Wno-error=array-bounds"},
             build_files={"vanta-build.cfg": "[libs]\nsystem_freetype = True\n"},
             vm_memory_mb=8192,
+            precompile=["lib/matplotlib/widgets.py"],
             hidden_by_collect_flip={
                 "tests/test_skip_defaults.py": (
                     "TypeError: get() got an unexpected keyword argument "
@@ -6339,6 +6443,10 @@ class TestPrepareRunRecordContract:
         # §3.4: the VM's memory, read on every run of the row -- the deps gate, the
         # oracle's grading runs and the ``vanta_m3`` sandbox -- off this same row.
         assert loaded.vm_memory_mb == 8192
+        # §3.4: the files an early compile leaves bytecode for, read on every run of
+        # the row -- the gates, the oracle's grading runs and the baselines -- off
+        # this same row.
+        assert loaded.precompile == ["lib/matplotlib/widgets.py"]
         assert loaded.hidden_by_collect_flip == original.hidden_by_collect_flip
         assert loaded.collect_flip_nodeids == sorted(original.collect_flip_nodeids)
         assert loaded.hidden_nodeids == sorted(

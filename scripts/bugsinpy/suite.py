@@ -158,6 +158,43 @@ def _shell_quote(parts: Sequence[str]) -> str:
     return " ".join(out)
 
 
+def precompile_lines(
+    precompile: Sequence[str], test_cmd: Sequence[str]
+) -> list[str]:
+    """The shell lines that run in every suite VM *before* pytest, one per rule.
+
+    [VANTA-WHY] ``precompile`` is the split's recorded per-project rule (matplotlib/1:
+    ``lib/matplotlib/widgets.py``). Its whole job is ordering: an invalid escape
+    sequence is reported while the module is *compiled*, and matplotlib's pytest
+    configuration escalates warnings to errors, so the first import of that module
+    during collection dies as ``SyntaxError``. Compiling first leaves a valid ``.pyc``
+    and nothing is compiled under pytest's filters at all.
+
+    Three choices are load-bearing:
+
+    * the interpreter is ``test_cmd[0]`` — the one about to run pytest. A ``.pyc`` is
+      only read by the interpreter whose magic number it carries, so compiling with
+      any other interpreter would leave a file pytest ignores and the warning would
+      fire exactly as before.
+    * ``-f`` forces the write. ``compileall`` otherwise skips a file whose ``.pyc``
+      already records the source's mtime, and that check is second-resolution on the
+      mtime alone — a patch applied in the same second as the previous compile would
+      leave a stale ``.pyc`` and the warning would come back. Forcing removes the
+      window entirely; the cost is one file's compile per VM run.
+    * the lines are *newline*-joined, not ``&&``-joined: a compile that failed must
+      not take pytest's report with it. The shell continues, pytest reports the
+      compile error itself as a collection failure, and the gate reads the honest
+      message instead of "no report at all".
+
+    Returns an empty list when the row records nothing, so a bug without the rule runs
+    exactly the script it ran before this key existed.
+    """
+    if not precompile:
+        return []
+    python = str(test_cmd[0]) if test_cmd else "python"
+    return [_shell_quote([python, "-m", "compileall", "-q", "-f", *precompile])]
+
+
 def run_suite_twice(
     *,
     checkpoint: str,
@@ -169,6 +206,7 @@ def run_suite_twice(
     timeout_secs: int = 1800,
     extra_env: Optional[dict[str, str]] = None,
     memory_mb: Optional[int] = None,
+    precompile: Sequence[str] = (),
 ) -> SuitePair:
     """Run ``test_cmd`` twice inside the checkpoint and diff the two reports."""
     reports_dir = batch_dir / "reports"
@@ -184,6 +222,7 @@ def run_suite_twice(
     script = "\n".join(
         [
             "set +e",
+            *precompile_lines(precompile, test_cmd),
             cmd1,
             "echo __VANTA_EXIT_1__=$?",
             cmd2,
@@ -387,6 +426,7 @@ def collect_report(
     timeout_secs: int = 600,
     extra_env: Optional[dict[str, str]] = None,
     memory_mb: Optional[int] = None,
+    precompile: Sequence[str] = (),
 ) -> CollectionReport:
     """Collect the whole suite, reporting every error instead of stopping at one.
 
@@ -411,8 +451,13 @@ def collect_report(
         command=[
             "sh",
             "-c",
-            _shell_quote(
-                collect_command(test_cmd) + ["--continue-on-collection-errors"]
+            "\n".join(
+                [
+                    *precompile_lines(precompile, test_cmd),
+                    _shell_quote(
+                        collect_command(test_cmd) + ["--continue-on-collection-errors"]
+                    ),
+                ]
             ),
         ],
         disk_mb=disk_mb,
@@ -524,6 +569,7 @@ def collect_only(
     extra_env: Optional[dict[str, str]] = None,
     ignore: Sequence[str] = (),
     memory_mb: Optional[int] = None,
+    precompile: Sequence[str] = (),
 ) -> set[str]:
     """``pytest --collect-only -q`` — the collectability gate (§3.4).
 
@@ -554,7 +600,16 @@ def collect_only(
     result = shuru.run(
         checkpoint=checkpoint,
         host_root=batch_dir,
-        command=["sh", "-c", _shell_quote(collect_command(test_cmd, ignore))],
+        command=[
+            "sh",
+            "-c",
+            "\n".join(
+                [
+                    *precompile_lines(precompile, test_cmd),
+                    _shell_quote(collect_command(test_cmd, ignore)),
+                ]
+            ),
+        ],
         disk_mb=disk_mb,
         memory_mb=memory_mb,
         guest_cwd=guest_tree_root(tree_rel),
@@ -581,6 +636,7 @@ def import_probe(
     timeout_secs: int = 300,
     extra_env: Optional[dict[str, str]] = None,
     memory_mb: Optional[int] = None,
+    precompile: Sequence[str] = (),
 ) -> str:
     """``import <module>; print(<module>.__file__)``, run exactly as the suites run.
 
@@ -612,7 +668,16 @@ def import_probe(
     result = shuru.run(
         checkpoint=checkpoint,
         host_root=batch_dir,
-        command=["sh", "-c", _shell_quote([python, "-c", code])],
+        command=[
+            "sh",
+            "-c",
+            "\n".join(
+                [
+                    *precompile_lines(precompile, test_cmd),
+                    _shell_quote([python, "-c", code]),
+                ]
+            ),
+        ],
         disk_mb=disk_mb,
         memory_mb=memory_mb,
         guest_cwd=guest_tree_root(tree_rel),

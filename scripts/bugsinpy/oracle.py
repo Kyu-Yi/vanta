@@ -268,6 +268,7 @@ def grade(
         timeout_secs=timeout_secs,
         extra_env=sandbox_env,
         memory_mb=prep.vm_memory_mb,
+        precompile=prep.precompile,
     )
     patched_pair = suite_mod.run_suite_twice(
         checkpoint=checkpoint,
@@ -279,6 +280,7 @@ def grade(
         timeout_secs=timeout_secs,
         extra_env=sandbox_env,
         memory_mb=prep.vm_memory_mb,
+        precompile=prep.precompile,
     )
 
     if not (hidden_pair.first.report_found or hidden_pair.second.report_found):

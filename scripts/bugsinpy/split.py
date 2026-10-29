@@ -153,7 +153,7 @@ contents verbatim. A bug that declares one records the reason in the split's
 ``reviewed_changes``.
 """
 
-SANDBOX_ENV_KEYS = frozenset({"PYTHONPATH"})
+SANDBOX_ENV_KEYS = frozenset({"PYTHONPATH", "MPLBACKEND"})
 """The keys ``sandbox_env`` may set, and nothing else.
 
 [VANTA-WHY] The allow-list *is* the rule. ``PYTHONPATH`` is what the projects declare
@@ -161,6 +161,23 @@ for themselves; a general "set any variable" channel through the split would be 
 to change the environment the graded tests run in, which is the measurement, without
 it showing up as a decision about the bug. A bug that needs another key is a change to
 this set and to the split's ``reviewed_changes``, not a quiet value in a bug entry.
+
+[VANTA-WHY] ``MPLBACKEND`` is the second key, admitted the same way, for matplotlib/1.
+matplotlib reads it into ``rcParams['backend']`` at import (``lib/matplotlib/__init__.py``:
+``if os.environ.get('MPLBACKEND'): rcParams['backend'] = os.environ.get('MPLBACKEND')``),
+and the backend ``pyplot`` resolves is the one that is current *when pyplot is first
+imported*. With nothing set the rcParams default is ``TkAgg``, so that import walks
+``backends/backend_tkagg`` -> ``backends/_backend_tk`` -> ``_tkinter.__file__``, which the
+layer's CPython 3.8 does not have: collection dies with ``AttributeError: module
+'_tkinter' has no attribute '__file__'`` and the bug has no measurable suite at all.
+Setting it is the project's own answer rather than a harness workaround -- matplotlib's
+own test conftest also selects ``agg`` (``matplotlib.use('agg', force=True)``), only too
+late, because ``use()`` imports pyplot on the way to ``switch_backend`` and pyplot has
+already resolved the default -- and the value is the non-interactive ``Agg`` because the
+suite's tests that do want another backend name it themselves in the child environment
+they spawn (``test_backends_interactive.py``, ``test_backend_webagg.py``) or blank it
+deliberately (``test_rcparams.py``), so a value in the parent cannot take a window away
+from a test that asks for one.
 """
 
 BUILD_ENV_KEYS = frozenset({"CFLAGS", "MPLSETUPCFG"})
@@ -549,14 +566,14 @@ def _validate_bug(entry: Any, where: str, index: int, seen: set[str]) -> None:
         for key, value in env.items():
             if key not in SANDBOX_ENV_KEYS:
                 raise SplitError(
-                    f"{tag}: sandbox_env key {key!r} is not allowed — the only key a "
-                    f"bug may set is {sorted(SANDBOX_ENV_KEYS)}, because a general "
+                    f"{tag}: sandbox_env key {key!r} is not allowed — the only keys a "
+                    f"bug may set are {sorted(SANDBOX_ENV_KEYS)}, because a general "
                     "environment channel would change what the graded tests run in"
                 )
             if not isinstance(value, str) or not value.strip():
                 raise SplitError(
                     f"{tag}: sandbox_env[{key!r}] must be a non-empty string — an empty "
-                    "value would put an empty entry on PYTHONPATH, which is not a path"
+                    "value is not the environment the project declares its suite runs in"
                 )
 
     build = entry.get("build_env")

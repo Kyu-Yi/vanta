@@ -59,14 +59,19 @@ pub fn backend_kind_label(kind: SandboxKind) -> &'static str {
 /// The complete set of environment keys `--sandbox-env` is allowed to inject.
 ///
 /// [VANTA-WHY] The allow-list *is* the feature. A recorded per-project rule has
-/// to be able to put the project's own import path in front of the baseline
-/// gates, the native suite, the generated tests and the oracle — e.g. fastapi's
-/// own `scripts/test.sh` exports `PYTHONPATH=./docs_src`, and the same import
-/// path must be visible to every one of those runs. A general "set any
-/// variable" flag would instead be an env-injection channel across the sandbox
-/// boundary, which is exactly what this flag refuses to be: only the keys named
-/// here may cross.
-pub const ALLOWED_SANDBOX_ENV_KEYS: &[&str] = &["PYTHONPATH"];
+/// to be able to put the project's own environment in front of the baseline
+/// gates, the native suite, the generated tests and the oracle — every one of
+/// those runs must see the same value, or the bug is measured against a
+/// different environment than the one its project declares. fastapi's own
+/// `scripts/test.sh` exports `PYTHONPATH=./docs_src`, which ~250 of its tests
+/// need at collection. matplotlib reads `MPLBACKEND` into `rcParams['backend']`
+/// at import, and without it `pyplot` resolves the default to TkAgg, whose
+/// import chain reaches `_tkinter.__file__` — absent from this layer's CPython
+/// 3.8 — so collection itself dies and the suite is unmeasurable. A general
+/// "set any variable" flag would instead be an env-injection channel across
+/// the sandbox boundary, which is exactly what this flag refuses to be: only
+/// the keys named here may cross.
+pub const ALLOWED_SANDBOX_ENV_KEYS: &[&str] = &["PYTHONPATH", "MPLBACKEND"];
 
 /// Parse one `--sandbox-env KEY=VALUE` specification.
 ///
@@ -375,6 +380,14 @@ mod tests {
         assert_eq!(
             parse_sandbox_env("PYTHONPATH=./docs_src").unwrap(),
             ("PYTHONPATH".to_string(), "./docs_src".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_sandbox_env_accepts_the_recorded_backend() {
+        assert_eq!(
+            parse_sandbox_env("MPLBACKEND=Agg").unwrap(),
+            ("MPLBACKEND".to_string(), "Agg".to_string())
         );
     }
 

@@ -65,7 +65,9 @@ struct CliArgs {
     /// fallback. Do not infer."). e.g. "pytest tests/ -q".
     test_cmd: Option<String>,
     /// Environment injected into every sandbox command of the run, from
-    /// `--sandbox-env KEY=VALUE` (repeatable). Only `PYTHONPATH` is allowed.
+    /// `--sandbox-env KEY=VALUE` (repeatable). Only the keys in the recorded
+    /// allow-list (`PYTHONPATH`, `MPLBACKEND`) are accepted; any other key is
+    /// refused rather than quietly injected.
     sandbox_env: Vec<(String, String)>,
     /// Path to a clean original tree (git worktree of the base commit) for
     /// Mode B. If set, BATE runs against this tree instead of the in-memory
@@ -478,7 +480,7 @@ fn print_help() {
          --open-pr              Open a GitHub PR after Gatekeeper approval\n    \
          --patch, -p PATH       Verify an EXISTING patch (skip Creator, run Attacker+BATE on this diff)\n    \
          --test-cmd CMD         Test command (default: 'python3 -m pytest'). e.g. 'pytest tests/ -q'\n    \
-         --sandbox-env K=V     Inject K=V into every sandbox command of the run (repeatable). PYTHONPATH only; refused for any other key\n    \
+         --sandbox-env K=V     Inject K=V into every sandbox command of the run (repeatable). PYTHONPATH or MPLBACKEND only; refused for any other key\n    \
          --original-tree PATH   Clean original tree (git worktree of base commit) for Mode B two-tree mode\n    \
          --rerun-signals ID     Re-run session ID's review-mode rejection signals against --good-tree (writes vanta_sessions/ID_signal_reruns.json; no --repo needed)\n    \
          --good-tree PATH       Known-good source: a directory, or a patch file applied onto --base-tree\n    \

@@ -99,6 +99,12 @@
       "reason": "The demotion is the project's own idiom, not the harness's: the same `setup.py` (line 459) appends `-Wno-error=deprecated-declarations` for Python 3.8, and the layer's own era rule demotes its six GCC-14 promotions the same way (`bake._ERA_WARNING_FLAGS`, `-Wno-error=` rather than `-Wno=`) so the diagnostics stay visible while they stop being fatal. The alternative the item offered -- `-Wno-error` through the `/opt/vanta-cc` wrapper -- was not taken because the wrapper is the layer's, not the bug's, and would demote every warning of every project.",
       "decided_by": "user review, 2026-10-29",
       "rule": "A project that compiles with `-Werror` against sources written for an older toolchain declares `build_env` with the demotion its own `setup.py` would have written. Only `CFLAGS` may be named, and its value is added to whatever the layer already sets for that variable, so the era's warning demotions and the stdint include survive; the rule is read by `prepare`'s in-place build of all three trees and by nothing else, so it cannot change what the graded tests observe. GCC documents that a more specific `-Wno-error=<name>` has priority over a bare `-Werror` independently of their position on the command line, which is what makes the token effective from `CFLAGS` while the build passes `-Werror` of its own accord. The bake's dropped pins (pyarrow, numba, llvmlite) are not changed by this entry: the graded nodeid imports none of them and nothing that reaches them (checked, not assumed), so the drop stays inert for this bug."
+    },
+    {
+      "change": "matplotlib/1 carries `build_env: {\"MPLSETUPCFG\": \"/workspace/vanta-build.cfg\"}` and `build_files: {\"vanta-build.cfg\": \"[libs]\\nsystem_freetype = True\\n\"}`. Its `setupext.py` reads the path of its build config from `MPLSETUPCFG` (line 134), defaulting to `setup.cfg`, which the tree does not ship -- the repo has only `setup.cfg.template`, so `config.getboolean('libs', 'system_freetype', fallback=False)` (line 140) is always False. With it False, `FreeType.do_custom_build` (line 541) finds no `build/freetype-2.6.1`, tries two GNU URLs and raises `IOError: Failed to download FreeType` -- the layer's VM has no network, so `python setup.py build_ext --inplace` exits 1 and all three trees die in the build with a gate failure about the network that is not about the bug. With `system_freetype = True` the same method returns at its first line and `FreeType.add_flags` (line 518) uses the layer's own FreeType through `pkg-config freetype2`.",
+      "reason": "The layer already carries what the build wants: `bake.SDIST_SYSTEM_PACKAGES['matplotlib']` installs `libfreetype-dev`, `libpng-dev`, `zlib1g-dev` and `pkg-config`, trixie's `libfreetype-dev` is 2.13.3, and `add_flags` asks for `atleast_version='9.11.3'` (FreeType 2.3's libtool version), which 2.13.3 satisfies -- so naming the system FreeType is the build's own supported route, not a workaround. `system_qhull` is left alone (fallback False): the tree vendors its qhull sources under `extern/libqhull/*.c`, and turning it on would ask the layer for a package nobody installed. The file is written into the batch directory, which Shuru mounts at `/workspace`, so it lands beside the trees and never inside one: the tree the Attacker and the Creator read stays exactly what the benchmark ships, which is why the file route was taken over a `setup.cfg` written into the repo.",
+      "decided_by": "user review, 2026-10-29",
+      "rule": "A build that selects its configuration through a file rather than a flag declares `build_files` with the file's contents and `build_env` with the variable that names it. The file is written into the batch directory -- the guest's `/workspace`, the mount point `suite.guest_tree_root` already fixes -- and nowhere else, so it cannot reach a tree; the name must be a bare file name, and the value must be an absolute path inside `/workspace` because the build runs with the tree as its working directory. `MPLSETUPCFG` is the second variable the build allow-list admits; the layer never sets it (`bake.COMPILER_ENV` names `CC`, `CXX`, `LDSHARED`, `LDCXXSHARED`, `CFLAGS`, `FFLAGS`), so its value is set outright rather than appended to the layer's. Like `build_env`, the rule is read by `prepare`'s in-place build of all three trees and by nothing else, so it cannot change what the graded tests observe; the graded FAIL_TO_PASS is the non-image `test_noop_tight_bbox`, and the one warning the suite's `filterwarnings = error` could have turned fatal goes through `matplotlib._log.warning`, not the warnings module."
     }
   ],
   "bugs": [
@@ -190,6 +196,12 @@
       "checkpoint": "vanta-bi-matplotlib-1",
       "wave": 1,
       "role": "pilot",
+      "build_env": {
+        "MPLSETUPCFG": "/workspace/vanta-build.cfg"
+      },
+      "build_files": {
+        "vanta-build.cfg": "[libs]\nsystem_freetype = True\n"
+      },
       "notes": "Round-robin pass 1, matplotlib. First py3.8 bug in the project."
     },
     {

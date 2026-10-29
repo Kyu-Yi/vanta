@@ -219,7 +219,22 @@ class BugPrep:
     their place. It is read by the in-place build and by nothing else — it is not put on
     the environment any suite runs in — so it cannot change what the graded tests
     observe. Empty for every bug that does not declare one, which is the whole corpus
-    but pandas's.
+    but pandas's and matplotlib's.
+    """
+    build_files: dict[str, str] = field(default_factory=dict)
+    """§3.4 — the build's own configuration file, written beside the trees before it runs.
+
+    [VANTA-WHY] The other half of :attr:`build_env`, for a build that selects its
+    configuration through a file rather than a flag: matplotlib's ``setupext.py`` reads
+    the config path from ``MPLSETUPCFG``, and without ``system_freetype`` it tries to
+    download FreeType 2.6.1 over the network, which a VM without one answers with an
+    ``IOError`` — a gate failure about the network dressed up as a failure about the
+    bug. The file is written into the batch directory (the guest's ``/workspace``) and
+    never into a tree, so the trees stay exactly what the benchmark ships and the graded
+    tests observe nothing of it: it is read by the in-place build and by nothing else.
+    Recorded on the row for the same reason :attr:`build_env` is — it is a fact about how
+    the project builds on this image, not about the bug. Empty for every bug that does
+    not declare one, which is the whole corpus but matplotlib's.
     """
     test_paths: list[str] = field(default_factory=list)
     fail_to_pass: list[str] = field(default_factory=list)
@@ -421,6 +436,7 @@ class BugPrep:
             "prepare_mode": self.prepare_mode,
             "sandbox_env": self.sandbox_env,
             "build_env": self.build_env,
+            "build_files": self.build_files,
             "runnable": self.runnable,
             "test_paths": self.test_paths,
             "fail_to_pass": sorted(self.fail_to_pass),
@@ -481,6 +497,7 @@ class BugPrep:
             prepare_mode=str(field_of(payload, "prepare_mode", owner=owner, where=where)),
             sandbox_env=map_of(payload, "sandbox_env", owner=owner, where=where),
             build_env=map_of(payload, "build_env", owner=owner, where=where),
+            build_files=map_of(payload, "build_files", owner=owner, where=where),
             test_paths=strings_of(payload, "test_paths", owner=owner, where=where),
             fail_to_pass=strings_of(payload, "fail_to_pass", owner=owner, where=where),
             f2p_undeclared=strings_of(payload, "f2p_undeclared", owner=owner, where=where),
@@ -798,7 +815,8 @@ def build_trees_in_place(
     interpretation of it here could disagree with the one the split was checked
     against. The command follows the rule's own trigger (:func:`setup_args_for`) and the
     environment is the layer's (``bake.build_env_for``) with the project's own
-    ``build_env`` added to it, for the reason ``suite.build_tree_in_place`` records.
+    ``build_env`` added to it and its ``build_files`` written beside the trees, for the
+    reason ``suite.build_tree_in_place`` records.
 
     Only ``full`` prepares reach this — it is called after ``load_deps`` and before the
     dependency gate — so a measure-only run never pays a compiler.
@@ -822,6 +840,16 @@ def build_trees_in_place(
         for name, value in sorted(prep.build_env.items()):
             layer_value = env.get(name, "")
             env[name] = f"{layer_value} {value}".strip() if layer_value else value
+    if prep.build_files:
+        # §3.4 — the build's own configuration file, written into the batch directory
+        # rather than into a tree: ``batch_dir`` is what Shuru mounts at ``/workspace``,
+        # so the file lands *beside* the trees and the trees stay exactly what the
+        # benchmark ships. Written before the first VM boots, so every one of the three
+        # builds already sees it, and rewritten each time so a re-prepare is the same
+        # run. The name is a bare file name (§3.4, the split's own validation), so it
+        # cannot be a path to somewhere else.
+        for name, content in sorted(prep.build_files.items()):
+            (batch_dir / name).write_text(content, encoding="utf-8")
     setup_args = setup_args_for(prep.bug.pythonpath)
     command = f"python setup.py {' '.join(setup_args)}"
     for tree_name in BUILD_TREES:
@@ -2049,6 +2077,10 @@ def prepare_one(
         # way and for the same reason: the split records it once, and every tree this
         # row builds gets it from the row rather than from a pipeline literal.
         build_env={str(k): str(v) for k, v in (entry.get("build_env") or {}).items()},
+        # §3.4 — the build's own configuration file (``build_files``), read here the
+        # same way: the split records the contents once, and the row carries them to
+        # the point where the build writes them beside the trees.
+        build_files={str(k): str(v) for k, v in (entry.get("build_files") or {}).items()},
     )
 
     mismatches = check_declared(entry, bug)

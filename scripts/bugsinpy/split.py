@@ -99,7 +99,9 @@ DECLARED_BUG_KEYS = frozenset(
     }
 )
 
-OPTIONAL_DECLARED_BUG_KEYS = frozenset({"import_package", "sandbox_env", "build_env"})
+OPTIONAL_DECLARED_BUG_KEYS = frozenset(
+    {"import_package", "sandbox_env", "build_env", "build_files"}
+)
 """Declared keys a bug may carry but need not.
 
 [VANTA-WHY] ``import_package`` is the last-resort override for the import name the
@@ -135,6 +137,20 @@ build and nothing else: ``sandbox_env`` is the environment the graded tests run 
 is the measurement, whereas this one is read by ``prepare``'s in-place build (§3.4) and
 by nothing that grades a patch. A bug that declares one records the reason in the split's
 ``reviewed_changes``, like every other departure from the first-authored protocol.
+
+[VANTA-WHY] ``build_files`` is the other half of that rule, for a build that selects its
+configuration through a file rather than through a flag. matplotlib/1 is the case: its
+``setupext.py`` reads the path of its config from ``MPLSETUPCFG`` (defaulting to
+``setup.cfg``, which the tree does not ship — only ``setup.cfg.template``), and
+``FreeType.do_custom_build`` returns immediately when ``system_freetype`` is true, so the
+one honest offline route is to *name* the system FreeType the layer already carries
+instead of letting the build try to download 2.6.1 from two GNU URLs, which is an
+``IOError`` in a VM with no network. The file is written into the batch directory — the
+guest's ``/workspace`` — and never into a tree, so it cannot change what the graded tests
+read; the tree stays exactly what the benchmark ships, for the reason ``sandbox_env``
+records. It is a map because a build may read more than one file, and the values are the
+contents verbatim. A bug that declares one records the reason in the split's
+``reviewed_changes``.
 """
 
 SANDBOX_ENV_KEYS = frozenset({"PYTHONPATH"})
@@ -147,7 +163,7 @@ it showing up as a decision about the bug. A bug that needs another key is a cha
 this set and to the split's ``reviewed_changes``, not a quiet value in a bug entry.
 """
 
-BUILD_ENV_KEYS = frozenset({"CFLAGS"})
+BUILD_ENV_KEYS = frozenset({"CFLAGS", "MPLSETUPCFG"})
 """The variables ``build_env`` may add to, and nothing else.
 
 [VANTA-WHY] The allow-list *is* the rule, for the reason :data:`SANDBOX_ENV_KEYS`
@@ -159,9 +175,16 @@ that writes it *adds* its token to a value that is already there rather than put
 in that value's place, and because it is the one the build's own configuration reads for
 both the compile and the link line. A build's own ``-Werror`` lands after it on the
 command line; GCC documents that a more specific ``-Wno-error=<name>`` has priority over
-a bare ``-Werror`` independently of their position. A bug that needs another variable is
-a change to this set and to the split's ``reviewed_changes``, not a quiet value in a bug
-entry.
+a bare ``-Werror`` independently of their position.
+
+``MPLSETUPCFG`` is the second shape: it names the path of the file a build reads its own
+configuration from — the other half of ``build_files``, which writes that file into the
+batch directory. The layer never sets it (``bake.COMPILER_ENV`` names ``CC``, ``CXX``,
+``LDSHARED``, ``LDCXXSHARED``, ``CFLAGS``, ``FFLAGS`` and nothing else), so the value is
+set outright rather than appended to one that is there, which is what "added to the
+layer's value" means for a variable the layer does not own. A bug that needs another
+variable is a change to this set and to the split's ``reviewed_changes``, not a quiet
+value in a bug entry.
 """
 
 # Written back by ``prepare``. Nothing here may be hand-edited into the file
@@ -563,6 +586,42 @@ def _validate_bug(entry: Any, where: str, index: int, seen: set[str]) -> None:
                     f"{tag}: build_env[{name!r}] must be a non-empty string — the value "
                     "is added to whatever the layer already sets for that variable, and "
                     "an empty one declares nothing"
+                )
+
+    files = entry.get("build_files")
+    if files is not None:
+        if not isinstance(files, dict) or not files:
+            raise SplitError(
+                f"{tag}: build_files must be a non-empty object of NAME=CONTENT strings "
+                "— the build's own configuration file, or nothing at all; an empty one "
+                "would record a file that is never written"
+            )
+        if not entry["needs_build"]:
+            raise SplitError(
+                f"{tag}: build_files is declared but needs_build is false — the file is "
+                "written just before the in-place build (§3.4), which a bug that needs "
+                "no build never reaches, so this entry would be a rule that can never "
+                "apply"
+            )
+        for name, content in files.items():
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in {".", ".."}
+                or "/" in name
+                or "\\" in name
+            ):
+                raise SplitError(
+                    f"{tag}: build_files name {name!r} must be a bare file name — the "
+                    "file is written into the batch directory, which the guest sees as "
+                    "/workspace, so a name carrying a path separator or a directory "
+                    "step could put it somewhere other than beside the trees, and the "
+                    "whole reason this rule is honest is that it cannot reach a tree"
+                )
+            if not isinstance(content, str) or not content.strip():
+                raise SplitError(
+                    f"{tag}: build_files[{name!r}] must be a non-empty string — the "
+                    "contents are written verbatim, and an empty file declares nothing"
                 )
 
     # Derived fields, when present, must be self-consistent.

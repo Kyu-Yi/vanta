@@ -679,6 +679,78 @@ class TestSplit:
                 )
             )
 
+    def test_the_build_allow_list_admits_the_config_path_variable(self):
+        """``MPLSETUPCFG`` is the second variable ``build_env`` may name (§3.4).
+
+        [VANTA-WHY] It is added for matplotlib/1, whose build reads its config path from
+        it, and it is admitted on the same terms as ``CFLAGS``: the layer never sets it,
+        so the value is set outright, and it reaches the in-place build and nothing else.
+        """
+        assert (
+            split_mod.validate(
+                split_data(
+                    bugs=[
+                        bug_entry(
+                            needs_build=True,
+                            build_env={"MPLSETUPCFG": "/workspace/vanta-build.cfg"},
+                        )
+                    ]
+                )
+            )
+            is None
+        )
+
+    def test_build_files_is_an_optional_declared_key(self):
+        """The build's own configuration file, carried only by a bug whose build reads one.
+
+        [VANTA-WHY] matplotlib/1 is the case: ``setupext.py`` takes the path of its
+        config from ``MPLSETUPCFG`` and, without ``system_freetype``, tries to download
+        FreeType over a network the layer's VM does not have. The file is written into
+        the batch directory and never into a tree, so it cannot change what the graded
+        tests observe; it is validated when present, so the shape stays closed.
+        """
+        assert split_mod.validate(split_data()) is None
+        assert (
+            split_mod.validate(
+                split_data(
+                    bugs=[
+                        bug_entry(
+                            needs_build=True,
+                            build_files={
+                                "vanta-build.cfg": "[libs]\nsystem_freetype = True\n"
+                            },
+                        )
+                    ]
+                )
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param({}, id="empty"),
+            pytest.param("[libs]\nsystem_freetype = True\n", id="not-an-object"),
+            pytest.param({"vanta-build.cfg": "  "}, id="blank-content"),
+            pytest.param({"vanta-build.cfg": 1}, id="not-a-string"),
+            pytest.param({"../setup.cfg": "x = 1"}, id="a-directory-step"),
+            pytest.param({"sub/cfg": "x = 1"}, id="a-path-separator"),
+            pytest.param({"": "x = 1"}, id="an-empty-name"),
+        ],
+    )
+    def test_build_files_is_validated_when_present(self, value):
+        with pytest.raises(SplitError, match="build_files"):
+            split_mod.validate(split_data(bugs=[bug_entry(needs_build=True, build_files=value)]))
+
+    def test_a_build_file_a_bug_never_reaches_is_refused(self):
+        """``build_files`` is written by the in-place build, which a build-free bug skips."""
+        with pytest.raises(SplitError, match="needs_build"):
+            split_mod.validate(
+                split_data(
+                    bugs=[bug_entry(build_files={"vanta-build.cfg": "x = 1"})]
+                )
+            )
+
     def test_unknown_top_level_key_is_an_error(self):
         with pytest.raises(SplitError, match="unknown top-level keys"):
             split_mod.validate(split_data(seed=0))  # typo for `seeds`
@@ -5566,6 +5638,8 @@ class TestPrepareRunRecordContract:
             hidden_files_deleted=["tests/test_hidden.py"],
             partially_hidden_functions=["hidden_fn"],
             sandbox_env={"PYTHONPATH": "./docs_src"},
+            build_env={"CFLAGS": "-Wno-error=array-bounds"},
+            build_files={"vanta-build.cfg": "[libs]\nsystem_freetype = True\n"},
             hidden_by_collect_flip={
                 "tests/test_skip_defaults.py": (
                     "TypeError: get() got an unexpected keyword argument "
@@ -5630,6 +5704,12 @@ class TestPrepareRunRecordContract:
         # §3.4: the recorded suite environment and the collect-flip record, which the
         # oracle, the strip and the run all read back off this same row.
         assert loaded.sandbox_env == {"PYTHONPATH": "./docs_src"}
+        # §3.4: the two halves of the build rule — the variables added to the compiler's
+        # environment and the file the build reads its own configuration from.
+        assert loaded.build_env == {"CFLAGS": "-Wno-error=array-bounds"}
+        assert loaded.build_files == {
+            "vanta-build.cfg": "[libs]\nsystem_freetype = True\n"
+        }
         assert loaded.hidden_by_collect_flip == original.hidden_by_collect_flip
         assert loaded.collect_flip_nodeids == sorted(original.collect_flip_nodeids)
         assert loaded.hidden_nodeids == sorted(
@@ -17247,6 +17327,72 @@ class TestBuildTreesInPlace:
             "the compiler the interpreter recorded is the builder's, not the layer's"
         )
         assert seen["env"]["CC"] == bake_mod.VANTA_CC_PATH
+
+    def test_the_projects_own_build_rule_reaches_the_build(self, tmp_path, monkeypatch):
+        """``build_env`` is added to the layer's environment, not put in its place.
+
+        [VANTA-WHY] The layer's ``CFLAGS`` carry the era's warning demotions and the
+        stdint include; a rule that replaced them would change the build in ways it does
+        not declare, so the two are joined. A variable the layer does not set is set
+        outright — that is the shape ``MPLSETUPCFG`` needs.
+        """
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod,
+            "build_tree_in_place",
+            lambda **kwargs: seen.update(kwargs),
+        )
+        self._rule(monkeypatch, needed=True)
+
+        prepare_mod.build_trees_in_place(
+            self._prep(
+                tmp_path,
+                build_env={
+                    "CFLAGS": "-Wno-error=array-bounds",
+                    "MPLSETUPCFG": "/workspace/vanta-build.cfg",
+                },
+            ),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            repo=tmp_path / "clone",
+        )
+
+        layer = bake_mod.build_env_for("3.8")
+        assert seen["env"]["CFLAGS"] == f"{layer['CFLAGS']} -Wno-error=array-bounds"
+        assert seen["env"]["MPLSETUPCFG"] == "/workspace/vanta-build.cfg"
+        assert seen["env"]["CC"] == layer["CC"], "the layer's own variables survive"
+
+    def test_the_projects_own_build_file_is_written_beside_the_trees(
+        self, tmp_path, monkeypatch
+    ):
+        """``build_files`` lands in the batch directory, which the guest sees as /workspace.
+
+        [VANTA-WHY] It is written *before* the first build and outside every tree, which
+        is the whole reason the rule is honest: the tree the Attacker and the Creator
+        read stays exactly what the benchmark ships, and the build still finds the file
+        at the path ``build_env`` names.
+        """
+        monkeypatch.setattr(suite_mod, "build_tree_in_place", lambda **kwargs: None)
+        self._rule(monkeypatch, needed=True)
+
+        batch = tmp_path / "batch"
+        batch.mkdir()  # `prepare` creates it before the trees are materialised
+        prepare_mod.build_trees_in_place(
+            self._prep(
+                tmp_path,
+                build_files={"vanta-build.cfg": "[libs]\nsystem_freetype = True\n"},
+            ),
+            checkpoint="chk",
+            batch_dir=batch,
+            repo=tmp_path / "clone",
+        )
+
+        written = batch / "vanta-build.cfg"
+        assert written.read_text(encoding="utf-8") == "[libs]\nsystem_freetype = True\n"
+        assert sorted(entry.name for entry in batch.iterdir()) == ["vanta-build.cfg"], (
+            "directly in the batch directory, which the guest sees as /workspace — never "
+            "inside a tree"
+        )
 
     def test_a_bug_that_needs_no_build_records_why_it_was_not_built(
         self, tmp_path, monkeypatch

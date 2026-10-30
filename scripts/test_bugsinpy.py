@@ -20258,6 +20258,131 @@ class TestParseSummary:
         assert runner_mod.read_run_summary(tmp_path / "absent_session.jsonl") == ("", {})
 
 
+class TestReportUnreadable:
+    """A report that cannot be read is named and classed, never read as empty.
+
+    The audit finding was that ``read_run_summary`` swallowing ``OSError`` and
+    ``JSONDecodeError`` made a missing or corrupt report look like a run that
+    wrote nothing — an empty summary nobody could tell from a legitimate one. The
+    strict reading names the file and the reason, and the class it is scored under
+    (``infra_failure``) is named on the record, so the two can never be pooled.
+    """
+
+    def test_a_missing_session_is_named_with_its_path_and_reason(self, tmp_path):
+        path = tmp_path / "absent_session.jsonl"
+        with pytest.raises(runner_mod.ReportUnreadable) as caught:
+            runner_mod.read_run_summary(path, strict=True)
+        assert caught.value.path == path
+        assert str(path) in str(caught.value)
+        assert runner_mod.REPORT_UNREADABLE in str(caught.value)
+        assert "session file not found" in str(caught.value)
+
+    def test_a_session_with_no_run_summary_row_is_named(self, tmp_path):
+        path = write(
+            tmp_path / "s_session.jsonl",
+            json.dumps({"phase": "session.start", "summary": "model=x"}) + "\n",
+        )
+        with pytest.raises(runner_mod.ReportUnreadable, match="no run.summary row"):
+            runner_mod.read_run_summary(path, strict=True)
+
+    def test_a_wholly_corrupt_jsonl_is_named_and_counted(self, tmp_path):
+        path = write(tmp_path / "s_session.jsonl", "{not json\nstill not json\n")
+        with pytest.raises(runner_mod.ReportUnreadable, match="corrupt JSONL") as caught:
+            runner_mod.read_run_summary(path, strict=True)
+        assert "2 unparseable line(s)" in str(caught.value)
+
+    def test_a_torn_tail_is_not_a_failure(self, tmp_path):
+        """A killed process leaves the COMPLETE rows before the tear: they still read.
+
+        The strict reading must not turn a normal mid-write truncation into an infra
+        failure — the last whole ``run.summary`` row is recovered and returned.
+        """
+        path = write(
+            tmp_path / "s_session.jsonl",
+            json.dumps({"phase": "run.summary", "summary": "attempts_run=2"}) + "\n"
+            '{"phase": "run.sum',
+        )
+        assert runner_mod.read_run_summary(path, strict=True)[1] == {"attempts_run": "2"}
+
+    def test_the_lenient_default_is_unchanged(self, tmp_path):
+        """Callers that treat a missing report as a documented state keep the old read."""
+        assert runner_mod.read_run_summary(tmp_path / "absent_session.jsonl") == ("", {})
+
+    def test_batch_metadata_present_but_corrupt_is_named(self, tmp_path):
+        path = write(tmp_path / "prepare.json", "{ oops")
+        with pytest.raises(runner_mod.ReportUnreadable, match="corrupt JSON"):
+            runner_mod._read_json(path, strict=True)
+        # The same bytes read as a CACHE stay lenient: a corrupt cache is a miss.
+        assert runner_mod._read_json(path) == {}
+
+    def test_batch_metadata_that_is_absent_is_still_empty(self, tmp_path):
+        """Absent is a documented state even under the strict reading, not an error."""
+        assert runner_mod._read_json(tmp_path / "absent.json", strict=True) == {}
+
+    def test_the_infra_class_is_the_label_the_manifest_table_gives_it(self):
+        """The failure record's class and `label_for` must agree on the spelling."""
+        censor = oracle_mod.OracleResult(apply_ok=False, patch_good=False)
+        assert (
+            runner_mod.label_for(runner_mod.INFRA_VERDICT, censor)
+            == runner_mod.INFRA_LABEL
+        )
+
+    def test_a_failure_record_names_the_reason_and_the_class(self, tmp_path):
+        """End to end: an unreadable report is `report_unreadable` / `infra_failure`,
+        not an anonymous failure a reader has to interpret from an error string."""
+        outcome = runner_mod.SessionOutcome(
+            session_id="sess",
+            exit_code=0,
+            timed_out=False,
+            decision="",
+            summary={},
+            raw_summary="",
+            session_path=tmp_path / "sess_session.jsonl",
+            debug_dir=None,
+            final_patch=None,
+            log_path=tmp_path / "run.log",
+            run_secs=1.0,
+            error=f"{runner_mod.REPORT_UNREADABLE}: no run.summary row in x",
+            reason=runner_mod.REPORT_UNREADABLE,
+        )
+        job = runner_mod.Job(
+            batch_id="b",
+            wave=1,
+            bug="Demo/1",
+            prep=object(),
+            entry={},
+            config="vanta",
+            arm="b3",
+            mode="repair",
+            seed=0,
+            checkpoint="ckpt",
+            python_version_pinned="3.8.1",
+        )
+        paths = runner_mod.BatchPaths.under(tmp_path)
+        runner_mod._append_failure(paths, job, outcome)
+        record = json.loads(paths.failures.read_text(encoding="utf-8").splitlines()[0])
+        assert record["reason"] == runner_mod.REPORT_UNREADABLE
+        assert record["label"] == runner_mod.INFRA_LABEL
+
+    def test_an_ordinary_failure_states_no_class(self):
+        """A failure with no named reason (no session id, a timeout) stays unclassed
+        rather than being blamed on infrastructure it did not name."""
+        assert runner_mod.SessionOutcome(
+            session_id=None,
+            exit_code=None,
+            timed_out=True,
+            decision="",
+            summary={},
+            raw_summary="",
+            session_path=None,
+            debug_dir=None,
+            final_patch=None,
+            log_path=Path("/dev/null"),
+            run_secs=0.0,
+            error="no session id",
+        ).reason == ""
+
+
 class TestSamplingBlock:
     """§7.3's provenance block: the pipeline's per-call schedule plus the server's `top_p`."""
 

@@ -140,6 +140,37 @@ class RunnerError(RuntimeError):
     """The runner cannot proceed — a broken preflight, not a bad run."""
 
 
+# [VANTA-WHY] The two names a report that could not be read is recorded under:
+# ``report_unreadable`` is the reason (what happened to the file) and
+# ``infra_failure`` is the class it is scored under (``label_for``'s verdict branch
+# for ``InfraFailure``). They are constants rather than literals because the reader,
+# the session outcome and the failure record must not be able to disagree about the
+# spelling of the same condition.
+REPORT_UNREADABLE = "report_unreadable"
+INFRA_VERDICT = "InfraFailure"
+INFRA_LABEL = "infra_failure"
+"""``label_for(INFRA_VERDICT, …)`` — pinned by a test so the failure record and the
+manifest's label table cannot drift apart about what an infrastructure failure is
+called."""
+
+
+class ReportUnreadable(RunnerError):
+    """A report that is *there* but cannot be read, carrying the path and the reason.
+
+    Kept apart from a report that is simply *absent*: a missing optional file is a
+    documented state (a batch that predates a field), while a present-and-unparseable
+    one is evidence the run wrote something it could not finish — an infrastructure
+    fact, not a model verdict. The path and the underlying reason travel with the
+    exception so the caller can record ``report_unreadable`` with both, instead of
+    letting an empty dict read as "this run recorded nothing".
+    """
+
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(f"{REPORT_UNREADABLE}: {path}: {reason}")
+        self.path = path
+        self.reason = reason
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -991,6 +1022,13 @@ class SessionOutcome:
     log_path: Path
     run_secs: float
     error: str = ""
+    reason: str = ""
+    """The machine's own name for *why* the session left no usable row.
+
+    ``report_unreadable`` when the session report could not be read at all (missing,
+    unreadable or corrupt) — the class the failure is scored under is ``infra_failure``
+    rather than an empty, normal-looking summary. ``""`` for every ordinary run.
+    """
 
     @property
     def usable(self) -> bool:
@@ -1009,24 +1047,67 @@ def parse_summary(text: str) -> dict[str, str]:
     return {key: value for key, value in SUMMARY_PAIR.findall(text)}
 
 
-def read_run_summary(session_path: Path) -> tuple[str, dict[str, str]]:
-    """The last ``run.summary`` row's raw text and its parsed pairs."""
-    raw = ""
+def _scan_run_summary(session_path: Path) -> tuple[str, dict[str, str], str]:
+    """The last ``run.summary`` row, its parsed pairs, and why it could not be read.
+
+    The third element is ``""`` when a ``run.summary`` row was recovered and the
+    reason otherwise. Three failures are kept apart because the runner classifies
+    them differently: the file is not there, the file is there but unreadable or
+    entirely unparseable, or the file is readable and carries no ``run.summary`` row
+    at all. A torn *tail* is not a failure — a process killed mid-write leaves the
+    rows before it intact, so the last **complete** ``run.summary`` still wins.
+    """
     try:
-        with open(session_path, encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if record.get("phase") == "run.summary":
-                    raw = str(record.get("summary") or "")
-    except OSError:
-        return "", {}
-    return raw, parse_summary(raw)
+        text = session_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "", {}, f"session file not found: {session_path}"
+    except OSError as exc:
+        return "", {}, f"session file unreadable: {session_path} ({exc})"
+    raw = ""
+    found = False
+    nonblank = 0
+    parsed = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        nonblank += 1
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        parsed += 1
+        if record.get("phase") == "run.summary":
+            found = True
+            raw = str(record.get("summary") or "")
+    if found:
+        return raw, parse_summary(raw), ""
+    if nonblank and not parsed:
+        return "", {}, f"corrupt JSONL: {session_path} ({nonblank} unparseable line(s))"
+    return "", {}, f"no run.summary row in {session_path}"
+
+
+def read_run_summary(
+    session_path: Path, *, strict: bool = False
+) -> tuple[str, dict[str, str]]:
+    """The last ``run.summary`` row's raw text and its parsed pairs.
+
+    Order matters: the per-call sampling schedule is emitted site by site
+    (``temperature_creator=… max_tokens_creator=…``), and the manifest reproduces
+    it in that order so a reader compares it against the request bodies rather
+    than against a re-sorted copy.
+
+    ``strict=True`` raises :class:`ReportUnreadable` (path and reason) rather than
+    returning ``("", {})`` when no ``run.summary`` row could be recovered. That is
+    the reading the runner uses where the report is the run's only evidence: an
+    unreadable one is an infrastructure failure, and must not look like a run that
+    quietly wrote nothing. The default — an empty summary — is kept for callers that
+    already treat a missing report as a documented state.
+    """
+    raw, pairs, reason = _scan_run_summary(session_path)
+    if reason and strict:
+        raise ReportUnreadable(session_path, reason)
+    return raw, pairs
 
 
 # ---------------------------------------------------------------------------
@@ -1219,7 +1300,7 @@ def localization_table(
     pointer to the fix rather than the fix, and a hit rate that counted it would
     report the ranking as better than the prompt the model read.
     """
-    report = _read_json(batch_dir / CONTEXT_REPORT_NAME)
+    report = _read_json(batch_dir / CONTEXT_REPORT_NAME, strict=True)
     if not report:
         raise RunnerError(
             f"no {CONTEXT_REPORT_NAME} in {batch_dir}. The audit reads the selection "
@@ -1707,7 +1788,18 @@ def invoke_vanta(
     debug_dir = sessions_dir() / session_id / "debug"
     outcome.session_path = session_path
     outcome.debug_dir = debug_dir
-    raw, summary = read_run_summary(session_path)
+    try:
+        raw, summary = read_run_summary(session_path, strict=True)
+    except ReportUnreadable as exc:
+        # [VANTA-WHY] The report is this run's only evidence, so an unreadable one is
+        # an infrastructure fact, not a run that quietly wrote nothing: the reason
+        # (`report_unreadable`) and the exact path and cause are recorded, and the
+        # class is `infra_failure` on the failure record (`_append_failure`). Reading
+        # it as `("", {})` would leave `decision` empty and the failure indistinguishable
+        # from a session that legitimately stopped before writing a verdict.
+        outcome.reason = REPORT_UNREADABLE
+        outcome.error = str(exc)
+        return outcome
     outcome.raw_summary = raw
     outcome.summary = summary
     outcome.decision = summary.get("final_decision", "")
@@ -2288,6 +2380,14 @@ def _append_failure(paths: BatchPaths, job: Job, outcome: SessionOutcome) -> Non
         "exit_code": outcome.exit_code,
         "timed_out": outcome.timed_out,
         "error": outcome.error,
+        # [VANTA-WHY] Why this job left no row, and the class it is scored under. A
+        # report that could not be read is `report_unreadable` and is classed
+        # `infra_failure`, so the class is named on the record instead of being
+        # inferable only from an error string, and a corrupt artefact cannot be pooled
+        # with a session that legitimately wrote no summary. `None` on every other
+        # failure (no session id, a timeout with no report, a mid-flight crash).
+        "reason": outcome.reason or None,
+        "label": INFRA_LABEL if outcome.reason == REPORT_UNREADABLE else None,
         "run_log": str(outcome.log_path),
     }
     with open(paths.failures, "a", encoding="utf-8") as handle:
@@ -2836,7 +2936,7 @@ def recorded_split_path(batch_dir: Path) -> Optional[Path]:
     bugs (#E). ``None`` when the batch predates the field or carries no
     ``prepare.json`` — the caller then keeps whatever default it had.
     """
-    raw = _read_json(batch_dir / "prepare.json").get("split")
+    raw = _read_json(batch_dir / "prepare.json", strict=True).get("split")
     return Path(str(raw)) if raw else None
 
 
@@ -2855,7 +2955,7 @@ def load_prepared(
     re-reads ``bug.info`` so a moved clone fails loudly here rather than silently
     grading against a tree nobody prepared.
     """
-    payload = _read_json(batch_dir / "prepare.json")
+    payload = _read_json(batch_dir / "prepare.json", strict=True)
     if not payload:
         raise RunnerError(
             f"no prepare.json in {batch_dir}; run `bugsinpy_run.py prepare --batch "
@@ -2942,10 +3042,34 @@ def _bug_key(entry: dict[str, Any]) -> str:
     return f"{entry['project']}/{entry['bug_id']}"
 
 
-def _read_json(path: Path) -> dict[str, Any]:
+def _read_json(path: Path, *, strict: bool = False) -> dict[str, Any]:
+    """A JSON file as a dict; ``{}`` when it is *absent*.
+
+    Absent and unparseable share one answer by default, which is right for a
+    **cache**: a corrupt cache entry means "cache miss, recompute" (the candidate
+    oracle cache, the environment cache), and refusing to run because a scratch
+    file got truncated would turn a recoverable miss into a dead batch.
+
+    It is wrong for **batch metadata**. There a file that is present and unparseable
+    is a corrupt artefact, not a missing one — the batch wrote something it could not
+    finish — so those callers pass ``strict=True`` and get :class:`ReportUnreadable`
+    naming the path and the reason, instead of an empty dict that reads as "this
+    batch recorded nothing" and then masquerades as a documented state. A *missing*
+    file is never an error, strict or not.
+    """
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        if strict:
+            raise ReportUnreadable(path, f"file unreadable ({exc})") from exc
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        if strict:
+            raise ReportUnreadable(path, f"corrupt JSON ({exc})") from exc
         return {}
 
 

@@ -2804,6 +2804,21 @@ pub async fn run(
         let bate_relabels = bate_run.relabel_events;
         let bate_intent_checks = bate_run.intent_checks;
         let bate_harness_error = bate_run.harness_error;
+        let bate_generated_tests = bate_run.generated_tests;
+        // [VANTA-WHY] M3 item 10 — one entry per Attacker test this round
+        // produced, admitted and discarded alike. Written HERE rather than beside
+        // `attempt_<n>_tests.json` further down, because a round whose tests were
+        // ALL discarded (or the round a `HarnessFailure` ended) is exactly the
+        // round whose sources exist nowhere else, and both of those paths leave
+        // before the `attempt_<n>_tests.json` write. Additive logging only: no
+        // verdict, label, score, key or existing row changes, and the name does
+        // not collide with the `attempt_<n>_{patched,graded}_tree` names
+        // `compact.py` / `pool.py` match on.
+        let attempt_generated_tests_path =
+            debug_dir.join(format!("attempt_{}_generated_tests.json", attempt + 1));
+        if let Ok(json) = serde_json::to_string_pretty(&bate_generated_tests) {
+            let _ = fs::write(&attempt_generated_tests_path, json);
+        }
         let discard_rate = if attacker_tests.is_empty() {
             0.0
         } else {

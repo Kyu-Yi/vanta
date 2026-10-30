@@ -61,6 +61,7 @@ from bugsinpy import oracle as oracle_mod  # noqa: E402
 from bugsinpy import pool as pool_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
 from bugsinpy import records as records_mod  # noqa: E402
+from bugsinpy import replay as replay_mod  # noqa: E402
 from bugsinpy import runner as runner_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
 from bugsinpy import suite as suite_mod  # noqa: E402
@@ -85,6 +86,7 @@ EXPECTED_ERRORS = (
     records_mod.RecordError,
     mutants_mod.MutantError,
     pool_mod.PoolError,
+    replay_mod.ReplayError,
 )
 """Every failure the harness raises on purpose, and the reason the CLI prints them.
 
@@ -1203,6 +1205,99 @@ def cmd_report(args: argparse.Namespace) -> int:
     return EXIT_OK if subprocess.run(argv, cwd=str(REPO_ROOT)).returncode == 0 else EXIT_BUG_FAILED
 
 
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Item 10 — replay every stored attempt of a row onto one fixed test set S.
+
+    [VANTA-WHY] Its own sub-command, never wired into ``run`` or ``pool``: a row's
+    live verdicts are complete before it runs, and replay writes only under
+    ``<batch>/replay/`` — the manifest, the transitions file, ``oracle/`` and
+    ``vanta_sessions/`` are opened read-only, so no verdict, label, score or row on
+    disk can move. The two checks up front are the same preflight every VM-booting
+    stage does, because Shuru may only mount trees under the process CWD.
+
+    The split resolves exactly as ``pool``'s does (:func:`_resolve_pool_split`): an
+    omitted ``--split`` means "the split this batch was prepared with", and a given
+    one must agree with that record. Reusing that function is deliberate — a second
+    copy of the rule is how two stages come to disagree about which bugs a batch
+    holds.
+    """
+    if len(args.batch) != 1:
+        raise replay_mod.ReplayError(
+            "`replay` replays one batch at a time and takes exactly one --batch; "
+            f"got {len(args.batch)}."
+        )
+    runner_mod.require_repo_cwd()
+    batch_dir = runner_mod.require_batch_dir(Path(args.batch[0]).resolve())
+    split = _resolve_pool_split(args, [batch_dir])
+    bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
+    batch = runner_mod.load_prepared(
+        batch_dir=batch_dir, split=split, bugsinpy_root=bugsinpy_root
+    )
+    waves = parse_waves(args.waves)
+    selected = select_preps(batch.preps, only=args.only, waves=waves)
+    preps = {prep.key: prep for prep in selected}
+    views = replay_mod.parse_views(args.views)
+    sessions = runner_mod.sessions_dir()
+
+    latest: dict[str, dict[str, Any]] = {}
+    for record in manifest_mod.Manifest(batch_dir).records():
+        key = str(record.get("key") or "")
+        if key:
+            # The manifest is append-only, so a resumed or re-run job appears more
+            # than once; the last occurrence is the one `Manifest.find` and
+            # `state.json` treat as current, and therefore the one replayed.
+            latest[key] = record
+    rows = [record for record in latest.values() if replay_mod.is_repair_row(record)]
+    if not rows:
+        raise replay_mod.ReplayError(
+            f"no repair rows to replay in {batch_dir}: replay needs a finished "
+            "repair row (a session and a final patch)."
+        )
+
+    out_dir = batch_dir / replay_mod.REPLAY_DIRNAME
+    for index, record in enumerate(rows, start=1):
+        key = str(record.get("key"))
+        prep = preps.get(str(record.get("bug") or ""))
+        if prep is None:
+            print(
+                f"[{index}/{len(rows)}] {key} — skipped: this selection names no prep "
+                f"for {record.get('bug')!r}",
+                flush=True,
+            )
+            continue
+        out_path = out_dir / f"{replay_mod.row_stem(key)}.json"
+        if out_path.exists() and not args.force:
+            print(
+                f"[{index}/{len(rows)}] {key} — skipped: {out_path.name} already "
+                "exists (--force to redo)",
+                flush=True,
+            )
+            continue
+        checkpoint = str(batch.entries[prep.key]["checkpoint"])
+        print(
+            f"[{index}/{len(rows)}] {key} — replaying {len(views)} view(s) in Shuru…",
+            flush=True,
+        )
+        result = replay_mod.replay_row(
+            record=record,
+            prep=prep,
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            sessions_dir=sessions,
+            views=views,
+            seed=args.seed,
+            sample_rate=args.sample_rate,
+            disk_mb=args.disk_mb,
+            timeout_secs=replay_mod.DEFAULT_TIMEOUT_SECS,
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        print(f"    -> {out_path}", flush=True)
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------------------
 # cli
 # ---------------------------------------------------------------------------
@@ -1528,6 +1623,81 @@ def build_parser() -> argparse.ArgumentParser:
         help="the batch directory `run` wrote its manifest into",
     )
     rep.set_defaults(func=cmd_report)
+
+    rpl = sub.add_parser(
+        "replay",
+        help=(
+            "replay a finished repair row's stored attempts onto one shared test set "
+            "in Shuru, writing the X[test][k] matrix under <batch>/replay (item 10)"
+        ),
+    )
+    rpl.add_argument(
+        "--batch",
+        action="append",
+        required=True,
+        default=[],
+        metavar="DIR",
+        help="the batch directory `run` wrote its manifest into (exactly one)",
+    )
+    rpl.add_argument(
+        "--split",
+        type=Path,
+        default=None,
+        help=(
+            "the split to read the batch with. Omit it and the batch's own recorded "
+            "split (its prepare.json) is used, exactly as for `pool`"
+        ),
+    )
+    rpl.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="PROJECT/BUG",
+        help="replay only these bugs (repeatable)",
+    )
+    rpl.add_argument("--waves", default="", help="comma-separated wave numbers")
+    rpl.add_argument(
+        "--views",
+        default=",".join(replay_mod.DEFAULT_VIEWS),
+        help=(
+            "comma-separated views to run (default "
+            f"'{','.join(replay_mod.DEFAULT_VIEWS)}'): 'generated' is S (the native "
+            "suite plus the admitted generated tests), 'oracle' the hidden nodeids"
+        ),
+    )
+    rpl.add_argument(
+        "--seed",
+        type=int,
+        default=replay_mod.DEFAULT_SEED,
+        help=(
+            "the seed for the re-execution flake sample (default "
+            f"{replay_mod.DEFAULT_SEED}); the draw is a pure function of it"
+        ),
+    )
+    rpl.add_argument(
+        "--sample-rate",
+        type=float,
+        default=replay_mod.DEFAULT_SAMPLE_RATE,
+        help=(
+            "the share of cells re-executed to catch a flaky one (default "
+            f"{replay_mod.DEFAULT_SAMPLE_RATE}); 0 draws none"
+        ),
+    )
+    rpl.add_argument(
+        "--force",
+        action="store_true",
+        help="redo a row whose <batch>/replay/<row-stem>.json already exists",
+    )
+    rpl.add_argument(
+        "--disk-mb",
+        type=int,
+        default=prepare_mod.DISK_MB,
+        help=(
+            "shuru disk in MB for every VM this stage boots; the default matches "
+            f"the suites prepare ran ({prepare_mod.DISK_MB})"
+        ),
+    )
+    rpl.set_defaults(func=cmd_replay)
 
     loc = sub.add_parser(
         "localize",

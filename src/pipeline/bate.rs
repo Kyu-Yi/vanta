@@ -308,6 +308,37 @@ pub struct HarnessError {
     pub evidence: String,
 }
 
+/// One entry in the per-attempt `attempt_<n>_generated_tests.json` artifact
+/// (M3 item 10, fold-ins 3 and 4).
+///
+/// [VANTA-WHY] A test BATE discards survives on disk today only as a
+/// `bate.scrap[<name>]` reason — its SOURCE is nowhere, so nothing downstream can
+/// look at what the Attacker actually wrote. Item 10 needs the discarded sources
+/// (fold-in 3) and, for each admitted reproduction probe, the baseline failure it
+/// was validated against (fold-in 4). Both are computed here and, before this
+/// artifact existed, dropped after the revise prompt. This is ADDITIVE LOGGING:
+/// it changes no verdict, label, score, key or existing row.
+///
+/// [VANTA-WHY] `test_name`/`test_source`/`declared_intent` describe the test's
+/// FINAL form — the form it was admitted or scrapped as. For an admitted test
+/// that is byte-identical to its entry in `attempt_<n>_tests.json`, which is what
+/// lets a reader join the two files by name; for a scrapped test it is the last
+/// body BATE rejected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GeneratedTestRecord {
+    pub test_name: String,
+    pub test_source: String,
+    pub declared_intent: TestIntent,
+    /// `"valid"`, `"scrapped"` or `"harness_error"`.
+    pub bate_status: String,
+    /// BATE's reason, exactly as the `bate.scrap[<name>]` row carries it.
+    pub bate_reason: Option<String>,
+    /// The bounded baseline account the test was judged on
+    /// (`baseline_evidence`). `None` only when no baseline run produced one — a
+    /// scrap at the flaky pre-check, which runs before any detailed baseline.
+    pub baseline_evidence: Option<String>,
+}
+
 /// §14.19 — `Some(evidence)` when this baseline run never reached a verdict for
 /// the generated test and the failure is not the test's own doing.
 pub fn harness_error(details: &TestExecutionDetails) -> Option<String> {
@@ -379,6 +410,10 @@ pub struct BateRun {
     /// Attacker for a broken environment and inflate the discard rate with a
     /// non-test. The caller stops the attempt instead of revising.
     pub harness_error: Option<HarnessError>,
+    /// M3 item 10 — one entry per Attacker test this round PRODUCED, admitted and
+    /// discarded alike, for `attempt_<n>_generated_tests.json`. See
+    /// `GeneratedTestRecord`.
+    pub generated_tests: Vec<GeneratedTestRecord>,
 }
 
 /// What BATE should do with a BugReproduction test whose baseline mismatched.
@@ -471,6 +506,21 @@ pub async fn run_bate(
             relabel_events: Vec::new(),
             intent_checks: Vec::new(),
             harness_error: None,
+            // No baseline ran, so there is no evidence and nothing was scrapped:
+            // every produced test is `valid`. The artifact still names them all,
+            // because "one entry per test the Attacker produced" is what makes a
+            // reader able to tell "no record" from "no tests".
+            generated_tests: tests
+                .iter()
+                .map(|t| GeneratedTestRecord {
+                    test_name: t.test_name.clone(),
+                    test_source: t.test_source.clone(),
+                    declared_intent: t.intent.clone(),
+                    bate_status: "valid".to_string(),
+                    bate_reason: None,
+                    baseline_evidence: None,
+                })
+                .collect(),
         };
     }
 
@@ -478,6 +528,7 @@ pub async fn run_bate(
     let mut scrapped_tests: Vec<(String, String)> = Vec::new();
     let mut relabel_events: Vec<IntentRelabel> = Vec::new();
     let mut intent_checks: Vec<IntentCheckRecord> = Vec::new();
+    let mut generated_tests: Vec<GeneratedTestRecord> = Vec::new();
 
     for test in tests {
         // [VANTA-WHY] Spec §7 "Flaky tests" row: run the baseline twice; a test
@@ -488,15 +539,28 @@ pub async fn run_bate(
         let r2 =
             harness::run_single_test(original_execution_source, &test.test_source, test_cmd).await;
         if r1 != r2 {
-            scrapped_tests.push((
-                test.test_name.clone(),
-                format!("FLAKY: baseline disagreed with itself (run1={r1:?}, run2={r2:?})"),
-            ));
+            let reason =
+                format!("FLAKY: baseline disagreed with itself (run1={r1:?}, run2={r2:?})");
+            generated_tests.push(GeneratedTestRecord {
+                test_name: test.test_name.clone(),
+                test_source: test.test_source.clone(),
+                declared_intent: test.intent.clone(),
+                bate_status: "scrapped".to_string(),
+                bate_reason: Some(reason.clone()),
+                // The pre-check runs `run_single_test`, which returns no detailed
+                // output, so there is no baseline evidence to record here.
+                baseline_evidence: None,
+            });
+            scrapped_tests.push((test.test_name.clone(), reason));
             continue;
         }
 
         let mut current_test = test.clone();
         let mut final_outcome: Option<BateOutcome> = None;
+        // M3 item 10 (fold-in 4) — the last baseline run this test was judged
+        // on, kept so the record can carry the failure a reproduction probe was
+        // validated against.
+        let mut last_baseline_evidence: Option<String> = None;
 
         // Layer 2: up to 3 Attacker revisions when the baseline mismatches intent.
         for revision in 0..=3 {
@@ -528,6 +592,9 @@ pub async fn run_bate(
             )
             .await;
             let baseline_result = baseline.result.clone();
+            // M3 item 10 — keep the bounded account of this baseline run; the
+            // record below carries it as fold-in 4's evidence.
+            last_baseline_evidence = Some(baseline_evidence(&baseline));
 
             // [VANTA-WHY] §14.19 — the environment, not the test. Checked before
             // the relabel and revise paths, because both of those hand the test
@@ -542,6 +609,18 @@ pub async fn run_bate(
                     "BATE: baseline never reached a verdict and the failure is not the test's \
                      — stopping BATE for this attempt"
                 );
+                // M3 item 10 — record the test that surfaced it. The tests after
+                // it were never judged, so they get no entry (a `null` status
+                // would be indistinguishable from "this batch predates the
+                // artifact").
+                generated_tests.push(GeneratedTestRecord {
+                    test_name: current_test.test_name.clone(),
+                    test_source: current_test.test_source.clone(),
+                    declared_intent: current_test.intent.clone(),
+                    bate_status: "harness_error".to_string(),
+                    bate_reason: None,
+                    baseline_evidence: Some(evidence.clone()),
+                });
                 return BateRun {
                     report: BateReport {
                         valid_tests: valid_tests.iter().map(|t| t.test_name.clone()).collect(),
@@ -554,6 +633,7 @@ pub async fn run_bate(
                         test_name: current_test.test_name.clone(),
                         evidence,
                     }),
+                    generated_tests,
                 };
             }
 
@@ -731,14 +811,40 @@ pub async fn run_bate(
         }
 
         match final_outcome {
-            Some(BateOutcome::Valid) => valid_tests.push(current_test),
+            Some(BateOutcome::Valid) => {
+                generated_tests.push(GeneratedTestRecord {
+                    test_name: current_test.test_name.clone(),
+                    test_source: current_test.test_source.clone(),
+                    declared_intent: current_test.intent.clone(),
+                    bate_status: "valid".to_string(),
+                    bate_reason: None,
+                    baseline_evidence: last_baseline_evidence.clone(),
+                });
+                valid_tests.push(current_test);
+            }
             Some(BateOutcome::Mismatch(reason)) => {
+                generated_tests.push(GeneratedTestRecord {
+                    test_name: current_test.test_name.clone(),
+                    test_source: current_test.test_source.clone(),
+                    declared_intent: current_test.intent.clone(),
+                    bate_status: "scrapped".to_string(),
+                    bate_reason: Some(reason.clone()),
+                    baseline_evidence: last_baseline_evidence.clone(),
+                });
                 scrapped_tests.push((current_test.test_name.clone(), reason))
             }
-            None => scrapped_tests.push((
-                current_test.test_name.clone(),
-                "unknown BATE outcome".into(),
-            )),
+            None => {
+                let reason = "unknown BATE outcome".to_string();
+                generated_tests.push(GeneratedTestRecord {
+                    test_name: current_test.test_name.clone(),
+                    test_source: current_test.test_source.clone(),
+                    declared_intent: current_test.intent.clone(),
+                    bate_status: "scrapped".to_string(),
+                    bate_reason: Some(reason.clone()),
+                    baseline_evidence: last_baseline_evidence.clone(),
+                });
+                scrapped_tests.push((current_test.test_name.clone(), reason));
+            }
         }
     }
 
@@ -751,6 +857,7 @@ pub async fn run_bate(
         relabel_events,
         intent_checks,
         harness_error: None,
+        generated_tests,
     }
 }
 

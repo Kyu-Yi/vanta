@@ -973,6 +973,37 @@ const CONTRADICTORY_INTENT_TEST: &str = r#"{"tests":[
         }
     ]}"#;
 
+/// A round carrying BOTH shapes item 10's artifact must keep: a `BugReproduction`
+/// probe that BATE SCRAPS after revising it, and one it ADMITS unchanged.
+///
+/// [VANTA-WHY] M3 item 10 — `attempt_<n>_generated_tests.json` exists to keep a
+/// round's generated tests on disk, discarded ones included, because a scrapped
+/// test's SOURCE appears nowhere else: the session log carries only BATE's
+/// reason. A round with one of each is the only shape that proves the file is
+/// not merely "the admitted tests under a new name". The scrap probe is FIRST so
+/// the stub's default revision answer (the generation array's first element)
+/// keeps it contradicting its intent; its baseline PASSES on the original tree,
+/// the relabel gate fails closed on the omitted `issue_requires_change`, and the
+/// revision budget runs out — exactly the path
+/// `a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped`
+/// pins.
+const ADMITTED_AND_DISCARDED_TESTS: &str = r#"{"tests":[
+        {
+            "test_name":"test_intent_contradiction",
+            "test_source":"from calc import add\n\ndef test_intent_contradiction():\n    assert add(2, 3) == 5\n",
+            "intent":"BugReproduction",
+            "reason":"Declares a bug that the original tree does not have.",
+            "issue_quote":"The issue expects a bug-reproduction probe asserting add(2, 3) == 6."
+        },
+        {
+            "test_name":"test_bug_reproduction_only",
+            "test_source":"from calc import add\n\ndef test_bug_reproduction_only():\n    assert add(2, 3) == 6\n",
+            "intent":"BugReproduction",
+            "reason":"Fails on the original baseline, so BATE admits it.",
+            "issue_quote":"The issue expects a bug-reproduction probe asserting add(2, 3) == 6."
+        }
+    ]}"#;
+
 /// The oracle loophole, in the exact shape the real fixture produced: the test
 /// asserts the PATCH's own arithmetic (`add(2, 3) == -1`) and legitimises it by
 /// quoting a sentence that IS verbatim in the issue — a sentence which in fact
@@ -2487,6 +2518,128 @@ fn a_test_whose_baseline_contradicts_its_intent_is_revised_before_being_scrapped
              the model has to be told: {body}"
         );
     }
+}
+
+/// [VANTA-WHY] M3 item 10 (fold-ins 3 and 4) — the repair loop must write, beside
+/// `attempt_<n>_tests.json`, one `attempt_<n>_generated_tests.json` naming EVERY
+/// Attacker test a round produced: the ones BATE admitted AND the ones it
+/// discarded. Before this artifact a scrapped test survived on disk only as a
+/// `bate.scrap[<name>]` reason string — its source and the baseline run it was
+/// judged on were computed and then dropped, so the replay (item 10) could never
+/// recover them. This pins the shape the replay reads back: the discarded test's
+/// SOURCE is on disk, its `bate_status` says `scrapped`, its `bate_reason` is
+/// BATE's own mismatch text, and `baseline_evidence` carries the account of the
+/// run it was judged on — with the admitted probe in the SAME file as `valid`,
+/// which is what proves the artifact is not just the admitted set renamed.
+#[test]
+fn the_repair_loop_records_every_generated_test_admitted_and_scrapped_alike() {
+    let _serial = serial_run();
+    let workspace = TempDir::new().unwrap();
+    let (_repo_dir, _issue_path, patch_path) =
+        write_test_repo(workspace.path(), WRONG_BEHAVIOUR_PATCH);
+    // The default stub answer keeps the batch audit from scrapping either probe,
+    // so the only discriminator afterwards is BATE's baseline check.
+    let server = StubLlmServer::start(ADMITTED_AND_DISCARDED_TESTS);
+
+    let _status = run_patch_mode_with(workspace.path(), &patch_path, &server, 1, &[]);
+
+    let records = read_session_records(&find_session_log(workspace.path()));
+    // The artifact is written next to the per-attempt debug tree, keyed by the
+    // session that produced it — the same location the replay resolves a row's
+    // attempts from.
+    let debug_dir = workspace
+        .path()
+        .join("vanta_sessions")
+        .join(records[0].session_id.as_str())
+        .join("debug");
+    let artifact_path = debug_dir.join("attempt_1_generated_tests.json");
+    assert!(
+        artifact_path.is_file(),
+        "the repair loop must write attempt_1_generated_tests.json; the debug dir had {:?}",
+        fs::read_dir(&debug_dir)
+            .map(|entries| entries
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+                .collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+    let artifact = read_json(&artifact_path);
+    let entries = artifact
+        .as_array()
+        .unwrap_or_else(|| panic!("the artifact must be a JSON array, got {artifact}"));
+
+    // One entry per Attacker test the round produced — no more, no fewer. A file
+    // that dropped the discarded test would have one; one that also logged the
+    // per-test retries would have more.
+    assert_eq!(
+        entries.len(),
+        2,
+        "one entry per generated test, admitted and scrapped alike; got {artifact}"
+    );
+
+    let by_name = |name: &str| -> &serde_json::Value {
+        entries
+            .iter()
+            .find(|e| e["test_name"] == serde_json::json!(name))
+            .unwrap_or_else(|| panic!("no entry for {name} in {artifact}"))
+    };
+
+    let scrapped = by_name("test_intent_contradiction");
+    assert_eq!(
+        scrapped["bate_status"],
+        serde_json::json!("scrapped"),
+        "the probe whose baseline contradicted its intent is scrapped, and the artifact \
+         must say so; got {scrapped}"
+    );
+    assert_eq!(
+        scrapped["declared_intent"],
+        serde_json::json!("BugReproduction"),
+        "the entry must carry the intent the test was judged under; got {scrapped}"
+    );
+    assert!(
+        scrapped["bate_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("BATE mismatch")),
+        "the discard reason must be BATE's own mismatch text, not a generic one; got {scrapped}"
+    );
+    assert!(
+        scrapped["test_source"]
+            .as_str()
+            .is_some_and(|s| s.contains("assert add(2, 3) == 5")),
+        "the discarded probe's SOURCE is the thing that exists nowhere else on disk, so the \
+         artifact must carry it verbatim; got {scrapped}"
+    );
+    // [VANTA-WHY] fold-in 4 — the baseline account the probe was judged on. The
+    // probe PASSES on the original tree, and that fact is what makes it a
+    // mismatch for a BugReproduction intent: the evidence must name the verdict,
+    // not merely exist.
+    let evidence = scrapped["baseline_evidence"].as_str().unwrap_or_else(|| {
+        panic!("a discarded probe judged on a baseline must carry that baseline's evidence; got {scrapped}")
+    });
+    assert!(
+        evidence.contains("verdict: PASSED"),
+        "the recorded baseline evidence must be the run the probe was actually judged on \
+         (it passed on the original tree); got {evidence}"
+    );
+
+    let valid = by_name("test_bug_reproduction_only");
+    assert_eq!(
+        valid["bate_status"],
+        serde_json::json!("valid"),
+        "the probe that failed its baseline as its intent requires is admitted, and the \
+         artifact must say so; got {valid}"
+    );
+    assert_eq!(
+        valid["bate_reason"],
+        serde_json::Value::Null,
+        "an admitted test has no discard reason; it must be null, never invented; got {valid}"
+    );
+    assert!(
+        valid["test_source"]
+            .as_str()
+            .is_some_and(|s| s.contains("assert add(2, 3) == 6")),
+        "the admitted probe's source must be carried too, so a reader can join the artifact \
+         to attempt_1_tests.json by name; got {valid}"
+    );
 }
 
 /// Regression guard for the oracle loophole: a patch must not be able to write

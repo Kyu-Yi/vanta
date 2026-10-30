@@ -60,6 +60,7 @@ from bugsinpy import pool as pool_mod  # noqa: E402
 from bugsinpy import prepare as prepare_mod  # noqa: E402
 from bugsinpy import records as records_mod  # noqa: E402
 from bugsinpy import redact as redact_mod  # noqa: E402
+from bugsinpy import replay as replay_mod  # noqa: E402
 from bugsinpy import runner as runner_mod  # noqa: E402
 from bugsinpy import shuru as shuru_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
@@ -25968,4 +25969,638 @@ class TestPoolBuildCommand:
             ]
         )
         assert code == run_mod.EXIT_OK
+
+
+# ============================================================================
+# replay.py — item 10: every stored attempt onto one fixed test set (no VM)
+# ============================================================================
+# The whole point of item 10 is a number a reader can trust, and every rule that
+# decides one is a pure function here. These tests pin those rules against a
+# matrix whose counts are known by hand, then drive one row end to end with the
+# Shuru layer replaced, so the record's shape is checked without a VM.
+def _replay_cell(test_id: str, k: int, value: str) -> dict:
+    """One matrix cell as :func:`transitions` reads it."""
+    return {
+        "test_id": test_id,
+        "k": k,
+        "value": value,
+        "evidence_source": replay_mod.evidence_source_for(test_id),
+        "observed_online": False,
+        "test_name": test_id.split(":", 1)[1],
+    }
+
+
+def _replay_matrix() -> list[dict]:
+    """Six tests over three columns, their transitions countable by hand.
+
+    ``t_a`` clears then breaks (an EIR), ``t_b`` breaks then clears (an ECR),
+    ``g_c`` the reverse, ``g_f`` stays broken then clears, ``g_d`` starts
+    unobserved (a censored cell), and ``g_e`` has no third column (absent).
+    """
+    return [
+        _replay_cell("native:t_a", 0, "pass"),
+        _replay_cell("native:t_a", 1, "pass"),
+        _replay_cell("native:t_a", 2, "fail"),
+        _replay_cell("native:t_b", 0, "fail"),
+        _replay_cell("native:t_b", 1, "pass"),
+        _replay_cell("native:t_b", 2, "pass"),
+        _replay_cell("generated:g_c", 0, "pass"),
+        _replay_cell("generated:g_c", 1, "fail"),
+        _replay_cell("generated:g_c", 2, "pass"),
+        _replay_cell("generated:g_d", 0, "error"),
+        _replay_cell("generated:g_d", 1, "pass"),
+        _replay_cell("generated:g_d", 2, "pass"),
+        _replay_cell("generated:g_e", 0, "pass"),
+        _replay_cell("generated:g_e", 1, "pass"),
+        _replay_cell("generated:g_f", 0, "fail"),
+        _replay_cell("generated:g_f", 1, "fail"),
+        _replay_cell("generated:g_f", 2, "pass"),
+    ]
+
+
+def _replay_prep(tmp_path: Path, **over) -> prepare_mod.BugPrep:
+    """A prep whose trees are real, so the graded-tree diff has something to read."""
+    root = tmp_path / "worktrees" / "Demo_1"
+    write(root / "vanta_clean" / "pkg" / "mod.py", "one = 1\n")
+    write(root / "oracle_tree" / "pkg" / "mod.py", "one = 1\n")
+    return oracle_prep(root=root, **over)
+
+
+def _replay_session(tmp_path: Path, *, attempts: int = 1, session_id: str = "sid"):
+    """``(sessions_dir, debug_dir)`` for a row with ``attempts`` stored attempts."""
+    sessions = tmp_path / "vanta_sessions"
+    debug = sessions / session_id / "debug"
+    for attempt in range(1, attempts + 1):
+        write(debug / f"attempt_{attempt}_creator_patch.txt", f"PATCH-{attempt}")
+        write(
+            debug / f"attempt_{attempt}_graded_tree" / "pkg" / "mod.py",
+            f"one = {attempt + 1}\n",
+        )
+    write(sessions / f"{session_id}_transitions.jsonl", "")
+    write(sessions / f"{session_id}_session.jsonl", "")
+    return sessions, debug
+
+
+def _replay_record(**over) -> dict:
+    record = {
+        "key": "b#Demo/1#vanta#repair#0#",
+        "bug": "Demo/1",
+        "mode": "repair",
+        "session_id": "sid",
+        "attempts_run": 1,
+        "artifacts": {"final_patch": "/tmp/final.patch"},
+    }
+    record.update(over)
+    return record
+
+
+def _fake_column(monkeypatch, outcomes_by_k, *, unstable=(), infra=None, calls=None):
+    """Replace the Shuru layer with a function that answers from a table."""
+
+    def fake(**kwargs):
+        if calls is not None:
+            calls.append(kwargs)
+        return replay_mod.ColumnRun(
+            outcomes=dict(outcomes_by_k.get(kwargs["k"], {})),
+            unstable=set(unstable),
+            infra=infra,
+            ran=True,
+            boots=1,
+        )
+
+    monkeypatch.setattr(replay_mod, "run_column", fake)
+    return fake
+
+
+class TestReplayCounts:
+    def test_every_transition_pair_is_counted_exactly(self):
+        entries = replay_mod.transitions(_replay_matrix())
+        assert [entry["k"] for entry in entries] == ["0->1", "1->2"]
+        first, second = entries
+        assert (
+            first["n_pp"],
+            first["n_pf"],
+            first["n_fp"],
+            first["n_ff"],
+            first["n_censored"],
+        ) == (2, 1, 1, 1, 1)
+        assert (
+            second["n_pp"],
+            second["n_pf"],
+            second["n_fp"],
+            second["n_ff"],
+            second["n_censored"],
+        ) == (2, 1, 2, 0, 1)
+
+    def test_a_censored_or_absent_cell_moves_only_the_censor_count(self):
+        first = replay_mod.transitions(_replay_matrix())[0]
+        # g_d's `error` at k=0 and g_e's absent k=2 are the two censored transitions;
+        # neither is read as a pass or a fail.
+        assert first["n_censored"] == 1  # g_d (0->1); g_e's absence is on 1->2
+        second = replay_mod.transitions(_replay_matrix())[1]
+        assert second["n_censored"] == 1  # g_e (absent at k=2)
+
+    def test_by_source_sums_to_the_pooled_counts(self):
+        first = replay_mod.transitions(_replay_matrix())[0]
+        pooled = {name: first[name] for name in ("n_pp", "n_pf", "n_fp", "n_ff", "n_censored")}
+        summed = {name: 0 for name in pooled}
+        for slot in first["by_source"].values():
+            for name in pooled:
+                summed[name] += slot[name]
+        assert summed == pooled
+        assert first["by_source"][replay_mod.SOURCE_REPO_BASELINE]["n_pp"] == 1
+        assert first["by_source"][replay_mod.SOURCE_VANTA_GENERATED]["n_ff"] == 1
+
+    def test_rates_are_null_on_a_zero_denominator_not_a_division_error(self):
+        got = replay_mod.rates({"n_pp": 0, "n_pf": 0, "n_fp": 2, "n_ff": 1, "n_censored": 3})
+        assert got["eir"] is None
+        assert got["ecr"] == pytest.approx(2 / 3)
+        assert got["acc"] == pytest.approx(2 / 3)
+        assert got["denominators"] == {
+            "eir": 0,
+            "ecr": 3,
+            "acc": 3,
+            "observed": 3,
+            "censored": 3,
+        }
+
+    def test_a_patch_caused_import_failure_is_a_fail_not_a_censor(self):
+        """§6: a collection error of a file in the column's tree is the patch's doing."""
+        assert replay_mod.cell_value("error", [], None) == replay_mod.CELL_FAIL
+        assert replay_mod.cell_value("failed", [], None) == replay_mod.CELL_FAIL
+        assert replay_mod.cell_value("passed", [], None) == replay_mod.CELL_PASS
+
+    def test_an_infrastructure_failure_censors_whatever_the_report_says(self):
+        assert replay_mod.cell_value("passed", [], "no report was written") == replay_mod.CELL_ERROR
+
+    def test_a_test_the_run_never_reached_is_not_run(self):
+        assert replay_mod.cell_value("skipped", [], None) == replay_mod.CELL_NOT_RUN
+        assert replay_mod.cell_value(None, ["other::test"], None) == replay_mod.CELL_NOT_RUN
+
+
+class TestReplayPatchId:
+    def test_patch_id_is_the_drivers_fnv1a_on_a_fixed_vector(self):
+        """The two canonical FNV-1a-64 vectors, prefixed as ``stable_patch_fingerprint``."""
+        assert replay_mod.patch_id("a") == "patch-af63dc4c8601ec8c"
+        assert replay_mod.patch_id("hello") == "patch-a430d84680aabd0b"
+
+    def test_patch_id_changes_when_the_patch_changes(self):
+        assert replay_mod.patch_id("one = 1\n") != replay_mod.patch_id("one = 2\n")
+
+
+class TestReplayEvidenceSource:
+    def test_each_matrix_key_maps_to_its_evidence_source(self):
+        assert replay_mod.evidence_source_for("native:x") == replay_mod.SOURCE_REPO_BASELINE
+        assert replay_mod.evidence_source_for("oracle:x") == replay_mod.SOURCE_BENCHMARK_ORACLE
+        assert replay_mod.evidence_source_for("generated:x") == replay_mod.SOURCE_VANTA_GENERATED
+
+
+class TestReplaySampling:
+    def test_rate_zero_draws_none(self):
+        assert replay_mod.sample_cells(_replay_matrix(), 7, 0.0) == []
+
+    def test_the_draw_is_a_pure_function_of_seed_and_rate(self):
+        cells = _replay_matrix()
+        assert replay_mod.sample_cells(cells, 7, 0.5) == replay_mod.sample_cells(cells, 7, 0.5)
+
+    def test_a_positive_rate_on_a_small_matrix_still_draws_one(self):
+        drawn = replay_mod.sample_cells(_replay_matrix()[:3], 7, 0.1)
+        assert len(drawn) == 1
+
+    def test_a_drawn_cell_is_a_copy_not_a_reference(self):
+        cells = _replay_matrix()
+        drawn = replay_mod.sample_cells(cells, 7, 1.0)
+        drawn[0]["value"] = "tampered"
+        assert cells[0]["value"] != "tampered"
+
+
+class TestReplayFlake:
+    def test_a_disagreeing_reexecution_marks_exactly_that_test(self):
+        cells = _replay_matrix()
+        reexecutions = {("native:t_a", 0): replay_mod.CELL_FAIL}
+        assert replay_mod.flaky(cells, reexecutions) == {"native:t_a"}
+
+    def test_a_matching_reexecution_marks_nothing(self):
+        cells = _replay_matrix()
+        reexecutions = {("native:t_a", 0): replay_mod.CELL_PASS}
+        assert replay_mod.flaky(cells, reexecutions) == set()
+
+    def test_a_flaky_test_leaves_the_cells_and_leaves_the_counts(self):
+        cells = _replay_matrix()
+        # t_a was pass->pass in 0->1, so excluding it drops n_pp from 2 to 1; the
+        # other three buckets and the censor count (g_d's error) are untouched.
+        first = replay_mod.transitions(cells, excluded={"native:t_a"})[0]
+        assert (
+            first["n_pp"],
+            first["n_pf"],
+            first["n_fp"],
+            first["n_ff"],
+            first["n_censored"],
+        ) == (1, 1, 1, 1, 1)
+        assert any(cell["test_id"] == "native:t_a" for cell in cells)
+
+
+class TestReplayColumns:
+    def test_k_attempts_produce_k_plus_one_columns_with_a_baseline_first(self, tmp_path):
+        prep = _replay_prep(tmp_path)
+        _, debug = _replay_session(tmp_path, attempts=2)
+        columns = replay_mod.build_columns(
+            debug_dir=debug, base_tree=prep.root / "vanta_clean", attempts=2
+        )
+        assert [column.k for column in columns] == [0, 1, 2]
+        assert columns[0].origin == replay_mod.ORIGIN_BASELINE
+        assert columns[0].patch_text is None
+        assert columns[1].origin == replay_mod.ORIGIN_GRADED
+        assert columns[1].patch_text and "one = 2" in columns[1].patch_text
+        assert columns[1].patch_id == replay_mod.patch_id("PATCH-1")
+
+    def test_an_attempt_with_no_artifact_is_a_missing_column_never_guessed(self, tmp_path):
+        prep = _replay_prep(tmp_path)
+        _, debug = _replay_session(tmp_path, attempts=1)
+        columns = replay_mod.build_columns(
+            debug_dir=debug, base_tree=prep.root / "vanta_clean", attempts=2
+        )
+        assert columns[2].origin == replay_mod.ORIGIN_MISSING
+        assert columns[2].usable is False
+        assert columns[2].censor_reason
+
+
+class TestReplayReuse:
+    """The guard: a live cell is trusted only when the column's patch id matches."""
+
+    def _row(self, patch_id_value: str, **over) -> dict:
+        row = {
+            "test_id": "t_a",
+            "test_name": "t_a",
+            "evidence_source": "Native",
+            "from_attempt": 0,
+            "to_attempt": 0,
+            "from_patch_attempt_id": None,
+            "to_patch_attempt_id": patch_id_value,
+            "from_result": "Passed",
+            "to_result": "Passed",
+            "censored": False,
+        }
+        row.update(over)
+        return row
+
+    def test_a_live_cell_is_reused_only_when_the_patch_id_matches(self):
+        matching = self._row(replay_mod.patch_id("PATCH-1"))
+        reused = replay_mod.reuse_cells([matching], {0: None, 1: replay_mod.patch_id("PATCH-1")})
+        assert set(reused) == {("native:t_a", 1)}
+        assert reused[("native:t_a", 1)]["observed_online"] is True
+        assert reused[("native:t_a", 1)]["value"] == replay_mod.CELL_PASS
+
+    def test_a_mismatched_id_is_not_reused(self):
+        other = self._row(replay_mod.patch_id("SOMETHING-ELSE"))
+        reused = replay_mod.reuse_cells([other], {0: None, 1: replay_mod.patch_id("PATCH-1")})
+        assert reused == {}
+
+    def test_a_column_whose_patch_is_gone_is_never_reused(self):
+        row = self._row(replay_mod.patch_id("PATCH-1"))
+        assert replay_mod.reuse_cells([row], {0: None, 1: None}) == {}
+
+    def test_column_zero_reads_prepares_failure_baseline(self):
+        cells = replay_mod.baseline_cells(["t_a", "t_b"], ["t_b"])
+        assert cells[("native:t_a", 0)]["value"] == replay_mod.CELL_PASS
+        assert cells[("native:t_b", 0)]["value"] == replay_mod.CELL_FAIL
+        assert all(cell["observed_online"] for cell in cells.values())
+
+
+class TestReplayRow:
+    def test_a_row_records_the_matrix_and_counts_the_reuse(self, tmp_path, monkeypatch):
+        prep = _replay_prep(tmp_path)
+        sessions, debug = _replay_session(tmp_path, attempts=1)
+        # The driver writes <sid>_transitions.jsonl directly under the sessions dir
+        # (session/mod.rs:372), not under <sid>/.
+        transitions = sessions / "sid_transitions.jsonl"
+        write(
+            transitions,
+            json.dumps(
+                {
+                    "test_id": "t_a",
+                    "test_name": "t_a",
+                    "evidence_source": "Native",
+                    "from_attempt": 0,
+                    "to_attempt": 0,
+                    "from_patch_attempt_id": None,
+                    "to_patch_attempt_id": replay_mod.patch_id("PATCH-1"),
+                    "from_result": "Passed",
+                    "to_result": "Passed",
+                    "censored": False,
+                }
+            )
+            + "\n",
+        )
+        write(debug / "shared_tests.json", json.dumps([{"test_name": "g_c", "test_source": "assert 1"}]))
+        _fake_column(monkeypatch, {0: {"generated:g_c": "passed"}, 1: {"generated:g_c": "failed"}})
+        batch = tmp_path / "batch"
+
+        record = replay_mod.replay_row(
+            record=_replay_record(),
+            prep=prep,
+            checkpoint="ck",
+            batch_dir=batch,
+            sessions_dir=sessions,
+            views=(replay_mod.VIEW_GENERATED,),
+            seed=replay_mod.DEFAULT_SEED,
+            sample_rate=0.0,
+            disk_mb=prepare_mod.DISK_MB,
+            timeout_secs=replay_mod.DEFAULT_TIMEOUT_SECS,
+            progress=False,
+        )
+
+        assert record["schema_version"] == replay_mod.SCHEMA_VERSION
+        assert record["kind"] == "replay"
+        assert record["index_convention"] == replay_mod.INDEX_CONVENTION
+        assert [column["k"] for column in record["columns"]] == [0, 1]
+        assert record["columns"][0]["origin"] == replay_mod.ORIGIN_BASELINE
+
+        # The native cell was reused from the live row; the generated cell was run.
+        assert record["replay"]["reused_cells"] == 2
+        assert record["replay"]["executed_cells"] == 2
+        live = [cell for cell in record["cells"] if cell["test_id"] == "native:t_a"]
+        assert all(cell["observed_online"] is True for cell in live)
+        executed = [cell for cell in record["cells"] if cell["test_id"] == "generated:g_c"]
+        assert executed and all(cell["observed_online"] is False for cell in executed)
+
+        # native:t_a passed both columns (n_pp=1); g_c passed then failed (n_pf=1).
+        # One of the two transitions that started at pass introduced an error: EIR=0.5.
+        entry = record["views"][replay_mod.VIEW_GENERATED]["transitions"][0]
+        assert (entry["n_pp"], entry["n_pf"]) == (1, 1)
+        assert entry["rates"]["eir"] == pytest.approx(0.5)
+        assert entry["by_source"][replay_mod.SOURCE_VANTA_GENERATED]["n_pf"] == 1
+
+        generated = next(t for t in record["tests"] if t["test_id"] == "generated:g_c")
+        assert generated["replay_file"] == "vanta_replay_001.py"
+        assert generated["evidence_source"] == replay_mod.SOURCE_VANTA_GENERATED
+
+    def test_the_oracle_view_is_kept_apart_from_s(self, tmp_path, monkeypatch):
+        prep = _replay_prep(tmp_path)
+        sessions, debug = _replay_session(tmp_path, attempts=1)
+        # The S view needs its own transition to inspect, otherwise the split is
+        # untested: give it one admitted generated test that flipped pass -> fail.
+        write(debug / "shared_tests.json", json.dumps([{"test_name": "g_c", "test_source": "assert 1"}]))
+        oracle_id = f"oracle:{prep.hidden_nodeids[0]}"
+        _fake_column(
+            monkeypatch,
+            {
+                0: {oracle_id: "passed", "generated:g_c": "passed"},
+                1: {oracle_id: "passed", "generated:g_c": "failed"},
+            },
+        )
+        record = replay_mod.replay_row(
+            record=_replay_record(),
+            prep=prep,
+            checkpoint="ck",
+            batch_dir=tmp_path / "batch",
+            sessions_dir=sessions,
+            views=replay_mod.DEFAULT_VIEWS,
+            seed=replay_mod.DEFAULT_SEED,
+            sample_rate=0.0,
+            disk_mb=prepare_mod.DISK_MB,
+            timeout_secs=replay_mod.DEFAULT_TIMEOUT_SECS,
+            progress=False,
+        )
+        assert set(record["views"]) == {"generated", "oracle"}
+        oracle_cells = [cell for cell in record["cells"] if cell["test_id"].startswith("oracle:")]
+        assert oracle_cells
+
+        # The oracle cells are counted in the oracle view and nowhere else: the S
+        # view's per-source counts name no benchmark oracle, and vice versa.
+        generated_view = record["views"][replay_mod.VIEW_GENERATED]
+        assert generated_view["transitions"], "the S view must have a transition to inspect"
+        for entry in generated_view["transitions"]:
+            assert replay_mod.SOURCE_BENCHMARK_ORACLE not in entry["by_source"]
+            assert set(entry["by_source"]) <= {
+                replay_mod.SOURCE_REPO_BASELINE,
+                replay_mod.SOURCE_VANTA_GENERATED,
+            }
+        oracle_view = record["views"][replay_mod.VIEW_ORACLE]
+        assert oracle_view["transitions"]
+        for entry in oracle_view["transitions"]:
+            assert replay_mod.SOURCE_BENCHMARK_ORACLE in entry["by_source"]
+            assert replay_mod.SOURCE_VANTA_GENERATED not in entry["by_source"]
+        assert record["tests"] and any(
+            t["evidence_source"] == replay_mod.SOURCE_BENCHMARK_ORACLE for t in record["tests"]
+        )
+
+    def test_a_within_boot_disagreement_marks_the_test_flaky(self, tmp_path, monkeypatch):
+        prep = _replay_prep(tmp_path)
+        sessions, debug = _replay_session(tmp_path, attempts=1)
+        write(debug / "shared_tests.json", json.dumps([{"test_name": "g_c", "test_source": "assert 1"}]))
+        _fake_column(
+            monkeypatch,
+            {0: {"generated:g_c": "passed"}, 1: {"generated:g_c": "passed"}},
+            unstable={"generated:g_c"},
+        )
+        record = replay_mod.replay_row(
+            record=_replay_record(),
+            prep=prep,
+            checkpoint="ck",
+            batch_dir=tmp_path / "batch",
+            sessions_dir=sessions,
+            views=(replay_mod.VIEW_GENERATED,),
+            seed=replay_mod.DEFAULT_SEED,
+            sample_rate=0.0,
+            disk_mb=prepare_mod.DISK_MB,
+            timeout_secs=replay_mod.DEFAULT_TIMEOUT_SECS,
+            progress=False,
+        )
+        assert record["flaky"] == ["generated:g_c"]
+        # Still in the raw record, but gone from the counts.
+        assert any(cell["test_id"] == "generated:g_c" for cell in record["cells"])
+        entry = record["views"][replay_mod.VIEW_GENERATED]["transitions"][0]
+        assert entry["n_pp"] == 0 and entry["n_censored"] == 0
+
+    def test_a_column_that_measures_nothing_makes_a_sampled_cell_unresolvable(
+        self, tmp_path, monkeypatch
+    ):
+        prep = _replay_prep(tmp_path)
+        sessions, debug = _replay_session(tmp_path, attempts=1)
+        write(
+            sessions / "sid_transitions.jsonl",
+            json.dumps(
+                {
+                    "test_id": "t_a",
+                    "test_name": "t_a",
+                    "evidence_source": "Native",
+                    "from_attempt": 0,
+                    "to_attempt": 0,
+                    "from_patch_attempt_id": None,
+                    "to_patch_attempt_id": replay_mod.patch_id("PATCH-1"),
+                    "from_result": "Passed",
+                    "to_result": "Passed",
+                    "censored": False,
+                }
+            )
+            + "\n",
+        )
+        write(debug / "shared_tests.json", json.dumps([{"test_name": "g_c", "test_source": "assert 1"}]))
+        _fake_column(monkeypatch, {}, infra="the column's patch did not apply")
+        record = replay_mod.replay_row(
+            record=_replay_record(),
+            prep=prep,
+            checkpoint="ck",
+            batch_dir=tmp_path / "batch",
+            sessions_dir=sessions,
+            views=(replay_mod.VIEW_GENERATED,),
+            seed=replay_mod.DEFAULT_SEED,
+            sample_rate=1.0,
+            disk_mb=prepare_mod.DISK_MB,
+            timeout_secs=replay_mod.DEFAULT_TIMEOUT_SECS,
+            progress=False,
+        )
+        # The sampled live cell has no second observation to compare against.
+        assert "native:t_a" in record["unresolvable"]
+
+    def test_a_row_whose_attempts_stored_no_generated_tests_says_so(self, tmp_path, monkeypatch):
+        prep = _replay_prep(tmp_path)
+        sessions, debug = _replay_session(tmp_path, attempts=1)
+        write(debug / "shared_tests.json", json.dumps([{"test_name": "g_c", "test_source": "assert 1"}]))
+        _fake_column(monkeypatch, {0: {}, 1: {}})
+        record = replay_mod.replay_row(
+            record=_replay_record(),
+            prep=prep,
+            checkpoint="ck",
+            batch_dir=tmp_path / "batch",
+            sessions_dir=sessions,
+            views=(replay_mod.VIEW_GENERATED,),
+            seed=replay_mod.DEFAULT_SEED,
+            sample_rate=0.0,
+            disk_mb=prepare_mod.DISK_MB,
+            timeout_secs=replay_mod.DEFAULT_TIMEOUT_SECS,
+            progress=False,
+        )
+        assert record["driver_artifacts"]["generated_tests"] == "absent"
+        generated = next(t for t in record["tests"] if t["test_id"] == "generated:g_c")
+        assert generated["bate_outcome"]["status"] is None
+        assert "absent" in generated["bate_outcome"]["reason"]
+
+    def test_a_replay_writes_only_under_the_replay_directory(self, tmp_path, monkeypatch):
+        prep = _replay_prep(tmp_path)
+        sessions, debug = _replay_session(tmp_path, attempts=1)
+        write(debug / "shared_tests.json", json.dumps([{"test_name": "g_c", "test_source": "assert 1"}]))
+        _fake_column(monkeypatch, {0: {"generated:g_c": "passed"}, 1: {"generated:g_c": "passed"}})
+        batch = tmp_path / "batch"
+        manifest = manifest_mod.Manifest(batch)
+        manifest.append(_replay_record())
+
+        before = {
+            path: path.read_bytes()
+            for path in batch.rglob("*")
+            if path.is_file()
+        }
+        before.update(
+            {
+                path: path.read_bytes()
+                for path in sessions.rglob("*")
+                if path.is_file()
+            }
+        )
+
+        replay_mod.replay_row(
+            record=_replay_record(),
+            prep=prep,
+            checkpoint="ck",
+            batch_dir=batch,
+            sessions_dir=sessions,
+            views=(replay_mod.VIEW_GENERATED,),
+            seed=replay_mod.DEFAULT_SEED,
+            sample_rate=0.0,
+            disk_mb=prepare_mod.DISK_MB,
+            timeout_secs=replay_mod.DEFAULT_TIMEOUT_SECS,
+            progress=False,
+        )
+
+        for path, data in before.items():
+            assert path.read_bytes() == data, f"{path} was touched by the replay"
+        for path in batch.rglob("*"):
+            if path.is_file() and path not in before:
+                assert replay_mod.REPLAY_DIRNAME in path.parts
+
+
+class TestReplayViews:
+    def test_views_are_normalised_and_an_unknown_one_is_refused(self):
+        assert replay_mod.parse_views("oracle,generated") == ["generated", "oracle"]
+        assert replay_mod.parse_views("") == ["generated", "oracle"]
+        assert replay_mod.parse_views("oracle") == ["oracle"]
+        with pytest.raises(replay_mod.ReplayError):
+            replay_mod.parse_views("nope")
+
+
+class TestReplayCli:
+    def test_the_replay_subcommand_parses_with_the_replay_defaults(self):
+        args = run_mod.build_parser().parse_args(["replay", "--batch", "b"])
+        assert args.func is run_mod.cmd_replay
+        assert args.batch == ["b"]
+        assert args.views == "generated,oracle"
+        assert args.seed == replay_mod.DEFAULT_SEED
+        assert args.sample_rate == replay_mod.DEFAULT_SAMPLE_RATE
+        assert args.force is False
+        assert args.disk_mb == prepare_mod.DISK_MB
+
+    def test_two_batches_are_refused(self, capsys):
+        code = run_mod.main(["replay", "--batch", "a", "--batch", "b"])
+        err = capsys.readouterr().err
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert "exactly one --batch" in err
+
+    def _prepare_cli(self, monkeypatch, batch: Path, preps):
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        monkeypatch.setattr(runner_mod, "recorded_split_path", lambda path: None)
+        monkeypatch.setattr(
+            run_mod, "load_split", lambda path: SimpleNamespace(bugsinpy_root="runs/bugsinpy")
+        )
+        monkeypatch.setattr(
+            runner_mod,
+            "load_prepared",
+            lambda **kwargs: SimpleNamespace(
+                preps=list(preps), entries={prep.key: {"checkpoint": "ck"} for prep in preps}
+            ),
+        )
+        monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: list(preps))
+
+    def test_a_batch_with_no_repair_row_is_refused(self, tmp_path, monkeypatch, capsys):
+        batch = tmp_path / "b"
+        manifest_mod.Manifest(batch).append(_replay_record(mode="review"))
+        self._prepare_cli(monkeypatch, batch, [])
+        code = run_mod.main(["replay", "--batch", str(batch)])
+        err = capsys.readouterr().err
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert "no repair rows" in err
+
+    def test_a_row_with_a_replay_file_is_skipped_unless_forced(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        record = _replay_record()
+        batch = tmp_path / "b"
+        manifest_mod.Manifest(batch).append(record)
+        prep = _replay_prep(tmp_path)
+        stem = replay_mod.row_stem(record["key"])
+        existing = write(batch / replay_mod.REPLAY_DIRNAME / f"{stem}.json", "{}\n")
+        self._prepare_cli(monkeypatch, batch, [prep])
+
+        def explode(**kwargs):
+            raise AssertionError("replay_row must not run for a row that already has a file")
+
+        monkeypatch.setattr(replay_mod, "replay_row", explode)
+        code = run_mod.main(["replay", "--batch", str(batch)])
+        assert code == run_mod.EXIT_OK
+        assert "already" in capsys.readouterr().out
+        assert existing.read_text() == "{}\n"
+
+    def test_force_rewrites_the_row(self, tmp_path, monkeypatch, capsys):
+        record = _replay_record()
+        batch = tmp_path / "b"
+        manifest_mod.Manifest(batch).append(record)
+        prep = _replay_prep(tmp_path)
+        stem = replay_mod.row_stem(record["key"])
+        existing = write(batch / replay_mod.REPLAY_DIRNAME / f"{stem}.json", "{}\n")
+        self._prepare_cli(monkeypatch, batch, [prep])
+        monkeypatch.setattr(replay_mod, "replay_row", lambda **kwargs: {"kind": "replay"})
+        code = run_mod.main(["replay", "--batch", str(batch), "--force"])
+        assert code == run_mod.EXIT_OK
+        assert json.loads(existing.read_text())["kind"] == "replay"
 

@@ -181,6 +181,20 @@ impl Governor {
         self.current_attempt
     }
 
+    /// Advance the attempt cursor WITHOUT changing the verdict (M3 item 9).
+    ///
+    /// [VANTA-WHY] A fixed-rounds run (`--fixed-rounds K`) must run exactly K
+    /// attempts. In REPAIR mode the only decision that ends the loop early is
+    /// `AllTestsPassed`, and `decide` returns it WITHOUT advancing the cursor —
+    /// correct for an ordinary run, where the pass IS the end. The driver
+    /// therefore needs the cursor moved exactly as `decide`'s continue path
+    /// would move it, while keeping the pass on record. This is that move and
+    /// nothing else: one increment, no verdict, no cap check (the caller only
+    /// reaches it when an attempt remains).
+    pub fn advance_attempt(&mut self) {
+        self.current_attempt += 1;
+    }
+
     pub fn max_attempts(&self) -> u32 {
         self.max_attempts
     }
@@ -605,6 +619,32 @@ mod tests {
         assert_eq!(
             g.decide(GovernorMode::Repair, AttemptVerdict::Inconclusive, true),
             GovernorDecision::MaxAttemptsReached
+        );
+    }
+
+    /// [VANTA-WHY] M3 item 9 — a fixed-rounds run needs the cursor moved
+    /// WITHOUT the pass ending the loop. `decide` deliberately does not advance
+    /// on `AllTestsPassed` (that verdict IS the end of an ordinary repair), so
+    /// `advance_attempt` is the only way to spend an attempt that passed.
+    #[test]
+    fn advance_attempt_spends_a_passing_attempt_without_a_verdict() {
+        let mut g = Governor::new(4);
+        let src = "def test_t1():\n    assert shipping_band(1000) == \"standard\"\n";
+        g.record_shared_results(vec![passed("t1", src)]);
+        assert_eq!(
+            g.decide(GovernorMode::Repair, AttemptVerdict::Passed, true),
+            GovernorDecision::AllTestsPassed
+        );
+        assert_eq!(
+            g.current_attempt(),
+            0,
+            "the pass itself must not move the cursor — that is what makes it a stop"
+        );
+        g.advance_attempt();
+        assert_eq!(
+            g.current_attempt(),
+            1,
+            "the spent attempt must be visible to the next round's transition keys"
         );
     }
 

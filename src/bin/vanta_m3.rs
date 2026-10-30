@@ -55,6 +55,10 @@ struct CliArgs {
     repo_path: Option<PathBuf>,
     issue_path: Option<PathBuf>,
     max_attempts: u32,
+    /// M3 item 9 — `--fixed-rounds K`: run EXACTLY K repair attempts, taking the
+    /// verdict from attempt K, so a patch that passes early is still re-examined
+    /// (EIR). Off by default. A repair option only; refused with `--patch`.
+    fixed_rounds: Option<u32>,
     model_override: Option<String>,
     /// If true, open a GitHub PR after Gatekeeper approval.
     open_pr: bool,
@@ -120,6 +124,7 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
     let mut repo_path: Option<PathBuf> = None;
     let mut issue_path: Option<PathBuf> = None;
     let mut max_attempts: u32 = 4;
+    let mut fixed_rounds: Option<u32> = None;
     let mut model_override: Option<String> = None;
     let mut open_pr = false;
     let mut patch_path: Option<PathBuf> = None;
@@ -161,6 +166,17 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
                 max_attempts = args[i]
                     .parse()
                     .map_err(|e| format!("--max-attempts: {e}"))?;
+            }
+            "--fixed-rounds" | "-k" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--fixed-rounds requires a number".to_string());
+                }
+                fixed_rounds = Some(
+                    args[i]
+                        .parse()
+                        .map_err(|e| format!("--fixed-rounds: {e}"))?,
+                );
             }
             "--model" | "-m" => {
                 i += 1;
@@ -294,6 +310,7 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
         repo_path,
         issue_path,
         max_attempts,
+        fixed_rounds,
         model_override,
         open_pr,
         patch_path,
@@ -489,13 +506,14 @@ fn print_help() {
     println!(
         "Vanta M3 — Adversarial verification repair loop\n\
          \n\
-         USAGE:\n    vanta --repo PATH [--issue PATH] [--max-attempts N] [--model NAME] [--open-pr] [--patch PATH] [--test-cmd CMD] [--original-tree PATH]\n    \
+         USAGE:\n    vanta --repo PATH [--issue PATH] [--max-attempts N] [--fixed-rounds K] [--model NAME] [--open-pr] [--patch PATH] [--test-cmd CMD] [--original-tree PATH]\n    \
          vanta --rerun-signals SESSION_ID --good-tree PATH [--base-tree PATH] [--allow-backend-upgrade]\n    \
          vanta --select-context --json --repo TREE --select-role ROLE --select-budget N [--issue PATH] [--patch PATH]\n\
          \n\
          OPTIONS:\n    --repo, -r PATH        Path to the repository to repair\n    \
          --issue, -i PATH       Path to the issue/bug description (default: auto-detect)\n    \
          --max-attempts, -n N   Max repair attempts (default: 4)\n    \
+         --fixed-rounds, -k K   Run EXACTLY K repair attempts and take the verdict from attempt K, so a patch that passes early is re-examined (default: off). Repair only; ignored with --patch\n    \
          --model, -m NAME       Override LLM model (default: from VANTA_LLM_MODEL)\n    \
          --open-pr              Open a GitHub PR after Gatekeeper approval\n    \
          --patch, -p PATH       Verify an EXISTING patch (skip Creator, run Attacker+BATE on this diff)\n    \
@@ -679,6 +697,47 @@ mod tests {
         let cli = parse_args_from(&args(&["--repo", "tree"])).unwrap();
         assert!(cli.precompile.is_empty());
     }
+
+    /// [VANTA-WHY] M3 item 9 — `--fixed-rounds K`. Off unless asked for, read
+    /// from either spelling, and refused where no number follows. The flag is
+    /// parsed here and INTERPRETED by the driver (`resolve_fixed_rounds`), which
+    /// is where the `--patch` refusal lives; the parser's only job is to carry
+    /// the number through as written.
+    #[test]
+    fn the_fixed_rounds_flag_is_off_by_default_and_reads_a_number() {
+        // Off by default: every run before this option is unchanged.
+        let cli = parse_args_from(&args(&["--repo", "tree"])).unwrap();
+        assert_eq!(cli.fixed_rounds, None);
+
+        let cli = parse_args_from(&args(&["--repo", "tree", "--fixed-rounds", "4"])).unwrap();
+        assert_eq!(cli.fixed_rounds, Some(4));
+
+        // The short spelling is the same flag.
+        let cli = parse_args_from(&args(&["--repo", "tree", "-k", "2"])).unwrap();
+        assert_eq!(cli.fixed_rounds, Some(2));
+
+        // Both spellings, with nothing to read.
+        for flag in ["--fixed-rounds", "-k"] {
+            let error = match parse_args_from(&args(&["--repo", "tree", flag])) {
+                Ok(_) => panic!("{flag} with no number must be refused"),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("requires a number"),
+                "{flag} must name what is missing; got: {error}"
+            );
+        }
+
+        // A value that is not a number is refused with the flag named.
+        let error = match parse_args_from(&args(&["--repo", "tree", "--fixed-rounds", "four"])) {
+            Ok(_) => panic!("--fixed-rounds four must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.starts_with("--fixed-rounds:"),
+            "the refusal must name the flag; got: {error}"
+        );
+    }
 }
 
 
@@ -736,6 +795,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         repo_path,
         issue_path: cli.issue_path,
         max_attempts: cli.max_attempts,
+        fixed_rounds: cli.fixed_rounds,
         model_override: cli.model_override,
         open_pr: cli.open_pr,
         patch_path: cli.patch_path,

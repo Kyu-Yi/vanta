@@ -22492,6 +22492,61 @@ class TestRunJob:
         )
         assert plain["seed_method"] is None
 
+    def test_a_row_says_whether_it_ran_a_fixed_number_of_rounds(
+        self, tmp_path, monkeypatch
+    ):
+        """Item 9 — the fixed-round setting is a recorded field, not an inference.
+
+        The same `AllTestsPassed` verdict means different things on the two
+        settings: a K = 4 run's approval is attempt 4's verdict, on a patch that
+        was re-examined three times, while a default run's is its first and only
+        attempt. A row that does not say which it is cannot be pooled, so the
+        value is read back from `run.summary` (where the driver writes
+        `off` or the number) rather than guessed. `None` for a summary that
+        predates the field — every row on disk today.
+        """
+        base = _outcome(tmp_path)
+        # `off` is the option available and not used: the pipeline's own spelling,
+        # kept so the row and the run that produced it can be read against each
+        # other.
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, summary=dict(base.summary, fixed_rounds="off")
+            ),
+        )
+        plain = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert plain["fixed_rounds"] == "off"
+
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, summary=dict(base.summary, fixed_rounds="4")
+            ),
+        )
+        fixed = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert fixed["fixed_rounds"] == "4"
+
+        # A summary with no such key is a row older than the option, and is kept
+        # distinct from `off` rather than read as one.
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        old = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert old["fixed_rounds"] is None
+
     def test_a_row_records_why_a_final_patch_that_did_not_apply_is_not_fixed(
         self, tmp_path, monkeypatch
     ):

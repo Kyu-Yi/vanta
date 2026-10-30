@@ -2058,6 +2058,19 @@ def build_record(
         "attempts_edited_unshown_file": _int(
             summary.get("attempts_edited_unshown_file")
         ),
+        # [VANTA-WHY] M3 item 9 — whether this run was asked to spend a FIXED
+        # number of repair attempts (`--fixed-rounds K`), read back from
+        # `run.summary` so a batch table can cut by it without opening a session
+        # log. Recorded for `seed_policy`'s reason: the SAME verdict means
+        # different things on the two settings. An `AllTestsPassed` row from a
+        # K = 4 run is attempt 4's verdict — a patch that was re-examined three
+        # times — while a default row's is the first and only attempt. Pooling
+        # them would compare a re-examined approval with an unexamined one, and a
+        # row that does not say which it is cannot be put in the right arm
+        # afterwards. `off` is the option available and not used; a number is K;
+        # `None` is a row older than the option. The per-attempt detail it
+        # indexes is `attempts` in the session's `run.evidence.json`.
+        "fixed_rounds": summary.get("fixed_rounds"),
         "oracle": oracle.as_dict(),
         "label": label_for(outcome.decision, oracle),
         # Item Q — the reason a label needs one. `unresolved` for a run whose final

@@ -97,6 +97,17 @@ pub struct RunConfig {
     /// two-tree mode. If set, BATE runs against this tree instead of the
     /// in-memory original files. Spec §7: "both trees present simultaneously".
     pub original_tree: Option<PathBuf>,
+    /// [VANTA-WHY] M3 item 9 — fixed-round repair (`--fixed-rounds K`).
+    ///
+    /// `None` is every run before this option and every ordinary run: the loop
+    /// stops the moment an attempt passes. `Some(k)` makes the loop run EXACTLY
+    /// `k` attempts — a passing attempt is evidence, not the end, because the
+    /// attempt-to-attempt transitions M3.5's EIR/ECR measurement needs only
+    /// exist between attempts (Liu & Meng continue after a correct answer to
+    /// see whether the model breaks it). The final verdict is the one attempt
+    /// `k` produces, and every attempt's patch, test set and feedback is
+    /// stored. Repair only: a `--patch` review has no Creator to re-ask.
+    pub fixed_rounds: Option<u32>,
 }
 
 // ============================================================================
@@ -1603,7 +1614,27 @@ pub async fn run(
     harness::set_seed_root(seed_tree.as_ref().map(|tree| tree.path().to_path_buf()));
 
     // ---- Governor + Gatekeeper ----
-    let mut governor = Governor::new(config.max_attempts);
+    // [VANTA-WHY] M3 item 9 — `--fixed-rounds K` makes the loop run EXACTLY K
+    // attempts, so the Governor's cap IS K when the option is set. `K` wins over
+    // `--max-attempts`: the option's whole meaning is "always run K attempts",
+    // and a smaller `--max-attempts` would silently truncate the run the option
+    // asked for. `None` leaves the cap exactly what it always was, so a default
+    // run is byte-identical.
+    //
+    // The second half of the reading — that `--patch` review cannot honour the
+    // option — is in `resolve_fixed_rounds`, which is where the decision is
+    // testable. All it leaves here is the loud sentence: a run that asked for
+    // something it cannot have must say so rather than quietly do something else.
+    let (fixed_rounds, fixed_rounds_refused) =
+        resolve_fixed_rounds(config.fixed_rounds, config.patch_path.is_some());
+    if fixed_rounds_refused {
+        println!(
+            "  ⚠ --fixed-rounds is a repair option and this run reviews a FIXED patch (--patch): \
+             the option is IGNORED and the attempt cap stays --max-attempts"
+        );
+    }
+    let loop_attempts = fixed_rounds.unwrap_or(config.max_attempts);
+    let mut governor = Governor::new(loop_attempts);
     let gatekeeper = Gatekeeper::new(VerificationPolicy::BestEffort);
 
     // [VANTA-WHY] The tree the context selection reads. In two-tree mode the
@@ -1736,6 +1767,19 @@ pub async fn run(
     // injects a file the Creator was not shown, and never touches the selection.
     let mut context_visibility_records: Vec<serde_json::Value> = Vec::new();
     let mut attempts_edited_unshown_file: u32 = 0;
+    // [VANTA-WHY] M3 item 9 — one record per attempt of a fixed-rounds run: the
+    // patch it produced, the test set it ran, the feedback it handed to the next
+    // attempt, the hash of the Creator prompt that produced it, and whether the
+    // attempt passed. The artifacts themselves live in the session's debug dir
+    // (`attempt_<n>_creator_patch.txt`, `attempt_<n>_tests.json`,
+    // `attempt_<n>_feedback.txt`); this is the index the evidence file carries, so
+    // "with K = 4 the run stores 4 patches and the per-attempt test sets" is
+    // answerable from the run's own files without a reader globbing a directory
+    // whose naming is otherwise a convention. Always populated (a default run
+    // simply has one entry), because the fold-ins exist to make M3 data usable by
+    // M3.5 later and a field that only exists on an optional flag is a field that
+    // cannot be recovered.
+    let mut fixed_round_records: Vec<serde_json::Value> = Vec::new();
     // [VANTA-WHY] Test-integrity records for the evidence file. A patch must
     // never control the tests that grade it, so the native suite runs the
     // ORIGINAL test files and these four lists are what make that visible after
@@ -1920,12 +1964,31 @@ pub async fn run(
         // times over.
         crate::llm::set_forensics_round(attempt + 1);
         println!("\n══════════════════════════════════════════════════════════════");
-        println!("  ATTEMPT {} / {}", attempt + 1, config.max_attempts);
+        if fixed_rounds.is_some() {
+            // [VANTA-WHY] M3 item 9 — say WHICH run this is. "ATTEMPT 2 / 4" reads
+            // the same whether the cap is a patch budget or a fixed round count,
+            // and the two mean different things to a reader of the console.
+            println!(
+                "  ATTEMPT {} / {} (fixed rounds)",
+                attempt + 1,
+                loop_attempts
+            );
+        } else {
+            println!("  ATTEMPT {} / {}", attempt + 1, loop_attempts);
+        }
         println!("══════════════════════════════════════════════════════════════");
 
         // ---- 1. Patch (Creator or --patch file) ----
         let patch_files: HashMap<String, String>;
         let patch_text: String;
+        // [VANTA-WHY] M3 item 9 fold-in — the hash of the Creator prompt THIS
+        // attempt sent (system + the exact user prompt, which differs per attempt
+        // because the feedback does). `None` on a `--patch` review: no Creator
+        // ran, so there is no Creator prompt. The prompt itself is NOT stored —
+        // the selection it was built from is already on disk (`context.select`)
+        // and the hash is what makes "two attempts whose Creator read the same
+        // thing" checkable without a second copy of the repository in the log.
+        let mut creator_prompt_hash: Option<String> = None;
         if let Some(patch_file) = &config.patch_path {
             // [VANTA-WHY] --patch mode verifies an EXISTING patch. Skip
             // Creator, but still allow multiple verification attempts so the
@@ -1949,6 +2012,14 @@ pub async fn run(
                     .unwrap_or_else(|| repo.source_files.clone()),
                 prior_feedback: prior_feedback.clone(),
             };
+            // [VANTA-WHY] M3 item 9 fold-in — hash the prompt the call is about
+            // to send. `creator_user_prompt` is the same function the call site
+            // uses, so the hash cannot describe a prompt the model never saw.
+            let creator_user_prompt = crate::agents::creator::creator_user_prompt(&creator_request);
+            creator_prompt_hash = Some(crate::core::prompt_content_hash(&[
+                crate::agents::creator::creator_system_prompt(),
+                creator_user_prompt.as_str(),
+            ]));
             let creator_response = match run_with_spinner("Creator generating patch", async {
                 creator_generate_patch(&cfg, &creator_request).await
             })
@@ -1990,6 +2061,18 @@ pub async fn run(
         let patch_attempt_id = patch_attempt_id_for_patch(&patch_text);
         attempt_patch_ids.push(patch_attempt_id.clone());
         let testing_iteration_id = fresh_testing_iteration_id();
+
+        // [VANTA-WHY] M3 item 9 — store the patch THIS attempt produced, so
+        // "every attempt's patch is stored" holds for the run's own files and not
+        // only for the tree snapshot the pool already derives from. This is the
+        // Creator's OWN text (full source or search/replace), exactly as emitted
+        // — `attempt_<n>_patched_tree` is the applied result and `final.patch` is
+        // the diff of the LAST attempt; neither is the text of an earlier one.
+        // A `--patch` review writes the same bytes every round; stored anyway,
+        // because the file is what makes an attempt's input recoverable.
+        let creator_patch_path =
+            debug_dir.join(format!("attempt_{}_creator_patch.txt", attempt + 1));
+        let _ = fs::write(&creator_patch_path, &patch_text);
 
         // [VANTA-WHY] M3 item V — how the files THIS patch touches stood in the
         // Creator's own context. Only a repair attempt has a Creator, so only a
@@ -2047,7 +2130,7 @@ pub async fn run(
             test_id: None,
             phase: "attempt.start".to_string(),
             summary: format!(
-                "attempt={} mode={} patch_files={} patch_bytes={}",
+                "attempt={} mode={} patch_files={} patch_bytes={} creator_prompt_hash={}",
                 attempt + 1,
                 if config.patch_path.is_some() {
                     "patch_review"
@@ -2055,7 +2138,12 @@ pub async fn run(
                     "creator"
                 },
                 patch_files.len(),
-                patch_text.len()
+                patch_text.len(),
+                // [VANTA-WHY] M3 item 9 fold-in — the 12-hex hash of the Creator
+                // prompt this attempt sent, and `none` where no Creator ran. The
+                // hash is space-free by construction, so it survives the session
+                // log's reader.
+                creator_prompt_hash.as_deref().unwrap_or("none")
             ),
             timestamp: now_iso(),
             benchmark_instance: None,
@@ -2926,6 +3014,24 @@ pub async fn run(
         for t in &valid_tests {
             tests_to_run.push(t);
         }
+        // [VANTA-WHY] M3 item 9 — store the test set THIS attempt ran (the fixed
+        // shared set plus the round's new tests), so "the test sets per attempt"
+        // is a file per attempt rather than something a reader has to
+        // reconstruct from `shared_tests.json` and the fold order.
+        let attempt_tests_path =
+            debug_dir.join(format!("attempt_{}_tests.json", attempt + 1));
+        if let Ok(json) = serde_json::to_string_pretty(&tests_to_run) {
+            let _ = fs::write(&attempt_tests_path, json);
+        }
+        // [VANTA-WHY] M3 item 9 — the attempt's test names, OWNED, taken here while
+        // `tests_to_run` is still the live reading. `tests_to_run` is a
+        // `Vec<&GeneratedTest>` that borrows `shared_tests`, and the fold-in below
+        // (item 17) mutates `shared_tests`; the per-attempt record is pushed long
+        // after that mutation, so it must carry owned names rather than re-reading
+        // the borrowed list — which would hold the immutable borrow open across the
+        // mutation and not compile.
+        let attempt_test_names: Vec<String> =
+            tests_to_run.iter().map(|t| t.test_name.clone()).collect();
 
         let patched_results = run_with_spinner("Running tests on patched code", async {
             harness::run_tests_parallel_detailed(&graded_concat, &tests_to_run, &test_cmd).await
@@ -3507,6 +3613,12 @@ pub async fn run(
         }
 
         let governor_decision = governor.decide(governor_mode, verdict, true);
+        // [VANTA-WHY] M3 item 9 — the Governor's own reading of THIS attempt, taken
+        // here because the very next binding MOVES `governor_decision` into
+        // `decision`, which the fixed-round interception then rewrites to
+        // `Continue`. The per-attempt record has to say what the attempt did, not
+        // what the loop did next, so the reading is captured before either happens.
+        let attempt_passed = governor_decision == GovernorDecision::AllTestsPassed;
         let decision = if harness_collapsed {
             let next = collapse_decision(
                 harness_collapse_streak,
@@ -3531,6 +3643,31 @@ pub async fn run(
             next
         } else {
             governor_decision
+        };
+        // [VANTA-WHY] M3 item 9 — fixed-round repair. In REPAIR mode the ONLY
+        // decision that ends the loop early is `AllTestsPassed`; a failing
+        // attempt already spends its budget and continues. A fixed-rounds run
+        // must therefore run all K attempts, so a pass before the last one is
+        // recorded as evidence and the loop continues. `advance_attempt` moves the
+        // cursor exactly as `decide`'s continue path would — `AllTestsPassed`
+        // deliberately does not advance it — so the next round's transition keys
+        // stay contiguous. Nothing is suppressed on the last attempt, so the final
+        // verdict is the one attempt K produced.
+        let fixed_round_pass =
+            fixed_round_continues(fixed_rounds, &decision, attempt, loop_attempts);
+        let decision = if fixed_round_pass {
+            println!(
+                "\n  ↻ FIXED ROUNDS: attempt {}/{} passed — running attempt {} anyway; the \
+                 verdict is taken from attempt {}.",
+                attempt + 1,
+                loop_attempts,
+                attempt + 2,
+                loop_attempts
+            );
+            governor.advance_attempt();
+            GovernorDecision::Continue
+        } else {
+            decision
         };
         let mut failing_names: Vec<String> = attempt_evidence
             .iter()
@@ -3678,6 +3815,48 @@ pub async fn run(
         // attempt, so this is the only place it is observable.
         revise_calls_used_total += revise_budget.used();
 
+        // [VANTA-WHY] M3 item 9 — the per-attempt index of this run, and the two
+        // fold-ins the M3.5 plan asked for (the attempt's feedback text and the
+        // hash of the Creator prompt). Recorded HERE, before the decision match,
+        // because every terminal arm below `break`s out of the loop: a record
+        // pushed after it would be missing for exactly the LAST attempt, which is
+        // the one the final verdict is taken from — so "with K = 4 the run stores
+        // 4 patches and the per-attempt test sets" would be false for every run
+        // that ended when it was supposed to.
+        //
+        // `passed` is the Governor's OWN reading of this attempt, taken from
+        // `governor_decision` and therefore BEFORE the fixed-round interception
+        // above rewrote an early pass into a `Continue`: the record has to say
+        // what the attempt did, not what the loop did next. `feedback` is the text
+        // this attempt RECEIVED (the text that drove this patch), not the one it
+        // produced: `prior_feedback` is only reassigned in the `Continue` arm
+        // below, so here it still holds the previous attempt's hand-over, which is
+        // what pairs each patch with the thing that produced it. It is `null` on
+        // attempt 1 and on every `--patch` review, where no Creator ran.
+        //
+        // The artifacts themselves also live in the session's debug dir, under
+        // NEW names (`attempt_<n>_creator_patch.txt`, `attempt_<n>_tests.json`,
+        // `attempt_<n>_feedback.txt`) that deliberately do not collide with the
+        // pinned `attempt_<n>_{patched,graded}_tree` names `compact.py` / `pool.py`
+        // match on; this list is what makes them reachable without a reader
+        // globbing a directory whose naming is otherwise a convention.
+        {
+            let received_feedback = prior_feedback.clone();
+            if let Some(fb) = &received_feedback {
+                let feedback_path =
+                    debug_dir.join(format!("attempt_{}_feedback.txt", attempt + 1));
+                let _ = fs::write(&feedback_path, fb);
+            }
+            fixed_round_records.push(serde_json::json!({
+                "attempt": attempt + 1,
+                "passed": attempt_passed,
+                "patch": patch_text.clone(),
+                "tests": attempt_test_names,
+                "feedback": received_feedback,
+                "creator_prompt_hash": creator_prompt_hash.clone(),
+            }));
+        }
+
         match decision {
             GovernorDecision::AllTestsPassed => {
                 // [VANTA-WHY] M3 item 1 — the approval invariant. §1.4's defect
@@ -3806,6 +3985,30 @@ pub async fn run(
                     println!(
                         "  → Retrying verification with the provided patch after {} failure(s)",
                         failed.len()
+                    );
+                } else if fixed_round_pass {
+                    // [VANTA-WHY] M3 item 9 — a PASSING attempt under
+                    // `--fixed-rounds`. The loop continues by design here, so the
+                    // Creator has to be given the suite result it just produced;
+                    // the ordinary branch below would tell it "the previous patch
+                    // failed verification" and then name no failure at all, which
+                    // is both untrue and useless as feedback. The spec's own
+                    // instruction is different in kind — "review and improve the
+                    // patch if needed, or return it unchanged" — so it is said in
+                    // its own words, by `build_fixed_round_pass_feedback`.
+                    let passed_names: Vec<String> =
+                        final_evidence.iter().map(|e| e.test_name.clone()).collect();
+                    prior_feedback = Some(build_fixed_round_pass_feedback(
+                        &passed_names,
+                        attempt + 1,
+                        loop_attempts,
+                    ));
+                    println!(
+                        "  ↻ FIXED ROUNDS: attempt {}/{} passed — asking the Creator to review \
+                         and improve, or return the patch unchanged ({} test(s))",
+                        attempt + 1,
+                        loop_attempts,
+                        passed_names.len()
                     );
                 } else {
                     // Build structured feedback for Creator.
@@ -4303,7 +4506,7 @@ pub async fn run(
              quarantine_count={} quarantined=[{}] \
              seed_method={} import_guard={} \
              n_ctx={} creator_effort={} creator_effort_mechanism={} \
-             creator_prompt_tokens={}{}",
+             creator_prompt_tokens={}{} fixed_rounds={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -4539,6 +4742,22 @@ pub async fn run(
             } else {
                 String::new()
             },
+            // [VANTA-WHY] M3 item 9 — appended after every pre-existing key so an
+            // older row's reader is unaffected, and space-free so it survives the
+            // `key=value` reader. `off` is the default and means the loop stopped
+            // at its first pass (or at `--max-attempts`); a number means the run was
+            // asked to spend exactly that many attempts. The row needs it because
+            // the SAME verdict means different things on the two settings: an
+            // `AllTestsPassed` row from a K = 4 run is attempt 4's verdict, and a
+            // reader who pooled it with a default run's first-attempt approval
+            // would be comparing a patch that was re-examined three times with one
+            // that was never re-examined at all. `attempts` in `evidence.json`
+            // holds the per-attempt detail this number indexes.
+            if fixed_rounds.is_some() {
+                loop_attempts.to_string()
+            } else {
+                "off".to_string()
+            },
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),
@@ -4733,6 +4952,16 @@ pub async fn run(
             // review run, which has no Creator.
             "context_visibility": context_visibility_records,
             "attempts_edited_unshown_file": attempts_edited_unshown_file,
+            // [VANTA-WHY] M3 item 9 — every attempt's patch, the test set it ran,
+            // the feedback it was given, the hash of the Creator prompt that
+            // produced it, and whether the Governor read it as passing. The
+            // acceptance for this item is "with K = 4 the run stores 4 patches and
+            // the test sets per attempt", and a fixed-rounds run's whole purpose is
+            // to be replayed attempt by attempt (item 10), so the index has to be a
+            // fact in the run's own artifacts rather than a directory convention.
+            // Always written, for every mode: a default run simply has one entry,
+            // and a review run's entry names the provided patch.
+            "attempts": fixed_round_records,
             "evidence": final_evidence,
         }))
         .unwrap(),
@@ -5162,6 +5391,38 @@ fn build_creator_feedback(
     fb
 }
 
+// [VANTA-WHY] M3 item 9 — the feedback a PASSING attempt hands to the next attempt
+// under `--fixed-rounds`. The ordinary `Continue` is driven by failures, and
+// `build_creator_feedback` builds its message from a failure list; on a passing
+// attempt that list is empty, so reusing it would tell the Creator "the previous
+// patch failed verification" and then name nothing. The option's own instruction
+// is different in kind, so it gets its own words: the suite passed, the run will
+// spend another attempt regardless, and the Creator should improve the patch if
+// it can and return it UNCHANGED if it cannot. Saying "return it unchanged" is
+// the point — without it a model asked for another attempt will invent a change,
+// and the EIR this arm exists to measure would be an artefact of the prompt.
+fn build_fixed_round_pass_feedback(
+    passed_names: &[String],
+    attempt: u32,
+    loop_attempts: u32,
+) -> String {
+    let mut fb = String::new();
+    fb.push_str(&format!(
+        "Your previous patch PASSED the test suite (attempt {attempt}/{loop_attempts}):\n\n"
+    ));
+    for name in passed_names {
+        fb.push_str(&format!("- Test '{name}' passed\n"));
+    }
+    fb.push_str(&format!(
+        "\nThis run always runs {loop_attempts} attempt(s), so you get another one regardless.\n\
+         Review your patch against the issue: if it can be improved — a more robust fix, an edge \
+         case it misses, a clearer or smaller change — return an improved patch. If it is already \
+         correct and complete, return the SAME patch unchanged. Returning it unchanged is a valid \
+         and expected answer; do not change working code only to have something to say."
+    ));
+    fb
+}
+
 fn read_json_value_from_debug(path: &Path) -> Option<serde_json::Value> {
     fs::read_to_string(path)
         .ok()
@@ -5496,6 +5757,49 @@ fn collapse_decision(streak: u32, governor_allows_retry: bool) -> GovernorDecisi
     } else {
         GovernorDecision::Continue
     }
+}
+
+// [VANTA-WHY] M3 item 9 — does this decision have to be turned back into a
+// `Continue` because the run was asked for a FIXED number of rounds? In REPAIR
+// mode `AllTestsPassed` is the loop's only early exit (a failing attempt already
+// spends its budget and continues), so a fixed-rounds run that passes at attempt
+// 1 would stop there and produce no transition at all — which is exactly why
+// there is no EIR data today. True only for a passing attempt that is NOT the
+// last: at attempt K the verdict is kept, so what the run reports is attempt K's
+// own outcome and nothing is suppressed. A `None` (the default) makes this
+// unconditionally false, so a run without the option is byte-identical.
+fn fixed_round_continues(
+    fixed_rounds: Option<u32>,
+    decision: &GovernorDecision,
+    attempt: u32,
+    loop_attempts: u32,
+) -> bool {
+    fixed_rounds.is_some()
+        && *decision == GovernorDecision::AllTestsPassed
+        && attempt + 1 < loop_attempts
+}
+
+// [VANTA-WHY] M3 item 9 — read `--fixed-rounds` against the KIND of run it is
+// attached to, returning the K the loop should actually use and whether a
+// request had to be refused.
+//
+// Two readings live here. A K of zero (or no option at all) is not a
+// fixed-rounds run: `--fixed-rounds 0` would ask for "no attempts", which is not
+// a run, so it is read as absent rather than honoured. And `--fixed-rounds` is a
+// REPAIR option — "the loop always runs K attempts". In `--patch` review mode
+// `max_attempts` is ATTACK DEPTH against a candidate that cannot change, so
+// "always run K rounds" is a statement about a different loop and honouring it
+// there would silently change how deep a review attacks. It is REFUSED, not
+// reinterpreted: the caller gets `refused = true` and says so out loud.
+fn resolve_fixed_rounds(
+    fixed_rounds: Option<u32>,
+    is_patch_review: bool,
+) -> (Option<u32>, bool) {
+    let fixed_rounds = fixed_rounds.filter(|k| *k > 0);
+    if fixed_rounds.is_some() && is_patch_review {
+        return (None, true);
+    }
+    (fixed_rounds, false)
 }
 
 // [VANTA-WHY] The Governor's three-way verdict is computed here, once, from the
@@ -6071,14 +6375,17 @@ mod tests {
     use super::{
         approval_invariant_status, attempt_verdict, bate_baseline_concat, benchmark_config_name,
         blocking_static_findings,
+        build_fixed_round_pass_feedback,
         build_source_concat, cache_hit_rate_value, collapse_decision, creator_effort_text,
         creator_prompt_tokens_text,
-        dependency_freeze_summary_value, env_arm, env_flag, harness_error_log_line,
+        dependency_freeze_summary_value, env_arm, env_flag, fixed_round_continues,
+        harness_error_log_line,
         harness_infrastructure_collapse,
         ledger_text,
         modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
-        resolve_arm, sampling_not_sent_rule, stamp_transition_row, stable_patch_fingerprint, ARMS,
+        resolve_arm, resolve_fixed_rounds, sampling_not_sent_rule, stamp_transition_row,
+        stable_patch_fingerprint, ARMS,
         INVARIANT_SATISFIED,
         JUDGE_ARM, NO_ADMITTED_TESTS, NO_REPRODUCTION_EVIDENCE,
     };
@@ -6109,6 +6416,111 @@ mod tests {
         assert_eq!(cache_hit_rate_value(Some(0), 0), "unset");
         // A whole prompt served from cache is a rate of one, not a special case.
         assert_eq!(cache_hit_rate_value(Some(500), 500), "1.0000");
+    }
+
+    // ---- M3 item 9: fixed-round repair (`--fixed-rounds K`) -------------------
+    //
+    // [VANTA-WHY] The option exists so the attempt-to-attempt transitions M3.5
+    // measures exist at all: today a repair run stops the moment an attempt
+    // passes, so there is no transition into a passing attempt to look at. These
+    // tests pin the three pure readings the loop is built from — when a pass is
+    // turned back into a `Continue`, what the Creator is told when that happens,
+    // and what the option means under `--patch`.
+
+    /// The turn-back rule. A pass continues ONLY when the option is on AND the
+    /// attempt is not the last, so nothing is suppressed where the run reports
+    /// its verdict.
+    #[test]
+    fn a_fixed_rounds_run_runs_past_a_pass_but_never_past_the_last_attempt() {
+        // Off (the default): a pass is always the end of the loop.
+        assert!(!fixed_round_continues(
+            None,
+            &GovernorDecision::AllTestsPassed,
+            0,
+            4
+        ));
+        // K = 4: a pass at attempt 1 or 3 continues...
+        assert!(fixed_round_continues(
+            Some(4),
+            &GovernorDecision::AllTestsPassed,
+            0,
+            4
+        ));
+        assert!(fixed_round_continues(
+            Some(4),
+            &GovernorDecision::AllTestsPassed,
+            2,
+            4
+        ));
+        // ...but a pass at attempt 4 (index 3) IS the verdict, so it is kept.
+        assert!(!fixed_round_continues(
+            Some(4),
+            &GovernorDecision::AllTestsPassed,
+            3,
+            4
+        ));
+        // Only a pass is turned back. Every other decision is the loop's own
+        // business and must keep the reading it made.
+        for other in [
+            GovernorDecision::Rejected,
+            GovernorDecision::NeedsReview,
+            GovernorDecision::MaxAttemptsReached,
+            GovernorDecision::Continue,
+            GovernorDecision::InfraFailure,
+        ] {
+            assert!(
+                !fixed_round_continues(Some(4), &other, 0, 4),
+                "{other:?} must not be rewritten as a fixed-round continuation"
+            );
+        }
+    }
+
+    /// The refusal rule: `--fixed-rounds` is a repair option and is refused under
+    /// `--patch`, where `max_attempts` is attack depth against a fixed candidate.
+    #[test]
+    fn fixed_rounds_is_read_against_the_kind_of_run_it_is_attached_to() {
+        // Off, and an explicit zero, are both "not a fixed-rounds run".
+        assert_eq!(resolve_fixed_rounds(None, false), (None, false));
+        assert_eq!(resolve_fixed_rounds(Some(0), false), (None, false));
+        // A repair run honours K.
+        assert_eq!(resolve_fixed_rounds(Some(4), false), (Some(4), false));
+        // A `--patch` review cannot honour it: refused, and the caller is told so
+        // it can say it out loud rather than silently attacking to a different
+        // depth than the one the option named.
+        assert_eq!(resolve_fixed_rounds(Some(4), true), (None, true));
+        // Nothing to refuse where the option was not set (or was zero).
+        assert_eq!(resolve_fixed_rounds(None, true), (None, false));
+        assert_eq!(resolve_fixed_rounds(Some(0), true), (None, false));
+    }
+
+    /// The feedback a passing attempt hands on. It has to say the suite PASSED
+    /// and that returning the patch unchanged is a valid answer — without the
+    /// second half, a model asked for another attempt invents a change and the
+    /// EIR this arm measures would be an artefact of the prompt.
+    #[test]
+    fn the_fixed_round_pass_feedback_says_it_passed_and_permits_an_unchanged_patch() {
+        let names = vec!["t_band".to_string(), "t_discount".to_string()];
+        let fb = build_fixed_round_pass_feedback(&names, 1, 4);
+        assert!(
+            fb.contains("PASSED the test suite"),
+            "the attempt that passed must be told it passed: {fb}"
+        );
+        assert!(
+            fb.contains("attempt 1/4"),
+            "which attempt, of how many, so the hand-over is unambiguous: {fb}"
+        );
+        assert!(
+            fb.contains("t_band") && fb.contains("t_discount"),
+            "the tests that passed must be named: {fb}"
+        );
+        assert!(
+            fb.contains("return the SAME patch unchanged"),
+            "returning it unchanged has to be named as valid, or the next patch is invented: {fb}"
+        );
+        assert!(
+            !fb.contains("failed"),
+            "a passing attempt must never be told its patch failed: {fb}"
+        );
     }
 
     #[test]

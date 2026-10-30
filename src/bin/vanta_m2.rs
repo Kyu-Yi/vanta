@@ -140,6 +140,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         repo_path: cli.repo_path,
         issue_path: cli.issue_path,
         max_attempts: 1,
+        // [VANTA-WHY] M3 item 9 — M2 is the SAME driver at N = 1 by construction,
+        // and `--fixed-rounds` is M3's repair-arm option, so M2 pins it off rather
+        // than exposing a flag whose whole meaning is "run the loop more than once".
+        fixed_rounds: None,
         model_override: cli.model_override,
         open_pr: false,
         patch_path: cli.patch_path,

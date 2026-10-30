@@ -104,6 +104,27 @@ pub fn creator_system_prompt() -> &'static str {
     CREATOR_SYSTEM_PROMPT
 }
 
+/// The Creator's USER prompt for a request: the issue, the selected files and
+/// the optional feedback, in the exact form `creator_generate_patch` sends.
+///
+/// [VANTA-WHY] M3 item 9 fold-in — the driver records a HASH of the Creator
+/// prompt beside each attempt's patch. A hash taken over text the model never
+/// saw would be a statement about the wrong thing (the same mistake the
+/// `CREATOR_SYSTEM_PROMPT` hoist above was made to prevent), so the prompt is
+/// built in exactly ONE place and both readers — the call site and the hash —
+/// read that place.
+pub fn creator_user_prompt(request: &CreatorRequest) -> String {
+    let mut user_parts: Vec<String> = Vec::new();
+    user_parts.push(format!("ISSUE:\n{}\n", request.issue_text));
+    for sf in &request.source_files {
+        user_parts.push(format!("FILE: {}\n```\n{}\n```\n", sf.path, sf.contents));
+    }
+    if let Some(fb) = &request.prior_feedback {
+        user_parts.push(format!("PRIOR FEEDBACK (from previous attempt, address this):\n{}\n", fb));
+    }
+    user_parts.join("\n")
+}
+
 // ============================================================================
 // CreatorRequest — input to the Creator agent
 // ============================================================================
@@ -168,15 +189,7 @@ pub async fn creator_generate_patch(
     let system_prompt = creator_system_prompt();
 
     // Build user prompt: issue + source files
-    let mut user_parts: Vec<String> = Vec::new();
-    user_parts.push(format!("ISSUE:\n{}\n", request.issue_text));
-    for sf in &request.source_files {
-        user_parts.push(format!("FILE: {}\n```\n{}\n```\n", sf.path, sf.contents));
-    }
-    if let Some(fb) = &request.prior_feedback {
-        user_parts.push(format!("PRIOR FEEDBACK (from previous attempt, address this):\n{}\n", fb));
-    }
-    let user_prompt = user_parts.join("\n");
+    let user_prompt = creator_user_prompt(request);
 
     debug!(system_len = system_prompt.len(), user_len = user_prompt.len(), "creator prompts built");
 
@@ -380,5 +393,38 @@ mod tests {
         assert!(result.contains_key("b.py"));
         assert!(result["a.py"].contains("def a()"));
         assert!(result["b.py"].contains("def b()"));
+    }
+
+    /// [VANTA-WHY] M3 item 9 fold-in — the prompt the driver hashes must be the
+    /// prompt the call sends. `creator_generate_patch` now builds it here, so
+    /// this pins the shape: the issue, a `FILE:` block per source file, and the
+    /// feedback block only when there is feedback.
+    #[test]
+    fn the_creator_user_prompt_is_issue_files_and_feedback() {
+        let request = CreatorRequest {
+            issue_text: "cart total is wrong".to_string(),
+            source_files: vec![SourceFile {
+                path: "cart.py".to_string(),
+                contents: "def total(): return 0\n".to_string(),
+            }],
+            prior_feedback: None,
+        };
+        let prompt = creator_user_prompt(&request);
+        assert!(prompt.starts_with("ISSUE:\ncart total is wrong"));
+        assert!(prompt.contains("FILE: cart.py\n```\ndef total(): return 0\n\n```"));
+        assert!(
+            !prompt.contains("PRIOR FEEDBACK"),
+            "no feedback on a first attempt: {prompt}"
+        );
+
+        let with_feedback = CreatorRequest {
+            prior_feedback: Some("Test 'x' failed".to_string()),
+            ..request
+        };
+        let prompt = creator_user_prompt(&with_feedback);
+        assert!(
+            prompt.contains("PRIOR FEEDBACK (from previous attempt, address this):\nTest 'x' failed"),
+            "the feedback must reach the prompt verbatim: {prompt}"
+        );
     }
 }

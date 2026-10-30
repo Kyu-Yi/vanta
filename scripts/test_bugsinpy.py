@@ -22170,6 +22170,55 @@ class TestRunJob:
         )
         assert plain["seed_policy"] is None
 
+    def test_a_row_says_which_seed_method_it_ran_under(self, tmp_path, monkeypatch):
+        """Item P — the sandbox seed mechanism is a recorded field, not an inference.
+
+        The seeding change is DEFAULT-ON and moves in-session behaviour for EVERY
+        bug (the sandboxes now carry the built tree rather than the UTF-8 source
+        concat), so a row's own `vanta_build_commit` cannot say which mechanism
+        staged it. `None` for a summary that predates the field: a guess would
+        silently pool a pre-change row with a post-change one, which is exactly
+        what the field exists to prevent.
+        """
+        base = _outcome(tmp_path)
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, summary=dict(base.summary, seed_method="clonefile")
+            ),
+        )
+        cloned = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert cloned["seed_method"] == "clonefile"
+
+        # The pipeline's own spelling is kept, so the row and the run that produced
+        # it can be read against each other.
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, summary=dict(base.summary, seed_method="copy_tree")
+            ),
+        )
+        copied = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert copied["seed_method"] == "copy_tree"
+
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        plain = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert plain["seed_method"] is None
+
     def test_a_review_row_reuses_the_candidate_label_and_never_re_grades(
         self, tmp_path, monkeypatch
     ):

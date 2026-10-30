@@ -1445,6 +1445,34 @@ pub async fn run(
         execution_root.display()
     );
 
+    // [VANTA-WHY] Item P — the run's SEED: the on-disk execution tree, staged once
+    // here so every in-session sandbox can be cloned from it. Before this, a
+    // sandbox was seeded from the source concatenation alone, so a compiled
+    // project (`pandas/1`, `matplotlib/1`) reached the VM without its `.so`
+    // extensions and without its root `pytest.ini`/`setup.cfg` — the in-session
+    // suite was then NOT the suite the harness's own oracle and native gates run.
+    // The concatenation is still the SOURCE overlay (`harness::seed_and_write`);
+    // the seed carries everything the walk cannot (compiled extensions, config
+    // files). A failure to stage is deliberately not fatal: the in-session import
+    // guard below turns a tree that did not arrive into a stated InfraFailure
+    // rather than a silent zero-test run.
+    let seed_tree = if resolved_arm.judge == Some("plain") {
+        // A plain judge arm spawns no sandbox at all, so there is no tree to stage.
+        None
+    } else {
+        match harness::prepare_seed_tree(&execution_root) {
+            Ok(tree) => Some(tree),
+            Err(e) => {
+                println!(
+                    "  ⚠ Could not stage the seed tree ({e}); sandboxes fall back to \
+                     source-concat seeding"
+                );
+                None
+            }
+        }
+    };
+    harness::set_seed_root(seed_tree.as_ref().map(|tree| tree.path().to_path_buf()));
+
     // ---- Governor + Gatekeeper ----
     let mut governor = Governor::new(config.max_attempts);
     let gatekeeper = Gatekeeper::new(VerificationPolicy::BestEffort);
@@ -1669,6 +1697,11 @@ pub async fn run(
     // it again. The accumulator is run-scoped, not attempt-scoped, because a
     // quarantine is a durable fact about the probe: once removed, it stays out.
     let mut quarantined: Vec<QuarantinedProbe> = Vec::new();
+    // [VANTA-WHY] Item P, point 2 — the in-session import guard's own line, carried
+    // out of the loop for the `run.summary` row and a `run.import_guard` session
+    // row. `None` means the guard has not run yet (and, for a plain judge arm,
+    // never will). It runs ONCE, before the run's first sandbox.
+    let mut import_guard_line: Option<String> = None;
     let decision = 'attempts: loop {
         // [VANTA-WHY] §14.15 — the deadline is checked here as well as in the LLM
         // layer, and this is the check that turns "the calls stopped" into "the
@@ -1712,6 +1745,30 @@ pub async fn run(
                     .to_string(),
             );
             break GovernorDecision::InfraFailure;
+        }
+
+        // [VANTA-WHY] Item P, point 2 — the in-session IMPORT GUARD. Runs once,
+        // before the run's first sandbox, and only for an arm that actually runs a
+        // suite (a plain judge arm spawns no sandbox by design, so there is nothing
+        // to guard). It imports the project's package in a sandbox seeded exactly
+        // as the suite will be, and refuses a run whose package resolves OUTSIDE
+        // the tree under test — the silent, unmeasurable state a
+        // concatenation-only seed produced for a compiled project. The refusal is
+        // infrastructure, not a statement about the candidate, so it reuses the
+        // existing InfraFailure machinery (run.infra_failure row, exit code 2).
+        if import_guard_line.is_none() && resolved_arm.judge != Some("plain") {
+            let guard_concat = build_source_concat(&original_files);
+            match harness::guard_project_import(&guard_concat, &test_cmd, &execution_root).await {
+                Ok(line) => {
+                    println!("  {line}");
+                    import_guard_line = Some(line);
+                }
+                Err(reason) => {
+                    println!("  ✗ IMPORT GUARD: {reason}");
+                    infra_failure_error = Some(reason);
+                    break GovernorDecision::InfraFailure;
+                }
+            }
         }
         // [VANTA-WHY] Forensics filenames carry the ROUND, not just the
         // structured-call retry index. Without this, every round wrote over the
@@ -3595,6 +3652,36 @@ pub async fn run(
     println!("  FINAL: {:?}", decision);
     println!("══════════════════════════════════════════════════════════════");
 
+    // [VANTA-WHY] Item P — the seed's lifetime ends with the loop: no sandbox is
+    // spawned after this point, so the stage can go and the harness can stop
+    // pointing at it. Clearing the root first keeps a later run in the same
+    // process from cloning a stage this one owns (and is about to remove). The
+    // mechanism the first seed used is read BEFORE the clear, because
+    // `set_seed_root` deliberately resets it alongside the root.
+    let seed_method_record = harness::seed_method().map(|m| m.as_str()).unwrap_or("unset");
+    harness::set_seed_root(None);
+    drop(seed_tree);
+
+    // [VANTA-WHY] Item P, point 2 — the import guard's outcome as its own phase,
+    // the way `run.infra_failure` and `run.judge` record their own. The full line
+    // names the package AND the path it imported from, which is the evidence that
+    // an in-session suite ran against the tree under test rather than
+    // site-packages; `run.summary` can carry only the space-free token.
+    if let Some(line) = &import_guard_line {
+        session_log.append(SessionRecord {
+            session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
+            patch_attempt_id: attempt_patch_ids.last().cloned(),
+            testing_iteration_id: None,
+            test_id: None,
+            phase: "run.import_guard".to_string(),
+            summary: line.chars().take(1000).collect::<String>(),
+            timestamp: now_iso(),
+            benchmark_instance: None,
+            benchmark_label: None,
+        })?;
+    }
+
     // [VANTA-WHY] The error text travels WITH the verdict. "InfraFailure" on its
     // own says the run died but not why, and the reason is what the reader acts
     // on: an idle timeout, a prompt refused by the pre-flight guard and an
@@ -4014,7 +4101,8 @@ pub async fn run(
              harness_error={} \
              invariant_applied={} invariant_reason={} \
              grounded_scrapped={} grounded_kept_by_issue={} \
-             quarantine_count={} quarantined=[{}]",
+             quarantine_count={} quarantined=[{}] \
+             seed_method={} import_guard={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -4211,6 +4299,22 @@ pub async fn run(
                 .map(|q| q.test_name.clone())
                 .collect::<Vec<_>>()
                 .join(","),
+            // [VANTA-WHY] Item P — which mechanism seeded this run's sandboxes
+            // (`clonefile` for a copy-on-write clone, `copy_tree` for the
+            // fallback), and the in-session import guard's space-free token
+            // (`import_guard=<module>`, or `import_guard=none` for a
+            // single-module project with no top-level package to check). Both are
+            // space-free, so they survive the `key=value` reader. `unset` is every
+            // run before this change, and also a plain judge arm, which spawns no
+            // sandbox to seed or guard. Appended after the pre-existing keys so an
+            // older row's reader is unaffected; the guard's full line (with the
+            // path the package imported from) is the `run.import_guard` session
+            // row.
+            seed_method_record,
+            import_guard_line
+                .as_deref()
+                .and_then(|line| line.split_whitespace().next())
+                .unwrap_or("unset"),
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),

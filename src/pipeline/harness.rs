@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::RwLock;
 
 use futures::future::join_all;
 
@@ -94,7 +96,7 @@ pub async fn run_tests_parallel_detailed(
                 Ok(b) => b,
                 Err(_) => return (name, TestExecutionDetails::infrastructure_error()),
             };
-            if write_source_files(sb.root(), &source).is_err() {
+            if seed_and_write(sb.root(), &source).is_err() {
                 sb.destroy();
                 return (name, TestExecutionDetails::infrastructure_error());
             }
@@ -185,7 +187,7 @@ pub async fn run_single_test_with_timeout(
         Ok(b) => b,
         Err(_) => return TestExecutionDetails::infrastructure_error(),
     };
-    let _ = write_source_files(sb.root(), source_concat);
+    let _ = seed_and_write(sb.root(), source_concat);
     let _ = write_conftest(sb.root());
     let _ = fs::write(sb.root().join(BATE_TEST_FILE), test_source);
     let cmd = build_single_test_cmd(test_cmd, BATE_TEST_FILE);
@@ -321,7 +323,7 @@ pub async fn run_native_suite(source: &str, test_cmd: &TestCommand) -> NativeSui
         Ok(b) => b,
         Err(_) => return NativeSuiteReport::not_run(),
     };
-    if write_source_files(sb.root(), source).is_err() {
+    if seed_and_write(sb.root(), source).is_err() {
         sb.destroy();
         return NativeSuiteReport::not_run();
     }
@@ -765,6 +767,383 @@ for _p in (os.path.join(_here, 'src'), _here):
 }
 
 // ============================================================================
+// The per-run sandbox SEED (item P) — the built tree, cloned per sandbox
+// ============================================================================
+//
+// [VANTA-WHY] Item P. Until this, every sandbox was seeded from the UTF-8
+// SOURCE CONCATENATION alone. `driver::build_source_concat` is built from
+// `context::walk_candidates`, which keeps `SOURCE_EXTENSIONS` files only, so a
+// compiled project (pandas/1, matplotlib/1) reached the VM without its `.so`
+// extensions — every in-session import died as a partially-initialised module
+// — and without its root `pytest.ini`/`setup.cfg`, so the in-session run was
+// NOT the run the harness's own oracle and native suites perform. The
+// in-session suite must run in the tree the prepare step built in place; the
+// concatenation is only the SOURCE overlay on top of it.
+//
+// The stage is built ONCE per run (`prepare_seed_tree`), from the on-disk
+// execution tree, and every sandbox gets its own writable tree from it
+// (`seed_sandbox`): a copy-on-write clonefile where the volume allows one, a
+// plain recursive copy otherwise. Which of the two the first seed used is
+// recorded, so the row can state it (a CoW row and a copy row are not the same
+// run). `set_seed_root(None)` — the default, and what the in-file unit tests
+// use — leaves every function byte-identical to the concat-only behaviour.
+
+/// Which mechanism a sandbox seed used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedMethod {
+    /// `cp -c` / clonefile — the sandbox shares blocks with the run's seed.
+    Clonefile,
+    /// A full recursive copy; the fallback when clonefile is unavailable.
+    CopyTree,
+}
+
+impl SeedMethod {
+    /// The token the row records this mechanism under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SeedMethod::Clonefile => "clonefile",
+            SeedMethod::CopyTree => "copy_tree",
+        }
+    }
+}
+
+/// The on-disk tree every sandbox of this run is seeded from.
+static SEED_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
+/// Which mechanism the FIRST sandbox seed used.
+static SEED_METHOD: RwLock<Option<SeedMethod>> = RwLock::new(None);
+
+/// Point the harness at the run's seed tree (item P). `None` restores the
+/// concat-only behaviour, which is what a caller that never built a seed gets.
+pub fn set_seed_root(root: Option<PathBuf>) {
+    let mut guard = SEED_ROOT.write().unwrap_or_else(|e| e.into_inner());
+    *guard = root;
+    let mut method = SEED_METHOD.write().unwrap_or_else(|e| e.into_inner());
+    *method = None;
+}
+
+/// The run's seed tree, if one was set.
+pub fn seed_root() -> Option<PathBuf> {
+    SEED_ROOT.read().ok().and_then(|guard| guard.clone())
+}
+
+/// Which mechanism the run's first sandbox seed used, for the row's own record.
+pub fn seed_method() -> Option<SeedMethod> {
+    SEED_METHOD.read().ok().and_then(|guard| *guard)
+}
+
+/// Build the run's seed tree once: a staging copy of the on-disk execution tree
+/// with `SKIP_DIRS` and symlinks left out, so a sandbox can be seeded from it by
+/// a copy-on-write clone.
+///
+/// [VANTA-WHY] The staging dir must live under the process's CWD: the Shuru
+/// backend mounts a sandbox host dir into the VM with `--mount`, and shuru
+/// 0.7.0 restricts `--mount` to paths within CWD (`sandbox/shuru.rs`). The
+/// caller holds the returned `TempDir` for the whole run; dropping it removes
+/// the stage.
+pub fn prepare_seed_tree(
+    execution_root: &Path,
+) -> Result<tempfile::TempDir, Box<dyn std::error::Error + Send + Sync>> {
+    let staging = tempfile::Builder::new()
+        .prefix("vanta-seed-")
+        .tempdir_in(std::env::current_dir()?)?;
+    copy_tree_excluding(staging.path(), execution_root)?;
+    Ok(staging)
+}
+
+/// Recursive copy that leaves out `SKIP_DIRS` names and symlinks.
+///
+/// [VANTA-WHY] `.git` and the build output are excluded for the reason
+/// `rerun::copy_tree_recursive` gives (an entire object database copied per
+/// sandbox), and symlinks for the same reason: a symlink pointing back into the
+/// original tree would let a `git apply` escape the copy.
+fn copy_tree_excluding(dst: &Path, src: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if crate::context::SKIP_DIRS.contains(&name_str.as_ref()) {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            copy_tree_excluding(&to, &from)?;
+        } else if file_type.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Seed one sandbox root from the run's seed tree. `None` when no seed was set
+/// (concat-only), so the caller can tell "seeded" from "nothing to do".
+///
+/// [VANTA-WHY] `cp -cR` clones rather than copies, so a 200 MB built tree costs
+/// metadata rather than 200 MB of I/O per sandbox — and
+/// `run_tests_parallel_detailed` spawns one sandbox PER TEST. If the clone fails
+/// (a non-APFS volume, or a file clonefile refuses) the tree is copied instead,
+/// and the fallback is what the row records.
+pub fn seed_sandbox(root: &Path) -> Option<SeedMethod> {
+    let seed = seed_root()?;
+    let method = seed_sandbox_from(&seed, root)?;
+    let mut recorded = SEED_METHOD.write().unwrap_or_else(|e| e.into_inner());
+    if recorded.is_none() {
+        *recorded = Some(method);
+    }
+    Some(method)
+}
+
+/// The mechanism-only half of `seed_sandbox`, with the seed named explicitly:
+/// no global is read and none is written, so a unit test can exercise the clone
+/// and its fallback without disturbing a concurrent run's harness.
+fn seed_sandbox_from(seed: &Path, root: &Path) -> Option<SeedMethod> {
+    let cloned = std::process::Command::new("cp")
+        .arg("-cR")
+        .arg(format!("{}/.", seed.display()))
+        .arg(format!("{}/", root.display()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if cloned {
+        return Some(SeedMethod::Clonefile);
+    }
+    copy_tree_excluding(root, seed).ok()?;
+    Some(SeedMethod::CopyTree)
+}
+
+/// Seed a sandbox root (when a seed is set) and overlay the concatenated source
+/// on top — the one entry point every test-running function uses.
+///
+/// [VANTA-WHY] The overlay is the whole point: the seed carries what the walk
+/// cannot (`pyproject.toml`, `pytest.ini`, `setup.cfg`, and every compiled
+/// extension), and the concatenation carries the SOURCE UNDER TEST, which for a
+/// patched attempt is not what is on disk. A source file the concatenation no
+/// longer lists — a path the patch deleted — is pruned from the seeded tree
+/// first, so the executed tree's source is exactly the concatenation's.
+pub fn seed_and_write(
+    root: &Path,
+    source_concat: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    seed_and_write_from(seed_root().as_deref(), root, source_concat)
+}
+
+/// The seed-plus-overlay step with the seed named explicitly (`None` = no seed),
+/// so the exact behaviour both with and without a seed is unit-testable.
+fn seed_and_write_from(
+    seed: Option<&Path>,
+    root: &Path,
+    source_concat: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(seed) = seed {
+        if seed_sandbox_from(seed, root).is_some() {
+            prune_source_files_not_in(root, source_concat)?;
+        }
+    }
+    write_source_files(root, source_concat)
+}
+
+/// Delete every `SOURCE_EXTENSIONS` file under `root` the concatenation does not
+/// list. Bounded to the source extensions the walk reads, so a `.so` or a config
+/// file the seed brought in is never touched.
+fn prune_source_files_not_in(
+    root: &Path,
+    source_concat: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let keep: std::collections::HashSet<String> = parse_source_files(source_concat)?
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    prune_walk(root, root, &keep)?;
+    Ok(())
+}
+
+fn prune_walk(
+    root: &Path,
+    dir: &Path,
+    keep: &std::collections::HashSet<String>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if crate::context::SKIP_DIRS.contains(&name_str.as_ref()) {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            prune_walk(root, &path, keep)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !crate::context::SOURCE_EXTENSIONS.contains(&extension) {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        if !keep.contains(&relative.to_string_lossy().to_string()) {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
+// The in-session IMPORT GUARD (item P, point 2)
+// ============================================================================
+
+/// The project's own top-level package: the first `__init__.py` directory
+/// directly under a `sys.path` root (the workspace itself, then each
+/// `PYTHONPATH` entry the run records).
+///
+/// [VANTA-WHY] `detect_import_path` reads a `src/` layout and misses
+/// matplotlib's, whose package sits under the `lib/` its own `PYTHONPATH=lib`
+/// names — which is exactly the layout the guard has to cover. Reading the
+/// `PYTHONPATH` the command actually carries is what makes the same rule work
+/// for both. Names that are the repo's own tooling rather than its package are
+/// skipped, so a stray `tests/__init__.py` cannot become "the project".
+pub fn project_package(tree_root: &Path, test_cmd: &TestCommand) -> Option<String> {
+    let mut roots: Vec<PathBuf> = vec![PathBuf::new()];
+    for (key, value) in &test_cmd.env {
+        if key != "PYTHONPATH" {
+            continue;
+        }
+        for part in value.split(':') {
+            let part = part.trim().trim_start_matches("./").trim_end_matches('/');
+            if !part.is_empty() && part != "." {
+                roots.push(PathBuf::from(part));
+            }
+        }
+    }
+    for relative in roots {
+        let Ok(entries) = fs::read_dir(tree_root.join(&relative)) else {
+            continue;
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|entry| {
+                let path = entry.path();
+                path.is_dir() && path.join("__init__.py").is_file()
+            })
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| !is_tooling_package(name))
+            .collect();
+        names.sort();
+        if let Some(name) = names.into_iter().next() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// A directory that is the repo's own tooling, not the package under test.
+fn is_tooling_package(name: &str) -> bool {
+    matches!(
+        name,
+        "test" | "tests" | "doc" | "docs" | "example" | "examples" | "benchmark"
+            | "benchmarks" | "asv_bench" | "scripts" | "tools" | "build" | "dist"
+    )
+}
+
+/// The in-session twin of the prepare-time gate: the project's package must
+/// import FROM THE TREE UNDER TEST, or the run is infrastructure, not a
+/// measurement.
+///
+/// [VANTA-WHY] `scripts/bugsinpy/prepare.py` refuses a bug whose package
+/// resolves outside the tree — but that gate runs in the PREPARE layer and
+/// cannot see a sandbox whose tree was seeded from the source concatenation
+/// alone: there the package was simply absent and every import resolved to
+/// whatever site-packages held, which is precisely the silent, unmeasurable
+/// state this guard converts into a stated `InfraFailure`. `Ok(..)` carries the
+/// line the run records (`import_guard=<module> file=<path>`); `Err(..)` is the
+/// reason the run must stop.
+pub async fn guard_project_import(
+    source_concat: &str,
+    test_cmd: &TestCommand,
+    tree_root: &Path,
+) -> Result<String, String> {
+    let module = match project_package(tree_root, test_cmd) {
+        Some(module) => module,
+        None => {
+            return Ok(
+                "import_guard=none — no top-level package under a sys.path root (a single-module \
+                 project); the guard has nothing to check"
+                    .to_string(),
+            )
+        }
+    };
+    let sandbox = Backend::spawn()
+        .await
+        .map_err(|e| format!("import_guard: sandbox could not spawn: {e}"))?;
+    let host_root = sandbox.root().display().to_string();
+    if seed_and_write(sandbox.root(), source_concat).is_err() {
+        sandbox.destroy();
+        return Err(
+            "import_guard: the tree under test could not be written into the sandbox".to_string(),
+        );
+    }
+    let _ = write_conftest(sandbox.root());
+    // [VANTA-WHY] No `.pyc` may be left in the tree under test: the probe
+    // imports the package exactly as a suite run would, and a bytecode cache
+    // written by the guard would be a run's leavings inside the graded tree.
+    let mut env = test_cmd.env.clone();
+    env.push(("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string()));
+    let probe = format!("import {module} as _vanta_import_guard; print(_vanta_import_guard.__file__)");
+    let program = test_cmd.program.clone();
+    let exec = sandbox
+        .execute(
+            &[program.as_str(), "-c", probe.as_str()],
+            Path::new(""),
+            120,
+            &env,
+            &test_cmd.precompile,
+        )
+        .await;
+    sandbox.destroy();
+    let exec = exec.map_err(|e| format!("import_guard: the probe could not run: {e}"))?;
+    let Some(where_from) = exec
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .next_back()
+    else {
+        return Err(format!(
+            "import_guard: `import {module}` printed nothing (exit {:?}, stderr: {})",
+            exec.exit_code,
+            stderr_tail(&exec.stderr)
+        ));
+    };
+    // [VANTA-WHY] The sandbox host dir is mounted into the VM at `/workspace`
+    // (`sandbox/shuru.rs`), so a package that resolved from the tree under test
+    // reports a `/workspace/...` path in the guest — while the same probe under
+    // the subprocess backend reports the host root. Both are the tree under
+    // test; anything else (site-packages, a frozen `setup.py install`) is not.
+    if !where_from.starts_with("/workspace/") && !where_from.starts_with(&format!("{host_root}/")) {
+        return Err(format!(
+            "import_guard: the package does not import from the tree under test — \
+             `import {module}` loaded {where_from}, which is neither under /workspace/ nor under \
+             {host_root}/"
+        ));
+    }
+    Ok(format!("import_guard={module} file={where_from}"))
+}
+
+// ============================================================================
 // pytest report parsing
 // ============================================================================
 
@@ -1138,7 +1517,7 @@ pub async fn run_static(
         Ok(b) => b,
         Err(_) => return StaticRun::default(),
     };
-    let _ = write_source_files(sb.root(), source);
+    let _ = seed_and_write(sb.root(), source);
     if let Some(root) = config_root {
         copy_static_configs(root, sb.root());
     }
@@ -1483,7 +1862,7 @@ pub async fn probe_missing_modules(
         Ok(b) => b,
         Err(_) => return Vec::new(),
     };
-    if write_source_files(sb.root(), original_source).is_err() {
+    if seed_and_write(sb.root(), original_source).is_err() {
         sb.destroy();
         return Vec::new();
     }
@@ -1584,11 +1963,12 @@ pub async fn heal_dependencies(
 mod tests {
     use super::{
         NativeSuiteReport, RUFF_ARGS, StaticDiagnostic, build_single_test_cmd,
-        copy_static_configs, interpreter_for, is_native_test_path, native_outcome,
-        native_regressions, native_suite_collapsed, native_tree_with_original_tests,
-        new_diagnostics, parse_mypy_line, parse_native_report, parse_pytest_report_detailed,
-        parse_ruff_line, report_tests, ruff_is_error_class, run_single_test, run_tests_parallel,
-        static_tool_runner, write_source_files,
+        copy_static_configs, copy_tree_excluding, interpreter_for, is_native_test_path,
+        is_tooling_package, native_outcome, native_regressions, native_suite_collapsed,
+        native_tree_with_original_tests, new_diagnostics, parse_mypy_line, parse_native_report,
+        parse_pytest_report_detailed, parse_ruff_line, project_package, report_tests,
+        ruff_is_error_class, run_single_test, run_tests_parallel, seed_and_write,
+        seed_and_write_from, seed_root, seed_sandbox_from, static_tool_runner, write_source_files,
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{TestIntent, TestResult};
@@ -2393,6 +2773,249 @@ mod tests {
                 "-q",
             ],
             "with no selection in the command the behaviour is unchanged, minus the append"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Item P — the per-run sandbox SEED and the in-session import guard
+    // ------------------------------------------------------------------
+
+    /// A small "built tree" on disk: the sources, the compiled extension and the
+    /// pytest config a compiled project has after `build_ext --inplace`, plus the
+    /// paths the seed stage must drop.
+    fn built_tree(dir: &std::path::Path) {
+        fs::create_dir_all(dir.join("pkg")).unwrap();
+        fs::write(dir.join("pkg/__init__.py"), "VALUE = 1\n").unwrap();
+        fs::write(dir.join("pkg/_ext.so"), [0u8, 1, 2, 3]).unwrap();
+        fs::write(dir.join("pytest.ini"), "[pytest]\nminversion=3.6\n").unwrap();
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join(".git/config"), "[core]\n").unwrap();
+        fs::create_dir_all(dir.join("build")).unwrap();
+        fs::write(dir.join("build/out.o"), "obj").unwrap();
+        std::os::unix::fs::symlink(dir.join("pkg"), dir.join("link")).unwrap();
+    }
+
+    #[test]
+    fn the_seed_stage_drops_git_build_output_and_symlinks() {
+        let exec = tempfile::tempdir().unwrap();
+        built_tree(exec.path());
+        let seed = tempfile::tempdir().unwrap();
+
+        copy_tree_excluding(seed.path(), exec.path()).unwrap();
+
+        assert!(seed.path().join("pkg/__init__.py").is_file());
+        assert!(
+            seed.path().join("pkg/_ext.so").is_file(),
+            "a compiled extension is exactly what the source walk cannot carry"
+        );
+        assert!(
+            seed.path().join("pytest.ini").is_file(),
+            "the project's config must survive staging"
+        );
+        assert!(!seed.path().join(".git").exists(), ".git is a SKIP_DIR");
+        assert!(!seed.path().join("build").exists(), "build output is a SKIP_DIR");
+        assert!(
+            !seed.path().join("link").exists(),
+            "a symlink is not copied: one pointing back into the tree would let a \
+             `git apply` escape the copy"
+        );
+    }
+
+    #[test]
+    fn seed_and_write_from_overlays_the_source_on_the_built_tree() {
+        let exec = tempfile::tempdir().unwrap();
+        built_tree(exec.path());
+        let seed = tempfile::tempdir().unwrap();
+        copy_tree_excluding(seed.path(), exec.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+
+        let concat = "# FILE: pkg/__init__.py\nVALUE = 2\n\n\n# FILE: pkg/core.py\ndef add(a, b):\n    return a + b\n";
+        seed_and_write_from(Some(seed.path()), root.path(), concat).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.path().join("pkg/__init__.py")).unwrap(),
+            "VALUE = 2\n",
+            "the concatenation is the SOURCE UNDER TEST and must win over the seed"
+        );
+        assert!(
+            root.path().join("pkg/core.py").is_file(),
+            "a file only the concatenation names is written"
+        );
+        assert_eq!(
+            fs::read(root.path().join("pkg/_ext.so")).unwrap(),
+            vec![0u8, 1, 2, 3],
+            "the compiled extension reaches the sandbox, so `import pkg` is not a \
+             partially-initialised module"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("pytest.ini")).unwrap(),
+            "[pytest]\nminversion=3.6\n",
+            "the project's pytest config reaches the sandbox, so pytest resolves the \
+             same rootdir/ini as the harness's own oracle and native runs"
+        );
+    }
+
+    #[test]
+    fn seed_and_write_from_prunes_the_source_the_concat_dropped() {
+        let exec = tempfile::tempdir().unwrap();
+        built_tree(exec.path());
+        fs::write(exec.path().join("pkg/old.py"), "OLD = 1\n").unwrap();
+        fs::write(exec.path().join("pkg/keep.py"), "KEEP = 1\n").unwrap();
+        let seed = tempfile::tempdir().unwrap();
+        copy_tree_excluding(seed.path(), exec.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+
+        let concat = "# FILE: pkg/keep.py\nKEEP = 2\n";
+        seed_and_write_from(Some(seed.path()), root.path(), concat).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.path().join("pkg/keep.py")).unwrap(),
+            "KEEP = 2\n"
+        );
+        assert!(
+            !root.path().join("pkg/old.py").exists(),
+            "a source file the concatenation no longer lists — a path the patch deleted — \
+             must not survive the overlay"
+        );
+        assert!(
+            !root.path().join("pkg/__init__.py").exists(),
+            "the executed tree's SOURCE is exactly the concatenation's, no more"
+        );
+    }
+
+    #[test]
+    fn seed_and_write_without_a_seed_writes_only_the_concat() {
+        assert!(seed_root().is_none(), "no seed is the harness's default");
+        let root = tempfile::tempdir().unwrap();
+        let concat = "# FILE: pkg/__init__.py\nVALUE = 2\n";
+
+        seed_and_write(root.path(), concat).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.path().join("pkg/__init__.py")).unwrap(),
+            "VALUE = 2\n"
+        );
+        assert_eq!(
+            fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "without a seed nothing but the concatenation's own paths is written"
+        );
+    }
+
+    #[test]
+    fn seed_sandbox_from_clones_the_seed_tree() {
+        let exec = tempfile::tempdir().unwrap();
+        built_tree(exec.path());
+        let seed = tempfile::tempdir().unwrap();
+        copy_tree_excluding(seed.path(), exec.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+
+        let method = seed_sandbox_from(seed.path(), root.path()).expect("the seed is readable");
+
+        assert!(
+            matches!(method.as_str(), "clonefile" | "copy_tree"),
+            "the mechanism is one of the two the row names, got {:?}",
+            method.as_str()
+        );
+        assert!(root.path().join("pkg/_ext.so").is_file());
+        assert!(root.path().join("pytest.ini").is_file());
+        // A clone (or a copy) is the sandbox's OWN tree: removing a file from it
+        // must not touch the seed every other sandbox is cloned from.
+        fs::remove_file(root.path().join("pkg/__init__.py")).unwrap();
+        assert!(
+            seed.path().join("pkg/__init__.py").is_file(),
+            "each sandbox must get its own writable tree"
+        );
+    }
+
+    #[test]
+    fn project_package_reads_the_pythonpath_root() {
+        let tree = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tree.path().join("lib/matplotlib")).unwrap();
+        fs::write(tree.path().join("lib/matplotlib/__init__.py"), "").unwrap();
+        fs::create_dir_all(tree.path().join("tests")).unwrap();
+        fs::write(tree.path().join("tests/__init__.py"), "").unwrap();
+        let cmd = TestCommand::default().with_env(vec![("PYTHONPATH".into(), "./lib".into())]);
+
+        assert_eq!(
+            project_package(tree.path(), &cmd),
+            Some("matplotlib".to_string()),
+            "matplotlib's package sits under the lib/ its own PYTHONPATH names — the layout \
+             `detect_import_path` reads as nothing"
+        );
+    }
+
+    #[test]
+    fn project_package_is_none_when_only_tooling_looks_like_a_package() {
+        let tree = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tree.path().join("tests")).unwrap();
+        fs::write(tree.path().join("tests/__init__.py"), "").unwrap();
+
+        assert_eq!(
+            project_package(tree.path(), &TestCommand::default()),
+            None,
+            "a stray tests/__init__.py must not become `the project`"
+        );
+    }
+
+    #[test]
+    fn is_tooling_package_names_the_repos_tooling_directories() {
+        for name in ["tests", "test", "docs", "examples", "benchmarks", "scripts", "build"] {
+            assert!(is_tooling_package(name), "{name} is repo tooling, not the package");
+        }
+        for name in ["matplotlib", "sanic", "pandas", "pysnooper", "fastapi"] {
+            assert!(!is_tooling_package(name), "{name} is a package under test");
+        }
+    }
+
+    #[test]
+    fn the_in_session_invocation_differs_from_the_harnesss_only_in_the_report_file() {
+        // [VANTA-WHY] Item P. The harness's own oracle/native runs execute the
+        // split's `test_cmd` with `{report}` substituted. Vanta is handed that
+        // command minus its report flags (`runner.py::vanta_test_cmd`) and appends
+        // its own (`build_single_test_cmd`). With the seed now carrying the
+        // project's config files, the two invocations must agree on everything the
+        // report file's path does not name — otherwise the in-session run measures
+        // a different suite from the one the harness grades.
+        let harness_argv: Vec<String> = [
+            "/venv/bin/python",
+            "-m",
+            "pytest",
+            "lib/matplotlib/tests",
+            "-p",
+            "no:cacheprovider",
+            "--json-report",
+            "--json-report-file=/workspace/report.json",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let handed_over =
+            TestCommand::from_shell("/venv/bin/python -m pytest lib/matplotlib/tests -p no:cacheprovider");
+        let in_session = build_single_test_cmd(&handed_over, "test_run.py");
+
+        let flags = |argv: &[String]| -> Vec<String> {
+            argv.iter()
+                .filter(|a| a.as_str().starts_with('-'))
+                .cloned()
+                .collect()
+        };
+        let without_report = |argv: &[String]| -> Vec<String> {
+            argv.iter()
+                .filter(|a| !a.as_str().starts_with("--json-report") && a.as_str() != "-q")
+                .cloned()
+                .collect()
+        };
+
+        assert_eq!(
+            without_report(&flags(&in_session)),
+            without_report(&flags(&harness_argv)),
+            "the interpreter, the module invocation and every pinned flag must survive the \
+             handoff unchanged; the in-session run adds only its own report flags and `-q`"
+        );
+        assert!(
+            in_session.iter().any(|a| a.starts_with("--json-report-file=")),
+            "the in-session run still writes a JSON report for the driver to read: {in_session:?}"
         );
     }
 }

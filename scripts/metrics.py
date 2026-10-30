@@ -489,6 +489,16 @@ def rate_text(count: int, denominator: int) -> str:
     return f"{count}/{denominator} ({count / denominator * 100:.2f}%)"
 
 
+def unshown_text(count: Optional[int]) -> str:
+    """`n` for a measured count, `n/a` when the field was never recorded.
+
+    [WHY] M3 item V — `None` is "not measured" (a review run, or a row written
+    before the field existed), never a `0` that would claim the run measured and
+    found none. The two must not render the same.
+    """
+    return "n/a" if count is None else str(count)
+
+
 def source_text(per_source: dict[str, dict[str, int]]) -> str:
     """`AttackerGenerated[ECR=… EIR=…] Native[…] Static[…]`."""
     parts = []
@@ -518,6 +528,13 @@ class Verdict:
     label: Optional[bool] = None
     warnings: list[str] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
+    # [WHY] M3 item V — how many attempts edited a file the Creator was not shown
+    # in full (an outline, a bare path, dropped for budget, or never selected).
+    # Read from this session's own `run.summary`; `None` when the key is absent,
+    # which is a review run (no Creator) or a row written before the field
+    # existed. It is deliberately not defaulted to `0`: "did not measure" and
+    # "measured zero" are different facts.
+    attempts_edited_unshown_file: Optional[int] = None
 
     @property
     def explanation(self) -> str:
@@ -652,7 +669,34 @@ def classify(
         label=known_bad,
         warnings=list(data.warnings),
         metrics=compute_ecr_eir(data.transitions),
+        attempts_edited_unshown_file=unshown_edit_count(
+            _run_summary_text(data.records)
+        ),
     )
+
+
+def _run_summary_text(records: list[dict[str, Any]]) -> str:
+    """This session's `run.summary` line, or `""` when it wrote none."""
+    record = run_summary_record(records)
+    return str(record.get("summary") or "") if record else ""
+
+
+def unshown_edit_count(summary: str) -> Optional[int]:
+    """M3 item V — the attempts this run edited a file the Creator could not read.
+
+    [WHY] Read from `run.summary` rather than the manifest, so the count is
+    available from the session directory alone (the same reason `provenance_of`
+    reads the row instead of an env var). An absent key and a malformed value are
+    both `None` — "did not measure" — never a `0` that would be read as a run that
+    measured and found none.
+    """
+    raw = summary_field(summary or "", ATTEMPTS_EDITED_UNSHOWN_FILE_KEY)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 # ============================================================================
@@ -710,23 +754,33 @@ def render_metrics(verdicts: list[Verdict]) -> str:
     AttackerGenerated result would credit the model for something the
     repository's own suite proved. A zero denominator prints `n/a`, never
     `0.00%`.
+
+    [WHY] M3 item V — the `UNSHOWN` column counts this run's attempts that edited
+    a file the Creator was not shown in full (an outline, a bare path, dropped for
+    budget, or never selected). It is a logging fact about the context, not a
+    verdict; a run that never recorded it (a review run, or a row from before the
+    field) prints `n/a`, and the pooled cell sums only the runs that did measure.
     """
     lines = [
         "",
         "ECR/EIR (conditional on the state at N; n/a = no such row)",
     ]
-    header = f"  {'SESSION':<10} {'ECR':<20} {'EIR':<20} BY SOURCE"
+    header = f"  {'SESSION':<10} {'ECR':<20} {'EIR':<20} {'UNSHOWN':<8} BY SOURCE"
     lines.append(header)
     lines.append("  " + "-" * (len(header) - 2))
     pooled = dict(_EMPTY_COUNTERS)
     pooled_sources: dict[str, dict[str, int]] = {}
+    measured_unshown: list[int] = []
     for verdict in verdicts:
         metrics_ = verdict.metrics or {}
         per_source = metrics_.get("per_source") or {}
+        if verdict.attempts_edited_unshown_file is not None:
+            measured_unshown.append(verdict.attempts_edited_unshown_file)
         lines.append(
             f"  {verdict.session_id[:8]:<10} "
             f"{rate_text(metrics_.get('ecr', 0), metrics_.get('ecr_denominator', 0)):<20} "
             f"{rate_text(metrics_.get('eir', 0), metrics_.get('eir_denominator', 0)):<20} "
+            f"{unshown_text(verdict.attempts_edited_unshown_file):<8} "
             f"{source_text(per_source)}"
         )
         for key in pooled:
@@ -735,11 +789,17 @@ def render_metrics(verdicts: list[Verdict]) -> str:
             acc = pooled_sources.setdefault(name, dict(_EMPTY_COUNTERS))
             for key in acc:
                 acc[key] += bucket.get(key, 0)
+    pooled_unshown = sum(measured_unshown) if measured_unshown else None
     lines.append(
         f"  {'POOLED':<10} "
         f"{rate_text(pooled['ecr'], pooled['ecr_denominator']):<20} "
         f"{rate_text(pooled['eir'], pooled['eir_denominator']):<20} "
+        f"{unshown_text(pooled_unshown):<8} "
         f"{source_text(pooled_sources)}"
+    )
+    lines.append(
+        "  UNSHOWN = attempts that edited a file the Creator was not shown in "
+        "full (M3 item V); n/a = not recorded"
     )
     return "\n".join(lines)
 
@@ -788,6 +848,15 @@ collide with a recorded one.
 
 SAMPLING_PRESET_KEY = "sampling_preset"
 """The one named key of the sampling block; it names the schedule (§4.3)."""
+
+ATTEMPTS_EDITED_UNSHOWN_FILE_KEY = "attempts_edited_unshown_file"
+"""M3 item V — the `run.summary` key for attempts that edited an unshown file.
+
+[WHY] A repair-only key (the Creator is the only role a "did the patch touch a
+file it could not read?" question applies to). A review run and any row written
+before the field existed simply do not carry it, which is why `unshown_edit_count`
+(and `Verdict.attempts_edited_unshown_file`) read `None` for them rather than `0`.
+"""
 
 SAMPLING_PIN_PREFIXES = (
     "temperature_",

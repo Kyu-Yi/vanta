@@ -2045,6 +2045,19 @@ def build_record(
         "localization_hit_reason": (
             "review_candidate_seeded" if job.mode == REVIEW else None
         ),
+        # [VANTA-WHY] M3 item V — the counterpart to `localization_hit`. That field
+        # asks whether a file the fix touched was in the run's SELECTION; this one
+        # counts the attempts whose patch touched a file the Creator was NOT shown
+        # in full (a file left as an outline, a bare path, dropped for budget, or
+        # never selected at all). matplotlib/1 is the motivating case: three
+        # attempts edited `lib/matplotlib/image.py` while its source was dropped for
+        # budget, and no field said the Creator was editing blind. `None` is a run
+        # the question cannot be asked of — a review run has no Creator, so the
+        # driver emits no key — and is kept distinct from a repair run that
+        # genuinely made no such attempt (`0`).
+        "attempts_edited_unshown_file": _int(
+            summary.get("attempts_edited_unshown_file")
+        ),
         "oracle": oracle.as_dict(),
         "label": label_for(outcome.decision, oracle),
         # Item Q — the reason a label needs one. `unresolved` for a run whose final
@@ -3157,6 +3170,15 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
                 # tally over rows the question cannot ask (the group key carries
                 # the mode, so a group is wholly one or the other).
                 "localization_applies": record.get("mode") != REVIEW,
+                # [VANTA-WHY] M3 item V — how many attempts in this group edited
+                # a file the Creator was not shown in full, summed over the rows
+                # that carry the field. Like `localization_applies`, the question
+                # needs a Creator, so a review group reports it as not applicable
+                # rather than as a `0` it never measured. Rows written before this
+                # field existed carry no value and add nothing (never a zero they
+                # did not measure).
+                "attempts_edited_unshown_file": 0,
+                "context_visibility_applies": record.get("mode") != REVIEW,
             },
         )
         group["runs"] += 1
@@ -3164,9 +3186,19 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
         group["labels"][label] = group["labels"].get(label, 0) + 1
         # Item T — derive the null when reading: a review row written before this
         # item can carry a `localization_hit`, and it cannot mean anything, so it
-        # is ignored rather than counted. Rows on disk are never rewritten.
+        # is ignored rather than counted. Rows on disk are never rewritten. Item V's
+        # unshown-edit count is the same REPAIR-only question and is guarded here
+        # for the same reason: a review run has no Creator, so a stored count is
+        # ignored on read rather than summed into a group that prints n/a.
         if record.get("mode") == REVIEW:
             continue
+        # [VANTA-WHY] M3 item V — sum the per-row count. A row that carries no
+        # value is a row the field did not exist for, and it contributes nothing;
+        # `isinstance(int)` guards against a `None`/`"0"` creeping in, which would
+        # raise rather than silently add.
+        unshown = record.get("attempts_edited_unshown_file")
+        if isinstance(unshown, int) and not isinstance(unshown, bool):
+            group["attempts_edited_unshown_file"] += unshown
         hit = record.get("localization_hit")
         group["localization"][
             "unknown" if hit is None else ("hit" if hit else "miss")
@@ -3177,8 +3209,8 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
 def render_digest(payload: dict[str, Any]) -> str:
     lines = [
         f"{'config':<10} {'arm':<7} {'mode':<8} {'seed':>4} {'model':<18} {'harness':<10} "
-        f"{'build':<10} {'runs':>5}  labels  localization",
-        "-" * 130,
+        f"{'build':<10} {'runs':>5}  labels  localization  unshown_edits",
+        "-" * 150,
     ]
     for group in payload.get("groups", []):
         harness = str(group.get("harness_commit") or "")[:9]
@@ -3195,11 +3227,20 @@ def render_digest(payload: dict[str, Any]) -> str:
             )
         else:
             localization = "n/a (review)"
+        # [VANTA-WHY] M3 item V — the count of attempts that edited a file the
+        # Creator was not shown in full. A review group has no Creator, so the
+        # question is not applicable there, printed the same way localization's
+        # review case is. A group whose rows predate the field sums to `0`, which
+        # is honest: none of them measured a nonzero value.
+        if group.get("context_visibility_applies", True):
+            unshown = f"unshown_edits={group.get('attempts_edited_unshown_file', 0)}"
+        else:
+            unshown = "unshown_edits=n/a (review)"
         lines.append(
             f"{str(group['config']):<10} {str(group.get('arm') or ''):<7} "
             f"{str(group['mode']):<8} {str(group['seed']):>4} "
             f"{model:<18} {harness:<10} {build:<10} {group['runs']:>5}  {labels}  "
-            f"{localization}"
+            f"{localization}  {unshown}"
         )
     return "\n".join(lines)
 

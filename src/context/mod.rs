@@ -637,6 +637,45 @@ pub struct DroppedFile {
     pub bytes: usize,
 }
 
+/// The label for a file shown as the whole source (M3 item V).
+pub const VISIBILITY_FULL: &str = "full";
+
+/// How one file a patch touched stood in the context a role was shown (M3 item V).
+///
+/// [VANTA-WHY] M3 item V — matplotlib/1's repair targeted `image.py` on three
+/// attempts while that file sat in `dropped_for_budget`, so the Creator was
+/// editing a file whose source it had never seen. Nothing on the row said so:
+/// `localization_hit` asks whether the bug's own file was in the *selection*, not
+/// whether the file a patch actually *touched* was visible in the form the patch
+/// needs. This pairs the two: one label per touched file, in the fixed vocabulary
+/// below, so an analysis can count the attempts that edited a file the Creator
+/// could not read in full without re-running the selector.
+///
+/// The five labels are exhaustive and mutually exclusive:
+///
+/// * `full`              — selected and shown as the whole source;
+/// * `outline`           — selected, but only its signatures and docstrings;
+/// * `path_only`         — selected, but only the `# FILE:` marker, no body;
+/// * `dropped_for_budget`— the ranking chose it and the budget could not fit it;
+/// * `not_selected`      — the ranking never reached it (or it is not in the tree).
+///
+/// Only `full` is a file whose text the role had. `outline` and `path_only` are
+/// deliberately NOT folded into `full`: a patch needs the exact source lines, and
+/// an outline cannot supply them — which is the whole point of recording the form
+/// and not a bare boolean.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TouchedFileVisibility {
+    pub path: String,
+    pub visibility: &'static str,
+}
+
+impl TouchedFileVisibility {
+    /// Whether the role saw this file's whole body — `full` and nothing else.
+    pub fn shown_in_full(&self) -> bool {
+        self.visibility == VISIBILITY_FULL
+    }
+}
+
 /// A complete context selection for one role.
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextSelection {
@@ -780,6 +819,57 @@ impl ContextSelection {
             files,
             pruned,
         )
+    }
+
+    /// Where each of `touched` stood in this selection, in path order (M3 item V).
+    ///
+    /// [VANTA-WHY] M3 item V — this is the pairing `localization_hit` cannot make:
+    /// it answers "was a file the fix touched among those the run was shown?" over
+    /// the SELECTION, while the question a repair row needs is "was the file this
+    /// PATCH touched one the Creator could actually read?". Here the patch's own
+    /// touched paths are resolved against this one selection, so an attempt that
+    /// edited a file with no visible body is a fact on the row instead of an
+    /// inference from two separate strings.
+    ///
+    /// Order is the sorted path order, not the selection's score order and not the
+    /// patch's own file order: the touch list is a set (a `HashMap`'s keys, whose
+    /// iteration order is not stable), and a record that a reader diffs across
+    /// attempts must not reorder itself between runs.
+    ///
+    /// A path that is in neither `files` nor `dropped_for_budget` is `not_selected`
+    /// — the ranking never reached it, or it is not in the tree at all. Both are
+    /// the same answer for the question asked ("was it in the role's context?"), so
+    /// they share one label rather than inventing a sixth.
+    pub fn touched_visibility(&self, touched: &[String]) -> Vec<TouchedFileVisibility> {
+        let mut paths: Vec<&String> = touched.iter().collect();
+        paths.sort();
+        paths.dedup();
+        paths
+            .into_iter()
+            .map(|path| TouchedFileVisibility {
+                path: path.clone(),
+                visibility: self.one_visibility(path),
+            })
+            .collect()
+    }
+
+    /// The visibility label for ONE path, against this selection.
+    fn one_visibility(&self, path: &str) -> &'static str {
+        if let Some(file) = self.files.iter().find(|file| file.path == path) {
+            return match file.shown {
+                ShownMode::Full => "full",
+                ShownMode::Outline => "outline",
+                ShownMode::Path => "path_only",
+            };
+        }
+        if self
+            .dropped_for_budget
+            .iter()
+            .any(|dropped| dropped.path == path)
+        {
+            return "dropped_for_budget";
+        }
+        "not_selected"
     }
 }
 
@@ -3880,6 +3970,120 @@ mod tests {
         assert!(
             !shown.contains(&"pkg/unrelated.py") && !shown.contains(&"tests/test_unrelated.py"),
             "files the patch does not reach stay out of the review prompt"
+        );
+    }
+
+    /// M3 item V — the fixture the item asks for: a patch whose own file the budget
+    /// dropped. This is the matplotlib/1 shape, where the Creator edited
+    /// `lib/matplotlib/image.py` on three attempts while its source was never in the
+    /// prompt, and nothing on the row said so.
+    #[test]
+    fn a_patch_on_a_dropped_file_is_named_not_full() {
+        fn shown(path: &str, form: ShownMode) -> SelectedFile {
+            SelectedFile {
+                path: path.to_string(),
+                rank: 1,
+                score: 0,
+                reasons: Vec::new(),
+                rules: BTreeMap::new(),
+                bytes: 0,
+                tokens: 0,
+                shown: form,
+                body: String::new(),
+            }
+        }
+        let selection = ContextSelection {
+            role: "creator".to_string(),
+            mode: "repair".to_string(),
+            budget_tokens: 0,
+            total_bytes: 0,
+            total_tokens: 0,
+            tree: Vec::new(),
+            tree_bytes: 0,
+            tree_tokens: 0,
+            files: vec![
+                shown("pkg/first.py", ShownMode::Full),
+                shown("pkg/outlined.py", ShownMode::Outline),
+                shown("pkg/header.py", ShownMode::Path),
+            ],
+            dropped_for_budget: vec![DroppedFile {
+                path: "lib/matplotlib/image.py".to_string(),
+                bytes: 64_405,
+            }],
+            skipped: Vec::new(),
+        };
+
+        let touched = vec![
+            "lib/matplotlib/image.py".to_string(),
+            "pkg/first.py".to_string(),
+            "pkg/outlined.py".to_string(),
+            "pkg/header.py".to_string(),
+            "pkg/nowhere.py".to_string(),
+        ];
+        let visibility = selection.touched_visibility(&touched);
+
+        assert_eq!(
+            visibility
+                .iter()
+                .map(|file| (file.path.as_str(), file.visibility))
+                .collect::<Vec<_>>(),
+            vec![
+                ("lib/matplotlib/image.py", "dropped_for_budget"),
+                ("pkg/first.py", "full"),
+                ("pkg/header.py", "path_only"),
+                ("pkg/nowhere.py", "not_selected"),
+                ("pkg/outlined.py", "outline"),
+            ],
+            "one label per touched file, in sorted path order"
+        );
+        assert!(
+            !visibility[0].shown_in_full(),
+            "the dropped file is exactly the file the count must catch"
+        );
+        assert!(
+            visibility[1].shown_in_full() && !visibility[2].shown_in_full(),
+            "only `full` is the whole source — an outline and a bare header are not"
+        );
+        assert!(
+            visibility.iter().any(|file| !file.shown_in_full()),
+            "this attempt edited a file the Creator could not read in full"
+        );
+    }
+
+    /// M3 item V — a patch that touches only files shown in full is not counted.
+    #[test]
+    fn a_patch_on_fully_shown_files_is_counted_nowhere() {
+        let selection = ContextSelection {
+            role: "creator".to_string(),
+            mode: "repair".to_string(),
+            budget_tokens: 0,
+            total_bytes: 0,
+            total_tokens: 0,
+            tree: Vec::new(),
+            tree_bytes: 0,
+            tree_tokens: 0,
+            files: vec![SelectedFile {
+                path: "pkg/core.py".to_string(),
+                rank: 1,
+                score: 0,
+                reasons: Vec::new(),
+                rules: BTreeMap::new(),
+                bytes: 0,
+                tokens: 0,
+                shown: ShownMode::Full,
+                body: String::new(),
+            }],
+            dropped_for_budget: Vec::new(),
+            skipped: Vec::new(),
+        };
+
+        let visibility = selection.touched_visibility(&["pkg/core.py".to_string()]);
+
+        assert_eq!(visibility.len(), 1);
+        assert!(visibility[0].shown_in_full());
+        assert!(
+            !visibility.iter().any(|file| !file.shown_in_full()),
+            "a patch on a fully shown file is not an unshown edit"
         );
     }
 }

@@ -33,15 +33,22 @@ def write_session(
     session_id: str,
     decision: str = "Rejected",
     schema_version=None,
+    summary: str = None,
 ) -> str:
-    """Write a minimal session JSONL and return the sessions dir."""
+    """Write a minimal session JSONL and return the sessions dir.
+
+    `summary` overrides the whole `run.summary` line, for a test that needs a
+    field the default does not carry (e.g. item V's unshown-edit count).
+    """
+    if summary is None:
+        summary = f"attempts_run=1 fixed_at_attempt_1=false final_decision={decision}"
     record = {
         "session_id": session_id,
         "patch_attempt_id": None,
         "testing_iteration_id": None,
         "test_id": None,
         "phase": "run.summary",
-        "summary": f"attempts_run=1 fixed_at_attempt_1=false final_decision={decision}",
+        "summary": summary,
         "timestamp": "2026-01-01T00:00:00Z",
     }
     if schema_version is not None:
@@ -292,6 +299,71 @@ def test_render_metrics_reports_the_native_breakdown_separately(tmp_path):
     assert "Native[ECR=1/1 (100.00%) EIR=n/a]" in text
     assert "AttackerGenerated[ECR=n/a EIR=n/a]" in text
     assert "Static[ECR=n/a EIR=n/a]" in text
+
+
+# ============================================================================
+# M3 item V — attempts that edited a file the Creator was not shown in full
+# ============================================================================
+
+
+def test_unshown_edit_count_reads_the_summary_key(tmp_path):
+    """The count comes off `run.summary`; absent/malformed is None, never 0."""
+    assert metrics.unshown_edit_count("attempts_edited_unshown_file=2") == 2
+    assert metrics.unshown_edit_count("attempts_edited_unshown_file=0") == 0
+    # [WHY] Absent (a review run, or a pre-field row) and malformed are both
+    # "did not measure". A `0` here would be read as "measured, found none".
+    assert metrics.unshown_edit_count("final_decision=AllTestsPassed") is None
+    assert metrics.unshown_edit_count("attempts_edited_unshown_file=oops") is None
+    assert metrics.unshown_edit_count("") is None
+
+
+def test_classify_reads_the_unshown_count_from_the_session(tmp_path):
+    """A repair run that recorded the count carries it; a run without it does not."""
+    write_session(
+        tmp_path,
+        "blind",
+        decision="MaxAttemptsReached",
+        schema_version=1,
+        summary=(
+            "attempts_run=3 fixed_at_attempt_1=false "
+            "attempts_edited_unshown_file=3 final_decision=MaxAttemptsReached"
+        ),
+    )
+    write_session(tmp_path, "review", decision="Rejected", schema_version=1)
+
+    blind = metrics.classify(metrics.load_session(str(tmp_path), "blind"), known_bad=True)
+    review = metrics.classify(
+        metrics.load_session(str(tmp_path), "review"), known_bad=True
+    )
+    assert blind.attempts_edited_unshown_file == 3
+    assert review.attempts_edited_unshown_file is None
+
+
+def test_render_metrics_shows_unshown_edits_and_not_measured(tmp_path):
+    """A measured count prints as a number; an absent one prints `n/a`."""
+    write_session(
+        tmp_path,
+        "blind",
+        decision="MaxAttemptsReached",
+        schema_version=1,
+        summary=(
+            "attempts_run=3 fixed_at_attempt_1=false "
+            "attempts_edited_unshown_file=3 final_decision=MaxAttemptsReached"
+        ),
+    )
+    write_session(tmp_path, "quiet", decision="AllTestsPassed", schema_version=1)
+
+    verdicts = [
+        metrics.classify(metrics.load_session(str(tmp_path), "blind"), known_bad=True),
+        metrics.classify(metrics.load_session(str(tmp_path), "quiet"), known_bad=False),
+    ]
+    text = metrics.render_metrics(verdicts)
+    assert "UNSHOWN" in text
+    # One measured session (3) and one that did not record it (n/a); the pooled
+    # cell sums only the measured one.
+    assert "3" in text
+    assert "n/a" in text
+    assert "POOLED" in text
 
 
 # ============================================================================

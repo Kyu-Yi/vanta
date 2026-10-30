@@ -1721,6 +1721,21 @@ pub async fn run(
     // NOWHERE in the session files: the console printed `mypy_new=true` and the
     // detail was dropped. The record below is that missing detail.
     let mut static_findings_records: Vec<serde_json::Value> = Vec::new();
+    // [VANTA-WHY] M3 item V — the file-visibility audit, per attempt. matplotlib/1
+    // repaired `lib/matplotlib/image.py` on three attempts while that file sat in
+    // the selection's `dropped_for_budget` set, so the Creator was editing the
+    // exact source lines it had never been shown. Nothing recorded that. Each
+    // attempt now contributes one record naming, for every file the patch touches,
+    // how that file stood in the Creator's own context (`full` / `outline` /
+    // `path_only` / `dropped_for_budget` / `not_selected`), and the run carries —
+    // out of the loop, onto `run.summary` and into the digest — the number of
+    // attempts that edited at least one file it could not read in full.
+    //
+    // [VANTA-WHY] LOGGING ONLY. This reads the selection and the patch that already
+    // exist and writes down what they were; it never changes the prompt, never
+    // injects a file the Creator was not shown, and never touches the selection.
+    let mut context_visibility_records: Vec<serde_json::Value> = Vec::new();
+    let mut attempts_edited_unshown_file: u32 = 0;
     // [VANTA-WHY] Test-integrity records for the evidence file. A patch must
     // never control the tests that grade it, so the native suite runs the
     // ORIGINAL test files and these four lists are what make that visible after
@@ -1975,6 +1990,54 @@ pub async fn run(
         let patch_attempt_id = patch_attempt_id_for_patch(&patch_text);
         attempt_patch_ids.push(patch_attempt_id.clone());
         let testing_iteration_id = fresh_testing_iteration_id();
+
+        // [VANTA-WHY] M3 item V — how the files THIS patch touches stood in the
+        // Creator's own context. Only a repair attempt has a Creator, so only a
+        // repair attempt has this question: `repair_selection` is `Some` exactly
+        // when `--patch` is absent, and a review run's patch was written outside
+        // the run against a different role's selection, which is not "the
+        // Creator's context" and must not be recorded as if it were. Logging
+        // only: the selection, the prompt and the patch are all read, never
+        // changed.
+        if let Some(selection) = &repair_selection {
+            let touched: Vec<String> = patch_files.keys().cloned().collect();
+            let visibility = selection.touched_visibility(&touched);
+            let unshown: Vec<&str> = visibility
+                .iter()
+                .filter(|file| !file.shown_in_full())
+                .map(|file| file.path.as_str())
+                .collect();
+            if !unshown.is_empty() {
+                attempts_edited_unshown_file += 1;
+                // [VANTA-WHY] the one line worth printing: a patch touched a file
+                // the Creator could not read in full (matplotlib/1's `image.py`
+                // was dropped for budget while three attempts patched it). An
+                // attempt whose files were all shown in full prints nothing — the
+                // record in `evidence.json` still carries every attempt.
+                println!(
+                    "  context visibility: {} edited file(s) not shown in full: {}",
+                    unshown.len(),
+                    visibility
+                        .iter()
+                        .filter(|file| !file.shown_in_full())
+                        .map(|file| format!("{}={}", file.path, file.visibility))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
+            context_visibility_records.push(serde_json::json!({
+                "attempt": attempt + 1,
+                "files": visibility
+                    .iter()
+                    .map(|file| serde_json::json!({
+                        "path": file.path,
+                        "visibility": file.visibility,
+                    }))
+                    .collect::<Vec<_>>(),
+                "unshown_files": unshown,
+                "edited_unshown": !unshown.is_empty(),
+            }));
+        }
 
         session_log.append(SessionRecord {
             session_id: session_id.clone(),
@@ -4240,7 +4303,7 @@ pub async fn run(
              quarantine_count={} quarantined=[{}] \
              seed_method={} import_guard={} \
              n_ctx={} creator_effort={} creator_effort_mechanism={} \
-             creator_prompt_tokens={}",
+             creator_prompt_tokens={}{}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -4464,6 +4527,18 @@ pub async fn run(
             creator_effort,
             creator_effort_mechanism,
             creator_prompt_tokens,
+            // [VANTA-WHY] M3 item V — appended after every pre-existing key so an
+            // older row's reader is unaffected. The count is present only where a
+            // Creator ran (a repair run): a review run's patch was written outside
+            // the run, so "how many attempts edited a file the Creator could not
+            // read in full" is a question that run cannot be asked, and an absent
+            // key says so more honestly than a `0` would. The leading space lives
+            // in this value, the way `judge_prompt_keys` carries its own.
+            if config.patch_path.is_none() {
+                format!(" attempts_edited_unshown_file={attempts_edited_unshown_file}")
+            } else {
+                String::new()
+            },
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),
@@ -4649,6 +4724,15 @@ pub async fn run(
             "removed_existing_tests": removed_existing_tests,
             "added_test_files": added_test_files,
             "modified_test_config": modified_test_config,
+            // [VANTA-WHY] M3 item V — per attempt, for every file the patch
+            // touches, how that file stood in the Creator's own context, and the
+            // run-level count of attempts that edited a file it could not read in
+            // full. The count also rides `run.summary` so the digest and
+            // `metrics.py` can cut by it; the per-file detail lives here, where a
+            // reader can see WHICH file an attempt overreached on. Empty on a
+            // review run, which has no Creator.
+            "context_visibility": context_visibility_records,
+            "attempts_edited_unshown_file": attempts_edited_unshown_file,
             "evidence": final_evidence,
         }))
         .unwrap(),

@@ -21167,6 +21167,69 @@ class TestLocalizationHit:
         assert "miss=1" in text
 
 
+class TestUnshownEdits:
+    """M3 item V — attempts that edited a file the Creator was not shown in full.
+
+    The count is part of a row's stored record (``build_record``) and is summed
+    per provenance group by ``digest``, printed as ``unshown_edits=``. Like the
+    localization rate it is a REPAIR-only question — a review run has no Creator —
+    so a review group reports it as not applicable. A row written before the field
+    existed carries no value and adds nothing; rows on disk are never rewritten.
+    """
+
+    BASE = dict(
+        kind="run", config="vanta", seed=0, model="m",
+        harness_commit="c" * 40, vanta_build_commit="d" * 40,
+    )
+
+    def test_a_repair_group_sums_the_count_across_its_rows(self):
+        rows = [
+            dict(self.BASE, mode="repair", label="unresolved",
+                 attempts_edited_unshown_file=1),
+            dict(self.BASE, mode="repair", label="unresolved",
+                 attempts_edited_unshown_file=2),
+        ]
+        payload = runner_mod.digest(rows)
+        group = payload["groups"][0]
+        assert group["attempts_edited_unshown_file"] == 3
+        assert group["context_visibility_applies"] is True
+
+    def test_a_row_without_the_field_adds_nothing(self):
+        """A pre-item-V row did not measure, so it contributes no count and is
+        not read as a zero it never recorded."""
+        rows = [
+            dict(self.BASE, mode="repair", label="unresolved",
+                 attempts_edited_unshown_file=2),
+            dict(self.BASE, mode="repair", label="unresolved"),
+        ]
+        group = runner_mod.digest(rows)["groups"][0]
+        assert group["attempts_edited_unshown_file"] == 2
+
+    def test_a_review_group_reports_it_as_not_applicable(self):
+        """A review run has no Creator, so a stored count is ignored on read and
+        the group says n/a rather than a tally over a question it cannot ask."""
+        rows = [
+            dict(self.BASE, mode="review", label="true_reject",
+                 attempts_edited_unshown_file=5),
+        ]
+        group = runner_mod.digest(rows)["groups"][0]
+        assert group["context_visibility_applies"] is False
+        # The stored 5 is not counted: a review row has no Creator to have shown
+        # anything, so the number cannot mean what the field means.
+        assert group["attempts_edited_unshown_file"] == 0
+
+    def test_the_rendered_digest_prints_the_count_and_the_review_case(self):
+        rows = [
+            dict(self.BASE, mode="repair", label="unresolved",
+                 attempts_edited_unshown_file=3),
+            dict(self.BASE, mode="review", label="true_reject"),
+        ]
+        text = runner_mod.render_digest(runner_mod.digest(rows))
+        assert "unshown_edits" in text
+        assert "unshown_edits=3" in text
+        assert "unshown_edits=n/a (review)" in text
+
+
 class TestLocalizationTable:
     """§1.6.5 and §1.6.11 — the ranking audit, computed offline from what prepare recorded.
 

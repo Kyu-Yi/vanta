@@ -38,6 +38,17 @@ graded one is what the rerun reads, the patched one is its documented fallback,
 and deleting a tree without a diff would destroy evidence the rule never
 described.
 
+[VANTA-WHY] The diff covers only the files that matter, and it is read as bytes.
+Naming the paths (:func:`tree_diff`, :func:`_diff_pathspec`) means untracked build
+output — ``build/**``, ``*.o``, ``*.so``, an in-place extension — is never read,
+decoded or written; reading the bytes with ``errors="surrogateescape"``
+(:func:`diff_bytes`) means a *tracked* file git prints verbatim but that is not
+valid UTF-8 — a PDF, a ``.ppm`` — cannot crash the decode either. A tracked
+*binary* change is still recorded, as ``Binary files … differ``. Before this, a
+project with C extensions (matplotlib/1) crashed compaction on the first
+non-UTF-8 byte of its own build output, and since compaction runs before the row
+is written the crash took the whole run's row with it.
+
 [VANTA-WHY] The hashes are ``sha256``, not the blake3 the design first sketched:
 ``sha256_text`` / ``sha256_file`` are already this harness's only hash, and a
 second algorithm would be a second thing to get right for no gain. The artifact
@@ -57,6 +68,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from . import trees as trees_mod
 from .split import sha256_bytes, sha256_text
 
 FULL = "full"
@@ -69,6 +81,14 @@ that never applied). A third value rather than reusing ``full``: "the snapshots
 are still here" and "there were never any" are different facts, and a metrics
 reader that folded them together could not tell a cheap session from an
 uncompacted one."""
+FAILED = "failed"
+"""Compaction raised, so nothing was deleted and the row records the reason.
+
+A fourth value rather than reusing ``full``: ``full`` is the §6.3 rule *deciding*
+to keep a snapshot (a rejecting signal with no rerun yet), and a metrics reader has
+to be able to tell a deliberate hold from a failure. Compaction is cleanup (§6.3),
+not part of a verdict, so a failure keeps every snapshot and the row survives —
+before this, a compaction error destroyed the run's whole row."""
 
 NOISE_DIRS = frozenset({".git", "__pycache__", "node_modules"})
 NOISE_SUFFIXES = (".pyc", ".pyo", "_manifest.json")
@@ -136,6 +156,76 @@ def tree_concat(root: Path) -> str:
     return "\n\n".join(parts)
 
 
+def diff_bytes(text: str) -> bytes:
+    """The bytes of a diff text: UTF-8 with ``errors="surrogateescape"``.
+
+    A diff is read off ``git`` as bytes and decoded with ``surrogateescape`` (see
+    :func:`tree_diff`), so a tracked file that is not valid UTF-8 survives as
+    surrogate code points. Writing the diff back and hashing it must use this same
+    codec and handler, or the bytes on disk would not be the bytes the hash pins.
+    """
+    return text.encode("utf-8", errors="surrogateescape")
+
+
+def tree_manifest_paths(tree: Path) -> Optional[set[str]]:
+    """The paths Vanta's ``write_tree_snapshot`` recorded beside ``tree``.
+
+    Vanta writes ``{paths, file_count}`` to ``<tree>_manifest.json`` next to the
+    snapshot it describes — the same file the pool's ``drop_base_only_deletions``
+    reads to scope a partial tree. ``None`` when it is absent or malformed (a
+    session from before the manifest was recorded), which leaves the caller with
+    the base's tracked paths alone.
+    """
+    manifest = tree.parent / f"{tree.name}_manifest.json"
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    paths = payload.get("paths")
+    if not isinstance(paths, list):
+        return None
+    return {str(path) for path in paths}
+
+
+def _tracked_paths(base: Path) -> set[str]:
+    """The paths git tracks in ``base``, or an empty set when that cannot be read.
+
+    ``base`` is the sanitized checkout ``export_tree`` made and it is its own
+    repository root, so ``git ls-tree``'s paths are already in the snapshot tree's
+    frame. A directory that is no checkout at all (a unit test's plain
+    ``vanta_clean``) has nothing to name, and an empty set is what tells
+    :func:`_diff_pathspec` to leave the diff unrestricted rather than filter it
+    against nothing.
+    """
+    try:
+        return trees_mod.tracked_paths([base])
+    except trees_mod.TreeError:
+        return set()
+
+
+def _diff_pathspec(base: Path, tree: Path) -> list[str]:
+    """``:(literal)`` pathspecs naming only the files a snapshot diff may touch.
+
+    The named set is every path git tracks in ``base`` (item N's
+    :func:`trees.tracked_paths` — "tracked in the buggy or fixed commit", and not a
+    hand-kept noise list) unioned with the paths the snapshot's own manifest
+    recorded (the Creator's new files, a generated test). Untracked build output —
+    ``build/**``, ``*.o``, ``*.so``, an in-place extension, ``*.egg-info`` — is in
+    neither set, so ``git`` never reads it. That is the only way it can never reach
+    a stored diff: a plain post-filter would still have read and decoded the binary.
+
+    Empty when ``base`` is not a checkout: there is then no "tracked" frame to
+    restrict to, so the diff is left unrestricted (the pre-item-O behaviour) rather
+    than filtered against the manifest alone, which would hide every base file the
+    partial snapshot legitimately never held.
+    """
+    tracked = _tracked_paths(base)
+    if not tracked:
+        return []
+    named = tracked | (tree_manifest_paths(tree) or set())
+    return [f":(literal){path}" for path in sorted(named)]
+
+
 def tree_diff(base: Path, tree: Path) -> str:
     """A unified diff of ``tree`` against ``base``, in ``git apply -p1``'s shape.
 
@@ -144,6 +234,16 @@ def tree_diff(base: Path, tree: Path) -> str:
     ``a/<base>/…`` / ``b/<tree>/…`` headers are rewritten down to ``a/…`` /
     ``b/…``. Hand-writing the hunk headers instead would risk a miscount that
     ``git apply --recount`` accepts silently.
+
+    Only the files that matter are named (:func:`_diff_pathspec`) and the result is
+    read as bytes and decoded with ``errors="surrogateescape"`` (:func:`diff_bytes`),
+    so neither untracked build output nor a tracked file that is not valid UTF-8 can
+    crash the diff — matplotlib/1's ``build/**`` ``.so``/``.o`` and its verbatim
+    ``.ppm``/PDF are what made the strict-text version fail.
+
+    Raises :class:`CompactError` for *every* failure — a missing tree, a git
+    non-zero exit, an exec error, a timeout — so callers have one thing to catch and
+    a diff is never half trusted.
     """
     base_abs = base.resolve()
     tree_abs = tree.resolve()
@@ -154,19 +254,30 @@ def tree_diff(base: Path, tree: Path) -> str:
     common = Path(os.path.commonpath([str(base_abs), str(tree_abs)]))
     base_rel = base_abs.relative_to(common).as_posix()
     tree_rel = tree_abs.relative_to(common).as_posix()
-    proc = subprocess.run(
-        ["git", "diff", "--no-index", "--no-color", "--", base_rel, tree_rel],
-        cwd=str(common),
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=300,
-        stdin=subprocess.DEVNULL,
-    )
+    command = ["git", "diff", "--no-index", "--no-color", "--", base_rel, tree_rel]
+    pathspec = _diff_pathspec(base_abs, tree_abs)
+    if pathspec:
+        command += ["--", *pathspec]
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(common),
+            capture_output=True,
+            check=False,
+            timeout=300,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CompactError(f"git diff --no-index could not be run: {exc}") from exc
     # `--no-index` exits 1 whenever the trees differ — the normal case.
     if proc.returncode not in (0, 1):
-        raise CompactError(f"git diff --no-index failed: {proc.stderr.strip()[:400]}")
-    return _rewrite_diff_headers(proc.stdout, base_rel, tree_rel)
+        raise CompactError(
+            "git diff --no-index failed: "
+            f"{proc.stderr.decode('utf-8', errors='replace').strip()[:400]}"
+        )
+    return _rewrite_diff_headers(
+        proc.stdout.decode("utf-8", errors="surrogateescape"), base_rel, tree_rel
+    )
 
 
 def _rewrite_diff_headers(diff_text: str, base_rel: str, tree_rel: str) -> str:
@@ -204,7 +315,9 @@ def reconstruct(base: Path, diff_text: str, dest: Path) -> Path:
         raise CompactError(f"{dest} already exists; reconstruct needs an empty destination")
     shutil.copytree(base, dest, symlinks=True)
     diff_path = dest.parent / f".{dest.name}.reconstruct.patch"
-    diff_path.write_text(diff_text, encoding="utf-8")
+    # Same codec/handler as the write side (`diff_bytes`): a diff carrying a
+    # tracked non-UTF-8 file's bytes must round-trip exactly through the disk.
+    diff_path.write_text(diff_text, encoding="utf-8", errors="surrogateescape")
     try:
         proc = subprocess.run(
             ["git", "apply", "-p1", "--verbose", str(diff_path)],
@@ -293,6 +406,19 @@ class Compaction:
     """Names of the snapshots that were deleted (or, for ``full``, that stayed)."""
 
 
+def compaction_failed(*, session_dir: Path, reason: str) -> Compaction:
+    """The row's record when §6.3 compaction raised: nothing deleted, snapshots kept.
+
+    Compaction is cleanup (§6.3), not part of a verdict, so its failure must not
+    destroy the run's row — and must not delete the snapshots either
+    (:func:`compact_session` computes and writes every artifact before it deletes a
+    single tree, so a raise leaves them all). The row still carries the reason so a
+    reader can tell a failed compaction from a deliberate §6.3 hold (``full``).
+    """
+    trees = [tree.name for tree in _attempt_trees(session_dir / "debug")]
+    return Compaction(state=FAILED, reason=reason, trees=trees)
+
+
 def compact_session(
     *,
     session_dir: Path,
@@ -305,8 +431,10 @@ def compact_session(
     """Apply §6.3 to one session: decide, then compact if the rule allows.
 
     Raises rather than degrading: a compaction that wrote a wrong diff and then
-    deleted the tree would have destroyed the only copy, so every write is
-    finished (and fsynced by ``close``) before the corresponding ``rmtree``.
+    deleted the tree would have destroyed the only copy. Every artifact is computed
+    and written **before** the first ``rmtree`` (compute all, write all, then delete
+    all), so a failure at any point up to the deletes leaves every snapshot intact
+    for the caller to record as :data:`FAILED`.
     """
     state, reason = compaction_plan(
         verdict=verdict, session_id=session_id, sessions_dir=sessions_dir
@@ -324,15 +452,22 @@ def compact_session(
             "is not a directory"
         )
 
-    graded_diff: Optional[str] = None
-    compacted: list[str] = []
+    # Phase 1 — compute. Nothing is written and no tree is deleted yet, so a
+    # `tree_diff` failure (a git error, a timeout) leaves the session untouched.
+    prepared: list[tuple[Path, str, dict[str, str], str]] = []
     for tree in trees:
-        diff_text = tree_diff(base_tree, tree)
-        hashes = tree_manifest(tree)
-        concat_sha = sha256_text(tree_concat(tree))
+        prepared.append(
+            (tree, tree_diff(base_tree, tree), tree_manifest(tree), tree_concat(tree))
+        )
+
+    # Phase 2 — write. The bytes on disk are what `diff_sha256` pins, so the hash
+    # and the write use the same codec/handler (`diff_bytes`): a tracked non-UTF-8
+    # file's bytes survive the round trip instead of breaking a strict re-encode.
+    written: list[tuple[Path, str]] = []
+    for tree, diff_text, hashes, concat in prepared:
         diff_path = tree.parent / f"{tree.name}.diff"
         hashes_path = tree.parent / f"{tree.name}.hashes.json"
-        diff_path.write_text(diff_text, encoding="utf-8")
+        diff_path.write_text(diff_text, encoding="utf-8", errors="surrogateescape")
         hashes_path.write_text(
             json.dumps(
                 {
@@ -342,8 +477,8 @@ def compact_session(
                     "base": base_tree.name,
                     "base_commit": base_commit,
                     "diff": diff_path.name,
-                    "diff_sha256": sha256_text(diff_text),
-                    "concat_sha256": concat_sha,
+                    "diff_sha256": sha256_bytes(diff_bytes(diff_text)),
+                    "concat_sha256": sha256_text(concat),
                     "file_count": len(hashes),
                     "files": hashes,
                 },
@@ -353,8 +488,15 @@ def compact_session(
             + "\n",
             encoding="utf-8",
         )
+        written.append((tree, diff_path.name))
+
+    # Phase 3 — delete. Only now, with every artifact on disk, are the trees
+    # replaced by their diffs.
+    graded_diff: Optional[str] = None
+    compacted: list[str] = []
+    for tree, diff_name in written:
         shutil.rmtree(tree)
         compacted.append(tree.name)
         if tree.name.endswith("_graded_tree"):
-            graded_diff = f"debug/{diff_path.name}"
+            graded_diff = f"debug/{diff_name}"
     return Compaction(state=COMPACTED, reason=reason, diff=graded_diff, trees=compacted)

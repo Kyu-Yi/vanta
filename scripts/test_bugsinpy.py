@@ -23063,8 +23063,12 @@ class TestCompaction:
         assert artifact["files"] == expected_hashes
         assert artifact["concat_sha256"] == split_mod.sha256_text(expected_concat)
 
-        diff_text = (tree.parent / artifact["diff"]).read_text()
-        assert artifact["diff_sha256"] == split_mod.sha256_text(diff_text)
+        diff_text = (tree.parent / artifact["diff"]).read_text(
+            encoding="utf-8", errors="surrogateescape"
+        )
+        assert artifact["diff_sha256"] == split_mod.sha256_bytes(
+            compact_mod.diff_bytes(diff_text)
+        )
 
         rebuilt = compact_mod.reconstruct(base, diff_text, tmp_path / "rebuilt")
         assert compact_mod.tree_concat(rebuilt) == expected_concat
@@ -23122,6 +23126,112 @@ class TestCompaction:
             "pkg/mod.py": split_mod.sha256_text("one = 1\n")
         }
         assert compact_mod.tree_concat(tree) == "# FILE: pkg/mod.py\none = 1\n"
+
+    # -- item O: naming the paths, reading the bytes -----------------------
+    def _git_base(self, base: Path) -> None:
+        """Turn ``base`` into a real one-commit checkout, like ``export_tree`` makes."""
+        base.mkdir()
+        tree_mod._git(["init", "--quiet"], cwd=base)
+        tree_mod._git(["config", "user.email", "t@example.com"], cwd=base)
+        tree_mod._git(["config", "user.name", "T"], cwd=base)
+
+    def test_untracked_build_output_never_reaches_the_diff(self, tmp_path):
+        """matplotlib/1's crash: naming only the tracked paths keeps git from ever
+        reading the ``.so``/``.o`` an in-tree build leaves behind.
+
+        This is the item-O regression: the old diff read the whole tree, hit a
+        non-UTF-8 byte in ``build/**`` and raised, taking the run's row with it.
+        """
+        base = tmp_path / "vanta_clean"
+        self._git_base(base)
+        write(base / "pkg" / "mod.py", "one = 1\n")
+        tree_mod._git(["add", "-A"], cwd=base)
+        tree_mod._git(["commit", "--quiet", "-m", "base"], cwd=base)
+        # Untracked build output *in the base* too: a build the prep left behind.
+        (base / "build").mkdir()
+        (base / "build" / "lib.so").write_bytes(b"\x7fELF base\x00")
+        (base / "pkg" / "mod.o").write_bytes(b"\x7fELF base obj\x00")
+
+        tree = tmp_path / "vanta_sessions" / "sid" / "debug" / "attempt_1_graded_tree"
+        write(tree / "pkg" / "mod.py", "one = 2\n")
+        (tree / "build").mkdir(parents=True)
+        (tree / "build" / "lib.so").write_bytes(b"\x7fELF tree\x00")
+        (tree / "pkg" / "mod.o").write_bytes(b"\x7fELF tree obj\x00")
+        (tree / "pkg" / "ext.cpython-38-darwin.so").write_bytes(b"\x7fELF inplace\x00")
+
+        diff_text = compact_mod.tree_diff(base, tree)
+
+        assert "one = 2" in diff_text, "the tracked source change must still be diffed"
+        for noise in ("build/", "lib.so", "mod.o", "ext.cpython-38-darwin.so"):
+            assert noise not in diff_text, f"{noise} is untracked build output"
+
+    def test_a_tracked_binary_and_non_utf8_change_are_recorded_not_dropped(self, tmp_path):
+        """A tracked binary is recorded as ``Binary files … differ`` and a tracked
+        file git prints verbatim but that is not UTF-8 must not crash the decode.
+
+        Both are the matplotlib/1 case: PDFs and a ``.ppm`` git classified as text
+        and emitted raw. The diff has to survive them, and neither file may be
+        silently dropped.
+        """
+        base = tmp_path / "vanta_clean"
+        self._git_base(base)
+        (base / "pkg").mkdir()
+        (base / "pkg" / "blob.bin").write_bytes(b"\x00\x01BINARY\x00" + b"\xff" * 32)
+        # No NUL in the first 8000 bytes, so git treats this as *text* and prints
+        # its bytes raw — the shape that broke the strict decode.
+        (base / "pkg" / "latin.txt").write_bytes(b"caf\xe9 na\xefve\n")
+        tree_mod._git(["add", "-A"], cwd=base)
+        tree_mod._git(["commit", "--quiet", "-m", "base"], cwd=base)
+
+        tree = tmp_path / "vanta_sessions" / "sid" / "debug" / "attempt_1_graded_tree"
+        (tree / "pkg").mkdir(parents=True)
+        (tree / "pkg" / "blob.bin").write_bytes(b"\x00\x01BINARY\x00" + b"\xfe" * 32)
+        (tree / "pkg" / "latin.txt").write_bytes(b"caf\xe9 na\xefve!\n")
+
+        diff_text = compact_mod.tree_diff(base, tree)  # must not raise
+
+        assert "pkg/blob.bin" in diff_text
+        assert "Binary files" in diff_text, "a binary change is recorded, not dropped"
+        assert "pkg/latin.txt" in diff_text
+        assert "caf" in diff_text, "the non-UTF-8 bytes survive as surrogates"
+
+    def test_a_failure_before_the_deletes_leaves_every_snapshot_intact(
+        self, tmp_path, monkeypatch
+    ):
+        """Item O#3: compaction is cleanup, so its failure deletes nothing.
+
+        The second tree's diff fails after the first was computed — with the old
+        interleaved write/delete the first tree would already be gone. Compute-all,
+        write-all, delete-all means a raise anywhere before the deletes keeps both.
+        """
+        base = self._base(tmp_path)
+        sessions = tmp_path / "vanta_sessions"
+        session_dir = sessions / "sid"
+        graded = self._snapshot(session_dir, "attempt_1_graded_tree")
+        patched = self._snapshot(session_dir, "attempt_1_patched_tree")
+        real = compact_mod.tree_diff
+        calls = {"n": 0}
+
+        def flaky(b, t):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise compact_mod.CompactError("boom")
+            return real(b, t)
+
+        monkeypatch.setattr(compact_mod, "tree_diff", flaky)
+
+        with pytest.raises(compact_mod.CompactError, match="boom"):
+            compact_mod.compact_session(
+                session_dir=session_dir,
+                base_tree=base,
+                verdict="AllTestsPassed",
+                session_id="sid",
+                sessions_dir=sessions,
+            )
+
+        assert graded.is_dir() and patched.is_dir(), "nothing may have been deleted"
+        assert not list((session_dir / "debug").glob("*.diff"))
+        assert not list((session_dir / "debug").glob("*.hashes.json"))
 
 
 class TestRunJobCompaction:
@@ -23189,6 +23299,33 @@ class TestRunJobCompaction:
         assert record["artifacts"]["graded_tree_diff"] is None
         assert "rerun" in record["artifacts"]["compact_reason"]
         assert tree.is_dir(), "§6.3: the rerun has not run yet"
+
+    def test_a_compaction_failure_keeps_the_row_and_the_snapshot(
+        self, tmp_path, monkeypatch
+    ):
+        """Item O#3: a compaction error is cleanup failing, not a verdict — the row
+        is still written, it says `failed` with the reason, and the snapshot stays.
+
+        This is the matplotlib/1 shape: the old code let a `tree_diff` raise out of
+        `compact_session` *before* `build_record`, so the crash destroyed the run's
+        whole row as well as its snapshots.
+        """
+
+        def boom(*args, **kwargs):
+            raise compact_mod.CompactError("git diff --no-index failed: boom")
+
+        sessions, tree = self._fixture(tmp_path)
+        monkeypatch.setattr(compact_mod, "tree_diff", boom)
+
+        record = self._run(
+            tmp_path, monkeypatch, decision="AllTestsPassed", sessions=sessions
+        )
+
+        assert record["artifacts"]["compact_state"] == compact_mod.FAILED
+        assert "boom" in record["artifacts"]["compact_reason"]
+        assert record["artifacts"]["graded_tree_diff"] is None
+        assert tree.is_dir(), "compaction failed, so nothing may have been deleted"
+        assert not list((sessions / "sess-1" / "debug").glob("*.diff"))
 
 
 class TestExpectedErrorsExitCleanly:

@@ -2142,14 +2142,23 @@ def run_job(
     # `graded_tree_diff` are the row's own statement about where the snapshots
     # went, and a row that said `full` about a tree compaction had just deleted
     # would misdescribe the session the manifest is the evidence for (§6.3, §7.3).
-    compaction = compact_mod.compact_session(
-        session_dir=sessions_dir() / outcome.session_id,
-        base_tree=prep.root / "vanta_clean",
-        verdict=outcome.decision,
-        session_id=outcome.session_id,
-        sessions_dir=sessions_dir(),
-        base_commit=prep.bug.buggy_commit,
-    )
+    #
+    # Compaction is cleanup, not part of the verdict, so its failure must not take
+    # the row with it (item O#3): a raising `compact_session` has deleted nothing
+    # (it computes and writes every artifact before the first `rmtree`), and the
+    # row records `failed` with the reason instead of vanishing.
+    session_dir = sessions_dir() / outcome.session_id
+    try:
+        compaction = compact_mod.compact_session(
+            session_dir=session_dir,
+            base_tree=prep.root / "vanta_clean",
+            verdict=outcome.decision,
+            session_id=outcome.session_id,
+            sessions_dir=sessions_dir(),
+            base_commit=prep.bug.buggy_commit,
+        )
+    except compact_mod.CompactError as exc:
+        compaction = compact_mod.compaction_failed(session_dir=session_dir, reason=str(exc))
 
     record = build_record(
         job=job,

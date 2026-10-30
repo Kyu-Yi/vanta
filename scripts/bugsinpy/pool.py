@@ -67,7 +67,7 @@ from . import mutants as mutants_mod
 from . import oracle as oracle_mod
 from . import runner as runner_mod
 from .prepare import BugPrep
-from .split import sha256_text
+from .split import sha256_bytes, sha256_text
 
 POOL_DIRNAME = "pool"
 POOL_SUFFIX = ".json"
@@ -354,18 +354,24 @@ def _attempt_total(record: Mapping[str, Any], debug_dir: Path) -> int:
 
 
 def _read_compacted(diff_path: Path, hashes_path: Path) -> tuple[Optional[str], Optional[str]]:
-    """``(diff text, reason)`` — the compacted diff, used only if its own hash verifies."""
+    """``(diff text, reason)`` — the compacted diff, used only if its own hash verifies.
+
+    Read and verified the way :func:`compact.compact_session` wrote it: UTF-8 with
+    ``errors="surrogateescape"`` and a ``sha256`` over those same bytes. A tracked
+    non-UTF-8 file (a PDF, a ``.ppm``) survives the round trip as surrogate code
+    points; a strict decode here would reject a diff the writer legitimately stored.
+    """
     try:
         payload = json.loads(hashes_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return None, f"the compacted .hashes.json could not be read: {exc}"
     pinned = str(payload.get("diff_sha256") or "")
     try:
-        with diff_path.open("r", encoding="utf-8", newline="") as handle:
+        with diff_path.open("r", encoding="utf-8", errors="surrogateescape", newline="") as handle:
             text = handle.read()
     except OSError as exc:
         return None, f"the compacted .diff could not be read: {exc}"
-    actual = sha256_text(text)
+    actual = sha256_bytes(compact_mod.diff_bytes(text))
     if actual != pinned:
         return None, (
             f"the compacted .diff hashes to {actual}, not the recorded "

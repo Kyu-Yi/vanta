@@ -179,10 +179,77 @@ fn git_apply(root: &std::path::Path, patch_arg: &str, extra: &[&str]) -> Result<
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyFailure {
     /// No strategy could place the patch: every hunk was rejected.
-    DidNotApply,
+    ///
+    /// [VANTA-WHY] Item R — this variant carries what the cascade already knew
+    /// instead of a constant. The Creator is told the FILE, every strategy that
+    /// was tried with its own reason, and — when whole-file reconstruction was
+    /// not attempted — why it was skipped. A bare "did not apply" is the same
+    /// sentence for a malformed diff and for an anchor that is not in the file,
+    /// and the Creator cannot tell which one it must fix.
+    DidNotApply {
+        /// The file path the patch named (as the patch names it).
+        path: String,
+        /// Every strategy the cascade tried, in order, with its reason.
+        strategies: Vec<StrategyFailure>,
+        /// Why whole-file reconstruction was not attempted, when it was not.
+        /// `None` means the cascade returned before reaching it.
+        reconstruction_skipped: Option<String>,
+    },
     /// A strategy produced a changed file, but the original parsed as Python and
     /// the result does not. Carries the interpreter's own message.
     InvalidPython(String),
+}
+
+/// One strategy's outcome inside the apply cascade, kept so the Creator can be
+/// told what was actually tried. Restored information only: the reason is what
+/// the strategy's own tool reported, never a nearest-match guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrategyFailure {
+    /// The strategy's name ("search/replace", "git apply --3way", …).
+    pub strategy: String,
+    /// Why it did not place the patch.
+    pub reason: String,
+}
+
+impl StrategyFailure {
+    fn new(strategy: &str, reason: impl Into<String>) -> Self {
+        Self {
+            strategy: strategy.to_string(),
+            reason: reason.into(),
+        }
+    }
+}
+
+impl ApplyFailure {
+    /// The message the Creator is sent when its patch could not be placed.
+    pub fn feedback(&self) -> String {
+        match self {
+            ApplyFailure::InvalidPython(err) => {
+                format!("patch result is not valid Python: {err}")
+            }
+            ApplyFailure::DidNotApply {
+                path,
+                strategies,
+                reconstruction_skipped,
+            } => {
+                let mut out = format!("patch did not apply to {path}");
+                if strategies.is_empty() {
+                    out.push_str(" — no apply strategy was reached");
+                } else {
+                    out.push_str(" — every apply strategy failed:");
+                }
+                for s in strategies {
+                    out.push_str(&format!("\n  - {}: {}", s.strategy, s.reason));
+                }
+                if let Some(why) = reconstruction_skipped {
+                    out.push_str(&format!(
+                        "\n  - whole-file reconstruction: skipped ({why})"
+                    ));
+                }
+                out
+            }
+        }
+    }
 }
 
 /// Apply a model-generated fix to the original source.
@@ -214,6 +281,13 @@ pub fn apply_patch_detailed(
     // rest of the pipeline cannot see through: the heretic run reported it for a
     // file whose `if` had no body.
     let mut failure: Option<ApplyFailure> = None;
+    // [VANTA-WHY] Item R — every strategy this cascade actually tried, with the
+    // reason it did not place the patch. The Creator is shown this list when the
+    // cascade gives up; the reasons are the strategies' OWN tool output, never a
+    // nearest-match guess.
+    let mut tried: Vec<StrategyFailure> = Vec::new();
+    // Why whole-file reconstruction was not attempted, when it was not.
+    let mut reconstruction_skipped: Option<String> = None;
     let accept = |patched: String, strategy: &str| -> Result<(String, bool), ApplyFailure> {
         let changed = patched != original;
         if changed {
@@ -227,11 +301,18 @@ pub fn apply_patch_detailed(
     // A strategy that produced different text is the answer; a strategy that
     // produced nothing different is a failure with a precise reason. Either way
     // the cascade stops here, exactly as it did before.
-    let finish = |patched: String, changed: bool| {
+    let finish = |patched: String,
+                  changed: bool,
+                  tried: &[StrategyFailure],
+                  skipped: &Option<String>| {
         let failure = if changed {
             None
         } else {
-            Some(ApplyFailure::DidNotApply)
+            Some(ApplyFailure::DidNotApply {
+                path: path.to_string(),
+                strategies: tried.to_vec(),
+                reconstruction_skipped: skipped.clone(),
+            })
         };
         (patched, changed, failure)
     };
@@ -250,21 +331,41 @@ pub fn apply_patch_detailed(
     {
         debug!("patch_text is full source — using directly");
         match accept(patch_text.to_string(), "full-source") {
-            Ok((patched, changed)) => return finish(patched, changed),
+            Ok((patched, changed)) => {
+                if changed {
+                    return (patched, true, None);
+                }
+                tried.push(StrategyFailure::new(
+                    "full-source",
+                    "produced text identical to the original",
+                ));
+                return finish(patched, false, &tried, &reconstruction_skipped);
+            }
             Err(refused) => failure = Some(refused),
         }
     }
 
     // ---- Strategy 2: Search/replace blocks ----
     if patch_text.contains("===SEARCH===") {
-        if let Some(patched) = apply_search_replace(original, patch_text) {
-            debug!("search/replace blocks applied");
-            match accept(patched, "search/replace") {
-                Ok((patched, changed)) => return finish(patched, changed),
+        match apply_search_replace(original, patch_text) {
+            Ok(patched) => match accept(patched, "search/replace") {
+                Ok((patched, changed)) => {
+                    if changed {
+                        debug!("search/replace blocks applied");
+                        return (patched, true, None);
+                    }
+                    tried.push(StrategyFailure::new(
+                        "search/replace",
+                        "produced text identical to the original",
+                    ));
+                    return finish(patched, false, &tried, &reconstruction_skipped);
+                }
                 Err(refused) => failure = Some(refused),
+            },
+            Err(why) => {
+                warn!("search/replace blocks failed to apply: {why}");
+                tried.push(StrategyFailure::new("search/replace", why.to_string()));
             }
-        } else {
-            warn!("search/replace blocks failed to apply");
         }
     }
 
@@ -287,7 +388,9 @@ pub fn apply_patch_detailed(
         let _ = fs::write(&patch_path, patch_text);
         let patch_arg = patch_path.to_string_lossy().to_string();
 
-        let via_git = |extra: &[&str]| -> Option<String> {
+        // [VANTA-WHY] Item R — return the tool's OWN message on failure instead
+        // of `None`, so the reason survives into the Creator's feedback.
+        let via_git = |extra: &[&str]| -> Result<String, String> {
             let mut args = vec!["apply", "-p1", "--verbose"];
             args.extend_from_slice(extra);
             args.push(&patch_arg);
@@ -295,39 +398,45 @@ pub fn apply_patch_detailed(
                 .args(&args)
                 .current_dir(root)
                 .output()
-                .ok()?;
+                .map_err(|e| format!("could not run git: {e}"))?;
             if out.status.success() {
-                fs::read_to_string(&src_path).ok()
+                fs::read_to_string(&src_path)
+                    .map_err(|e| format!("git apply {} changed the file but it could not be read: {e}", extra.join(" ")))
             } else {
-                debug!(
-                    "git apply {} failed: {}",
-                    extra.join(" "),
-                    String::from_utf8_lossy(&out.stderr)
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                );
-                None
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(stderr.trim().lines().take(6).collect::<Vec<_>>().join(" | "))
             }
         };
 
         // Strategy 3: git apply (strict).
         // [PITFALL] Without --3way, git apply can hang on certain malformed
         // diffs. We add it to force non-interactive behavior.
-        if let Some(patched) = via_git(&["--3way"]) {
-            let changed = patched != original;
-            if changed {
-                return (patched, true, None);
+        match via_git(&["--3way"]) {
+            Ok(patched) => {
+                if patched != original {
+                    return (patched, true, None);
+                }
+                tried.push(StrategyFailure::new(
+                    "git apply --3way",
+                    "produced text identical to the original",
+                ));
             }
+            Err(why) => tried.push(StrategyFailure::new("git apply --3way", why)),
         }
 
         // Strategy 4: git apply --recount
-        if let Some(patched) = via_git(&["--recount"]) {
-            let changed = patched != original;
-            if changed {
-                debug!("git apply --recount succeeded");
-                return (patched, true, None);
+        match via_git(&["--recount"]) {
+            Ok(patched) => {
+                if patched != original {
+                    debug!("git apply --recount succeeded");
+                    return (patched, true, None);
+                }
+                tried.push(StrategyFailure::new(
+                    "git apply --recount",
+                    "produced text identical to the original",
+                ));
             }
+            Err(why) => tried.push(StrategyFailure::new("git apply --recount", why)),
         }
 
         // Strategy 5: patch -p1 --fuzz=3
@@ -338,25 +447,60 @@ pub fn apply_patch_detailed(
             .args(["-p1", "--fuzz=3", "--batch", "-i", "fix.diff"])
             .current_dir(root)
             .output();
-        if let Ok(o) = out {
-            if o.status.success() {
-                if let Ok(patched) = fs::read_to_string(&src_path) {
-                    debug!("patch -p1 --fuzz=3 succeeded");
-                    match accept(patched, "patch -p1") {
-                        Ok((patched, changed)) => return finish(patched, changed),
-                        Err(refused) => failure = Some(refused),
+        match out {
+            Ok(o) if o.status.success() => match fs::read_to_string(&src_path) {
+                Ok(patched) => match accept(patched, "patch -p1") {
+                    Ok((patched, changed)) => {
+                        if changed {
+                            debug!("patch -p1 --fuzz=3 succeeded");
+                            return (patched, true, None);
+                        }
+                        tried.push(StrategyFailure::new(
+                            "patch -p1 --fuzz=3",
+                            "produced text identical to the original",
+                        ));
+                        return finish(patched, false, &tried, &reconstruction_skipped);
                     }
-                }
+                    Err(refused) => failure = Some(refused),
+                },
+                Err(e) => tried.push(StrategyFailure::new(
+                    "patch -p1 --fuzz=3",
+                    format!("applied but the patched file could not be read: {e}"),
+                )),
+            },
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                tried.push(StrategyFailure::new(
+                    "patch -p1 --fuzz=3",
+                    stderr.trim().lines().take(6).collect::<Vec<_>>().join(" | "),
+                ));
             }
+            Err(e) => tried.push(StrategyFailure::new(
+                "patch -p1 --fuzz=3",
+                format!("could not run patch: {e}"),
+            )),
         }
     }
 
     // ---- Strategy 6: hunk-by-hunk engine (context-anchored) ----
-    if let Some(patched) = apply_hunks(original, patch_text) {
-        debug!("hunk-by-hunk engine succeeded");
-        match accept(patched, "hunk-by-hunk") {
-            Ok((patched, changed)) => return finish(patched, changed),
+    match apply_hunks_detailed(original, patch_text) {
+        Ok(patched) => match accept(patched, "hunk-by-hunk") {
+            Ok((patched, changed)) => {
+                if changed {
+                    debug!("hunk-by-hunk engine succeeded");
+                    return (patched, true, None);
+                }
+                tried.push(StrategyFailure::new(
+                    "hunk-by-hunk",
+                    "produced text identical to the original",
+                ));
+                return finish(patched, false, &tried, &reconstruction_skipped);
+            }
             Err(refused) => failure = Some(refused),
+        },
+        Err(why) => {
+            debug!("hunk-by-hunk engine did not apply: {why}");
+            tried.push(StrategyFailure::new("hunk-by-hunk", why));
         }
     }
 
@@ -398,17 +542,47 @@ pub fn apply_patch_detailed(
             info!("whole-file reconstruction succeeded (no deletions in patch)");
             let patched = reconstructed + "\n";
             match accept(patched, "whole-file reconstruction") {
-                Ok((patched, changed)) => return finish(patched, changed),
+                Ok((patched, changed)) => {
+                    if changed {
+                        return (patched, true, None);
+                    }
+                    tried.push(StrategyFailure::new(
+                        "whole-file reconstruction",
+                        "produced text identical to the original",
+                    ));
+                    return finish(patched, false, &tried, &reconstruction_skipped);
+                }
                 Err(refused) => failure = Some(refused),
             }
+        } else {
+            tried.push(StrategyFailure::new(
+                "whole-file reconstruction",
+                format!(
+                    "produced too little text ({} bytes; the file is {} bytes)",
+                    reconstructed.len(),
+                    original.len()
+                ),
+            ));
         }
     } else {
-        info!("whole-file reconstruction SKIPPED (patch contains deletions — unsafe)");
+        // [VANTA-WHY] Item R — the original logged ONE sentence naming deletions
+        // for BOTH reasons this branch can take. Say which one it actually was.
+        let why = if !looks_like_diff_v7 {
+            "the patch does not look like a diff (no @@ hunk and no --- header)"
+        } else {
+            "the patch contains deletions, which reconstruction cannot represent safely"
+        };
+        info!("whole-file reconstruction SKIPPED ({why})");
+        reconstruction_skipped = Some(why.to_string());
     }
 
     // ---- All strategies failed ----
     warn!("ALL patch strategies failed — returning original unchanged");
-    let reason = failure.unwrap_or(ApplyFailure::DidNotApply);
+    let reason = failure.unwrap_or(ApplyFailure::DidNotApply {
+        path: path.to_string(),
+        strategies: tried,
+        reconstruction_skipped,
+    });
     (original.to_string(), false, Some(reason))
 }
 
@@ -477,10 +651,39 @@ fn python_parses(source: &str) -> Option<bool> {
 //
 // [VANTA-WHY] Search/replace blocks use exact anchor text (no line counting).
 // Each block: find the SEARCH text in the original, replace with REPLACE text.
-// Multiple blocks are applied sequentially. Returns None if any block's search
-// text can't be found.
+// Multiple blocks are applied sequentially. Returns the first block that could
+// not be placed, so the reason reaches the Creator (Item R).
 // ============================================================================
-pub fn apply_search_replace(original: &str, patch_text: &str) -> Option<String> {
+/// Why a `===SEARCH===`/`===REPLACE===` block could not be applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchReplaceFailure {
+    /// A block's SEARCH text does not appear in the original file. Carries the
+    /// exact anchor text, so the Creator can see the line it wrote is not there.
+    AnchorNotFound { search: String },
+    /// The patch declared blocks, but none of them changed anything (each block
+    /// needs both a `===SEARCH===` and a `===REPLACE===` marker).
+    NothingApplied,
+}
+
+impl std::fmt::Display for SearchReplaceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SearchReplaceFailure::AnchorNotFound { search } => write!(
+                f,
+                "the ===SEARCH=== anchor text is not present in the file:\n{search}"
+            ),
+            SearchReplaceFailure::NothingApplied => write!(
+                f,
+                "no ===SEARCH===/===REPLACE=== block changed anything"
+            ),
+        }
+    }
+}
+
+pub fn apply_search_replace(
+    original: &str,
+    patch_text: &str,
+) -> Result<String, SearchReplaceFailure> {
     let mut result = original.to_string();
     let mut applied_any = false;
 
@@ -504,14 +707,16 @@ pub fn apply_search_replace(original: &str, patch_text: &str) -> Option<String> 
             applied_any = true;
         } else {
             warn!("search/replace: SEARCH text not found in original");
-            return None;
+            return Err(SearchReplaceFailure::AnchorNotFound {
+                search: search.to_string(),
+            });
         }
     }
 
     if applied_any {
-        Some(result)
+        Ok(result)
     } else {
-        None
+        Err(SearchReplaceFailure::NothingApplied)
     }
 }
 
@@ -539,10 +744,16 @@ pub fn apply_search_replace(original: &str, patch_text: &str) -> Option<String> 
 // ============================================================================
 
 pub fn apply_hunks(original: &str, patch_text: &str) -> Option<String> {
+    apply_hunks_detailed(original, patch_text).ok()
+}
+
+/// As `apply_hunks`, but reports WHY the engine refused the patch (Item R), so
+/// the reason reaches the Creator instead of a bare `None`.
+pub fn apply_hunks_detailed(original: &str, patch_text: &str) -> Result<String, String> {
     let hunks = parse_hunks(patch_text);
 
     if hunks.is_empty() {
-        return None;
+        return Err("the patch has no @@ hunks to apply".to_string());
     }
 
     let mut result_lines: Vec<String> = original.lines().map(|l| l.to_string()).collect();
@@ -553,14 +764,17 @@ pub fn apply_hunks(original: &str, patch_text: &str) -> Option<String> {
         let new_side = hunk.new_side();
         if old_side.is_empty() {
             debug!("hunk-by-hunk: hunk has no old-side lines — refusing the whole patch");
-            return None;
+            return Err("a hunk has no old-side lines".to_string());
         }
         let Some(start) = anchor_hunk(&result_lines, hunk, &old_side, offset) else {
             debug!(
                 "hunk-by-hunk: hunk could not be anchored ({} old-side line(s)) — refusing the whole patch",
                 old_side.len()
             );
-            return None;
+            return Err(format!(
+                "a hunk with {} old-side line(s) could not be anchored in the file",
+                old_side.len()
+            ));
         };
 
         offset += new_side.len() as isize - old_side.len() as isize;
@@ -569,9 +783,9 @@ pub fn apply_hunks(original: &str, patch_text: &str) -> Option<String> {
 
     let patched = result_lines.join("\n") + "\n";
     if patched == original {
-        return None;
+        return Err("the hunks applied but produced no change".to_string());
     }
-    Some(patched)
+    Ok(patched)
 }
 
 /// Where does this hunk's old side start in `file_lines`?
@@ -1043,5 +1257,85 @@ diff --git a/src/pkg/mod.py b/src/pkg/mod.py
         let (kept, refused) = apply_patch(original, broken, "src/pkg/mod.py");
         assert!(!refused, "the same content must be refused for a .py file");
         assert_eq!(kept, original);
+    }
+
+    // ---- Item R: the apply failure carries what the cascade already knew ----
+
+    #[test]
+    fn a_missing_search_anchor_names_the_file_and_the_anchor() {
+        // The model wrote a SEARCH anchor that is not in the file. The feedback
+        // the Creator receives must name the file, quote the exact anchor, and
+        // give the strategy's reason — never the old fixed sentence.
+        let original = "def add(a, b):\n    return a + b\n";
+        let patch = "\
+===SEARCH===
+def subtract(a, b):
+    return a - b
+===REPLACE===
+def subtract(a, b):
+    return b - a
+===END===
+";
+        let (_text, changed, failure) = apply_patch_detailed(original, patch, "src/pkg/mod.py");
+        assert!(!changed, "an anchor that is not in the file cannot apply");
+        let msg = failure.expect("the cascade must report why it gave up").feedback();
+
+        assert!(msg.contains("src/pkg/mod.py"), "the file must be named: {msg}");
+        assert!(
+            msg.contains("def subtract(a, b):\n    return a - b"),
+            "the exact SEARCH anchor must be quoted: {msg}"
+        );
+        assert!(
+            msg.contains("search/replace"),
+            "the failing strategy must be named: {msg}"
+        );
+        assert!(
+            !msg.contains("no file was changed by any strategy"),
+            "the old constant string must be gone: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_full_cascade_failure_lists_every_strategy_and_the_skip() {
+        // A unified diff whose hunk anchor is not in the file: git apply, patch(1)
+        // and the hunk engine all refuse it, and reconstruction is skipped
+        // because the patch contains a deletion. Every one of those facts must be
+        // carried back, with the reason the skip happened.
+        let original = "def f():\n    return 1\n";
+        let patch = "\
+--- a/src/pkg/mod.py
++++ b/src/pkg/mod.py
+@@ -10,2 +10,2 @@
+ def other():
+-    return 2
++    return 3
+";
+        let (_text, changed, failure) = apply_patch_detailed(original, patch, "src/pkg/mod.py");
+        assert!(!changed);
+        let msg = failure.expect("must fail").feedback();
+
+        assert!(msg.contains("git apply --3way"), "{msg}");
+        assert!(msg.contains("hunk-by-hunk"), "{msg}");
+        assert!(msg.contains("whole-file reconstruction: skipped"), "{msg}");
+        assert!(msg.contains("deletions"), "{msg}");
+        assert!(
+            !msg.contains("patch contains deletions — unsafe"),
+            "the old one-size sentence must be gone: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_python_result_still_reports_the_interpreter_message() {
+        // The other variant is untouched: a diff that applied but does not parse
+        // must still lead with the interpreter's own message.
+        let original = "def f():\n    return 1\n";
+        let patch = "def f():\n    if True:\n    return 1\n";
+        let (_text, changed, failure) = apply_patch_detailed(original, patch, "src/pkg/mod.py");
+        assert!(!changed);
+        let msg = failure.expect("must fail").feedback();
+        assert!(
+            msg.starts_with("patch result is not valid Python:"),
+            "the interpreter message must lead: {msg}"
+        );
     }
 }

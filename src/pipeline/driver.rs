@@ -1996,13 +1996,15 @@ pub async fn run(
                 // a censored transition row, and the reason goes back as the
                 // Creator's feedback. Review mode, whose candidate was written
                 // outside the run, still stops — see `Governor::decide`.
+                // [VANTA-WHY] Item R — `ApplyFailure::feedback()` carries the
+                // cascade's own account (the file, every strategy tried with its
+                // reason, and why reconstruction was skipped) instead of the
+                // fixed sentence this used to send. Every arm that reaches
+                // repair mode (b0/b1/b2/vanta) is `GovernorMode::Repair` and so
+                // goes through this one path; review mode never enters here.
                 let feedback = match &apply_failure {
-                    // Content problem: the diff applied, the code does not parse.
-                    Some(ApplyFailure::InvalidPython(err)) => {
-                        format!("patch result is not valid Python: {err}")
-                    }
-                    // Formatting problem: nothing could place the hunks at all.
-                    _ => format!("patch did not apply: {reason}"),
+                    Some(failure) => failure.feedback(),
+                    None => format!("patch did not apply: {reason}"),
                 };
                 println!("  ↻ Returning to Creator: {feedback}");
                 apply_failed_attempt_indices.push(attempt);

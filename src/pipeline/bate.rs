@@ -110,6 +110,25 @@ pub fn validate_test_against_baseline(
 /// shows a test rewritten 45 times while the model guessed what "ERROR" meant,
 /// because the exception, its message and the traceback were thrown away here.
 /// Carrying the details keeps one runner for both the verdict and the evidence.
+///
+/// [VANTA-WHY] Item (b) — the run-log account of a `validate_with_retry` that
+/// ran out of attempts. "SCRAPPED" is only true when the baseline GRADED the
+/// test and disagreed with its intent. A never-graded failure (a plugin that
+/// fails to load, a `conftest.py` that fails to import) is classified by
+/// `harness_error` and the CALLER stops the attempt WITHOUT adding the test to
+/// `scrapped_tests` — so the unconditional "SCRAPPED" warning used to contradict
+/// the very next line (`BATE: 0 valid, 0 scrapped`) and made the discard rate
+/// describe a scrap that never happened. This names the environment case in its
+/// own words, so the console and the `bate.summary` row agree. The retry policy
+/// is unchanged: the same three attempts still run.
+fn mismatch_log_line(details: &TestExecutionDetails, attempts: u32) -> String {
+    if harness_error(details).is_some() {
+        "BATE: baseline never reached a verdict (environment error) — not a scrap".to_string()
+    } else {
+        format!("BATE: test SCRAPPED after {attempts} mismatches")
+    }
+}
+
 pub async fn validate_with_retry<F, Fut>(
     test_name: &str,
     intent: &TestIntent,
@@ -147,7 +166,7 @@ where
         last_mismatch.unwrap_or_else(|| "unknown mismatch".into()),
         max_attempts
     );
-    warn!(test = test_name, max_attempts, "BATE: test SCRAPPED after {max_attempts} mismatches");
+    warn!(test = test_name, max_attempts, "{}", mismatch_log_line(&last_details, max_attempts));
     (BateOutcome::Mismatch(reason), last_details)
 }
 
@@ -821,6 +840,34 @@ mod tests {
         .await;
         assert_eq!(outcome, BateOutcome::Valid);
         assert_eq!(*attempts.borrow(), 3);
+    }
+
+    #[test]
+    fn a_never_graded_baseline_is_not_logged_as_a_scrap() {
+        // Item (b): a harness error must NOT print "SCRAPPED". The caller stops
+        // the attempt on the environment error and never adds the test to
+        // `scrapped_tests`, so the run log saying SCRAPPED while the
+        // `bate.summary` row says `valid=0 scrapped=0` was two accounts of the
+        // same event that could not both be true.
+        let mut ungraded = details(TestResult::Error, "", PLUGIN_LOAD_FAILURE);
+        ungraded.report_path_exists = false;
+        let line = mismatch_log_line(&ungraded, 3);
+        assert!(
+            !line.contains("SCRAPPED"),
+            "a baseline that was never graded is not scrapped: {line}"
+        );
+        assert!(
+            line.contains("not a scrap"),
+            "the log must say what the event IS, not just drop the word: {line}"
+        );
+
+        // A graded disagreement is a genuine scrap and keeps the old words.
+        let graded = details(TestResult::Passed, "", "");
+        let line = mismatch_log_line(&graded, 3);
+        assert!(
+            line.contains("SCRAPPED"),
+            "a graded mismatch is still a scrap: {line}"
+        );
     }
 
     // ---- §14.17: what the baseline ACTUALLY did, for the revise prompt --------

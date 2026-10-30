@@ -931,20 +931,42 @@ pub fn seed_and_write(
     root: &Path,
     source_concat: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    seed_and_write_from(seed_root().as_deref(), root, source_concat)
+    // [VANTA-WHY] Item P follow-up — the production path goes through
+    // `seed_sandbox`, which is the one place that RECORDS the run's mechanism.
+    // `seed_sandbox_from` is deliberately global-free (the unit tests use it), so
+    // seeding through it, as this did, seeded every tree correctly and still left
+    // every row saying `seed_method=unset`.
+    let seeded = seed_sandbox(root).is_some();
+    seed_and_write_after(seeded, root, source_concat)
 }
 
 /// The seed-plus-overlay step with the seed named explicitly (`None` = no seed),
-/// so the exact behaviour both with and without a seed is unit-testable.
+/// so the exact behaviour both with and without a seed is unit-testable. It is
+/// the tests' seam and nothing else now that `seed_and_write` seeds through
+/// `seed_sandbox` — the variant that records the mechanism — so it is compiled
+/// only for them.
+#[cfg(test)]
 fn seed_and_write_from(
     seed: Option<&Path>,
     root: &Path,
     source_concat: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(seed) = seed {
-        if seed_sandbox_from(seed, root).is_some() {
-            prune_source_files_not_in(root, source_concat)?;
-        }
+    let seeded = seed
+        .map(|seed| seed_sandbox_from(seed, root).is_some())
+        .unwrap_or(false);
+    seed_and_write_after(seeded, root, source_concat)
+}
+
+/// Overlay the concatenation on a root that `seeded` says was seeded: the source
+/// the concatenation dropped is pruned first. Only a seed can carry source the
+/// walk did not, so an unseeded root has nothing to prune.
+fn seed_and_write_after(
+    seeded: bool,
+    root: &Path,
+    source_concat: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if seeded {
+        prune_source_files_not_in(root, source_concat)?;
     }
     write_source_files(root, source_concat)
 }
@@ -1968,7 +1990,8 @@ mod tests {
         native_tree_with_original_tests, new_diagnostics, parse_mypy_line, parse_native_report,
         parse_pytest_report_detailed, parse_ruff_line, project_package, report_tests,
         ruff_is_error_class, run_single_test, run_tests_parallel, seed_and_write,
-        seed_and_write_from, seed_root, seed_sandbox_from, static_tool_runner, write_source_files,
+        seed_and_write_from, seed_method, seed_root, seed_sandbox_from, set_seed_root,
+        static_tool_runner, write_source_files,
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{TestIntent, TestResult};
@@ -2899,6 +2922,40 @@ mod tests {
             fs::read_dir(root.path()).unwrap().count(),
             1,
             "without a seed nothing but the concatenation's own paths is written"
+        );
+    }
+
+    // [VANTA-WHY] Item P follow-up — the bug this pins: `seed_and_write` seeded
+    // through `seed_sandbox_from` (the global-free variant the tests above use),
+    // so the mechanism was never recorded and every row read `seed_method=unset`
+    // however the tree had actually been seeded. It drives the production pair —
+    // `set_seed_root`, then `seed_and_write` — and restores the global after.
+    #[test]
+    fn the_production_seed_records_which_mechanism_it_used() {
+        let exec = tempfile::tempdir().unwrap();
+        built_tree(exec.path());
+        let seed = tempfile::tempdir().unwrap();
+        copy_tree_excluding(seed.path(), exec.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let concat = "# FILE: pkg/__init__.py\nVALUE = 2\n";
+
+        set_seed_root(Some(seed.path().to_path_buf()));
+        assert!(seed_method().is_none(), "a run has recorded nothing before it seeds");
+        seed_and_write(root.path(), concat).unwrap();
+        let first = seed_method();
+        // The record is the FIRST seed's mechanism (`seed_method`'s own doc), so a
+        // later sandbox of the same run must not rewrite it.
+        seed_and_write(root.path(), concat).unwrap();
+        assert_eq!(seed_method(), first, "the record belongs to the run's first seed");
+        set_seed_root(None);
+
+        assert!(
+            matches!(first.map(|m| m.as_str()), Some("clonefile") | Some("copy_tree")),
+            "the row must be able to state which mechanism seeded the run, got {first:?}"
+        );
+        assert!(
+            root.path().join("pkg/_ext.so").is_file(),
+            "and the production path really did seed"
         );
     }
 

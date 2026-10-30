@@ -108,6 +108,13 @@ fi"#;
 /// compile that failed must not take the test report with it. The exit status
 /// the script reports is still the command's, because the command is last. An
 /// empty ``precompile`` reproduces the previous line exactly.
+///
+/// ``cmd`` is an argv, and every one of its tokens is shell-quoted on the way in —
+/// the same rule the ``export`` values and the precompile line follow. It has to
+/// be: the trait's ``execute`` takes an argv and the subprocess backend hands it
+/// to ``Command::args`` with no shell, so an argument is allowed to contain a
+/// space or a metacharacter, and this is the only backend that has to spell one
+/// out for ``sh -c``.
 fn guest_inner_command(
     guest_cwd: &str,
     cmd: &[&str],
@@ -118,18 +125,29 @@ fn guest_inner_command(
     for (key, value) in env {
         exports.push_str(&format!("export {key}={}\n", shell_quote_value(value)));
     }
+    // [VANTA-WHY] Item P follow-up — every argv token is quoted, like the
+    // precompile line below already was. `cmd` is an ARGV (`Backend::Subprocess`
+    // hands it straight to `Command::args`, no shell), so an argument may legally
+    // contain a space, a `;`, a parenthesis or a quote; joining it into a shell
+    // line unquoted does not pass it through, it re-parses it. The in-session
+    // import guard is the first caller that needs this: it runs
+    // `python -c 'import pkg as g; print(g.__file__)'`, and before this the shell
+    // read the `(` in `print(` as a subshell — `sh: Syntax error: word unexpected
+    // (expecting ")")`, every run an InfraFailure that had nothing to do with the
+    // candidate. `shell_quote_value` leaves a plain token (which is every token
+    // the recorded `test_cmd`s carry) byte-identical, so no existing command line
+    // changes.
+    let quoted: Vec<String> = cmd.iter().map(|arg| shell_quote_value(arg)).collect();
+    let command = quoted.join(" ");
+    let cd = shell_quote_value(guest_cwd);
     let pre = crate::sandbox::precompile_argv(cmd, precompile);
     if pre.is_empty() {
-        return format!(
-            "{DEV_SHM_GUARD}\n{exports}cd {guest_cwd} && {command}",
-            command = cmd.join(" ")
-        );
+        return format!("{DEV_SHM_GUARD}\n{exports}cd {cd} && {command}");
     }
     let pre_line: Vec<String> = pre.iter().map(|arg| shell_quote_value(arg)).collect();
     format!(
-        "{DEV_SHM_GUARD}\n{exports}cd {guest_cwd}\n{pre}\n{command}",
-        pre = pre_line.join(" "),
-        command = cmd.join(" ")
+        "{DEV_SHM_GUARD}\n{exports}cd {cd}\n{pre}\n{command}",
+        pre = pre_line.join(" ")
     )
 }
 
@@ -739,7 +757,60 @@ mod tests {
         // A newline, not `&&`: the guard ends in an `if` block, and chaining it with
         // `&&` would make every failure read as the chain's.
         let inner = guest_inner_command("/workspace/x", &["sh", "-c", "exit 3"], &[], &[]);
-        assert_eq!(inner, format!("{DEV_SHM_GUARD}\ncd /workspace/x && sh -c exit 3"));
+        assert_eq!(
+            inner,
+            format!("{DEV_SHM_GUARD}\ncd /workspace/x && sh -c 'exit 3'")
+        );
+    }
+
+    // [VANTA-WHY] Item P follow-up — the argv is an argv, not a shell fragment.
+    // The in-session import guard runs `python -c '<program>'`, and the program
+    // holds a `;` and a `(`; joined unquoted, `sh` read the `(` in `print(` as a
+    // subshell and refused the whole line — `sh: Syntax error: word unexpected
+    // (expecting ")")` — turning every matplotlib/1 and pandas/1 run into an
+    // InfraFailure that had nothing to do with the candidate. The test carries its
+    // own negative control: it rebuilds the UNQUOTED line and asserts `sh` rejects
+    // it, so a regression that dropped the quoting would fail here rather than
+    // silently pass a string comparison.
+    #[test]
+    fn an_argument_with_shell_metacharacters_survives_as_one_token() {
+        let args = ["python", "-c", "import matplotlib as g; print(g.__file__)"];
+
+        // The line as it was composed before the fix: `cmd.join(" ")`, unquoted.
+        let unquoted = format!("{DEV_SHM_GUARD}\ncd /workspace && {}", args.join(" "));
+        let rejected = sh_parse(&unquoted);
+        assert!(
+            rejected.is_err(),
+            "the unquoted line is the bug this test exists for, and `sh` must reject it"
+        );
+
+        let inner = guest_inner_command("/workspace", &args, &[], &[]);
+        assert!(inner.ends_with("cd /workspace && python -c 'import matplotlib as g; print(g.__file__)'"));
+        sh_parse(&inner).expect("the quoted line is a valid shell script, so `sh -c` reaches python");
+    }
+
+    /// `sh -n` on `line`: parses without running it, exactly as `sh -c` would.
+    fn sh_parse(line: &str) -> Result<(), String> {
+        use std::io::Write;
+        let mut child = std::process::Command::new("sh")
+            .arg("-n")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(line.as_bytes())
+            .expect("write the guest line");
+        let parsed = child.wait_with_output().expect("sh -n");
+        if parsed.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&parsed.stderr).into_owned())
+        }
     }
 
     // [VANTA-WHY] The recorded `sandbox_env` has to reach the guest line without

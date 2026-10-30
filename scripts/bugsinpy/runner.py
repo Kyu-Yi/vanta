@@ -1713,6 +1713,14 @@ def _discover_session(log_text: str, before: set[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # labels (§5.3) and the manifest row (§7.3)
 # ---------------------------------------------------------------------------
+# Item Q — a run that ended ``MaxAttemptsReached`` with no applyable final patch is
+# a measured repair failure (the Creator never produced a patch that could be
+# applied before the budget ran out), not an unobservable row. The reason is
+# recorded on the row so that class is citable, and so it can be counted apart from
+# an ``unresolved`` row whose final patch applied but did not fix the bug.
+FINAL_PATCH_DID_NOT_APPLY = "final_patch_did_not_apply"
+
+
 def label_for(verdict: str, oracle: oracle_mod.OracleResult) -> str:
     """§5.3's label table, a pure function of (verdict, oracle).
 
@@ -1736,6 +1744,16 @@ def label_for(verdict: str, oracle: oracle_mod.OracleResult) -> str:
         return "infra_failure"
     if verdict == "JudgeFailed":
         return "judge_failed"
+    # [VANTA-WHY] Item Q — a `MaxAttemptsReached` run whose FINAL attempt's patch
+    # did not apply is a measured REPAIR FAILURE, not a censor. The loop spent its
+    # whole budget and the Creator never produced a patch that could be applied, so
+    # the honest reading is "not fixed". Routing it through the `apply_ok` censor
+    # below would report it as `unobservable` and hide a Creator failure from the
+    # fix rate; `unobservable` stays for the runs we genuinely could not measure (a
+    # `HarnessFailure`, an infra failure) — and carries no patch to grade, which is
+    # exactly the distinction `label_reason_for` names as `final_patch_did_not_apply`.
+    if verdict == "MaxAttemptsReached" and not oracle.apply_ok:
+        return "unresolved"
     if not oracle.apply_ok:
         return "unobservable"
     if verdict in ("AllTestsPassed", "JudgeApproved"):
@@ -1754,6 +1772,23 @@ def label_for(verdict: str, oracle: oracle_mod.OracleResult) -> str:
     if verdict == "MaxAttemptsReached":
         return "unresolved_but_fixed" if oracle.patch_good else "unresolved"
     return "unobservable"
+
+
+def label_reason_for(verdict: str, oracle: oracle_mod.OracleResult) -> Optional[str]:
+    """The stated reason for a label whose class does not speak for itself.
+
+    [VANTA-WHY] Item Q — ``unresolved`` covers two different histories: a run whose
+    final patch applied but did not fix the bug, and a run whose final patch never
+    applied at all. Only the second is a Creator failure, and only the row that
+    says ``final_patch_did_not_apply`` can be counted as one — so the reason is
+    recorded beside the label rather than re-derived from ``apply_ok`` by every
+    reader (a derivation that a later change to the censor could silently invert).
+    ``None`` on every other row: a label that already names its class needs no
+    second statement.
+    """
+    if verdict == "MaxAttemptsReached" and not oracle.apply_ok:
+        return FINAL_PATCH_DID_NOT_APPLY
+    return None
 
 
 def build_record(
@@ -1887,6 +1922,12 @@ def build_record(
         "localization_hit": localization_hit(prep, summary.get("context_selection")),
         "oracle": oracle.as_dict(),
         "label": label_for(outcome.decision, oracle),
+        # Item Q — the reason a label needs one. `unresolved` for a run whose final
+        # patch did not apply is a Creator failure and not a censor, and only the
+        # row that names `final_patch_did_not_apply` says so; every other row is
+        # `None`. Recorded beside the label so the class is citable without a reader
+        # re-deriving it from `oracle.apply_ok`.
+        "label_reason": label_reason_for(outcome.decision, oracle),
         "timings": {
             "prepare_s": round(prepare_s, 3),
             "run_s": round(outcome.run_secs, 3),

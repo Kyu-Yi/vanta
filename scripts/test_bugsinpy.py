@@ -20124,11 +20124,40 @@ class TestLabelFor:
             ("PatchApplicationFailed", False, False, "unobservable"),
             ("HarnessFailure", False, False, "unobservable"),
             ("SomethingNobodyNamed", True, True, "unobservable"),
+            # Item Q — but a run that spent its whole budget and never produced an
+            # applyable final patch IS a measured repair failure, so it is `unresolved`
+            # (not fixed) rather than censored. The Creator failure stays in the fix
+            # rate instead of being hidden as `unobservable`.
+            ("MaxAttemptsReached", False, False, "unresolved"),
         ],
     )
     def test_the_table(self, verdict, apply_ok, patch_good, expected):
         oracle = oracle_mod.OracleResult(apply_ok=apply_ok, patch_good=patch_good)
         assert runner_mod.label_for(verdict, oracle) == expected
+
+    def test_a_final_patch_that_did_not_apply_states_its_reason(self):
+        """Item Q — `unresolved` has two histories and only one is a Creator failure.
+
+        A `MaxAttemptsReached` run whose final patch applied but did not fix the bug
+        and one whose final patch never applied both label `unresolved`; only the
+        second is a Creator failure, and only the reason beside the label separates
+        them. A run we genuinely could not measure stays censored — and censoring is
+        what would have hidden the failure from the fix rate.
+        """
+        censor = oracle_mod.OracleResult(apply_ok=False, patch_good=False)
+        assert runner_mod.label_for("MaxAttemptsReached", censor) == "unresolved"
+        assert (
+            runner_mod.label_reason_for("MaxAttemptsReached", censor)
+            == "final_patch_did_not_apply"
+        )
+        # A final patch that applied and simply did not fix: same label, no reason.
+        applied = oracle_mod.OracleResult(apply_ok=True, patch_good=False)
+        assert runner_mod.label_for("MaxAttemptsReached", applied) == "unresolved"
+        assert runner_mod.label_reason_for("MaxAttemptsReached", applied) is None
+        # A run we could not measure keeps the censor, and states no reason of its own.
+        for verdict in ("HarnessFailure", "PatchApplicationFailed", "Rejected", "NeedsReview"):
+            assert runner_mod.label_for(verdict, censor) == "unobservable"
+            assert runner_mod.label_reason_for(verdict, censor) is None
 
     def test_a_needs_review_label_is_not_a_rejection_label(self):
         """§14.6: the two refusals must not collide with the four decisions.
@@ -22218,6 +22247,43 @@ class TestRunJob:
             max_attempts=4, disk_mb=8192, python_version="3.8.20",
         )
         assert plain["seed_method"] is None
+
+    def test_a_row_records_why_a_final_patch_that_did_not_apply_is_not_fixed(
+        self, tmp_path, monkeypatch
+    ):
+        """Item Q — the reason is on the row, so the class is citable, not re-derived.
+
+        Built from a `MaxAttemptsReached` run that wrote no `final.patch` (the shape
+        a failed FINAL apply leaves): `grade` censors a missing patch without booting a
+        VM, so the row carries `apply_ok=false`, and the label must be `unresolved`
+        with `final_patch_did_not_apply` beside it — never the censor's `unobservable`,
+        which would hide the Creator failure from the fix rate.
+        """
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(tmp_path, decision="MaxAttemptsReached"),
+        )
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root", fail_to_pass=["tests/test_a.py::test_b"])),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert record["verdict"] == "MaxAttemptsReached"
+        assert record["oracle"]["apply_ok"] is False
+        assert record["label"] == "unresolved"
+        assert record["label_reason"] == "final_patch_did_not_apply"
+
+    def test_an_ordinary_row_states_no_label_reason(self, tmp_path, monkeypatch):
+        """Every label that already names its class carries `label_reason = None`."""
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert record["label_reason"] is None
 
     def test_a_review_row_reuses_the_candidate_label_and_never_re_grades(
         self, tmp_path, monkeypatch

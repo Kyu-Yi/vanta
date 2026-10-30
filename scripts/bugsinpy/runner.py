@@ -1395,6 +1395,20 @@ def sampling_block(summary: dict[str, str]) -> dict[str, Any]:
     # `None`, so a reader cannot mistake "no switch" for "a switch with no value".
     budget_text = summary.get("reasoning_budget")
     budget_mechanism = summary.get("reasoning_budget_mechanism")
+    # Item S — the sampling knobs the preset PINS (`pinned` above) that this
+    # backend did NOT put in the body. On a hosted reasoning model `temperature`
+    # and `top_p` are dropped before the body leaves (§14.26), so the model
+    # samples at the provider's own default and the `pinned` block names a value
+    # it never saw. `None` means every preset pin reached the server (the local
+    # backend, or a hosted family this table does not know). Recorded separately
+    # rather than folded into `pinned`, so the preset stays the preset and the
+    # sent body is stated beside it — never one mistaken for the other.
+    not_sent_text = summary.get("sampling_not_sent")
+    not_sent = (
+        None
+        if not not_sent_text or not_sent_text == "none"
+        else not_sent_text.split(",")
+    )
     return {
         # The split's own constant, not a copied literal: the manifest must name the
         # same policy the committed design declares, or the provenance block would
@@ -1421,6 +1435,10 @@ def sampling_block(summary: dict[str, str]) -> dict[str, Any]:
             if not top_p or top_p == "unset"
             else "read from the server's /props"
         ),
+        # Item S — the preset pins this backend did not send; each entry is
+        # `<key>:provider_default` because the value the server applied is its
+        # own, not a number Vanta chose. `None` = every pin reached the server.
+        "not_sent": not_sent,
     }
 
 

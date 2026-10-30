@@ -20403,6 +20403,34 @@ class TestSamplingBlock:
             "effort_mechanism": "llamacpp:noop",
         }
 
+    def test_the_sampling_the_backend_did_not_send_is_read_from_the_record(self):
+        """Item S — a hosted run's `pinned` names a value the model never saw.
+
+        The preset's `temperature`/`top_p` are recorded in `pinned` for every
+        backend, because the preset is defined independently of one. On a hosted
+        reasoning model §14.26's shaper drops both before the body leaves, so the
+        model samples at the provider's own default and a row that showed only
+        `pinned` would read as a run that sampled at the preset value. The record
+        carries the keys that did not reach the server beside them.
+        """
+        # A local row (and a pre-Item-S row) carries no such key: nothing to claim.
+        assert runner_mod.sampling_block(runner_mod.parse_summary(self.SUMMARY))[
+            "not_sent"
+        ] is None
+        # The local pipeline spells the absence explicitly.
+        local = runner_mod.parse_summary(self.SUMMARY + " sampling_not_sent=none")
+        assert runner_mod.sampling_block(local)["not_sent"] is None
+        # A hosted row names the knobs the shaper dropped, and whose value the
+        # server used instead.
+        hosted = runner_mod.parse_summary(
+            self.SUMMARY
+            + " sampling_not_sent=temperature:provider_default,top_p:provider_default"
+        )
+        assert runner_mod.sampling_block(hosted)["not_sent"] == [
+            "temperature:provider_default",
+            "top_p:provider_default",
+        ]
+
     def test_the_pinned_schedule_matches_the_pipeline_constant(self):
         """`SAMPLING_SCHEDULE` is the only definition of the per-call schedule (§4.3)."""
         text = (REPO_ROOT / "src" / "llm" / "mod.rs").read_text(encoding="utf-8")

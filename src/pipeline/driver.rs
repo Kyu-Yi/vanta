@@ -1011,6 +1011,111 @@ fn request_shape_rule(cfg: &LlmConfig) -> String {
     )
 }
 
+/// The sampling knobs the preset pins that this backend does NOT put in the
+/// body, and the value the server applies in their place (Item S).
+///
+/// [VANTA-WHY] Item S — `sampling_schedule_keys` records the PRESET's own
+/// `temperature_<site>` / `top_p_<site>` pins, and it records them for every
+/// backend because the preset is defined independently of one. On the local
+/// backend that is honest: the body carries 0.6/0.95 and the server samples at
+/// them. On a hosted reasoning model it is not — §14.26's shaper drops both
+/// before the body leaves, so the model samples at the provider's OWN default.
+/// A row that shows `temperature_creator=0.6` without saying so reads as a run
+/// that sampled at 0.6. This names the keys that did not reach the server and the
+/// value it used instead, so the preset and the sent body are both on the row and
+/// neither can be mistaken for the other. It is the sampling-specific twin of
+/// `request_shape_not_sent`, which states the same drop as a bare field list;
+/// this states the EFFECT (a server default), which a field list cannot.
+fn sampling_not_sent_rule(cfg: &LlmConfig) -> String {
+    // The two sampling knobs `SamplingPreset::Coding` pins on the generative
+    // sites and no call site pins under the default preset (§14.11). Named here
+    // in a fixed order so the list is stable across runs.
+    const SAMPLED_KNOBS: [&str; 2] = ["temperature", "top_p"];
+    if !cfg.is_openai() {
+        return "sampling_not_sent=none".to_string();
+    }
+    let family = crate::llm::capabilities::OpenAiFamily::from_model_id(&cfg.model_id);
+    let unsent: Vec<&str> = crate::llm::capabilities::unsent_keys(family)
+        .into_iter()
+        .map(|(key, _why)| key)
+        .collect();
+    let replaced: Vec<String> = SAMPLED_KNOBS
+        .iter()
+        .filter(|key| unsent.contains(key))
+        .map(|key| format!("{key}:provider_default"))
+        .collect();
+    if replaced.is_empty() {
+        // Either the local backend or a hosted family this table does not know:
+        // every preset pin reached (or was kept for) the server.
+        "sampling_not_sent=none".to_string()
+    } else {
+        format!("sampling_not_sent={}", replaced.join(","))
+    }
+}
+
+/// The effort the CREATOR's request body actually carried, and its mechanism
+/// (Item S).
+///
+/// [VANTA-WHY] Item S — the run-level `reasoning_effort` field names the level
+/// this RUN asked for (`VANTA_REASONING_EFFORT`, effective). It cannot answer
+/// the narrower question a reader of a hosted row has: what did the CREATOR's
+/// own body carry? On the local backend the call site's pin is sent verbatim and
+/// the server ignores it (`llamacpp:noop`); on a hosted reasoning model the pin
+/// is dropped unless the run asked for a level the family accepts (§14.28), and
+/// then the body carries nothing. The two facts are recorded separately so a run
+/// whose Creator was never asked for an effort cannot be read as one where it
+/// was. The decision reuses the shaper's own predicate (`keeps_effort`), so the
+/// field and the body it describes cannot disagree.
+fn creator_effort_text(cfg: &LlmConfig) -> (String, &'static str) {
+    let requested = crate::llm::requested_effort();
+    // The value `apply_reasoning_control` leaves in the body: the call site's pin,
+    // replaced by the run switch when one is set.
+    let carried = requested.unwrap_or(crate::llm::CREATOR_PINNED_EFFORT);
+    if !cfg.is_openai() {
+        return (
+            carried.to_string(),
+            crate::llm::reasoning_effort_mechanism(false),
+        );
+    }
+    let family = crate::llm::capabilities::OpenAiFamily::from_model_id(&cfg.model_id);
+    if crate::llm::capabilities::keeps_effort(family, requested) {
+        (carried.to_string(), crate::llm::OPENAI_EFFORT_MECHANISM)
+    } else {
+        // No level was requested, so `capabilities` removed the call site's `low`
+        // before the body left. `none` (a level nobody sent) is the fact; the
+        // mechanism is `unset` for the same reason the run-level field uses it.
+        ("none".to_string(), "unset")
+    }
+}
+
+/// The real assembled prompt tokens for each Creator call, in call order
+/// (Item S).
+///
+/// [VANTA-WHY] Item S — the batch table carries the Creator prompt ESTIMATE
+/// (`est tok`, priced by the harness before the run) and the model's own count
+/// (`llm_prompt_tokens`, a run total). Neither answers "how big was the Creator's
+/// assembled prompt, and how close did it come to the window?" — the estimate is
+/// a pre-run guess and the run total mixes every site. Recorded per Creator call,
+/// beside `n_ctx`, so the two can be read against each other. `unmeasured` is a
+/// call the server published no `usage` block for (the `estimate` source), kept
+/// as a word rather than a `0`, which would read as an empty prompt.
+fn creator_prompt_tokens_text(calls: &[crate::llm::CallUsage]) -> String {
+    let values: Vec<String> = calls
+        .iter()
+        .filter(|call| call.site == "creator")
+        .map(|call| {
+            call.prompt_tokens
+                .map(|tokens| tokens.to_string())
+                .unwrap_or_else(|| "unmeasured".to_string())
+        })
+        .collect();
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
 /// Read the server's own `top_p` default for the provenance block.
 ///
 /// [VANTA-WHY] Bounded, unlike every other HTTP call in this file.
@@ -1232,7 +1337,7 @@ pub async fn run(
     };
     let (prompt_budget_tokens, _prompt_margin_tokens) = crate::context::budget_tokens(n_ctx);
     println!(
-        "▌ Context budget: {prompt_budget_tokens} tok (n_ctx {n_ctx} − {} output − {} overhead − 25 % margin)",
+        "▌ File-selection budget: {prompt_budget_tokens} tok (n_ctx {n_ctx} − {} output − {} overhead − 25 % margin)",
         crate::context::OUTPUT_RESERVE_TOKENS,
         crate::context::CHAT_OVERHEAD_TOKENS,
     );
@@ -4073,6 +4178,13 @@ pub async fn run(
     } else {
         invariant_reason_here
     };
+    // [VANTA-WHY] Item S — the Creator's own request facts, read from the same
+    // values the body was built from and the same `call.usage` rows the run
+    // already records. Purely additive: nothing here feeds a verdict, a selection
+    // or a guard, and the fields are appended after every pre-existing key so an
+    // older row's reader is unaffected.
+    let (creator_effort, creator_effort_mechanism) = creator_effort_text(&cfg);
+    let creator_prompt_tokens = creator_prompt_tokens_text(&call_usages);
     session_log.append(SessionRecord {
         session_id: session_id.clone(),
         schema_version: Some(SCHEMA_VERSION),
@@ -4082,7 +4194,7 @@ pub async fn run(
         phase: "run.summary".to_string(),
         summary: format!(
             "attempts_run={} fixed_at_attempt_1={} final_decision={:?} \
-             config={} arm={} mode={} seed={} seed_policy={} model={} top_p={} {} {} \
+             config={} arm={} mode={} seed={} seed_policy={} model={} top_p={} {} {} {} \
              llm_calls={} llm_calls_measured={} llm_prompt_tokens={} llm_completion_tokens={} \
              llm_cached_tokens={} llm_reasoning_tokens={} llm_cache_hit_rate={} \
              cost_usd={} cost_basis={} \
@@ -4104,7 +4216,9 @@ pub async fn run(
              invariant_applied={} invariant_reason={} \
              grounded_scrapped={} grounded_kept_by_issue={} \
              quarantine_count={} quarantined=[{}] \
-             seed_method={} import_guard={}",
+             seed_method={} import_guard={} \
+             n_ctx={} creator_effort={} creator_effort_mechanism={} \
+             creator_prompt_tokens={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -4121,6 +4235,7 @@ pub async fn run(
             top_p_value,
             sampling_schedule_keys(resolved_arm.judge.is_some()),
             request_shape_rule(&cfg),
+            sampling_not_sent_rule(&cfg),
             llm_calls,
             llm_calls_measured,
             llm_prompt_tokens,
@@ -4317,6 +4432,16 @@ pub async fn run(
                 .as_deref()
                 .and_then(|line| line.split_whitespace().next())
                 .unwrap_or("unset"),
+            // [VANTA-WHY] Item S — appended after every pre-existing key so an
+            // older row's reader is unaffected. `n_ctx` is the window this run
+            // sized its file selection against; `creator_*` are the Creator's own
+            // request facts (see `creator_effort_text` /
+            // `creator_prompt_tokens_text`). All three values are space-free, so
+            // they survive the `key=value` reader.
+            n_ctx,
+            creator_effort,
+            creator_effort_mechanism,
+            creator_prompt_tokens,
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),
@@ -5840,15 +5965,18 @@ mod tests {
     use super::{
         approval_invariant_status, attempt_verdict, bate_baseline_concat, benchmark_config_name,
         blocking_static_findings,
-        build_source_concat, cache_hit_rate_value, collapse_decision,
+        build_source_concat, cache_hit_rate_value, collapse_decision, creator_effort_text,
+        creator_prompt_tokens_text,
         dependency_freeze_summary_value, env_arm, env_flag, harness_infrastructure_collapse,
         ledger_text,
         modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
-        resolve_arm, stamp_transition_row, stable_patch_fingerprint, ARMS, INVARIANT_SATISFIED,
+        resolve_arm, sampling_not_sent_rule, stamp_transition_row, stable_patch_fingerprint, ARMS,
+        INVARIANT_SATISFIED,
         JUDGE_ARM, NO_ADMITTED_TESTS, NO_REPRODUCTION_EVIDENCE,
     };
     use crate::agents::attacker::GeneratedTest;
+    use crate::config::{LlmBackend, LlmConfig};
     use crate::core::{
         AttemptTransition, EvidenceSource, FailureClass, GovernorDecision, TestEvidence,
         TestIntent, TestResult, VerificationOutcome,
@@ -6975,5 +7103,105 @@ mod tests {
             ledger_text(Some(0)),
             "an audit that ran and scrapped nothing is not the same row as one that never ran"
         );
+    }
+
+    /// A `CallUsage` with only the two fields `creator_prompt_tokens_text` reads
+    /// set; built through `serde` so a new field on the struct cannot make this
+    /// helper lie about the ones it does set.
+    fn a_usage(site: &str, prompt_tokens: Option<u64>) -> crate::llm::CallUsage {
+        serde_json::from_value(serde_json::json!({
+            "seq": 0,
+            "site": site,
+            "round": 1,
+            "attempt": 1,
+            "provider_retries": 0,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": null,
+            "total_tokens": null,
+            "cached_tokens": null,
+            "reasoning_tokens": null,
+            "cost_usd": null,
+            "cost_basis": "not_billed",
+            "source": "server-usage",
+            "seed": null,
+            "seed_mechanism": "unset",
+            "finish_reason": "stop",
+            "wall_ms": 0,
+            "truncated": false,
+            "request_shape": {"requested": [], "sent": [], "dropped": [], "renamed": []},
+            "service_tier": "unset"
+        }))
+        .expect("a CallUsage with only the fields the reader needs")
+    }
+
+    /// Item S — the Creator's OWN effort and its mechanism, apart from the
+    /// run-level `reasoning_effort` switch.
+    #[test]
+    fn the_creator_effort_field_names_what_the_creator_body_carried() {
+        // The local backend: the call site's pin is sent verbatim and the
+        // server ignores it, whatever the switch says.
+        assert_eq!(
+            creator_effort_text(&LlmConfig::default()),
+            ("low".to_string(), "llamacpp:noop")
+        );
+        // A hosted run that asked for no level: the shaper drops the call site's
+        // `low`, so the body carries none of our making and the level is the
+        // provider's. `none` is the honest value — nobody sent a level.
+        let hosted = LlmConfig {
+            backend: LlmBackend::OpenAi,
+            model_id: "gpt-6-luna".to_string(),
+            ..LlmConfig::default()
+        };
+        assert_eq!(
+            creator_effort_text(&hosted),
+            ("none".to_string(), "unset")
+        );
+    }
+
+    /// Item S — the sampling knobs the preset PINS that this backend did NOT put
+    /// in the body. On a hosted reasoning model the model samples at the
+    /// provider's own default and the row must say so.
+    #[test]
+    fn the_sampling_not_sent_field_names_the_preset_keys_the_backend_dropped() {
+        // Local: every preset pin reaches the server.
+        assert_eq!(
+            sampling_not_sent_rule(&LlmConfig::default()),
+            "sampling_not_sent=none"
+        );
+        // A hosted known family: §14.26's shaper drops `temperature` and `top_p`,
+        // so their effective value is the provider's own.
+        let hosted = LlmConfig {
+            backend: LlmBackend::OpenAi,
+            model_id: "gpt-6-luna".to_string(),
+            ..LlmConfig::default()
+        };
+        assert_eq!(
+            sampling_not_sent_rule(&hosted),
+            "sampling_not_sent=temperature:provider_default,top_p:provider_default"
+        );
+        // A hosted model this table does not know: the per-family rejection is
+        // not applied, so the shaper keeps both and nothing is unsent.
+        let unknown = LlmConfig {
+            backend: LlmBackend::OpenAi,
+            model_id: "qwen3.8-27b".to_string(),
+            ..LlmConfig::default()
+        };
+        assert_eq!(sampling_not_sent_rule(&unknown), "sampling_not_sent=none");
+    }
+
+    /// Item S — the real assembled prompt tokens per Creator call, in call
+    /// order, never scored as a zero.
+    #[test]
+    fn the_creator_prompt_tokens_are_recorded_per_call_and_never_scored_as_zero() {
+        let calls = vec![
+            a_usage("creator", Some(1234)),
+            a_usage("attacker_generate", Some(999)),
+            a_usage("creator", None),
+        ];
+        assert_eq!(creator_prompt_tokens_text(&calls), "1234,unmeasured");
+        // A run whose Creator call published no `usage` block records the word,
+        // not a `0` that would read as an empty prompt. No Creator call at all
+        // is `none`, not an empty string.
+        assert_eq!(creator_prompt_tokens_text(&[]), "none");
     }
 }

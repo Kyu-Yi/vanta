@@ -200,7 +200,10 @@ pub async fn creator_generate_patch(
     let extras = crate::llm::with_sampling(
         json!({
             "response_format": {"type": "json_object"},
-            "reasoning_effort": "low",
+            // Item S — the pin is named once (`llm::CREATOR_PINNED_EFFORT`) so the
+            // body and the `run.summary` field that describes it cannot drift.
+            // `with_sampling` replaces the value when `VANTA_REASONING_EFFORT` is set.
+            "reasoning_effort": crate::llm::CREATOR_PINNED_EFFORT,
         }),
         "creator",
     );

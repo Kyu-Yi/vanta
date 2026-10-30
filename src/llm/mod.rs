@@ -1139,6 +1139,17 @@ pub const UNSUPPORTED_MECHANISM: &str = "unsupported";
 /// pairs with, so a reader of one field can read the other.
 pub const PROVIDER_DEFAULT_EFFORT: &str = "provider_default";
 
+/// The effort level the Creator call site pins (Item S).
+///
+/// [VANTA-WHY] Item S — the Creator has hard-coded `reasoning_effort: "low"`
+/// since v0.2, exactly like the five other call sites. On the local backend that
+/// value is sent verbatim and ignored (`llamacpp:noop`); on a hosted reasoning
+/// model it is a real intervention nobody chose, so `capabilities` drops it
+/// unless the run asked for a level the family accepts (§14.28). Named here so
+/// the request body the Creator builds and the `run.summary` field that
+/// describes it read the SAME pin and cannot drift onto two spellings of "low".
+pub const CREATOR_PINNED_EFFORT: &str = "low";
+
 /// Apply the run's reasoning controls to ONE request body (§14.21).
 ///
 /// [VANTA-WHY] Called at the tail of [`with_sampling`], and therefore on the body

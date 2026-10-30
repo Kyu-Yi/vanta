@@ -1768,6 +1768,22 @@ const VALUE_TAKING_OPTIONS: &[&str] = &[
 /// direction — an option missing from `VALUE_TAKING_OPTIONS` loses its value —
 /// and that is the benign failure: a reporting flag falls back to its default,
 /// instead of a test being graded against the wrong result with nobody noticing.
+///
+/// [VANTA-WHY] Item U — the generated test file lands at the REPO ROOT, so
+/// pytest reads the repository's own ini (`setup.cfg` / `pytest.ini`). That ini
+/// can set `addopts` naming an option the repository registers only from its own
+/// `conftest.py` — pandas' `setup.cfg` sets `addopts = --strict-data-files`, and
+/// `pandas/conftest.py` is what calls `pytest_addoption` for it. A root-level
+/// `test_bate.py` does NOT collect `pandas/conftest.py`, so pytest exits with
+/// `unrecognized arguments: --strict-data-files` before it can run anything: the
+/// generated test never reaches a verdict and every baseline run is an
+/// environment failure (§14.19). `-o addopts=` clears the repository's `addopts`
+/// for this single generated test, so those repo-conftest options never reach a
+/// command that does not load their conftest. It is a no-op for a repo whose
+/// `addopts` is empty, and the harness's own flags (`--json-report`, `-q`) are on
+/// the command line, not in `addopts`, so they survive. The repository's NATIVE
+/// suite is unaffected: it runs at the repo's own paths, collects the repo's
+/// conftest, and does not go through this function.
 pub fn build_single_test_cmd(test_cmd: &TestCommand, test_file: &str) -> Vec<String> {
     let mut cmd = vec![test_cmd.program.clone()];
     let args = &test_cmd.args;
@@ -1799,6 +1815,8 @@ pub fn build_single_test_cmd(test_cmd: &TestCommand, test_file: &str) -> Vec<Str
         i += 1;
     }
 
+    cmd.push("-o".to_string());
+    cmd.push("addopts=".to_string());
     cmd.push(test_file.to_string());
     cmd.push("--json-report".to_string());
     cmd.push("--json-report-file=report.json".to_string());
@@ -2092,6 +2110,51 @@ mod tests {
             patched.get(&test.test_name),
             Some(&TestResult::Failed),
             "a semantic behavior change should stay an assertion failure, not become Error/Static"
+        );
+    }
+
+    // [VANTA-WHY] Item U — the pandas BATE baseline went `actual=Error` in ~1.2 s
+    // because the generated test lands at the repo ROOT and pytest therefore reads
+    // the repository's own ini: pandas' `setup.cfg` sets
+    // `addopts = --strict-data-files`, and only `pandas/conftest.py` registers that
+    // option. A root-level `test_bate.py` does not collect `pandas/conftest.py`, so
+    // pytest exits with `unrecognized arguments: --strict-data-files` and the test
+    // never reaches a verdict. This builds that exact shape — a root `setup.cfg`
+    // whose `addopts` names an option that only a sub-package conftest registers —
+    // and pins that the generated-test command neutralizes it so the test is graded.
+    #[tokio::test]
+    async fn a_repo_conftest_only_addopts_does_not_stop_the_generated_test() {
+        let source = concat!(
+            "# FILE: setup.cfg\n",
+            "[tool:pytest]\n",
+            "addopts = --strict-data-files\n",
+            "\n",
+            "# FILE: pkg/__init__.py\n",
+            "\n",
+            "\n",
+            "# FILE: pkg/conftest.py\n",
+            "def pytest_addoption(parser):\n",
+            "    parser.addoption(\"--strict-data-files\", action=\"store_true\", default=False)\n",
+            "\n",
+        );
+        let test = GeneratedTest {
+            test_name: "test_repo_addopts_is_neutralized".to_string(),
+            test_source: "def test_repo_addopts_is_neutralized():\n    assert True\n".to_string(),
+            intent: TestIntent::BehaviorPreservation,
+            reason: "pin that a repo-conftest-only addopts cannot stop the generated test"
+                .to_string(),
+            issue_quote: None,
+            relabeled: false,
+        };
+
+        let result = run_single_test(source, &test.test_source, &TestCommand::default()).await;
+
+        assert_eq!(
+            result,
+            TestResult::Passed,
+            "a repo whose setup.cfg addopts names an option its own sub-package conftest \
+             registers must still grade the generated test; an Error here is the pandas \
+             `unrecognized arguments` environment failure, not a result"
         );
     }
 
@@ -2749,6 +2812,8 @@ mod tests {
                 "-m",
                 "pytest",
                 "-q",
+                "-o",
+                "addopts=",
                 "test_bate.py",
                 "--json-report",
                 "--json-report-file=report.json",
@@ -2790,6 +2855,8 @@ mod tests {
                 "python3",
                 "-m",
                 "pytest",
+                "-o",
+                "addopts=",
                 "test_run.py",
                 "--json-report",
                 "--json-report-file=report.json",
@@ -3059,7 +3126,16 @@ mod tests {
         };
         let without_report = |argv: &[String]| -> Vec<String> {
             argv.iter()
-                .filter(|a| !a.as_str().starts_with("--json-report") && a.as_str() != "-q")
+                .filter(|a| {
+                    !a.as_str().starts_with("--json-report")
+                        && a.as_str() != "-q"
+                        // [VANTA-WHY] Item U — the in-session run also adds the
+                        // harness-owned `-o addopts=`, which the native harness
+                        // invocation does not carry (it runs the repo's own suite
+                        // and loads the repo's conftest, so the repo's addopts is
+                        // valid there). It is not part of the handoff.
+                        && a.as_str() != "-o"
+                })
                 .cloned()
                 .collect()
         };
@@ -3068,7 +3144,8 @@ mod tests {
             without_report(&flags(&in_session)),
             without_report(&flags(&harness_argv)),
             "the interpreter, the module invocation and every pinned flag must survive the \
-             handoff unchanged; the in-session run adds only its own report flags and `-q`"
+             handoff unchanged; the in-session run adds only its own report flags, `-q` and \
+             the `-o addopts=` that neutralizes a repo-conftest-only addopts"
         );
         assert!(
             in_session.iter().any(|a| a.starts_with("--json-report-file=")),

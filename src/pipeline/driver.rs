@@ -1116,6 +1116,30 @@ fn creator_prompt_tokens_text(calls: &[crate::llm::CallUsage]) -> String {
     }
 }
 
+/// The run-log account of a BATE harness error (Item (a)).
+///
+/// [VANTA-WHY] Item (a) — the evidence that says WHY BATE stopped used to live
+/// only in the `bate.harness_error[…]` session row, so the run's own console
+/// printed "the failure is not the test's own" without ever saying what the
+/// failure WAS: a reader of the run log could not see the `ModuleNotFoundError`
+/// (or the pytest option that was not recognized) that ended the attempt. The
+/// evidence is bounded (`bate::REVISE_EVIDENCE_MAX_LINES`), so quoting it here
+/// restores the lost information without risking a runaway test flooding the
+/// log. Indented so the multi-line block reads as one report under the header.
+fn harness_error_log_line(test_name: &str, evidence: &str) -> String {
+    let mut out = format!(
+        "  ✖ BATE HARNESS ERROR: the baseline never reached a verdict for '{test_name}' and the \
+         failure is not the test's own. Stopping this attempt — the Attacker cannot fix \
+         the environment."
+    );
+    for line in evidence.lines() {
+        out.push('\n');
+        out.push_str("      ");
+        out.push_str(line);
+    }
+    out
+}
+
 /// Read the server's own `top_p` default for the provenance block.
 ///
 /// [VANTA-WHY] Bounded, unlike every other HTTP call in this file.
@@ -2675,12 +2699,10 @@ pub async fn run(
         // verdict for "the setup is broken, not the patch", which is terminal and
         // therefore one row rather than a retry.
         if let Some(broken) = bate_harness_error {
-            eprintln!(
-                "  ✖ BATE HARNESS ERROR: the baseline never reached a verdict for '{}' and the \
-                 failure is not the test's own. Stopping this attempt — the Attacker cannot fix \
-                 the environment.",
-                broken.test_name
-            );
+            // [VANTA-WHY] Item (a) — the evidence is quoted into the run log, not
+            // left only in the session row: otherwise the console says BATE stopped
+            // without saying what broke it.
+            eprintln!("{}", harness_error_log_line(&broken.test_name, &broken.evidence));
             session_log.append(SessionRecord {
                 session_id: session_id.clone(),
                 schema_version: Some(SCHEMA_VERSION),
@@ -5967,7 +5989,8 @@ mod tests {
         blocking_static_findings,
         build_source_concat, cache_hit_rate_value, collapse_decision, creator_effort_text,
         creator_prompt_tokens_text,
-        dependency_freeze_summary_value, env_arm, env_flag, harness_infrastructure_collapse,
+        dependency_freeze_summary_value, env_arm, env_flag, harness_error_log_line,
+        harness_infrastructure_collapse,
         ledger_text,
         modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
@@ -7132,6 +7155,28 @@ mod tests {
             "service_tier": "unset"
         }))
         .expect("a CallUsage with only the fields the reader needs")
+    }
+
+    /// Item (a) — the run log must carry WHY BATE stopped, not just that it did.
+    #[test]
+    fn a_harness_error_quotes_its_evidence_into_the_run_log() {
+        let line = harness_error_log_line(
+            "test_middleware_order",
+            "verdict: ERROR (the test was never graded: it failed to import or collect)\n\
+             exception: ModuleNotFoundError: No module named 'sanic.websocket'",
+        );
+        assert!(
+            line.contains("test_middleware_order"),
+            "the failing test must be named: {line}"
+        );
+        assert!(
+            line.contains("ModuleNotFoundError: No module named 'sanic.websocket'"),
+            "the run log must quote the error that broke the environment: {line}"
+        );
+        assert!(
+            line.contains("never reached a verdict"),
+            "and still state what happened in BATE's own words: {line}"
+        );
     }
 
     /// Item S — the Creator's OWN effort and its mechanism, apart from the

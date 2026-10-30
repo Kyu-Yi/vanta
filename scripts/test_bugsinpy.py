@@ -21013,6 +21013,34 @@ class TestLocalizationHit:
         }
         assert "hit=1 miss=1 unknown=1" in runner_mod.render_digest(payload)
 
+    def test_a_review_group_derives_the_null_and_reports_no_rate(self):
+        """Item T — a stored review hit is ignored on read, and no rate is shown.
+
+        A review row written before Item T can carry a ``localization_hit``; it
+        cannot mean anything over a seeded candidate, so the digest derives the
+        null rather than counting it, and the group prints ``n/a`` instead of a
+        tally. Rows on disk are never rewritten.
+        """
+        base = dict(
+            kind="run", config="vanta", seed=0, model="m",
+            harness_commit="c" * 40, vanta_build_commit="d" * 40,
+        )
+        rows = [
+            dict(base, mode="repair", label="true_accept", localization_hit=False),
+            dict(base, mode="review", label="true_accept", localization_hit=True),
+        ]
+        payload = runner_mod.digest(rows)
+        repair = next(g for g in payload["groups"] if g["mode"] == "repair")
+        review = next(g for g in payload["groups"] if g["mode"] == "review")
+        assert repair["localization"] == {"hit": 0, "miss": 1, "unknown": 0}
+        assert repair["localization_applies"] is True
+        # The stored `True` is not counted: the null is derived when reading.
+        assert review["localization"] == {"hit": 0, "miss": 0, "unknown": 0}
+        assert review["localization_applies"] is False
+        text = runner_mod.render_digest(payload)
+        assert "n/a (review)" in text
+        assert "miss=1" in text
+
 
 class TestLocalizationTable:
     """§1.6.5 and §1.6.11 — the ranking audit, computed offline from what prepare recorded.
@@ -22312,6 +22340,69 @@ class TestRunJob:
             max_attempts=4, disk_mb=8192, python_version="3.8.20",
         )
         assert record["label_reason"] is None
+
+    def test_a_review_row_records_no_localization_hit_and_says_why(self, tmp_path, monkeypatch):
+        """Item T — the metric cannot mean anything over a seeded candidate.
+
+        A review run is shown the seed's own candidate, not a search for the bug's
+        fix, so ``localization_hit`` is ``null`` with ``review_candidate_seeded``
+        beside it. A REPAIR row given the SAME selection keeps the computed value,
+        which is what makes the null a property of the mode and not of the input.
+        """
+        line = "selected=[pkg/mod.py@1.0[issue]shown:9B/3tok]:pruned=[none]"
+        bug_prep = prep(
+            root=tmp_path / "root", bug=bug_info(bug_patch_txt=_diff("pkg/mod.py", "fix"))
+        )
+        summary = {
+            "attempts_run": "2",
+            "fixed_at_attempt_1": "false",
+            "final_decision": "MaxAttemptsReached",
+            "config": "vanta",
+            "mode": "repair",
+            "seed": "0",
+            "model": "qwen3.5-27b",
+            "commit": "d" * 40,
+            "dirty": "false",
+            "context_selection": line,
+        }
+        defaults = dict(
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, decision="MaxAttemptsReached", summary=dict(summary)
+            ),
+        )
+        repair = runner_mod.run_job(job=_job(bug_prep), **defaults)
+        assert repair["localization_hit"] is True
+        assert repair["localization_hit_reason"] is None
+
+        candidate = runner_mod.write_candidate_patch(
+            tmp_path, bug_prep, runner_mod.DEV_FIX, _diff("pkg/mod.py", "fix"), source="dev"
+        )
+        candidate.oracle = oracle_mod.OracleResult(apply_ok=True, patch_good=True)
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, decision="AllTestsPassed", final_patch=tmp_path / "final.patch",
+                summary=dict(summary, final_decision="AllTestsPassed"),
+            ),
+        )
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: pytest.fail("the candidate was re-graded")
+        )
+        review = runner_mod.run_job(
+            job=_job(bug_prep, mode=runner_mod.REVIEW, candidate=candidate), **defaults
+        )
+        assert review["mode"] == runner_mod.REVIEW
+        assert review["localization_hit"] is None
+        assert review["localization_hit_reason"] == "review_candidate_seeded"
 
     def test_a_review_row_reuses_the_candidate_label_and_never_re_grades(
         self, tmp_path, monkeypatch

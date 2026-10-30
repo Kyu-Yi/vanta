@@ -1937,7 +1937,22 @@ def build_record(
         # touched, computed here, AFTER the run and never during it: the selector
         # must not be able to see the answer, so the answer is only ever compared
         # against the selection afterwards. `null` means "no evidence", not "no".
-        "localization_hit": localization_hit(prep, summary.get("context_selection")),
+        #
+        # Item T — a REVIEW row answers a question this metric cannot ask. Its
+        # selection is the seed's own candidate, not a search for the bug's fix, so
+        # "was a file the fix touched among those the run was shown?" has no
+        # meaning there and the honest value is `null`. The reason is recorded
+        # beside it so the class is citable without re-deriving it from the mode.
+        # REPAIR rows keep the computed value. Rows already on disk are never
+        # rewritten; the null is derived again when the digest reads them.
+        "localization_hit": (
+            None
+            if job.mode == REVIEW
+            else localization_hit(prep, summary.get("context_selection"))
+        ),
+        "localization_hit_reason": (
+            "review_candidate_seeded" if job.mode == REVIEW else None
+        ),
         "oracle": oracle.as_dict(),
         "label": label_for(outcome.decision, oracle),
         # Item Q — the reason a label needs one. `unresolved` for a run whose final
@@ -3013,11 +3028,21 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
                 # reader re-deriving it from `context_selection` strings. `unknown`
                 # is rows that carried no evidence, kept apart from `miss`.
                 "localization": {"hit": 0, "miss": 0, "unknown": 0},
+                # Item T — the rate is only meaningful over REPAIR rows. A group
+                # whose mode is REVIEW reports it as not applicable rather than a
+                # tally over rows the question cannot ask (the group key carries
+                # the mode, so a group is wholly one or the other).
+                "localization_applies": record.get("mode") != REVIEW,
             },
         )
         group["runs"] += 1
         label = str(record.get("label"))
         group["labels"][label] = group["labels"].get(label, 0) + 1
+        # Item T — derive the null when reading: a review row written before this
+        # item can carry a `localization_hit`, and it cannot mean anything, so it
+        # is ignored rather than counted. Rows on disk are never rewritten.
+        if record.get("mode") == REVIEW:
+            continue
         hit = record.get("localization_hit")
         group["localization"][
             "unknown" if hit is None else ("hit" if hit else "miss")
@@ -3037,9 +3062,15 @@ def render_digest(payload: dict[str, Any]) -> str:
         model = str(group.get("model") or "")[:18]
         labels = " ".join(f"{k}={v}" for k, v in sorted(group["labels"].items()))
         loc = group.get("localization") or {}
-        localization = " ".join(
-            f"{key}={loc.get(key, 0)}" for key in ("hit", "miss", "unknown")
-        )
+        # Item T — a review group's localization rate is not reported: the question
+        # has no meaning over a seeded candidate. `localization_applies` defaults
+        # to True so a payload written before this item still renders its tally.
+        if group.get("localization_applies", True):
+            localization = " ".join(
+                f"{key}={loc.get(key, 0)}" for key in ("hit", "miss", "unknown")
+            )
+        else:
+            localization = "n/a (review)"
         lines.append(
             f"{str(group['config']):<10} {str(group.get('arm') or ''):<7} "
             f"{str(group['mode']):<8} {str(group['seed']):>4} "

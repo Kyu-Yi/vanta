@@ -1274,9 +1274,12 @@ def cmd_replay(args: argparse.Namespace) -> int:
             )
             continue
         checkpoint = str(batch.entries[prep.key]["checkpoint"])
-        # A row whose every attempt failed to apply is recorded, not replayed: it
-        # has no candidate code to put in any column past the baseline, and raising
-        # here would take the rest of the batch down with it (item 10, replay fix 2).
+        # A row that cannot be replayed is recorded, not dropped: an infra-failed run
+        # and a run whose every attempt failed to apply both have no candidate code to
+        # put in a column past the baseline, and raising here would take the rest of
+        # the batch down with one row (item 10, replay fix 2). The reason tells the two
+        # apart, and the note beside it is read from `replay_mod.SKIP_NOTES` so this
+        # line cannot hardcode one meaning for both.
         reason = replay_mod.replay_skip_reason(record)
         if reason is not None:
             result = replay_mod.skipped_row(
@@ -1293,9 +1296,9 @@ def cmd_replay(args: argparse.Namespace) -> int:
             out_path.write_text(
                 json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
+            note = replay_mod.SKIP_NOTES.get(reason, "recorded, not replayed")
             print(
-                f"[{index}/{len(rows)}] {key} — skipped: {reason} "
-                f"(no attempt applied; recorded, not replayed) -> {out_path}",
+                f"[{index}/{len(rows)}] {key} — skipped: {reason} ({note}) -> {out_path}",
                 flush=True,
             )
             continue

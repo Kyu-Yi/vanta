@@ -26553,11 +26553,15 @@ class TestReplaySessionReuse:
 
 
 class TestReplaySkippedRow:
-    """A repair row whose every attempt failed to apply is recorded, not replayed.
+    """A repair row that cannot be replayed is recorded, not replayed.
 
-    matplotlib/1 night1: 4 Creator patches, all `patch_application_failed.json`, no
-    `final_patch`, `attempts_run=4`. Naming it here is what keeps a reader's
-    population explicit — the row is neither replayed nor quietly dropped.
+    Two histories land here and must not be conflated. matplotlib/1 night1: 4 Creator
+    patches, all `patch_application_failed.json`, no `final_patch`, `attempts_run=4`
+    — a measured Creator failure with no candidate code. pandas/1 night2: attempt 1
+    applied, then the run died at the native gate (exit 2), so `final_patch` is None
+    but the row's label is `infra_failure` — a censor. Naming each here is what keeps
+    a reader's population explicit — such a row is neither replayed nor quietly
+    dropped.
     """
 
     def _record(self, **over):
@@ -26581,6 +26585,30 @@ class TestReplaySkippedRow:
         assert replay_mod.is_repairable_row(record)
         assert replay_mod.replay_skip_reason(record) is None
         assert replay_mod.is_repair_row(record)
+
+    def test_an_infra_failure_row_is_skipped_for_the_machine_not_a_missing_patch(self):
+        # pandas/1 night2: attempt 1 applied and the run then died at the native gate
+        # (exit 2), so `final_patch` is None although a patch was applied.
+        record = self._record(
+            attempts_run=1, label=runner_mod.INFRA_LABEL, artifacts={"final_patch": None}
+        )
+        assert replay_mod.is_repairable_row(record)
+        assert replay_mod.replay_skip_reason(record) == replay_mod.SKIP_INFRA_FAILURE
+        assert replay_mod.replay_skip_reason(record) != replay_mod.SKIP_NO_APPLIED_ATTEMPT
+        assert not replay_mod.is_repair_row(record), "its cells are not evidence about the patch"
+
+    def test_the_infra_reason_is_checked_before_the_final_patch(self):
+        # A run lost to the machine is not replayed on the strength of a patch it may
+        # have written: its cells are censored, so the reason is `infra_failure` even
+        # when a `final_patch` is present.
+        record = self._record(label=runner_mod.INFRA_LABEL)
+        assert replay_mod.replay_skip_reason(record) == replay_mod.SKIP_INFRA_FAILURE
+
+    def test_every_skip_reason_has_a_note(self):
+        assert set(replay_mod.SKIP_NOTES) == {
+            replay_mod.SKIP_INFRA_FAILURE,
+            replay_mod.SKIP_NO_APPLIED_ATTEMPT,
+        }
 
     def test_the_record_is_skipped_with_only_the_baseline_column_runnable(self, tmp_path):
         prep = _replay_prep(tmp_path)
@@ -26959,6 +26987,35 @@ class TestReplayCli:
         )
         assert written["skipped"] is True
         assert written["skip_reason"] == replay_mod.SKIP_NO_APPLIED_ATTEMPT
+
+    def test_an_infra_failure_row_is_recorded_as_skipped_with_its_own_reason(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # The pandas/1 night2 row: attempt 1 applied, then the native gate killed the
+        # run (exit 2), so `final_patch` is None and the label is `infra_failure`.
+        record = _replay_record(
+            attempts_run=1, label=runner_mod.INFRA_LABEL, artifacts={"final_patch": None}
+        )
+        batch = tmp_path / "b"
+        manifest_mod.Manifest(batch).append(record)
+        prep = _replay_prep(tmp_path)
+        self._prepare_cli(monkeypatch, batch, [prep])
+
+        def explode(**kwargs):
+            raise AssertionError("an infra-failed row must not be replayed")
+
+        monkeypatch.setattr(replay_mod, "replay_row", explode)
+        code = run_mod.main(["replay", "--batch", str(batch)])
+        assert code == run_mod.EXIT_OK
+        out = capsys.readouterr().out
+        assert "infra_failure" in out
+        assert "no_applied_attempt" not in out, "the wrong history must not be named"
+        written = json.loads(
+            (batch / replay_mod.REPLAY_DIRNAME / f"{replay_mod.row_stem(record['key'])}.json")
+            .read_text()
+        )
+        assert written["skipped"] is True
+        assert written["skip_reason"] == replay_mod.SKIP_INFRA_FAILURE
 
     def test_a_skipped_row_does_not_stop_the_next_row(self, tmp_path, monkeypatch):
         skipped = _replay_record(

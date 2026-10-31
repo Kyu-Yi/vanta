@@ -33,9 +33,13 @@ The index convention (§4): column 0 is the *unmodified* baseline tree; column k
 produce K+1 columns, and the 0->1 transition is baseline-to-first-patch and nothing
 else.
 
-A repair row whose every attempt failed to apply has no column to build past the
-baseline. It is neither replayed nor dropped: :func:`skipped_row` records it as
-skipped with the reason, so the population a rate is taken over stays explicit.
+A repair row that cannot be replayed has no column to build past the baseline —
+either because its every attempt failed to apply (no candidate code) or because the
+run itself was lost to the machine (an infrastructure failure, whose cells are not
+evidence about the patch). Such a row is neither replayed nor dropped:
+:func:`skipped_row` records it as skipped with the reason, so the population a rate
+is taken over stays explicit, and :func:`replay_skip_reason` keeps those two reasons
+apart.
 """
 
 from __future__ import annotations
@@ -578,6 +582,29 @@ def _tri_state(text: Optional[str]) -> Optional[bool]:
 SKIP_NO_APPLIED_ATTEMPT = "no_applied_attempt"
 """Replay's skip reason for a repair row whose every attempt failed to apply."""
 
+SKIP_INFRA_FAILURE = runner_mod.INFRA_LABEL
+"""Replay's skip reason for a repair row the run classed an infrastructure failure.
+
+[VANTA-WHY] The same spelling as the row's own label (:data:`runner.INFRA_LABEL`)
+because it names the same condition, and a reader that finds ``infra_failure`` in a
+skip reason and in a label must not have to learn that they are two words for one
+thing. Kept apart from :data:`SKIP_NO_APPLIED_ATTEMPT` because the two name opposite
+histories: ``no_applied_attempt`` is a measured Creator failure (every patch failed
+to apply — no candidate code exists to replay), while ``infra_failure`` is a censor
+(an attempt DID apply and the run was then lost to the machine). The pandas/1 night2
+row is the case in hand: ``attempts_run=1`` with a stored patch, but ``final_patch``
+is ``None`` because the run died at the native gate with exit 2 — reading that as
+"nothing applied" would record a machine failure as a Creator failure and shrink the
+population a rate is taken over. The row is skipped either way; only the reason
+changes.
+"""
+
+SKIP_NOTES = {
+    SKIP_INFRA_FAILURE: "the run failed on infrastructure; recorded, not replayed",
+    SKIP_NO_APPLIED_ATTEMPT: "no attempt applied; recorded, not replayed",
+}
+"""One line of prose per skip reason, so the caller's log cannot hardcode one."""
+
 
 def is_repairable_row(record: Mapping[str, Any]) -> bool:
     """A row the repair loop ran — a repair with a session, applied or not."""
@@ -589,14 +616,27 @@ def is_repairable_row(record: Mapping[str, Any]) -> bool:
 def replay_skip_reason(record: Mapping[str, Any]) -> Optional[str]:
     """Why this repair row cannot be replayed, or ``None`` when it can.
 
-    [VANTA-WHY] When no attempt applied there is nothing to replay: no graded tree
-    and no ``final_patch``, hence no candidate code for columns 1..K (matplotlib/1
-    night1 — 4 Creator patches, all ``patch_application_failed.json``,
-    ``attempts_run=4``, verdict ``MaxAttemptsReached``). Such a row is recorded as
-    skipped rather than dropped — dropping it would silently shrink the population
-    the rates are taken over — or raised on, which would take the whole batch down
-    with one row.
+    Three outcomes, checked in this order — the first two are different histories
+    and must not be conflated:
+
+    * ``infra_failure`` — the run was classed an infrastructure failure
+      (:data:`runner.INFRA_LABEL`). An attempt may well have applied, but the run
+      was lost to the machine, so its cells are not evidence about the patch. Checked
+      FIRST: the pandas/1 night2 row carries ``attempts_run=1`` yet no
+      ``final_patch`` (the run died at the native gate), so the ``final_patch`` test
+      below would misread it as "nothing applied".
+    * ``no_applied_attempt`` — nothing applied at all: no graded tree and no
+      ``final_patch``, hence no candidate code for columns 1..K (matplotlib/1 night1
+      — 4 Creator patches, all ``patch_application_failed.json``, ``attempts_run=4``,
+      verdict ``MaxAttemptsReached``).
+    * ``None`` — a ``final_patch`` is present, so columns 1..K can be built.
+
+    A skipped row is recorded rather than dropped — dropping it would silently shrink
+    the population the rates are taken over — or raised on, which would take the whole
+    batch down with one row.
     """
+    if record.get("label") == SKIP_INFRA_FAILURE:
+        return SKIP_INFRA_FAILURE
     if (record.get("artifacts") or {}).get("final_patch"):
         return None
     return SKIP_NO_APPLIED_ATTEMPT

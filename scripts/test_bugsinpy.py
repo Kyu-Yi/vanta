@@ -28464,6 +28464,31 @@ class TestAnalyseEirEcr:
         assert "n/a" in tex, "a rate with no denominator is not computed, not zero"
         assert "0.000" in tex, "a measured zero still prints as a number"
 
+    def test_eir_ecr_and_acc_come_from_the_synthetic_matrix_with_known_values(self, tmp_path):
+        """Item 12 property — the three rates are hand-countable from `_replay_matrix()`.
+
+        `test_the_pooled_and_per_source_columns_are_both_written` checks the SHAPE of
+        `eir_ecr.tex`; this pins the NUMBERS, derived by hand from the fixture rather
+        than from `replay_mod.transitions`, so a change in the counting rule (which
+        cell pairs count, what `acc` divides by) cannot pass by agreeing with itself.
+
+        Hand count over `_replay_matrix()` (generated view = every cell in S):
+          0->1  n_pp=2 (t_a pass->pass, g_e pass->pass)
+                n_pf=1 (g_c pass->fail)   n_fp=1 (t_b fail->pass)
+                n_ff=1 (g_f fail->fail)   n_censored=1 (g_d error->pass)
+          1->2  n_pp=2 (t_b, g_d)          n_pf=1 (t_a pass->fail)
+                n_fp=2 (g_c, g_f)          n_ff=0
+                n_censored=1 (g_e has no k=2 column)
+        `eir = n_pf/(n_pp+n_pf)`, `ecr = n_fp/(n_fp+n_ff)`, `acc = (n_pp+n_fp)/observed`
+        — `acc` is the share of OBSERVED transitions whose newer cell passed, which is
+        why 1->2 reads 0.800 (4 of 5) and not 0.400.
+        """
+        batch = _analyse_batch(tmp_path, replays=[_analyse_replay(cells=_replay_matrix())])
+        result = analyse_mod.EirEcrMetrics().run(_analyse_load(batch))
+        summary = "\n".join(result.summary)
+        assert "generated  0->1     EIR=0.333 (n=3) ECR=0.500 (n=2) Acc=0.600 censored=1" in summary
+        assert "generated  1->2     EIR=0.333 (n=3) ECR=1.000 (n=2) Acc=0.800 censored=1" in summary
+
 
 class TestAnalysePipeline:
     def test_pipeline_reads_tests_from_the_replay_and_truncations_from_the_session(self, tmp_path):
@@ -28731,6 +28756,70 @@ class TestAnalyseCli:
         assert code == 0
         assert (out / "summary.txt").is_file()
         assert (out / "eir_ecr.tex").is_file()
+
+
+class TestAnalyseRecordedLuna:
+    """Item 12 — the analyser reproduces the recorded Luna numbers from EXISTING rows.
+
+    One of the seven properties the item-12 analysis must have. Every other test in
+    this file feeds the analyser a hand-built row; this one feeds it the operator's
+    own recorded rows (`runs/bugsinpy/luna-*`, git-ignored output of the real night
+    runs) and re-derives the totals straight from the manifest's `llm`/`timings`
+    fields — never through `analyse`'s `cost_facts` — so the numbers the paper would
+    print are checked against the numbers the rows actually carry. Nothing here
+    calls a model or boots a VM; it only reads files that already exist.
+
+    The batch is git-ignored, so on a machine without it the test skips with a named
+    reason (the same pattern the real-repo tests in this file use). It is NOT a
+    vacuous pass: it is the only cover the "reproduces the record" property has, and
+    the arithmetic it checks is a genuine independent recomputation.
+    """
+
+    @staticmethod
+    def _batch() -> "Path | None":
+        batches = sorted((REPO_ROOT / "runs" / "bugsinpy").glob("luna-*"))
+        return batches[0] if batches else None
+
+    @staticmethod
+    def _recorded_totals(records: "list[dict]") -> dict:
+        llm = lambda record: record.get("llm") or {}
+        timings = lambda record: record.get("timings") or {}
+        return {
+            "cost": sum(float(llm(r).get("cost_usd") or 0.0) for r in records),
+            "prompt_tokens": sum(int(llm(r).get("prompt_tokens") or 0) for r in records),
+            "completion_tokens": sum(
+                int(llm(r).get("completion_tokens_total") or 0) for r in records
+            ),
+            "sandbox_s": sum(float(timings(r).get("oracle_s") or 0.0) for r in records),
+            "bases": {
+                llm(r).get("cost_basis") for r in records if llm(r).get("cost_usd") is not None
+            },
+        }
+
+    def test_it_reproduces_the_recorded_luna_numbers_from_existing_rows(self):
+        batch = self._batch()
+        if batch is None:
+            pytest.skip(
+                "no recorded Luna batch under runs/bugsinpy/luna-*; the reproduction "
+                "test needs the operator's own recorded rows"
+            )
+        records = analyse_mod.load_manifest(batch / "manifest.jsonl")
+        analysis = analyse_mod.load_analysis([str(batch)], seed=1, resamples=20)
+        assert len(analysis.rows) == len(records), (
+            "the analyser must read every row the manifest carries, or the totals "
+            "below would be a reproduction of a subset"
+        )
+
+        recorded = self._recorded_totals(records)
+        facts = analyse_mod.cost_facts(analysis)
+
+        assert facts.prompt_tokens == recorded["prompt_tokens"]
+        assert facts.completion_tokens == recorded["completion_tokens"]
+        assert facts.sandbox_s == pytest.approx(recorded["sandbox_s"])
+        assert sum(facts.by_arm_cost.values()) == pytest.approx(recorded["cost"])
+        # Every priced row names the basis it was billed under, and the batch is one
+        # basis: a total built from two price dates must be visible, not pooled.
+        assert recorded["bases"] == {"gpt-6-luna/standard/2026-10-26"}
 
 
 # ============================================================================

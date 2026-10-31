@@ -5830,12 +5830,31 @@ fn the_recorded_prompt_hash_is_the_hash_of_the_prompts_the_run_sends() {
         String::from_utf8_lossy(&output.stdout)
     );
 
+    // M3 item 19 (fix 4) — every role's hash is now taken over its SYSTEM and its
+    // USER templates, system-first, so a change to either half moves the record.
+    // The Diagnostician is rule-based and sends no prompt, so its slot names the
+    // reason instead of hashing an empty set (which would be `e3b0c44298fc`, the
+    // SHA-256 of "", indistinguishable from a real prompt that was truncated).
+    let system_then_user = |system: &[&'static str], user: Vec<&'static str>| {
+        let mut all: Vec<&'static str> = system.to_vec();
+        all.extend(user);
+        vanta::core::prompt_content_hash(&all)
+    };
     let expected = format!(
         "attacker={};intent_check={};creator={};diagnostician={}",
-        vanta::core::prompt_content_hash(&vanta::agents::attacker::attacker_system_prompts()),
-        vanta::core::prompt_content_hash(&vanta::agents::attacker::intent_auditor_system_prompts()),
-        vanta::core::prompt_content_hash(&[vanta::agents::creator::creator_system_prompt()]),
-        vanta::core::prompt_content_hash(&[]),
+        system_then_user(
+            &vanta::agents::attacker::attacker_system_prompts(),
+            vanta::agents::attacker::attacker_user_prompts().to_vec(),
+        ),
+        system_then_user(
+            &vanta::agents::attacker::intent_auditor_system_prompts(),
+            vanta::agents::attacker::intent_auditor_user_prompts().to_vec(),
+        ),
+        system_then_user(
+            &[vanta::agents::creator::creator_system_prompt()],
+            vanta::agents::creator::creator_user_prompts().to_vec(),
+        ),
+        "not_applicable",
     );
 
     let records = read_session_records(&find_session_log(workspace.path()));

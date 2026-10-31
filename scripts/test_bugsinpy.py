@@ -28815,6 +28815,42 @@ class TestFrozenConfig:
             "VANTA_SHURU_DISK_MB": "16384",
         }
 
+    def test_editing_a_prompt_template_moves_the_config_hash(self, tmp_path):
+        """Item 19 (fix 4) — a prompt edit must move `config_hash`, end to end.
+
+        Two halves make the chain, and this test pins the half Python owns. The
+        Rust guard `pipeline::tests::the_committed_prompts_block_is_the_hash_of_the_templates_this_code_sends`
+        forces `[prompts]` to be recomputed whenever a prompt template in the
+        source changes; this test proves that a change to `[prompts]` — any
+        template's hash — moves `config_hash`, because the hash is taken over the
+        file's own bytes and the `[prompts]` values sit inside them. Without the
+        first half a template edit leaves `[prompts]` stale; without this half a
+        stale `[prompts]` would not have moved `config_hash`, which is exactly the
+        gap item 16 fell into (it reordered a USER prompt and no hash moved).
+        """
+        raw = frozen_mod.CONFIG_PATH.read_text()
+        committed = frozen_mod.load().prompts()
+        # Every recorded template hash is literally in the file's bytes, so a
+        # template edit that updates the block cannot fail to change `sha256`.
+        for role in ("attacker", "intent_check", "creator"):
+            assert f'{role} = "{committed[role]}"' in raw
+
+        edited_path = write(
+            tmp_path / "v1-m3-edited.toml",
+            raw.replace(
+                f'attacker = "{committed["attacker"]}"',
+                'attacker = "000000000000"',
+                1,
+            ),
+        )
+        edited = frozen_mod.load(edited_path)
+        assert edited.prompts()["attacker"] == "000000000000"
+        assert edited.sha256 != frozen_mod.load().sha256
+        # Only the template hash changed; the rest of the record is untouched, so
+        # the hash moved because of the template and nothing else.
+        assert edited.prompts()["intent_check"] == committed["intent_check"]
+        assert edited.frozen() == frozen_mod.load().frozen()
+
     def test_the_committed_prereg_names_the_source_of_both_budgets(self):
         """The two `[prereg]` literals are cited, not chosen — and the citation is in the file.
 

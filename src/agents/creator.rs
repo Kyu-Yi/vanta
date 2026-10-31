@@ -109,6 +109,46 @@ pub fn creator_system_prompt() -> &'static str {
     CREATOR_SYSTEM_PROMPT
 }
 
+/// The three blocks the Creator's USER prompt is built from, as macros, so the
+/// `format!` call and the prompt-content hash (`creator_user_prompts`) read one
+/// text.
+///
+/// [VANTA-WHY] M3 item 19 (fix 4) — the record used to hash the system prompt
+/// only, which left every user-prompt change invisible to the frozen config. The
+/// user prompt is three literals joined with a blank line, not one `format!`, so
+/// all three are templates and all three are covered.
+macro_rules! creator_issue_block {
+    () => {
+        "ISSUE:\n{}\n"
+    };
+}
+
+macro_rules! creator_file_block {
+    () => {
+        "FILE: {}\n```\n{}\n```\n"
+    };
+}
+
+macro_rules! creator_feedback_block {
+    () => {
+        "PRIOR FEEDBACK (from previous attempt, address this):\n{}\n"
+    };
+}
+
+/// The Creator's USER prompt templates, in the order [`creator_user_prompt`]
+/// emits them: the issue block, the per-file block, the optional feedback block.
+///
+/// [VANTA-WHY] M3 item 19 (fix 4) — the ingredient of the `creator=` prompt-content
+/// hash beside `CREATOR_SYSTEM_PROMPT`. Each entry is the macro the builder
+/// expands, so a wording change to any block moves the hash.
+pub fn creator_user_prompts() -> [&'static str; 3] {
+    [
+        creator_issue_block!(),
+        creator_file_block!(),
+        creator_feedback_block!(),
+    ]
+}
+
 /// The Creator's USER prompt for a request: the issue, the selected files and
 /// the optional feedback, in the exact form `creator_generate_patch` sends.
 ///
@@ -120,12 +160,12 @@ pub fn creator_system_prompt() -> &'static str {
 /// read that place.
 pub fn creator_user_prompt(request: &CreatorRequest) -> String {
     let mut user_parts: Vec<String> = Vec::new();
-    user_parts.push(format!("ISSUE:\n{}\n", request.issue_text));
+    user_parts.push(format!(creator_issue_block!(), request.issue_text));
     for sf in &request.source_files {
-        user_parts.push(format!("FILE: {}\n```\n{}\n```\n", sf.path, sf.contents));
+        user_parts.push(format!(creator_file_block!(), sf.path, sf.contents));
     }
     if let Some(fb) = &request.prior_feedback {
-        user_parts.push(format!("PRIOR FEEDBACK (from previous attempt, address this):\n{}\n", fb));
+        user_parts.push(format!(creator_feedback_block!(), fb));
     }
     user_parts.join("\n")
 }

@@ -194,17 +194,24 @@ fixed_rounds = 4
 seed = "not guaranteed by this file; the split supplies it and the row records it"
 
 # ---------------------------------------------------------------------------
-# [prompts] — the SHA-256 of every prompt template, as `pipeline::prompt_hashes()`
-# records it (`src/pipeline/mod.rs:122`). The values are the 12-hex
-# `prompt_content_hash` of each role's system prompt set, as recorded by M3 item 16
-# at binary commit 3e21ee0. Item 16 reordered a *user* prompt, which this hash does
-# not cover, so these four are unchanged from before it — the full-hash gap is
-# flagged in the item 19 report.
+# [prompts] — the SHA-256 of every prompt TEMPLATE, as `pipeline::prompt_hashes()`
+# records it. Each value is the 12-hex `prompt_content_hash` of that role's system
+# and user templates, joined by U+001F in a fixed order: the role's system
+# templates first, then its user templates.
+#
+# [VANTA-WHY] Item 16 reordered a USER prompt and this block did not move, because
+# it hashed the system prompts only — so `config_hash` described a configuration
+# whose prompt text was no longer the text the binary sent. The user templates are
+# covered here now. The tie to the code is a test, not a convention:
+# `pipeline::tests::the_committed_prompts_block_is_the_hash_of_the_templates_this_code_sends`
+# (in `src/pipeline/mod.rs`) recomputes each value from the templates the call sites
+# expand, so a template edit fails the suite until this block is updated, and
+# updating it changes the file's bytes — and therefore every row's `config_hash`.
 # ---------------------------------------------------------------------------
 [prompts]
-attacker = "04fa32b2b204"
-intent_check = "bbed28c47b1c"
-creator = "53883e3b1c81"
+attacker = "e9a69cc76c42"
+intent_check = "600220339e14"
+creator = "70003e722ca6"
 # The Diagnostician is rule-based and sends no prompt of its own (its Unknown path
 # sends the Attacker's simplify prompt, already covered above), so there is no
 # prompt text to hash. The slot is `not_applicable` rather than the hash of the

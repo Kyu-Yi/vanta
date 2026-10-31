@@ -96,7 +96,7 @@ pub fn prompt_versions() -> String {
     )
 }
 
-/// A short CONTENT hash of each role's system prompt text, in the same
+/// A short CONTENT hash of each role's prompt-template text, in the same
 /// `role=hash` shape as [`prompt_versions`].
 ///
 /// [VANTA-WHY] §14.10 f — the version labels above are bumped by hand, and the
@@ -109,11 +109,23 @@ pub fn prompt_versions() -> String {
 /// complementary — the label says which revision a human MEANT to ship, the hash
 /// says which text actually went out.
 ///
-/// Every system prompt a role can send is covered, not just the one a given run
-/// happens to select: the Attacker's three (generate / revise / simplify), the
-/// auditor's four (the flag combinations of the grounded and batched variants),
-/// and the Creator's one. A variant's wording change shows in the hash of any run,
-/// which is what makes the record comparable across runs under different flags.
+/// Every SYSTEM and USER template a role can send is covered, not just the one a
+/// given run happens to select: the Attacker's three system prompts (generate /
+/// revise / simplify) and its three user bodies, the auditor's four system
+/// variants (the flag combinations of grounded and batched) and its seven user
+/// bodies and flag-selected closing questions, and the Creator's one system
+/// prompt and three user blocks. A variant's wording change shows in the hash of
+/// any run, which is what makes the record comparable across runs under different
+/// flags.
+///
+/// [VANTA-WHY] M3 item 19 (fix 4) — the record used to hash the SYSTEM prompts
+/// only. Item 16 reordered the Attacker's generate USER prompt and NO recorded
+/// hash moved, so the frozen configuration could not detect a prompt change:
+/// `config_hash` described a configuration whose prompt text was no longer the
+/// text the binary sent. The user templates are covered now, so an edit to any
+/// template moves its role's hash, and
+/// `the_committed_prompts_block_is_the_hash_of_the_templates_this_code_sends`
+/// makes the committed `[prompts]` block — and therefore `config_hash` — follow.
 ///
 /// The Diagnostician is rule-based and sends no prompt of its own (its Unknown
 /// path sends the Attacker's simplify prompt, already covered above), so its slot
@@ -123,18 +135,33 @@ pub fn prompt_versions() -> String {
 /// opposite of what the record is for. Naming the reason keeps the key's fixed
 /// shape in every log AND keeps the value from reading as a real prompt.
 pub fn prompt_hashes() -> String {
-    let attacker = crate::core::prompt_content_hash(
+    let attacker = crate::core::prompt_content_hash(&role_templates(
         &crate::agents::attacker::attacker_system_prompts(),
-    );
-    let intent_check = crate::core::prompt_content_hash(
+        &crate::agents::attacker::attacker_user_prompts(),
+    ));
+    let intent_check = crate::core::prompt_content_hash(&role_templates(
         &crate::agents::attacker::intent_auditor_system_prompts(),
-    );
-    let creator = crate::core::prompt_content_hash(&[crate::agents::creator::CREATOR_SYSTEM_PROMPT]);
+        &crate::agents::attacker::intent_auditor_user_prompts(),
+    ));
+    let creator = crate::core::prompt_content_hash(&role_templates(
+        &[crate::agents::creator::creator_system_prompt()],
+        &crate::agents::creator::creator_user_prompts(),
+    ));
     let diagnostician = "not_applicable";
 
     format!(
         "attacker={attacker};intent_check={intent_check};creator={creator};diagnostician={diagnostician}"
     )
+}
+
+/// `system then user` — the template list one role's hash is taken over.
+///
+/// [VANTA-WHY] M3 item 19 (fix 4) — the order is fixed and meaningful: a role's
+/// system templates first, then its user templates. `prompt_content_hash` joins
+/// the parts with U+001F, so a change to any template moves the role's hash and
+/// text moved across the system/user boundary cannot be invisible.
+fn role_templates(system: &[&'static str], user: &[&'static str]) -> Vec<&'static str> {
+    system.iter().copied().chain(user.iter().copied()).collect()
 }
 
 #[cfg(test)]
@@ -170,11 +197,18 @@ mod tests {
         );
 
         let expected = [
-            crate::core::prompt_content_hash(&crate::agents::attacker::attacker_system_prompts()),
-            crate::core::prompt_content_hash(
+            crate::core::prompt_content_hash(&role_templates(
+                &crate::agents::attacker::attacker_system_prompts(),
+                &crate::agents::attacker::attacker_user_prompts(),
+            )),
+            crate::core::prompt_content_hash(&role_templates(
                 &crate::agents::attacker::intent_auditor_system_prompts(),
-            ),
-            crate::core::prompt_content_hash(&[crate::agents::creator::creator_system_prompt()]),
+                &crate::agents::attacker::intent_auditor_user_prompts(),
+            )),
+            crate::core::prompt_content_hash(&role_templates(
+                &[crate::agents::creator::creator_system_prompt()],
+                &crate::agents::creator::creator_user_prompts(),
+            )),
             // The Diagnostician is rule-based and sends no prompt of its own, so
             // its slot names the reason instead of hashing an empty set — which
             // would be `e3b0c44298fc`, the SHA-256 of "", indistinguishable from a
@@ -202,6 +236,125 @@ mod tests {
                 "`{role}`'s hash must be 12 lowercase hex characters; got {hash:?}"
             );
         }
+    }
+
+    /// [VANTA-WHY] M3 item 19 (fix 4) — the user templates count too. Item 16
+    /// reordered a USER prompt and no recorded hash moved, so a hash over the
+    /// system prompts alone could not see a prompt change. This pins the fix's two
+    /// halves per role: a role's user templates are INSIDE its hash (hashing the
+    /// system half alone gives a different value), and editing ANY one template —
+    /// system or user — moves that role's hash.
+    #[test]
+    fn every_prompt_template_is_inside_its_roles_hash() {
+        let roles: [(&str, Vec<&'static str>, Vec<&'static str>); 3] = [
+            (
+                "attacker",
+                crate::agents::attacker::attacker_system_prompts().to_vec(),
+                crate::agents::attacker::attacker_user_prompts().to_vec(),
+            ),
+            (
+                "intent_check",
+                crate::agents::attacker::intent_auditor_system_prompts().to_vec(),
+                crate::agents::attacker::intent_auditor_user_prompts().to_vec(),
+            ),
+            (
+                "creator",
+                vec![crate::agents::creator::creator_system_prompt()],
+                crate::agents::creator::creator_user_prompts().to_vec(),
+            ),
+        ];
+
+        for (role, system, user) in roles {
+            assert!(!system.is_empty(), "{role} must expose its system templates");
+            assert!(!user.is_empty(), "{role} must expose its user templates");
+            let all = role_templates(&system, &user);
+            for (i, template) in all.iter().enumerate() {
+                assert!(
+                    !template.is_empty(),
+                    "{role}'s template {i} is empty; an empty template hashes to the \
+                     e3b0c44298fc value this record exists to keep out"
+                );
+            }
+            assert_ne!(
+                crate::core::prompt_content_hash(&system),
+                crate::core::prompt_content_hash(&all),
+                "{role}'s recorded hash must cover its user templates, not only its system ones"
+            );
+            for i in 0..all.len() {
+                let edited: Vec<String> = all
+                    .iter()
+                    .enumerate()
+                    .map(|(j, t)| if j == i { format!("{t} ") } else { t.to_string() })
+                    .collect();
+                let edited_refs: Vec<&str> = edited.iter().map(String::as_str).collect();
+                assert_ne!(
+                    crate::core::prompt_content_hash(&all),
+                    crate::core::prompt_content_hash(&edited_refs),
+                    "{role}'s template {i} is not inside the hash: editing it changed nothing"
+                );
+            }
+        }
+    }
+
+    /// [VANTA-WHY] M3 item 19 (fix 4) — the chain that makes a prompt edit move
+    /// `config_hash`. `config_hash` is the SHA-256 of `configs/v1-m3.toml`, and
+    /// the `[prompts]` block records this code's own hashes. Edit a template and
+    /// this test fails; the only fix is to update `[prompts]`, which changes the
+    /// file's bytes and therefore every row's `config_hash`. Without this link the
+    /// block could silently describe text the binary no longer sends — exactly the
+    /// gap item 16 fell into.
+    #[test]
+    fn the_committed_prompts_block_is_the_hash_of_the_templates_this_code_sends() {
+        let raw = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/configs/v1-m3.toml"));
+        let doc: toml::Value = toml::from_str(raw).expect("configs/v1-m3.toml must parse as TOML");
+        let recorded = doc
+            .get("prompts")
+            .and_then(|value| value.as_table())
+            .expect("configs/v1-m3.toml must carry a [prompts] table");
+
+        let expected: [(&str, String); 4] = [
+            (
+                "attacker",
+                crate::core::prompt_content_hash(&role_templates(
+                    &crate::agents::attacker::attacker_system_prompts(),
+                    &crate::agents::attacker::attacker_user_prompts(),
+                )),
+            ),
+            (
+                "intent_check",
+                crate::core::prompt_content_hash(&role_templates(
+                    &crate::agents::attacker::intent_auditor_system_prompts(),
+                    &crate::agents::attacker::intent_auditor_user_prompts(),
+                )),
+            ),
+            (
+                "creator",
+                crate::core::prompt_content_hash(&role_templates(
+                    &[crate::agents::creator::creator_system_prompt()],
+                    &crate::agents::creator::creator_user_prompts(),
+                )),
+            ),
+            ("diagnostician", "not_applicable".to_string()),
+        ];
+
+        assert_eq!(
+            recorded.len(),
+            expected.len(),
+            "[prompts] must name exactly the roles the code records"
+        );
+        let mismatches: Vec<String> = expected
+            .iter()
+            .filter_map(|(role, want)| {
+                let got = recorded.get(*role).and_then(|value| value.as_str());
+                (got != Some(want.as_str())).then(|| format!("{role}: file={got:?} code={want}"))
+            })
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "configs/v1-m3.toml [prompts] must be the hashes this code sends, or `config_hash` \
+             describes other text; update the file (which moves config_hash) or revert the \
+             template edit. Mismatches: {mismatches:#?}"
+        );
     }
 
     /// [VANTA-WHY] §14.14 — the budget's whole contract in one place: it hands

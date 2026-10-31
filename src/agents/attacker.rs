@@ -449,6 +449,89 @@ pub fn attacker_concise_suffix() -> &'static str {
 }
 
 // ============================================================================
+// The USER prompt templates, as macros — one source for the text and its hash
+// ============================================================================
+//
+// [VANTA-WHY] M3 item 19 (fix 4) — the prompt-content record hashed the SYSTEM
+// prompts only, so item 16's reorder of a USER prompt moved no recorded hash and
+// the freeze could not see a prompt change. These templates are what the user
+// messages are built from. `format!` accepts a macro that expands to a string
+// literal, so the SAME macro is both the call site's format string and the text
+// the hash is taken over; a duplicated literal could satisfy the hash and still
+// let the two drift, which is the failure the accessors exist to prevent.
+//
+// The `\` line continuations are load-bearing: they collapse each template to a
+// single line, so the text is byte-identical to the literal that preceded this
+// change (the Attacker's generate ORDER moved in item 16; the text did not).
+macro_rules! attacker_generate_user_prompt {
+    () => {
+        "ISSUE:\n{}\n\nORIGINAL SOURCE:\n```\n{}\n```{}{}\n\nPATCH:\n```diff\n{}\n```\n\nWrite AttackerResponse JSON.{}"
+    };
+}
+
+macro_rules! attacker_revise_user_prompt {
+    () => {
+        "ISSUE:\n{issue_text}\n\n\
+         ORIGINAL SOURCE:\n```\n{original_source}\n```\n\n\
+         PRIOR TEST (failed BATE):\n- name: {name}\n- intent: {intent:?}\n- source:\n```python\n{source}\n```\n\n\
+         BATE MISMATCH REASON:\n{reason}\n\n\
+         WHAT THE BASELINE ACTUALLY DID (the real run on the ORIGINAL code — read this, \
+         do not guess at it):\n{evidence}\n\n\
+         Revise the test so its baseline result on the original source matches its declared intent. Expected values come from the issue and original code, never from the patch alone. Output JSON."
+    };
+}
+
+macro_rules! attacker_simplify_user_prompt {
+    () => {
+        "ORIGINAL SOURCE:\n```\n{original_source}\n```\n\n\
+         PRIOR TEST (Unknown result):\n- name: {name}\n- intent: {intent:?}\n- source:\n```python\n{source}\n```\n\n\
+         Simplify this test so it produces a deterministic PASS or FAIL. Output JSON."
+    };
+}
+
+macro_rules! intent_auditor_user_prompt {
+    () => {
+        "ISSUE:\n{}\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nTEST UNDER AUDIT ({}):\n```\n{}\n```\n\nDeclared intent: {:?}\n\n{}"
+    };
+}
+
+macro_rules! intent_auditor_batch_test_body {
+    () => {
+        "TEST {} — {}\nDeclared intent: {:?}\n```\n{}\n```\n\n"
+    };
+}
+
+macro_rules! intent_auditor_batch_user_prompt {
+    () => {
+        "ISSUE:\n{}\n\nORIGINAL SOURCE:\n```\n{}\n```\n\n{} {} TESTS TO AUDIT:\n\n{}\n{}"
+    };
+}
+
+macro_rules! intent_auditor_batch_closing_plain {
+    () => {
+        "Does the issue ask for the behaviour each of the {} tests asserts at the input it \
+         asserts, and does it require the behaviour at that input to change? Answer with one \
+         JSON entry per test."
+    };
+}
+
+macro_rules! intent_auditor_batch_closing_grounded {
+    () => {
+        "Does the issue ask for the behaviour each of the {} tests asserts at the input it \
+         asserts, does it require the behaviour at that input to change, and does each test \
+         assert only behaviour the issue describes? Answer with one JSON entry per test."
+    };
+}
+
+/// The single-test auditor's closing question, selected by `VANTA_GROUNDED_AUDIT`.
+///
+/// [VANTA-WHY] Hoisted out of the call site's `if grounded` so the same text is
+/// both sent and hashed (`intent_auditor_user_prompts`), for the reason the
+/// system-prompt variants are separately covered: the wording depends on a flag.
+const INTENT_AUDITOR_CLOSING_PLAIN: &str = "Does the issue ask for this behaviour at the input this test asserts, and does it require the behaviour at that input to change? Answer with JSON.";
+const INTENT_AUDITOR_CLOSING_GROUNDED: &str = "Does the issue ask for this behaviour at the input this test asserts, does it require the behaviour at that input to change, and does the test assert only behaviour the issue describes? Answer with JSON.";
+
+// ============================================================================
 // attacker_generate_tests() — call LLM, get typed AttackerResponse
 // ============================================================================
 pub async fn attacker_generate_tests(
@@ -487,7 +570,7 @@ pub async fn attacker_generate_tests(
     // byte 0 and left the cache nothing to reuse. The strings the sections
     // carry are unchanged; only their order is.
     let user_prompt = format!(
-        "ISSUE:\n{}\n\nORIGINAL SOURCE:\n```\n{}\n```{}{}\n\nPATCH:\n```diff\n{}\n```\n\nWrite AttackerResponse JSON.{}",
+        attacker_generate_user_prompt!(),
         request.issue_text,
         request.original_source,
         already_probed,
@@ -662,6 +745,44 @@ pub fn intent_auditor_system_prompts() -> [&'static str; 4] {
     ]
 }
 
+/// Every USER prompt template the Attacker's call sites can send, in the same
+/// fixed order as [`attacker_system_prompts`]: generate, revise, simplify.
+///
+/// [VANTA-WHY] M3 item 19 (fix 4) — the prompt-content record used to hash the
+/// system prompts only, so item 16's reorder of the generate USER prompt moved no
+/// recorded hash and the freeze could not detect a prompt change. Each entry is
+/// the macro the `format!` call expands, so "the template the hash covers" and
+/// "the template the model is sent" are one text.
+pub fn attacker_user_prompts() -> [&'static str; 3] {
+    [
+        attacker_generate_user_prompt!(),
+        attacker_revise_user_prompt!(),
+        attacker_simplify_user_prompt!(),
+    ]
+}
+
+/// Every USER prompt template the intent auditor's call sites can send, in a
+/// fixed order: the single-test body, its plain then grounded closing question,
+/// the batched body, the batched per-test body, and the batched plain then
+/// grounded closing question.
+///
+/// [VANTA-WHY] M3 item 19 (fix 4) — the flag-selected closing questions are
+/// covered for the same reason the system side covers all four variants: the
+/// wording that is sent depends on `VANTA_GROUNDED_AUDIT` and `VANTA_BATCH_AUDIT`,
+/// and a wording change to one variant must show in the hash of a run under that
+/// flag. Order is part of the hash's meaning and must not be reshuffled.
+pub fn intent_auditor_user_prompts() -> [&'static str; 7] {
+    [
+        intent_auditor_user_prompt!(),
+        INTENT_AUDITOR_CLOSING_PLAIN,
+        INTENT_AUDITOR_CLOSING_GROUNDED,
+        intent_auditor_batch_user_prompt!(),
+        intent_auditor_batch_test_body!(),
+        intent_auditor_batch_closing_plain!(),
+        intent_auditor_batch_closing_grounded!(),
+    ]
+}
+
 // ============================================================================
 // attacker_revise_test() — BATE feedback loop: revise a mismatched test
 // ============================================================================
@@ -690,13 +811,7 @@ pub async fn attacker_revise_test(
     let system_prompt = ATTACKER_REVISE_SYSTEM_PROMPT;
 
     let user_prompt = format!(
-        "ISSUE:\n{issue_text}\n\n\
-         ORIGINAL SOURCE:\n```\n{original_source}\n```\n\n\
-         PRIOR TEST (failed BATE):\n- name: {name}\n- intent: {intent:?}\n- source:\n```python\n{source}\n```\n\n\
-         BATE MISMATCH REASON:\n{reason}\n\n\
-         WHAT THE BASELINE ACTUALLY DID (the real run on the ORIGINAL code — read this, \
-         do not guess at it):\n{evidence}\n\n\
-         Revise the test so its baseline result on the original source matches its declared intent. Expected values come from the issue and original code, never from the patch alone. Output JSON.",
+        attacker_revise_user_prompt!(),
         issue_text = issue_text,
         original_source = original_source,
         name = prior_test.test_name,
@@ -768,9 +883,7 @@ pub async fn attacker_simplify_test(
     let system_prompt = attacker_simplify_system_prompt();
 
     let user_prompt = format!(
-        "ORIGINAL SOURCE:\n```\n{original_source}\n```\n\n\
-         PRIOR TEST (Unknown result):\n- name: {name}\n- intent: {intent:?}\n- source:\n```python\n{source}\n```\n\n\
-         Simplify this test so it produces a deterministic PASS or FAIL. Output JSON.",
+        attacker_simplify_user_prompt!(),
         original_source = original_source,
         name = prior_test.test_name,
         intent = prior_test.intent,
@@ -1201,13 +1314,13 @@ pub async fn attacker_check_intent(
     let client = build_reqwest_client(cfg)?;
 
     let closing_question = if grounded {
-        "Does the issue ask for this behaviour at the input this test asserts, does it require the behaviour at that input to change, and does the test assert only behaviour the issue describes? Answer with JSON."
+        INTENT_AUDITOR_CLOSING_GROUNDED
     } else {
-        "Does the issue ask for this behaviour at the input this test asserts, and does it require the behaviour at that input to change? Answer with JSON."
+        INTENT_AUDITOR_CLOSING_PLAIN
     };
 
     let user_prompt = format!(
-        "ISSUE:\n{}\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nTEST UNDER AUDIT ({}):\n```\n{}\n```\n\nDeclared intent: {:?}\n\n{}",
+        intent_auditor_user_prompt!(),
         request.issue_text,
         request.original_source,
         request.test_name,
@@ -1866,7 +1979,7 @@ async fn attacker_check_intent_batch(
     let mut body = String::new();
     for (i, test) in tests.iter().enumerate() {
         body.push_str(&format!(
-            "TEST {} — {}\nDeclared intent: {:?}\n```\n{}\n```\n\n",
+            intent_auditor_batch_test_body!(),
             i + 1,
             test.test_name,
             test.intent,
@@ -1875,23 +1988,13 @@ async fn attacker_check_intent_batch(
     }
 
     let closing_question = if grounded {
-        format!(
-            "Does the issue ask for the behaviour each of the {} tests asserts at the input it \
-             asserts, does it require the behaviour at that input to change, and does each test \
-             assert only behaviour the issue describes? Answer with one JSON entry per test.",
-            tests.len()
-        )
+        format!(intent_auditor_batch_closing_grounded!(), tests.len())
     } else {
-        format!(
-            "Does the issue ask for the behaviour each of the {} tests asserts at the input it \
-             asserts, and does it require the behaviour at that input to change? Answer with one \
-             JSON entry per test.",
-            tests.len()
-        )
+        format!(intent_auditor_batch_closing_plain!(), tests.len())
     };
 
     let user_prompt = format!(
-        "ISSUE:\n{}\n\nORIGINAL SOURCE:\n```\n{}\n```\n\n{} {} TESTS TO AUDIT:\n\n{}\n{}",
+        intent_auditor_batch_user_prompt!(),
         issue_text,
         original_source,
         tests.len(),
@@ -4102,6 +4205,12 @@ mod tests {
     /// three call sites: each slot is the value a call site assigns, in the order
     /// the accessor declares.
     ///
+    /// [VANTA-WHY] M3 item 19 (fix 4) — the attacker= hash now covers the USER
+    /// templates as well as the system ones, because item 16 reordered a USER
+    /// prompt and moved no recorded hash. The hash this test recomputes is
+    /// therefore system-then-user, the same order `pipeline::role_templates`
+    /// fixes for every role.
+    ///
     /// [VANTA-WHY] The call-site lines are read out of this file's own source
     /// because `let system_prompt = ATTACKER_SYSTEM_PROMPT;` is the only thing
     /// that makes "the prompt the hash covers" and "the prompt the model
@@ -4137,13 +4246,19 @@ mod tests {
             );
         }
 
+        let all: Vec<&'static str> = prompts
+            .iter()
+            .copied()
+            .chain(attacker_user_prompts())
+            .collect();
         assert_eq!(
             crate::pipeline::prompt_hashes()
                 .split(';')
                 .find_map(|field| field.strip_prefix("attacker="))
                 .expect("prompt_hashes must carry the attacker slot"),
-            crate::core::prompt_content_hash(&prompts),
-            "the recorded attacker hash must be the hash of the prompts its call sites send"
+            crate::core::prompt_content_hash(&all),
+            "the recorded attacker hash must be the hash of the system AND user \
+             templates its call sites send"
         );
     }
 

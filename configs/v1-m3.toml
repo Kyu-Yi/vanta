@@ -205,4 +205,9 @@ seed = "not guaranteed by this file; the split supplies it and the row records i
 attacker = "04fa32b2b204"
 intent_check = "bbed28c47b1c"
 creator = "53883e3b1c81"
-diagnostician = "e3b0c44298fc"
+# The Diagnostician is rule-based and sends no prompt of its own (its Unknown path
+# sends the Attacker's simplify prompt, already covered above), so there is no
+# prompt text to hash. The slot is `not_applicable` rather than the hash of the
+# empty set (`e3b0c44298fc`, the SHA-256 of ""), which would be indistinguishable
+# from a real prompt that had been truncated.
+diagnostician = "not_applicable"

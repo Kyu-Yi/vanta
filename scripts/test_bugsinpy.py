@@ -28775,6 +28775,9 @@ class TestFrozenConfig:
             "creator",
             "diagnostician",
         }
+        # The rule-based role sends no prompt, so its slot names the reason instead
+        # of carrying the empty-set hash `e3b0c44298fc` (the SHA-256 of "").
+        assert config.prompts()["diagnostician"] == "not_applicable"
 
     def test_the_committed_env_freezes_the_night_run_values(self):
         """Item 19 — `[env]` is the night runs' `# env:` header, not a chosen set.

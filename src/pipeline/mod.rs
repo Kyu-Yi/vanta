@@ -115,10 +115,13 @@ pub fn prompt_versions() -> String {
 /// and the Creator's one. A variant's wording change shows in the hash of any run,
 /// which is what makes the record comparable across runs under different flags.
 ///
-/// The Diagnostician is rule-based and has no system prompt of its own (its
-/// Unknown path sends the Attacker's simplify prompt, already covered above), so
-/// its hash is the hash of the empty prompt set. It is recorded rather than
-/// omitted so the four keys keep a fixed shape in every log.
+/// The Diagnostician is rule-based and sends no prompt of its own (its Unknown
+/// path sends the Attacker's simplify prompt, already covered above), so its slot
+/// is the literal `not_applicable` rather than a hash. Hashing the empty prompt
+/// set would produce `e3b0c44298fc`, the SHA-256 of the empty string — a value
+/// indistinguishable from a prompt that was truncated or mistyped, which is the
+/// opposite of what the record is for. Naming the reason keeps the key's fixed
+/// shape in every log AND keeps the value from reading as a real prompt.
 pub fn prompt_hashes() -> String {
     let attacker = crate::core::prompt_content_hash(
         &crate::agents::attacker::attacker_system_prompts(),
@@ -127,7 +130,7 @@ pub fn prompt_hashes() -> String {
         &crate::agents::attacker::intent_auditor_system_prompts(),
     );
     let creator = crate::core::prompt_content_hash(&[crate::agents::creator::CREATOR_SYSTEM_PROMPT]);
-    let diagnostician = crate::core::prompt_content_hash(&[]);
+    let diagnostician = "not_applicable";
 
     format!(
         "attacker={attacker};intent_check={intent_check};creator={creator};diagnostician={diagnostician}"
@@ -172,9 +175,11 @@ mod tests {
                 &crate::agents::attacker::intent_auditor_system_prompts(),
             ),
             crate::core::prompt_content_hash(&[crate::agents::creator::creator_system_prompt()]),
-            // The Diagnostician is rule-based and sends no system prompt of its
-            // own, so its slot is the hash of the empty set rather than absent.
-            crate::core::prompt_content_hash(&[]),
+            // The Diagnostician is rule-based and sends no prompt of its own, so
+            // its slot names the reason instead of hashing an empty set — which
+            // would be `e3b0c44298fc`, the SHA-256 of "", indistinguishable from a
+            // real prompt that was truncated.
+            "not_applicable".to_string(),
         ];
 
         for ((role, hash), expected) in fields.iter().zip(expected) {
@@ -182,6 +187,13 @@ mod tests {
                 *hash, expected,
                 "`{role}`'s recorded hash must be the hash of the prompts that role sends"
             );
+            if *role == "diagnostician" {
+                assert_eq!(
+                    *hash, "not_applicable",
+                    "the rule-based role has no prompt to hash, so it is named not_applicable"
+                );
+                continue;
+            }
             assert!(
                 hash.len() == 12
                     && hash

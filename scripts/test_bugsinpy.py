@@ -28812,6 +28812,26 @@ class TestFrozenConfig:
             "VANTA_SHURU_DISK_MB": "16384",
         }
 
+    def test_the_committed_prereg_names_the_source_of_both_budgets(self):
+        """The two `[prereg]` literals are cited, not chosen — and the citation is in the file.
+
+        `max_attempts` is measured (every night argv carries `--max-attempts 4`);
+        `fixed_rounds` is the plan's Phase-3 K (§6.4, §6.1). Unlike `[env]`,
+        `[prereg]` is declarative: the harness never applies it, so this is a
+        commitment about the Phase-3 K arm, not a value the normal-mode night
+        rows ran under. The test pins the values and the provenance so an edit
+        that keeps the number but drops the reason fails here.
+        """
+        config = frozen_mod.load()
+        assert config.prereg()["max_attempts"] == 4
+        assert config.prereg()["fixed_rounds"] == 4
+        block = (
+            frozen_mod.CONFIG_PATH.read_text().split("\n[prereg]\n", 1)[1].split("\n[prompts]\n", 1)[0]
+        )
+        assert "--max-attempts 4" in block  # the measured source
+        assert "Fixed rounds K" in block  # the plan citation, §6.4
+        assert "declarative" in block  # why `[prereg]` is not applied to the child
+
     def test_the_hash_is_of_the_files_own_bytes(self, tmp_path):
         path = _frozen_file(tmp_path, "v1")
         assert frozen_mod.load(path).sha256 == hashlib.sha256(path.read_bytes()).hexdigest()

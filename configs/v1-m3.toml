@@ -168,8 +168,25 @@ native_expected_tests = "recorded"
 split = "recorded"
 split_sha256 = "recorded"
 # The repair budget, and the fixed-round count the K arm runs (M3 items 9, 11).
-# An arm that pins its own budget owns it (B0 is one Creator call), which is why
-# these are the invocation's defaults and not the arms'.
+#
+# `max_attempts = 4` is MEASURED. Every night1/night2 invocation carries
+# `--max-attempts 4` on its argv line (line 1 of each run log), so the budget is
+# the one those rows actually ran under.
+#
+# `fixed_rounds = 4` is the M3 plan's Phase-3 value, cited rather than chosen:
+# §6.4 "Fixed rounds K: 4, matching the default attempt budget", and §6.1 names
+# the arms that spend it ("B3 fixed-rounds K = 4 + B1 fixed-rounds K = 4"). The
+# night smokes passed no `--fixed-rounds`, so they ran normal mode; they are not
+# the K arm, and this line is not a claim about them.
+#
+# [VANTA-WHY] Unlike [env], [prereg] is declarative: nothing applies it to the
+# child, so it is a commitment about how Phase 3 is conducted, not a default the
+# harness enforces. Only an invocation that passes `--fixed-rounds 4` satisfies
+# the `fixed_rounds` line; the normal-mode rows pass none. Two things are left
+# open and flagged, not decided here: the plan's §14 still asks "Fixed-round K: 4
+# to match the attempt budget, or more?", and an arm that pins its own budget owns
+# it (B0 is one Creator call), which is why these are the invocation's defaults
+# and not the arms'.
 max_attempts = 4
 fixed_rounds = 4
 # The split supplies each run's seed and the server's own seed is not pinned, so

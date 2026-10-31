@@ -27253,6 +27253,46 @@ class TestAnalyseLoading:
         assert per_source["0->1"][replay_mod.SOURCE_REPO_BASELINE]["n_pp"] == 1
         assert "Demo/1" in by_bug
 
+    def test_the_per_source_columns_sum_to_the_pooled_column(self, tmp_path):
+        # Two replay rows, so `pooled` accumulates across rows while each row's
+        # `by_source` still partitions its own counts. That identity is what lets a
+        # paper read a per-source column as a share of the pooled one; if a source
+        # were ever dropped from `by_source` the totals would silently disagree.
+        batch = _analyse_batch(
+            tmp_path,
+            replays=[
+                _analyse_replay(bug="Demo/1", cells=_replay_matrix()),
+                _analyse_replay(bug="Other/1", session_id="sid2", cells=_replay_matrix()),
+            ],
+        )
+        analysis = _analyse_load(batch)
+        pooled, per_source, _by_bug = analyse_mod.view_transitions(
+            analysis, replay_mod.VIEW_GENERATED
+        )
+        assert pooled, "the fixture must produce transitions for the identity to mean anything"
+        for key, counts in pooled.items():
+            sources = per_source.get(key, {})
+            for name in ("n_pp", "n_pf", "n_fp", "n_ff", "n_censored"):
+                total = sum(slot[name] for slot in sources.values())
+                assert total == counts[name], f"{key} {name}: {total} != {counts[name]}"
+
+    @pytest.mark.skip(
+        reason="item 19 — the frozen-config hash; until then analyse.py pools every "
+        "matched row"
+    )
+    def test_rows_with_different_config_hashes_are_never_pooled(self, tmp_path):
+        # M3 §Versioning: "Rows from different configs are never pooled." analyse.py
+        # has no such guard yet — it is item 19's frozen-config hash — so this test is
+        # held out. The field name below is provisional (item 19 pins it); drop the
+        # skip once the guard lands, and the assertion should already hold.
+        first = _analyse_row("k1", arm="b3", bug="A/1", config="judge", seed=1)
+        first["config_hash"] = "h1"
+        second = _analyse_row("k2", arm="b3", bug="A/1", config="judge+suite", seed=1)
+        second["config_hash"] = "h2"
+        batch = _analyse_batch(tmp_path, rows=[first, second])
+        with pytest.raises(analyse_mod.AnalysisError):
+            _analyse_load(batch)
+
 
 class TestAnalyseReview:
     def _rows(self) -> list[dict]:
@@ -27434,6 +27474,24 @@ class TestAnalyseEirEcr:
         assert analyse_mod._stability({"eir": 0.5, "ecr": 0.5, "acc": 1.0}) == "n/a"
         assert analyse_mod._stability({"eir": 0.5, "ecr": 0.9, "acc": 0.5}) == "yes"
         assert analyse_mod._stability({"eir": 0.5, "ecr": 0.2, "acc": 0.5}) == "no"
+
+    def test_a_rate_with_no_denominator_renders_not_computed_not_zero(self, tmp_path):
+        # One test that stays broken: n_ff=1, so EIR's denominator (n_pp+n_pf) is 0.
+        # EIR is None and must print `n/a`; ECR's denominator is 1, and its 0.0 is a
+        # MEASURED zero. Rendering both as `0.000` would put a number the input never
+        # supported into the paper.
+        cells = [
+            _replay_cell("generated:g_z", 0, "fail"),
+            _replay_cell("generated:g_z", 1, "fail"),
+        ]
+        batch = _analyse_batch(tmp_path, replays=[_analyse_replay(cells=cells)])
+        result = analyse_mod.EirEcrMetrics().run(_analyse_load(batch))
+        summary = "\n".join(result.summary)
+        assert "EIR=n/a (n=0)" in summary
+        assert "ECR=0.000 (n=1)" in summary
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["eir_ecr.tex"]
+        assert "n/a" in tex, "a rate with no denominator is not computed, not zero"
+        assert "0.000" in tex, "a measured zero still prints as a number"
 
 
 class TestAnalysePipeline:

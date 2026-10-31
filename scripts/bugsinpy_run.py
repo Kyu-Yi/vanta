@@ -77,6 +77,8 @@ EXPECTED_ERRORS = (
     meta_mod.MetadataError,
     ShuruError,
     runner_mod.RunnerError,
+    # Item 13 — a second queue over one batch directory is a refusal, not a crash.
+    manifest_mod.BatchLocked,
     context_mod.ContextError,
     oracle_mod.OracleError,
     suite_mod.SuiteError,
@@ -895,6 +897,140 @@ def cmd_run(args: argparse.Namespace) -> int:
     return code
 
 
+def _parse_arms(raw: str) -> Optional[list[str]]:
+    """``--arms`` as a spelling list, or ``None`` for the split's own arms.
+
+    Empty means "not given", which is the whole protocol — the same default the
+    ``run`` command has, so a queue with no ``--arms`` runs every arm.
+    """
+    if not raw.strip():
+        return None
+    return [part for part in raw.replace(",", " ").split() if part]
+
+
+def _parse_seeds(raw: str) -> Optional[list[int]]:
+    """``--seeds`` as an int list, or ``None`` for the split's own seeds."""
+    if not raw.strip():
+        return None
+    try:
+        return [int(part) for part in raw.replace(",", " ").split()]
+    except ValueError as exc:
+        raise SplitError(f"--seeds must be comma-separated integers, got {raw!r}") from exc
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    """Item 13 — run a prepared batch's bugs several at a time.
+
+    The same preamble as ``run`` — repo-root, endpoint, frozen configuration, split,
+    prepared batch, window and stale-binary warnings, spend cap — because a queue
+    is the same batch with a different claim loop, and none of those checks stop
+    being true because several bugs run at once. The difference is the last call:
+    ``run_queue`` owns the batch directory and runs up to ``--jobs`` bugs of one
+    wave concurrently, delegating each bug to the same ``run_batch`` ``run`` uses.
+    """
+    runner_mod.require_repo_cwd()
+    if not args.plan:
+        runner_mod.require_model_endpoint()
+    # Item 19 — the frozen configuration, resolved once for the whole queue. `jobs`
+    # parallel bugs share one configuration; a queue split across two config files
+    # would be two experiments sharing a batch directory.
+    frozen = frozen_mod.load()
+    config_block, frozen_env = frozen_mod.resolve(
+        frozen, environ=os.environ, allow_override=args.allow_override
+    )
+    print(
+        f"[config] {frozen.name} {frozen.sha256[:12]} ({config_block['config_path']})"
+        + (
+            "; --allow-override waives "
+            + ", ".join(config_block["config_overrides"])
+            if config_block["config_overrides"]
+            else ""
+        ),
+        flush=True,
+    )
+    split = load_split(args.split.resolve())
+    batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
+    bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
+    batch = runner_mod.load_prepared(
+        batch_dir=batch_dir, split=split, bugsinpy_root=bugsinpy_root
+    )
+    window_warning = runner_mod.context_window_warning(batch)
+    if window_warning:
+        print(f"WARNING: {window_warning}", file=sys.stderr, flush=True)
+    waves = parse_waves(args.waves)
+    selected = select_preps(batch.preps, only=args.only, waves=waves)
+    # The queue's own selections, resolved here so a bad value is refused before
+    # the schedule prints rather than once per bug: the arms and seeds a queue runs
+    # are a subset of what the split declares, never a second protocol.
+    arm_spellings = _parse_arms(args.arms)
+    seeds = _parse_seeds(args.seeds) or split.seeds
+    vanta_bin = runner_mod.require_vanta_bin(args.vanta_bin.resolve())
+    stale_warning = runner_mod.stale_binary_warning(vanta_bin)
+    if stale_warning:
+        print(f"WARNING: {stale_warning}", file=sys.stderr, flush=True)
+
+    max_spend_usd = max_spend_usd_from_env(os.environ)
+    if max_spend_usd is not None:
+        print(
+            f"[spend] VANTA_MAX_SPEND_USD=${max_spend_usd:g}: the queue stops claiming "
+            "once its rows' cost has reached this.",
+            flush=True,
+        )
+
+    code, outcomes = runner_mod.run_queue(
+        batch_dir=batch_dir,
+        batch_id=batch_dir.name,
+        split=split,
+        preps=selected,
+        entries=batch.entries,
+        seeds=seeds,
+        waves=waves or sorted({prep.wave for prep in selected}),
+        vanta_bin=vanta_bin,
+        jobs=args.jobs,
+        max_attempts=args.max_attempts,
+        disk_mb=args.disk_mb,
+        show_hints=args.show_hints,
+        plan_only=args.plan,
+        max_spend_usd=max_spend_usd,
+        preflight=runner_mod.model_endpoint_preflight,
+        config_block=config_block,
+        frozen_env=frozen_env,
+        arm_spellings=arm_spellings,
+    )
+    if args.plan:
+        return EXIT_OK
+
+    # Same tail as `run`: the report is the manifest on disk, so a resumed queue
+    # summarises the whole batch and not the part this invocation happened to run.
+    records = manifest_mod.Manifest(batch_dir).records()
+    if records:
+        labels_path, payload = runner_mod.write_batch_report(batch_dir, records)
+        print()
+        print(runner_mod.render_digest(payload))
+        print()
+        print(f"{payload['runs']} rows -> {batch_dir / 'run_digest.md'}")
+        print(f"labels for metrics.py -> {labels_path}")
+
+    failed = sum(outcome.failed for outcome in outcomes)
+    broken = [outcome.bug for outcome in outcomes if outcome.reason == "task_failed"]
+    if failed:
+        print(
+            f"\n{failed} job(s) left no usable session and were written to "
+            f"{batch_dir / 'failures.jsonl'}; their keys stay `failed` in "
+            "state.json, so the next `queue` re-runs them.",
+            file=sys.stderr,
+        )
+    if broken:
+        print(
+            f"\n{len(broken)} bug(s) raised and were skipped: {broken}. Re-run them "
+            "once the cause is fixed; their claimed jobs keep their keys.",
+            file=sys.stderr,
+        )
+    if failed or broken:
+        return EXIT_BUG_FAILED
+    return code
+
+
 def _resolve_pool_split(args: argparse.Namespace, batch_dirs: Sequence[Path]) -> Split:
     """The split a ``pool`` invocation reads, resolving an omitted ``--split`` (#E).
 
@@ -1590,6 +1726,107 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.set_defaults(func=cmd_run)
+
+    queue = sub.add_parser(
+        "queue",
+        help=(
+            "run a prepared batch's bugs several at a time (item 13): up to --jobs "
+            "bugs of one wave at once, one shared spend cap, a STOP file, resumable"
+        ),
+    )
+    queue.add_argument("--split", type=Path, default=DEFAULT_SPLIT)
+    queue.add_argument(
+        "--batch",
+        type=Path,
+        required=True,
+        help="the batch directory `prepare` created — the resume cursor lives there",
+    )
+    queue.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="PROJECT/BUG",
+        help="run only these bugs (repeatable)",
+    )
+    queue.add_argument("--waves", default="", help="comma-separated wave numbers")
+    queue.add_argument(
+        "--arms",
+        default="",
+        metavar="SPELLING,...",
+        help=(
+            "the arm spellings to run, comma- or space-separated. Default: every arm "
+            "the split declares. A spelling the split does not declare is refused — "
+            "the split is the protocol and this flag is only a selection (§12.2.5)"
+        ),
+    )
+    queue.add_argument(
+        "--seeds",
+        default="",
+        metavar="N,...",
+        help=(
+            "the seeds to run, comma- or space-separated. Default: every seed the "
+            "split declares; a value the split does not declare is refused"
+        ),
+    )
+    queue.add_argument(
+        "--vanta-bin",
+        type=Path,
+        default=runner_mod.DEFAULT_VANTA_BIN,
+        help="the vanta_m3 binary to invoke (default: target/release/vanta_m3)",
+    )
+    queue.add_argument(
+        "--max-attempts",
+        type=int,
+        default=None,
+        help=(
+            "Vanta's repair budget per run (default: 4, the binary's own). An arm "
+            "that pins a budget owns it: an explicit different value is refused "
+            "before the queue starts."
+        ),
+    )
+    queue.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help=(
+            "how many bugs of one wave to run at once (default 1). Each bug boots its "
+            "own VM, so this is bounded by memory: a pandas VM wants 8 GB. Waves stay "
+            "sequential — the gate is a statement about the earlier stages (§8.1)."
+        ),
+    )
+    queue.add_argument(
+        "--disk-mb",
+        type=int,
+        default=prepare_mod.DISK_MB,
+        help=(
+            "shuru disk in MB for every VM this stage boots; the default matches "
+            f"the suites prepare ran ({prepare_mod.DISK_MB})"
+        ),
+    )
+    queue.add_argument(
+        "--plan",
+        action="store_true",
+        help="print the schedule and the queue's task list, then exit",
+    )
+    queue.add_argument(
+        "--allow-override",
+        action="store_true",
+        help=(
+            "run even though the environment contradicts configs/v1-m3.toml (item 19); "
+            "the waiver and the values it waived are recorded on every row"
+        ),
+    )
+    queue.add_argument(
+        "--show-hints",
+        action="store_true",
+        help=(
+            "send each report's comments on top of its content (§2.4.4). Off by "
+            "default and off for every batch a verdict rests on; such rows take a "
+            "`#hints` job key and cannot be resumed as, or compared by name to, a "
+            "default run."
+        ),
+    )
+    queue.set_defaults(func=cmd_queue)
 
     pool = sub.add_parser(
         "pool",

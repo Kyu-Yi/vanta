@@ -50,6 +50,7 @@ signals afterwards. The manifest records the path instead of owning the files.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -58,10 +59,11 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
 
 from . import bake as bake_mod
 from . import compact as compact_mod
@@ -2380,7 +2382,7 @@ def run_job(
         candidate=job.candidate,
     )
     if not outcome.usable:
-        _append_failure(paths, job, outcome)
+        _append_failure(paths, job, outcome, lock=manifest.lock)
         manifest.mark(job.key, FAILED)
         print(f"  {job.label()} FAILED — {outcome.error}", flush=True)
         return None
@@ -2468,7 +2470,20 @@ def run_job(
     return record
 
 
-def _append_failure(paths: BatchPaths, job: Job, outcome: SessionOutcome) -> None:
+def _append_failure(
+    paths: BatchPaths,
+    job: Job,
+    outcome: SessionOutcome,
+    *,
+    lock: Optional[manifest_mod.FileLock] = None,
+) -> None:
+    """One line per failed job, appended under the batch's lock (item 13).
+
+    The payload is written with a single ``write`` either way, but two workers of a
+    queue appending at once is exactly the case where two lines can interleave into
+    one unreadable line — and a failure record nobody can parse is a failure that
+    did not get recorded.
+    """
     paths.failures.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "created_utc": utc_now(),
@@ -2494,8 +2509,19 @@ def _append_failure(paths: BatchPaths, job: Job, outcome: SessionOutcome) -> Non
         "label": INFRA_LABEL if outcome.reason == REPORT_UNREADABLE else None,
         "run_log": str(outcome.log_path),
     }
-    with open(paths.failures, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    with (lock or _null_lock()):
+        with open(paths.failures, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+@contextlib.contextmanager
+def _null_lock() -> Iterator[None]:
+    """A stand-in for :class:`manifest.FileLock` when a caller has none.
+
+    ``run_job`` is called directly by tests and by nothing else, and a single job
+    needs no lock; the queue's jobs get the manifest's.
+    """
+    yield
 
 
 def _stem(key: str) -> str:
@@ -2598,8 +2624,17 @@ def run_batch(
     preflight: Optional[Callable[[], Optional[str]]] = None,
     config_block: Optional[dict[str, Any]] = None,
     frozen_env: Optional[Mapping[str, str]] = None,
+    stop_file: Optional[Path] = None,
+    announce: bool = True,
+    arm_spellings: Optional[Sequence[str]] = None,
 ) -> tuple[int, list[WaveResult]]:
     """The whole batch: per wave, D13's four phases, then the wave-1 gate.
+
+    ``arm_spellings`` is the arms this invocation runs, or ``None`` for every arm
+    the split declares (the whole protocol, which is what ``run`` does). The queue
+    passes a selection: it is a *subset* of ``split.configs``, never a free list, so
+    the split stays the protocol and the flag is only a filter — the same shape as
+    ``--only`` for bugs.
 
     ``show_hints`` is the with-hints ablation's switch (§2.4.4) and is off for every batch a
     verdict is meant to rest on: it sends the report's comments on top of its content, which
@@ -2632,20 +2667,27 @@ def run_batch(
     read in the CLI rather than here — the configuration belongs to the invocation, and a test
     that drives this loop must not depend on whatever file the developer happens to have
     committed.
+
+    ``stop_file`` is item 13's stop: when the file exists, no job is claimed and the
+    batch returns 1 (see :func:`run_queue`). ``announce`` is the queue's switch for
+    the one-bug-per-call shape: a queue runs this function once per (wave, bug) and
+    prints the schedule itself, so the per-call plan and ``[env]`` preamble would be
+    the same lines repeated once per bug.
     """
     paths = BatchPaths.under(batch_dir)
     manifest = Manifest(batch_dir)
-    # §14.29 — the batch's spend to date, from the rows already on disk (a resumed
-    # batch has some). `None` for a row that priced nothing.
-    spent = _spent_so_far(manifest)
     # The harness's own revision, read once for the whole batch (§7.3). The binary's
     # is read per row from `run.summary`, because it belongs to the binary and not to
     # this tree.
     harness = git_revision()
     # The split's own spellings, NOT filtered down to a known list: a filter here
     # would drop `vanta_planner` before the guard could refuse it, and a split that
-    # names the placeholder must not start at all (§4.4).
-    spellings = list(split.configs)
+    # names the placeholder must not start at all (§4.4). ``arm_spellings`` is the
+    # invocation's selection — already checked to be a subset of the split by the
+    # caller — and replaces the split's list only when it is given.
+    spellings = (
+        list(arm_spellings) if arm_spellings is not None else list(split.configs)
+    )
     _require_arm_list(spellings)
     # M3 item 11 — refuse an explicit `--max-attempts` a pinned arm contradicts,
     # before the schedule is printed and before any VM boots.
@@ -2664,42 +2706,46 @@ def run_batch(
         if REPAIR in arms_mod.modes_of(written)
     ]
 
-    plan = _render_schedule(batch_id, preps, entries, spellings, seeds, waves)
-    print(plan, flush=True)
-    if show_hints:
-        print(
-            "[prompt] --show-hints: every row's issue text is the report's content *plus* "
-            "its comments (§2.4.4). These rows take a `#hints` job key and record "
-            "show_hints=true; they are a separate arm and not comparable-by-name to a "
-            "default run.",
-            flush=True,
-        )
+    if announce:
+        plan = _render_schedule(batch_id, preps, entries, spellings, seeds, waves)
+        print(plan, flush=True)
+        if show_hints:
+            print(
+                "[prompt] --show-hints: every row's issue text is the report's content "
+                "*plus* its comments (§2.4.4). These rows take a `#hints` job key and "
+                "record show_hints=true; they are a separate arm and not "
+                "comparable-by-name to a default run.",
+                flush=True,
+            )
     if plan_only:
         return 0, []
 
     checkpoint_pythons: dict[str, str] = {}
-    print(
-        f"[env] harness {harness.commit or 'unknown'}"
-        f"{' (dirty)' if harness.dirty else ''}",
-        flush=True,
-    )
+    if announce:
+        print(
+            f"[env] harness {harness.commit or 'unknown'}"
+            f"{' (dirty)' if harness.dirty else ''}",
+            flush=True,
+        )
     for prep in preps:
         checkpoint = entries[prep.key]["checkpoint"]
         if checkpoint not in checkpoint_pythons:
             checkpoint_pythons[checkpoint] = python_version_of(paths, checkpoint, disk_mb)
-            print(
-                f"[env] {checkpoint}: python "
-                f"{checkpoint_pythons[checkpoint] or 'unknown'} "
-                f"(pinned {entries[prep.key]['python_version']})",
-                flush=True,
-            )
+            if announce:
+                print(
+                    f"[env] {checkpoint}: python "
+                    f"{checkpoint_pythons[checkpoint] or 'unknown'} "
+                    f"(pinned {entries[prep.key]['python_version']})",
+                    flush=True,
+                )
 
     results: list[WaveResult] = []
     for wave in waves:
         wave_preps = [p for p in preps if p.wave == wave]
         if not wave_preps:
             continue
-        print(f"\n=== wave {wave}: {len(wave_preps)} bug(s) ===", flush=True)
+        if announce:
+            print(f"\n=== wave {wave}: {len(wave_preps)} bug(s) ===", flush=True)
         result = WaveResult(wave=wave)
         for mode, written in phases:
             config = arms_mod.config_of(written)
@@ -2767,14 +2813,36 @@ def run_batch(
                             if found:
                                 result.records.append(found)
                             continue
+                        # Item 13 — the stop file. Checked between jobs, like the
+                        # spend cap and for the same reason: the claim below is the
+                        # last moment at which nothing has been written, so a stop
+                        # never leaves a half-written row or a cursor parked at
+                        # `running`. Deleting the file resumes from this key.
+                        if stop_file is not None and Path(stop_file).exists():
+                            print(
+                                f"\n=== stop file present: {stop_file} — no job after "
+                                f"this point was claimed ===\n"
+                                "  delete it to resume from this key.",
+                                flush=True,
+                            )
+                            return 1, results
                         # §14.29 — the spend cap is checked BEFORE the job starts,
                         # never during one: the check is between rows, so the row
                         # that crossed the cap is already complete and the rows
                         # that follow it are never half-written. `>=` rather than
                         # `>`: a batch that has reached its budget has spent it.
-                        if max_spend_usd is not None and spent >= max_spend_usd:
-                            _record_spend_cap(batch_dir, max_spend_usd, spent, job)
-                            return 1, results
+                        #
+                        # Re-read from the manifest at every check rather than
+                        # carried in a local counter (item 13): a queue runs several
+                        # of these loops at once against one batch directory, so a
+                        # counter that started before another worker's rows landed
+                        # would understate the batch's spend and let the cap be
+                        # overshot by as many workers as there are jobs.
+                        if max_spend_usd is not None:
+                            spent = _spent_so_far(manifest)
+                            if spent >= max_spend_usd:
+                                _record_spend_cap(batch_dir, max_spend_usd, spent, job)
+                                return 1, results
                         # Item 14 — before the row, not after it. Asked here rather
                         # than inside `run_job` because the refusal has to leave no
                         # trace at all: `run_job`'s first act is to mark the key
@@ -2801,7 +2869,6 @@ def run_batch(
                         )
                         if record:
                             result.records.append(record)
-                            spent += _row_cost(record)
                         else:
                             result.failed += 1
         results.append(result)
@@ -3367,3 +3434,375 @@ def write_batch_report(
     )
     (batch_dir / "run_digest.md").write_text(render_digest(payload) + "\n", encoding="utf-8")
     return labels_path, payload
+
+
+# ---------------------------------------------------------------------------
+# item 13 — the queue
+# ---------------------------------------------------------------------------
+QUEUE_LOCK_NAME = ".queue.lock"
+STOP_NAME = "STOP"
+"""The stop file, in the batch directory: create it and no further job is claimed."""
+
+
+@dataclass
+class QueueOutcome:
+    """What one queue task (one bug of one wave) did."""
+
+    wave: int
+    bug: str
+    code: int
+    records: list[dict[str, Any]] = field(default_factory=list)
+    failed: int = 0
+    """Jobs that left no usable session — the same count ``run_batch`` reports."""
+    reason: str = ""
+    """``""`` when the task finished everything it scheduled. Otherwise why it
+    stopped early: ``stop_file``, ``spend_cap``, ``gate`` or ``task_failed``
+    (the harness raised on this bug alone)."""
+
+
+def queue_stop_path(batch_dir: Path) -> Path:
+    """The stop file of one batch directory."""
+    return Path(batch_dir) / STOP_NAME
+
+
+def queue_lock(batch_dir: Path) -> manifest_mod.FileLock:
+    """The batch directory's queue lock, with the message a refusal should carry."""
+    return manifest_mod.FileLock(
+        Path(batch_dir) / QUEUE_LOCK_NAME,
+        held_message=(
+            f"another queue owns {Path(batch_dir)}: its {QUEUE_LOCK_NAME} is held. Two "
+            "queues over one batch directory would claim the same job keys and "
+            "double-write rows for work neither had finished. Wait for the first one, "
+            "or point --batch at another directory."
+        ),
+    )
+
+
+def _select_arms(
+    split: Split, arm_spellings: Optional[Sequence[str]]
+) -> list[str]:
+    """The arms a queue invocation runs: the split's own, or a declared subset.
+
+    A spelling the split does not declare is refused rather than run, because the
+    split is the protocol (§12.2.5) — a queue that accepted a free arm list would
+    be a second place the experiment is defined, and the first place a typo would
+    look like an arm nobody can pool.
+    """
+    declared = list(split.configs)
+    if arm_spellings is None:
+        return declared
+    chosen = list(arm_spellings)
+    unknown = sorted(set(chosen) - set(declared))
+    if unknown:
+        raise RunnerError(
+            f"--arms names spellings the split does not declare: {unknown}. "
+            f"The split's arms are {declared}."
+        )
+    if not chosen:
+        raise RunnerError("--arms selected no arm.")
+    return chosen
+
+
+def _require_seeds(split: Split, seeds: Sequence[int]) -> None:
+    """The seeds a queue invocation runs must be seeds the split declares.
+
+    Same reason as :func:`_select_arms`: a seed is part of the protocol, and a
+    subset is a selection while an outside value is a second experiment.
+    """
+    declared = set(split.seeds)
+    unknown = sorted(set(seeds) - declared)
+    if unknown:
+        raise RunnerError(
+            f"--seeds names values the split does not declare: {unknown}. "
+            f"The split's seeds are {sorted(declared)}."
+        )
+    if not seeds:
+        raise RunnerError("--seeds selected no seed.")
+
+
+def queue_tasks(
+    preps: Sequence[prepare_mod.BugPrep], waves: Sequence[int]
+) -> list[tuple[int, prepare_mod.BugPrep]]:
+    """The queue's unit of work, in the order it runs: ``(wave, bug)``.
+
+    [VANTA-WHY] The unit is a **bug**, not a job, because a review job's candidate
+    set is pooled from repair rows the same bug has already written (§7.1): the
+    review rows cannot be scheduled before their own repairs have run, and a job
+    list built up front would give every review the {developer fix, no-op} floor.
+    Waves stay sequential — §8.1's gate is a statement about the earlier stages of
+    the same batch — so the parallelism is *within* a wave, which is also what the
+    memory budget allows: N bugs, N VMs, no more (see ``--jobs``).
+    """
+    return [
+        (wave, prep)
+        for wave in waves
+        for prep in preps
+        if prep.wave == wave
+    ]
+
+
+def run_queue(
+    *,
+    batch_dir: Path,
+    batch_id: str,
+    split: Split,
+    preps: list[prepare_mod.BugPrep],
+    entries: dict[str, dict[str, Any]],
+    seeds: Sequence[int],
+    waves: Sequence[int],
+    vanta_bin: Path,
+    jobs: int = 1,
+    max_attempts: Optional[int] = None,
+    disk_mb: int,
+    show_hints: bool = False,
+    plan_only: bool = False,
+    max_spend_usd: Optional[float] = None,
+    preflight: Optional[Callable[[], Optional[str]]] = None,
+    config_block: Optional[dict[str, Any]] = None,
+    frozen_env: Optional[Mapping[str, str]] = None,
+    arm_spellings: Optional[Sequence[str]] = None,
+) -> tuple[int, list[QueueOutcome]]:
+    """Item 13 — run a prepared batch's bugs up to ``jobs`` at a time.
+
+    [VANTA-WHY] Why this is a second entry point rather than a flag on
+    :func:`run_batch`: ``run_batch`` walks a wave's bugs in order and prints one
+    schedule; a queue claims a bug, runs its whole phase order, and prints one
+    schedule for the batch. The two differ in the loop that owns the job list, and
+    the queue delegates to ``run_batch`` per (wave, bug) rather than reimplementing
+    it, so the phase order, the candidate pooling, the spend cap, the gate and the
+    resume cursor stay in exactly one place.
+
+    The batch directory is owned for the whole call (``.queue.lock``): a second
+    queue over the same rows is refused rather than interleaved. Inside, every
+    manifest write is taken under the manifest's own lock, so the workers cannot
+    lose each other's cursor updates or interleave a row.
+
+    Exit code 1 means "something stopped early" — a stop file, the spend cap, a
+    wave gate, or a job that left no usable session. It is deliberately the same
+    value ``run_batch`` uses for the first three, because the queue's callers read
+    the outcome list, not the number, to tell them apart.
+    """
+    if jobs < 1:
+        raise RunnerError(f"--jobs must be at least 1, not {jobs}.")
+    batch_dir = Path(batch_dir)
+    owner = queue_lock(batch_dir)
+    if not owner.acquire(blocking=False):
+        raise manifest_mod.BatchLocked(str(owner.held_message))
+    try:
+        return _run_queue(
+            batch_dir=batch_dir,
+            batch_id=batch_id,
+            split=split,
+            preps=preps,
+            entries=entries,
+            seeds=seeds,
+            waves=waves,
+            vanta_bin=vanta_bin,
+            jobs=jobs,
+            max_attempts=max_attempts,
+            disk_mb=disk_mb,
+            show_hints=show_hints,
+            plan_only=plan_only,
+            max_spend_usd=max_spend_usd,
+            preflight=preflight,
+            config_block=config_block,
+            frozen_env=frozen_env,
+            arm_spellings=arm_spellings,
+        )
+    finally:
+        owner.release()
+
+
+def _run_queue(**kwargs: Any) -> tuple[int, list[QueueOutcome]]:
+    """The queue proper, with the batch directory already owned.
+
+    The arguments are ``run_queue``'s, forwarded verbatim: each is read at least
+    twice — once for the schedule, once per task — so naming them all again here
+    would only be a second place to get them wrong.
+    """
+    batch_dir: Path = kwargs["batch_dir"]
+    jobs: int = kwargs["jobs"]
+    stop_file = queue_stop_path(batch_dir)
+    tasks = queue_tasks(kwargs["preps"], kwargs["waves"])
+    if not tasks:
+        raise RunnerError(
+            "the queue selection is empty: no prepared bug is in waves "
+            f"{list(kwargs['waves'])}."
+        )
+    # The same two refusals `run_batch` makes, made once here instead of once per
+    # bug: they are properties of the split and the invocation, not of a job.
+    spellings = _select_arms(kwargs["split"], kwargs["arm_spellings"])
+    _require_arm_list(spellings)
+    _require_arm_budget(spellings, kwargs["max_attempts"])
+    _require_seeds(kwargs["split"], kwargs["seeds"])
+
+    print(
+        _render_schedule(
+            kwargs["batch_id"],
+            kwargs["preps"],
+            kwargs["entries"],
+            spellings,
+            kwargs["seeds"],
+            kwargs["waves"],
+        )
+    )
+    print(
+        f"[queue] {len(tasks)} task(s) = wave × bug, up to {jobs} at once; "
+        f"stop file {stop_file}",
+        flush=True,
+    )
+    if stop_file.exists():
+        print(
+            f"[queue] {stop_file} already exists: no job will be claimed. Delete it "
+            "and run again.",
+            flush=True,
+        )
+    if kwargs["plan_only"]:
+        return 0, []
+
+    by_wave: dict[int, list[prepare_mod.BugPrep]] = {}
+    for wave, prep in tasks:
+        by_wave.setdefault(wave, []).append(prep)
+
+    outcomes: list[QueueOutcome] = []
+    for wave in kwargs["waves"]:
+        wave_preps = by_wave.get(wave)
+        if not wave_preps:
+            continue
+        print(
+            f"\n=== wave {wave}: {len(wave_preps)} bug(s), up to "
+            f"{min(jobs, len(wave_preps))} at once ===",
+            flush=True,
+        )
+        wave_outcomes = _run_wave_tasks(
+            wave=wave,
+            bugs=wave_preps,
+            workers=jobs,
+            stop_file=stop_file,
+            **kwargs,
+        )
+        outcomes.extend(wave_outcomes)
+        # §8.1 — the gate is a statement about the earlier stages, so a wave whose
+        # gate failed stops the next wave exactly as it does in `run_batch`. A
+        # deliberate stop (the file, the cap) does too, for a different reason: the
+        # operator or the budget said so.
+        stoppers = [
+            outcome
+            for outcome in wave_outcomes
+            if outcome.reason in ("stop_file", "spend_cap", "gate")
+        ]
+        if stoppers:
+            print(
+                f"\n=== queue stopped in wave {wave}: "
+                + ", ".join(f"{o.bug} ({o.reason})" for o in stoppers)
+                + " ===",
+                flush=True,
+            )
+            break
+    return (1 if any(outcome.code != 0 for outcome in outcomes) else 0), outcomes
+
+
+def _run_wave_tasks(
+    *,
+    wave: int,
+    bugs: Sequence[prepare_mod.BugPrep],
+    workers: int,
+    stop_file: Path,
+    **kwargs: Any,
+) -> list[QueueOutcome]:
+    """Run one wave's bugs, up to ``workers`` of them at once.
+
+    ``bugs`` and ``workers`` are named separately from the ``preps`` and ``jobs``
+    keys that ``kwargs`` carries so that a key of the shared invocation dict cannot
+    collide with a parameter of this call.
+
+    In-flight bugs are never interrupted: the stop file and the spend cap are
+    checked before the *next* claim, which is what makes "the rows already written
+    are complete" structural rather than a promise (`_record_spend_cap`).
+    """
+    limit = min(workers, len(bugs))
+    pending: list[prepare_mod.BugPrep] = list(bugs)
+    running: dict[Future[QueueOutcome], str] = {}
+    outcomes: list[QueueOutcome] = []
+    with ThreadPoolExecutor(max_workers=limit) as pool:
+        while pending or running:
+            while pending and len(running) < limit:
+                if stop_file.exists():
+                    print(
+                        f"  [queue] {stop_file} appeared: not claiming the "
+                        f"{len(pending)} bug(s) still waiting.",
+                        flush=True,
+                    )
+                    pending = []
+                    break
+                prep = pending.pop(0)
+                future = pool.submit(
+                    _run_task, wave=wave, prep=prep, stop_file=stop_file, **kwargs
+                )
+                running[future] = prep.key
+            if not running:
+                break
+            done, _ = wait(list(running), return_when=FIRST_COMPLETED)
+            for future in done:
+                running.pop(future)
+                outcomes.append(future.result())
+    return outcomes
+
+
+def _run_task(
+    *,
+    wave: int,
+    prep: prepare_mod.BugPrep,
+    stop_file: Path,
+    **kwargs: Any,
+) -> QueueOutcome:
+    """One bug of one wave: ``run_batch`` restricted to this bug, then the reason."""
+    batch_dir: Path = kwargs["batch_dir"]
+    try:
+        code, results = run_batch(
+            batch_dir=batch_dir,
+            batch_id=kwargs["batch_id"],
+            split=kwargs["split"],
+            preps=[prep],
+            entries=kwargs["entries"],
+            seeds=kwargs["seeds"],
+            waves=[wave],
+            vanta_bin=kwargs["vanta_bin"],
+            max_attempts=kwargs["max_attempts"],
+            disk_mb=kwargs["disk_mb"],
+            show_hints=kwargs["show_hints"],
+            plan_only=False,
+            max_spend_usd=kwargs["max_spend_usd"],
+            preflight=kwargs["preflight"],
+            config_block=kwargs["config_block"],
+            frozen_env=kwargs["frozen_env"],
+            stop_file=stop_file,
+            # The queue printed this batch's schedule once. `announce=False` keeps
+            # the per-bug call from repeating it once per bug.
+            announce=False,
+            # The arm selection, resolved once by `_run_queue` and carried on every
+            # task so each bug runs exactly the arms the schedule named.
+            arm_spellings=_select_arms(kwargs["split"], kwargs["arm_spellings"]),
+        )
+    except Exception as exc:  # one bug must not take the queue down
+        print(f"  [{prep.key}] FAILED — {type(exc).__name__}: {exc}", flush=True)
+        return QueueOutcome(wave=wave, bug=prep.key, code=1, reason="task_failed")
+
+    records = [record for result in results for record in result.records]
+    failed = sum(result.failed for result in results)
+    reason = ""
+    if code != 0:
+        if stop_file.exists():
+            reason = "stop_file"
+        elif (
+            kwargs["max_spend_usd"] is not None
+            and _spent_so_far(Manifest(batch_dir)) >= kwargs["max_spend_usd"]
+        ):
+            reason = "spend_cap"
+        elif wave_gate_failures(records):
+            reason = "gate"
+        else:
+            reason = "task_failed"
+    return QueueOutcome(
+        wave=wave, bug=prep.key, code=code, records=records, failed=failed, reason=reason
+    )

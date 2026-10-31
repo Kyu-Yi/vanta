@@ -34,6 +34,7 @@ import shlex
 import subprocess
 import sys
 import tarfile
+import threading
 import zipfile
 from collections import Counter
 from dataclasses import replace
@@ -20014,10 +20015,19 @@ class TestManifest:
         assert manifest.is_done("never-seen") is False
 
     def test_mark_leaves_no_temp_file_behind(self, tmp_path):
-        """`mark` writes a temp file then `os.replace`s it — atomicity is the whole point."""
+        """`mark` writes a temp file then `os.replace`s it — atomicity is the whole point.
+
+        The batch directory also holds the item-13 lock file (``.manifest.lock``),
+        created by :class:`manifest.FileLock` and meant to stay for the life of the
+        batch; what must not stay is the ``.json.tmp`` that ``os.replace`` consumes."""
         manifest = manifest_mod.Manifest(tmp_path)
         manifest.mark("k1", manifest_mod.DONE)
-        assert [p.name for p in tmp_path.iterdir()] == [manifest_mod.STATE_NAME]
+        left = sorted(
+            p.name
+            for p in tmp_path.iterdir()
+            if p.name != manifest_mod.MANIFEST_LOCK_NAME
+        )
+        assert left == [manifest_mod.STATE_NAME]
 
     def test_a_corrupt_cursor_reads_as_empty_rather_than_crashing(self, tmp_path):
         write(tmp_path / manifest_mod.STATE_NAME, "{not json")
@@ -23148,10 +23158,13 @@ class TestRunJob:
 
 
 class _FakeSplit:
-    """A `Split` with only the field `run_batch` reads, so no split file is needed."""
+    """A `Split` with only the fields `run_batch` and the queue read, so no split
+    file is needed. ``seeds`` defaults to ``[0]`` — the value every fixture seeds
+    with — and is read by the queue's ``--seeds`` selection (item 13)."""
 
-    def __init__(self, configs):
+    def __init__(self, configs, seeds=None):
         self.configs = list(configs)
+        self.seeds = list(seeds) if seeds is not None else [0]
 
 
 class TestRunBatchLoop:
@@ -23640,6 +23653,354 @@ class TestRunBatchLoop:
         assert len(asked) == 3, "one ask per started row, and it stopped at the third"
         assert [job.key for job in calls] == schedule[:2], "the third row never started"
         assert not manifest_mod.Manifest(tmp_path / "batch-flaky").state().get(schedule[2])
+
+
+class TestQueue:
+    """M3 item 13 — the multi-bug queue: one owner, a shared cap, a stop, a resume.
+
+    `run_job` is replaced, so no VM boots. What is under test is the acceptance the
+    item names — "all dev bugs × all arms run from one command, and killing and
+    restarting resumes without duplicate rows" — plus the three mechanisms that make
+    it safe: one owner per batch directory, a stop that leaves no half-written row,
+    and a spend cap read from the rows on disk rather than from a counter in one
+    worker's memory.
+
+    The fixture uses the repair-only ``b0`` arm: one arm, one phase, one row per
+    seed, so a claim count is a row count and the concurrency is the queue's own
+    rather than the review pool's.
+    """
+
+    DEV_ONE = _diff("pkg/mod.py", "developer-fix-one")
+
+    # -- fixture -----------------------------------------------------------
+    @staticmethod
+    def _tree(tmp_path: Path, name: str) -> Path:
+        root = tmp_path / name
+        write(root / "vanta_tree" / "pkg" / "mod.py", f"{name} = 1\nsecond = 2\n")
+        return root
+
+    def _fixture(self, tmp_path, *, count=3, wave=1, seeds=(0,)):
+        preps = [
+            prep(
+                bug=bug_info(bug_id=n, bug_patch_txt=self.DEV_ONE),
+                root=self._tree(tmp_path, f"b{n}"),
+                wave=wave,
+            )
+            for n in range(1, count + 1)
+        ]
+        entries = {
+            bug_prep.key: {
+                "checkpoint": f"chk-{bug_prep.slug.lower()}",
+                "python_version": "3.8.1",
+            }
+            for bug_prep in preps
+        }
+        return preps, entries, _FakeSplit(["b0"], seeds=list(seeds))
+
+    @staticmethod
+    def _row(job, *, cost_usd=None) -> dict:
+        row = {
+            "key": job.key,
+            "bug": job.bug,
+            "wave": job.wave,
+            "config": job.config,
+            "arm": job.arm,
+            "mode": job.mode,
+            "seed": job.seed,
+            "verdict": "Rejected",
+            "label": "true_reject",
+            "oracle": {"apply_ok": True, "patch_good": False, "apply_detail": "", "error": ""},
+        }
+        if cost_usd is not None:
+            row["llm"] = {"cost_usd": cost_usd, "cost_basis": "test/tier/2026-10-26"}
+        return row
+
+    def _stub(self, calls, *, cost_usd=None, on_call=None):
+        """A `run_job` that writes a gate-passing row and records the claim."""
+
+        def stub(*, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version):
+            calls.append(job)
+            if on_call is not None:
+                on_call(len(calls), job, manifest)
+            record = self._row(job, cost_usd=cost_usd)
+            manifest.append(record)
+            manifest.mark(job.key, manifest_mod.DONE)
+            return record
+
+        return stub
+
+    def _prepare(self, monkeypatch, tmp_path, *, count=3, seeds=(0,), cost_usd=None, on_call=None):
+        preps, entries, split = self._fixture(tmp_path, count=count, seeds=seeds)
+        calls: list = []
+        monkeypatch.setattr(runner_mod, "python_version_of", lambda *a, **k: "3.8.20")
+        monkeypatch.setattr(
+            runner_mod, "run_job", self._stub(calls, cost_usd=cost_usd, on_call=on_call)
+        )
+        return preps, entries, split, calls
+
+    @staticmethod
+    def _run(
+        preps,
+        entries,
+        split,
+        batch_dir,
+        *,
+        jobs=1,
+        seeds=None,
+        waves=(1,),
+        arm_spellings=None,
+        max_spend_usd=None,
+    ):
+        return runner_mod.run_queue(
+            batch_dir=batch_dir,
+            batch_id="b1",
+            split=split,
+            preps=preps,
+            entries=entries,
+            seeds=list(seeds if seeds is not None else split.seeds),
+            waves=list(waves),
+            vanta_bin=Path("/nonexistent/vanta_m3"),
+            jobs=jobs,
+            max_attempts=None,
+            disk_mb=8192,
+            max_spend_usd=max_spend_usd,
+            arm_spellings=arm_spellings,
+        )
+
+    # -- the unit of work --------------------------------------------------
+    def test_the_unit_of_work_is_wave_times_bug_in_wave_order(self, tmp_path):
+        """A review's candidate set is pooled from the bug's own repair rows (§7.1),
+        so the unit is a bug and the waves stay sequential (§8.1)."""
+        one = [
+            prep(bug=bug_info(bug_id=n), root=self._tree(tmp_path, f"w1b{n}"), wave=1)
+            for n in (1, 2)
+        ]
+        two = [
+            prep(bug=bug_info(bug_id=n), root=self._tree(tmp_path, f"w2b{n}"), wave=2)
+            for n in (3,)
+        ]
+        tasks = runner_mod.queue_tasks(one + two, [1, 2])
+        assert [(wave, bug.key) for wave, bug in tasks] == [
+            (1, one[0].key),
+            (1, one[1].key),
+            (2, two[0].key),
+        ], "wave 1's bugs all precede wave 2's"
+
+    def test_jobs_below_one_is_refused(self, tmp_path, monkeypatch):
+        preps, entries, split, calls = self._prepare(monkeypatch, tmp_path)
+        with pytest.raises(runner_mod.RunnerError, match="--jobs must be at least 1"):
+            self._run(preps, entries, split, tmp_path / "batch", jobs=0)
+        assert calls == [], "the refusal must precede any claim"
+
+    # -- one owner per batch directory -------------------------------------
+    def test_a_second_queue_over_one_batch_directory_is_refused(self, tmp_path, monkeypatch):
+        preps, entries, split, calls = self._prepare(monkeypatch, tmp_path)
+        batch_dir = tmp_path / "batch"
+        batch_dir.mkdir(parents=True)
+        held = runner_mod.queue_lock(batch_dir)
+        assert held.acquire(blocking=False)
+        try:
+            with pytest.raises(manifest_mod.BatchLocked, match="another queue owns"):
+                self._run(preps, entries, split, batch_dir)
+        finally:
+            held.release()
+        assert calls == [], "a refused queue must claim nothing"
+        assert runner_mod.queue_lock(batch_dir).acquire(blocking=False), (
+            "the refusal must not leak the lock"
+        )
+
+    def test_a_locked_batch_directory_is_an_expected_error(self):
+        """A refusal, not a traceback: ``main`` prints these without frames."""
+        assert manifest_mod.BatchLocked in run_mod.EXPECTED_ERRORS
+
+    def test_two_file_locks_on_one_path_exclude_each_other(self, tmp_path):
+        """``flock`` is per open file description, so it excludes two *threads* too —
+        which is what a queue with ``--jobs > 1`` needs, and a ``threading.Lock``
+        would not give a second process."""
+        target = tmp_path / "lock"
+        held = manifest_mod.FileLock(target)
+        assert held.acquire(blocking=False)
+        seen: list[bool] = []
+        try:
+            thread = threading.Thread(
+                target=lambda: seen.append(
+                    manifest_mod.FileLock(target).acquire(blocking=False)
+                )
+            )
+            thread.start()
+            thread.join()
+        finally:
+            held.release()
+        assert seen == [False], "a second holder must be excluded while the first holds it"
+        assert manifest_mod.FileLock(target).acquire(blocking=False)
+
+    def test_concurrent_cursor_updates_keep_every_key(self, tmp_path):
+        """The cursor is read-modify-write: without the lock, two marks that overlap
+        each drop the other's key and a resume re-runs a job that is already done.
+
+        Each worker owns its own :class:`Manifest` — and so its own ``FileLock`` —
+        which is the contract ``FileLock`` documents and the shape the queue has
+        (one ``run_batch``, and so one ``Manifest``, per claimed bug). One object
+        shared across threads would be a bug of its own: the second thread would
+        overwrite the first's file descriptor and the lock could be leaked, which is
+        why the exclusion is per object rather than per path.
+        """
+        keys = [f"k{n}" for n in range(200)]
+        barrier = threading.Barrier(4)
+
+        def worker(chunk: list[str]) -> None:
+            manifest = manifest_mod.Manifest(tmp_path)
+            barrier.wait()
+            for key in chunk:
+                manifest.mark(key, manifest_mod.DONE)
+
+        threads = [
+            threading.Thread(target=worker, args=(keys[i::4],)) for i in range(4)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        state = manifest_mod.Manifest(tmp_path).state()
+        assert set(state) == set(keys), "every mark must survive every other mark"
+        assert set(state.values()) == {manifest_mod.DONE}
+
+    # -- the acceptance: every bug of the wave, one command ---------------
+    def test_the_queue_runs_every_bug_of_a_wave(self, tmp_path, monkeypatch):
+        preps, entries, split, calls = self._prepare(monkeypatch, tmp_path, count=3)
+        batch_dir = tmp_path / "batch"
+        code, outcomes = self._run(preps, entries, split, batch_dir, jobs=2)
+        assert code == 0
+        assert {outcome.bug for outcome in outcomes} == {p.key for p in preps}
+        assert {outcome.reason for outcome in outcomes} == {""}, [
+            outcome.reason for outcome in outcomes
+        ]
+        assert len(calls) == 3, "one row per bug, and no bug runs twice"
+        assert len(manifest_mod.Manifest(batch_dir).records()) == 3
+
+    def test_the_stop_file_stops_claiming_and_the_resume_writes_no_duplicate_rows(
+        self, tmp_path, monkeypatch
+    ):
+        """Acceptance: killing and restarting resumes without duplicate rows.
+
+        The stop file is checked between jobs, so the rows already written stay
+        complete and the unclaimed keys keep no cursor entry — which is exactly what
+        makes the second invocation a *resume* and not a re-run.
+        """
+        batch_dir = tmp_path / "batch"
+        stop = runner_mod.queue_stop_path(batch_dir)
+
+        def stop_after_first(n: int, job, manifest) -> None:
+            if n == 1:
+                stop.write_text("stop\n", encoding="utf-8")
+
+        preps, entries, split, calls = self._prepare(
+            monkeypatch, tmp_path, count=3, seeds=(0, 1), on_call=stop_after_first
+        )
+        code, outcomes = self._run(
+            preps, entries, split, batch_dir, jobs=1, seeds=[0, 1]
+        )
+        assert code == 1, "a stopped queue must not report success"
+        assert outcomes[0].reason == "stop_file"
+
+        manifest = manifest_mod.Manifest(batch_dir)
+        first_keys = [record["key"] for record in manifest.records()]
+        assert len(first_keys) == 1, "the stop must leave exactly the rows already written"
+        assert len(calls) == 1
+
+        stop.unlink()
+        resumed_preps, resumed_entries, resumed_split, resumed_calls = self._prepare(
+            monkeypatch, tmp_path, count=3, seeds=(0, 1)
+        )
+        code2, _ = self._run(
+            resumed_preps, resumed_entries, resumed_split, batch_dir, jobs=1, seeds=[0, 1]
+        )
+        assert code2 == 0
+
+        keys = [record["key"] for record in manifest.records()]
+        assert len(keys) == len(set(keys)), (
+            "a resume must not write a second row for a key it already finished"
+        )
+        assert len(set(keys)) == 6, "3 bugs × 2 seeds, all reached across the two runs"
+        assert {job.key for job in resumed_calls} == set(keys) - set(first_keys)
+
+    # -- the shared spend cap ---------------------------------------------
+    def test_the_spend_cap_is_read_from_the_manifest_not_one_worker_s_counter(
+        self, tmp_path, monkeypatch
+    ):
+        """§14.29 under a queue: the cap is a property of the *batch*, so a worker
+        that starts after another has spent must see the money, not a zero."""
+        batch_dir = tmp_path / "batch"
+        preps, entries, split, _calls = self._prepare(monkeypatch, tmp_path, count=2, cost_usd=0.6)
+        first, second = preps
+
+        code, _ = self._run(
+            [first], entries, split, batch_dir, jobs=1, max_spend_usd=0.5
+        )
+        assert code == 0
+        assert len(manifest_mod.Manifest(batch_dir).records()) == 1
+
+        code2, outcomes2 = self._run(
+            [second], entries, split, batch_dir, jobs=1, max_spend_usd=0.5
+        )
+        assert code2 == 1
+        assert outcomes2[0].reason == "spend_cap"
+        assert len(manifest_mod.Manifest(batch_dir).records()) == 1, (
+            "the second worker must read the first worker's row, not a counter that "
+            "started at zero"
+        )
+        spend = json.loads(
+            (batch_dir / runner_mod.SPEND_CAP_NAME).read_text(encoding="utf-8")
+        )
+        assert spend["spent_usd"] == 0.6
+
+    # -- the arms and seeds are a selection over the split, not a protocol --
+    def test_an_arm_the_split_does_not_declare_is_refused(self, tmp_path, monkeypatch):
+        preps, entries, split, calls = self._prepare(monkeypatch, tmp_path)
+        with pytest.raises(runner_mod.RunnerError, match="--arms names spellings"):
+            self._run(preps, entries, split, tmp_path / "batch", arm_spellings=["b3"])
+        assert calls == []
+
+    def test_a_seed_the_split_does_not_declare_is_refused(self, tmp_path, monkeypatch):
+        preps, entries, split, calls = self._prepare(monkeypatch, tmp_path, seeds=(0,))
+        with pytest.raises(runner_mod.RunnerError, match="--seeds names values"):
+            self._run(preps, entries, split, tmp_path / "batch", seeds=[7])
+        assert calls == []
+
+    def test_a_selection_with_no_bug_is_refused(self, tmp_path, monkeypatch):
+        preps, entries, split, calls = self._prepare(monkeypatch, tmp_path, count=1)
+        with pytest.raises(runner_mod.RunnerError, match="the queue selection is empty"):
+            self._run(preps, entries, split, tmp_path / "batch", waves=[9])
+        assert calls == []
+
+    # -- the CLI surface ---------------------------------------------------
+    def test_the_queue_command_defaults_to_one_job(self):
+        args = run_mod.build_parser().parse_args(["queue", "--batch", "/tmp/x"])
+        assert args.func is run_mod.cmd_queue
+        assert args.jobs == 1
+
+    def test_the_queue_command_reads_jobs_and_the_selections(self):
+        args = run_mod.build_parser().parse_args(
+            [
+                "queue",
+                "--batch",
+                "/tmp/x",
+                "--jobs",
+                "4",
+                "--arms",
+                "vanta, b0",
+                "--seeds",
+                "0,1",
+            ]
+        )
+        assert args.jobs == 4
+        assert run_mod._parse_arms(args.arms) == ["vanta", "b0"]
+        assert run_mod._parse_seeds(args.seeds) == [0, 1]
+
+    def test_an_empty_arms_or_seeds_flag_means_the_split_s_own(self):
+        assert run_mod._parse_arms("") is None
+        assert run_mod._parse_seeds("  ") is None
 
 
 class TestModelEndpointPreflight:

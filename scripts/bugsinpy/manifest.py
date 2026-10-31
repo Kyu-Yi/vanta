@@ -19,12 +19,75 @@ re-running costs time and cannot corrupt an earlier record.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 SCHEMA_VERSION = 1
+
+MANIFEST_LOCK_NAME = ".manifest.lock"
+
+
+class BatchLocked(RuntimeError):
+    """A second invocation tried to own a batch directory that is already owned."""
+
+
+class FileLock:
+    """An ``flock`` on a file, held for the life of a ``with`` block (M3 item 13).
+
+    [VANTA-WHY] The batch directory is shared by every job the queue runs at once,
+    and three of its files are read-modify-write: ``state.json`` (read, change one
+    key, replace), ``manifest.jsonl`` (append) and ``failures.jsonl`` (append). Two
+    workers interleaving those writes lose updates — the cursor forgets a
+    ``running`` mark and a resume re-runs the job, or two failure lines interleave
+    into one line no reader can parse.
+
+    ``flock`` rather than a ``threading.Lock`` because the unit of exclusion is the
+    *directory*, not the process: a second ``queue`` invocation, or a ``run``
+    started by hand against the same batch, is a different process and has to be
+    excluded too. ``flock`` is per open file description on macOS and BSD, so two
+    threads that each hold their own :class:`FileLock` on one path exclude each
+    other exactly as two processes do — one object per caller, not one per path.
+
+    The lock file is created on first :meth:`acquire`, never in ``__init__``, so a
+    reader that only reads does not write a dotfile into the batch.
+    """
+
+    def __init__(self, path: Path, *, held_message: Optional[str] = None) -> None:
+        self.path = Path(path)
+        self.held_message = held_message
+        self._fd: Optional[int] = None
+
+    def acquire(self, *, blocking: bool = True) -> bool:
+        """Take the lock. ``False`` means it was held and ``blocking`` was off."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except OSError:
+            os.close(fd)
+            return False
+        self._fd = fd
+        return True
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._fd)
+            self._fd = None
+
+    def __enter__(self) -> "FileLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.release()
+
 
 RUNNING = "running"
 DONE = "done"
@@ -72,17 +135,22 @@ class Manifest:
         self.batch_dir = Path(batch_dir)
         self.path = self.batch_dir / MANIFEST_NAME
         self.state_path = self.batch_dir / STATE_NAME
+        # Item 13 — the batch directory's own exclusion, taken for the two
+        # read-modify-write operations below and for nothing else: a job's work is
+        # minutes long and must not hold the directory while it runs.
+        self.lock = FileLock(self.batch_dir / MANIFEST_LOCK_NAME)
 
     # -- evidence ----------------------------------------------------------
     def append(self, record: dict[str, Any]) -> None:
         self.batch_dir.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, ensure_ascii=False, sort_keys=False)
-        with open(self.path, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-            # Flushed *and* fsynced before the caller may mark the job done: a row
-            # that exists only in the page cache is not evidence a reboot can read.
-            handle.flush()
-            os.fsync(handle.fileno())
+        with self.lock:
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+                # Flushed *and* fsynced before the caller may mark the job done: a row
+                # that exists only in the page cache is not evidence a reboot can read.
+                handle.flush()
+                os.fsync(handle.fileno())
 
     def records(self) -> list[dict[str, Any]]:
         try:
@@ -118,17 +186,23 @@ class Manifest:
         return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
 
     def mark(self, key: str, value: str) -> None:
-        state = self.state()
-        state[key] = value
         self.batch_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        # ``os.replace`` is atomic on the same filesystem, so a crash during the
-        # rewrite leaves either the old cursor or the new one — never a truncated
-        # file that would read as "no jobs done" and re-run the whole batch.
-        os.replace(tmp, self.state_path)
+        with self.lock:
+            state = self.state()
+            state[key] = value
+            tmp = self.state_path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            # ``os.replace`` is atomic on the same filesystem, so a crash during the
+            # rewrite leaves either the old cursor or the new one — never a truncated
+            # file that would read as "no jobs done" and re-run the whole batch.
+            #
+            # The read above has to be inside the lock (item 13): otherwise two jobs
+            # finishing at once each read the cursor without the other's key, and the
+            # second replace drops the first job's ``done`` — which a resume then
+            # re-runs, producing a duplicate row for work that is already on disk.
+            os.replace(tmp, self.state_path)
 
     def is_done(self, key: str) -> bool:
         # Strictly `done`. `running` and `failed` both mean "no trustworthy row",

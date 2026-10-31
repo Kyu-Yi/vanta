@@ -28763,8 +28763,9 @@ class TestFrozenConfig:
         assert config.sha256 == config.sha256.lower()
         # The two kinds of `[env]` statement: a literal the harness applies, and
         # `unset`, which is a literal too (it freezes the model's own default).
-        assert config.frozen()["VANTA_SAMPLING"] == "pinned"
-        assert config.frozen()["VANTA_REASONING_EFFORT"] == frozen_mod.UNSET
+        assert config.frozen()["VANTA_SAMPLING"] == "coding"
+        assert config.frozen()["VANTA_REASONING_EFFORT"] == "medium"
+        assert config.frozen()["VANTA_CORROBORATE"] == frozen_mod.UNSET
         # The pre-registration's own literals.
         assert config.prereg()["max_attempts"] == 4
         assert config.prereg()["fixed_rounds"] == 4
@@ -28773,6 +28774,42 @@ class TestFrozenConfig:
             "intent_check",
             "creator",
             "diagnostician",
+        }
+
+    def test_the_committed_env_freezes_the_night_run_values(self):
+        """Item 19 — `[env]` is the night runs' `# env:` header, not a chosen set.
+
+        Every literal below was read off line 2 of the fifteen night1/night2 run
+        logs (written by `runner.env_log_line`), and the six `unset` entries are the
+        variables those headers do NOT carry — frozen to absence because each one
+        changes a verdict when exported. `VANTA_LLM_CONTEXT_TOKENS` is the one whose
+        drift would do the most damage: with the variable absent the binary falls
+        back to 65536 on a hosted backend, about a quarter of the window the rows
+        were budgeted against.
+        """
+        assert frozen_mod.load().frozen() == {
+            "VANTA_ARM": "b3",
+            "VANTA_ATTACKER": "on",
+            "VANTA_BATE": "on",
+            "VANTA_JUDGE": "off",
+            "VANTA_PLANNER": "off",
+            "VANTA_LLM_BACKEND": "openai",
+            "VANTA_LLM_MODEL": "gpt-6-luna",
+            "VANTA_LLM_CONTEXT_TOKENS": "262144",
+            "VANTA_SAMPLING": "coding",
+            "VANTA_REASONING_EFFORT": "medium",
+            "VANTA_REASONING_BUDGET": frozen_mod.UNSET,
+            "VANTA_PRESENCE_PENALTY": frozen_mod.UNSET,
+            "VANTA_CORROBORATE": frozen_mod.UNSET,
+            "VANTA_GROUNDED_AUDIT": frozen_mod.UNSET,
+            "VANTA_BATCH_AUDIT": frozen_mod.UNSET,
+            "VANTA_ATTACKER_CONCISE": frozen_mod.UNSET,
+            "VANTA_DEADLINE_SECS": "10200",
+            "VANTA_LLM_SEED": "2",
+            "VANTA_MAX_SPEND_USD": "5",
+            "VANTA_SANDBOX_BACKEND": "shuru",
+            "VANTA_SHURU_AUTO_DEPS": "0",
+            "VANTA_SHURU_DISK_MB": "16384",
         }
 
     def test_the_hash_is_of_the_files_own_bytes(self, tmp_path):
@@ -28819,7 +28856,7 @@ class TestFrozenConfigResolution:
     """Item 19 — the override rule: a caller value the file freezes differently refuses."""
 
     def _config(self) -> frozen_mod.FrozenConfig:
-        return frozen_mod.load()  # VANTA_SAMPLING frozen to `pinned`, the rest to `unset`
+        return frozen_mod.load()  # VANTA_SAMPLING frozen to `coding`, effort to `medium`
 
     def test_an_absent_variable_is_not_an_override(self):
         config = self._config()
@@ -28827,15 +28864,15 @@ class TestFrozenConfigResolution:
         block, env = frozen_mod.resolve(config, environ={}, allow_override=False)
         assert block["config_override"] is False
         assert block["config_overrides"] == []
-        assert env["VANTA_SAMPLING"] == "pinned"
+        assert env["VANTA_SAMPLING"] == "coding"
 
     def test_a_caller_value_that_contradicts_a_literal_is_refused(self):
         config = self._config()
         with pytest.raises(
-            frozen_mod.FrozenConfigError, match="VANTA_SAMPLING=pinned!=coding"
+            frozen_mod.FrozenConfigError, match="VANTA_SAMPLING=coding!=pinned"
         ):
             frozen_mod.resolve(
-                config, environ={"VANTA_SAMPLING": "coding"}, allow_override=False
+                config, environ={"VANTA_SAMPLING": "pinned"}, allow_override=False
             )
 
     def test_a_variable_frozen_to_unset_is_an_override_when_set(self):
@@ -28843,19 +28880,19 @@ class TestFrozenConfigResolution:
         something other than what the rows claim."""
         config = self._config()
         with pytest.raises(
-            frozen_mod.FrozenConfigError, match="VANTA_REASONING_EFFORT=unset!=low"
+            frozen_mod.FrozenConfigError, match="VANTA_REASONING_BUDGET=unset!=low"
         ):
             frozen_mod.resolve(
-                config, environ={"VANTA_REASONING_EFFORT": "low"}, allow_override=False
+                config, environ={"VANTA_REASONING_BUDGET": "low"}, allow_override=False
             )
 
     def test_the_waiver_records_the_contradiction_and_leaves_the_caller_value(self):
         config = self._config()
         block, env = frozen_mod.resolve(
-            config, environ={"VANTA_SAMPLING": "coding"}, allow_override=True
+            config, environ={"VANTA_SAMPLING": "pinned"}, allow_override=True
         )
         assert block["config_override"] is True
-        assert block["config_overrides"] == ["VANTA_SAMPLING=pinned!=coding"]
+        assert block["config_overrides"] == ["VANTA_SAMPLING=coding!=pinned"]
         # The waived key is NOT applied, so the harness leaves the caller's own value in
         # place (`vanta_env` only ever adds keys); `config_overrides` on the row is what
         # makes that auditable rather than invisible.
@@ -28865,8 +28902,9 @@ class TestFrozenConfigResolution:
         config = self._config()
         _, env = frozen_mod.resolve(config, environ={}, allow_override=False)
         assert frozen_mod.UNSET not in env.values()
-        assert "VANTA_REASONING_EFFORT" not in env
+        assert "VANTA_REASONING_BUDGET" not in env
         assert "VANTA_PRESENCE_PENALTY" not in env
+        assert "VANTA_CORROBORATE" not in env
 
     def test_the_block_carries_the_hash_and_a_repo_relative_path(self):
         config = self._config()

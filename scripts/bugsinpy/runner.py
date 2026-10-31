@@ -569,8 +569,13 @@ def vanta_env(
     entries the caller was allowed to keep (frozen-to-``unset``, or waived by
     ``--allow-override``), because this function only ever *adds* keys and never
     removes one. A key the harness itself owns (``VANTA_ARM``, ``VANTA_JUDGE``,
-    the shuru pair) is set below and would win a collision — none of the frozen
-    keys is one of those today.
+    ``VANTA_BATE``, ``VANTA_PLANNER``, ``VANTA_ATTACKER``, ``VANTA_LLM_SEED``,
+    ``VANTA_DEADLINE_SECS``, the shuru pair) is set below and wins a collision, and
+    ``configs/v1-m3.toml`` does freeze several of those on purpose. There the frozen
+    value is a caller-side guard rather than the source of the child's value: the
+    two agree because the harness derives each from the same fixed arm entry and
+    timeout arithmetic the file names, and the value differs only for a caller the
+    freeze should have refused.
 
     [VANTA-WHY] Every switch, the attempt budget's owner and the arm name come from
     ONE ``arms.py`` entry, so a run cannot be configured as one arm and recorded as

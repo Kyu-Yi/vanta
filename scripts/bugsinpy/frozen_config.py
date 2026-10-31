@@ -54,11 +54,11 @@ UNSET = "unset"
 
 [VANTA-WHY] Distinct from "not listed": a variable that is absent from ``[env]`` is
 simply not frozen, while one frozen to ``unset`` is frozen *to absence* — its
-presence in the caller's environment is an override the run refuses. The two
-settings that need it (``VANTA_REASONING_EFFORT``, ``VANTA_PRESENCE_PENALTY``) are
-verdict-affecting precisely because they are unset: the model's own default is part
-of what the configuration measured, and a caller who sets one measures something
-else."""
+presence in the caller's environment is an override the run refuses. The settings
+that need it (``VANTA_REASONING_BUDGET``, ``VANTA_PRESENCE_PENALTY`` and the four
+audit switches) are verdict-affecting precisely because they are unset: the
+binary's own default is part of what the configuration measured, and a caller who
+sets one measures something else."""
 
 SCHEMA = 1
 

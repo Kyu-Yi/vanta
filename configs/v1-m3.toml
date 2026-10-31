@@ -14,69 +14,124 @@
 #               sets one of these to a different value, unless `--allow-override`
 #               is given (recorded on every row). The value "unset" is a frozen
 #               value meaning "this variable must be absent".
-#   [recorded]  part of the configuration, but only knowable at run time. The
-#               comment gives the row/summary field that carries the observed
-#               value; the file does not freeze a literal it cannot make true.
+#   [recorded]  part of the configuration, but only knowable at run time (or, for
+#               the per-bug sandbox tree, only knowable per bug). The comment gives
+#               the row/summary field that carries the observed value; the file
+#               does not freeze a literal it cannot make true.
 #   [prereg]    what the configuration commits to before a run.
 #   [prompts]   the content hash of every prompt template, inside the hash above.
 #
-# This is the seed of the M4 config file and is kept minimal on purpose: a
-# setting belongs here when changing it changes a verdict, and not otherwise.
+# [VANTA-WHY] Every value in [env] below is MEASURED, not chosen: it is the value
+# the night1/night2 runs actually ran under, read off the `# env:` header that
+# `runner.env_log_line` writes as line 2 of each run log. All fifteen night logs
+# (night1 matplotlib_1 / pandas_1 / PySnooper_3, night2 pandas_1 / PySnooper_3)
+# carry the same set apart from the per-bug checkpoint and pandas' extra memory
+# key, so no variable had to be reconciled between runs. The two variables this
+# file previously froze to other values — `VANTA_SAMPLING = "pinned"` and
+# `VANTA_REASONING_EFFORT = "unset"` — were wrong: the smokes ran `coding` and
+# `medium`, and `VANTA_LLM_CONTEXT_TOKENS`, previously frozen to `unset`, was set
+# to 262144. `unset` there is not neutral: with the variable absent the binary
+# falls back to 65536 on a hosted backend, which is roughly a quarter of the
+# window the rows were sized against (prepare's own `n_ctx_source` names
+# `VANTA_LLM_CONTEXT_TOKENS`).
+#
+# A variable the caller does not set is never an override — the harness applies
+# this file's value instead — so freezing a literal both pins the child env and
+# refuses a caller who exports a different one. Freezing `unset` is the opposite
+# guard: it refuses a caller who exports the variable at all.
 
 schema = 1
 name = "v1-m3"
 
 # ---------------------------------------------------------------------------
-# [env] — frozen. Applied to every vanta_m3 child; a caller value that differs
-# is refused before the first VM boots.
+# [env] — frozen to the night-run literals. Applied to every vanta_m3 child; a
+# caller value that differs is refused before the first VM boots.
 # ---------------------------------------------------------------------------
 [env]
-# §14.11 — the sampler. `pinned` is the per-site schedule every v0.2-era baseline
-# ran under, and the binary's own default when the variable is unset, so applying
-# it is byte-identical to leaving it out; freezing it here is what stops a batch
-# from silently running `coding` instead.
-VANTA_SAMPLING = "pinned"
-# §14.21 — the reasoning knobs. `unset` is a frozen value: the model's own default
-# IS the configuration these rows measure, so exporting either variable at all is
-# an override. "reasoning effort as sent, for every site including intent_audit and
-# when unset" is recorded per row by `run.summary` (see [recorded] below); what the
-# file freezes is that nothing in the caller's environment varies it.
-VANTA_REASONING_EFFORT = "unset"
+# The arm, and the switches the arm's own `arms.py` entry derives from it. The
+# harness also sets these itself (`runner.vanta_env`, from the ONE arm entry), and
+# its keys are applied AFTER this file's — so the freeze is a guard on the caller:
+# it refuses a shell that exports, say, `VANTA_ARM=b0` while claiming to run this
+# configuration. `b3` is `on`/`on`/`off`/`off` for attacker/bate/judge/planner.
+VANTA_ARM = "b3"
+VANTA_ATTACKER = "on"
+VANTA_BATE = "on"
+VANTA_JUDGE = "off"
+VANTA_PLANNER = "off"
+
+# The endpoint and the model. Frozen rather than inherited: a different model is a
+# different measurement, and `gpt-6-luna` is what every night row was taken under.
+VANTA_LLM_BACKEND = "openai"
+VANTA_LLM_MODEL = "gpt-6-luna"
+
+# §1.6.1 — the window. 262144 is the value prepare's gate was sized against
+# (`prepare.json`'s `n_ctx`, whose `n_ctx_source` is this variable's name) and the
+# value every night row's prompts were budgeted against. Freezing it is what stops
+# a shell with the variable absent from silently rerunning at the 65536 fallback.
+VANTA_LLM_CONTEXT_TOKENS = "262144"
+
+# §14.11 — the sampler. `coding` is the night setting; `pinned` is the per-site
+# schedule the v0.2-era baselines used, and a different schedule is a different
+# measurement.
+VANTA_SAMPLING = "coding"
+
+# §14.21 — the reasoning effort as sent, for every site including `intent_audit`.
+# `medium` is the night setting. `VANTA_REASONING_BUDGET` and
+# `VANTA_PRESENCE_PENALTY` were ABSENT in every night run, so they stay frozen to
+# `unset`: the provider's own default is part of what those rows measure, and
+# exporting either knob measures something else.
+VANTA_REASONING_EFFORT = "medium"
 VANTA_REASONING_BUDGET = "unset"
-# §14.21 — the provider's presence penalty. Unset by default and dropped from the
-# request body until a non-default value has been probed, so a stored value is a
-# different prompt; frozen to absence for the same reason as the two above.
 VANTA_PRESENCE_PENALTY = "unset"
-# §1.6.1 — the window. Unset means the binary reads `/props` and records what it
-# was told; a pinned value would size every prompt against a number this file
-# guessed at, and prepare sized its gate against the server's own.
-VANTA_LLM_CONTEXT_TOKENS = "unset"
+
+# §14 — the audit switches. Absent in every night run, i.e. the binary's own `off`
+# default (driver.rs reads each with a `false` default). Frozen to absence for the
+# same reason as the two knobs above.
+VANTA_CORROBORATE = "unset"
+VANTA_GROUNDED_AUDIT = "unset"
+VANTA_BATCH_AUDIT = "unset"
+VANTA_ATTACKER_CONCISE = "unset"
+
+# §14.15 — Vanta's own deadline. The harness derives and sets it itself
+# (`RUN_TIMEOUT_SECS` 3 h minus a ten-minute margin), so the freeze is a guard on
+# the caller, not the source of the child's value: a shell that exports a
+# different deadline would end the run on a clock the rows do not describe.
+VANTA_DEADLINE_SECS = "10200"
+
+# §4.4 — the seed pinned on the request. `2` is the seed the night rows ran under.
+VANTA_LLM_SEED = "2"
+
+# The batch's spend ceiling. A cap that trips mid-run truncates the row, so the
+# value is verdict-affecting and is frozen to the night setting.
+VANTA_MAX_SPEND_USD = "5"
+
+# The sandbox. `shuru` is the FORCED backend (`runner.vanta_env` sets it
+# unconditionally); the freeze refuses a caller that tries to name another. The
+# dependency self-heal needs network the VM does not have, so it is off.
+VANTA_SANDBOX_BACKEND = "shuru"
+VANTA_SHURU_AUTO_DEPS = "0"
+VANTA_SHURU_DISK_MB = "16384"
 
 # ---------------------------------------------------------------------------
 # [recorded] — part of the configuration, observed at run time. Not frozen and not
 # applied: a literal here would be a claim the harness cannot make true.
 # ---------------------------------------------------------------------------
 [recorded]
-# Which endpoint served the run. Inherited by `runner.vanta_env` from the caller
-# on purpose — the harness must not invent a model.
-VANTA_LLM_BACKEND = "run.summary llm_backend + the row's llm block"
-VANTA_LLM_MODEL = "run.summary model — the string the API returns on each response"
+# The endpoint's own name and the server-side request knobs. Inherited from the
+# caller on purpose — the harness must not invent a model or a tier — and carried
+# into the row by `run.summary` (see the comment on each line).
 VANTA_LLM_BASE_URL = "the invocation, not recorded (it names the server, not the model)"
 VANTA_OPENAI_SERVICE_TIER = "run.summary sampling / the row's sampling block"
 # §14.21 — the per-call-site output caps (`VANTA_MAX_TOKENS_<SITE>`, §14.20). A
 # family of variables rather than one, so it cannot be a single frozen key; each
 # site's effective cap is recorded in `run.summary`.
 VANTA_MAX_TOKENS_SITE = "run.summary max_tokens_<role> / the row's sampling block"
-# §14 — the audit switches. `off` is the binary's default; this configuration runs
-# them off and the invocation that wants them on passes it in the environment and
-# records the waiver with --allow-override, or names them here in a later file.
-VANTA_CORROBORATE = "run.summary corroborate / the row's session log"
-VANTA_GROUNDED_AUDIT = "run.summary grounded_audit / the row's session log"
-VANTA_BATCH_AUDIT = "run.summary batch_audit / the row's session log"
-VANTA_ATTACKER_CONCISE = "run.summary attacker_concise; the row's attacker_concise field"
-# §14.15 — Vanta's own deadline. The harness SETS this itself (the timeout minus a
-# margin), so it is never a caller's setting; recorded here only to say so.
-VANTA_DEADLINE_SECS = "set by runner.vanta_env; run.summary deadline_secs"
+# The per-bug sandbox tree. The checkpoint names the bug (`vanta-bi-<project>`) and
+# the memory size is set only for the bugs prepare sized (pandas, 8192 MB), so
+# neither is a value this file could freeze. `runner.vanta_env` sets both from the
+# bug's own row, and the run log's `# env:` header records what it set.
+VANTA_SHURU_CHECKPOINT = "set by runner.vanta_env from the bug (vanta-bi-<project>)"
+VANTA_SHURU_MEMORY_MB = "set by runner.vanta_env from the row's prepare; absent = shuru's default"
 
 # ---------------------------------------------------------------------------
 # [prereg] — the pre-registration: what this configuration commits to before a
@@ -85,8 +140,8 @@ VANTA_DEADLINE_SECS = "set by runner.vanta_env; run.summary deadline_secs"
 # ---------------------------------------------------------------------------
 [prereg]
 # The model string the API returns on each response, and the sampling/effort as
-# sent. Recorded per row: `model`, `sampling`, and `run.summary`'s
-# `reasoning_effort` — including for `intent_audit`, and including when unset.
+# sent. The frozen literals are in [env] above; what is recorded per row is the
+# AS-SENT value — the server may normalise it — including for `intent_audit`.
 model = "recorded"
 reasoning_effort = "recorded"
 sampling = "recorded"

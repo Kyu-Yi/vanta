@@ -67,6 +67,7 @@ from bugsinpy import split as split_mod  # noqa: E402
 from bugsinpy import suite as suite_mod  # noqa: E402
 from bugsinpy import trees as tree_mod  # noqa: E402
 from bugsinpy.split import SplitError, load_split  # noqa: E402
+import analyse as analyse_mod  # noqa: E402
 import bugsinpy_run as run_mod  # noqa: E402
 
 SPLIT_PATH = REPO_ROOT / "plans" / "bugsinpy_split.json"
@@ -26919,4 +26920,523 @@ class TestReplayCli:
         code = run_mod.main(["replay", "--batch", str(batch), "--force"])
         assert code == run_mod.EXIT_OK
         assert json.loads(existing.read_text())["kind"] == "replay"
+
+
+# ============================================================================
+# analyse.py — item 12: every paper number from the batches' own records
+# ============================================================================
+# The script is a plug-in table over item 10's matrix: the counting rules stay in
+# replay.py and are CALLED, never re-implemented, so these tests pin (a) the pure
+# numeric helpers, (b) that the metrics read the matrix through replay.py's own
+# functions, and (c) that a whole run is deterministic and writes one fixed file
+# set. A number the input cannot support must read `unavailable(...)`, never `0`.
+def _analyse_oracle(*, apply_ok: bool = True, patch_good: bool = True, regressions=(), error: str = "") -> dict:
+    """One row's ``oracle`` payload, in the manifest's own recorded shape."""
+    return {
+        "apply_ok": apply_ok,
+        "apply_detail": "",
+        "hidden_pass": patch_good,
+        "hidden_nodeids": [],
+        "hidden_outcomes": {},
+        "suite_regressions": list(regressions),
+        "suite_regressions_count": len(regressions),
+        "patched_failures": [],
+        "patch_good": patch_good,
+        "oracle_secs": 0.0,
+        "error": error,
+    }
+
+
+def _analyse_row(
+    key: str,
+    *,
+    bug: str = "Demo/1",
+    arm: str = "b3",
+    mode: str = "review",
+    config: str = "judge",
+    verdict: str = "AllTestsPassed",
+    kind: str = "dev_fix",
+    patch_sha256: str = "a" * 64,
+    seed: int = 0,
+    oracle: "dict | None" = None,
+    session_id: str = "",
+    **over,
+) -> dict:
+    """One manifest row with exactly the fields §5.3's label reads."""
+    record = {
+        "schema_version": 1,
+        "kind": "run",
+        "key": key,
+        "bug": bug,
+        "arm": arm,
+        "mode": mode,
+        "config": config,
+        "seed": seed,
+        "session_id": session_id,
+        "verdict": verdict,
+        "candidate": {"kind": kind, "patch_sha256": patch_sha256},
+        "oracle": _analyse_oracle() if oracle is None else oracle,
+        "artifacts": {"session_dir": None},
+    }
+    record.update(over)
+    return record
+
+
+def _analyse_replay(
+    bug: str = "Demo/1",
+    *,
+    session_id: str = "sid",
+    cells=None,
+    tests=None,
+    flaky=(),
+    views=None,
+) -> dict:
+    """One replay record, both views declared so ``view_transitions`` will read it."""
+    return {
+        "schema_version": 1,
+        "kind": "replay",
+        "session_id": session_id,
+        "bug": bug,
+        "views": (
+            views
+            if views is not None
+            else {view: {"transitions": []} for view in replay_mod.DEFAULT_VIEWS}
+        ),
+        "cells": list(cells or []),
+        "tests": list(tests or []),
+        "flaky": list(flaky),
+    }
+
+
+def _analyse_batch(tmp_path: Path, *, rows=(), replays=(), name: str = "batch") -> Path:
+    """A batch directory with a manifest and its replay files, and nothing else."""
+    batch = tmp_path / name
+    batch.mkdir(parents=True, exist_ok=True)
+    write(batch / "manifest.jsonl", "".join(json.dumps(row) + "\n" for row in rows))
+    for index, replay in enumerate(replays):
+        write(batch / replay_mod.REPLAY_DIRNAME / f"r{index}.json", json.dumps(replay) + "\n")
+    return batch
+
+
+def _analyse_load(batch: Path, *, resamples: int = 40):
+    return analyse_mod.load_analysis([str(batch)], seed=1, resamples=resamples)
+
+
+class TestAnalyseNumbers:
+    def test_unavailable_is_a_token_not_a_zero(self):
+        assert analyse_mod.unavailable("item 15 not built") == "unavailable(item 15 not built)"
+
+    def test_label_for_reads_the_verdict_and_the_oracle(self):
+        assert analyse_mod.label_for(_analyse_row("k", verdict="AllTestsPassed")) == "true_approval"
+        assert analyse_mod.label_for({"verdict": "AllTestsPassed"}) == ""
+
+    def test_candidate_kind_names_the_papers_word_and_cuts_mutants_by_operator(self):
+        assert analyse_mod.candidate_kind(_analyse_row("k", kind="dev_fix")) == "reference"
+        assert analyse_mod.candidate_kind(_analyse_row("k", kind="noop")) == "no-op"
+        assert analyse_mod.candidate_kind(_analyse_row("k", kind="failed_patch")) == "failed_patch"
+        mutant = _analyse_row("k", candidate={"kind": "mutant", "operator": "AOR"})
+        assert analyse_mod.candidate_kind(mutant) == "mutant:AOR"
+        assert analyse_mod.candidate_kind({}) is None
+
+    def test_candidate_id_prefers_the_patch_hash_and_falls_back(self):
+        assert analyse_mod.candidate_id(_analyse_row("k", patch_sha256="h")) == "h"
+        assert analyse_mod.candidate_id(
+            _analyse_row("k", candidate={"kind": "dev_fix", "normalized_sha256": "n"})
+        ) == "n"
+        assert analyse_mod.candidate_id({}) is None
+
+    def test_approval_and_rejection_rates_keep_refusals_out_of_the_denominator(self):
+        counts = {
+            analyse_mod.CELL_TA: 3,
+            analyse_mod.CELL_FA: 1,
+            analyse_mod.CELL_TR: 4,
+            analyse_mod.CELL_FR: 2,
+            analyse_mod.CELL_NR: 9,
+        }
+        assert analyse_mod.approval_rate(counts) == pytest.approx(0.4)
+        assert analyse_mod.rejection_rate(counts) == pytest.approx(0.6)
+        assert analyse_mod.approval_rate({analyse_mod.CELL_NR: 5}) is None
+        assert analyse_mod.rejection_rate({}) is None
+
+    def test_balanced_accuracy_needs_both_classes(self):
+        counts = {
+            analyse_mod.CELL_TA: 3,
+            analyse_mod.CELL_FA: 1,
+            analyse_mod.CELL_TR: 4,
+            analyse_mod.CELL_FR: 2,
+        }
+        assert analyse_mod.balanced_accuracy(counts) == pytest.approx(0.7)
+        assert analyse_mod.balanced_accuracy({analyse_mod.CELL_TA: 1}) is None  # no bad rows
+        assert analyse_mod.balanced_accuracy({analyse_mod.CELL_TR: 1}) is None  # no good rows
+
+    def test_mcnemar_exact_is_the_two_sided_binomial_and_caps_at_one(self):
+        assert analyse_mod.mcnemar_exact(0, 0) == 1.0
+        assert analyse_mod.mcnemar_exact(4, 1) == pytest.approx(0.375)
+        assert analyse_mod.mcnemar_exact(1, 4) == pytest.approx(0.375)  # symmetric
+        assert analyse_mod.mcnemar_exact(5, 0) == pytest.approx(2 * 0.5**5)
+
+    def test_cluster_bootstrap_is_seeded_and_refuses_a_single_cluster(self):
+        by_cluster = {"A/1": [1.0, 1.0], "B/1": [0.0], "C/1": [1.0, 0.0]}
+
+        def mean(values):
+            return sum(values) / len(values)
+
+        first = analyse_mod.cluster_bootstrap(by_cluster, mean, seed=7, resamples=200)
+        second = analyse_mod.cluster_bootstrap(by_cluster, mean, seed=7, resamples=200)
+        assert first == second and first is not None
+        assert first[0] <= first[1]
+        # one cluster resampled with replacement is the same cluster every draw: the
+        # zero-width interval that came out of it claimed a precision it never measured.
+        assert analyse_mod.cluster_bootstrap({"A/1": [1.0]}, mean, seed=7, resamples=200) is None
+
+
+class TestAnalyseLoading:
+    def test_a_torn_last_line_is_dropped_and_the_last_key_wins(self, tmp_path):
+        batch = tmp_path / "b"
+        batch.mkdir()
+        write(
+            batch / "manifest.jsonl",
+            json.dumps(_analyse_row("k1", verdict="Rejected")) + "\n"
+            + json.dumps(_analyse_row("k1", verdict="AllTestsPassed")) + "\n"
+            + '{"key": "k2", "verdict": "AllTestsPassed"',  # torn: no closing brace
+        )
+        records = analyse_mod.load_manifest(batch / "manifest.jsonl")
+        assert [record["key"] for record in records] == ["k1"]
+        assert records[0]["verdict"] == "AllTestsPassed"
+
+    def test_no_matching_batch_is_an_error_not_an_empty_report(self, tmp_path):
+        with pytest.raises(analyse_mod.AnalysisError):
+            analyse_mod.load_analysis([str(tmp_path / "nope-*")], seed=1, resamples=10)
+
+    def test_view_transitions_recompute_from_the_cells_through_replay(self, tmp_path):
+        batch = _analyse_batch(tmp_path, replays=[_analyse_replay(cells=_replay_matrix())])
+        analysis = _analyse_load(batch)
+        pooled, per_source, by_bug = analyse_mod.view_transitions(
+            analysis, replay_mod.VIEW_GENERATED
+        )
+        expected = {entry["k"]: entry for entry in replay_mod.transitions(_replay_matrix())}
+        assert set(pooled) == set(expected)
+        for key, entry in expected.items():
+            for name in ("n_pp", "n_pf", "n_fp", "n_ff", "n_censored"):
+                assert pooled[key][name] == entry[name]
+        # the per-source cut is the same counts, split by evidence_source
+        assert per_source["0->1"][replay_mod.SOURCE_VANTA_GENERATED]["n_ff"] == 1
+        assert per_source["0->1"][replay_mod.SOURCE_REPO_BASELINE]["n_pp"] == 1
+        assert "Demo/1" in by_bug
+
+
+class TestAnalyseReview:
+    def _rows(self) -> list[dict]:
+        return [
+            _analyse_row("k1", verdict="AllTestsPassed", kind="dev_fix", patch_sha256="p1"),
+            _analyse_row(
+                "k2",
+                verdict="AllTestsPassed",
+                kind="dev_fix",
+                patch_sha256="p2",
+                oracle=_analyse_oracle(patch_good=False),
+            ),
+            _analyse_row("k3", verdict="Rejected", kind="noop", patch_sha256="p3"),
+            _analyse_row(
+                "k4",
+                verdict="Rejected",
+                kind="noop",
+                patch_sha256="p4",
+                oracle=_analyse_oracle(patch_good=False),
+            ),
+            _analyse_row(
+                "k5",
+                verdict="NeedsReview",
+                patch_sha256="p5",
+                candidate={"kind": "mutant", "operator": "AOR", "patch_sha256": "p5"},
+            ),
+            _analyse_row("k6", verdict="InfraFailure", kind="dev_fix", patch_sha256="p6"),
+        ]
+
+    def test_review_confusion_counts_the_cells_and_drops_the_censors(self, tmp_path):
+        analysis = _analyse_load(_analyse_batch(tmp_path, rows=self._rows()))
+        table = analyse_mod.review_confusion(analysis)
+        assert table[("b3", "reference")] == Counter(
+            {analyse_mod.CELL_TA: 1, analyse_mod.CELL_FA: 1}
+        )
+        assert table[("b3", "no-op")] == Counter(
+            {analyse_mod.CELL_TR: 1, analyse_mod.CELL_FR: 1}
+        )
+        assert table[("b3", "mutant:AOR")] == Counter({analyse_mod.CELL_NR: 1})
+
+    def test_a_row_a_label_cannot_score_is_not_counted(self, tmp_path):
+        # k6 is an InfraFailure: it still carries a candidate and an oracle, so only
+        # the label keeps it out of the reference cell's counts.
+        analysis = _analyse_load(_analyse_batch(tmp_path, rows=self._rows()))
+        reference = analyse_mod.review_confusion(analysis)[("b3", "reference")]
+        assert sum(reference.values()) == 2
+
+    def test_the_review_tex_carries_the_cells_and_a_wilson_interval(self, tmp_path):
+        analysis = _analyse_load(_analyse_batch(tmp_path, rows=self._rows()))
+        result = analyse_mod.ReviewMetrics().run(analysis)
+        assert sorted(artifact.filename for artifact in result.artifacts) == [
+            "review_rates.svg",
+            "review_rates.tex",
+        ]
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["review_rates.tex"]
+        assert "b3" in tex and "reference" in tex
+        assert "[" in tex and "]" in tex  # the Wilson interval is printed, not the rate alone
+
+
+class TestAnalysePaired:
+    def _rows(self) -> list[dict]:
+        return [
+            # seed 1: b3 right, judge wrong -> b
+            _analyse_row("k1", arm="b3", bug="A/1", seed=1, patch_sha256="x"),
+            _analyse_row("k2", arm="judge", bug="A/1", seed=1, patch_sha256="x", verdict="Rejected"),
+            # seed 2 of the same bug+candidate is a distinct experiment, so it must
+            # not overwrite seed 1 -> c
+            _analyse_row("k3", arm="b3", bug="A/1", seed=2, patch_sha256="x", verdict="Rejected"),
+            _analyse_row("k4", arm="judge", bug="A/1", seed=2, patch_sha256="x"),
+            # a b3 row with no judge partner, and a refusal that is not a decision
+            _analyse_row("k5", arm="b3", bug="B/1", seed=1, patch_sha256="y"),
+            _analyse_row("k6", arm="b3", bug="C/1", seed=1, patch_sha256="z", verdict="NeedsReview"),
+            _analyse_row("k7", arm="judge", bug="C/1", seed=1, patch_sha256="z", verdict="Rejected"),
+        ]
+
+    def test_pairing_keeps_the_seed_and_drops_unpaired_and_refused_rows(self, tmp_path):
+        analysis = _analyse_load(_analyse_batch(tmp_path, rows=self._rows()))
+        index = analyse_mod.pair_index(analysis)
+        shared, b, c = analyse_mod.paired_counts(index, "b3", "judge")
+        assert len(shared) == 2, "both seeds of the one candidate must pair, not overwrite"
+        assert (b, c) == (1, 1)
+        assert ("b3", "C/1#1#z") not in index  # a refusal is not a pairing outcome
+        assert all(key.startswith("A/1#") for key, _l, _r in shared)
+
+    def test_the_paired_tex_reports_n_for_the_shared_rows_only(self, tmp_path):
+        analysis = _analyse_load(_analyse_batch(tmp_path, rows=self._rows()))
+        result = analyse_mod.PairedMetrics().run(analysis)
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["paired.tex"]
+        assert "B3 vs judge" in tex
+        assert " & 2 & 1 & 1 &" in tex  # n=2 b=1 c=1
+
+
+class TestAnalyseRepair:
+    def _caught_views(self) -> dict:
+        return {
+            replay_mod.VIEW_GENERATED: {
+                "transitions": [
+                    {
+                        "k": "0->1",
+                        "by_source": {
+                            replay_mod.SOURCE_VANTA_GENERATED: {
+                                "n_pp": 0,
+                                "n_pf": 1,
+                                "n_fp": 0,
+                                "n_ff": 0,
+                                "n_censored": 0,
+                            }
+                        },
+                    }
+                ]
+            },
+            replay_mod.VIEW_ORACLE: {"transitions": []},
+        }
+
+    def _batch(self, tmp_path: Path) -> Path:
+        rows = [
+            _analyse_row(
+                "k1", mode="repair", bug="A/1", session_id="s1",
+                fixed_at_attempt_1=True, attempts_run=1,
+            ),
+            _analyse_row(
+                "k2", mode="repair", bug="B/1", session_id="s2", attempts_run=2,
+                oracle=_analyse_oracle(patch_good=False, regressions=["t::x"]),
+            ),
+            _analyse_row(
+                "k3", mode="repair", bug="C/1", session_id="s3", attempts_run=3,
+                oracle=_analyse_oracle(patch_good=False),
+            ),
+            _analyse_row(
+                "k4", mode="repair", bug="D/1", session_id="s4", attempts_run=4,
+                oracle=_analyse_oracle(apply_ok=False, patch_good=False),
+            ),
+        ]
+        replays = [
+            _analyse_replay(bug="A/1", session_id="s1", views=self._caught_views()),
+            _analyse_replay(bug="C/1", session_id="s3"),
+        ]
+        return _analyse_batch(tmp_path, rows=rows, replays=replays)
+
+    def test_repair_counts_fix_and_regression_and_need_a_replay_for_the_catch_rate(self, tmp_path):
+        counts = analyse_mod.repair_counts(_analyse_load(self._batch(tmp_path)))
+        assert counts.total == 4 and counts.applied == 3
+        assert counts.fixed == 1 and counts.fixed_first_attempt == 1
+        assert counts.regressed == 1
+        assert counts.attempt_hist == Counter({1: 1, 2: 1, 3: 1, 4: 1})
+        assert counts.fix_rate == pytest.approx(0.25)
+        assert counts.regression_rate == pytest.approx(1 / 3)
+        # k1's replay caught a regression the native suite did not; k3's replay did
+        # not, so it stays in the denominator. k2/k4 have no replay at all.
+        assert counts.replayed == 2
+        assert counts.adversarial_catches == 1
+        assert counts.adversarial_catch_rate == pytest.approx(0.5)
+
+    def test_the_repair_tex_marks_cost_unavailable_and_never_zero(self, tmp_path):
+        result = analyse_mod.RepairMetrics().run(_analyse_load(self._batch(tmp_path)))
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["repair.tex"]
+        assert "unavailable(item 15 not built)" in tex
+
+
+class TestAnalyseEirEcr:
+    def test_the_pooled_and_per_source_columns_are_both_written(self, tmp_path):
+        batch = _analyse_batch(tmp_path, replays=[_analyse_replay(cells=_replay_matrix())])
+        result = analyse_mod.EirEcrMetrics().run(_analyse_load(batch))
+        assert sorted(artifact.filename for artifact in result.artifacts) == [
+            "eir_ecr.svg",
+            "eir_ecr.tex",
+        ]
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["eir_ecr.tex"]
+        assert "pooled" in tex
+        # the per-source cut is written too, with its underscore escaped for LaTeX
+        assert analyse_mod._tex(replay_mod.SOURCE_VANTA_GENERATED) in tex
+        assert analyse_mod._tex(replay_mod.SOURCE_REPO_BASELINE) in tex
+        assert "n\\_EIR" in tex and "n\\_ECR" in tex
+        assert "0->1" in tex and "1->2" in tex
+
+    def test_stability_is_undefined_when_a_side_of_it_is_undefined(self):
+        assert analyse_mod._stability({"eir": 0.0, "ecr": 0.5, "acc": 0.5}) == "n/a"
+        assert analyse_mod._stability({"eir": 0.5, "ecr": None, "acc": 0.5}) == "n/a"
+        assert analyse_mod._stability({"eir": 0.5, "ecr": 0.5, "acc": 1.0}) == "n/a"
+        assert analyse_mod._stability({"eir": 0.5, "ecr": 0.9, "acc": 0.5}) == "yes"
+        assert analyse_mod._stability({"eir": 0.5, "ecr": 0.2, "acc": 0.5}) == "no"
+
+
+class TestAnalysePipeline:
+    def test_pipeline_reads_tests_from_the_replay_and_truncations_from_the_session(self, tmp_path):
+        sessions = tmp_path / "vanta_sessions"
+        (sessions / "sid").mkdir(parents=True)
+        write(
+            sessions / "sid_session.jsonl",
+            json.dumps(
+                {"phase": "run.summary", "summary": "truncated_calls=2 provider_retries=3"}
+            )
+            + "\n"
+            + json.dumps(
+                {"phase": "patched.result[0]", "summary": "failure_class=AssertionError"}
+            )
+            + "\n",
+        )
+        tests = [
+            {
+                "test_id": "generated:g1",
+                "evidence_source": replay_mod.SOURCE_VANTA_GENERATED,
+                "round_admitted": 1,
+                "assertion_grounding_type": replay_mod.GROUNDING_LITERAL,
+            },
+            {
+                "test_id": "generated:g2",
+                "evidence_source": replay_mod.SOURCE_VANTA_GENERATED,
+                "round_admitted": 2,
+                "assertion_grounding_type": replay_mod.GROUNDING_LITERAL,
+            },
+            {
+                "test_id": "generated:g3",
+                "evidence_source": replay_mod.SOURCE_VANTA_GENERATED,
+                "round_admitted": None,
+                "assertion_grounding_type": replay_mod.GROUNDING_UNGROUNDED_SCRAPPED,
+            },
+            {
+                "test_id": "native:t_a",
+                "evidence_source": replay_mod.SOURCE_REPO_BASELINE,
+                "round_admitted": None,
+                "assertion_grounding_type": None,
+            },
+        ]
+        row = _analyse_row("k1", mode="repair", artifacts={"session_dir": str(sessions / "sid")})
+        batch = _analyse_batch(
+            tmp_path, rows=[row], replays=[_analyse_replay(tests=tests)]
+        )
+        result = analyse_mod.PipelineMetrics().run(_analyse_load(batch))
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["pipeline.tex"]
+        assert "tests generated & 3" in tex
+        assert "admitted first time & 1" in tex
+        assert "admitted after revision & 1" in tex
+        assert "discarded (ungrounded, scrapped) & 1" in tex
+        assert "truncated calls & 2" in tex
+        assert "provider retries & 3" in tex
+        assert "assertionerror:1" in tex
+
+
+class TestAnalyseCost:
+    def test_every_cost_and_time_number_states_it_is_unavailable(self):
+        result = analyse_mod.CostTimeMetrics().run(analyse_mod.Analysis(batches=[]))
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["cost_time.tex"]
+        assert tex.count("unavailable(item 15 not built)") == 6
+        assert " & 0 " not in tex
+
+
+class TestAnalyseOutputs:
+    def _analysis(self, tmp_path: Path):
+        rows = [
+            _analyse_row("k1", arm="b3", bug="A/1", mode="repair", patch_sha256="x"),
+            _analyse_row("k2", arm="judge", bug="A/1", patch_sha256="x", verdict="Rejected"),
+        ]
+        replays = [_analyse_replay(bug="A/1", cells=_replay_matrix())]
+        return _analyse_load(_analyse_batch(tmp_path, rows=rows, replays=replays), resamples=20)
+
+    def test_every_metric_writes_its_files_and_the_run_is_deterministic(self, tmp_path):
+        analysis = self._analysis(tmp_path)
+        first = analyse_mod.run_analysis(analysis)
+        second = analyse_mod.run_analysis(analysis)
+        assert first == second, "regenerating must give identical files"
+        assert set(first) == {
+            "cost_time.tex",
+            "eir_ecr.svg",
+            "eir_ecr.tex",
+            "fix_regression.svg",
+            "paired.tex",
+            "pipeline.tex",
+            "repair.tex",
+            "review_rates.svg",
+            "review_rates.tex",
+            "summary.txt",
+        }
+
+    def test_write_outputs_writes_every_file_it_was_handed(self, tmp_path):
+        analysis = self._analysis(tmp_path)
+        out = tmp_path / "out"
+        written = analyse_mod.write_outputs(analyse_mod.run_analysis(analysis), out)
+        assert sorted(path.name for path in written) == sorted(
+            path.name for path in out.iterdir()
+        )
+        assert (out / "summary.txt").read_text(encoding="utf-8").startswith(
+            "item 12 — analysis summary"
+        )
+
+
+class TestAnalyseCli:
+    def test_the_parser_requires_a_batch_and_carries_the_defaults(self):
+        parser = analyse_mod.build_parser()
+        args = parser.parse_args(["--batches", "runs/x"])
+        assert args.batches == ["runs/x"]
+        assert args.out == analyse_mod.DEFAULT_OUT
+        assert args.seed == analyse_mod.DEFAULT_SEED
+        assert args.bootstrap == analyse_mod.DEFAULT_BOOTSTRAP
+        with pytest.raises(SystemExit):
+            parser.parse_args([])
+
+    def test_main_refuses_a_pattern_that_matches_no_batch(self, tmp_path, capsys):
+        code = analyse_mod.main(
+            ["--batches", str(tmp_path / "none-*"), "--out", str(tmp_path / "o")]
+        )
+        assert code == 1
+        assert "matched no batch" in capsys.readouterr().err
+
+    def test_main_writes_the_outputs_for_a_real_batch(self, tmp_path):
+        batch = _analyse_batch(
+            tmp_path, rows=[_analyse_row("k1")], replays=[_analyse_replay(cells=_replay_matrix())]
+        )
+        out = tmp_path / "out"
+        code = analyse_mod.main(
+            ["--batches", str(batch), "--out", str(out), "--bootstrap", "20"]
+        )
+        assert code == 0
+        assert (out / "summary.txt").is_file()
+        assert (out / "eir_ecr.tex").is_file()
 

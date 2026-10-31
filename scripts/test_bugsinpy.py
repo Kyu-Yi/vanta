@@ -26479,6 +26479,67 @@ class TestReplaySessionReuse:
         assert entry["by_source"][replay_mod.SOURCE_REPO_BASELINE]["n_pp"] == 1
 
 
+class TestReplaySkippedRow:
+    """A repair row whose every attempt failed to apply is recorded, not replayed.
+
+    matplotlib/1 night1: 4 Creator patches, all `patch_application_failed.json`, no
+    `final_patch`, `attempts_run=4`. Naming it here is what keeps a reader's
+    population explicit — the row is neither replayed nor quietly dropped.
+    """
+
+    def _record(self, **over):
+        record = _replay_record(attempts_run=4, artifacts={"final_patch": None})
+        record.update(over)
+        return record
+
+    def test_a_repair_row_with_no_applied_attempt_is_skippable_but_not_replayable(self):
+        record = self._record()
+        assert replay_mod.is_repairable_row(record), "the repair loop ran, so it is a candidate"
+        assert replay_mod.replay_skip_reason(record) == replay_mod.SKIP_NO_APPLIED_ATTEMPT
+        assert not replay_mod.is_repair_row(record), "there is no candidate code to replay"
+
+    def test_a_review_row_is_not_a_replay_candidate_at_all(self):
+        record = _replay_record(mode="review")
+        assert not replay_mod.is_repairable_row(record)
+        assert replay_mod.replay_skip_reason(record) is None
+
+    def test_an_applied_patch_leaves_no_skip_reason(self):
+        record = _replay_record()
+        assert replay_mod.is_repairable_row(record)
+        assert replay_mod.replay_skip_reason(record) is None
+        assert replay_mod.is_repair_row(record)
+
+    def test_the_record_is_skipped_with_only_the_baseline_column_runnable(self, tmp_path):
+        prep = _replay_prep(tmp_path)
+        sessions, debug = _replay_session(tmp_path, attempts=0)
+        for attempt in range(1, 5):
+            write(debug / f"attempt_{attempt}_creator_patch.txt", f"PATCH-{attempt}")
+        record = replay_mod.skipped_row(
+            record=self._record(),
+            prep=prep,
+            checkpoint="ck",
+            sessions_dir=sessions,
+            views=replay_mod.DEFAULT_VIEWS,
+            seed=replay_mod.DEFAULT_SEED,
+            sample_rate=replay_mod.DEFAULT_SAMPLE_RATE,
+            reason=replay_mod.SKIP_NO_APPLIED_ATTEMPT,
+        )
+        assert record["skipped"] is True
+        assert record["skip_reason"] == "no_applied_attempt"
+        assert record["cells"] == [], "nothing was observed, so nothing is claimed"
+        assert record["replay"]["boots"] == 0
+        assert set(record["views"]) == set(replay_mod.DEFAULT_VIEWS)
+        assert all(view["transitions"] == [] for view in record["views"].values())
+        columns = record["columns"]
+        assert [column["k"] for column in columns] == [0, 1, 2, 3, 4]
+        assert columns[0]["origin"] == replay_mod.ORIGIN_BASELINE
+        assert columns[0]["ran"] is False
+        for column in columns[1:]:
+            assert column["origin"] == replay_mod.ORIGIN_MISSING
+            assert column["ran"] is False
+            assert column["censor_reason"], "every attempt column carries its own reason"
+
+
 class TestReplayRow:
     def test_a_row_records_the_matrix_and_counts_the_reuse(self, tmp_path, monkeypatch):
         prep = _replay_prep(tmp_path)
@@ -26802,6 +26863,49 @@ class TestReplayCli:
         assert code == run_mod.EXIT_OK
         assert "already" in capsys.readouterr().out
         assert existing.read_text() == "{}\n"
+
+    def test_a_repair_row_with_no_applied_attempt_is_recorded_as_skipped(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        record = _replay_record(attempts_run=4, artifacts={"final_patch": None})
+        batch = tmp_path / "b"
+        manifest_mod.Manifest(batch).append(record)
+        prep = _replay_prep(tmp_path)
+        self._prepare_cli(monkeypatch, batch, [prep])
+
+        def explode(**kwargs):
+            raise AssertionError("a row with no applied attempt must not be replayed")
+
+        monkeypatch.setattr(replay_mod, "replay_row", explode)
+        code = run_mod.main(["replay", "--batch", str(batch)])
+        assert code == run_mod.EXIT_OK
+        assert "no_applied_attempt" in capsys.readouterr().out
+        written = json.loads(
+            (batch / replay_mod.REPLAY_DIRNAME / f"{replay_mod.row_stem(record['key'])}.json")
+            .read_text()
+        )
+        assert written["skipped"] is True
+        assert written["skip_reason"] == replay_mod.SKIP_NO_APPLIED_ATTEMPT
+
+    def test_a_skipped_row_does_not_stop_the_next_row(self, tmp_path, monkeypatch):
+        skipped = _replay_record(
+            key="b#Demo/1#vanta#repair#0#", attempts_run=4, artifacts={"final_patch": None}
+        )
+        played = _replay_record(key="b#Demo/1#vanta#repair#1#")
+        batch = tmp_path / "b"
+        for record in (skipped, played):
+            manifest_mod.Manifest(batch).append(record)
+        prep = _replay_prep(tmp_path)
+        self._prepare_cli(monkeypatch, batch, [prep])
+        replayed: list[str] = []
+        monkeypatch.setattr(
+            replay_mod,
+            "replay_row",
+            lambda **kwargs: replayed.append(str(kwargs["record"]["key"])) or {"kind": "replay"},
+        )
+        code = run_mod.main(["replay", "--batch", str(batch)])
+        assert code == run_mod.EXIT_OK
+        assert replayed == [played["key"]], "replay continued past the skipped row"
 
     def test_force_rewrites_the_row(self, tmp_path, monkeypatch, capsys):
         record = _replay_record()

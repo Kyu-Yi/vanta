@@ -1247,11 +1247,11 @@ def cmd_replay(args: argparse.Namespace) -> int:
             # than once; the last occurrence is the one `Manifest.find` and
             # `state.json` treat as current, and therefore the one replayed.
             latest[key] = record
-    rows = [record for record in latest.values() if replay_mod.is_repair_row(record)]
+    rows = [record for record in latest.values() if replay_mod.is_repairable_row(record)]
     if not rows:
         raise replay_mod.ReplayError(
-            f"no repair rows to replay in {batch_dir}: replay needs a finished "
-            "repair row (a session and a final patch)."
+            f"no repair rows to replay in {batch_dir}: replay needs a repair row "
+            "with a session."
         )
 
     out_dir = batch_dir / replay_mod.REPLAY_DIRNAME
@@ -1274,6 +1274,31 @@ def cmd_replay(args: argparse.Namespace) -> int:
             )
             continue
         checkpoint = str(batch.entries[prep.key]["checkpoint"])
+        # A row whose every attempt failed to apply is recorded, not replayed: it
+        # has no candidate code to put in any column past the baseline, and raising
+        # here would take the rest of the batch down with it (item 10, replay fix 2).
+        reason = replay_mod.replay_skip_reason(record)
+        if reason is not None:
+            result = replay_mod.skipped_row(
+                record=record,
+                prep=prep,
+                checkpoint=checkpoint,
+                sessions_dir=sessions,
+                views=views,
+                seed=args.seed,
+                sample_rate=args.sample_rate,
+                reason=reason,
+            )
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(
+                json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+            print(
+                f"[{index}/{len(rows)}] {key} — skipped: {reason} "
+                f"(no attempt applied; recorded, not replayed) -> {out_path}",
+                flush=True,
+            )
+            continue
         print(
             f"[{index}/{len(rows)}] {key} — replaying {len(views)} view(s) in Shuru…",
             flush=True,

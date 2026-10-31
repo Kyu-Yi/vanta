@@ -32,6 +32,10 @@ The index convention (§4): column 0 is the *unmodified* baseline tree; column k
 (1..K) is the tree the live graded run used for attempt k. So K stored attempts
 produce K+1 columns, and the 0->1 transition is baseline-to-first-patch and nothing
 else.
+
+A repair row whose every attempt failed to apply has no column to build past the
+baseline. It is neither replayed nor dropped: :func:`skipped_row` records it as
+skipped with the reason, so the population a rate is taken over stays explicit.
 """
 
 from __future__ import annotations
@@ -571,13 +575,36 @@ def _tri_state(text: Optional[str]) -> Optional[bool]:
     return None
 
 
-def is_repair_row(record: Mapping[str, Any]) -> bool:
-    """A row item 10 may replay: a finished repair with a session and a patch."""
+SKIP_NO_APPLIED_ATTEMPT = "no_applied_attempt"
+"""Replay's skip reason for a repair row whose every attempt failed to apply."""
+
+
+def is_repairable_row(record: Mapping[str, Any]) -> bool:
+    """A row the repair loop ran — a repair with a session, applied or not."""
     if str(record.get("mode") or "") != arms_mod.REPAIR:
         return False
-    if not record.get("session_id"):
-        return False
-    return bool((record.get("artifacts") or {}).get("final_patch"))
+    return bool(record.get("session_id"))
+
+
+def replay_skip_reason(record: Mapping[str, Any]) -> Optional[str]:
+    """Why this repair row cannot be replayed, or ``None`` when it can.
+
+    [VANTA-WHY] When no attempt applied there is nothing to replay: no graded tree
+    and no ``final_patch``, hence no candidate code for columns 1..K (matplotlib/1
+    night1 — 4 Creator patches, all ``patch_application_failed.json``,
+    ``attempts_run=4``, verdict ``MaxAttemptsReached``). Such a row is recorded as
+    skipped rather than dropped — dropping it would silently shrink the population
+    the rates are taken over — or raised on, which would take the whole batch down
+    with one row.
+    """
+    if (record.get("artifacts") or {}).get("final_patch"):
+        return None
+    return SKIP_NO_APPLIED_ATTEMPT
+
+
+def is_repair_row(record: Mapping[str, Any]) -> bool:
+    """A row item 10 may replay: a finished repair with a session and a patch."""
+    return is_repairable_row(record) and replay_skip_reason(record) is None
 
 
 def row_stem(key: str) -> str:
@@ -1098,6 +1125,79 @@ def _column_test_cmd(view: str, prep: Any) -> list[str]:
 
 def _base_tree(view: str, prep: Any) -> Path:
     return prep.root / ("oracle_tree" if view == VIEW_ORACLE else "vanta_clean")
+
+
+def skipped_row(
+    *,
+    record: Mapping[str, Any],
+    prep: Any,
+    checkpoint: str,
+    sessions_dir: Path,
+    views: Sequence[str],
+    seed: int,
+    sample_rate: float,
+    reason: str,
+) -> dict[str, Any]:
+    """One row's replay record when the row cannot be replayed at all.
+
+    [VANTA-WHY] Recorded, not replayed and not dropped. A replay record for every
+    repair row is what lets a reader cut the population without a second list of
+    "which rows were quietly left out": the row is present, says ``skipped`` and
+    carries the reason. The shape is the same as a replayed record's so one reader
+    handles both — the baseline column is the only one that could have run, every
+    attempt column is enumerated and censored with its own ``censor_reason``, and
+    there are no cells, because nothing was observed and so nothing is claimed.
+    """
+    key = str(record.get("key") or "")
+    session_id = str(record.get("session_id") or "")
+    debug_dir = sessions_dir / session_id / "debug"
+    attempts = pool_mod._attempt_total(record, debug_dir)
+    columns = build_columns(
+        debug_dir=debug_dir, base_tree=prep.root / "vanta_clean", attempts=attempts
+    )
+    generated_tests_present = any(
+        _attempt_generated_tests(debug_dir, attempt) is not None
+        for attempt in range(1, attempts + 1)
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "replay",
+        "key": key,
+        "session_id": session_id,
+        "bug": str(record.get("bug") or prep.key),
+        "checkpoint": checkpoint,
+        "index_convention": INDEX_CONVENTION,
+        "skipped": True,
+        "skip_reason": reason,
+        "columns": [
+            {
+                "k": column.k,
+                "origin": column.origin,
+                "patch_id": column.patch_id,
+                "ran": False,
+                "censor_reason": column.censor_reason,
+            }
+            for column in columns
+        ],
+        "tests": [],
+        "cells": [],
+        "views": {view: {"transitions": []} for view in views},
+        "flaky": [],
+        "unresolvable": [],
+        "driver_artifacts": {
+            "generated_tests": "present" if generated_tests_present else "absent"
+        },
+        "replay": {
+            "boots": 0,
+            "sandbox_secs": 0.0,
+            "seed": seed,
+            "sample_rate": sample_rate,
+            "sampled_cells": 0,
+            "sampled_resolved": 0,
+            "executed_cells": 0,
+            "reused_cells": 0,
+        },
+    }
 
 
 def replay_row(

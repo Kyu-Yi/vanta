@@ -8355,6 +8355,320 @@ fn the_cacheable_prefix_leads_every_request_and_the_variable_tail_trails_it() {
     );
 }
 
+/// The Attacker's answer for the item-16 prompt-layout test.
+///
+/// [VANTA-WHY] Local rather than `SINGLE_BEHAVIOR_TEST` so every field of the
+/// answer is spelled out, `issue_quote` included: this test reads the recorded
+/// request BODIES, so it must not depend on a shared fixture whose omissible
+/// fields are another test's concern.
+const ITEM16_ATTACKER_TESTS: &str = r#"{"tests":[
+        {
+            "test_name":"test_add_is_preserved",
+            "test_source":"from calc import add\n\ndef test_add_is_preserved():\n    assert add(2, 3) == 5\n",
+            "intent":"BehaviorPreservation",
+            "reason":"Passes on the original tree.",
+            "issue_quote":null
+        }
+    ]}"#;
+
+/// M3 item 16 — within a role, the stable block leads and consecutive calls of
+/// that role share it byte-for-byte.
+///
+/// [VANTA-WHY] §14.32 (item 8) pinned the MESSAGE order and found the call sites
+/// already correct — but it checked `--patch` REVIEWS, where the diff is fixed for
+/// the whole run, so the head really was stable. In a REPAIR the Creator rewrites
+/// the patch every attempt, and the Attacker's generate turn used to open with
+/// `PATCH:` — so the one part that changes every round sat at byte 0 of the user
+/// message and the provider's prefix cache had nothing to reuse past the system
+/// prompt. Item 16 reorders that turn; this is the proof.
+///
+/// [VANTA-WHY] It drives the two call sites DIRECTLY — `attacker_generate_tests`
+/// and `creator_generate_patch` — against the same stub backend the fixture runs
+/// use, and reads the request bodies the server recorded. Deliberately not a
+/// `vanta_m3` process run: a repair-shaped process run has to reach a SECOND
+/// attempt, which needs a working in-sandbox pytest, so the property would be
+/// observable only on a machine where that holds. Here the asserted bytes are the
+/// bytes the call sites really send, and the assertion holds anywhere.
+///
+/// [VANTA-WHY] The second Attacker call carries probes already in the shared set
+/// and a quarantined one, so the test pins the plan's whole order inside the user
+/// message: the issue and the repository context, then the tests admitted so far,
+/// then the quarantined ones, then this round's diff.
+///
+/// [VANTA-WHY] The Creator is the CONTROL: its user prompt already led with
+/// `ISSUE:`/`FILE:` before item 16 (`creator_user_prompt`). Checking both roles
+/// against one rule is what makes a later edit that moves the per-call part ahead
+/// of the stable block fail here — at either site.
+#[tokio::test]
+async fn item16_consecutive_same_role_calls_share_the_stable_block() {
+    let _serial = serial_run();
+
+    // Two DIFFERENT Creator answers, one served per call: a stub that answers
+    // both calls identically cannot show that the FEEDBACK (not the patch) is the
+    // part that varies between attempts.
+    let creator_script = serde_json::json!([
+        {
+            "patch_text": "def add(a, b):\n    return a + b - 1\n",
+            "explanation": "repair attempt one",
+            "files_touched": ["calc.py"],
+            "confidence": 0.2
+        },
+        {
+            "patch_text": "def add(a, b):\n    return a + b - 2\n",
+            "explanation": "repair attempt two",
+            "files_touched": ["calc.py"],
+            "confidence": 0.2
+        }
+    ])
+    .to_string();
+    let server = StubLlmServer::start_with_creator_script(&creator_script, ITEM16_ATTACKER_TESTS);
+    let cfg = vanta::config::LlmConfig {
+        base_url: server.base_url.clone(),
+        model_id: "stub-model".to_string(),
+        ..Default::default()
+    };
+
+    // The stable block both roles send: identical on every call of the role, which
+    // is what the run computes once and hands to each round.
+    let issue_text = "The issue expects a bug-reproduction probe asserting add(2, 3) == 6.";
+    let original_source = "def add(a, b):\n    return a + b\n";
+    const PATCH_ONE: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a + b\n+    return a + b - 1\n";
+    const PATCH_TWO: &str = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a + b\n+    return a + b - 2\n";
+
+    // ---- the Attacker's generate turn, twice ----
+    let round_one = vanta::agents::attacker::AttackerRequest {
+        patch_text: PATCH_ONE.to_string(),
+        original_source: original_source.to_string(),
+        issue_text: issue_text.to_string(),
+        existing_tests: Vec::new(),
+        quarantined_tests: Vec::new(),
+    };
+    // Round 2 has admitted one probe and quarantined another, so its per-call text
+    // is more than `PATCH:` alone — which is what pins the order of those three.
+    let round_two = vanta::agents::attacker::AttackerRequest {
+        patch_text: PATCH_TWO.to_string(),
+        original_source: original_source.to_string(),
+        issue_text: issue_text.to_string(),
+        existing_tests: vec![vanta::agents::attacker::SharedProbe {
+            test_name: "test_add_is_preserved".to_string(),
+            test_source: "from calc import add\n\n\ndef test_add_is_preserved():\n    assert add(2, 3) == 5\n"
+                .to_string(),
+        }],
+        quarantined_tests: vec![vanta::agents::attacker::QuarantinedProbe {
+            test_name: "test_add_again".to_string(),
+            test_source: "from calc import add\n\n\ndef test_add_again():\n    assert add(2, 3) == 5\n"
+                .to_string(),
+            reason: "a duplicate of a probe already in the shared set".to_string(),
+        }],
+    };
+    vanta::agents::attacker::attacker_generate_tests(&cfg, &round_one)
+        .await
+        .expect("the stub answers a valid AttackerResponse for round 1");
+    vanta::agents::attacker::attacker_generate_tests(&cfg, &round_two)
+        .await
+        .expect("the stub answers a valid AttackerResponse for round 2");
+
+    // ---- the Creator, twice, on the same repair ----
+    let source_files = vec![vanta::agents::creator::SourceFile {
+        path: "calc.py".to_string(),
+        contents: original_source.to_string(),
+    }];
+    let attempt_one = vanta::agents::creator::CreatorRequest {
+        issue_text: issue_text.to_string(),
+        source_files: source_files.clone(),
+        prior_feedback: None,
+    };
+    let attempt_two = vanta::agents::creator::CreatorRequest {
+        issue_text: issue_text.to_string(),
+        source_files,
+        prior_feedback: Some("the probe still fails: add(2, 3) is 4, not 5".to_string()),
+    };
+    vanta::agents::creator::creator_generate_patch(&cfg, &attempt_one)
+        .await
+        .expect("the stub answers a valid CreatorResponse for attempt 1");
+    vanta::agents::creator::creator_generate_patch(&cfg, &attempt_two)
+        .await
+        .expect("the stub answers a valid CreatorResponse for attempt 2");
+
+    // ---- what the backend actually received ----
+    let kinds = server.request_kinds();
+    let bodies = server.request_bodies();
+    assert_eq!(kinds.len(), bodies.len(), "one kind per recorded body");
+    for body in &bodies {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+        assert_eq!(
+            value["messages"][0]["role"], "system",
+            "every request must OPEN on the system prompt: a prefix cache can only reuse a run \
+             that starts at byte 0 of the request:\n{body}"
+        );
+    }
+
+    // The decoded user message of a recorded body. Decoded, not raw: every prompt
+    // is one JSON string, so a raw substring test would search the escaped form and
+    // could match a `\n`-escaped marker inside another field.
+    let user_of = |body: &str| -> String {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("request body is not JSON: {e}\n{body}"));
+        value["messages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("body must carry a messages array: {body}"))
+            .iter()
+            .find(|m| m["role"] == "user")
+            .and_then(|m| m["content"].as_str())
+            .unwrap_or_else(|| panic!("body must carry a user message string: {body}"))
+            .to_string()
+    };
+
+    // Every user message a role sent, in the order the backend received them.
+    let calls_of = |role: &str| -> Vec<String> {
+        kinds
+            .iter()
+            .zip(bodies.iter())
+            .filter(|(kind, _)| kind.as_str() == role)
+            .map(|(_, body)| user_of(body))
+            .collect()
+    };
+
+    // The per-call part of a call site is everything from its FIRST per-call
+    // heading on; the stable block is the bytes before it.
+    let stable_head = |user: &str, markers: &[&str]| -> usize {
+        markers
+            .iter()
+            .filter_map(|marker| user.find(marker))
+            .min()
+            .unwrap_or_else(|| {
+                panic!("the user prompt carries none of {markers:?}, so its stable block is \
+                        unbounded — the prompt shape changed:\n{user}")
+            })
+    };
+
+    const GENERATE_MARKERS: &[&str] =
+        &["PATCH:", "ALREADY IN THE SHARED TEST SET", "QUARANTINED TESTS"];
+
+    let generates = calls_of("generate");
+    assert_eq!(
+        generates.len(),
+        2,
+        "two rounds must mean two generate calls; got kinds {kinds:?}"
+    );
+    for (round, user) in generates.iter().enumerate() {
+        assert!(
+            user.starts_with("ISSUE:\n"),
+            "round {} must OPEN on the issue, which is identical in every round; the old order \
+             opened on `PATCH:`, the one part a repair rewrites:\n{user}",
+            round + 1
+        );
+        let source_at = user.find("ORIGINAL SOURCE:").unwrap_or_else(|| {
+            panic!("round {} must carry the repository context:\n{user}", round + 1)
+        });
+        assert!(
+            source_at < stable_head(user, GENERATE_MARKERS),
+            "the repository context must precede this round's per-call text, or the diff and the \
+             probe lists sit inside the cacheable prefix and every round re-bills them:\n{user}"
+        );
+    }
+
+    let region = stable_head(&generates[0], GENERATE_MARKERS)
+        .min(stable_head(&generates[1], GENERATE_MARKERS));
+    assert!(
+        generates[0][..region].contains("ORIGINAL SOURCE:\n```\n")
+            && generates[0][..region].trim_end().ends_with("```"),
+        "the shared prefix must CLOSE the repository block, so the cacheable run covers the whole \
+         stable block rather than stopping inside it:\n{}",
+        generates[0]
+    );
+    assert_eq!(
+        &generates[0][..region],
+        &generates[1][..region],
+        "two consecutive generate calls must send the stable block byte-for-byte, or the \
+         provider's prefix cache has nothing to reuse:\n{}\n---\n{}",
+        generates[0],
+        generates[1]
+    );
+
+    // The per-call material really does differ between the two rounds — otherwise
+    // the byte-equality above would hold on the old order too and prove nothing.
+    let diff_of = |user: &str| -> String {
+        const HEAD: &str = "PATCH:\n```diff\n";
+        let start = user
+            .find(HEAD)
+            .unwrap_or_else(|| panic!("the generate turn must carry the diff:\n{user}"))
+            + HEAD.len();
+        let rest = &user[start..];
+        let end = rest
+            .find("\n```")
+            .unwrap_or_else(|| panic!("the diff block must be closed:\n{user}"));
+        rest[..end].to_string()
+    };
+    assert_ne!(
+        diff_of(&generates[0]),
+        diff_of(&generates[1]),
+        "the two rounds must carry a DIFFERENT diff, or the shared prefix would include the diff \
+         on the old order too and this test would prove nothing"
+    );
+
+    // Round 2's extra sections stay AFTER the stable block, in the plan's order.
+    let probed_at = generates[1]
+        .find("ALREADY IN THE SHARED TEST SET")
+        .expect("round 2 must carry the probes already in the shared set");
+    let quarantined_at = generates[1]
+        .find("QUARANTINED TESTS")
+        .expect("round 2 must carry the quarantined probes");
+    let diff_at = generates[1]
+        .find("PATCH:")
+        .expect("round 2 must carry this round's diff");
+    assert_eq!(
+        region, probed_at,
+        "the shared prefix must end exactly where the per-call text begins:\n{}",
+        generates[1]
+    );
+    assert!(
+        probed_at < quarantined_at && quarantined_at < diff_at,
+        "the tests admitted so far, then the quarantined ones, then this round's diff — in that \
+         order, all after the stable block:\n{}",
+        generates[1]
+    );
+
+    // ---- the Creator ----
+    // Its per-call text is the attempt feedback (`PRIOR FEEDBACK`, absent on the
+    // first attempt); its stable block is the issue and the selected files.
+    let creators = calls_of("creator");
+    assert_eq!(
+        creators.len(),
+        2,
+        "two attempts must mean two Creator calls; got kinds {kinds:?}"
+    );
+    assert!(
+        creators[1].contains("PRIOR FEEDBACK (from previous attempt, address this):"),
+        "the second attempt's per-call feedback must actually be there, or the byte-equality \
+         below is vacuous:\n{}",
+        creators[1]
+    );
+    let feedback_at = |user: &str| -> usize {
+        user.find("PRIOR FEEDBACK").unwrap_or(user.len())
+    };
+    let region = feedback_at(&creators[0]).min(feedback_at(&creators[1]));
+    assert!(
+        creators[0].starts_with("ISSUE:\n"),
+        "the Creator's user prompt must open on the issue:\n{}",
+        creators[0]
+    );
+    assert!(
+        creators[0][..region].contains("FILE: "),
+        "the shared prefix must carry the repository context the Creator reads:\n{}",
+        creators[0]
+    );
+    assert_eq!(
+        &creators[0][..region],
+        &creators[1][..region],
+        "two consecutive Creator calls must send the stable block byte-for-byte, with the \
+         feedback after it:\n{}\n---\n{}",
+        creators[0],
+        creators[1]
+    );
+}
+
 /// §4.3 token accounting: the numbers a cost table is built from are the
 /// SERVER's, recorded per call, and `run.summary` totals exactly those.
 ///

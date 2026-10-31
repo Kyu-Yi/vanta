@@ -38,6 +38,11 @@ use tracing::{debug, info, trace, warn};
 // file tree as a labelled listing. Two runs whose Creator read different code
 // are different experiments; a tag that only moves for system-text edits would
 // log them as one.
+// [VANTA-WHY] Checked for M3 item 16 and NOT bumped: `creator_user_prompt`
+// already leads with the stable block — `ISSUE:` then the `FILE:` blocks, both
+// identical on every attempt of a repair — and puts the one per-attempt part
+// (`PRIOR FEEDBACK`) last. Nothing the model is shown moved, so there is no new
+// text for a tag to name.
 pub const CREATOR_PROMPT_VERSION: &str = "3";
 
 // ============================================================================

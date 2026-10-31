@@ -91,7 +91,26 @@ use tracing::{debug, info, trace, warn};
 // not: a round-2 reply under this tag and one under `10.` are different
 // experiments. Item 1 shipped no bump because its change was code — the loosened
 // grounding rule in `apply_intent_verdict` — and left every prompt's text alone.
-pub const ATTACKER_PROMPT_VERSION: &str = "11.quarantined-tests";
+//
+// [VANTA-WHY] Bumped for M3 item 16 (cache-friendly prompts). The generate turn's
+// USER prompt was REORDERED: it used to open with `PATCH:`, then `ORIGINAL
+// SOURCE:`, then `ISSUE:`. In a repair the Creator rewrites the patch every
+// round, so that head made every round a different prompt from its first byte
+// and left the provider's prefix cache nothing to reuse after the system
+// message. The stable block — the issue and the repository context, which are
+// identical on every call of the review — now leads, and the per-call text
+// follows in the plan's order (the tests admitted so far, then this round's
+// diff). Item 8 checked this order and found it correct *within a single
+// review*, where `--patch` fixes the diff and the head really was stable; item
+// 16 is about the repair, where it is not. The same paragraph in
+// `plans/bugsinpy.md` §14.32 records that earlier check and is superseded for
+// this call site. The SYSTEM text is unchanged, so `prompt_hashes`'s
+// `attacker=` slot still does not move — which is exactly what the version label
+// is for: it is the only record that says a prompt the model is shown changed.
+// The revise, simplify, single-test intent and batch intent user prompts already
+// led with their stable block (`ISSUE:`/`ORIGINAL SOURCE:`) before this item, so
+// their bytes are unchanged and their tags do not move; only this call site did.
+pub const ATTACKER_PROMPT_VERSION: &str = "12.stable-block-first";
 
 // ============================================================================
 // INTENT_AUDITOR_PROMPT_VERSION — the run-identity tag for the intent check
@@ -121,6 +140,11 @@ pub const ATTACKER_PROMPT_VERSION: &str = "11.quarantined-tests";
 // the Attacker's: the auditor's system text is unchanged, but it now reads the
 // selected files and the repo file tree instead of the capped dump, and what the
 // auditor is shown is what it judges against.
+// [VANTA-WHY] Checked for M3 item 16 and NOT bumped: the auditor's user prompt
+// already leads with the stable block — `ISSUE:` then `ORIGINAL SOURCE:`, both
+// identical on every audit of a review — and puts the per-call text (the test or
+// numbered tests under audit, the closing question) after it. Nothing the model
+// is shown moved, so there is no new text for a tag to name.
 pub const INTENT_AUDITOR_PROMPT_VERSION: &str = "6.localized-source-context";
 
 // ============================================================================
@@ -453,13 +477,22 @@ pub async fn attacker_generate_tests(
     // quarantine sends the same body it always did plus one empty string.
     let quarantined = quarantined_section(&request.quarantined_tests);
 
+    // [VANTA-WHY] M3 item 16 — the stable block leads. The issue and the
+    // repository context are identical on every call of the review (round 1 and
+    // every repair round), so they come FIRST and byte-identical, and the
+    // provider's prefix cache can reuse them across rounds; the per-call text
+    // (the tests admitted so far, this round's diff) follows, in the plan's
+    // order. Before this item the head was `PATCH:` then `ORIGINAL SOURCE:` then
+    // `ISSUE:`, which in a repair put the one part that changes every round at
+    // byte 0 and left the cache nothing to reuse. The strings the sections
+    // carry are unchanged; only their order is.
     let user_prompt = format!(
-        "PATCH:\n```diff\n{}\n```\n\nORIGINAL SOURCE:\n```\n{}\n```\n\nISSUE:\n{}{}{}\n\nWrite AttackerResponse JSON.{}",
-        request.patch_text,
-        request.original_source,
+        "ISSUE:\n{}\n\nORIGINAL SOURCE:\n```\n{}\n```{}{}\n\nPATCH:\n```diff\n{}\n```\n\nWrite AttackerResponse JSON.{}",
         request.issue_text,
+        request.original_source,
         already_probed,
         quarantined,
+        request.patch_text,
         // [VANTA-WHY] §14.22 — empty unless the arm is on, so every default run's
         // first request body is byte-for-byte what it was before this existed.
         if attacker_concise() { ATTACKER_CONCISE_SUFFIX } else { "" }

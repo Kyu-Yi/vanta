@@ -3257,16 +3257,21 @@ pub async fn run(
             testing_iteration_id: Some(testing_iteration_id.clone()),
             test_id: None,
             phase: "native_suite.summary".to_string(),
+            // [VANTA-WHY] M3 item W follow-up — the collection census is
+            // appended so a vacuous gate's session record names the module that
+            // broke collection, for BOTH sides, instead of only reporting that
+            // 0 tests were collected. See `harness::native_collection_summary`.
             summary: format!(
                 "ran_original={} ran_patched={} original_tests={} patched_tests={} regressions={} \
-                 native_vacuous={} native_expected_tests={}",
+                 native_vacuous={} native_expected_tests={} {}",
                 native_original.ran,
                 native_patched.ran,
                 native_original.tests.len(),
                 native_patched.tests.len(),
                 native_regressions.len(),
                 native_vacuous,
-                native_expected
+                native_expected,
+                harness::native_collection_summary(&native_original, &native_patched)
             ),
             timestamp: now_iso(),
             benchmark_instance: None,

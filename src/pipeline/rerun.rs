@@ -1584,6 +1584,7 @@ mod tests {
             ran,
             exit_code: Some(0),
             stderr_tail: String::new(),
+            collection: None,
         }
     }
 
@@ -1618,6 +1619,7 @@ mod tests {
             exit_code: Some(127),
             stderr_tail:
                 "env: /Users/nathan/heretic/.venv/bin/python: No such file or directory".to_string(),
+            collection: None,
         };
 
         let (bad_r, good_r, note) =

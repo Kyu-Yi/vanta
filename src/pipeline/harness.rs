@@ -246,6 +246,88 @@ pub struct NativeSuiteReport {
     pub exit_code: Option<i32>,
     /// The last few non-empty stderr lines, for a run-failure report.
     pub stderr_tail: String,
+    /// The report's own account of its COLLECTION failures, or `None` when the
+    /// document carries no `collectors` array at all.
+    ///
+    /// [VANTA-WHY] M3 item W follow-up. `empty_report_note` rendered
+    /// `errors=unset` for pandas/1's in-session run, because pytest's
+    /// json-report document has no top-level `errors` key — the thing that
+    /// actually failed is named by the `collectors` array, where a module that
+    /// cannot be imported appears as `outcome: "failed"` with the
+    /// `ImportError while importing test module …` text in `longrepr`. Without
+    /// that count and that name the reason says "0 tests" and nothing else, and
+    /// the offending module is only findable by re-running the sandbox.
+    /// Carried on the report (not only inside `stderr_tail`) so
+    /// `native_suite.summary` can record it for BOTH sides of the gate — a
+    /// value with spaces in a summary is already the norm (`judge_reason=`).
+    pub collection: Option<CollectionFailure>,
+}
+
+/// A report's census of its own collectors, and its FIRST collection failure.
+///
+/// [VANTA-WHY] M3 item W follow-up. pytest's terminal summary says
+/// `Interrupted: N errors during collection` on STDOUT, which the harness never
+/// reads — it parses only `report.json` and stderr. The same fact is in the
+/// document, in the `collectors` array: a module pytest could not import is an
+/// entry with `outcome: "failed"` whose `longrepr` is the
+/// `ImportError while importing test module …` text. Naming it here is what
+/// turns "0 tests" from a dead end into a pointer at the module that broke the
+/// session, without a second sandbox boot.
+pub struct CollectionFailure {
+    /// Collectors whose `outcome` is neither `passed` nor `skipped`: a module
+    /// that failed to import, or any future outcome this reader does not
+    /// recognise. A module-level optional-import skip is `skipped` and is NOT
+    /// a failure (pandas/1's 72 MB prepare report lists 2624 collectors, every
+    /// one `passed` or `skipped`).
+    failed: usize,
+    /// The first failed collector's nodeid and its `one_line`-collapsed error.
+    first: Option<(String, String)>,
+}
+
+impl CollectionFailure {
+    /// The census of a report document, or `None` when it has no `collectors`
+    /// array (the flat 0.1/0.2 schema, or a document of an unforeseen shape).
+    fn of(report: &serde_json::Value) -> Option<Self> {
+        let collectors = report.get("collectors")?.as_array()?;
+        let mut failed = 0usize;
+        let mut first: Option<(String, String)> = None;
+        for collector in collectors {
+            let outcome = collector
+                .get("outcome")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if outcome == "passed" || outcome == "skipped" {
+                continue;
+            }
+            failed += 1;
+            if first.is_none() {
+                let nodeid = collector
+                    .get("nodeid")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let error = collector
+                    .get("longrepr")
+                    .and_then(serde_json::Value::as_str)
+                    .map(one_line)
+                    .unwrap_or_default();
+                first = Some((nodeid, error));
+            }
+        }
+        Some(Self { failed, first })
+    }
+
+    /// `failed_collectors=N`, plus the first failure's nodeid and error when
+    /// there is one.
+    fn note(&self) -> String {
+        match &self.first {
+            Some((nodeid, error)) => format!(
+                "failed_collectors={} first_failed_collector={} first_collector_error={}",
+                self.failed, nodeid, error
+            ),
+            None => format!("failed_collectors={}", self.failed),
+        }
+    }
 }
 
 impl NativeSuiteReport {
@@ -258,6 +340,7 @@ impl NativeSuiteReport {
             ran: false,
             exit_code: None,
             stderr_tail: String::new(),
+            collection: None,
         }
     }
 
@@ -272,6 +355,7 @@ impl NativeSuiteReport {
             ran: false,
             exit_code,
             stderr_tail,
+            collection: None,
         }
     }
 
@@ -413,7 +497,16 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
     // FAILED run, and the report's own diagnostics travel with it so the reason
     // is a fact instead of a guess.
     if tests.is_empty() {
-        return NativeSuiteReport::failed_run(exec.exit_code, empty_report_note(&report, &tail));
+        let mut failed = NativeSuiteReport::failed_run(
+            exec.exit_code,
+            empty_report_note(&report, &tail),
+        );
+        // [VANTA-WHY] M3 item W follow-up — the note above is free text rendered
+        // into `stderr_tail`; the structured census rides alongside it so
+        // `native_suite.summary` can name the offending module for BOTH sides of
+        // the gate, not only for the side whose note made it into the reason.
+        failed.collection = CollectionFailure::of(&report);
+        return failed;
     }
     NativeSuiteReport {
         tests,
@@ -421,18 +514,31 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
         ran: true,
         exit_code: exec.exit_code,
         stderr_tail: tail,
+        collection: CollectionFailure::of(&report),
     }
 }
 
 /// The report's own account of a zero-test result, appended to the stderr tail.
 ///
-/// [VANTA-WHY] M3 item W — `exitcode`, `summary`, `collectors` and `errors` are
-/// the four fields pytest's json-report plugin writes that say WHY nothing was
+/// [VANTA-WHY] M3 item W — `exitcode`, `summary.collected` and `collectors` are
+/// the fields pytest's json-report plugin writes that say WHY nothing was
 /// collected, and a reader that turns a report into a regression verdict must
 /// not discard them: without them "0 tests" is indistinguishable from "the tree
 /// has no tests", which is the exact reading that approved a patch on nothing.
 /// Each is rendered `unset` when the document does not carry it, so a report of
 /// a shape this reader did not expect cannot look like a clean exit either.
+///
+/// [VANTA-WHY] M3 item W follow-up — the fourfold note used to end in
+/// `errors=…`, and that field is ALWAYS `unset`: `errors` is not in
+/// pytest-json-report's top-level schema (the 72 MB prepare report carries
+/// `collectors`, `created`, `duration`, `environment`, `exitcode`, `root`,
+/// `summary`, `tests`, `warnings` and nothing else), so it could never say
+/// anything and printed a reassuring `unset` over a collection that had in fact
+/// failed. The real fact is the collector census, so it replaces the dead
+/// field: `failed_collectors=N` and, when N>0, the first failing module's
+/// nodeid and error. Measured on pandas/1's in-session run, whose reason was
+/// `tests=0 exit_code=2 … errors=unset` against a tree that prepare collected
+/// 88642 tests from.
 fn empty_report_note(report: &serde_json::Value, stderr_tail: &str) -> String {
     let field = |path: &[&str]| -> String {
         let mut value = report;
@@ -448,13 +554,16 @@ fn empty_report_note(report: &serde_json::Value, stderr_tail: &str) -> String {
             _ => "unset".to_string(),
         }
     };
+    let census = CollectionFailure::of(report)
+        .map(|failure| failure.note())
+        .unwrap_or_else(|| "failed_collectors=unset".to_string());
     let note = format!(
         "native report collected 0 tests (report exitcode={} summary.collected={} \
-         collectors={} errors={})",
+         collectors={} {})",
         field(&["exitcode"]),
         field(&["summary", "collected"]),
         field(&["collectors"]),
-        field(&["errors"]),
+        census,
     );
     if stderr_tail.is_empty() {
         note
@@ -627,6 +736,49 @@ pub fn native_vacuous_reason(
         side("original", original),
         side("patched", patched),
     )
+}
+
+/// Collapse whitespace runs to `_`, so a text field can live inside the
+/// whitespace-separated `k=v` form of a `native_suite.summary` record.
+///
+/// [VANTA-WHY] M3 item W follow-up. `pr/mod.rs::parse_summary_fields` splits a
+/// summary on whitespace and each token on `=`. A raw `ImportError while
+/// importing test module …` would therefore be truncated at `ImportError` AND
+/// inject bogus `key=value` pairs from its own interior tokens (a path like
+/// `module=foo` becomes a spurious field). The free-text copies of the same
+/// census — the `empty_report_note` in `stderr_tail` and the
+/// `native_vacuous_reason` — keep their spaces; only the summary is tokenised.
+fn summary_token(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join("_")
+}
+
+/// The collection census of BOTH sides of the native gate, as the
+/// whitespace-free `k=v` tail of a `native_suite.summary` record.
+///
+/// [VANTA-WHY] M3 item W follow-up. When the guard fires, the session record
+/// said only `original_tests=0 patched_tests=0` — the count of what was
+/// collected, never WHY. pytest's own pointer to the module that broke the
+/// session is the `collectors` census (`outcome: "failed"` plus the
+/// `ImportError while importing test module …` text), so the count, the first
+/// failing module's nodeid and its error are recorded for BOTH sides. `0` and
+/// `none none` describe a side that collected cleanly (or has no census at
+/// all): the point is that a side which DID fail names itself here.
+pub fn native_collection_summary(
+    original: &NativeSuiteReport,
+    patched: &NativeSuiteReport,
+) -> String {
+    let side = |label: &str, report: &NativeSuiteReport| -> String {
+        let failed = report.collection.as_ref().map(|c| c.failed).unwrap_or(0);
+        let (nodeid, error) = match report.collection.as_ref().and_then(|c| c.first.clone()) {
+            Some((nodeid, error)) => (summary_token(&nodeid), summary_token(&error)),
+            None => ("none".to_string(), "none".to_string()),
+        };
+        format!(
+            "{label}_failed_collectors={failed} {label}_first_failed_collector={nodeid} \
+             {label}_first_collector_error={error}"
+        )
+    };
+    format!("{} {}", side("original", original), side("patched", patched))
 }
 
 // ============================================================================
@@ -2110,10 +2262,10 @@ pub async fn heal_dependencies(
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeSuiteReport, RUFF_ARGS, StaticDiagnostic, build_single_test_cmd,
+        CollectionFailure, NativeSuiteReport, RUFF_ARGS, StaticDiagnostic, build_single_test_cmd,
         copy_static_configs, copy_tree_excluding, empty_report_note, interpreter_for,
-        is_native_test_path, is_tooling_package, native_gate_vacuous, native_outcome,
-        native_regressions, native_suite_collapsed, native_tree_with_original_tests,
+        is_native_test_path, is_tooling_package, native_collection_summary, native_gate_vacuous,
+        native_outcome, native_regressions, native_suite_collapsed, native_tree_with_original_tests,
         native_vacuous_reason, new_diagnostics, parse_mypy_line, parse_native_report,
         parse_pytest_report_detailed, parse_ruff_line, project_package, report_tests,
         ruff_is_error_class, run_single_test, run_tests_parallel, seed_and_write,
@@ -2285,6 +2437,7 @@ mod tests {
             ran: true,
             exit_code: Some(0),
             stderr_tail: String::new(),
+            collection: None,
         }
     }
 
@@ -2529,15 +2682,31 @@ mod tests {
     /// nothing (exit 5) and a run that died after collection; in all three the
     /// `tests` array is empty, so emptiness must not read as a clean bill of
     /// health.
+    ///
+    /// [VANTA-WHY] M3 item W follow-up — the fixture is a REAL collection error
+    /// (`collectors` with one `outcome: "failed"` entry), not a synthetic
+    /// top-level `errors` array: `errors` is not in pytest-json-report's schema,
+    /// so asserting on it proved the note rendered a field that can never carry
+    /// information. pytest's pointer at the offending module is the failed
+    /// collector, and that is what the note must name.
     #[test]
     fn an_empty_native_report_is_a_failed_run_never_a_clean_suite() {
         let dir = tempfile::tempdir().unwrap();
         let report_path = dir.path().join("report.json");
-        // The bundle variant: a valid document, no tests collected.
+        // The real shape: the session collected 88592 items, then a module
+        // failed to import and pytest refused to run any test (exit 2).
         fs::write(
             &report_path,
-            r#"{"exitcode":2,"summary":{"collected":0},"collectors":[],
-                "errors":[{"nodeid":"pandas/tests","message":"ImportError"}],"tests":[]}"#,
+            r#"{"exitcode":2,"summary":{"collected":88592},
+                "collectors":[
+                    {"nodeid":"pandas/tests/io/sas","outcome":"passed","result":[]},
+                    {"nodeid":"pandas/tests/io/test_x.py","outcome":"failed",
+                     "result":[],
+                     "longrepr":"ImportError while importing test module 'pandas/tests/io/test_x.py'.\nHint: make sure your test modules have valid Python names.\nE   ImportError: cannot import name 'X' from 'pandas.io'"},
+                    {"nodeid":"pandas/tests/io/test_y.py","outcome":"skipped",
+                     "result":[],"longrepr":"Skipped: could not import 'pyarrow'"}
+                ],
+                "tests":[]}"#,
         )
         .unwrap();
         let exec = ExecutionResult {
@@ -2557,11 +2726,113 @@ mod tests {
             Some(2),
             "the exit code must survive so a caller can report WHY the suite failed"
         );
-        for needle in ["exitcode=2", "summary.collected=0", "collectors=0", "errors=1"] {
+        for needle in [
+            "exitcode=2",
+            "summary.collected=88592",
+            "collectors=3",
+            "failed_collectors=1",
+            "first_failed_collector=pandas/tests/io/test_x.py",
+            "first_collector_error=E   ImportError: cannot import name 'X' from 'pandas.io'",
+        ] {
             assert!(
                 report.stderr_tail.contains(needle),
                 "the note must carry the report's own diagnostics; missing {needle:?} in {:?}",
                 report.stderr_tail
+            );
+        }
+        let census = report
+            .collection
+            .as_ref()
+            .expect("the failed collector must reach the structured census");
+        assert_eq!(census.failed, 1, "a skipped optional import is not a failure");
+        assert_eq!(
+            census.first.as_ref().map(|(nodeid, _)| nodeid.as_str()),
+            Some("pandas/tests/io/test_x.py"),
+            "the FIRST failed collector in document order is the one named"
+        );
+    }
+
+    /// A collection failure is only named when a collector actually failed: a
+    /// clean census reports `failed_collectors=0` and a document with no
+    /// `collectors` array at all reports `failed_collectors=unset`, so neither
+    /// can be mistaken for "there was a failed module".
+    #[test]
+    fn a_failed_collector_is_named_only_when_one_exists() {
+        let clean = serde_json::json!({
+            "exitcode": 5,
+            "summary": {"collected": 0},
+            "collectors": [{"nodeid": "a", "outcome": "passed"}],
+            "tests": []
+        });
+        let note = empty_report_note(&clean, "");
+        assert!(note.contains("collectors=1"), "{note}");
+        assert!(note.contains("failed_collectors=0"), "{note}");
+        assert!(
+            !note.contains("first_failed_collector"),
+            "nothing failed, so no module may be named: {note}"
+        );
+
+        let unreadable = serde_json::json!({"tests": []});
+        let note = empty_report_note(&unreadable, "");
+        assert!(
+            note.contains("collectors=unset") && note.contains("failed_collectors=unset"),
+            "a document with no census must render unset, never an invented zero: {note}"
+        );
+    }
+
+    /// `native_collection_summary` is the machine-readable half: both sides'
+    /// counts plus the first failing module's nodeid and error, whitespace-free
+    /// so `parse_summary_fields`' whitespace split cannot truncate a field or
+    /// read an interior token of the error as a bogus `key=value`.
+    #[test]
+    fn native_collection_summary_names_the_failing_module_for_both_sides() {
+        let mut original = vacuity_report(&[], false, Some(2));
+        original.collection = Some(CollectionFailure {
+            failed: 2,
+            first: Some((
+                "pandas/tests/io/test_x.py".to_string(),
+                "ImportError while importing test module 'pandas/tests/io/test_x.py'.".to_string(),
+            )),
+        });
+        let patched = vacuity_report(&["a"], true, Some(1));
+
+        let summary = native_collection_summary(&original, &patched);
+        assert!(
+            summary.contains("original_failed_collectors=2"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("original_first_failed_collector=pandas/tests/io/test_x.py"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(
+                "original_first_collector_error=ImportError_while_importing_test_module_\
+                 'pandas/tests/io/test_x.py'."
+            ),
+            "the error must be one token: {summary}"
+        );
+        assert!(
+            summary.contains("patched_failed_collectors=0"),
+            "a clean side reports 0 and names no module: {summary}"
+        );
+        assert!(
+            summary.contains("patched_first_failed_collector=none")
+                && summary.contains("patched_first_collector_error=none"),
+            "{summary}"
+        );
+        let tokens: Vec<&str> = summary.split_whitespace().collect();
+        assert_eq!(
+            tokens.len(),
+            6,
+            "six `k=v` fields, no token split off by an interior space: {summary}"
+        );
+        for token in tokens {
+            assert_eq!(
+                token.matches('=').count(),
+                1,
+                "every token is exactly one `key=value`, so no interior token can be \
+                 misread as a bogus field: {token:?} in {summary}"
             );
         }
     }
@@ -2601,7 +2872,7 @@ mod tests {
             "exitcode=unset",
             "summary.collected=unset",
             "collectors=unset",
-            "errors=unset",
+            "failed_collectors=unset",
         ] {
             assert!(note.contains(needle), "missing {needle:?} in {note:?}");
         }
@@ -2619,6 +2890,7 @@ mod tests {
             ran,
             exit_code,
             stderr_tail: String::new(),
+            collection: None,
         }
     }
 
@@ -2669,11 +2941,21 @@ mod tests {
 
     /// The reason names the failing side and its exit code, so the reader can
     /// tell "the original never ran" from "the patch collected nothing".
+    ///
+    /// [VANTA-WHY] M3 item W follow-up — the reason also has to carry WHICH
+    /// module broke collection. `empty_report_note` renders the collector census
+    /// into the report's `stderr_tail`, and the reason prints that tail, so the
+    /// module name reaches the operator here (and, tokenised, in
+    /// `native_suite.summary`) instead of forcing a second sandbox boot.
     #[test]
     fn native_vacuous_reason_names_the_side_and_its_exit_code() {
         let full = vacuity_report(&["a", "b"], true, Some(0));
         let mut empty = vacuity_report(&[], true, Some(5));
-        empty.stderr_tail = "collected 0 items".to_string();
+        empty.stderr_tail = "shuru: booting VM | native report collected 0 tests (report \
+             exitcode=2 summary.collected=88592 collectors=2620 failed_collectors=1 \
+             first_failed_collector=pandas/tests/io/test_x.py \
+             first_collector_error=ImportError while importing test module)"
+            .to_string();
 
         let reason = native_vacuous_reason(88642, &full, &empty);
 
@@ -2687,7 +2969,12 @@ mod tests {
             reason.contains("patched=ran (tests=0 exit_code=5"),
             "the empty side and its exit code must be named: {reason}"
         );
-        assert!(reason.contains("collected 0 items"), "{reason}");
+        assert!(
+            reason.contains("failed_collectors=1")
+                && reason.contains("first_failed_collector=pandas/tests/io/test_x.py")
+                && reason.contains("first_collector_error=ImportError while importing test module"),
+            "the reason must name the module that broke collection: {reason}"
+        );
     }
 
     // ---- static findings: error-class only ------------------------------------

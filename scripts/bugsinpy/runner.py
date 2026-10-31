@@ -1965,6 +1965,17 @@ def build_record(
         # never be pooled with one after it. Read back from `run.summary` so a
         # batch table can cut by it without opening a session log.
         "seed_method": summary.get("seed_method"),
+        # §1.2 — the project version frozen into the sandbox tree at prepare time,
+        # as `version_pin.as_record` recorded it on the bug's row and carried here
+        # onto its run rows. Recorded for `seed_method`'s reason: the version a
+        # project reports at import time is a fact about what the Creator read, and
+        # a row that does not say whether the tree's version file was frozen — or
+        # was frozen to what — cannot be pooled with one prepared after this fix.
+        # `pinned: false` with a `None` reason is a project that needed no pinning
+        # (PySnooper); a non-null `reason` is one that needed one and could not get
+        # it. `null` is a record that carries no pin at all, which the strict reader
+        # cannot produce for a bug this version of `prepare` wrote.
+        "version_pin": prep.version_pin or None,
         # §2.4.4 — whether this row's prompt carried the report's comments as well as its
         # content. Recorded rather than inferred because the ablation's whole value is that
         # its rows are comparable to the default ones, and a row that does not say which

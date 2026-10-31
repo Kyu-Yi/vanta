@@ -92,6 +92,28 @@ def map_of(payload: Any, key: str, *, owner: str, where: str = "") -> dict[str, 
     return {str(k): str(v) for k, v in value.items()}
 
 
+def record_of(
+    payload: Any, key: str, *, owner: str, where: str = ""
+) -> dict[str, Any]:
+    """``payload[key]`` as a JSON object, values kept as they were stored.
+
+    The counterpart of :func:`map_of` for a record whose values are not all
+    strings — ``version_pin`` carries a bool, a nullable string and ``None`` —
+    so coercing every value with ``str`` (as :func:`map_of` does, correctly, for
+    ``builds``) would silently turn ``False`` into ``"False"``. The shape is
+    checked for :func:`map_of`'s reason: a list written where a record is read
+    arrives as a :class:`RecordError` naming the field rather than as an
+    ``AttributeError`` from inside the reader.
+    """
+    value = field_of(payload, key, owner=owner, where=where)
+    if not isinstance(value, Mapping):
+        raise RecordError(
+            f"{_origin(owner, where)}: field {key!r} is "
+            f"{type(value).__name__}, not a mapping"
+        )
+    return {str(k): v for k, v in value.items()}
+
+
 def memory_of(payload: Any, key: str, *, owner: str, where: str = "") -> Optional[int]:
     """``payload[key]`` as a positive integer number of megabytes, or ``None``.
 

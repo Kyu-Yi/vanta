@@ -288,6 +288,7 @@ DERIVED_BUG_KEYS = frozenset(
         "issue_needs_decision",
         "deps",
         "builds",
+        "version_pin",
     }
 )
 

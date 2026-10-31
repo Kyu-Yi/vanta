@@ -24,6 +24,7 @@ never by booting a VM.
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 import io
 import json
@@ -66,6 +67,7 @@ from bugsinpy import shuru as shuru_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
 from bugsinpy import suite as suite_mod  # noqa: E402
 from bugsinpy import trees as tree_mod  # noqa: E402
+from bugsinpy import version_pin as version_pin_mod  # noqa: E402
 from bugsinpy.split import SplitError, load_split  # noqa: E402
 import analyse as analyse_mod  # noqa: E402
 import bugsinpy_run as run_mod  # noqa: E402
@@ -6411,6 +6413,295 @@ class TestMemoryOf:
             self._read({"vm_memory_mb": value})
 
 
+class TestRecordOf:
+    """``records.record_of`` reads a JSON object without coercing its values.
+
+    [VANTA-WHY] ``map_of`` is the reader for ``builds``, a ``str -> str`` record,
+    and it coerces every value with ``str``. ``version_pin`` is not that shape — it
+    carries a bool, a nullable string and ``None`` — so reading it with ``map_of``
+    would silently turn ``False`` into ``"False"`` and ``None`` into ``"None"``.
+    """
+
+    @staticmethod
+    def _read(payload):
+        return records_mod.record_of(payload, "version_pin", owner="BugPrep")
+
+    def test_values_keep_the_type_they_were_stored_with(self):
+        stored = {
+            "pinned": True,
+            "kind": "versioneer",
+            "file": "pandas/_version.py",
+            "full_revisionid": None,
+            "reason": None,
+        }
+        loaded = self._read({"version_pin": stored})
+        assert loaded == stored
+        assert loaded["pinned"] is True
+        assert loaded["reason"] is None
+
+    def test_a_missing_field_is_an_error(self):
+        with pytest.raises(
+            records_mod.RecordError, match="missing field 'version_pin'"
+        ):
+            self._read({})
+
+    def test_a_non_mapping_is_an_error(self):
+        with pytest.raises(records_mod.RecordError, match="version_pin"):
+            self._read({"version_pin": ["pinned", True]})
+
+
+class TestVersionPin:
+    """The sdist freeze: the sandbox tree keeps the version prepare measured.
+
+    [VANTA-WHY] The seed drops ``.git`` on purpose (the history carries the fix),
+    which makes a versioneer project report ``0+unknown`` in-session and aborts
+    pytest's collection on pandas/1. The fix is the one an sdist already performs —
+    write the measured version into the version file — so the tests below are about
+    the *freeze*, not about the git plumbing: a stub version file that returns a
+    canned ``get_versions()`` is enough to prove the rewritten file still answers
+    with the same version once no repository is present.
+    """
+
+    @staticmethod
+    def _stub(
+        *,
+        source: str = "pkg/_version.py",
+        version: str = "1.2.3",
+        full: Optional[str] = "a" * 40,
+        dirty: bool = False,
+        error: Optional[str] = None,
+    ) -> str:
+        """A versioneer-shaped version file that returns ``get_versions()`` verbatim.
+
+        Self-naming like the real one: its ``get_config().versionfile_source`` is
+        its own path, which is the property the detector keys on.
+        """
+        return (
+            "def get_config():\n"
+            "    class C:\n"
+            "        pass\n"
+            "    c = C()\n"
+            "    c.VCS = 'git'\n"
+            f"    c.versionfile_source = {source!r}\n"
+            "    return c\n"
+            "\n"
+            "\n"
+            "def get_versions():\n"
+            f"    return {{'version': {version!r}, 'full-revisionid': {full!r}, "
+            f"'dirty': {dirty!r}, 'error': {error!r}}}\n"
+        )
+
+    @staticmethod
+    def _version_in(tree: Path) -> tuple[str, dict]:
+        """Import the tree's package and read back ``__version__`` and the dict."""
+        program = (
+            "import json, sys\n"
+            "sys.path.insert(0, '.')\n"
+            "import pkg\n"
+            "from pkg import _version\n"
+            "sys.stdout.write(json.dumps("
+            "{'version': pkg.__version__, 'versions': _version.get_versions()}))\n"
+        )
+        completed = subprocess.run(
+            [version_pin_mod._python(), "-c", program],
+            cwd=str(tree),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert completed.returncode == 0, completed.stderr
+        payload = json.loads(completed.stdout)
+        return payload["version"], payload["versions"]
+
+    def test_a_versioneer_tree_is_measured_and_frozen(self, tmp_path):
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "_version.py", self._stub())
+        write(
+            tree / "pkg" / "__init__.py",
+            "from ._version import get_versions\n"
+            "__version__ = get_versions()['version']\n",
+        )
+
+        before = self._version_in(tree)
+        assert before[0] == "1.2.3"
+
+        outcome = version_pin_mod.measure(tree)
+        assert outcome.kind == "versioneer"
+        assert outcome.reason is None
+        assert outcome.pin is not None
+        assert outcome.pin.file == "pkg/_version.py"
+        assert outcome.pin.version == "1.2.3"
+        assert outcome.pin.full_revisionid == "a" * 40
+
+        version_pin_mod.freeze(tree, outcome.pin)
+
+        after = self._version_in(tree)
+        # The same version and the same full revision, now with the version file
+        # rewritten to the frozen form rather than computed.
+        assert after == before
+
+    def test_the_frozen_bytes_are_versioneer_short_form(self, tmp_path):
+        """The one fact this module must get exactly right: the file's shape.
+
+        versioneer reads the frozen file back with
+        ``version_json = '''\\n(.*)'''  # END VERSION_JSON`` and ``json.loads``, so a
+        file that renders the dict any other way is a file the project cannot read.
+        Asserted against that same regex rather than against our own renderer.
+        """
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "_version.py", self._stub(dirty=True))
+        outcome = version_pin_mod.measure(tree)
+        assert outcome.pin is not None
+
+        found = re.search(
+            r"version_json = '''\n(.*)'''  # END VERSION_JSON",
+            outcome.pin.contents,
+            re.DOTALL,
+        )
+        assert found is not None, outcome.pin.contents
+        assert json.loads(found.group(1)) == {
+            "version": "1.2.3",
+            "full-revisionid": "a" * 40,
+            "dirty": True,
+            "error": None,
+        }
+        assert "def get_versions():" in outcome.pin.contents
+        # The row's digest is over the exact bytes written, not over the version.
+        assert outcome.pin.sha256 == hashlib.sha256(
+            outcome.pin.contents.encode("utf-8")
+        ).hexdigest()
+
+    def test_a_project_with_no_version_machinery_is_left_alone(self, tmp_path):
+        tree = tmp_path / "tree"
+        write(tree / "setup.py", "from setuptools import setup\nsetup(version='0.0.6')\n")
+        write(tree / "mod.py", "x = 1\n")
+        before = sorted(str(p.relative_to(tree)) for p in tree.rglob("*"))
+
+        outcome = version_pin_mod.measure(tree)
+        assert outcome == version_pin_mod.PinOutcome(
+            kind=None, pin=None, reason=None
+        )
+        record = version_pin_mod.as_record(outcome.pin, reason=outcome.reason)
+        assert record["pinned"] is False
+        assert record["reason"] is None
+        # Nothing to freeze means nothing is written.
+        assert sorted(str(p.relative_to(tree)) for p in tree.rglob("*")) == before
+
+    def test_the_placeholder_is_refused_rather_than_frozen(self, tmp_path):
+        """``0+unknown`` is the bug, so freezing it would be freezing the bug."""
+        tree = tmp_path / "tree"
+        write(
+            tree / "pkg" / "_version.py",
+            self._stub(version="0+unknown", full=None, error="unable to compute version"),
+        )
+        outcome = version_pin_mod.measure(tree)
+        assert outcome.kind == "versioneer"
+        assert outcome.pin is None
+        assert "placeholder" in outcome.reason
+        record = version_pin_mod.as_record(outcome.pin, reason=outcome.reason)
+        assert record["pinned"] is False
+        assert record["reason"] == outcome.reason
+
+    def test_a_version_file_that_does_not_name_itself_is_not_used(self, tmp_path):
+        """A detector, not a guess: a vendored ``_version.py`` names another path."""
+        tree = tmp_path / "tree"
+        write(tree / "vendor" / "_version.py", self._stub(source="other/_version.py"))
+        outcome = version_pin_mod.measure(tree)
+        assert outcome == version_pin_mod.PinOutcome(kind=None, pin=None, reason=None)
+
+    def test_the_self_naming_version_file_wins_over_a_vendored_one(self, tmp_path):
+        tree = tmp_path / "tree"
+        # Shallowest first, so the vendored one is probed and rejected first.
+        write(tree / "_version.py", self._stub(source="elsewhere/_version.py"))
+        write(tree / "pkg" / "_version.py", self._stub(version="9.9.9"))
+        outcome = version_pin_mod.measure(tree)
+        assert outcome.pin is not None
+        assert outcome.pin.file == "pkg/_version.py"
+        assert outcome.pin.version == "9.9.9"
+
+    def test_a_setuptools_scm_project_freezes_its_version_file(
+        self, tmp_path, monkeypatch
+    ):
+        tree = tmp_path / "tree"
+        write(
+            tree / "pyproject.toml",
+            "[build-system]\n"
+            'requires = ["setuptools_scm"]\n'
+            "\n"
+            "[tool.setuptools_scm]\n"
+            'write_to = "pkg/_version.py"\n',
+        )
+        monkeypatch.setattr(
+            version_pin_mod, "_setuptools_scm_version", lambda _tree: "1.2.3"
+        )
+        outcome = version_pin_mod.measure(tree)
+        assert outcome.kind == "setuptools_scm"
+        assert outcome.reason is None
+        assert outcome.pin is not None
+        assert outcome.pin.file == "pkg/_version.py"
+        assert outcome.pin.version == "1.2.3"
+        assert outcome.pin.full_revisionid is None
+
+        version_pin_mod.freeze(tree, outcome.pin)
+        text = (tree / "pkg" / "_version.py").read_text(encoding="utf-8")
+        assert "__version__ = version = '1.2.3'" in text
+        assert "__version_tuple__ = version_tuple = (1, 2, 3)" in text
+
+    def test_setuptools_scm_without_a_write_target_is_reported_not_guessed(
+        self, tmp_path
+    ):
+        tree = tmp_path / "tree"
+        write(
+            tree / "pyproject.toml",
+            "[tool.setuptools_scm]\n"
+            'version_scheme = "guess-next-dev"\n',
+        )
+        outcome = version_pin_mod.measure(tree)
+        assert outcome.kind == "setuptools_scm"
+        assert outcome.pin is None
+        assert "write_to" in outcome.reason
+
+    def test_a_version_file_that_cannot_be_measured_is_reported(
+        self, tmp_path, monkeypatch
+    ):
+        """A probe that does not run must not read as "this project needs no pinning".
+
+        [VANTA-WHY] The probe is a subprocess, so it can fail for a reason that has
+        nothing to do with the tree — the interpreter it was named after does not
+        start, the file raises on import. Both leave ``_probe`` with ``None``, and
+        the answer the caller must not give in that case is the one it gives for a
+        project with no version machinery at all (``pin is None, reason is None``),
+        because a sandbox seeded from that tree would report the ``0+unknown``
+        placeholder this module exists to remove — silently.
+        """
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "_version.py", self._stub())
+        monkeypatch.setattr(version_pin_mod, "_probe", lambda _path, _tree: None)
+
+        outcome = version_pin_mod.measure(tree)
+        assert outcome.kind == "versioneer"
+        assert outcome.pin is None
+        assert "could not be measured" in outcome.reason
+        assert "pkg/_version.py" in outcome.reason
+        # And it is distinguishable from the honest no-op.
+        assert outcome != version_pin_mod.PinOutcome(kind=None, pin=None, reason=None)
+
+    def test_the_probe_interpreter_is_one_that_runs(self):
+        """``sys.executable`` is a claim; the probe's interpreter is a measurement.
+
+        A path that cannot start looks exactly like a tree with no version file, so
+        the interpreter is chosen by running it. Asserted against a path that
+        certainly does not start, rather than by naming a broken one.
+        """
+        assert version_pin_mod._runs("/nonexistent/vanta-no-such-python") is False
+        interpreter = version_pin_mod._python()
+        completed = subprocess.run(
+            [interpreter, "-c", "print('up')"], capture_output=True, text=True
+        )
+        assert completed.returncode == 0
+        assert completed.stdout.strip() == "up"
+
+
 class TestPrepareRunRecordContract:
     """``prepare.json`` has one writer and one reader, and they cannot drift.
 
@@ -6543,6 +6834,15 @@ class TestPrepareRunRecordContract:
                 "carries no extension sources",
                 "vanta_tree": prepare_mod.VANTA_TREE_INHERITANCE,
             },
+            version_pin={
+                "pinned": True,
+                "kind": "versioneer",
+                "file": "pandas/_version.py",
+                "version": "1.1.0.dev0+1627.g3fd150c9e6.dirty",
+                "full_revisionid": "3fd150c9e6e3a1a39622577745a7d821611c09d3",
+                "sha256": "7d69af3467fff301",
+                "reason": None,
+            },
         )
         split, batch_dir, manifest = self._write_batch(tmp_path, preps=[original])
         batch = self._load(monkeypatch, split, batch_dir, tmp_path)
@@ -6615,6 +6915,12 @@ class TestPrepareRunRecordContract:
         assert loaded.context == verdict
         assert loaded.deps == deps
         assert loaded.builds == original.builds
+        # §1.2 — the frozen version record, read back off the same row. A bool, a
+        # nullable string and ``None`` survive the round trip as they were stored:
+        # ``record_of`` keeps the values rather than coercing them to ``str``.
+        assert loaded.version_pin == original.version_pin
+        assert loaded.version_pin["pinned"] is True
+        assert loaded.version_pin["reason"] is None
         assert loaded.runnable == original.runnable
         assert batch.entries["Demo/1"]["checkpoint"] == "vanta-bi-Demo-1"
 
@@ -6625,6 +6931,7 @@ class TestPrepareRunRecordContract:
             pytest.param(("issue", "needs_decision"), id="issue.needs_decision"),
             pytest.param(("context",), id="context"),
             pytest.param(("deps",), id="deps"),
+            pytest.param(("version_pin",), id="version_pin"),
         ],
     )
     def test_a_missing_field_names_the_field_and_the_batch(

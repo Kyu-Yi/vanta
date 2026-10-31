@@ -31,13 +31,14 @@ from . import issue as issue_mod
 from . import issue_source
 from . import suite as suite_mod
 from . import trees as tree_mod
+from . import version_pin as version_pin_mod
 from .bugsinpy_meta import (
     BugInfo,
     MetadataError,
     load_bug_info,
     project_github_url,
 )
-from .records import field_of, map_of, memory_of, strings_of
+from .records import field_of, map_of, memory_of, record_of, strings_of
 from .split import Split, sha256_file, sha256_text
 
 DISK_MB = 16384
@@ -392,6 +393,38 @@ class BugPrep:
     (``not built: setup.py declares no ext_modules…``), so a tree with no entry would
     mean the stage was skipped rather than that the tree needed nothing.
     """
+    version_pin: dict[str, Any] = field(default_factory=dict)
+    """§1.2 — the project version frozen into the sandbox tree, and how.
+
+    [VANTA-WHY] The seed the run stages is the execution tree with ``SKIP_DIRS``
+    left out (``harness::copy_tree_excluding``), and ``.git`` is one of those names
+    — deliberately, because the history carries the FIX commit. The cost is that
+    the project's own version machinery can no longer compute a version: pandas'
+    and matplotlib's versioneer run ``git describe``, find no ``.git``, and fall
+    through to the placeholder ``0+unknown``. That placeholder is not cosmetic —
+    xarray's ``pdcompat`` does ``LooseVersion(pd.__version__) < "0.25.0"`` and
+    ``LooseVersion`` cannot compare ``"0+unknown"`` with ``"0.25"``, so it raises
+    ``TypeError`` in every module that imports xarray and pytest aborts the whole
+    session (``Interrupted: 2 errors during collection``, exit 2; measured on
+    pandas/1: ``collected=88592 bad_collectors=2``). :mod:`version_pin` freezes the
+    real version into the version file at prepare time, while the exported trees
+    still hold their ``.git``, exactly as an sdist does.
+
+    Written as ``version_pin.as_record`` — ``pinned`` (was a version file
+    rewritten), ``kind`` (``versioneer``/``setuptools_scm``/``None``), ``file``,
+    ``version``, ``full_revisionid``, ``sha256`` and ``reason``. ``pinned`` is the
+    load-bearing field: a reader must be able to tell "this row's version was
+    frozen" from "this project needed no pinning" (``reason`` is ``None``) and from
+    "it needed one and the freeze failed". The ``full_revisionid`` the frozen file
+    carries is the **buggy tree's own** commit — the string an sdist of that commit
+    already ships, and never the fix's — which ``test_show_versions`` reads back.
+
+    A project that needs no pinning records ``pinned: false`` with a ``None``
+    reason, and its tree is left exactly as it was. The empty default is only what
+    a ``BugPrep`` built in this process holds before the freeze stage fills it: a
+    ``prepare.json`` written before this key existed is refused by ``from_dict``
+    like any other missing field, whose error says to re-run the stage.
+    """
 
     @property
     def key(self) -> str:
@@ -498,6 +531,7 @@ class BugPrep:
             "issue_text_names_symbols": sorted(self.issue_text_names_symbols),
             "deps": self.deps,
             "builds": self.builds,
+            "version_pin": self.version_pin,
         }
 
     @classmethod
@@ -592,6 +626,7 @@ class BugPrep:
             ),
             deps=field_of(payload, "deps", owner=owner, where=where),
             builds=map_of(payload, "builds", owner=owner, where=where),
+            version_pin=record_of(payload, "version_pin", owner=owner, where=where),
         )
 
 
@@ -1326,6 +1361,23 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bo
     if leak:
         prep.gate_failures.append(leak)
         return False
+
+    # §1.2 — freeze the project's own version into the tree the sandbox is seeded
+    # from, while this tree still holds its `.git`. The seed the run stages is this
+    # tree with `SKIP_DIRS` left out (`harness::copy_tree_excluding`), and `.git` is
+    # one of those names, so in-session the project's versioneer/setuptools_scm can
+    # no longer compute a version and falls through to `0+unknown` — which makes
+    # xarray's `LooseVersion` comparison raise and aborts collection. Freezing here,
+    # rather than excluding `_version.py` from the seed, is the sdist's own answer
+    # and the one that keeps prepare and the run measuring the same version. It runs
+    # AFTER the leak guard above on purpose: the frozen file is a tracked source
+    # file, so pinning before the guard would make the guard call the pin a leak.
+    # The baseline suite below therefore also sees the frozen version, which is what
+    # makes the prepare-side and in-session native runs comparable (§3.1).
+    pin = version_pin_mod.measure(vanta)
+    if pin.pin is not None:
+        version_pin_mod.freeze(vanta, pin.pin)
+    prep.version_pin = version_pin_mod.as_record(pin.pin, reason=pin.reason)
 
     after_strip = _suite(checkpoint, batch_dir, prep, "vanta_tree", "vanta")
     # The same rule as ``derive_hidden``'s, on the fifth graded run. The baseline below
@@ -2538,6 +2590,7 @@ def derive_verdict(prep: BugPrep) -> dict[str, Any]:
         ),
         "deps": prep.deps,
         "builds": prep.builds,
+        "version_pin": prep.version_pin,
     }
 
 

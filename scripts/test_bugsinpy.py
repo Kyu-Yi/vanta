@@ -26859,6 +26859,206 @@ class TestReplaySessionReuse:
         assert entry["by_source"][replay_mod.SOURCE_REPO_BASELINE]["n_pp"] == 1
 
 
+class TestReplayBaselineParity:
+    """Item 3 — the in-session native run is compared with prepare's baseline.
+
+    Record-only. The record names the collected count on each side, the nodeids only
+    one side saw, and the nodeids whose outcome differs — with the known-flaky tests
+    excluded from both sides. Nothing here reads or writes a verdict, a label or a
+    score; three bugs are meant to be read before anyone decides whether it should
+    gate anything at all.
+    """
+
+    def _reports(self, batch: Path, run1: dict[str, str], run2: dict[str, str] | None = None):
+        """prepare's two stored vanta-tree reports at ``<batch>/reports/``."""
+        for index, outcomes in enumerate((run1, run2 if run2 is not None else run1), start=1):
+            write(
+                batch / "reports" / f"Demo_1-vanta.run{index}.json",
+                json.dumps(
+                    {
+                        "tests": [
+                            {"nodeid": nodeid, "outcome": outcome}
+                            for nodeid, outcome in outcomes.items()
+                        ]
+                    }
+                ),
+            )
+
+    def _gate(self, outcomes: dict[str, str], *, ran: bool = True) -> list[dict]:
+        """The session-log rows the native gate writes for one original side.
+
+        ``outcomes`` maps a nodeid to the Rust ``TestResult`` Debug string the gate
+        actually recorded (``Passed``/``Failed``) — the report's raw pytest outcome
+        never reaches the log. ``ran=False`` is the vacuous shape: the summary says the
+        gate collected nothing and no ``native_suite.test[<nodeid>]`` row exists.
+        """
+        count = len(outcomes) if ran else 0
+        log: list[dict] = [
+            {
+                "phase": "native_suite.summary",
+                "summary": (
+                    f"ran_original={str(ran).lower()} ran_patched={str(ran).lower()} "
+                    f"original_tests={count} patched_tests={count} regressions=0 "
+                    f"native_vacuous={str(not ran).lower()} native_expected_tests=3"
+                ),
+            }
+        ]
+        if ran:
+            log += [
+                {
+                    "phase": f"native_suite.test[{nodeid}]",
+                    "summary": f"original={value} patched=Some(Passed) regression=false",
+                }
+                for nodeid, value in outcomes.items()
+            ]
+        return log
+
+    def test_a_matching_baseline_reports_no_difference(self, tmp_path):
+        batch = tmp_path / "batch"
+        self._reports(batch, {"t_a": "passed", "t_b": "failed"})
+        record = replay_mod.baseline_parity(
+            self._gate({"t_a": "Passed", "t_b": "Failed"}), _replay_prep(tmp_path), batch
+        )
+        assert record["state"] == replay_mod.PARITY_COMPARED
+        assert (record["prepare_collected"], record["session_collected"]) == (2, 2)
+        assert record["only_in_prepare"] == []
+        assert record["only_in_session"] == []
+        assert record["different_outcome"] == []
+        assert record["note"] == ""
+
+    def test_a_nodeid_only_one_side_saw_is_named(self, tmp_path):
+        batch = tmp_path / "batch"
+        self._reports(batch, {"t_a": "passed", "t_shared": "passed"})
+        record = replay_mod.baseline_parity(
+            self._gate({"t_shared": "Passed", "t_extra": "Passed"}),
+            _replay_prep(tmp_path),
+            batch,
+        )
+        assert record["state"] == replay_mod.PARITY_COMPARED
+        assert (record["prepare_collected"], record["session_collected"]) == (2, 2)
+        assert record["only_in_prepare"] == ["t_a"]
+        assert record["only_in_session"] == ["t_extra"]
+        assert record["different_outcome"] == []
+
+    def test_a_different_outcome_is_named(self, tmp_path):
+        batch = tmp_path / "batch"
+        self._reports(batch, {"t_a": "passed", "t_b": "failed"})
+        record = replay_mod.baseline_parity(
+            self._gate({"t_a": "Failed", "t_b": "Failed"}), _replay_prep(tmp_path), batch
+        )
+        assert record["different_outcome"] == ["t_a"]
+        assert record["only_in_prepare"] == []
+        assert record["only_in_session"] == []
+
+    def test_a_skip_in_prepare_is_not_a_parity_break(self, tmp_path):
+        """Item 4's rule, applied to the parity check: the gate drops skipped/xfailed."""
+        batch = tmp_path / "batch"
+        self._reports(batch, {"t_a": "passed", "t_skip": "skipped", "t_x": "xfailed"})
+        record = replay_mod.baseline_parity(
+            self._gate({"t_a": "Passed"}), _replay_prep(tmp_path), batch
+        )
+        assert record["state"] == replay_mod.PARITY_COMPARED
+        assert record["prepare_collected"] == 1, "the gate never had the other two"
+        assert record["only_in_prepare"] == []
+
+    def test_a_known_flaky_nodeid_is_excluded_from_both_sides(self, tmp_path):
+        batch = tmp_path / "batch"
+        self._reports(batch, {"t_a": "passed", "t_flaky": "passed"})
+        prep = _replay_prep(tmp_path, flaky_nodeids=["t_flaky"])
+        record = replay_mod.baseline_parity(
+            self._gate({"t_a": "Passed", "t_flaky": "Failed"}), prep, batch
+        )
+        assert record["excluded_flaky"] == 1
+        assert (record["prepare_collected"], record["session_collected"]) == (1, 1)
+        assert record["different_outcome"] == [], "a known-flaky test cannot break parity"
+
+    def test_a_session_that_measured_nothing_names_its_state(self, tmp_path):
+        """pandas/1 night2: the gate died at attempt 1, so no test row was ever written."""
+        batch = tmp_path / "batch"
+        self._reports(batch, {"t_a": "passed", "t_b": "passed"})
+        record = replay_mod.baseline_parity(
+            self._gate({}, ran=False), _replay_prep(tmp_path), batch
+        )
+        assert record["state"] == replay_mod.PARITY_SESSION_BLANK
+        assert record["session_collected"] == 0
+        assert record["prepare_collected"] == 2
+        assert record["only_in_prepare"] == ["t_a", "t_b"]
+        assert "never ran" in record["note"]
+
+    def test_absent_prepare_reports_record_only_prepares_own_count(self, tmp_path):
+        prep = _replay_prep(
+            tmp_path,
+            pass_to_pass_count=41,
+            native_failure_baseline=["t_b"],
+            flaky_nodeids=["t_flaky"],
+        )
+        record = replay_mod.baseline_parity(
+            self._gate({"t_a": "Passed", "t_flaky": "Failed"}),
+            prep,
+            tmp_path / "batch",
+        )
+        assert record["state"] == replay_mod.PARITY_PREPARE_ABSENT
+        assert record["prepare_collected"] == 42, "pass_to_pass_count plus the failures"
+        assert record["session_collected"] == 1, "the row's own flaky set still applies"
+        assert record["excluded_flaky"] == 1
+        assert record["only_in_prepare"] == [], "not claimed without the reports"
+        assert "not both readable" in record["note"]
+
+    def test_a_skipped_row_carries_the_parity_record(self, tmp_path):
+        """The most interesting case: an infra-failed row whose gate measured nothing."""
+        prep = _replay_prep(tmp_path)
+        sessions, _ = _replay_session(tmp_path, attempts=1)
+        batch = tmp_path / "batch"
+        write(
+            sessions / "sid_session.jsonl",
+            "\n".join(json.dumps(row) for row in self._gate({}, ran=False)) + "\n",
+        )
+        self._reports(batch, {"t_a": "passed"})
+        record = replay_mod.skipped_row(
+            record=_replay_record(attempts_run=1, label=runner_mod.INFRA_LABEL),
+            prep=prep,
+            checkpoint="ck",
+            sessions_dir=sessions,
+            views=replay_mod.DEFAULT_VIEWS,
+            seed=replay_mod.DEFAULT_SEED,
+            sample_rate=replay_mod.DEFAULT_SAMPLE_RATE,
+            reason=replay_mod.SKIP_INFRA_FAILURE,
+            batch_dir=batch,
+        )
+        parity = record["baseline_parity"]
+        assert parity["state"] == replay_mod.PARITY_SESSION_BLANK
+        assert parity["prepare_collected"] == 1
+        assert record["cells"] == [], "the parity record changes nothing about the cells"
+
+    def test_a_replayed_row_carries_the_parity_record(self, tmp_path, monkeypatch):
+        prep = _replay_prep(tmp_path)
+        sessions, _ = _replay_session(tmp_path, attempts=1)
+        batch = tmp_path / "batch"
+        write(
+            sessions / "sid_session.jsonl",
+            "\n".join(json.dumps(row) for row in self._gate({"t_a": "Passed"})) + "\n",
+        )
+        self._reports(batch, {"t_a": "passed"})
+        _fake_column(monkeypatch, {})
+        record = replay_mod.replay_row(
+            record=_replay_record(),
+            prep=prep,
+            checkpoint="ck",
+            batch_dir=batch,
+            sessions_dir=sessions,
+            views=(replay_mod.VIEW_GENERATED,),
+            seed=replay_mod.DEFAULT_SEED,
+            sample_rate=0.0,
+            disk_mb=prepare_mod.DISK_MB,
+            timeout_secs=replay_mod.DEFAULT_TIMEOUT_SECS,
+            progress=False,
+        )
+        parity = record["baseline_parity"]
+        assert parity["state"] == replay_mod.PARITY_COMPARED
+        assert parity["session_collected"] == 1
+        assert parity["different_outcome"] == []
+
+
 class TestReplaySkippedRow:
     """A repair row that cannot be replayed is recorded, not replayed.
 

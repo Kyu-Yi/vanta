@@ -936,6 +936,219 @@ def baseline_cells(
     return out
 
 
+NATIVE_GATE_OUTCOME = {
+    "passed": CELL_PASS,
+    "subtests passed": CELL_PASS,
+    "failed": CELL_FAIL,
+    "error": CELL_FAIL,
+}
+"""``harness.rs:608 native_outcome`` in Python — the **report** side of the parity check.
+
+[VANTA-WHY] The parity check reads the same reduction from two differently-shaped
+sources, and this map is the one item 4 depends on. ``prepare``'s stored report holds
+raw pytest outcome strings, and the Rust gate reduces them with ``native_outcome``:
+``passed``/``subtests passed`` are a pass, ``failed``/``error`` a fail, and every other
+string (``skipped``, ``xfailed``, an outcome a future plugin invents) is **dropped** —
+the test is not in the gate's universe at all. The session log's
+``native_suite.test[<nodeid>]`` rows have already been through that reduction, so they
+carry the ``TestResult`` Debug string (``Passed``/``Failed``) instead and are read with
+:func:`live_value`. Without this map on the prepare side the two sides would be
+different universes: item 4's matplotlib pair is 7524 collected in prepare against 6167
+in-session, and the whole 1357 is 1345 ``skipped`` plus 12 ``xfailed`` — tests the
+session never had, not tests it lost.
+"""
+
+PARITY_COMPARED = "compared"
+"""Both sides produced a nodeid set; the three diff lists are meaningful."""
+
+PARITY_SESSION_BLANK = "session_measured_nothing"
+"""The in-session native gate collected nothing, so there is nothing to diff against.
+
+[VANTA-WHY] A named state, not an empty diff. pandas/1 night2's native gate broke at
+the FIRST attempt (``native_vacuous``), so the driver never wrote a single
+``native_suite.test[<nodeid>]`` row — the session side is empty for a reason that is
+NOT "the two sides agree". Read as a diff, an empty session side would put every
+prepare nodeid in ``only_in_prepare`` and look like a catastrophic collection gap;
+read as this state, it says plainly that the run measured nothing.
+"""
+
+PARITY_PREPARE_ABSENT = "prepare_reports_absent"
+"""prepare's stored ``<slug>-vanta.run{1,2}.json`` are not both on disk.
+
+[VANTA-WHY] ``prepare`` records only ``native_failure_baseline`` (the failures) and
+``pass_to_pass_count`` (a number) on the row — the full nodeid→outcome map survives
+only in the two reports. Without them the nodeid diff cannot be built, so the count
+prepare itself used is recorded and the nodeid lists are left empty rather than
+guessed at.
+"""
+
+
+def _native_gate_outcomes(raw: object) -> Optional[str]:
+    """One **pytest** outcome string -> the gate's cell, or ``None`` when it is dropped."""
+    return NATIVE_GATE_OUTCOME.get(str(raw))
+
+
+def _session_original_outcomes(
+    session_rows: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, str], Optional[int], Optional[bool]]:
+    """``(nodeid -> pass/fail, original_tests, ran_original)`` from the session log.
+
+    Two phases are read: ``native_suite.summary`` (the count the driver itself
+    printed, and whether the gate ran at all) and one ``native_suite.test[<nodeid>]``
+    row per original-side nodeid. Later attempts repeat the original side — it is the
+    same tree every time — so the first value seen for a nodeid wins.
+
+    The row's ``original=`` is a ``TestResult`` Debug string (``Passed``/``Failed``),
+    the Rust gate's output, not a raw pytest outcome — so it is read with
+    :func:`live_value` (the same reader :func:`session_reuse` uses) and only an
+    observed value is kept. A nodeid the gate dropped for being skipped never has a
+    row at all, which is exactly the reduction :data:`NATIVE_GATE_OUTCOME` reproduces
+    on the prepare side.
+    """
+    outcomes: dict[str, str] = {}
+    reported: Optional[int] = None
+    ran: Optional[bool] = None
+    for row in session_rows:
+        phase = str(row.get("phase") or "")
+        if phase == "native_suite.summary":
+            fields = _token_fields(row.get("summary"))
+            if reported is None and fields.get("original_tests", "").isdigit():
+                reported = int(fields["original_tests"])
+            if ran is None:
+                ran = _tri_state(fields.get("ran_original"))
+            continue
+        if not (phase.startswith(NATIVE_SESSION_PHASE) and phase.endswith("]")):
+            continue
+        nodeid = phase[len(NATIVE_SESSION_PHASE) : -1]
+        value = live_value(_token_fields(row.get("summary")).get("original"))
+        if _is_observed(value):
+            outcomes.setdefault(nodeid, value)
+    return outcomes, reported, ran
+
+
+def _prepare_baseline_outcomes(prep: Any, batch_dir: Path) -> Optional[tuple[dict[str, str], set[str]]]:
+    """``(nodeid -> pass/fail, nodeids the two reports themselves disagreed on)``.
+
+    ``None`` when the two reports are not both readable — the caller then records the
+    count prepare used (:attr:`prepare.BugPrep.pass_to_pass_count` plus the failures)
+    and no nodeid diff. The reports are the only place the full baseline map survives:
+    the row carries the failures list and a count, not the map.
+
+    [VANTA-WHY] ``compare_runs`` rather than a single report, so the prepare side is
+    reduced the same way ``pass_to_pass_count`` was: a nodeid whose two runs disagreed,
+    or that one run never reached, is not in ``stable_outcomes`` and so cannot appear
+    in the diff as a difference that is really the run's own noise. The second return
+    value is that disagreement set — it is returned rather than swallowed so the
+    caller can exclude the SAME nodeids from the session side, which is the only way
+    a known-flaky test is kept out of the parity diff on both ends.
+    """
+    run1 = batch_dir / "reports" / f"{prep.slug}-vanta.run1.json"
+    run2 = batch_dir / "reports" / f"{prep.slug}-vanta.run2.json"
+    if not (run1.exists() and run2.exists()):
+        return None
+    try:
+        pair = suite_mod.compare_runs(
+            suite_mod.SuiteRun(outcomes=suite_mod.parse_report(run1)),
+            suite_mod.SuiteRun(outcomes=suite_mod.parse_report(run2)),
+        )
+    except suite_mod.SuiteError:
+        return None
+    outcomes = {
+        nodeid: value
+        for nodeid, raw in pair.stable_outcomes.items()
+        if (value := _native_gate_outcomes(raw)) is not None
+    }
+    return outcomes, pair.flaky_nodeids | pair.missing_from_one_run
+
+
+def baseline_parity(
+    session_rows: Sequence[Mapping[str, Any]], prep: Any, batch_dir: Optional[Path] = None
+) -> dict[str, Any]:
+    """Item 3 — did the in-session native run on the original tree match prepare's?
+
+    [VANTA-WHY] Record-only, and it must stay that way. The native gate compares the
+    patch against the ORIGINAL tree, which is the very tree ``prepare`` measured its
+    baseline on (``prepare.strip_and_baseline``), so the two runs answer the same
+    question and a divergence means one of them measured a different thing — the
+    pandas/1 divergence (prepare 88642, in-session 88592 then an aborted collection)
+    was a real bug and this is the instrument that would have named it. Nothing here
+    reads a verdict, a label or a score, and nothing it returns is consumed by the
+    counting stage: it is a record for a human to read on three bugs before anyone
+    decides whether it should gate anything.
+
+    Both sides are filtered through :data:`NATIVE_GATE_OUTCOME` (or the already-reduced
+    ``TestResult`` the session log carries) and the known-flaky nodeids —
+    ``prep.flaky_nodeids``, the union across ``src_buggy``/``oracle_tree``/``src_fixed``,
+    plus whatever the two stored vanta reports themselves disagreed on — are dropped
+    from BOTH sides. So ``only_in_*`` and ``different_outcome`` are differences in what
+    was collected and how it came out, never a skip, an xfail or a flaky test dressed
+    up as a divergence.
+
+    Three states, because "the lists are empty" has three different meanings:
+    :data:`PARITY_COMPARED`, :data:`PARITY_SESSION_BLANK` and
+    :data:`PARITY_PREPARE_ABSENT`; the last two carry a ``note`` naming the cause.
+    """
+    session_outcomes, reported, ran_original = _session_original_outcomes(session_rows)
+    if batch_dir is None:
+        # worktrees/<slug>/<tree> — the batch dir is two levels above the bug root
+        # (``prepare._batch_root``), and replay is given no batch dir on the skip path.
+        batch_dir = prep.root.parent.parent
+    prepared = _prepare_baseline_outcomes(prep, batch_dir)
+    # The row's own flaky set is known without the reports, so it is applied to the
+    # session side even when prepare's reports are gone.
+    excluded = {str(nodeid) for nodeid in prep.flaky_nodeids}
+    if prepared is not None:
+        excluded |= prepared[1]
+    session_outcomes = {n: v for n, v in session_outcomes.items() if n not in excluded}
+
+    if prepared is None:
+        return {
+            "state": PARITY_PREPARE_ABSENT,
+            "prepare_collected": prep.pass_to_pass_count + len(prep.native_failure_baseline),
+            "session_collected": len(session_outcomes),
+            "excluded_flaky": len(excluded),
+            "only_in_prepare": [],
+            "only_in_session": [],
+            "different_outcome": [],
+            "note": (
+                f"prepare's reports/{prep.slug}-vanta.run{{1,2}}.json are not both "
+                "readable, so only prepare's own count is recorded and the nodeid "
+                "diff is not claimed"
+            ),
+        }
+
+    prepare_outcomes = prepared[0]
+    prepare_ids = {n for n in prepare_outcomes if n not in excluded}
+    session_ids = set(session_outcomes)
+    state = PARITY_COMPARED
+    note = ""
+    if not session_outcomes:
+        state = PARITY_SESSION_BLANK
+        if ran_original is False:
+            note = "the in-session native gate never ran (ran_original=false)"
+        elif reported == 0:
+            note = "the in-session native gate ran but collected nothing (original_tests=0)"
+        else:
+            note = (
+                "the session log carries no usable native_suite.test rows "
+                f"(ran_original={ran_original!r} original_tests={reported!r})"
+            )
+    return {
+        "state": state,
+        "prepare_collected": len(prepare_ids),
+        "session_collected": len(session_ids),
+        "excluded_flaky": len(excluded),
+        "only_in_prepare": sorted(prepare_ids - session_ids),
+        "only_in_session": sorted(session_ids - prepare_ids),
+        "different_outcome": sorted(
+            nodeid
+            for nodeid in prepare_ids & session_ids
+            if prepare_outcomes[nodeid] != session_outcomes[nodeid]
+        ),
+        "note": note,
+    }
+
+
 # ---------------------------------------------------------------------------
 # the run layer — Shuru produces reports; everything above turns them into numbers
 # ---------------------------------------------------------------------------
@@ -1177,6 +1390,7 @@ def skipped_row(
     seed: int,
     sample_rate: float,
     reason: str,
+    batch_dir: Optional[Path] = None,
 ) -> dict[str, Any]:
     """One row's replay record when the row cannot be replayed at all.
 
@@ -1187,6 +1401,14 @@ def skipped_row(
     handles both — the baseline column is the only one that could have run, every
     attempt column is enumerated and censored with its own ``censor_reason``, and
     there are no cells, because nothing was observed and so nothing is claimed.
+
+    ``batch_dir`` exists for the item 3 parity record alone: the skip path has no
+    bursts of boots to place it near, and prepare's reports live at
+    ``<batch>/reports/``, so :func:`baseline_parity` needs the batch dir to find them
+    (it falls back to ``prep.root``'s parent when it is not given). A skipped row is
+    exactly the one whose parity is most worth recording — pandas/1 night2 is an
+    infra failure whose in-session native gate measured nothing — so the record is
+    built here rather than only on the replay path.
     """
     key = str(record.get("key") or "")
     session_id = str(record.get("session_id") or "")
@@ -1224,6 +1446,9 @@ def skipped_row(
         "views": {view: {"transitions": []} for view in views},
         "flaky": [],
         "unresolvable": [],
+        "baseline_parity": baseline_parity(
+            _session_log(sessions_dir, session_id), prep, batch_dir
+        ),
         "driver_artifacts": {
             "generated_tests": "present" if generated_tests_present else "absent"
         },
@@ -1527,6 +1752,7 @@ def replay_row(
         "views": views_out,
         "flaky": sorted(flaky_ids),
         "unresolvable": sorted(set(unresolvable)),
+        "baseline_parity": baseline_parity(session_rows, prep, batch_dir),
         "driver_artifacts": {
             "generated_tests": "present" if generated_tests_present else "absent"
         },

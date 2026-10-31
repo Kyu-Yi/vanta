@@ -1291,6 +1291,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
                 seed=args.seed,
                 sample_rate=args.sample_rate,
                 reason=reason,
+                batch_dir=batch_dir,
             )
             out_dir.mkdir(parents=True, exist_ok=True)
             out_path.write_text(

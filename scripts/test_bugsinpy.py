@@ -19867,6 +19867,84 @@ class TestInvokeVantaCarriesTheRecordedPrecompileRule:
         assert "--test-cmd python -m pytest tests" in text
 
 
+class TestInvokeVantaCarriesTheNativeExpectedTestCount:
+    """item W — the native-suite size the row's own prepare measured reaches ``--native-expected-tests``.
+
+    [VANTA-WHY] The in-session native gate is ``run_native_suite(original)``
+    against ``run_native_suite(patched)``, and ``native_regressions`` over an
+    empty original is vacuously empty: a suite that collected NOTHING reads as
+    "0 regressions" and the attempt is approved on no evidence at all (measured:
+    pandas/1 session c9289597). This count — the same figure
+    ``prepare_summary.md`` prints — lets ``vanta_m3`` tell "this bug ships no
+    native tests" from "the suite could not run": with a positive count an empty
+    in-session result ends the run as an InfraFailure. Only a FULL prepare
+    measured the native suite, so a measure-only row records nothing and keeps
+    the old reading.
+    """
+
+    @staticmethod
+    def _run(tmp_path, monkeypatch, **over):
+        import types
+
+        monkeypatch.setattr(
+            runner_mod.subprocess,
+            "run",
+            lambda *a, **kw: types.SimpleNamespace(returncode=0),
+        )
+        log_path = tmp_path / "vanta.log"
+        bug_prep = prep(
+            root=tmp_path / "root",
+            test_cmd=["python", "-m", "pytest", "tests", "--json-report-file={report}"],
+            **over,
+        )
+        runner_mod.invoke_vanta(
+            vanta_bin=tmp_path / "vanta_m3",
+            prep=bug_prep,
+            issue_path=tmp_path / "issue.md",
+            env={"PATH": "/usr/bin"},
+            log_path=log_path,
+            max_attempts=2,
+        )
+        return log_path.read_text(encoding="utf-8")
+
+    def test_a_full_prepare_passes_the_measured_native_size(self, tmp_path, monkeypatch):
+        text = self._run(
+            tmp_path,
+            monkeypatch,
+            prepare_mode=prepare_mod.FULL,
+            pass_to_pass_count=88388,
+            native_failure_baseline=[
+                "tests/test_a.py::test_x",
+                "tests/test_a.py::test_y",
+            ],
+        )
+        assert "--native-expected-tests 88390" in text, (
+            "the count is pass_to_pass_count plus the native-failure baseline, the "
+            "figure prepare_summary.md prints (pandas/1 = 88642)"
+        )
+        assert text.index("--max-attempts 2") < text.index("--native-expected-tests"), (
+            "the flag is appended after the fixed arguments"
+        )
+
+    def test_no_tests_is_recorded_as_zero_not_omitted(self, tmp_path, monkeypatch):
+        text = self._run(tmp_path, monkeypatch, prepare_mode=prepare_mod.FULL)
+        assert "--native-expected-tests 0" in text, (
+            "a bug that genuinely ships no native tests records 0, which leaves the "
+            "guard silent; omitting the flag would be indistinguishable on the row"
+        )
+
+    def test_a_measure_only_row_records_nothing(self, tmp_path, monkeypatch):
+        text = self._run(
+            tmp_path,
+            monkeypatch,
+            prepare_mode=prepare_mod.MEASURE_ONLY,
+            pass_to_pass_count=88388,
+        )
+        assert "--native-expected-tests" not in text, (
+            "a measure-only prepare never ran the native suite, so it has no size to assert"
+        )
+
+
 class TestNormalizedDiff:
     """§7.1's dedup key: two patches that produce the same tree are one candidate."""
 

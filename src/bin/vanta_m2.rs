@@ -150,6 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         test_cmd: cli.test_cmd,
         sandbox_env: Vec::new(),
         precompile: Vec::new(),
+        native_expected_tests: None,
         original_tree: cli.original_tree,
     })
     .await?;

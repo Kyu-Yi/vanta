@@ -82,6 +82,19 @@ struct CliArgs {
     /// path outside the tree, a backslash, a `..` step or a non-`.py` name is
     /// refused rather than compiled.
     precompile: Vec<String>,
+    /// M3 item W — `--native-expected-tests N`: how many native tests the row's
+    /// own `prepare` collected for this bug (`pass_to_pass_count` plus the
+    /// native-failure baseline — the figure `prepare_summary.md` prints). The
+    /// harness records it on every run of the row.
+    ///
+    /// The native gate compares the repo's own suite on the original tree with
+    /// the same suite on the patch, and `native_regressions` over an empty
+    /// original is vacuously empty, so a suite that collected NOTHING reads as
+    /// "0 regressions". With a positive count recorded here, an in-session suite
+    /// that collected nothing is an `InfraFailure` instead of a pass. Absent
+    /// means "not recorded" (a hand-run binary) and leaves the run exactly as it
+    /// was; `0` means the bug genuinely ships no native tests.
+    native_expected_tests: Option<usize>,
     /// Path to a clean original tree (git worktree of the base commit) for
     /// Mode B. If set, BATE runs against this tree instead of the in-memory
     /// original files. Spec §7: "both trees present simultaneously".
@@ -131,6 +144,7 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
     let mut test_cmd: Option<String> = None;
     let mut sandbox_env: Vec<(String, String)> = Vec::new();
     let mut precompile: Vec<String> = Vec::new();
+    let mut native_expected_tests: Option<usize> = None;
     let mut original_tree: Option<PathBuf> = None;
     let mut rerun_signals: Option<String> = None;
     let mut good_tree: Option<PathBuf> = None;
@@ -219,6 +233,16 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
                 let path = vanta::sandbox::parse_precompile_path(&args[i])
                     .map_err(|e| format!("--precompile: {e}"))?;
                 precompile.push(path);
+            }
+            "--native-expected-tests" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--native-expected-tests requires a count".to_string());
+                }
+                let count = args[i]
+                    .parse::<usize>()
+                    .map_err(|e| format!("--native-expected-tests: {e}"))?;
+                native_expected_tests = Some(count);
             }
             "--original-tree" => {
                 i += 1;
@@ -317,6 +341,7 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
         test_cmd,
         sandbox_env,
         precompile,
+        native_expected_tests,
         original_tree,
         rerun_signals,
         good_tree,
@@ -520,6 +545,7 @@ fn print_help() {
          --test-cmd CMD         Test command (default: 'python3 -m pytest'). e.g. 'pytest tests/ -q'\n    \
          --sandbox-env K=V     Inject K=V into every sandbox command of the run (repeatable). PYTHONPATH or MPLBACKEND only; refused for any other key\n    \
          --precompile PATH      Byte-compile PATH (tree-relative .py) in every suite VM before the test command runs (repeatable). A path outside the tree, a .py-less name or a non-.py file is refused\n    \
+         --native-expected-tests N  How many native tests this row's prepare collected. With a positive N, an in-session native suite that collects NOTHING is an InfraFailure (exit 2) instead of a pass; absent means not recorded\n    \
          --original-tree PATH   Clean original tree (git worktree of base commit) for Mode B two-tree mode\n    \
          --rerun-signals ID     Re-run session ID's review-mode rejection signals against --good-tree (writes vanta_sessions/ID_signal_reruns.json; no --repo needed)\n    \
          --good-tree PATH       Known-good source: a directory, or a patch file applied onto --base-tree\n    \
@@ -698,6 +724,35 @@ mod tests {
         assert!(cli.precompile.is_empty());
     }
 
+    /// [VANTA-WHY] M3 item W — `--native-expected-tests N`. Off unless the row's
+    /// own prepare recorded a count; absent means the guard stays silent, which
+    /// is every manual invocation and every measure-only row.
+    #[test]
+    fn the_native_expected_tests_flag_is_off_by_default_and_reads_a_count() {
+        let cli = parse_args_from(&args(&["--repo", "tree"])).unwrap();
+        assert_eq!(
+            cli.native_expected_tests, None,
+            "absent must leave the native gate exactly as it was before item W"
+        );
+
+        let cli =
+            parse_args_from(&args(&["--repo", "tree", "--native-expected-tests", "88642"])).unwrap();
+        assert_eq!(cli.native_expected_tests, Some(88642));
+
+        // Zero is a real answer — the bug ships no native tests — not "unset".
+        let cli =
+            parse_args_from(&args(&["--repo", "tree", "--native-expected-tests", "0"])).unwrap();
+        assert_eq!(cli.native_expected_tests, Some(0));
+
+        // The count is a number; a missing one or a non-number is refused with
+        // the flag named.
+        assert!(parse_args_from(&args(&["--repo", "tree", "--native-expected-tests"])).is_err());
+        assert!(
+            parse_args_from(&args(&["--repo", "tree", "--native-expected-tests", "many"]))
+                .is_err()
+        );
+    }
+
     /// [VANTA-WHY] M3 item 9 — `--fixed-rounds K`. Off unless asked for, read
     /// from either spelling, and refused where no number follows. The flag is
     /// parsed here and INTERPRETED by the driver (`resolve_fixed_rounds`), which
@@ -802,6 +857,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         test_cmd: cli.test_cmd,
         sandbox_env: cli.sandbox_env,
         precompile: cli.precompile,
+        native_expected_tests: cli.native_expected_tests,
         original_tree: cli.original_tree,
     })
     .await?;

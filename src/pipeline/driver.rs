@@ -93,6 +93,20 @@ pub struct RunConfig {
     /// Empty in the normal case, and an empty rule leaves every run exactly as
     /// it was.
     pub precompile: Vec<String>,
+    /// [VANTA-WHY] M3 item W — how many native tests the row's own `prepare`
+    /// collected for this bug (`pass_to_pass_count` plus the native-failure
+    /// baseline, the figure `prepare_summary.md` prints). `None` means the
+    /// caller did not record one, which is every manual invocation; `Some(0)`
+    /// means the bug genuinely ships no native tests.
+    ///
+    /// The native gate is `run_native_suite(original) vs run_native_suite(patch)`
+    /// and `native_regressions` over an empty original is VACUOUSLY empty, so a
+    /// suite that collected nothing reads as "0 regressions" and the attempt is
+    /// approved on no evidence (measured: pandas/1 session c9289597). With a
+    /// positive count recorded, an in-session suite that collected nothing is an
+    /// infrastructure failure instead of a pass. Zero and `None` leave every
+    /// pre-item-W run byte-for-byte as it was.
+    pub native_expected_tests: Option<usize>,
     /// Path to a clean original tree (git worktree of the base commit) for
     /// two-tree mode. If set, BATE runs against this tree instead of the
     /// in-memory original files. Spec §7: "both trees present simultaneously".
@@ -1746,6 +1760,11 @@ pub async fn run(
     // "which repo test did attempt 1 break?" could not be answered from the
     // run's files alone.
     let mut native_regression_records: Vec<serde_json::Value> = Vec::new();
+    // [VANTA-WHY] M3 item W — did any attempt's native gate collect nothing
+    // while the row's own prepare recorded tests for this bug? Run-level, like
+    // `apply_failed_attempts`: it says the native check could not be done at all,
+    // which is a property of the run and not of any one test.
+    let mut native_vacuous_seen = false;
     // [VANTA-WHY] Every NEW static finding this run's patch introduced, per
     // attempt, so evidence.json can name the finding that rejected a review
     // round. Session 40e84874 was rejected for a mypy finding that appeared
@@ -3184,6 +3203,22 @@ pub async fn run(
         }
         let native_original = harness::run_native_suite(&original_concat, &test_cmd).await;
         let native_patched = harness::run_native_suite(&native_patched_concat, &test_cmd).await;
+        // [VANTA-WHY] M3 item W — a native gate that measured NOTHING is not a
+        // clean gate. `native_regressions` over an empty original list is
+        // vacuously empty and `native_suite_collapsed` needs a non-empty
+        // original, so a suite that collected nothing on BOTH sides reads as "0
+        // regressions" and the attempt is approved on no evidence at all.
+        // Measured on pandas/1's in-session run (session c9289597: `Native:
+        // original ran=true (0 tests), patched ran=true (0 tests), 0
+        // regression(s)`) while the SAME tree collected 88643 tests through the
+        // prepare path. When the row's own prepare recorded tests for this bug,
+        // a native run that collected nothing means the check could not be DONE:
+        // it is an infrastructure fact, never a pass, and it ends the run as
+        // `InfraFailure` (exit 2) so the row is `infra_failure`.
+        let native_expected = config.native_expected_tests.unwrap_or(0);
+        let native_vacuous =
+            harness::native_gate_vacuous(native_expected, &native_original, &native_patched);
+        native_vacuous_seen |= native_vacuous;
         let mut native_regressions =
             harness::native_regressions(&native_original.tests, &native_patched.tests);
         // [VANTA-WHY] A suite that ran N>0 tests on the original and collects
@@ -3206,13 +3241,14 @@ pub async fn run(
         }
         let native_regression = !native_regressions.is_empty();
         println!(
-            "  Native: original ran={} ({} tests), patched ran={} ({} tests), {} regression(s){}",
+            "  Native: original ran={} ({} tests), patched ran={} ({} tests), {} regression(s){}{}",
             native_original.ran,
             native_original.tests.len(),
             native_patched.ran,
             native_patched.tests.len(),
             native_regressions.len(),
-            if native_collapsed { " [SUITE COLLAPSED]" } else { "" }
+            if native_collapsed { " [SUITE COLLAPSED]" } else { "" },
+            if native_vacuous { " [NATIVE VACUOUS]" } else { "" }
         );
         session_log.append(SessionRecord {
             session_id: session_id.clone(),
@@ -3222,17 +3258,34 @@ pub async fn run(
             test_id: None,
             phase: "native_suite.summary".to_string(),
             summary: format!(
-                "ran_original={} ran_patched={} original_tests={} patched_tests={} regressions={}",
+                "ran_original={} ran_patched={} original_tests={} patched_tests={} regressions={} \
+                 native_vacuous={} native_expected_tests={}",
                 native_original.ran,
                 native_patched.ran,
                 native_original.tests.len(),
                 native_patched.tests.len(),
-                native_regressions.len()
+                native_regressions.len(),
+                native_vacuous,
+                native_expected
             ),
             timestamp: now_iso(),
             benchmark_instance: None,
             benchmark_label: None,
         })?;
+        // [VANTA-WHY] M3 item W — the vacuous gate ends the RUN, not just the
+        // attempt: the native check is the one signal that does not depend on
+        // what the Attacker sampled, so a run that could not perform it has no
+        // evidence that survives this attempt's own tests. Reusing the existing
+        // `InfraFailure` machinery (run.infra_failure row, exit code 2, row
+        // verdict `InfraFailure` → label `infra_failure`) is what makes the row
+        // unapprovable on this evidence rather than a silent false accept.
+        if native_vacuous {
+            let reason =
+                harness::native_vacuous_reason(native_expected, &native_original, &native_patched);
+            println!("  ✗ NATIVE VACUOUS: {reason}");
+            infra_failure_error = Some(reason);
+            break 'attempts GovernorDecision::InfraFailure;
+        }
         for (nodeid, original_result) in &native_original.tests {
             let patched_result = native_patched
                 .tests
@@ -4521,7 +4574,7 @@ pub async fn run(
              quarantine_count={} quarantined=[{}] \
              seed_method={} import_guard={} \
              n_ctx={} creator_effort={} creator_effort_mechanism={} \
-             creator_prompt_tokens={}{} fixed_rounds={}",
+             creator_prompt_tokens={}{} fixed_rounds={} native_vacuous={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -4773,6 +4826,13 @@ pub async fn run(
             } else {
                 "off".to_string()
             },
+            // [VANTA-WHY] M3 item W — appended after every pre-existing key so an
+            // older row's reader is unaffected. `true` means the run's native gate
+            // collected nothing while the row's own prepare had recorded tests for
+            // this bug, so the run ended as `InfraFailure`: the row carries
+            // `verdict=InfraFailure` and the label `infra_failure`, and a reader
+            // must never pool it with a run whose native suite actually ran.
+            native_vacuous_seen,
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),
@@ -4940,6 +5000,14 @@ pub async fn run(
         serde_json::to_string_pretty(&serde_json::json!({
             "schema_version": crate::session::SCHEMA_VERSION,
             "apply_failed_attempts": apply_failed_attempt_indices.len(),
+            // [VANTA-WHY] M3 item W — did the native gate measure anything? A
+            // `true` here means the in-session suite collected no tests while the
+            // row's prepare had recorded some, so the run ended as `InfraFailure`
+            // and the native check was NOT performed. Recorded beside the
+            // regressions because "0 regressions" and "0 regressions measured over
+            // 0 tests" are opposite claims that the old row could not tell apart.
+            "native_vacuous": native_vacuous_seen,
+            "native_expected_tests": config.native_expected_tests,
             "new_static_findings": static_findings_records,
             // [VANTA-WHY] The repo's own suite, per attempt. `native_test_source`
             // says the suite ran the ORIGINAL tests; this key names WHICH of them

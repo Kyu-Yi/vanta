@@ -399,12 +399,67 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
         }
         tests.push((nodeid, result));
     }
+    // [VANTA-WHY] M3 item W — an EMPTY test list is not a clean suite. pytest
+    // writes a structurally valid `--json-report` document for a collection
+    // error (exit 2), for a session that collected nothing (exit 5) and for a
+    // run that died after collection; in every one of those the `tests` array
+    // is empty. Read as `ran: true, tests: []` it makes
+    // `native_regressions(original = [], ..)` VACUOUSLY empty, so the native
+    // gate reports "0 regressions" and the attempt is approved on no evidence
+    // at all. Measured on pandas/1's in-session run (session c9289597:
+    // `Native: original ran=true (0 tests), patched ran=true (0 tests), 0
+    // regression(s)`) while the SAME tree collected 88643 tests through the
+    // prepare path. A recognised shape with zero usable outcomes is therefore a
+    // FAILED run, and the report's own diagnostics travel with it so the reason
+    // is a fact instead of a guess.
+    if tests.is_empty() {
+        return NativeSuiteReport::failed_run(exec.exit_code, empty_report_note(&report, &tail));
+    }
     NativeSuiteReport {
         tests,
         failure_outputs,
         ran: true,
         exit_code: exec.exit_code,
         stderr_tail: tail,
+    }
+}
+
+/// The report's own account of a zero-test result, appended to the stderr tail.
+///
+/// [VANTA-WHY] M3 item W — `exitcode`, `summary`, `collectors` and `errors` are
+/// the four fields pytest's json-report plugin writes that say WHY nothing was
+/// collected, and a reader that turns a report into a regression verdict must
+/// not discard them: without them "0 tests" is indistinguishable from "the tree
+/// has no tests", which is the exact reading that approved a patch on nothing.
+/// Each is rendered `unset` when the document does not carry it, so a report of
+/// a shape this reader did not expect cannot look like a clean exit either.
+fn empty_report_note(report: &serde_json::Value, stderr_tail: &str) -> String {
+    let field = |path: &[&str]| -> String {
+        let mut value = report;
+        for key in path {
+            match value.get(*key) {
+                Some(inner) => value = inner,
+                None => return "unset".to_string(),
+            }
+        }
+        match value {
+            serde_json::Value::Array(items) => items.len().to_string(),
+            serde_json::Value::Number(number) => number.to_string(),
+            _ => "unset".to_string(),
+        }
+    };
+    let note = format!(
+        "native report collected 0 tests (report exitcode={} summary.collected={} \
+         collectors={} errors={})",
+        field(&["exitcode"]),
+        field(&["summary", "collected"]),
+        field(&["collectors"]),
+        field(&["errors"]),
+    );
+    if stderr_tail.is_empty() {
+        note
+    } else {
+        format!("{stderr_tail} | {note}")
     }
 }
 
@@ -519,6 +574,59 @@ pub fn native_suite_collapsed(
     patched: &NativeSuiteReport,
 ) -> bool {
     original.ran && !original.tests.is_empty() && patched.tests.len() < original.tests.len()
+}
+
+/// Is this attempt's native gate VACUOUS — did either side measure nothing,
+/// for a bug whose own preparation recorded that it has tests?
+///
+/// [VANTA-WHY] M3 item W. `native_regressions` over an empty original list is
+/// VACUOUSLY empty, and `native_suite_collapsed` requires a non-empty original,
+/// so a native pair of `(0 tests, 0 tests)` clears BOTH holes and reads as "0
+/// regressions" — a clean gate on no evidence. `expected_tests` is the count the
+/// row's own `prepare` recorded for this bug (``pass_to_pass_count`` plus the
+/// native-failure baseline, the same figure `prepare_summary.md` prints); when
+/// it is zero the bug genuinely ships no native tests and the gate is
+/// legitimately silent, so the guard does not fire. When it is positive and the
+/// in-session suite collected nothing, the check COULD NOT BE DONE — an
+/// infrastructure fact, never a pass.
+pub fn native_gate_vacuous(
+    expected_tests: usize,
+    original: &NativeSuiteReport,
+    patched: &NativeSuiteReport,
+) -> bool {
+    expected_tests > 0 && (original.collected_nothing() || patched.collected_nothing())
+}
+
+/// The recorded reason a native gate is vacuous, naming the side and the cause.
+///
+/// [VANTA-WHY] M3 item W. The reader acts on the reason, not the boolean: "the
+/// original side never ran", "the patch side collected nothing" and "neither
+/// side produced a usable report" need different responses, and the exit code
+/// and the stderr tail of the empty side are what tell them apart.
+pub fn native_vacuous_reason(
+    expected_tests: usize,
+    original: &NativeSuiteReport,
+    patched: &NativeSuiteReport,
+) -> String {
+    let side = |label: &str, report: &NativeSuiteReport| -> String {
+        format!(
+            "{label}={} (tests={} exit_code={} stderr={:?})",
+            if report.ran { "ran" } else { "not_run" },
+            report.tests.len(),
+            report
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unset".to_string()),
+            report.stderr_tail,
+        )
+    };
+    format!(
+        "native_vacuous=true expected_tests={expected_tests} — the row's own prepare recorded \
+         {expected_tests} native test(s) for this bug, but the in-session suite collected nothing, \
+         so the native gate could not run and is NOT evidence of zero regressions: {} {}",
+        side("original", original),
+        side("patched", patched),
+    )
 }
 
 // ============================================================================
@@ -2003,9 +2111,10 @@ pub async fn heal_dependencies(
 mod tests {
     use super::{
         NativeSuiteReport, RUFF_ARGS, StaticDiagnostic, build_single_test_cmd,
-        copy_static_configs, copy_tree_excluding, interpreter_for, is_native_test_path,
-        is_tooling_package, native_outcome, native_regressions, native_suite_collapsed,
-        native_tree_with_original_tests, new_diagnostics, parse_mypy_line, parse_native_report,
+        copy_static_configs, copy_tree_excluding, empty_report_note, interpreter_for,
+        is_native_test_path, is_tooling_package, native_gate_vacuous, native_outcome,
+        native_regressions, native_suite_collapsed, native_tree_with_original_tests,
+        native_vacuous_reason, new_diagnostics, parse_mypy_line, parse_native_report,
         parse_pytest_report_detailed, parse_ruff_line, project_package, report_tests,
         ruff_is_error_class, run_single_test, run_tests_parallel, seed_and_write,
         seed_and_write_from, seed_method, seed_root, seed_sandbox_from, set_seed_root,
@@ -2406,6 +2515,179 @@ mod tests {
             Some(TestResult::Passed),
             "the passing subTest item must survive parsing as a Passed test"
         );
+    }
+
+    // ---- M3 item W: an empty native report is not a clean suite --------------
+
+    /// A report of a recognised shape whose `tests` array is empty must read as
+    /// a FAILED run, never as `ran: true` with zero tests, and the report's own
+    /// diagnostics must travel with it.
+    ///
+    /// [VANTA-WHY] This is the false accept that approved a patch on nothing
+    /// (pandas/1 session c9289597). pytest writes a structurally valid
+    /// `--json-report` for a collection error (exit 2), a session that collected
+    /// nothing (exit 5) and a run that died after collection; in all three the
+    /// `tests` array is empty, so emptiness must not read as a clean bill of
+    /// health.
+    #[test]
+    fn an_empty_native_report_is_a_failed_run_never_a_clean_suite() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("report.json");
+        // The bundle variant: a valid document, no tests collected.
+        fs::write(
+            &report_path,
+            r#"{"exitcode":2,"summary":{"collected":0},"collectors":[],
+                "errors":[{"nodeid":"pandas/tests","message":"ImportError"}],"tests":[]}"#,
+        )
+        .unwrap();
+        let exec = ExecutionResult {
+            stdout: String::new(),
+            stderr: "ERROR collecting pandas/tests".to_string(),
+            exit_code: Some(2),
+            wall_time_ms: 0,
+            timed_out: false,
+        };
+
+        let report = parse_native_report(&report_path, &exec);
+
+        assert!(!report.ran, "a report with no tests is a FAILED run, not a clean one");
+        assert!(report.tests.is_empty());
+        assert_eq!(
+            report.exit_code,
+            Some(2),
+            "the exit code must survive so a caller can report WHY the suite failed"
+        );
+        for needle in ["exitcode=2", "summary.collected=0", "collectors=0", "errors=1"] {
+            assert!(
+                report.stderr_tail.contains(needle),
+                "the note must carry the report's own diagnostics; missing {needle:?} in {:?}",
+                report.stderr_tail
+            );
+        }
+    }
+
+    /// The plugin's other schema — a top-level array — must be refused exactly
+    /// the same way when it carries no tests.
+    #[test]
+    fn an_empty_top_level_array_report_is_a_failed_run_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("report.json");
+        fs::write(&report_path, "[]").unwrap();
+        let exec = ExecutionResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(5),
+            wall_time_ms: 0,
+            timed_out: false,
+        };
+
+        let report = parse_native_report(&report_path, &exec);
+
+        assert!(!report.ran, "an empty array is not a populated suite");
+        assert_eq!(report.exit_code, Some(5));
+        assert!(
+            report.stderr_tail.contains("collected 0 tests"),
+            "the note must state the emptiness: {:?}",
+            report.stderr_tail
+        );
+    }
+
+    /// `empty_report_note` renders `unset` for every field the document does not
+    /// carry, so a shape this reader did not anticipate cannot look clean either.
+    #[test]
+    fn empty_report_note_marks_missing_fields_unset() {
+        let note = empty_report_note(&serde_json::json!({}), "");
+        for needle in [
+            "exitcode=unset",
+            "summary.collected=unset",
+            "collectors=unset",
+            "errors=unset",
+        ] {
+            assert!(note.contains(needle), "missing {needle:?} in {note:?}");
+        }
+        assert!(!note.contains(" | "), "no stderr tail means no separator: {note:?}");
+    }
+
+    /// A report with the given nodeids and run state, for the gate tests.
+    fn vacuity_report(tests: &[&str], ran: bool, exit_code: Option<i32>) -> NativeSuiteReport {
+        NativeSuiteReport {
+            tests: tests
+                .iter()
+                .map(|name| (name.to_string(), TestResult::Passed))
+                .collect(),
+            failure_outputs: HashMap::new(),
+            ran,
+            exit_code,
+            stderr_tail: String::new(),
+        }
+    }
+
+    /// The guard: with a POSITIVE expected count, either side measuring nothing
+    /// makes the gate vacuous; with zero the bug genuinely has no native tests
+    /// and the gate is legitimately silent.
+    ///
+    /// [VANTA-WHY] `native_regressions` over an empty original is vacuously empty
+    /// and `native_suite_collapsed` requires a non-empty original, so `(0, 0)`
+    /// cleared both holes and read as "0 regressions" (pandas/1 c9289597). This
+    /// is the only thing that tells "no tests to check" apart from "the suite
+    /// could not run".
+    #[test]
+    fn native_gate_vacuous_fires_only_when_prepare_measured_tests() {
+        let full = vacuity_report(&["a", "b"], true, Some(1));
+        let empty = vacuity_report(&[], true, Some(5));
+        let not_run = vacuity_report(&[], false, None);
+
+        assert!(
+            native_gate_vacuous(88642, &full, &empty),
+            "a patch side that collected nothing must not read as 0 regressions"
+        );
+        assert!(
+            native_gate_vacuous(88642, &empty, &full),
+            "an original side that collected nothing is just as vacuous"
+        );
+        assert!(
+            native_gate_vacuous(88642, &not_run, &not_run),
+            "neither side running is the worst case, not a clean gate"
+        );
+        assert!(
+            native_gate_vacuous(88642, &empty, &empty),
+            "0 vs 0 is exactly the false accept the guard exists for"
+        );
+        assert!(
+            !native_gate_vacuous(88642, &full, &full),
+            "both sides measured: this is a real gate, not a vacuous one"
+        );
+        assert!(
+            !native_gate_vacuous(0, &empty, &empty),
+            "a bug with no native tests must not be forced into infra_failure"
+        );
+        assert!(
+            !native_gate_vacuous(0, &not_run, &not_run),
+            "a hand-run binary records no count and keeps the old reading"
+        );
+    }
+
+    /// The reason names the failing side and its exit code, so the reader can
+    /// tell "the original never ran" from "the patch collected nothing".
+    #[test]
+    fn native_vacuous_reason_names_the_side_and_its_exit_code() {
+        let full = vacuity_report(&["a", "b"], true, Some(0));
+        let mut empty = vacuity_report(&[], true, Some(5));
+        empty.stderr_tail = "collected 0 items".to_string();
+
+        let reason = native_vacuous_reason(88642, &full, &empty);
+
+        assert!(reason.contains("native_vacuous=true"), "{reason}");
+        assert!(reason.contains("expected_tests=88642"), "{reason}");
+        assert!(
+            reason.contains("original=ran (tests=2 exit_code=0"),
+            "the measuring side must be reported too: {reason}"
+        );
+        assert!(
+            reason.contains("patched=ran (tests=0 exit_code=5"),
+            "the empty side and its exit code must be named: {reason}"
+        );
+        assert!(reason.contains("collected 0 items"), "{reason}");
     }
 
     // ---- static findings: error-class only ------------------------------------

@@ -1734,6 +1734,19 @@ def invoke_vanta(
     # failure the row would be blamed for. One flag per file, in the split's order.
     for path in prep.precompile:
         argv += ["--precompile", path]
+    # M3 item W — the native gate's expected size. The in-session native suite is
+    # the repo's own, and `native_regressions` over an empty original is
+    # vacuously empty, so a suite that collected NOTHING reads as "0 regressions"
+    # and the attempt is approved on no evidence (measured: pandas/1 session
+    # c9289597). This count — the same figure `prepare_summary.md` prints — lets
+    # `vanta_m3` tell "this bug has no native tests" from "the suite could not
+    # run": with a positive count, an empty in-session native result ends the run
+    # as an InfraFailure (exit 2), so the row is `infra_failure` and cannot be
+    # approved on that evidence. Only a FULL prepare measured the native suite,
+    # so a measure-only row records nothing and keeps the old reading.
+    if prep.prepare_mode == prepare_mod.FULL:
+        native_expected = prep.pass_to_pass_count + len(prep.native_failure_baseline)
+        argv += ["--native-expected-tests", str(native_expected)]
     if candidate is not None:
         argv += ["--patch", str(candidate.patch_path)]
 

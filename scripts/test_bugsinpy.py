@@ -25119,6 +25119,46 @@ class TestPoolNormalisation:
         assert pool_mod.is_noop(_one_line_diff("a", "b")) is False
 
 
+class TestPoolBinaryReason:
+    """``binary_patch_reason`` — a patch that is not text is dropped, with a reason."""
+
+    def test_a_clean_text_diff_is_reviewable(self):
+        assert pool_mod.binary_patch_reason(_one_line_diff("a", "b")) is None
+
+    def test_a_binary_files_section_is_not_reviewable(self):
+        text = (
+            "diff --git a/pkg/logo.png b/pkg/logo.png\n"
+            "index 1111111..2222222 100644\n"
+            "Binary files a/pkg/logo.png and b/pkg/logo.png differ\n"
+        )
+        assert pool_mod.binary_patch_reason(text) == "the patch changes a binary file"
+
+    def test_a_git_binary_patch_section_is_not_reviewable(self):
+        text = (
+            "diff --git a/pkg/logo.png b/pkg/logo.png\n"
+            "index 1111111..2222222 100644\n"
+            "GIT binary patch\n"
+            "literal 4\n"
+            "Lc$@\n"
+        )
+        assert (
+            pool_mod.binary_patch_reason(text)
+            == "the patch carries a git binary-patch section"
+        )
+
+    def test_a_replacement_character_marks_a_non_utf8_patch(self):
+        # ``errors="replace"`` turns undecodable bytes into U+FFFD.
+        assert pool_mod.binary_patch_reason("diff --git a/x b/x\n+\ufffd\n") == (
+            "the patch is not valid UTF-8"
+        )
+
+    def test_a_lone_surrogate_marks_a_non_utf8_patch(self):
+        # ``errors="surrogateescape"`` carries the raw byte as a lone surrogate.
+        assert pool_mod.binary_patch_reason("diff --git a/x b/x\n+\udc80\n") == (
+            "the patch is not valid UTF-8"
+        )
+
+
 class TestPoolHarvest:
     """Every attempt of every repair row — snapshot, compacted, or the last one's final.patch."""
 
@@ -25155,7 +25195,7 @@ class TestPoolHarvest:
         assert attempt.slug == prep.slug
         assert "second = 22" in attempt.patch_text
         assert harvest.missing == []
-        assert harvest.not_reviewable == 0
+        assert harvest.not_reviewable == []
 
     def test_a_compacted_attempt_reconstructs_the_same_normalised_diff(self, tmp_path):
         prep = _pool_prep(tmp_path)
@@ -25272,7 +25312,39 @@ class TestPoolHarvest:
             tmp_path, records=[_attempt_row()], preps={prep.key: prep}
         )
         assert harvest.attempts == []
-        assert harvest.not_reviewable == 1
+        assert len(harvest.not_reviewable) == 1
+        dropped = harvest.not_reviewable[0]
+        assert dropped.attempt == 1
+        assert "test hunks" in dropped.reason
+
+    def test_a_binary_patch_is_not_reviewable_and_records_its_reason(self, tmp_path):
+        """A binary change is dropped before the stripper, with its reason recorded."""
+        prep = _pool_prep(tmp_path)
+        base = prep.root / "vanta_clean"
+        tree = tmp_path / "vanta_sessions" / "sid" / "debug" / "attempt_1_patched_tree"
+        write(base / "pkg" / "logo.png", "not really a png\n")
+        write(tree / "pkg" / "logo.png", "still not a png\n")
+        # A binary file diff is what `git diff --no-index` prints for it.
+        diff = (
+            "diff --git a/pkg/logo.png b/pkg/logo.png\n"
+            "index 1111111..2222222 100644\n"
+            "Binary files a/pkg/logo.png and b/pkg/logo.png differ\n"
+        )
+        write(tree.parent / "attempt_1_patched_tree.diff", diff)
+        write(
+            tree.parent / "attempt_1_patched_tree.hashes.json",
+            json.dumps({"schema_version": 1, "diff_sha256": split_mod.sha256_text(diff)}),
+        )
+        import shutil
+
+        shutil.rmtree(tree)
+        harvest = self._harvest(
+            tmp_path, records=[_attempt_row()], preps={prep.key: prep}
+        )
+        assert harvest.attempts == []
+        assert len(harvest.not_reviewable) == 1
+        assert harvest.not_reviewable[0].attempt == 1
+        assert "binary" in harvest.not_reviewable[0].reason
 
     def test_only_repair_rows_are_harvested(self, tmp_path):
         """A review row's candidate is not a Creator attempt — it is what is measured."""

@@ -24,6 +24,13 @@ failure mode that looks like a result rather than a bug:
   drops what ``suite.drop_test_file_hunks`` drops, which is the tree the oracle
   actually applies a patch to. A candidate that smuggled a change into the tests
   would be graded against a tree the oracle never builds.
+* **A patch that is not text is not a candidate.** A binary file change (git's
+  ``Binary files … differ`` or a ``GIT binary patch`` section) or bytes that are
+  not UTF-8 cannot be read, diffed or applied as a reviewable diff, so it is
+  counted ``not_reviewable`` with its reason and dropped *before* the test-hunk
+  stripper rather than being silently corrupted by a lossy decode. The check lives
+  here, on the assembled text, so ``runner.git_diff_no_index`` — which the grading
+  path shares — keeps producing its bytes unchanged.
 * **Normalisation is a pure function of the diff, and it preserves application.**
   Hunks are sorted by *position*, never by hash, because the normalised diff is
   the thing that gets applied. Grading the normalised text is what makes
@@ -311,6 +318,20 @@ class MissingAttempt:
     reason: str
 
 
+@dataclass(frozen=True)
+class NotReviewable:
+    """An attempt that WAS reconstructed but is not a reviewable candidate.
+
+    Two shapes so far: a patch that is nothing but test hunks (there is no code to
+    review) and a patch that is binary or not valid UTF-8 (it cannot be read as a
+    diff at all). Both carry the reason, so the count is not a bare number.
+    """
+
+    slug: str
+    attempt: int
+    reason: str
+
+
 @dataclass
 class Harvest:
     """What one tagged batch contributed, and what it cost in missing attempts."""
@@ -320,7 +341,7 @@ class Harvest:
     batch_dir: Path
     attempts: list[HarvestedAttempt] = field(default_factory=list)
     missing: list[MissingAttempt] = field(default_factory=list)
-    not_reviewable: int = 0
+    not_reviewable: list[NotReviewable] = field(default_factory=list)
 
 
 def _highest_attempt(debug_dir: Path) -> int:
@@ -502,6 +523,37 @@ def _final_patch_text(record: Mapping[str, Any]) -> tuple[Optional[str], str]:
         return None, f"final.patch could not be read: {exc}"
 
 
+BINARY_SECTION_MARKER = "Binary files "
+GIT_BINARY_MARKER = "GIT binary patch"
+"""git's two ways of saying a section is not text.
+
+``Binary files a/x and b/x differ`` is what ``--no-index``/``--binary``-off prints
+for a tracked binary file; ``GIT binary patch`` is the literal/delta form printed
+under ``--binary``. Either one means the section carries no reviewable text.
+"""
+
+
+def binary_patch_reason(text: str) -> Optional[str]:
+    """Why ``text`` is not a reviewable patch, or ``None`` when it is.
+
+    [VANTA-WHY] A patch that changes a binary file, or that arrived as bytes which
+    are not UTF-8, cannot be read, diffed or applied as text. It is caught in the
+    pool — on the *assembled* text — rather than in ``runner.git_diff_no_index``,
+    which the grading path also calls and which must keep producing its bytes
+    untouched. The two non-UTF-8 tells are the decoder's own: ``U+FFFD`` from a
+    lossy ``errors="replace"`` read, and lone surrogates from the
+    ``errors="surrogateescape"`` read the compacted diff uses.
+    """
+    for line in text.splitlines():
+        if line.startswith(BINARY_SECTION_MARKER) and line.rstrip().endswith(" differ"):
+            return "the patch changes a binary file"
+        if line.startswith(GIT_BINARY_MARKER):
+            return "the patch carries a git binary-patch section"
+    if "\ufffd" in text or any(0xDC80 <= ord(character) <= 0xDCFF for character in text):
+        return "the patch is not valid UTF-8"
+    return None
+
+
 def source_model_for(record: Mapping[str, Any], tag: str) -> str:
     """What the entry records as the model that wrote the patch.
 
@@ -594,13 +646,26 @@ def harvest_batch(
                     MissingAttempt(slug=slug, attempt=attempt, reason=reason or "no snapshot")
                 )
                 continue
+            # A binary or non-UTF-8 patch is not a diff to review, and must not be
+            # handed to the test-hunk stripper (which would only see mojibake). It is
+            # counted with its reason, in front of everything else.
+            binary_reason = binary_patch_reason(text)
+            if binary_reason is not None:
+                harvest.not_reviewable.append(
+                    NotReviewable(slug=slug, attempt=attempt, reason=binary_reason)
+                )
+                continue
             try:
                 cleaned = runner_mod.test_hunk_free(
                     text, what=f"{slug} attempt {attempt}"
                 )
             except runner_mod.RunnerError:
                 # Nothing but test hunks: there is no code to review.
-                harvest.not_reviewable += 1
+                harvest.not_reviewable.append(
+                    NotReviewable(
+                        slug=slug, attempt=attempt, reason="the patch is nothing but test hunks"
+                    )
+                )
                 continue
             harvest.attempts.append(
                 HarvestedAttempt(
@@ -1381,7 +1446,7 @@ def run_pool(
     for harvest in harvests:
         attempts.extend(harvest.attempts)
         tally.missing_snapshot += len(harvest.missing)
-        tally.not_reviewable += harvest.not_reviewable
+        tally.not_reviewable += len(harvest.not_reviewable)
         sources.append(harvest.tag)
     tally.harvested = len(attempts)
     candidates, duplicates = dedupe(attempts)
@@ -1463,7 +1528,7 @@ def plan_lines(prep: BugPrep, *, harvests: Sequence[Harvest], limit: int = 8) ->
     for harvest in harvests:
         attempts.extend(harvest.attempts)
         missing += len(harvest.missing)
-        not_reviewable += harvest.not_reviewable
+        not_reviewable += len(harvest.not_reviewable)
     candidates, duplicates = dedupe(attempts)
     tags = priority_of([harvest.tag for harvest in harvests])
     lines = [

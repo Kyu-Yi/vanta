@@ -263,6 +263,17 @@ def _fmt(value: Optional[float], places: int = 3) -> str:
     return "n/a" if value is None else f"{value:.{places}f}"
 
 
+def _money(value: float) -> str:
+    """A priced figure, to four places — the resolution Luna's rates need.
+
+    Item 15's acceptance is a 5% match against the dashboard, and a single Luna
+    row costs a few thousandths of a dollar, so three places would round most
+    rows to ``$0.009`` and hide the difference. Never used for a hole: a number
+    no row supports is rendered ``unavailable(...)``, not ``$0.0000``.
+    """
+    return f"${value:.4f}"
+
+
 def _interval_text(interval: Optional[tuple[float, float]]) -> str:
     if interval is None:
         return "n/a"
@@ -270,7 +281,7 @@ def _interval_text(interval: Optional[tuple[float, float]]) -> str:
 
 
 def _tex(text: str) -> str:
-    """Escape the four characters that would otherwise end a LaTeX cell."""
+    """Escape the characters that would otherwise end or corrupt a LaTeX cell."""
     out = str(text)
     for needle, replacement in (
         ("\\", r"\textbackslash{}"),
@@ -278,6 +289,7 @@ def _tex(text: str) -> str:
         ("%", r"\%"),
         ("&", r"\&"),
         ("#", r"\#"),
+        ("$", r"\$"),
     ):
         out = out.replace(needle, replacement)
     return out
@@ -864,7 +876,7 @@ class RepairMetrics(Metric):
             ("regression rate (net of baseline)", _fmt(counts.regression_rate)),
             ("rows with a replay record", str(counts.replayed)),
             ("adversarial catch rate", _fmt(counts.adversarial_catch_rate)),
-            ("cost per safely fixed defect", unavailable("item 15 not built")),
+            ("cost per safely fixed defect", cost_per_fixed_defect(analysis)),
         ]
         tex = (
             r"% item 12 — repair metrics. `regressed` counts oracle suite_regressions;"
@@ -875,7 +887,7 @@ class RepairMetrics(Metric):
             "\n"
             r"\hline"
             "\n"
-            + "\n".join(f"{_tex(name)} & {value} \\\\" for name, value in rows)
+            + "\n".join(f"{_tex(name)} & {_tex(value)} \\\\" for name, value in rows)
             + "\n"
             + r"\hline"
             + "\n"
@@ -1198,26 +1210,331 @@ def _int_field(summary: str, key: str) -> int:
         return 0
 
 
+def _float_field(summary: str, key: str) -> Optional[float]:
+    """A ``call.usage`` summary field as ``float``, or ``None`` when absent.
+
+    ``metrics.summary_field`` returns the field's TEXT — a summary line is a
+    string — so a recorded number arrives as e.g. ``"0.0050"`` and has to be
+    parsed before it can be summed. ``None`` (field missing, or the ``unset``
+    placeholder) is "the call did not record this", which is kept distinct from
+    a recorded ``0.0``.
+    """
+    raw = metrics_mod.summary_field(summary, key)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # metric 6 — cost and time (item 15)
 # ---------------------------------------------------------------------------
+# [VANTA-WHY] The pipeline prices every model call from its own versioned table
+# (`llm::pricing`, PRICE_TABLE — a rate per token for input, for CACHED input
+# and for output) and writes the money, the tokens and the `cost_basis` that
+# produced it on the call's own `call.usage` row, plus the run's summed figure on
+# the row's `llm.cost_usd`. This script never re-prices a token: a second price
+# table here could disagree with the first (the harness makes the same argument
+# for copying `cost_usd` rather than re-deriving it), so the numbers below SUM
+# what the pipeline already priced. Where no row was priced — the local backend
+# is `not_billed` — the metric says `unavailable(...)`, never a fabricated `0`.
+CALL_USAGE_PHASE = "call.usage"
+
+SITE_ROLE: dict[str, str] = {
+    "creator": "creator",
+    "attacker_generate": "attacker",
+    "attacker_revise": "attacker",
+    "attacker_simplify": "attacker",
+    "intent_audit": "intent_audit",
+    "judge": "judge",
+}
+"""The reportable role of each call site, mirroring ``llm::truncation_role``.
+
+The Attacker has four call sites and one role, so "which role spent the money"
+and "which of that role's calls did" are different questions; this map answers
+the first. A site outside the map reports under its own name rather than being
+dropped, so a call whose cost vanished from every role cannot make a per-role
+total a lower bound nobody labelled. Costs are grouped by SITE in the record and
+never re-derived from the row summary, which carries no per-role money.
+"""
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    """A recorded count as ``int``, or ``None`` when it is absent/unusable.
+
+    ``None`` is "not recorded" and is kept distinct from ``0``, which is
+    "recorded, and it was zero" — the whole distinction this section preserves.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _number_or_none(value: Any) -> Optional[float]:
+    """A recorded money/wall figure as ``float``, or ``None`` when unusable."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _row_price(record: Mapping[str, Any]) -> Optional[float]:
+    """One row's priced spend, or ``None`` when the run priced nothing.
+
+    Read from ``llm.cost_usd`` — the run's OWN total, which the pipeline sums
+    from the calls it priced. ``None`` is the local backend (``not_billed``) and
+    is NOT ``0.0``: "nothing was priced" and "priced, and it was free" are
+    different facts, and averaging them together would understate the hosted
+    cost.
+    """
+    llm = record.get("llm")
+    if not isinstance(llm, dict):
+        return None
+    return _number_or_none(llm.get("cost_usd"))
+
+
+@dataclass
+class CostFacts:
+    """Every cost/time figure item 12's table prints, summed from the records.
+
+    Each ``Optional`` field is a measurement or a hole: ``None`` means no input
+    row carried the fact, so the metric prints ``unavailable(...)`` rather than a
+    zero. The dicts are keyed in sorted order when rendered, so the output is a
+    pure function of the batches.
+    """
+
+    by_arm_cost: dict[str, float] = field(default_factory=dict)
+    by_arm_verdicts: dict[str, int] = field(default_factory=dict)
+    correct_cost: dict[str, float] = field(default_factory=dict)
+    correct_count: dict[str, int] = field(default_factory=dict)
+    fixed_cost: Optional[float] = None
+    fixed_count: int = 0
+    prompt_tokens: Optional[int] = None
+    cached_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    model_ms: Optional[int] = None
+    sandbox_s: Optional[float] = None
+    by_role_cost: dict[str, float] = field(default_factory=dict)
+    by_role_calls: dict[str, int] = field(default_factory=dict)
+
+
+def _add_int(current: Optional[int], value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return current
+    return (current or 0) + value
+
+
+def _add_float(current: Optional[float], value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return current
+    return (current or 0.0) + value
+
+
+def cost_facts(analysis: Analysis) -> CostFacts:
+    """Sum item 15's cost/time facts from the rows and their session logs.
+
+    Two passes over the same inputs: the manifest rows carry the money, the
+    tokens and the grading wall, and the session's own ``call.usage`` rows carry
+    the per-call money and the model wall. Nothing here reads a verdict beyond
+    ``label_for`` (to recognise a CORRECT one) and nothing here writes anything
+    back — the same record-only discipline as the rest of this script.
+    """
+    facts = CostFacts()
+    for _batch, record in analysis.rows:
+        price = _row_price(record)
+        llm = record.get("llm") if isinstance(record.get("llm"), dict) else {}
+        arm = arms_mod.row_arm(record)
+
+        if price is not None:
+            facts.by_arm_cost[arm] = facts.by_arm_cost.get(arm, 0.0) + price
+        if str(record.get("verdict") or ""):
+            facts.by_arm_verdicts[arm] = facts.by_arm_verdicts.get(arm, 0) + 1
+
+        # §5.3's two CORRECT cells: an approval that should have happened and a
+        # rejection that should have. A refusal (NR) and a mis-decision (FA/FR)
+        # are outside the denominator, exactly as they are everywhere else.
+        cell = LABEL_TO_CELL.get(label_for(record))
+        if cell in (CELL_TA, CELL_TR):
+            facts.correct_count[arm] = facts.correct_count.get(arm, 0) + 1
+            if price is not None:
+                facts.correct_cost[arm] = facts.correct_cost.get(arm, 0.0) + price
+
+        # The grading sandbox's own wall, recorded per row. The in-session run's
+        # wall (`timings.run_s`) mixes model wait with sandbox work, so it is not
+        # used as "sandbox" here; the oracle run is the sandbox-only figure.
+        timings = record.get("timings") if isinstance(record.get("timings"), dict) else {}
+        facts.sandbox_s = _add_float(facts.sandbox_s, _number_or_none(timings.get("oracle_s")))
+
+        prompt = _int_or_none(llm.get("prompt_tokens"))
+        cached = _int_or_none(llm.get("cached_tokens"))
+        completion = _int_or_none(llm.get("completion_tokens_total"))
+        facts.prompt_tokens = _add_int(facts.prompt_tokens, prompt)
+        facts.cached_tokens = _add_int(facts.cached_tokens, cached)
+        facts.completion_tokens = _add_int(facts.completion_tokens, completion)
+
+        # A repair row whose patch is good and whose suite did not regress — the
+        # defect it was asked to fix stayed fixed. Restricted to repair rows for
+        # the same reason `repair_counts` is: a review row grades a candidate, it
+        # does not fix one.
+        oracle = row_oracle(record)
+        if (
+            str(record.get("mode") or "") == arms_mod.REPAIR
+            and oracle is not None
+            and oracle.patch_good
+            and not oracle.suite_regressions
+        ):
+            facts.fixed_count += 1
+            facts.fixed_cost = _add_float(facts.fixed_cost, price)
+
+    _add_call_usage(analysis, facts)
+    return facts
+
+
+def _add_call_usage(analysis: Analysis, facts: CostFacts) -> None:
+    """Fold the session's per-call ``call.usage`` rows into ``facts``.
+
+    ``source=estimate`` rows are the pipeline's own character-derived guesses,
+    not provider measurements, so they are excluded from the money and the wall
+    — the same rule the pipeline applies when it sums its token totals.
+    """
+    for _batch, record in analysis.rows:
+        for row in analysis.session_rows(record):
+            if str(row.get("phase") or "") != CALL_USAGE_PHASE:
+                continue
+            summary = str(row.get("summary") or "")
+            if (metrics_mod.summary_field(summary, "source") or "") == "estimate":
+                continue
+            role = role_for_site(metrics_mod.summary_field(summary, "site") or "?")
+            facts.by_role_calls[role] = facts.by_role_calls.get(role, 0) + 1
+            cost = _float_field(summary, "cost_usd")
+            if cost is not None:
+                facts.by_role_cost[role] = facts.by_role_cost.get(role, 0.0) + cost
+            wall = _float_field(summary, "wall_ms")
+            facts.model_ms = _add_int(
+                facts.model_ms, None if wall is None else int(wall)
+            )
+
+
+def role_for_site(site: str) -> str:
+    """The reportable role of a call site (see :data:`SITE_ROLE`)."""
+    return SITE_ROLE.get(site, site)
+
+
+def cost_per_fixed_defect(analysis: Analysis) -> str:
+    """§5's "cost per safely fixed defect", or ``unavailable(...)``.
+
+    The numerator is the priced spend of the rows that fixed a defect and did
+    not regress; the denominator is how many those were. Neither a missing
+    denominator nor an unpriced numerator is a zero.
+    """
+    facts = cost_facts(analysis)
+    if facts.fixed_count == 0:
+        return unavailable("no safely fixed defect row")
+    if facts.fixed_cost is None:
+        return unavailable("no safely fixed defect row was priced")
+    return f"{_money(facts.fixed_cost / facts.fixed_count)} (n={facts.fixed_count})"
+
+
+def _cost_by_arm(facts: CostFacts) -> str:
+    parts: list[str] = []
+    for arm in sorted(facts.by_arm_cost):
+        count = facts.by_arm_verdicts.get(arm, 0)
+        if count <= 0:
+            continue
+        parts.append(f"{arm} {_money(facts.by_arm_cost[arm] / count)}/verdict (n={count})")
+    if not parts:
+        return unavailable("no arm had both a verdict and a price")
+    return " ".join(parts)
+
+
+def _cost_per_correct_verdict(facts: CostFacts) -> str:
+    counted = [arm for arm in ("b3", "judge") if facts.correct_count.get(arm, 0) > 0]
+    if not counted:
+        return unavailable("no correct verdict to price")
+    if not facts.correct_cost:
+        # The denominator exists but no row was priced — a local (`not_billed`)
+        # run. That is "not measured", not "free", so it is unavailable, never
+        # a per-arm `n/a` that reads like a figure someone could have made.
+        return unavailable("no correct verdict was priced")
+    parts: list[str] = []
+    for arm in ("b3", "judge"):
+        count = facts.correct_count.get(arm, 0)
+        if count <= 0 or arm not in facts.correct_cost:
+            parts.append(f"{arm} n/a")
+            continue
+        parts.append(f"{arm} {_money(facts.correct_cost[arm] / count)} (n={count})")
+    return " ".join(parts)
+
+
+def _cost_per_call_by_role(facts: CostFacts) -> str:
+    parts: list[str] = []
+    for role in sorted(facts.by_role_cost):
+        calls = facts.by_role_calls.get(role, 0)
+        if calls <= 0:
+            continue
+        parts.append(f"{role} {_money(facts.by_role_cost[role] / calls)}/call (n={calls})")
+    if not parts:
+        return unavailable("no call.usage row was priced")
+    return " ".join(parts)
+
+
+def _tokens_text(facts: CostFacts) -> str:
+    if (
+        facts.prompt_tokens is None
+        and facts.cached_tokens is None
+        and facts.completion_tokens is None
+    ):
+        return unavailable("no row reported tokens")
+
+    def side(value: Optional[int]) -> str:
+        return "n/a" if value is None else str(value)
+
+    return f"{side(facts.prompt_tokens)} / {side(facts.cached_tokens)} / {side(facts.completion_tokens)}"
+
+
+def _cache_hit_rate_text(facts: CostFacts) -> str:
+    if facts.prompt_tokens is None or facts.prompt_tokens == 0:
+        return unavailable("no prompt tokens were measured")
+    if facts.cached_tokens is None:
+        return unavailable("no cached-token count was reported")
+    return f"{facts.cached_tokens / facts.prompt_tokens:.4f}"
+
+
+def _wall_clock_text(facts: CostFacts) -> str:
+    if facts.model_ms is None and facts.sandbox_s is None:
+        return unavailable("no wall clock was recorded")
+    model = "n/a" if facts.model_ms is None else f"{facts.model_ms / 1000.0:.3f}s"
+    sandbox = "n/a" if facts.sandbox_s is None else f"{facts.sandbox_s:.3f}s"
+    return f"model {model} / sandbox {sandbox}"
+
+
 class CostTimeMetrics(Metric):
     name = "cost_time"
 
     def run(self, analysis: Analysis) -> MetricResult:
-        why = unavailable("item 15 not built")
+        facts = cost_facts(analysis)
         rows = [
-            ("cost per verdict, by arm", why),
-            ("cost per correct verdict (B3 vs judge)", why),
-            ("cost per safely fixed defect", why),
-            ("tokens: input / cached / output", why),
-            ("cache hit rate", why),
-            ("wall clock: model / sandbox", why),
+            ("cost per call, by role", _cost_per_call_by_role(facts)),
+            ("cost per verdict, by arm", _cost_by_arm(facts)),
+            ("cost per correct verdict (B3 vs judge)", _cost_per_correct_verdict(facts)),
+            ("cost per safely fixed defect", cost_per_fixed_defect(analysis)),
+            ("tokens: input / cached / output", _tokens_text(facts)),
+            ("cache hit rate", _cache_hit_rate_text(facts)),
+            ("wall clock: model / sandbox", _wall_clock_text(facts)),
         ]
         tex = (
-            r"% item 12 — cost and time. Item 15 (complete cost accounting) is not"
+            r"% item 12 — cost and time. Every figure is summed from the pipeline's"
             "\n"
-            r"% built, so every number here states that it is unavailable."
+            r"% own priced records (`llm.cost_usd` and the `call.usage` rows); a"
+            "\n"
+            r"% figure no row supports is marked unavailable, never `0`."
             "\n"
             r"\begin{tabular}{ll}"
             "\n"

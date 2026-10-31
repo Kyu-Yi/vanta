@@ -27658,6 +27658,37 @@ def _analyse_load(batch: Path, *, resamples: int = 40):
     return analyse_mod.load_analysis([str(batch)], seed=1, resamples=resamples)
 
 
+def _analyse_call_usage(
+    site: str,
+    *,
+    cost_usd: str = "unset",
+    wall_ms: int = 0,
+    source: str = "provider",
+    seq: int = 1,
+) -> str:
+    """One `call.usage` summary line, in the pipeline's own recorded shape."""
+    return (
+        f"seq={seq} site={site} round=0 attempt=1 prompt_tokens=100 "
+        f"completion_tokens=10 total_tokens=110 source={source} seed=unset "
+        f"seed_mechanism=unset finish_reason=stop wall_ms={wall_ms} truncated=false "
+        f"requested_fields=none sent_fields=none dropped_fields=none renamed_fields=none "
+        f"cached_tokens=0 reasoning_tokens=0 cost_usd={cost_usd} "
+        f"cost_basis=gpt-6-luna/standard/2026-10-26 provider_retries=0 "
+        f"service_tier=standard"
+    )
+
+
+def _analyse_session(tmp_path: Path, name: str, calls: "list[str]") -> str:
+    """A session dir holding `call.usage` rows; returns the `session_dir` to record."""
+    directory = tmp_path / "vanta_sessions" / name
+    directory.mkdir(parents=True, exist_ok=True)
+    write(
+        directory.parent / f"{name}_session.jsonl",
+        "".join(json.dumps({"phase": "call.usage", "summary": call}) + "\n" for call in calls),
+    )
+    return str(directory)
+
+
 class TestAnalyseNumbers:
     def test_unavailable_is_a_token_not_a_zero(self):
         assert analyse_mod.unavailable("item 15 not built") == "unavailable(item 15 not built)"
@@ -27956,7 +27987,27 @@ class TestAnalyseRepair:
     def test_the_repair_tex_marks_cost_unavailable_and_never_zero(self, tmp_path):
         result = analyse_mod.RepairMetrics().run(_analyse_load(self._batch(tmp_path)))
         tex = {artifact.filename: artifact.text for artifact in result.artifacts}["repair.tex"]
-        assert "unavailable(item 15 not built)" in tex
+        assert "unavailable(no safely fixed defect row was priced)" in tex
+
+    def test_the_repair_cost_divides_the_priced_spend_by_the_safely_fixed_rows(self, tmp_path):
+        rows = [
+            _analyse_row(
+                "k1", mode="repair", bug="A/1", llm={"cost_usd": 0.0100},
+            ),
+            _analyse_row(
+                "k2", mode="repair", bug="B/1", llm={"cost_usd": 0.0200},
+                oracle=_analyse_oracle(patch_good=False),
+            ),
+            _analyse_row(
+                "k3", mode="repair", bug="C/1", llm={"cost_usd": 0.0300},
+                oracle=_analyse_oracle(patch_good=True, regressions=["t::x"]),
+            ),
+        ]
+        result = analyse_mod.RepairMetrics().run(_analyse_load(_analyse_batch(tmp_path, rows=rows)))
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["repair.tex"]
+        # Only k1 both fixed the defect and stayed regression-free, so it alone is
+        # the denominator (n=1) and it alone is the numerator (its own $0.0100).
+        assert "cost per safely fixed defect & \\$0.0100 (n=1)" in tex
 
 
 class TestAnalyseEirEcr:
@@ -28058,11 +28109,145 @@ class TestAnalysePipeline:
 
 
 class TestAnalyseCost:
+    """Item 15 — the cost/time table is summed from the pipeline's own prices.
+
+    Every number must come from a row that recorded it, and a number no row
+    supports must read `unavailable(...)`, never a fabricated `0`.
+    """
+
     def test_every_cost_and_time_number_states_it_is_unavailable(self):
         result = analyse_mod.CostTimeMetrics().run(analyse_mod.Analysis(batches=[]))
         tex = {artifact.filename: artifact.text for artifact in result.artifacts}["cost_time.tex"]
-        assert tex.count("unavailable(item 15 not built)") == 6
+        assert tex.count("unavailable(") == 7
         assert " & 0 " not in tex
+        assert "\\$0" not in tex, "a hole is not a zero dollar figure"
+
+    def test_a_local_run_prices_nothing_so_never_zero(self, tmp_path):
+        """A row with no `llm` block is a local (`not_billed`) run: no money at all."""
+        rows = [_analyse_row("k1", arm="b3", mode="repair")]
+        result = analyse_mod.CostTimeMetrics().run(_analyse_load(_analyse_batch(tmp_path, rows=rows)))
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["cost_time.tex"]
+        assert tex.count("unavailable(") == 7
+        assert "\\$0" not in tex
+
+    def test_role_groups_the_attackers_sites_and_keeps_an_unknown_one(self):
+        for site in ("attacker_generate", "attacker_revise", "attacker_simplify"):
+            assert analyse_mod.role_for_site(site) == "attacker"
+        assert analyse_mod.role_for_site("creator") == "creator"
+        assert analyse_mod.role_for_site("intent_audit") == "intent_audit"
+        assert analyse_mod.role_for_site("judge") == "judge"
+        # A site outside the schedule reports under its own name, not dropped.
+        assert analyse_mod.role_for_site("m0_spike") == "m0_spike"
+
+    def test_the_price_tokens_and_sandbox_wall_are_summed_from_the_rows(self, tmp_path):
+        rows = [
+            _analyse_row(
+                "k1", arm="b3", mode="repair",
+                llm={
+                    "cost_usd": 0.0100,
+                    "cost_basis": "gpt-6-luna/standard/2026-10-26",
+                    "prompt_tokens": 1000,
+                    "cached_tokens": 400,
+                    "completion_tokens_total": 100,
+                },
+                timings={"oracle_s": 2.0},
+            ),
+            _analyse_row(
+                "k2", arm="b3", mode="repair",
+                llm={
+                    "cost_usd": 0.0200,
+                    "prompt_tokens": 3000,
+                    "cached_tokens": 1200,
+                    "completion_tokens_total": 300,
+                },
+                timings={"oracle_s": 4.0},
+            ),
+        ]
+        facts = analyse_mod.cost_facts(_analyse_load(_analyse_batch(tmp_path, rows=rows)))
+        assert facts.by_arm_cost["b3"] == pytest.approx(0.03)
+        assert facts.by_arm_verdicts["b3"] == 2
+        assert facts.prompt_tokens == 4000
+        assert facts.cached_tokens == 1600
+        assert facts.completion_tokens == 400
+        assert facts.sandbox_s == pytest.approx(6.0)
+        assert facts.fixed_count == 2
+        assert facts.fixed_cost == pytest.approx(0.03)
+
+    def test_the_rendered_money_and_tokens_and_the_tex_escaping(self, tmp_path):
+        rows = [
+            _analyse_row(
+                "k1", arm="b3", mode="repair",
+                llm={
+                    "cost_usd": 0.0100,
+                    "prompt_tokens": 4000,
+                    "cached_tokens": 1000,
+                    "completion_tokens_total": 200,
+                },
+                timings={"oracle_s": 2.5},
+            ),
+            _analyse_row(
+                "k2", arm="judge", mode="review", verdict="Rejected",
+                llm={
+                    "cost_usd": 0.0300,
+                    "prompt_tokens": 6000,
+                    "cached_tokens": 3000,
+                    "completion_tokens_total": 400,
+                },
+                timings={"oracle_s": 1.5},
+            ),
+        ]
+        result = analyse_mod.CostTimeMetrics().run(_analyse_load(_analyse_batch(tmp_path, rows=rows)))
+        summary = "\n".join(result.summary)
+        assert "b3 $0.0100/verdict (n=1)" in summary
+        assert "judge $0.0300/verdict (n=1)" in summary
+        assert "10000 / 4000 / 600" in summary
+        assert "0.4000" in summary
+        assert "model n/a / sandbox 4.000s" in summary
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["cost_time.tex"]
+        assert "b3 \\$0.0100/verdict (n=1)" in tex, "a $ must not open math mode in a cell"
+
+    def test_the_per_role_cost_comes_from_the_call_usage_rows(self, tmp_path):
+        session = _analyse_session(
+            tmp_path,
+            "s1",
+            [
+                _analyse_call_usage("creator", cost_usd="0.0010", wall_ms=1000, seq=1),
+                _analyse_call_usage("attacker_generate", cost_usd="0.0020", wall_ms=2000, seq=2),
+                _analyse_call_usage("attacker_revise", cost_usd="0.0030", wall_ms=3000, seq=3),
+                # An `estimate` row is the pipeline's own guess, not a measurement.
+                _analyse_call_usage(
+                    "judge", cost_usd="9.0000", wall_ms=90000, source="estimate", seq=4
+                ),
+            ],
+        )
+        row = _analyse_row("k1", arm="b3", session_id="s1", artifacts={"session_dir": session})
+        facts = analyse_mod.cost_facts(_analyse_load(_analyse_batch(tmp_path, rows=[row])))
+        assert facts.by_role_calls == {"creator": 1, "attacker": 2}
+        assert facts.by_role_cost["attacker"] == pytest.approx(0.005)
+        assert "judge" not in facts.by_role_cost
+        assert facts.model_ms == 6000
+
+    def test_correct_verdict_cost_keeps_refusals_and_mistakes_out_of_the_denominator(self, tmp_path):
+        rows = [
+            _analyse_row("k1", arm="b3", bug="A/1", verdict="AllTestsPassed",
+                         llm={"cost_usd": 0.0100}),          # correct (approve a good fix)
+            _analyse_row("k2", arm="b3", bug="B/1", verdict="AllTestsPassed",
+                         oracle=_analyse_oracle(patch_good=False),
+                         llm={"cost_usd": 0.0200}),          # false approval: not correct
+            _analyse_row("k3", arm="judge", bug="A/1", verdict="Rejected",
+                         oracle=_analyse_oracle(patch_good=False),
+                         llm={"cost_usd": 0.0400}),          # correct (reject a bad patch)
+        ]
+        facts = analyse_mod.cost_facts(_analyse_load(_analyse_batch(tmp_path, rows=rows)))
+        assert facts.correct_count == {"b3": 1, "judge": 1}
+        assert facts.correct_cost["b3"] == pytest.approx(0.0100)
+        assert facts.correct_cost["judge"] == pytest.approx(0.0400)
+        summary = "\n".join(
+            analyse_mod.CostTimeMetrics()
+            .run(_analyse_load(_analyse_batch(tmp_path, rows=rows, name="b2")))
+            .summary
+        )
+        assert "b3 $0.0100 (n=1) judge $0.0400 (n=1)" in summary
 
 
 class TestAnalyseOutputs:

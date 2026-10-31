@@ -18,7 +18,11 @@ Three rules shape everything below.
   suite already ran on each attempt's exact patch and the baseline ran in
   ``prepare``, so those cells are read back from the stored results — but only when
   the column's identity (a content hash of its patch) matches the id the live rows
-  carry. A cell is never reused on a guess.
+  carry. A cell is never reused on a guess. The stored results live in two places
+  and both are read: the transitions file (rows *between two different* patches,
+  :func:`reuse_cells`) and the per-attempt session log (one row per attempt,
+  :func:`session_reuse`). The second is what makes a repair that finished in ONE
+  attempt reusable at all — such a row writes a 0-byte transitions file.
 * **Everything that decides a number is a pure function** (:func:`cell_value`,
   :func:`transitions`, :func:`rates`, :func:`sample_cells`, :func:`flaky`,
   :func:`patch_id`). The Shuru layer below produces reports and decides nothing, so
@@ -512,7 +516,33 @@ def _transitions(sessions_dir: Path, session_id: str) -> list[dict[str, Any]]:
     return _read_jsonl(sessions_dir / f"{session_id}_transitions.jsonl")
 
 
-def _intent_checks(sessions_dir: Path, session_id: str) -> dict[str, dict[str, Any]]:
+def _session_log(sessions_dir: Path, session_id: str) -> list[dict[str, Any]]:
+    """``<sid>_session.jsonl`` — the per-attempt log, the second live-observation store.
+
+    [VANTA-WHY] The transitions file only holds rows *between two different
+    patches* (``driver.rs`` emits them from ``previous_native``/the Governor's
+    previous shared set, and only when ``from_patch != to_patch``), so a row whose
+    repair finished in one attempt writes a 0-byte transitions file and has no
+    rows to reuse. The same per-test outcomes are also written here, once per
+    attempt and stamped with the attempt's own ``patch_attempt_id``:
+    ``native_suite.test[<nodeid>]`` (``original=… patched=Some(Passed)|None …``)
+    and ``patched.result[<name>]`` (``outcome=…``). Those two phases are what
+    :func:`session_reuse` reads.
+    """
+    return _read_jsonl(sessions_dir / f"{session_id}_session.jsonl")
+
+
+def _token_fields(summary: object) -> dict[str, str]:
+    """``"a=1 b=2"`` -> ``{"a": "1", "b": "2"}`` — the log's one-line key=value form."""
+    fields: dict[str, str] = {}
+    for token in str(summary or "").split(" "):
+        if "=" in token:
+            key, value = token.split("=", 1)
+            fields[key] = value
+    return fields
+
+
+def _intent_checks(session_rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
     """``{test_name: {assertions_grounded, scrapped}}`` from the session log.
 
     The log's ``intent.check[<name>]`` rows carry the facts as one ``key=value``
@@ -520,17 +550,12 @@ def _intent_checks(sessions_dir: Path, session_id: str) -> dict[str, dict[str, A
     needs and nothing else.
     """
     out: dict[str, dict[str, Any]] = {}
-    for row in _read_jsonl(sessions_dir / f"{session_id}_session.jsonl"):
+    for row in session_rows:
         phase = str(row.get("phase") or "")
         if not phase.startswith("intent.check[") or not phase.endswith("]"):
             continue
         name = phase[len("intent.check[") : -1]
-        summary = str(row.get("summary") or "")
-        fields: dict[str, str] = {}
-        for token in summary.split(" "):
-            if "=" in token:
-                key, value = token.split("=", 1)
-                fields[key] = value
+        fields = _token_fields(row.get("summary"))
         out[name] = {
             "assertions_grounded": _tri_state(fields.get("assertions_grounded")),
             "scrapped": fields.get("scrapped") == "true",
@@ -703,6 +728,115 @@ def reuse_cells(
                 "end": end,
             }
     return out
+
+
+NATIVE_SESSION_PHASE = "native_suite.test["
+"""The session-log phase the native gate writes one per-test outcome under."""
+
+RESULT_SESSION_PHASE = "patched.result["
+"""The session-log phase the graded run writes one per-test outcome under."""
+
+_LIVE_VERIFICATION_VALUES = {"VerifiedWithinBounds": CELL_PASS, "Counterexample": CELL_FAIL}
+"""A stored ``VerificationOutcome`` (``core``) -> a cell value.
+
+[VANTA-WHY] ``patched.result`` carries a ``VerificationOutcome``, not a
+``TestResult``: the driver writes ``Passed -> VerifiedWithinBounds`` and everything
+else -> ``Counterexample`` onto the evidence (``driver.rs:3503``), so this is that
+mapping read back. An outcome that is neither (``Inconclusive``/``Unsupported``/
+``Timeout``/``ToolFailure``) is not reused at all — the replay still executes that
+cell rather than recording a guess.
+"""
+
+
+def _optional_result(text: Optional[str]) -> Optional[str]:
+    """``"Some(Passed)"`` -> ``"Passed"``; ``"None"`` -> ``None`` (Debug of an ``Option``)."""
+    if not text or text == "None":
+        return None
+    if text.startswith("Some(") and text.endswith(")"):
+        return text[len("Some(") : -1]
+    return text
+
+
+def session_reuse(
+    session_rows: Sequence[Mapping[str, Any]], column_ids: Mapping[int, Optional[str]]
+) -> tuple[list[str], dict[tuple[str, int], dict[str, Any]]]:
+    """``(native nodeids, live cells)`` read from the per-attempt session log.
+
+    [VANTA-WHY] This is :func:`reuse_cells`'s other half, and it exists because the
+    transitions file is empty for every row that finished in ONE attempt: a
+    transition needs two *different* patches, so a one-attempt row has none, and
+    without this nothing the run observed was ever reused — night1 PySnooper/3 and
+    pandas/1 both read ``0 reused, 8 executed`` for exactly that reason. The guard
+    is the same one: the row's ``patch_attempt_id`` must equal the column's
+    ``patch-<fnv1a64(patch body)>``, so a cell is still never reused on a guess.
+
+    Two phases are read, the two per-attempt stores the driver writes:
+
+    * ``native_suite.test[<nodeid>]`` — the nodeid the native gate compared, whose
+      ``patched`` value is that column's native cell; ``patched=None`` (the suite
+      never reached it) contributes the nodeid to S but no cell.
+    * ``patched.result[<name>]`` — one graded Attacker test, whose ``outcome`` is
+      that column's ``generated:<name>`` cell.
+
+    The first return value is the native nodeids those rows name, which is what
+    lets a one-attempt row have a native view at all: the transitions file — the
+    only other source of native ids — is empty for it.
+
+    Both phases stamp the attempt's own ``patch_attempt_id``, so a row is
+    attributed to the column whose patch it names. Two attempts that produced
+    byte-identical patches share one id and the earlier column wins: that is
+    sound because identical patch bodies grade identical code, and a carried-over
+    generated test keeps its source, so both columns' cells hold the same value.
+    """
+    native_ids: set[str] = set()
+    out: dict[tuple[str, int], dict[str, Any]] = {}
+    for row in session_rows:
+        phase = str(row.get("phase") or "")
+        patch = row.get("patch_attempt_id")
+        if not patch:
+            continue
+        column: Optional[int] = None
+        for k, pid in column_ids.items():
+            if k != 0 and pid == patch:
+                column = k
+                break
+        if column is None:
+            continue
+        fields = _token_fields(row.get("summary"))
+        if phase.startswith(NATIVE_SESSION_PHASE) and phase.endswith("]"):
+            test_name = phase[len(NATIVE_SESSION_PHASE) : -1]
+            matrix_key = f"native:{test_name}"
+            native_ids.add(test_name)
+            value = live_value(_optional_result(fields.get("patched")))
+            evidence_source = SOURCE_REPO_BASELINE
+            raw = str(fields.get("patched"))
+        elif phase.startswith(RESULT_SESSION_PHASE) and phase.endswith("]"):
+            test_name = phase[len(RESULT_SESSION_PHASE) : -1]
+            matrix_key = f"generated:{test_name}"
+            value = _LIVE_VERIFICATION_VALUES.get(str(fields.get("outcome")), CELL_NOT_RUN)
+            evidence_source = SOURCE_VANTA_GENERATED
+            raw = str(fields.get("outcome"))
+        else:
+            continue
+        if not _is_observed(value):
+            # The run reached the test but did not decide it (the patched suite
+            # never got there, or the diagnosis left the outcome undecided).
+            # Nothing to reuse — leave the cell to the replay.
+            continue
+        out.setdefault(
+            (matrix_key, column),
+            {
+                "test_id": matrix_key,
+                "k": column,
+                "value": value,
+                "observed_online": True,
+                "raw": raw,
+                "source": "live",
+                "evidence_source": evidence_source,
+                "test_name": test_name,
+            },
+        )
+    return sorted(native_ids), out
 
 
 def baseline_cells(
@@ -994,6 +1128,7 @@ def replay_row(
     column_ids = {column.k: column.patch_id for column in columns}
 
     transition_rows = _transitions(sessions_dir, session_id)
+    session_rows = _session_log(sessions_dir, session_id)
     native_ids = sorted(
         {
             str(row.get("test_id"))
@@ -1003,8 +1138,16 @@ def replay_row(
             and not row.get("censored")
         }
     )
+    # The transitions file is the design's first source (§7) and is empty for a
+    # one-attempt row, so the per-attempt session log supplies both the native
+    # ids S was missing and the cells it observed. Transition rows win where both
+    # speak (they are the index-exact source), and the session log fills the rest.
+    session_native_ids, session_cells = session_reuse(session_rows, column_ids)
+    native_ids = sorted(set(native_ids) | set(session_native_ids))
 
     reused = reuse_cells(transition_rows, column_ids)
+    for cell_key, session_cell in session_cells.items():
+        reused.setdefault(cell_key, session_cell)
     reused.update(baseline_cells(native_ids, prep.native_failure_baseline))
 
     shared_tests = _shared_tests(debug_dir)
@@ -1139,7 +1282,7 @@ def replay_row(
             entry["rates"] = rates(entry)
         views_out[view] = {"transitions": entries}
 
-    intent_checks = _intent_checks(sessions_dir, session_id)
+    intent_checks = _intent_checks(session_rows)
     gen_meta: dict[str, dict[str, Any]] = {}
     generated_tests_present = False
     for attempt in range(1, attempts + 1):

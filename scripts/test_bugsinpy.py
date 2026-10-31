@@ -26345,6 +26345,140 @@ class TestReplayReuse:
         assert all(cell["observed_online"] for cell in cells.values())
 
 
+class TestReplaySessionReuse:
+    """The session log is the second live store, and the only one a 1-attempt row has.
+
+    A transition row needs two *different* patches, so a repair that finished in one
+    attempt writes a 0-byte ``<sid>_transitions.jsonl`` and nothing was ever reused
+    (night1 PySnooper/3 and pandas/1 both read ``0 reused, 8 executed``). These tests
+    pin the reading of the per-attempt rows the driver *does* write in that case.
+    """
+
+    PATCH = "PATCH-1"
+
+    def _native_row(self, phase, summary, patch=None):
+        # `PATCH` is the patch *body*; the log stamps `patch-<fnv1a64(body)>`, the
+        # same id `build_columns` derives, so the default row matches column 1.
+        return {
+            "phase": phase,
+            "summary": summary,
+            "patch_attempt_id": replay_mod.patch_id(self.PATCH) if patch is None else patch,
+        }
+
+    def _columns(self):
+        return {0: None, 1: replay_mod.patch_id(self.PATCH)}
+
+    def test_a_matching_native_and_graded_row_are_both_reused(self):
+        rows = [
+            self._native_row(
+                "native_suite.test[t_a]",
+                "original=Passed patched=Some(Passed) regression=false",
+            ),
+            self._native_row(
+                "patched.result[g_c]",
+                "outcome=VerifiedWithinBounds intent=BugReproduction failure_class=None",
+            ),
+        ]
+        native_ids, cells = replay_mod.session_reuse(rows, self._columns())
+        assert native_ids == ["t_a"], "the native nodeid is what puts it in S"
+        assert cells[("native:t_a", 1)]["value"] == replay_mod.CELL_PASS
+        assert cells[("generated:g_c", 1)]["value"] == replay_mod.CELL_PASS
+        assert all(cell["observed_online"] for cell in cells.values())
+
+    def test_a_counterexample_is_a_fail(self):
+        rows = [
+            self._native_row(
+                "patched.result[g_c]",
+                "outcome=Counterexample intent=BugReproduction failure_class=Logic",
+            )
+        ]
+        _, cells = replay_mod.session_reuse(rows, self._columns())
+        assert cells[("generated:g_c", 1)]["value"] == replay_mod.CELL_FAIL
+
+    def test_a_mismatched_patch_id_is_never_reused(self):
+        rows = [
+            self._native_row(
+                "patched.result[g_c]",
+                "outcome=VerifiedWithinBounds intent=BugReproduction failure_class=None",
+                patch="patch-0000000000000000",
+            )
+        ]
+        assert replay_mod.session_reuse(rows, self._columns()) == ([], {})
+
+    def test_a_native_test_the_patched_suite_never_reached_is_named_but_not_reused(self):
+        rows = [
+            self._native_row(
+                "native_suite.test[t_a]", "original=Passed patched=None regression=false"
+            )
+        ]
+        native_ids, cells = replay_mod.session_reuse(rows, self._columns())
+        assert native_ids == ["t_a"], "it is still part of S"
+        assert cells == {}, "an undecided cell is left for the replay to run"
+
+    def test_an_undecided_graded_outcome_is_not_reused(self):
+        rows = [
+            self._native_row(
+                "patched.result[g_c]",
+                "outcome=ToolFailure intent=BugReproduction failure_class=None",
+            )
+        ]
+        assert replay_mod.session_reuse(rows, self._columns()) == ([], {})
+
+    def test_a_one_attempt_row_reuses_what_its_session_log_observed(
+        self, tmp_path, monkeypatch
+    ):
+        """End to end on the night1 shape: empty transitions file, populated log."""
+        prep = _replay_prep(tmp_path)
+        sessions, debug = _replay_session(tmp_path, attempts=1)
+        write(
+            debug / "shared_tests.json",
+            json.dumps([{"test_name": "g_c", "test_source": "assert 1"}]),
+        )
+        patch = replay_mod.patch_id("PATCH-1")
+        lines = [
+            {
+                "session_id": "sid",
+                "patch_attempt_id": patch,
+                "phase": "native_suite.test[t_a]",
+                "summary": "original=Passed patched=Some(Passed) regression=false",
+            },
+            {
+                "session_id": "sid",
+                "patch_attempt_id": patch,
+                "phase": "patched.result[g_c]",
+                "summary": "outcome=VerifiedWithinBounds intent=BugReproduction failure_class=None",
+            },
+        ]
+        write(sessions / "sid_session.jsonl", "\n".join(json.dumps(r) for r in lines) + "\n")
+        assert (sessions / "sid_transitions.jsonl").read_text() == "", "the night1 shape"
+        calls: list[dict] = []
+        _fake_column(monkeypatch, {0: {"generated:g_c": "passed"}}, calls=calls)
+
+        record = replay_mod.replay_row(
+            record=_replay_record(),
+            prep=prep,
+            checkpoint="ck",
+            batch_dir=tmp_path / "batch",
+            sessions_dir=sessions,
+            views=(replay_mod.VIEW_GENERATED,),
+            seed=replay_mod.DEFAULT_SEED,
+            sample_rate=0.0,
+            disk_mb=prepare_mod.DISK_MB,
+            timeout_secs=replay_mod.DEFAULT_TIMEOUT_SECS,
+            progress=False,
+        )
+
+        # native:t_a rides on both columns (column 0 from prepare's baseline) and
+        # generated:g_c on the patch column; only baseline's g_c is left to run.
+        assert record["replay"]["reused_cells"] == 3
+        assert record["replay"]["executed_cells"] == 1
+        assert [call["k"] for call in calls] == [0], "the patch column needs no boot"
+        assert any(test["test_id"] == "native:t_a" for test in record["tests"])
+        entry = record["views"][replay_mod.VIEW_GENERATED]["transitions"][0]
+        assert (entry["n_pp"], entry["n_pf"]) == (2, 0)
+        assert entry["by_source"][replay_mod.SOURCE_REPO_BASELINE]["n_pp"] == 1
+
+
 class TestReplayRow:
     def test_a_row_records_the_matrix_and_counts_the_reuse(self, tmp_path, monkeypatch):
         prep = _replay_prep(tmp_path)

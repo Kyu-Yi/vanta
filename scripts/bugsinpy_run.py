@@ -53,6 +53,7 @@ from bugsinpy import bake as bake_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
 from bugsinpy import compact as compact_mod  # noqa: E402
 from bugsinpy import context as context_mod  # noqa: E402
+from bugsinpy import frozen_config as frozen_mod  # noqa: E402
 from bugsinpy import issue as issue_mod  # noqa: E402
 from bugsinpy import issue_source  # noqa: E402
 from bugsinpy import manifest as manifest_mod  # noqa: E402
@@ -83,6 +84,7 @@ EXPECTED_ERRORS = (
     tree_mod.StripError,
     issue_mod.IssueError,
     compact_mod.CompactError,
+    frozen_mod.FrozenConfigError,
     records_mod.RecordError,
     mutants_mod.MutantError,
     pool_mod.PoolError,
@@ -790,6 +792,27 @@ def cmd_run(args: argparse.Namespace) -> int:
     # because printing the schedule sends no request, so it must not need one.
     if not args.plan:
         runner_mod.require_model_endpoint()
+    # Item 19 — the frozen configuration, resolved before anything else runs.
+    # `load` reads `configs/v1-m3.toml`; `resolve` REFUSES the run when the caller's
+    # own environment contradicts a setting the file freezes to a literal, unless
+    # `--allow-override` waives it — and the waiver, with the values it waived, is
+    # recorded on every row. It returns the row block (`config_hash` and friends)
+    # and the `[env]` settings to apply. Computed once, here, because they describe
+    # the whole invocation: one batch has one configuration.
+    frozen = frozen_mod.load()
+    config_block, frozen_env = frozen_mod.resolve(
+        frozen, environ=os.environ, allow_override=args.allow_override
+    )
+    print(
+        f"[config] {frozen.name} {frozen.sha256[:12]} ({config_block['config_path']})"
+        + (
+            "; --allow-override waives "
+            + ", ".join(config_block["config_overrides"])
+            if config_block["config_overrides"]
+            else ""
+        ),
+        flush=True,
+    )
     split = load_split(args.split.resolve())
     batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
     bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
@@ -841,6 +864,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Item 14's per-row half. `--plan` returns from `run_batch` before the loop,
         # so passing the probe unconditionally cannot make a plan need an endpoint.
         preflight=runner_mod.model_endpoint_preflight,
+        # Item 19 — the frozen configuration resolved above: the block lands on every
+        # row, the environment on every child.
+        config_block=config_block,
+        frozen_env=frozen_env,
     )
     if args.plan:
         return EXIT_OK
@@ -1536,6 +1563,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--plan",
         action="store_true",
         help="print the schedule (and the honest floor on review rows) and exit",
+    )
+    run.add_argument(
+        "--allow-override",
+        action="store_true",
+        help=(
+            "run even though the environment contradicts configs/v1-m3.toml (item 19). "
+            "Without it, a `VANTA_` variable the file freezes to a different value — or "
+            "freezes to `unset` and the caller set — refuses the run before the first VM "
+            "boots, because the rows would claim a configuration they did not measure. "
+            "The waiver and the values it waived are recorded on every row "
+            "(`config_override`, `config_overrides`), so such a batch still cannot be "
+            "pooled with one that did not need it."
+        ),
     )
     run.add_argument(
         "--show-hints",

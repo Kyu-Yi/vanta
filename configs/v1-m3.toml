@@ -1,0 +1,136 @@
+# configs/v1-m3.toml — the M3 frozen configuration (M3 plan item 19).
+#
+# The file's SHA-256 is written on every manifest row as `config_hash`, and
+# `analyse.py` refuses to pool rows whose hashes differ. Two rows under two
+# different config files therefore carry two different hashes and can never be
+# averaged together, which is the whole of "rows from different configs are never
+# pooled" (§Versioning).
+#
+# Read it with `scripts/bugsinpy/frozen_config.py`. Three sections, three
+# different kinds of statement:
+#
+#   [env]       frozen to a literal — the harness APPLIES it to the child
+#               environment and REFUSES the run when the caller's own environment
+#               sets one of these to a different value, unless `--allow-override`
+#               is given (recorded on every row). The value "unset" is a frozen
+#               value meaning "this variable must be absent".
+#   [recorded]  part of the configuration, but only knowable at run time. The
+#               comment gives the row/summary field that carries the observed
+#               value; the file does not freeze a literal it cannot make true.
+#   [prereg]    what the configuration commits to before a run.
+#   [prompts]   the content hash of every prompt template, inside the hash above.
+#
+# This is the seed of the M4 config file and is kept minimal on purpose: a
+# setting belongs here when changing it changes a verdict, and not otherwise.
+
+schema = 1
+name = "v1-m3"
+
+# ---------------------------------------------------------------------------
+# [env] — frozen. Applied to every vanta_m3 child; a caller value that differs
+# is refused before the first VM boots.
+# ---------------------------------------------------------------------------
+[env]
+# §14.11 — the sampler. `pinned` is the per-site schedule every v0.2-era baseline
+# ran under, and the binary's own default when the variable is unset, so applying
+# it is byte-identical to leaving it out; freezing it here is what stops a batch
+# from silently running `coding` instead.
+VANTA_SAMPLING = "pinned"
+# §14.21 — the reasoning knobs. `unset` is a frozen value: the model's own default
+# IS the configuration these rows measure, so exporting either variable at all is
+# an override. "reasoning effort as sent, for every site including intent_audit and
+# when unset" is recorded per row by `run.summary` (see [recorded] below); what the
+# file freezes is that nothing in the caller's environment varies it.
+VANTA_REASONING_EFFORT = "unset"
+VANTA_REASONING_BUDGET = "unset"
+# §14.21 — the provider's presence penalty. Unset by default and dropped from the
+# request body until a non-default value has been probed, so a stored value is a
+# different prompt; frozen to absence for the same reason as the two above.
+VANTA_PRESENCE_PENALTY = "unset"
+# §1.6.1 — the window. Unset means the binary reads `/props` and records what it
+# was told; a pinned value would size every prompt against a number this file
+# guessed at, and prepare sized its gate against the server's own.
+VANTA_LLM_CONTEXT_TOKENS = "unset"
+
+# ---------------------------------------------------------------------------
+# [recorded] — part of the configuration, observed at run time. Not frozen and not
+# applied: a literal here would be a claim the harness cannot make true.
+# ---------------------------------------------------------------------------
+[recorded]
+# Which endpoint served the run. Inherited by `runner.vanta_env` from the caller
+# on purpose — the harness must not invent a model.
+VANTA_LLM_BACKEND = "run.summary llm_backend + the row's llm block"
+VANTA_LLM_MODEL = "run.summary model — the string the API returns on each response"
+VANTA_LLM_BASE_URL = "the invocation, not recorded (it names the server, not the model)"
+VANTA_OPENAI_SERVICE_TIER = "run.summary sampling / the row's sampling block"
+# §14.21 — the per-call-site output caps (`VANTA_MAX_TOKENS_<SITE>`, §14.20). A
+# family of variables rather than one, so it cannot be a single frozen key; each
+# site's effective cap is recorded in `run.summary`.
+VANTA_MAX_TOKENS_SITE = "run.summary max_tokens_<role> / the row's sampling block"
+# §14 — the audit switches. `off` is the binary's default; this configuration runs
+# them off and the invocation that wants them on passes it in the environment and
+# records the waiver with --allow-override, or names them here in a later file.
+VANTA_CORROBORATE = "run.summary corroborate / the row's session log"
+VANTA_GROUNDED_AUDIT = "run.summary grounded_audit / the row's session log"
+VANTA_BATCH_AUDIT = "run.summary batch_audit / the row's session log"
+VANTA_ATTACKER_CONCISE = "run.summary attacker_concise; the row's attacker_concise field"
+# §14.15 — Vanta's own deadline. The harness SETS this itself (the timeout minus a
+# margin), so it is never a caller's setting; recorded here only to say so.
+VANTA_DEADLINE_SECS = "set by runner.vanta_env; run.summary deadline_secs"
+
+# ---------------------------------------------------------------------------
+# [prereg] — the pre-registration: what this configuration commits to before a
+# run. A value of "recorded" means the run writes the observation into its own
+# records (named in the comment) rather than this file freezing a literal.
+# ---------------------------------------------------------------------------
+[prereg]
+# The model string the API returns on each response, and the sampling/effort as
+# sent. Recorded per row: `model`, `sampling`, and `run.summary`'s
+# `reasoning_effort` — including for `intent_audit`, and including when unset.
+model = "recorded"
+reasoning_effort = "recorded"
+sampling = "recorded"
+# §1.6.1 — the context selector's own file budget is a property of the binary's
+# selector, not of this file; what is pre-registered is the window it was sized
+# against (prepare.json's `n_ctx`, compared with the run's own by
+# `runner.context_window_warning`).
+file_selection_budget = "recorded"
+context_window = "recorded"
+# Item U — the harness's own `-o addopts=` neutralisation (harness.rs:2040): the
+# repository's `addopts` is cleared for the generated test, because pandas'
+# `setup.cfg` names an option only its own `conftest.py` registers. This is a
+# property of the binary, frozen here as a statement that it is on.
+neutralise_repo_addopts = true
+# Item 2 — the project version prepare froze into the sandbox tree, so in-session
+# `__version__` equals prepare's (prepare.json's per-bug `version_pin`).
+version_pin = "recorded"
+# The native suite whose regression gate the in-session run applies: the nodeids
+# prepare recorded (prepare.json's `fail_to_pass`, `native_failure_baseline`), the
+# count handed to `vanta_m3 --native-expected-tests` (M3 item W), and the split
+# those came from.
+native_suite_sha256 = "recorded"
+native_expected_tests = "recorded"
+split = "recorded"
+split_sha256 = "recorded"
+# The repair budget, and the fixed-round count the K arm runs (M3 items 9, 11).
+# An arm that pins its own budget owns it (B0 is one Creator call), which is why
+# these are the invocation's defaults and not the arms'.
+max_attempts = 4
+fixed_rounds = 4
+# The split supplies each run's seed and the server's own seed is not pinned, so
+# this file cannot guarantee one. Recorded rather than claimed.
+seed = "not guaranteed by this file; the split supplies it and the row records it"
+
+# ---------------------------------------------------------------------------
+# [prompts] — the SHA-256 of every prompt template, as `pipeline::prompt_hashes()`
+# records it (`src/pipeline/mod.rs:122`). The values are the 12-hex
+# `prompt_content_hash` of each role's system prompt set, as recorded by M3 item 16
+# at binary commit 3e21ee0. Item 16 reordered a *user* prompt, which this hash does
+# not cover, so these four are unchanged from before it — the full-hash gap is
+# flagged in the item 19 report.
+# ---------------------------------------------------------------------------
+[prompts]
+attacker = "04fa32b2b204"
+intent_check = "bbed28c47b1c"
+creator = "53883e3b1c81"
+diagnostician = "e3b0c44298fc"

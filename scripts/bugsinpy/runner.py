@@ -551,6 +551,7 @@ def vanta_env(
     disk_mb: int,
     memory_mb: Optional[int] = None,
     base: Optional[dict[str, str]] = None,
+    frozen: Optional[Mapping[str, str]] = None,
 ) -> dict[str, str]:
     """The controlled environment for one ``vanta_m3`` invocation (§7.4).
 
@@ -558,6 +559,16 @@ def vanta_env(
     — is inherited from the caller: the harness must not invent a model, and a
     copied value in this file would be one more thing that can drift from what
     actually ran.
+
+    ``frozen`` is item 19's ``[env]`` section — the settings the frozen config
+    applies because a caller is not free to vary them. It is applied over the
+    inherited base BEFORE the keys below, so a caller's value cannot reach the
+    child: ``frozen_config.FrozenConfig.applied_env`` has already dropped the
+    entries the caller was allowed to keep (frozen-to-``unset``, or waived by
+    ``--allow-override``), because this function only ever *adds* keys and never
+    removes one. A key the harness itself owns (``VANTA_ARM``, ``VANTA_JUDGE``,
+    the shuru pair) is set below and would win a collision — none of the frozen
+    keys is one of those today.
 
     [VANTA-WHY] Every switch, the attempt budget's owner and the arm name come from
     ONE ``arms.py`` entry, so a run cannot be configured as one arm and recorded as
@@ -569,6 +580,11 @@ def vanta_env(
     except arms_mod.ArmError as exc:
         raise RunnerError(str(exc)) from exc
     env = dict(os.environ if base is None else base)
+    # Item 19 — the frozen configuration's own settings, applied to the base before
+    # the harness's keys below. See the docstring for why this is `update` and not
+    # an assignment per key.
+    if frozen:
+        env.update(frozen)
     env["VANTA_SANDBOX_BACKEND"] = "shuru"
     env["VANTA_SHURU_CHECKPOINT"] = checkpoint
     env["VANTA_SHURU_DISK_MB"] = str(disk_mb)
@@ -1948,6 +1964,22 @@ def build_record(
         "arm": job.arm,
         "mode": job.mode,
         "seed": job.seed,
+        # Item 19 — the frozen configuration this row was produced under: the
+        # SHA-256 of the config file's bytes, the file it came from, whether the
+        # caller waived a contradiction (`--allow-override`) and which
+        # contradictions were waived. Recorded for `seed_policy`'s reason: the same
+        # verdict means different things under a different reasoning effort, a
+        # different sampling preset or a different set of audit switches, and the
+        # environment that carried them is exactly what a later reader cannot
+        # recover from a row — so `analyse.py` refuses to pool rows whose
+        # `config_hash` values differ. `None` on a row no `run` invocation wrote (a
+        # test-built job, or a row from before this field existed): the strict
+        # reader treats "no config recorded" as its own group, never as agreement
+        # with a hashed one.
+        "config_hash": (job.config_block or {}).get("config_hash"),
+        "config_path": (job.config_block or {}).get("config_path"),
+        "config_override": (job.config_block or {}).get("config_override"),
+        "config_overrides": list((job.config_block or {}).get("config_overrides") or []),
         # §14.23 — how the pinned seed was turned into a per-round seed. Recorded
         # because the offset is DEFAULT-ON: a row's own `seed` cannot say whether its
         # later review rounds were independent draws or deterministic duplicates, so
@@ -2183,6 +2215,26 @@ class Job:
     cannot be mistaken for the main result or resumed under its name.
     """
 
+    config_block: Optional[dict[str, Any]] = None
+    """Item 19 — the frozen configuration's row block, carried onto every row.
+
+    ``frozen_config.FrozenConfig.record`` returns it: ``config_hash``,
+    ``config_path``, ``config_override``, ``config_overrides``. It is
+    batch-level, like ``harness`` above — one ``run`` invocation has one config —
+    and it lives on the job so ``run_job``'s signature (which tests stub) does not
+    have to grow a parameter for it. ``None`` when no ``run`` invocation supplied
+    one, which is every test-built job and every row written before this field.
+    """
+
+    frozen_env: Optional[Mapping[str, str]] = None
+    """Item 19 — the frozen configuration's ``[env]`` settings, applied to the child.
+
+    ``vanta_env(frozen=...)`` applies these over the inherited environment for this
+    job's ``vanta_m3``. ``None`` (or empty) leaves the environment exactly as it
+    was, which is the pre-item-19 behaviour. Batch-level for the same reason
+    ``config_block`` is.
+    """
+
     @property
     def key(self) -> str:
         return job_key(
@@ -2315,6 +2367,8 @@ def run_job(
         checkpoint=job.checkpoint,
         disk_mb=disk_mb,
         memory_mb=prep.vm_memory_mb,
+        # Item 19 — the frozen config's `[env]` settings, from the job (batch-level).
+        frozen=job.frozen_env,
     )
     outcome = invoke_vanta(
         vanta_bin=vanta_bin,
@@ -2542,6 +2596,8 @@ def run_batch(
     plan_only: bool = False,
     max_spend_usd: Optional[float] = None,
     preflight: Optional[Callable[[], Optional[str]]] = None,
+    config_block: Optional[dict[str, Any]] = None,
+    frozen_env: Optional[Mapping[str, str]] = None,
 ) -> tuple[int, list[WaveResult]]:
     """The whole batch: per wave, D13's four phases, then the wave-1 gate.
 
@@ -2568,6 +2624,14 @@ def run_batch(
     flag the harness states the pin and records it, and an explicit flag that contradicts
     it is refused by :func:`_require_arm_budget` before the schedule is printed. Every
     other arm runs what the invocation asked for, or the binary's own default.
+
+    ``config_block`` and ``frozen_env`` are item 19's frozen configuration, supplied by the
+    ``run`` command (``frozen_config.resolve``) and carried on every job: the block goes onto
+    each row (``build_record``), the environment onto each ``vanta_m3`` child (``vanta_env``).
+    Both are ``None`` by default for the same reason ``max_spend_usd`` and ``preflight`` are
+    read in the CLI rather than here — the configuration belongs to the invocation, and a test
+    that drives this loop must not depend on whatever file the developer happens to have
+    committed.
     """
     paths = BatchPaths.under(batch_dir)
     manifest = Manifest(batch_dir)
@@ -2660,6 +2724,8 @@ def run_batch(
                                 python_version_pinned=entry["python_version"],
                                 harness=harness,
                                 show_hints=show_hints,
+                                config_block=config_block,
+                                frozen_env=frozen_env,
                             )
                         ]
                     else:
@@ -2679,6 +2745,8 @@ def run_batch(
                                 candidate=candidate,
                                 harness=harness,
                                 show_hints=show_hints,
+                                config_block=config_block,
+                                frozen_env=frozen_env,
                             )
                             for candidate in _review_candidates(
                                 batch_dir=batch_dir,

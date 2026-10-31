@@ -51,6 +51,7 @@ from bugsinpy import bake as bake_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
 from bugsinpy import compact as compact_mod  # noqa: E402
 from bugsinpy import context as ctx  # noqa: E402
+from bugsinpy import frozen_config as frozen_mod  # noqa: E402
 from bugsinpy import issue as issue_mod  # noqa: E402
 from bugsinpy import issue_source as source_mod  # noqa: E402
 from bugsinpy import locked as locked_mod  # noqa: E402
@@ -22494,6 +22495,8 @@ def _job(
     candidate=None,
     harness=None,
     show_hints=False,
+    config_block=None,
+    frozen_env=None,
 ) -> runner_mod.Job:
     # [VANTA-WHY] M3 item 8 follow-up — `arm` is its own field now (the row records
     # both `config` and `arm`), so a helper that named only the config would have to
@@ -22521,6 +22524,8 @@ def _job(
         candidate=candidate,
         harness=harness,
         show_hints=show_hints,
+        config_block=config_block,
+        frozen_env=frozen_env,
     )
 
 
@@ -24213,6 +24218,14 @@ class TestExpectedErrorsExitCleanly:
         # `run`'s preflight call takes no injection point — that is the point of
         # it — so the stub replaces the name `cmd_run` resolves.
         monkeypatch.setattr(runner_mod, "require_model_endpoint", lambda **kwargs: None)
+        # Item 19 resolves the frozen configuration in `cmd_run` before it loads the
+        # split, and that step reads the caller's own environment: a shell that
+        # exports a `VANTA_` variable the config freezes refuses the run before the
+        # stubbed `ContextError` above ever fires. This test is about how a refusal
+        # is printed, so the variables in question — the config's own `[env]` keys,
+        # read from the committed file rather than named here — are cleared.
+        for _name in frozen_mod.load().frozen():
+            monkeypatch.delenv(_name, raising=False)
         monkeypatch.setattr(run_mod, "load_split", boom)
 
         code = run_mod.main(["run", "--batch", str(tmp_path)])
@@ -27814,15 +27827,10 @@ class TestAnalyseLoading:
                 total = sum(slot[name] for slot in sources.values())
                 assert total == counts[name], f"{key} {name}: {total} != {counts[name]}"
 
-    @pytest.mark.skip(
-        reason="item 19 — the frozen-config hash; until then analyse.py pools every "
-        "matched row"
-    )
     def test_rows_with_different_config_hashes_are_never_pooled(self, tmp_path):
-        # M3 §Versioning: "Rows from different configs are never pooled." analyse.py
-        # has no such guard yet — it is item 19's frozen-config hash — so this test is
-        # held out. The field name below is provisional (item 19 pins it); drop the
-        # skip once the guard lands, and the assertion should already hold.
+        # M3 §Versioning: "Rows from different configs are never pooled." Item 19's
+        # frozen config writes `config_hash` on every row it runs; `load_analysis`
+        # refuses a load that carries more than one value.
         first = _analyse_row("k1", arm="b3", bug="A/1", config="judge", seed=1)
         first["config_hash"] = "h1"
         second = _analyse_row("k2", arm="b3", bug="A/1", config="judge+suite", seed=1)
@@ -27830,6 +27838,50 @@ class TestAnalyseLoading:
         batch = _analyse_batch(tmp_path, rows=[first, second])
         with pytest.raises(analyse_mod.AnalysisError):
             _analyse_load(batch)
+
+    def test_one_config_hash_across_rows_is_not_a_refusal(self, tmp_path):
+        """The guard must fire only on a MIX: a single-hash load pools as it always did."""
+        rows = [_analyse_row("k1"), _analyse_row("k2")]
+        for row in rows:
+            row["config_hash"] = "h1"
+        analysis = _analyse_load(_analyse_batch(tmp_path, rows=rows))
+        assert len(analysis.rows) == 2
+
+    def test_a_row_with_no_config_hash_is_its_own_group(self, tmp_path):
+        """A pre-item-19 row is never "agreement" with a hashed one, and vice versa.
+
+        Pooling a row whose configuration nothing recorded with one whose configuration
+        did would be pooling a known experiment with an unknown one under the known
+        one's name — which is the failure §Versioning's rule exists to stop.
+        """
+        hashed = _analyse_row("k1")
+        hashed["config_hash"] = "h1"
+        batch = _analyse_batch(tmp_path, rows=[hashed, _analyse_row("k2")])
+        with pytest.raises(analyse_mod.AnalysisError):
+            _analyse_load(batch)
+
+    def test_allow_mixed_configs_is_the_told_to_escape(self, tmp_path):
+        """§Versioning says "never pooled", and item 19's flag is the recorded exception."""
+        first = _analyse_row("k1")
+        first["config_hash"] = "h1"
+        second = _analyse_row("k2")
+        second["config_hash"] = "h2"
+        batch = _analyse_batch(tmp_path, rows=[first, second])
+        analysis = analyse_mod.load_analysis(
+            [str(batch)], seed=1, resamples=40, allow_mixed_configs=True
+        )
+        assert len(analysis.rows) == 2
+
+    def test_the_refusal_names_every_hash_it_would_have_pooled(self, tmp_path):
+        first = _analyse_row("k1")
+        first["config_hash"] = "aaaa111122223333"
+        second = _analyse_row("k2")
+        second["config_hash"] = "bbbb444455556666"
+        batch = _analyse_batch(tmp_path, rows=[first, second])
+        with pytest.raises(analyse_mod.AnalysisError) as exc:
+            _analyse_load(batch)
+        message = str(exc.value)
+        assert "aaaa11112222" in message and "bbbb44445555" in message
 
 
 class TestAnalyseReview:
@@ -28318,4 +28370,244 @@ class TestAnalyseCli:
         assert code == 0
         assert (out / "summary.txt").is_file()
         assert (out / "eir_ecr.tex").is_file()
+
+
+# ============================================================================
+# item 19 — the frozen configuration
+# ============================================================================
+def _frozen_file(tmp_path: Path, name: str, *, sampling: str = "pinned") -> Path:
+    """A minimal frozen-config file that ``frozen_config._validate`` accepts."""
+    return write(
+        tmp_path / f"{name}.toml",
+        "schema = 1\n"
+        f'name = "{name}"\n'
+        "[env]\n"
+        f'VANTA_SAMPLING = "{sampling}"\n'
+        "[recorded]\n"
+        'VANTA_LLM_MODEL = "run.summary model"\n'
+        "[prereg]\n"
+        "max_attempts = 4\n"
+        "[prompts]\n"
+        'creator = "abc123"\n',
+    )
+
+
+class TestFrozenConfig:
+    """Item 19 — the file, its hash over its own bytes, and the files it refuses."""
+
+    def test_the_committed_config_loads_and_validates(self):
+        config = frozen_mod.load()
+        assert config.name == "v1-m3"
+        assert len(config.sha256) == 64
+        assert config.sha256 == config.sha256.lower()
+        # The two kinds of `[env]` statement: a literal the harness applies, and
+        # `unset`, which is a literal too (it freezes the model's own default).
+        assert config.frozen()["VANTA_SAMPLING"] == "pinned"
+        assert config.frozen()["VANTA_REASONING_EFFORT"] == frozen_mod.UNSET
+        # The pre-registration's own literals.
+        assert config.prereg()["max_attempts"] == 4
+        assert config.prereg()["fixed_rounds"] == 4
+        assert set(config.prompts()) == {
+            "attacker",
+            "intent_check",
+            "creator",
+            "diagnostician",
+        }
+
+    def test_the_hash_is_of_the_files_own_bytes(self, tmp_path):
+        path = _frozen_file(tmp_path, "v1")
+        assert frozen_mod.load(path).sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def test_two_config_files_carry_two_hashes(self, tmp_path):
+        """Item 19's acceptance: two files, two hashes on their rows, never pooled."""
+        first = frozen_mod.load(_frozen_file(tmp_path, "a", sampling="pinned"))
+        second = frozen_mod.load(_frozen_file(tmp_path, "b", sampling="coding"))
+        assert first.sha256 != second.sha256
+
+    def test_a_non_vanta_env_key_is_refused(self, tmp_path):
+        path = write(
+            tmp_path / "bad.toml",
+            'schema = 1\nname = "bad"\n[env]\nSAMPLING = "pinned"\n'
+            "[recorded]\n[prereg]\n[prompts]\n",
+        )
+        with pytest.raises(frozen_mod.FrozenConfigError, match="not a VANTA_ variable"):
+            frozen_mod.load(path)
+
+    def test_a_wrong_schema_is_refused(self, tmp_path):
+        path = write(
+            tmp_path / "bad.toml",
+            'schema = 2\nname = "bad"\n[env]\n[recorded]\n[prereg]\n[prompts]\n',
+        )
+        with pytest.raises(frozen_mod.FrozenConfigError, match="schema must be 1"):
+            frozen_mod.load(path)
+
+    def test_a_missing_prompt_value_is_refused(self, tmp_path):
+        path = write(
+            tmp_path / "bad.toml",
+            'schema = 1\nname = "bad"\n[env]\n[recorded]\n[prereg]\n[prompts]\ncreator = ""\n',
+        )
+        with pytest.raises(frozen_mod.FrozenConfigError, match=r"\[prompts\]"):
+            frozen_mod.load(path)
+
+    def test_a_missing_file_is_a_named_refusal(self, tmp_path):
+        with pytest.raises(frozen_mod.FrozenConfigError, match="cannot read"):
+            frozen_mod.load(tmp_path / "nope.toml")
+
+
+class TestFrozenConfigResolution:
+    """Item 19 — the override rule: a caller value the file freezes differently refuses."""
+
+    def _config(self) -> frozen_mod.FrozenConfig:
+        return frozen_mod.load()  # VANTA_SAMPLING frozen to `pinned`, the rest to `unset`
+
+    def test_an_absent_variable_is_not_an_override(self):
+        config = self._config()
+        assert config.overrides({}) == []
+        block, env = frozen_mod.resolve(config, environ={}, allow_override=False)
+        assert block["config_override"] is False
+        assert block["config_overrides"] == []
+        assert env["VANTA_SAMPLING"] == "pinned"
+
+    def test_a_caller_value_that_contradicts_a_literal_is_refused(self):
+        config = self._config()
+        with pytest.raises(
+            frozen_mod.FrozenConfigError, match="VANTA_SAMPLING=pinned!=coding"
+        ):
+            frozen_mod.resolve(
+                config, environ={"VANTA_SAMPLING": "coding"}, allow_override=False
+            )
+
+    def test_a_variable_frozen_to_unset_is_an_override_when_set(self):
+        """`unset` freezes the model's own default, so exporting the knob measures
+        something other than what the rows claim."""
+        config = self._config()
+        with pytest.raises(
+            frozen_mod.FrozenConfigError, match="VANTA_REASONING_EFFORT=unset!=low"
+        ):
+            frozen_mod.resolve(
+                config, environ={"VANTA_REASONING_EFFORT": "low"}, allow_override=False
+            )
+
+    def test_the_waiver_records_the_contradiction_and_leaves_the_caller_value(self):
+        config = self._config()
+        block, env = frozen_mod.resolve(
+            config, environ={"VANTA_SAMPLING": "coding"}, allow_override=True
+        )
+        assert block["config_override"] is True
+        assert block["config_overrides"] == ["VANTA_SAMPLING=pinned!=coding"]
+        # The waived key is NOT applied, so the harness leaves the caller's own value in
+        # place (`vanta_env` only ever adds keys); `config_overrides` on the row is what
+        # makes that auditable rather than invisible.
+        assert "VANTA_SAMPLING" not in env
+
+    def test_the_applied_env_never_carries_an_unset_key(self):
+        config = self._config()
+        _, env = frozen_mod.resolve(config, environ={}, allow_override=False)
+        assert frozen_mod.UNSET not in env.values()
+        assert "VANTA_REASONING_EFFORT" not in env
+        assert "VANTA_PRESENCE_PENALTY" not in env
+
+    def test_the_block_carries_the_hash_and_a_repo_relative_path(self):
+        config = self._config()
+        block, _ = frozen_mod.resolve(config, environ={}, allow_override=False)
+        assert block["config_hash"] == config.sha256
+        assert block["config_path"] == "configs/v1-m3.toml"
+
+
+class TestFrozenConfigWiring:
+    """Item 19 — where the block lands: the child env, the row, and the analysis load."""
+
+    def test_vanta_env_applies_the_frozen_settings(self):
+        env = runner_mod.vanta_env(
+            arm="b3",
+            seed=0,
+            checkpoint="chk",
+            disk_mb=8192,
+            base={},
+            frozen={"VANTA_SAMPLING": "pinned"},
+        )
+        assert env["VANTA_SAMPLING"] == "pinned"
+        # The harness's own keys are set AFTER the frozen ones, so they are unaffected.
+        assert env["VANTA_SANDBOX_BACKEND"] == "shuru"
+
+    def test_vanta_env_without_a_frozen_block_changes_nothing(self):
+        plain = runner_mod.vanta_env(
+            arm="b3", seed=0, checkpoint="chk", disk_mb=8192, base={}
+        )
+        assert "VANTA_SAMPLING" not in plain
+
+    def test_the_row_records_the_config_hash_and_the_waiver(self, tmp_path, monkeypatch):
+        seen: dict = {}
+
+        def fake_invoke(**kwargs):
+            seen["env"] = kwargs["env"]
+            return _outcome(tmp_path)
+
+        monkeypatch.setattr(runner_mod, "invoke_vanta", fake_invoke)
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        block = {
+            "config_hash": "h" * 64,
+            "config_path": "configs/v1-m3.toml",
+            "config_override": False,
+            "config_overrides": [],
+        }
+        record = runner_mod.run_job(
+            job=_job(
+                prep(root=tmp_path / "root"),
+                config_block=block,
+                frozen_env={"VANTA_SAMPLING": "pinned"},
+            ),
+            paths=runner_mod.BatchPaths.under(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4,
+            disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert record["config_hash"] == "h" * 64
+        assert record["config_path"] == "configs/v1-m3.toml"
+        assert record["config_override"] is False
+        assert record["config_overrides"] == []
+        assert seen["env"]["VANTA_SAMPLING"] == "pinned"
+
+    def test_a_row_with_no_frozen_config_says_none_rather_than_guessing(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")),
+            paths=runner_mod.BatchPaths.under(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4,
+            disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert record["config_hash"] is None
+        assert record["config_path"] is None
+        assert record["config_override"] is None
+        assert record["config_overrides"] == []
+
+    def test_the_run_command_carries_allow_override_defaulting_off(self):
+        parser = run_mod.build_parser()
+        assert parser.parse_args(["run", "--batch", "b"]).allow_override is False
+        assert (
+            parser.parse_args(["run", "--batch", "b", "--allow-override"]).allow_override
+            is True
+        )
+
+    def test_the_analyse_command_carries_allow_mixed_configs_defaulting_off(self):
+        parser = analyse_mod.build_parser()
+        assert parser.parse_args(["--batches", "x"]).allow_mixed_configs is False
+        assert (
+            parser.parse_args(
+                ["--batches", "x", "--allow-mixed-configs"]
+            ).allow_mixed_configs
+            is True
+        )
 

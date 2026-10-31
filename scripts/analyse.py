@@ -435,7 +435,13 @@ class Analysis:
         return counts
 
 
-def load_analysis(patterns: Sequence[str], *, seed: int, resamples: int) -> Analysis:
+def load_analysis(
+    patterns: Sequence[str],
+    *,
+    seed: int,
+    resamples: int,
+    allow_mixed_configs: bool = False,
+) -> Analysis:
     paths = discover_batches(patterns)
     if not paths:
         raise AnalysisError(
@@ -445,7 +451,58 @@ def load_analysis(patterns: Sequence[str], *, seed: int, resamples: int) -> Anal
         Batch(path=path, records=load_manifest(path / MANIFEST_NAME), replays=load_replays(path))
         for path in paths
     ]
+    # Item 19 — refuse to pool rows the frozen config would make incomparable, BEFORE
+    # any metric reads them. `allow_mixed_configs` is §Versioning's "unless told to".
+    if not allow_mixed_configs:
+        _refuse_mixed_configs(batches)
     return Analysis(batches=batches, seed=seed, resamples=resamples)
+
+
+CONFIG_HASH_FIELD = "config_hash"
+"""The row field item 19's frozen config writes (``frozen_config.FrozenConfig.record``).
+
+[VANTA-WHY] Named once, because :func:`_refuse_mixed_configs` is the only reader that
+turns the field into a refusal: a typo in a literal there would make the guard read
+``None`` for every row and silently pool everything, and the row's own copies in
+``runner.build_record`` would keep looking right."""
+
+
+def _refuse_mixed_configs(batches: Sequence[Batch]) -> None:
+    """Item 19 — never pool rows from different frozen configurations.
+
+    [VANTA-WHY] §Versioning's "rows from different configs are never pooled" is a
+    ROW-level rule a batch directory cannot enforce: a batch resumed across a config
+    edit carries both hashes in one manifest, and every metric here pools by bug and
+    arm while ignoring which file produced a row. Two distinct hashes in one load is
+    therefore a refusal rather than a warning — the numbers the caller is about to
+    compute would be averages over two different experiments, and nothing downstream
+    could tell. A row with no ``config_hash`` (one written before this field existed,
+    or by a caller that supplied no frozen config) is its own group, never agreement
+    with a hashed row.
+    """
+    groups: dict[Any, list[str]] = {}
+    for batch in batches:
+        for record in batch.records:
+            value = record.get(CONFIG_HASH_FIELD)
+            groups.setdefault(None if value is None else str(value), []).append(
+                str(batch.path)
+            )
+    if len(groups) <= 1:
+        return
+    described: list[str] = []
+    for value, where in sorted(
+        groups.items(), key=lambda item: (item[0] is not None, item[0] or "")
+    ):
+        label = "none recorded" if value is None else value[:12]
+        described.append(
+            f"{label} ({len(where)} row(s) in {', '.join(sorted(set(where)))})"
+        )
+    raise AnalysisError(
+        f"{len(groups)} distinct frozen configurations across the loaded rows: "
+        + "; ".join(described)
+        + ". Rows from different configs are never pooled (§Versioning). Analyse the "
+        "batches separately, or pass --allow-mixed-configs to pool them on purpose."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1630,13 +1687,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_BOOTSTRAP,
         help=f"cluster-bootstrap resamples (default {DEFAULT_BOOTSTRAP})",
     )
+    parser.add_argument(
+        "--allow-mixed-configs",
+        action="store_true",
+        help=(
+            "pool rows whose config_hash values differ (item 19). Off by default: rows "
+            "produced under different frozen configurations are never pooled "
+            "(§Versioning), and two distinct hashes in one load is a refusal rather than "
+            "a warning. Pass this only to look at a mixed load on purpose."
+        ),
+    )
     return parser
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        analysis = load_analysis(args.batches, seed=args.seed, resamples=args.bootstrap)
+        analysis = load_analysis(
+            args.batches,
+            seed=args.seed,
+            resamples=args.bootstrap,
+            allow_mixed_configs=args.allow_mixed_configs,
+        )
     except AnalysisError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

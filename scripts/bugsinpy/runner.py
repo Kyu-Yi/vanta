@@ -2938,6 +2938,19 @@ def _recorded_costs(records: Iterable[dict[str, Any]]) -> tuple[list[float], int
     return known, unknown
 
 
+def _at_or_over_cap(manifest: Manifest, cap_usd: float) -> bool:
+    """True when the batch's recorded spend has reached ``cap_usd`` (H7).
+
+    The *same* micro-dollar comparison :meth:`SpendGate.acquire` makes, exposed so
+    that a worker recording why its own call returned nonzero cannot disagree with
+    the arithmetic that refused it. The two used to be a float sum against a float
+    cap — a hair either side of the boundary depending on the order the costs were
+    added in, so a worker could be stopped by the gate and then name a different
+    reason.
+    """
+    return _usd_to_micro(_spent_so_far(manifest)) >= _usd_to_micro(cap_usd)
+
+
 def _record_spend_cap(
     batch_dir: Path, cap_usd: float, spent_usd: float, job: Job
 ) -> None:
@@ -3492,47 +3505,53 @@ def run_batch(
                         # `running`. Deleting the file resumes from this key.
                         if stop_file is not None and Path(stop_file).exists():
                             return stopped()
-                        # §14.29 — the spend cap is checked BEFORE the job starts,
-                        # never during one: the check is between rows, so the row
-                        # that crossed the cap is already complete and the rows
-                        # that follow it are never half-written. `>=` rather than
-                        # `>`: a batch that has reached its budget has spent it.
-                        #
-                        # G1 — the admission is atomic across the queue's workers
-                        # (`SpendGate`): a re-read of the manifest was not. The gate
-                        # reserves this job's budget under a lock before the job
-                        # starts, so two workers cannot both pass on the same
-                        # `spent`, and `None` — the batch has reached its cap — is
-                        # the only value that stops it. The reservation is released
-                        # in the `finally` below on every exit, a job that raised
-                        # included.
                         reservation: Optional[int] = None
-                        if spend_gate is not None:
-                            reservation = spend_gate.acquire(job)
-                            if reservation is None:
-                                _record_spend_cap(
-                                    batch_dir,
-                                    spend_gate.cap_usd,
-                                    _spent_so_far(manifest),
-                                    job,
-                                )
-                                return 1, results
-                            # H3 — the stop file can appear while this worker is
-                            # asleep in `acquire`. A job started after it exists is
-                            # exactly what the file was created to prevent, so
-                            # re-check it here and hand the reservation back without
-                            # starting the job.
-                            if stop_file is not None and Path(stop_file).exists():
-                                spend_gate.release(reservation)
-                                return stopped()
-                        # Item 14 — before the row, not after it. Asked here rather
-                        # than inside `run_job` because the refusal has to leave no
-                        # trace at all: `run_job`'s first act is to mark the key
-                        # `running` in `state.json`, and a key parked there is a row
-                        # the next resume re-runs. Raising before the call means the
-                        # cursor never moves and the batch continues from here once
-                        # the endpoint is back.
+                        # H7 — the `try` opens *before* `acquire`, not at the job.
+                        # Between the return of a successful `acquire` and the old
+                        # `try` there was a window in which a `KeyboardInterrupt` (or
+                        # any other raise) left a token held by a frame that never
+                        # reached the `finally`, and every waiter behind it slept out
+                        # the batch. With the `finally` covering the acquire itself, a
+                        # token is released on every path that can carry one;
+                        # `release(None)` is a no-op, so a refusal or an H1 rollback
+                        # still leaves nothing behind.
                         try:
+                            # §14.29 — the spend cap is checked BEFORE the job starts,
+                            # never during one: the check is between rows, so the row
+                            # that crossed the cap is already complete and the rows
+                            # that follow it are never half-written. `>=` rather than
+                            # `>`: a batch that has reached its budget has spent it.
+                            #
+                            # G1 — the admission is atomic across the queue's workers
+                            # (`SpendGate`): a re-read of the manifest was not. The
+                            # gate reserves this job's budget under a lock before the
+                            # job starts, so two workers cannot both pass on the same
+                            # `spent`, and `None` — the batch has reached its cap — is
+                            # the only value that stops it.
+                            if spend_gate is not None:
+                                reservation = spend_gate.acquire(job)
+                                if reservation is None:
+                                    _record_spend_cap(
+                                        batch_dir,
+                                        spend_gate.cap_usd,
+                                        _spent_so_far(manifest),
+                                        job,
+                                    )
+                                    return 1, results
+                                # H3 — the stop file can appear while this worker is
+                                # asleep in `acquire`. A job started after it exists
+                                # is exactly what the file was created to prevent, so
+                                # re-check it here; the `finally` releases the
+                                # reservation that `stopped()` returns past.
+                                if stop_file is not None and Path(stop_file).exists():
+                                    return stopped()
+                            # Item 14 — before the row, not after it. Asked here rather
+                            # than inside `run_job` because the refusal has to leave no
+                            # trace at all: `run_job`'s first act is to mark the key
+                            # `running` in `state.json`, and a key parked there is a row
+                            # the next resume re-runs. Raising before the call means the
+                            # cursor never moves and the batch continues from here once
+                            # the endpoint is back.
                             if preflight is not None:
                                 require_model_endpoint(preflight=preflight, before=job.key)
                             record = run_job(
@@ -4655,9 +4674,13 @@ def _run_task(
     if code != 0:
         if stop_file.exists():
             reason = "stop_file"
-        elif (
-            kwargs["max_spend_usd"] is not None
-            and _spent_so_far(Manifest(batch_dir)) >= kwargs["max_spend_usd"]
+        elif kwargs["max_spend_usd"] is not None and _at_or_over_cap(
+            # H7 — the reason this task stopped has to be the gate's own verdict.
+            # `_at_or_over_cap` is the one micro-dollar comparison the gate makes
+            # (H2), so a float `>=` here could call a batch capped while the gate
+            # that stopped it was still willing to admit, and mislabel the outcome.
+            Manifest(batch_dir),
+            kwargs["max_spend_usd"],
         ):
             reason = "spend_cap"
         elif wave_gate_failures(records):

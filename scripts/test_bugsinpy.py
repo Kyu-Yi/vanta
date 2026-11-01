@@ -25684,6 +25684,63 @@ class TestQueue:
             (batch_dir / runner_mod.SPEND_LOG_NAME).read_text(encoding="utf-8")
         )["schema"] == 1
 
+    def test_an_interrupt_between_admission_and_the_job_releases_the_reservation(
+        self, tmp_path, monkeypatch
+    ):
+        """H7 — the window `try`-before-`acquire` closes.
+
+        `acquire` returns a token and the loop's very next act is to run the job. A
+        `KeyboardInterrupt` delivered in that gap reached neither the old `finally`
+        (the `try` had not opened yet) nor `acquire`'s own rollback (it had already
+        returned), so the token was held by a frame that could never release it. The
+        interrupt is injected with a trace hook at the first line of the loop after
+        the admission — where a real Ctrl-C lands.
+        """
+        batch_dir = tmp_path / "batch"
+        preps, entries, split, _calls = self._prepare(monkeypatch, tmp_path, count=1, cost_usd=0.5)
+        gate = runner_mod.SpendGate(batch_dir, 1.0, manifest_mod.Manifest(batch_dir))
+
+        state = {"armed": False, "fired": False}
+        batch_code = runner_mod.run_batch.__code__
+
+        def hook(frame, event, arg):
+            if frame.f_code.co_name == "acquire" and event == "return":
+                state["armed"] = True
+            elif (
+                state["armed"]
+                and not state["fired"]
+                and event == "line"
+                and frame.f_code is batch_code
+            ):
+                state["fired"] = True
+                raise KeyboardInterrupt
+            return hook
+
+        sys.settrace(hook)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                runner_mod.run_batch(
+                    batch_dir=batch_dir,
+                    batch_id="b1",
+                    split=split,
+                    preps=preps,
+                    entries=entries,
+                    seeds=[0],
+                    waves=[1],
+                    vanta_bin=Path("/nonexistent/vanta_m3"),
+                    max_attempts=None,
+                    disk_mb=8192,
+                    spend_gate=gate,
+                    announce=False,
+                )
+        finally:
+            sys.settrace(None)
+
+        assert state["fired"], "the interrupt must have landed in the window after admission"
+        assert self._reserved(gate) == 0, "an interrupted admission must not keep its budget"
+        assert gate._inflight == {}
+        assert not manifest_mod.Manifest(batch_dir).records(), "the job never started"
+
     # -- H4/H5 — what the spend report counts ------------------------------
     def test_spend_reporting_counts_every_charged_row_superseded_included(
         self, tmp_path, monkeypatch

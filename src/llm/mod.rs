@@ -1909,7 +1909,8 @@ async fn post_chat_meta(
         // as a flaky one, so `structured_call_with_retry` returns on the first
         // occurrence (it matches this exact prefix).
         return Err(format!(
-            "Prompt would exceed model context: prompt_tokens={} + max_tokens={} + overhead={} > context_window={}",
+            "{}: prompt_tokens={} + max_tokens={} + overhead={} > context_window={}",
+            DETERMINISTIC_CONTEXT_PREFIX,
             prompt_tokens,
             requested_output_tokens,
             CHAT_OVERHEAD_TOKENS,
@@ -2173,7 +2174,13 @@ async fn post_chat_meta(
 /// Prefix of the pre-flight budget failure. Kept as one constant because the
 /// producer (`post_chat`) and the consumer (the retry loop below) must agree on
 /// it exactly.
-const DETERMINISTIC_CONTEXT_PREFIX: &str = "Prompt would exceed model context";
+///
+/// [VANTA-WHY] M3 item F5 — the driver names this failure as its own reason
+/// (`prompt_over_budget`) instead of folding it into "the Creator call failed",
+/// because a prompt that cannot fit says something about the RUN'S CONFIGURATION
+/// and not about the candidate. Public for the same reason as
+/// `TRUNCATED_OUTPUT_PREFIX`: so that second consumer does not re-spell the string.
+pub const DETERMINISTIC_CONTEXT_PREFIX: &str = "Prompt would exceed model context";
 
 /// Prefix of the failure a response cut off at `max_tokens` produces.
 ///

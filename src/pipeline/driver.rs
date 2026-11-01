@@ -2206,6 +2206,22 @@ pub async fn run(
                 crate::agents::creator::creator_system_prompt(),
                 creator_user_prompt.as_str(),
             ]));
+            // [VANTA-WHY] M3 item F5 — price the prompt BEFORE spending the call, so
+            // a prompt that cannot fit this window is named `prompt_over_budget`
+            // rather than arriving later as a generic "the Creator call failed".
+            let creator_prompt_tokens = crate::context::estimate_tokens(
+                crate::agents::creator::creator_system_prompt().len()
+                    + creator_user_prompt.len(),
+            );
+            if let Some(reason) = prompt_over_budget_reason(
+                creator_prompt_tokens,
+                crate::context::OUTPUT_RESERVE_TOKENS,
+                n_ctx,
+            ) {
+                println!("\n  ✗ {reason}");
+                infra_failure_error = Some(reason);
+                break GovernorDecision::InfraFailure;
+            }
             let creator_response = match run_with_spinner("Creator generating patch", async {
                 creator_generate_patch(&cfg, &creator_request).await
             })
@@ -2227,7 +2243,19 @@ pub async fn run(
                     break 'attempts GovernorDecision::NeedsReview;
                 }
                 Err(error) => {
-                    infra_failure_error = Some(format!("Creator LLM call failed: {error}"));
+                    let message = error.to_string();
+                    // [VANTA-WHY] M3 item F5 — the pre-call check is a lower bound
+                    // (it prices the two prompt strings; the guard also prices its
+                    // own role wrappers), so the guard can still be the one that
+                    // refuses. Give that case the same name instead of folding it
+                    // into "the Creator call failed".
+                    infra_failure_error = Some(if message
+                        .contains(crate::llm::DETERMINISTIC_CONTEXT_PREFIX)
+                    {
+                        format!("prompt_over_budget: {message}")
+                    } else {
+                        format!("Creator LLM call failed: {message}")
+                    });
                     break GovernorDecision::InfraFailure;
                 }
             };
@@ -5812,6 +5840,51 @@ fn build_creator_feedback(
     fb
 }
 
+/// [VANTA-WHY] M3 item F5 — whether a Creator prompt can fit the run's context
+/// window, priced exactly as the run-time guard prices it
+/// (`llm::context_budget_exceeded`: prompt + completion + chat overhead > window).
+/// `Some(reason)` when it cannot, `None` when it can.
+///
+/// [VANTA-WHY] Why this exists when the guard already refuses: the guard's refusal
+/// reaches the driver as an ordinary `Err` from the Creator call and was reported
+/// as `Creator LLM call failed: …` — the same row an unreachable server or a
+/// refused connection produces. A prompt that cannot fit is a fact about the RUN'S
+/// CONFIGURATION (a window too small for the file-selection budget plus one
+/// attempt's patch), not about the candidate, and the reader acts on it
+/// differently. Naming it `prompt_over_budget` — before the call spends a token —
+/// is what makes it its own reason.
+///
+/// [VANTA-WHY] For the window the batch runs against this can never fire: see
+/// `context::tests::the_selection_budget_leaves_room_for_the_largest_prompt_the_guard_allows`,
+/// where the budget, one whole patch, the frame and this call's completion still
+/// fit with 29,768 tokens to spare. The selection is deliberately NOT shrunk to
+/// make room — the K arms must see the same context as the normal arms — so this
+/// check exists to NAME a window that does break that invariant rather than to
+/// change what the Creator is shown.
+///
+/// `prompt_tokens` is the caller's conservative estimate of everything the call
+/// sends (system + user). The guard's own estimate also prices its role wrappers,
+/// so this is a lower bound by a handful of tokens; the caller therefore names the
+/// guard's refusal too (see the `Err` arm of the Creator call).
+fn prompt_over_budget_reason(
+    prompt_tokens: u32,
+    output_tokens: u32,
+    context_window_tokens: u32,
+) -> Option<String> {
+    let cost = prompt_tokens
+        .saturating_add(output_tokens)
+        .saturating_add(crate::context::CHAT_OVERHEAD_TOKENS);
+    (cost > context_window_tokens).then(|| {
+        format!(
+            "prompt_over_budget: prompt_tokens≈{prompt_tokens} + max_tokens={output_tokens} \
+             + overhead={} > context_window={context_window_tokens} — the file-selection budget \
+             and the previous attempt's patch do not fit this window; the selection is not shrunk \
+             to make room, because the K arms must see the same context as the normal arms",
+            crate::context::CHAT_OVERHEAD_TOKENS,
+        )
+    })
+}
+
 // [VANTA-WHY] M3 item 9 — the feedback a PASSING attempt hands to the next attempt
 // under `--fixed-rounds`. The ordinary `Continue` is driven by failures, and
 // `build_creator_feedback` builds its message from a failure list; on a passing
@@ -6865,6 +6938,7 @@ mod tests {
         is_judge_site,
         ledger_text,
         modified_test_config_records, open_fixed_round_record, patch_attempt_id_for_patch,
+        prompt_over_budget_reason,
         record_new_static_findings,
         refuse_reasoning_budget_on_judge_arm,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
@@ -6901,6 +6975,40 @@ mod tests {
         assert_eq!(cache_hit_rate_value(Some(0), 0), "unset");
         // A whole prompt served from cache is a rate of one, not a special case.
         assert_eq!(cache_hit_rate_value(Some(500), 500), "1.0000");
+    }
+
+    // ---- M3 item F5: the prompt-over-budget reason ----------------------------
+
+    /// F5 — the check prices a Creator prompt exactly as the run-time guard does,
+    /// so the two cannot disagree about whether a prompt fits; when it does not
+    /// fit, the reason names itself instead of reading as a failed call.
+    #[test]
+    fn a_prompt_that_cannot_fit_is_reported_as_prompt_over_budget() {
+        // The configured window's worst case — the budget spent to the last token
+        // plus one whole previous patch plus the frame (the F5 invariant): no reason.
+        assert!(prompt_over_budget_reason(163_584 + 32_768 + 3_000, 32_768, 262_144).is_none());
+
+        // Exactly ON the guard's boundary is NOT over it: the guard refuses `>`.
+        // boundary = n_ctx − output reserve − overhead = 262144 − 32768 − 256.
+        assert!(prompt_over_budget_reason(262_144 - 32_768 - 256, 32_768, 262_144).is_none());
+
+        // One token past it: its own reason, carrying the numbers the reader acts on.
+        let reason = prompt_over_budget_reason(262_144 - 32_768 - 256 + 1, 32_768, 262_144)
+            .expect("one token past the guard's boundary must be named");
+        assert!(reason.starts_with("prompt_over_budget: "), "{reason}");
+        assert!(reason.contains("prompt_tokens≈229121"), "{reason}");
+        assert!(reason.contains("max_tokens=32768"), "{reason}");
+        assert!(reason.contains("context_window=262144"), "{reason}");
+        assert!(
+            !reason.contains("Creator LLM call failed"),
+            "it is its own reason, not the generic call failure: {reason}"
+        );
+
+        // A window too small for the reserve is named whatever the prompt holds —
+        // the check is a comparison, not a threshold on the prompt alone.
+        let small = prompt_over_budget_reason(0, 32_768, 32_768)
+            .expect("a window smaller than the reserve cannot fit any prompt");
+        assert!(small.contains("context_window=32768"), "{small}");
     }
 
     // ---- M3 item 9: fixed-round repair (`--fixed-rounds K`) -------------------

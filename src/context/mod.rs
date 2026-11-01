@@ -3385,6 +3385,64 @@ mod tests {
         );
     }
 
+    /// [VANTA-WHY] M3 item F5 — the file-selection budget must leave room for the
+    /// rest of the prompt the run-time guard measures, so the guard can never
+    /// refuse a repair attempt's Creator prompt for being over budget. This is the
+    /// arithmetic that says the selection must NOT be shrunk to make room for a
+    /// previous patch: the K arms have to see the same context as the normal arms,
+    /// and there is space.
+    ///
+    /// The largest prompt a repair attempt can build is the selection — which
+    /// `fill` (§1.6.9) may spend down to the last token of the budget — plus the
+    /// feedback the previous attempt handed forward. That feedback echoes the
+    /// previous patch, which is Creator output capped at a completion reserve
+    /// (:data:`OUTPUT_RESERVE_TOKENS`), inside a frame
+    /// (:data:`PROMPT_FRAME_TOKENS`). The guard
+    /// (`llm::context_budget_exceeded`) then compares prompt + this call's
+    /// completion + chat overhead against `n_ctx`.
+    ///
+    /// Substituting the budget (`n_ctx − reserve − overhead − margin`) the whole
+    /// condition reduces to `reserve + frame ≤ margin`, which holds for any window
+    /// of at least ~143,072 tokens. The window the batch runs against is above
+    /// that with 29,768 tokens to spare; below the threshold the two readings do
+    /// disagree, which is exactly the case `driver::prompt_over_budget_reason`
+    /// exists to name.
+    #[test]
+    fn the_selection_budget_leaves_room_for_the_largest_prompt_the_guard_allows() {
+        // `configs/v1-m3.toml`'s `VANTA_LLM_CONTEXT_TOKENS`, the window the M3
+        // batch runs against (`llm::context_window_tokens` reads it first).
+        const CONFIGURED_N_CTX: u32 = 262_144;
+        let (budget, margin) = budget_tokens(CONFIGURED_N_CTX);
+        assert_eq!(budget, 163_584, "n_ctx − 32768 output − 256 overhead − 25 % margin");
+        assert_eq!(margin, 65_536, "a quarter of the window");
+
+        // The worst prompt: the budget spent to the last token, the frame, and one
+        // whole previous patch (Creator output) echoed back.
+        let worst_prompt = budget + OUTPUT_RESERVE_TOKENS + PROMPT_FRAME_TOKENS;
+        // What the guard measures: that prompt, this call's completion, overhead.
+        let guard_measure = worst_prompt + OUTPUT_RESERVE_TOKENS + CHAT_OVERHEAD_TOKENS;
+
+        assert!(
+            guard_measure <= CONFIGURED_N_CTX,
+            "the run-time guard must not be able to refuse a Creator prompt built inside \
+             the selection budget: {guard_measure} > {CONFIGURED_N_CTX}"
+        );
+        assert_eq!(
+            CONFIGURED_N_CTX - guard_measure,
+            29_768,
+            "the headroom is what makes this an invariant rather than a near miss"
+        );
+
+        // The same condition, reduced: it holds exactly when the output reserve plus
+        // the frame fit inside the margin. Stated directly so a change to ANY of the
+        // four constants fails here rather than in a batch.
+        assert!(
+            OUTPUT_RESERVE_TOKENS + PROMPT_FRAME_TOKENS <= margin,
+            "`reserve + frame ≤ margin` is the whole invariant; below it the selection \
+             budget and the guard disagree and `prompt_over_budget` is reachable"
+        );
+    }
+
     /// [VANTA-WHY] §1.6.8 — the walk's extension set says which paths exist; this
     /// says which of them may spend the budget on a body. Reaching a `.js` file is
     /// not the same as the run naming it: an issue that names its *path* buys it a

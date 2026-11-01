@@ -90,6 +90,20 @@ frozen generator config — the deviation from "the first that grades bad" is on
 the exhaustion direction and is recorded per bug as ``cap-hit``.
 """
 
+PREFLIGHT_CAP = 48
+"""The most preflights one bug may spend, whatever the outcome of each.
+
+[VANTA-WHY] C10 — ``GRADE_CAP`` bounds *gradings*, and a mutant is graded only
+after it has applied and compiled, so a candidate that fails either is discarded
+before it counts. Those discards still boot a Shuru VM each (the tree copy, the
+``git apply`` and the ``py_compile`` all run in the checkpoint), and nothing
+bounded them: a fix whose candidates mostly fail to apply could preflight every
+mutant the operators produced. This is the missing bound. It is the same shape as
+``GRADE_CAP`` — four times it — so a bug may lose up to three quarters of its
+attempts to discards and still spend its full grading budget; past that the pool
+is starved, the loop stops, and ``cap-hit`` says so.
+"""
+
 POOL_COMPILE_TIMEOUT_SECS = 600
 """``py_compile`` is fast; this is a backstop, not an estimate."""
 
@@ -274,7 +288,7 @@ def hunk_drop(text: str) -> list[str]:
 
 
 _FLIP_RE = re.compile(
-    r"==|!=|<=|>=|(?<![<>=!])<(?![<=])|(?<![<>=!])>(?![>=])|\b(?:and|or)\b"
+    r"==|!=|<=|>=|(?<![<>=!-])<(?![<=])|(?<![<>=!-])>(?![>=])|\b(?:and|or)\b"
 )
 _FLIP = {
     "==": "!=",
@@ -287,16 +301,67 @@ _FLIP = {
     "or": "and",
 }
 
+# [VANTA-WHY] C10 — the negatable heads, and the guard against the rest.
+#
+# ``_flip_not`` used to prepend ``not `` to *any* non-empty line, so
+# ``with open(…) as f:`` became ``not with open(…) as f:`` and ``return x`` became
+# ``not return x`` — both syntax errors. A syntax-error mutant is trivially
+# detectable (see the module docstring), so it pads the pool with patches no
+# reviewer can be credited for finding. The operator now negates only a real
+# condition: an ``if``/``elif``/``while`` header, the value of an ``assert`` or a
+# ``return``, or a bare expression statement. Everything else is left alone.
+_COND_HEADER_RE = re.compile(r"^(if|elif|while)\s+([^:]+):\s*$")
+_EXPR_HEAD_RE = re.compile(r"^(assert|return)\s+(\S.*)$")
+# A statement head — `not <such a line>` never parses, so it is never touched.
+_STATEMENT_START_RE = re.compile(
+    r"^(?:def|class|with|for|async|await|import|from|del|pass|break|continue|"
+    r"raise|global|nonlocal|yield|try|except|finally|else|if|elif|while|assert|"
+    r"return|lambda)\b"
+)
+# Any `=` that makes the line an assignment rather than an expression, so that
+# `not <line>` is a syntax error and the line is never negated: a plain `x = 1`,
+# an augmented `x += 1` … `x **= 2` … `x <<= 2` / `x >>= 2`, or the walrus
+# `x := 1`. `==`, `!=`, `<=` and `>=` are comparisons, not assignments. The
+# shifts get their own alternative because the negative lookbehind that keeps
+# `<=`/`>=` out of the plain case would also swallow `<<=`/`>>=` (their `=` is
+# preceded by `<`/`>`), and `not x <<= 1` does not parse.
+_ASSIGN_RE = re.compile(r"[+\-*/%@&|^]=|<<=|>>=|(?<![=!<>:])=(?!=)")
+
+
+def _toggle_not(expr: str) -> str:
+    """``expr`` with a leading ``not `` removed, or added when there is none."""
+    return expr[len("not ") :] if expr.startswith("not ") else "not " + expr
+
+
+def _is_bare_expression(line: str) -> bool:
+    """Is ``line`` a single expression, so that ``not <line>`` still parses?"""
+    if _STATEMENT_START_RE.match(line) or line[0] in "@#":
+        # a statement keyword, a decorator or a comment — not an expression
+        return False
+    return _ASSIGN_RE.search(line) is None
+
 
 def _flip_not(content: str) -> Optional[str]:
-    """``content`` with a leading ``not `` added, or removed when one is already there."""
+    """``content`` with its condition negated, or ``None`` when it is not one.
+
+    Three forms are conditions: ``if``/``elif``/``while <cond>:`` (negate the
+    condition, keeping the header), ``assert``/``return <value>`` (negate the
+    value), and a bare expression statement (negate the whole line). A leading
+    ``not`` is removed in each case, so the operator is an involution.
+    """
     stripped = content.lstrip()
     if not stripped:
         return None
     indent = content[: len(content) - len(stripped)]
-    if stripped.startswith("not "):
-        return indent + stripped[len("not ") :]
-    return indent + "not " + stripped
+    header = _COND_HEADER_RE.match(stripped)
+    if header:
+        return f"{indent}{header.group(1)} {_toggle_not(header.group(2))}:"
+    head = _EXPR_HEAD_RE.match(stripped)
+    if head:
+        return f"{indent}{head.group(1)} {_toggle_not(head.group(2))}"
+    if _is_bare_expression(stripped):
+        return indent + _toggle_not(stripped)
+    return None
 
 
 def condition_flip(text: str) -> list[str]:
@@ -504,6 +569,7 @@ def select(
     grade_fn: Callable[[Mutant], oracle_mod.OracleResult],
     max_mutants: int = MAX_MUTANTS,
     grade_cap: int = GRADE_CAP,
+    preflight_cap: int = PREFLIGHT_CAP,
 ) -> Selected:
     """The spec's rule: ``(priority, sha256)`` order, preflight, grade, keep ≤3 bad.
 
@@ -518,14 +584,24 @@ def select(
     judged. That state is ``inconclusive``: it is dropped and counted separately,
     exactly as an equivalent mutant is, because neither is a patch a reviewer can
     be credited for finding.
+
+    [VANTA-WHY] C10 — two caps, not one. ``grade_cap`` bounds the *gradings*, and
+    ``preflight_cap`` bounds the *preflights*, because the two are not the same
+    count: a mutant that fails to apply or to ``py_compile`` is discarded before it
+    can be graded, and that discard still booted a Shuru VM. Without the second cap
+    a fix whose candidates mostly fail to apply preflights every candidate the
+    operators produced. Either cap stopping the loop is recorded as ``cap_hit``, so
+    a starved pool is visible rather than silent.
     """
     tally = Tally(per_operator=dict(candidates.per_operator))
     ordered = sorted(candidates.mutants, key=lambda mutant: (mutant.priority, mutant.sha256))
     kept: list[tuple[Mutant, oracle_mod.OracleResult]] = []
+    preflights = 0
     for mutant in ordered:
-        if tally.graded >= grade_cap:
+        if tally.graded >= grade_cap or preflights >= preflight_cap:
             tally.cap_hit = True
             break
+        preflights += 1
         outcome = preflight_fn(mutant)
         if not outcome.applied:
             tally.did_not_apply += 1
@@ -890,6 +966,7 @@ def run_mutants(
     disk_mb: int,
     max_mutants: int = MAX_MUTANTS,
     grade_cap: int = GRADE_CAP,
+    preflight_cap: int = PREFLIGHT_CAP,
     preflight_fn: Optional[Callable[[Mutant], Preflight]] = None,
     grade_fn: Optional[Callable[[Mutant], oracle_mod.OracleResult]] = None,
 ) -> PoolResult:
@@ -935,6 +1012,7 @@ def run_mutants(
         grade_fn=grade_fn or default_grade,
         max_mutants=max_mutants,
         grade_cap=grade_cap,
+        preflight_cap=preflight_cap,
     )
     entries: list[PoolEntry] = []
     for mutant, result in selected.entries:

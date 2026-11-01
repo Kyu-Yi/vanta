@@ -25842,6 +25842,45 @@ def _added_lines(diff_text: str) -> list[str]:
     ]
 
 
+def _parses_as_a_statement(line: str) -> bool:
+    """Can ``line`` stand alone as a statement inside a function body?
+
+    ``return`` and ``with`` are only legal in a body, so the line is wrapped in
+    one; a header gets a ``pass`` so it can be parsed without the block that
+    followed it in the original file.
+    """
+    body = line + "\n    pass" if line.rstrip().endswith(":") else line
+    wrapped = "def _w():\n" + "".join(f"    {part}\n" for part in body.split("\n"))
+    try:
+        ast.parse(wrapped)
+    except SyntaxError:
+        return False
+    return True
+
+
+# Added lines spanning every shape ``condition_flip`` meets: a header, an
+# ``assert`` and a ``return``, a bare call — and the shapes it must leave alone
+# (an assignment, an augmented shift, a ``with``/``for``/``def`` statement head,
+# a return-type arrow). The operator test below asserts every mutant of it parses.
+_CONDITIONS_SRC = (
+    "diff --git a/pkg/mod.py b/pkg/mod.py\n"
+    "--- a/pkg/mod.py\n"
+    "+++ b/pkg/mod.py\n"
+    "@@ -1,10 +1,12 @@\n"
+    "-old = 0\n"
+    "+if a < 3:\n"
+    "+while n != 0:\n"
+    "+assert x, 'msg'\n"
+    "+return a <= b and c\n"
+    "+names.append('x')\n"
+    "+x = 1\n"
+    "+mask <<= 2\n"
+    "+with open(p) as f:\n"
+    "+for i in items:\n"
+    "+def g(a) -> int:\n"
+)
+
+
 def _accept_all(mutant) -> "mutants_mod.Preflight":
     return mutants_mod.Preflight(applied=True, compiled=True)
 
@@ -25931,7 +25970,10 @@ class TestMutantOperators:
         out = mutants_mod.condition_flip(_one_line_diff("if a > b:", "if a < 3:"))
         flipped = {_added_lines(text)[0] for text in out}
         assert "if a <= 3:" in flipped
-        assert "not if a < 3:" in flipped
+        # [VANTA-WHY] C10 — the negation keeps the header, so the mutant is
+        # ``if not a < 3:``, not ``not if a < 3:`` (which does not parse).
+        assert "if not a < 3:" in flipped
+        assert not any(line.startswith("not ") for line in flipped)
         # Only added lines are touched: the removed line is copied verbatim.
         assert all("-if a > b:" in text for text in out)
 
@@ -25952,6 +25994,52 @@ class TestMutantOperators:
             for text in mutants_mod.condition_flip(_one_line_diff("pass", "not x"))
         }
         assert "x" in removed
+
+    def test_the_not_flip_refuses_a_statement_an_assignment_and_a_def(self):
+        """[VANTA-WHY] C10 — ``not <line>`` only parses over an expression, so a
+        statement head (``with``/``for``/``def``/``return`` as a bare keyword), an
+        assignment (``x = 1``) or an augmented shift (``mask <<= 2``) must be
+        refused rather than negated into a syntax error."""
+        for line in (
+            "with open(p) as f:",
+            "for i in items:",
+            "def g(a) -> int:",
+            "x = 1",
+            "mask <<= 2",
+            "mask >>= 2",
+            "x += 1",
+            "n -= 1",
+            "# a comment",
+            "",
+        ):
+            assert mutants_mod._flip_not(line) is None, line
+
+    def test_the_not_flip_negates_each_real_condition_shape(self):
+        assert mutants_mod._flip_not("if a < 3:") == "if not a < 3:"
+        assert mutants_mod._flip_not("    while n != 0:") == "    while not n != 0:"
+        assert mutants_mod._flip_not("assert x, 'msg'") == "assert not x, 'msg'"
+        assert mutants_mod._flip_not("    return a <= b") == "    return not a <= b"
+        assert mutants_mod._flip_not("names.append('x')") == "not names.append('x')"
+        # and it is an involution on each form
+        assert mutants_mod._flip_not("if not a < 3:") == "if a < 3:"
+        assert mutants_mod._flip_not("    return not a <= b") == "    return a <= b"
+
+    def test_a_return_type_arrow_is_not_a_comparison(self):
+        """[VANTA-WHY] C10 — ``->`` is not ``>``: flipping it would rewrite a
+        signature into ``->=`` and the mutant would not compile."""
+        assert mutants_mod.condition_flip(_one_line_diff("pass", "def f(a) -> int:")) == []
+
+    def test_every_mutant_of_a_pile_of_conditions_is_syntactically_valid(self):
+        """[VANTA-WHY] C10 — a mutant whose Python does not parse is *trivially*
+        detectable: pytest collects nothing, the hidden nodeids read ``absent`` and
+        the oracle grades it ``bad``, so it would sit in the "known-bad" pool as a
+        patch no reviewer can be credited for finding. Every added line the
+        operators emit must therefore stand as a statement."""
+        mutants = mutants_mod.generate(_CONDITIONS_SRC).mutants
+        assert mutants, "the fixture must produce mutants"
+        for mutant in mutants:
+            for line in _added_lines(mutant.text):
+                assert _parses_as_a_statement(line), (mutant.operator, line)
 
     def test_boundary_shift_moves_an_integer_both_ways(self):
         out = mutants_mod.boundary_shift(_one_line_diff("pass", "x = 1"))
@@ -26012,6 +26100,10 @@ class TestMutantRegistry:
     def test_the_caps_are_the_frozen_values(self):
         assert mutants_mod.MAX_MUTANTS == 3
         assert mutants_mod.GRADE_CAP == 12
+        # [VANTA-WHY] C10 — the preflight cap is four times the grading cap, so a
+        # bug may lose three quarters of its candidates to discards and still
+        # spend its whole grading budget.
+        assert mutants_mod.PREFLIGHT_CAP == 4 * mutants_mod.GRADE_CAP
 
 
 class TestMutantGeneration:
@@ -26215,6 +26307,75 @@ class TestMutantSelection:
         )
         assert selected.tally.cap_hit is False
         assert selected.tally.graded == 3
+
+    def test_the_preflight_cap_bounds_a_run_that_only_discards(self):
+        """[VANTA-WHY] C10 — ``grade_cap`` counts gradings, and a discarded mutant
+        is never graded, so without a second cap a fix whose candidates mostly fail
+        to apply would preflight every candidate the operators produced — a Shuru
+        VM each. The preflight cap stops it, and the stop is recorded."""
+        preflights: list[str] = []
+
+        def preflight(mutant):
+            preflights.append(mutant.sha256)
+            return mutants_mod.Preflight(
+                applied=False, compiled=False, detail="error: patch does not apply"
+            )
+
+        def grade(mutant):  # pragma: no cover — a discard is never graded
+            raise AssertionError("a discarded mutant must never reach the grader")
+
+        selected = mutants_mod.select(
+            candidates=mutants_mod.generate(_SRC),
+            preflight_fn=preflight,
+            grade_fn=grade,
+            preflight_cap=4,
+        )
+        assert len(preflights) == 4
+        assert selected.tally.did_not_apply == 4
+        assert selected.tally.graded == 0
+        assert selected.tally.cap_hit is True
+        assert selected.entries == []
+
+    def test_the_two_caps_count_different_things(self):
+        """The preflight cap counts every candidate the loop touched; the grading
+        cap counts only those that applied and compiled. A discard inflates the
+        first and not the second, so the preflight cap can stop a loop that is
+        still far from its grading cap."""
+        counts = {"preflight": 0, "grade": 0}
+
+        def preflight(mutant):
+            counts["preflight"] += 1
+            # every other candidate fails to compile
+            return mutants_mod.Preflight(applied=True, compiled=counts["preflight"] % 2 == 0)
+
+        def grade(mutant):
+            counts["grade"] += 1
+            return _grade_bad(mutant)
+
+        selected = mutants_mod.select(
+            candidates=mutants_mod.generate(_SRC),
+            preflight_fn=preflight,
+            grade_fn=grade,
+            grade_cap=1000,
+            preflight_cap=3,
+        )
+        assert counts["preflight"] == 3
+        assert counts["grade"] == 1  # only the even-numbered candidate compiled
+        assert selected.tally.did_not_compile == 2
+        assert selected.tally.cap_hit is True
+
+    def test_a_run_that_neither_discards_nor_caps_does_not_hit_either(self):
+        selected = mutants_mod.select(
+            candidates=mutants_mod.generate(_SRC),
+            preflight_fn=_accept_all,
+            grade_fn=_grade_bad,
+            grade_cap=1000,
+            preflight_cap=1000,
+        )
+        # _SRC yields fewer than 1000 candidates: the loop ends by exhaustion,
+        # which is not a cap stop.
+        assert selected.tally.cap_hit is False
+        assert selected.tally.selected == 3
 
 
 class TestMutantPreflight:

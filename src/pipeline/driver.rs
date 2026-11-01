@@ -1926,6 +1926,11 @@ pub async fn run(
     // M3.5 later and a field that only exists on an optional flag is a field that
     // cannot be recovered.
     let mut fixed_round_records: Vec<serde_json::Value> = Vec::new();
+    // [VANTA-WHY] M3 item 9 — the patch the PREVIOUS attempt returned, so this
+    // attempt's record can say whether the Creator returned it byte-identical
+    // ("unchanged") or wrote a new one. `None` on attempt 1, where there is no
+    // previous attempt to have repeated.
+    let mut previous_patch_text: Option<String> = None;
     // [VANTA-WHY] Test-integrity records for the evidence file. A patch must
     // never control the tests that grade it, so the native suite runs the
     // ORIGINAL test files and these four lists are what make that visible after
@@ -4094,7 +4099,15 @@ pub async fn run(
                 "tests": attempt_test_names,
                 "feedback": received_feedback,
                 "creator_prompt_hash": creator_prompt_hash.clone(),
+                // [VANTA-WHY] M3 item 9 — did this attempt return the previous
+                // attempt's patch byte-identical? Recorded so the EIR these
+                // arms measure can be read back without re-hashing the records.
+                "unchanged": fixed_round_patch_is_unchanged(
+                    previous_patch_text.as_deref(),
+                    &patch_text,
+                ),
             }));
+            previous_patch_text = Some(patch_text.clone());
         }
 
         match decision {
@@ -4240,6 +4253,7 @@ pub async fn run(
                         final_evidence.iter().map(|e| e.test_name.clone()).collect();
                     prior_feedback = Some(build_fixed_round_pass_feedback(
                         &passed_names,
+                        &patch_text,
                         attempt + 1,
                         loop_attempts,
                     ));
@@ -5743,6 +5757,7 @@ fn build_creator_feedback(
 // and the EIR this arm exists to measure would be an artefact of the prompt.
 fn build_fixed_round_pass_feedback(
     passed_names: &[String],
+    patch_text: &str,
     attempt: u32,
     loop_attempts: u32,
 ) -> String {
@@ -5753,14 +5768,32 @@ fn build_fixed_round_pass_feedback(
     for name in passed_names {
         fb.push_str(&format!("- Test '{name}' passed\n"));
     }
+    // [VANTA-WHY] M3 item 9 — the Creator is shown the patch it just returned.
+    // Without it "review your patch and improve it if needed, or return it
+    // unchanged" is undecidable: the model cannot compare a patch it cannot see,
+    // so the b1-k4/b3-k4 arms would measure prompt confusion rather than
+    // willingness to return a working patch unchanged.
+    fb.push_str(&format!("\nYour patch, as applied:\n\n{patch_text}\n\n"));
     fb.push_str(&format!(
-        "\nThis run always runs {loop_attempts} attempt(s), so you get another one regardless.\n\
-         Review your patch against the issue: if it can be improved — a more robust fix, an edge \
+        "This run always runs {loop_attempts} attempt(s), so you get another one regardless.\n\
+         Review your patch above against the issue: if it can be improved — a more robust fix, an edge \
          case it misses, a clearer or smaller change — return an improved patch. If it is already \
          correct and complete, return the SAME patch unchanged. Returning it unchanged is a valid \
          and expected answer; do not change working code only to have something to say."
     ));
     fb
+}
+
+/// Whether THIS attempt's patch is byte-identical to the one the previous
+/// attempt returned — M3 item 9's "return it unchanged", recorded rather than
+/// left to a reader re-hashing the attempt records. `false` on the first
+/// attempt, which by definition repeated nothing.
+fn fixed_round_patch_is_unchanged(previous_patch: Option<&str>, current_patch: &str) -> bool {
+    previous_patch
+        .map(|previous| {
+            stable_patch_fingerprint(previous) == stable_patch_fingerprint(current_patch)
+        })
+        .unwrap_or(false)
 }
 
 fn read_json_value_from_debug(path: &Path) -> Option<serde_json::Value> {
@@ -6720,6 +6753,7 @@ mod tests {
         build_source_concat, cache_hit_rate_value, collapse_decision, creator_effort_text,
         creator_prompt_tokens_text,
         dependency_freeze_summary_value, env_arm, env_flag, fixed_round_continues,
+        fixed_round_patch_is_unchanged,
         harness_error_log_line,
         harness_infrastructure_collapse,
         is_judge_site,
@@ -6843,7 +6877,8 @@ mod tests {
     #[test]
     fn the_fixed_round_pass_feedback_says_it_passed_and_permits_an_unchanged_patch() {
         let names = vec!["t_band".to_string(), "t_discount".to_string()];
-        let fb = build_fixed_round_pass_feedback(&names, 1, 4);
+        let patch = "===FILE=== foo.py\n===SEARCH===\nx = 1\n===REPLACE===\nx = 2\n===END===";
+        let fb = build_fixed_round_pass_feedback(&names, patch, 1, 4);
         assert!(
             fb.contains("PASSED the test suite"),
             "the attempt that passed must be told it passed: {fb}"
@@ -6857,12 +6892,37 @@ mod tests {
             "the tests that passed must be named: {fb}"
         );
         assert!(
+            fb.contains(patch),
+            "M3 item 9: the Creator must be shown the patch it is asked to review, or \
+             'return it unchanged' is undecidable: {fb}"
+        );
+        assert!(
             fb.contains("return the SAME patch unchanged"),
             "returning it unchanged has to be named as valid, or the next patch is invented: {fb}"
         );
         assert!(
             !fb.contains("failed"),
             "a passing attempt must never be told its patch failed: {fb}"
+        );
+    }
+
+    /// M3 item 9 — the `unchanged` flag on a per-attempt record is decided by
+    /// the candidate fingerprint, not by the attempt counter: a Creator that
+    /// returns the same patch makes attempt N `unchanged`, and any edit makes it
+    /// new. `None` (attempt 1) repeated nothing and must never read as unchanged.
+    #[test]
+    fn a_repeated_patch_is_recorded_as_unchanged() {
+        assert!(
+            !fixed_round_patch_is_unchanged(None, "patch A"),
+            "the first attempt has no previous patch to repeat"
+        );
+        assert!(
+            fixed_round_patch_is_unchanged(Some("patch A"), "patch A"),
+            "a byte-identical re-return is the unchanged answer item 9 asks for"
+        );
+        assert!(
+            !fixed_round_patch_is_unchanged(Some("patch A"), "patch B"),
+            "any edit is a new patch, not an unchanged one"
         );
     }
 

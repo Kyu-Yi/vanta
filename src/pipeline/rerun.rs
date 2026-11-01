@@ -352,12 +352,20 @@ pub async fn rerun_signals(
         });
     }
 
+    // [VANTA-WHY] M3 item E2 — index both reports ONCE; the per-signal lookup
+    // below used to re-scan each report's whole test list on every signal.
+    let native_indexes = native_reports.as_ref().map(|(bad, good)| {
+        (
+            harness::native_results_index(&bad.tests),
+            harness::native_results_index(&good.tests),
+        )
+    });
     for nodeid in &native_regressions {
-        let (bad, good, note) = match &native_reports {
-            Some((bad_report, good_report)) => {
-                native_signal_observation(bad_report, good_report, nodeid)
+        let (bad, good, note) = match (&native_reports, &native_indexes) {
+            (Some((bad_report, good_report)), Some((bad_index, good_index))) => {
+                native_signal_observation(bad_report, good_report, bad_index, good_index, nodeid)
             }
-            None => (None, None, Some("native suite not re-run".to_string())),
+            _ => (None, None, Some("native suite not re-run".to_string())),
         };
         let disc = outcome_discriminates(bad.as_ref(), good.as_ref());
         let bad_name = bad.as_ref().map(test_result_name);
@@ -732,13 +740,13 @@ fn static_contains(run: &StaticRun, tool: &str, file: &str, code: &str, message:
     set.contains(&probe)
 }
 
-/// Look a nodeid up in a native-suite report, if present.
-fn lookup_native(report: &NativeSuiteReport, nodeid: &str) -> Option<TestResult> {
-    report
-        .tests
-        .iter()
-        .find(|(name, _)| name == nodeid)
-        .map(|(_, result)| result.clone())
+/// Look a nodeid up in a native-suite report's index, if present.
+///
+/// [VANTA-WHY] M3 item E2 — the caller re-ran this per rejecting signal, and the
+/// scan was over the whole report each time. The index is built once per report
+/// (`harness::native_results_index`) and passed in.
+fn lookup_native(index: &HashMap<&str, &TestResult>, nodeid: &str) -> Option<TestResult> {
+    index.get(nodeid).map(|result| (*result).clone())
 }
 
 /// Which backend a rerun must run under, given what its session recorded.
@@ -892,6 +900,8 @@ fn generated_signal_observation(
 fn native_signal_observation(
     bad_report: &NativeSuiteReport,
     good_report: &NativeSuiteReport,
+    bad_index: &HashMap<&str, &TestResult>,
+    good_index: &HashMap<&str, &TestResult>,
     nodeid: &str,
 ) -> (Option<TestResult>, Option<TestResult>, Option<String>) {
     if bad_report.collected_nothing() {
@@ -916,8 +926,8 @@ fn native_signal_observation(
             )),
         );
     }
-    let bad_result = lookup_native(bad_report, nodeid);
-    let good_result = lookup_native(good_report, nodeid);
+    let bad_result = lookup_native(bad_index, nodeid);
+    let good_result = lookup_native(good_index, nodeid);
     let note = if good_result.is_none() {
         Some("absent from the good tree".to_string())
     } else {
@@ -1628,8 +1638,13 @@ mod tests {
             collection: None,
         };
 
-        let (bad_r, good_r, note) =
-            native_signal_observation(&bad, &good, "tests/test_k.py::K::test_x");
+        let (bad_r, good_r, note) = native_signal_observation(
+            &bad,
+            &good,
+            &harness::native_results_index(&bad.tests),
+            &harness::native_results_index(&good.tests),
+            "tests/test_k.py::K::test_x",
+        );
 
         let note = note.expect("a failed run must carry a note");
         assert!(note.starts_with("tree_run_failed"), "got: {note}");
@@ -1654,8 +1669,13 @@ mod tests {
             true,
         );
 
-        let (bad_r, good_r, note) =
-            native_signal_observation(&bad, &good, "tests/test_k.py::K::test_x");
+        let (bad_r, good_r, note) = native_signal_observation(
+            &bad,
+            &good,
+            &harness::native_results_index(&bad.tests),
+            &harness::native_results_index(&good.tests),
+            "tests/test_k.py::K::test_x",
+        );
 
         assert_eq!(note.as_deref(), Some("absent from the good tree"));
         assert_eq!(bad_r, Some(TestResult::Failed));

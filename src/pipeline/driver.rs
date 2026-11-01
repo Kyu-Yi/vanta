@@ -21,7 +21,7 @@
 //   gatekeeper   — deterministic approve/reject
 // ============================================================================
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::io::IsTerminal;
@@ -3388,10 +3388,14 @@ pub async fn run(
         // originals that vanished had not been passing either.
         let native_collapsed = harness::native_suite_collapsed(&native_original, &native_patched);
         if native_collapsed {
+            // [VANTA-WHY] M3 item E2 — one nodeid index, not a `.any()` scan per
+            // original test, and a `HashSet` of the names already recorded rather
+            // than a `.any()` over `native_regressions` per test. The pair ran
+            // per attempt over ~88k nodeids on pandas.
+            let patched_index = harness::native_results_index(&native_patched.tests);
+            let mut named: HashSet<String> = native_regressions.iter().cloned().collect();
             for (name, _) in &native_original.tests {
-                if !native_patched.tests.iter().any(|(n, _)| n == name)
-                    && !native_regressions.iter().any(|n| n == name)
-                {
+                if !patched_index.contains_key(name.as_str()) && named.insert(name.clone()) {
                     native_regressions.push(name.clone());
                 }
             }
@@ -3463,12 +3467,13 @@ pub async fn run(
             infra_failure_error = Some(reason);
             break 'attempts GovernorDecision::InfraFailure;
         }
+        // [VANTA-WHY] M3 item E2 — one nodeid index and one regression-membership
+        // set, both built once, instead of a pair of linear scans per original
+        // test (~88k of them on pandas, per attempt).
+        let patched_index = harness::native_results_index(&native_patched.tests);
+        let regression_set: HashSet<&str> = native_regressions.iter().map(|n| n.as_str()).collect();
         for (nodeid, original_result) in &native_original.tests {
-            let patched_result = native_patched
-                .tests
-                .iter()
-                .find(|(n, _)| n == nodeid)
-                .map(|(_, r)| r);
+            let patched_result = patched_index.get(nodeid.as_str()).copied();
             // [VANTA-WHY] A native test already failing on the original is
             // RECORDED, not blocking: the patch did not break it.
             session_log.append(SessionRecord {
@@ -3481,7 +3486,7 @@ pub async fn run(
                 summary: format!(
                     "original={original_result:?} patched={:?} regression={}",
                     patched_result,
-                    native_regressions.iter().any(|n| n == nodeid)
+                    regression_set.contains(nodeid.as_str())
                 ),
                 timestamp: now_iso(),
                 benchmark_instance: None,
@@ -5866,14 +5871,17 @@ impl AttemptNativeOutcome {
         patched: &harness::NativeSuiteReport,
     ) -> Self {
         let mut results = HashMap::new();
+        // [VANTA-WHY] M3 item E2 — index the patched report once; the previous
+        // `patched.tests.iter().find(...)` ran a full scan per original test.
+        let patched_index = harness::native_results_index(&patched.tests);
         for (nodeid, original_result) in &original.tests {
             if *original_result != TestResult::Passed {
                 continue;
             }
             // A vanished test is a regression (`native_suite_collapsed` also
             // names it), so "absent on the patched tree" is a failure here too.
-            let outcome = match patched.tests.iter().find(|(n, _)| n == nodeid) {
-                Some((_, TestResult::Passed)) => TestResult::Passed,
+            let outcome = match patched_index.get(nodeid.as_str()).copied() {
+                Some(TestResult::Passed) => TestResult::Passed,
                 _ => TestResult::Failed,
             };
             results.insert(nodeid.clone(), outcome);

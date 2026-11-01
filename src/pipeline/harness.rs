@@ -713,8 +713,7 @@ pub fn native_regressions(
     original: &[(String, TestResult)],
     patched: &[(String, TestResult)],
 ) -> Vec<String> {
-    let patched_map: HashMap<&str, &TestResult> =
-        patched.iter().map(|(n, r)| (n.as_str(), r)).collect();
+    let patched_map = native_results_index(patched);
 
     let mut regressions: Vec<String> = Vec::new();
     for (name, result) in original {
@@ -731,6 +730,25 @@ pub fn native_regressions(
         }
     }
     regressions
+}
+
+/// nodeid → outcome for one native suite's test list, built ONCE.
+///
+/// [VANTA-WHY] M3 item E2 — the callers that ask "what did this nodeid do on
+/// the other tree?" used to re-scan the list for every nodeid, so comparing two
+/// reports was O(n_original × n_patched). On pandas that is ~88k tests per side
+/// and the scan ran per attempt. One index per report makes each lookup O(1);
+/// callers that also need set membership build a `HashSet` from its keys.
+///
+/// A duplicated nodeid keeps the FIRST occurrence — that is what the
+/// `iter().find(...)` scans this replaces returned, and a report that lists the
+/// same nodeid twice is pathological either way.
+pub fn native_results_index(tests: &[(String, TestResult)]) -> HashMap<&str, &TestResult> {
+    let mut index: HashMap<&str, &TestResult> = HashMap::with_capacity(tests.len());
+    for (name, result) in tests {
+        index.entry(name.as_str()).or_insert(result);
+    }
+    index
 }
 
 /// Did the patched side collect FEWER tests than the original ran?
@@ -2377,7 +2395,8 @@ mod tests {
         CollectionFailure, NativeSuiteReport, RUFF_ARGS, StaticDiagnostic, build_single_test_cmd,
         copy_static_configs, copy_tree_excluding, empty_report_note, interpreter_for,
         is_native_test_path, is_tooling_package, native_collection_summary, native_gate_vacuous,
-        native_outcome, native_regressions, native_suite_collapsed, native_tree_with_original_tests,
+        native_outcome, native_regressions, native_results_index, native_suite_collapsed,
+        native_tree_with_original_tests,
         native_vacuous_reason, new_diagnostics, parse_mypy_line, parse_native_report,
         parse_pytest_report_detailed, parse_ruff_line, project_package, prune_keeps, report_tests,
         ruff_is_error_class, run_single_test, run_tests_parallel, seed_and_write,
@@ -2584,6 +2603,33 @@ mod tests {
 
         assert!(native_regressions(&original.tests, &patched.tests).is_empty());
         assert!(!native_suite_collapsed(&original, &patched));
+    }
+
+    /// M3 item E2 — the one index must answer exactly what the per-nodeid linear
+    /// scan it replaces answered, so swapping the scan for the index cannot change
+    /// a verdict. Covers a present, a failing, a duplicated and an absent nodeid.
+    #[test]
+    fn the_native_results_index_matches_a_linear_scan() {
+        let report = native_report(&[
+            ("a::t", TestResult::Passed),
+            ("b::t", TestResult::Failed),
+            ("b::t", TestResult::Error),
+            ("c::t", TestResult::Passed),
+        ]);
+        let index = native_results_index(&report.tests);
+
+        for (name, _) in &report.tests {
+            let linear = report.tests.iter().find(|(n, _)| n == name).map(|(_, r)| r);
+            assert_eq!(
+                index.get(name.as_str()).copied(),
+                linear,
+                "the index must agree with the scan it replaces for {name}"
+            );
+        }
+        assert!(
+            index.get("absent::t").is_none(),
+            "a nodeid the report does not list must not be invented"
+        );
     }
 
     #[test]

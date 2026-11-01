@@ -2855,6 +2855,31 @@ class WaveResult:
     caller can tell "the wave is short" from "the wave is broken"."""
 
 
+MICRO_USD = 1_000_000
+"""One dollar in the integer unit the spend gate computes in (§14.29).
+
+[VANTA-WHY] H2. A reservation is added and subtracted many times as workers come
+and go, and binary floats do not survive that: ``0.1 + 0.1 + 0.1 - 0.1 - 0.1 -
+0.1`` is not ``0.0`` but ``2.8e-17``, so a gate whose budget has been fully
+released is not exactly zero. The next admission then computes a total a hair
+above the cap and waits for a release that has already happened — a deadlock with
+nothing in flight to wake it. Integers have no such residue: a released gate is
+exactly zero and the comparison against the cap is exact. The boundary is the row
+(the float a cost was recorded as) and the cap; everything between them is
+micro-dollars.
+"""
+
+
+def _usd_to_micro(value: float) -> int:
+    """Dollars as integer micro-dollars, rounded once at the boundary (H2)."""
+    return int(round(float(value) * MICRO_USD))
+
+
+def _micro_to_usd(micro: int) -> float:
+    """Micro-dollars back to the float a record, a log or a report carries (H2)."""
+    return micro / MICRO_USD
+
+
 def _spent_so_far(manifest: Manifest) -> float:
     """§14.29 — the batch's cost to date, summed from the rows already on disk.
 
@@ -2979,17 +3004,25 @@ class SpendGate:
     either (9 < 10), which is a hang rather than a stop. The clamp can only fire
     when nothing else is in flight, so it never lets a second job in on budget the
     first has already reserved.
+
+    [VANTA-WHY] Every number inside this class is an integer count of
+    micro-dollars (H2, :data:`MICRO_USD`). The boundary is crossed twice and only
+    twice: a recorded cost or the cap on the way in, and the log or an admission's
+    ``reservation_usd`` on the way out. Nothing in between is a float, so a fully
+    released gate is *exactly* zero and a waiter can never be left computing a
+    total a rounding error above the cap.
     """
 
     def __init__(self, batch_dir: Path, cap_usd: float, manifest: Manifest) -> None:
         self.batch_dir = Path(batch_dir)
         self.cap_usd = float(cap_usd)
+        self.cap_micro = _usd_to_micro(self.cap_usd)
         self.manifest = manifest
         self._condition = threading.Condition(threading.Lock())
         # token -> reservation, so a release cannot free the wrong worker's budget
-        # even when two reservations are the same amount (floats compare equal).
-        self._inflight: dict[int, float] = {}
-        self._reserved = 0.0
+        # even when two reservations are the same amount.
+        self._inflight: dict[int, int] = {}
+        self._reserved_micro = 0
         self._next_token = 0
         self._admissions: list[dict[str, Any]] = []
 
@@ -3003,17 +3036,20 @@ class SpendGate:
         """
         with self._condition:
             while True:
-                spent = _spent_so_far(self.manifest)
-                if spent >= self.cap_usd:
+                spent_micro = _usd_to_micro(_spent_so_far(self.manifest))
+                if spent_micro >= self.cap_micro:
                     return None
-                reservation = self._reservation_size(spent)
-                if spent + self._reserved + reservation <= self.cap_usd:
+                reservation_micro = self._reservation_size(spent_micro)
+                if spent_micro + self._reserved_micro + reservation_micro <= self.cap_micro:
                     token = self._next_token
                     self._next_token += 1
-                    self._inflight[token] = reservation
-                    self._reserved += reservation
+                    self._inflight[token] = reservation_micro
+                    self._reserved_micro += reservation_micro
                     self._admissions.append(
-                        {"key": job.key, "reservation_usd": round(reservation, 6)}
+                        {
+                            "key": job.key,
+                            "reservation_usd": _micro_to_usd(reservation_micro),
+                        }
                     )
                     self._write_log()
                     return token
@@ -3036,17 +3072,19 @@ class SpendGate:
         if token is None:
             return
         with self._condition:
-            reservation = self._inflight.pop(token, None)
-            if reservation is not None:
-                self._reserved -= reservation
+            reservation_micro = self._inflight.pop(token, None)
+            if reservation_micro is not None:
+                self._reserved_micro -= reservation_micro
                 self._write_log()
             self._condition.notify_all()
 
-    def _reservation_size(self, spent: float) -> float:
+    def _reservation_size(self, spent_micro: int) -> int:
         """The largest finished cost, or the whole remaining budget if none."""
         bound = _max_recorded_cost(self.manifest)
-        remaining = self.cap_usd - spent
-        return remaining if bound is None else min(bound, remaining)
+        remaining_micro = self.cap_micro - spent_micro
+        if bound is None:
+            return remaining_micro
+        return min(_usd_to_micro(bound), remaining_micro)
 
     def _write_log(self) -> None:
         """Persist the admissions for :func:`write_batch_report`. Called under the
@@ -3061,7 +3099,7 @@ class SpendGate:
         payload = {
             "schema": 1,
             "cap_usd": self.cap_usd,
-            "inflight_usd": round(self._reserved, 6),
+            "inflight_usd": _micro_to_usd(self._reserved_micro),
             "admissions": list(self._admissions),
         }
         path = self.batch_dir / SPEND_LOG_NAME

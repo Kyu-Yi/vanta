@@ -25463,6 +25463,63 @@ class TestQueue:
         assert "spend" not in payload
         assert "spend:" not in runner_mod.render_digest(payload)
 
+    # -- H1/H2/H6/H7 — the gate's own invariants ---------------------------
+    @staticmethod
+    def _gate(tmp_path, *, cap, costs=()):
+        """A gate over a batch directory holding one row per cost in ``costs``."""
+        batch_dir = tmp_path / "gate"
+        manifest = manifest_mod.Manifest(batch_dir)
+        for index, cost in enumerate(costs):
+            manifest.append({"key": f"prior-{index}", "llm": {"cost_usd": cost}})
+        return runner_mod.SpendGate(batch_dir, cap, manifest), batch_dir, manifest
+
+    @staticmethod
+    def _job(key: str):
+        return SimpleNamespace(key=key)
+
+    @staticmethod
+    def _reserved(gate) -> int:
+        """The gate's reservation, in micro-dollars, read where it lives."""
+        return gate._reserved_micro
+
+    def test_a_fully_released_gate_admits_again_and_is_exactly_zero(self, tmp_path):
+        """H2 — CodeRabbit's case, as arithmetic.
+
+        A $0.40 cap, a prior $0.10 row and three $0.10 admissions released by jobs
+        that each cost $0.08. In floats the three additions and the three
+        subtractions leave the reservation at 2.8e-17, so the next admission computes
+        $0.4000000000000001 against a $0.40 cap and waits for a release that has
+        already happened — with nothing in flight to wake it.
+        """
+        residue = 0.0
+        for _ in range(3):
+            residue += 0.1
+        for _ in range(3):
+            residue -= 0.1
+        assert residue != 0.0, "the float gate's residue, the bug this item removes"
+
+        gate, batch_dir, manifest = self._gate(tmp_path, cap=0.40, costs=(0.10,))
+        tokens = [gate.acquire(self._job(f"a{n}")) for n in range(3)]
+        assert all(token is not None for token in tokens)
+        assert self._reserved(gate) == 300_000
+
+        for n, token in enumerate(tokens):
+            manifest.append({"key": f"done-{n}", "llm": {"cost_usd": 0.08}})
+            gate.release(token)
+        assert self._reserved(gate) == 0, "a fully released gate is exactly zero"
+        payload = json.loads((batch_dir / runner_mod.SPEND_LOG_NAME).read_text(encoding="utf-8"))
+        assert payload["inflight_usd"] == 0.0
+
+        admitted: list = []
+        thread = threading.Thread(target=lambda: admitted.append(gate.acquire(self._job("next"))))
+        thread.start()
+        thread.join(timeout=10)
+        assert not thread.is_alive(), (
+            "the next admission must not wait for a release that has already happened"
+        )
+        assert admitted and admitted[0] is not None
+        gate.release(admitted[0])
+
     # -- the arms and seeds are a selection over the split, not a protocol --
     def test_an_arm_the_split_does_not_declare_is_refused(self, tmp_path, monkeypatch):
         preps, entries, split, calls = self._prepare(monkeypatch, tmp_path)

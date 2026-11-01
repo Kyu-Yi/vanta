@@ -25323,6 +25323,59 @@ class TestQueue:
         )
         assert [a["reservation_usd"] for a in log["admissions"]] == [1.0, 0.5]
 
+    def test_simultaneous_refusals_all_record_the_stop(self, tmp_path):
+        """G1 — every worker refused at once records the stop, and none of them dies.
+
+        The reservation wakes every waiter the moment the budget is full, so more
+        than one worker reaches the cap in the same instant. Recording it is an
+        atomic write through a temp file, and with one fixed temp name the first
+        `os.replace` consumed the file the others were about to move: the losers
+        raised `FileNotFoundError`, which `_run_task` reports as `task_failed` —
+        blaming a row for a stop the batch *did* record. Four writers are released
+        together, again and again, so the collision is the rule rather than the one
+        run in two the four-worker queue test catches; what is asserted is that no
+        writer fails and no temp file is left in the batch.
+        """
+        batch_dir = tmp_path / "batch"
+        batch_dir.mkdir()
+
+        class StubJob:
+            """All `_record_spend_cap` reads off a job: its key."""
+
+            def __init__(self, key: str) -> None:
+                self.key = key
+
+        failures: list[BaseException] = []
+
+        def record(key: str, gate: threading.Barrier) -> None:
+            gate.wait(timeout=10)
+            try:
+                runner_mod._record_spend_cap(batch_dir, 1.0, 1.0, StubJob(key))
+            except BaseException as exc:  # the regression: a temp file consumed twice
+                failures.append(exc)
+
+        for _ in range(25):
+            gate = threading.Barrier(4)
+            threads = [
+                threading.Thread(target=record, args=(f"b1#Demo/{n}#b0#repair#0#", gate))
+                for n in range(4)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        assert failures == [], "a refusal must record the stop, never crash on it"
+        payload = json.loads(
+            (batch_dir / runner_mod.SPEND_CAP_NAME).read_text(encoding="utf-8")
+        )
+        assert payload["reason"] == "spend_cap"
+        assert payload["cap_usd"] == 1.0
+        assert payload["spent_usd"] == 1.0
+        assert list(batch_dir.glob("*.tmp")) == [], (
+            "whoever wins the race, the write must leave no temp file behind"
+        )
+
     def test_only_one_job_runs_until_the_first_cost_is_known(
         self, tmp_path, monkeypatch
     ):

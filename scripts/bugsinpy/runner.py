@@ -2902,7 +2902,18 @@ def _record_spend_cap(
         "first_unstarted_key": job.key,
     }
     path = batch_dir / SPEND_CAP_NAME
-    tmp = path.with_name(path.name + ".tmp")
+    # [VANTA-WHY] G1. The temp name carries the writer, because this is the one
+    # atomic write in the batch that is NOT under a lock. G1's reservation lets
+    # every waiter wake together the moment the budget is full, so several workers
+    # reach the cap in the same instant and record it at once; a fixed
+    # `<name>.tmp` then has one `os.replace` win the race and the next raise
+    # `FileNotFoundError` on a file that is already gone — an exception `_run_task`
+    # reports as `task_failed`, blaming the row for a stop it did record. Two
+    # writers cannot collide on `(pid, thread)`, and `os.replace` is atomic, so the
+    # last one wins exactly as it did before, without the crash. The payload is the
+    # same shape either way: with several jobs refused at once "the first unstarted
+    # key" has no single answer, and never had one.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
     tmp.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )

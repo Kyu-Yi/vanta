@@ -66,7 +66,7 @@ def test_empty_cart():
     // ---- Run pytest with --json-report ----
     // [SYNTAX] cmd slice: [program, arg1, arg2, ...]. cwd is sandbox root.
     let cmd = ["python3", "-m", "pytest", "--json-report", "--json-report-file=report.json", "-q"];
-    let result = sb.execute(&cmd, Path::new(""), 30).await?;
+    let result = sb.execute(&cmd, Path::new(""), 30, &[], &[]).await?;
 
     println!("\n▌ pytest exit_code={:?}, wall_time={}ms, timed_out={}",
         result.exit_code, result.wall_time_ms, result.timed_out);
@@ -80,7 +80,10 @@ def test_empty_cart():
         let report_text = std::fs::read_to_string(&report_path)?;
         let report: serde_json::Value = serde_json::from_str(&report_text)?;
 
-        let tests = report["tests"].as_array().ok_or("no 'tests' array in report")?;
+        // The shared reader, so this recipe cannot teach a shape the pipeline
+        // stopped accepting: pytest-json-report 0.1/0.2 write a flat list and
+        // 0.3+ write {"tests": [...]} (§3.2 of plans/bugsinpy.md).
+        let tests = vanta::pipeline::harness::report_tests(&report).map_err(|e| e.to_string())?;
         println!("\n▌ Parsed {} test results from report.json:", tests.len());
         for t in tests {
             let name = t["nodeid"].as_str().unwrap_or("?");
@@ -130,7 +133,10 @@ def test_empty_cart():
 // RECIPE E3 — "Parse pytest --json-report per-test outcomes"
 //
 //   let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("report.json")?)?;
-//   for t in report["tests"].as_array().unwrap() {
+//   // report_tests reads BOTH schemas the plugin writes: 0.1/0.2 write a flat
+//   // JSON list, 0.3+ write {"tests": [...]}. A bug pinning an old pytest gets
+//   // the old plugin, so reading only ["tests"] would see zero tests there.
+//   for t in vanta::pipeline::harness::report_tests(&report).unwrap() {
 //       let name = t["nodeid"].as_str().unwrap();
 //       let outcome = t["outcome"].as_str().unwrap();  // "passed" | "failed" | "error"
 //   }

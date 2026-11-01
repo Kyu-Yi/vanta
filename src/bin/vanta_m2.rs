@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 
+use vanta::core::GovernorDecision;
 use vanta::logging::init_logging;
 use vanta::pipeline::driver::{self, RunConfig};
 
@@ -135,17 +136,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("║  VANTA M2 — Creator → Attacker → BATE → Diagnostician       ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
-    driver::run(RunConfig {
+    let decision = driver::run(RunConfig {
         repo_path: cli.repo_path,
         issue_path: cli.issue_path,
         max_attempts: 1,
+        // [VANTA-WHY] M3 item 9 — M2 is the SAME driver at N = 1 by construction,
+        // and `--fixed-rounds` is M3's repair-arm option, so M2 pins it off rather
+        // than exposing a flag whose whole meaning is "run the loop more than once".
+        fixed_rounds: None,
         model_override: cli.model_override,
         open_pr: false,
         patch_path: cli.patch_path,
         test_cmd: cli.test_cmd,
+        sandbox_env: Vec::new(),
+        precompile: Vec::new(),
+        native_expected_tests: None,
+        // [VANTA-WHY] M3 item D1 — M2 records no prepare measurement, so it keeps
+        // the historical in-session native cap (`harness::test_timeout_secs()`)
+        // rather than deriving one. The derived cap is M3's, from a row's own
+        // prepare.
+        native_timeout_secs: None,
         original_tree: cli.original_tree,
     })
     .await?;
+
+    // [VANTA-WHY] M2's job is a single verification pass, not a repair, so it
+    // does not gate on approval the way M3 does. It MUST still refuse to claim
+    // success after an infrastructure failure: no test ever judged the patch,
+    // so "M2 PIPELINE COMPLETE" would be a lie. Exit 2 mirrors M3's distinct
+    // InfraFailure code.
+    if decision == GovernorDecision::InfraFailure {
+        println!("\n  ✗ M2 stopped on an infrastructure failure (see the summary above)");
+        std::process::exit(2);
+    }
 
     println!("\n╔══════════════════════════════════════════════════════════════╗");
     println!("║  M2 PIPELINE COMPLETE                                        ║");

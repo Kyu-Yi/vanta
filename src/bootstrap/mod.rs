@@ -69,7 +69,7 @@ pub async fn m1_single_call(cfg: &LlmConfig) -> Result<String, Box<dyn Error + S
         json!({"role": "system", "content": "You are a concise assistant. Answer in 1 sentence max."}),
         json!({"role": "user", "content": "In one short sentence, explain what a Result<T,E> is in Rust."}),
     ];
-    let text = post_chat(&client, cfg, messages, json!({})).await?;
+    let text = post_chat(&client, cfg, messages, json!({}), "bootstrap_m1").await?;
     let preview = text.chars().take(120).collect::<String>();
     if preview.trim().is_empty() {
         return Err("m1_single_call: model returned EMPTY response".into());
@@ -148,7 +148,7 @@ Write CreatorResponse JSON.";
     };
 
     let typed: CreatorResponse = structured_call_with_retry(
-        &client, cfg, 3, build_messages, extras, parse_closure
+        &client, cfg, 3, "", "bootstrap_m2_creator", build_messages, extras, parse_closure
     ).await?;
 
     // ---- BUILT-IN MALFORMED CASE (M0 exit test: must NOT panic) ----
@@ -229,7 +229,7 @@ pub fn cart_total(items: &[u32]) -> u32 {
     };
 
     let creator: CreatorResponse = structured_call_with_retry(
-        &client, cfg, 4, creator_build_msgs, creator_extras, creator_parse
+        &client, cfg, 4, "", "bootstrap_m3_creator", creator_build_msgs, creator_extras, creator_parse
     ).await?;
 
     let patch_text = creator.patch_text.clone();
@@ -293,7 +293,7 @@ Write Attacker JSON with "tests" array of 2 items. Valid JSON only."#
     };
 
     let typed_attacker: AttackerResponse = structured_call_with_retry(
-        &client, cfg, 4, attacker_build_msgs, attacker_extras, attacker_parse
+        &client, cfg, 4, "", "bootstrap_m3_attacker", attacker_build_msgs, attacker_extras, attacker_parse
     ).await?;
 
     if typed_attacker.tests.is_empty() {

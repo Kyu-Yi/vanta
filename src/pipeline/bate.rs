@@ -17,12 +17,15 @@
 // ============================================================================
 
 use crate::agents::attacker::{
-    GeneratedTest, IntentCheckRecord, IntentRelabel, attacker_revise_test, audit_test_intent,
+    GeneratedTest, IntentCheckRecord, IntentRelabel, attacker_revise_test, audit_issue_requires_change,
+    audit_test_intent,
 };
 use crate::config::LlmConfig;
 use crate::core::{TestIntent, TestResult};
 use crate::pipeline::candidate::TestCommand;
 use crate::pipeline::harness;
+use crate::pipeline::harness::TestExecutionDetails;
+use crate::pipeline::{REVISE_BUDGET_EXHAUSTED, ReviseBudget};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -92,25 +95,63 @@ pub fn validate_test_against_baseline(
 //
 // [SYNTAX] Async function taking an async closure. Each call to run_fn is
 // awaited, allowing the test runner to be async (e.g. sandbox.execute).
+//
+// [VANTA-WHY] Returns the LAST observed baseline alongside the outcome. BATE's
+// relabel-before-revise rule (Fix 6) needs to know that the baseline PASSED — a
+// BugReproduction that passes reproduced nothing — and that fact is only
+// observable here, where the baseline actually ran. Reconstructing it from a
+// `Mismatch` would confuse "passed" with "errored", and an errored baseline must
+// not be relabelled into a preservation probe.
+/// [VANTA-WHY] §14.17 — the run returns the whole [`TestExecutionDetails`], not
+/// just the `TestResult`. BATE's revise step is the one place a test is handed
+/// back to the model with an account of what went wrong, and the account used to
+/// be the CLASSIFIED string alone ("expects baseline=Failed but got Error"). A
+/// model shown only the category cannot act on it: the overnight sanic session
+/// shows a test rewritten 45 times while the model guessed what "ERROR" meant,
+/// because the exception, its message and the traceback were thrown away here.
+/// Carrying the details keeps one runner for both the verdict and the evidence.
+///
+/// [VANTA-WHY] Item (b) — the run-log account of a `validate_with_retry` that
+/// ran out of attempts. "SCRAPPED" is only true when the baseline GRADED the
+/// test and disagreed with its intent. A never-graded failure (a plugin that
+/// fails to load, a `conftest.py` that fails to import) is classified by
+/// `harness_error` and the CALLER stops the attempt WITHOUT adding the test to
+/// `scrapped_tests` — so the unconditional "SCRAPPED" warning used to contradict
+/// the very next line (`BATE: 0 valid, 0 scrapped`) and made the discard rate
+/// describe a scrap that never happened. This names the environment case in its
+/// own words, so the console and the `bate.summary` row agree. The retry policy
+/// is unchanged: the same three attempts still run.
+fn mismatch_log_line(details: &TestExecutionDetails, attempts: u32) -> String {
+    if harness_error(details).is_some() {
+        "BATE: baseline never reached a verdict (environment error) — not a scrap".to_string()
+    } else {
+        format!("BATE: test SCRAPPED after {attempts} mismatches")
+    }
+}
+
 pub async fn validate_with_retry<F, Fut>(
     test_name: &str,
     intent: &TestIntent,
     max_attempts: u32,
     mut run_fn: F,
-) -> BateOutcome
+) -> (BateOutcome, TestExecutionDetails)
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = TestResult>,
+    Fut: std::future::Future<Output = TestExecutionDetails>,
 {
     let mut last_mismatch: Option<String> = None;
+    // Only ever read when `max_attempts` is 0, which no caller passes.
+    let mut last_details = TestExecutionDetails::from_rerun(TestResult::Error);
 
     for attempt in 1..=max_attempts {
         debug!(test = test_name, attempt, max_attempts, "BATE retry loop: running baseline test");
         let actual = run_fn().await;
-        match validate_test_against_baseline(test_name, intent, actual) {
+        let result = actual.result.clone();
+        last_details = actual;
+        match validate_test_against_baseline(test_name, intent, result) {
             BateOutcome::Valid => {
                 info!(test = test_name, attempt, "BATE: test VALID on attempt {attempt}");
-                return BateOutcome::Valid;
+                return (BateOutcome::Valid, last_details);
             }
             BateOutcome::Mismatch(reason) => {
                 warn!(test = test_name, attempt, "BATE: mismatch on attempt {attempt}, retrying");
@@ -125,8 +166,195 @@ where
         last_mismatch.unwrap_or_else(|| "unknown mismatch".into()),
         max_attempts
     );
-    warn!(test = test_name, max_attempts, "BATE: test SCRAPPED after {max_attempts} mismatches");
-    BateOutcome::Mismatch(reason)
+    warn!(test = test_name, max_attempts, "{}", mismatch_log_line(&last_details, max_attempts));
+    (BateOutcome::Mismatch(reason), last_details)
+}
+
+// ============================================================================
+// baseline_evidence — what the baseline ACTUALLY did, for the revise prompt
+// ============================================================================
+//
+// [VANTA-WHY] §14.17 — BATE's mismatch reason is a CATEGORY ("got Error"); the
+// revise prompt needs the EVIDENCE. The overnight sanic session shows the model
+// guessing, over and over, why a test it wrote came back Error when the answer
+// was in the run's output all along: the exception, its message, and the frames
+// pytest printed. This renders exactly that, and nothing else — the model is
+// being told why its test failed, not given the repository's whole log.
+//
+// [VANTA-WHY] BOUNDED, for the same reason §14.13 is: a generated test can print
+// tens of thousands of lines (one sanic test did), and the remedy for "the model
+// cannot see the error" must not become "the model is buried in it". The tail is
+// the right end to keep: pytest prints the innermost frame last.
+
+/// The most lines a revise prompt's baseline evidence may carry, footer included.
+pub const REVISE_EVIDENCE_MAX_LINES: usize = 40;
+
+/// One compact, bounded account of what the baseline run actually did: the
+/// verdict in BATE's own terms, the exception line, and the tail of the last
+/// traceback. Used verbatim as the revise prompt's evidence block.
+pub fn baseline_evidence(details: &TestExecutionDetails) -> String {
+    let combined = format!("{}\n{}", details.stdout, details.stderr);
+    let lines: Vec<&str> = combined.lines().map(str::trim_end).collect();
+
+    // The LAST traceback is the failure the run ended on — an earlier one may be
+    // a captured log line or a warning's stack.
+    let start = lines
+        .iter()
+        .rposition(|line| line.trim_start().starts_with("Traceback (most recent call last)"))
+        .unwrap_or(0);
+    let tail: Vec<&str> = lines[start..]
+        .iter()
+        .copied()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    let mut out: Vec<String> = vec![format!("verdict: {}", verdict_label(details))];
+    if let Some(exception) = exception_line(&tail) {
+        out.push(format!("exception: {exception}"));
+    }
+    if !tail.is_empty() {
+        out.push("run output (last lines, most recent last):".to_string());
+        // The header lines count against the cap, so a 40-line slice is 40 lines.
+        let budget = REVISE_EVIDENCE_MAX_LINES.saturating_sub(out.len());
+        let from = tail.len().saturating_sub(budget);
+        out.extend(tail[from..].iter().map(|line| (*line).to_string()));
+    }
+    out.join("\n")
+}
+
+/// BATE's verdict in words a reader can act on, with the distinction it cares
+/// about: ERROR (the test never reached its assertions) is not FAILED (an
+/// assertion ran and did not hold).
+fn verdict_label(details: &TestExecutionDetails) -> &'static str {
+    match details.result {
+        TestResult::Passed => "PASSED (the test ran and every assertion held)",
+        TestResult::Failed => "FAILED (an assertion in the test did not hold)",
+        TestResult::Error if details.timed_out => {
+            "ERROR (the test timed out and never produced a verdict)"
+        }
+        TestResult::Error if !details.report_path_exists => {
+            "ERROR (the test was never graded: it failed to import or collect)"
+        }
+        TestResult::Error => {
+            "ERROR (the test raised an exception before its assertions completed)"
+        }
+    }
+}
+
+/// The exception line from a failure's tail, e.g. `AttributeError: 'NoneType'
+/// object has no attribute 'items'`.
+///
+/// [VANTA-WHY] The TYPE comes from `diagnostician::parse_failure_site`, the same
+/// locator the Diagnostician classifies with, so "what exception was that" has
+/// one answer in this codebase. A plain `assert` prints no type in its `E` lines,
+/// so the line is preferred by type and only then by pytest's own `E` marker.
+fn exception_line(tail: &[&str]) -> Option<String> {
+    let output = tail.join("\n");
+    let (_, _, exception_type) = crate::pipeline::diagnostician::parse_failure_site(&output);
+    if let Some(exception_type) = exception_type {
+        if let Some(line) = tail.iter().rev().find(|line| line.contains(&exception_type)) {
+            return Some(line.trim().to_string());
+        }
+    }
+    tail.iter().rev().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("E ")
+            .map(|rest| rest.trim().to_string())
+    })
+}
+
+// ============================================================================
+// harness_error — a baseline run that died before pytest graded the test (§14.19)
+// ============================================================================
+//
+// [VANTA-WHY] §14.19 — some failures are the ENVIRONMENT, not the test, and
+// revising the test cannot fix them. The overnight sanic session is the worked
+// example: `pytest_sanic` is a `pytest11` entry point, so pytest imported the
+// project under test while loading plugins, that import reached a module the
+// (then truncated) tree did not have, and pytest aborted in `_preparse` with a
+// plain traceback and exit 1. No `report.json` was ever written, so the
+// generated test was never graded — it came back `Error`, never `Failed` — and
+// BATE scrapped it, then handed it back for revision. The Attacker was asked to
+// fix a broken environment from inside a test file, twice per test, at 32k
+// tokens a call, and burned hours.
+//
+// [VANTA-WHY] The discriminator is two facts together, and both are needed:
+//   1. `report_path_exists == false` — pytest reached no verdict for the
+//      generated test. Combined with `result == Error` and `!timed_out`, this
+//      is "never graded": a timeout DID run the test, and a real exception
+//      inside the test leaves a report with its nodeid in it.
+//   2. The output does NOT name the generated test file. A collection error
+//      that names it is the test's own fault — a syntax error, a bad import in
+//      the test — and the Attacker CAN fix that, so it must still be revised.
+//      A plugin load or a `conftest.py` import error names other files, and the
+//      Attacker can do nothing about it.
+//
+// [VANTA-WHY] Read from the LAST of `validate_with_retry`'s attempts, not the
+// first: that function re-runs three times precisely so a one-off spawn failure
+// is absorbed. A transient VM fault must not abort the attempt, and a genuine
+// broken environment reproduces across all three.
+//
+// [VANTA-WHY] Why the output text is quoted into the record: the guard exists to
+// turn this class into one legible row, and "harness_error" alone would send the
+// reader back to the log to learn WHICH plugin or module failed.
+
+/// A baseline run that errored before pytest could grade the generated test.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessError {
+    /// The test whose baseline run surfaced it. Every test in the batch would
+    /// fail the same way, which is why BATE stops here rather than continuing.
+    pub test_name: String,
+    /// The tail of what pytest printed, bounded like §14.17's revise evidence.
+    pub evidence: String,
+}
+
+/// One entry in the per-attempt `attempt_<n>_generated_tests.json` artifact
+/// (M3 item 10, fold-ins 3 and 4).
+///
+/// [VANTA-WHY] A test BATE discards survives on disk today only as a
+/// `bate.scrap[<name>]` reason — its SOURCE is nowhere, so nothing downstream can
+/// look at what the Attacker actually wrote. Item 10 needs the discarded sources
+/// (fold-in 3) and, for each admitted reproduction probe, the baseline failure it
+/// was validated against (fold-in 4). Both are computed here and, before this
+/// artifact existed, dropped after the revise prompt. This is ADDITIVE LOGGING:
+/// it changes no verdict, label, score, key or existing row.
+///
+/// [VANTA-WHY] `test_name`/`test_source`/`declared_intent` describe the test's
+/// FINAL form — the form it was admitted or scrapped as. For an admitted test
+/// that is byte-identical to its entry in `attempt_<n>_tests.json`, which is what
+/// lets a reader join the two files by name; for a scrapped test it is the last
+/// body BATE rejected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GeneratedTestRecord {
+    pub test_name: String,
+    pub test_source: String,
+    pub declared_intent: TestIntent,
+    /// `"valid"`, `"scrapped"` or `"harness_error"`.
+    pub bate_status: String,
+    /// BATE's reason, exactly as the `bate.scrap[<name>]` row carries it.
+    pub bate_reason: Option<String>,
+    /// The bounded baseline account the test was judged on
+    /// (`baseline_evidence`). `None` only when no baseline run produced one — a
+    /// scrap at the flaky pre-check, which runs before any detailed baseline.
+    pub baseline_evidence: Option<String>,
+}
+
+/// §14.19 — `Some(evidence)` when this baseline run never reached a verdict for
+/// the generated test and the failure is not the test's own doing.
+pub fn harness_error(details: &TestExecutionDetails) -> Option<String> {
+    if details.result != TestResult::Error || details.timed_out || details.report_path_exists {
+        return None;
+    }
+    let output = format!("{}\n{}", details.stdout, details.stderr);
+    if output.contains(harness::BATE_TEST_FILE) {
+        // The generated test file is named in the failure, so its own collection
+        // or import is what broke: the Attacker's problem, not the environment's.
+        return None;
+    }
+    // Reuse §14.17's renderer for the log tail, so the record carries the same
+    // "verdict / exception / last lines" shape the revise prompt would have
+    // seen, and is bounded by the same cap.
+    Some(baseline_evidence(details))
 }
 
 // ============================================================================
@@ -176,12 +404,77 @@ pub struct BateRun {
     /// patch-blind intent audit ran on revised tests too — including a
     /// preservation revision the audit scrapped for contradicting the issue.
     pub intent_checks: Vec<IntentCheckRecord>,
+    /// [VANTA-WHY] §14.19 — `Some` when a baseline run died before pytest graded
+    /// the generated test, so this batch stopped here. It is NOT a scrap reason:
+    /// the tests were never judged, so reporting them as scrapped would blame the
+    /// Attacker for a broken environment and inflate the discard rate with a
+    /// non-test. The caller stops the attempt instead of revising.
+    pub harness_error: Option<HarnessError>,
+    /// M3 item 10 — one entry per Attacker test this round PRODUCED, admitted and
+    /// discarded alike, for `attempt_<n>_generated_tests.json`. See
+    /// `GeneratedTestRecord`.
+    pub generated_tests: Vec<GeneratedTestRecord>,
+}
+
+/// What BATE should do with a BugReproduction test whose baseline mismatched.
+///
+/// [VANTA-WHY] Fix 6 — relabel before revise. A BugReproduction test that PASSES
+/// on the original reproduced nothing: it asserts behaviour the original already
+/// has. Sending it straight to revision asks the Attacker to "fix" a test that is
+/// not broken. When the issue requires that behaviour to STAY, the test is a
+/// legitimate preservation probe that was mislabelled, so it is relabelled and
+/// admitted UNCHANGED. Only when the issue requires the behaviour to change (or
+/// the auditor cannot say) does the ordinary revision path run.
+///
+/// [VANTA-WHY] The relabel only ever goes BugReproduction → BehaviorPreservation,
+/// never the other way. A preservation test whose baseline FAILED must not
+/// become a BugReproduction: that direction would launder a broken probe into
+/// one that is allowed to fail on the original, which is the loophole.
+///
+/// [VANTA-WHY] `issue_requires_change` is an `Option` and the relabel fires ONLY
+/// on an explicit `Some(false)`. A local model dropping the field must not be
+/// able to promote a test: absent means UNKNOWN, and unknown fails closed to the
+/// ordinary revision path (`Revise`). Unavailable auditors arrive here as `None`
+/// for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MislabeledReproductionOutcome {
+    /// The baseline passed and the issue explicitly requires that behaviour
+    /// preserved: relabel to BehaviorPreservation and admit the test unchanged.
+    RelabelToPreservation,
+    /// Anything else — including an unknown answer: hand the test to the
+    /// Attacker for revision as before.
+    Revise,
+}
+
+pub fn mislabeled_reproduction_decision(
+    intent: &TestIntent,
+    baseline: TestResult,
+    issue_requires_change: Option<bool>,
+) -> MislabeledReproductionOutcome {
+    if *intent == TestIntent::BugReproduction
+        && baseline == TestResult::Passed
+        && issue_requires_change == Some(false)
+    {
+        MislabeledReproductionOutcome::RelabelToPreservation
+    } else {
+        MislabeledReproductionOutcome::Revise
+    }
 }
 
 /// Run the BATE phase over a batch of Attacker tests against the ORIGINAL code.
 ///
 /// Returns the report (for discard-rate logging) and the surviving tests using
 /// their possibly-revised source.
+///
+/// [VANTA-WHY] `grounded_audit` is §14.4's flag, threaded to the two intent
+/// audits this phase performs (the relabel question and the audit of a revised
+/// test). It only selects the auditor's prompt variant; with it `false` both calls
+/// are byte-identical to v0.2's.
+///
+/// [VANTA-WHY] §14.14 — `revise_budget` is the attempt's SHARED ceiling on
+/// Attacker remediation calls. It is borrowed rather than local so the
+/// Diagnostician's Unknown-path simplification draws from the same counter:
+/// "revise+simplify" is one budget per attempt, not two.
 pub async fn run_bate(
     cfg: &LlmConfig,
     issue_text: &str,
@@ -189,11 +482,53 @@ pub async fn run_bate(
     original_prompt_source: &str,
     tests: &[GeneratedTest],
     test_cmd: &TestCommand,
+    grounded_audit: bool,
+    admit_all: bool,
+    revise_budget: &mut ReviseBudget,
 ) -> BateRun {
+    // [VANTA-WHY] M3 item 8 — the B2 arm. `admit_all` is `VANTA_BATE=off`: the
+    // whole phase is a pass-through, so this returns BEFORE any baseline run,
+    // any revision, any relabel and any intent audit. Every test enters exactly
+    // as the Attacker wrote it (no revision, no intent change), `scrapped_tests`
+    // is empty and no record is produced. This is the arm's definition: in
+    // review every Attacker test is admitted regardless of declared intent or
+    // baseline behaviour, so the callers' existing "any failing admitted test
+    // rejects / is feedback" rule applies without a second admission path. The
+    // `report` still names every test as valid so the `bate.summary` row is
+    // well-formed (valid=N, scrapped=0).
+    if admit_all {
+        return BateRun {
+            report: BateReport {
+                valid_tests: tests.iter().map(|t| t.test_name.clone()).collect(),
+                scrapped_tests: Vec::new(),
+            },
+            valid_tests: tests.to_vec(),
+            relabel_events: Vec::new(),
+            intent_checks: Vec::new(),
+            harness_error: None,
+            // No baseline ran, so there is no evidence and nothing was scrapped:
+            // every produced test is `valid`. The artifact still names them all,
+            // because "one entry per test the Attacker produced" is what makes a
+            // reader able to tell "no record" from "no tests".
+            generated_tests: tests
+                .iter()
+                .map(|t| GeneratedTestRecord {
+                    test_name: t.test_name.clone(),
+                    test_source: t.test_source.clone(),
+                    declared_intent: t.intent.clone(),
+                    bate_status: "valid".to_string(),
+                    bate_reason: None,
+                    baseline_evidence: None,
+                })
+                .collect(),
+        };
+    }
+
     let mut valid_tests: Vec<GeneratedTest> = Vec::new();
     let mut scrapped_tests: Vec<(String, String)> = Vec::new();
     let mut relabel_events: Vec<IntentRelabel> = Vec::new();
     let mut intent_checks: Vec<IntentCheckRecord> = Vec::new();
+    let mut generated_tests: Vec<GeneratedTestRecord> = Vec::new();
 
     for test in tests {
         // [VANTA-WHY] Spec §7 "Flaky tests" row: run the baseline twice; a test
@@ -204,22 +539,35 @@ pub async fn run_bate(
         let r2 =
             harness::run_single_test(original_execution_source, &test.test_source, test_cmd).await;
         if r1 != r2 {
-            scrapped_tests.push((
-                test.test_name.clone(),
-                format!("FLAKY: baseline disagreed with itself (run1={r1:?}, run2={r2:?})"),
-            ));
+            let reason =
+                format!("FLAKY: baseline disagreed with itself (run1={r1:?}, run2={r2:?})");
+            generated_tests.push(GeneratedTestRecord {
+                test_name: test.test_name.clone(),
+                test_source: test.test_source.clone(),
+                declared_intent: test.intent.clone(),
+                bate_status: "scrapped".to_string(),
+                bate_reason: Some(reason.clone()),
+                // The pre-check runs `run_single_test`, which returns no detailed
+                // output, so there is no baseline evidence to record here.
+                baseline_evidence: None,
+            });
+            scrapped_tests.push((test.test_name.clone(), reason));
             continue;
         }
 
         let mut current_test = test.clone();
         let mut final_outcome: Option<BateOutcome> = None;
+        // M3 item 10 (fold-in 4) — the last baseline run this test was judged
+        // on, kept so the record can carry the failure a reproduction probe was
+        // validated against.
+        let mut last_baseline_evidence: Option<String> = None;
 
         // Layer 2: up to 3 Attacker revisions when the baseline mismatches intent.
         for revision in 0..=3 {
             let src = original_execution_source.to_string();
             let test_source = current_test.test_source.clone();
             let cmd_template = test_cmd.clone();
-            let outcome = validate_with_retry(
+            let (outcome, baseline) = validate_with_retry(
                 &current_test.test_name,
                 &current_test.intent,
                 3, // Layer 1: re-run in a fresh sandbox up to 3× for flakiness
@@ -227,10 +575,67 @@ pub async fn run_bate(
                     let src = src.clone();
                     let test_source = test_source.clone();
                     let cmd_template = cmd_template.clone();
-                    async move { harness::run_single_test(&src, &test_source, &cmd_template).await }
+                    // [VANTA-WHY] §14.17 — the DETAILED runner, not
+                    // `run_single_test`: the verdict is the same (the plain
+                    // wrapper is this call's `.result`), but the revise step
+                    // below needs the output the verdict was read from.
+                    async move {
+                        harness::run_single_test_with_timeout(
+                            &src,
+                            &test_source,
+                            &cmd_template,
+                            harness::test_timeout_secs(),
+                        )
+                        .await
+                    }
                 },
             )
             .await;
+            let baseline_result = baseline.result.clone();
+            // M3 item 10 — keep the bounded account of this baseline run; the
+            // record below carries it as fold-in 4's evidence.
+            last_baseline_evidence = Some(baseline_evidence(&baseline));
+
+            // [VANTA-WHY] §14.19 — the environment, not the test. Checked before
+            // the relabel and revise paths, because both of those hand the test
+            // back to the Attacker, and the Attacker cannot fix a plugin load or
+            // a `conftest.py` that fails to import. Every remaining test in the
+            // batch would fail identically (same interpreter, same plugins, same
+            // tree), so BATE stops for this attempt instead of spending a
+            // revision budget on each of them.
+            if let Some(evidence) = harness_error(&baseline) {
+                warn!(
+                    test = %current_test.test_name,
+                    "BATE: baseline never reached a verdict and the failure is not the test's \
+                     — stopping BATE for this attempt"
+                );
+                // M3 item 10 — record the test that surfaced it. The tests after
+                // it were never judged, so they get no entry (a `null` status
+                // would be indistinguishable from "this batch predates the
+                // artifact").
+                generated_tests.push(GeneratedTestRecord {
+                    test_name: current_test.test_name.clone(),
+                    test_source: current_test.test_source.clone(),
+                    declared_intent: current_test.intent.clone(),
+                    bate_status: "harness_error".to_string(),
+                    bate_reason: None,
+                    baseline_evidence: Some(evidence.clone()),
+                });
+                return BateRun {
+                    report: BateReport {
+                        valid_tests: valid_tests.iter().map(|t| t.test_name.clone()).collect(),
+                        scrapped_tests,
+                    },
+                    valid_tests,
+                    relabel_events,
+                    intent_checks,
+                    harness_error: Some(HarnessError {
+                        test_name: current_test.test_name.clone(),
+                        evidence,
+                    }),
+                    generated_tests,
+                };
+            }
 
             match outcome {
                 BateOutcome::Valid => {
@@ -238,7 +643,87 @@ pub async fn run_bate(
                     break;
                 }
                 BateOutcome::Mismatch(reason) => {
+                    // [VANTA-WHY] Fix 6 — relabel before revise. A test labelled
+                    // BugReproduction whose baseline PASSED is not a reproduction
+                    // at all: it asserts behaviour the original already has.
+                    // Before asking the Attacker to "fix" it, ask whether the
+                    // issue requires that behaviour to stay. If it does, the
+                    // test is a legitimate — merely mislabelled — preservation
+                    // probe, so it is relabelled and admitted UNCHANGED. If the
+                    // issue requires the behaviour to change, the ordinary
+                    // revision path runs as before.
+                    if current_test.intent == TestIntent::BugReproduction
+                        && baseline_result == TestResult::Passed
+                    {
+                        let (requires_change, record) = audit_issue_requires_change(
+                            cfg,
+                            issue_text,
+                            original_prompt_source,
+                            &current_test,
+                            grounded_audit,
+                        )
+                        .await;
+                        intent_checks.push(record);
+                        if requires_change.is_none() {
+                            // [VANTA-WHY] Fail closed. A local model that drops
+                            // the field must not be able to promote a test: an
+                            // absent answer is UNKNOWN, and unknown never
+                            // relabels. Take the ordinary revision path.
+                            info!(
+                                test = %current_test.test_name,
+                                "audit omitted issue_requires_change, not relabeling"
+                            );
+                        }
+                        if mislabeled_reproduction_decision(
+                            &current_test.intent,
+                            baseline_result.clone(),
+                            requires_change,
+                        ) == MislabeledReproductionOutcome::RelabelToPreservation
+                        {
+                            let mut relabeled = current_test.clone();
+                            relabeled.intent = TestIntent::BehaviorPreservation;
+                            relabeled.issue_quote = None;
+                            // [VANTA-WHY] Item 6 — record that this test has
+                            // spent its one relabel, so a later verdict can never
+                            // flip it back.
+                            relabeled.relabeled = true;
+                            info!(
+                                test = %current_test.test_name,
+                                "relabeled BugReproduction→BehaviorPreservation (baseline passed, issue requires preservation)"
+                            );
+                            relabel_events.push(IntentRelabel {
+                                test_name: relabeled.test_name.clone(),
+                                from_intent: TestIntent::BugReproduction,
+                                to_intent: TestIntent::BehaviorPreservation,
+                                reason: "relabeled BugReproduction→BehaviorPreservation \
+                                         (baseline passed, issue requires preservation)"
+                                    .to_string(),
+                            });
+                            current_test = relabeled;
+                            final_outcome = Some(BateOutcome::Valid);
+                            break;
+                        }
+                    }
                     if revision < 3 {
+                        // [VANTA-WHY] §14.14 — the attempt's SHARED revise+simplify
+                        // budget. The per-test cap (`revision < 3`) bounds one
+                        // test; this bounds the whole round, and a revision that
+                        // returns a RENAMED test cannot escape it, because the
+                        // counter belongs to the round and is not reset when the
+                        // name changes. Spending it BEFORE the call is what makes
+                        // "at most 4 revisions" true rather than "at most 4 that
+                        // returned". When it is spent the test is scrapped and the
+                        // round continues with the tests it has.
+                        if !revise_budget.try_use() {
+                            info!(
+                                test = %current_test.test_name,
+                                "BATE: the attempt's revise budget is spent — scrapping"
+                            );
+                            final_outcome = Some(BateOutcome::Mismatch(
+                                REVISE_BUDGET_EXHAUSTED.to_string(),
+                            ));
+                            break;
+                        }
                         info!(
                             test = %current_test.test_name,
                             revision = revision + 1,
@@ -250,10 +735,18 @@ pub async fn run_bate(
                             original_prompt_source,
                             &current_test,
                             &reason,
+                            &baseline_evidence(&baseline),
                         )
                         .await
                         {
                             Ok(revised) => {
+                                // [VANTA-WHY] Item 6 — a revision is the same test
+                                // under a new body, so it inherits the relabel
+                                // ceiling: the test has already spent its one
+                                // relabel, and a verdict that would relabel it
+                                // again flips it back, which the audit scraps.
+                                let mut revised = revised;
+                                revised.relabeled = current_test.relabeled;
                                 // [VANTA-WHY] The reviver can change what a test
                                 // declares, so the revised test is audited too: a
                                 // revision that claims FeatureAcceptance for a
@@ -265,6 +758,7 @@ pub async fn run_bate(
                                         issue_text,
                                         original_prompt_source,
                                         &revised,
+                                        grounded_audit,
                                     )
                                         .await;
                                 if let Some(relabel) = relabel {
@@ -317,14 +811,40 @@ pub async fn run_bate(
         }
 
         match final_outcome {
-            Some(BateOutcome::Valid) => valid_tests.push(current_test),
+            Some(BateOutcome::Valid) => {
+                generated_tests.push(GeneratedTestRecord {
+                    test_name: current_test.test_name.clone(),
+                    test_source: current_test.test_source.clone(),
+                    declared_intent: current_test.intent.clone(),
+                    bate_status: "valid".to_string(),
+                    bate_reason: None,
+                    baseline_evidence: last_baseline_evidence.clone(),
+                });
+                valid_tests.push(current_test);
+            }
             Some(BateOutcome::Mismatch(reason)) => {
+                generated_tests.push(GeneratedTestRecord {
+                    test_name: current_test.test_name.clone(),
+                    test_source: current_test.test_source.clone(),
+                    declared_intent: current_test.intent.clone(),
+                    bate_status: "scrapped".to_string(),
+                    bate_reason: Some(reason.clone()),
+                    baseline_evidence: last_baseline_evidence.clone(),
+                });
                 scrapped_tests.push((current_test.test_name.clone(), reason))
             }
-            None => scrapped_tests.push((
-                current_test.test_name.clone(),
-                "unknown BATE outcome".into(),
-            )),
+            None => {
+                let reason = "unknown BATE outcome".to_string();
+                generated_tests.push(GeneratedTestRecord {
+                    test_name: current_test.test_name.clone(),
+                    test_source: current_test.test_source.clone(),
+                    declared_intent: current_test.intent.clone(),
+                    bate_status: "scrapped".to_string(),
+                    bate_reason: Some(reason.clone()),
+                    baseline_evidence: last_baseline_evidence.clone(),
+                });
+                scrapped_tests.push((current_test.test_name.clone(), reason));
+            }
         }
     }
 
@@ -336,6 +856,8 @@ pub async fn run_bate(
         valid_tests,
         relabel_events,
         intent_checks,
+        harness_error: None,
+        generated_tests,
     }
 }
 
@@ -388,14 +910,19 @@ mod tests {
     async fn retry_loop_scraps_after_all_mismatches() {
         // Test that ALWAYS returns Passed for a BugReproduction intent.
         // After 3 attempts it should be scrapped.
-        let outcome = validate_with_retry(
+        let (outcome, last) = validate_with_retry(
             "flaky_fail",
             &TestIntent::BugReproduction,
             3,
-            || async { TestResult::Passed },
+            || async { TestExecutionDetails::from_rerun(TestResult::Passed) },
         )
         .await;
         assert!(matches!(outcome, BateOutcome::Mismatch(_)));
+        assert_eq!(
+            last.result,
+            TestResult::Passed,
+            "the observed baseline must ride along so BATE can tell 'passed' from 'errored'"
+        );
     }
 
     #[tokio::test]
@@ -403,7 +930,7 @@ mod tests {
         // Test that fails twice then passes. Should be Valid (not scrapped).
         use std::cell::RefCell;
         let attempts = RefCell::new(0);
-        let outcome = validate_with_retry(
+        let (outcome, _last) = validate_with_retry(
             "recovers",
             &TestIntent::BugReproduction,
             3,
@@ -411,14 +938,411 @@ mod tests {
                 let mut a = attempts.borrow_mut();
                 *a += 1;
                 if *a < 3 {
-                    TestResult::Passed // mismatch on attempts 1, 2
+                    TestExecutionDetails::from_rerun(TestResult::Passed) // mismatch on 1, 2
                 } else {
-                    TestResult::Failed // matches on attempt 3
+                    TestExecutionDetails::from_rerun(TestResult::Failed) // matches on 3
                 }
             },
         )
         .await;
         assert_eq!(outcome, BateOutcome::Valid);
         assert_eq!(*attempts.borrow(), 3);
+    }
+
+    #[test]
+    fn a_never_graded_baseline_is_not_logged_as_a_scrap() {
+        // Item (b): a harness error must NOT print "SCRAPPED". The caller stops
+        // the attempt on the environment error and never adds the test to
+        // `scrapped_tests`, so the run log saying SCRAPPED while the
+        // `bate.summary` row says `valid=0 scrapped=0` was two accounts of the
+        // same event that could not both be true.
+        let mut ungraded = details(TestResult::Error, "", PLUGIN_LOAD_FAILURE);
+        ungraded.report_path_exists = false;
+        let line = mismatch_log_line(&ungraded, 3);
+        assert!(
+            !line.contains("SCRAPPED"),
+            "a baseline that was never graded is not scrapped: {line}"
+        );
+        assert!(
+            line.contains("not a scrap"),
+            "the log must say what the event IS, not just drop the word: {line}"
+        );
+
+        // A graded disagreement is a genuine scrap and keeps the old words.
+        let graded = details(TestResult::Passed, "", "");
+        let line = mismatch_log_line(&graded, 3);
+        assert!(
+            line.contains("SCRAPPED"),
+            "a graded mismatch is still a scrap: {line}"
+        );
+    }
+
+    // ---- §14.17: what the baseline ACTUALLY did, for the revise prompt --------
+    //
+    // [VANTA-WHY] The revise prompt used to carry only BATE's CATEGORY ("got
+    // Error") and the model guessed at the cause for 45 rewrites. These pin the
+    // evidence block: it must name the exception and the frames, and it must stay
+    // small enough that a runaway test cannot bury the message.
+
+    /// Details as the detailed runner would report them: a verdict plus the
+    /// streams it was read from.
+    fn details(result: TestResult, stdout: &str, stderr: &str) -> TestExecutionDetails {
+        TestExecutionDetails {
+            result,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code: Some(1),
+            timed_out: false,
+            report_path_exists: true,
+            sandbox_root: None,
+        }
+    }
+
+    #[test]
+    fn the_evidence_carries_the_exception_and_the_frames_the_model_used_to_guess_at() {
+        // The shape pytest prints for a test that raised: the location line, the
+        // traceback, and the short-summary line that repeats type and message.
+        let stdout = "=================== FAILURES ====================\n\
+                      ____________________ test_reverse_order ____________________\n\n\
+                      \x20   def test_reverse_order():\n\
+                      >       cart = make_cart(None)\n\n\
+                      tests/test_bate.py:4: \n\
+                      _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\n\
+                      value = None\n\n\
+                      \x20   def make_cart(value):\n\
+                      >       return value.items()\n\
+                      E       AttributeError: 'NoneType' object has no attribute 'items'\n\n\
+                      pkg/cart.py:88: AttributeError\n\
+                      =================== short test summary info ====================\n\
+                      FAILED test_bate.py::test_reverse_order - AttributeError: 'NoneType' \
+                      object has no attribute 'items'\n\
+                      ====================== 1 failed in 0.04s ======================\n";
+        let evidence = baseline_evidence(&details(TestResult::Error, stdout, ""));
+
+        assert!(
+            evidence.contains("verdict: ERROR (the test raised an exception"),
+            "an ERROR must not be reported as a FAILED assertion: {evidence}"
+        );
+        assert!(
+            evidence.contains(
+                "exception: FAILED test_bate.py::test_reverse_order - AttributeError: \
+                 'NoneType' object has no attribute 'items'"
+            ),
+            "the type AND the message must both be in front of the model: {evidence}"
+        );
+        assert!(
+            evidence.contains(">       return value.items()"),
+            "the innermost frame is what says WHICH call raised: {evidence}"
+        );
+    }
+
+    #[test]
+    fn a_passing_baseline_is_reported_as_passed_and_an_assertion_as_failed() {
+        assert!(
+            baseline_evidence(&details(TestResult::Passed, "", "")).starts_with("verdict: PASSED"),
+            "a preservation probe's passing baseline must read as a pass"
+        );
+        assert!(
+            baseline_evidence(&details(TestResult::Failed, "", "")).starts_with("verdict: FAILED"),
+            "a failing assertion is FAILED, which is not the same claim as ERROR"
+        );
+    }
+
+    #[test]
+    fn an_ungraded_error_is_told_apart_from_an_exception_the_test_raised() {
+        // `report_path_exists == false` means the generated test never got a
+        // verdict at all (import/collect failure) — the distinction that used to
+        // reach the model as the single word "Error".
+        let mut ungraded = details(TestResult::Error, "", "");
+        ungraded.report_path_exists = false;
+        let evidence = baseline_evidence(&ungraded);
+        assert!(
+            evidence.contains("never graded"),
+            "a test that was never graded must not be blamed on an exception: {evidence}"
+        );
+    }
+
+    // ---- §14.19: the environment vs the test ---------------------------------
+    //
+    // [VANTA-WHY] The recorded sanic failure, verbatim in shape: a `pytest11`
+    // plugin imports the project under test, the import reaches a module the tree
+    // does not have, and pytest aborts in `_preparse` — before collection, before
+    // any report. `test_bate.py` is nowhere in it.
+
+    const PLUGIN_LOAD_FAILURE: &str = "\
+Traceback (most recent call last):
+  File \"/opt/venv38/lib/python3.8/site-packages/_pytest/config/__init__.py\", line 890, in _preparse
+    self.pluginmanager.load_setuptools_entrypoints(\"pytest11\")
+  File \"/opt/venv38/lib/python3.8/site-packages/pluggy/manager.py\", line 299, in load_setuptools_entrypoints
+    plugin = ep.load()
+  File \"/opt/venv38/lib/python3.8/site-packages/pytest_sanic/plugin.py\", line 6, in <module>
+    from .utils import TestServer, TestClient
+  File \"/workspace/sanic/asgi.py\", line 26, in <module>
+    from sanic.websocket import WebSocketConnection
+ModuleNotFoundError: No module named 'sanic.websocket'
+";
+
+    #[test]
+    fn a_plugin_that_fails_to_load_is_the_environment_not_the_test() {
+        // `report_path_exists == false` + the output naming no generated test.
+        let mut ungraded = details(TestResult::Error, "", PLUGIN_LOAD_FAILURE);
+        ungraded.report_path_exists = false;
+
+        let evidence =
+            harness_error(&ungraded).expect("a plugin load failure is not the Attacker's to fix");
+        assert!(
+            evidence.contains("never graded"),
+            "the record must say the test was never judged: {evidence}"
+        );
+        assert!(
+            evidence.contains("ModuleNotFoundError"),
+            "the record must name what actually broke, or the reader is back in the log: {evidence}"
+        );
+    }
+
+    #[test]
+    fn a_collection_error_that_names_the_generated_test_is_still_the_tests_own() {
+        // The Attacker CAN fix a syntax error in its own file, so this must stay
+        // on the revise path even though nothing was graded.
+        let mut ungraded = details(
+            TestResult::Error,
+            "",
+            "ERROR collecting test_bate.py\n\
+             test_bate.py:2: in <module>\n\
+             import sanic\n\
+             E   SyntaxError: invalid syntax\n",
+        );
+        ungraded.report_path_exists = false;
+
+        assert!(
+            harness_error(&ungraded).is_none(),
+            "a failure that names the generated test is revisable, not a harness error"
+        );
+    }
+
+    #[test]
+    fn nothing_else_is_a_harness_error() {
+        // A graded verdict, however negative, is evidence about the test.
+        assert!(harness_error(&details(TestResult::Passed, "", "")).is_none());
+        assert!(harness_error(&details(TestResult::Failed, "assert 1 == 2", "")).is_none());
+        let mut graded_error = details(TestResult::Error, "Traceback...\nValueError: x", "");
+        graded_error.report_path_exists = true;
+        assert!(
+            harness_error(&graded_error).is_none(),
+            "an exception inside the test leaves a report for its nodeid: that is the test's own"
+        );
+        // A timeout DID run the test — it is slow, not ungraded.
+        let mut timed_out = details(TestResult::Error, "", "hung");
+        timed_out.report_path_exists = false;
+        timed_out.timed_out = true;
+        assert!(
+            harness_error(&timed_out).is_none(),
+            "a timeout is a verdict about the test's runtime, not a broken environment"
+        );
+    }
+
+    #[test]
+    fn a_runaway_tests_output_is_cut_to_the_forty_lines_of_evidence() {
+        let mut stdout = String::from("Traceback (most recent call last):\n");
+        for i in 0..5_000 {
+            stdout.push_str(&format!("  File \"pkg/big.py\", line {i}, in f\n    step({i})\n"));
+        }
+        stdout.push_str("AssertionError: boom\n");
+        let evidence = baseline_evidence(&details(TestResult::Failed, &stdout, ""));
+
+        assert!(
+            evidence.lines().count() <= REVISE_EVIDENCE_MAX_LINES,
+            "the block claims to be bounded: {} lines",
+            evidence.lines().count()
+        );
+        assert!(
+            evidence.ends_with("AssertionError: boom"),
+            "the cap must keep the tail — the innermost failure is the last thing printed: \
+             {evidence}"
+        );
+    }
+
+    // ---- Fix 6: relabel before revise -----------------------------------------
+    //
+    // [VANTA-WHY] The decision is a pure function so the rule can be pinned
+    // without an LLM: a BugReproduction whose baseline PASSED is only a
+    // legitimate probe when the issue requires that behaviour to stay.
+
+    #[test]
+    fn a_preservation_style_test_mislabelled_bug_reproduction_is_relabelled_not_revised() {
+        assert_eq!(
+            mislabeled_reproduction_decision(
+                &TestIntent::BugReproduction,
+                TestResult::Passed,
+                Some(false),
+            ),
+            MislabeledReproductionOutcome::RelabelToPreservation,
+            "baseline passed and the issue explicitly requires preservation: keep the test, fix the label"
+        );
+    }
+
+    #[test]
+    fn a_bug_reproduction_the_issue_wants_changed_is_still_revised() {
+        assert_eq!(
+            mislabeled_reproduction_decision(
+                &TestIntent::BugReproduction,
+                TestResult::Passed,
+                Some(true),
+            ),
+            MislabeledReproductionOutcome::Revise,
+            "the issue requires the behaviour to change, so this probe is not a preservation test"
+        );
+    }
+
+    #[test]
+    fn an_errored_baseline_is_not_relabelled() {
+        assert_eq!(
+            mislabeled_reproduction_decision(
+                &TestIntent::BugReproduction,
+                TestResult::Error,
+                Some(false),
+            ),
+            MislabeledReproductionOutcome::Revise,
+            "an error is not a pass — it is not evidence the behaviour already holds"
+        );
+    }
+
+    #[test]
+    fn the_relabel_never_runs_the_other_way() {
+        // [VANTA-WHY] The loophole direction. A preservation test whose baseline
+        // FAILED must never be laundered into a BugReproduction, which is allowed
+        // to fail on the original.
+        assert_eq!(
+            mislabeled_reproduction_decision(
+                &TestIntent::BehaviorPreservation,
+                TestResult::Failed,
+                Some(false),
+            ),
+            MislabeledReproductionOutcome::Revise,
+            "a failing preservation test must not become a BugReproduction"
+        );
+    }
+
+    #[test]
+    fn no_relabel_on_missing_issue_requires_change() {
+        // [VANTA-WHY] Fail closed. The model omitting the field is exactly the
+        // case that used to promote a test: `#[serde(default)]` filled in
+        // `false`, which is the "preserve" answer. Absent must mean UNKNOWN, and
+        // unknown must take the ordinary revision path — never relabel.
+        assert_eq!(
+            mislabeled_reproduction_decision(
+                &TestIntent::BugReproduction,
+                TestResult::Passed,
+                None,
+            ),
+            MislabeledReproductionOutcome::Revise,
+            "a dropped field is unknown, not an explicit preservation answer"
+        );
+    }
+
+    // ---- M3 item 8: the B2 arm's BATE bypass (VANTA_BATE=off) ----------------
+    //
+    // [VANTA-WHY] The arm is DEFINED as adversarial tests with no baseline
+    // validation and no intent audit, so the bypass has to admit every test
+    // byte-for-byte and produce none of the phase's byproducts. This is checked
+    // here, in-process, with `admit_all = true`; the base_url points at a closed
+    // port so a regression that let the pass-through fall into the real loop
+    // would fail the test (the baseline run would error) instead of passing
+    // silently. That substitutes for a model backend: the pass-through must not
+    // reach the network at all, which is stronger than answering a stub.
+
+    fn generated(name: &str, intent: TestIntent) -> GeneratedTest {
+        GeneratedTest {
+            test_name: name.to_string(),
+            test_source: format!("def {name}():\n    assert True\n"),
+            intent,
+            reason: "unit test fixture".to_string(),
+            issue_quote: None,
+            relabeled: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn admit_all_admits_every_attacker_test_unvalidated() {
+        let mut cfg = LlmConfig::default();
+        // Port 1 is never listening: if the bypass were broken and the phase ran
+        // a baseline, it would be an error here rather than a silent pass.
+        cfg.base_url = "http://127.0.0.1:1/v1".to_string();
+        let mut budget = ReviseBudget::new();
+        // Three tests that the REAL BATE would treat three different ways: a
+        // reproduction that must fail on the baseline, a preservation that must
+        // pass, and a feature-acceptance that must fail. The bypass must admit
+        // all three without judging any of them.
+        let tests = vec![
+            generated("t_repro", TestIntent::BugReproduction),
+            generated("t_pres", TestIntent::BehaviorPreservation),
+            generated("t_feature", TestIntent::FeatureAcceptance),
+        ];
+        let cmd = TestCommand::new("pytest", vec!["-q".to_string()]);
+
+        let run = run_bate(
+            &cfg,
+            "the issue",
+            "original execution source",
+            "original prompt source",
+            &tests,
+            &cmd,
+            false,
+            true, // admit_all — VANTA_BATE=off
+            &mut budget,
+        )
+        .await;
+
+        assert_eq!(
+            run.valid_tests, tests,
+            "every Attacker test must be admitted byte-for-byte, in order, with its \
+             declared intent untouched"
+        );
+        assert_eq!(run.report.valid_tests.len(), tests.len());
+        assert!(
+            run.report.scrapped_tests.is_empty(),
+            "B2 admits regardless of baseline behaviour, so nothing is scrapped"
+        );
+        assert!(
+            run.relabel_events.is_empty(),
+            "B2 performs no intent relabel — the arm has no intent admission"
+        );
+        assert!(
+            run.intent_checks.is_empty(),
+            "B2 runs no intent audit, so it records no intent-check row"
+        );
+        assert!(run.harness_error.is_none());
+        assert_eq!(
+            budget.used(),
+            0,
+            "the pass-through must not spend the attempt's revise budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn admit_all_is_a_pass_through_that_touches_nothing() {
+        // An empty batch is the boundary: the pass-through must still be
+        // well-formed (and, with no tests, identical to the empty loop's output).
+        let cfg = LlmConfig::default();
+        let mut budget = ReviseBudget::new();
+        let cmd = TestCommand::new("pytest", Vec::new());
+        let run = run_bate(
+            &cfg,
+            "issue",
+            "src",
+            "prompt",
+            &[],
+            &cmd,
+            true,
+            true,
+            &mut budget,
+        )
+        .await;
+        assert!(run.valid_tests.is_empty());
+        assert!(run.report.scrapped_tests.is_empty());
+        assert!(run.report.valid_tests.is_empty());
+        assert!(run.relabel_events.is_empty());
+        assert!(run.intent_checks.is_empty());
+        assert!(run.harness_error.is_none());
     }
 }

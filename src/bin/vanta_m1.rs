@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use vanta::agents::attacker::{AttackerRequest, AttackerResponse};
 use vanta::agents::creator::{CreatorRequest, CreatorResponse, SourceFile};
 use vanta::config::LlmConfig;
-use vanta::session::{fresh_patch_attempt_id, fresh_session_id, SessionLog, SessionRecord};
+use vanta::session::{fresh_patch_attempt_id, fresh_session_id, SCHEMA_VERSION, SessionLog, SessionRecord};
 use vanta::logging::init_logging;
 
 // Path to the sample bug repo (relative to project root when run via cargo).
@@ -78,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     session_log.push(SessionRecord {
         session_id: session_id.clone(),
+        schema_version: Some(SCHEMA_VERSION),
         patch_attempt_id: Some(patch_attempt_id.clone()),
         testing_iteration_id: None,
         test_id: None,
@@ -97,6 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         issue_text: issue_text.clone(),
         // M1 is a single-shot demo: no previous rounds, no shared set.
         existing_tests: Vec::new(),
+        // M1 runs one round, so no probe can have been quarantined yet (§item 17).
+        quarantined_tests: Vec::new(),
     };
     let attacker_response: AttackerResponse =
         vanta::agents::attacker::attacker_generate_tests(&cfg, &attacker_request).await?;
@@ -106,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("    [{:>2}] {} (intent={:?}) — {}", i + 1, t.test_name, t.intent, t.reason);
         session_log.push(SessionRecord {
             session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
             patch_attempt_id: Some(patch_attempt_id.clone()),
             testing_iteration_id: None,
             test_id: None,

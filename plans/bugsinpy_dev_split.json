@@ -1,0 +1,478 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-10-21T04:57:36Z",
+  "bugsinpy_commit": "11c5f1eea954a42132cfd06bf257766a7963e0fd",
+  "bugsinpy_root": "runs/bugsinpy/bugsinpy",
+  "configs": [
+    "baseline",
+    "vanta"
+  ],
+  "seeds": [
+    0
+  ],
+  "review_mode": true,
+  "sampling": {
+    "policy": "pinned_per_call_plus_server_top_p",
+    "note": "temperature/max_tokens come from the pipeline's per-call pins (design §4.3); top_p is the one value read from the server's /props. The harness adds no run-level value."
+  },
+  "module_distributions": {
+    "PIL": "Pillow",
+    "dateutil": "python-dateutil",
+    "yaml": "PyYAML",
+    "sklearn": "scikit-learn",
+    "bs4": "beautifulsoup4",
+    "cv2": "opencv-python",
+    "attr": "attrs",
+    "jwt": "PyJWT",
+    "dns": "dnspython",
+    "Crypto": "pycryptodome",
+    "google.protobuf": "protobuf",
+    "OpenSSL": "pyOpenSSL",
+    "magic": "python-magic",
+    "serial": "pyserial",
+    "usb": "pyusb",
+    "zmq": "pyzmq",
+    "MySQLdb": "mysqlclient",
+    "mysql.connector": "mysql-connector-python",
+    "pylab": "matplotlib",
+    "mpl_toolkits": "matplotlib",
+    "pkg_resources": "setuptools",
+    "psycopg2": "psycopg2-binary",
+    "pydispatch": "PyDispatcher"
+  },
+  "reviewed_changes": [
+    {
+      "change": "This is the development split of §14.7: five py3.8 bugs, one per project, from projects that appear in no evaluation wave, plus PySnooper/3 labelled 'seen during development'. It is a separate file so the evaluation split's bugs, waves and sampling are not rewritten by the choice of development data.",
+      "reason": "Items 1-3 of §14 are developed on bugs no evaluation number will be computed from, so no number is produced by a pipeline tuned on the bug it measures. Flat directory order was rejected: it makes the first ten candidates ten fastapi bugs, so every item would be developed against one codebase's idioms. Round-robin gives one bug per project.",
+      "decided_by": "user review, 2026-10-21",
+      "rule": "Round-robin across projects in clone order (fastapi, luigi, matplotlib, pandas, sanic, scrapy, spacy): take the first bug in each project that passes both gates, until 5. If a project has no bug that passes, skip it and continue. One pass over the projects gives their next py3.8 bug in ascending id and the pass repeats until 10 candidates are listed; the first 5 are pilots, the rest the substitution pool. The two gates are the existing ones -- the §1.6 context gate and the §8.2 dev-fix self-check -- neither is loosened and no cap is raised. Recorded before any gate was run and before any Vanta result was looked at."
+    },
+    {
+      "change": "Excluded from the candidate pool: ansible, keras and tornado. No bug of theirs in the pinned clone declares ``python_version`` 3.8 (0 of 18, 0 of 45, 0 of 16), so the §1.6 context gate can never pass for them and §14.7's round-robin has nothing to take from these projects.",
+      "reason": "Recorded so the skip reads as a decision rather than an omission: a reader comparing the clone's projects with the seven in the round-robin would otherwise have to re-derive it from the corpus. They are not evaluation-wave projects either, and the same fact is noted in the plan doc (§14.7).",
+      "decided_by": "user review, 2026-10-21"
+    },
+    {
+      "change": "`module_distributions` maps `psycopg2` -> `psycopg2-binary`. The closure reaches `import psycopg2` from pandas/1's test side, and that module is provided by two distributions, so the harness refused to choose.",
+      "reason": "The bug's tests only need the module to import: the SQL tests skip without a database server, so no live connection is exercised and the binary wheel is enough. The source `psycopg2` builds against libpq and needs pg_config, which the sandbox does not have, so choosing it would turn a dependency into a build failure the test never asked for.",
+      "decided_by": "user review, 2026-10-22",
+      "rule": "The choice is the distribution's, not the harness's, and is pinned by the same date rule as every other dependency (the newest release on or before the declaration's commit date; the closure's own stamp is the fixed commit's). If the pinned psycopg2-binary has no wheel for the sandbox's platform and the bake fails, that is a normal build failure for pandas/1, recorded as such -- not special-cased, and not worked around by installing the source distribution."
+    },
+    {
+      "change": "`module_distributions` maps `mysql.connector` -> `mysql-connector-python`. The closure reaches `import mysql.connector` from luigi/1's `test/_mysqldb_test.py` line 20, and the fallback -- the top-level word `mysql` -- is a distribution of its own on PyPI: `mysql` 0.0.2, a 2018 'virtual package' whose sdist declares `mysqlclient`, which cannot be built here (no MySQL client headers or `mysqlclient.pc`, so its `find_package_name` raises and the whole layer's install dies). Measured on the luigi/1 bake.",
+      "reason": "The module is `mysql.connector`, which is mysql-connector-python's, not the virtual `mysql` package's, and the reviewed table is keyed by the import spelling precisely so the dotted name is matched before its top-level one (`google.protobuf` is the same case). mysql-connector-python also resolves to an installable release under the same date rule: the newest release on or before 2019-05-15 that PyPI still carries is 8.0.5 (2017-11-20), which has a `py2.py3-none-any` wheel -- pure Python, so no build and no system library. Nothing else in either tree imports the plain `mysql` name.",
+      "decided_by": "user review, 2026-10-24",
+      "rule": "Pinned by the same date rule as every other dependency -- the newest release on or before the fixed commit's date -- and installed from the wheel it publishes for any platform. The mapping is a decision recorded in the protocol, not a guess in the harness: a module whose top-level word happens to name an unrelated PyPI project is exactly what the table is for."
+    },
+    {
+      "change": "fastapi bugs carry `sandbox_env: {\"PYTHONPATH\": \"./docs_src\"}`. It is the project's own suite environment, not a harness invention: fastapi's `scripts/test.sh` at both commits begins `export PYTHONPATH=./docs_src` before `pytest --cov=... tests`. Without it, 250-odd tests under `tests/test_tutorial/**` die at collection with `ModuleNotFoundError: No module named 'additional_responses'`, because they import a module the tree ships in `docs_src/` rather than a distribution.",
+      "reason": "The rule is the project's, so it belongs in the split and not in pipeline code that would have to name a bug id. Recording it per bug is how this file, which is a list of bugs, can carry a per-project fact; the value is read from the project's own test script at the bug's commit.",
+      "decided_by": "user review, 2026-10-28",
+      "rule": "A project that puts a directory of importable modules on `PYTHONPATH` in its own checked-in test script declares `sandbox_env` on each of its bugs in this split, with the path exactly as the script writes it. The harness applies it to every run of that bug -- baseline gates, native suite, generated tests, oracle -- through `--sandbox-env`, which accepts `PYTHONPATH` and refuses every other key. The tree the Creator and the Attacker read is not touched: no `conftest.py` and no other harness-made file is written into the repo, so what they see is exactly what the benchmark ships."
+    },
+    {
+      "change": "A fixed-commit test file that fails to collect on the buggy source but collects cleanly on the fixed source is treated as hidden oracle: removed from the visible suite, added to FAIL_TO_PASS, and recorded on the bug's prepare record as `hidden_by_collect_flip` with the error type. Measured on fastapi/1: the fix rewrites `tests/test_skip_defaults.py`, whose fixed version declares an endpoint with `response_model_exclude_defaults=True` at module level, so on the buggy source the module raises `TypeError: get() got an unexpected keyword argument 'response_model_exclude_defaults'` and pytest exits 2 with the whole `tests` directory uncollected.",
+      "reason": "Design section 4 (oracle and blinding) says the system sees the fixed commit's tests minus the tests that flip from failing to passing, and those hidden tests are the oracle. A module-level import error on the buggy tree that disappears after the fix is exactly such a flip; BugsInPy's recorded list simply does not name it. Left alone it is not conservative -- it is a collection error that costs the bug its whole suite.",
+      "decided_by": "user review, 2026-10-28",
+      "rule": "During `prepare`, each fixed-commit test file is collected on the buggy source and on the fixed tree inside the sandbox. A file that errors on the buggy source **and** collects cleanly on the fixed tree qualifies; a file that errors on both is a real environment problem and is not hidden. Qualifying nodeids come from the fixed tree and join FAIL_TO_PASS, so both gates keep their meaning: they fail on the buggy source and pass on the fixed one. The count of dev bugs this rule touches is read from the per-bug `hidden_by_collect_flip` records, so it is visible in the paper as a harness rule rather than a silent change."
+    },
+    {
+      "change": "`module_distributions` maps `pydispatch` -> `PyDispatcher`. The closure reaches `import pydispatch` from scrapy/1's test side (`tests/test_engine.py` line 25) and from scrapy's own source (`scrapy/signalmanager.py` line 1; `scrapy/utils/signal.py` lines 8 and 10), and the fallback -- the module name canonicalised to itself -- is a *different* PyPI project: `pydispatch` 1.0.3/1.1.0, an abandoned upload of a different codebase whose 1.1.0 metadata declares the single requirement `r`. The closure walked off to that requirement, `https://pypi.org/pypi/r/json` answered HTTP 404, and scrapy/1 came back from the five-reserve preflight flagged `BakeError: cannot read release dates for 'r'`.",
+      "reason": "The module is PyDispatcher's, and PyDispatcher's own metadata says so: the 2.0.5 sdist's `PyDispatcher.egg-info/top_level.txt` names the top-level module `pydispatch`, and every file it ships is `pydispatch/*.py`. scrapy pins the distribution in the same breath as it imports the module -- `setup.py` line 71 `PyDispatcher>=2.0.5` and BugsInPy's `requirements.txt` line 30 `PyDispatcher==2.0.5`, against `from pydispatch import dispatcher` -- so the mapping adds no package: `pydispatcher` is already a pin of the layer, and the entry only makes the import-to-distribution lookup agree with the pin that was already there. Both canonicalisations are real PyPI projects and only one of them provides the module the tests import; canonicalising the module name cannot tell them apart, which is what the table is for.",
+      "decided_by": "user review, 2026-10-28",
+      "rule": "Keyed by the import spelling, like `mysql.connector` and `google.protobuf`, and applied by the closure rather than to a named bug. The mapped name is one the layer already pins, so the closure never walks the abandoned `pydispatch` project's metadata and installs nothing new: a layer whose requirements already declare `PyDispatcher` is unchanged, and the only difference is that the closure no longer resolves the import to `pydispatch==1.1.0` in its place."
+    },
+    {
+      "change": "spacy/4 is excluded: it cannot be baked on this image. Its layer installs `blis==0.4.1` (spacy's `thinc` pin), whose `setup.py` compiles the vendored BLIS C from the per-platform build spec the sdist carries, and 0.4.1 carries the x86-64 one -- `gcc -c .../blis/_src/kernels/zen/1/bli_amaxv_zen_int.c ... -O3 -mavx2 -mfma -mfpmath=sse -march=core-avx2 -fPIC -std=c99 ... -Iinclude/linux-x86_64 -I.../blis/_src/include/linux-x86_64`. This image is aarch64, so gcc answers `unrecognized command-line option '-mavx2'` (the same for `-mfma` and `-mfpmath=sse`), `setup.py` line 201's `build_object` raises `CalledProcessError`, and pip ends with `ERROR: Failed building wheel for blis`.",
+      "reason": "Item 4's rule is that a bug which cannot pass both gates after a reasonable attempt is excluded with its reason recorded, and both gates are unreachable here: a layer whose build fails is deleted and `prepare` refuses it, so the bug has no tree to derive an oracle from. The fix is not a system package, which is why none was added: blis `0.4.1` needs no library at all, it needs an architecture the sdist has no build spec for, and `SDIST_SYSTEM_PACKAGES` cannot express that. Recorded in that table's companion instead, `bake.UNBUILDABLE_ON_PLATFORM['blis']` bounded to `==0.4.1`, so `--preflight-only` reports the pin by name rather than letting a bake spend a cycle rediscovering it. Measured on `runs/bugsinpy/bake-logs/vanta-bi-spacy-4.log` (the `bake_reserves.sh` run); the seven spacy/4 `SDIST_SYSTEM_PACKAGES` reviews of item 4 stand as written, because each is a statement about which Debian packages the build needs and `()` is still the right answer to that.",
+      "decided_by": "user review, 2026-10-28",
+      "rule": "The pre-registered exclusion rule of item 4, applied mechanically: a bug is excluded only when it still fails after a reasonable attempt, and the fail is recorded here with the evidence. The bug stays in `bugs` as a reserve rather than being silently dropped, so a reader can see it was considered and why it is not in the runnable set; `plans/private/prepare_dev_split.sh` leaves it out of the prepare batch for the same reason. Nothing else changes -- the five pilots are unaffected, and the substitution pool is the three reserves that still bake."
+    },
+    {
+      "change": "scrapy/1 is excluded: it cannot be baked on this image either. Its layer's install of the tree's own requirements reaches `cryptography<1.2,>=1.1.1`, pip resolves `cryptography-1.1.2`, and that sdist's C bindings are compiled against OpenSSL's headers -- `build/temp.linux-aarch64-3.8/_openssl.c` fails with dozens of `conflicting types for 'PEM_write_bio_PrivateKey'` / `'X509_dup'` / `'BIO_new'` errors against `/usr/include/openssl/ssl.h` and with `macro \"SSL_library_init\" passed 1 arguments, but takes just 0`. The 13 sdists that the item-4 preflight reported as unreviewed (`twisted`, `leveldb`, `accesscontrol`, `acquisition`, `btrees`, `extensionclass`, `persistence`, `persistent`, `zodbpickle`, `zope-container`, `zope-i18nmessageid`, `zope-proxy`, `zope-security`) all built successfully in the same bake; `cryptography` is the only failure.",
+      "reason": "No `SDIST_SYSTEM_PACKAGES` entry can close it: every `cryptography` release below 35 builds against OpenSSL 1.1 headers, this image is trixie (OpenSSL 3.x) and carries no 1.1 headers, and a header package that does not exist cannot be named. The table already says exactly this -- `bake.UNBUILDABLE_ON_PLATFORM['cryptography']`, bound `<35` -- which is why nothing was added. The pin is not one the closure walked, so the preflight could not classify it (the pinned `cryptography` versions of other layers are reported as unbuildable by name; scrapy/1's arrives through a declared range at install time), and the bake is the measurement that found it: `runs/bugsinpy/bake-logs/vanta-bi-scrapy-1.log`.",
+      "decided_by": "user review, 2026-10-28",
+      "rule": "Same rule and same treatment as spacy/4 above, after the timebox Nathan set on this bug (the 13 unreviewed sdists plus `cryptography`, judged together against the cited-build-file requirement): the sdists need no entry because the bake shows they build, and `cryptography` needs none because no entry would help. The bug stays in `bugs` as a reserve and is left out of the prepare batch, so the exclusion is visible in the split rather than inferred from a missing row."
+    },
+    {
+      "change": "pandas/1 carries `build_env: {\"CFLAGS\": \"-Wno-error=array-bounds\"}`. Its `setup.py` appends `-Werror` to every compile on a non-Windows platform (line 437; removed only when numpy < 1.16, and the layer's numpy is 1.18.4), and the layer's GCC 14 promotes `src/parser/tokenizer.c:1764`'s negative-index idiom to `error: array subscript 309 is above array bounds of 'double[309]'`, so `python setup.py build_ext --inplace` exits 1 and the oracle tree dies in the build -- reported by the gate as a compiler diagnostic that has nothing to do with the bug.",
+      "reason": "The demotion is the project's own idiom, not the harness's: the same `setup.py` (line 459) appends `-Wno-error=deprecated-declarations` for Python 3.8, and the layer's own era rule demotes its six GCC-14 promotions the same way (`bake._ERA_WARNING_FLAGS`, `-Wno-error=` rather than `-Wno=`) so the diagnostics stay visible while they stop being fatal. The alternative the item offered -- `-Wno-error` through the `/opt/vanta-cc` wrapper -- was not taken because the wrapper is the layer's, not the bug's, and would demote every warning of every project.",
+      "decided_by": "user review, 2026-10-29",
+      "rule": "A project that compiles with `-Werror` against sources written for an older toolchain declares `build_env` with the demotion its own `setup.py` would have written. Only `CFLAGS` may be named, and its value is added to whatever the layer already sets for that variable, so the era's warning demotions and the stdint include survive; the rule is read by `prepare`'s in-place build of all three trees and by nothing else, so it cannot change what the graded tests observe. GCC documents that a more specific `-Wno-error=<name>` has priority over a bare `-Werror` independently of their position on the command line, which is what makes the token effective from `CFLAGS` while the build passes `-Werror` of its own accord. The bake's dropped pins (pyarrow, numba, llvmlite) are not changed by this entry: the graded nodeid imports none of them and nothing that reaches them (checked, not assumed), so the drop stays inert for this bug."
+    },
+    {
+      "change": "matplotlib/1 carries `build_env: {\"MPLSETUPCFG\": \"/workspace/vanta-build.cfg\"}` and `build_files: {\"vanta-build.cfg\": \"[libs]\\nsystem_freetype = True\\n\"}`. Its `setupext.py` reads the path of its build config from `MPLSETUPCFG` (line 134), defaulting to `setup.cfg`, which the tree does not ship -- the repo has only `setup.cfg.template`, so `config.getboolean('libs', 'system_freetype', fallback=False)` (line 140) is always False. With it False, `FreeType.do_custom_build` (line 541) finds no `build/freetype-2.6.1`, tries two GNU URLs and raises `IOError: Failed to download FreeType` -- the layer's VM has no network, so `python setup.py build_ext --inplace` exits 1 and all three trees die in the build with a gate failure about the network that is not about the bug. With `system_freetype = True` the same method returns at its first line and `FreeType.add_flags` (line 518) uses the layer's own FreeType through `pkg-config freetype2`.",
+      "reason": "The layer already carries what the build wants: `bake.SDIST_SYSTEM_PACKAGES['matplotlib']` installs `libfreetype-dev`, `libpng-dev`, `zlib1g-dev` and `pkg-config`, trixie's `libfreetype-dev` is 2.13.3, and `add_flags` asks for `atleast_version='9.11.3'` (FreeType 2.3's libtool version), which 2.13.3 satisfies -- so naming the system FreeType is the build's own supported route, not a workaround. `system_qhull` is left alone (fallback False): the tree vendors its qhull sources under `extern/libqhull/*.c`, and turning it on would ask the layer for a package nobody installed. The file is written into the batch directory, which Shuru mounts at `/workspace`, so it lands beside the trees and never inside one: the tree the Attacker and the Creator read stays exactly what the benchmark ships, which is why the file route was taken over a `setup.cfg` written into the repo.",
+      "decided_by": "user review, 2026-10-29",
+      "rule": "A build that selects its configuration through a file rather than a flag declares `build_files` with the file's contents and `build_env` with the variable that names it. The file is written into the batch directory -- the guest's `/workspace`, the mount point `suite.guest_tree_root` already fixes -- and nowhere else, so it cannot reach a tree; the name must be a bare file name, and the value must be an absolute path inside `/workspace` because the build runs with the tree as its working directory. `MPLSETUPCFG` is the second variable the build allow-list admits; the layer never sets it (`bake.COMPILER_ENV` names `CC`, `CXX`, `LDSHARED`, `LDCXXSHARED`, `CFLAGS`, `FFLAGS`), so its value is set outright rather than appended to the layer's. Like `build_env`, the rule is read by `prepare`'s in-place build of all three trees and by nothing else, so it cannot change what the graded tests observe; the graded FAIL_TO_PASS is the non-image `test_noop_tight_bbox`, and the one warning the suite's `filterwarnings = error` could have turned fatal goes through `matplotlib._log.warning`, not the warnings module."
+    },
+    {
+      "change": "matplotlib/1 carries `sandbox_env: {\"MPLBACKEND\": \"Agg\"}`. Its suite cannot be collected without it: `pyplot` resolves whichever backend is current when it is first imported, the rcParams default is `TkAgg`, and that import walks `pyplot.py` line 260 -> `backends/backend_tkagg.py` line 1 -> `backends/_backend_tk.py` line 21 `from . import _tkagg`, where `_tkinter.__file__` -- absent from the layer's uv-built CPython 3.8 -- raises `AttributeError: module '_tkinter' has no attribute '__file__'`, so pytest reports `INTERNALERROR` and exits 3 having collected nothing. matplotlib reads `MPLBACKEND` itself at import (`lib/matplotlib/__init__.py`: `if os.environ.get('MPLBACKEND'): rcParams['backend'] = os.environ.get('MPLBACKEND')`, and the `backend` validator is case-insensitive, so `Agg` is accepted and canonicalised), so the variable sets the backend before `pyplot` is ever imported. Measured on this batch's `matplotlib_1/prepare.json`: `sandbox_env: {}`, `runnable: false`, and gate A's single failure quoted in full above.",
+      "reason": "The project's own suite already runs under `agg` -- `matplotlib.testing.conftest.pytest_configure` calls `matplotlib.use('agg', force=True)` -- so the harness is not choosing a backend the project does not; it is making the environment say so early enough to matter, because `use()` reaches `switch_backend` through `from matplotlib import pyplot` (line 1144) and pyplot has resolved TkAgg before that line can run. It takes no backend away from a test that asks for one: this suite's interactive-backend tests name their own backend in the child environment they spawn (`test_backends_interactive.py` line 154, `test_backend_webagg.py` line 16) and `test_rcparams.py` blanks it deliberately, so each of those overrides the parent's value. The tree is untouched, exactly like fastapi's `PYTHONPATH`: a variable in the run's environment, not a file in the repo.",
+      "decided_by": "user review, 2026-10-29",
+      "rule": "`MPLBACKEND` is the second key the sandbox-env allow-list admits, and it was admitted the way that allow-list requires -- as a change to `SANDBOX_ENV_KEYS` and to `ALLOWED_SANDBOX_ENV_KEYS` on the Rust side of the boundary, which refuses any key the split has not recorded, plus this record -- rather than as a quiet value in a bug entry. A project that names the backend its suite runs under declares `sandbox_env` with it, per bug like every other project-level rule in this file. The harness applies it to every run of that bug -- the deps gate, the dev-fix gate, the native suite, the generated tests and the oracle -- through `--sandbox-env`, so all of them see the same backend; the value is the non-interactive `Agg` because the measured failure is at collection and no test of this suite needs a window in the parent process. matplotlib/2, the project's reserve, carries no entry: it is excluded at `issue_source=none`, before any suite run."
+    },
+    {
+      "change": "pandas/1 carries `vm_memory_mb: 8192`. Its whole-suite graded run was killed by the VM's memory: the probe run measured `exit 137 after 245 s at about 61 %` with the `--json-report` document never written, and the default a run VM boots at is 2048 MB. The full pandas suite plus the in-memory JSON report does not fit in 2048 MB, so the bug's graded run is not merely slow -- it is killed mid-write and leaves no report, which `prepare` now refuses as an unmeasured run rather than reading the missing report as an empty oracle.",
+      "reason": "The number is recorded rather than assumed for the same reason every other project-level fact in this file is: a larger VM lowers how many VMs fit in parallel, so the M4 queue has to be able to read the size off the row instead of rediscovering it at run time. 8192 MB is the size a *bake* VM already boots at (`shuru.DEFAULT_MEMORY_MB`), so it is a size this image is known to hold, not a new one; the probe's 245 s to reach 61 % and die is consistent with a report that is a large fraction of the suite's own footprint, and the next step up (16384 MB) would halve the batch's parallelism again for a case that has no evidence of needing it. The number is confirmed in the re-prepare: the item is not closed until pandas/1's graded runs write their report pairs at this size.",
+      "decided_by": "user review, 2026-10-29",
+      "rule": "A bug whose graded suite run is killed for memory declares `vm_memory_mb`, in MB, larger than the 2048 MB a run VM boots at; `split._validate_bug` refuses a value that does not exceed it, so a recorded size always declares something that was not already true. The one value reaches every VM the bug boots -- the deps gate, the collect-flip readers, the in-place build, the three derivation runs, the stripped baseline, the oracle's grading runs and the `vanta_m3` run's own sandbox -- through `shuru.run(--memory)` and the Rust backend's `VANTA_SHURU_MEMORY_MB`. A bug that records no size sends no `--memory` at all, so its argv is byte-for-byte what it was before this key existed. The size is a property of the *VM*, not of the graded environment, which is why it is its own key beside `sandbox_env` rather than a value in it."
+    },
+    {
+      "change": "matplotlib/1 carries `precompile: [\"lib/matplotlib/widgets.py\"]`. Its pytest configuration escalates warnings to errors (`filterwarnings = error`), and the layer's CPython 3.8.1 emits `invalid escape sequence \\s` as a `DeprecationWarning` while *compiling* `lib/matplotlib/widgets.py` -- the warning is at line 1924, inside the docstring opened at line 1911. pytest installs its filters before collection, so the first import of that module during collection turns a compile-time warning into `SyntaxError: invalid escape sequence \\s`; gate A reported it six times (the same module reached from six collected modules) on `matplotlib_1/prepare.json` and collected nothing.",
+      "reason": "The two narrow routes the item offered were a targeted `-W ignore:invalid escape sequence:DeprecationWarning` and an early compile; the compile was taken because it removes the *cause* rather than the report of it, and because `-W` cannot ride in the recorded `test_cmd` at all (`runner.vanta_test_cmd` splits Vanta's `--test-cmd` on whitespace with no quoting, so a `-W` value containing a space is refused). The item also forbids the broad fix: a global `-W ignore::DeprecationWarning` would silence every deprecation the suite deliberately escalates, which is exactly the project's own decision this rule has to leave intact. A whole-tree scan of the fixed commit (`5324adae`) found **one** invalid-escape warning, so the rule names one file and is not a general `compileall` of the tree.",
+      "decided_by": "user review, 2026-10-29",
+      "rule": "A project whose test configuration escalates warnings to errors, over sources that emit a compile-time warning under the layer's interpreter, declares `precompile` with the tree-relative `.py` files an early compile has to leave bytecode for. `suite.precompile_lines` runs `python -m compileall -q -f <files>` inside every VM run of the bug, with the interpreter that is about to run pytest (`test_cmd[0]`), *after* that run's patch is applied and *before* its pytest. `-f` is required: without it `compileall` skips a file whose `.pyc` header matches the source's mtime at second resolution, so a patch applied in the same second as a previous compile would leave a stale `.pyc` and bring the warning straight back. It is a *step* and not a value written into a tree once for the same reason -- the import machinery validates the `.pyc` against the source's mtime and size, so a Creator patch that edits the file invalidates it, and the step has to run again inside the run that measures the patched tree. An empty list adds no line at all, so a bug without the rule gets a byte-for-byte unchanged run script. The compiled file is the project's own, byte-compiled in place in that run's own tree copy, so it edits no source and cannot change what the graded tests read; `filterwarnings = error` itself is untouched. This entry also corrects the closing claim of the matplotlib `build_files` entry above -- the invalid-escape warning does reach the warnings module, at compile time, and *is* fatal under `filterwarnings = error`."
+    },
+    {
+      "change": "matplotlib/1 carries `sandbox_env: {\"MPLBACKEND\": \"Agg\", \"PYTHONPATH\": \"lib\"}` -- the `PYTHONPATH` key is new. Its package is not at the tree root: `setup.py` line 265 says `package_dir={\"\": \"lib\"}` and the package lives at `lib/matplotlib/`, so a bare `python -c \"import matplotlib\"` from the tree root cannot see it. The `deps` import probe runs exactly that (\"the project's own package imports from the tree under test\") and reported `ModuleNotFoundError: No module named 'matplotlib'` on `matplotlib_1/prepare.json`, refusing the bug after the collect gate had passed.",
+      "reason": "The suites pass anyway, which is why the gate is the only place this shows: `python -m pytest lib/matplotlib/tests` finds the first directory without an `__init__.py` as the import base, and `lib/matplotlib/tests/__init__.py` and `lib/matplotlib/__init__.py` exist while `lib/__init__.py` does not, so pytest inserts `lib/` into `sys.path` for the collected modules. The probe deliberately does not use pytest's insertion -- it must not prove an import path the suites do not have -- so the project's import root has to be *recorded* instead, which is exactly what `sandbox_env` exists for (the fastapi entry above records `PYTHONPATH=./docs_src` the same way). The value is the one the project's own `setup.py` states, not a harness choice, and it is what an editable install (`pip install -e .`) would put on the path -- except that the harness never installs, because a frozen copy in site-packages would make every patch grade the same.",
+      "decided_by": "agent decide-and-flag, 2026-10-30",
+      "rule": "A project whose importable package does not sit at the tree root, and whose own `setup.py` names the root it does sit under (`package_dir`), declares `sandbox_env.PYTHONPATH` with that directory, tree-relative like fastapi's `./docs_src`. `sandbox_env` is applied to every VM run of the bug -- the deps gate, the collect-flip readers, the native suite, the generated tests, the oracle and the `vanta_m3` run's own sandbox -- through `--sandbox-env`, which admits `PYTHONPATH` and refuses every other key, so all of them resolve the package through the tree rather than through site-packages. The tree itself is not touched: no `conftest.py`, no `.pth`, no installed copy, so what the Attacker and the Creator read is exactly what the benchmark ships. For matplotlib the added entry cannot change what any test observes: `lib/` is the directory pytest already prepends for this suite, so the recorded value states the environment the suite already ran under."
+    }
+  ],
+  "bugs": [
+    {
+      "project": "fastapi",
+      "bug_id": 1,
+      "python_version": "3.8.3",
+      "buggy_commit": "766157bfb4e7dfccba09ab398e8ec444d14e947c",
+      "fixed_commit": "3397d4d69a9c2d64c1219fcbf291ea5697a4abb8",
+      "test_file": "tests/test_jsonable_encoder.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-fastapi-1",
+      "wave": 1,
+      "role": "pilot",
+      "sandbox_env": {
+        "PYTHONPATH": "./docs_src"
+      },
+      "notes": "Round-robin pass 1, fastapi. First py3.8 bug in the project."
+    },
+    {
+      "project": "luigi",
+      "bug_id": 1,
+      "python_version": "3.8.3",
+      "buggy_commit": "1164eb6b85b8a70f596dbb99452bec513e72c12e",
+      "fixed_commit": "aec5dc2ed8db53fc282a0bd24aabe59031b6d1ba",
+      "test_file": "test/server_test.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "test"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "test",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-luigi-1",
+      "wave": 1,
+      "role": "pilot",
+      "notes": "Round-robin pass 1, luigi. First py3.8 bug in the project."
+    },
+    {
+      "project": "matplotlib",
+      "bug_id": 1,
+      "python_version": "3.8.1",
+      "buggy_commit": "c404d1f716e8aaefd4d7371ff49673e9c1f7f07c",
+      "fixed_commit": "5324adaec6a7fd3d78dea7b28451d5f6e95392a6",
+      "test_file": "lib/matplotlib/tests/test_bbox_tight.py",
+      "pythonpath": null,
+      "needs_build": true,
+      "native_test_paths": [
+        "lib/matplotlib/tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "lib/matplotlib/tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-matplotlib-1",
+      "wave": 1,
+      "role": "pilot",
+      "build_env": {
+        "MPLSETUPCFG": "/workspace/vanta-build.cfg"
+      },
+      "build_files": {
+        "vanta-build.cfg": "[libs]\nsystem_freetype = True\n"
+      },
+      "sandbox_env": {
+        "MPLBACKEND": "Agg",
+        "PYTHONPATH": "lib"
+      },
+      "precompile": [
+        "lib/matplotlib/widgets.py"
+      ],
+      "notes": "Round-robin pass 1, matplotlib. First py3.8 bug in the project."
+    },
+    {
+      "project": "pandas",
+      "bug_id": 1,
+      "python_version": "3.8.3",
+      "buggy_commit": "3fd150c",
+      "fixed_commit": "e41ee47a90bb1d8a1fa28fcefcd45ed8ef5cb946",
+      "test_file": "pandas/tests/dtypes/test_dtypes.py",
+      "pythonpath": null,
+      "needs_build": true,
+      "native_test_paths": [
+        "pandas/tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "pandas/tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-pandas-1",
+      "wave": 1,
+      "role": "pilot",
+      "build_env": {
+        "CFLAGS": "-Wno-error=array-bounds"
+      },
+      "vm_memory_mb": 8192,
+      "notes": "Round-robin pass 1, pandas. First py3.8 bug in the project."
+    },
+    {
+      "project": "sanic",
+      "bug_id": 1,
+      "python_version": "3.8.3",
+      "buggy_commit": "e7001b00747b659f7042b0534802b936ee8a53e0",
+      "fixed_commit": "44973125c15304b4262c51c78b5a86bd1daafa86",
+      "test_file": "tests/test_blueprints.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-sanic-1",
+      "wave": 1,
+      "role": "pilot",
+      "notes": "Round-robin pass 1, sanic. First py3.8 bug in the project. Pilot #5, the last of the one-per-project pass."
+    },
+    {
+      "project": "scrapy",
+      "bug_id": 1,
+      "python_version": "3.8.3",
+      "buggy_commit": "c57512fa669e6f6b1b766a7639206a380f0d10ce",
+      "fixed_commit": "9d9dea0d69709ef0f7aef67ddba1bd7bda25d273",
+      "test_file": "tests/test_spidermiddleware_offsite.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-scrapy-1",
+      "wave": 1,
+      "role": "reserve",
+      "notes": "Round-robin pass 1, scrapy. Reserve #1: the substitution pool starts with another project's first bug, so promoting it keeps the dev set at five distinct projects. EXCLUDED 2026-10-28 -- its layer cannot be baked on this image (`cryptography<1.2,>=1.1.1` builds against OpenSSL 1.1 headers, trixie has 3.x); reason and evidence in `reviewed_changes`, and it is not in the runnable set."
+    },
+    {
+      "project": "spacy",
+      "bug_id": 4,
+      "python_version": "3.8.3",
+      "buggy_commit": "abd5c06374eab5db0cf897b73543b1f3eb007e12",
+      "fixed_commit": "9fa9d7f2cb52ce6a70c264d4e57c7f190d7686bf",
+      "test_file": "spacy/tests/regression/test_issue4665.py",
+      "pythonpath": null,
+      "needs_build": true,
+      "native_test_paths": [
+        "spacy/tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "spacy/tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-spacy-4",
+      "wave": 1,
+      "role": "reserve",
+      "notes": "Round-robin pass 1, spacy. Reserve #2. spacy has exactly one py3.8 bug in the corpus, so this project cannot supply a second candidate. EXCLUDED 2026-10-28 -- its layer cannot be baked on this image (`blis==0.4.1` compiles with the x86-64 build spec the sdist carries; aarch64 gcc rejects `-mavx2`); reason and evidence in `reviewed_changes`, and it is not in the runnable set."
+    },
+    {
+      "project": "fastapi",
+      "bug_id": 2,
+      "python_version": "3.8.3",
+      "buggy_commit": "210af1fd3dc0f612a08fa02a0cb3f5adb81e5bfb",
+      "fixed_commit": "02441ff0313d5b471b662293244c53e712f1243f",
+      "test_file": "tests/test_ws_router.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-fastapi-2",
+      "wave": 1,
+      "role": "reserve",
+      "sandbox_env": {
+        "PYTHONPATH": "./docs_src"
+      },
+      "notes": "Round-robin pass 2, fastapi. Reserve #3, the first second-bug depth: used if fastapi/1 fails a gate."
+    },
+    {
+      "project": "luigi",
+      "bug_id": 2,
+      "python_version": "3.8.3",
+      "buggy_commit": "baa54c9f4f809692d62d4c3e4497161717c76550",
+      "fixed_commit": "24e85945ae39e5975491527e00c3f0f64b42ea6e",
+      "test_file": "test/contrib/beam_dataflow_test.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "test"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "test",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-luigi-2",
+      "wave": 1,
+      "role": "reserve",
+      "notes": "Round-robin pass 2, luigi. Reserve #4. The test root is the project's ``test``, not the file's own ``test/contrib``."
+    },
+    {
+      "project": "matplotlib",
+      "bug_id": 2,
+      "python_version": "3.8.1",
+      "buggy_commit": "2a3707d9c3472b1a010492322b6946388d4989ae",
+      "fixed_commit": "d86cc2bab8183fd3288ed474e4dfd33e0f018908",
+      "test_file": "lib/matplotlib/tests/test_axes.py",
+      "pythonpath": null,
+      "needs_build": true,
+      "native_test_paths": [
+        "lib/matplotlib/tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "lib/matplotlib/tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-matplotlib-2",
+      "wave": 1,
+      "role": "reserve",
+      "notes": "Round-robin pass 2, matplotlib. Reserve #5, the tenth candidate."
+    },
+    {
+      "project": "PySnooper",
+      "bug_id": 3,
+      "python_version": "3.8.1",
+      "buggy_commit": "6e3d797be3fa0a746fb5b1b7c7fea78eb926c208",
+      "fixed_commit": "15555ed760000b049aff8fecc79d29339c1224c3",
+      "test_file": "tests/test_pysnooper.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-PySnooper-3",
+      "wave": 1,
+      "role": "pilot",
+      "notes": "Seen during development. Items 1 and 2 of §14 were designed from this bug's round-4 false reject, so it is development data, not an evaluation bug: it is run here to check that a no-op still rejects via rule (b) and that the developer fix no longer false-rejects, and it is never reported as an evaluation result. The evaluation split records the same exclusion in its ``reviewed_changes``."
+    }
+  ]
+}

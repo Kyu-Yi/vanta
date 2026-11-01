@@ -30,7 +30,145 @@ use tracing::{debug, info, trace, warn};
 // agent prompt in the run, so a later change to the Creator's Verify-First
 // wording is visible in the log instead of looking like "no change". Bump this
 // whenever the Creator system/user prompt text changes.
-pub const CREATOR_PROMPT_VERSION: &str = "1";
+//
+// [VANTA-WHY] Bumped for the context-localization change (§1.6.2): the system
+// text is unchanged, but what the Creator is SHOWN is not. It used to receive
+// `repo.source_files` — the first ~262 KB of the repo in `read_dir` order — and
+// now receives the selected files (ranked from the issue text) plus the repo's
+// file tree as a labelled listing. Two runs whose Creator read different code
+// are different experiments; a tag that only moves for system-text edits would
+// log them as one.
+// [VANTA-WHY] Checked for M3 item 16 and NOT bumped: `creator_user_prompt`
+// already leads with the stable block — `ISSUE:` then the `FILE:` blocks, both
+// identical on every attempt of a repair — and puts the one per-attempt part
+// (`PRIOR FEEDBACK`) last. Nothing the model is shown moved, so there is no new
+// text for a tag to name.
+pub const CREATOR_PROMPT_VERSION: &str = "3";
+
+// ============================================================================
+// CREATOR_SYSTEM_PROMPT — the Verify-First system prompt, as a const
+// ============================================================================
+//
+// [VANTA-WHY] §14.10 f — the text is hoisted out of the call site so the
+// prompt-provenance hash (`core::prompt_content_hash`) can be taken over the
+// prompt the Creator ACTUALLY sends. While it was a function-local literal the
+// only reachable copy was outside the function, so a hash — or a test — could
+// have been computed over text the model never saw. This is the same move the
+// A10 follow-up made for the Attacker's simplify prompt.
+pub const CREATOR_SYSTEM_PROMPT: &str = r#"You are Vanta Creator. Before writing any patch, THINK BRIEFLY (under 200 words) about how the change will be verified: what tests would pass/fail, what properties must hold. Then output the fix.
+
+IMPORTANT: Keep your reasoning SHORT. The bulk of your output budget must go to the JSON answer in content.
+
+YOU MUST output valid JSON. NO EXCEPTIONS.
+  1. First character of content MUST be '{'
+  2. Last character MUST be the matching '}'
+  3. No prose, no markdown fences
+  4. Do not stop until the full '}' is written
+
+How to provide the fix in patch_text — CHOOSE ONE:
+
+OPTION A (preferred for files under ~200 lines): Output the COMPLETE patched file content.
+  Write the entire file as it should look after the fix, from the first line to the last.
+  Do NOT use diff markers (---, +++, @@, +, -). Just the plain source code.
+
+  If the patch touches MULTIPLE files, separate each with a marker line:
+    ===FILE: path/to/file.py===
+    <complete file content>
+    ===FILE: path/to/other.py===
+    <complete file content>
+
+OPTION B (for larger files where full source is wasteful): Use SEARCH/REPLACE blocks.
+  For a single file, just use the blocks.
+  For multiple files, prefix each block group with ===FILE: path===:
+    ===FILE: path/to/file.py===
+    ===SEARCH===
+    <exact lines from the original file, including indentation>
+    ===REPLACE===
+    <the replacement lines>
+    ===END===
+
+  The SEARCH text must match the original EXACTLY (whitespace included) so it can be found.
+
+NEVER modify or delete an EXISTING test file. The repository's own tests grade your patch and are always run from their original contents, so any edit you make to an existing test is discarded before verification. Do not weaken, skip, rename or remove an existing test to make your change pass. If you need a test, put it in a NEW test file.
+
+Required JSON schema:
+{
+  "patch_text":    string — the fix as full source (Option A) or search/replace blocks (Option B),
+  "explanation":   string — 1 sentence,
+  "files_touched": array of strings,
+  "confidence":    number 0.0 to 1.0
+}"#;
+
+/// The Verify-First prompt the call site sends.
+///
+/// Routed through an accessor so "the prompt the call sends" and "the prompt the
+/// hash is taken over" are one value by construction (see
+/// `attacker_simplify_system_prompt` for the incident that makes that worth
+/// pinning).
+pub fn creator_system_prompt() -> &'static str {
+    CREATOR_SYSTEM_PROMPT
+}
+
+/// The three blocks the Creator's USER prompt is built from, as macros, so the
+/// `format!` call and the prompt-content hash (`creator_user_prompts`) read one
+/// text.
+///
+/// [VANTA-WHY] M3 item 19 (fix 4) — the record used to hash the system prompt
+/// only, which left every user-prompt change invisible to the frozen config. The
+/// user prompt is three literals joined with a blank line, not one `format!`, so
+/// all three are templates and all three are covered.
+macro_rules! creator_issue_block {
+    () => {
+        "ISSUE:\n{}\n"
+    };
+}
+
+macro_rules! creator_file_block {
+    () => {
+        "FILE: {}\n```\n{}\n```\n"
+    };
+}
+
+macro_rules! creator_feedback_block {
+    () => {
+        "PRIOR FEEDBACK (from previous attempt, address this):\n{}\n"
+    };
+}
+
+/// The Creator's USER prompt templates, in the order [`creator_user_prompt`]
+/// emits them: the issue block, the per-file block, the optional feedback block.
+///
+/// [VANTA-WHY] M3 item 19 (fix 4) — the ingredient of the `creator=` prompt-content
+/// hash beside `CREATOR_SYSTEM_PROMPT`. Each entry is the macro the builder
+/// expands, so a wording change to any block moves the hash.
+pub fn creator_user_prompts() -> [&'static str; 3] {
+    [
+        creator_issue_block!(),
+        creator_file_block!(),
+        creator_feedback_block!(),
+    ]
+}
+
+/// The Creator's USER prompt for a request: the issue, the selected files and
+/// the optional feedback, in the exact form `creator_generate_patch` sends.
+///
+/// [VANTA-WHY] M3 item 9 fold-in — the driver records a HASH of the Creator
+/// prompt beside each attempt's patch. A hash taken over text the model never
+/// saw would be a statement about the wrong thing (the same mistake the
+/// `CREATOR_SYSTEM_PROMPT` hoist above was made to prevent), so the prompt is
+/// built in exactly ONE place and both readers — the call site and the hash —
+/// read that place.
+pub fn creator_user_prompt(request: &CreatorRequest) -> String {
+    let mut user_parts: Vec<String> = Vec::new();
+    user_parts.push(format!(creator_issue_block!(), request.issue_text));
+    for sf in &request.source_files {
+        user_parts.push(format!(creator_file_block!(), sf.path, sf.contents));
+    }
+    if let Some(fb) = &request.prior_feedback {
+        user_parts.push(format!(creator_feedback_block!(), fb));
+    }
+    user_parts.join("\n")
+}
 
 // ============================================================================
 // CreatorRequest — input to the Creator agent
@@ -93,58 +231,10 @@ pub async fn creator_generate_patch(
     //
     // [VANTA-WHY] MULTI-FILE SUPPORT: For patches touching >1 file, separate
     // each file's content with `===FILE: path/to/file.py===` markers.
-    let system_prompt = r#"You are Vanta Creator. Before writing any patch, THINK BRIEFLY (under 200 words) about how the change will be verified: what tests would pass/fail, what properties must hold. Then output the fix.
-
-IMPORTANT: Keep your reasoning SHORT. The bulk of your output budget must go to the JSON answer in content.
-
-YOU MUST output valid JSON. NO EXCEPTIONS.
-  1. First character of content MUST be '{'
-  2. Last character MUST be the matching '}'
-  3. No prose, no markdown fences
-  4. Do not stop until the full '}' is written
-
-How to provide the fix in patch_text — CHOOSE ONE:
-
-OPTION A (preferred for files under ~200 lines): Output the COMPLETE patched file content.
-  Write the entire file as it should look after the fix, from the first line to the last.
-  Do NOT use diff markers (---, +++, @@, +, -). Just the plain source code.
-
-  If the patch touches MULTIPLE files, separate each with a marker line:
-    ===FILE: path/to/file.py===
-    <complete file content>
-    ===FILE: path/to/other.py===
-    <complete file content>
-
-OPTION B (for larger files where full source is wasteful): Use SEARCH/REPLACE blocks.
-  For a single file, just use the blocks.
-  For multiple files, prefix each block group with ===FILE: path===:
-    ===FILE: path/to/file.py===
-    ===SEARCH===
-    <exact lines from the original file, including indentation>
-    ===REPLACE===
-    <the replacement lines>
-    ===END===
-
-  The SEARCH text must match the original EXACTLY (whitespace included) so it can be found.
-
-Required JSON schema:
-{
-  "patch_text":    string — the fix as full source (Option A) or search/replace blocks (Option B),
-  "explanation":   string — 1 sentence,
-  "files_touched": array of strings,
-  "confidence":    number 0.0 to 1.0
-}"#;
+    let system_prompt = creator_system_prompt();
 
     // Build user prompt: issue + source files
-    let mut user_parts: Vec<String> = Vec::new();
-    user_parts.push(format!("ISSUE:\n{}\n", request.issue_text));
-    for sf in &request.source_files {
-        user_parts.push(format!("FILE: {}\n```\n{}\n```\n", sf.path, sf.contents));
-    }
-    if let Some(fb) = &request.prior_feedback {
-        user_parts.push(format!("PRIOR FEEDBACK (from previous attempt, address this):\n{}\n", fb));
-    }
-    let user_prompt = user_parts.join("\n");
+    let user_prompt = creator_user_prompt(request);
 
     debug!(system_len = system_prompt.len(), user_len = user_prompt.len(), "creator prompts built");
 
@@ -165,12 +255,16 @@ Required JSON schema:
         messages
     };
 
-    let extras = json!({
-        "response_format": {"type": "json_object"},
-        "temperature": 0.1,
-        "max_tokens": 32768,
-        "reasoning_effort": "low",
-    });
+    let extras = crate::llm::with_sampling(
+        json!({
+            "response_format": {"type": "json_object"},
+            // Item S — the pin is named once (`llm::CREATOR_PINNED_EFFORT`) so the
+            // body and the `run.summary` field that describes it cannot drift.
+            // `with_sampling` replaces the value when `VANTA_REASONING_EFFORT` is set.
+            "reasoning_effort": crate::llm::CREATOR_PINNED_EFFORT,
+        }),
+        "creator",
+    );
 
     let parse_closure = |raw: &str| -> Result<CreatorResponse, String> {
         let cleaned = extract_json_candidate(raw).map_err(|e| format!("{e}"))?;
@@ -181,7 +275,7 @@ Required JSON schema:
     };
 
     let typed: CreatorResponse = structured_call_with_retry(
-        &client, cfg, 3, build_messages, extras, parse_closure
+        &client, cfg, cfg.retry_attempts, "", "creator", build_messages, extras, parse_closure
     ).await?;
 
     // Sanity checks
@@ -344,5 +438,38 @@ mod tests {
         assert!(result.contains_key("b.py"));
         assert!(result["a.py"].contains("def a()"));
         assert!(result["b.py"].contains("def b()"));
+    }
+
+    /// [VANTA-WHY] M3 item 9 fold-in — the prompt the driver hashes must be the
+    /// prompt the call sends. `creator_generate_patch` now builds it here, so
+    /// this pins the shape: the issue, a `FILE:` block per source file, and the
+    /// feedback block only when there is feedback.
+    #[test]
+    fn the_creator_user_prompt_is_issue_files_and_feedback() {
+        let request = CreatorRequest {
+            issue_text: "cart total is wrong".to_string(),
+            source_files: vec![SourceFile {
+                path: "cart.py".to_string(),
+                contents: "def total(): return 0\n".to_string(),
+            }],
+            prior_feedback: None,
+        };
+        let prompt = creator_user_prompt(&request);
+        assert!(prompt.starts_with("ISSUE:\ncart total is wrong"));
+        assert!(prompt.contains("FILE: cart.py\n```\ndef total(): return 0\n\n```"));
+        assert!(
+            !prompt.contains("PRIOR FEEDBACK"),
+            "no feedback on a first attempt: {prompt}"
+        );
+
+        let with_feedback = CreatorRequest {
+            prior_feedback: Some("Test 'x' failed".to_string()),
+            ..request
+        };
+        let prompt = creator_user_prompt(&with_feedback);
+        assert!(
+            prompt.contains("PRIOR FEEDBACK (from previous attempt, address this):\nTest 'x' failed"),
+            "the feedback must reach the prompt verbatim: {prompt}"
+        );
     }
 }

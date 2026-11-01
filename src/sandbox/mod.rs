@@ -56,6 +56,120 @@ pub fn backend_kind_label(kind: SandboxKind) -> &'static str {
     }
 }
 
+/// The complete set of environment keys `--sandbox-env` is allowed to inject.
+///
+/// [VANTA-WHY] The allow-list *is* the feature. A recorded per-project rule has
+/// to be able to put the project's own environment in front of the baseline
+/// gates, the native suite, the generated tests and the oracle — every one of
+/// those runs must see the same value, or the bug is measured against a
+/// different environment than the one its project declares. fastapi's own
+/// `scripts/test.sh` exports `PYTHONPATH=./docs_src`, which ~250 of its tests
+/// need at collection. matplotlib reads `MPLBACKEND` into `rcParams['backend']`
+/// at import, and without it `pyplot` resolves the default to TkAgg, whose
+/// import chain reaches `_tkinter.__file__` — absent from this layer's CPython
+/// 3.8 — so collection itself dies and the suite is unmeasurable. A general
+/// "set any variable" flag would instead be an env-injection channel across
+/// the sandbox boundary, which is exactly what this flag refuses to be: only
+/// the keys named here may cross.
+pub const ALLOWED_SANDBOX_ENV_KEYS: &[&str] = &["PYTHONPATH", "MPLBACKEND"];
+
+/// Parse one `--sandbox-env KEY=VALUE` specification.
+///
+/// [VANTA-WHY] The value comes only from the harness's recorded per-project
+/// rule — it is never typed per bug — so the parser's whole job is to refuse to
+/// grow into an env channel. The key must name a member of
+/// `ALLOWED_SANDBOX_ENV_KEYS` (a rejected key is the flag refusing to be a
+/// general env channel: the error names both the offending key and the allowed
+/// set), and the value must be non-empty after trimming. The split is on the
+/// FIRST `=`, so a value may itself contain `=`.
+pub fn parse_sandbox_env(spec: &str) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
+    let Some((key, value)) = spec.split_once('=') else {
+        return Err(format!("sandbox env {spec:?} is not KEY=VALUE (no '=')").into());
+    };
+    if key.is_empty() || !ALLOWED_SANDBOX_ENV_KEYS.contains(&key) {
+        return Err(format!(
+            "sandbox env key {key:?} is not allowed; allowed keys: {}",
+            ALLOWED_SANDBOX_ENV_KEYS.join(", ")
+        )
+        .into());
+    }
+    if value.trim().is_empty() {
+        return Err(format!("sandbox env {key} has an empty value").into());
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+/// Parse one `--precompile PATH` specification: a tree-relative `.py` path.
+///
+/// [VANTA-WHY] The rule is the split's recorded per-project one, never typed per
+/// bug, so this parser's job is to refuse a path the compile step could not
+/// honour — the same shape of refusal `parse_sandbox_env` makes about keys. The
+/// rules mirror the split's own validator (`scripts/bugsinpy/split.py`) so a row
+/// that passed the split cannot fail here: non-empty, no absolute path, no
+/// backslash, no `..` component, and `.py`. A path that named a file outside the
+/// tree would compile something the benchmark does not ship; one the compiler
+/// cannot parse (a directory, a non-Python file) would fail silently, and the
+/// failure the rule exists to prevent would come back disguised as a suite error.
+pub fn parse_precompile_path(spec: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let path = spec.trim();
+    if path.is_empty() {
+        return Err("precompile path is empty".into());
+    }
+    if path.starts_with('/') || path.contains('\\') || path.split('/').any(|part| part == "..") {
+        return Err(format!(
+            "precompile path {spec:?} must be tree-relative with no directory step"
+        )
+        .into());
+    }
+    if !path.ends_with(".py") {
+        return Err(format!("precompile path {spec:?} must name a .py file").into());
+    }
+    Ok(path.to_string())
+}
+
+/// The pre-compile argv for a suite command: `<cmd[0]> -m compileall -q -f <files>`.
+///
+/// [VANTA-WHY] This is the in-session half of the harness's recorded `precompile`
+/// rule (matplotlib/1: `lib/matplotlib/widgets.py`). Its whole job is ordering:
+/// an invalid escape sequence is reported while the module is *compiled*, and
+/// matplotlib's pytest configuration escalates warnings to errors, so the first
+/// import of that module during collection dies as `SyntaxError`. Compiling first
+/// leaves a valid `.pyc`, and nothing is compiled under pytest's filters at all.
+///
+/// Three choices are load-bearing and are the same three the Python harness's
+/// `suite.precompile_lines` makes, so both halves of one rule behave identically:
+///
+/// * the interpreter is `cmd[0]` — the one about to run the tests. A `.pyc` is
+///   only read by the interpreter whose magic number it carries, so compiling
+///   with any other interpreter would leave a file the tests ignore and the
+///   warning would fire exactly as before.
+/// * `-f` forces the write. `compileall` otherwise skips a file whose `.pyc`
+///   already records the source's mtime, and that check is second-resolution on
+///   the mtime alone — a patch applied in the same second as the previous compile
+///   would leave a stale `.pyc` and the warning would come back.
+/// * the backends run it as its own line, not `&&`-chained to the command: a
+///   compile that failed must not take the test report with it. The shell
+///   continues, the suite reports the compile error itself as a collection
+///   failure, and the gate reads the honest message instead of "no report at all".
+///
+/// Empty `precompile` returns an empty argv, so a bug without the rule runs
+/// exactly the command it ran before the rule existed.
+pub fn precompile_argv(cmd: &[&str], precompile: &[String]) -> Vec<String> {
+    if precompile.is_empty() {
+        return Vec::new();
+    }
+    let python = cmd.first().copied().unwrap_or("python3");
+    let mut argv: Vec<String> = vec![
+        python.to_string(),
+        "-m".to_string(),
+        "compileall".to_string(),
+        "-q".to_string(),
+        "-f".to_string(),
+    ];
+    argv.extend(precompile.iter().cloned());
+    argv
+}
+
 /// The sandbox kind this process will actually use: the env preference, with
 /// `auto` resolved through the shuru availability + boot test.
 pub async fn actual_backend_kind() -> Result<SandboxKind, Box<dyn Error + Send + Sync>> {
@@ -67,6 +181,19 @@ pub async fn actual_backend_kind() -> Result<SandboxKind, Box<dyn Error + Send +
 
 pub async fn actual_backend_label() -> Result<&'static str, Box<dyn Error + Send + Sync>> {
     Ok(backend_kind_label(actual_backend_kind().await?))
+}
+
+/// Whether the shuru backend can actually be used on this machine right now:
+/// the CLI is present AND the VM boot test passes.
+///
+/// [VANTA-WHY] `actual_backend_kind` answers a different question — "what would
+/// `auto` pick under the current env?" With `VANTA_SANDBOX_BACKEND=subprocess`
+/// exported it reports `subprocess` even on a machine where shuru boots fine.
+/// The rerun needs the machine fact, not the preference: it must know whether a
+/// session recorded as `shuru` can be replayed at all, and whether an explicit
+/// subprocess→shuru upgrade is even possible.
+pub async fn shuru_usable() -> bool {
+    shuru_available() && shuru_boot_ok().await
 }
 
 /// Cached result of the shuru boot test. We run it ONCE per process because
@@ -258,10 +385,12 @@ impl Backend {
         cmd: &[&str],
         cwd: &std::path::Path,
         timeout_secs: u64,
+        env: &[(String, String)],
+        precompile: &[String],
     ) -> Result<ExecutionResult, Box<dyn Error + Send + Sync>> {
         match self {
-            Backend::Subprocess(b) => b.execute(cmd, cwd, timeout_secs).await,
-            Backend::Shuru(b) => b.execute(cmd, cwd, timeout_secs).await,
+            Backend::Subprocess(b) => b.execute(cmd, cwd, timeout_secs, env, precompile).await,
+            Backend::Shuru(b) => b.execute(cmd, cwd, timeout_secs, env, precompile).await,
         }
     }
 
@@ -316,5 +445,46 @@ mod tests {
         unsafe {
             std::env::remove_var("VANTA_SANDBOX_BACKEND");
         }
+    }
+
+    #[test]
+    fn parse_sandbox_env_accepts_the_recorded_import_path() {
+        assert_eq!(
+            parse_sandbox_env("PYTHONPATH=./docs_src").unwrap(),
+            ("PYTHONPATH".to_string(), "./docs_src".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_sandbox_env_accepts_the_recorded_backend() {
+        assert_eq!(
+            parse_sandbox_env("MPLBACKEND=Agg").unwrap(),
+            ("MPLBACKEND".to_string(), "Agg".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_sandbox_env_rejects_a_key_the_boundary_must_not_carry() {
+        let err = parse_sandbox_env("PATH=/x").unwrap_err().to_string();
+        assert!(err.contains("PATH"));
+        assert!(err.contains("PYTHONPATH"));
+    }
+
+    #[test]
+    fn parse_sandbox_env_rejects_an_empty_value() {
+        assert!(parse_sandbox_env("PYTHONPATH=").is_err());
+    }
+
+    #[test]
+    fn parse_sandbox_env_rejects_a_missing_separator() {
+        assert!(parse_sandbox_env("PYTHONPATH").is_err());
+    }
+
+    #[test]
+    fn parse_sandbox_env_splits_on_the_first_equals_only() {
+        assert_eq!(
+            parse_sandbox_env("PYTHONPATH=./docs_src=./other").unwrap(),
+            ("PYTHONPATH".to_string(), "./docs_src=./other".to_string())
+        );
     }
 }

@@ -13,6 +13,7 @@
 //   - Repo exposes source_files: Vec<SourceFile> for the Creator
 // ============================================================================
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -68,9 +69,8 @@ impl Repo {
         info!(repo = %repo_dir.display(), "loading repo");
 
         // ---- Discover source files ----
-        let mut source_files = Vec::new();
-        let mut total_bytes: usize = 0;
-        collect_source_files(repo_dir, repo_dir, &mut source_files, &mut total_bytes);
+        let source_files = capped_source_files(repo_dir);
+        let total_bytes: usize = source_files.iter().map(|f| f.contents.len()).sum();
 
         info!(
             file_count = source_files.len(),
@@ -111,6 +111,49 @@ impl Repo {
 // ----------------------------------------------------------------------------
 // collect_source_files — recursive walk, collecting source files by extension
 // ----------------------------------------------------------------------------
+/// The repo's source files as the loader has always collected them: a
+/// deterministic walk stopped by a per-file cap and a total byte cap.
+///
+/// [VANTA-WHY] §14.18 — this is a PROMPT budget, so the only callers left are
+/// prompt-shaped: `Repo::load` (the Creator's fallback context, the import-path
+/// probe) and the prompt fallback in the driver. The trees tests are executed
+/// in come from `complete_tree_files`, because a cap that drops files silently
+/// turns "the repo" into "the first 256 KB of the repo" — see that function.
+pub fn capped_source_files(root: &Path) -> Vec<SourceFile> {
+    let mut files = Vec::new();
+    let mut total_bytes: usize = 0;
+    collect_source_files(root, root, &mut files, &mut total_bytes);
+    files
+}
+
+/// Every readable text file under `root`, as a `path -> contents` map.
+///
+/// [VANTA-WHY] §14.18 — this is the tree BATE's baseline, every revise, the
+/// native suite, the graded patched tree, the dependency probe and the static
+/// pass are executed against, so it has to be the REPOSITORY, not an excerpt of
+/// it. It used to be `repo.source_files` (and `candidate::collect_tree`): the
+/// same deterministic walk, but stopped at 64 KB per file and 256 KB in total,
+/// and blind to every non-source extension. On sanic/1 that dropped
+/// `sanic/websocket.py` and ALL of `tests/`, and both failures were silent:
+/// the `pytest_sanic` entry-point plugin imports `sanic`, so pytest aborted in
+/// `_preparse` before collecting anything and every generated test came back
+/// `Error` (three identical mismatches, then a 32k-token revise against an
+/// environment error no test can fix), while the repo's own suite "ran" with
+/// zero tests and the Governor read that as no regressions.
+///
+/// This is the cap-free walk the context selection already uses — one
+/// implementation, two consumers — so what the prompt may spend and what the
+/// tests may see are decided independently instead of by the same byte cap.
+/// It skips `SKIP_DIRS`, never follows a symlink, and leaves out anything that
+/// is not valid UTF-8 (a binary file cannot be carried in the concat).
+pub fn complete_tree_files(root: &Path) -> HashMap<String, String> {
+    let (candidates, _skipped) = crate::context::walk_candidates(root);
+    candidates
+        .into_iter()
+        .map(|candidate| (candidate.path, candidate.contents))
+        .collect()
+}
+
 fn collect_source_files(
     base: &Path,
     current: &Path,
@@ -121,10 +164,16 @@ fn collect_source_files(
         Ok(e) => e,
         Err(_) => return,
     };
+    // [VANTA-WHY] `read_dir` order is filesystem-dependent, so once the byte cap
+    // bites the same tree can yield a different subset on a different machine —
+    // the bug's own file in the prompt here, absent there. Sorting makes the walk
+    // (and, while it lasts, the truncation) reproducible. `context::walk_candidates`
+    // is the cap-free replacement this walk feeds into; this stays as the loader
+    // for the trees BATE and the harness run against.
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-
+    for path in paths {
         // Skip directories in SKIP_DIRS
         if path.is_dir() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -248,5 +297,99 @@ mod tests {
     fn test_missing_repo_errors() {
         let result = Repo::load(Path::new("/nonexistent/vanta/repo"), None);
         assert!(result.is_err());
+    }
+
+    /// [VANTA-WHY] §14.18 regression — how sanic/1 lost 100 % of its graded
+    /// tests. The walk below is deterministic and sorted, so once the 256 KB
+    /// total cap is spent it drops whatever sorts last. On sanic/1 that was
+    /// `sanic/websocket.py` and all of `tests/`, and neither failure was
+    /// visible: `pytest_sanic` is registered as a `pytest11` entry point, so
+    /// pytest imported it during `_preparse`, that import reached
+    /// `sanic/asgi.py` -> `sanic.websocket`, and pytest aborted BEFORE collecting
+    /// anything. Every generated test then came back `Error` (never `Failed`),
+    /// BATE scrapped all of them after three identical mismatches, and the
+    /// repo's own suite "ran" with zero tests and read as no regressions.
+    ///
+    /// The assertion this test makes is the one that would have caught it: the
+    /// tree the tests EXECUTE in must be the whole repo, and must not converge
+    /// back onto the byte-capped dump the PROMPT is still allowed to fall back
+    /// to. Both walks stay in the codebase — one is a prompt budget, the other
+    /// is a filesystem — so the test pins the difference between them.
+    #[test]
+    fn test_execution_tree_is_not_the_capped_prompt_dump() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Six 60 KB source files. The 256 KB total budget fits four, so the
+        // sorted walk drops the last two — `ee.py` by the total cap, and
+        // `zz_module.py` because it sorts last, exactly like the module an
+        // import chain reaches for at the end of the alphabet.
+        let body = "x = 1\n".repeat(10_000); // 60_000 bytes
+        for name in ["aa.py", "bb.py", "cc.py", "dd.py", "ee.py"] {
+            fs::write(root.join(name), &body).unwrap();
+        }
+        fs::write(root.join("zz_module.py"), &body).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("tests/conftest.py"), "import sys\n").unwrap();
+
+        let capped: Vec<String> = capped_source_files(root)
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        let execution_tree = complete_tree_files(root);
+
+        assert!(
+            !capped.contains(&"zz_module.py".to_string()),
+            "the prompt dump IS capped, so it must drop files once the budget is \
+             spent — if this fails the fixture no longer exercises the cap: {capped:?}"
+        );
+        assert!(
+            execution_tree.contains_key("zz_module.py"),
+            "the tree tests execute in must NOT be the capped prefix; it was \
+             missing {:?}",
+            execution_tree.keys().collect::<Vec<_>>()
+        );
+        assert!(execution_tree.contains_key("tests/conftest.py"));
+        assert!(
+            execution_tree.len() > capped.len(),
+            "the execution tree ({}) must not converge back onto the prompt dump ({})",
+            execution_tree.len(),
+            capped.len()
+        );
+        // A file in the execution tree is carried WHOLE — the cap must not have
+        // truncated it either.
+        assert_eq!(execution_tree["zz_module.py"], body);
+    }
+
+    /// [VANTA-WHY] §14.18 — the other half of the sanic/1 shape: the module the
+    /// import chain needs lives in a directory the capped walk never reached, so
+    /// the file is absent rather than truncated. Pinned separately because a
+    /// future cap change could pass the byte assertion above while still
+    /// pruning `tests/`.
+    #[test]
+    fn test_execution_tree_reaches_directories_the_cap_front_never_reaches() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Spend the whole 256 KB budget from a directory that sorts FIRST, so
+        // the walk reaches `sanic/` with nothing left. Four files of exactly
+        // 64 KB are the most the per-file cap admits, and together they are
+        // exactly the total budget.
+        fs::create_dir_all(root.join("aaa_filler")).unwrap();
+        let body = "x".repeat(64 * 1024);
+        for index in 0..4 {
+            fs::write(root.join("aaa_filler").join(format!("f{index}.py")), &body).unwrap();
+        }
+        fs::create_dir_all(root.join("sanic")).unwrap();
+        fs::write(root.join("sanic/websocket.py"), "class WebSocketConnection:\n    pass\n").unwrap();
+
+        let capped: Vec<String> = capped_source_files(root)
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        let execution_tree = complete_tree_files(root);
+
+        assert!(!capped.contains(&"sanic/websocket.py".to_string()), "{capped:?}");
+        assert!(execution_tree.contains_key("sanic/websocket.py"));
     }
 }

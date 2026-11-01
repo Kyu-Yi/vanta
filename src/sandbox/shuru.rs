@@ -37,6 +37,148 @@ const DEFAULT_CHECKPOINT: &str = "vanta-python";
 // VANTA_SHURU_DISK_MB when a dependency checkpoint needs more space.
 const DEFAULT_DISK_MB: u64 = crate::sandbox::deps::BASE_DISK_MB;
 
+// ---------------------------------------------------------------------------
+// The VM start-up check — DEV_SHM_GUARD
+// ---------------------------------------------------------------------------
+//
+// [VANTA-WHY] A Shuru microVM boots with NO ``/dev/shm`` at all. CPython's
+// ``multiprocessing`` creates its semaphores and shared-memory segments as files
+// *in that directory* (``multiprocessing/synchronize.py`` ->
+// ``_multiprocessing.SemLock`` -> ``sem_open``), so the first
+// ``multiprocessing.Lock()`` in such a VM raises
+// ``FileNotFoundError: [Errno 2] No such file or directory`` — with **no
+// filename**, because the errno comes from the kernel rather than from a failed
+// open of a named path.
+//
+// Measured, and the shape is why it cost a debugging session: it is the same
+// error text a missing compiler produces. On the harness layer
+// (``vanta-bugsinpy-py3.8``):
+//
+//     ls: cannot access '/dev/shm': No such file or directory
+//     multiprocessing.Lock()  -> FileNotFoundError: [Errno 2]
+//     after `mkdir -p /dev/shm && mount -t tmpfs -o rw,nosuid,nodev tmpfs /dev/shm`
+//                             -> the lock is created
+//
+// [VANTA-WHY] Per boot, not per layer: a mount does not survive into a
+// checkpoint, so "the checkpoint has /dev/shm" is not a property that could be
+// baked in and read back later. Every boot re-establishes it.
+//
+// [VANTA-WHY] This is the same check the BugsInPy harness runs
+// (``scripts/bugsinpy/shuru.py``, DEV_SHM_GUARD), in the other language this repo
+// runs untrusted code from. One rule, two spellings — a second *rule* would drift.
+//
+// Without it, a bug whose tests use a ``Pool``, a ``Queue`` or a ``Lock`` fails
+// inside the VM for a reason that has nothing to do with the code under test: a
+// false failure that reads as a model error.
+const DEV_SHM_GUARD: &str = r#"VANTA_DEV_SHM=''
+if grep -q '^tmpfs /dev/shm ' /proc/mounts 2>/dev/null; then VANTA_DEV_SHM='tmpfs mounted'
+elif mkdir -p /dev/shm && mount -t tmpfs -o rw,nosuid,nodev tmpfs /dev/shm; then VANTA_DEV_SHM='tmpfs mounted'
+fi
+export VANTA_DEV_SHM
+[ -n "$VANTA_DEV_SHM" ] || { echo "vanta dev/shm: the VM has no /dev/shm and a tmpfs cannot be mounted on it, so CPython's multiprocessing cannot create a semaphore" >&2; exit 86; }
+VANTA_MP_PY="$(command -v python3 || command -v python || true)"
+if [ -n "$VANTA_MP_PY" ]; then
+  "$VANTA_MP_PY" -c 'import multiprocessing as mp; lock = mp.Lock(); pool = mp.Pool(2); assert pool.map(abs, [-1, -2, -3]) == [1, 2, 3], "Pool.map"; pool.close(); pool.join()' || { echo "vanta multiprocessing smoke: FAILED -- /dev/shm is mounted but multiprocessing cannot use it (Lock and Pool are what every test in this VM would fail on)" >&2; exit 87; }
+fi"#;
+
+/// The guest shell line for one sandboxed command: the start-up check, then the command.
+///
+/// [VANTA-WHY] Split out of :func:`ShuruBackend::execute` so the boot step is
+/// testable without booting a VM. The guard is the only part of that command line
+/// no caller supplies, so a regression that dropped it would stay invisible until
+/// a test using multiprocessing failed for a reason that had nothing to do with
+/// the code under test.
+///
+/// A newline rather than ``&&`` between the two, because the guard ends in an
+/// ``if`` block: the command's exit status has to be the command's, and an
+/// ``&&``-chain makes every failure look like the chain's.
+///
+/// ``env`` is the run's recorded ``sandbox_env`` (e.g. ``PYTHONPATH=./docs_src``,
+/// the import path fastapi's own ``scripts/test.sh`` exports). Each pair becomes
+/// its own ``export K=<value>`` line between the guard and the ``cd`` — newline
+/// separated for the same reason as above, so a failed export cannot swallow the
+/// command. An empty ``env`` reproduces the previous line exactly, which is what
+/// a run that never passed the flag gets.
+///
+/// ``precompile`` is the run's recorded per-project pre-compile rule. When it is
+/// not empty, one ``<cmd[0]> -m compileall -q -f <files>`` line runs after the
+/// ``cd`` and before the command, in the same tree and under the same
+/// interpreter — see :func:`crate::sandbox::precompile_argv` for why. It is its
+/// own line rather than an ``&&``-chain for the same reason the guard is: a
+/// compile that failed must not take the test report with it. The exit status
+/// the script reports is still the command's, because the command is last. An
+/// empty ``precompile`` reproduces the previous line exactly.
+///
+/// ``cmd`` is an argv, and every one of its tokens is shell-quoted on the way in —
+/// the same rule the ``export`` values and the precompile line follow. It has to
+/// be: the trait's ``execute`` takes an argv and the subprocess backend hands it
+/// to ``Command::args`` with no shell, so an argument is allowed to contain a
+/// space or a metacharacter, and this is the only backend that has to spell one
+/// out for ``sh -c``.
+fn guest_inner_command(
+    guest_cwd: &str,
+    cmd: &[&str],
+    env: &[(String, String)],
+    precompile: &[String],
+) -> String {
+    let mut exports = String::new();
+    for (key, value) in env {
+        exports.push_str(&format!("export {key}={}\n", shell_quote_value(value)));
+    }
+    // [VANTA-WHY] Item P follow-up — every argv token is quoted, like the
+    // precompile line below already was. `cmd` is an ARGV (`Backend::Subprocess`
+    // hands it straight to `Command::args`, no shell), so an argument may legally
+    // contain a space, a `;`, a parenthesis or a quote; joining it into a shell
+    // line unquoted does not pass it through, it re-parses it. The in-session
+    // import guard is the first caller that needs this: it runs
+    // `python -c 'import pkg as g; print(g.__file__)'`, and before this the shell
+    // read the `(` in `print(` as a subshell — `sh: Syntax error: word unexpected
+    // (expecting ")")`, every run an InfraFailure that had nothing to do with the
+    // candidate. `shell_quote_value` leaves a plain token (which is every token
+    // the recorded `test_cmd`s carry) byte-identical, so no existing command line
+    // changes.
+    let quoted: Vec<String> = cmd.iter().map(|arg| shell_quote_value(arg)).collect();
+    let command = quoted.join(" ");
+    let cd = shell_quote_value(guest_cwd);
+    let pre = crate::sandbox::precompile_argv(cmd, precompile);
+    if pre.is_empty() {
+        return format!("{DEV_SHM_GUARD}\n{exports}cd {cd} && {command}");
+    }
+    let pre_line: Vec<String> = pre.iter().map(|arg| shell_quote_value(arg)).collect();
+    format!(
+        "{DEV_SHM_GUARD}\n{exports}cd {cd}\n{pre}\n{command}",
+        pre = pre_line.join(" ")
+    )
+}
+
+/// Shell-quote one exported value.
+///
+/// [VANTA-WHY] The value is single-quoted with embedded single quotes escaped
+/// (``'\''``) so a value with whitespace or shell metacharacters cannot break out
+/// of the ``export`` line. A plain token (letters, digits, and the path-safe
+/// punctuation this rule actually uses) is emitted unchanged, so the common
+/// ``PYTHONPATH=./docs_src`` reads as it was written.
+fn shell_quote_value(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '/' | '.' | '_' | '-' | ':' | '=' | '+' | ',' | '@')
+        });
+    if plain {
+        return value.to_string();
+    }
+    let mut out = String::from("'");
+    for c in value.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 pub struct RepoCheckpoint {
     pub name: String,
     pub disk_mb: u64,
@@ -51,6 +193,14 @@ pub struct ShuruBackend {
     pub root: PathBuf,
     checkpoint: String,
     disk_mb: u64,
+    // [VANTA-WHY] The VM's memory, from VANTA_SHURU_MEMORY_MB. None — the value
+    // every caller leaves unset — passes no --memory, so the boot line is exactly
+    // what it was before this field existed and shuru picks its own default
+    // (2048 MB). The harness sets it only for a project whose suite cannot fit that
+    // default (the split's recorded `vm_memory_mb`), through `runner.vanta_env`, so
+    // the sandbox the pipeline runs third-party code in is the same size the
+    // preparation gates measured the bug in.
+    memory_mb: Option<u64>,
 }
 
 impl ShuruBackend {
@@ -419,6 +569,17 @@ impl SandboxBackend for ShuruBackend {
             .unwrap_or(DEFAULT_DISK_MB)
             .max(DEFAULT_DISK_MB);
 
+        // Resolve the VM's memory. Unset — the normal case — passes no --memory and
+        // lets shuru choose its own default. `runner.vanta_env` sets
+        // VANTA_SHURU_MEMORY_MB from the row's recorded per-project `vm_memory_mb`, so
+        // the sandbox the pipeline runs third-party code in matches the size the
+        // preparation gates measured the bug in. A value at or below shuru's default is
+        // refused by the split's validator, so a parsed value here is always meaningful.
+        let memory_mb = std::env::var("VANTA_SHURU_MEMORY_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|mb| *mb > 0);
+
         // Ensure the python checkpoint exists. Create it if missing.
         if !Self::checkpoint_exists(&checkpoint) {
             info!(checkpoint = %checkpoint, "python checkpoint not found — creating (one-time)");
@@ -436,7 +597,7 @@ impl SandboxBackend for ShuruBackend {
         let temp_dir = TempDir::new_in(&cwd)?;
         let root = temp_dir.path().to_path_buf();
         info!(root = %root.display(), checkpoint = %checkpoint, disk_mb, "shuru backend spawned");
-        Ok(Self { temp_dir, root, checkpoint, disk_mb })
+        Ok(Self { temp_dir, root, checkpoint, disk_mb, memory_mb })
     }
 
     async fn execute(
@@ -444,6 +605,8 @@ impl SandboxBackend for ShuruBackend {
         cmd: &[&str],
         cwd: &Path,
         timeout_secs: u64,
+        env: &[(String, String)],
+        precompile: &[String],
     ) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>> {
         if cmd.is_empty() {
             return Err("execute: empty command".into());
@@ -463,37 +626,46 @@ impl SandboxBackend for ShuruBackend {
             format!("{guest_mount}/{}", cwd.display())
         };
 
-        // Build the command to run inside the VM.
-        let inner_cmd = format!("cd {guest_cwd} && {}", cmd.join(" "));
+        // Build the command to run inside the VM. The start-up check comes first on
+        // every boot (guest_inner_command): this is the single path
+        // ``src/pipeline/harness.rs`` runs third-party code through, and a mount does
+        // not persist in a checkpoint, so it cannot be folded into the layer.
+        let inner_cmd = guest_inner_command(&guest_cwd, cmd, env, precompile);
         let cmd_str = cmd.join(" ");
         debug!(cmd = %cmd_str, guest_cwd = %guest_cwd, timeout_secs, "shuru exec");
 
         let start = Instant::now();
 
-        // [SYNTAX] shuru run --from CHECKPOINT --disk-size SIZE --mount HOST:GUEST:rw --allow-host-writes -- <command>
+        // [SYNTAX] shuru run --from CHECKPOINT --disk-size SIZE [--memory MB] --mount HOST:GUEST:rw --allow-host-writes -- <command>
         // --from starts from the checkpoint so python3/pytest/ruff/mypy (and any
         //   auto-installed repo deps) are available.
         // --disk-size must be >= the checkpoint's base image size, else shuru errors
         //   with "--disk-size 4096MB is smaller than the base image (8192MB)".
         //   self.disk_mb tracks the size the selected checkpoint was created with.
+        // --memory is present only when the harness recorded a size for this bug
+        //   (self.memory_mb). A bigger VM lowers how many VMs fit in parallel, so an
+        //   unrecorded bug sends no flag and boots shuru's own default.
         // :rw allows the VM to write back to the host dir (for report.json).
         let disk = self.disk_mb.to_string();
+        let memory = self.memory_mb.map(|mb| mb.to_string());
+        let mount = format!("{host_root}:{guest_mount}:rw");
+        let mut args: Vec<&str> = vec!["run", "--from", &self.checkpoint, "--disk-size", &disk];
+        if let Some(mem) = memory.as_deref() {
+            args.push("--memory");
+            args.push(mem);
+        }
+        args.extend_from_slice(&[
+            "--mount",
+            &mount,
+            "--allow-host-writes",
+            "--",
+            "sh",
+            "-c",
+            &inner_cmd,
+        ]);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            tokio::process::Command::new("shuru")
-                .args([
-                    "run",
-                    "--from", &self.checkpoint,
-                    "--disk-size", &disk,
-                    "--mount",
-                    &format!("{host_root}:{guest_mount}:rw"),
-                    "--allow-host-writes",
-                    "--",
-                    "sh",
-                    "-c",
-                    &inner_cmd,
-                ])
-                .output(),
+            tokio::process::Command::new("shuru").args(&args).output(),
         )
         .await;
 
@@ -532,5 +704,175 @@ impl SandboxBackend for ShuruBackend {
     fn destroy(self) {
         // TempDir is dropped here → auto-deletes the host mount directory.
         info!(root = %self.root.display(), "shuru backend destroyed (host temp dir removed)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // [VANTA-WHY] These are the only assertions about the guard that do not need a
+    // VM. They exist because the failure it prevents is *silent* on the machine doing
+    // the developing: a host has /dev/shm, so a boot that skipped the mount works
+    // locally and fails inside the VM as a test failure that names no file.
+
+    #[test]
+    fn the_guard_mounts_a_tmpfs_and_stops_the_boot_without_one() {
+        assert!(DEV_SHM_GUARD.contains("mkdir -p /dev/shm"));
+        assert!(DEV_SHM_GUARD.contains("mount -t tmpfs"));
+        assert!(DEV_SHM_GUARD.contains("/dev/shm"));
+        // Loud, and before the command: the alternative is an `[Errno 2]` twenty
+        // minutes into a source build that names no file and no variable.
+        assert!(DEV_SHM_GUARD.contains("exit 86"));
+        // Idempotent, because the guard also runs on the boot that created a layer.
+        assert!(DEV_SHM_GUARD.contains("grep -q '^tmpfs /dev/shm ' /proc/mounts"));
+    }
+
+    #[test]
+    fn the_guard_smokes_multiprocessing_on_whichever_interpreter_the_vm_has() {
+        // Both halves of the smoke: `Lock()` is the call that raises the measured
+        // FileNotFoundError, and a `Pool` is what numpy 1.18.5's build reached
+        // through numpy/distutils/ccompiler.py.
+        assert!(DEV_SHM_GUARD.contains("mp.Lock()"));
+        assert!(DEV_SHM_GUARD.contains("mp.Pool(2)"));
+        assert!(DEV_SHM_GUARD.contains("exit 87"));
+        // Skipped, not failed, when the VM has no interpreter: the base image has
+        // none before `create_python_checkpoint` installs one, and a VM that will
+        // never run Python cannot have a Python multiprocessing problem.
+        assert!(DEV_SHM_GUARD.contains("if [ -n \"$VANTA_MP_PY\" ]; then"));
+    }
+
+    #[test]
+    fn every_sandboxed_command_runs_the_guard_first() {
+        let inner = guest_inner_command("/workspace", &["python", "-m", "pytest"], &[], &[]);
+        // First, so a VM that cannot provide a semaphore fails before the command
+        // rather than inside it.
+        assert!(inner.starts_with(DEV_SHM_GUARD));
+        // And the command still ends the line, so its exit status is the line's.
+        assert!(inner.ends_with("cd /workspace && python -m pytest"));
+    }
+
+    #[test]
+    fn the_guard_does_not_swallow_the_command_or_its_status() {
+        // A newline, not `&&`: the guard ends in an `if` block, and chaining it with
+        // `&&` would make every failure read as the chain's.
+        let inner = guest_inner_command("/workspace/x", &["sh", "-c", "exit 3"], &[], &[]);
+        assert_eq!(
+            inner,
+            format!("{DEV_SHM_GUARD}\ncd /workspace/x && sh -c 'exit 3'")
+        );
+    }
+
+    // [VANTA-WHY] Item P follow-up — the argv is an argv, not a shell fragment.
+    // The in-session import guard runs `python -c '<program>'`, and the program
+    // holds a `;` and a `(`; joined unquoted, `sh` read the `(` in `print(` as a
+    // subshell and refused the whole line — `sh: Syntax error: word unexpected
+    // (expecting ")")` — turning every matplotlib/1 and pandas/1 run into an
+    // InfraFailure that had nothing to do with the candidate. The test carries its
+    // own negative control: it rebuilds the UNQUOTED line and asserts `sh` rejects
+    // it, so a regression that dropped the quoting would fail here rather than
+    // silently pass a string comparison.
+    #[test]
+    fn an_argument_with_shell_metacharacters_survives_as_one_token() {
+        let args = ["python", "-c", "import matplotlib as g; print(g.__file__)"];
+
+        // The line as it was composed before the fix: `cmd.join(" ")`, unquoted.
+        let unquoted = format!("{DEV_SHM_GUARD}\ncd /workspace && {}", args.join(" "));
+        let rejected = sh_parse(&unquoted);
+        assert!(
+            rejected.is_err(),
+            "the unquoted line is the bug this test exists for, and `sh` must reject it"
+        );
+
+        let inner = guest_inner_command("/workspace", &args, &[], &[]);
+        assert!(inner.ends_with("cd /workspace && python -c 'import matplotlib as g; print(g.__file__)'"));
+        sh_parse(&inner).expect("the quoted line is a valid shell script, so `sh -c` reaches python");
+    }
+
+    /// `sh -n` on `line`: parses without running it, exactly as `sh -c` would.
+    fn sh_parse(line: &str) -> Result<(), String> {
+        use std::io::Write;
+        let mut child = std::process::Command::new("sh")
+            .arg("-n")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(line.as_bytes())
+            .expect("write the guest line");
+        let parsed = child.wait_with_output().expect("sh -n");
+        if parsed.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&parsed.stderr).into_owned())
+        }
+    }
+
+    // [VANTA-WHY] The recorded `sandbox_env` has to reach the guest line without
+    // touching the case that never passes the flag: an empty env must reproduce
+    // the previous command byte-for-byte, or a run that set nothing would still
+    // change the command it shipped.
+
+    #[test]
+    fn an_empty_env_reproduces_the_old_guest_line_exactly() {
+        assert_eq!(
+            guest_inner_command("/workspace/t", &["python", "-m", "pytest"], &[], &[]),
+            format!("{DEV_SHM_GUARD}\ncd /workspace/t && python -m pytest")
+        );
+    }
+
+    #[test]
+    fn a_recorded_env_becomes_an_export_before_the_command() {
+        let inner = guest_inner_command(
+            "/workspace/t",
+            &["python", "-m", "pytest"],
+            &[("PYTHONPATH".to_string(), "./docs_src".to_string())],
+            &[],
+        );
+        assert!(inner.contains("export PYTHONPATH=./docs_src"));
+        assert!(inner.ends_with("cd /workspace/t && python -m pytest"));
+    }
+
+    // [VANTA-WHY] The recorded `precompile` rule (item L) has to reach the guest
+    // line the same way `sandbox_env` does, or the in-session suite runs of
+    // matplotlib/1 die on the compile-time warning the rule exists to disarm. The
+    // assertions below are the three load-bearing choices: same interpreter as the
+    // command, the forcing `-f`, and its own line rather than an `&&`-chain.
+
+    #[test]
+    fn an_empty_precompile_reproduces_the_old_guest_line_exactly() {
+        assert_eq!(
+            guest_inner_command("/workspace/t", &["python3", "-m", "pytest"], &[], &[]),
+            format!("{DEV_SHM_GUARD}\ncd /workspace/t && python3 -m pytest")
+        );
+    }
+
+    #[test]
+    fn a_recorded_precompile_compiles_before_the_command_with_its_interpreter() {
+        let inner = guest_inner_command(
+            "/workspace/t",
+            &["python3", "-m", "pytest"],
+            &[],
+            &["lib/matplotlib/widgets.py".to_string()],
+        );
+        let lines: Vec<&str> = inner.lines().collect();
+        let cd = lines.iter().position(|l| *l == "cd /workspace/t").unwrap();
+        let pre = lines
+            .iter()
+            .position(|l| *l == "python3 -m compileall -q -f lib/matplotlib/widgets.py")
+            .unwrap();
+        // Its own line, after the `cd` (so the path is tree-relative) and before the
+        // command (so nothing is compiled under pytest's filters) …
+        assert!(cd < pre);
+        // … and last, so the script's exit status is still the command's, and a
+        // failed compile cannot take the test report with it.
+        assert_eq!(*lines.last().unwrap(), "python3 -m pytest");
+        // Not `&&`-chained to the command.
+        assert!(!inner.contains("compileall -q -f lib/matplotlib/widgets.py &&"));
     }
 }

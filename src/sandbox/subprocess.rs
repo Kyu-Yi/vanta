@@ -86,6 +86,8 @@ impl SandboxBackend for SubprocessBackend {
         cmd: &[&str],
         cwd: &Path,
         timeout_secs: u64,
+        env: &[(String, String)],
+        precompile: &[String],
     ) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>> {
         if cmd.is_empty() {
             return Err("execute: empty command".into());
@@ -98,6 +100,29 @@ impl SandboxBackend for SubprocessBackend {
         };
 
         debug!(cmd = ?cmd, cwd = %full_cwd.display(), timeout_secs, "executing command");
+
+        // [VANTA-WHY] The run's recorded pre-compile rule (item L) runs FIRST, in
+        // the same tree and under the same interpreter as the command itself —
+        // exactly the ordering `shuru::guest_inner_command` gives the microVM. It
+        // matters here for the same reason: a module whose compile-time warning the
+        // project escalates to an error must have left valid bytecode before the
+        // test command compiles it under pytest's filters. An empty rule runs
+        // nothing and leaves the invocation byte-identical. The compile's output is
+        // prepended to the command's, and the exit code stays the command's.
+        let pre_argv = crate::sandbox::precompile_argv(cmd, precompile);
+        let (pre_stdout, pre_stderr) = if pre_argv.is_empty() {
+            (String::new(), String::new())
+        } else {
+            let out = Command::new(&pre_argv[0])
+                .args(&pre_argv[1..])
+                .current_dir(&full_cwd)
+                .output()
+                .await?;
+            (
+                String::from_utf8_lossy(&out.stdout).to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
 
         let start = Instant::now();
 
@@ -125,6 +150,14 @@ impl SandboxBackend for SubprocessBackend {
         command.env_remove("HTTPS_PROXY");
         command.env("no_proxy", "*");
         command.env("NO_PROXY", "*");
+
+        // [VANTA-WHY] Extra environment from the run's recorded rule (e.g.
+        // `PYTHONPATH=./docs_src`), so the project's own import path reaches
+        // every command. The default is empty, which leaves the invocation
+        // byte-identical to a run that never set this flag.
+        for (key, value) in env {
+            command.env(key, value);
+        }
 
         // [VANTA-WHY] Memory limit enforced at process level (optional).
         // pre_exec runs in the forked child BEFORE exec, so setrlimit applies
@@ -168,8 +201,14 @@ impl SandboxBackend for SubprocessBackend {
         match output_result {
             Ok(Ok(output)) => {
                 let result = ExecutionResult {
-                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                    stdout: format!(
+                        "{pre_stdout}{}",
+                        String::from_utf8_lossy(&output.stdout)
+                    ),
+                    stderr: format!(
+                        "{pre_stderr}{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
                     exit_code: output.status.code(),
                     wall_time_ms,
                     timed_out: false,

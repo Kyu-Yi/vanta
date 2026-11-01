@@ -126,6 +126,17 @@ pub enum FailureClass {
     // the reason). NOTE: Repository and benchmark oracle tests are NEVER
     // quarantined; they escalate to "human review required".
     Unknown,
+
+    // [VANTA-WHY] TestDefect = the failure is a property of the TEST, not of
+    // the candidate. Two shapes produce it: (a) the failure reproduces
+    // IDENTICALLY on the unpatched tree (patch-insensitive — B v2's
+    // HereticSettings parsed pytest's own argv and raised SystemExit on both
+    // trees); (b) the exception was raised in an object the TEST defined, or in
+    // test setup, before the code under test ran (56eb4fd3's FakeTensor had no
+    // `.shape`). Blaming the patch for either is a FALSE finding about the
+    // model, so this class is sent back to the Attacker for revision and NEVER
+    // counted as Logic. → Excluded from EIR/ECR exactly like Infrastructure.
+    TestDefect,
 }
 
 /// True when a failure was a genuine LOGIC failure — the only class that is
@@ -147,8 +158,18 @@ pub fn is_logic_failure(class: &Option<FailureClass>) -> bool {
 ///   failure class is Logic. An Infrastructure/Static/Unknown `Error` still
 ///   counts as a failing side, so it is excluded too;
 /// - an unchanged all-pass result carries no attribution, so it stays
-///   COUNTABLE — it remains in the denominator to keep the rate comparable
-///   across runs.
+///   COUNTABLE — under the CONDITIONAL definition below it joins EIR's
+///   denominator (the row WAS passing at N) and never ECR's.
+///
+/// [VANTA-WHY] `source` is the ONE class that reopens the exclusion, and only
+/// for itself. `FailureClass::Static` stays uncountable for Attacker tests (an
+/// `import-not-found` is the environment's fault, not the candidate's), but a
+/// row whose OWN source is `EvidenceSource::Static` is a blocking finding that
+/// was already differenced against the pre-patch baseline — everything the
+/// patch did not introduce is gone, so the finding that remains is the
+/// candidate's and a finding that disappears on the next attempt is a real
+/// correction. Without this, a static error fixed in N+1 would be structurally
+/// invisible exactly like the native correction in 4d55123d.
 ///
 /// The other half of the rule — that the row must be a genuine patch
 /// transition, both ends observed and different — is
@@ -158,13 +179,17 @@ pub fn counts_toward_metrics(
     to_result: &TestResult,
     from_failure_class: &Option<FailureClass>,
     to_failure_class: &Option<FailureClass>,
+    source: &EvidenceSource,
 ) -> bool {
-    let side_is_logic_or_pass = |result: &TestResult, class: &Option<FailureClass>| {
-        matches!(result, TestResult::Passed) || is_logic_failure(class)
+    let static_finding = matches!(source, EvidenceSource::Static);
+    let side_is_countable = |result: &TestResult, class: &Option<FailureClass>| {
+        matches!(result, TestResult::Passed)
+            || is_logic_failure(class)
+            || (static_finding && matches!(class, Some(FailureClass::Static)))
     };
 
-    side_is_logic_or_pass(from_result, from_failure_class)
-        && side_is_logic_or_pass(to_result, to_failure_class)
+    side_is_countable(from_result, from_failure_class)
+        && side_is_countable(to_result, to_failure_class)
 }
 
 /// FNV-1a 64-bit, hex-encoded. Deterministic across runs and platforms.
@@ -175,6 +200,37 @@ fn fnv1a_hex(input: &str) -> String {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+/// The first 12 hex characters of the SHA-256 of one role's system prompt
+/// text(s), taken over the parts joined by U+001F.
+///
+/// [VANTA-WHY] §14.10 f — prompt provenance. A version LABEL is only as good as
+/// the discipline of bumping it: `3588728` (the A3 follow-up) and `d4ea314` (the
+/// A10 follow-up) both changed prompt wording after the `a2617b3` bump and left
+/// the label alone, so two different prompts were logged under one tag and the
+/// logs said "no change" about a change that moves verdicts. A content hash
+/// cannot be forgotten: it is derived from the text that is sent.
+///
+/// [VANTA-WHY] Joined with U+001F (the ASCII unit separator, a character no
+/// prompt contains) so the parts' boundaries are unambiguous — without a
+/// separator, moving a word from the end of one prompt to the start of the next
+/// would leave the concatenation identical and the change invisible.
+///
+/// The digest is TRUNCATED to 12 hex characters (48 bits): this is a change
+/// detector for a handful of prompts, not an attack-resistant fingerprint, and a
+/// short tag keeps `run.summary` readable.
+pub fn prompt_content_hash(prompts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let joined = prompts.join("\u{1f}");
+    let digest = Sha256::digest(joined.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex.truncate(12);
+    hex
 }
 
 /// Canonical identity of a test's PROBE, independent of the name it was given.
@@ -393,6 +449,51 @@ pub enum EvidenceSource {
     // "add(2,3) returns 4 but should be 7". Weakest form of property — may be
     // miswritten, ambiguous, or partial. Logged separately from repo tests.
     IssueDescription,
+
+    // [VANTA-WHY] THE REPOSITORY'S OWN test suite, run on the candidate's tree
+    // (Spec §5 native-suite gate). It is not `ExistingRepositoryTest` in the
+    // sense above: that variant describes a repo test used as part of the shared
+    // question set. These are the repo's existing tests run as a whole, and they
+    // are the only evidence that does not depend on what the Attacker happened
+    // to sample.
+    //
+    // [VANTA-WHY] Session 4d55123d approved a patch whose ONE real correction
+    // was to a native test the previous attempt had broken. The correction was
+    // invisible: the native suite wrote only session records, never transition
+    // rows, so ECR read 0/0 and the only thing the run actually fixed counted
+    // for nothing. A native row has the same fail->pass / pass->fail shape as a
+    // shared-set row, keyed by the pytest nodeid, so it can be counted the same
+    // way — and, like every other row, separately.
+    Native,
+
+    // [VANTA-WHY] A BLOCKING static finding: an error-class diagnostic (ruff
+    // `F`/`E9`, or any mypy error) in a file the patch touches, differenced
+    // against the pre-patch baseline. Its class is `FailureClass::Static`, and
+    // that class is normally NOT countable — an environment-induced
+    // `import-not-found` is a fact about the analysis environment, not about the
+    // candidate. This source is the discriminator: baseline differencing already
+    // removed every finding the patch did not introduce, so what is left IS the
+    // candidate's doing, and a finding that disappears on the next attempt is a
+    // genuine correction. Rows carry this source so the class gate can count
+    // them without reopening the non-Logic exclusion for Attacker-generated
+    // tests.
+    Static,
+}
+
+/// Normalised identity of a blocking static finding: rule + file + message.
+///
+/// [VANTA-WHY] A static finding has no name and no body hash to key on, so its
+/// identity has to be derived from what identifies it: the rule that fired, the
+/// file it fired in, and its message. The line number is deliberately EXCLUDED —
+/// a finding that survives an edit and only moves down the file is the SAME
+/// finding, and keying on the line would read as "the old one was fixed and a
+/// new one appeared", which is exactly the false correction this identity
+/// exists to prevent. The message is collapsed to single spaces so pure
+/// reflowing of a wrapped diagnostic (mypy wraps long type names) does not fork
+/// the identity either.
+pub fn static_finding_identity(rule: &str, file: &str, message: &str) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("{rule}|{file}|{normalized}")
 }
 
 // ============================================================================
@@ -566,6 +667,7 @@ impl AttemptTransition {
             &self.to_result,
             &self.from_failure_class,
             &self.to_failure_class,
+            &self.evidence_source,
         )
     }
 }
@@ -573,24 +675,193 @@ impl AttemptTransition {
 // ============================================================================
 // EcrEirSnapshot — counted ECR/EIR over a set of complete transitions
 // ============================================================================
+//
+// [VANTA-WHY] The rates are CONDITIONAL on the state at N, not a share of every
+// observed row:
+//
+//   ECR = rows Failed at N that Pass at N+1  ÷  rows Failed at N
+//   EIR = rows Passed at N that Fail at N+1  ÷  rows Passed at N
+//
+// The per-row alternative — divide by every countable row — answers a different
+// and much weaker question, "what share of all observed tests changed in a good
+// way", and its denominator is the SIZE OF THE SUITE. Session 4d55123d fixed one
+// native regression among five native tests, so dividing by every row scores
+// ECR(Native) = 1/5; a BugsInPy repo with 800 native tests would score ~0.1%
+// for the one fix that mattered. That measures the repository, not the repair,
+// and makes two repos incomparable. Conditional gives 1/1 in both.
+//
+// `complete` is kept because it describes the run's overall CHURN — how much of
+// the observed suite moved at all. It is deliberately NOT either rate's
+// denominator.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EcrEirSnapshot {
-    pub ecr_count: usize,   // fail -> pass
-    pub eir_count: usize,   // pass -> fail
-    pub complete: usize,    // number of complete transitions observed
+    pub ecr_count: usize, // rows Failed at N that Pass at N+1
+    pub eir_count: usize, // rows Passed at N that Fail at N+1
+    // [VANTA-WHY] The two CONDITIONAL denominators. A row belongs to at most
+    // one of them — its state at N is Failed, Passed, or (for an Error) neither,
+    // which moves no rate at all — so neither rate may be read off the other's
+    // denominator.
+    #[serde(default)]
+    pub ecr_denominator: usize, // rows Failed at N
+    #[serde(default)]
+    pub eir_denominator: usize, // rows Passed at N
+    pub complete: usize, // countable rows observed (churn; not a rate denominator)
     // [VANTA-WHY] Complete transitions dropped because a failure involved was
     // not Logic-class. Reported rather than silently discarded so a run that
     // excluded most of its evidence is visible instead of looking precise.
     #[serde(default)]
     pub excluded_non_logic: usize,
+    // [VANTA-WHY] The same counts, split by where the evidence came from, and
+    // additive to the totals above. A pooled ECR of 1/6 says nothing about
+    // WHICH evidence moved: session 4d55123d's only correction was a native
+    // test, and reading the number as an Attacker-test result would credit the
+    // model for something the repository's own suite proved. `#[serde(default)]`
+    // so snapshots written before the breakdown existed still load.
+    #[serde(default)]
+    pub attacker_generated: SourceBreakdown,
+    #[serde(default)]
+    pub native: SourceBreakdown,
+    #[serde(default)]
+    pub static_findings: SourceBreakdown,
+}
+
+/// ECR/EIR counts for ONE evidence source. See `EcrEirSnapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct SourceBreakdown {
+    pub ecr_count: usize,
+    pub eir_count: usize,
+    #[serde(default)]
+    pub ecr_denominator: usize,
+    #[serde(default)]
+    pub eir_denominator: usize,
+    pub complete: usize,
+    #[serde(default)]
+    pub excluded_non_logic: usize,
+}
+
+impl SourceBreakdown {
+    /// Conditional ECR for this source, e.g. `1/1 (100.00%)` or `n/a`.
+    pub fn ecr_text(&self) -> String {
+        EcrEirSnapshot::render_rate(self.ecr_count, self.ecr_denominator)
+    }
+
+    /// Conditional EIR for this source, e.g. `0/4 (0.00%)` or `n/a`.
+    pub fn eir_text(&self) -> String {
+        EcrEirSnapshot::render_rate(self.eir_count, self.eir_denominator)
+    }
 }
 
 impl EcrEirSnapshot {
     pub fn ecr_rate(&self) -> f64 {
-        if self.complete == 0 { 0.0 } else { self.ecr_count as f64 / self.complete as f64 }
+        if self.ecr_denominator == 0 {
+            0.0
+        } else {
+            self.ecr_count as f64 / self.ecr_denominator as f64
+        }
     }
     pub fn eir_rate(&self) -> f64 {
-        if self.complete == 0 { 0.0 } else { self.eir_count as f64 / self.complete as f64 }
+        if self.eir_denominator == 0 {
+            0.0
+        } else {
+            self.eir_count as f64 / self.eir_denominator as f64
+        }
+    }
+
+    /// Record one countable row in the totals AND in its source's breakdown.
+    ///
+    /// The row's state at N decides which denominator it joins — Failed joins
+    /// ECR's, Passed joins EIR's, an Error joins neither — and the (from, to)
+    /// pair decides whether it is a numerator. Both rates therefore stay
+    /// conditional on what was broken / passing at N, whatever the size of the
+    /// suite that produced the rows.
+    pub fn record(&mut self, source: &EvidenceSource, from: &TestResult, to: &TestResult) {
+        self.complete += 1;
+        let breakdown = match source {
+            EvidenceSource::Native => &mut self.native,
+            EvidenceSource::Static => &mut self.static_findings,
+            _ => &mut self.attacker_generated,
+        };
+        breakdown.complete += 1;
+        match from {
+            TestResult::Failed => {
+                self.ecr_denominator += 1;
+                breakdown.ecr_denominator += 1;
+            }
+            TestResult::Passed => {
+                self.eir_denominator += 1;
+                breakdown.eir_denominator += 1;
+            }
+            TestResult::Error => {}
+        }
+        match (from, to) {
+            (TestResult::Failed, TestResult::Passed) => {
+                self.ecr_count += 1;
+                breakdown.ecr_count += 1;
+            }
+            (TestResult::Passed, TestResult::Failed) => {
+                self.eir_count += 1;
+                breakdown.eir_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    /// Record one excluded (non-countable-class) row in the totals and in its
+    /// source's breakdown.
+    pub fn record_excluded(&mut self, source: &EvidenceSource) {
+        self.excluded_non_logic += 1;
+        match source {
+            EvidenceSource::Native => self.native.excluded_non_logic += 1,
+            EvidenceSource::Static => self.static_findings.excluded_non_logic += 1,
+            _ => self.attacker_generated.excluded_non_logic += 1,
+        }
+    }
+
+    /// `count/denominator (pct%)`, or `n/a` when the denominator is zero.
+    ///
+    /// [VANTA-WHY] A zero denominator must NEVER render as `0.00%`. "No
+    /// transitions were countable" and "every countable transition was
+    /// uncorrected" are opposite claims about a run, and a rate of 0.00% states
+    /// the second one. `n/a` states the first.
+    ///
+    /// The denominator is the CONDITIONAL one (`ecr_denominator` /
+    /// `eir_denominator`), never `complete`: dividing by every observed row
+    /// would let the size of the repo's test suite decide the rate.
+    pub fn render_rate(count: usize, denominator: usize) -> String {
+        if denominator == 0 {
+            "n/a".to_string()
+        } else {
+            format!(
+                "{count}/{denominator} ({:.2}%)",
+                count as f64 / denominator as f64 * 100.0
+            )
+        }
+    }
+
+    /// Combined ECR, e.g. `1/1 (100.00%)` or `n/a`.
+    pub fn ecr_text(&self) -> String {
+        Self::render_rate(self.ecr_count, self.ecr_denominator)
+    }
+
+    /// Combined EIR, e.g. `0/4 (0.00%)` or `n/a`.
+    pub fn eir_text(&self) -> String {
+        Self::render_rate(self.eir_count, self.eir_denominator)
+    }
+
+    /// ECR and EIR for one source, e.g. `ECR=1/1 (100.00%) EIR=0/4 (0.00%)`.
+    fn source_text(breakdown: &SourceBreakdown) -> String {
+        format!("ECR={} EIR={}", breakdown.ecr_text(), breakdown.eir_text())
+    }
+
+    /// The same metric per evidence source, so a pooled number can be read
+    /// apart: `AttackerGenerated[ECR=n/a EIR=n/a] Native[ECR=1/1 (100.00%) …] …`
+    pub fn per_source_text(&self) -> String {
+        format!(
+            "AttackerGenerated[{}] Native[{}] Static[{}]",
+            Self::source_text(&self.attacker_generated),
+            Self::source_text(&self.native),
+            Self::source_text(&self.static_findings)
+        )
     }
 }
 
@@ -608,8 +879,57 @@ pub enum GovernorDecision {
     // regression" and "gave up after N tries" are different claims about the
     // model, and the PR and the paper both read this field to tell them apart.
     Rejected,
-    // [VANTA-WHY] Reached max attempts (Fixed-N = 4). Stopped without a clean pass.
+    // [VANTA-WHY] Reached the attempt budget without a clean pass. The number is
+    // the run's own `--max-attempts` (the driver logs `attempts_run`); it is NOT
+    // a fixed 4.
     MaxAttemptsReached,
+    // [VANTA-WHY] §14.3. Review mode spent its whole attack depth on failures
+    // that no corroborating rule covers: the candidate is not approved, and it
+    // is not rejected either, because the only evidence against it might be a
+    // wrong test. Reachable ONLY in review mode with `VANTA_CORROBORATE=on`, and
+    // only once the budget is exhausted — a human has to look.
+    //
+    // Deliberately NOT an approval: the Gatekeeper still approves only on
+    // `AllTestsPassed`, so this variant cannot inflate an approval count, and
+    // the harness scores it as its own outcome (`needs_review_on_good` /
+    // `needs_review_on_bad`) rather than as an approval, a rejection or an
+    // unresolved run. It has its own exit code (3) so a caller can tell "a
+    // human should look" from "no".
+    NeedsReview,
+    // [VANTA-WHY] M3 item 7 — the judge arms' positive verdict: one model call
+    // read the issue, the SAME selected context the B3 arm would have seen, and
+    // the candidate diff (plus the native suite's result under `judge+suite`),
+    // and answered that the patch resolves the issue. Deliberately NOT
+    // `AllTestsPassed`: that token claims a test ran and passed, and under the
+    // judge no generated test ran at all — reading it as one would make a
+    // verdict with no execution behind it indistinguishable from one with the
+    // whole adversarial pipeline behind it, in the session log, in `metrics.py`
+    // and in the approval-invariant checks. The harness maps it onto the same
+    // TA/FA label `AllTestsPassed` gets, so a judge row still pairs with a Vanta
+    // row on the same candidate.
+    JudgeApproved,
+    // [VANTA-WHY] M3 item 7 — the judge decided the candidate does NOT resolve
+    // the issue. Same argument in the other direction: `Rejected` claims a test
+    // observed a failure, and no test did here. Mapped onto the TR/FR labels for
+    // pairing, recorded under its own token so the log says which mechanism
+    // reached the verdict.
+    JudgeRejected,
+    // [VANTA-WHY] M3 item 7 — the judge answered with something unusable (an
+    // unknown `verdict`, or JSON that would not parse) on BOTH the call and its
+    // one retry, so there is no verdict at all. Its own token because it is none
+    // of the neighbouring outcomes: not an approval and not a rejection (the
+    // model did not decide), and not `InfraFailure` (the machine answered
+    // perfectly well — it answered with text nobody can read as a verdict). It
+    // gets its own exit code (4) and its own harness bucket (`judge_failed`),
+    // and is never folded into `NeedsReview`, `Rejected` or `InfraFailure`.
+    JudgeFailed,
+    // [VANTA-WHY] An LLM call failed for every attempt the retry loop was
+    // allowed. This says NOTHING about the candidate: the model never produced an
+    // answer, so there is no evidence for or against the patch. It exists so the
+    // run can end as a RECORDED outcome — final_decision, session summary,
+    // evidence and transitions all on disk — instead of a crash with no verdict.
+    // metrics.py must never score it as approval, rejection or unresolved.
+    InfraFailure,
     // [VANTA-WHY] Patch failed to apply (changed == false). Cannot continue —
     // the Creator produced no usable change.
     PatchApplicationFailed,
@@ -622,4 +942,226 @@ pub enum GovernorDecision {
     HarnessFailure,
     // [VANTA-WHY] Loop should continue (used internally; never a final decision).
     Continue,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The identity of a blocking static finding is rule + file + message. The
+    /// line number is NOT part of it.
+    #[test]
+    fn a_static_finding_identity_ignores_the_line_it_sits_on() {
+        let a = static_finding_identity("F821", "calc.py", "Undefined name `x`");
+        let b = static_finding_identity("F821", "calc.py", "Undefined name `x`");
+        assert_eq!(a, b, "the same finding must have one identity");
+
+        // The identity does not even take a line, so a finding that only moved
+        // down the file keeps it. A message that itself carries a colon (mypy
+        // writes "path:line: error: ..." style text) must survive intact — the
+        // identity is never split on one.
+        let with_colon = static_finding_identity("index", "mod.py", "Incompatible type: int");
+        assert_eq!(with_colon, "index|mod.py|Incompatible type: int");
+    }
+
+    /// A message that is re-wrapped by the analyzer is the SAME finding.
+    #[test]
+    fn a_static_finding_identity_normalises_whitespace_in_the_message() {
+        let wrapped = static_finding_identity(
+            "index",
+            "mod.py",
+            "Item of \"list\" has no\n   attribute \"shape\"",
+        );
+        let flat =
+            static_finding_identity("index", "mod.py", "Item of \"list\" has no attribute \"shape\"");
+        assert_eq!(
+            wrapped, flat,
+            "re-wrapping a diagnostic must not fork the identity"
+        );
+        assert_eq!(
+            flat,
+            r#"index|mod.py|Item of "list" has no attribute "shape""#,
+            "the identity is readable: rule | file | normalised message"
+        );
+    }
+
+    /// Different rule, file, or message -> different identity.
+    #[test]
+    fn a_static_finding_identity_separates_rule_file_and_message() {
+        let base = static_finding_identity("F821", "calc.py", "Undefined name `x`");
+        assert_ne!(base, static_finding_identity("F401", "calc.py", "Undefined name `x`"));
+        assert_ne!(base, static_finding_identity("F821", "other.py", "Undefined name `x`"));
+        assert_ne!(base, static_finding_identity("F821", "calc.py", "Undefined name `y`"));
+    }
+
+    /// A Static-class failure counts ONLY on a row whose own source is Static.
+    ///
+    /// [VANTA-WHY] This is the whole reason the gate takes a source: the static
+    /// class is uncountable for Attacker evidence (an `import-not-found` blames
+    /// the environment) but countable for a blocking finding that was already
+    /// differenced against the baseline.
+    #[test]
+    fn a_static_class_failure_counts_only_for_static_source_rows() {
+        let passed = TestResult::Passed;
+        let failed = TestResult::Failed;
+        let static_class = Some(FailureClass::Static);
+
+        assert!(
+            counts_toward_metrics(
+                &failed,
+                &passed,
+                &static_class,
+                &None,
+                &EvidenceSource::Static
+            ),
+            "a blocking static error fixed on the next attempt is a correction"
+        );
+        assert!(
+            counts_toward_metrics(
+                &passed,
+                &failed,
+                &None,
+                &static_class,
+                &EvidenceSource::Static
+            ),
+            "a blocking static error introduced on the next attempt is an introduction"
+        );
+        assert!(
+            !counts_toward_metrics(
+                &failed,
+                &passed,
+                &static_class,
+                &None,
+                &EvidenceSource::AttackerGenerated
+            ),
+            "an Attacker test that merely classified Static must stay excluded"
+        );
+        assert!(
+            !counts_toward_metrics(
+                &failed,
+                &passed,
+                &static_class,
+                &None,
+                &EvidenceSource::Native
+            ),
+            "the allowance is for Static-source rows only, not for every source"
+        );
+    }
+
+    /// Native rows carry Logic on their failing side, so a repo-native
+    /// regression and its repair are countable under the ordinary rule.
+    #[test]
+    fn a_native_regression_counts_under_the_ordinary_logic_rule() {
+        assert!(counts_toward_metrics(
+            &TestResult::Failed,
+            &TestResult::Passed,
+            &Some(FailureClass::Logic),
+            &None,
+            &EvidenceSource::Native
+        ));
+        assert!(counts_toward_metrics(
+            &TestResult::Passed,
+            &TestResult::Failed,
+            &None,
+            &Some(FailureClass::Logic),
+            &EvidenceSource::Native
+        ));
+    }
+
+    /// A zero denominator renders `n/a`, never `0.00%`.
+    #[test]
+    fn a_zero_denominator_renders_not_applicable_never_a_zero_percent() {
+        assert_eq!(EcrEirSnapshot::render_rate(0, 0), "n/a");
+        assert_eq!(EcrEirSnapshot::render_rate(0, 3), "0/3 (0.00%)");
+        assert_eq!(EcrEirSnapshot::render_rate(1, 2), "1/2 (50.00%)");
+
+        let empty = EcrEirSnapshot::default();
+        assert_eq!(empty.ecr_text(), "n/a");
+        assert_eq!(empty.eir_text(), "n/a");
+        assert!(
+            !empty.per_source_text().contains("0.00%"),
+            "an empty snapshot must not state a rate: {}",
+            empty.per_source_text()
+        );
+    }
+
+    /// The per-source breakdown is additive to the totals, and each rate's
+    /// denominator is the row's state at N — not the row count.
+    #[test]
+    fn the_source_breakdown_adds_up_to_the_totals() {
+        let mut snap = EcrEirSnapshot::default();
+        snap.record(
+            &EvidenceSource::AttackerGenerated,
+            &TestResult::Passed,
+            &TestResult::Passed,
+        );
+        snap.record(&EvidenceSource::Native, &TestResult::Failed, &TestResult::Passed);
+        snap.record(&EvidenceSource::Static, &TestResult::Passed, &TestResult::Failed);
+        snap.record_excluded(&EvidenceSource::AttackerGenerated);
+
+        assert_eq!(snap.complete, 3);
+        assert_eq!(snap.ecr_count, 1);
+        assert_eq!(snap.eir_count, 1);
+        assert_eq!(snap.excluded_non_logic, 1);
+        assert_eq!(
+            snap.ecr_denominator, 1,
+            "only the Native row was FAILING at N, and it is the only ECR denominator"
+        );
+        assert_eq!(
+            snap.eir_denominator, 2,
+            "the Attacker and Static rows were PASSING at N, so they form EIR's denominator"
+        );
+        assert_eq!(snap.attacker_generated.complete, 1);
+        assert_eq!(snap.native.ecr_count, 1);
+        assert_eq!(snap.native.complete, 1);
+        assert_eq!(snap.native.ecr_denominator, 1);
+        assert_eq!(
+            snap.native.eir_denominator, 0,
+            "nothing was passing at N under the Native source, so EIR(Native) is n/a"
+        );
+        assert_eq!(snap.static_findings.eir_count, 1);
+        assert_eq!(snap.static_findings.complete, 1);
+        assert_eq!(snap.static_findings.eir_denominator, 1);
+        assert_eq!(
+            snap.native.complete + snap.static_findings.complete + snap.attacker_generated.complete,
+            snap.complete
+        );
+    }
+
+    /// A row whose `from` side is an Error belongs to NEITHER conditional
+    /// denominator: it was not passing at N and it was not failing at N, so it
+    /// can neither be fixed nor broken.
+    #[test]
+    fn an_error_at_n_joins_neither_conditional_denominator() {
+        let mut snap = EcrEirSnapshot::default();
+        snap.record(&EvidenceSource::Native, &TestResult::Error, &TestResult::Passed);
+
+        assert_eq!(snap.complete, 1, "it is still a countable, observed row");
+        assert_eq!(snap.ecr_count, 0);
+        assert_eq!(snap.eir_count, 0);
+        assert_eq!(snap.ecr_denominator, 0);
+        assert_eq!(snap.eir_denominator, 0);
+        assert_eq!(snap.ecr_text(), "n/a");
+        assert_eq!(snap.eir_text(), "n/a");
+    }
+
+    /// The suite size must not move ECR: the same single fix scores `1/1`
+    /// whether four other tests kept passing or eight hundred did.
+    #[test]
+    fn a_fix_scores_the_same_whatever_else_the_suite_contains() {
+        let snapshot = |bystanders: usize| {
+            let mut snap = EcrEirSnapshot::default();
+            snap.record(&EvidenceSource::Native, &TestResult::Failed, &TestResult::Passed);
+            for _ in 0..bystanders {
+                snap.record(&EvidenceSource::Native, &TestResult::Passed, &TestResult::Passed);
+            }
+            snap
+        };
+
+        assert_eq!(snapshot(4).native.ecr_text(), "1/1 (100.00%)");
+        assert_eq!(snapshot(800).native.ecr_text(), "1/1 (100.00%)");
+        // ... while churn keeps growing, which is what `complete` is for.
+        assert_eq!(snapshot(4).native.complete, 5);
+        assert_eq!(snapshot(800).native.complete, 801);
+    }
 }

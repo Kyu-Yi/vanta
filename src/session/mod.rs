@@ -29,6 +29,15 @@ use crate::core::{
     TestIntent, TestResult,
 };
 
+/// Version of the on-disk session/transition/evidence schema.
+///
+/// [VANTA-WHY] Files written before this marker existed carry NO version at all,
+/// which is a DIFFERENT fact from "written by an older version of the current
+/// schema". So the field is `Option<u32>` and absence deserialises as `None`
+/// ("v0"), never as `Some(SCHEMA_VERSION)` — a serde default would destroy
+/// exactly the distinction the marker exists to provide.
+pub const SCHEMA_VERSION: u32 = 1;
+
 // ============================================================================
 // ID NEWTYPES — compile-time type safety for every record
 // ============================================================================
@@ -113,6 +122,10 @@ impl TestId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub session_id: SessionId,
+    /// On-disk schema version; `None` for files written before the marker
+    /// existed (v0). See `SCHEMA_VERSION`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     /// [VANTA-WHY] `None` for a RUN-LEVEL record (e.g. `session.start`, written
     /// before attempt 1): there is no patch attempt yet, and inventing one would
     /// write an unobserved value to disk as a fact. A null here means "no patch
@@ -151,6 +164,10 @@ pub struct SessionRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionRow {
     pub session_id: SessionId,
+    /// On-disk schema version; `None` for rows written before the marker existed
+    /// (v0). See `SCHEMA_VERSION`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     /// Identity of the candidate the OLDER attempt ran, or `null` if that
     /// attempt produced no candidate to identify (skipped, censored, or its
     /// patch never applied).
@@ -190,6 +207,24 @@ pub struct TransitionRow {
     /// recorded HOLE, not a deleted row: it exists so the missing observation is
     /// visible and excludable from EIR/ECR rather than silently absent.
     pub censored: bool,
+    /// The attempt on the NEWER side never applied its patch, so nothing about
+    /// that candidate was observed.
+    ///
+    /// [VANTA-WHY] `censored` already excludes these rows from EIR/ECR; this says
+    /// WHY the hole is there. "No candidate existed" and "a probe was missing
+    /// from an otherwise complete attempt" are different facts about a run, and
+    /// only the flag keeps them apart when the rows are read back months later.
+    pub apply_failed: bool,
+    /// The comparison skipped at least one attempt: `to_attempt - from_attempt`
+    /// is greater than 1, because an attempt in between observed nothing.
+    ///
+    /// [VANTA-WHY] A `1 -> 3` row is a genuine repair transition between two
+    /// real candidates, but it is NOT the N -> N+1 shape the EIR/ECR rate is
+    /// defined over, and a metrics script that pooled them would silently mix
+    /// "the next patch fixed it" with "the patch after the one that never
+    /// applied fixed it". Derived from the attempt indices rather than stored at
+    /// the source, so it cannot disagree with them.
+    pub gap: bool,
     /// Membership of S^(0), the shared set as it stood on the first attempt.
     /// The restricted analysis needs this per row and it cannot be rebuilt later.
     pub in_s0: bool,
@@ -198,12 +233,14 @@ pub struct TransitionRow {
 impl TransitionRow {
     /// Stamp a Governor-computed transition with the run identities it needs to
     /// be joined from disk. An end with no real candidate id is passed as
-    /// `None`; the row is then CENSORED, never filled in.
+    /// `None`; the row is then CENSORED, never filled in. `apply_failed` marks
+    /// rows whose newer candidate never ran at all.
     pub fn from_transition(
         transition: &AttemptTransition,
         session_id: &SessionId,
         from_patch_attempt_id: Option<PatchAttemptId>,
         to_patch_attempt_id: Option<PatchAttemptId>,
+        apply_failed: bool,
     ) -> Self {
         // [VANTA-WHY] A missing candidate id on either end is a partially
         // observed transition: it identifies a hole and must never be treated as
@@ -212,8 +249,10 @@ impl TransitionRow {
         let censored = !transition.complete
             || from_patch_attempt_id.is_none()
             || to_patch_attempt_id.is_none();
+        let gap = transition.to_attempt.saturating_sub(transition.from_attempt) > 1;
         Self {
             session_id: session_id.clone(),
+            schema_version: Some(SCHEMA_VERSION),
             from_patch_attempt_id,
             to_patch_attempt_id,
             from_attempt: transition.from_attempt,
@@ -228,6 +267,8 @@ impl TransitionRow {
             evidence_source: transition.evidence_source.clone(),
             test_intent: transition.test_intent.clone(),
             censored,
+            apply_failed,
+            gap,
             in_s0: transition.in_s0,
         }
     }
@@ -261,9 +302,27 @@ impl TransitionRow {
 /// call, so there is exactly one definition of the metric and a single test
 /// covers both. A row counts only if it is a genuine, complete patch transition
 /// (`TransitionRow::is_countable_patch_transition`) whose failing side is
-/// Logic-class (`counts_toward_metrics`); then fail->pass is ECR and pass->fail
-/// is EIR. Review rounds, censored holes, and non-Logic transitions are excluded
-/// here, at calculation time.
+/// countable for its own evidence source (`counts_toward_metrics`); then
+/// fail->pass is ECR and pass->fail is EIR. Review rounds, censored holes, and
+/// non-countable transitions are excluded here, at calculation time.
+///
+/// [VANTA-WHY] The rates are CONDITIONAL on the row's state at N:
+///
+///   ECR = rows Failed at N that Pass at N+1 ÷ rows Failed at N
+///   EIR = rows Passed at N that Fail at N+1 ÷ rows Passed at N
+///
+/// Dividing by every countable row instead would make the denominator the size
+/// of the observed suite, so the fix in 4d55123d — one native regression among
+/// five native tests — would read 1/5 rather than 1/1, and a BugsInPy repo with
+/// hundreds of native tests would drown a real repair. Rows that never moved
+/// stay counted in `complete` (the churn number) but they only enter a rate's
+/// denominator through the state they held at N.
+///
+/// [VANTA-WHY] Totals AND the per-source breakdown come out of the SAME pass
+/// over the SAME rows, so the breakdown can never disagree with the total. A
+/// run whose only real correction was a repository-native test (4d55123d) has an
+/// ECR that is entirely Native, and the pooled number alone would credit the
+/// Attacker for it.
 pub fn ecr_eir_from_rows(rows: &[TransitionRow]) -> EcrEirSnapshot {
     let mut snap = EcrEirSnapshot::default();
     for row in rows {
@@ -275,16 +334,12 @@ pub fn ecr_eir_from_rows(rows: &[TransitionRow]) -> EcrEirSnapshot {
             &row.to_result,
             &row.from_failure_class,
             &row.to_failure_class,
+            &row.evidence_source,
         ) {
-            snap.excluded_non_logic += 1;
+            snap.record_excluded(&row.evidence_source);
             continue;
         }
-        snap.complete += 1;
-        match (&row.from_result, &row.to_result) {
-            (TestResult::Failed, TestResult::Passed) => snap.ecr_count += 1,
-            (TestResult::Passed, TestResult::Failed) => snap.eir_count += 1,
-            _ => {}
-        }
+        snap.record(&row.evidence_source, &row.from_result, &row.to_result);
     }
     snap
 }
@@ -546,6 +601,7 @@ mod tests {
         let mut log = SessionLog::new(SessionId::new("sess-test"));
         log.push(SessionRecord {
             session_id: SessionId::new("sess-test"),
+            schema_version: Some(SCHEMA_VERSION),
             patch_attempt_id: Some(PatchAttemptId::new("pa-1")),
             testing_iteration_id: None,
             test_id: None,
@@ -559,6 +615,47 @@ mod tests {
         let content = fs::read_to_string(path).unwrap();
         assert!(content.contains("sess-test"));
         assert!(content.contains("creator"));
+    }
+
+    /// [VANTA-WHY] A file written before the marker existed carries NO
+    /// `schema_version` key. That is a DIFFERENT fact from "written by an older
+    /// version of the current schema", so absence must deserialise as `None`
+    /// (v0) — never as `Some(SCHEMA_VERSION)`. A serde default would erode
+    /// exactly that distinction; this test pins it.
+    #[test]
+    fn a_record_without_a_schema_version_deserialises_as_v0_not_as_the_current_version() {
+        let legacy = r#"{
+            "session_id": "legacy-session",
+            "patch_attempt_id": null,
+            "testing_iteration_id": null,
+            "test_id": null,
+            "phase": "session.start",
+            "summary": "written before the marker existed",
+            "timestamp": "2026-01-01T00:00:00Z"
+        }"#;
+        let record: SessionRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            record.schema_version, None,
+            "a record with no marker is v0, not the current version"
+        );
+
+        let stamped = SessionRecord {
+            session_id: SessionId::new("legacy-session"),
+            schema_version: Some(SCHEMA_VERSION),
+            patch_attempt_id: None,
+            testing_iteration_id: None,
+            test_id: None,
+            phase: "session.start".into(),
+            summary: "written by the current schema".into(),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            benchmark_instance: None,
+            benchmark_label: None,
+        };
+        let serialised = serde_json::to_string(&stamped).unwrap();
+        assert!(
+            serialised.contains("\"schema_version\":1"),
+            "a record written by the current schema must carry the marker: {serialised}"
+        );
     }
 
     /// Build a minimal Governor transition for exercising the sink.
@@ -586,6 +683,7 @@ mod tests {
             &SessionId::new("s1"),
             Some(PatchAttemptId::new(from_pid)),
             Some(PatchAttemptId::new(to_pid)),
+            false,
         )
     }
 
@@ -612,6 +710,8 @@ mod tests {
             "evidence_source",
             "test_intent",
             "censored",
+            "apply_failed",
+            "gap",
             "in_s0",
         ] {
             assert!(value.get(key).is_some(), "row schema is missing `{key}`");
@@ -629,6 +729,7 @@ mod tests {
             &SessionId::new("s1"),
             Some(PatchAttemptId::new("p0")),
             Some(PatchAttemptId::new("p1")),
+            false,
         );
         assert!(
             stamped.censored,
@@ -647,6 +748,7 @@ mod tests {
             &SessionId::new("s1"),
             None,
             Some(PatchAttemptId::new("p1")),
+            false,
         );
 
         assert!(
@@ -685,6 +787,7 @@ mod tests {
 
         log.append(SessionRecord {
             session_id: SessionId::new("durable-session"),
+            schema_version: Some(SCHEMA_VERSION),
             // A run-level record: no patch attempt exists yet.
             patch_attempt_id: None,
             testing_iteration_id: None,
@@ -769,6 +872,29 @@ mod tests {
         from_pid: Option<&str>,
         to_pid: Option<&str>,
     ) -> TransitionRow {
+        counting_row_from_source(
+            from_result,
+            to_result,
+            from_class,
+            to_class,
+            from_pid,
+            to_pid,
+            EvidenceSource::AttackerGenerated,
+        )
+    }
+
+    /// As `counting_row`, with an explicit evidence source, so a Native or
+    /// Static row can be exercised through the SAME counting function.
+    #[allow(clippy::too_many_arguments)]
+    fn counting_row_from_source(
+        from_result: TestResult,
+        to_result: TestResult,
+        from_class: Option<FailureClass>,
+        to_class: Option<FailureClass>,
+        from_pid: Option<&str>,
+        to_pid: Option<&str>,
+        source: EvidenceSource,
+    ) -> TransitionRow {
         let bare = AttemptTransition {
             from_attempt: 0,
             to_attempt: 1,
@@ -781,7 +907,7 @@ mod tests {
             to_failure_class: to_class,
             complete: true,
             in_s0: true,
-            evidence_source: EvidenceSource::AttackerGenerated,
+            evidence_source: source,
             test_intent: TestIntent::BugReproduction,
         };
         TransitionRow::from_transition(
@@ -789,6 +915,7 @@ mod tests {
             &SessionId::new("s1"),
             from_pid.map(|s| PatchAttemptId::new(s)),
             to_pid.map(|s| PatchAttemptId::new(s)),
+            false,
         )
     }
 
@@ -817,6 +944,14 @@ mod tests {
             snap.complete, 2,
             "review rounds and censored holes are excluded from the denominator too"
         );
+        assert_eq!(
+            snap.ecr_denominator, 1,
+            "ECR is conditional: only the one row that was FAILING at N can be corrected"
+        );
+        assert_eq!(
+            snap.eir_denominator, 1,
+            "EIR is conditional: only the one row that was PASSING at N can be broken"
+        );
     }
 
     /// A non-Logic failure is evidence about the harness, not the candidate, so
@@ -840,8 +975,36 @@ mod tests {
         assert_eq!(snap.eir_count, 1);
         assert_eq!(snap.complete, 1);
         assert_eq!(
+            snap.eir_denominator, 1,
+            "the one surviving row was passing at N, so it is EIR's denominator"
+        );
+        assert_eq!(
+            snap.ecr_denominator, 0,
+            "no countable row was failing at N, so ECR is n/a rather than 0.00%"
+        );
+        assert_eq!(snap.ecr_text(), "n/a");
+        assert_eq!(
             snap.excluded_non_logic, 3,
             "the exclusions must be visible so an evidence-starved run reads as thin"
+        );
+    }
+
+    /// A test defect (a patch-insensitive failure) is a property of the TEST,
+    /// not the candidate, so it must never move EIR/ECR — the same exclusion as
+    /// any other non-Logic class.
+    #[test]
+    fn a_test_defect_is_excluded_from_eir_and_ecr() {
+        let rows = vec![
+            counting_row(TestResult::Passed, TestResult::Failed, None, Some(FailureClass::TestDefect), Some("p1"), Some("p2")),
+            counting_row(TestResult::Failed, TestResult::Passed, Some(FailureClass::TestDefect), None, Some("p0"), Some("p1")),
+        ];
+
+        let snap = ecr_eir_from_rows(&rows);
+        assert_eq!(snap.ecr_count, 0, "a test defect is not a correction");
+        assert_eq!(snap.eir_count, 0, "a test defect is not an introduction");
+        assert_eq!(
+            snap.excluded_non_logic, 2,
+            "the exclusion must be visible, never silent"
         );
     }
 
@@ -863,5 +1026,149 @@ mod tests {
         assert_eq!(snap.complete, 0);
         assert_eq!(snap.ecr_count, 0);
         assert_eq!(snap.eir_count, 0);
+    }
+
+    /// Native and Static rows move the metric under their OWN source, and the
+    /// breakdown keeps them apart from the Attacker's rows.
+    ///
+    /// [VANTA-WHY] This is 4d55123d's ECR: the only real correction in the run
+    /// was a repository-native test the previous attempt had broken. Pooled into
+    /// one number it credits the Attacker; split by source it says who proved
+    /// it. A Static-class failure is countable here ONLY because the row's own
+    /// source is Static — see `counts_toward_metrics`.
+    #[test]
+    fn native_and_static_rows_count_under_their_own_source() {
+        let rows = vec![
+            // A native test the patch broke, fixed by the next patch -> ECR.
+            counting_row_from_source(
+                TestResult::Failed,
+                TestResult::Passed,
+                Some(FailureClass::Logic),
+                None,
+                Some("p0"),
+                Some("p1"),
+                EvidenceSource::Native,
+            ),
+            // A second native test that simply kept passing: it is EIR's
+            // denominator only — it can be broken, never "corrected".
+            counting_row_from_source(
+                TestResult::Passed,
+                TestResult::Passed,
+                None,
+                None,
+                Some("p0"),
+                Some("p1"),
+                EvidenceSource::Native,
+            ),
+            // A blocking static error the next patch introduced -> EIR.
+            counting_row_from_source(
+                TestResult::Passed,
+                TestResult::Failed,
+                None,
+                Some(FailureClass::Static),
+                Some("p0"),
+                Some("p1"),
+                EvidenceSource::Static,
+            ),
+            // The Attacker's rows, unchanged by any of this.
+            counting_row(TestResult::Passed, TestResult::Passed, None, None, Some("p0"), Some("p1")),
+        ];
+
+        let snap = ecr_eir_from_rows(&rows);
+        assert_eq!(snap.complete, 4);
+        assert_eq!(snap.ecr_count, 1, "the native correction is in the totals");
+        assert_eq!(snap.eir_count, 1, "the static introduction is in the totals");
+        assert_eq!(snap.ecr_denominator, 1, "only the native row was failing at N");
+        assert_eq!(
+            snap.eir_denominator, 3,
+            "the two native rows and the static row were passing at N"
+        );
+        assert_eq!(snap.native.complete, 2);
+        assert_eq!(snap.native.ecr_count, 1);
+        assert_eq!(snap.native.eir_count, 0);
+        assert_eq!(snap.native.ecr_denominator, 1);
+        assert_eq!(snap.native.eir_denominator, 1);
+        assert_eq!(
+            snap.native.ecr_text(),
+            "1/1 (100.00%)",
+            "one fix in a suite of two reads 1/1, not 1/2"
+        );
+        assert_eq!(snap.static_findings.complete, 1);
+        assert_eq!(snap.static_findings.eir_count, 1);
+        assert_eq!(snap.static_findings.ecr_denominator, 0);
+        assert_eq!(snap.static_findings.eir_denominator, 1);
+        assert_eq!(snap.attacker_generated.complete, 1);
+        assert_eq!(snap.attacker_generated.ecr_count, 0);
+        assert_eq!(
+            snap.excluded_non_logic, 0,
+            "every row here is countable for its own source"
+        );
+    }
+
+    /// Session 4d55123d's native shape, re-scored under the conditional
+    /// definition: FIVE native tests ran on both attempts and ONE of them was
+    /// fixed by attempt 2.
+    ///
+    /// [VANTA-WHY] Per row this reads `1/5`, which is exactly the dilution the
+    /// change removes — the four tests that passed on both attempts were never
+    /// broken, so they are not part of "of what was broken, how much got fixed".
+    /// Conditional reads `1/1`, and the four bystanders belong to EIR's
+    /// denominator, where "of what worked, how much got broken" = 0/4.
+    #[test]
+    fn the_4d55123d_native_shape_scores_one_of_one_fixed_and_none_of_four_broken() {
+        let mut rows = vec![counting_row_from_source(
+            TestResult::Failed,
+            TestResult::Passed,
+            Some(FailureClass::Logic),
+            None,
+            Some("p0"),
+            Some("p1"),
+            EvidenceSource::Native,
+        )];
+        for _ in 0..4 {
+            rows.push(counting_row_from_source(
+                TestResult::Passed,
+                TestResult::Passed,
+                None,
+                None,
+                Some("p0"),
+                Some("p1"),
+                EvidenceSource::Native,
+            ));
+        }
+
+        let snap = ecr_eir_from_rows(&rows);
+        assert_eq!(snap.native.complete, 5, "all five native tests are observed");
+        assert_eq!(snap.native.ecr_count, 1);
+        assert_eq!(snap.native.ecr_denominator, 1);
+        assert_eq!(snap.native.ecr_text(), "1/1 (100.00%)");
+        assert_eq!(snap.native.eir_count, 0);
+        assert_eq!(snap.native.eir_denominator, 4);
+        assert_eq!(snap.native.eir_text(), "0/4 (0.00%)");
+
+        // Combined: the five native rows are the whole run's evidence here, so
+        // the pooled rates must equal the Native ones.
+        assert_eq!(snap.ecr_text(), "1/1 (100.00%)");
+        assert_eq!(snap.eir_text(), "0/4 (0.00%)");
+    }
+
+    /// A Static-class failure on an ATTACKER row stays excluded, so the
+    /// per-source allowance does not leak into the ordinary rule.
+    #[test]
+    fn a_static_class_attacker_row_remains_excluded() {
+        let rows = vec![counting_row(
+            TestResult::Passed,
+            TestResult::Failed,
+            None,
+            Some(FailureClass::Static),
+            Some("p0"),
+            Some("p1"),
+        )];
+
+        let snap = ecr_eir_from_rows(&rows);
+        assert_eq!(snap.complete, 0);
+        assert_eq!(snap.eir_count, 0);
+        assert_eq!(snap.excluded_non_logic, 1);
+        assert_eq!(snap.attacker_generated.excluded_non_logic, 1);
     }
 }

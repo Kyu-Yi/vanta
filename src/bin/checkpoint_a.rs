@@ -274,6 +274,8 @@ fn format_source(source: &EvidenceSource) -> &'static str {
         EvidenceSource::HumanProvided          => "HumanProvided",
         EvidenceSource::FormalVerifier         => "FormalVerifier",
         EvidenceSource::IssueDescription       => "IssueDescription",
+        EvidenceSource::Native                 => "Native",
+        EvidenceSource::Static                 => "Static",
     }
 }
 

@@ -60,11 +60,24 @@ pub trait SandboxBackend: Send {
         Self: Sized;
 
     /// Execute a command inside the sandbox. cwd is relative to sandbox root.
+    ///
+    /// Extra environment for this one command, from the run's recorded
+    /// `sandbox_env`; empty in the normal case. Applied to the process the
+    /// command runs in.
+    ///
+    /// `precompile` is the run's recorded per-project pre-compile rule (tree-
+    /// relative `.py` files), also empty in the normal case. When it is not
+    /// empty the backend byte-compiles those files with the SAME interpreter as
+    /// `cmd`, in the same tree, BEFORE `cmd` runs — see
+    /// `crate::sandbox::precompile_argv` for why the ordering is the whole
+    /// point. Empty reproduces the previous invocation exactly.
     async fn execute(
         &self,
         cmd: &[&str],
         cwd: &Path,
         timeout_secs: u64,
+        env: &[(String, String)],
+        precompile: &[String],
     ) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Destroy the sandbox. For subprocess: delete temp dir. For shuru: stop VM.

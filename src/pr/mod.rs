@@ -433,6 +433,7 @@ fn failure_class_label(class: &FailureClass) -> &'static str {
         FailureClass::Static => "Static",
         FailureClass::Logic => "Logic",
         FailureClass::Unknown => "Unknown",
+        FailureClass::TestDefect => "TestDefect",
     }
 }
 
@@ -473,7 +474,7 @@ mod tests {
     use crate::core::{
         EvidenceSource, FailureClass, TestEvidence, TestIntent, VerificationOutcome,
     };
-    use crate::session::{SessionId, SessionRecord};
+    use crate::session::{SCHEMA_VERSION, SessionId, SessionRecord};
 
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -622,6 +623,7 @@ mod tests {
                 .join(format!("{}_session.jsonl", session_id.as_str()));
             let record = SessionRecord {
                 session_id: session_id.clone(),
+                schema_version: Some(SCHEMA_VERSION),
                 patch_attempt_id: None,
                 testing_iteration_id: None,
                 test_id: None,
@@ -633,6 +635,7 @@ mod tests {
             };
             let native_summary = SessionRecord {
                 session_id: session_id.clone(),
+                schema_version: Some(SCHEMA_VERSION),
                 patch_attempt_id: None,
                 testing_iteration_id: None,
                 test_id: None,
@@ -644,6 +647,7 @@ mod tests {
             };
             let native_fixed = SessionRecord {
                 session_id: session_id.clone(),
+                schema_version: Some(SCHEMA_VERSION),
                 patch_attempt_id: None,
                 testing_iteration_id: None,
                 test_id: None,

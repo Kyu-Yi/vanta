@@ -28,9 +28,19 @@ target
 # Vanta local artefacts
 # Run logs and per-run forensics — written on every execution, never source.
 vanta_sessions/
+# Raw forensics dumps. They embed the patched tree and patch context verbatim,
+# which is the analysed project's source (heretic is AGPL) — readable locally,
+# never published from this repo.
+plans/private/
 # Scratch directories the sandbox backends create inside the working tree.
 .tmp*/
 .shurutest/
+# Bytecode caches from the analysis scripts (scripts/metrics.py and its tests).
+__pycache__/
+# BugsInPy harness artefacts: the BugsInPy clone, cached project clones, per-bug
+# worktrees, checkpoints and batch manifests. Large, machine-local, reproducible
+# from plans/bugsinpy_split.json — never source.
+runs/
 
 # macOS / editor noise
 .DS_Store

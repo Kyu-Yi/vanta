@@ -1,0 +1,647 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-10-19T15:12:07Z",
+  "bugsinpy_commit": "11c5f1eea954a42132cfd06bf257766a7963e0fd",
+  "bugsinpy_root": "runs/bugsinpy/bugsinpy",
+  "configs": [
+    "baseline",
+    "vanta"
+  ],
+  "seeds": [
+    0
+  ],
+  "review_mode": true,
+  "sampling": {
+    "policy": "pinned_per_call_plus_server_top_p",
+    "note": "temperature/max_tokens come from the pipeline's per-call pins (design §4.3); top_p is the one value read from the server's /props. The harness adds no run-level value."
+  },
+  "module_distributions": {
+    "PIL": "Pillow",
+    "dateutil": "python-dateutil",
+    "yaml": "PyYAML",
+    "sklearn": "scikit-learn",
+    "bs4": "beautifulsoup4",
+    "cv2": "opencv-python",
+    "attr": "attrs",
+    "jwt": "PyJWT",
+    "dns": "dnspython",
+    "Crypto": "pycryptodome",
+    "google.protobuf": "protobuf",
+    "OpenSSL": "pyOpenSSL",
+    "magic": "python-magic",
+    "serial": "pyserial",
+    "usb": "pyusb",
+    "zmq": "pyzmq",
+    "MySQLdb": "mysqlclient",
+    "mysql.connector": "mysql-connector-python",
+    "pylab": "matplotlib",
+    "mpl_toolkits": "matplotlib",
+    "pkg_resources": "setuptools",
+    "psycopg2": "psycopg2-binary",
+    "pydispatch": "PyDispatcher"
+  },
+  "reviewed_changes": [
+    {
+      "change": "PySnooper/1 is removed from `bugs`. It was wave 1, role pilot, and its slot in the wave-1 go/no-go gate is taken by black/22 (`bugs[2]`, promoted from the py3.8 candidate pool).",
+      "reason": "PySnooper/1 is a Python-2-only encoding bug. Its run_test.sh test passes on both the buggy commit and the fixed commit under Python 3.8, so the bug is never reproduced, FAIL_TO_PASS is empty, and no oracle can be derived from it. Prepare cannot detect this: the three-suite derivation would simply record `empty FAIL_TO_PASS` and the slot would be spent. This is the exclusion §8 anticipates, and it is recorded here rather than applied silently to `bugs`.",
+      "decided_by": "user review, 2026-10-20"
+    },
+    {
+      "change": "black/22 is promoted into wave 1 as a pilot, in the PySnooper/1 slot. No cap was raised and the context gate's constants are unchanged.",
+      "reason": "The §1.6 context gate is the only rule that can reject a candidate, and black/22 is the first py3.8 candidate in the reserve-then-split order that passes it: ~58497 estimated prompt tokens against a 65280 token budget (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin), with no file skipped by the per-file or total cap. black/1 and black/2, the split's own declared wave-1 reserves, both reject — black/1 also exceeds the budget and both truncate the source — so the pool continues past them, which is why the search walks the whole black block. Every candidate is listed below with its own measurement. The measurements were re-taken from the current code, after the test-path change of item 4 / e7fdb41 moved the vanta_tree the precheck walks; the earlier scratch sweep (including its black/22 row) predates that change and was discarded rather than allowed to inform the pick.",
+      "decided_by": "user review, 2026-10-20",
+      "rule": "\"in a wave\" means already scheduled to run as a pilot; reserves are the substitution pool by design. Order: the remaining wave-1 reserves first in the split's reserve order, then other py3.8 bugs in split order; the first candidate that passes the gate at n_ctx 131072 with the current caps unchanged wins. Measure-only: no suite run and no Vanta run per candidate. If no py3.8 candidate fits, wave 1 falls back to the two remaining PySnooper bugs, with both exclusion reasons recorded.",
+      "measurements": [
+        {
+          "bug": "black/1",
+          "estimated_prompt_tokens": 68376,
+          "headroom_tokens": -3096,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 3 file(s) over the 262144 B total budget — Vanta would show the Creator 261502 B of 4596238 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~68376 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/2",
+          "estimated_prompt_tokens": 67039,
+          "headroom_tokens": -1759,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 256155 B of 4456744 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~67039 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/3",
+          "estimated_prompt_tokens": 66979,
+          "headroom_tokens": -1699,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 255915 B of 4456179 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~66979 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/4",
+          "estimated_prompt_tokens": 58572,
+          "headroom_tokens": 6708,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 222286 B of 4409951 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/5",
+          "estimated_prompt_tokens": 57903,
+          "headroom_tokens": 7377,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 219611 B of 4400877 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/6",
+          "estimated_prompt_tokens": 57590,
+          "headroom_tokens": 7690,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 218360 B of 4396499 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/7",
+          "estimated_prompt_tokens": 57299,
+          "headroom_tokens": 7981,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 217194 B of 4392547 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/8",
+          "estimated_prompt_tokens": 57226,
+          "headroom_tokens": 8054,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 8 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 216902 B of 4391534 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/9",
+          "estimated_prompt_tokens": 57046,
+          "headroom_tokens": 8234,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 1 file(s) over the 262144 B total budget — Vanta would show the Creator 216184 B of 4388636 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/10",
+          "estimated_prompt_tokens": 56506,
+          "headroom_tokens": 8774,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 1 file(s) over the 262144 B total budget — Vanta would show the Creator 214021 B of 4384141 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/11",
+          "estimated_prompt_tokens": 56476,
+          "headroom_tokens": 8804,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 1 file(s) over the 262144 B total budget — Vanta would show the Creator 213901 B of 4382725 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/12",
+          "estimated_prompt_tokens": 67871,
+          "headroom_tokens": -2591,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 259483 B of 4361783 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~67871 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/13",
+          "estimated_prompt_tokens": 67614,
+          "headroom_tokens": -2334,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 258456 B of 4360303 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~67614 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/14",
+          "estimated_prompt_tokens": 66773,
+          "headroom_tokens": -1493,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 255089 B of 4354148 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~66773 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/15",
+          "estimated_prompt_tokens": 66214,
+          "headroom_tokens": -934,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 252853 B of 4354602 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~66214 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/16",
+          "estimated_prompt_tokens": 65651,
+          "headroom_tokens": -371,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 7 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 250601 B of 4347801 B and the bug's own file may not be in it",
+            "prompt_exceeds_budget: ~65651 tok estimated vs a budget of 65280 tok (= n_ctx 131072 − 32768 output − 256 overhead − 32768 margin)"
+          ]
+        },
+        {
+          "bug": "black/17",
+          "estimated_prompt_tokens": 60100,
+          "headroom_tokens": 5180,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 1 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 228398 B of 338960 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/18",
+          "estimated_prompt_tokens": 59837,
+          "headroom_tokens": 5443,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 1 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 227346 B of 336740 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/19",
+          "estimated_prompt_tokens": 48683,
+          "headroom_tokens": 16597,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 1 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 182731 B of 266575 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/20",
+          "estimated_prompt_tokens": 48082,
+          "headroom_tokens": 17198,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 1 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 180326 B of 263855 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/21",
+          "estimated_prompt_tokens": 45929,
+          "headroom_tokens": 19351,
+          "verdict": "reject",
+          "reasons": [
+            "source_truncated_by_cap: 1 file(s) over 65536 B, 0 file(s) over the 262144 B total budget — Vanta would show the Creator 171715 B of 250354 B and the bug's own file may not be in it"
+          ]
+        },
+        {
+          "bug": "black/22",
+          "estimated_prompt_tokens": 58497,
+          "headroom_tokens": 6783,
+          "verdict": "pass",
+          "reasons": []
+        }
+      ]
+    },
+    {
+      "change": "black/22 is removed from `bugs`, which supersedes the promotion in the change above: it was wave 1, role pilot, and wave 1 is now the two remaining PySnooper bugs (PySnooper/2 and PySnooper/3), both already pilots. Nothing was promoted into the slot — the pool was not searched again — so wave 1 runs with two pilots rather than three.",
+      "reason": "black/22's BugsInPy `requirements.txt` is a pip freeze of the corpus author's own environment, not black's dependency list, and the environment it names cannot be built in the sandbox. Decoded (the file is UTF-16 LE with a BOM; see the reader change of 2043f64) it is 71 requirement lines, all 71 exact `==` pins, carrying black's whole dev toolchain and an unrelated application stack with it — sphinx, mypy, flake8, coverage, aiohttp plus its 12 transitive packages, typed-ast, PyYAML. Its buggy commit is dated 2018-03-29 and 65 of the 71 pins were released after that date (newest tqdm==4.44.1, 2020-03-29), so the file is a freeze taken about two years after the commit it is attached to. Mechanically, 10 of the 71 pins have no cp38 aarch64 wheel and would have to build from source inside the sandbox: accessify==0.3.1 and distlib==3.0.0 (sdist only), typed-ast==1.4.0 (its wheels are x86_64-only), pyyaml==5.1 (no aarch64 wheel at any version), cffi==1.14.0, coverage==5.0.4, multidict==4.7.5, regex==2020.2.20 and yarl==1.4.2 (wheels exist, none for this platform), and cryptography==2.8 (needs Rust and OpenSSL headers in the layer). The sandbox has a C toolchain, so a few of these would compile; typed-ast 1.4.0 and PyYAML 5.1 are the ones that do not build against this interpreter, and a 90-minute bake is the wrong place to discover it. The exclusion is therefore a property of the benchmark's own metadata — the reference environment is a snapshot of somebody's laptop from 2020 — and not a judgement about the bug, its difficulty or its context size, all of which are fine (it is the only candidate the §1.6 gate accepted: ~58497 estimated prompt tokens against a 65280 budget, no file skipped). The resolver no longer refuses this bug, so nothing here is left of the dependency-conflict stop that prompted this review: with the pin-intersects-bound rule the `attrs==19.3.0` / `attrs>=17.4.0` disagreement is one requirement, and with the reference-pin exemption all 71 pins resolve and all 71 would be installed. The two rules are recorded in the design (§3.3) and are general for the later waves; this entry is only the black/22 consequence.",
+      "decided_by": "user review, 2026-10-20",
+      "rule": "A candidate whose resolved dependency set cannot be built in the sandbox's own environment is excluded before a slot is spent on it, by the same principle as the §1.6 context gate. The check is per pin and mechanical: for every resolved pin, does PyPI list a wheel whose platform tag is `any` or `aarch64` and whose Python tag matches the bug's interpreter? A pin with no such wheel is a source build. A single pin that has no aarch64 wheel at all makes the layer unbuildable rather than merely slow, and its count is the measurement, not a judgement. Measured for black/22 on 2026-10-20: 71 pins, 65 released after the buggy commit, 10 with no cp38/aarch64 wheel. The same check is what the wave-2/3 freeze-file rule has to be applied with, and it is recorded here because a later wave must not re-derive it by hand."
+    },
+    {
+      "change": "PySnooper/2 is removed from `bugs`. It was wave 1, role pilot; wave 1 is now PySnooper/3 alone, and the slot was not refilled — no substitute was searched for in the candidate pool. Wave 1 therefore runs one pilot bug rather than two. This supersedes the wave-1 composition stated at the end of the change above (\"the two remaining PySnooper bugs\").",
+      "reason": "BugsInPy's `bug_patch.txt` for PySnooper/2 is an INCOMPLETE developer fix, which makes the oracle unpassable by construction rather than merely hard. `bug_patch.txt` touches exactly one file (`pysnooper/tracer.py`, 143 lines), while the fix commit it is cut from (buggy e21a31162f4c54be693d8ca8260e42393b39abd3 -> fixed 814abc34a098c1b98cb327105ac396f985d2413e) changes 18 paths, including `pysnooper/pycompat.py`, `pysnooper/utils.py`, `pysnooper/variables.py`, `pysnooper/__init__.py`, `setup.py`, `tox.ini` and `tests/`. The tracer.py hunks it does apply call code added by those other files and never installed by it: `pycompat.PY2` (patch line 17, `if pycompat.PY2:`), `pycompat.collections_abc.Iterable` (line 84), and `utils.get_shortish_repr(value, custom_repr=...)` (lines 30 and 140). None of those exist in the buggy tree, where `pycompat.py` defines only `PY3 = (sys.version_info[0] == 3)` and `utils.get_shortish_repr` takes a single argument with no `custom_repr`. The patched `pysnooper` therefore cannot be imported at all. Measured, from batch runs/bugsinpy/prepare-wave1-3: the oracle grades the DEVELOPER FIX ITSELF `apply_ok=true, hidden_pass=false, patch_good=false`, with all three derived FAIL_TO_PASS nodeids — `tests/test_pysnooper.py::test_custom_repr`, `::test_custom_repr_single`, `::test_disable` — recorded as `\"absent\"` rather than failed, because pytest cannot collect them; and both review configs report `Native: original ran=true (29 tests), patched ran=true (0 tests), 29 regression(s) [SUITE COLLAPSED]`. No patch of any kind can pass this oracle, so every grade this bug produces is uninformative about the model: the baseline review of the developer fix is `Rejected` on `[SUITE COLLAPSED]`, and the Diagnostician classifies that collapse as Infrastructure (import/collect error), not as a property of the candidate. The general mechanism that catches this class is prepare's developer-fix self-check (`oracle.grade_dev_fix`, wired into `prepare.prepare_one`): it grades a bug's developer fix with the real oracle and refuses the bug when its own fix does not grade `patch_good`. With that check in place PySnooper/2 would be refused before any GPU time is spent; this entry removes it from the split first, so its wave-1 slot is not spent producing a refusal. A separate, thinner reason not to rely on it: the issue text Vanta was given (\"Support single tuple to , fix #144\" plus one generic sentence) is too thin for the Attacker to write a reproduction test at all, so the no-op was approved with zero BugReproduction evidence. Fetching the real linked GitHub issue text behind `fix #144`, leak-gated, is recorded as future work in the design (§13); it is not the reason for this exclusion.",
+      "decided_by": "user review, 2026-10-21",
+      "rule": "A bug whose own developer fix does not grade `patch_good` under the hidden oracle is excluded before a wave runs on it: the oracle is unpassable, so the bug cannot produce a label that means anything, whatever the model does. `prepare` enforces this per bug (`prepare.selfcheck_dev_fix`) and refuses rather than skips, so a bug that fails the check while still present in `bugs` stops prepare with the grader's evidence in hand. The exclusion is recorded here because removing a bug changes the wave-1 gate's membership, and §8.2 is a committed protocol rather than a note."
+    },
+    {
+      "change": "PySnooper/3 is development data: its rows are excluded from every reported evaluation result. The exclusion is at the reporting step only. The entry stays in `bugs` with the same wave, role and notes, wave 1 still runs it, and no config, seed, sampling or gate field is touched. The manifest keeps its rows unfiltered — the manifest is raw evidence — so the exclusion is applied where the rates are computed, by dropping this bug's sessions from the labels file `metrics.py --labels` reads; nothing in the harness filters rows by itself, and this record is what tells a reader which sessions are not poolable. The same bug appears in `plans/bugsinpy_dev_split.json` labelled \"seen during development\".",
+      "reason": "§14 item 1 replaces a hard reject with a corroborated one after this bug's round-4 bogus generated test asserted output text the issue never mentions, and §14 item 2 scraps exactly that shape of assertion: both were designed with PySnooper/3's transcript in front of them. Any rate computed from its rows would therefore be a number produced by a pipeline tuned on the bug it measures, which §14.7 forbids. The paper reports it as a development case — the mechanism and its before/after behaviour (the no-op still rejects via rule (b); the developer fix stops false-rejecting) — and reports evaluation numbers only from bugs the work was not tuned on. Excluding the row from the report is the minimum change that keeps a tuned-on number out of the pooled results; excluding it from the wave would instead change what wave 1 is, and the wave-1 gate is left counting exactly the rows it counted before.",
+      "decided_by": "user review, 2026-10-21"
+    },
+    {
+      "change": "`module_distributions` maps `psycopg2` -> `psycopg2-binary`. `import psycopg2` is provided by two distributions, so the closure refused to choose and stopped the bug that reaches it.",
+      "reason": "The tests only need the module to import: they skip without a database server, so nothing opens a connection and the binary wheel is enough. The source `psycopg2` builds against libpq and needs pg_config, which the sandbox does not have, so choosing it would turn a dependency into a build failure the test never asked for. Recorded here as well as in the development split because the table is the protocol for every wave, not a dev-only detail.",
+      "decided_by": "user review, 2026-10-22",
+      "rule": "The choice is the distribution's, not the harness's, and is pinned by the same date rule as every other dependency (the newest release on or before the declaration's commit date; the closure's own stamp is the fixed commit's). If the pinned psycopg2-binary has no wheel for the sandbox's platform and the bake fails, that is a normal build failure for the bug that needed it, recorded as such -- not special-cased, and not worked around by installing the source distribution."
+    },
+    {
+      "change": "`module_distributions` maps `mysql.connector` -> `mysql-connector-python`. `import mysql.connector` under the fallback resolves to the top-level word `mysql`, which is a PyPI distribution of its own -- `mysql` 0.0.2, a 2018 'virtual package' whose sdist declares `mysqlclient` -- and that is not the distribution that provides the module.",
+      "reason": "The module is `mysql.connector`, which is mysql-connector-python's; the reviewed table is keyed by the import spelling precisely so the dotted name is matched before its top-level one (`google.protobuf` is the same case). Under the date rule the newest release of mysql-connector-python on or before the declaring commit's date that PyPI still carries is 8.0.5 (2017-11-20), which publishes a `py2.py3-none-any` wheel: pure Python, nothing to build and no system library. Recorded here as well as in the development split because the table is the protocol for every wave, not a dev-only detail -- it was measured on `luigi/1` in the development split.",
+      "decided_by": "user review, 2026-10-24",
+      "rule": "Pinned by the same date rule as every other dependency -- the newest release on or before the fixed commit's date -- and installed from the wheel it publishes for any platform. The mapping is a decision recorded in the protocol, not a guess in the harness: a module whose top-level word happens to name an unrelated PyPI project is exactly what the table is for."
+    },
+    {
+      "change": "`module_distributions` maps `pydispatch` -> `PyDispatcher`. Two PyPI projects answer to that word: `PyDispatcher`, whose 2.0.5 sdist's `PyDispatcher.egg-info/top_level.txt` names the top-level module `pydispatch`, and `pydispatch` itself -- 1.0.3/1.1.0, an abandoned upload of a different codebase whose 1.1.0 metadata declares the single requirement `r`. Canonicalising the module name picks the second one, so the closure walked off to `https://pypi.org/pypi/r/json`, got HTTP 404, and the bug that reaches the import was flagged `BakeError: cannot read release dates for 'r'`.",
+      "reason": "The module is PyDispatcher's: scrapy pins the distribution in the same breath as it imports the module (`setup.py` `PyDispatcher>=2.0.5` and its requirements `PyDispatcher==2.0.5`, against `from pydispatch import dispatcher`), so the entry adds no package and only makes the import-to-distribution lookup agree with the pin that is already there. Recorded here as well as in the development split because the table is the protocol for every wave, not a dev-only detail -- it was measured on `scrapy/1` in the development split.",
+      "decided_by": "user review, 2026-10-28",
+      "rule": "Keyed by the import spelling, like `mysql.connector` and `google.protobuf`, and applied by the closure rather than to a named bug. The mapped name is one the layer already pins, so the closure never walks the abandoned `pydispatch` project's metadata and installs nothing new: a layer whose requirements already declare `PyDispatcher` is unchanged, and the only difference is that the closure no longer resolves the import to `pydispatch==1.1.0` in its place."
+    }
+  ],
+  "bugs": [
+    {
+      "project": "PySnooper",
+      "bug_id": 3,
+      "python_version": "3.8.1",
+      "buggy_commit": "6e3d797be3fa0a746fb5b1b7c7fea78eb926c208",
+      "fixed_commit": "15555ed760000b049aff8fecc79d29339c1224c3",
+      "test_file": "tests/test_pysnooper.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-PySnooper-3",
+      "wave": 1,
+      "role": "pilot",
+      "notes": "Wave-1 go/no-go gate (§8.2)."
+    },
+    {
+      "project": "thefuck",
+      "bug_id": 1,
+      "python_version": "3.7.0",
+      "buggy_commit": "2ced7a7f33ae0bec3ffc7a43ce95330bdf6cfcb9",
+      "fixed_commit": "444908ce1c17767ef4aaf9e0b4950497914f7f63",
+      "test_file": "tests/rules/test_pip_unknown_command.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "7.4.4",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-thefuck-1",
+      "wave": 2,
+      "role": "pilot",
+      "notes": "Context borderline (§8) — the precheck measures it; a reject falls through to the reserves."
+    },
+    {
+      "project": "thefuck",
+      "bug_id": 2,
+      "python_version": "3.7.0",
+      "buggy_commit": "40ab4eb62db57627bff10cf029d29c94704086a2",
+      "fixed_commit": "78ef9eec88f43d5727986be2237f6e0e250cbbbc",
+      "test_file": "tests/test_utils.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "7.4.4",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-thefuck-2",
+      "wave": 2,
+      "role": "pilot",
+      "notes": "Context borderline (§8)."
+    },
+    {
+      "project": "thefuck",
+      "bug_id": 3,
+      "python_version": "3.7.0",
+      "buggy_commit": "ac343fb1bd7dadbb9e1a9fd7e3071f5778e338a4",
+      "fixed_commit": "ce5feaebf7fd5c1190b5e14fbc1e962cc8db5f39",
+      "test_file": "tests/shells/test_fish.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "7.4.4",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-thefuck-3",
+      "wave": 2,
+      "role": "pilot",
+      "notes": "Context borderline (§8)."
+    },
+    {
+      "project": "httpie",
+      "bug_id": 1,
+      "python_version": "3.7.3",
+      "buggy_commit": "001bda19450ad85c91345eea3cfa3991e1d492ba",
+      "fixed_commit": "5300b0b490b8db48fac30b5e32164be93dc574b7",
+      "test_file": "tests/test_downloads.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "7.4.4",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-httpie-1",
+      "wave": 2,
+      "role": "pilot",
+      "notes": "pytest-native but the suite lives in tests/tests.py, so the project's own pytest config must stay intact for collection."
+    },
+    {
+      "project": "httpie",
+      "bug_id": 2,
+      "python_version": "3.7.3",
+      "buggy_commit": "356e0436510fee70b4071fac58be81c0a0a7db59",
+      "fixed_commit": "e18b609ef7d867d6efa0efe42c832be5e0d09338",
+      "test_file": "tests/test_redirects.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "7.4.4",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-httpie-2",
+      "wave": 2,
+      "role": "pilot",
+      "notes": "Redirect tests spin up a local HTTP server; no network device is needed inside Shuru."
+    },
+    {
+      "project": "httpie",
+      "bug_id": 3,
+      "python_version": "3.7.3",
+      "buggy_commit": "8c33e5e3d31d3cd6476c4d9bc963a4c529f883d2",
+      "fixed_commit": "589887939507ff26d36ec74bd2c045819cfa3d56",
+      "test_file": "tests/test_sessions.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "7.4.4",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-httpie-3",
+      "wave": 2,
+      "role": "pilot",
+      "notes": "Session-file tests touch the filesystem; the tree is mounted read-write, so pytest noise is cleaned after each run."
+    },
+    {
+      "project": "cookiecutter",
+      "bug_id": 1,
+      "python_version": "3.6.9",
+      "buggy_commit": "c15633745df6abdb24e02746b82aadb20b8cdf8c",
+      "fixed_commit": "7f6804c4953a18386809f11faf4d86898570debc",
+      "test_file": "tests/test_generate_context.py",
+      "pythonpath": "cookiecutter/build/lib/",
+      "needs_build": true,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "6.2.5",
+      "json_report_version": "1.4.1",
+      "checkpoint": "vanta-bi-cookiecutter-1",
+      "wave": 3,
+      "role": "pilot",
+      "notes": "pythonpath=cookiecutter/build/lib/ -> the checkpoint must run setup.py build before the suite imports the package. Last pilot slot."
+    },
+    {
+      "project": "black",
+      "bug_id": 1,
+      "python_version": "3.8.3",
+      "buggy_commit": "26c9465a22c732ab1e17b0dec578fa3432e9b558",
+      "fixed_commit": "c0a7582e3d4cc8bec3b7f5a6c52b36880dcb57d7",
+      "test_file": "tests/test_black.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-black-1",
+      "wave": 1,
+      "role": "reserve",
+      "notes": "Reserve #1. 20 bugs upstream, so one bad environment does not exhaust it. Reuses the py3.8 interpreter; the suite is large and slow to collect."
+    },
+    {
+      "project": "black",
+      "bug_id": 2,
+      "python_version": "3.8.3",
+      "buggy_commit": "c8ca6b2b9ff3510bee12129824cebfc2fc51e5b2",
+      "fixed_commit": "892eddacd215d685e136686b7f629ade70adca83",
+      "test_file": "tests/test_black.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "8.0.2",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-black-2",
+      "wave": 1,
+      "role": "reserve",
+      "notes": "Reserve #1, second bug. Reuses the py3.8 interpreter."
+    },
+    {
+      "project": "tqdm",
+      "bug_id": 1,
+      "python_version": "3.6.9",
+      "buggy_commit": "8cc777fe8401a05d07f2c97e65d15e4460feab88",
+      "fixed_commit": "c0dcf39b046d1b4ff6de14ac99ad9a1b10487512",
+      "test_file": "tqdm/tests/tests_contrib.py",
+      "pythonpath": "tqdm/build/lib/",
+      "needs_build": true,
+      "native_test_paths": [
+        "tqdm/tests"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "tqdm/tests",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "6.2.5",
+      "json_report_version": "1.4.1",
+      "checkpoint": "vanta-bi-tqdm-1",
+      "wave": 3,
+      "role": "reserve",
+      "notes": "Reserve #2. Same py3.6 environment and setup.py build step as cookiecutter/1."
+    },
+    {
+      "project": "youtube-dl",
+      "bug_id": 1,
+      "python_version": "3.7.0",
+      "buggy_commit": "99036a1298089068dcf80c0985bfcc3f8c24f281",
+      "fixed_commit": "1cc47c667419e0eadc0a6989256ab7b276852adf",
+      "test_file": "test/test_utils.py",
+      "pythonpath": null,
+      "needs_build": false,
+      "native_test_paths": [
+        "test"
+      ],
+      "test_cmd": [
+        "python",
+        "-m",
+        "pytest",
+        "test",
+        "-p",
+        "no:cacheprovider",
+        "--json-report",
+        "--json-report-file={report}"
+      ],
+      "pytest_version": "7.4.4",
+      "json_report_version": "1.5.0",
+      "checkpoint": "vanta-bi-youtube-dl-1",
+      "wave": 2,
+      "role": "reserve",
+      "notes": "Kept in the split only so the context precheck's expected reject is audit-able in the committed record. Consumes zero runs; its slot is taken by the reserves above. Also the bug.info entry that writes 'fixed_commit_id =' with a space before '='."
+    }
+  ]
+}

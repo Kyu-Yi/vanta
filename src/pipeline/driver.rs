@@ -712,6 +712,22 @@ fn resolve_arm(
             ));
         }
     }
+    // [VANTA-WHY] M3 item E9 — a fixed-round count is a claim about how many attempts
+    // the run makes, so it must not exceed an arm that PINS its budget. `b0` (and the
+    // judge arms) ARE one attempt, and `--fixed-rounds 4` under one of those names would
+    // run four: the check above only guards `--max-attempts`, and `--fixed-rounds` never
+    // touches it, so before E9 this slipped through. A fixed-round arm is checked by its
+    // own `fixed_rounds` pin below; an ordinary arm with no pinned budget keeps item 9's
+    // legitimate use. Only GREATER is refused — a count equal to the pinned budget
+    // contradicts nothing.
+    if let (Some(pinned), Some(rounds)) = (spec.max_attempts, fixed_rounds) {
+        if rounds > pinned {
+            return Err(format!(
+                "CONFIG_ERROR: VANTA_ARM='{name}' pins --max-attempts {pinned} (that is \
+                 what the arm IS), but --fixed-rounds {rounds} asks for {rounds} rounds."
+            ));
+        }
+    }
     // [VANTA-WHY] M3 item 7 — the judge switch and the stated arm must agree, in
     // BOTH directions: a judge arm with `VANTA_JUDGE=off` would run the whole
     // adversarial pipeline under a name that claims a one-call verdict, and a
@@ -8303,6 +8319,31 @@ mod tests {
         // An ordinary arm is free to state a K — that is item 9's own option.
         assert!(resolve_arm(Some("b3"), true, false, true, 4, None, Some(4)).is_ok());
         assert!(resolve_arm(Some("b1"), false, false, true, 4, None, Some(2)).is_ok());
+    }
+
+    // [VANTA-WHY] M3 item E9 — a fixed-round count must not exceed an arm that PINS its
+    // attempt budget. `b0` IS one Creator call, and before E9 `b0` + `--fixed-rounds 4`
+    // ran four attempts under a name that pins one: `b0`'s `fixed_rounds` is `None`, so
+    // the arm-vs-K check above was skipped, and `--fixed-rounds` never touches
+    // `--max-attempts`, so the budget check never saw it either.
+    #[test]
+    fn a_fixed_round_count_must_not_exceed_a_pinned_attempt_budget() {
+        // Four rounds contradict b0's one attempt; the refusal names the arm and both
+        // numbers.
+        let error = resolve_arm(Some("b0"), false, false, true, 1, None, Some(4))
+            .expect_err("a fixed-round count above b0's pinned budget must be refused");
+        assert!(
+            error.contains("CONFIG_ERROR")
+                && error.contains("VANTA_ARM='b0'")
+                && error.contains("--max-attempts 1")
+                && error.contains("--fixed-rounds 4"),
+            "got: {error}"
+        );
+        // A count EQUAL to the pinned budget contradicts nothing.
+        assert!(resolve_arm(Some("b0"), false, false, true, 1, None, Some(1)).is_ok());
+        // An arm with no pinned budget keeps item 9's own option, however large.
+        assert!(resolve_arm(Some("b1"), false, false, true, 4, None, Some(4)).is_ok());
+        assert!(resolve_arm(Some("b3"), true, false, true, 4, None, Some(9)).is_ok());
     }
 
     // [VANTA-WHY] M3 item 1 — the grounding ledger separates "the audit ran and

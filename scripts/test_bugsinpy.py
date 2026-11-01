@@ -20891,13 +20891,107 @@ class TestReportUnreadable:
         assert runner_mod.REPORT_UNREADABLE in str(caught.value)
         assert "session file not found" in str(caught.value)
 
-    def test_a_session_with_no_run_summary_row_is_named(self, tmp_path):
+    def test_a_readable_session_with_no_run_summary_row_is_not_a_report_failure(self, tmp_path):
+        """Item B5 — the raise is about the FILE, never about the run.
+
+        A run the harness killed at the wall-clock cap leaves its earlier rows on
+        disk and no ``run.summary`` at all. Raising there classed the timeout
+        ``report_unreadable`` / ``infra_failure`` and hid the row's real shape
+        (``decision=""``, ``reason`` and ``label`` unset). The documented handling
+        is the empty read: the job is FAILED in the manifest and re-runs on resume.
+        """
         path = write(
             tmp_path / "s_session.jsonl",
             json.dumps({"phase": "session.start", "summary": "model=x"}) + "\n",
         )
-        with pytest.raises(runner_mod.ReportUnreadable, match="no run.summary row"):
-            runner_mod.read_run_summary(path, strict=True)
+        assert runner_mod.read_run_summary(path, strict=True) == ("", {})
+
+    def test_an_empty_session_file_is_not_a_report_failure_either(self, tmp_path):
+        """No bytes at all is the same class: readable, and carrying no row.
+
+        An empty file is not "corrupt JSONL" — nothing in it failed to parse — and
+        it is not an unreadable file. It reads as the empty summary, exactly as a
+        file of rows with no ``run.summary`` among them does.
+        """
+        path = write(tmp_path / "s_session.jsonl", "")
+        assert runner_mod.read_run_summary(path, strict=True) == ("", {})
+
+    def test_a_readable_session_with_foreign_rows_only_is_not_corrupt(self, tmp_path):
+        """The boundary: SOME lines parse and none is the summary → no raise.
+
+        ``corrupt JSONL`` means no line could be parsed. A file whose lines all
+        parse but never carry a ``run.summary`` is the readable-no-row case, and
+        must not be promoted to an unreadable report by the strict reading.
+        """
+        path = write(
+            tmp_path / "s_session.jsonl",
+            json.dumps({"phase": "session.start"}) + "\n"
+            + json.dumps({"phase": "attempt.start", "attempt": 1}) + "\n",
+        )
+        assert runner_mod.read_run_summary(path, strict=True) == ("", {})
+
+    def test_a_killed_run_reads_as_a_failure_not_as_an_unreadable_report(
+        self, tmp_path, monkeypatch
+    ):
+        """Item B5 end to end — the before/after of the timed-out row.
+
+        A run the harness killed at the wall-clock cap leaves a READABLE session file
+        whose last rows are there and whose ``run.summary`` never was. Before B5 the
+        strict read raised on it, so the row was reported as a report that could not
+        be read: ``reason=report_unreadable`` and ``label=infra_failure``. After it,
+        the run keeps its own shape — ``decision=""``,
+        ``error="no run.summary in … (exit N)"``, no reason and no label — which is
+        what leaves the job FAILED in the manifest and re-runs it on resume.
+        """
+        import types
+
+        monkeypatch.setattr(runner_mod, "sessions_dir", lambda: tmp_path / "vanta_sessions")
+        monkeypatch.setattr(
+            runner_mod.subprocess,
+            "run",
+            lambda *a, **kw: types.SimpleNamespace(returncode=0),
+        )
+        monkeypatch.setattr(runner_mod, "_discover_session", lambda text, before: "sess-1")
+        write(
+            tmp_path / "vanta_sessions" / "sess-1_session.jsonl",
+            json.dumps({"phase": "session.start", "summary": "model=x"}) + "\n",
+        )
+
+        outcome = runner_mod.invoke_vanta(
+            vanta_bin=tmp_path / "vanta_m3",
+            prep=prep(root=tmp_path / "root"),
+            issue_path=tmp_path / "issue.md",
+            env={"PATH": "/usr/bin"},
+            log_path=tmp_path / "vanta.log",
+            max_attempts=2,
+        )
+        assert outcome.session_id == "sess-1"
+        assert outcome.decision == ""
+        assert outcome.reason == "", "the raise is about the file, not about the run"
+        assert outcome.error.startswith("no run.summary in ")
+        assert not outcome.usable
+
+        paths = runner_mod.BatchPaths.under(tmp_path)
+        runner_mod._append_failure(
+            paths,
+            runner_mod.Job(
+                batch_id="b",
+                wave=1,
+                bug="Demo/1",
+                prep=object(),
+                entry={},
+                config="vanta",
+                arm="b3",
+                mode="repair",
+                seed=0,
+                checkpoint="ckpt",
+                python_version_pinned="3.8.1",
+            ),
+            outcome,
+        )
+        record = json.loads(paths.failures.read_text(encoding="utf-8").splitlines()[0])
+        assert record["reason"] is None
+        assert record["label"] is None
 
     def test_a_wholly_corrupt_jsonl_is_named_and_counted(self, tmp_path):
         path = write(tmp_path / "s_session.jsonl", "{not json\nstill not json\n")
@@ -20944,6 +21038,10 @@ class TestReportUnreadable:
     def test_a_failure_record_names_the_reason_and_the_class(self, tmp_path):
         """End to end: an unreadable report is `report_unreadable` / `infra_failure`,
         not an anonymous failure a reader has to interpret from an error string."""
+
+        # The error text is the one `read_run_summary(strict=True)` builds for an
+        # unusable FILE (item B5: a readable session with no `run.summary` row no
+        # longer raises, so it is not what reaches this record).
         outcome = runner_mod.SessionOutcome(
             session_id="sess",
             exit_code=0,
@@ -20956,7 +21054,8 @@ class TestReportUnreadable:
             final_patch=None,
             log_path=tmp_path / "run.log",
             run_secs=1.0,
-            error=f"{runner_mod.REPORT_UNREADABLE}: no run.summary row in x",
+            error=f"{runner_mod.REPORT_UNREADABLE}: /x/sess_session.jsonl: "
+            "session file not found: /x/sess_session.jsonl",
             reason=runner_mod.REPORT_UNREADABLE,
         )
         job = runner_mod.Job(

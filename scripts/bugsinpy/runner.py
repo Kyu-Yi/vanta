@@ -1051,7 +1051,10 @@ class SessionOutcome:
 
     ``report_unreadable`` when the session report could not be read at all (missing,
     unreadable or corrupt) — the class the failure is scored under is ``infra_failure``
-    rather than an empty, normal-looking summary. ``""`` for every ordinary run.
+    rather than an empty, normal-looking summary. [VANTA-WHY] Item B5 — a *readable*
+    session with no ``run.summary`` row is deliberately not this: a run killed at the
+    wall-clock cap leaves exactly that file, and it is a timeout of the run rather
+    than an unreadable report, so it keeps ``""`` here. ``""`` for every ordinary run.
     """
 
     @property
@@ -1071,22 +1074,27 @@ def parse_summary(text: str) -> dict[str, str]:
     return {key: value for key, value in SUMMARY_PAIR.findall(text)}
 
 
-def _scan_run_summary(session_path: Path) -> tuple[str, dict[str, str], str]:
-    """The last ``run.summary`` row, its parsed pairs, and why it could not be read.
+def _scan_run_summary(session_path: Path) -> tuple[str, dict[str, str], str, bool]:
+    """The last ``run.summary`` row, its parsed pairs, why it could not be read, and
+    whether that failure is about the *file* rather than about the run.
 
     The third element is ``""`` when a ``run.summary`` row was recovered and the
-    reason otherwise. Three failures are kept apart because the runner classifies
-    them differently: the file is not there, the file is there but unreadable or
-    entirely unparseable, or the file is readable and carries no ``run.summary`` row
-    at all. A torn *tail* is not a failure — a process killed mid-write leaves the
-    rows before it intact, so the last **complete** ``run.summary`` still wins.
+    reason otherwise. Four failures are kept apart because the runner classifies
+    them differently: the file is not there, the file is there but unreadable, the
+    file has no parseable line at all, or the file is readable and simply carries
+    no ``run.summary`` row. Only the first three make the *report* unusable, which
+    is what the fourth element states: the last one is a run that stopped before it
+    wrote its verdict, and has a documented handling of its own (item B5, see
+    :func:`read_run_summary`). A torn *tail* is not a failure either — a process
+    killed mid-write leaves the rows before it intact, so the last **complete**
+    ``run.summary`` still wins.
     """
     try:
         text = session_path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return "", {}, f"session file not found: {session_path}"
+        return "", {}, f"session file not found: {session_path}", True
     except OSError as exc:
-        return "", {}, f"session file unreadable: {session_path} ({exc})"
+        return "", {}, f"session file unreadable: {session_path} ({exc})", True
     raw = ""
     found = False
     nonblank = 0
@@ -1105,10 +1113,10 @@ def _scan_run_summary(session_path: Path) -> tuple[str, dict[str, str], str]:
             found = True
             raw = str(record.get("summary") or "")
     if found:
-        return raw, parse_summary(raw), ""
+        return raw, parse_summary(raw), "", False
     if nonblank and not parsed:
-        return "", {}, f"corrupt JSONL: {session_path} ({nonblank} unparseable line(s))"
-    return "", {}, f"no run.summary row in {session_path}"
+        return "", {}, f"corrupt JSONL: {session_path} ({nonblank} unparseable line(s))", True
+    return "", {}, f"no run.summary row in {session_path}", False
 
 
 def read_run_summary(
@@ -1122,14 +1130,26 @@ def read_run_summary(
     than against a re-sorted copy.
 
     ``strict=True`` raises :class:`ReportUnreadable` (path and reason) rather than
-    returning ``("", {})`` when no ``run.summary`` row could be recovered. That is
-    the reading the runner uses where the report is the run's only evidence: an
-    unreadable one is an infrastructure failure, and must not look like a run that
-    quietly wrote nothing. The default — an empty summary — is kept for callers that
-    already treat a missing report as a documented state.
+    returning ``("", {})`` when the *report itself* is unusable: the session file is
+    not there, is not readable, or has no parseable line at all. That is the reading
+    the runner uses where the report is the run's only evidence — an unreadable one
+    is an infrastructure failure and must not look like a run that quietly wrote
+    nothing.
+
+    [VANTA-WHY] Item B5 — a *readable* session that simply carries no
+    ``run.summary`` row is **not** that failure, and must not raise. It is the
+    documented state of a run that stopped before it wrote a verdict, which is what
+    a run killed at the wall-clock cap leaves behind (the earlier rows are on disk;
+    the summary never was). Raising classed that timeout ``report_unreadable`` /
+    ``infra_failure`` and hid the row's real shape — ``decision=""``,
+    ``error="no run.summary in … (exit N)"``, ``reason`` and ``label`` unset —
+    which is the shape that makes the job FAILED in the manifest and re-runs it on
+    resume, and reads as ``unobservable`` if a row is emitted anyway. The raise is
+    about the file, never about the run. The default — an empty summary — is kept
+    for callers that already treat a missing report as a documented state.
     """
-    raw, pairs, reason = _scan_run_summary(session_path)
-    if reason and strict:
+    raw, pairs, reason, unusable = _scan_run_summary(session_path)
+    if reason and unusable and strict:
         raise ReportUnreadable(session_path, reason)
     return raw, pairs
 
@@ -1846,6 +1866,15 @@ def invoke_vanta(
         # class is `infra_failure` on the failure record (`_append_failure`). Reading
         # it as `("", {})` would leave `decision` empty and the failure indistinguishable
         # from a session that legitimately stopped before writing a verdict.
+        #
+        # [VANTA-WHY] Item B5 — that last sentence names the case this call must NOT
+        # raise for, and no longer does. A session file that IS readable and simply
+        # carries no `run.summary` row falls through to the `no run.summary in …`
+        # branch below, so the row keeps `decision=""`, no reason and no label: the
+        # job is FAILED in the manifest and re-run on resume, and a row emitted from
+        # it is `unobservable` rather than `infra_failure`. Reaching this branch now
+        # means the file itself could not be read (missing, unreadable, or with no
+        # parseable line at all).
         outcome.reason = REPORT_UNREADABLE
         outcome.error = str(exc)
         return outcome

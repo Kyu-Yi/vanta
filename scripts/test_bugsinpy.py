@@ -7449,6 +7449,89 @@ class TestTheUnmeasuredPinIsAGate:
         assert bug_prep.version_pin["reason"] == carve_out.reason
 
 
+class TestTheFrozenPinReachesVantaClean:
+    """[VANTA-WHY] M3 item P4 — the regression guard for the pandas/1 pin loss.
+
+    P1, P2 and P3 each repaired one link: the probe's failure is quoted in the reason
+    (P1), the read-only mount no longer makes shuru refuse the boot before a VM exists
+    (P2), and a measurement that fails now refuses the bug at prepare (P3). None of the
+    three proves the chain *end to end*, and the loss this round started from was
+    exactly a link no test watched: the probe answered nothing, the row read ``pinned
+    false``, and prepare went on — nobody noticed because nothing asserted the positive
+    case at prepare at all.
+
+    So this test walks the chain at the level prepare owns: a versioneer project, a
+    working probe, and ``strip_and_baseline`` run to its last line. It asserts the two
+    facts the session then depends on — the row records ``pinned true``, and the frozen
+    version file is in ``vanta_clean``, the tree the runner seeds from. The frozen bytes
+    are read back with versioneer's own reader regex, and their digest is compared with
+    the row's ``sha256``, so the file on disk and the number in the record cannot drift.
+
+    Only the probe VM is faked (a unit test cannot boot one); the detection, the freeze,
+    the record and the copy are all the real code.
+    """
+
+    @staticmethod
+    def _measured_suite(*_args, **_kwargs) -> suite_mod.SuitePair:
+        """A measured pair: a report was written, one test collected and passed twice."""
+        run = suite_mod.SuiteRun(
+            outcomes={"tests/test_demo.py::test_a": "passed"},
+            exit_code=0,
+            report_found=True,
+        )
+        return suite_mod.SuitePair(first=run, second=run)
+
+    def test_prepare_pins_a_versioneer_tree_and_freezes_vanta_clean(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "batch" / "worktrees" / "Demo_1"
+        write(root / "oracle_tree" / "pkg" / "_version.py", TestVersionPin._stub())
+        write(
+            root / "oracle_tree" / "pkg" / "__init__.py",
+            "from ._version import get_versions\n"
+            "__version__ = get_versions()['version']\n",
+        )
+        monkeypatch.setattr(
+            prepare_mod, "_read_report", lambda batch_dir, stem: {"tests": []}
+        )
+        # No repository here, so the guard's candidate set is empty; nothing is scanned.
+        monkeypatch.setattr(tree_mod, "tracked_paths", lambda checkouts: set())
+        # The one piece a unit test cannot boot, so it is the only stand-in here.
+        TestVersionPin._fake_probe(monkeypatch)
+        monkeypatch.setattr(prepare_mod, "_suite", self._measured_suite)
+        bug_prep = prep(root=root)
+
+        recorded = prepare_mod.strip_and_baseline(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch"
+        )
+
+        assert recorded is True
+        assert bug_prep.gate_failures == []
+        assert bug_prep.version_pin["pinned"] is True
+        assert bug_prep.version_pin["kind"] == "versioneer"
+        assert bug_prep.version_pin["file"] == "pkg/_version.py"
+        assert bug_prep.version_pin["version"] == "1.2.3"
+        assert bug_prep.version_pin["probe_sandbox"] == "shuru"
+
+        # The tree the runner seeds from carries the file, and it is the sdist SHORT
+        # form versioneer itself reads back — not the long form it replaced.
+        frozen = (root / "vanta_clean" / "pkg" / "_version.py").read_text()
+        found = re.search(
+            r"version_json = '''\n(.*)'''  # END VERSION_JSON", frozen, re.DOTALL
+        )
+        assert found is not None, frozen
+        assert json.loads(found.group(1)) == {
+            "version": "1.2.3",
+            "full-revisionid": "a" * 40,
+            "dirty": False,
+            "error": None,
+        }
+        # The record's digest is over the bytes that landed in ``vanta_clean``.
+        assert bug_prep.version_pin["sha256"] == hashlib.sha256(
+            frozen.encode("utf-8")
+        ).hexdigest()
+
+
 class TestPrepareRunRecordContract:
     """``prepare.json`` has one writer and one reader, and they cannot drift.
 

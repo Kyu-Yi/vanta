@@ -29235,6 +29235,50 @@ class TestAnalyseLoading:
         message = str(exc.value)
         assert "aaaa11112222" in message and "bbbb44445555" in message
 
+    def test_the_same_hash_with_different_overrides_is_never_pooled(self, tmp_path):
+        """[VANTA-WHY] M3 item B8 — the file hash is not the effective configuration.
+
+        ``--config-override`` waives a frozen default without touching the config file,
+        so two rows can share a ``config_hash`` and still be two different experiments.
+        Pooling them would average the waived and the unwaived run under one name.
+        """
+        first = _analyse_row("k1")
+        first["config_hash"] = "h1"
+        first["config_overrides"] = []
+        second = _analyse_row("k2")
+        second["config_hash"] = "h1"
+        second["config_overrides"] = ["VANTA_SAMPLING=coding!=pinned"]
+        batch = _analyse_batch(tmp_path, rows=[first, second])
+        with pytest.raises(analyse_mod.AnalysisError) as exc:
+            _analyse_load(batch)
+        assert "VANTA_SAMPLING=coding!=pinned" in str(exc.value)
+
+    def test_the_same_hash_and_the_same_overrides_are_one_group(self, tmp_path):
+        """The same overrides in a different order are the same configuration."""
+        rows = [_analyse_row("k1"), _analyse_row("k2")]
+        for index, row in enumerate(rows):
+            row["config_hash"] = "h1"
+            row["config_overrides"] = ["a=1", "b=2"] if index == 0 else ["b=2", "a=1"]
+        analysis = _analyse_load(_analyse_batch(tmp_path, rows=rows))
+        assert len(analysis.rows) == 2
+
+    def test_an_unrecorded_override_list_is_not_an_empty_one(self, tmp_path):
+        """Absence of the field is a different claim from "there were no overrides".
+
+        A row that says nothing about its overrides is an unknown experiment and is its
+        own group, exactly as a row with no ``config_hash`` is — never agreement with a
+        row that recorded "none".
+        """
+        first = _analyse_row("k1")
+        first["config_hash"] = "h1"
+        first["config_overrides"] = []
+        second = _analyse_row("k2")
+        second["config_hash"] = "h1"  # no config_overrides field at all
+        batch = _analyse_batch(tmp_path, rows=[first, second])
+        with pytest.raises(analyse_mod.AnalysisError) as exc:
+            _analyse_load(batch)
+        assert "overrides not recorded" in str(exc.value)
+
 
 class TestAnalyseReview:
     def _rows(self) -> list[dict]:

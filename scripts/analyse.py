@@ -502,6 +502,36 @@ turns the field into a refusal: a typo in a literal there would make the guard r
 ``None`` for every row and silently pool everything, and the row's own copies in
 ``runner.build_record`` would keep looking right."""
 
+OVERRIDES_FIELD = "config_overrides"
+"""The row field naming the overrides the frozen config was run with.
+
+[VANTA-WHY] M3 item B8. ``config_hash`` is the hash of the config **file**, not of the
+configuration a row was produced under: ``--config-override`` can waive a frozen
+default or swap a sampling preset without touching the file, so two rows with the same
+hash can be two different experiments. The rendered overrides are the other half of the
+key. Named here for the same reason ``CONFIG_HASH_FIELD`` is — a typo would make the
+guard read every row as "no overrides recorded" and pool them all."""
+
+
+def _config_group(record: Mapping[str, Any]) -> tuple[Any, Any]:
+    """The ``(config_hash, config_overrides)`` key two rows must share to be poolable.
+
+    Overrides are recorded as an unordered list of rendered strings
+    (``frozen_config.Override.render``), so they are sorted into the key — two rows that
+    applied the same overrides in a different order are the same configuration. A row
+    with no ``config_overrides`` field at all is **not** the same claim as one that
+    recorded an empty list, and gets its own key, exactly as a row with no
+    ``config_hash`` does: the first says nothing about its overrides, the second says
+    there were none, and pooling an unknown with a known under the known one's name is
+    what the guard exists to stop.
+    """
+    value = record.get(CONFIG_HASH_FIELD)
+    hash_key = None if value is None else str(value)
+    raw = record.get(OVERRIDES_FIELD)
+    if not isinstance(raw, list):
+        return hash_key, None
+    return hash_key, tuple(sorted(str(item) for item in raw))
+
 
 def _refuse_mixed_configs(batches: Sequence[Batch]) -> None:
     """Item 19 — never pool rows from different frozen configurations.
@@ -515,21 +545,36 @@ def _refuse_mixed_configs(batches: Sequence[Batch]) -> None:
     could tell. A row with no ``config_hash`` (one written before this field existed,
     or by a caller that supplied no frozen config) is its own group, never agreement
     with a hashed row.
+
+    [VANTA-WHY] M3 item B8 — the key is the hash **and** the applied overrides
+    (:func:`_config_group`): one file hash can be run with and without `--config-override`
+    waivers, and those rows are as incomparable as two different files. So the guard
+    reads both fields and the refusal names the overrides that made the groups differ.
     """
-    groups: dict[Any, list[str]] = {}
+    groups: dict[tuple[Any, Any], list[str]] = {}
     for batch in batches:
         for record in batch.records:
-            value = record.get(CONFIG_HASH_FIELD)
-            groups.setdefault(None if value is None else str(value), []).append(
-                str(batch.path)
-            )
+            groups.setdefault(_config_group(record), []).append(str(batch.path))
     if len(groups) <= 1:
         return
     described: list[str] = []
-    for value, where in sorted(
-        groups.items(), key=lambda item: (item[0] is not None, item[0] or "")
+    for (hash_key, overrides), where in sorted(
+        groups.items(),
+        key=lambda item: (
+            item[0][0] is not None,
+            item[0][0] or "",
+            item[0][1] is not None,
+            item[0][1] or (),
+        ),
     ):
-        label = "none recorded" if value is None else value[:12]
+        if hash_key is None:
+            label = "none recorded"
+        else:
+            label = hash_key[:12]
+            if overrides is None:
+                label += " (overrides not recorded)"
+            elif overrides:
+                label += " (with overrides " + ", ".join(overrides) + ")"
         described.append(
             f"{label} ({len(where)} row(s) in {', '.join(sorted(set(where)))})"
         )

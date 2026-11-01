@@ -27170,6 +27170,48 @@ class TestReplayCounts:
         assert first["by_source"][replay_mod.SOURCE_REPO_BASELINE]["n_pp"] == 1
         assert first["by_source"][replay_mod.SOURCE_VANTA_GENERATED]["n_ff"] == 1
 
+    def test_a_test_that_appears_only_at_the_newer_column_is_censored_not_a_crash(self):
+        """Item B3 — the pair is read before the source it used to index.
+
+        The Governor's shared set can gain a test between two attempts, so the newer
+        column holds a test the older one never ran. Reading the older cell's
+        ``evidence_source`` first raised ``KeyError`` on that pair and took the whole
+        row's replay with it; the pair has to be censored like any other unobserved
+        transition.
+        """
+        cells = [
+            _replay_cell("native:t_a", 0, "pass"),
+            _replay_cell("native:t_a", 1, "pass"),
+            _replay_cell("generated:late", 1, "fail"),  # only in the newer column
+        ]
+
+        (entry,) = replay_mod.transitions(cells)
+
+        assert entry["k"] == "0->1"
+        assert (entry["n_pp"], entry["n_pf"], entry["n_fp"], entry["n_ff"]) == (
+            1,
+            0,
+            0,
+            0,
+        )
+        assert entry["n_censored"] == 1
+        # …and the censored pair is attributed to the source of the cell that exists.
+        assert (
+            entry["by_source"][replay_mod.SOURCE_VANTA_GENERATED]["n_censored"] == 1
+        )
+
+    def test_a_test_present_at_both_columns_is_still_counted(self):
+        """The companion: the reordering must not over-censor an ordinary pair."""
+        cells = [
+            _replay_cell("native:t_a", 0, "pass"),
+            _replay_cell("native:t_a", 1, "fail"),
+        ]
+
+        (entry,) = replay_mod.transitions(cells)
+
+        assert entry["n_pf"] == 1
+        assert entry["n_censored"] == 0
+
     def test_rates_are_null_on_a_zero_denominator_not_a_division_error(self):
         got = replay_mod.rates({"n_pp": 0, "n_pf": 0, "n_fp": 2, "n_ff": 1, "n_censored": 3})
         assert got["eir"] is None

@@ -203,12 +203,21 @@ def transitions(
         for test_id in sorted(by_test):
             if test_id in excluded_ids:
                 continue
-            source = str(by_test[test_id][older].get("evidence_source") or "")
+            older_cell = by_test[test_id].get(older)
+            newer_cell = by_test[test_id].get(newer)
+            # Item B3 — the guard has to come before the source read, because the
+            # source is the *older* column's. The Governor's shared set can gain a
+            # test between two attempts, so the newer column can hold a test the
+            # older one never ran; indexing `by_test[test_id][older]` for its
+            # `evidence_source` raised `KeyError` on that pair and took the whole
+            # row's replay with it. A test present at only one column of a pair is
+            # the censored transition the docstring already describes, so the
+            # source falls back to whichever cell exists and the pair is censored.
+            source_cell = older_cell if older_cell is not None else newer_cell
+            source = str((source_cell or {}).get("evidence_source") or "")
             slot = by_source.setdefault(
                 source, {"n_pp": 0, "n_pf": 0, "n_fp": 0, "n_ff": 0, "n_censored": 0}
             )
-            older_cell = by_test[test_id].get(older)
-            newer_cell = by_test[test_id].get(newer)
             if older_cell is None or newer_cell is None:
                 counts["n_censored"] += 1
                 slot["n_censored"] += 1

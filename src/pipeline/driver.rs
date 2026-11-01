@@ -1006,11 +1006,17 @@ fn is_judge_site(site: &str) -> bool {
 /// non-judge row and a LEADING-SPACE-prefixed string for a judge row, so it can be
 /// spliced in right after `prompt_hash=` and a non-judge `run.summary` stays
 /// byte-identical to what it was before the judge existed.
+///
+/// [VANTA-WHY] C4 — the hash is `judge::judge_prompt_hash()`, the same value
+/// `configs/v1-m3.toml [prompts] judge` pins: it covers the judge's USER templates
+/// as well as its system one, so rewording a user block now moves both the row's
+/// recorded provenance and `config_hash`. Taking it from that one accessor is what
+/// keeps the row and the frozen config from describing different judge prompts.
 fn judge_prompt_keys(judge_arm: bool) -> String {
     if !judge_arm {
         return String::new();
     }
-    let hash = crate::core::prompt_content_hash(&[crate::agents::judge::JUDGE_SYSTEM_PROMPT]);
+    let hash = crate::agents::judge::judge_prompt_hash();
     format!(
         " judge_prompt_version={} judge_prompt_hash={}",
         crate::agents::judge::JUDGE_PROMPT_VERSION,

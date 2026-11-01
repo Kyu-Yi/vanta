@@ -30385,15 +30385,23 @@ class TestFrozenConfig:
         # The K arm's declaration is its own ENFORCED table (M3 item 9/A5), not a
         # `[prereg]` literal: the harness reads it and refuses a mismatch.
         assert config.fixed_rounds() == {"b1-k4": 4, "b3-k4": 4}
+        # C4 — the judge is here too: its prompt is sent only on a judge arm, so it
+        # is not a role `prompt_hashes()` records on every row, but its text is a
+        # prompt the binary sends and a reworded judge block must move `config_hash`.
         assert set(config.prompts()) == {
             "attacker",
             "intent_check",
             "creator",
             "diagnostician",
+            "judge",
         }
         # The rule-based role sends no prompt, so its slot names the reason instead
         # of carrying the empty-set hash `e3b0c44298fc` (the SHA-256 of "").
         assert config.prompts()["diagnostician"] == "not_applicable"
+        # The judge's value is a real 12-hex content hash, not the empty-set value.
+        judge = config.prompts()["judge"]
+        assert len(judge) == 12 and all(c in "0123456789abcdef" for c in judge), judge
+        assert judge != "e3b0c44298fc"
 
     def test_the_committed_env_freezes_the_night_run_values(self):
         """Item 19 — `[env]` is the night runs' `# env:` header, not a chosen set.
@@ -30448,7 +30456,9 @@ class TestFrozenConfig:
         committed = frozen_mod.load().prompts()
         # Every recorded template hash is literally in the file's bytes, so a
         # template edit that updates the block cannot fail to change `sha256`.
-        for role in ("attacker", "intent_check", "creator"):
+        # C4 adds `judge`: its prompt is the one whose wording used to be inline at
+        # the judge call site, and a reworded block has to move `config_hash` too.
+        for role in ("attacker", "intent_check", "creator", "judge"):
             assert f'{role} = "{committed[role]}"' in raw
 
         edited_path = write(

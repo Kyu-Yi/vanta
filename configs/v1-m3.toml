@@ -216,15 +216,20 @@ b1-k4 = 4
 b3-k4 = 4
 
 # ---------------------------------------------------------------------------
-# [prompts] — the SHA-256 of every prompt TEMPLATE, as `pipeline::prompt_hashes()`
-# records it. Each value is the 12-hex `prompt_content_hash` of that role's system
-# and user templates, joined by U+001F in a fixed order: the role's system
-# templates first, then its user templates.
+# [prompts] — the SHA-256 of every prompt TEMPLATE. Each value is the 12-hex
+# `prompt_content_hash` of that role's system and user templates, joined by U+001F
+# in a fixed order: the role's system templates first, then its user templates.
+#
+# Every role `pipeline::prompt_hashes()` records is here, plus `judge`: the judge's
+# prompt is sent only on a judge arm, so it cannot go in that every-row string
+# (every row, `session.start` included, carries it), but its text is a prompt the
+# binary sends and so it is recorded here, where an edit moves `config_hash`.
 #
 # [VANTA-WHY] Item 16 reordered a USER prompt and this block did not move, because
 # it hashed the system prompts only — so `config_hash` described a configuration
 # whose prompt text was no longer the text the binary sent. The user templates are
-# covered here now. The tie to the code is a test, not a convention:
+# covered here now, the judge's included (C4: the judge's user blocks used to be
+# inline at the call site). The tie to the code is a test, not a convention:
 # `pipeline::tests::the_committed_prompts_block_is_the_hash_of_the_templates_this_code_sends`
 # (in `src/pipeline/mod.rs`) recomputes each value from the templates the call sites
 # expand, so a template edit fails the suite until this block is updated, and
@@ -240,3 +245,6 @@ creator = "70003e722ca6"
 # empty set (`e3b0c44298fc`, the SHA-256 of ""), which would be indistinguishable
 # from a real prompt that had been truncated.
 diagnostician = "not_applicable"
+# The judge's system prompt AND its user blocks / retry tail, from the one accessor
+# the judge row's `judge_prompt_hash` also reads (`agents::judge::judge_prompt_hash`).
+judge = "5462ccc08255"

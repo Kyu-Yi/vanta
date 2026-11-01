@@ -160,7 +160,12 @@ pub fn prompt_hashes() -> String {
 /// system templates first, then its user templates. `prompt_content_hash` joins
 /// the parts with U+001F, so a change to any template moves the role's hash and
 /// text moved across the system/user boundary cannot be invisible.
-fn role_templates(system: &[&'static str], user: &[&'static str]) -> Vec<&'static str> {
+///
+/// `pub(crate)` for C4: the judge's own hash (`agents::judge::judge_prompt_hash`)
+/// is taken over its system and user templates in this same order, and the judge
+/// must not have a second, differently-ordered notion of "this role's prompt
+/// text" than the arm it is compared with.
+pub(crate) fn role_templates(system: &[&'static str], user: &[&'static str]) -> Vec<&'static str> {
     system.iter().copied().chain(user.iter().copied()).collect()
 }
 
@@ -312,7 +317,7 @@ mod tests {
             .and_then(|value| value.as_table())
             .expect("configs/v1-m3.toml must carry a [prompts] table");
 
-        let expected: [(&str, String); 4] = [
+        let expected: [(&str, String); 5] = [
             (
                 "attacker",
                 crate::core::prompt_content_hash(&role_templates(
@@ -335,12 +340,20 @@ mod tests {
                 )),
             ),
             ("diagnostician", "not_applicable".to_string()),
+            // [VANTA-WHY] C4 — the judge's prompt is hashed here too, though it is
+            // NOT in `prompt_hashes()`: it is sent only on a judge arm, so the
+            // every-row string must not name it, but `config_hash` must still be
+            // able to see a reworded judge prompt. Its value comes from the one
+            // accessor the driver records on the row, so the two cannot describe
+            // different prompts.
+            ("judge", crate::agents::judge::judge_prompt_hash()),
         ];
 
         assert_eq!(
             recorded.len(),
             expected.len(),
-            "[prompts] must name exactly the roles the code records"
+            "[prompts] must name exactly the prompt records the code has — `prompt_hashes()`'s \
+             roles plus the arm-gated judge"
         );
         let mismatches: Vec<String> = expected
             .iter()

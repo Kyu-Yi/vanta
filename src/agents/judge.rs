@@ -72,6 +72,118 @@ pub fn judge_system_prompt() -> &'static str {
 }
 
 // ============================================================================
+// The USER prompt templates — one macro per block the call sends (C4)
+// ============================================================================
+//
+// [VANTA-WHY] C4 — the judge's USER prompt used to be written inline at the call
+// site, so only the system half of the prompt was templated and hashed: the
+// frozen config's `[prompts]` block (via `judge_prompt_hash`) described a judge
+// whose user wording could be rewritten — "the same selection the test-driven arm
+// is shown", "decide whether this patch correctly resolves the issue" — without
+// any recorded value moving. That is exactly the gap item 19 (fix 4) closed for
+// the Attacker, the auditor and the Creator: a prompt edit has to be visible in
+// the record, or two different experiments look identical. Each block is now a
+// macro that IS the `format!` format string the builder expands AND IS the text
+// the hash is taken over, so the two cannot drift the way a parallel copy would.
+
+macro_rules! judge_issue_block {
+    () => {
+        "ISSUE:\n{}\n"
+    };
+}
+
+macro_rules! judge_context_block {
+    () => {
+        "REPOSITORY CONTEXT (the same selection the test-driven arm is shown):\n{}\n"
+    };
+}
+
+macro_rules! judge_patch_block {
+    () => {
+        "CANDIDATE PATCH:\n{}\n"
+    };
+}
+
+/// The suite block exists only under `judge+suite`; the plain judge sends no such
+/// message at all, which is the arms' whole difference.
+macro_rules! judge_suite_block {
+    () => {
+        "NATIVE TEST SUITE RESULT ON THE CANDIDATE:\n{}\n"
+    };
+}
+
+macro_rules! judge_closing_block {
+    () => {
+        "Decide whether this patch correctly resolves the issue without breaking behaviour. Answer with the JSON object described in your instructions."
+    };
+}
+
+/// The third message on the retry attempt (see `build_messages`).
+macro_rules! judge_reprompt_block {
+    () => {
+        "REPROMPT (attempt #2): Last response was not valid JSON or the `verdict` was not \"approve\" or \"reject\". Write ONLY a JSON object beginning with '{' and ending with '}'. Keys: verdict (\"approve\" or \"reject\"), confidence (0.0-1.0), reason."
+    };
+}
+
+/// Every USER template the judge can send, in the order [`judge_user_prompt`]
+/// emits them plus the retry tail.
+///
+/// [VANTA-WHY] C4 — the judge side of the `[prompts]` block. The retry tail is
+/// here too: it is a message the model reads and it carries instructions ("write
+/// ONLY a JSON object"), so a rewording of it moves verdicts and must move the
+/// hash.
+pub fn judge_user_prompts() -> [&'static str; 6] {
+    [
+        judge_issue_block!(),
+        judge_context_block!(),
+        judge_patch_block!(),
+        judge_suite_block!(),
+        judge_closing_block!(),
+        judge_reprompt_block!(),
+    ]
+}
+
+/// The judge's USER prompt for a request, in the exact form `judge_candidate`
+/// sends.
+///
+/// [VANTA-WHY] C4, the same shape `creator_user_prompt` has and for the same
+/// reason: `judge_prompt_hash` is taken over the templates below, so the builder
+/// and the hash must read ONE text. A request built anywhere else could send
+/// wording no recorded hash covers, and the judge row's provenance would describe
+/// the wrong prompt.
+pub fn judge_user_prompt(request: &JudgeRequest) -> String {
+    let mut user_parts: Vec<String> = Vec::new();
+    user_parts.push(format!(judge_issue_block!(), request.issue_text));
+    user_parts.push(format!(judge_context_block!(), request.context));
+    user_parts.push(format!(judge_patch_block!(), request.candidate_diff));
+    if let Some(suite) = &request.suite_result {
+        user_parts.push(format!(judge_suite_block!(), suite));
+    }
+    user_parts.push(judge_closing_block!().to_string());
+    user_parts.join("\n")
+}
+
+/// The content hash of the judge's prompt TEMPLATES — system then user.
+///
+/// [VANTA-WHY] C4 — the value `configs/v1-m3.toml [prompts] judge` pins and the
+/// judge row's `judge_prompt_hash` records. It covers the user templates now, so a
+/// reworded user block moves it; before this, editing any of the six blocks left
+/// the recorded value identical. Same system-then-user order and the same
+/// `role_templates` helper every other role uses, so the judge cannot drift into a
+/// different notion of "this role's prompt text" than the arm it is compared with.
+///
+/// Note this is deliberately NOT part of `pipeline::prompt_hashes()`: the judge
+/// prompt is sent only on a judge arm, and every row — `session.start` included —
+/// carries that string, so folding the judge in would claim every run sent a judge
+/// prompt (see `driver::judge_prompt_keys`).
+pub fn judge_prompt_hash() -> String {
+    crate::core::prompt_content_hash(&crate::pipeline::role_templates(
+        &[JUDGE_SYSTEM_PROMPT],
+        &judge_user_prompts(),
+    ))
+}
+
+// ============================================================================
 // JudgeVerdict — the typed verdict
 // ============================================================================
 //
@@ -186,26 +298,9 @@ pub async fn judge_candidate(
         .map_err(|e| JudgeError::Call(format!("could not build the HTTP client: {e}")))?;
 
     let system_prompt = judge_system_prompt();
-
-    let mut user_parts: Vec<String> = Vec::new();
-    user_parts.push(format!("ISSUE:\n{}\n", request.issue_text));
-    user_parts.push(format!(
-        "REPOSITORY CONTEXT (the same selection the test-driven arm is shown):\n{}\n",
-        request.context
-    ));
-    user_parts.push(format!("CANDIDATE PATCH:\n{}\n", request.candidate_diff));
-    if let Some(suite) = &request.suite_result {
-        user_parts.push(format!(
-            "NATIVE TEST SUITE RESULT ON THE CANDIDATE:\n{}\n",
-            suite
-        ));
-    }
-    user_parts.push(
-        "Decide whether this patch correctly resolves the issue without breaking existing \
-         behaviour. Answer with the JSON object described in your instructions."
-            .to_string(),
-    );
-    let user_prompt = user_parts.join("\n");
+    // [VANTA-WHY] C4 — built from the templates `judge_prompt_hash` covers, never
+    // inline here: the recorded provenance has to describe the text that goes out.
+    let user_prompt = judge_user_prompt(request);
 
     debug!(
         system_len = system_prompt.len(),
@@ -221,12 +316,9 @@ pub async fn judge_candidate(
             json!({"role": "user", "content": user_owned.clone()}),
         ];
         if attempt >= 2 {
-            let tail = "REPROMPT (attempt #2): Last response was not valid JSON or the \
-                        `verdict` was not \"approve\" or \"reject\". Write ONLY a JSON object \
-                        beginning with '{' and ending with '}'. Keys: verdict (\"approve\" or \
-                        \"reject\"), confidence (0.0-1.0), reason."
-                .to_string();
-            messages.push(json!({"role": "user", "content": tail}));
+            // The template, not a copy: this is the third message the model reads,
+            // so its wording is inside the hash too (C4).
+            messages.push(json!({"role": "user", "content": judge_reprompt_block!()}));
         }
         messages
     };
@@ -304,6 +396,94 @@ mod tests {
         assert!(
             crate::llm::SAMPLING_SCHEDULE.iter().any(|(site, ..)| *site == "judge"),
             "`judge` must be a site in SAMPLING_SCHEDULE"
+        );
+    }
+
+    fn request_with(suite_result: Option<&str>) -> JudgeRequest {
+        JudgeRequest {
+            issue_text: "the issue".to_string(),
+            context: "the context".to_string(),
+            candidate_diff: "--- a/f.py\n+++ b/f.py\n".to_string(),
+            suite_result: suite_result.map(str::to_string),
+        }
+    }
+
+    /// [VANTA-WHY] C4 — the fix's whole point: every block the judge can send is
+    /// inside `judge_prompt_hash`, so a reworded user block moves the value the
+    /// judge row records and the frozen config pins. Before C4 the user wording was
+    /// inline at the call site and this loop had one member (the system prompt); a
+    /// template that is not inside the hash is a prompt whose rewording the record
+    /// cannot see, which is the gap item 19 (fix 4) closed for the other roles.
+    #[test]
+    fn every_judge_prompt_template_is_inside_the_judge_hash() {
+        let mut all: Vec<&'static str> = vec![JUDGE_SYSTEM_PROMPT];
+        all.extend(judge_user_prompts());
+        assert_eq!(
+            all.len(),
+            7,
+            "one system template plus the six user blocks (issue, context, patch, \
+             suite, closing, retry tail)"
+        );
+
+        for (i, template) in all.iter().enumerate() {
+            assert!(
+                !template.is_empty(),
+                "judge template {i} is empty; an empty template hashes to the \
+                 e3b0c44298fc value this record exists to keep out"
+            );
+            let edited: Vec<String> = all
+                .iter()
+                .enumerate()
+                .map(|(j, t)| if j == i { format!("{t} ") } else { t.to_string() })
+                .collect();
+            let edited_refs: Vec<&str> = edited.iter().map(String::as_str).collect();
+            assert_ne!(
+                crate::core::prompt_content_hash(&all),
+                crate::core::prompt_content_hash(&edited_refs),
+                "judge template {i} is not inside the hash: editing it changed nothing"
+            );
+        }
+
+        assert_ne!(
+            crate::core::prompt_content_hash(&[JUDGE_SYSTEM_PROMPT]),
+            judge_prompt_hash(),
+            "the recorded judge hash must cover the USER templates, not only the system one"
+        );
+    }
+
+    /// [VANTA-WHY] C4 — the builder and the hash read one text. This pins the
+    /// rendered prompt to the templates themselves (each block's literal text, with
+    /// its placeholder filled, appears in the body in order), so a future edit that
+    /// rebuilds the prompt somewhere else — the shape the bug had — cannot send
+    /// wording the hash does not cover.
+    #[test]
+    fn the_user_prompt_is_the_blocks_the_judge_hash_covers() {
+        let rendered = judge_user_prompt(&request_with(Some("1 failed, 4 passed")));
+        let expected = [
+            format!(judge_issue_block!(), "the issue"),
+            format!(judge_context_block!(), "the context"),
+            format!(judge_patch_block!(), "--- a/f.py\n+++ b/f.py\n"),
+            format!(judge_suite_block!(), "1 failed, 4 passed"),
+            judge_closing_block!().to_string(),
+        ]
+        .join("\n");
+        assert_eq!(rendered, expected);
+    }
+
+    /// The plain judge is shown no suite result — that is `judge+suite`'s whole
+    /// difference — so the optional block must be exactly that: absent, not empty.
+    #[test]
+    fn the_plain_judges_prompt_carries_no_suite_block() {
+        let judged = judge_user_prompt(&request_with(Some("1 failed, 4 passed")));
+        let plain = judge_user_prompt(&request_with(None));
+        assert!(judged.contains("NATIVE TEST SUITE RESULT ON THE CANDIDATE:"));
+        assert!(
+            !plain.contains("NATIVE TEST SUITE RESULT"),
+            "the plain judge must be sent no suite block at all; got {plain}"
+        );
+        assert!(
+            plain.starts_with(&format!(judge_issue_block!(), "the issue")),
+            "the plain judge still opens with the issue block; got {plain}"
         );
     }
 }

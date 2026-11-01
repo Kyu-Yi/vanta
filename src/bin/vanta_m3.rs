@@ -57,7 +57,8 @@ struct CliArgs {
     max_attempts: u32,
     /// M3 item 9 — `--fixed-rounds K`: run EXACTLY K repair attempts, taking the
     /// verdict from attempt K, so a patch that passes early is still re-examined
-    /// (EIR). Off by default. A repair option only; refused with `--patch`.
+    /// (EIR). Off by default. A repair option only; when combined with `--patch`
+    /// it is ignored, with a warning, and the attempt cap stays `--max-attempts`.
     fixed_rounds: Option<u32>,
     model_override: Option<String>,
     /// If true, open a GitHub PR after Gatekeeper approval.
@@ -568,7 +569,7 @@ fn print_help() {
          OPTIONS:\n    --repo, -r PATH        Path to the repository to repair\n    \
          --issue, -i PATH       Path to the issue/bug description (default: auto-detect)\n    \
          --max-attempts, -n N   Max repair attempts (default: 4)\n    \
-         --fixed-rounds, -k K   Run EXACTLY K repair attempts and take the verdict from attempt K, so a patch that passes early is re-examined (default: off). Repair only; ignored with --patch\n    \
+         --fixed-rounds, -k K   Run EXACTLY K repair attempts and take the verdict from attempt K, so a patch that passes early is re-examined (default: off). Repair only; ignored with a warning when combined with --patch\n    \
          --model, -m NAME       Override LLM model (default: from VANTA_LLM_MODEL)\n    \
          --open-pr              Open a GitHub PR after Gatekeeper approval\n    \
          --patch, -p PATH       Verify an EXISTING patch (skip Creator, run Attacker+BATE on this diff)\n    \
@@ -833,8 +834,9 @@ mod tests {
     /// [VANTA-WHY] M3 item 9 — `--fixed-rounds K`. Off unless asked for, read
     /// from either spelling, and refused where no number follows. The flag is
     /// parsed here and INTERPRETED by the driver (`resolve_fixed_rounds`), which
-    /// is where the `--patch` refusal lives; the parser's only job is to carry
-    /// the number through as written.
+    /// is where the `--patch` case lives: that run IGNORES the option and says so
+    /// with a warning — it is not refused; the parser's only job is to carry the
+    /// number through as written.
     #[test]
     fn the_fixed_rounds_flag_is_off_by_default_and_reads_a_number() {
         // Off by default: every run before this option is unchanged.

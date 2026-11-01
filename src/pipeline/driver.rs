@@ -2243,6 +2243,22 @@ pub async fn run(
                 &creator_response.files_touched,
             );
         }
+
+        // [VANTA-WHY] F2 — open this attempt's record and advance the comparison
+        // basis the moment the patch text exists, BEFORE any apply check can
+        // `continue` past it (see `open_fixed_round_record`). Doing it later is
+        // exactly the defect: a repair attempt whose patch fails to apply
+        // `continue`s to the next round, so the attempt owned no record AND
+        // `previous_patch_text` never advanced — the attempt after it was
+        // compared with a patch two attempts old.
+        let fixed_round_record_index = open_fixed_round_record(
+            &mut fixed_round_records,
+            &mut previous_patch_text,
+            attempt,
+            &patch_text,
+            prior_feedback.clone(),
+            creator_prompt_hash.clone(),
+        );
         println!("  Patch spans {} file(s)", patch_files.len());
         let patch_attempt_id = patch_attempt_id_for_patch(&patch_text);
         attempt_patch_ids.push(patch_attempt_id.clone());
@@ -2506,6 +2522,12 @@ pub async fn run(
             break decision;
         }
         let _ = any_changed; // used implicitly via all_patch_failed
+        // [VANTA-WHY] F2 — reaching here means the patch APPLIED (a failure
+        // broke or `continue`d above), so mark the attempt's own record, which
+        // was opened before the apply checks and so exists either way.
+        if let Some(record) = fixed_round_records.get_mut(fixed_round_record_index) {
+            record["applied"] = serde_json::json!(true);
+        }
 
         // ---- Build source strings ----
         // [VANTA-WHY] §14.18 — the concat the tests run in is now the whole
@@ -4132,22 +4154,19 @@ pub async fn run(
                     debug_dir.join(format!("attempt_{}_feedback.txt", attempt + 1));
                 let _ = fs::write(&feedback_path, fb);
             }
-            fixed_round_records.push(serde_json::json!({
-                "attempt": attempt + 1,
-                "passed": attempt_passed,
-                "patch": patch_text.clone(),
-                "tests": attempt_test_names,
-                "feedback": received_feedback,
-                "creator_prompt_hash": creator_prompt_hash.clone(),
-                // [VANTA-WHY] M3 item 9 — did this attempt return the previous
-                // attempt's patch byte-identical? Recorded so the EIR these
-                // arms measure can be read back without re-hashing the records.
-                "unchanged": fixed_round_patch_is_unchanged(
-                    previous_patch_text.as_deref(),
-                    &patch_text,
-                ),
-            }));
-            previous_patch_text = Some(patch_text.clone());
+            // [VANTA-WHY] F2 — the entry was opened right after the Creator
+            // answered (so an attempt whose patch never applied still owns one);
+            // here it is completed with what only the graded attempt can know.
+            // `patch`, `feedback`, `creator_prompt_hash` and `unchanged` were
+            // captured then and are deliberately NOT rewritten: `prior_feedback`
+            // is only reassigned on paths that `break`/`continue` before reaching
+            // here, and the comparison basis (`previous_patch_text`) was already
+            // advanced there too. `unchanged` is `fixed_round_patch_is_unchanged`
+            // of the PREVIOUS Creator response, applied or not.
+            if let Some(record) = fixed_round_records.get_mut(fixed_round_record_index) {
+                record["passed"] = serde_json::json!(attempt_passed);
+                record["tests"] = serde_json::json!(attempt_test_names);
+            }
         }
 
         match decision {
@@ -5844,6 +5863,42 @@ fn fixed_round_patch_is_unchanged(previous_patch: Option<&str>, current_patch: &
         .unwrap_or(false)
 }
 
+/// Open this attempt's `fixed_round_records` entry the moment the Creator has
+/// answered, and advance the comparison basis in the same step.
+///
+/// [VANTA-WHY] F2 — the two acts are deliberately fused, and both happen BEFORE
+/// any apply check. `previous_patch_text` must name the previous CREATOR
+/// RESPONSE whether or not that response applied: with A, then B (which fails to
+/// apply), then A, the third attempt repeats the FIRST patch, but the basis is
+/// B, so its `unchanged` is `false` — comparing against a two-attempt-old patch
+/// would have read `true`. And the entry is created here rather than after the
+/// graded run so an attempt whose patch never applies still owns a record: a
+/// K=4 run always shows 4, with `applied: false` on the ones that never landed.
+/// The returned index is how the caller fills in `applied`/`passed`/`tests`
+/// once the attempt has actually been graded.
+fn open_fixed_round_record(
+    records: &mut Vec<serde_json::Value>,
+    previous_patch_text: &mut Option<String>,
+    attempt_index: u32,
+    patch_text: &str,
+    feedback: Option<String>,
+    creator_prompt_hash: Option<String>,
+) -> usize {
+    let unchanged = fixed_round_patch_is_unchanged(previous_patch_text.as_deref(), patch_text);
+    *previous_patch_text = Some(patch_text.to_string());
+    records.push(serde_json::json!({
+        "attempt": attempt_index + 1,
+        "applied": false,
+        "passed": false,
+        "patch": patch_text,
+        "tests": Vec::<String>::new(),
+        "feedback": feedback,
+        "creator_prompt_hash": creator_prompt_hash,
+        "unchanged": unchanged,
+    }));
+    records.len() - 1
+}
+
 fn read_json_value_from_debug(path: &Path) -> Option<serde_json::Value> {
     fs::read_to_string(path)
         .ok()
@@ -6809,7 +6864,8 @@ mod tests {
         harness_infrastructure_collapse,
         is_judge_site,
         ledger_text,
-        modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
+        modified_test_config_records, open_fixed_round_record, patch_attempt_id_for_patch,
+        record_new_static_findings,
         refuse_reasoning_budget_on_judge_arm,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
         resolve_arm, resolve_fixed_rounds, resolve_native_timeout_secs, sampling_not_sent_rule,
@@ -6976,6 +7032,72 @@ mod tests {
             !fixed_round_patch_is_unchanged(Some("patch A"), "patch B"),
             "any edit is a new patch, not an unchanged one"
         );
+    }
+
+    /// [VANTA-WHY] F2 — the failed-apply sequence that made the old code lie.
+    /// The record is opened, and the comparison basis advanced, right after each
+    /// Creator response — BEFORE the apply checks — so:
+    ///
+    /// * an attempt whose patch never applies still owns a record (`applied`
+    ///   stays `false`), so a K=4 run always shows 4; and
+    /// * attempt 3, which returns patch A again, is compared against attempt 2's
+    ///   patch B (the previous REsponse), so it is NOT `unchanged`. Comparing
+    ///   against the last patch that APPLIED (A, from attempt 1) is the bug: it
+    ///   would have read `true`.
+    #[test]
+    fn every_creator_response_opens_its_own_record_and_advances_the_basis() {
+        let mut records: Vec<serde_json::Value> = Vec::new();
+        let mut previous: Option<String> = None;
+
+        // A K=4 run: attempt 1 returns A; attempt 2 returns B and (in production)
+        // fails to apply, so it is never completed; attempt 3 returns A; attempt
+        // 4 returns A again.
+        open_fixed_round_record(&mut records, &mut previous, 0, "patch A", None, Some("h1".into()));
+        open_fixed_round_record(
+            &mut records,
+            &mut previous,
+            1,
+            "patch B",
+            Some("fb-1".into()),
+            Some("h2".into()),
+        );
+        open_fixed_round_record(
+            &mut records,
+            &mut previous,
+            2,
+            "patch A",
+            Some("fb-2".into()),
+            Some("h3".into()),
+        );
+        open_fixed_round_record(&mut records, &mut previous, 3, "patch A", None, Some("h4".into()));
+
+        assert_eq!(
+            records.len(),
+            4,
+            "a K=4 run records all four Creator attempts, the one that never applied included"
+        );
+        assert_eq!(
+            records[1]["applied"],
+            serde_json::json!(false),
+            "attempt 2's patch never applied and its record must say so, not vanish"
+        );
+        assert_eq!(records[0]["unchanged"], serde_json::json!(false));
+        assert_eq!(records[1]["unchanged"], serde_json::json!(false));
+        assert_eq!(
+            records[2]["unchanged"],
+            serde_json::json!(false),
+            "attempt 3 repeats attempt 1, but attempt 2 was the previous response and the basis, \
+             so it is a NEW patch — the whole point of advancing the basis on a failed apply"
+        );
+        assert_eq!(
+            records[3]["unchanged"],
+            serde_json::json!(true),
+            "attempt 4 repeats attempt 3, which is genuinely the previous response"
+        );
+        assert_eq!(records[2]["feedback"], serde_json::json!("fb-2"));
+        assert_eq!(records[2]["creator_prompt_hash"], serde_json::json!("h3"));
+        assert_eq!(records[0]["attempt"], serde_json::json!(1));
+        assert_eq!(records[3]["attempt"], serde_json::json!(4));
     }
 
     #[test]

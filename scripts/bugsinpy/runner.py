@@ -1324,6 +1324,106 @@ def localization_hit(
     return paths_hit(fix_touched_paths(prep), selected_paths(context_selection))
 
 
+def selected_forms(context_selection: str) -> dict[str, str]:
+    """The paths in a provenance line's ``selected=[…]`` list, with the form each was shown in.
+
+    [VANTA-WHY] M3 item A2 — the row vocabulary :func:`selected_paths` throws away.
+    ``localization_hit`` only ever asks whether a touched file was *among those
+    shown*, so a path is enough for it; fix-file coverage (§1.6.11's narrowing)
+    asks *in what form* it was shown, and that is the token between the entry's
+    closing ``]`` and its ``bytesB/tok`` tail.
+
+    The line's entry is ``path@score[reasons]shown:bytesB/tok``
+    (``context::ContextSelection::provenance_line``): ``shown`` is the Rust
+    ``ShownMode::as_str`` — ``full``, ``outline`` or ``path``. The same
+    ``:pruned=[`` partition as :func:`selected_paths` is used for the same reason:
+    the entry's own ``[reasons]`` brackets make the first ``]`` the wrong boundary.
+    The third form is returned under the row's spelling ``path_only``
+    (``context_visibility``, §1.6.11) so the two never name one form two ways.
+
+    Returns ``{}`` for ``none`` and for a line that carries no ``selected`` list —
+    a selection that showed nothing, exactly as :func:`selected_paths` reports it.
+    """
+    forms: dict[str, str] = {}
+    if not context_selection or context_selection == "none":
+        return forms
+    head = context_selection.partition(":pruned=[")[0]
+    if "selected=[" not in head:
+        return forms
+    body = head.partition("selected=[")[2]
+    if body.endswith("]"):
+        body = body[:-1]
+    if body in ("", "none"):
+        return forms
+    for entry in body.split(";"):
+        if not entry:
+            continue
+        path = entry.split("@", 1)[0]
+        # The form is the token after the entry's LAST ``]`` (the one that closes
+        # ``[reasons]``) up to the ``:`` that opens the ``bytesB/tok`` tail. An
+        # entry with no ``]`` at all is not the grammar this producer writes; it is
+        # left unrecorded rather than given an invented form.
+        _before, closing, tail = entry.rpartition("]")
+        if not closing:
+            continue
+        form = tail.split(":", 1)[0]
+        forms[path] = "path_only" if form == "path" else form
+    return forms
+
+
+# [VANTA-WHY] M3 item A2 — the reasons a row cannot answer the coverage question.
+# Each is a distinct finding, so each is named rather than collapsed into one
+# "unknown": a review row has no Creator selection at all, a repair row can be
+# missing its selection line (a pre-§1.6.2 item 4 batch), and a fix that touches
+# only tests has no source file the selection could have shown.
+COVERAGE_NO_SELECTION = "no_context_selection"
+COVERAGE_NO_GOLD_FILES = "no_gold_source_files"
+COVERAGE_REVIEW = "review_candidate_seeded"
+
+
+def fix_file_coverage(
+    prep: prepare_mod.BugPrep, context_selection: Optional[str]
+) -> tuple[Optional[str], Optional[list[dict[str, str]]], Optional[str]]:
+    """Gold fix files shown **in full**, and each gold file's own visibility (M3 item A2).
+
+    ``(coverage, detail, reason)``. ``coverage`` is ``"k/n"`` — the k gold fix
+    files the run's selection showed **in full** over the n it touches — and
+    ``detail`` is one ``{"path", "visibility"}`` per gold file, so a row states
+    which of the fix's files the Creator could actually read rather than only how
+    many. ``localization_hit`` answers "was one of them shown?"; this answers "how
+    much of the fix was", which is a different number on a multi-file bug.
+
+    The gold set is :func:`fix_touched_paths` — the same fix-commit patch the hit
+    metric reads, so the two can never disagree about what the fix touched. The
+    forms come from the recorded ``context_selection`` alone; nothing here runs the
+    selector, and the answer is only ever computed AFTER the run, never during it.
+
+    ``(None, None, reason)`` — never ``"0/n"`` — when the question cannot be asked:
+
+    * ``no_context_selection`` — the run's summary carries no selection line;
+    * ``no_gold_source_files`` — the fix touches only tests, so there is no source
+      file the selection could have shown (the same case :func:`paths_hit` refuses
+      to call a miss);
+    * the caller uses ``review_candidate_seeded`` on a review row (no Creator).
+
+    A gold file absent from the selection reads ``not_selected``. The line records
+    the *number* of files dropped for budget (``dropped=``) but not their paths, so
+    a file that was dropped and one the ranking never reached are one label here —
+    the same limit :func:`selected_paths` works under.
+    """
+    if context_selection is None:
+        return None, None, COVERAGE_NO_SELECTION
+    gold = fix_touched_paths(prep)
+    if not gold:
+        return None, None, COVERAGE_NO_GOLD_FILES
+    forms = selected_forms(context_selection)
+    detail = [
+        {"path": path, "visibility": forms.get(path, "not_selected")} for path in gold
+    ]
+    shown_full_count = sum(1 for file in detail if file["visibility"] == "full")
+    return f"{shown_full_count}/{len(detail)}", detail, None
+
+
 CONTEXT_REPORT_NAME = "context_report.json"
 
 
@@ -2063,6 +2163,26 @@ def build_record(
     """One ``manifest.jsonl`` line (§7.3)."""
     summary = outcome.summary
     total = outcome.run_secs + oracle_secs
+    # [VANTA-WHY] M3 item A2 — fix-file coverage, computed AFTER the row has
+    # finished, from the same two inputs `localization_hit` uses just below: the
+    # gold fix paths and the Creator's own recorded selection. It is built here
+    # because the gold paths live only where `prep` is in hand, and a review row has
+    # no Creator selection to ask about, so it takes the same null-plus-reason shape
+    # `localization_hit` uses for the mode it cannot answer — and for the same
+    # reason: the selector must never see this number, so it is only ever compared
+    # against the selection afterwards.
+    if job.mode == REVIEW:
+        fix_coverage, fix_coverage_files, fix_coverage_reason = (
+            None,
+            None,
+            COVERAGE_REVIEW,
+        )
+    else:
+        (
+            fix_coverage,
+            fix_coverage_files,
+            fix_coverage_reason,
+        ) = fix_file_coverage(prep, summary.get("context_selection"))
     return {
         "schema_version": manifest_mod.SCHEMA_VERSION,
         "kind": "run",
@@ -2217,6 +2337,23 @@ def build_record(
         "localization_hit_reason": (
             "review_candidate_seeded" if job.mode == REVIEW else None
         ),
+        # [VANTA-WHY] M3 item A2 — the counterpart that measures how MUCH of the
+        # fix the Creator could read, where `localization_hit` only asks whether any
+        # of it was shown at all. `fix_file_coverage` is `k/n`: k gold fix files the
+        # run was shown in FULL, over the n the fix touches — computed here, after
+        # the run, from the same `context_selection`; `fix_file_visibility` carries
+        # one `{path, visibility}` per gold file so a multi-file bug says which file
+        # was left unread, not merely how many were. It is `null` with a reason
+        # whenever the question cannot be asked (a review row, a missing selection
+        # line, a fix that touches only tests) — never `0/n`, for the same reason
+        # `localization_hit` is `null` and not `False`. It reaches NO agent input:
+        # it lives only on this manifest row, is never written to the pool, a
+        # session log or `context_report.json`, and is read back only by
+        # `analyse.py`, next to `localization_hit`. Rows already on disk are never
+        # rewritten.
+        "fix_file_coverage": fix_coverage,
+        "fix_file_visibility": fix_coverage_files,
+        "fix_file_coverage_reason": fix_coverage_reason,
         # [VANTA-WHY] M3 item V — the counterpart to `localization_hit`. That field
         # asks whether a file the fix touched was in the run's SELECTION; this one
         # counts the attempts whose patch touched a file the Creator was NOT shown

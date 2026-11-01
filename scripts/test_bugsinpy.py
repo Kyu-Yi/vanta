@@ -22153,6 +22153,107 @@ class TestLocalizationHit:
         assert "miss=1" in text
 
 
+class TestFixFileCoverage:
+    """M3 item A2 — gold fix files shown **in full**, over the gold fix files.
+
+    ``localization_hit`` asks whether **any** file the fix touched was among those
+    the run was shown; this asks **how much** of the fix the Creator could read.
+    Both are computed on the finished row from the same recorded selection, and the
+    answer is never written anywhere a selector or a model can see it — it lives on
+    this row, and ``analyse.py`` reports it from there.
+    """
+
+    # A fix that changes three source files, so coverage is a real fraction.
+    FIX = _diff("pkg/a.py", "a1") + _diff("pkg/b.py", "b1") + _diff("pkg/c.py", "c1")
+
+    LINE = (
+        "mode=repair:role=creator:budget=65280:files=3:tree=9:dropped=0:"
+        "total=600B/150tok:selected=["
+        "pkg/a.py@9[path]full:100B/25tok;"
+        "pkg/b.py@8[traceback]outline:200B/50tok;"
+        "pkg/c.py@7[issue]full:300B/75tok"
+        "]:pruned=[vendor/x.py:vendored]"
+    )
+
+    @classmethod
+    def _prep(cls, patch: Optional[str] = None) -> prepare_mod.BugPrep:
+        return prep(bug=bug_info(bug_patch_txt=cls.FIX if patch is None else patch))
+
+    def test_it_reads_each_selected_paths_form_out_of_the_line(self):
+        assert runner_mod.selected_forms(self.LINE) == {
+            "pkg/a.py": "full",
+            "pkg/b.py": "outline",
+            "pkg/c.py": "full",
+        }
+
+    def test_the_path_form_is_named_path_only_like_the_row_vocabulary(self):
+        """The provenance line spells the third form ``path``; the driver's
+        ``context_visibility`` (and this field) spell it ``path_only``. One form
+        must not be named two ways across two fields a reader diffs."""
+        line = "mode=repair:selected=[pkg/a.py@1[path]path:1B/1tok]:pruned=[none]"
+        assert runner_mod.selected_forms(line) == {"pkg/a.py": "path_only"}
+
+    def test_coverage_is_the_gold_files_shown_in_full_over_the_gold_files(self):
+        """gold = {a, b, c}, full = {a, c} → 2/3. An outline is a pointer to the fix,
+        not the fix, so ``b`` is not counted (§1.6.11's narrowing)."""
+        coverage, detail, reason = runner_mod.fix_file_coverage(self._prep(), self.LINE)
+        assert coverage == "2/3"
+        assert reason is None
+        assert detail == [
+            {"path": "pkg/a.py", "visibility": "full"},
+            {"path": "pkg/b.py", "visibility": "outline"},
+            {"path": "pkg/c.py", "visibility": "full"},
+        ]
+
+    def test_a_gold_file_the_selection_never_reached_is_not_selected(self):
+        line = "mode=repair:selected=[pkg/a.py@1[path]full:1B/1tok]:pruned=[none]"
+        coverage, detail, _reason = runner_mod.fix_file_coverage(self._prep(), line)
+        assert coverage == "1/3"
+        assert detail == [
+            {"path": "pkg/a.py", "visibility": "full"},
+            {"path": "pkg/b.py", "visibility": "not_selected"},
+            {"path": "pkg/c.py", "visibility": "not_selected"},
+        ]
+
+    def test_a_path_row_is_not_shown_in_full(self):
+        line = "mode=repair:selected=[pkg/a.py@1[path]path:1B/1tok]:pruned=[none]"
+        coverage, _detail, _reason = runner_mod.fix_file_coverage(self._prep(), line)
+        assert coverage == "0/3"
+
+    def test_a_selection_that_showed_nothing_is_a_real_zero_not_unknown(self):
+        """``none`` is the driver's word for "the run had no selection at all": the
+        fix's files could have been shown and were not, so ``0/n`` is a measurement
+        — unlike a row that recorded no selection line at all."""
+        coverage, detail, reason = runner_mod.fix_file_coverage(self._prep(), "none")
+        assert coverage == "0/3"
+        assert reason is None
+        assert [file["visibility"] for file in detail] == ["not_selected"] * 3
+
+    def test_a_row_with_no_selection_line_has_no_reading_and_says_why(self):
+        coverage, detail, reason = runner_mod.fix_file_coverage(self._prep(), None)
+        assert coverage is None
+        assert detail is None
+        assert reason == runner_mod.COVERAGE_NO_SELECTION
+
+    def test_a_test_only_fix_has_no_source_file_and_says_why(self):
+        """The hidden tests are stripped from the tree before any run sees it, so a
+        fix that touches only tests has no source file the selection could show —
+        ``null``, never ``0/0``."""
+        test_only = _diff("tests/test_demo.py", "b")
+        coverage, detail, reason = runner_mod.fix_file_coverage(self._prep(test_only), self.LINE)
+        assert coverage is None
+        assert detail is None
+        assert reason == runner_mod.COVERAGE_NO_GOLD_FILES
+
+    def test_the_same_gold_set_the_hit_metric_reads(self):
+        """Both fields read ``fix_touched_paths``, so they can never disagree about
+        what the fix touched."""
+        gold = runner_mod.fix_touched_paths(self._prep())
+        assert gold == ["pkg/a.py", "pkg/b.py", "pkg/c.py"]
+        _coverage, detail, _reason = runner_mod.fix_file_coverage(self._prep(), self.LINE)
+        assert [file["path"] for file in detail] == gold
+
+
 class TestUnshownEdits:
     """M3 item V — attempts that edited a file the Creator was not shown in full.
 
@@ -22503,6 +22604,27 @@ class TestLocalizationTable:
         source = (REPO_ROOT / "scripts" / "bugsinpy" / "prepare.py").read_text(encoding="utf-8")
         assert "localization_table" not in source
         assert "localization_hit" not in source
+
+    def test_no_agent_input_path_reads_the_fix_file_coverage(self):
+        """M3 item A2 — the coverage number is a property of a FINISHED run.
+
+        It is written on the manifest row and read back only by ``analyse.py``. If
+        any path that produces what an agent reads ever names it, the answer becomes
+        something the selector or the prompt can see, and a metric computed inside
+        selection is a term the ranking then optimises. The sources that build agent
+        input — the Python context gate ``prepare`` runs, and the Rust modules that
+        select and render the Creator's context — must never mention it.
+        """
+        sources = [
+            REPO_ROOT / "scripts" / "bugsinpy" / "prepare.py",
+            REPO_ROOT / "scripts" / "bugsinpy" / "context.py",
+            REPO_ROOT / "src" / "context" / "mod.rs",
+            REPO_ROOT / "src" / "agents" / "creator.rs",
+        ]
+        for path in sources:
+            text = path.read_text(encoding="utf-8")
+            assert "fix_file_coverage" not in text, f"{path} reads the A2 coverage"
+            assert "fix_file_visibility" not in text, f"{path} reads the A2 coverage"
 
     def test_the_audit_refuses_the_evaluation_split(self, tmp_path, capsys):
         """Ranking quality is a tuning number; the evaluation split's is reported once,
@@ -23749,6 +23871,82 @@ class TestRunJob:
         assert review["mode"] == runner_mod.REVIEW
         assert review["localization_hit"] is None
         assert review["localization_hit_reason"] == "review_candidate_seeded"
+
+    def test_a_repair_row_records_its_fix_file_coverage(self, tmp_path, monkeypatch):
+        """M3 item A2 — coverage is on the finished row, computed from the same
+        selection ``localization_hit`` reads. A repair run is shown in full the one
+        source file the fix touches, so its coverage is ``1/1`` with the per-file
+        detail naming that file."""
+        line = (
+            "mode=repair:selected=[pkg/mod.py@9[path]full:9B/3tok]"
+            ":pruned=[tests/test_mod.py:tests]"
+        )
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, summary=dict(_outcome(tmp_path).summary, context_selection=line)
+            ),
+        )
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root",
+                          bug=bug_info(bug_patch_txt=_diff("pkg/mod.py", "fix")))),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert record["fix_file_coverage"] == "1/1"
+        assert record["fix_file_visibility"] == [
+            {"path": "pkg/mod.py", "visibility": "full"}
+        ]
+        assert record["fix_file_coverage_reason"] is None
+
+    def test_a_review_row_records_no_fix_file_coverage_and_says_why(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item A2 — a review run has no Creator, so there is no selection to ask
+        about: the field is ``null`` with ``review_candidate_seeded`` beside it, the
+        same shape ``localization_hit`` takes on that mode."""
+        line = "selected=[pkg/mod.py@1.0[issue]full:9B/3tok]:pruned=[none]"
+        bug_prep = prep(
+            root=tmp_path / "root", bug=bug_info(bug_patch_txt=_diff("pkg/mod.py", "fix"))
+        )
+        summary = {
+            "attempts_run": "2",
+            "fixed_at_attempt_1": "false",
+            "final_decision": "AllTestsPassed",
+            "config": "vanta",
+            "mode": "repair",
+            "seed": "0",
+            "model": "qwen3.5-27b",
+            "commit": "d" * 40,
+            "dirty": "false",
+            "context_selection": line,
+        }
+        candidate = runner_mod.write_candidate_patch(
+            tmp_path, bug_prep, runner_mod.DEV_FIX, _diff("pkg/mod.py", "fix"), source="dev"
+        )
+        candidate.oracle = oracle_mod.OracleResult(apply_ok=True, patch_good=True)
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, decision="AllTestsPassed", final_patch=tmp_path / "final.patch",
+                summary=dict(summary),
+            ),
+        )
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: pytest.fail("the candidate was re-graded")
+        )
+        review = runner_mod.run_job(
+            job=_job(bug_prep, mode=runner_mod.REVIEW, candidate=candidate),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert review["fix_file_coverage"] is None
+        assert review["fix_file_visibility"] is None
+        assert review["fix_file_coverage_reason"] == "review_candidate_seeded"
 
     def test_a_review_row_reuses_the_candidate_label_and_never_re_grades(
         self, tmp_path, monkeypatch
@@ -29749,6 +29947,74 @@ class TestAnalyseCost:
         assert "b3 $0.0100 (n=1) judge $0.0400 (n=1)" in summary
 
 
+class TestAnalyseLocalization:
+    """M3 item A2 — the per-repair-run coverage report, beside ``localization_hit``.
+
+    ``analyse.py`` computes neither number: both are read from the manifest rows the
+    runner wrote, so the column can never become a term the selector optimises.
+    """
+
+    def test_a_reading_parses_into_shown_in_full_and_gold_files(self):
+        assert analyse_mod.coverage_pair("2/3") == (2, 3)
+        assert analyse_mod.coverage_pair("0/1") == (0, 1)
+
+    def test_no_reading_is_none_never_a_zero(self):
+        """A review row, a pre-A2 row and a malformed value are all "cannot answer";
+        turning any of them into ``0/0`` would report a measurement nobody made."""
+        assert analyse_mod.coverage_pair(None) is None
+        assert analyse_mod.coverage_pair("2") is None
+        assert analyse_mod.coverage_pair("a/b") is None
+        assert analyse_mod.coverage_pair(0) is None
+
+    def test_the_report_reads_the_rows_and_pools_the_readings(self, tmp_path):
+        rows = [
+            _analyse_row("k1", mode="repair", localization_hit=True,
+                         fix_file_coverage="2/3", fix_file_coverage_reason=None),
+            _analyse_row("k2", mode="repair", localization_hit=False,
+                         fix_file_coverage=None,
+                         fix_file_coverage_reason="no_gold_source_files"),
+        ]
+        result = analyse_mod.LocalizationMetrics().run(
+            _analyse_load(_analyse_batch(tmp_path, rows=rows))
+        )
+        summary = "\n".join(result.summary)
+        assert "k1" in summary and "2/3" in summary
+        assert "rows with a coverage reading        1" in summary
+        assert "pooled fix-file coverage            2/3 (0.667)" in summary
+        assert "no_gold_source_files" in summary
+        assert "localization_hit: hit 1 / miss 1 / unknown 0" in summary
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["localization.tex"]
+        assert "k1 & yes & 2/3 &" in tex
+        assert "k2 & no & — & no\\_gold\\_source\\_files" in tex
+
+    def test_a_repair_row_with_no_reading_is_unavailable_not_zero(self, tmp_path):
+        rows = [_analyse_row("k1", mode="repair", fix_file_coverage=None)]
+        result = analyse_mod.LocalizationMetrics().run(
+            _analyse_load(_analyse_batch(tmp_path, rows=rows))
+        )
+        summary = "\n".join(result.summary)
+        assert (
+            "pooled fix-file coverage            "
+            "unavailable(no repair row recorded fix_file_coverage)" in summary
+        )
+        assert "rows with a coverage reading        0" in summary
+
+    def test_a_review_row_is_not_in_the_table(self, tmp_path):
+        """The column is per REPAIR run: a review row has no Creator selection, so it
+        is not a row the question can be asked of."""
+        rows = [
+            _analyse_row("k1", mode="repair", fix_file_coverage="1/1"),
+            _analyse_row("k2", mode="review", fix_file_coverage="1/1"),
+        ]
+        result = analyse_mod.LocalizationMetrics().run(
+            _analyse_load(_analyse_batch(tmp_path, rows=rows))
+        )
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["localization.tex"]
+        assert "k1 &" in tex
+        assert "k2 &" not in tex
+        assert "rows with a coverage reading        1" in "\n".join(result.summary)
+
+
 class TestAnalyseOutputs:
     def _analysis(self, tmp_path: Path):
         rows = [
@@ -29768,6 +30034,7 @@ class TestAnalyseOutputs:
             "eir_ecr.svg",
             "eir_ecr.tex",
             "fix_regression.svg",
+            "localization.tex",
             "paired.tex",
             "pipeline.tex",
             "repair.tex",

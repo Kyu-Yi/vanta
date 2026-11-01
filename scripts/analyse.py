@@ -1109,6 +1109,123 @@ def _fix_regression_points(analysis: Analysis) -> list[tuple[str, float, float]]
 
 
 # ---------------------------------------------------------------------------
+# metric 3b — per repair run: localization_hit beside fix-file coverage (M3 item A2)
+# ---------------------------------------------------------------------------
+def coverage_pair(text: Any) -> Optional[tuple[int, int]]:
+    """One row's recorded ``fix_file_coverage`` as ``(shown_in_full, gold_files)``.
+
+    The manifest field is the string ``"k/n"`` the runner wrote after the run
+    (M3 item A2): k gold fix files the run was shown **in full**, over the n the
+    fix touches. Anything else — ``None`` on a review row, a row from before the
+    field existed, a malformed value — is ``None``: the row cannot answer, and a
+    reader must never turn "no reading" into ``0/0`` (item B4's general rule, the
+    same one :func:`unavailable` exists for).
+    """
+    if not isinstance(text, str) or "/" not in text:
+        return None
+    shown, _, total = text.partition("/")
+    try:
+        return int(shown), int(total)
+    except ValueError:
+        return None
+
+
+class LocalizationMetrics(Metric):
+    """M3 item A2 — fix-file coverage per repair run, reported beside ``localization_hit``.
+
+    The two questions are asked of the same selection and answer different things:
+    ``localization_hit`` says whether **any** gold file was among those the run was
+    shown; ``fix_file_coverage`` says **how much of the fix** was shown whole
+    (``k/n``), which are different numbers on a multi-file bug. Both are read from
+    the manifest rows the runner wrote after each run — this metric computes
+    neither, it only reports them side by side, so the column cannot become a term
+    the selector optimises (the answer is fixed on the row before any analysis).
+
+    A repair row with no coverage reading (a pre-A2 row, or a fix that touches only
+    tests) prints ``—`` and is in no denominator; only rows that recorded a reading
+    feed the pooled rate. Rows already on disk are never rewritten.
+    """
+
+    name = "localization"
+
+    def run(self, analysis: Analysis) -> MetricResult:
+        rows: list[tuple[str, str, str, str]] = []
+        hits: dict[Optional[bool], int] = {True: 0, False: 0, None: 0}
+        shown_full = 0
+        gold_total = 0
+        with_reading = 0
+        for _batch, record in analysis.rows:
+            if str(record.get("mode") or "") != arms_mod.REPAIR:
+                continue
+            hit = record.get("localization_hit")
+            hit = hit if isinstance(hit, bool) else None
+            hits[hit] += 1
+            pair = coverage_pair(record.get("fix_file_coverage"))
+            if pair is None:
+                coverage_text = "—"
+            else:
+                with_reading += 1
+                shown_full += pair[0]
+                gold_total += pair[1]
+                coverage_text = f"{pair[0]}/{pair[1]}"
+            reason = record.get("fix_file_coverage_reason")
+            rows.append(
+                (
+                    str(record.get("key") or ""),
+                    {True: "yes", False: "no", None: "—"}[hit],
+                    coverage_text,
+                    str(reason) if reason else "",
+                )
+            )
+        rows.sort(key=lambda row: row[0])
+
+        if with_reading:
+            pooled = _fmt(shown_full / gold_total)
+        else:
+            pooled = unavailable("no repair row recorded fix_file_coverage")
+        summary = [
+            "",
+            "== Fix-file coverage per repair run (M3 item A2) ==",
+            f"  rows with a coverage reading        {with_reading}",
+            f"  pooled fix-file coverage            {shown_full}/{gold_total} ({pooled})"
+            if with_reading
+            else f"  pooled fix-file coverage            {pooled}",
+            f"  localization_hit: hit {hits[True]} / miss {hits[False]} / unknown {hits[None]}",
+        ]
+        summary += [
+            f"  {key:<40} hit={hit:<4} coverage={coverage:<5} {reason}".rstrip()
+            for key, hit, coverage, reason in rows
+        ]
+
+        header = (
+            r"% item 12 — M3 item A2: per repair run, `localization_hit` beside fix-file"
+            "\n"
+            r"% coverage (gold fix files shown in full / gold fix files). `reason` is"
+            "\n"
+            r"% blank when the row answered; a row with no reading is `—`, never `0/0`."
+            "\n"
+            r"\begin{tabular}{llll}"
+            "\n"
+            r"\hline"
+            "\n"
+            r"run & localization hit & fix-file coverage & reason \\"
+            "\n"
+            r"\hline"
+            "\n"
+        )
+        body = "\n".join(
+            " & ".join([_tex(key), hit, coverage, _tex(reason)]) + r" \\"
+            for key, hit, coverage, reason in rows
+        ) or r"% no repair rows in the input batches"
+        tex = header + body + "\n" + r"\hline" + "\n" + r"\end{tabular}" + "\n"
+        return MetricResult(
+            name=self.name,
+            artifacts=[Artifact("localization.tex", tex)],
+            summary=summary,
+        )
+
+
+# ---------------------------------------------------------------------------
 # metric 4 — EIR/ECR per transition, pooled and per source
 # ---------------------------------------------------------------------------
 _COUNT_KEYS = ("n_pp", "n_pf", "n_fp", "n_ff", "n_censored")
@@ -1722,6 +1839,7 @@ METRICS: tuple[Metric, ...] = (
     ReviewMetrics(),
     PairedMetrics(),
     RepairMetrics(),
+    LocalizationMetrics(),
     EirEcrMetrics(),
     PipelineMetrics(),
     CostTimeMetrics(),

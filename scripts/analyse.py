@@ -144,6 +144,42 @@ def label_for(record: Mapping[str, Any]) -> str:
     )
 
 
+def label_rule_for(record: Mapping[str, Any]) -> str:
+    """Which rule read one manifest row's label, or ``""`` when it carries no oracle.
+
+    [VANTA-WHY] M3 item B6 — old rows are never rewritten, so the rows already on disk
+    were labelled by item Q's rule and only rows written after B6 carry a recorded apply
+    class. The row states which rule read it (``label_rule``); a row that predates the
+    field is read by the oracle's own shape, which is exactly item Q's set. Reporting
+    the count per rule is what makes "no Phase 3 number depends on the legacy reading"
+    checkable.
+    """
+    recorded = record.get("label_rule")
+    if isinstance(recorded, str) and recorded:
+        return recorded
+    payload = record.get("oracle")
+    if not isinstance(payload, dict):
+        return ""
+    return runner_mod.label_rule_for(runner_mod.oracle_from_dict(payload))
+
+
+def label_rule_counts(analysis: "Analysis") -> dict[str, int]:
+    """How many rows each label rule read — the report item B6 asks for.
+
+    [VANTA-WHY] Item B6 — rows already on disk were labelled by item Q's rule and are
+    never rewritten, so the only honest way to show "no Phase 3 number depends on the
+    legacy reading" is to count the rules apart. A load with any ``legacy_item_q`` row
+    is visibly a mixed load rather than a silently pooled one.
+    """
+    counts: dict[str, int] = {}
+    for batch in analysis.batches:
+        for record in batch.records:
+            rule = label_rule_for(record)
+            if rule:
+                counts[rule] = counts.get(rule, 0) + 1
+    return counts
+
+
 def row_oracle(record: Mapping[str, Any]) -> Optional[Any]:
     payload = record.get("oracle")
     if not isinstance(payload, dict):
@@ -1626,6 +1662,14 @@ def render_summary(analysis: Analysis, results: Sequence[MetricResult]) -> str:
     lines = ["item 12 — analysis summary", "", "input batches:"]
     for batch in analysis.batches:
         lines.append(f"  {batch.path}  ({len(batch.records)} row(s), {len(batch.replays)} replay(s))")
+    # Item B6 — which rule read each row. Rows already on disk keep item Q's reading
+    # and are tagged, so a mixed load is visible here rather than silently pooled.
+    rules = label_rule_counts(analysis)
+    if rules:
+        lines.append("")
+        lines.append("label rules:")
+        for rule in sorted(rules):
+            lines.append(f"  {rule:<20} {rules[rule]}")
     for result in results:
         lines.extend(result.summary)
     lines.append("")

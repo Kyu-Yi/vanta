@@ -19283,7 +19283,11 @@ class TestSandboxEnvReachesEveryRun:
         monkeypatch.setattr(
             tree_mod, "copy_tree", lambda src, dest: dest.mkdir(parents=True, exist_ok=True)
         )
-        monkeypatch.setattr(suite_mod, "git_apply_patch", lambda **kwargs: (True, "applied"))
+        monkeypatch.setattr(
+            suite_mod,
+            "git_apply_patch",
+            lambda **kwargs: (True, "applied", suite_mod.APPLY_APPLIED),
+        )
         monkeypatch.setattr(
             suite_mod,
             "run_suite_twice",
@@ -19645,7 +19649,7 @@ class TestOracleGrade:
 
         def fake_apply(**kwargs):
             calls["apply"] = kwargs
-            return True, "applied"
+            return True, "applied", suite_mod.APPLY_APPLIED
 
         def fake_runs(**kwargs):
             calls["runs"].append(kwargs)
@@ -19766,7 +19770,7 @@ class TestOracleGrade:
         """§5.2 step 2: `unobservable`, excluded from the rates. Booting two suites
         to learn nothing would also be a waste of the only LLM slot's time budget."""
         def fake_apply(**kwargs):
-            return False, "error: patch does not apply"
+            return False, "error: patch does not apply", suite_mod.APPLY_REJECTED
 
         monkeypatch.setattr(suite_mod, "git_apply_patch", fake_apply)
         monkeypatch.setattr(tree_mod, "copy_tree", lambda src, dest: dest.mkdir(parents=True, exist_ok=True))
@@ -19781,6 +19785,9 @@ class TestOracleGrade:
         assert result.patch_good is False
         assert result.label_input == "unobservable"
         assert "does not apply" in result.apply_detail
+        # Item B6 — the class travels with the detail, so `unresolved` can be
+        # reserved for a real `git apply` refusal rather than any non-applying patch.
+        assert result.apply_outcome == suite_mod.APPLY_REJECTED
 
     def test_a_missing_patch_is_reported_not_crashed(self, wired, tmp_path):
         result = self._grade(wired, tmp_path, patch_path=tmp_path / "absent.patch")
@@ -20772,6 +20779,66 @@ class TestLabelFor:
         for verdict in ("HarnessFailure", "PatchApplicationFailed", "Rejected", "NeedsReview"):
             assert runner_mod.label_for(verdict, censor) == "unobservable"
             assert runner_mod.label_reason_for(verdict, censor) is None
+
+    @pytest.mark.parametrize(
+        "outcome_class", ["", suite_mod.APPLY_REJECTED, suite_mod.APPLY_MISSING_PATCH,
+                          suite_mod.APPLY_EXEC_FAILURE, oracle_mod.APPLY_NO_ORACLE]
+    )
+    def test_unresolved_fires_only_on_a_real_apply_rejection(self, outcome_class):
+        """Item B6 — `unresolved` is a rejection by `git apply`, nothing else.
+
+        `apply_ok=false` is three histories at once. Only the refusal is evidence about
+        the Creator; a missing patch and an apply that never ran are facts about the
+        harness and stay `unobservable`. A row with no recorded class predates the field
+        and keeps item Q's reading, which is why `""` is in the same branch as a refusal.
+        """
+        oracle = oracle_mod.OracleResult(apply_ok=False, apply_outcome=outcome_class)
+        expected = (
+            "unresolved"
+            if outcome_class in ("", suite_mod.APPLY_REJECTED)
+            else "unobservable"
+        )
+        assert runner_mod.label_for("MaxAttemptsReached", oracle) == expected
+        assert runner_mod.label_reason_for("MaxAttemptsReached", oracle) == (
+            runner_mod.FINAL_PATCH_DID_NOT_APPLY
+            if outcome_class in ("", suite_mod.APPLY_REJECTED)
+            else None
+        )
+
+    def test_an_inconclusive_grade_is_its_own_label_on_every_verdict(self):
+        """Item B4 — applied but the hidden run wrote no report: never credited, never blamed.
+
+        Checked before the verdict, so an `AllTestsPassed` row cannot become a
+        `false_approval` (a patch called bad on no evidence), a `Rejected` row a
+        `true_reject` (credit for a catch nobody made), or a budget run a
+        `true_reject`/`unresolved` it did not earn — and it collides with none of them.
+        """
+        inconclusive = oracle_mod.OracleResult(apply_ok=True, inconclusive=True)
+        verdicts = (
+            "AllTestsPassed", "Rejected", "MaxAttemptsReached", "NeedsReview",
+            "JudgeApproved", "JudgeRejected",
+        )
+        decided = {
+            runner_mod.label_for(v, oracle_mod.OracleResult(apply_ok=True, patch_good=g))
+            for v in verdicts
+            for g in (True, False)
+        } | {"unobservable", "infra_failure", "judge_failed"}
+        for verdict in verdicts:
+            assert runner_mod.label_for(verdict, inconclusive) == "inconclusive"
+        assert "inconclusive" not in decided
+
+    def test_the_rule_that_read_a_row_is_derived_from_its_apply_class(self):
+        """Item B6 — a recorded class means strict B6; an absent one means item Q."""
+        assert (
+            runner_mod.label_rule_for(
+                oracle_mod.OracleResult(apply_ok=True, apply_outcome=suite_mod.APPLY_APPLIED)
+            )
+            == runner_mod.LABEL_RULE_STRICT_B6
+        )
+        assert (
+            runner_mod.label_rule_for(oracle_mod.OracleResult(apply_ok=False))
+            == runner_mod.LABEL_RULE_LEGACY_ITEM_Q
+        )
 
     def test_a_needs_review_label_is_not_a_rejection_label(self):
         """§14.6: the two refusals must not collide with the four decisions.
@@ -23307,16 +23374,19 @@ class TestRunJob:
         assert old["native_timeout_secs"] is None
         assert old["native_timeout"] is None
 
-    def test_a_row_records_why_a_final_patch_that_did_not_apply_is_not_fixed(
+    def test_a_missing_final_patch_is_a_measurement_failure_not_a_creator_failure(
         self, tmp_path, monkeypatch
     ):
-        """Item Q — the reason is on the row, so the class is citable, not re-derived.
+        """Item B6 — "no patch at all" is not "git apply refused the patch".
 
-        Built from a `MaxAttemptsReached` run that wrote no `final.patch` (the shape
-        a failed FINAL apply leaves): `grade` censors a missing patch without booting a
-        VM, so the row carries `apply_ok=false`, and the label must be `unresolved`
-        with `final_patch_did_not_apply` beside it — never the censor's `unobservable`,
-        which would hide the Creator failure from the fix rate.
+        Built from a `MaxAttemptsReached` run that wrote no `final.patch`: `grade`
+        finds nothing to apply and records the class `missing_patch` without booting a
+        VM. Item Q read every non-applying final patch as a measured repair failure
+        (`unresolved`); item B6 narrows `unresolved` to a real `git apply` refusal, so
+        this row is `unobservable` with no reason — the run told us nothing about the
+        Creator, and charging the fix rate for a patch that was never written would
+        blame the model for the harness. The class travels on the row, so the reading
+        is citable without re-deriving it from `apply_ok`.
         """
         monkeypatch.setattr(
             runner_mod,
@@ -23331,8 +23401,75 @@ class TestRunJob:
         )
         assert record["verdict"] == "MaxAttemptsReached"
         assert record["oracle"]["apply_ok"] is False
+        assert record["oracle"]["apply_outcome"] == suite_mod.APPLY_MISSING_PATCH
+        assert record["label"] == "unobservable"
+        assert record["label_reason"] is None
+        assert record["label_rule"] == runner_mod.LABEL_RULE_STRICT_B6
+
+    def test_a_rejected_final_patch_is_a_measured_repair_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """Item B6 — the case `unresolved` is FOR: `git apply` refused a real patch.
+
+        A `MaxAttemptsReached` run whose final patch was present and which `git apply`
+        **refused** spent its whole budget without producing a patch that fits the
+        tree. That is a Creator failure, so it stays in the fix rate as `unresolved`
+        and states `final_patch_did_not_apply` beside the label — the one history item
+        Q meant, now separated from a patch that was never written.
+        """
+        patch = write(tmp_path / "final.patch", "diff --git a/x b/x\n")
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, decision="MaxAttemptsReached", final_patch=patch
+            ),
+        )
+        monkeypatch.setattr(
+            runner_mod.oracle_mod,
+            "grade",
+            lambda **kwargs: oracle_mod.OracleResult(
+                apply_ok=False,
+                apply_detail="error: patch does not apply",
+                apply_outcome=suite_mod.APPLY_REJECTED,
+            ),
+        )
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root", fail_to_pass=["tests/test_a.py::test_b"])),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert record["verdict"] == "MaxAttemptsReached"
         assert record["label"] == "unresolved"
         assert record["label_reason"] == "final_patch_did_not_apply"
+        assert record["label_rule"] == runner_mod.LABEL_RULE_STRICT_B6
+
+    def test_an_old_row_with_no_recorded_class_is_tagged_legacy(self, tmp_path, monkeypatch):
+        """Item B6 — a row written before the field keeps item Q's rule and says so.
+
+        The oracle payload has no `apply_outcome`, so `label_rule_for` reads it as the
+        legacy set and the row is tagged `legacy_item_q`; `analyse.py` reports the two
+        rules apart, so no Phase 3 number can depend on the legacy reading.
+        """
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(tmp_path, decision="MaxAttemptsReached"),
+        )
+        monkeypatch.setattr(
+            runner_mod.oracle_mod,
+            "grade",
+            lambda **kwargs: oracle_mod.OracleResult(apply_ok=False, patch_good=False),
+        )
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root", fail_to_pass=["tests/test_a.py::test_b"])),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert record["label"] == "unresolved"
+        assert record["label_rule"] == runner_mod.LABEL_RULE_LEGACY_ITEM_Q
 
     def test_an_ordinary_row_states_no_label_reason(self, tmp_path, monkeypatch):
         """Every label that already names its class carries `label_reason = None`."""
@@ -25590,7 +25727,7 @@ class TestMutantPreflight:
 
         def fake_apply(**kwargs):
             calls["apply"] = kwargs
-            return True, "applied"
+            return True, "applied", suite_mod.APPLY_APPLIED
 
         def fake_run(**kwargs):
             calls["runs"].append(kwargs)
@@ -25650,7 +25787,7 @@ class TestMutantPreflight:
         monkeypatch.setattr(
             suite_mod,
             "git_apply_patch",
-            lambda **kwargs: (False, "error: patch does not apply"),
+            lambda **kwargs: (False, "error: patch does not apply", suite_mod.APPLY_REJECTED),
         )
         result, _ = self._preflight(wired, tmp_path)
         assert result.applied is False and result.compiled is False
@@ -28430,11 +28567,19 @@ class TestReplayCli:
 # numeric helpers, (b) that the metrics read the matrix through replay.py's own
 # functions, and (c) that a whole run is deterministic and writes one fixed file
 # set. A number the input cannot support must read `unavailable(...)`, never `0`.
-def _analyse_oracle(*, apply_ok: bool = True, patch_good: bool = True, regressions=(), error: str = "") -> dict:
+def _analyse_oracle(
+    *,
+    apply_ok: bool = True,
+    patch_good: bool = True,
+    regressions=(),
+    error: str = "",
+    apply_outcome: str = "",
+) -> dict:
     """One row's ``oracle`` payload, in the manifest's own recorded shape."""
     return {
         "apply_ok": apply_ok,
         "apply_detail": "",
+        "apply_outcome": apply_outcome,
         "hidden_pass": patch_good,
         "hidden_nodeids": [],
         "hidden_outcomes": {},
@@ -28560,6 +28705,49 @@ class TestAnalyseNumbers:
     def test_label_for_reads_the_verdict_and_the_oracle(self):
         assert analyse_mod.label_for(_analyse_row("k", verdict="AllTestsPassed")) == "true_approval"
         assert analyse_mod.label_for({"verdict": "AllTestsPassed"}) == ""
+
+    def test_label_rule_for_reads_the_tag_then_falls_back_to_the_oracle(self):
+        """Item B6 — the recorded tag wins; a row without one is read by its oracle.
+
+        Rows already on disk carry no `label_rule` and no apply class, so they read as
+        item Q's set. A new row records its class (and `build_record` also records the
+        tag); when both are present the recorded tag is what the row says about itself.
+        """
+        # No tag, no recorded class → the legacy set (the rows already on disk).
+        assert (
+            analyse_mod.label_rule_for(_analyse_row("k"))
+            == runner_mod.LABEL_RULE_LEGACY_ITEM_Q
+        )
+        # A recorded class, no tag → strict B6.
+        strict = _analyse_row(
+            "k", oracle=_analyse_oracle(apply_outcome=suite_mod.APPLY_APPLIED)
+        )
+        assert analyse_mod.label_rule_for(strict) == runner_mod.LABEL_RULE_STRICT_B6
+        # An explicit tag wins over the oracle's own shape.
+        tagged = _analyse_row(
+            "k",
+            label_rule=runner_mod.LABEL_RULE_LEGACY_ITEM_Q,
+            oracle=_analyse_oracle(apply_outcome=suite_mod.APPLY_APPLIED),
+        )
+        assert analyse_mod.label_rule_for(tagged) == runner_mod.LABEL_RULE_LEGACY_ITEM_Q
+        # No oracle at all → no rule.
+        assert analyse_mod.label_rule_for({"verdict": "AllTestsPassed"}) == ""
+
+    def test_label_rule_counts_reports_the_two_readings_apart(self, tmp_path):
+        """Item B6 — a mixed load is visible, so no number silently pools the rules."""
+        batch = _analyse_batch(
+            tmp_path,
+            rows=[
+                _analyse_row("legacy"),
+                _analyse_row(
+                    "strict", oracle=_analyse_oracle(apply_outcome=suite_mod.APPLY_APPLIED)
+                ),
+            ],
+        )
+        assert analyse_mod.label_rule_counts(_analyse_load(batch)) == {
+            runner_mod.LABEL_RULE_LEGACY_ITEM_Q: 1,
+            runner_mod.LABEL_RULE_STRICT_B6: 1,
+        }
 
     def test_candidate_kind_names_the_papers_word_and_cuts_mutants_by_operator(self):
         assert analyse_mod.candidate_kind(_analyse_row("k", kind="dev_fix")) == "reference"

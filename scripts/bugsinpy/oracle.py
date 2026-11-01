@@ -61,6 +61,17 @@ ORACLE_WORK_DIR = "oracle_work"
 # what take minutes. 300 s matches the review-mode apply used by Vanta itself.
 APPLY_TIMEOUT_SECS = 300
 
+APPLY_NO_ORACLE = "no_oracle"
+"""The fifth apply class (item B6): there was no patch to grade **against**.
+
+[VANTA-WHY] A bug with no ``FAIL_TO_PASS`` nodeids never reaches an apply at all, so
+its result is not one of ``suite.git_apply_patch``'s three — but it is still *not* a
+rejection, and item B6's rule reads a ``MaxAttemptsReached`` row's ``apply_ok = false``
+as a repair failure only when ``git apply`` refused the patch. Naming this case keeps
+the "did the patch get refused" question answerable without equating "no oracle" with
+"the patch would not apply".
+"""
+
 
 @dataclass
 class OracleResult:
@@ -68,6 +79,23 @@ class OracleResult:
 
     apply_ok: bool
     apply_detail: str = ""
+    apply_outcome: str = ""
+    """Which apply class this grading saw (§5.2, item B6).
+
+    One of :data:`suite_mod.APPLY_APPLIED` / ``APPLY_REJECTED`` /
+    ``APPLY_EXEC_FAILURE`` / ``APPLY_MISSING_PATCH`` — or :data:`NO_ORACLE` when
+    there was nothing to grade against — and ``""`` on a row written before the
+    field existed, which is read by item Q's rule unchanged.
+
+    [VANTA-WHY] M3 item B6. ``apply_ok = false`` is three histories at once, and
+    before this field the label could not tell them apart: a ``MaxAttemptsReached``
+    run whose final patch ``git apply`` **refused** is a measured repair failure
+    (``unresolved``), while one that wrote no patch at all, or whose apply command
+    never ran, is a measurement failure (``unobservable``). Recording the class
+    here keeps that distinction on the row rather than re-deriving it from a
+    human-readable ``apply_detail`` that any wording change would silently invert.
+    """
+
     hidden_pass: bool = False
     hidden_nodeids: list[str] = field(default_factory=list)
     hidden_outcomes: dict[str, str] = field(default_factory=dict)
@@ -105,6 +133,7 @@ class OracleResult:
         return {
             "apply_ok": self.apply_ok,
             "apply_detail": self.apply_detail,
+            "apply_outcome": self.apply_outcome,
             "hidden_pass": self.hidden_pass,
             "hidden_nodeids": sorted(self.hidden_nodeids),
             "hidden_outcomes": dict(sorted(self.hidden_outcomes.items())),
@@ -239,12 +268,14 @@ def grade(
     hidden_nodeids = prep.hidden_nodeids
     if not hidden_nodeids:
         result.error = "no FAIL_TO_PASS nodeids: this bug has no oracle to grade against"
+        result.apply_outcome = APPLY_NO_ORACLE
         result.oracle_secs = time.monotonic() - started
         return result
 
     if not patch_path.is_file():
         result.apply_detail = f"patch not found: {patch_path}"
         result.error = result.apply_detail
+        result.apply_outcome = suite_mod.APPLY_MISSING_PATCH
         result.oracle_secs = time.monotonic() - started
         return result
 
@@ -254,7 +285,7 @@ def grade(
     # label starts from the unpatched tree rather than from the previous patch.
     tree_mod.copy_tree(prep.root / "oracle_tree", work)
 
-    apply_ok, apply_detail = suite_mod.git_apply_patch(
+    apply_ok, apply_detail, apply_outcome = suite_mod.git_apply_patch(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
         tree_rel=work_rel,
@@ -266,10 +297,13 @@ def grade(
     )
     result.apply_ok = apply_ok
     result.apply_detail = apply_detail
+    result.apply_outcome = apply_outcome
     if not apply_ok:
         # Censored, not failed (§5.2 step 2): an un-appliable patch tells us nothing
         # about the patch's behaviour, and forcing it into `bad` would invent a
-        # `true_reject` for Vanta out of a patch-formatting accident.
+        # `true_reject` for Vanta out of a patch-formatting accident. Item B6 —
+        # `apply_detail` alone cannot say whether `git apply` refused the diff or the
+        # apply command never ran, so the class travels to the row separately.
         result.oracle_secs = time.monotonic() - started
         return result
 
@@ -387,6 +421,7 @@ def grade_dev_fix(
     if not text.strip():
         result.apply_detail = "the developer fix is nothing but test hunks"
         result.error = result.apply_detail
+        result.apply_outcome = suite_mod.APPLY_MISSING_PATCH
         save(batch_dir / f"{stem}.oracle.json", result)
         return result
 

@@ -53,6 +53,24 @@ pytest's own exit codes stop at 5, so 137 can only have come from a signal — w
 what makes "likely out of memory" a reading of the evidence rather than a guess.
 """
 
+APPLY_APPLIED = "applied"
+APPLY_REJECTED = "rejected"
+APPLY_EXEC_FAILURE = "exec_failure"
+APPLY_MISSING_PATCH = "missing_patch"
+"""What happened when a patch was applied — the four classes ``apply_ok`` cannot tell apart.
+
+[VANTA-WHY] M3 item B6. ``apply_ok = false`` said only "the tree does not carry this
+patch", and three unrelated histories share that flag: ``git apply`` ran and **refused**
+the diff (:data:`APPLY_REJECTED` — a real rejection, and for a ``MaxAttemptsReached`` run
+a measured repair failure), there was no patch to apply at all
+(:data:`APPLY_MISSING_PATCH`), and the apply command never completed — a VM that failed to
+boot, an interpreter that died, a timeout (:data:`APPLY_EXEC_FAILURE`). Only the first is a
+fact about the patch; the other two are facts about the harness, and reading them as a
+Creator failure credits Vanta (or blames it) for an experiment that did not run. Named
+once here because :func:`git_apply_patch` is the one function that can see ``git apply``'s
+exit status, and ``oracle.grade`` is the one reader that turns it into a label.
+"""
+
 
 class SuiteError(RuntimeError):
     """The suite could not be run or its report could not be read."""
@@ -976,7 +994,7 @@ def git_apply_patch(
     drop_test_hunks: bool,
     memory_mb: Optional[int] = None,
     timeout_secs: int = 300,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str]:
     """Apply a patch inside the VM. Strict — no fuzzy fallback (§5.2).
 
     ``drop_test_hunks`` filters the diff by path before applying, so a Creator
@@ -984,12 +1002,24 @@ def git_apply_patch(
     with ``filterdiff``-free code (a small awk-free split in Python on the host)
     because the patch body is a host-side artifact; only ``git apply`` runs in the
     VM.
+
+    Returns ``(ok, detail, outcome)``. [VANTA-WHY] M3 item B6 — ``outcome`` is the
+    *class* of the result (:data:`APPLY_APPLIED` / :data:`APPLY_REJECTED` /
+    :data:`APPLY_EXEC_FAILURE`), because ``ok = False`` alone cannot tell a patch
+    ``git apply`` refused from a command that never ran. Only this function can
+    see ``git apply``'s exit status and whether the run timed out, so the class is
+    decided here and carried, rather than re-guessed from ``detail``'s text by
+    every reader.
     """
     body = patch_path.read_text(encoding="utf-8")
     if drop_test_hunks:
         body = drop_test_file_hunks(body)
         if not body.strip():
-            return True, "patch contained only test hunks; nothing to apply"
+            return (
+                True,
+                "patch contained only test hunks; nothing to apply",
+                APPLY_APPLIED,
+            )
     staged = batch_dir / "reports" / f"_apply_{patch_path.name}"
     staged.parent.mkdir(parents=True, exist_ok=True)
     staged.write_text(body, encoding="utf-8")
@@ -1002,9 +1032,14 @@ def git_apply_patch(
         guest_cwd=f"/workspace/{tree_rel}",
         timeout_secs=timeout_secs,
     )
-    ok = result.exit_code == 0
     detail = (result.stdout + result.stderr).strip()[-2000:]
-    return ok, detail
+    if result.timed_out or result.exit_code is None:
+        # The command did not finish, so nothing about the patch was learned:
+        # neither an acceptance nor a refusal.
+        return False, detail, APPLY_EXEC_FAILURE
+    if result.exit_code != 0:
+        return False, detail, APPLY_REJECTED
+    return True, detail, APPLY_APPLIED
 
 
 def drop_test_file_hunks(diff_text: str) -> str:

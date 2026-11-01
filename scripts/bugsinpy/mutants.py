@@ -583,7 +583,7 @@ def preflight(
     work_rel = f"{oracle_mod.ORACLE_WORK_DIR}/{prep.slug}__pre-{mutant.sha256[:12]}"
     work = batch_dir / work_rel
     tree_mod.copy_tree(prep.root / "oracle_tree", work)
-    applied, detail = suite_mod.git_apply_patch(
+    applied, detail, _ = suite_mod.git_apply_patch(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
         tree_rel=work_rel,

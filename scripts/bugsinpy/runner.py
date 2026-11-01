@@ -895,6 +895,9 @@ def oracle_from_dict(payload: dict[str, Any]) -> oracle_mod.OracleResult:
     result = oracle_mod.OracleResult(
         apply_ok=bool(payload.get("apply_ok", False)),
         apply_detail=str(payload.get("apply_detail") or ""),
+        # Item B6 — `""` on a row written before the field existed, which
+        # `label_rule_for` then reads by item Q's rule, byte for byte.
+        apply_outcome=str(payload.get("apply_outcome") or ""),
         hidden_pass=bool(payload.get("hidden_pass", False)),
         hidden_nodeids=[str(n) for n in payload.get("hidden_nodeids", [])],
         hidden_outcomes={str(k): str(v) for k, v in (payload.get("hidden_outcomes") or {}).items()},
@@ -919,6 +922,9 @@ def censored_oracle(prep: prepare_mod.BugPrep, reason: str) -> oracle_mod.Oracle
     return oracle_mod.OracleResult(
         apply_ok=False,
         apply_detail=reason,
+        # Item B6 — there is no patch, so `git apply` was never asked anything: this
+        # is the missing-patch class, never a rejection by `git apply`.
+        apply_outcome=suite_mod.APPLY_MISSING_PATCH,
         hidden_nodeids=prep.hidden_nodeids,
         error=reason,
     )
@@ -1908,6 +1914,31 @@ def _discover_session(log_text: str, before: set[str]) -> Optional[str]:
 # an ``unresolved`` row whose final patch applied but did not fix the bug.
 FINAL_PATCH_DID_NOT_APPLY = "final_patch_did_not_apply"
 
+LABEL_RULE_LEGACY_ITEM_Q = "legacy_item_q"
+LABEL_RULE_STRICT_B6 = "strict_b6"
+"""Which rule read a row's label — recorded on every new row (item B6).
+
+[VANTA-WHY] M3 item B6 narrows item Q: `unresolved` now fires only when ``git apply``
+**refused** the final patch, so a `MaxAttemptsReached` row that wrote no patch at all, or
+whose apply command never ran, is `unobservable` instead. A row written before the oracle
+carried an ``apply_outcome`` cannot be re-labelled without rewriting bytes on disk, so it
+keeps item Q's reading and is **tagged** instead: `analyse.py` reads the tag from the
+oracle's own payload, so old and new rows are never pooled as one rule and the Phase 3
+batches (all new) can be shown to be free of the legacy reading.
+"""
+
+
+def label_rule_for(oracle: oracle_mod.OracleResult) -> str:
+    """The rule that read ``oracle``'s row: strict B6 once the apply class is recorded.
+
+    ``apply_outcome`` empty means the payload predates the field (or the row carries no
+    oracle at all), which is exactly the set item Q's rule was written for; every other
+    row carries an explicit class and is read by item B6.
+    """
+    if not oracle.apply_outcome:
+        return LABEL_RULE_LEGACY_ITEM_Q
+    return LABEL_RULE_STRICT_B6
+
 
 def label_for(verdict: str, oracle: oracle_mod.OracleResult) -> str:
     """§5.3's label table, a pure function of (verdict, oracle).
@@ -1927,23 +1958,42 @@ def label_for(verdict: str, oracle: oracle_mod.OracleResult) -> str:
     branch: no patch is attached to that row, so routing it through ``apply_ok`` would
     report the censor's ``unobservable`` and hide the judge failure. It is deliberately
     NOT ``infra_failure``: the machine was fine and the call succeeded.
+
+    [VANTA-WHY] M3 item B6 — a *rejection by ``git apply``* is narrowed from "any final
+    patch that did not apply". ``apply_ok = false`` is three histories at once (a refusal,
+    a missing patch, an apply that never ran), and only the refusal is evidence about the
+    Creator. The other two keep the censor's ``unobservable``: reading a VM that failed to
+    boot as a measured repair failure would charge the Creator for the harness. A row whose
+    oracle carries no class predates this field and keeps item Q's reading unchanged.
     """
     if verdict == "InfraFailure":
         return "infra_failure"
     if verdict == "JudgeFailed":
         return "judge_failed"
-    # [VANTA-WHY] Item Q — a `MaxAttemptsReached` run whose FINAL attempt's patch
-    # did not apply is a measured REPAIR FAILURE, not a censor. The loop spent its
-    # whole budget and the Creator never produced a patch that could be applied, so
-    # the honest reading is "not fixed". Routing it through the `apply_ok` censor
-    # below would report it as `unobservable` and hide a Creator failure from the
-    # fix rate; `unobservable` stays for the runs we genuinely could not measure (a
+    # [VANTA-WHY] Item Q, narrowed by item B6 — a `MaxAttemptsReached` run whose FINAL
+    # attempt's patch `git apply` REFUSED is a measured REPAIR FAILURE, not a censor.
+    # The loop spent its whole budget and the Creator never produced a patch that fit
+    # the tree, so the honest reading is "not fixed"; routing it through the `apply_ok`
+    # censor below would report it as `unobservable` and hide a Creator failure from the
+    # fix rate. `unobservable` stays for the runs we genuinely could not measure (a
     # `HarnessFailure`, an infra failure) — and carries no patch to grade, which is
     # exactly the distinction `label_reason_for` names as `final_patch_did_not_apply`.
     if verdict == "MaxAttemptsReached" and not oracle.apply_ok:
-        return "unresolved"
+        if oracle.apply_outcome in ("", suite_mod.APPLY_REJECTED):
+            return "unresolved"
+        # Item B6 — no patch to apply, or an apply command that never ran: a
+        # measurement failure, never a verdict about the Creator.
+        return "unobservable"
     if not oracle.apply_ok:
         return "unobservable"
+    if oracle.inconclusive:
+        # [VANTA-WHY] M3 item B4 — an applied patch whose hidden run wrote no pytest
+        # report was neither credited nor blamed, and every branch below would claim
+        # one: `AllTestsPassed` would become a `false_approval` (a patch called bad on
+        # no evidence), `Rejected` a `true_reject` (credit for a catch nobody made), and
+        # `MaxAttemptsReached` an `unresolved_but_fixed`/`unresolved`. It gets its own
+        # label, checked in the same order `OracleResult.label_input` checks it.
+        return "inconclusive"
     if verdict in ("AllTestsPassed", "JudgeApproved"):
         return "true_approval" if oracle.patch_good else "false_approval"
     if verdict in ("Rejected", "JudgeRejected"):
@@ -1973,8 +2023,18 @@ def label_reason_for(verdict: str, oracle: oracle_mod.OracleResult) -> Optional[
     reader (a derivation that a later change to the censor could silently invert).
     ``None`` on every other row: a label that already names its class needs no
     second statement.
+
+    [VANTA-WHY] Item B6 — the reason is stated **only where the label is
+    ``unresolved``**: a `MaxAttemptsReached` row whose final patch ``git apply``
+    refused, or a pre-B6 row (no recorded class), which item Q read the same way.
+    A missing patch or an apply that never ran is ``unobservable`` now, and an
+    unobservable row has no Creator failure to name.
     """
-    if verdict == "MaxAttemptsReached" and not oracle.apply_ok:
+    if (
+        verdict == "MaxAttemptsReached"
+        and not oracle.apply_ok
+        and oracle.apply_outcome in ("", suite_mod.APPLY_REJECTED)
+    ):
         return FINAL_PATCH_DID_NOT_APPLY
     return None
 
@@ -2198,6 +2258,11 @@ def build_record(
         # `None`. Recorded beside the label so the class is citable without a reader
         # re-deriving it from `oracle.apply_ok`.
         "label_reason": label_reason_for(outcome.decision, oracle),
+        # Item B6 — which rule read this row. Old rows recorded no apply class and keep
+        # item Q's reading byte for byte; `analyse.py` reads the tag so the two rules are
+        # never pooled as one. Recorded here, not derived by the reader, so a row on disk
+        # is citable without re-guessing its rule from the oracle's own shape.
+        "label_rule": label_rule_for(oracle),
         "timings": {
             "prepare_s": round(prepare_s, 3),
             "run_s": round(outcome.run_secs, 3),

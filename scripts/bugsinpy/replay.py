@@ -1316,7 +1316,7 @@ def run_column(
         patch_path = row_root / f"col_{k}.diff"
         patch_path.write_text(patch_text, encoding="utf-8")
         started = time.monotonic()
-        applied, detail = suite_mod.git_apply_patch(
+        applied, detail, _ = suite_mod.git_apply_patch(
             checkpoint=checkpoint,
             batch_dir=row_root,
             tree_rel=col_dir.name,

@@ -25482,6 +25482,90 @@ class TestQueue:
         """The gate's reservation, in micro-dollars, read where it lives."""
         return gate._reserved_micro
 
+    def test_a_log_write_that_fails_during_admission_holds_no_reservation(self, tmp_path):
+        """H1 — the token is never handed out, so the reservation must not survive.
+
+        A failing `_write_log` (a full disk) makes `acquire` raise. The reservation,
+        the in-flight entry and the admission must all be gone by then: the caller
+        never learns the token, so nothing could ever release it and every waiter
+        behind it would sleep out the batch.
+        """
+        gate, batch_dir, _manifest = self._gate(tmp_path, cap=1.0, costs=(0.5,))
+
+        def failing() -> None:
+            raise OSError("no space left on device")
+
+        gate._write_log = failing
+        with pytest.raises(OSError, match="no space left"):
+            gate.acquire(self._job("b1#Demo/1#b0#repair#0#"))
+        assert self._reserved(gate) == 0
+        assert gate._inflight == {}
+        assert gate._admissions == [], "the rolled-back admission must not be logged"
+
+        # The budget is intact: with the write working the same admission fits.
+        del gate._write_log
+        token = gate.acquire(self._job("b1#Demo/1#b0#repair#0#"))
+        assert token is not None
+        assert self._reserved(gate) == 500_000
+        gate.release(token)
+        assert self._reserved(gate) == 0
+        payload = json.loads((batch_dir / runner_mod.SPEND_LOG_NAME).read_text(encoding="utf-8"))
+        assert payload["inflight_usd"] == 0.0, "a fully released gate is exactly zero"
+
+    def test_a_log_write_that_fails_during_release_still_wakes_the_waiters(
+        self, tmp_path, monkeypatch
+    ):
+        """H1 — the wakeup is a `finally`, so a failing write cannot strand a waiter.
+
+        The reservation is dropped *before* the write and `notify_all` runs whether
+        the write succeeds or not; the old order wrote the log first, so a disk-full
+        there raised out of `release` with every waiter still asleep on budget
+        nobody held.
+        """
+        gate, _batch_dir, _manifest = self._gate(tmp_path, cap=1.0, costs=())
+        holder = gate.acquire(self._job("holder"))
+        assert holder is not None
+        assert self._reserved(gate) == 1_000_000, "the cold start reserves the whole budget"
+
+        original_acquire = runner_mod.SpendGate.acquire
+        reached = threading.Event()
+
+        def traced(self, job):
+            reached.set()
+            return original_acquire(self, job)
+
+        monkeypatch.setattr(runner_mod.SpendGate, "acquire", traced)
+        woken: list = []
+
+        def waiter() -> None:
+            woken.append(gate.acquire(self._job("waiter")))
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        assert reached.wait(timeout=10), "the waiter never reached `acquire`"
+
+        original = runner_mod.SpendGate._write_log
+        failures = [1]
+
+        def flaky(self) -> None:
+            if failures[0]:
+                failures[0] -= 1
+                raise OSError("no space left on device")
+            return original(self)
+
+        monkeypatch.setattr(runner_mod.SpendGate, "_write_log", flaky)
+        # `release` needs the gate's own lock, which the waiter holds from inside
+        # `acquire` until it parks in `wait()` — so by the time this raises, the
+        # waiter is provably asleep and only `notify_all` can wake it.
+        with pytest.raises(OSError, match="no space left"):
+            gate.release(holder)
+        assert self._reserved(gate) == 0, "the reservation is freed before the write"
+
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "a failing log write must not strand a waiter"
+        assert woken and woken[0] is not None, "the waiter was woken and admitted"
+        gate.release(woken[0])
+
     def test_a_fully_released_gate_admits_again_and_is_exactly_zero(self, tmp_path):
         """H2 — CodeRabbit's case, as arithmetic.
 
@@ -25519,6 +25603,86 @@ class TestQueue:
         )
         assert admitted and admitted[0] is not None
         gate.release(admitted[0])
+
+    def test_no_thread_hangs_and_the_gate_returns_to_zero_under_failures_and_a_stop(
+        self, tmp_path
+    ):
+        """H1/H3/H7 — the property the item exists for, under six live workers.
+
+        The cap admits exactly one worker at a time (a $0.50 cap over the one recorded
+        $0.25 row), so five of the six are always parked inside `acquire` and only a
+        release can wake one of them. Every third log write fails, and the stop file
+        is written once every worker has claimed once: each worker follows the
+        caller's contract — after `acquire` returns it re-checks the stop file and
+        releases without running the job. Nothing may hang (every wait is bounded)
+        and the gate must end with no reservation held and nothing in flight.
+        """
+        gate, batch_dir, manifest = self._gate(tmp_path, cap=0.50, costs=(0.25,))
+        stop = batch_dir / runner_mod.STOP_NAME
+
+        original = runner_mod.SpendGate._write_log
+        writes = [0]
+        failures: list = []
+        stopped_early: list = []
+
+        def flaky() -> None:
+            writes[0] += 1
+            if writes[0] % 3 == 1:
+                raise OSError("no space left on device")
+            return original(gate)
+
+        gate._write_log = flaky
+        workers = 6
+        barrier = threading.Barrier(workers + 1)
+
+        def worker(n: int) -> None:
+            for round_ in range(1, 65):
+                try:
+                    token = gate.acquire(self._job(f"w{n}-{round_}"))
+                except BaseException as exc:  # the injected write failure
+                    failures.append(exc)
+                    token = None
+                if token is not None:
+                    try:
+                        if stop.exists():
+                            stopped_early.append(n)
+                            break
+                        # No `llm` block: H5 — the row's cost is unknown, not zero, so
+                        # it adds nothing to the recorded spend and the $0.25 bound is
+                        # still the only one the gate has. The budget therefore stays
+                        # exactly as tight as it started, for the whole run.
+                        manifest.append({"key": f"row-{n}-{round_}"})
+                    finally:
+                        try:
+                            gate.release(token)
+                        except BaseException as exc:
+                            failures.append(exc)
+                if round_ == 1:
+                    # Nothing decides the stop before this line: the file is not
+                    # written until every worker has claimed once and is waiting here.
+                    # Reached whether or not this round's write failed.
+                    barrier.wait(timeout=15)
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(workers)]
+        for thread in threads:
+            thread.start()
+        barrier.wait(timeout=15)
+        stop.write_text("", encoding="utf-8")
+        for thread in threads:
+            thread.join(timeout=15)
+
+        assert not any(thread.is_alive() for thread in threads), (
+            "no worker may hang: every join has a 15 s timeout"
+        )
+        assert failures, "the test must actually inject log-write failures"
+        assert sorted(stopped_early) == list(range(workers)), (
+            "every worker must have seen the stop file and released its reservation"
+        )
+        assert self._reserved(gate) == 0, "every reservation was given back"
+        assert gate._inflight == {}
+        assert json.loads(
+            (batch_dir / runner_mod.SPEND_LOG_NAME).read_text(encoding="utf-8")
+        )["schema"] == 1
 
     # -- the arms and seeds are a selection over the split, not a protocol --
     def test_an_arm_the_split_does_not_declare_is_refused(self, tmp_path, monkeypatch):

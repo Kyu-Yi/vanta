@@ -3011,6 +3011,12 @@ class SpendGate:
     ``reservation_usd`` on the way out. Nothing in between is a float, so a fully
     released gate is *exactly* zero and a waiter can never be left computing a
     total a rounding error above the cap.
+
+    [VANTA-WHY] Every exit from :meth:`acquire` and :meth:`release` leaves the
+    gate consistent, including the exits it does not take deliberately (H1/H7): a
+    reservation is rolled back before the exception that would hide it, and the
+    waiters are woken from a ``finally`` so no failure can leave one asleep while
+    the budget it is waiting for is free.
     """
 
     def __init__(self, batch_dir: Path, cap_usd: float, manifest: Manifest) -> None:
@@ -3043,15 +3049,31 @@ class SpendGate:
                 if spent_micro + self._reserved_micro + reservation_micro <= self.cap_micro:
                     token = self._next_token
                     self._next_token += 1
+                    admitted = len(self._admissions)
                     self._inflight[token] = reservation_micro
                     self._reserved_micro += reservation_micro
-                    self._admissions.append(
-                        {
-                            "key": job.key,
-                            "reservation_usd": _micro_to_usd(reservation_micro),
-                        }
-                    )
-                    self._write_log()
+                    try:
+                        self._admissions.append(
+                            {
+                                "key": job.key,
+                                "reservation_usd": _micro_to_usd(reservation_micro),
+                            }
+                        )
+                        self._write_log()
+                    except BaseException:
+                        # H1/H7 — the token has not been handed to anyone yet, so a
+                        # reservation that outlives this frame is one no worker could
+                        # ever release and no waiter could ever be woken for. Roll
+                        # every step the admit took back, in reverse, and re-raise:
+                        # the caller never learns the token, so the token must not
+                        # exist. `BaseException` and not `Exception`, because a
+                        # `KeyboardInterrupt` during the write is a way out of this
+                        # frame like any other (H7); the slice from `admitted` undoes
+                        # the append whether or not it got as far as happening.
+                        del self._admissions[admitted:]
+                        self._reserved_micro -= reservation_micro
+                        del self._inflight[token]
+                        raise
                     return token
                 # Nothing in flight could not reach here: with `_reserved == 0` the
                 # clamped reservation is <= the remaining budget, so the sum is at
@@ -3072,11 +3094,19 @@ class SpendGate:
         if token is None:
             return
         with self._condition:
-            reservation_micro = self._inflight.pop(token, None)
-            if reservation_micro is not None:
-                self._reserved_micro -= reservation_micro
-                self._write_log()
-            self._condition.notify_all()
+            try:
+                reservation_micro = self._inflight.pop(token, None)
+                if reservation_micro is not None:
+                    self._reserved_micro -= reservation_micro
+                    self._write_log()
+            finally:
+                # H1 — from a `finally`, and after the budget is already free
+                # (the reservation is dropped above the failing write): a log
+                # write that raises must not be able to keep a waiter asleep on
+                # budget nobody holds. The write's own failure still propagates,
+                # because a batch that cannot record its admissions is a real
+                # failure worth reporting.
+                self._condition.notify_all()
 
     def _reservation_size(self, spent_micro: int) -> int:
         """The largest finished cost, or the whole remaining budget if none."""

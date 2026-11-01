@@ -769,6 +769,27 @@ fn resolve_arm(
     })
 }
 
+/// The in-session native wall-clock cap, from `--native-timeout-secs` or the default.
+///
+/// [VANTA-WHY] M3 item E13 — the flag RAISES the cap for a slow bug; it must never
+/// LOWER it. `harness::test_timeout_secs()` (120 s, or `VANTA_TEST_TIMEOUT_SECS`) is the
+/// cap this run would otherwise use, and the Python side already passes its value as
+/// `max(floor, 3 × measured)`, so a value below that floor asks every suite to time out
+/// sooner than the default — the gate could no longer measure the very bug the cap was
+/// raised for. Refused here, where the cap is resolved, naming the flag and the floor.
+/// `None` keeps the default; the CLI still refuses `0` at parse time.
+pub fn resolve_native_timeout_secs(requested: Option<u64>) -> Result<u64, String> {
+    let floor = harness::test_timeout_secs();
+    match requested {
+        None => Ok(floor),
+        Some(secs) if secs < floor => Err(format!(
+            "CONFIG_ERROR: --native-timeout-secs {secs} is below the effective cap of \
+             {floor} s — the flag may only RAISE the cap, never lower it."
+        )),
+        Some(secs) => Ok(secs),
+    }
+}
+
 /// Render one effective sampling value for the `run.summary` provenance keys.
 ///
 /// [VANTA-WHY] `unset` (not `null`, not a plausible default) is what an absent
@@ -1905,9 +1926,7 @@ pub async fn run(
     // terminal `run.summary` all name the SAME number: `None` on the config keeps
     // the historical `harness::test_timeout_secs()`, and a row whose prepare
     // measured its native suite passes `max(120, 3 × measured)`.
-    let native_cap = config
-        .native_timeout_secs
-        .unwrap_or_else(harness::test_timeout_secs);
+    let native_cap = resolve_native_timeout_secs(config.native_timeout_secs)?;
     // [VANTA-WHY] Every NEW static finding this run's patch introduced, per
     // attempt, so evidence.json can name the finding that rejected a review
     // round. Session 40e84874 was rejected for a mypy finding that appeared
@@ -6793,7 +6812,8 @@ mod tests {
         modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
         refuse_reasoning_budget_on_judge_arm,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
-        resolve_arm, resolve_fixed_rounds, sampling_not_sent_rule, stamp_transition_row,
+        resolve_arm, resolve_fixed_rounds, resolve_native_timeout_secs, sampling_not_sent_rule,
+        stamp_transition_row,
         stable_patch_fingerprint, ARMS,
         INVARIANT_SATISFIED,
         JUDGE_ARM, NO_ADMITTED_TESTS, NO_REPRODUCTION_EVIDENCE,
@@ -8344,6 +8364,36 @@ mod tests {
         // An arm with no pinned budget keeps item 9's own option, however large.
         assert!(resolve_arm(Some("b1"), false, false, true, 4, None, Some(4)).is_ok());
         assert!(resolve_arm(Some("b3"), true, false, true, 4, None, Some(9)).is_ok());
+    }
+
+    // [VANTA-WHY] M3 item E13 — `--native-timeout-secs` may only RAISE the in-session
+    // native cap. Below the effective cap (`harness::test_timeout_secs()`, 120 s by
+    // default) the value would make every suite time out sooner than the default, which
+    // is the opposite of what the flag exists for; refused where the cap is resolved,
+    // naming the flag and the floor.
+    #[test]
+    fn a_native_timeout_below_the_effective_cap_is_refused() {
+        let floor = crate::pipeline::harness::test_timeout_secs();
+        assert_eq!(
+            floor, 120,
+            "these assertions are written against the default cap"
+        );
+        // Absent keeps the default; the floor itself and anything above it are accepted.
+        assert_eq!(resolve_native_timeout_secs(None).unwrap(), 120);
+        assert_eq!(resolve_native_timeout_secs(Some(120)).unwrap(), 120);
+        assert_eq!(resolve_native_timeout_secs(Some(1461)).unwrap(), 1461);
+        // Below the floor is refused, naming the flag and both numbers.
+        for bad in [30_u64, 119] {
+            let error = resolve_native_timeout_secs(Some(bad))
+                .expect_err("a cap below the effective cap must be refused");
+            assert!(
+                error.contains("CONFIG_ERROR")
+                    && error.contains("--native-timeout-secs")
+                    && error.contains(&bad.to_string())
+                    && error.contains("120"),
+                "got: {error}"
+            );
+        }
     }
 
     // [VANTA-WHY] M3 item 1 — the grounding ledger separates "the audit ran and

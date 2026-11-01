@@ -873,8 +873,15 @@ def grade_candidate(
     """
     cached = batch_dir / "oracle" / "candidates" / prep.slug / f"{candidate.name}.json"
     if cached.is_file():
-        candidate.oracle = oracle_from_dict(_read_json(cached))
-        return candidate
+        cached_result = oracle_from_dict(_read_json(cached))
+        # [VANTA-WHY] Item E6 — an INCONCLUSIVE cached grade established no ground
+        # truth (the patch applied but a run wrote no readable report), so reusing it
+        # would persist the unknown forever and a resume could never resolve it.
+        # Re-grade instead; the conclusive reading below overwrites the cache. A
+        # conclusive grade is still reused, which is what makes a resume cheap.
+        if not cached_result.inconclusive:
+            candidate.oracle = cached_result
+            return candidate
     result = oracle_mod.grade(
         prep=prep,
         batch_dir=batch_dir,
@@ -2744,6 +2751,17 @@ def run_job(
         oracle_json=oracle_json,
         compaction=compaction,
     )
+    # [VANTA-WHY] Item E6 + Q3 — the only reason `is_done` let this key through is
+    # that its previous row's oracle was INCONCLUSIVE. Rows stay append-only, so the
+    # old row is kept; this one names the session it supersedes, and both readers
+    # (`analyse.load_manifest`, `metrics.oracle_by_session`) drop that session. With
+    # no superseded session (the old row carried none), there is nothing to name.
+    previous = manifest.find(job.key)
+    if manifest_mod.oracle_inconclusive(previous) and previous.get("session_id"):
+        record["supersedes"] = {
+            "session_id": previous["session_id"],
+            "key": job.key,
+        }
     manifest.append(record)
     manifest.mark(job.key, DONE)
     print(

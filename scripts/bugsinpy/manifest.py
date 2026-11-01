@@ -108,6 +108,22 @@ MANIFEST_NAME = "manifest.jsonl"
 STATE_NAME = "state.json"
 
 
+def oracle_inconclusive(record: Optional[dict[str, Any]]) -> bool:
+    """True when a row's own oracle recorded an INCONCLUSIVE grading (item E6).
+
+    [VANTA-WHY] Item E6 — an inconclusive grading (the patch applied but a run
+    wrote no readable report) established no ground truth. Such a row is not
+    trustworthy evidence, so `Manifest.is_done` treats it as not-done and a resume
+    re-runs the job; the re-run appends a new row naming the superseded session.
+    A row without an oracle block (a `failed` job, a non-run row) is not
+    inconclusive.
+    """
+    if not isinstance(record, dict):
+        return False
+    oracle = record.get("oracle")
+    return bool(isinstance(oracle, dict) and oracle.get("inconclusive"))
+
+
 def job_key(
     *,
     batch_id: str,
@@ -215,7 +231,14 @@ class Manifest:
     def is_done(self, key: str) -> bool:
         # Strictly `done`. `running` and `failed` both mean "no trustworthy row",
         # so both are re-run.
-        return self.state().get(key) == DONE
+        if self.state().get(key) != DONE:
+            return False
+        # [VANTA-WHY] Item E6 — a `done` row whose oracle is INCONCLUSIVE (the patch
+        # applied but a run wrote no readable report) established no ground truth,
+        # so a resume must re-run it rather than skip it. The row stays on disk
+        # (append-only); the re-run appends a new row under the same key naming the
+        # superseded session, and only then is the key `done` again.
+        return not oracle_inconclusive(self.find(key))
 
     def pending(self, jobs: Iterable[Any]) -> list[Any]:
         return [job for job in jobs if not self.is_done(job.key)]

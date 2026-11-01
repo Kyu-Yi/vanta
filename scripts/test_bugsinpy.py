@@ -20121,6 +20121,69 @@ class TestOracleGrade:
         assert wired["copies"][0][1].name == "Demo_1__a_b_c"
 
 
+class TestGradeCandidateCache:
+    """Item E6 — a cached grade is reused only when it is conclusive.
+
+    [VANTA-WHY] An INCONCLUSIVE grade (the patch applied but a run wrote no readable
+    report) established no ground truth. Reusing it from the cache would freeze the
+    unknown into the batch: every later resume would read the same unreadable file and
+    never resolve it. Re-grade instead; a conclusive cache is still reused, which is
+    what makes a resume cheap.
+    """
+
+    def _candidate(self, tmp_path):
+        bug_prep = prep(root=tmp_path / "root", bug=bug_info())
+        candidate = runner_mod.write_candidate_patch(
+            tmp_path, bug_prep, runner_mod.DEV_FIX, _diff("pkg/mod.py", "fix"), source="dev"
+        )
+        cache = tmp_path / "oracle" / "candidates" / bug_prep.slug / f"{candidate.name}.json"
+        return bug_prep, candidate, cache
+
+    def test_an_inconclusive_cache_is_re_graded(self, tmp_path, monkeypatch):
+        bug_prep, candidate, cache = self._candidate(tmp_path)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        oracle_mod.save(cache, oracle_mod.OracleResult(apply_ok=True, inconclusive=True))
+
+        calls = []
+
+        def fake_grade(**kwargs):
+            calls.append(kwargs)
+            return oracle_mod.OracleResult(apply_ok=True, patch_good=True)
+
+        monkeypatch.setattr(oracle_mod, "grade", fake_grade)
+        graded = runner_mod.grade_candidate(
+            batch_dir=tmp_path,
+            prep=bug_prep,
+            candidate=candidate,
+            checkpoint="vanta-bi-Demo-1",
+            disk_mb=8192,
+        )
+        assert len(calls) == 1, "an inconclusive cache must not be reused as final"
+        assert graded.oracle.inconclusive is False
+        assert graded.oracle.patch_good is True
+        # the conclusive reading replaced the cache, so the next resume is cheap again
+        assert json.loads(cache.read_text(encoding="utf-8"))["inconclusive"] is False
+
+    def test_a_conclusive_cache_is_reused(self, tmp_path, monkeypatch):
+        bug_prep, candidate, cache = self._candidate(tmp_path)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        oracle_mod.save(cache, oracle_mod.OracleResult(apply_ok=True, patch_good=True))
+
+        monkeypatch.setattr(
+            oracle_mod,
+            "grade",
+            lambda **kwargs: pytest.fail("a conclusive cache must not be re-graded"),
+        )
+        graded = runner_mod.grade_candidate(
+            batch_dir=tmp_path,
+            prep=bug_prep,
+            candidate=candidate,
+            checkpoint="vanta-bi-Demo-1",
+            disk_mb=8192,
+        )
+        assert graded.oracle.patch_good is True
+
+
 class TestDevFixSelfCheck:
     """prepare grades the developer fix with the real oracle and refuses the bug if it fails.
 
@@ -20436,6 +20499,27 @@ class TestManifest:
         assert manifest.is_done("k2") is False
         assert manifest.is_done("k3") is False
         assert manifest.is_done("never-seen") is False
+
+    def test_a_done_row_whose_oracle_is_inconclusive_is_not_done(self, tmp_path):
+        """Item E6 — an inconclusive grade established no ground truth, so a resume re-runs it.
+
+        `done` in the cursor is not enough: the row's own oracle has to be conclusive.
+        The row stays on disk (append-only); the re-run appends a new one under the same
+        key, and only then is the key `done` again.
+        """
+        manifest = manifest_mod.Manifest(tmp_path)
+        manifest.append({"key": "k1", "session_id": "old", "oracle": {"inconclusive": True}})
+        manifest.mark("k1", manifest_mod.DONE)
+        assert manifest.is_done("k1") is False
+        manifest.append({"key": "k1", "session_id": "new", "oracle": {"inconclusive": False}})
+        assert manifest.is_done("k1") is True
+
+    def test_a_row_without_an_oracle_block_is_not_inconclusive(self, tmp_path):
+        """A `failed` job and a non-run row carry no oracle; neither is inconclusive."""
+        assert manifest_mod.oracle_inconclusive(None) is False
+        assert manifest_mod.oracle_inconclusive({"key": "k"}) is False
+        assert manifest_mod.oracle_inconclusive({"oracle": {}}) is False
+        assert manifest_mod.oracle_inconclusive({"oracle": {"inconclusive": True}}) is True
 
     def test_mark_leaves_no_temp_file_behind(self, tmp_path):
         """`mark` writes a temp file then `os.replace`s it — atomicity is the whole point.
@@ -29669,6 +29753,57 @@ class TestAnalyseLoading:
         records = analyse_mod.load_manifest(batch / "manifest.jsonl")
         assert [record["key"] for record in records] == ["k1"]
         assert records[0]["verdict"] == "AllTestsPassed"
+
+    def test_a_rerun_with_a_new_session_id_replaces_the_old_inconclusive_one(self, tmp_path):
+        """Item E6 + Q3 — the reader drops the session a later row names in `supersedes`.
+
+        The old row stays on disk (append-only); the reading keeps only the rerun. This
+        is the last-key-wins rule for a rerun under the same key, and the `supersedes`
+        filter is what makes it hold for a named session whatever its key.
+        """
+        batch = tmp_path / "b"
+        batch.mkdir()
+        write(
+            batch / "manifest.jsonl",
+            json.dumps(
+                _analyse_row("k1", session_id="old", oracle=_analyse_oracle(inconclusive=True))
+            )
+            + "\n"
+            + json.dumps(
+                _analyse_row(
+                    "k1",
+                    session_id="new",
+                    supersedes={"session_id": "old", "key": "k1"},
+                )
+            )
+            + "\n",
+        )
+        records = analyse_mod.load_manifest(batch / "manifest.jsonl")
+        assert [record["session_id"] for record in records] == ["new"]
+
+    def test_a_named_superseded_session_is_dropped_whatever_its_key(self, tmp_path):
+        """The `supersedes` filter names a session, not a key (§7.3, item E6).
+
+        The same-key case is already covered by last-key-wins; this pins the filter
+        itself, which drops the named session even when its own key is not the one the
+        rerun was appended under.
+        """
+        batch = tmp_path / "b"
+        batch.mkdir()
+        write(
+            batch / "manifest.jsonl",
+            json.dumps(_analyse_row("k-old", session_id="old")) + "\n"
+            + json.dumps(
+                _analyse_row(
+                    "k-new",
+                    session_id="new",
+                    supersedes={"session_id": "old", "key": "k-old"},
+                )
+            )
+            + "\n",
+        )
+        records = analyse_mod.load_manifest(batch / "manifest.jsonl")
+        assert [record["session_id"] for record in records] == ["new"]
 
     def test_no_matching_batch_is_an_error_not_an_empty_report(self, tmp_path):
         with pytest.raises(analyse_mod.AnalysisError):

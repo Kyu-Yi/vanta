@@ -1240,6 +1240,25 @@ def test_an_inconclusive_oracle_is_neither_a_resolve_nor_a_patch_good(tmp_path):
     assert rates["inconclusive_rate"] == (1, 2)
 
 
+def test_a_superseded_session_is_dropped_from_the_oracle_index(tmp_path):
+    """Item E6 + Q3 — a rerun's new session id fully replaces the old inconclusive one.
+
+    The manifest stays append-only (both rows are on disk); this reader drops the
+    session a later row names in `supersedes`, so the unreadable grade can never be
+    counted even though its row is still there.
+    """
+    rows = [
+        manifest_row("old", hidden_pass=False, patch_good=False, inconclusive=True),
+        {**manifest_row("new"), "supersedes": {"session_id": "old", "key": "k1"}},
+    ]
+    write_manifest(tmp_path, rows)
+
+    facts = metrics.oracle_by_session(rows)
+    assert set(facts) == {"new"}
+    assert facts["new"].inconclusive is False
+    assert facts["new"].patch_good is True
+
+
 def test_a_group_without_manifest_rows_reports_na_not_zero(tmp_path):
     write_provenance_session(tmp_path, "s1", provenance_summary())
     groups, facts = groups_and_facts(tmp_path)

@@ -349,8 +349,14 @@ def load_manifest(path: Path) -> list[dict[str, Any]]:
     The manifest is append-only, so a resumed job appears twice; the LAST
     occurrence is the current one, which is what ``Manifest.find`` returns and
     therefore what a report must read.
+
+    [VANTA-WHY] Item E6 + Q3 — a re-run of a job whose previous grade was
+    INCONCLUSIVE appends a new row that names the session it supersedes. That
+    superseded session is dropped from the reading as well, so a superseded
+    inconclusive row can never be counted even if its own key were the latest.
     """
     latest: dict[str, dict[str, Any]] = {}
+    superseded: set[str] = set()
     with open(path, encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -360,12 +366,16 @@ def load_manifest(path: Path) -> list[dict[str, Any]]:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            supersedes = record.get("supersedes")
+            if isinstance(supersedes, dict) and supersedes.get("session_id"):
+                superseded.add(str(supersedes["session_id"]))
             key = str(record.get("key") or "")
             if key:
                 latest[key] = record
             else:
                 latest[f"#{len(latest)}"] = record
-    return [latest[key] for key in sorted(latest)]
+    rows = [latest[key] for key in sorted(latest)]
+    return [row for row in rows if str(row.get("session_id") or "") not in superseded]
 
 
 def load_replays(batch_dir: Path) -> list[dict[str, Any]]:

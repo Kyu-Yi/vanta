@@ -1052,12 +1052,26 @@ def oracle_by_session(records: list[dict[str, Any]]) -> dict[str, OracleFacts]:
     Vanta's: they are what makes a false approval NAMEABLE ("the hidden test
     still failed" vs "the native suite regressed") instead of merely counted.
     Reading them from the manifest keeps one copy of the oracle in one place.
+
+    [WHY] Item E6 + Q3 — a re-run of a job whose previous grade was INCONCLUSIVE
+    appends a row naming the session it supersedes. That superseded session is
+    dropped here, so the inconclusive reading can never be counted. Read from the
+    rows, not from `load_manifest`, because this reader is handed every row in
+    order (including both the old and the new one).
     """
+    superseded = {
+        str(supersedes["session_id"])
+        for record in records
+        for supersedes in [record.get("supersedes")]
+        if isinstance(supersedes, dict) and supersedes.get("session_id")
+    }
     out: dict[str, OracleFacts] = {}
     for record in records:
         session_id = record.get("session_id")
         oracle = record.get("oracle")
         if not session_id or not isinstance(oracle, dict):
+            continue
+        if str(session_id) in superseded:
             continue
         regressions = oracle.get("suite_regressions_count")
         if regressions is None:

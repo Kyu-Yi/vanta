@@ -268,6 +268,11 @@ pub fn apply_patch(original: &str, patch_text: &str, path: &str) -> (String, boo
 
 /// As `apply_patch`, but also reports WHY the apply failed.
 ///
+/// [VANTA-WHY] The third value is `None` when there was NO failure: either a
+/// strategy changed the file, or a strategy anchored and produced text identical
+/// to the original — the block simply changed nothing (item E5). It is `Some`
+/// only when every strategy was tried and none placed the patch.
+///
 /// [VANTA-WHY] This is a single implementation with a thin wrapper rather than a
 /// second cascade: two copies of the strategy order would drift, and the drift
 /// would only show up as a patch that applies in one path and not the other.
@@ -298,24 +303,14 @@ pub fn apply_patch_detailed(
         }
         Ok((patched, changed))
     };
-    // A strategy that produced different text is the answer; a strategy that
-    // produced nothing different is a failure with a precise reason. Either way
-    // the cascade stops here, exactly as it did before.
-    let finish = |patched: String,
-                  changed: bool,
-                  tried: &[StrategyFailure],
-                  skipped: &Option<String>| {
-        let failure = if changed {
-            None
-        } else {
-            Some(ApplyFailure::DidNotApply {
-                path: path.to_string(),
-                strategies: tried.to_vec(),
-                reconstruction_skipped: skipped.clone(),
-            })
-        };
-        (patched, changed, failure)
-    };
+    // [VANTA-WHY] Item E5 — a strategy that anchored but produced text identical
+    // to the original is NOT a failure: the block simply changed nothing. It
+    // returns `changed = false` with `why = None`, which the caller reads as
+    // "this file did not change" (the whole-patch no-change check is what turns a
+    // patch that changed nothing into "patch changed nothing"). Reporting it as a
+    // per-block `DidNotApply` was a misleading reason for a block that DID
+    // anchor — e.g. a `===SEARCH===` whose `===REPLACE===` is identical.
+    let no_change = |patched: String| (patched, false, None);
 
     // ---- Strategy 1: Full source (model emitted complete file) ----
     let looks_like_diff = patch_text.starts_with("--- ")
@@ -335,11 +330,8 @@ pub fn apply_patch_detailed(
                 if changed {
                     return (patched, true, None);
                 }
-                tried.push(StrategyFailure::new(
-                    "full-source",
-                    "produced text identical to the original",
-                ));
-                return finish(patched, false, &tried, &reconstruction_skipped);
+                // Anchored, but the text is identical: this file did not change.
+                return no_change(patched);
             }
             Err(refused) => failure = Some(refused),
         }
@@ -354,11 +346,8 @@ pub fn apply_patch_detailed(
                         debug!("search/replace blocks applied");
                         return (patched, true, None);
                     }
-                    tried.push(StrategyFailure::new(
-                        "search/replace",
-                        "produced text identical to the original",
-                    ));
-                    return finish(patched, false, &tried, &reconstruction_skipped);
+                    // The block anchored but changed nothing (e.g. SEARCH == REPLACE).
+                    return no_change(patched);
                 }
                 Err(refused) => failure = Some(refused),
             },
@@ -476,11 +465,8 @@ pub fn apply_patch_detailed(
                             debug!("patch -p1 --fuzz=3 succeeded");
                             return (patched, true, None);
                         }
-                        tried.push(StrategyFailure::new(
-                            "patch -p1 --fuzz=3",
-                            "produced text identical to the original",
-                        ));
-                        return finish(patched, false, &tried, &reconstruction_skipped);
+                        // `patch -p1` applied but the text is identical.
+                        return no_change(patched);
                     }
                     Err(refused) => failure = Some(refused),
                 },
@@ -511,11 +497,8 @@ pub fn apply_patch_detailed(
                     debug!("hunk-by-hunk engine succeeded");
                     return (patched, true, None);
                 }
-                tried.push(StrategyFailure::new(
-                    "hunk-by-hunk",
-                    "produced text identical to the original",
-                ));
-                return finish(patched, false, &tried, &reconstruction_skipped);
+                // The hunks anchored but the text is identical.
+                return no_change(patched);
             }
             Err(refused) => failure = Some(refused),
         },
@@ -567,11 +550,8 @@ pub fn apply_patch_detailed(
                     if changed {
                         return (patched, true, None);
                     }
-                    tried.push(StrategyFailure::new(
-                        "whole-file reconstruction",
-                        "produced text identical to the original",
-                    ));
-                    return finish(patched, false, &tried, &reconstruction_skipped);
+                    // Reconstruction produced the same text.
+                    return no_change(patched);
                 }
                 Err(refused) => failure = Some(refused),
             }

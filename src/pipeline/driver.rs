@@ -5366,24 +5366,32 @@ fn apply_patch_files_all_or_nothing(
         let patch_content = &patch_files[path];
         match original_files.get(path) {
             Some(original) => {
-                let (text, changed, why) = apply_patch_detailed(original, patch_content, path);
-                if !changed {
-                    // Contract B: one block that does not anchor fails them all.
-                    return Err(match why {
-                        // The syntax refusal's own message does not carry the path;
-                        // add it so the Creator is told WHICH block.
-                        Some(ApplyFailure::InvalidPython(err)) => {
-                            ApplyFailure::InvalidPython(format!("{path}: {err}"))
-                        }
-                        Some(other) => other,
-                        None => ApplyFailure::DidNotApply {
-                            path: path.clone(),
-                            strategies: Vec::new(),
-                            reconstruction_skipped: None,
-                        },
-                    });
+                let (text, _changed, why) = apply_patch_detailed(original, patch_content, path);
+                // [VANTA-WHY] Item E5 — `why`, not `changed`, is the decision. A
+                // block that anchored but produced text identical to the original
+                // returns `why = None` (the file simply did not change); it is not
+                // a per-block failure, and the caller's whole-patch check is what
+                // turns "nothing changed" into "patch changed nothing". A block
+                // that could not anchor returns `Some(...)`, and Contract B fails
+                // the whole apply. Before E5 an anchored no-change block was
+                // rejected here with the misleading reason "search/replace:
+                // produced text identical to the original".
+                match why {
+                    None => {
+                        patched.insert(path.clone(), text);
+                    }
+                    Some(failure) => {
+                        // Contract B: one block that does not anchor fails them all.
+                        return Err(match failure {
+                            // The syntax refusal's own message does not carry the path;
+                            // add it so the Creator is told WHICH block.
+                            ApplyFailure::InvalidPython(err) => {
+                                ApplyFailure::InvalidPython(format!("{path}: {err}"))
+                            }
+                            other => other,
+                        });
+                    }
                 }
-                patched.insert(path.clone(), text);
             }
             // A block that introduces a file the tree does not have (a new module
             // the fix adds) is taken verbatim; an empty block adds nothing, and the
@@ -7540,6 +7548,31 @@ mod tests {
             failure.feedback()
         );
         assert_eq!(patched, original, "Contract B: nothing may be written");
+    }
+
+    /// [VANTA-WHY] Item E5. A block that anchors but produces identical text is
+    /// NOT an anchor failure: the file just did not change. The helper returns
+    /// `Ok` with the unchanged tree, and the caller's whole-patch check reports
+    /// "patch changed nothing". Before E5 this block was rejected here with the
+    /// misleading reason "search/replace: produced text identical to the
+    /// original" — naming a strategy failure for a block that DID anchor.
+    #[test]
+    fn a_search_replace_block_that_changes_nothing_is_not_an_anchor_failure() {
+        let original = HashMap::from([(
+            "calc.py".to_string(),
+            "def scale(x):\n    return x\n".to_string(),
+        )]);
+        let blocks = HashMap::from([(
+            "calc.py".to_string(),
+            "===SEARCH===\n    return x\n===REPLACE===\n    return x\n===END===\n".to_string(),
+        )]);
+
+        let patched = apply_patch_files_all_or_nothing(&original, &blocks)
+            .expect("SEARCH == REPLACE anchors; it just changes nothing");
+        assert_eq!(
+            patched, original,
+            "nothing was written; the whole-patch check reports 'patch changed nothing'"
+        );
     }
 
     /// The message and the gate read the SAME list, so the finding a rejection

@@ -30161,6 +30161,49 @@ class TestAnalyseOutputs:
             "item 12 — analysis summary"
         )
 
+    def test_every_generated_table_has_as_many_cells_as_its_declared_columns(
+        self, tmp_path
+    ):
+        """C1 — a table's `\\begin{tabular}` spec must match every row's cell count.
+
+        The review-rates table shipped a 9-column spec over 10-cell data rows and a
+        header whose `bal.\\\\ acc` broke the row mid-cell. This counts every row of
+        every generated table, so that whole class of defect cannot recur unseen.
+        """
+        row_break = "\\\\"  # LaTeX row terminator: two backslashes
+
+        def shape(tex: str) -> tuple[int, list[str]]:
+            match = re.search(r"\\begin\{tabular\}\{([^}]*)\}", tex)
+            assert match, "every table declares a column spec"
+            declared = sum(1 for ch in match.group(1) if ch in "lcr")
+            rows = [
+                line.strip()
+                for line in tex.splitlines()
+                # skip blanks, `%` comments, and `\begin`/`\end`/`\hline` lines
+                if line.strip() and not line.strip().startswith(("%", "\\"))
+            ]
+            return declared, rows
+
+        outputs = analyse_mod.run_analysis(self._analysis(tmp_path))
+        tables = 0
+        for name, text in outputs.items():
+            if not name.endswith(".tex"):
+                continue
+            tables += 1
+            declared, rows = shape(text)
+            assert declared > 0, f"{name}: no columns declared"
+            for row in rows:
+                cells = re.split(r"(?<!\\)&", row)
+                assert len(cells) == declared, (
+                    f"{name}: a row has {len(cells)} cells but {declared} columns "
+                    f"are declared: {row!r}"
+                )
+                assert row.endswith(row_break), f"{name}: row has no terminator: {row!r}"
+                assert row.count(row_break) == 1, (
+                    f"{name}: an inner line break splits a row mid-cell: {row!r}"
+                )
+        assert tables == 7  # every metric's table was checked
+
 
 class TestAnalyseCli:
     def test_the_parser_requires_a_batch_and_carries_the_defaults(self):

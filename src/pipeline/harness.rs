@@ -96,12 +96,17 @@ pub async fn run_tests_parallel_detailed(
                 Ok(b) => b,
                 Err(_) => return (name, TestExecutionDetails::infrastructure_error()),
             };
-            if seed_and_write(sb.root(), &source).is_err() {
+            if seed_source_and_conftest(sb.root(), &source).is_err() {
                 sb.destroy();
                 return (name, TestExecutionDetails::infrastructure_error());
             }
-            let _ = write_conftest(sb.root());
-            let _ = fs::write(sb.root().join("test_run.py"), &test.test_source);
+            // [VANTA-WHY] F1 — a test file that is never written makes pytest
+            // grade NOTHING, which reads as a normal verdict rather than a setup
+            // failure. Guard it the same way as the seed.
+            if fs::write(sb.root().join("test_run.py"), &test.test_source).is_err() {
+                sb.destroy();
+                return (name, TestExecutionDetails::infrastructure_error());
+            }
             let cmd = build_single_test_cmd(&cmd_template, "test_run.py");
             let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
             let sandbox_root = sb.root().display().to_string();
@@ -187,9 +192,20 @@ pub async fn run_single_test_with_timeout(
         Ok(b) => b,
         Err(_) => return TestExecutionDetails::infrastructure_error(),
     };
-    let _ = seed_and_write(sb.root(), source_concat);
-    let _ = write_conftest(sb.root());
-    let _ = fs::write(sb.root().join(BATE_TEST_FILE), test_source);
+    // [VANTA-WHY] F1 — the parallel path above already treats a failed
+    // `seed_and_write` as infrastructure; this path discarded it, so a test could
+    // run against the seeded tree instead of `source_concat` and return a
+    // normal-looking verdict. Destroy the sandbox and report infrastructure, as
+    // the parallel path does. The graded test file's own write is guarded the
+    // same way: a test file that is never written makes pytest grade nothing.
+    if seed_source_and_conftest(sb.root(), source_concat).is_err() {
+        sb.destroy();
+        return TestExecutionDetails::infrastructure_error();
+    }
+    if fs::write(sb.root().join(BATE_TEST_FILE), test_source).is_err() {
+        sb.destroy();
+        return TestExecutionDetails::infrastructure_error();
+    }
     let cmd = build_single_test_cmd(test_cmd, BATE_TEST_FILE);
     let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
     let sandbox_root = sb.root().display().to_string();
@@ -462,11 +478,13 @@ pub async fn run_native_suite(
         Ok(b) => b,
         Err(_) => return NativeSuiteReport::not_run(),
     };
-    if seed_and_write(sb.root(), source).is_err() {
+    // [VANTA-WHY] F1 — the conftest write was discarded here too: a `src/`-layout
+    // repo would then fail to import and the gate would report regressions from a
+    // tree it could not set up. Same treatment as the seed.
+    if seed_source_and_conftest(sb.root(), source).is_err() {
         sb.destroy();
         return NativeSuiteReport::not_run();
     }
-    let _ = write_conftest(sb.root());
 
     // No test-file argument: pytest collects the repo's own tests from rootdir.
     let mut cmd = test_cmd.as_cmd_vec();
@@ -1132,6 +1150,27 @@ for _p in (os.path.join(_here, 'src'), _here):
 "#;
     fs::write(root.join("conftest.py"), conftest)?;
     Ok(())
+}
+
+/// Lay down the tree a sandbox will be graded on: the source overlay
+/// (`seed_and_write`) followed by the conftest that puts `src/` on `sys.path`.
+///
+/// [VANTA-WHY] F1 — every one of these writes used to be discarded (`let _ =`)
+/// on a path that ends in a verdict about the candidate. `seed_and_write` can
+/// fail inside `prune_source_files_not_in`, AFTER the seed copy but BEFORE the
+/// overlay, so the sandbox is left holding the SEEDED tree rather than
+/// `source_concat`; a discarded `write_conftest` failure leaves `src/` off
+/// `sys.path` (a `src/`-layout repo then fails to import). Either way the test
+/// runs against a tree it is not being asked about and returns a normal-looking
+/// Passed/Failed. `Err` here means the caller MUST destroy the sandbox and
+/// return its own failure value (`infrastructure_error()` / `not_run()`), never
+/// grade the tree.
+fn seed_source_and_conftest(
+    root: &Path,
+    source_concat: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    seed_and_write(root, source_concat)?;
+    write_conftest(root)
 }
 
 // ============================================================================
@@ -1929,7 +1968,15 @@ pub async fn run_static(
         Ok(b) => b,
         Err(_) => return StaticRun::default(),
     };
-    let _ = seed_and_write(sb.root(), source);
+    // [VANTA-WHY] F1 — a discarded `seed_and_write` here let ruff/mypy run over
+    // the SEEDED tree rather than `source`, and their findings feed the verdict
+    // (a blocking static error is a failure signal). Same treatment as the
+    // test-running paths: destroy the sandbox and return the "could not run"
+    // value.
+    if seed_and_write(sb.root(), source).is_err() {
+        sb.destroy();
+        return StaticRun::default();
+    }
     if let Some(root) = config_root {
         copy_static_configs(root, sb.root());
     }
@@ -2400,7 +2447,8 @@ mod tests {
         native_vacuous_reason, new_diagnostics, parse_mypy_line, parse_native_report,
         parse_pytest_report_detailed, parse_ruff_line, project_package, prune_keeps, report_tests,
         ruff_is_error_class, run_single_test, run_tests_parallel, seed_and_write,
-        seed_and_write_from, seed_method, seed_root, seed_sandbox_from, set_seed_root,
+        seed_and_write_from, seed_method, seed_root, seed_sandbox_from, seed_source_and_conftest,
+        set_seed_root,
         static_tool_runner, write_source_files,
     };
     use crate::agents::attacker::GeneratedTest;
@@ -3870,6 +3918,50 @@ mod tests {
             fs::read_dir(root.path()).unwrap().count(),
             1,
             "without a seed nothing but the concatenation's own paths is written"
+        );
+    }
+
+    // [VANTA-WHY] F1 — `seed_source_and_conftest` is the seam every graded path
+    // now goes through, and the bug it pins is that its two writes used to be
+    // DISCARDED (`let _ =`) on a path that ends in a verdict about the
+    // candidate. A concat that names no file makes `seed_and_write` fail
+    // (production hits the same condition one step later, inside
+    // `prune_source_files_not_in`, after the seed copy but before the overlay);
+    // the helper must REPORT that failure and must NOT then leave a conftest
+    // behind, which would make a tree that was never overlaid look set up. The
+    // success path must land both writes.
+    #[test]
+    fn seed_source_and_conftest_reports_a_failed_seed_and_lands_both_writes_on_success() {
+        // Hold the seed lock: the helper seeds through the process-wide
+        // `SEED_ROOT`, which the production-seed test also writes.
+        let _seed = SeedGlobalGuard::take();
+        assert!(seed_root().is_none(), "no seed is the harness's default");
+
+        let bad_root = tempfile::tempdir().unwrap();
+        let err = seed_source_and_conftest(bad_root.path(), "no headers here\n")
+            .expect_err("a seed that names no file must be reported, not swallowed");
+        assert!(
+            err.to_string().contains("no # FILE: entries"),
+            "the helper propagates the seed's own error, got {err}"
+        );
+        assert!(
+            !bad_root.path().join("conftest.py").exists(),
+            "the failed seed must not be followed by the conftest write"
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let concat = "# FILE: pkg/__init__.py\nVALUE = 2\n";
+        seed_source_and_conftest(root.path(), concat).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.path().join("pkg/__init__.py")).unwrap(),
+            "VALUE = 2\n",
+            "the overlay is written"
+        );
+        let conftest = fs::read_to_string(root.path().join("conftest.py")).unwrap();
+        assert!(
+            conftest.contains("'src'"),
+            "the conftest puts src/ on sys.path so a src-layout repo imports, got {conftest:?}"
         );
     }
 

@@ -30122,12 +30122,75 @@ class TestAnalyseLoading:
         records = analyse_mod.load_manifest(batch / "manifest.jsonl")
         assert [record["session_id"] for record in records] == ["new"]
 
+    def test_a_superseded_sessions_replay_is_not_read(self, tmp_path):
+        """F9 — a replay left on disk by a superseded session never reaches the metrics.
+
+        ``cmd_replay`` names a replay file by the row's KEY and never removes one, so a
+        re-run under a different key leaves the old session's replay behind. The reader
+        keeps only replays whose session is effective — the same
+        ``manifest.effective_records`` rule the manifest reader uses — so the stale
+        replay is not read and the file is left untouched on disk.
+        """
+        rows = [
+            _analyse_row("k-old", session_id="old", bug="A/1", mode="repair"),
+            _analyse_row(
+                "k-new",
+                session_id="new",
+                bug="A/1",
+                mode="repair",
+                supersedes={"session_id": "old", "key": "k-old"},
+            ),
+        ]
+        replays = [
+            _analyse_replay(bug="A/1", session_id="old", cells=_replay_matrix()),
+            _analyse_replay(bug="A/1", session_id="new", cells=_replay_matrix()),
+        ]
+        batch = _analyse_batch(tmp_path, rows=rows, replays=replays)
+        analysis = _analyse_load(batch, resamples=20)
+
+        # Only the current session's replay is read; the superseded one is not.
+        assert [replay["session_id"] for _b, replay in analysis.replays] == ["new"]
+        # Neither replay file was deleted or rewritten — the fix is read-time only.
+        assert sorted(path.name for path in (batch / replay_mod.REPLAY_DIRNAME).glob("*.json")) == [
+            "r0.json",
+            "r1.json",
+        ]
+        # EIR/ECR sees ONE replay's counts: the hand-counted single-matrix numbers, not
+        # the doubled denominators two identical replays would produce.
+        result = analyse_mod.EirEcrMetrics().run(analysis)
+        summary = "\n".join(result.summary)
+        assert "generated  0->1     EIR=0.333 (n=3) ECR=0.500 (n=2) Acc=0.600 censored=1" in summary
+
+    def test_a_replay_with_no_session_id_is_counted_not_silently_dropped(self, tmp_path):
+        """F9 — a keyless replay is neither pooled nor dropped in silence.
+
+        It cannot be matched to an effective session, so it is kept out of the metrics;
+        the count is surfaced as its own number in the summary.
+        """
+        rows = [_analyse_row("k1", session_id="sid")]
+        replays = [
+            _analyse_replay(cells=_replay_matrix()),
+            _analyse_replay(bug="X/1", session_id=""),
+        ]
+        batch = _analyse_batch(tmp_path, rows=rows, replays=replays)
+        analysis = _analyse_load(batch)
+
+        assert [replay["session_id"] for _b, replay in analysis.replays] == ["sid"]
+        assert analysis.batches[0].keyless_replays == 1
+        assert "1 replay(s) with no session_id (not pooled)" in analyse_mod.render_summary(
+            analysis, []
+        )
+
     def test_no_matching_batch_is_an_error_not_an_empty_report(self, tmp_path):
         with pytest.raises(analyse_mod.AnalysisError):
             analyse_mod.load_analysis([str(tmp_path / "nope-*")], seed=1, resamples=10)
 
     def test_view_transitions_recompute_from_the_cells_through_replay(self, tmp_path):
-        batch = _analyse_batch(tmp_path, replays=[_analyse_replay(cells=_replay_matrix())])
+        batch = _analyse_batch(
+            tmp_path,
+            rows=[_analyse_row("r1", session_id="sid")],
+            replays=[_analyse_replay(cells=_replay_matrix())],
+        )
         analysis = _analyse_load(batch)
         pooled, per_source, by_bug = analyse_mod.view_transitions(
             analysis, replay_mod.VIEW_GENERATED
@@ -30149,6 +30212,10 @@ class TestAnalyseLoading:
         # were ever dropped from `by_source` the totals would silently disagree.
         batch = _analyse_batch(
             tmp_path,
+            rows=[
+                _analyse_row("r1", session_id="sid", bug="Demo/1"),
+                _analyse_row("r2", session_id="sid2", bug="Other/1"),
+            ],
             replays=[
                 _analyse_replay(bug="Demo/1", cells=_replay_matrix()),
                 _analyse_replay(bug="Other/1", session_id="sid2", cells=_replay_matrix()),
@@ -30501,7 +30568,11 @@ class TestAnalyseRepair:
 
 class TestAnalyseEirEcr:
     def test_the_pooled_and_per_source_columns_are_both_written(self, tmp_path):
-        batch = _analyse_batch(tmp_path, replays=[_analyse_replay(cells=_replay_matrix())])
+        batch = _analyse_batch(
+            tmp_path,
+            rows=[_analyse_row("r1", session_id="sid")],
+            replays=[_analyse_replay(cells=_replay_matrix())],
+        )
         result = analyse_mod.EirEcrMetrics().run(_analyse_load(batch))
         assert sorted(artifact.filename for artifact in result.artifacts) == [
             "eir_ecr.svg",
@@ -30531,7 +30602,11 @@ class TestAnalyseEirEcr:
             _replay_cell("generated:g_z", 0, "fail"),
             _replay_cell("generated:g_z", 1, "fail"),
         ]
-        batch = _analyse_batch(tmp_path, replays=[_analyse_replay(cells=cells)])
+        batch = _analyse_batch(
+            tmp_path,
+            rows=[_analyse_row("r1", session_id="sid")],
+            replays=[_analyse_replay(cells=cells)],
+        )
         result = analyse_mod.EirEcrMetrics().run(_analyse_load(batch))
         summary = "\n".join(result.summary)
         assert "EIR=n/a (n=0)" in summary
@@ -30559,7 +30634,11 @@ class TestAnalyseEirEcr:
         — `acc` is the share of OBSERVED transitions whose newer cell passed, which is
         why 1->2 reads 0.800 (4 of 5) and not 0.400.
         """
-        batch = _analyse_batch(tmp_path, replays=[_analyse_replay(cells=_replay_matrix())])
+        batch = _analyse_batch(
+            tmp_path,
+            rows=[_analyse_row("r1", session_id="sid")],
+            replays=[_analyse_replay(cells=_replay_matrix())],
+        )
         result = analyse_mod.EirEcrMetrics().run(_analyse_load(batch))
         summary = "\n".join(result.summary)
         assert "generated  0->1     EIR=0.333 (n=3) ECR=0.500 (n=2) Acc=0.600 censored=1" in summary
@@ -30607,7 +30686,12 @@ class TestAnalysePipeline:
                 "assertion_grounding_type": None,
             },
         ]
-        row = _analyse_row("k1", mode="repair", artifacts={"session_dir": str(sessions / "sid")})
+        row = _analyse_row(
+            "k1",
+            mode="repair",
+            session_id="sid",
+            artifacts={"session_dir": str(sessions / "sid")},
+        )
         batch = _analyse_batch(
             tmp_path, rows=[row], replays=[_analyse_replay(tests=tests)]
         )
@@ -30849,7 +30933,9 @@ class TestAnalyseLocalization:
 class TestAnalyseOutputs:
     def _analysis(self, tmp_path: Path):
         rows = [
-            _analyse_row("k1", arm="b3", bug="A/1", mode="repair", patch_sha256="x"),
+            _analyse_row(
+                "k1", arm="b3", bug="A/1", mode="repair", session_id="sid", patch_sha256="x"
+            ),
             _analyse_row("k2", arm="judge", bug="A/1", patch_sha256="x", verdict="Rejected"),
         ]
         replays = [_analyse_replay(bug="A/1", cells=_replay_matrix())]
@@ -30949,7 +31035,9 @@ class TestAnalyseCli:
 
     def test_main_writes_the_outputs_for_a_real_batch(self, tmp_path):
         batch = _analyse_batch(
-            tmp_path, rows=[_analyse_row("k1")], replays=[_analyse_replay(cells=_replay_matrix())]
+            tmp_path,
+            rows=[_analyse_row("k1", session_id="sid")],
+            replays=[_analyse_replay(cells=_replay_matrix())],
         )
         out = tmp_path / "out"
         code = analyse_mod.main(

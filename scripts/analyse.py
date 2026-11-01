@@ -342,6 +342,10 @@ class Batch:
     path: Path
     records: list[dict[str, Any]] = field(default_factory=list)
     replays: list[dict[str, Any]] = field(default_factory=list)
+    # F9 — replay files that carry no ``session_id``. They cannot be tied to an
+    # effective session, so they are kept out of the metrics, but the count is
+    # carried here so the summary can surface them rather than drop them in silence.
+    keyless_replays: int = 0
 
 
 def load_manifest(path: Path) -> list[dict[str, Any]]:
@@ -372,20 +376,45 @@ def load_manifest(path: Path) -> list[dict[str, Any]]:
     return manifest_mod.effective_records(rows)
 
 
-def load_replays(batch_dir: Path) -> list[dict[str, Any]]:
-    """Every ``<batch>/replay/*.json`` record, in filename order."""
-    out: list[dict[str, Any]] = []
+def load_replays(batch_dir: Path) -> tuple[list[dict[str, Any]], int]:
+    """The ``<batch>/replay/*.json`` records whose session is current, and the count
+    of records that carry no ``session_id`` at all (F9).
+
+    ``cmd_replay`` names each replay file by the row's **key** and never removes one,
+    so a re-run under a different key leaves the superseded session's replay on disk:
+    the file would otherwise still feed EIR/ECR and the pipeline metrics. The session
+    set is the effective manifest's, through the same ``manifest.effective_records``
+    rule every other reader uses (via :func:`load_manifest`), so a replay whose session
+    is not effective is not read. Nothing on disk is deleted or rewritten.
+
+    A record with no ``session_id`` cannot be matched to any session, so it is neither
+    pooled nor dropped in silence: it is counted and the count is surfaced in the
+    summary. Returns ``(kept, keyless)``, ``kept`` in filename order.
+    """
+    sessions = {
+        str(record.get("session_id") or "")
+        for record in load_manifest(batch_dir / MANIFEST_NAME)
+        if record.get("session_id")
+    }
+    kept: list[dict[str, Any]] = []
+    keyless = 0
     directory = batch_dir / replay_mod.REPLAY_DIRNAME
     if not directory.is_dir():
-        return out
+        return kept, keyless
     for path in sorted(directory.glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(payload, dict):
-            out.append(payload)
-    return out
+        if not isinstance(payload, dict):
+            continue
+        session_id = str(payload.get("session_id") or "")
+        if not session_id:
+            keyless += 1
+            continue
+        if session_id in sessions:
+            kept.append(payload)
+    return kept, keyless
 
 
 def discover_batches(patterns: Sequence[str]) -> list[Path]:
@@ -487,10 +516,13 @@ def load_analysis(
         raise AnalysisError(
             f"--batches {list(patterns)} matched no batch with a {MANIFEST_NAME}"
         )
-    batches = [
-        Batch(path=path, records=load_manifest(path / MANIFEST_NAME), replays=load_replays(path))
-        for path in paths
-    ]
+    batches: list[Batch] = []
+    for path in paths:
+        records = load_manifest(path / MANIFEST_NAME)
+        replays, keyless = load_replays(path)
+        batches.append(
+            Batch(path=path, records=records, replays=replays, keyless_replays=keyless)
+        )
     # Item 19 — refuse to pool rows the frozen config would make incomparable, BEFORE
     # any metric reads them. `allow_mixed_configs` is §Versioning's "unless told to".
     if not allow_mixed_configs:
@@ -1862,7 +1894,16 @@ def render_summary(analysis: Analysis, results: Sequence[MetricResult]) -> str:
     """The plain-text summary: the input batches, then every metric's lines."""
     lines = ["item 12 — analysis summary", "", "input batches:"]
     for batch in analysis.batches:
-        lines.append(f"  {batch.path}  ({len(batch.records)} row(s), {len(batch.replays)} replay(s))")
+        # F9 — a replay with no session cannot be pooled, so it is reported as its own
+        # number rather than read or dropped silently.
+        keyless = (
+            f", {batch.keyless_replays} replay(s) with no session_id (not pooled)"
+            if batch.keyless_replays
+            else ""
+        )
+        lines.append(
+            f"  {batch.path}  ({len(batch.records)} row(s), {len(batch.replays)} replay(s){keyless})"
+        )
     # Item B6 — which rule read each row. Rows already on disk keep item Q's reading
     # and are tagged, so a mixed load is visible here rather than silently pooled.
     rules = label_rule_counts(analysis)

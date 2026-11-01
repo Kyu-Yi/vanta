@@ -2241,42 +2241,48 @@ pub async fn run(
                 }
             }
         } else {
-            // [VANTA-WHY] REPAIR MODE keeps the cascade: the Creator can emit a
-            // diff with wrong headers, and the loop has a budget to recover. The
-            // per-file path is passed through so `git apply`/`patch(1)` see the
-            // file at the name the diff header uses, and so the syntax guard
-            // knows whether the result must parse as Python.
-            for (path, patch_content) in &patch_files {
-                print!(
-                    "  ⏳ {path}: applying ({:.1}KB patch)... ",
-                    patch_content.len() as f64 / 1024.0
-                );
-                let _ = io::Write::flush(&mut io::stdout());
-                if let Some(original) = original_files.get(path) {
-                    let (patched, changed, why) =
-                        apply_patch_detailed(original, patch_content, path);
-                    if changed {
-                        patched_files.insert(path.clone(), patched);
-                        any_changed = true;
-                        all_patch_failed = false;
-                        println!("✔ patched (changed)");
-                    } else {
-                        println!("✗ patch did not change file");
-                        // Keep the FIRST reason: it is the strategy the patch was
-                        // most likely written for, and a later syntax-guard
-                        // refusal of a different strategy would otherwise hide it.
-                        if apply_failure.is_none() {
-                            apply_failure = why;
+            // [VANTA-WHY] REPAIR MODE keeps the cascade — the Creator can emit a
+            // diff with wrong headers, and the loop has a budget to recover — but
+            // the cascade now runs per file INSIDE one all-or-nothing apply (M3
+            // item A1, Contract B): if any block fails to anchor, no block is
+            // written. Letting a first block land while a second fails would test
+            // a tree no patch describes, and `final.patch` (built from the same
+            // map) would silently disagree with the tree the tests ran on.
+            print!(
+                "  ⏳ applying {} file block(s), all-or-nothing... ",
+                patch_files.len()
+            );
+            let _ = io::Write::flush(&mut io::stdout());
+            match apply_patch_files_all_or_nothing(&original_files, &patch_files) {
+                Ok(changed) if changed != original_files => {
+                    println!("✔ all blocks applied");
+                    for (path, content) in &changed {
+                        if original_files.get(path) != Some(content) {
+                            println!("  ✔ {path}: patched");
                         }
                     }
-                } else {
-                    // New file not in original
-                    if !patch_content.trim().is_empty() {
-                        patched_files.insert(path.clone(), patch_content.clone());
-                        any_changed = true;
-                        all_patch_failed = false;
-                        println!("  ✔ {path}: new file");
-                    }
+                    // [VANTA-WHY] Assigning the WHOLE map (not merging per file) is
+                    // what makes Contract B structural: on success the tested tree is
+                    // exactly what the helper returned, and on failure
+                    // `patched_files` is never touched, so nothing is written.
+                    patched_files = changed;
+                    any_changed = true;
+                    all_patch_failed = false;
+                }
+                Ok(_) => {
+                    // Every block was a no-op (e.g. an all-empty new-file block):
+                    // nothing changed, so this is the cascade's historical "patch
+                    // produced no change" failure. `all_patch_failed` stays true.
+                    println!("✗ patch changed nothing");
+                }
+                Err(failure) => {
+                    // `apply_failure` carries item R's account (the file and every
+                    // strategy tried) to the Creator; `patch_failure_reason` makes
+                    // the forensics file and the `patch.apply_failed` row name the
+                    // same thing instead of the generic "nothing changed".
+                    println!("✗ a block did not apply — Contract B writes no file");
+                    patch_failure_reason = Some(failure.feedback());
+                    apply_failure = Some(failure);
                 }
             }
         }
@@ -5206,6 +5212,74 @@ fn write_diff_tree(root: &Path, files: &HashMap<String, String>) -> io::Result<(
 }
 
 // ============================================================================
+// apply_patch_files_all_or_nothing — Contract B (M3 item A1)
+// ============================================================================
+//
+// [VANTA-WHY] A Creator patch is ALL-OR-NOTHING across its `===FILE===` blocks.
+// The repair loop used to apply each block on its own and keep whichever landed,
+// so a two-file patch whose second block failed to anchor left the TESTED tree
+// holding the first file's change — a program the Creator never proposed — while
+// `final.patch`, written from the same map, was the only honest record of it. The
+// verdict was then a statement about a tree no patch describes, and the oracle
+// graded something other than what repair tested.
+//
+// [VANTA-WHY] One block failing now fails the whole apply, so NOTHING is written:
+// the tested tree, the source strings the roles read and `final.patch` are all
+// derived from the map this returns, so they can never disagree. The reason names
+// the failing file, which is the whole point of item R's feedback.
+//
+// [VANTA-WHY] PURE on purpose — `(original tree, patch blocks) -> all patched
+// files | one error`, with no I/O and no logging — so the rule is tested directly
+// instead of through a sandbox. The caller does the writing, and on `Err` it
+// writes nothing.
+fn apply_patch_files_all_or_nothing(
+    original_files: &HashMap<String, String>,
+    patch_files: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, ApplyFailure> {
+    // [VANTA-WHY] Sorted, so WHICH file is reported as the failure does not
+    // depend on HashMap iteration order: "the second block did not apply" has to
+    // be the same statement on every run, or the feedback the Creator gets is
+    // nondeterministic.
+    let mut paths: Vec<&String> = patch_files.keys().collect();
+    paths.sort();
+    let mut patched = original_files.clone();
+    for path in paths {
+        let patch_content = &patch_files[path];
+        match original_files.get(path) {
+            Some(original) => {
+                let (text, changed, why) = apply_patch_detailed(original, patch_content, path);
+                if !changed {
+                    // Contract B: one block that does not anchor fails them all.
+                    return Err(match why {
+                        // The syntax refusal's own message does not carry the path;
+                        // add it so the Creator is told WHICH block.
+                        Some(ApplyFailure::InvalidPython(err)) => {
+                            ApplyFailure::InvalidPython(format!("{path}: {err}"))
+                        }
+                        Some(other) => other,
+                        None => ApplyFailure::DidNotApply {
+                            path: path.clone(),
+                            strategies: Vec::new(),
+                            reconstruction_skipped: None,
+                        },
+                    });
+                }
+                patched.insert(path.clone(), text);
+            }
+            // A block that introduces a file the tree does not have (a new module
+            // the fix adds) is taken verbatim; an empty block adds nothing, and the
+            // caller's "did anything change" check catches a patch that changes
+            // nothing at all.
+            None if !patch_content.trim().is_empty() => {
+                patched.insert(path.clone(), patch_content.clone());
+            }
+            None => {}
+        }
+    }
+    Ok(patched)
+}
+
+// ============================================================================
 // build_creator_feedback — structured feedback for the Creator from failures
 // ============================================================================
 fn tested_commit_sha(repo_path: &Path) -> String {
@@ -6539,6 +6613,7 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
+        apply_patch_files_all_or_nothing,
         approval_invariant_status, attempt_verdict, bate_baseline_concat, benchmark_config_name,
         blocking_static_findings,
         build_fixed_round_pass_feedback,
@@ -7127,6 +7202,135 @@ mod tests {
         assert!(
             modified_test_config_records(&patch_files).is_empty(),
             "pyproject.toml carries non-test content; an unrelated edit is not a test-config change"
+        );
+    }
+
+    // ---- M3 item A1: Contract B — a multi-file patch is all-or-nothing --------
+
+    /// [VANTA-WHY] M3 item A1 (Contract B). Two `===FILE===` blocks where the
+    /// SECOND does not anchor must write NOTHING: the tested tree must never keep
+    /// the first block's change while `final.patch` — built from the same map —
+    /// records a patch the tree no longer matches. The old per-file loop applied
+    /// the first block and continued on the partial tree.
+    #[test]
+    fn a_multi_file_patch_whose_second_block_does_not_anchor_writes_nothing() {
+        let original = HashMap::from([
+            ("calc.py".to_string(), "def scale(x):\n    return x\n".to_string()),
+            ("util.py".to_string(), "def helper():\n    return 1\n".to_string()),
+        ]);
+        let patch_text = concat!(
+            "===FILE: calc.py===\n",
+            "def scale(x):\n    return x * 2\n",
+            "===FILE: util.py===\n",
+            "===SEARCH===\n    return 999\n===REPLACE===\n    return 1\n===END===\n",
+        );
+        let blocks = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
+        assert_eq!(blocks.len(), 2, "the patch must name two files");
+
+        // The driver's own decision, exactly: on `Err` it writes nothing.
+        let (patched, failure) = match apply_patch_files_all_or_nothing(&original, &blocks) {
+            Ok(changed) => (changed, None),
+            Err(failure) => (original.clone(), Some(failure)),
+        };
+
+        let failure = failure.expect("the second block cannot anchor, so the apply must fail");
+        assert!(
+            failure.feedback().contains("util.py"),
+            "the failing block must be named; got: {}",
+            failure.feedback()
+        );
+        assert_eq!(
+            patched, original,
+            "Contract B: no block may be written when any block fails"
+        );
+    }
+
+    /// The other half of Contract B: when EVERY block anchors, the returned map is
+    /// the whole patched tree — the same map the tests run on and the same map
+    /// `final.patch` is diffed from, so the two cannot disagree.
+    #[test]
+    fn a_multi_file_patch_whose_blocks_all_anchor_applies_every_block() {
+        let original = HashMap::from([
+            ("calc.py".to_string(), "def scale(x):\n    return x\n".to_string()),
+            ("util.py".to_string(), "def helper():\n    return 1\n".to_string()),
+        ]);
+        let patch_text = concat!(
+            "===FILE: calc.py===\n",
+            "def scale(x):\n    return x * 2\n",
+            "===FILE: util.py===\n",
+            "def helper():\n    return 2\n",
+        );
+        let blocks = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
+
+        let patched =
+            apply_patch_files_all_or_nothing(&original, &blocks).expect("both blocks anchor");
+
+        assert!(patched["calc.py"].contains("return x * 2"), "{patched:?}");
+        assert!(patched["util.py"].contains("return 2"), "{patched:?}");
+        assert_ne!(patched, original);
+    }
+
+    /// [VANTA-WHY] A syntax-broken block is refused, and the refusal names the
+    /// file — `ApplyFailure::InvalidPython`'s own message is the interpreter's
+    /// stderr and carries no path, so Contract B's "name the failing file" would
+    /// be lost without the wrapper the helper adds.
+    #[test]
+    fn a_syntax_breaking_block_names_the_file_in_the_refusal() {
+        let original = HashMap::from([(
+            "util.py".to_string(),
+            "def helper():\n    return 1\n".to_string(),
+        )]);
+        let blocks = HashMap::from([(
+            "util.py".to_string(),
+            "def helper(\n    return 1\n".to_string(),
+        )]);
+
+        let failure = apply_patch_files_all_or_nothing(&original, &blocks)
+            .expect_err("the replacement does not parse as Python");
+
+        assert!(
+            failure.feedback().contains("util.py"),
+            "the refusal must name the file; got: {}",
+            failure.feedback()
+        );
+        assert!(
+            failure
+                .feedback()
+                .starts_with("patch result is not valid Python:"),
+            "and it must still read as a syntax refusal; got: {}",
+            failure.feedback()
+        );
+    }
+
+    /// A block that adds a file the tree does not have is applied verbatim; an
+    /// empty new-file block changes nothing (and the driver's `all_patch_failed`
+    /// check is what turns "changed nothing" into a failure).
+    #[test]
+    fn a_new_file_block_is_added_and_an_empty_one_changes_nothing() {
+        let original = HashMap::from([(
+            "calc.py".to_string(),
+            "def scale(x):\n    return x\n".to_string(),
+        )]);
+
+        let added = apply_patch_files_all_or_nothing(
+            &original,
+            &HashMap::from([(
+                "brand_new.py".to_string(),
+                "def f():\n    return 3\n".to_string(),
+            )]),
+        )
+        .expect("adding a new file is not an anchor failure");
+        assert_eq!(added["brand_new.py"], "def f():\n    return 3\n");
+        assert!(added.contains_key("calc.py"));
+
+        let empty = apply_patch_files_all_or_nothing(
+            &original,
+            &HashMap::from([("empty.py".to_string(), String::new())]),
+        )
+        .expect("an empty new-file block is not an anchor failure");
+        assert_eq!(
+            empty, original,
+            "an empty block changes nothing; the driver reports that as the apply failure"
         );
     }
 

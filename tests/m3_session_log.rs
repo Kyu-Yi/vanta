@@ -1759,11 +1759,12 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
     );
 
     // Per round: attempt.start, attacker.dedup, attacker.summary,
-    // native_suite.summary, one patched.result (the shared probe), and
-    // attempt.summary — 7, plus the round-1 intent.check row for the freshly
+    // bate.summary, native_suite.summary, one patched.result (the shared probe),
+    // and attempt.summary — 7, plus the round-1 intent.check row for the freshly
     // generated probe. Plus the run-level session.start, run.summary,
-    // context.select (the source selection's provenance, §1.6.2 item 4) and
-    // M3_repair_loop records.
+    // context.select (the source selection's provenance, §1.6.2 item 4),
+    // run.import_guard (item P — the package and path the in-session suite
+    // imported from) and M3_repair_loop records.
     //
     // [VANTA-WHY] Counted over the ATTEMPT-STRUCTURE rows only. Token accounting
     // writes one `call.usage` row per chat call, and how many calls a round makes
@@ -1772,7 +1773,7 @@ fn patch_mode_three_attempt_run_writes_multi_record_session_log() {
     // Those rows have their own test
     // (`token_accounting_records_the_servers_counts_per_call_and_a_run_total`).
     let structure_rows: Vec<_> = records.iter().filter(|r| r.phase != "call.usage").collect();
-    assert_eq!(structure_rows.len(), 26);
+    assert_eq!(structure_rows.len(), 27);
     assert!(
         records.iter().any(|r| r.phase == "call.usage"),
         "this run called the model, so it must record token usage"

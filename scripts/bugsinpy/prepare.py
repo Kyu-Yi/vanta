@@ -116,6 +116,15 @@ text a run sends has to be the text that was committed and reviewed. The remedy 
 message — delete the frozen report and re-freeze it against the derived oracle."""
 
 
+VERSION_PIN_ESCAPE_REASON = "version_pin_escape"
+"""[VANTA-WHY] M3 item E12. ``version_pin.freeze`` refuses to write outside the tree
+the sandbox is seeded from — an absolute ``write_to``/``version_file``, a ``../``
+traversal, or a symlink the checkout planted. That refusal used to escape
+``strip_and_baseline`` as an uncaught ``VersionPinError`` and kill prepare with no gate
+failure recorded; it is one more refusal of this step, recorded under this name like
+every other one."""
+
+
 NO_ISSUE_SOURCE_REASON = "issue_source=none"
 """[VANTA-WHY] A bug whose fix commit points at no issue has no report to send, and §2.4
 refuses to give it the commit message back: that message is written by the person who fixed
@@ -1423,7 +1432,16 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bo
         ),
     )
     if pin.pin is not None:
-        version_pin_mod.freeze(vanta, pin.pin)
+        try:
+            version_pin_mod.freeze(vanta, pin.pin)
+        except version_pin_mod.VersionPinError as exc:
+            # [VANTA-WHY] M3 item E12 — a pin whose ``write_to`` would take the write
+            # outside the tree is refused by ``freeze``. Left uncaught it escaped this
+            # function as a RuntimeError and killed prepare with no gate failure
+            # recorded; it is one more refusal here, recorded like the strip and the
+            # leak above, so the bug is refused with a cause a reader can see.
+            prep.gate_failures.append(f"{VERSION_PIN_ESCAPE_REASON}: {exc}")
+            return False
     prep.version_pin = version_pin_mod.as_record(
         pin.pin, reason=pin.reason, probed=pin.probed
     )

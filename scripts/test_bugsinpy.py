@@ -7022,6 +7022,49 @@ class TestVersionPinWriteContainment:
         assert not (tmp_path / "escape.py").exists()
 
 
+class TestTheFreezeRefusalIsAGate:
+    """[VANTA-WHY] M3 item E12 — ``version_pin.freeze`` refuses a ``write_to`` /
+    ``version_file`` that would take its write outside the tree (an absolute path, a
+    ``../`` traversal, a planted symlink). ``strip_and_baseline`` used to call it
+    outside any handler, so the refusal escaped as an uncaught ``VersionPinError`` and
+    killed prepare with no gate failure recorded. It is one more refusal of that step,
+    recorded like the strip and the leak before it, so the bug is refused with a cause a
+    reader can see and no file is ever written outside the tree."""
+
+    def test_a_pin_that_escapes_the_tree_is_a_gate_failure(self, tmp_path, monkeypatch):
+        root = tmp_path / "batch" / "worktrees" / "Demo_1"
+        write(root / "oracle_tree" / "demo.py", "x = 1\n")
+        monkeypatch.setattr(
+            prepare_mod, "_read_report", lambda batch_dir, stem: {"tests": []}
+        )
+        # No repository here, so the guard's candidate set is empty; nothing is scanned.
+        monkeypatch.setattr(tree_mod, "tracked_paths", lambda checkouts: set())
+        escaping = version_pin_mod.PinOutcome(
+            kind="setuptools_scm",
+            pin=version_pin_mod.VersionPin(
+                kind="setuptools_scm",
+                file="../escape.py",
+                contents="x = 1\n",
+                version="1",
+                full_revisionid=None,
+                sha256="0",
+            ),
+            reason=None,
+        )
+        monkeypatch.setattr(version_pin_mod, "measure", lambda tree, *, vm: escaping)
+        bug_prep = prep(root=root)
+
+        recorded = prepare_mod.strip_and_baseline(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch"
+        )
+
+        assert recorded is False
+        assert len(bug_prep.gate_failures) == 1
+        assert prepare_mod.VERSION_PIN_ESCAPE_REASON in bug_prep.gate_failures[0]
+        assert not (root / "escape.py").exists()
+        assert not (root.parent / "escape.py").exists()
+
+
 class TestPrepareRunRecordContract:
     """``prepare.json`` has one writer and one reader, and they cannot drift.
 

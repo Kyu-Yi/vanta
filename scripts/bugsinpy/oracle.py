@@ -342,7 +342,14 @@ def grade(
     # state, ``inconclusive``: the patch is not credited and not blamed. The
     # check runs before the patched suite so an unreadable hidden run does not
     # spend a second full suite for a result that is never returned.
-    if not (hidden_pair.first.report_found or hidden_pair.second.report_found):
+    #
+    # [VANTA-WHY] Item E3 — ``and`` BOTH reports, not ``or``. With ``or`` a run
+    # where only ONE side wrote a report fell through to ``score``: the unreadable
+    # side's nodeids all read ``absent``, ``hidden_pass`` came back false, and the
+    # grade was a definite ``bad`` manufactured from a run that produced no
+    # evidence. The error text is kept verbatim — ``pool.py`` matches the
+    # ``"the hidden run produced no pytest report at all"`` substring.
+    if not (hidden_pair.first.report_found and hidden_pair.second.report_found):
         result.inconclusive = True
         result.error = (
             "the hidden run produced no pytest report at all (exit "
@@ -364,6 +371,21 @@ def grade(
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
     )
+
+    # [VANTA-WHY] Item E3 — the mirror of the hidden guard, on the patched side.
+    # A patched run that wrote no report leaves ``stable_failures`` empty, so
+    # ``regressions == []`` and ``patch_good = hidden_pass``: a FALSE APPROVAL,
+    # the one grading error that must never be manufactured from absent evidence.
+    # Unreadable on the patched side is ``inconclusive``, never "no regressions".
+    if not (patched_pair.first.report_found and patched_pair.second.report_found):
+        result.inconclusive = True
+        result.error = (
+            "the patched run produced no pytest report at all (exit "
+            f"{patched_pair.first.exit_code}/{patched_pair.second.exit_code}); "
+            f"tail: {patched_pair.first.stdout_tail[-600:]!r}"
+        )
+        result.oracle_secs = time.monotonic() - started
+        return result
 
     baseline = (
         prep.native_failure_baseline if baseline_failures is None else list(baseline_failures)

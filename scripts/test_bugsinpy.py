@@ -20041,6 +20041,56 @@ class TestOracleGrade:
         )
         assert result.as_dict()["inconclusive"] is True
 
+    def test_one_missing_hidden_report_is_inconclusive_not_bad(self, wired, tmp_path):
+        """Item E3: with ``or``, ONE unreadable hidden run fell through to ``score``.
+
+        The unreadable side's nodeids all read ``absent``, so ``hidden_pass`` came
+        back false and the grade was a definite ``bad`` — a rejection manufactured
+        from a run that produced no evidence. Either missing report is now
+        ``inconclusive``, and the patched suite is still not run.
+        """
+        wired["hidden_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(
+                outcomes={"tests/test_demo.py::test_fix": "passed"},
+                exit_code=0,
+                report_found=True,
+            ),
+            suite_mod.SuiteRun(exit_code=4, report_found=False),
+        )
+        result = self._grade(wired, tmp_path)
+        assert result.apply_ok is True
+        assert result.inconclusive is True
+        assert result.patch_good is False
+        assert result.label_input == "inconclusive"
+        assert "the hidden run produced no pytest report" in result.error
+        assert len(wired["runs"]) == 1, (
+            "the patched suite must not run for a grading that is never returned"
+        )
+
+    def test_a_missing_patched_report_is_inconclusive_never_no_regressions(
+        self, wired, tmp_path
+    ):
+        """Item E3: the mirror guard on the patched side.
+
+        A patched run that wrote no report leaves ``stable_failures`` empty, so
+        ``regressions == []`` and ``patch_good = hidden_pass`` — a FALSE APPROVAL
+        read from absent evidence. The hidden pair is readable here, so this
+        exercises the second guard alone, and never "no regressions".
+        """
+        wired["patched_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(exit_code=4, report_found=False),
+            suite_mod.SuiteRun(exit_code=4, report_found=False),
+        )
+        result = self._grade(wired, tmp_path)
+        assert result.apply_ok is True
+        assert result.inconclusive is True
+        assert result.patch_good is False
+        assert result.label_input == "inconclusive"
+        assert "the patched run produced no pytest report" in result.error
+        assert len(wired["runs"]) == 2, (
+            "the hidden pair was readable, so the patched run still had to be attempted"
+        )
+
     def test_the_inconclusive_state_survives_its_recorded_round_trip(self):
         """Item B4: a cached ``oracle.json`` re-read must not relabel it ``bad``."""
         result = oracle_mod.OracleResult(

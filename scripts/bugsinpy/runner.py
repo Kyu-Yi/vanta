@@ -4127,9 +4127,7 @@ def render_digest(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _spend_report(
-    batch_dir: Path, records: Sequence[dict[str, Any]]
-) -> Optional[dict[str, Any]]:
+def _spend_report(batch_dir: Path) -> Optional[dict[str, Any]]:
     """G1 — each admission's reservation and the batch's final overshoot.
 
     ``None`` when the batch ran under no cap (no :data:`SPEND_LOG_NAME`), so an
@@ -4140,6 +4138,15 @@ def _spend_report(
     recorded, rather than stored by the gate: a batch is resumed across
     invocations, and the money that overshot the cap is in the rows, not in the
     memory of whichever process admitted the last job.
+
+    [VANTA-WHY] H4. This is the ONE place a superseded row must still be counted.
+    Everywhere else in the harness the "current" rows are ``effective_records`` —
+    last row per key, minus anything a later row supersedes — so a number computed
+    twice does not double-count a re-run. Spend is not that number: the money was
+    really paid, once for the superseded row and once for its replacement, and the
+    gate that stopped the batch counted both. Summing ``effective_records`` here
+    would report less than the budget actually consumed and hide the overshoot the
+    cap exists to expose. Do not "fix" this back to the effective set.
 
     The rows that recorded no cost are *unknown*, not zero (H5): they are counted
     and reported, because a batch whose spend rests on rows with no ``cost_usd``
@@ -4154,7 +4161,7 @@ def _spend_report(
     cap = log.get("cap_usd")
     if not isinstance(cap, (int, float)) or isinstance(cap, bool):
         return None
-    known, unknown = _recorded_costs(records)
+    known, unknown = _recorded_costs(Manifest(batch_dir).records())
     spent = sum(known)
     return {
         "cap_usd": float(cap),
@@ -4180,7 +4187,7 @@ def write_batch_report(
     # G1 — the spend block, when the batch ran under a cap. A third view of the
     # same evidence: the admissions the gate logged, plus the overshoot the rows
     # and the cap imply.
-    spend = _spend_report(batch_dir, records)
+    spend = _spend_report(batch_dir)
     if spend is not None:
         payload["spend"] = spend
     (batch_dir / "run_digest.json").write_text(

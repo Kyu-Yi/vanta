@@ -25685,6 +25685,42 @@ class TestQueue:
         )["schema"] == 1
 
     # -- H4/H5 — what the spend report counts ------------------------------
+    def test_spend_reporting_counts_every_charged_row_superseded_included(
+        self, tmp_path, monkeypatch
+    ):
+        """H4 — a superseded row was really paid for, so the report must count it.
+
+        CodeRabbit's case: a $0.60 run replaced by another $0.60 run against a $1.00
+        cap. Every other reader drops the superseded row, which is right for a
+        metric computed twice; spend is not that number, and reporting $0.60 here
+        would hide the $0.20 overshoot the cap exists to expose.
+        """
+        batch_dir = tmp_path / "batch"
+        preps, entries, split, _calls = self._prepare(monkeypatch, tmp_path, count=1, cost_usd=0.6)
+        self._run(preps, entries, split, batch_dir, jobs=1, max_spend_usd=1.0)
+
+        manifest = manifest_mod.Manifest(batch_dir)
+        rows = manifest.records()
+        assert len(rows) == 1
+        first = dict(rows[0], session_id="s-first")
+        second = dict(rows[0], session_id="s-second", supersedes={"session_id": "s-first"})
+        manifest.path.write_text(
+            "\n".join(json.dumps(row) for row in (first, second)) + "\n", encoding="utf-8"
+        )
+
+        effective = manifest.effective_records()
+        assert [row["session_id"] for row in effective] == ["s-second"], (
+            "every other reader keeps only the replacement"
+        )
+        _labels, payload = runner_mod.write_batch_report(batch_dir, effective)
+        spend = payload["spend"]
+        assert spend["spent_usd"] == 1.2, "both charged rows are counted"
+        assert spend["overshoot_usd"] == 0.2, "and the cap they crossed is visible"
+        assert spend["unknown_cost_rows"] == 0
+        assert runner_mod._spent_so_far(manifest) == 1.2, (
+            "the report agrees with what the gate counted"
+        )
+
     def test_a_row_without_a_cost_is_unknown_and_not_zero(self, tmp_path):
         """H5 — an absent `cost_usd` is a hole; a recorded `0.0` is a measurement."""
         batch_dir = tmp_path / "batch"

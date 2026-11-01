@@ -481,6 +481,11 @@ class Tally:
     did_not_compile: int = 0
     graded: int = 0
     equivalent: int = 0
+    inconclusive: int = 0
+    """Graded mutants whose grading was unreadable (item B4): the patch applied
+    but its hidden run wrote no pytest report, so it is neither a definite bad
+    mutant nor an equivalent one. Dropped from the pool and counted here, so the
+    exclusion is visible rather than silent."""
     selected: int = 0
     cap_hit: bool = False
 
@@ -504,6 +509,14 @@ def select(
     Both the preflight and the grader are injected so the whole rule is executable
     without a VM (a stubbed preflight shows a mutant that does not compile never
     reaches the grader, and that an equivalent mutant is dropped rather than kept).
+
+    [VANTA-WHY] Only a **definite bad** mutant enters the pool (item B4). A
+    mutant whose patch applied but whose grading was *unreadable* — the hidden run
+    wrote no pytest report at all — used to be appended here as a known-bad patch,
+    which would score every review row against a patch the oracle never actually
+    judged. That state is ``inconclusive``: it is dropped and counted separately,
+    exactly as an equivalent mutant is, because neither is a patch a reviewer can
+    be credited for finding.
     """
     tally = Tally(per_operator=dict(candidates.per_operator))
     ordered = sorted(candidates.mutants, key=lambda mutant: (mutant.priority, mutant.sha256))
@@ -524,6 +537,11 @@ def select(
         if result.patch_good:
             # Still a real fix: dropped as equivalent, never assumed bad.
             tally.equivalent += 1
+            continue
+        if result.label_input == "inconclusive":
+            # Item B4: applied but unreadable — not a definite bad mutant, so it
+            # never enters the pool. Counted so the exclusion is not silent.
+            tally.inconclusive += 1
             continue
         kept.append((mutant, result))
         if len(kept) >= max_mutants:
@@ -949,7 +967,8 @@ def render_pool_line(prep: BugPrep, result: PoolResult) -> str:
     return (
         f"{prep.key}: generated {generated} · did-not-apply {tally.did_not_apply} · "
         f"did-not-compile {tally.did_not_compile} · graded {tally.graded} · "
-        f"equivalent {tally.equivalent} · selected {tally.selected} · "
+        f"equivalent {tally.equivalent} · inconclusive {tally.inconclusive} · "
+        f"selected {tally.selected} · "
         f"cap-hit {'true' if tally.cap_hit else 'false'} · {result.path}"
     )
 

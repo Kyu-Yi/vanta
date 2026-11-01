@@ -903,6 +903,7 @@ def oracle_from_dict(payload: dict[str, Any]) -> oracle_mod.OracleResult:
         patch_good=bool(payload.get("patch_good", False)),
         oracle_secs=float(payload.get("oracle_secs") or 0.0),
         error=str(payload.get("error") or ""),
+        inconclusive=bool(payload.get("inconclusive", False)),
     )
     return result
 

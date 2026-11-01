@@ -19805,6 +19805,38 @@ class TestOracleGrade:
         assert result.hidden_pass is False
         assert "no pytest report" in result.error
 
+    def test_a_hidden_run_without_a_report_is_inconclusive_not_bad(self, wired, tmp_path):
+        """Item B4: applied but unreadable is a third state, never a definite bad.
+
+        [VANTA-WHY] The old flow set ``error`` and carried on to ``score``, so the
+        grading read ``bad`` and (in the mutant pool) a patch the oracle never judged
+        was pooled as known-bad. It must be ``inconclusive`` — and the patched suite
+        must not even run, because its result can never be returned.
+        """
+        wired["hidden_pair"] = suite_mod.compare_runs(
+            suite_mod.SuiteRun(exit_code=4, report_found=False),
+            suite_mod.SuiteRun(exit_code=4, report_found=False),
+        )
+        result = self._grade(wired, tmp_path)
+        assert result.apply_ok is True
+        assert result.inconclusive is True
+        assert result.patch_good is False
+        assert result.label_input == "inconclusive"
+        assert "no pytest report" in result.error
+        assert len(wired["runs"]) == 1, (
+            "the patched suite must not run for a grading that is never returned"
+        )
+        assert result.as_dict()["inconclusive"] is True
+
+    def test_the_inconclusive_state_survives_its_recorded_round_trip(self):
+        """Item B4: a cached ``oracle.json`` re-read must not relabel it ``bad``."""
+        result = oracle_mod.OracleResult(
+            apply_ok=True, inconclusive=True, error="the hidden run produced no report"
+        )
+        back = runner_mod.oracle_from_dict(result.as_dict())
+        assert back.inconclusive is True
+        assert back.label_input == "inconclusive"
+
     def test_oracle_json_has_the_documented_keys(self, wired, tmp_path):
         result = self._grade(wired, tmp_path)
         path = oracle_mod.save(tmp_path / "sessions" / "sess1" / "oracle.json", result)
@@ -25083,6 +25115,15 @@ def _grade_good(mutant) -> oracle_mod.OracleResult:
     return oracle_mod.OracleResult(apply_ok=True, hidden_pass=True, patch_good=True)
 
 
+def _grade_inconclusive(mutant) -> oracle_mod.OracleResult:
+    """Item B4: the patch applied but the hidden run wrote no report at all."""
+    return oracle_mod.OracleResult(
+        apply_ok=True,
+        inconclusive=True,
+        error="the hidden run produced no pytest report at all (exit 4/4)",
+    )
+
+
 def _mutant(text: str | None = None) -> mutants_mod.Mutant:
     text = text if text is not None else _one_line_diff("a", "b")
     return mutants_mod.Mutant(
@@ -25326,6 +25367,34 @@ class TestMutantSelection:
         assert [mutant.sha256 for mutant, _ in selected.entries] == [
             mutant.sha256 for mutant in ordered[1:4]
         ]
+
+    def test_a_mutant_whose_grading_is_unreadable_is_dropped_and_counted(self):
+        """Item B4: applied but unreadable is not a definite bad mutant.
+
+        [VANTA-WHY] The blind mutant used to be kept as a known-bad patch, which
+        would score every review row against a patch the oracle never judged. It is
+        dropped and counted separately, exactly as an equivalent mutant is.
+        """
+        candidates = mutants_mod.generate(_SRC)
+        ordered = self._ordered(candidates)
+        blind = ordered[0].sha256
+
+        def grade(mutant):
+            return (
+                _grade_inconclusive(mutant)
+                if mutant.sha256 == blind
+                else _grade_bad(mutant)
+            )
+
+        selected = mutants_mod.select(
+            candidates=candidates, preflight_fn=_accept_all, grade_fn=grade
+        )
+        assert selected.tally.inconclusive == 1
+        assert blind not in [mutant.sha256 for mutant, _ in selected.entries]
+        assert [mutant.sha256 for mutant, _ in selected.entries] == [
+            mutant.sha256 for mutant in ordered[1:4]
+        ]
+        assert all(result.label_input == "bad" for _, result in selected.entries)
 
     def test_a_mutant_that_does_not_apply_is_counted_and_never_graded(self):
         candidates = mutants_mod.generate(_SRC)

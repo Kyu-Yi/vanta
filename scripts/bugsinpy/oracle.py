@@ -35,6 +35,10 @@ un-upstreamed patch that will not apply is unattributable — it is a fact about
 artifact, not about Vanta, and both a `true_reject` and a `false_reject` would be
 inventions.
 
+An *applied* patch whose hidden run produced no pytest report at all is
+``inconclusive`` (item B4): the grading is unreadable, so it is a third state —
+neither a pass nor a definite failure — and is never pooled as a known-bad patch.
+
 Everything third-party still runs in Shuru, through ``suite.py``: this module only
 decides *which* commands run and how their reports compare.
 """
@@ -72,12 +76,29 @@ class OracleResult:
     patch_good: bool = False
     oracle_secs: float = 0.0
     error: str = ""
+    inconclusive: bool = False
+    """The patch applied but the grading is unreadable (item B4).
+
+    Set when the hidden run produced no pytest report at all: the patch could be
+    applied, so this is not the ``unobservable`` censor, but there is no evidence
+    that it failed either. It is a third state — neither a pass nor a definite
+    failure — and must never be pooled as a known-bad patch.
+    """
 
     @property
     def label_input(self) -> str:
-        """What §5.3's table switches on: ``patch_good``, or the censor."""
+        """What §5.3's table switches on: ``patch_good``, the censor, or the
+        inconclusive grading.
+
+        ``apply_ok = false`` is the censor; an applied patch whose hidden run was
+        unreadable is ``inconclusive`` (item B4), not ``bad`` — reading it as
+        ``bad`` would invent a ``true_reject`` out of a run that produced no
+        evidence either way.
+        """
         if not self.apply_ok:
             return "unobservable"
+        if self.inconclusive:
+            return "inconclusive"
         return "good" if self.patch_good else "bad"
 
     def as_dict(self) -> dict[str, Any]:
@@ -93,6 +114,7 @@ class OracleResult:
             "patch_good": self.patch_good,
             "oracle_secs": round(self.oracle_secs, 3),
             "error": self.error,
+            "inconclusive": self.inconclusive,
         }
 
 
@@ -276,6 +298,26 @@ def grade(
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
     )
+    # [VANTA-WHY] Item B4. The patch applied, but if the hidden run wrote no
+    # pytest report at all there is nothing to compare against: every hidden
+    # nodeid would read ``absent``, ``score`` would say ``hidden_pass = false``
+    # and ``patch_good = false``, and the grading would read as a *definite*
+    # ``bad`` — inventing a ``true_reject`` out of a run that produced no
+    # evidence either way, and (in the mutant pool) putting a patch no reviewer
+    # can be credited for finding into a "known-bad" pool. This is a third
+    # state, ``inconclusive``: the patch is not credited and not blamed. The
+    # check runs before the patched suite so an unreadable hidden run does not
+    # spend a second full suite for a result that is never returned.
+    if not (hidden_pair.first.report_found or hidden_pair.second.report_found):
+        result.inconclusive = True
+        result.error = (
+            "the hidden run produced no pytest report at all (exit "
+            f"{hidden_pair.first.exit_code}/{hidden_pair.second.exit_code}); "
+            f"tail: {hidden_pair.first.stdout_tail[-600:]!r}"
+        )
+        result.oracle_secs = time.monotonic() - started
+        return result
+
     patched_pair = suite_mod.run_suite_twice(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
@@ -288,13 +330,6 @@ def grade(
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
     )
-
-    if not (hidden_pair.first.report_found or hidden_pair.second.report_found):
-        result.error = (
-            "the hidden run produced no pytest report at all (exit "
-            f"{hidden_pair.first.exit_code}/{hidden_pair.second.exit_code}); "
-            f"tail: {hidden_pair.first.stdout_tail[-600:]!r}"
-        )
 
     baseline = (
         prep.native_failure_baseline if baseline_failures is None else list(baseline_failures)

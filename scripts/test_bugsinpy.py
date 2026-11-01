@@ -24811,6 +24811,27 @@ class TestQueue:
         assert seen == [False], "a second holder must be excluded while the first holds it"
         assert manifest_mod.FileLock(target).acquire(blocking=False)
 
+    def test_the_lock_context_manager_refuses_when_it_could_not_acquire(
+        self, tmp_path, monkeypatch
+    ):
+        """C2 — ``with lock:`` must not silently run the critical section unlocked.
+
+        ``acquire`` returns ``False`` when ``flock`` cannot take the lock; the
+        context manager used to drop that answer and run the covered reads/writes
+        anyway, which is the lost update the lock exists to prevent."""
+        monkeypatch.setattr(
+            manifest_mod.FileLock, "acquire", lambda self, blocking=True: False
+        )
+        with pytest.raises(manifest_mod.BatchLocked, match="another queue owns"):
+            with manifest_mod.FileLock(
+                tmp_path / "x.lock", held_message="another queue owns this directory"
+            ):
+                pass  # pragma: no cover - must not be reached
+        # With no message it still refuses, naming the lock path it could not take.
+        with pytest.raises(manifest_mod.BatchLocked, match="x.lock"):
+            with manifest_mod.FileLock(tmp_path / "x.lock"):
+                pass  # pragma: no cover - must not be reached
+
     def test_concurrent_cursor_updates_keep_every_key(self, tmp_path):
         """The cursor is read-modify-write: without the lock, two marks that overlap
         each drop the other's key and a resume re-runs a job that is already done.

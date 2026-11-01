@@ -82,7 +82,15 @@ class FileLock:
             self._fd = None
 
     def __enter__(self) -> "FileLock":
-        self.acquire()
+        # [VANTA-WHY] C2 — a lock that could not be taken must not be skipped. The
+        # caller reads ``with self.lock:`` as "I hold the directory", and running the
+        # covered read-modify-write unlocked is exactly the lost-update this class
+        # exists to prevent; so a failed ``acquire`` is a refusal here, not a no-op.
+        if not self.acquire():
+            raise BatchLocked(
+                self.held_message
+                or f"the lock {self.path} could not be taken; refusing to proceed without it"
+            )
         return self
 
     def __exit__(self, *exc: Any) -> None:

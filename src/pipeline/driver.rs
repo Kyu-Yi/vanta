@@ -8601,26 +8601,39 @@ mod tests {
     // default) the value would make every suite time out sooner than the default, which
     // is the opposite of what the flag exists for; refused where the cap is resolved,
     // naming the flag and the floor.
+    //
+    // [VANTA-WHY] M3 item F6 — every expectation is DERIVED from the floor the run
+    // actually resolves, so this passes whatever `VANTA_TEST_TIMEOUT_SECS` is set to.
+    // It used to assert the floor was 120 and hard-code 120/119, which would fail —
+    // for no reason about the code — on any machine that raised the variable.
     #[test]
     fn a_native_timeout_below_the_effective_cap_is_refused() {
         let floor = crate::pipeline::harness::test_timeout_secs();
+        assert!(floor > 0, "the effective cap is a positive number of seconds");
+        // Absent keeps the floor; the floor itself and anything above it are accepted.
+        assert_eq!(resolve_native_timeout_secs(None).unwrap(), floor);
+        assert_eq!(resolve_native_timeout_secs(Some(floor)).unwrap(), floor);
         assert_eq!(
-            floor, 120,
-            "these assertions are written against the default cap"
+            resolve_native_timeout_secs(Some(floor + 1)).unwrap(),
+            floor + 1
         );
-        // Absent keeps the default; the floor itself and anything above it are accepted.
-        assert_eq!(resolve_native_timeout_secs(None).unwrap(), 120);
-        assert_eq!(resolve_native_timeout_secs(Some(120)).unwrap(), 120);
-        assert_eq!(resolve_native_timeout_secs(Some(1461)).unwrap(), 1461);
+        assert_eq!(
+            resolve_native_timeout_secs(Some(floor * 4 + 1)).unwrap(),
+            floor * 4 + 1
+        );
         // Below the floor is refused, naming the flag and both numbers.
-        for bad in [30_u64, 119] {
+        let mut below = vec![floor - 1, 1];
+        if floor > 30 {
+            below.push(30);
+        }
+        for bad in below {
             let error = resolve_native_timeout_secs(Some(bad))
                 .expect_err("a cap below the effective cap must be refused");
             assert!(
                 error.contains("CONFIG_ERROR")
                     && error.contains("--native-timeout-secs")
                     && error.contains(&bad.to_string())
-                    && error.contains("120"),
+                    && error.contains(&floor.to_string()),
                 "got: {error}"
             );
         }

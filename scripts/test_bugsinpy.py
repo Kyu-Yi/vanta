@@ -5899,6 +5899,40 @@ class TestNativeTimeoutDerivation:
         )
         assert suite_mod.native_timeout_secs(None, floor=1800) == 1800
 
+    def test_the_floor_is_the_environments_own_cap(self):
+        """F4 — the floor is the run's EFFECTIVE ``VANTA_TEST_TIMEOUT_SECS``, not 120.
+
+        [VANTA-WHY] The binary resolves its own floor from the same variable
+        (``harness::test_timeout_secs()``), so the harness must derive the cap from the
+        environment the child is given. Measuring against the fixed 120 while that
+        variable is raised sends a ``--native-timeout-secs`` the binary refuses before
+        it runs, and the job ends ``infra_failure`` with no ``run.summary``. The parse
+        mirrors the Rust ``u64`` parse: an optional leading ``+`` and digits, positive
+        only.
+        """
+        assert suite_mod.native_timeout_floor({}) == 120
+        assert suite_mod.native_timeout_floor({suite_mod.NATIVE_TIMEOUT_ENV: "300"}) == 300
+        assert suite_mod.native_timeout_floor({suite_mod.NATIVE_TIMEOUT_ENV: "+300"}) == 300
+        for bad in ("0", "-5", "300.5", "abc", "", " ", "3_00"):
+            assert (
+                suite_mod.native_timeout_floor({suite_mod.NATIVE_TIMEOUT_ENV: bad}) == 120
+            ), (
+                f"{bad!r} is not a value the Rust u64 parse accepts, so both sides "
+                "must read the historical 120 s"
+            )
+
+    def test_a_raised_environment_raises_a_short_suites_cap(self):
+        """F4 — the finding's arithmetic against the shared rule."""
+        env = {suite_mod.NATIVE_TIMEOUT_ENV: "300"}
+        floor = suite_mod.native_timeout_floor(env)
+        assert suite_mod.native_timeout_secs(None, floor=floor) == 300, (
+            "an unmeasured suite used to be sent 120 s and the binary refused it"
+        )
+        assert suite_mod.native_timeout_secs(10.0, floor=floor) == 300
+        assert suite_mod.native_timeout_secs(487.0, floor=floor) == 1461, (
+            "3 × the measurement still wins when it is the larger number"
+        )
+
     def test_the_slower_run_of_a_pair_sizes_the_cap(self):
         fast = suite_mod.SuiteRun(outcomes={}, exit_code=0, report_found=True, secs=90.0)
         slow = suite_mod.SuiteRun(outcomes={}, exit_code=0, report_found=True, secs=487.0)
@@ -20854,7 +20888,7 @@ class TestInvokeVantaCarriesTheNativeTimeout:
     """
 
     @staticmethod
-    def _run(tmp_path, monkeypatch, **over):
+    def _run(tmp_path, monkeypatch, env=None, **over):
         import types
 
         monkeypatch.setattr(
@@ -20872,7 +20906,7 @@ class TestInvokeVantaCarriesTheNativeTimeout:
             vanta_bin=tmp_path / "vanta_m3",
             prep=bug_prep,
             issue_path=tmp_path / "issue.md",
-            env={"PATH": "/usr/bin"},
+            env={"PATH": "/usr/bin"} if env is None else env,
             log_path=log_path,
             max_attempts=2,
         )
@@ -20895,6 +20929,53 @@ class TestInvokeVantaCarriesTheNativeTimeout:
             "a pre-D1 or measure-only row keeps the old 120 s, never a cap derived "
             "from a missing number"
         )
+
+    def test_a_raised_environment_timeout_raises_the_flag(self, tmp_path, monkeypatch):
+        """F4 — the finding's case: ``VANTA_TEST_TIMEOUT_SECS=300``, no measurement.
+
+        [VANTA-WHY] The old fixed 120 s floor emitted ``--native-timeout-secs 120``,
+        which ``driver.rs::resolve_native_timeout_secs`` refuses as below its own
+        effective cap of 300 s: the binary exited before running, the row landed as
+        ``infra_failure`` with no ``run.summary``, and every affected job was blamed for
+        a discrepancy between two readings of one number.
+        """
+        env = {"PATH": "/usr/bin", suite_mod.NATIVE_TIMEOUT_ENV: "300"}
+        text = self._run(tmp_path, monkeypatch, env=env)
+        assert "--native-timeout-secs 300" in text, (
+            "an unmeasured suite must be sent the environment's own cap, not 120"
+        )
+        measured = self._run(tmp_path, monkeypatch, env=env, native_secs=487.0)
+        assert "--native-timeout-secs 1461" in measured, (
+            "3 × the measurement is still the larger number and still wins"
+        )
+
+    def test_the_cap_is_never_below_the_binarys_own_floor(self, tmp_path, monkeypatch):
+        """F4 — the flag always clears the floor the binary enforces for the SAME env.
+
+        The floor is stated independently here (the Rust rule: a positive integer, else
+        120) rather than read back from the helper under test, so this fails if the two
+        sides ever disagree about what ``VANTA_TEST_TIMEOUT_SECS`` means.
+        """
+        for raw, expected in (
+            (None, 120),
+            ("300", 300),
+            ("+300", 300),
+            ("60", 60),
+            ("0", 120),
+            ("-5", 120),
+            ("nope", 120),
+        ):
+            env = {"PATH": "/usr/bin"}
+            if raw is not None:
+                env[suite_mod.NATIVE_TIMEOUT_ENV] = raw
+            for native_secs in (None, 1.0, 487.0):
+                text = self._run(tmp_path, monkeypatch, env=env, native_secs=native_secs)
+                cap = int(re.search(r"--native-timeout-secs (\d+)", text).group(1))
+                assert cap >= expected, (
+                    f"VANTA_TEST_TIMEOUT_SECS={raw!r}, native_secs={native_secs}: the "
+                    f"runner emitted {cap} s but the binary's floor is {expected} s — "
+                    "the flag would be refused and the job would end infra_failure"
+                )
 
 
 class TestNormalizedDiff:

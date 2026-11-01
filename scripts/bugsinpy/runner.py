@@ -1930,8 +1930,14 @@ def invoke_vanta(
     # `max(120, 3 × measured)`; `native_secs` is `None` on a row prepared before D1 (or
     # a measure-only row), which holds the old 120 s. The cap the run actually used is
     # recorded on the row from `run.summary`.
+    # M3 item F4 — the floor is the run's EFFECTIVE environment's own cap, not the fixed
+    # 120: `driver.rs::resolve_native_timeout_secs` refuses any `--native-timeout-secs`
+    # below `harness::test_timeout_secs()` for the SAME child environment (`env` here,
+    # which already carries item 19's frozen `[env]`). Measuring against the fixed 120
+    # while the operator raised `VANTA_TEST_TIMEOUT_SECS` sent a value the binary
+    # refused before it ran, so the job ended `infra_failure` with no `run.summary`.
     native_cap = suite_mod.native_timeout_secs(
-        prep.native_secs, floor=suite_mod.NATIVE_TIMEOUT_FLOOR_SECS
+        prep.native_secs, floor=suite_mod.native_timeout_floor(env)
     )
     argv += ["--native-timeout-secs", str(native_cap)]
     if candidate is not None:

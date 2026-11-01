@@ -191,7 +191,49 @@ NATIVE_TIMEOUT_FLOOR_SECS = 120
 that default is what D1 exists to replace with a per-bug number. Keeping it as the
 FLOOR means the rule can only ever raise a cap: a bug whose suite is fast keeps the
 old 120 s, and one whose suite cannot finish in 120 s gets room to finish.
+
+It is the FALLBACK for :func:`native_timeout_floor`, not the floor itself (M3 item
+F4): a run whose environment raises ``VANTA_TEST_TIMEOUT_SECS`` raises the floor with
+it, so the two sides of the process boundary read one number.
 """
+
+NATIVE_TIMEOUT_ENV = "VANTA_TEST_TIMEOUT_SECS"
+"""The variable the Rust binary's own cap floor is read from.
+
+[VANTA-WHY] M3 item F4 — ``harness::test_timeout_secs()`` resolves the cap the binary
+uses (this variable, else 120 s), and ``driver.rs::resolve_native_timeout_secs``
+refuses a ``--native-timeout-secs`` below it. The harness derives the value it sends
+from prepare's measurement, so it has to measure against the SAME variable the binary
+enforces, or the flag is refused before the run starts. Named once here so the reader,
+the helper and the tests cannot drift apart.
+"""
+
+
+def native_timeout_floor(env: Mapping[str, str]) -> int:
+    """The floor a native cap may not go below, from the run's EFFECTIVE environment.
+
+    [VANTA-WHY] M3 item F4. The binary resolves ``harness::test_timeout_secs()`` from
+    the environment it is given (:data:`NATIVE_TIMEOUT_ENV`, else
+    :data:`NATIVE_TIMEOUT_FLOOR_SECS`) and refuses a ``--native-timeout-secs`` below
+    its own floor. The harness sends ``max(floor, 3 × measured)``. If it measured
+    against the fixed 120 while the operator's environment raised the binary's cap —
+    ``VANTA_TEST_TIMEOUT_SECS=300``, exported by the batch or frozen by item 19's
+    ``[env]`` — a bug whose suite is short or unmeasured sends 120, the binary refuses
+    the flag, and the job ends ``infra_failure`` with no ``run.summary``: a fault
+    invented by two readings of ONE number disagreeing. Reading the floor from the
+    environment the child actually receives (:func:`runner.vanta_env`'s result) makes
+    that impossible.
+
+    The parse mirrors the Rust ``u64`` parse exactly — an optional leading ``+`` and
+    ASCII digits only, kept only when positive — so a value one side accepts is not a
+    different value on the other. Unset, unparsable, zero and negative all fall back
+    to :data:`NATIVE_TIMEOUT_FLOOR_SECS`.
+    """
+    raw = env.get(NATIVE_TIMEOUT_ENV)
+    if raw is None or not re.fullmatch(r"\+?[0-9]+", str(raw)):
+        return NATIVE_TIMEOUT_FLOOR_SECS
+    secs = int(raw)
+    return secs if secs > 0 else NATIVE_TIMEOUT_FLOOR_SECS
 
 
 def native_timeout_secs(native_secs: Optional[float], *, floor: int) -> int:
@@ -206,11 +248,12 @@ def native_timeout_secs(native_secs: Optional[float], *, floor: int) -> int:
     margin.
 
     One rule, one helper, applied everywhere a full native suite runs — the in-session
-    gate (floor :data:`NATIVE_TIMEOUT_FLOOR_SECS`), the replay columns and the oracle
-    grading (floor 1800) — so the three can never disagree about how long a bug's suite
-    may take. ``floor`` is the caller's CURRENT cap, so the rule can only raise a cap,
-    never lower one that was already large enough; ``native_secs is None`` (a row
-    prepared before D1, or a run whose timing was lost) returns ``floor`` unchanged.
+    gate (floor :func:`native_timeout_floor`, which is the environment's own cap), the
+    replay columns and the oracle grading (floor 1800) — so the three can never disagree
+    about how long a bug's suite may take. ``floor`` is the caller's CURRENT cap, so the
+    rule can only raise a cap, never lower one that was already large enough;
+    ``native_secs is None`` (a row prepared before D1, or a run whose timing was lost)
+    returns ``floor`` unchanged.
     """
     if native_secs is None:
         return floor

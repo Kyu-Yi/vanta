@@ -25684,6 +25684,88 @@ class TestQueue:
             (batch_dir / runner_mod.SPEND_LOG_NAME).read_text(encoding="utf-8")
         )["schema"] == 1
 
+    # -- H4/H5 — what the spend report counts ------------------------------
+    def test_a_row_without_a_cost_is_unknown_and_not_zero(self, tmp_path):
+        """H5 — an absent `cost_usd` is a hole; a recorded `0.0` is a measurement."""
+        batch_dir = tmp_path / "batch"
+        manifest = manifest_mod.Manifest(batch_dir)
+        manifest.append({"key": "no-cost", "llm": {"cost_basis": "test/tier/2026-10-26"}})
+
+        assert runner_mod._row_cost({"key": "x"}) is None
+        assert runner_mod._row_cost({"key": "x", "llm": {}}) is None
+        assert runner_mod._row_cost({"key": "x", "llm": {"cost_usd": "0.5"}}) is None
+        assert runner_mod._row_cost({"key": "x", "llm": {"cost_usd": True}}) is None
+        assert runner_mod._row_cost({"key": "x", "llm": {"cost_usd": 0.0}}) == 0.0
+        assert runner_mod._spent_so_far(manifest) == 0.0
+        assert runner_mod._recorded_costs(manifest.records()) == ([], 1)
+        assert runner_mod._max_recorded_cost(manifest) is None, (
+            "no usable bound: the gate reserves the whole remaining budget"
+        )
+
+        manifest.append({"key": "zero", "llm": {"cost_usd": 0.0}})
+        assert runner_mod._recorded_costs(manifest.records()) == ([0.0], 1)
+        assert runner_mod._max_recorded_cost(manifest) == 0.0, (
+            "a recorded zero IS a bound — the local backend prices nothing"
+        )
+
+    def test_a_resumed_batch_over_costless_rows_still_runs_one_job_at_a_time(
+        self, tmp_path, monkeypatch
+    ):
+        """H5 — no bound in the rows the batch already has, so no admission on one.
+
+        The old `_row_cost` read a missing field as $0.00, which made the largest
+        recorded cost of a resumed batch $0.00 and so made every reservation $0.00: a
+        queue resumed over rows that recorded nothing admitted every worker at once
+        against a budget none of them had counted.
+        """
+        batch_dir = tmp_path / "batch"
+        quiet, quiet_entries, quiet_split, _calls = self._prepare(
+            monkeypatch, tmp_path, count=1, cost_usd=None
+        )
+        code, _ = self._run(
+            quiet, quiet_entries, quiet_split, batch_dir, jobs=1, max_spend_usd=2.0
+        )
+        assert code == 0
+        assert runner_mod._max_recorded_cost(manifest_mod.Manifest(batch_dir)) is None
+
+        first_open = threading.Event()
+        release_first = threading.Event()
+        observed: list = []
+
+        def on_call(n, job, manifest):
+            if n == 1:
+                first_open.set()
+                assert release_first.wait(timeout=10)
+
+        preps, entries, split, calls = self._prepare(
+            monkeypatch, tmp_path, count=4, cost_usd=0.5, on_call=on_call
+        )
+
+        def observe() -> None:
+            assert first_open.wait(timeout=10)
+            threading.Event().wait(0.3)
+            observed.append(len(calls))
+            release_first.set()
+
+        watcher = threading.Thread(target=observe)
+        watcher.start()
+        code2, outcomes = self._run(
+            preps, entries, split, batch_dir, jobs=4, max_spend_usd=2.0
+        )
+        watcher.join()
+
+        assert observed == [1], (
+            "a resumed batch with no recorded cost has no bound, so one job at a time"
+        )
+        assert code2 == 0
+        assert len(calls) == 3, "bug 1 was already done; bugs 2-4 are the new work"
+        assert {outcome.reason for outcome in outcomes} == {""}
+
+        effective = manifest_mod.Manifest(batch_dir).effective_records()
+        _labels, payload = runner_mod.write_batch_report(batch_dir, effective)
+        assert payload["spend"]["unknown_cost_rows"] == 1, "the report says what it could not price"
+        assert "unknown_cost_rows=1" in runner_mod.render_digest(payload)
+
     # -- the arms and seeds are a selection over the split, not a protocol --
     def test_an_arm_the_split_does_not_declare_is_refused(self, tmp_path, monkeypatch):
         preps, entries, split, calls = self._prepare(monkeypatch, tmp_path)

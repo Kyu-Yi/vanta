@@ -2881,24 +2881,61 @@ def _micro_to_usd(micro: int) -> float:
 
 
 def _spent_so_far(manifest: Manifest) -> float:
-    """§14.29 — the batch's cost to date, summed from the rows already on disk.
+    """§14.29 — the batch's *recorded* cost to date, summed from the rows on disk.
 
     Read from the manifest rather than carried in a local counter, because the
     cap is a property of the *batch*: a resumed batch must not restart the
     count, and the rows that spent the money are on disk, not in this process's
     memory. A row that priced nothing contributes ``0.0`` — that is the local
     backend, and every run before this change.
+
+    A row that recorded no cost contributes nothing either, because the recorded
+    total is the only thing this can honestly be. That is not the same as reading
+    a hole as zero: the hole is what :func:`_max_recorded_cost` answers, with the
+    cold start, and :func:`_recorded_costs` counts it for the report (H5).
     """
-    return sum(_row_cost(record) for record in manifest.records())
+    known, _unknown = _recorded_costs(manifest.records())
+    return sum(known)
 
 
-def _row_cost(record: dict[str, Any]) -> float:
-    """One row's ``llm.cost_usd``, ``None`` read as zero (see :func:`_cost`)."""
+def _row_cost(record: dict[str, Any]) -> Optional[float]:
+    """One row's ``llm.cost_usd``, or ``None`` when the row records no cost.
+
+    [VANTA-WHY] H5. ``None`` is *unknown*, and it is deliberately not zero. A row
+    with no ``cost_usd`` used to read as $0.00, which made the largest recorded
+    cost of a resumed batch $0.00 and so made every reservation $0.00: a queue
+    resumed over rows that recorded nothing would admit every worker at once
+    against a budget none of them had counted. A row that *did* price nothing —
+    the local backend, and every run before the field existed — records
+    ``cost_usd: 0.0`` and that is a measurement; an absent or non-numeric field is
+    a hole, and the gate answers a hole with the cold-start rule rather than with
+    a number it invented.
+    """
     llm = record.get("llm")
     if not isinstance(llm, dict):
-        return 0.0
+        return None
     cost = llm.get("cost_usd")
-    return float(cost) if isinstance(cost, (int, float)) else 0.0
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    return float(cost)
+
+
+def _recorded_costs(records: Iterable[dict[str, Any]]) -> tuple[list[float], int]:
+    """The costs a set of rows recorded, and how many rows recorded none (H5).
+
+    One scan for both numbers, because they are two halves of the same answer: a
+    batch that spent nothing and a batch whose rows priced nothing look identical
+    in a total, and only the count can tell them apart.
+    """
+    known: list[float] = []
+    unknown = 0
+    for record in records:
+        cost = _row_cost(record)
+        if cost is None:
+            unknown += 1
+        else:
+            known.append(cost)
+    return known, unknown
 
 
 def _record_spend_cap(
@@ -2966,13 +3003,12 @@ def _max_recorded_cost(manifest: Manifest) -> Optional[float]:
     G1 — the reservation a *known* batch uses: once one job has finished, its
     recorded cost is the best evidence of what the next job costs, so a batch
     admits jobs up to ``cap / cost`` at once instead of one at a time. ``None``
-    (no row on disk yet) is not a zero: it means the batch has no evidence at all,
-    which is why the first job reserves the whole remaining budget.
+    is not a zero: it means the batch has no bound at all, which is two cases and
+    the same answer for both — no row on disk yet, or rows that recorded no cost
+    (H5). Either way the first job reserves the whole remaining budget.
     """
-    records = manifest.records()
-    if not records:
-        return None
-    return max(_row_cost(record) for record in records)
+    known, _unknown = _recorded_costs(manifest.records())
+    return max(known) if known else None
 
 
 class SpendGate:
@@ -4079,9 +4115,13 @@ def render_digest(payload: dict[str, Any]) -> str:
     # batch (or from before this item) has no `spend` and prints no line.
     spend = payload.get("spend")
     if spend:
+        # H5 — a row with no `cost_usd` is unknown, and its count is part of the
+        # line: `spent` above is only the money the rows could name, and how much
+        # of the batch it does NOT account for is a fact the reader needs.
         lines.append(
             f"spend: cap=${spend['cap_usd']:.6f} spent=${spend['spent_usd']:.6f} "
             f"overshoot=${spend['overshoot_usd']:.6f} "
+            f"unknown_cost_rows={spend.get('unknown_cost_rows', 0)} "
             f"admissions={len(spend.get('admissions') or [])}"
         )
     return "\n".join(lines)
@@ -4100,6 +4140,10 @@ def _spend_report(
     recorded, rather than stored by the gate: a batch is resumed across
     invocations, and the money that overshot the cap is in the rows, not in the
     memory of whichever process admitted the last job.
+
+    The rows that recorded no cost are *unknown*, not zero (H5): they are counted
+    and reported, because a batch whose spend rests on rows with no ``cost_usd``
+    is a batch whose report cannot be turned into dollars.
     """
     try:
         log = json.loads((batch_dir / SPEND_LOG_NAME).read_text(encoding="utf-8"))
@@ -4110,11 +4154,13 @@ def _spend_report(
     cap = log.get("cap_usd")
     if not isinstance(cap, (int, float)) or isinstance(cap, bool):
         return None
-    spent = sum(_row_cost(record) for record in records)
+    known, unknown = _recorded_costs(records)
+    spent = sum(known)
     return {
         "cap_usd": float(cap),
         "spent_usd": round(spent, 6),
         "overshoot_usd": round(max(0.0, spent - float(cap)), 6),
+        "unknown_cost_rows": unknown,
         "admissions": list(log.get("admissions") or []),
     }
 

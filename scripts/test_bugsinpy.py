@@ -25855,6 +25855,47 @@ class TestQueue:
         )
         assert "is not a spend log" in capsys.readouterr().out
 
+    # -- H3 — the stop file can appear while a worker waits ----------------
+    def test_a_stop_file_that_appears_while_a_worker_waits_stops_it(
+        self, tmp_path, monkeypatch
+    ):
+        """H3 — the file can appear during the wait for budget, so it is re-checked.
+
+        The stop was only tested before the claim, so a worker that had been asleep
+        in `acquire` woke on another worker's release and started a new billed job —
+        exactly the job the file was created to prevent.
+        """
+        batch_dir = tmp_path / "batch"
+        first_open = threading.Event()
+        release_first = threading.Event()
+
+        def on_call(n, job, manifest):
+            if n == 1:
+                first_open.set()
+                assert release_first.wait(timeout=10)
+
+        preps, entries, split, calls = self._prepare(
+            monkeypatch, tmp_path, count=2, cost_usd=0.5, on_call=on_call
+        )
+
+        def stop_while_the_first_job_runs() -> None:
+            assert first_open.wait(timeout=10)
+            runner_mod.queue_stop_path(batch_dir).write_text("", encoding="utf-8")
+            release_first.set()
+
+        watcher = threading.Thread(target=stop_while_the_first_job_runs)
+        watcher.start()
+        code, outcomes = self._run(preps, entries, split, batch_dir, jobs=2, max_spend_usd=2.0)
+        watcher.join()
+
+        assert len(calls) == 1, [job.label() for job in calls]
+        assert code == 1
+        assert sorted(outcome.reason for outcome in outcomes) == ["", "stop_file"]
+        payload = json.loads((batch_dir / runner_mod.SPEND_LOG_NAME).read_text(encoding="utf-8"))
+        assert payload["inflight_usd"] == 0.0, (
+            "the stopped worker released the reservation it had just been given"
+        )
+
     # -- the arms and seeds are a selection over the split, not a protocol --
     def test_an_arm_the_split_does_not_declare_is_refused(self, tmp_path, monkeypatch):
         preps, entries, split, calls = self._prepare(monkeypatch, tmp_path)

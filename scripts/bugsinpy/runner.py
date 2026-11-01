@@ -3395,6 +3395,23 @@ def run_batch(
                 )
 
     results: list[WaveResult] = []
+
+    def stopped() -> tuple[int, list[WaveResult]]:
+        """Refuse to claim another job, and tell the reader why (item 13, H3).
+
+        One body for both check sites: before the claim, and — H3 — after a worker
+        has come back from waiting for budget, because the file can appear while
+        that worker sleeps and a job started after it is exactly what the file was
+        created to prevent.
+        """
+        print(
+            f"\n=== stop file present: {stop_file} — no job after "
+            f"this point was claimed ===\n"
+            "  delete it to resume from this key.",
+            flush=True,
+        )
+        return 1, results
+
     for wave in waves:
         wave_preps = [p for p in preps if p.wave == wave]
         if not wave_preps:
@@ -3474,13 +3491,7 @@ def run_batch(
                         # never leaves a half-written row or a cursor parked at
                         # `running`. Deleting the file resumes from this key.
                         if stop_file is not None and Path(stop_file).exists():
-                            print(
-                                f"\n=== stop file present: {stop_file} — no job after "
-                                f"this point was claimed ===\n"
-                                "  delete it to resume from this key.",
-                                flush=True,
-                            )
-                            return 1, results
+                            return stopped()
                         # §14.29 — the spend cap is checked BEFORE the job starts,
                         # never during one: the check is between rows, so the row
                         # that crossed the cap is already complete and the rows
@@ -3506,6 +3517,14 @@ def run_batch(
                                     job,
                                 )
                                 return 1, results
+                            # H3 — the stop file can appear while this worker is
+                            # asleep in `acquire`. A job started after it exists is
+                            # exactly what the file was created to prevent, so
+                            # re-check it here and hand the reservation back without
+                            # starting the job.
+                            if stop_file is not None and Path(stop_file).exists():
+                                spend_gate.release(reservation)
+                                return stopped()
                         # Item 14 — before the row, not after it. Asked here rather
                         # than inside `run_job` because the refusal has to leave no
                         # trace at all: `run_job`'s first act is to mark the key

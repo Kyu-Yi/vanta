@@ -388,6 +388,27 @@ pub fn apply_patch_detailed(
         let _ = fs::write(&patch_path, patch_text);
         let patch_arg = patch_path.to_string_lossy().to_string();
 
+        // [VANTA-WHY] C8 — `git apply --3way` implies `--index`, and `--index`
+        // needs a repository whose index holds the paths the patch touches. In a
+        // bare temp dir it refused with `'--3way' outside a repository` (exit 128)
+        // on every patch, so strategy 3 was dead and that environment sentence —
+        // about our temp dir, not about the patch — was carried back as the
+        // strategy's "reason" in the Creator's feedback. Make the dir a repository
+        // and index the file we just wrote, exactly as `apply_patch_strict` does;
+        // both commands are best-effort, so a failure leaves `git apply` to report
+        // its own reason. `--3way` then runs: it falls back to a plain application
+        // where the patch carries no usable preimage blob, and reaches the real
+        // three-way merge whenever the patch's `index` line names a blob this
+        // repository holds.
+        let git_quiet = |args: &[&str]| {
+            let _ = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output();
+        };
+        git_quiet(&["init", "-q"]);
+        git_quiet(&["add", "-A"]);
+
         // [VANTA-WHY] Item R — return the tool's OWN message on failure instead
         // of `None`, so the reason survives into the Creator's feedback.
         let via_git = |extra: &[&str]| -> Result<String, String> {
@@ -1336,6 +1357,48 @@ def subtract(a, b):
         assert!(
             msg.starts_with("patch result is not valid Python:"),
             "the interpreter message must lead: {msg}"
+        );
+    }
+
+    // [VANTA-WHY] C8 — strategy 3 (`git apply --3way`) ran in a bare temp dir, so
+    // it refused with `'--3way' outside a repository` (exit 128) on every patch,
+    // and that environment sentence — about our temp dir, not about the patch —
+    // was carried into the Creator's feedback as the strategy's reason. With the
+    // workspace now a repository holding the file in its index, the strategy runs
+    // and reports the patch's own failure instead.
+    #[test]
+    fn the_3way_strategy_runs_inside_a_repository_not_outside_one() {
+        // A hunk-only diff whose anchor is not in the file: every strategy refuses
+        // it, so the cascade fails and carries what strategy 3 said.
+        let original = "def f():\n    return 1\n";
+        let patch = "\
+--- a/src/pkg/mod.py
++++ b/src/pkg/mod.py
+@@ -10,2 +10,2 @@
+ def other():
+-    return 2
++    return 3
+";
+        let (_text, changed, failure) = apply_patch_detailed(original, patch, "src/pkg/mod.py");
+        assert!(!changed, "the patch must not be placed");
+        let ApplyFailure::DidNotApply { strategies, .. } = failure.expect("must fail") else {
+            panic!("expected DidNotApply");
+        };
+        let three_way = strategies
+            .iter()
+            .find(|s| s.strategy == "git apply --3way")
+            .expect("strategy 3 must be among the tried strategies");
+        assert!(
+            !three_way.reason.contains("outside a repository"),
+            "strategy 3 must run inside a repository; its reason was: {}",
+            three_way.reason
+        );
+        assert!(
+            three_way.reason.contains("patch failed")
+                || three_way.reason.contains("does not apply")
+                || three_way.reason.contains("searching for"),
+            "the reason must be git's message about the patch, got: {}",
+            three_way.reason
         );
     }
 }

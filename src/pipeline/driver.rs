@@ -336,6 +336,35 @@ fn env_reasoning_budget() -> Result<Option<u32>, String> {
     }
 }
 
+/// Refuse `VANTA_REASONING_BUDGET` on a judge arm (C5).
+///
+/// [VANTA-WHY] C5 — the budget reaches only the Attacker's three sites
+/// (`REASONING_BUDGET_SITES`), and a judge arm makes exactly ONE call — to the
+/// `judge` site, which is deliberately outside that list. A budget set on a judge
+/// arm would therefore reach nothing and the row would silently describe an arm
+/// other than the one the operator asked for. The switch is a property of the arm
+/// (§14.21), so an arm it cannot act on is a misconfiguration, not a no-op: the
+/// run is refused by name before the repo is loaded and before any request is
+/// built. A non-judge arm — including one whose Attacker is off — is returned
+/// `Ok`: there the budget reaches the Attacker's sites whenever the Attacker runs,
+/// and this guard is about the arm that HAS no such site, not about every arm that
+/// happens not to call it.
+fn refuse_reasoning_budget_on_judge_arm(
+    reasoning_budget: Option<u32>,
+    arm: &ResolvedArm,
+) -> Result<(), String> {
+    if reasoning_budget.is_some() && arm.judge.is_some() {
+        return Err(format!(
+            "CONFIG_ERROR: VANTA_REASONING_BUDGET is set but arm '{}' is a judge arm: \
+             the budget reaches only the Attacker sites ({}), and a judge arm makes no \
+             Attacker call. Unset it.",
+            arm.name,
+            crate::llm::REASONING_BUDGET_SITES.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// Read the reasoning effort from `VANTA_REASONING_EFFORT` (§14.21).
 ///
 /// [VANTA-WHY] §14.21 — the levels and the rejection of anything else live with
@@ -1392,6 +1421,10 @@ pub async fn run(
     // in place before the first request body is built. `None`/`None` — the
     // default, and every run before this change — leaves every body untouched.
     let reasoning_budget = env_reasoning_budget()?;
+    // [VANTA-WHY] C5 — refuse the switch on a judge arm before it is applied, so a
+    // budget that could never reach the judge's own (non-allow-listed) site stops
+    // the run instead of silently producing an arm the operator did not ask for.
+    refuse_reasoning_budget_on_judge_arm(reasoning_budget, &resolved_arm)?;
     crate::llm::set_reasoning_budget(reasoning_budget);
     let reasoning_effort = env_reasoning_effort()?;
     // [VANTA-WHY] §14.28 — the effort is validated against the MODEL that will
@@ -6689,8 +6722,10 @@ mod tests {
         dependency_freeze_summary_value, env_arm, env_flag, fixed_round_continues,
         harness_error_log_line,
         harness_infrastructure_collapse,
+        is_judge_site,
         ledger_text,
         modified_test_config_records, patch_attempt_id_for_patch, record_new_static_findings,
+        refuse_reasoning_budget_on_judge_arm,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
         resolve_arm, resolve_fixed_rounds, sampling_not_sent_rule, stamp_transition_row,
         stable_patch_fingerprint, ARMS,
@@ -7931,6 +7966,57 @@ mod tests {
             Some(value) => unsafe { std::env::set_var("VANTA_ARM", value) },
             None => unsafe { std::env::remove_var("VANTA_ARM") },
         }
+    }
+
+    // [VANTA-WHY] C5 — `VANTA_REASONING_BUDGET` reaches only the Attacker's three
+    // sites, and a judge arm makes exactly one call, to the `judge` site. A budget
+    // asked for on a judge arm therefore reaches nothing and the row would describe
+    // a different arm than the operator asked for, so it is refused by name.
+    #[test]
+    fn a_reasoning_budget_is_refused_on_a_judge_arm_and_allowed_elsewhere() {
+        let judge = resolve_arm(Some("judge"), false, false, true, 1, Some("plain"), None).unwrap();
+        let judge_suite =
+            resolve_arm(Some("judge+suite"), false, false, true, 1, Some("suite"), None).unwrap();
+        // Arms whose Attacker is off are NOT refused: their budget reaches the
+        // Attacker's sites whenever the Attacker runs, which is a real arm.
+        let baseline = resolve_arm(Some("b1"), false, false, true, 4, None, None).unwrap();
+        let attacker = resolve_arm(Some("b3"), true, false, true, 4, None, None).unwrap();
+
+        for arm in [&judge, &judge_suite] {
+            let error = refuse_reasoning_budget_on_judge_arm(Some(12000), arm)
+                .expect_err("a judge arm has no allow-listed call site for a budget");
+            assert!(
+                error.contains("CONFIG_ERROR")
+                    && error.contains("VANTA_REASONING_BUDGET")
+                    && error.contains(&arm.name),
+                "the refusal must name the switch and the arm, got: {error}"
+            );
+            // No budget asked for: a judge arm runs exactly as before.
+            assert!(
+                refuse_reasoning_budget_on_judge_arm(None, arm).is_ok(),
+                "an unset budget must never refuse a judge arm"
+            );
+        }
+        for arm in [&baseline, &attacker] {
+            assert!(
+                refuse_reasoning_budget_on_judge_arm(Some(12000), arm).is_ok(),
+                "a non-judge arm's budget reaches the Attacker's sites and is allowed"
+            );
+        }
+    }
+
+    // [VANTA-WHY] C5 — the refusal above is only CORRECT because the judge's own
+    // site is outside the allow-list. Were `judge` ever added to it, the guard
+    // would reject a switch that could act, so the two facts are pinned together:
+    // the site is the judge's, and it is not budgetable.
+    #[test]
+    fn the_judge_site_is_outside_the_reasoning_budget_allow_list() {
+        assert!(is_judge_site("judge"), "the judge site is spelled `judge`");
+        assert!(
+            !crate::llm::REASONING_BUDGET_SITES.contains(&"judge"),
+            "the judge site must stay outside the budget allow-list, or C5's refusal \
+             would reject a switch that could act on it"
+        );
     }
 
     // [VANTA-WHY] M3 item 8 follow-up — a stated arm carries its own config, which

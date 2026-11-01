@@ -32,6 +32,19 @@ own ``get_config().versionfile_source``, and only a file whose declared source
 path equals its own relative path is used. A tree with no versioneer and no
 ``setuptools_scm`` — PySnooper, whose version is a literal in ``setup.py`` — is
 left exactly as it was.
+
+[VANTA-WHY] M3 item B7 — measuring the version is the one thing this harness used
+to do by *running third-party checkout code on the host*: ``runpy.run_path`` over
+the project's own ``_version.py``, and an ``import setuptools_scm`` with ``cwd``
+set to the tree. Both now run in **Shuru**, in a probe VM of their own that mounts
+the prepare tree **read-only**, separate from every agent and test sandbox
+(:func:`_guest_probe`). The tree is mounted because versioneer answers by running
+``git describe`` against it and needs its ``.git`` — and ``.git`` must never reach
+a sandbox the Creator or a graded run can read, which is exactly why the mount is a
+dedicated, read-only one. Nothing the guest learns is written by the guest: the host
+renders the frozen file itself (:func:`freeze`), every path it writes is contained
+to the tree (:func:`_contained_target`), and the row says which sandbox the
+measurement ran in (:data:`_PROBE_SANDBOX`).
 """
 
 from __future__ import annotations
@@ -40,18 +53,40 @@ import hashlib
 import json
 import os
 import re
-import shutil
-import subprocess
-import sys
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
+
+from . import shuru
 
 # The sentinel the probe writes before its JSON payload, so a project's own
 # import-time chatter (versioneer's ``verbose`` branch, a DeprecationWarning on
 # stderr, anything a future version file prints) cannot corrupt the reading.
 _PROBE_SENTINEL = "<<<VANTA-PIN>>>"
+
+GUEST_ROOT = "/workspace"
+"""Where the probe VM sees the tree it measures — the same mount point the suites use."""
+
+PROBE_INTERPRETER = "python"
+"""The interpreter the probe runs, as named inside the checkpoint.
+
+Named ``python`` and not ``python3`` because that is the element the split's
+``test_cmd`` starts with and the one ``runner.python_version_of`` reports: the probe
+has to run the project's machinery under the *same* interpreter its suites run under
+(the rule ``suite.import_probe`` follows), and a second spelling here could name an
+interpreter the checkpoint's site-packages were not built for.
+"""
+
+PROBE_TIMEOUT_SECS = 300
+"""A probe is one import and one ``git describe``; minutes, not the suite's timeout."""
+
+_PROBE_SANDBOX = "shuru"
+"""The value the row records for *which sandbox measured the version*.
+
+Recorded rather than assumed because "the version was measured" and "the version was
+measured without executing checkout code on the host" are different claims, and only
+this field distinguishes a row prepared after B7 from one prepared before it.
+"""
 
 # Directories never descended while looking for a version file. The same
 # reasoning as ``context::SKIP_DIRS``: a `.git` object database, a build tree and
@@ -153,75 +188,100 @@ class VersionPin:
     """sha256 of the frozen file's bytes, for the row."""
 
 
-def _runs(path: str) -> bool:
-    """Whether ``path`` is an interpreter that starts at all."""
+class VersionPinError(RuntimeError):
+    """A freeze was asked to write outside the tree it was told to freeze."""
+
+
+@dataclass(frozen=True)
+class ProbeVM:
+    """Where and how a probe runs: the checkpoint, the VM's size, and the interpreter.
+
+    Carried as one object rather than as four parameters because every probe this
+    module makes runs the same way, and a probe that ran under a *different*
+    checkpoint or interpreter than its siblings would be measuring a different
+    environment without saying so.
+    """
+
+    checkpoint: str
+    """The Shuru checkpoint to boot — the project's own environment layer."""
+
+    disk_mb: int
+    """The VM's disk, passed straight to ``shuru run --disk-size``."""
+
+    python: str = PROBE_INTERPRETER
+    """The interpreter to run, named as it is inside the checkpoint."""
+
+    memory_mb: Optional[int] = None
+    """The checkpoint's recorded VM memory, or ``None`` for Shuru's own default."""
+
+
+def _sentinel_payload(out: str) -> Any:
+    """The JSON a probe wrote after :data:`_PROBE_SENTINEL`, or ``None``.
+
+    One reader for both probes, so the sentinel convention has one spelling: a
+    project's own import-time chatter (versioneer's ``verbose`` branch, a
+    ``DeprecationWarning``, anything a future version file prints) lands before the
+    marker and is ignored, and output with no marker at all answers ``None`` — "the
+    probe said nothing", which is a different answer from any payload.
+    """
+    marker = out.find(_PROBE_SENTINEL)
+    if marker < 0:
+        return None
     try:
-        completed = subprocess.run(
-            [path, "-c", ""], capture_output=True, timeout=60
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return completed.returncode == 0
+        return json.loads(out[marker + len(_PROBE_SENTINEL) :])
+    except json.JSONDecodeError:
+        return None
 
 
-def _python_candidates() -> list[str]:
-    """Interpreters to try for the probe, best first.
+def _guest_probe(
+    tree: Path,
+    program: str,
+    argv: Sequence[str] = (),
+    *,
+    vm: ProbeVM,
+) -> str:
+    """Run ``program`` over ``tree`` in a read-only Shuru VM; return its stdout.
 
-    ``sys.executable`` is first because the interpreter running ``prepare`` is the
-    one whose site-packages the tree's version machinery was installed for. Then
-    the unversioned ``python3`` on ``PATH``, then the versioned ``python3.x``
-    names beside it in each ``PATH`` directory — the widening matters because the
-    unusable path is usually the unversioned one (a package-manager shim, a
-    framework build whose ``sys.executable`` points at the build prefix).
+    [VANTA-WHY] M3 item B7. Two properties are the whole reason this exists:
+
+    * The mount is **read-only** (``shuru.run``'s ``allow_host_writes=False``), so
+      nothing a probe does can change the tree, the batch or anything else on the
+      host — and a probe that *tries* to write (``setuptools_scm`` writing its
+      ``write_to`` file) fails inside the VM rather than editing the tree the run is
+      seeded from.
+    * The VM is **dedicated**: it exists for this probe, and it mounts the prepare
+      tree, which carries ``.git``. versioneer cannot answer without a repository, and
+      ``.git`` must never reach a sandbox the Creator or a graded run can read — so
+      the history is exposed to this one throwaway boot and to nothing else.
+
+    ``tree`` appears inside as :data:`GUEST_ROOT`, so callers pass guest paths (built
+    from :data:`GUEST_ROOT`); the host path does not exist in the VM.
     """
-    candidates: list[str] = []
-
-    def add(path: Optional[str]) -> None:
-        if path and path not in candidates:
-            candidates.append(path)
-
-    add(sys.executable)
-    add(shutil.which("python3"))
-    for directory in os.environ.get("PATH", "").split(os.pathsep):
-        if not directory:
-            continue
-        try:
-            names = sorted(os.listdir(directory))
-        except OSError:
-            continue
-        for name in names:
-            if re.fullmatch(r"python3(\.\d+)?", name):
-                add(os.path.join(directory, name))
-    return candidates
+    result = shuru.run(
+        checkpoint=vm.checkpoint,
+        host_root=tree,
+        command=[vm.python, "-c", program, *argv],
+        disk_mb=vm.disk_mb,
+        memory_mb=vm.memory_mb,
+        guest_cwd=GUEST_ROOT,
+        timeout_secs=PROBE_TIMEOUT_SECS,
+        allow_host_writes=False,
+        # Writing ``__pycache__`` beside a probe's import is the one write a read-only
+        # mount would still *attempt*; the suites set the same variable for the same
+        # reason.
+        env={"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"},
+    )
+    return result.stdout
 
 
-@lru_cache(maxsize=1)
-def _python() -> str:
-    """An interpreter the probe can actually run the project's version file with.
+def _probe(path: Path, tree: Path, *, vm: ProbeVM) -> Optional[dict[str, Any]]:
+    """Load a versioneer version file in the probe VM and read both of its maps.
 
-    [VANTA-WHY] ``sys.executable`` is a *claim*, not a guarantee: a frozen
-    harness, a package-manager shim pointing at a deleted install, or a framework
-    build whose recorded executable is a path the OS refuses to load all leave it
-    a string that starts nothing. That matters here more than elsewhere, because a
-    probe that cannot start is indistinguishable from a tree that has no version
-    machinery — and this module exists precisely to stop that "nothing to do here"
-    answer from being given when the truth is "the version could not be read".
-    So the interpreter is chosen by running it once, and the loud
-    :func:`measure` reason stays the last resort rather than the first.
-    """
-    for candidate in _python_candidates():
-        if _runs(candidate):
-            return candidate
-    return sys.executable or "python3"
-
-
-def _probe(path: Path, tree: Path) -> Optional[dict[str, Any]]:
-    """Load a versioneer version file in a subprocess and read both of its maps.
-
-    A subprocess rather than an import: the file's ``get_versions`` shells out to
-    ``git`` and mutates nothing, but ``runpy`` inside this interpreter would leave
-    the project's module namespace in the harness process, and the file is
-    third-party code the harness does not execute in-process anywhere else.
+    In the VM rather than in this process: the file is third-party checkout code whose
+    ``get_versions`` shells out to ``git``, so it runs where the harness runs every
+    other piece of a project's code — inside Shuru, over a read-only mount
+    (:func:`_guest_probe`). A ``runpy`` in *this* interpreter would also leave the
+    project's module namespace in the harness process, the one place it must never be.
     """
     program = (
         "import json, runpy, sys\n"
@@ -237,24 +297,13 @@ def _probe(path: Path, tree: Path) -> Optional[dict[str, Any]]:
         "}\n"
         "sys.stdout.write('" + _PROBE_SENTINEL + "' + json.dumps(payload))\n"
     )
-    try:
-        completed = subprocess.run(
-            [_python(), "-c", program, str(path.resolve())],
-            cwd=str(tree.resolve()),
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    out = completed.stdout
-    marker = out.find(_PROBE_SENTINEL)
-    if marker < 0:
-        return None
-    try:
-        payload = json.loads(out[marker + len(_PROBE_SENTINEL) :])
-    except json.JSONDecodeError:
-        return None
+    out = _guest_probe(
+        tree,
+        program,
+        [f"{GUEST_ROOT}/{path.relative_to(tree).as_posix()}"],
+        vm=vm,
+    )
+    payload = _sentinel_payload(out)
     if not isinstance(payload, dict) or not isinstance(payload.get("versions"), dict):
         return None
     return payload
@@ -319,22 +368,26 @@ def _looks_like_versioneer(path: Path) -> bool:
 
 
 def _versioneer_version_file(
-    tree: Path,
-) -> tuple[Optional[tuple[Path, dict[str, Any]]], list[Path]]:
+    tree: Path, *, vm: ProbeVM
+) -> tuple[Optional[tuple[Path, dict[str, Any]]], list[Path], bool]:
     """The tree's own versioneer version file and its measurement, and the rest.
 
-    Returns ``(found, unmeasured)``. ``found`` is ``(candidate, payload)`` for the
-    one versioneer-shaped file that names *itself* in
+    Returns ``(found, unmeasured, probed)``. ``found`` is ``(candidate, payload)``
+    for the one versioneer-shaped file that names *itself* in
     ``get_config().versionfile_source`` — the property that makes this a detector
     rather than a guess: a vendored copy of some other project's ``_version.py``,
     or a ``_version.py`` that is not versioneer's, names a different path and is
     rejected. ``unmeasured`` is the versioneer-shaped files whose probe returned
     nothing at all, which on a healthy host is empty — an importable Python file
     with ``get_config``/``get_versions`` always probes. A non-empty list therefore
-    says the measurement itself failed (a broken interpreter, a file that raises
-    on import), and the caller reports that rather than reading it as "this
-    project needs no pinning", which is the silent no-op this module exists to
-    remove.
+    says the measurement itself failed (a VM that would not boot, a file that raises
+    on import), and the caller reports that rather than reading it as "this project
+    needs no pinning", which is the silent no-op this module exists to remove.
+
+    ``probed`` is whether a probe VM was booted at all — the fact the row records.
+    It is not ``bool(found or unmeasured)``: a tree whose only ``_version.py`` files
+    are vendored copies of somebody else's boots a VM, gets an answer and rejects it,
+    and that row must still say the measurement happened in the sandbox.
     """
     declared = _declared_version_file(tree)
     candidates: list[Path] = []
@@ -349,7 +402,7 @@ def _versioneer_version_file(
     unmeasured: list[Path] = []
     for candidate in candidates:
         rel = candidate.relative_to(tree).as_posix()
-        payload = _probe(candidate, tree)
+        payload = _probe(candidate, tree, vm=vm)
         if payload is None:
             unmeasured.append(candidate)
             continue
@@ -357,8 +410,8 @@ def _versioneer_version_file(
             continue
         named = payload.get("versionfile_source")
         if isinstance(named, str) and named.strip("./") == rel:
-            return (candidate, payload), unmeasured
-    return None, unmeasured
+            return (candidate, payload), unmeasured, True
+    return None, unmeasured, bool(candidates)
 
 
 def _pyproject_setuptools_scm(tree: Path) -> Optional[dict[str, str]]:
@@ -410,8 +463,15 @@ def _setuptools_scm_write_to(tree: Path, table: dict[str, str]) -> Optional[str]
     return None
 
 
-def _setuptools_scm_version(tree: Path) -> Optional[str]:
-    """``setuptools_scm.get_version(root=.)``, or ``None`` when it cannot run."""
+def _setuptools_scm_version(tree: Path, *, vm: ProbeVM) -> Optional[str]:
+    """``setuptools_scm.get_version(root=.)`` in the probe VM, or ``None``.
+
+    In the VM for the same reason the versioneer probe is (:func:`_guest_probe`): the
+    call imports the *checkout's* ``setuptools_scm`` and asks it to walk the checkout's
+    ``.git``, so running it here would be host execution of third-party code over a
+    repository this process must not open. ``root='.'`` resolves against
+    ``guest_cwd``, which :func:`_guest_probe` sets to the mounted tree.
+    """
     program = (
         "import json, sys\n"
         "try:\n"
@@ -424,24 +484,7 @@ def _setuptools_scm_version(tree: Path) -> Optional[str]:
         "    sys.exit(4)\n"
         "sys.stdout.write('" + _PROBE_SENTINEL + "' + json.dumps(str(value)))\n"
     )
-    try:
-        completed = subprocess.run(
-            [_python(), "-c", program],
-            cwd=str(tree.resolve()),
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    out = completed.stdout
-    marker = out.find(_PROBE_SENTINEL)
-    if marker < 0:
-        return None
-    try:
-        value = json.loads(out[marker + len(_PROBE_SENTINEL) :])
-    except json.JSONDecodeError:
-        return None
+    value = _sentinel_payload(_guest_probe(tree, program, vm=vm))
     return value if isinstance(value, str) and value else None
 
 
@@ -502,21 +545,37 @@ class PinOutcome:
     pin: Optional["VersionPin"]
     reason: Optional[str]
 
+    probed: bool = False
+    """Whether a probe VM was booted to reach this outcome.
 
-def measure(tree: Path) -> PinOutcome:
+    [VANTA-WHY] M3 item B7. ``False`` for a tree whose version is a literal with no
+    machinery to read — PySnooper, where no sandbox ever ran — and ``True`` whenever a
+    probe booted, even one that only rejected a vendored ``_version.py``. Recorded so
+    "measured in Shuru" is a claim each row makes rather than one a reader assumes, and
+    so nothing silently reports a measurement that never happened.
+    """
+
+
+def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
     """The version to freeze for ``tree``, and what to record about it.
 
     ``pin is None`` means exactly "change nothing", and :attr:`PinOutcome.reason`
     says which of the two ways that happened. The caller writes nothing in that
     case — the record is the whole of the change.
+
+    ``vm`` is where both probes run (:func:`_guest_probe`): a read-only Shuru VM
+    dedicated to this measurement, so the version is read without executing any
+    checkout code on the host and without opening the tree's ``.git`` here.
     """
-    found, unmeasured = _versioneer_version_file(tree)
+    found, unmeasured, probed = _versioneer_version_file(tree, vm=vm)
     if found is not None:
         candidate, payload = found
         versions = payload["versions"]
         unusable = _placeholder_free(versions)
         if unusable is not None:
-            return PinOutcome(kind="versioneer", pin=None, reason=unusable)
+            return PinOutcome(
+                kind="versioneer", pin=None, reason=unusable, probed=probed
+            )
         contents = _short_version_contents(versions)
         pin = VersionPin(
             kind="versioneer",
@@ -526,7 +585,7 @@ def measure(tree: Path) -> PinOutcome:
             full_revisionid=_str_or_none(versions.get("full-revisionid")),
             sha256=hashlib.sha256(contents.encode("utf-8")).hexdigest(),
         )
-        return PinOutcome(kind="versioneer", pin=pin, reason=None)
+        return PinOutcome(kind="versioneer", pin=pin, reason=None, probed=probed)
 
     if unmeasured:
         # A versioneer-shaped file that could not be measured at all. On a healthy
@@ -544,11 +603,12 @@ def measure(tree: Path) -> PinOutcome:
                 f"a versioneer-shaped version file was found but could not be "
                 f"measured: {named}{more}"
             ),
+            probed=probed,
         )
 
     table = _pyproject_setuptools_scm(tree)
     if table is None and not _setup_py_uses_scm(tree):
-        return PinOutcome(kind=None, pin=None, reason=None)
+        return PinOutcome(kind=None, pin=None, reason=None, probed=probed)
     if table is None:
         table = {}
     write_to = _setuptools_scm_write_to(tree, table)
@@ -560,13 +620,17 @@ def measure(tree: Path) -> PinOutcome:
                 "setuptools_scm is configured without a write_to/version_file, so "
                 "the project keeps no version file for a sandbox to read"
             ),
+            probed=probed,
         )
-    version = _setuptools_scm_version(tree)
+    version = _setuptools_scm_version(tree, vm=vm)
+    # A VM was booted to ask setuptools_scm, whatever it answered.
+    probed = True
     if not version:
         return PinOutcome(
             kind="setuptools_scm",
             pin=None,
-            reason="setuptools_scm could not compute a version on this host",
+            reason="setuptools_scm could not compute a version in the probe sandbox",
+            probed=probed,
         )
     contents = _setuptools_scm_contents(version)
     pin = VersionPin(
@@ -577,7 +641,7 @@ def measure(tree: Path) -> PinOutcome:
         full_revisionid=None,
         sha256=hashlib.sha256(contents.encode("utf-8")).hexdigest(),
     )
-    return PinOutcome(kind="setuptools_scm", pin=pin, reason=None)
+    return PinOutcome(kind="setuptools_scm", pin=pin, reason=None, probed=probed)
 
 
 def _str_or_none(value: Any) -> Optional[str]:
@@ -595,24 +659,74 @@ def _short_version_contents(versions: dict[str, Any]) -> str:
     return _SHORT_VERSION_PY % body
 
 
+def _contained_target(tree: Path, rel: str) -> Path:
+    """``rel`` resolved beneath ``tree``, or raise :class:`VersionPinError`.
+
+    [VANTA-WHY] M3 item B7. ``pin.file`` is not always a path this module chose: for
+    a ``setuptools_scm`` project it is the ``write_to``/``version_file`` string out of
+    the checkout's own ``pyproject.toml``, and :func:`freeze` writes it with
+    ``write_text``. Three strings would take that write out of the tree — an absolute
+    path (``/etc/passwd``), a parent traversal (``../../x``) and a symlink the checkout
+    planted that points outside the tree — and each is refused here, before the write,
+    rather than discovered after it. The check resolves the deepest existing ancestor
+    so a symlinked *directory* cannot launder the escape either.
+    """
+    raw = Path(rel)
+    if raw.is_absolute() or rel.startswith("~"):
+        raise VersionPinError(
+            f"refusing to write outside the tree: {rel!r} is an absolute path"
+        )
+    if any(part == ".." for part in raw.parts):
+        raise VersionPinError(
+            f"refusing to write outside the tree: {rel!r} traverses a parent directory"
+        )
+    root = tree.resolve()
+    target = root / raw
+    # Resolve symlinks on the deepest already-existing ancestor, then re-attach the
+    # parts that do not exist yet: a symlinked directory, or a symlink sitting exactly
+    # on the target, would otherwise point the write outside the tree unnoticed.
+    probe = target
+    tail: list[str] = []
+    while not os.path.lexists(probe) and probe != probe.parent:
+        tail.append(probe.name)
+        probe = probe.parent
+    resolved = probe.resolve()
+    for name in reversed(tail):
+        resolved = resolved / name
+    if root not in resolved.parents:
+        raise VersionPinError(
+            f"refusing to write outside the tree: {rel!r} resolves to {resolved}"
+        )
+    return target
+
+
 def freeze(tree: Path, pin: VersionPin) -> None:
-    """Write ``pin``'s frozen version file into ``tree``."""
-    target = tree / pin.file
+    """Write ``pin``'s frozen version file into ``tree``, contained to ``tree``."""
+    target = _contained_target(tree, pin.file)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(pin.contents, encoding="utf-8")
 
 
-def as_record(pin: Optional[VersionPin], *, reason: Optional[str] = None) -> dict[str, Any]:
+def as_record(pin: Optional[VersionPin], *, reason: Optional[str] = None,
+              probed: bool = False) -> dict[str, Any]:
     """The dict ``prepare.json`` and the manifest row carry.
 
     ``pinned`` is the load-bearing field: a reader must be able to tell "this
     row's version was frozen" from "this project needed no pinning" (``reason``
     is ``None``) and from "it needed one and the freeze failed" (``reason`` is
     set), because only the first is comparable to a post-pin row.
+
+    ``probe_sandbox`` records *which sandbox measured the version*: ``"shuru"`` when a
+    probe VM booted (:func:`measure`'s ``probed``), ``None`` when the project has no
+    version machinery to read and nothing was measured at all. [VANTA-WHY] M3 item B7 —
+    present on every row this writes, so a reader can tell a post-B7 row (measured
+    without host execution of checkout code) from a pre-B7 one, which lacks the key.
     """
+    sandbox = _PROBE_SANDBOX if probed else None
     if pin is None:
         return {"pinned": False, "kind": None, "file": None, "version": None,
-                "full_revisionid": None, "sha256": None, "reason": reason}
+                "full_revisionid": None, "sha256": None, "reason": reason,
+                "probe_sandbox": sandbox}
     return {
         "pinned": True,
         "kind": pin.kind,
@@ -621,4 +735,5 @@ def as_record(pin: Optional[VersionPin], *, reason: Optional[str] = None) -> dic
         "full_revisionid": pin.full_revisionid,
         "sha256": pin.sha256,
         "reason": None,
+        "probe_sandbox": sandbox,
     }

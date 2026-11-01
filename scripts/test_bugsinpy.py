@@ -6575,7 +6575,49 @@ class TestVersionPin:
     the *freeze*, not about the git plumbing: a stub version file that returns a
     canned ``get_versions()`` is enough to prove the rewritten file still answers
     with the same version once no repository is present.
+
+    [VANTA-WHY] M3 item B7 — the measurement itself now runs inside Shuru, over a
+    read-only mount of the tree (``version_pin._guest_probe``). A unit test cannot
+    boot a microVM, so ``_fake_probe`` stands in for it: it runs the probe program on
+    the host with the tree as both CWD and ``/workspace``, which are the two
+    properties the module depends on. What the tests assert is *what* the probe is
+    asked and what the host does with the answer — never that a VM booted here.
     """
+
+    @staticmethod
+    def _vm(checkpoint: str = "vanta-test", *, disk_mb: int = 1024):
+        return version_pin_mod.ProbeVM(checkpoint=checkpoint, disk_mb=disk_mb)
+
+    @classmethod
+    def _fake_probe(cls, monkeypatch, seen=None):
+        """Stand in for the read-only probe VM: run ``program`` over the tree here.
+
+        It reproduces the two facts the module relies on — the program runs, and it
+        runs with the tree as CWD and mounted at ``/workspace`` — by rewriting the
+        guest path back to the host tree. ``seen`` captures the ``ProbeVM`` each call
+        carried, so a test can assert the probe ran against the sandbox it was told to.
+        """
+
+        def fake(tree, program, argv=(), *, vm):
+            if seen is not None:
+                seen.append(vm)
+            translated = [
+                a.replace(version_pin_mod.GUEST_ROOT, str(tree), 1)
+                if a.startswith(version_pin_mod.GUEST_ROOT)
+                else a
+                for a in argv
+            ]
+            completed = subprocess.run(
+                [sys.executable, "-c", program, *translated],
+                cwd=str(tree),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            return completed.stdout
+
+        monkeypatch.setattr(version_pin_mod, "_guest_probe", fake)
+        return fake
 
     @staticmethod
     def _stub(
@@ -6618,7 +6660,7 @@ class TestVersionPin:
             "{'version': pkg.__version__, 'versions': _version.get_versions()}))\n"
         )
         completed = subprocess.run(
-            [version_pin_mod._python(), "-c", program],
+            [sys.executable, "-c", program],
             cwd=str(tree),
             capture_output=True,
             text=True,
@@ -6628,7 +6670,7 @@ class TestVersionPin:
         payload = json.loads(completed.stdout)
         return payload["version"], payload["versions"]
 
-    def test_a_versioneer_tree_is_measured_and_frozen(self, tmp_path):
+    def test_a_versioneer_tree_is_measured_and_frozen(self, tmp_path, monkeypatch):
         tree = tmp_path / "tree"
         write(tree / "pkg" / "_version.py", self._stub())
         write(
@@ -6636,13 +6678,15 @@ class TestVersionPin:
             "from ._version import get_versions\n"
             "__version__ = get_versions()['version']\n",
         )
+        self._fake_probe(monkeypatch)
 
         before = self._version_in(tree)
         assert before[0] == "1.2.3"
 
-        outcome = version_pin_mod.measure(tree)
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
         assert outcome.kind == "versioneer"
         assert outcome.reason is None
+        assert outcome.probed is True
         assert outcome.pin is not None
         assert outcome.pin.file == "pkg/_version.py"
         assert outcome.pin.version == "1.2.3"
@@ -6655,7 +6699,7 @@ class TestVersionPin:
         # rewritten to the frozen form rather than computed.
         assert after == before
 
-    def test_the_frozen_bytes_are_versioneer_short_form(self, tmp_path):
+    def test_the_frozen_bytes_are_versioneer_short_form(self, tmp_path, monkeypatch):
         """The one fact this module must get exactly right: the file's shape.
 
         versioneer reads the frozen file back with
@@ -6665,7 +6709,8 @@ class TestVersionPin:
         """
         tree = tmp_path / "tree"
         write(tree / "pkg" / "_version.py", self._stub(dirty=True))
-        outcome = version_pin_mod.measure(tree)
+        self._fake_probe(monkeypatch)
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
         assert outcome.pin is not None
 
         found = re.search(
@@ -6692,44 +6737,69 @@ class TestVersionPin:
         write(tree / "mod.py", "x = 1\n")
         before = sorted(str(p.relative_to(tree)) for p in tree.rglob("*"))
 
-        outcome = version_pin_mod.measure(tree)
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
         assert outcome == version_pin_mod.PinOutcome(
             kind=None, pin=None, reason=None
         )
-        record = version_pin_mod.as_record(outcome.pin, reason=outcome.reason)
-        assert record["pinned"] is False
-        assert record["reason"] is None
+        record = version_pin_mod.as_record(
+            outcome.pin, reason=outcome.reason, probed=outcome.probed
+        )
+        # The exact shape recorded for PySnooper/3 in night3, plus the B7 field: a
+        # project with no version machinery pins nothing, reads no sandbox, and its
+        # tree is left exactly as it was.
+        assert record == {
+            "pinned": False,
+            "kind": None,
+            "file": None,
+            "version": None,
+            "full_revisionid": None,
+            "sha256": None,
+            "reason": None,
+            "probe_sandbox": None,
+        }
         # Nothing to freeze means nothing is written.
         assert sorted(str(p.relative_to(tree)) for p in tree.rglob("*")) == before
 
-    def test_the_placeholder_is_refused_rather_than_frozen(self, tmp_path):
+    def test_the_placeholder_is_refused_rather_than_frozen(self, tmp_path, monkeypatch):
         """``0+unknown`` is the bug, so freezing it would be freezing the bug."""
         tree = tmp_path / "tree"
         write(
             tree / "pkg" / "_version.py",
             self._stub(version="0+unknown", full=None, error="unable to compute version"),
         )
-        outcome = version_pin_mod.measure(tree)
+        self._fake_probe(monkeypatch)
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
         assert outcome.kind == "versioneer"
         assert outcome.pin is None
         assert "placeholder" in outcome.reason
-        record = version_pin_mod.as_record(outcome.pin, reason=outcome.reason)
+        record = version_pin_mod.as_record(
+            outcome.pin, reason=outcome.reason, probed=outcome.probed
+        )
         assert record["pinned"] is False
         assert record["reason"] == outcome.reason
 
-    def test_a_version_file_that_does_not_name_itself_is_not_used(self, tmp_path):
+    def test_a_version_file_that_does_not_name_itself_is_not_used(
+        self, tmp_path, monkeypatch
+    ):
         """A detector, not a guess: a vendored ``_version.py`` names another path."""
         tree = tmp_path / "tree"
         write(tree / "vendor" / "_version.py", self._stub(source="other/_version.py"))
-        outcome = version_pin_mod.measure(tree)
-        assert outcome == version_pin_mod.PinOutcome(kind=None, pin=None, reason=None)
+        self._fake_probe(monkeypatch)
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+        # Rejected, but a probe VM *was* booted to reject it — the row has to say so.
+        assert outcome == version_pin_mod.PinOutcome(
+            kind=None, pin=None, reason=None, probed=True
+        )
 
-    def test_the_self_naming_version_file_wins_over_a_vendored_one(self, tmp_path):
+    def test_the_self_naming_version_file_wins_over_a_vendored_one(
+        self, tmp_path, monkeypatch
+    ):
         tree = tmp_path / "tree"
         # Shallowest first, so the vendored one is probed and rejected first.
         write(tree / "_version.py", self._stub(source="elsewhere/_version.py"))
         write(tree / "pkg" / "_version.py", self._stub(version="9.9.9"))
-        outcome = version_pin_mod.measure(tree)
+        self._fake_probe(monkeypatch)
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
         assert outcome.pin is not None
         assert outcome.pin.file == "pkg/_version.py"
         assert outcome.pin.version == "9.9.9"
@@ -6747,11 +6817,14 @@ class TestVersionPin:
             'write_to = "pkg/_version.py"\n',
         )
         monkeypatch.setattr(
-            version_pin_mod, "_setuptools_scm_version", lambda _tree: "1.2.3"
+            version_pin_mod,
+            "_setuptools_scm_version",
+            lambda _tree, *, vm: "1.2.3",
         )
-        outcome = version_pin_mod.measure(tree)
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
         assert outcome.kind == "setuptools_scm"
         assert outcome.reason is None
+        assert outcome.probed is True
         assert outcome.pin is not None
         assert outcome.pin.file == "pkg/_version.py"
         assert outcome.pin.version == "1.2.3"
@@ -6771,10 +6844,12 @@ class TestVersionPin:
             "[tool.setuptools_scm]\n"
             'version_scheme = "guess-next-dev"\n',
         )
-        outcome = version_pin_mod.measure(tree)
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
         assert outcome.kind == "setuptools_scm"
         assert outcome.pin is None
         assert "write_to" in outcome.reason
+        # No write target means no version file to render, so no probe ever booted.
+        assert outcome.probed is False
 
     def test_a_version_file_that_cannot_be_measured_is_reported(
         self, tmp_path, monkeypatch
@@ -6782,18 +6857,18 @@ class TestVersionPin:
         """A probe that does not run must not read as "this project needs no pinning".
 
         [VANTA-WHY] The probe is a subprocess, so it can fail for a reason that has
-        nothing to do with the tree — the interpreter it was named after does not
-        start, the file raises on import. Both leave ``_probe`` with ``None``, and
-        the answer the caller must not give in that case is the one it gives for a
-        project with no version machinery at all (``pin is None, reason is None``),
-        because a sandbox seeded from that tree would report the ``0+unknown``
-        placeholder this module exists to remove — silently.
+        nothing to do with the tree — the VM it was named after does not boot, the
+        file raises on import. Both leave ``_probe`` with ``None``, and the answer the
+        caller must not give in that case is the one it gives for a project with no
+        version machinery at all (``pin is None, reason is None``), because a sandbox
+        seeded from that tree would report the ``0+unknown`` placeholder this module
+        exists to remove — silently.
         """
         tree = tmp_path / "tree"
         write(tree / "pkg" / "_version.py", self._stub())
-        monkeypatch.setattr(version_pin_mod, "_probe", lambda _path, _tree: None)
+        monkeypatch.setattr(version_pin_mod, "_probe", lambda _path, _tree, *, vm: None)
 
-        outcome = version_pin_mod.measure(tree)
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
         assert outcome.kind == "versioneer"
         assert outcome.pin is None
         assert "could not be measured" in outcome.reason
@@ -6801,20 +6876,150 @@ class TestVersionPin:
         # And it is distinguishable from the honest no-op.
         assert outcome != version_pin_mod.PinOutcome(kind=None, pin=None, reason=None)
 
-    def test_the_probe_interpreter_is_one_that_runs(self):
-        """``sys.executable`` is a claim; the probe's interpreter is a measurement.
-
-        A path that cannot start looks exactly like a tree with no version file, so
-        the interpreter is chosen by running it. Asserted against a path that
-        certainly does not start, rather than by naming a broken one.
+    def test_the_probe_mounts_the_tree_read_only_in_its_own_vm(
+        self, tmp_path, monkeypatch
+    ):
+        """[VANTA-WHY] M3 item B7 — the measurement is host-code execution unless it
+        is fenced, and ``shuru.run`` is the fence. The probe must ask for a read-only
+        mount (``allow_host_writes=False``), mount the tree itself (``host_root=tree``,
+        seen inside as ``/workspace``), and carry the ``ProbeVM``'s checkpoint, disk
+        and memory. Asserted on the call ``_guest_probe`` actually makes rather than on
+        a boot, so the test needs no VM.
         """
-        assert version_pin_mod._runs("/nonexistent/vanta-no-such-python") is False
-        interpreter = version_pin_mod._python()
-        completed = subprocess.run(
-            [interpreter, "-c", "print('up')"], capture_output=True, text=True
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "_version.py", self._stub())
+        seen: dict = {}
+        monkeypatch.setattr(
+            version_pin_mod.shuru,
+            "run",
+            lambda **kwargs: seen.update(kwargs)
+            or shuru_mod.ExecResult(stdout="", stderr="", exit_code=0, timed_out=False),
         )
-        assert completed.returncode == 0
-        assert completed.stdout.strip() == "up"
+        outcome = version_pin_mod.measure(
+            tree, vm=self._vm(checkpoint="vanta-bi-Demo-1")
+        )
+
+        assert seen["host_root"] == tree
+        assert seen["checkpoint"] == "vanta-bi-Demo-1"
+        assert seen["disk_mb"] == 1024
+        assert seen["memory_mb"] is None
+        assert seen["allow_host_writes"] is False
+        assert seen["guest_cwd"] == version_pin_mod.GUEST_ROOT
+        assert seen["command"][:2] == ["python", "-c"]
+        assert seen["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+        # Empty stdout carries no payload, so the tree is reported as unmeasured
+        # rather than silently read as "nothing to pin".
+        assert outcome.reason is not None and "could not be measured" in outcome.reason
+
+    @pytest.mark.parametrize(
+        "rel,version,full,sha256",
+        [
+            pytest.param(
+                "lib/matplotlib/_version.py",
+                "3.2.1.post2788.dev0+gc404d1f716",
+                "c404d1f716e8aaefd4d7371ff49673e9c1f7f07c",
+                "c2a07b652fb6dd31df55308e6e523a7c871b9654bf1d09c0c1337bbf3bd55135",
+                id="matplotlib_1",
+            ),
+            pytest.param(
+                "pandas/_version.py",
+                "1.1.0.dev0+1627.g3fd150c9e6.dirty",
+                "3fd150c9e6e3a1a39622577745a7d821611c09d3",
+                "7d69af3467fff3019def1548932e7ade4b4159abc2ca2771740573fa96aac7de",
+                id="pandas_1",
+            ),
+        ],
+    )
+    def test_the_night3_frozen_versions_are_reproduced(
+        self, rel, version, full, sha256, tmp_path, monkeypatch
+    ):
+        """The frozen file must equal, byte for byte, what night3 recorded.
+
+        [VANTA-WHY] These are the values on disk (``runs/bugsinpy/night3-*/prepare.json``),
+        not expectations the test invented: ``version``, ``full-revisionid``, the rendered
+        file and its digest are the recorded ones. Pinning them stops a later refactor
+        from silently changing the frozen version — and the ``.dirty`` suffix on pandas/1
+        is exactly the character a "read the version from the git tag" shortcut loses.
+        """
+        tree = tmp_path / "tree"
+        write(tree / rel, self._stub(source=rel, version=version, full=full, dirty=True))
+        self._fake_probe(monkeypatch)
+
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+
+        assert outcome.pin is not None
+        assert outcome.pin.kind == "versioneer"
+        assert outcome.pin.file == rel
+        assert outcome.pin.version == version
+        assert outcome.pin.full_revisionid == full
+        # The digest is over the exact bytes written, so it pins the whole file.
+        assert outcome.pin.sha256 == sha256
+
+
+class TestVersionPinWriteContainment:
+    """[VANTA-WHY] M3 item B7 — the host, not the guest, writes ``pin.file``.
+
+    For a ``setuptools_scm`` project ``pin.file`` is the ``write_to``/``version_file``
+    string read out of the checkout's own ``pyproject.toml``, and :func:`freeze` writes
+    it with ``write_text``. Three strings would take that write out of the tree — an
+    absolute path, a parent traversal, and a symlink the checkout planted — so each is
+    refused before the write, and the escaping file is never created.
+    """
+
+    @staticmethod
+    def _tree(tmp_path: Path) -> Path:
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        return tree
+
+    def test_a_nested_path_resolves_beneath_the_tree(self, tmp_path):
+        tree = self._tree(tmp_path)
+        target = version_pin_mod._contained_target(tree, "pkg/_version.py")
+        assert target == tree.resolve() / "pkg" / "_version.py"
+
+    @pytest.mark.parametrize("rel", ["/etc/passwd", "/tmp/escape.py"])
+    def test_an_absolute_path_is_refused(self, tmp_path, rel):
+        with pytest.raises(version_pin_mod.VersionPinError, match="absolute"):
+            version_pin_mod._contained_target(self._tree(tmp_path), rel)
+
+    def test_a_parent_traversal_is_refused(self, tmp_path):
+        with pytest.raises(version_pin_mod.VersionPinError, match="parent"):
+            version_pin_mod._contained_target(self._tree(tmp_path), "../../escape.py")
+
+    def test_an_embedded_traversal_is_refused(self, tmp_path):
+        with pytest.raises(version_pin_mod.VersionPinError, match="parent"):
+            version_pin_mod._contained_target(
+                self._tree(tmp_path), "pkg/../../escape.py"
+            )
+
+    def test_a_symlinked_directory_that_escapes_is_refused(self, tmp_path):
+        tree = self._tree(tmp_path)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (tree / "link").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(version_pin_mod.VersionPinError, match="resolves"):
+            version_pin_mod._contained_target(tree, "link/pwned.py")
+
+    def test_a_symlink_that_stays_inside_is_allowed(self, tmp_path):
+        tree = self._tree(tmp_path)
+        (tree / "real").mkdir()
+        (tree / "link").symlink_to(tree / "real", target_is_directory=True)
+        target = version_pin_mod._contained_target(tree, "link/x.py")
+        assert target == tree.resolve() / "link" / "x.py"
+
+    def test_freeze_refuses_a_pin_that_escapes_and_writes_nothing(self, tmp_path):
+        tree = self._tree(tmp_path)
+        pin = version_pin_mod.VersionPin(
+            kind="setuptools_scm",
+            file="../escape.py",
+            contents="x = 1\n",
+            version="1",
+            full_revisionid=None,
+            sha256="0",
+        )
+        with pytest.raises(version_pin_mod.VersionPinError):
+            version_pin_mod.freeze(tree, pin)
+        assert not (tmp_path / "escape.py").exists()
 
 
 class TestPrepareRunRecordContract:
@@ -6957,6 +7162,7 @@ class TestPrepareRunRecordContract:
                 "full_revisionid": "3fd150c9e6e3a1a39622577745a7d821611c09d3",
                 "sha256": "7d69af3467fff301",
                 "reason": None,
+                "probe_sandbox": "shuru",
             },
         )
         split, batch_dir, manifest = self._write_batch(tmp_path, preps=[original])

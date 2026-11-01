@@ -448,12 +448,16 @@ class BugPrep:
 
     Written as ``version_pin.as_record`` — ``pinned`` (was a version file
     rewritten), ``kind`` (``versioneer``/``setuptools_scm``/``None``), ``file``,
-    ``version``, ``full_revisionid``, ``sha256`` and ``reason``. ``pinned`` is the
-    load-bearing field: a reader must be able to tell "this row's version was
-    frozen" from "this project needed no pinning" (``reason`` is ``None``) and from
-    "it needed one and the freeze failed". The ``full_revisionid`` the frozen file
-    carries is the **buggy tree's own** commit — the string an sdist of that commit
-    already ships, and never the fix's — which ``test_show_versions`` reads back.
+    ``version``, ``full_revisionid``, ``sha256``, ``reason`` and ``probe_sandbox``.
+    ``pinned`` is the load-bearing field: a reader must be able to tell "this row's
+    version was frozen" from "this project needed no pinning" (``reason`` is ``None``)
+    and from "it needed one and the freeze failed". ``probe_sandbox`` is ``"shuru"``
+    when the measurement ran in a probe VM and ``None`` when the project had no
+    machinery to measure — [VANTA-WHY] M3 item B7, the version is read by running the
+    checkout's own version code inside a dedicated, read-only Shuru VM rather than on
+    the host, and the row says so. The ``full_revisionid`` the frozen file carries is
+    the **buggy tree's own** commit — the string an sdist of that commit already
+    ships, and never the fix's — which ``test_show_versions`` reads back.
 
     A project that needs no pinning records ``pinned: false`` with a ``None``
     reason, and its tree is left exactly as it was. The empty default is only what
@@ -1412,10 +1416,17 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bo
     # file, so pinning before the guard would make the guard call the pin a leak.
     # The baseline suite below therefore also sees the frozen version, which is what
     # makes the prepare-side and in-session native runs comparable (§3.1).
-    pin = version_pin_mod.measure(vanta)
+    pin = version_pin_mod.measure(
+        vanta,
+        vm=version_pin_mod.ProbeVM(
+            checkpoint=checkpoint, disk_mb=DISK_MB, memory_mb=prep.vm_memory_mb
+        ),
+    )
     if pin.pin is not None:
         version_pin_mod.freeze(vanta, pin.pin)
-    prep.version_pin = version_pin_mod.as_record(pin.pin, reason=pin.reason)
+    prep.version_pin = version_pin_mod.as_record(
+        pin.pin, reason=pin.reason, probed=pin.probed
+    )
 
     after_strip = _suite(checkpoint, batch_dir, prep, "vanta_tree", "vanta")
     # The same rule as ``derive_hidden``'s, on the fifth graded run. The baseline below

@@ -5862,6 +5862,64 @@ class TestShuruRunMemory:
         assert shuru_mod.DEFAULT_RUN_MEMORY_MB == 2048, "shuru's own run default"
 
 
+class TestShuruMountMode:
+    """``--mount``'s mode must agree with ``--allow-host-writes``, or shuru refuses the boot.
+
+    [VANTA-WHY] M3 item P2. shuru's ``--mount <HOST:GUEST[:ro|:rw]>`` **defaults to
+    ``ro``**, and a ``:rw`` mount is only legal together with ``--allow-host-writes``.
+    ``run`` used to spell ``:rw`` unconditionally while adding the flag only when
+    writes were allowed, so its one read-only caller — the version probe (B7), the
+    reason the parameter exists — sent an argv shuru rejects *before booting anything*:
+
+        Error: read-write mount '<tree>:/workspace:rw' requires --allow-host-writes flag
+
+    Measured against pandas/1's ``vanta_tree``: exit code 1, empty stdout, no VM, so
+    the probe reported "could not be measured" and the pin was never frozen. The unit
+    test that covers the probe stubs ``shuru.run`` and so never saw the argv; these
+    assert the argv itself, which is the only place the two spellings can disagree.
+    """
+
+    def _argv(self, monkeypatch, **over):
+        seen: dict = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        monkeypatch.setattr(shuru_mod, "_shuru_bin", lambda: "/usr/bin/shuru")
+        monkeypatch.setattr(shuru_mod.subprocess, "run", fake_run)
+        args = dict(
+            checkpoint="vanta-bi-Demo-1",
+            host_root=Path.cwd(),
+            command=["python", "-c", "pass"],
+            disk_mb=8192,
+        )
+        args.update(over)
+        result = shuru_mod.run(**args)
+        assert result.ok
+        return seen["args"]
+
+    @staticmethod
+    def _mount(argv) -> str:
+        return argv[argv.index("--mount") + 1]
+
+    def test_a_read_only_run_mounts_read_only_and_passes_no_write_flag(self, monkeypatch):
+        argv = self._argv(monkeypatch, allow_host_writes=False)
+        assert self._mount(argv).endswith(":/workspace:ro")
+        assert "--allow-host-writes" not in argv
+
+    def test_a_writable_run_mounts_rw_and_passes_the_flag(self, monkeypatch):
+        argv = self._argv(monkeypatch, allow_host_writes=True)
+        assert self._mount(argv).endswith(":/workspace:rw")
+        assert "--allow-host-writes" in argv
+
+    def test_the_default_mount_is_writable(self, monkeypatch):
+        """Every caller but the probe keeps the argv it always had."""
+        argv = self._argv(monkeypatch)
+        assert self._mount(argv).endswith(":/workspace:rw")
+        assert "--allow-host-writes" in argv
+
+
 # ============================================================================
 # suite.py — command construction and report reading (no VM)
 # ============================================================================

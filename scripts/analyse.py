@@ -1135,9 +1135,17 @@ def coverage_pair(text: Any) -> Optional[tuple[int, int]]:
         return None
     shown, _, total = text.partition("/")
     try:
-        return int(shown), int(total)
+        shown_i, total_i = int(shown), int(total)
     except ValueError:
         return None
+    # [VANTA-WHY] M3 item E10 — a pair that cannot describe a coverage reading is not
+    # one. `0/0` (no gold file to show), `1/0` and `5/3` (shown more than the fix
+    # touches) all passed the parse above and were summed into
+    # `with_reading`/`shown_full`/`gold_total`, so a pooled rate could exceed 1 or
+    # divide by zero. `0/n` IS a reading ("none of the n shown whole"), so it stays.
+    if total_i < 1 or shown_i < 0 or shown_i > total_i:
+        return None
+    return shown_i, total_i
 
 
 class LocalizationMetrics(Metric):

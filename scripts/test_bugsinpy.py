@@ -30493,6 +30493,20 @@ class TestAnalyseLocalization:
         assert analyse_mod.coverage_pair("a/b") is None
         assert analyse_mod.coverage_pair(0) is None
 
+    def test_an_impossible_coverage_pair_is_none_not_a_reading(self):
+        """Item E10 — `shown` must be within `1..=total`, so the pooled rate stays sane.
+
+        `0/0` has no gold file to show, and `1/0`/`5/3` show more than the fix touches;
+        each used to parse into a `(shown, total)` reading that fed `shown_full` and
+        `gold_total`, so the pooled coverage could exceed 1 or divide by zero.
+        """
+        assert analyse_mod.coverage_pair("0/0") is None
+        assert analyse_mod.coverage_pair("1/0") is None
+        assert analyse_mod.coverage_pair("5/3") is None
+        # `0/n` IS a reading — "none of the n shown whole".
+        assert analyse_mod.coverage_pair("0/3") == (0, 3)
+        assert analyse_mod.coverage_pair("3/3") == (3, 3)
+
     def test_the_report_reads_the_rows_and_pools_the_readings(self, tmp_path):
         rows = [
             _analyse_row("k1", mode="repair", localization_hit=True,

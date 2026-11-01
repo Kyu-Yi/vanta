@@ -1336,6 +1336,23 @@ fn prune_source_files_not_in(
     Ok(())
 }
 
+/// Decide whether the prune keeps the source file at `relative`.
+///
+/// [VANTA-WHY] C7 — `keep` is the set of path keys the concatenation lists, and
+/// every key is a UTF-8 `String` (the concatenation is text). A relative path that
+/// is not valid UTF-8 therefore cannot be one of them, and the old
+/// `to_string_lossy()` decode turned it into a string that matched nothing —
+/// deleting a source file the concatenation never told us to drop. Membership is
+/// undecidable for such a path, and the prune must not answer an undecidable case
+/// by deleting: it keeps the file. A valid-UTF-8 path is compared exactly as
+/// before, so the drop of a file the concatenation omits is unchanged.
+fn prune_keeps(relative: &Path, keep: &std::collections::HashSet<String>) -> bool {
+    match relative.to_str() {
+        Some(relative) => keep.contains(relative),
+        None => true,
+    }
+}
+
 fn prune_walk(
     root: &Path,
     dir: &Path,
@@ -1344,9 +1361,14 @@ fn prune_walk(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if crate::context::SKIP_DIRS.contains(&name_str.as_ref()) {
-            continue;
+        // [VANTA-WHY] C7 — `SKIP_DIRS` holds ASCII names, so a name that is not valid
+        // UTF-8 cannot be one of them; reading it lossily could only swap its invalid
+        // bytes for U+FFFD, which matches nothing here. Comparing only when the name
+        // decodes states that in the type instead of relying on the substitution.
+        if let Some(name_str) = name.to_str() {
+            if crate::context::SKIP_DIRS.contains(&name_str) {
+                continue;
+            }
         }
         let path = entry.path();
         let file_type = entry.file_type()?;
@@ -1367,7 +1389,7 @@ fn prune_walk(
         let Ok(relative) = path.strip_prefix(root) else {
             continue;
         };
-        if !keep.contains(&relative.to_string_lossy().to_string()) {
+        if !prune_keeps(relative, keep) {
             fs::remove_file(&path)?;
         }
     }
@@ -2357,18 +2379,18 @@ mod tests {
         is_native_test_path, is_tooling_package, native_collection_summary, native_gate_vacuous,
         native_outcome, native_regressions, native_suite_collapsed, native_tree_with_original_tests,
         native_vacuous_reason, new_diagnostics, parse_mypy_line, parse_native_report,
-        parse_pytest_report_detailed, parse_ruff_line, project_package, report_tests,
+        parse_pytest_report_detailed, parse_ruff_line, project_package, prune_keeps, report_tests,
         ruff_is_error_class, run_single_test, run_tests_parallel, seed_and_write,
         seed_and_write_from, seed_method, seed_root, seed_sandbox_from, set_seed_root,
         static_tool_runner, write_source_files,
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{TestIntent, TestResult};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use crate::pipeline::candidate::TestCommand;
     use crate::sandbox::ExecutionResult;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard};
 
     fn generated_test(name: &str, assertion: &str) -> GeneratedTest {
@@ -3704,6 +3726,41 @@ mod tests {
         assert!(
             !root.path().join("pkg/__init__.py").exists(),
             "the executed tree's SOURCE is exactly the concatenation's, no more"
+        );
+    }
+
+    // [VANTA-WHY] C7 — `keep` is keyed by the concatenation's UTF-8 paths, so a
+    // source file whose relative path is not valid UTF-8 can never be one of them.
+    // The prune must keep it rather than delete it: the old `to_string_lossy()`
+    // decode made the path match nothing and the file was removed. The non-UTF-8
+    // path is built in memory (unix `OsStrExt`) because macOS, where this suite
+    // runs, refuses to create such a file at all (`EILSEQ`); the branch it covers
+    // is reachable on the Linux VMs the tree is actually seeded into.
+    #[cfg(unix)]
+    #[test]
+    fn a_source_file_whose_relative_path_is_not_valid_utf8_is_kept_by_the_prune() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let keep: HashSet<String> = ["pkg/keep.py".to_string()].into_iter().collect();
+
+        let weird = Path::new(OsStr::from_bytes(b"pkg/\xff\xfe.py"));
+        assert!(
+            weird.to_str().is_none(),
+            "the fixture must actually be invalid UTF-8, or the test proves nothing"
+        );
+        assert!(
+            prune_keeps(weird, &keep),
+            "a non-UTF-8 relative path cannot be a `keep` key, so the prune keeps it"
+        );
+
+        assert!(
+            prune_keeps(Path::new("pkg/keep.py"), &keep),
+            "a valid-UTF-8 path the concatenation lists is kept"
+        );
+        assert!(
+            !prune_keeps(Path::new("pkg/old.py"), &keep),
+            "a valid-UTF-8 path the concatenation omits is still pruned"
         );
     }
 

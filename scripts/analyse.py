@@ -961,7 +961,18 @@ class RepairCounts:
     fixed: int = 0
     regressed: int = 0
     fixed_first_attempt: int = 0
+    fixed_first_attempt_unknown: int = 0
+    """Fixed rows whose ``fixed_at_attempt_1`` was never recorded (G2).
+
+    The row carries the flag as ``None`` when its ``run.summary`` is absent (a run
+    the harness killed) or predates the field, and ``None`` is not ``False``:
+    reading it as "not at attempt 1" makes the printed "fixed at attempt 1" a count
+    over fewer rows than ``fixed`` claims, so the hole is counted apart and named.
+    """
     attempt_hist: Counter = field(default_factory=Counter)
+    attempts_unknown: int = 0
+    """Repair rows whose ``attempts_run`` was never recorded (G2) — the same hole in
+    the histogram below: a distribution over fewer rows than ``total`` claims."""
     adversarial_catches: int = 0
     replayed: int = 0
     inconclusive: int = 0
@@ -1001,6 +1012,12 @@ def repair_counts(analysis: Analysis) -> RepairCounts:
 
     A row whose grading was unreadable (``inconclusive``) is in no denominator at all:
     it is neither a fix nor a failure, so it is counted apart (item B4's general rule).
+
+    G2 — ``fixed_at_attempt_1`` and ``attempts_run`` are ``None`` on a row whose
+    ``run.summary`` is absent, and ``None`` is "not recorded", not ``False`` and not
+    ``0``. Each hole is counted (``fixed_first_attempt_unknown`` / ``attempts_unknown``)
+    so the two figures that read from them print ``unavailable(...)`` rather than a
+    count over fewer rows than ``fixed`` / ``total`` claims.
     """
     counts = RepairCounts()
     by_session: dict[str, dict[str, Any]] = {}
@@ -1028,13 +1045,21 @@ def repair_counts(analysis: Analysis) -> RepairCounts:
             counts.applied += 1
         if oracle.patch_good:
             counts.fixed += 1
-            if record.get("fixed_at_attempt_1"):
+            # G2 — the row records the flag as `None` when its `run.summary` is
+            # absent, and `None` must not be read as `False`: that would make the
+            # printed "fixed at attempt 1" a count over fewer rows than `fixed`.
+            fixed_at_attempt_1 = record.get("fixed_at_attempt_1")
+            if fixed_at_attempt_1 is None:
+                counts.fixed_first_attempt_unknown += 1
+            elif fixed_at_attempt_1:
                 counts.fixed_first_attempt += 1
         if oracle.suite_regressions:
             counts.regressed += 1
         attempts = record.get("attempts_run")
         if isinstance(attempts, int):
             counts.attempt_hist[attempts] += 1
+        else:
+            counts.attempts_unknown += 1
 
         replay = by_session.get(str(record.get("session_id") or ""))
         if replay is None:
@@ -1065,8 +1090,8 @@ class RepairMetrics(Metric):
             ("fixed (oracle patch_good)", str(counts.fixed)),
             ("inconclusive gradings (in no rate)", str(counts.inconclusive)),
             ("fix rate", _fmt(counts.fix_rate)),
-            ("fixed at attempt 1", str(counts.fixed_first_attempt)),
-            ("attempts_run histogram", _tex(attempt_text)),
+            ("fixed at attempt 1", _counted(counts.fixed_first_attempt, counts.fixed_first_attempt_unknown, "fixed_at_attempt_1")),
+            ("attempts_run histogram", _counted(attempt_text, counts.attempts_unknown, "attempts_run")),
             ("regressed (native)", str(counts.regressed)),
             ("regression rate (net of baseline)", _fmt(counts.regression_rate)),
             ("rows with a replay record", str(counts.replayed)),
@@ -1465,7 +1490,7 @@ class PipelineMetrics(Metric):
     name = "pipeline"
 
     def run(self, analysis: Analysis) -> MetricResult:
-        generated = admitted_first = admitted_after = discarded = 0
+        generated = admitted_first = admitted_after = discarded = no_round = 0
         for _batch, replay in analysis.replays:
             for test in replay.get("tests") or []:
                 if test.get("evidence_source") != replay_mod.SOURCE_VANTA_GENERATED:
@@ -1476,18 +1501,45 @@ class PipelineMetrics(Metric):
                     admitted_first += 1
                 elif isinstance(round_admitted, int) and round_admitted > 1:
                     admitted_after += 1
+                else:
+                    # G2 — most often a row written before item 10, whose per-attempt
+                    # artifact is absent (`replay` records `None` there deliberately).
+                    # It is a hole in the round, not a zero: the test is in
+                    # `generated`, so leaving it out of both counts would print a
+                    # classification that misses tests it silently drops.
+                    no_round += 1
                 if test.get("assertion_grounding_type") == replay_mod.GROUNDING_UNGROUNDED_SCRAPPED:
                     discarded += 1
 
+        # G2 — a counter is a measurement only while EVERY row recorded it. The sum
+        # below is still accumulated from the rows that did record the field, but a
+        # total printed over rows whose summary was absent (or lacked the field)
+        # understates the aggregate and states it as if it had been measured — the
+        # `0` the module's `unavailable` exists to replace. The two holes are
+        # counted separately so the renderer can name which rows are missing.
         truncations = 0
         retries = 0
+        no_summary = 0
+        no_truncations = 0
+        no_retries = 0
         patch_apply_failed = 0
         failure_classes: Counter = Counter()
         for _batch, record in analysis.rows:
             summary = analysis.run_summary(record)
-            if summary:
-                truncations += _int_field(summary, "truncated_calls")
-                retries += _int_field(summary, "provider_retries")
+            if not summary:
+                # No `run.summary` line at all: neither field was measured here.
+                no_summary += 1
+            else:
+                value = _int_field(summary, "truncated_calls")
+                if value is None:
+                    no_truncations += 1
+                else:
+                    truncations += value
+                value = _int_field(summary, "provider_retries")
+                if value is None:
+                    no_retries += 1
+                else:
+                    retries += value
             if str(record.get("stop_reason") or "") == "patch_application_failed":
                 patch_apply_failed += 1
             failure_classes.update(analysis.failure_classes(record))
@@ -1497,13 +1549,13 @@ class PipelineMetrics(Metric):
         ) or "n/a"
         rows = [
             ("tests generated", str(generated)),
-            ("admitted first time", str(admitted_first)),
-            ("admitted after revision", str(admitted_after)),
+            ("admitted first time", _counted(admitted_first, no_round, "round_admitted", unit="test")),
+            ("admitted after revision", _counted(admitted_after, no_round, "round_admitted", unit="test")),
             ("discarded (ungrounded, scrapped)", str(discarded)),
-            ("failure classes", _tex(class_text)),
+            ("failure classes", class_text),
             ("patch applications failed", str(patch_apply_failed)),
-            ("truncated calls", str(truncations)),
-            ("provider retries", str(retries)),
+            ("truncated calls", _counted(truncations, no_summary + no_truncations, "truncated_calls")),
+            ("provider retries", _counted(retries, no_summary + no_retries, "provider_retries")),
         ]
         tex = (
             r"% item 12 — pipeline metrics. Test counts come from the replay records;"
@@ -1514,7 +1566,11 @@ class PipelineMetrics(Metric):
             "\n"
             r"\hline"
             "\n"
-            + "\n".join(f"{_tex(name)} & {value} \\\\" for name, value in rows)
+            # [VANTA-WHY] Every value goes through `_tex`, not only the names: a
+            # counter can render `unavailable(...)` with a field name in it and a
+            # failure class can carry an underscore, and this is a LaTeX table — an
+            # unescaped `_` there ends the cell's meaning ("Missing $ inserted").
+            + "\n".join(f"{_tex(name)} & {_tex(value)} \\\\" for name, value in rows)
             + "\n"
             + r"\hline"
             + "\n"
@@ -1525,14 +1581,39 @@ class PipelineMetrics(Metric):
         return MetricResult(name=self.name, artifacts=[Artifact("pipeline.tex", tex)], summary=summary)
 
 
-def _int_field(summary: str, key: str) -> int:
+def _counted(value: object, missing: int, what: str, *, unit: str = "row") -> str:
+    """A summed or counted value, or ``unavailable(...)`` when an input lacked it.
+
+    Item 12's rule, the one the cost section applies throughout: a number no input
+    supports reads ``unavailable(...)``, never a fabricated ``0``. ``missing`` is how
+    many inputs did not record ``what`` (no ``run.summary`` line, or no such field in
+    it); while it is non-zero the value covers fewer inputs than the table claims, so
+    the hole is named instead of the short figure being printed. ``value`` is a total
+    or a count — or a rendered distribution, for a field whose value is text — and
+    ``unit`` names what the missing ones are, since a hole in a per-test count and a
+    hole in a per-row count are different statements.
+    """
+    if missing:
+        return unavailable(f"{missing} {unit}(s) recorded no {what} measurement")
+    return str(value)
+
+
+def _int_field(summary: str, key: str) -> Optional[int]:
+    """A ``run.summary`` count as ``int``, or ``None`` when it was not recorded.
+
+    ``None`` — the field absent, or its text unparseable — is "this summary did
+    not record it", kept distinct from a recorded ``0``, exactly as
+    :func:`_float_field` and the whole cost section do. Returning ``0`` turned a
+    hole into a measurement and made every total that contained one understate
+    itself.
+    """
     raw = metrics_mod.summary_field(summary, key)
     if raw is None:
-        return 0
+        return None
     try:
         return int(raw)
     except ValueError:
-        return 0
+        return None
 
 
 def _float_field(summary: str, key: str) -> Optional[float]:

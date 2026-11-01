@@ -30717,6 +30717,40 @@ class TestAnalyseRepair:
         tex = {artifact.filename: artifact.text for artifact in result.artifacts}["repair.tex"]
         assert "inconclusive gradings (in no rate) & 1" in tex
 
+    def test_a_repair_row_that_recorded_no_attempt_fields_reads_unavailable(self, tmp_path):
+        """G2 — `fixed_at_attempt_1` and `attempts_run` are `None` on a row whose
+        `run.summary` is absent, and `None` is not `False` and not `0`.
+
+        k1 recorded both; k2 recorded neither, so the two figures that read them
+        name the hole rather than a count over fewer rows than `fixed` / `total`
+        claims. `fixed` itself stays a number: it comes from the oracle, not the
+        summary, so nothing about it is missing.
+        """
+        rows = [
+            _analyse_row(
+                "k1", mode="repair", bug="A/1", session_id="s1",
+                fixed_at_attempt_1=True, attempts_run=1,
+            ),
+            _analyse_row("k2", mode="repair", bug="B/1", session_id="s2"),
+        ]
+        analysis = _analyse_load(_analyse_batch(tmp_path, rows=rows))
+        counts = analyse_mod.repair_counts(analysis)
+        assert counts.fixed == 2
+        assert counts.fixed_first_attempt == 1 and counts.fixed_first_attempt_unknown == 1
+        assert counts.attempt_hist == Counter({1: 1}) and counts.attempts_unknown == 1
+
+        result = analyse_mod.RepairMetrics().run(analysis)
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["repair.tex"]
+        assert "fixed (oracle patch\\_good) & 2" in tex
+        assert (
+            "fixed at attempt 1 & unavailable(1 row(s) recorded no fixed\\_at\\_attempt\\_1 measurement)"
+            in tex
+        )
+        assert (
+            "attempts\\_run histogram & unavailable(1 row(s) recorded no attempts\\_run measurement)"
+            in tex
+        )
+
     def test_the_repair_tex_marks_cost_unavailable_and_never_zero(self, tmp_path):
         result = analyse_mod.RepairMetrics().run(_analyse_load(self._batch(tmp_path)))
         tex = {artifact.filename: artifact.text for artifact in result.artifacts}["repair.tex"]
@@ -30874,13 +30908,111 @@ class TestAnalysePipeline:
         )
         result = analyse_mod.PipelineMetrics().run(_analyse_load(batch))
         tex = {artifact.filename: artifact.text for artifact in result.artifacts}["pipeline.tex"]
+        summary = "\n".join(result.summary)
         assert "tests generated & 3" in tex
-        assert "admitted first time & 1" in tex
-        assert "admitted after revision & 1" in tex
+        # G2 — g3 is generated but its round was never recorded (a row written before
+        # item 10). The two admission counts cannot cover it, so they name the hole
+        # instead of printing 1 (and 1) as a classification of all 3 tests. The `.tex`
+        # escapes the field name's underscore; the plain-text summary keeps it raw.
+        assert (
+            "unavailable(1 test(s) recorded no round_admitted measurement)" in summary
+        )
+        assert (
+            "admitted first time & unavailable(1 test(s) recorded no round\\_admitted measurement)"
+            in tex
+        )
+        assert (
+            "admitted after revision & unavailable(1 test(s) recorded no round\\_admitted measurement)"
+            in tex
+        )
         assert "discarded (ungrounded, scrapped) & 1" in tex
         assert "truncated calls & 2" in tex
         assert "provider retries & 3" in tex
         assert "assertionerror:1" in tex
+
+    def test_a_counter_with_a_hole_reads_unavailable_and_the_valid_ones_still_sum(self, tmp_path):
+        """G2 — a total over rows that did not record a field is a hole, not a short sum.
+
+        Row 1 records both counters, row 2 records `truncated_calls` only. The
+        truncations total covers both rows and reads 7; the retry total covers one
+        row where 2 were measured, so it names the row it is missing rather than
+        printing the 3 that a zero-for-a-hole would have produced.
+        """
+        sessions = tmp_path / "vanta_sessions"
+        write(
+            sessions / "sid1_session.jsonl",
+            json.dumps({"phase": "run.summary", "summary": "truncated_calls=2 provider_retries=3"})
+            + "\n",
+        )
+        write(
+            sessions / "sid2_session.jsonl",
+            json.dumps({"phase": "run.summary", "summary": "truncated_calls=5"}) + "\n",
+        )
+        batch = _analyse_batch(
+            tmp_path,
+            rows=[
+                _analyse_row(
+                    "k1",
+                    mode="repair",
+                    session_id="sid1",
+                    artifacts={"session_dir": str(sessions / "sid1")},
+                ),
+                _analyse_row(
+                    "k2",
+                    mode="repair",
+                    session_id="sid2",
+                    artifacts={"session_dir": str(sessions / "sid2")},
+                ),
+            ],
+        )
+        result = analyse_mod.PipelineMetrics().run(_analyse_load(batch))
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["pipeline.tex"]
+        summary = "\n".join(result.summary)
+        assert "truncated calls & 7" in tex
+        assert "provider retries & unavailable(" in tex
+        assert "unavailable(1 row(s) recorded no provider_retries measurement)" in summary
+
+    def test_a_row_with_no_run_summary_puts_both_counters_unavailable(self, tmp_path):
+        """G2 — a session with no `run.summary` line measured neither counter.
+
+        The row is counted, and both totals name it: the alternative — adding
+        nothing and printing the total anyway — reads as "measured, and it was 0".
+        """
+        sessions = tmp_path / "vanta_sessions"
+        write(
+            sessions / "sid1_session.jsonl",
+            json.dumps({"phase": "run.summary", "summary": "truncated_calls=2 provider_retries=3"})
+            + "\n",
+        )
+        write(
+            sessions / "sid2_session.jsonl",
+            json.dumps({"phase": "patched.result[0]", "summary": "failure_class=AssertionError"})
+            + "\n",
+        )
+        batch = _analyse_batch(
+            tmp_path,
+            rows=[
+                _analyse_row(
+                    "k1",
+                    mode="repair",
+                    session_id="sid1",
+                    artifacts={"session_dir": str(sessions / "sid1")},
+                ),
+                _analyse_row(
+                    "k2",
+                    mode="repair",
+                    session_id="sid2",
+                    artifacts={"session_dir": str(sessions / "sid2")},
+                ),
+            ],
+        )
+        result = analyse_mod.PipelineMetrics().run(_analyse_load(batch))
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["pipeline.tex"]
+        summary = "\n".join(result.summary)
+        assert "truncated calls & unavailable(" in tex
+        assert "provider retries & unavailable(" in tex
+        assert "unavailable(1 row(s) recorded no truncated_calls measurement)" in summary
+        assert "unavailable(1 row(s) recorded no provider_retries measurement)" in summary
 
 
 class TestAnalyseCost:

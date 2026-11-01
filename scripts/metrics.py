@@ -37,10 +37,16 @@ unresolved         The run stopped at its attempt budget without an approved
                    nothing this run produced was ever accepted. It is "gave up",
                    never an approval: counted on its own so it can never inflate
                    an approval bucket, whatever ground-truth label it carries.
-undetermined       Rejected, but no signal could be evaluated (e.g. a legacy v0
-                   session whose static findings were never recorded). Reported
+undetermined       Rejected, but nothing supports a claim about it: no signal
+                   could be evaluated (e.g. a legacy v0 session whose static
+                   findings were never recorded), or there is no ground-truth
+                   label at all (M3 item E8 — an inconclusive candidate, whose
+                   patch applied but was never graded). `true_catch` and
+                   `spurious_reject` both claim the rejected patch was known-bad,
+                   so a rejection with no label cannot be either. Reported
                    separately so it is never silently folded into
-                   spurious_reject.
+                   spurious_reject, and excluded from every ground-truth-dependent
+                   denominator.
 approved_unlabeled Approved with no ground-truth label, so nothing is claimed.
 needs_review_on_good
                    The run refused to decide (`NeedsReview`, §14) on a patch the
@@ -603,6 +609,17 @@ def classify(
             # about signals a judge row does not have. An unlabelled judge
             # rejection still claims nothing and falls through to `undetermined`.
             bucket = TRUE_CATCH
+        elif known_bad is None:
+            # [VANTA-WHY] M3 item E8 — with NO ground truth (an inconclusive
+            # candidate: the patch applied but no run wrote a readable grade), a
+            # rejection supports neither `true_catch` nor `spurious_reject`: both
+            # are claims about a KNOWN-BAD patch, and `deciding` says only that a
+            # signal discriminated — not that the patch was bad. It falls to
+            # `undetermined`, which claims nothing, and is thereby excluded from
+            # every ground-truth-dependent denominator (`spurious_reject_rate`
+            # divides by `true_catch + spurious_reject`, and no labelled row is
+            # affected). The bucket is still visible in the totals.
+            bucket = UNDETERMINED
         elif deciding:
             bucket = TRUE_CATCH
         elif signals and not undecidable:

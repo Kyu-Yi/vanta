@@ -465,6 +465,40 @@ def test_rejected_with_no_rerun_at_all_is_undetermined_not_spurious(tmp_path):
     assert metrics.classify(data, known_bad=True).bucket == metrics.UNDETERMINED
 
 
+def test_a_rejection_with_no_ground_truth_is_undetermined_not_a_catch(tmp_path):
+    """Item E8 — `true_catch`/`spurious_reject` both claim the patch was known-bad.
+
+    [WHY] An inconclusive candidate (the patch applied but no readable grade) has no
+    ground truth, so `known_bad` is None. A discriminating signal is evidence about the
+    SIGNAL, not that the rejected patch was bad; crediting a catch here would put a
+    number into the detection rate that nobody's ground truth supports.
+    """
+    write_session(tmp_path, "unknown", decision="Rejected", schema_version=1)
+    write_reruns(tmp_path, "unknown", [signal(True)])
+
+    verdict = metrics.classify(metrics.load_session(str(tmp_path), "unknown"), known_bad=None)
+    assert verdict.bucket == metrics.UNDETERMINED
+
+
+def test_an_unknown_ground_truth_rejection_leaves_the_ground_truth_denominator_empty(tmp_path):
+    """The unknown-ground-truth rejection is out of every ground-truth-dependent count.
+
+    `spurious_reject_rate` divides by `true_catch + spurious_reject`, and both are
+    claims about a known-bad patch. With no label the rejection is in neither, so the
+    denominator stays empty — an honest "n/a" rather than a rate over a row nobody's
+    ground truth supports. It is still visible in the bucket totals.
+    """
+    write_provenance_session(tmp_path, "unknown", provenance_summary())
+    write_reruns(tmp_path, "unknown", [signal(True)])
+
+    groups, facts = groups_and_facts(tmp_path)
+    pooled = metrics.pooled_metrics(groups[0], facts)
+    assert pooled.buckets[metrics.UNDETERMINED] == 1
+    assert pooled.buckets[metrics.TRUE_CATCH] == 0
+    assert pooled.buckets[metrics.SPURIOUS_REJECT] == 0
+    assert pooled.rates()["spurious_reject_rate"] == (0, 0)
+
+
 def test_false_approval_on_a_known_bad_patch(tmp_path):
     write_session(tmp_path, "approved-bad", decision="AllTestsPassed", schema_version=1)
 

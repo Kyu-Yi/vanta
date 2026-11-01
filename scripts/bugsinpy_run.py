@@ -1416,6 +1416,55 @@ def cmd_report(args: argparse.Namespace) -> int:
     return EXIT_OK if subprocess.run(argv, cwd=str(REPO_ROOT)).returncode == 0 else EXIT_BUG_FAILED
 
 
+def _replay_session_id(path: Path) -> Optional[str]:
+    """The ``session_id`` a replay file records, or ``None`` when it records none.
+
+    ``None`` covers every way a file can fail to name a session — absent, not
+    JSON, not an object, an empty or non-string ``session_id`` — because the only
+    use is "is this file the one the current row's session wrote?", and a file
+    that cannot say is not that file.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("session_id")
+    return str(value) if isinstance(value, str) and value else None
+
+
+def _replay_target(
+    out_dir: Path, stem: str, session_id: str, *, force: bool
+) -> tuple[Optional[Path], Path]:
+    """Where this row's replay goes, and the file it would already be there as (G3).
+
+    ``replay`` names a replay by the row's **key**, so a re-run of an inconclusive
+    row — same key, NEW session — produced the path of the session it replaces.
+    Skipping on the path alone then left the replacement with no replay at all,
+    and F9's effective-session filter dropped the old file, so *neither* session
+    had one. A file on disk is never rewritten: when the plain name holds another
+    session's replay, this session's goes beside it as ``<stem>.<session>.json``
+    and ``analyse.load_replays`` — which globs the directory and keeps the rows
+    whose session is effective — picks the live one. Nothing else reads these
+    files by name, so no lookup has to move with it.
+
+    Returns ``(write_to, found)``. ``write_to`` is ``None`` when this session's
+    own replay is already on disk and ``--force`` was not given; ``found`` is
+    where it was found, so the caller can name it in the skip message. A session
+    id is unique per run, so the qualified name is this session's and a re-run
+    under it resumes on the same file rather than writing a second copy.
+    """
+    plain = out_dir / f"{stem}.json"
+    if not plain.exists() or _replay_session_id(plain) == session_id:
+        target = plain
+    else:
+        target = out_dir / f"{stem}.{session_id}.json"
+    if target.exists() and not force and _replay_session_id(target) == session_id:
+        return None, target
+    return target, target
+
+
 def cmd_replay(args: argparse.Namespace) -> int:
     """Item 10 — replay every stored attempt of a row onto one fixed test set S.
 
@@ -1479,10 +1528,15 @@ def cmd_replay(args: argparse.Namespace) -> int:
                 flush=True,
             )
             continue
-        out_path = out_dir / f"{replay_mod.row_stem(key)}.json"
-        if out_path.exists() and not args.force:
+        out_path, found = _replay_target(
+            out_dir,
+            replay_mod.row_stem(key),
+            str(record.get("session_id") or ""),
+            force=args.force,
+        )
+        if out_path is None:
             print(
-                f"[{index}/{len(rows)}] {key} — skipped: {out_path.name} already "
+                f"[{index}/{len(rows)}] {key} — skipped: {found.name} already "
                 "exists (--force to redo)",
                 flush=True,
             )

@@ -29884,7 +29884,8 @@ class TestReplayCli:
         manifest_mod.Manifest(batch).append(record)
         prep = _replay_prep(tmp_path)
         stem = replay_mod.row_stem(record["key"])
-        existing = write(batch / replay_mod.REPLAY_DIRNAME / f"{stem}.json", "{}\n")
+        text = json.dumps({"session_id": record["session_id"]}) + "\n"
+        existing = write(batch / replay_mod.REPLAY_DIRNAME / f"{stem}.json", text)
         self._prepare_cli(monkeypatch, batch, [prep])
 
         def explode(**kwargs):
@@ -29894,7 +29895,7 @@ class TestReplayCli:
         code = run_mod.main(["replay", "--batch", str(batch)])
         assert code == run_mod.EXIT_OK
         assert "already" in capsys.readouterr().out
-        assert existing.read_text() == "{}\n"
+        assert existing.read_text() == text
 
     def test_a_repair_row_with_no_applied_attempt_is_recorded_as_skipped(
         self, tmp_path, monkeypatch, capsys
@@ -29974,12 +29975,56 @@ class TestReplayCli:
         manifest_mod.Manifest(batch).append(record)
         prep = _replay_prep(tmp_path)
         stem = replay_mod.row_stem(record["key"])
-        existing = write(batch / replay_mod.REPLAY_DIRNAME / f"{stem}.json", "{}\n")
+        existing = write(
+            batch / replay_mod.REPLAY_DIRNAME / f"{stem}.json",
+            json.dumps({"session_id": record["session_id"], "kind": "old"}) + "\n",
+        )
         self._prepare_cli(monkeypatch, batch, [prep])
         monkeypatch.setattr(replay_mod, "replay_row", lambda **kwargs: {"kind": "replay"})
         code = run_mod.main(["replay", "--batch", str(batch), "--force"])
         assert code == run_mod.EXIT_OK
         assert json.loads(existing.read_text())["kind"] == "replay"
+
+    def test_a_superseded_row_writes_beside_the_old_replay_and_leaves_it_intact(
+        self, tmp_path, monkeypatch
+    ):
+        """G3 — the replacement replay goes beside the file it supersedes, never over it.
+
+        An inconclusive row re-run under the same key keeps `row_stem`, so the
+        replacement used to find the superseded session's file at its own path and
+        skip; F9's effective-session filter then dropped that old file, leaving the
+        replacement with no replay at all. Here the row is re-run under a new
+        session, the old file is byte-identical after the run, and the reader keeps
+        exactly the effective session's replay.
+        """
+        old = _replay_record(session_id="oldsid")
+        new = _replay_record(session_id="newsid", supersedes={"session_id": "oldsid"})
+        batch = tmp_path / "b"
+        for record in (old, new):
+            manifest_mod.Manifest(batch).append(record)
+        prep = _replay_prep(tmp_path)
+        stem = replay_mod.row_stem(new["key"])
+        existing = write(
+            batch / replay_mod.REPLAY_DIRNAME / f"{stem}.json",
+            json.dumps({"kind": "replay", "session_id": "oldsid"}) + "\n",
+        )
+        before = existing.read_bytes()
+        self._prepare_cli(monkeypatch, batch, [prep])
+        monkeypatch.setattr(
+            replay_mod,
+            "replay_row",
+            lambda **kwargs: {"kind": "replay", "session_id": "newsid"},
+        )
+
+        code = run_mod.main(["replay", "--batch", str(batch)])
+
+        assert code == run_mod.EXIT_OK
+        assert existing.read_bytes() == before, "a file on disk is never rewritten"
+        replacement = batch / replay_mod.REPLAY_DIRNAME / f"{stem}.newsid.json"
+        assert json.loads(replacement.read_text())["session_id"] == "newsid"
+        kept, keyless = analyse_mod.load_replays(batch)
+        assert [row["session_id"] for row in kept] == ["newsid"]
+        assert keyless == 0
 
 
 # ============================================================================

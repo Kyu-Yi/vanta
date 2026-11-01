@@ -9,7 +9,8 @@ recover. So the M3 configuration lives in one committed file
 (``configs/v1-m3.toml``), the file's SHA-256 is written on every manifest row, and
 two rows under different files can never be pooled (``analyse.py``).
 
-Three things the file's sections mean, and they are different things on purpose.
+Each of the file's sections means a different thing, and they are different
+things on purpose.
 
 ``[env]``
     The verdict-affecting settings that are *frozen to a literal*. The harness
@@ -31,6 +32,16 @@ Three things the file's sections mean, and they are different things on purpose.
     The pre-registration: what the M3 configuration commits to before a run, and
     the content hash of every prompt template. Both are inside the file's bytes,
     so both are inside ``config_hash``.
+
+``[fixed_rounds]``
+    The fixed-round arms and their K (M3 item 9/A5). This one IS enforced — the
+    harness reads it and refuses a run whose scheduled K arm it does not declare,
+    or declares at a different K — and, like every other section, it sits inside
+    the file's bytes, so changing K or the arm list moves ``config_hash``. It is
+    therefore neither a frozen literal (nothing is applied to a child from it) nor
+    merely declarative like ``[prereg]``: it is a table the run is checked
+    against. ``fixed_rounds()`` reads it, and an absent table means "this
+    configuration declares no K arm".
 """
 
 from __future__ import annotations
@@ -47,6 +58,7 @@ CONFIG_PATH = REPO_ROOT / "configs" / "v1-m3.toml"
 FROZEN_SECTION = "env"
 RECORDED_SECTION = "recorded"
 PREREG_SECTION = "prereg"
+FIXED_ROUNDS_SECTION = "fixed_rounds"
 PROMPTS_SECTION = "prompts"
 
 UNSET = "unset"
@@ -103,6 +115,24 @@ class FrozenConfig:
 
     def prereg(self) -> dict[str, Any]:
         return dict(self.data.get(PREREG_SECTION) or {})
+
+    def fixed_rounds(self) -> dict[str, int]:
+        """``arm name -> K`` — the fixed-round arms this configuration declares.
+
+        [VANTA-WHY] M3 item 9/A5 — this table is the DECLARATION OF RECORD for the
+        K arm: it is read (the harness refuses a run whose scheduled K arm is not
+        in it, or is declared at a different K) *and* hashed (it sits in the file's
+        bytes, so changing K or the arm list moves ``config_hash``). That is why
+        the value moved here out of ``[prereg]``, which the harness never applies
+        and therefore cannot enforce. An absent table is ``{}`` — a configuration
+        that declares no K arm — and never an error: the same "no claim" reading
+        the rest of this module gives an absent setting.
+        """
+
+        return {
+            str(key): int(value)
+            for key, value in (self.data.get(FIXED_ROUNDS_SECTION) or {}).items()
+        }
 
     def prompts(self) -> dict[str, str]:
         return {str(k): str(v) for k, v in (self.data.get(PROMPTS_SECTION) or {}).items()}
@@ -212,6 +242,27 @@ def _validate(data: Mapping[str, Any], path: Path) -> None:
                     f"{path}: [{section}] {key} must be a non-empty string"
                 )
     table(PREREG_SECTION)
+    # M3 item 9/A5 — the K arm's declaration is read and enforced, so a file that
+    # could not mean what `fixed_rounds()` assumes is refused here rather than
+    # turning into a silently wrong K at run time. The section is OPTIONAL, unlike
+    # the three above: a configuration that declares no K arm is a legitimate one
+    # (every configuration written before A5 does), and `fixed_rounds()` reads an
+    # absent table as "no claim" — the same reading the rest of this module gives
+    # an absent setting.
+    declared = data.get(FIXED_ROUNDS_SECTION)
+    if declared is not None:
+        for key, value in table(FIXED_ROUNDS_SECTION).items():
+            if not isinstance(key, str) or not key:
+                raise FrozenConfigError(
+                    f"{path}: [{FIXED_ROUNDS_SECTION}] keys are arm names and must be "
+                    "non-empty strings"
+                )
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise FrozenConfigError(
+                    f"{path}: [{FIXED_ROUNDS_SECTION}] {key} must be a positive integer "
+                    f"K (found {value!r}); K=0 would ask for no attempt, which is not "
+                    "a run"
+                )
     for key, value in table(PROMPTS_SECTION).items():
         if not isinstance(value, str) or not value:
             raise FrozenConfigError(

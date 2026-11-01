@@ -892,6 +892,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         waves=waves or sorted({prep.wave for prep in selected}),
         vanta_bin=vanta_bin,
         max_attempts=args.max_attempts,
+        fixed_rounds=args.fixed_rounds,
+        fixed_rounds_declaration=frozen.fixed_rounds(),
         disk_mb=args.disk_mb,
         show_hints=args.show_hints,
         plan_only=args.plan,
@@ -1031,6 +1033,8 @@ def cmd_queue(args: argparse.Namespace) -> int:
         vanta_bin=vanta_bin,
         jobs=args.jobs,
         max_attempts=args.max_attempts,
+        fixed_rounds=args.fixed_rounds,
+        fixed_rounds_declaration=frozen.fixed_rounds(),
         disk_mb=args.disk_mb,
         show_hints=args.show_hints,
         plan_only=args.plan,
@@ -1731,6 +1735,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--fixed-rounds",
+        type=int,
+        default=None,
+        help=(
+            "state that this run spends EXACTLY K repair attempts (M3 item 9). A "
+            "fixed-round run IS the arm, so schedule b1-k4/b3-k4; the flag is a "
+            "caller's statement and is refused — before the batch starts — when no "
+            "scheduled arm is a fixed-round arm, or when it disagrees with the K the "
+            "arm (and the frozen config's [fixed_rounds] table) declares. The harness "
+            "states the arm's own K on the child's argv; it does not need this flag."
+        ),
+    )
+    run.add_argument(
         "--disk-mb",
         type=int,
         default=prepare_mod.DISK_MB,
@@ -1826,6 +1843,18 @@ def build_parser() -> argparse.ArgumentParser:
             "Vanta's repair budget per run (default: 4, the binary's own). An arm "
             "that pins a budget owns it: an explicit different value is refused "
             "before the queue starts."
+        ),
+    )
+    queue.add_argument(
+        "--fixed-rounds",
+        type=int,
+        default=None,
+        help=(
+            "state that this queue's runs spend EXACTLY K repair attempts (M3 item 9). "
+            "A fixed-round run IS the arm, so schedule b1-k4/b3-k4; the flag is a "
+            "caller's statement and is refused — before the queue starts — when no "
+            "scheduled arm is a fixed-round arm, or when it disagrees with the K the "
+            "arm (and the frozen config's [fixed_rounds] table) declares."
         ),
     )
     queue.add_argument(

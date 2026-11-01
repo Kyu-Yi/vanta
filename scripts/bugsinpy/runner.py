@@ -1860,6 +1860,7 @@ def invoke_vanta(
     env: dict[str, str],
     log_path: Path,
     max_attempts: int,
+    fixed_rounds: Optional[int] = None,
     candidate: Optional[Candidate] = None,
 ) -> SessionOutcome:
     """Run ``vanta_m3`` once, then discover and read what it wrote.
@@ -1878,6 +1879,16 @@ def invoke_vanta(
         "--test-cmd", vanta_test_cmd(prep.test_cmd),
         "--max-attempts", str(max_attempts),
     ]
+    # [VANTA-WHY] M3 item 9/A5 — the harness STATES a fixed-round arm's K on the
+    # child's argv, exactly as it states B0's pinned `--max-attempts`, so the run
+    # cannot be asked to spend a different number of rounds than the arm its row
+    # names. It reaches this flag from the arm (``arms.arm_fixed_rounds``), never
+    # from a caller's flag, and the binary refuses a stated K arm whose argv does
+    # not carry the matching K. ``None`` is every ordinary arm, and leaves the argv
+    # byte-identical to a run before this option. A K arm is repair-only, so the
+    # ``--patch`` review branch below is never combined with it.
+    if fixed_rounds is not None:
+        argv += ["--fixed-rounds", str(fixed_rounds)]
     # §3.4 — the row's recorded suite environment, handed to every run of this bug
     # so Vanta's own suites see the same import path the preparation gates did.
     # One flag per key, the value never typed per bug: it comes from the split's
@@ -2649,6 +2660,10 @@ def run_job(
         env=env,
         log_path=log_path,
         max_attempts=max_attempts,
+        # M3 item 9/A5 — the arm owns its K: a fixed-round arm states `--fixed-rounds K`
+        # on the child's argv, an ordinary arm states nothing (`None`). Read from the
+        # job's arm so the row's `arm` and the run's K come from one place.
+        fixed_rounds=arms_mod.arm_fixed_rounds(job.arm),
         candidate=job.candidate,
     )
     if not outcome.usable:
@@ -2887,6 +2902,8 @@ def run_batch(
     waves: Sequence[int],
     vanta_bin: Path,
     max_attempts: Optional[int] = None,
+    fixed_rounds: Optional[int] = None,
+    fixed_rounds_declaration: Optional[Mapping[str, int]] = None,
     disk_mb: int,
     show_hints: bool = False,
     plan_only: bool = False,
@@ -2930,6 +2947,15 @@ def run_batch(
     it is refused by :func:`_require_arm_budget` before the schedule is printed. Every
     other arm runs what the invocation asked for, or the binary's own default.
 
+    ``fixed_rounds`` is the invocation's ``--fixed-rounds``, or ``None`` when the flag was
+    NOT given (M3 item 9/A5). A fixed-round arm owns its K: the harness STATES it on the
+    child's argv from the arm, so the flag is a caller's *statement* that must match rather
+    than the mechanism a K arm runs by. ``fixed_rounds_declaration`` is the frozen
+    configuration's ``[fixed_rounds]`` table (``FrozenConfig.fixed_rounds``), supplied by
+    the ``run``/``queue`` command, which refuses a scheduled K arm the configuration does
+    not declare. Both are checked by :func:`_require_fixed_rounds` before the first VM
+    boots.
+
     ``config_block`` and ``frozen_env`` are item 19's frozen configuration, supplied by the
     ``run`` command (``frozen_config.resolve``) and carried on every job: the block goes onto
     each row (``build_record``), the environment onto each ``vanta_m3`` child (``vanta_env``).
@@ -2962,6 +2988,10 @@ def run_batch(
     # M3 item 11 — refuse an explicit `--max-attempts` a pinned arm contradicts,
     # before the schedule is printed and before any VM boots.
     _require_arm_budget(spellings, max_attempts)
+    # M3 item 9/A5 — the same refusal for `--fixed-rounds`: the arm list, the frozen
+    # `[fixed_rounds]` declaration of record and a caller's flag must all agree before
+    # the first VM boots.
+    _require_fixed_rounds(spellings, fixed_rounds, fixed_rounds_declaration)
     # D13's order, mode-major, derived from the spellings themselves, so every repair
     # pass precedes every review pass by construction. The `config` column of a
     # phase's rows is the spelling's config value (`baseline` for both `b1` and
@@ -3241,6 +3271,63 @@ def _arm_attempt_budget(arm: str, requested: Optional[int]) -> int:
         return arms_mod.arm_attempts(arm, requested)
     except arms_mod.ArmError as exc:
         raise RunnerError(str(exc)) from exc
+
+
+def _require_fixed_rounds(
+    spellings: Sequence[str],
+    requested: Optional[int],
+    declaration: Optional[Mapping[str, int]],
+) -> None:
+    """Refuse a ``--fixed-rounds`` (or a frozen declaration) the arm list contradicts.
+
+    [VANTA-WHY] M3 item 9/A5 — a fixed-round arm IS K attempts, so three things have
+    to agree before the schedule prints: the arm's own K (the registry, itself a
+    mirror of the frozen config), the frozen config's ``[fixed_rounds]`` declaration
+    of record, and the caller's ``--fixed-rounds`` statement when one was given. The
+    harness STATES the arm's K on the child's argv (:func:`invoke_vanta`) and never
+    needs the flag from a caller, so a caller's flag is a *statement* that must match
+    rather than the mechanism a K arm runs by. The declaration is checked only when a
+    frozen configuration was supplied — a test-driven job carries ``None`` and is
+    answered from the registry alone.
+    """
+    scheduled: list[tuple[str, int]] = []
+    for mode, written in arms_mod.phases_for(spellings):
+        name = arms_mod.arm_for(written, mode)
+        k = arms_mod.arm_fixed_rounds(name)
+        if k is not None:
+            scheduled.append((name, k))
+    # The arm list against the frozen configuration's declaration of record: a
+    # scheduled K arm the config does not declare — or declares at a different K —
+    # means the rows this run writes would not be the ones `config_hash` claims.
+    if declaration is not None:
+        for name, k in scheduled:
+            declared = declaration.get(name)
+            if declared is None:
+                raise RunnerError(
+                    f"the scheduled arm {name!r} is a fixed-round arm (K = {k}), but "
+                    "the frozen configuration's [fixed_rounds] table does not declare "
+                    "it; the arm list and the hashed configuration disagree"
+                )
+            if declared != k:
+                raise RunnerError(
+                    f"the frozen configuration declares {name!r} at K = {declared}, but "
+                    f"the registry runs it at K = {k}; the declaration of record and the "
+                    "arm it names disagree"
+                )
+    # The caller's own statement.
+    if requested is not None:
+        if not scheduled:
+            raise RunnerError(
+                f"--fixed-rounds {requested} was given, but no scheduled arm is a "
+                "fixed-round arm; a fixed-round run IS the arm, so schedule b1-k4 or "
+                "b3-k4 rather than passing the flag to an ordinary arm"
+            )
+        for name, k in scheduled:
+            if k != requested:
+                raise RunnerError(
+                    f"--fixed-rounds {requested} disagrees with arm {name!r}, which IS "
+                    f"{k} attempts; drop the flag or schedule an arm that runs {requested}"
+                )
 
 
 def _require_arm_budget(spellings: Sequence[str], requested: Optional[int]) -> None:
@@ -3834,6 +3921,8 @@ def run_queue(
     vanta_bin: Path,
     jobs: int = 1,
     max_attempts: Optional[int] = None,
+    fixed_rounds: Optional[int] = None,
+    fixed_rounds_declaration: Optional[Mapping[str, int]] = None,
     disk_mb: int,
     show_hints: bool = False,
     plan_only: bool = False,
@@ -3881,6 +3970,8 @@ def run_queue(
             vanta_bin=vanta_bin,
             jobs=jobs,
             max_attempts=max_attempts,
+            fixed_rounds=fixed_rounds,
+            fixed_rounds_declaration=fixed_rounds_declaration,
             disk_mb=disk_mb,
             show_hints=show_hints,
             plan_only=plan_only,
@@ -3910,11 +4001,14 @@ def _run_queue(**kwargs: Any) -> tuple[int, list[QueueOutcome]]:
             "the queue selection is empty: no prepared bug is in waves "
             f"{list(kwargs['waves'])}."
         )
-    # The same two refusals `run_batch` makes, made once here instead of once per
+    # The same refusals `run_batch` makes, made once here instead of once per
     # bug: they are properties of the split and the invocation, not of a job.
     spellings = _select_arms(kwargs["split"], kwargs["arm_spellings"])
     _require_arm_list(spellings)
     _require_arm_budget(spellings, kwargs["max_attempts"])
+    _require_fixed_rounds(
+        spellings, kwargs["fixed_rounds"], kwargs["fixed_rounds_declaration"]
+    )
     _require_seeds(kwargs["split"], kwargs["seeds"])
 
     print(
@@ -4050,6 +4144,8 @@ def _run_task(
             waves=[wave],
             vanta_bin=kwargs["vanta_bin"],
             max_attempts=kwargs["max_attempts"],
+            fixed_rounds=kwargs["fixed_rounds"],
+            fixed_rounds_declaration=kwargs["fixed_rounds_declaration"],
             disk_mb=kwargs["disk_mb"],
             show_hints=kwargs["show_hints"],
             plan_only=False,

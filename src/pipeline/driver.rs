@@ -424,6 +424,14 @@ struct ArmSpec {
     /// setting is a switch, not a mode, so it lives here rather than in `arms.py`'s
     /// `modes` (which is the harness's repair/review split).
     judge: Option<&'static str>,
+    /// [VANTA-WHY] M3 item 9/A5 — the K a fixed-round arm runs the repair loop for
+    /// (`--fixed-rounds K`), or `None` for every ordinary arm. The value mirrors the
+    /// Python registry's `Arm.fixed_rounds`, which itself mirrors
+    /// `configs/v1-m3.toml`'s `[fixed_rounds]` table (the declaration of record); a
+    /// Python test binds the file, and the table-mirror test binds this array to the
+    /// registry. `resolve_arm` refuses a stated K arm whose `--fixed-rounds` does not
+    /// state its K — a fixed-round arm IS K attempts, exactly as B0 IS one.
+    fixed_rounds: Option<u32>,
 }
 
 const ARMS: &[ArmSpec] = &[
@@ -436,6 +444,7 @@ const ARMS: &[ArmSpec] = &[
         bate: true,
         max_attempts: Some(1),
         judge: None,
+        fixed_rounds: None,
     },
     // B1 — today's `baseline` repair.
     ArmSpec {
@@ -446,6 +455,7 @@ const ARMS: &[ArmSpec] = &[
         bate: true,
         max_attempts: None,
         judge: None,
+        fixed_rounds: None,
     },
     // M3 item 8 — B2: the Attacker runs, BATE does not admit-test.
     ArmSpec {
@@ -456,6 +466,7 @@ const ARMS: &[ArmSpec] = &[
         bate: false,
         max_attempts: None,
         judge: None,
+        fixed_rounds: None,
     },
     // B3 — today's `vanta`, both modes.
     ArmSpec {
@@ -466,6 +477,7 @@ const ARMS: &[ArmSpec] = &[
         bate: true,
         max_attempts: None,
         judge: None,
+        fixed_rounds: None,
     },
     // The review half of today's `baseline`: attacker off, reviewing a candidate.
     ArmSpec {
@@ -476,6 +488,7 @@ const ARMS: &[ArmSpec] = &[
         bate: true,
         max_attempts: None,
         judge: None,
+        fixed_rounds: None,
     },
     // M3 item 7 — the judge: ONE model call decides the candidate. Review-only and
     // attacker-off (nothing is generated), and it pins `--max-attempts 1` for the
@@ -488,6 +501,7 @@ const ARMS: &[ArmSpec] = &[
         bate: true,
         max_attempts: Some(1),
         judge: Some("plain"),
+        fixed_rounds: None,
     },
     // M3 item 7 — the judge WITH the native suite's result on the candidate folded
     // into its prompt. Same one call; the only difference is what the call is shown.
@@ -499,6 +513,32 @@ const ARMS: &[ArmSpec] = &[
         bate: true,
         max_attempts: Some(1),
         judge: Some("suite"),
+        fixed_rounds: None,
+    },
+    // M3 item 9/A5 — the fixed-round arms: B1/B3 with the repair loop forced to run
+    // exactly K attempts (`--fixed-rounds K`), taking the verdict from attempt K so
+    // a patch that passes early is re-examined rather than accepted (EIR). The K
+    // below mirrors the Python registry's `Arm.fixed_rounds`, which mirrors
+    // `configs/v1-m3.toml`'s `[fixed_rounds]` table.
+    ArmSpec {
+        name: "b1-k4",
+        config: "b1-k4",
+        attacker: false,
+        planner: false,
+        bate: true,
+        max_attempts: None,
+        judge: None,
+        fixed_rounds: Some(4),
+    },
+    ArmSpec {
+        name: "b3-k4",
+        config: "b3-k4",
+        attacker: true,
+        planner: false,
+        bate: true,
+        max_attempts: None,
+        judge: None,
+        fixed_rounds: Some(4),
     },
 ];
 
@@ -599,6 +639,7 @@ fn resolve_arm(
     bate: bool,
     max_attempts: u32,
     judge: Option<&str>,
+    fixed_rounds: Option<u32>,
 ) -> Result<ResolvedArm, String> {
     let Some(name) = stated else {
         // [VANTA-WHY] M3 item 7 — a judge run MUST state its arm. The
@@ -656,6 +697,25 @@ fn resolve_arm(
             spec.judge.unwrap_or("off"),
             judge.unwrap_or("off")
         ));
+    }
+    // [VANTA-WHY] M3 item 9/A5 — a fixed-round arm IS K attempts, so the invocation
+    // must state the same K, exactly as B0 must be handed the `--max-attempts 1` it
+    // pins. The harness always states it (`runner.invoke_vanta` builds the flag from
+    // the arm), so only a hand-run binary or a wrapper that named the arm but not its
+    // K reaches this refusal. The check is one-directional on purpose: `--fixed-rounds`
+    // on an ORDINARY arm is a legitimate item-9 run (the option is available to any
+    // repair run), and only the arm whose NAME claims K is contradicted by a mismatch.
+    if let Some(pinned) = spec.fixed_rounds {
+        if fixed_rounds != Some(pinned) {
+            return Err(format!(
+                "CONFIG_ERROR: VANTA_ARM='{name}' IS a {pinned}-attempt run \
+                 (--fixed-rounds {pinned}), but the invocation {}.",
+                match fixed_rounds {
+                    Some(k) => format!("asked for --fixed-rounds {k}"),
+                    None => "did not state --fixed-rounds".to_string(),
+                }
+            ));
+        }
     }
     Ok(ResolvedArm {
         name: spec.name.to_string(),
@@ -1255,6 +1315,7 @@ pub async fn run(
         bate_enabled,
         config.max_attempts,
         judge,
+        config.fixed_rounds,
     )?;
     // [VANTA-WHY] §14.2/§14.4/§14.5 — the three robustness switches. All
     // default OFF so v0.2 behaves exactly as before until they are flipped, and
@@ -7845,7 +7906,7 @@ mod tests {
             for planner in [false, true] {
                 for bate in [false, true] {
                     let resolved =
-                        resolve_arm(None, attacker, planner, bate, 4, None).unwrap();
+                        resolve_arm(None, attacker, planner, bate, 4, None, None).unwrap();
                     let pre = benchmark_config_name(attacker, planner, bate);
                     assert_eq!(
                         resolved.name, pre,
@@ -7879,6 +7940,7 @@ mod tests {
                 spec.bate,
                 budget,
                 spec.judge,
+                spec.fixed_rounds,
             )
             .unwrap_or_else(|e| panic!("arm '{}' must resolve: {e}", spec.name));
             assert_eq!(resolved.name, spec.name);
@@ -7890,19 +7952,19 @@ mod tests {
         }
         // The two legacy arms keep the config name every row on disk already has.
         assert_eq!(
-            resolve_arm(Some("b1"), false, false, true, 4, None)
+            resolve_arm(Some("b1"), false, false, true, 4, None, None)
                 .unwrap()
                 .config,
             "baseline"
         );
         assert_eq!(
-            resolve_arm(Some("b3"), true, false, true, 4, None)
+            resolve_arm(Some("b3"), true, false, true, 4, None, None)
                 .unwrap()
                 .config,
             "vanta"
         );
         assert_eq!(
-            resolve_arm(Some("b0"), false, false, true, 1, None)
+            resolve_arm(Some("b0"), false, false, true, 1, None, None)
                 .unwrap()
                 .config,
             "b0"
@@ -7916,7 +7978,7 @@ mod tests {
     fn a_stated_arm_that_contradicts_the_switches_or_budget_is_refused() {
         // Unknown name: refused, and the sentence lists the known arms. The list
         // holds ARM names, so `baseline` (a config, not an arm) must not appear in it.
-        let error = resolve_arm(Some("nope"), false, false, true, 4, None)
+        let error = resolve_arm(Some("nope"), false, false, true, 4, None, None)
             .expect_err("an unknown arm name must not fall back to the switches");
         assert!(
             error.contains("CONFIG_ERROR")
@@ -7931,7 +7993,7 @@ mod tests {
         );
 
         // Switch disagreement: `b2` is attacker=on, bate=off; the switches say otherwise.
-        let error = resolve_arm(Some("b2"), true, false, true, 4, None)
+        let error = resolve_arm(Some("b2"), true, false, true, 4, None, None)
             .expect_err("VANTA_ARM must not disagree with the switches");
         assert!(
             error.contains("CONFIG_ERROR")
@@ -7940,10 +8002,10 @@ mod tests {
             "got: {error}"
         );
         // `b1` is attacker=off; asking for it with the Attacker on is the same fault.
-        assert!(resolve_arm(Some("b1"), true, false, true, 4, None).is_err());
+        assert!(resolve_arm(Some("b1"), true, false, true, 4, None, None).is_err());
 
         // Budget: `b0` IS one Creator call, so a four-attempt invocation is not b0.
-        let error = resolve_arm(Some("b0"), false, false, true, 4, None)
+        let error = resolve_arm(Some("b0"), false, false, true, 4, None, None)
             .expect_err("b0 pins its attempt budget and the invocation must not override it");
         assert!(
             error.contains("CONFIG_ERROR")
@@ -7952,30 +8014,64 @@ mod tests {
             "got: {error}"
         );
         // The budget the arm pins is accepted.
-        assert!(resolve_arm(Some("b0"), false, false, true, 1, None).is_ok());
+        assert!(resolve_arm(Some("b0"), false, false, true, 1, None, None).is_ok());
         // An arm with no pinned budget takes the invocation's own.
-        assert!(resolve_arm(Some("b1"), false, false, true, 4, None).is_ok());
+        assert!(resolve_arm(Some("b1"), false, false, true, 4, None, None).is_ok());
 
         // [VANTA-WHY] M3 item 7 — a judge setting is a STATEMENT like the arm name
         // is: it needs an arm to hang off, and the arm it names must agree with it.
-        assert!(resolve_arm(Some("judge"), false, false, true, 1, Some("plain")).is_ok());
-        assert!(resolve_arm(Some("judge+suite"), false, false, true, 1, Some("suite")).is_ok());
+        assert!(resolve_arm(Some("judge"), false, false, true, 1, Some("plain"), None).is_ok());
+        assert!(resolve_arm(Some("judge+suite"), false, false, true, 1, Some("suite"), None).is_ok());
         // A judge mode with no arm would be recorded under a switch-derived name.
-        let error = resolve_arm(None, false, false, true, 4, Some("plain"))
+        let error = resolve_arm(None, false, false, true, 4, Some("plain"), None)
             .expect_err("a judge mode must not be recorded under a switch-derived arm");
         assert!(
             error.contains("CONFIG_ERROR") && error.contains("VANTA_JUDGE='plain'"),
             "got: {error}"
         );
         // The arm and the setting must agree in both directions.
-        let error = resolve_arm(Some("judge"), false, false, true, 1, Some("suite"))
+        let error = resolve_arm(Some("judge"), false, false, true, 1, Some("suite"), None)
             .expect_err("VANTA_ARM/VANTA_JUDGE must agree");
         assert!(
             error.contains("CONFIG_ERROR") && error.contains("disagrees"),
             "got: {error}"
         );
         // A non-judge arm with a judge mode set is the same fault.
-        assert!(resolve_arm(Some("b1"), false, false, true, 4, Some("plain")).is_err());
+        assert!(resolve_arm(Some("b1"), false, false, true, 4, Some("plain"), None).is_err());
+    }
+
+    // [VANTA-WHY] M3 item 9/A5 — a fixed-round arm IS K attempts, so the stated arm
+    // and the stated `--fixed-rounds` must agree, exactly as B0's name and its pinned
+    // `--max-attempts` must. The harness builds both from one registry entry, so this
+    // catches a hand-run binary that named the arm but not its K. An ordinary arm with
+    // `--fixed-rounds` is deliberately NOT refused: the option is available to any
+    // repair run (item 9), and only the name that claims K is contradicted by a miss.
+    #[test]
+    fn a_fixed_round_arm_must_be_handed_the_k_its_name_claims() {
+        // The K the arm claims is accepted.
+        assert!(resolve_arm(Some("b1-k4"), false, false, true, 4, None, Some(4)).is_ok());
+        assert!(resolve_arm(Some("b3-k4"), true, false, true, 4, None, Some(4)).is_ok());
+        // No `--fixed-rounds`: the arm's K is unstated, so the name is not earned.
+        let error = resolve_arm(Some("b1-k4"), false, false, true, 4, None, None)
+            .expect_err("a fixed-round arm without its K must be refused");
+        assert!(
+            error.contains("CONFIG_ERROR")
+                && error.contains("VANTA_ARM='b1-k4'")
+                && error.contains("--fixed-rounds 4"),
+            "got: {error}"
+        );
+        // A different K contradicts the name.
+        let error = resolve_arm(Some("b3-k4"), true, false, true, 4, None, Some(3))
+            .expect_err("a fixed-round arm handed the wrong K must be refused");
+        assert!(
+            error.contains("CONFIG_ERROR")
+                && error.contains("VANTA_ARM='b3-k4'")
+                && error.contains("--fixed-rounds 3"),
+            "got: {error}"
+        );
+        // An ordinary arm is free to state a K — that is item 9's own option.
+        assert!(resolve_arm(Some("b3"), true, false, true, 4, None, Some(4)).is_ok());
+        assert!(resolve_arm(Some("b1"), false, false, true, 4, None, Some(2)).is_ok());
     }
 
     // [VANTA-WHY] M3 item 1 — the grounding ledger separates "the audit ran and

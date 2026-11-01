@@ -108,6 +108,27 @@ class Arm:
     driver records it and refuses a stated ``VANTA_ARM`` whose entry disagrees, so a
     run cannot be configured as one judge and recorded as another."""
 
+    fixed_rounds: Optional[int] = None
+    """M3 item 9/A5 — the K this arm runs the repair loop for, or ``None`` for a
+    normal-mode arm.
+
+    A fixed-round arm runs *exactly* K attempts and takes its verdict from attempt K
+    (``--fixed-rounds K``), so a patch that passes early is re-examined rather than
+    accepted on its first pass. That makes EIR measurable at all: an ordinary run
+    stops at the first approval, so it has no N→N+1 transition to count.
+
+    [VANTA-WHY] The value is MIRRORED from ``configs/v1-m3.toml``'s ``[fixed_rounds]``
+    table — the declaration of record — rather than chosen here, and
+    ``TestArms::test_the_fixed_round_arms_match_the_frozen_config`` binds the two so
+    neither can move alone. The configuration is where it has to live: its bytes are
+    hashed into every row's ``config_hash``, so changing K or the arm list is visible
+    on disk, while this module is code the reader cannot see from a row. The harness
+    *states* an arm's K on the argv (it does not need ``--fixed-rounds`` from a
+    caller), exactly as it states B0's one-attempt budget, and the driver refuses a
+    stated K arm whose argv disagrees — the same two-sided check ``max_attempts`` and
+    ``judge`` already get.
+    """
+
 
 ARMS: dict[str, Arm] = {
     arm.name: arm
@@ -129,6 +150,14 @@ ARMS: dict[str, Arm] = {
         # M3 item 7 — `judge+suite`: the same one call, shown the native suite's
         # result on the candidate (which tests failed, with the pass/fail summary).
         Arm("judge+suite", "judge+suite", (REVIEW,), False, False, True, 1, judge="suite"),
+        # M3 item 9/A5 — the fixed-round arms: B1/B3 with the repair loop forced to
+        # run exactly K attempts and take its verdict from attempt K, so an early
+        # pass is re-examined rather than accepted (EIR). K = 4 here mirrors the
+        # frozen config's `[fixed_rounds]` table; a test binds the two. Repair-only:
+        # a fixed-round REVIEW row would be byte-identical to an ordinary one — the
+        # loop is the repair loop — so it could only collide on the key.
+        Arm("b1-k4", "b1-k4", (REPAIR,), False, False, True, None, fixed_rounds=4),
+        Arm("b3-k4", "b3-k4", (REPAIR,), True, False, True, None, fixed_rounds=4),
     )
 }
 
@@ -142,6 +171,10 @@ _SPELLINGS: dict[str, dict[str, str]] = {
     "b2": {REPAIR: "b2", REVIEW: "b2"},
     "judge": {REVIEW: "judge"},
     "judge+suite": {REVIEW: "judge+suite"},
+    # M3 item 9/A5 — the fixed-round arms are split-addressable under their own
+    # names (each is its own `config`, so neither collides with `b1`/`b3`).
+    "b1-k4": {REPAIR: "b1-k4"},
+    "b3-k4": {REPAIR: "b3-k4"},
 }
 
 CONFIGS: tuple[str, ...] = tuple(_SPELLINGS)
@@ -226,6 +259,18 @@ def arm_attempts(name: str, requested: Optional[int]) -> int:
             "different arm"
         )
     return pinned
+
+
+def arm_fixed_rounds(name: str) -> Optional[int]:
+    """The K a fixed-round arm runs the repair loop for, or ``None``.
+
+    ``None`` is both "an ordinary arm" and "not a registered arm"; the caller that
+    needs to tell them apart asks :func:`arm` first. The value is the one the
+    harness **states** on the child's argv (``--fixed-rounds K``), exactly as
+    :func:`arm_attempts` states B0's one-attempt budget — it is not a parameter a
+    caller supplies.
+    """
+    return arm(name).fixed_rounds
 
 
 def resolve_configs(spellings: Sequence[str]) -> list[str]:

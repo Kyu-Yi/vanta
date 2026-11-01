@@ -22835,7 +22835,8 @@ class TestArms:
         r"planner:\s*(?P<planner>true|false),\s*"
         r"bate:\s*(?P<bate>true|false),\s*"
         r"max_attempts:\s*(?P<max>Some\(\d+\)|None),\s*"
-        r'judge:\s*(?P<judge>Some\("[^"]+"\)|None),',
+        r'judge:\s*(?P<judge>Some\("[^"]+"\)|None),\s*'
+        r"fixed_rounds:\s*(?P<fixed_rounds>Some\(\d+\)|None),",
         re.DOTALL,
     )
 
@@ -22849,6 +22850,7 @@ class TestArms:
         for spec in self._ARM_SPEC.finditer(block.group("body")):
             max_attempts = spec.group("max")
             judge = spec.group("judge")
+            fixed_rounds = spec.group("fixed_rounds")
             parsed[spec.group("name")] = arms_mod.Arm(
                 name=spec.group("name"),
                 config=spec.group("config"),
@@ -22860,19 +22862,31 @@ class TestArms:
                     None if max_attempts == "None" else int(max_attempts[5:-1])
                 ),
                 judge=None if judge == "None" else judge[6:-2],
+                fixed_rounds=(
+                    None if fixed_rounds == "None" else int(fixed_rounds[5:-1])
+                ),
             )
         assert set(parsed) == set(arms_mod.ARMS), (
             f"the Rust table names {sorted(parsed)}, the registry {sorted(arms_mod.ARMS)}"
         )
         for name, rust in parsed.items():
             python = arms_mod.ARMS[name]
-            assert (rust.config, rust.attacker, rust.planner, rust.bate, rust.max_attempts, rust.judge) == (
+            assert (
+                rust.config,
+                rust.attacker,
+                rust.planner,
+                rust.bate,
+                rust.max_attempts,
+                rust.judge,
+                rust.fixed_rounds,
+            ) == (
                 python.config,
                 python.attacker,
                 python.planner,
                 python.bate,
                 python.max_attempts,
                 python.judge,
+                python.fixed_rounds,
             ), f"arm {name!r} disagrees between arms.py and driver.rs"
 
     def test_the_two_arms_of_one_spelling_agree_about_the_switches(self):
@@ -22985,6 +22999,70 @@ class TestArms:
         runner_mod._require_arm_budget(["b0"], 1)
         runner_mod._require_arm_budget(["baseline", "vanta"], 4)
         runner_mod._require_arm_budget(["b1", "b2", "b3", "suite"], 9)
+
+    # -- M3 item 9/A5 — the fixed-round arms ----------------------------------
+    def test_the_fixed_round_arms_are_repair_only_and_declare_their_k(self):
+        """A fixed-round arm is the ordinary arm with the loop forced to run K attempts,
+        so it differs from it only in the name its row carries (which is what lets
+        `analyse.py` keep the two apart) and the K the harness states on the argv."""
+        for name, base in (("b1-k4", "b1"), ("b3-k4", "b3")):
+            entry = arms_mod.ARMS[name]
+            ordinary = arms_mod.ARMS[base]
+            assert entry.modes == (runner_mod.REPAIR,)
+            assert entry.config == name
+            assert entry.max_attempts is None  # the invocation's budget, not a pin
+            assert entry.fixed_rounds == 4
+            assert arms_mod.arm_fixed_rounds(name) == 4
+            # The same switches as the arm it is the fixed-round version of.
+            assert (entry.attacker, entry.planner, entry.bate) == (
+                ordinary.attacker,
+                ordinary.planner,
+                ordinary.bate,
+            )
+            # Repair-only: a fixed-round review row would be byte-identical to an
+            # ordinary review row (the loop is the repair loop).
+            with pytest.raises(arms_mod.ArmError, match="does not run"):
+                arms_mod.arm_for(name, "review")
+        assert arms_mod.phases_for(["b1-k4"]) == [(runner_mod.REPAIR, "b1-k4")]
+        assert arms_mod.phases_for(["b3-k4"]) == [(runner_mod.REPAIR, "b3-k4")]
+        # An ordinary arm declares no K, so the flag never reaches its argv.
+        assert arms_mod.arm_fixed_rounds("b3") is None
+        assert arms_mod.arm_fixed_rounds("b0") is None
+
+    def test_the_fixed_round_arms_match_the_frozen_config(self):
+        """[VANTA-WHY] M3 item 9/A5 — `arms.py` does not CHOOSE a K: it mirrors the
+        frozen configuration's `[fixed_rounds]` table, the declaration of record that is
+        hashed into every row. This test is the binding, so neither side moves alone."""
+        declared = frozen_mod.load().fixed_rounds()
+        registry = {
+            name: entry.fixed_rounds
+            for name, entry in arms_mod.ARMS.items()
+            if entry.fixed_rounds is not None
+        }
+        assert registry == declared, (
+            f"arms.py declares {registry}, the frozen config {declared}"
+        )
+        # And the K is a real choice, not two empty tables accidentally agreeing.
+        assert declared == {"b1-k4": 4, "b3-k4": 4}
+
+    def test_the_fixed_rounds_guard_refuses_a_disagreeing_arm_list_or_flag(self):
+        """Three things must agree before the schedule prints: the scheduled arm, the
+        frozen `[fixed_rounds]` declaration, and a caller's `--fixed-rounds`."""
+        # The declaration must cover every scheduled K arm, at its own K.
+        runner_mod._require_fixed_rounds(["b3-k4"], None, {"b3-k4": 4})
+        with pytest.raises(runner_mod.RunnerError, match="does not declare"):
+            runner_mod._require_fixed_rounds(["b3-k4"], None, {"b1-k4": 4})
+        with pytest.raises(runner_mod.RunnerError, match="at K = 2"):
+            runner_mod._require_fixed_rounds(["b3-k4"], None, {"b3-k4": 2})
+        # A caller's flag must match the arm's own K.
+        runner_mod._require_fixed_rounds(["b1-k4"], 4, {"b1-k4": 4})
+        with pytest.raises(runner_mod.RunnerError, match="disagrees with arm"):
+            runner_mod._require_fixed_rounds(["b1-k4"], 3, {"b1-k4": 4})
+        # A flag with no fixed-round arm scheduled is refused.
+        with pytest.raises(runner_mod.RunnerError, match="no scheduled arm is a"):
+            runner_mod._require_fixed_rounds(["b3"], 4, None)
+        # An ordinary arm list with no flag and no declaration is untouched.
+        runner_mod._require_fixed_rounds(["baseline", "vanta"], None, None)
 
     def test_two_spellings_under_one_config_are_refused(self):
         with pytest.raises(arms_mod.ArmError, match="share a job key"):
@@ -29568,6 +29646,35 @@ class TestAnalysePaired:
         assert "B3 vs judge" in tex
         assert " & 2 & 1 & 1 &" in tex  # n=2 b=1 c=1
 
+    def test_a_fixed_round_arm_is_its_own_arm_and_is_in_no_pair(self, tmp_path):
+        """M3 item 9/A5 — `b1-k4`/`b3-k4` stay separate arms.
+
+        `PAIRS` (item 12) names only the ordinary arms, so a fixed-round row is
+        invisible to every paired comparison until a split deliberately names it;
+        and `pair_index` keys each row by its recorded `arm`, so a `b3-k4` row is
+        never attributed to `b3`."""
+        paired = {name for pair in analyse_mod.PAIRS for name in pair[:2]}
+        assert not paired & {"b1-k4", "b3-k4"}
+        rows = [
+            _analyse_row(
+                "k1", arm="b3", mode="repair", config="b3", bug="A/1", seed=1,
+                patch_sha256="x",
+            ),
+            _analyse_row(
+                "k2", arm="b3-k4", mode="repair", config="b3-k4", bug="A/1", seed=1,
+                patch_sha256="x", verdict="Rejected",
+            ),
+        ]
+        analysis = _analyse_load(_analyse_batch(tmp_path, rows=rows))
+        index = analyse_mod.pair_index(analysis)
+        # The same bug, seed and candidate — two distinct arms, two index entries.
+        assert ("b3", "A/1#1#x") in index
+        assert ("b3-k4", "A/1#1#x") in index
+        # No paired-comparison row is produced for a fixed-round arm.
+        result = analyse_mod.PairedMetrics().run(analysis)
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["paired.tex"]
+        assert "b3-k4" not in tex and "b1-k4" not in tex
+
 
 class TestAnalyseRepair:
     def _caught_views(self) -> dict:
@@ -30185,7 +30292,9 @@ class TestFrozenConfig:
         assert config.frozen()["VANTA_CORROBORATE"] == frozen_mod.UNSET
         # The pre-registration's own literals.
         assert config.prereg()["max_attempts"] == 4
-        assert config.prereg()["fixed_rounds"] == 4
+        # The K arm's declaration is its own ENFORCED table (M3 item 9/A5), not a
+        # `[prereg]` literal: the harness reads it and refuses a mismatch.
+        assert config.fixed_rounds() == {"b1-k4": 4, "b3-k4": 4}
         assert set(config.prompts()) == {
             "attacker",
             "intent_check",
@@ -30268,25 +30377,28 @@ class TestFrozenConfig:
         assert edited.prompts()["intent_check"] == committed["intent_check"]
         assert edited.frozen() == frozen_mod.load().frozen()
 
-    def test_the_committed_prereg_names_the_source_of_both_budgets(self):
-        """The two `[prereg]` literals are cited, not chosen — and the citation is in the file.
+    def test_the_committed_config_names_the_source_of_both_budgets(self):
+        """Both budgets — the default and the K arm's — are cited, not chosen.
 
-        `max_attempts` is measured (every night argv carries `--max-attempts 4`);
-        `fixed_rounds` is the plan's Phase-3 K (§6.4, §6.1). Unlike `[env]`,
-        `[prereg]` is declarative: the harness never applies it, so this is a
-        commitment about the Phase-3 K arm, not a value the normal-mode night
-        rows ran under. The test pins the values and the provenance so an edit
-        that keeps the number but drops the reason fails here.
+        `max_attempts` is MEASURED (every night argv carries `--max-attempts 4`) and
+        lives in `[prereg]`. The K arm's count lives in `[fixed_rounds]` (M3 item
+        9/A5), which the harness ENFORCES. This test pins both the values and the
+        provenance so an edit that keeps a number but drops the reason fails here.
         """
         config = frozen_mod.load()
         assert config.prereg()["max_attempts"] == 4
-        assert config.prereg()["fixed_rounds"] == 4
-        block = (
-            frozen_mod.CONFIG_PATH.read_text().split("\n[prereg]\n", 1)[1].split("\n[prompts]\n", 1)[0]
-        )
-        assert "--max-attempts 4" in block  # the measured source
-        assert "Fixed rounds K" in block  # the plan citation, §6.4
-        assert "declarative" in block  # why `[prereg]` is not applied to the child
+        assert config.fixed_rounds() == {"b1-k4": 4, "b3-k4": 4}
+        raw = frozen_mod.CONFIG_PATH.read_text()
+        # Both budgets and the comments that justify them live between `[prereg]`
+        # and `[prompts]`. `[fixed_rounds]`'s own comment block sits directly above
+        # its header (the usual TOML placement), so the whole span — not just the
+        # table body — is the unit that must carry both reasons.
+        span = raw.split("\n[prereg]\n", 1)[1].split("\n[prompts]\n", 1)[0]
+        assert "--max-attempts 4" in span  # the measured source
+        assert "ENFORCES" in span  # why the K moved out of the declarative section
+        assert "Fixed rounds K: 4" in span  # the plan citation, §6.4
+        assert "ENFORCED" in span  # the section's own kind of statement
+        assert "Phase-3" in span  # the arm set the plan names (§6.1)
 
     def test_the_hash_is_of_the_files_own_bytes(self, tmp_path):
         path = _frozen_file(tmp_path, "v1")
@@ -30326,6 +30438,39 @@ class TestFrozenConfig:
     def test_a_missing_file_is_a_named_refusal(self, tmp_path):
         with pytest.raises(frozen_mod.FrozenConfigError, match="cannot read"):
             frozen_mod.load(tmp_path / "nope.toml")
+
+    # -- M3 item 9/A5 — the fixed-round declaration ---------------------------
+    def test_the_fixed_rounds_table_is_optional_and_read_as_a_mapping(self, tmp_path):
+        """A configuration written before A5 declares no K arm, and that is not an
+        error: `fixed_rounds()` reads an absent table as "no claim", the same way the
+        rest of the module reads an absent setting."""
+        assert frozen_mod.load(_frozen_file(tmp_path, "v1")).fixed_rounds() == {}
+
+    def test_a_bad_fixed_rounds_value_is_refused(self, tmp_path):
+        """The table is ENFORCED, so a file that could not mean what the reader assumes
+        is refused at load rather than turning into a silently wrong K at run time."""
+        for bad in ("b1-k4 = 0", "b1-k4 = true", 'b1-k4 = "4"', "b1-k4 = -1"):
+            path = write(
+                tmp_path / f"bad_{bad.replace(' ', '_').replace('\"', '')}.toml",
+                'schema = 1\nname = "bad"\n[env]\n[recorded]\n[prereg]\n'
+                "[fixed_rounds]\n" + bad + "\n[prompts]\n",
+            )
+            with pytest.raises(frozen_mod.FrozenConfigError, match=r"\[fixed_rounds\]"):
+                frozen_mod.load(path)
+
+    def test_editing_the_fixed_rounds_table_moves_the_config_hash(self, tmp_path):
+        """The K and the arm list are inside the file's bytes, so a change to either
+        moves `config_hash` — the property that keeps two K values from pooling."""
+        raw = (
+            'schema = 1\nname = "k"\n[env]\n[recorded]\n[prereg]\n'
+            "[fixed_rounds]\nb1-k4 = 4\nb3-k4 = 4\n[prompts]\ncreator = \"abc\"\n"
+        )
+        base = frozen_mod.load(write(tmp_path / "base.toml", raw))
+        other = frozen_mod.load(
+            write(tmp_path / "other.toml", raw.replace("b3-k4 = 4", "b3-k4 = 6"))
+        )
+        assert base.fixed_rounds() != other.fixed_rounds()
+        assert base.sha256 != other.sha256
 
 
 class TestFrozenConfigResolution:

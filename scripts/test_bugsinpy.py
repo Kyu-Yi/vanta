@@ -25802,6 +25802,59 @@ class TestQueue:
         assert payload["spend"]["unknown_cost_rows"] == 1, "the report says what it could not price"
         assert "unknown_cost_rows=1" in runner_mod.render_digest(payload)
 
+    # -- H6 — the log survives a resume and a corruption -------------------
+    def test_a_resumed_gate_appends_to_the_admissions_already_logged(
+        self, tmp_path, monkeypatch
+    ):
+        """H6 — a fresh batch starts empty; a resume appends to what is already there."""
+        batch_dir = tmp_path / "batch"
+        preps, entries, split, _calls = self._prepare(monkeypatch, tmp_path, count=2, cost_usd=0.5)
+        first, second = preps
+
+        self._run([first], entries, split, batch_dir, jobs=1, max_spend_usd=1.0)
+        before = json.loads(
+            (batch_dir / runner_mod.SPEND_LOG_NAME).read_text(encoding="utf-8")
+        )
+        assert [a["reservation_usd"] for a in before["admissions"]] == [1.0]
+
+        self._run([second], entries, split, batch_dir, jobs=1, max_spend_usd=1.0)
+        after = json.loads((batch_dir / runner_mod.SPEND_LOG_NAME).read_text(encoding="utf-8"))
+        assert [a["reservation_usd"] for a in after["admissions"]] == [1.0, 0.5], (
+            "the resume appended its admission to the first invocation's log"
+        )
+
+    def test_an_unreadable_spend_log_is_kept_and_reported_never_replaced(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """H6 — a log the gate cannot parse is moved aside under its own name."""
+        batch_dir = tmp_path / "batch"
+        batch_dir.mkdir(parents=True)
+        log_path = batch_dir / runner_mod.SPEND_LOG_NAME
+        log_path.write_text("{ this is not json\n", encoding="utf-8")
+
+        preps, entries, split, _calls = self._prepare(monkeypatch, tmp_path, count=1, cost_usd=0.5)
+        self._run(preps, entries, split, batch_dir, jobs=1, max_spend_usd=1.0)
+
+        kept = batch_dir / "spend_log.corrupt1.json"
+        assert kept.read_text(encoding="utf-8") == "{ this is not json\n", (
+            "the bytes are kept, not deleted"
+        )
+        assert log_path.exists()
+        assert json.loads(log_path.read_text(encoding="utf-8"))["schema"] == 1
+        out = capsys.readouterr().out
+        assert "could not be read" in out and str(kept) in out, (
+            "the run has to be told which file it could not read"
+        )
+
+        # A readable object that is not a spend log is set aside the same way.
+        log_path.write_text('{"not": "a spend log"}\n', encoding="utf-8")
+        self._run(preps, entries, split, batch_dir, jobs=1, max_spend_usd=1.0)
+        assert (batch_dir / "spend_log.corrupt1.json").exists()
+        assert (batch_dir / "spend_log.corrupt2.json").read_text(encoding="utf-8") == (
+            '{"not": "a spend log"}\n'
+        )
+        assert "is not a spend log" in capsys.readouterr().out
+
     # -- the arms and seeds are a selection over the split, not a protocol --
     def test_an_arm_the_split_does_not_declare_is_refused(self, tmp_path, monkeypatch):
         preps, entries, split, calls = self._prepare(monkeypatch, tmp_path)

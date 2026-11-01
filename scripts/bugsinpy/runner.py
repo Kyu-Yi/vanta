@@ -3011,6 +3011,24 @@ def _max_recorded_cost(manifest: Manifest) -> Optional[float]:
     return max(known) if known else None
 
 
+def _set_aside(path: Path) -> Path:
+    """Move an unreadable batch artifact beside itself, under a new name (H6).
+
+    The bytes are kept and never overwritten: a reader can still open what this
+    run could not parse, which is the entire point of not deleting it. A numbered
+    suffix rather than a timestamp, so a second unusable file does not collide
+    with the first.
+    """
+    index = 1
+    while True:
+        kept = path.with_name(f"{path.stem}.corrupt{index}{path.suffix}")
+        if not kept.exists():
+            break
+        index += 1
+    os.replace(path, kept)
+    return kept
+
+
 class SpendGate:
     """§14.29 + G1 — the batch's spend cap as a reservation, shared by workers.
 
@@ -3067,6 +3085,7 @@ class SpendGate:
         self._reserved_micro = 0
         self._next_token = 0
         self._admissions: list[dict[str, Any]] = []
+        self._load_log()
 
     def acquire(self, job: Job) -> Optional[int]:
         """Reserve budget for ``job``, blocking until it fits.
@@ -3151,6 +3170,46 @@ class SpendGate:
         if bound is None:
             return remaining_micro
         return min(_usd_to_micro(bound), remaining_micro)
+
+    def _load_log(self) -> None:
+        """Pick up the admissions an earlier invocation of this batch recorded (H6).
+
+        [VANTA-WHY] H6. A batch is resumed, and the gate of the second invocation
+        knows nothing of the first one's admissions; without this, the very first
+        :meth:`_write_log` of the resume replaces ``spend_log.json`` with a
+        one-entry list and the batch report loses every admission from every
+        earlier invocation. The log is appended to and never restarted, so a fresh
+        batch — which has no log — simply starts empty.
+
+        An unreadable log is NOT silently replaced. It is moved aside under its own
+        name (:func:`_set_aside`) and the run is told, because a gate that cannot
+        account for the money already admitted is something the reader has to know
+        about: losing the record is bad, and losing it while reporting nothing is
+        worse.
+        """
+        path = self.batch_dir / SPEND_LOG_NAME
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError) as exc:
+            kept = _set_aside(path)
+            print(
+                f"[spend] {path} could not be read ({exc}); kept as {kept}. This "
+                "invocation's admissions start from empty.",
+                flush=True,
+            )
+            return
+        admissions = payload.get("admissions") if isinstance(payload, dict) else None
+        if not isinstance(admissions, list):
+            kept = _set_aside(path)
+            print(
+                f"[spend] {path} is not a spend log (no `admissions` list); kept as "
+                f"{kept}. This invocation's admissions start from empty.",
+                flush=True,
+            )
+            return
+        self._admissions.extend(admissions)
 
     def _write_log(self) -> None:
         """Persist the admissions for :func:`write_batch_report`. Called under the

@@ -56,6 +56,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -126,6 +127,12 @@ MAX_POOLED_CANDIDATES = 2
 # the exit code, but whoever opens the directory later has to be able to tell a
 # batch that ran out of budget from one that finished.
 SPEND_CAP_NAME = "spend.json"
+
+# G1 — every admission's reservation and the batch's final overshoot. A second
+# file rather than a field in `spend.json`, because admissions happen whether or
+# not the cap is ever reached: `spend.json` is the "the batch stopped" marker and
+# exists after only some batches, while the log exists for every capped batch.
+SPEND_LOG_NAME = "spend_log.json"
 
 SESSION_LINE = re.compile(r"▌ Session:\s*(\S+)")
 SUMMARY_PAIR = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(\S+)")
@@ -2917,6 +2924,143 @@ def _record_spend_cap(
     )
 
 
+def _max_recorded_cost(manifest: Manifest) -> Optional[float]:
+    """The largest ``llm.cost_usd`` among the rows on disk, or ``None`` if none.
+
+    G1 — the reservation a *known* batch uses: once one job has finished, its
+    recorded cost is the best evidence of what the next job costs, so a batch
+    admits jobs up to ``cap / cost`` at once instead of one at a time. ``None``
+    (no row on disk yet) is not a zero: it means the batch has no evidence at all,
+    which is why the first job reserves the whole remaining budget.
+    """
+    records = manifest.records()
+    if not records:
+        return None
+    return max(_row_cost(record) for record in records)
+
+
+class SpendGate:
+    """§14.29 + G1 — the batch's spend cap as a reservation, shared by workers.
+
+    [VANTA-WHY] G1. The cap used to be a re-read of the manifest before each job,
+    which a queue cannot make atomic: several workers read the same ``spent``
+    before any of them had written its cost row, so a ``--jobs 4`` batch could
+    start four cost-bearing jobs on one budget and overshoot it four times over.
+    The workers are **threads** — ``_run_wave_tasks`` submits every bug of a wave
+    to one ``ThreadPoolExecutor`` — so the matching primitive is a
+    ``threading.Condition`` and not ``flock``: one process, many threads, one
+    batch directory. A single-threaded ``run`` gets a gate too, where it can never
+    have a competitor, so there is one code path and no second definition of the
+    rule.
+
+    The rule (round-5 G1): a job is admitted only when the recorded spend, plus
+    every reservation already in flight, plus this job's own reservation, stays
+    within the cap. The reservation is the largest recorded cost of a finished job
+    in the batch, or — before any job has finished — the whole remaining budget,
+    which runs unknown-cost jobs one at a time until the first cost is known. A
+    worker whose reservation does not fit waits for budget to free and re-checks;
+    only ``spent >= cap`` stops the batch, through :func:`_record_spend_cap`.
+
+    [VANTA-WHY] The reservation is clamped to the remaining budget
+    (``min(bound, cap - spent)``). Without the clamp a batch whose recorded spend
+    is below the cap but within one job's cost of it — a $9 row under a $10 cap —
+    would never admit the next job (9 + 9 > 10) and never record ``spend_cap``
+    either (9 < 10), which is a hang rather than a stop. The clamp can only fire
+    when nothing else is in flight, so it never lets a second job in on budget the
+    first has already reserved.
+    """
+
+    def __init__(self, batch_dir: Path, cap_usd: float, manifest: Manifest) -> None:
+        self.batch_dir = Path(batch_dir)
+        self.cap_usd = float(cap_usd)
+        self.manifest = manifest
+        self._condition = threading.Condition(threading.Lock())
+        # token -> reservation, so a release cannot free the wrong worker's budget
+        # even when two reservations are the same amount (floats compare equal).
+        self._inflight: dict[int, float] = {}
+        self._reserved = 0.0
+        self._next_token = 0
+        self._admissions: list[dict[str, Any]] = []
+
+    def acquire(self, job: Job) -> Optional[int]:
+        """Reserve budget for ``job``, blocking until it fits.
+
+        Returns the reservation token, or ``None`` when the batch has reached its
+        cap. ``None`` is the only value that stops the batch: the caller records
+        ``spend_cap`` and returns without ever calling :meth:`release`, so an
+        unadmitted job leaves nothing behind.
+        """
+        with self._condition:
+            while True:
+                spent = _spent_so_far(self.manifest)
+                if spent >= self.cap_usd:
+                    return None
+                reservation = self._reservation_size(spent)
+                if spent + self._reserved + reservation <= self.cap_usd:
+                    token = self._next_token
+                    self._next_token += 1
+                    self._inflight[token] = reservation
+                    self._reserved += reservation
+                    self._admissions.append(
+                        {"key": job.key, "reservation_usd": round(reservation, 6)}
+                    )
+                    self._write_log()
+                    return token
+                # Nothing in flight could not reach here: with `_reserved == 0` the
+                # clamped reservation is <= the remaining budget, so the sum is at
+                # most the cap. Some other worker holds budget, and it will notify
+                # when its job finishes.
+                self._condition.wait()
+
+    def release(self, token: Optional[int]) -> None:
+        """Give a finished job's reservation back, and wake the waiters.
+
+        Reconciliation is implicit and needs no cost argument: what a job actually
+        spent is on its row in the manifest, which is what the next :meth:`acquire`
+        reads, so releasing only has to make the reservation disappear. Called on
+        every exit — a succeeded job, a job that left no session, an
+        ``infra_failure`` — because a leaked reservation would shrink the batch's
+        budget for the rest of its life.
+        """
+        if token is None:
+            return
+        with self._condition:
+            reservation = self._inflight.pop(token, None)
+            if reservation is not None:
+                self._reserved -= reservation
+                self._write_log()
+            self._condition.notify_all()
+
+    def _reservation_size(self, spent: float) -> float:
+        """The largest finished cost, or the whole remaining budget if none."""
+        bound = _max_recorded_cost(self.manifest)
+        remaining = self.cap_usd - spent
+        return remaining if bound is None else min(bound, remaining)
+
+    def _write_log(self) -> None:
+        """Persist the admissions for :func:`write_batch_report`. Called under the
+        condition's lock, so two workers never interleave a half-written file.
+
+        The directory is made here rather than in ``__init__``: the first job of a
+        fresh batch is admitted before it has written anything, so nothing else has
+        created the batch directory yet — but a capped ``--plan`` run, which admits
+        nothing, must not create one either.
+        """
+        self.batch_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": 1,
+            "cap_usd": self.cap_usd,
+            "inflight_usd": round(self._reserved, 6),
+            "admissions": list(self._admissions),
+        }
+        path = self.batch_dir / SPEND_LOG_NAME
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(tmp, path)
+
+
 def run_batch(
     *,
     batch_dir: Path,
@@ -2934,6 +3078,7 @@ def run_batch(
     show_hints: bool = False,
     plan_only: bool = False,
     max_spend_usd: Optional[float] = None,
+    spend_gate: Optional[SpendGate] = None,
     preflight: Optional[Callable[[], Optional[str]]] = None,
     config_block: Optional[dict[str, Any]] = None,
     frozen_env: Optional[Mapping[str, str]] = None,
@@ -2958,6 +3103,11 @@ def run_batch(
     checked BETWEEN jobs, against the cost of the rows already on disk: a job that would push
     the batch past the cap is not started, and the count it is compared against includes rows
     an earlier invocation of the same batch wrote, so a resume cannot double-spend.
+
+    ``spend_gate`` is G1's shared reservation, or ``None``. ``run_queue`` builds ONE gate for
+    the whole queue and passes it to every per-bug call, so the workers of one batch share one
+    reservation table; a single-threaded ``run`` gets its own gate here. Either way the rule
+    lives once, in :class:`SpendGate` — the queue does not re-implement the cap.
 
     ``preflight`` is item 14's endpoint check, ``None`` for no per-row check. It is a
     zero-argument callable returning ``None`` or a sentence saying why the endpoint did not
@@ -2998,6 +3148,11 @@ def run_batch(
     """
     paths = BatchPaths.under(batch_dir)
     manifest = Manifest(batch_dir)
+    # G1 — the cap as one shared reservation. The queue hands in the gate it made
+    # for the whole batch; a single-threaded `run` gets its own here, where it can
+    # never have a competitor, so the admission rule lives in exactly one place.
+    if max_spend_usd is not None and spend_gate is None:
+        spend_gate = SpendGate(batch_dir, max_spend_usd, manifest)
     # The harness's own revision, read once for the whole batch (§7.3). The binary's
     # is read per row from `run.summary`, because it belongs to the binary and not to
     # this tree.
@@ -3158,16 +3313,24 @@ def run_batch(
                         # that follow it are never half-written. `>=` rather than
                         # `>`: a batch that has reached its budget has spent it.
                         #
-                        # Re-read from the manifest at every check rather than
-                        # carried in a local counter (item 13): a queue runs several
-                        # of these loops at once against one batch directory, so a
-                        # counter that started before another worker's rows landed
-                        # would understate the batch's spend and let the cap be
-                        # overshot by as many workers as there are jobs.
-                        if max_spend_usd is not None:
-                            spent = _spent_so_far(manifest)
-                            if spent >= max_spend_usd:
-                                _record_spend_cap(batch_dir, max_spend_usd, spent, job)
+                        # G1 — the admission is atomic across the queue's workers
+                        # (`SpendGate`): a re-read of the manifest was not. The gate
+                        # reserves this job's budget under a lock before the job
+                        # starts, so two workers cannot both pass on the same
+                        # `spent`, and `None` — the batch has reached its cap — is
+                        # the only value that stops it. The reservation is released
+                        # in the `finally` below on every exit, a job that raised
+                        # included.
+                        reservation: Optional[int] = None
+                        if spend_gate is not None:
+                            reservation = spend_gate.acquire(job)
+                            if reservation is None:
+                                _record_spend_cap(
+                                    batch_dir,
+                                    spend_gate.cap_usd,
+                                    _spent_so_far(manifest),
+                                    job,
+                                )
                                 return 1, results
                         # Item 14 — before the row, not after it. Asked here rather
                         # than inside `run_job` because the refusal has to leave no
@@ -3176,23 +3339,31 @@ def run_batch(
                         # the next resume re-runs. Raising before the call means the
                         # cursor never moves and the batch continues from here once
                         # the endpoint is back.
-                        if preflight is not None:
-                            require_model_endpoint(preflight=preflight, before=job.key)
-                        record = run_job(
-                            job=job,
-                            paths=paths,
-                            manifest=manifest,
-                            vanta_bin=vanta_bin,
-                            # The arm owns the budget, not the invocation: B0 is
-                            # "one Creator call, no feedback" (§M3 item 11), so a
-                            # pinned arm states its budget here and an explicit
-                            # `--max-attempts` that disagrees was already refused
-                            # by `_require_arm_budget`. Every other arm runs what
-                            # the invocation asked for, or the binary's default.
-                            max_attempts=_arm_attempt_budget(arm, max_attempts),
-                            disk_mb=disk_mb,
-                            python_version=checkpoint_pythons.get(checkpoint, ""),
-                        )
+                        try:
+                            if preflight is not None:
+                                require_model_endpoint(preflight=preflight, before=job.key)
+                            record = run_job(
+                                job=job,
+                                paths=paths,
+                                manifest=manifest,
+                                vanta_bin=vanta_bin,
+                                # The arm owns the budget, not the invocation: B0 is
+                                # "one Creator call, no feedback" (§M3 item 11), so a
+                                # pinned arm states its budget here and an explicit
+                                # `--max-attempts` that disagrees was already refused
+                                # by `_require_arm_budget`. Every other arm runs what
+                                # the invocation asked for, or the binary's default.
+                                max_attempts=_arm_attempt_budget(arm, max_attempts),
+                                disk_mb=disk_mb,
+                                python_version=checkpoint_pythons.get(checkpoint, ""),
+                            )
+                        finally:
+                            # Reconcile against the job's recorded cost by releasing:
+                            # what it actually spent is on its row, which the next
+                            # `acquire` reads. Runs for a failed job and an
+                            # infra_failure too, so a reservation can never leak.
+                            if spend_gate is not None:
+                                spend_gate.release(reservation)
                         if record:
                             result.records.append(record)
                         else:
@@ -3824,7 +3995,49 @@ def render_digest(payload: dict[str, Any]) -> str:
             f"{model:<18} {harness:<10} {build:<10} {group['runs']:>5}  {labels}  "
             f"{localization}  {unshown}"
         )
+    # G1 — the spend cap, when the batch ran under one. A line rather than a
+    # column: it describes the batch, not a group, and a report from an uncapped
+    # batch (or from before this item) has no `spend` and prints no line.
+    spend = payload.get("spend")
+    if spend:
+        lines.append(
+            f"spend: cap=${spend['cap_usd']:.6f} spent=${spend['spent_usd']:.6f} "
+            f"overshoot=${spend['overshoot_usd']:.6f} "
+            f"admissions={len(spend.get('admissions') or [])}"
+        )
     return "\n".join(lines)
+
+
+def _spend_report(
+    batch_dir: Path, records: Sequence[dict[str, Any]]
+) -> Optional[dict[str, Any]]:
+    """G1 — each admission's reservation and the batch's final overshoot.
+
+    ``None`` when the batch ran under no cap (no :data:`SPEND_LOG_NAME`), so an
+    uncapped batch's report carries no spend block at all rather than a block of
+    zeros it never measured — the same rule `analyse`'s ``unavailable`` uses.
+
+    Overshoot is computed here, from the rows on disk and the cap the log
+    recorded, rather than stored by the gate: a batch is resumed across
+    invocations, and the money that overshot the cap is in the rows, not in the
+    memory of whichever process admitted the last job.
+    """
+    try:
+        log = json.loads((batch_dir / SPEND_LOG_NAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(log, dict):
+        return None
+    cap = log.get("cap_usd")
+    if not isinstance(cap, (int, float)) or isinstance(cap, bool):
+        return None
+    spent = sum(_row_cost(record) for record in records)
+    return {
+        "cap_usd": float(cap),
+        "spent_usd": round(spent, 6),
+        "overshoot_usd": round(max(0.0, spent - float(cap)), 6),
+        "admissions": list(log.get("admissions") or []),
+    }
 
 
 def write_batch_report(
@@ -3839,6 +4052,12 @@ def write_batch_report(
     """
     labels_path = write_labels(records, batch_dir / "run_labels.json")
     payload = digest(records)
+    # G1 — the spend block, when the batch ran under a cap. A third view of the
+    # same evidence: the admissions the gate logged, plus the overshoot the rows
+    # and the cap imply.
+    spend = _spend_report(batch_dir, records)
+    if spend is not None:
+        payload["spend"] = spend
     (batch_dir / "run_digest.json").write_text(
         json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8"
     )
@@ -4052,6 +4271,16 @@ def _run_queue(**kwargs: Any) -> tuple[int, list[QueueOutcome]]:
         spellings, kwargs["fixed_rounds"], kwargs["fixed_rounds_declaration"]
     )
     _require_seeds(kwargs["split"], kwargs["seeds"])
+    # G1 — ONE gate for the whole queue, shared by every per-bug call, so the cap
+    # is a single reservation table instead of one table per worker. Created here
+    # because this is the only place that knows the batch is a queue; each
+    # `run_batch` would otherwise build its own and the reservation would be
+    # per-worker again, which is the bug.
+    kwargs["spend_gate"] = (
+        SpendGate(batch_dir, kwargs["max_spend_usd"], Manifest(batch_dir))
+        if kwargs["max_spend_usd"] is not None
+        else None
+    )
 
     print(
         _render_schedule(
@@ -4192,6 +4421,9 @@ def _run_task(
             show_hints=kwargs["show_hints"],
             plan_only=False,
             max_spend_usd=kwargs["max_spend_usd"],
+            # G1 — the one gate `_run_queue` built for the whole batch, so every
+            # worker of this wave reserves from the same budget.
+            spend_gate=kwargs["spend_gate"],
             preflight=kwargs["preflight"],
             config_block=kwargs["config_block"],
             frozen_env=kwargs["frozen_env"],

@@ -25286,6 +25286,130 @@ class TestQueue:
         )
         assert spend["spent_usd"] == 0.6
 
+    def test_the_cap_admits_exactly_the_jobs_it_fits_under_four_workers(
+        self, tmp_path, monkeypatch
+    ):
+        """G1 — admission is atomic: four workers, one budget, two jobs' worth.
+
+        The old check re-read the manifest before each job, so several workers read
+        the same `spent` before any of them had written its cost row and every one
+        of them started — a `--jobs 4` batch could overshoot its cap four times
+        over. With a $1.00 cap and $0.50 rows exactly two jobs fit, and the
+        assertion is that exactly two ran however many workers were ready, and that
+        the rest stopped with `spend_cap`.
+        """
+        batch_dir = tmp_path / "batch"
+        preps, entries, split, calls = self._prepare(
+            monkeypatch, tmp_path, count=4, cost_usd=0.5
+        )
+        code, outcomes = self._run(
+            preps, entries, split, batch_dir, jobs=4, max_spend_usd=1.0
+        )
+        assert len(calls) == 2, [job.label() for job in calls]
+        assert code == 1, "a batch that stopped at its cap must not report success"
+        assert len(manifest_mod.Manifest(batch_dir).records()) == 2
+        spend = json.loads(
+            (batch_dir / runner_mod.SPEND_CAP_NAME).read_text(encoding="utf-8")
+        )
+        assert spend["spent_usd"] == 1.0
+        assert [outcome.reason for outcome in outcomes if outcome.reason] == [
+            "spend_cap",
+            "spend_cap",
+        ], "the two workers that could not be admitted must say why"
+        # The first job reserved the whole budget (nothing was known yet); the
+        # second reserved the largest recorded cost.
+        log = json.loads(
+            (batch_dir / runner_mod.SPEND_LOG_NAME).read_text(encoding="utf-8")
+        )
+        assert [a["reservation_usd"] for a in log["admissions"]] == [1.0, 0.5]
+
+    def test_only_one_job_runs_until_the_first_cost_is_known(
+        self, tmp_path, monkeypatch
+    ):
+        """G1's cold start: an unknown-cost job reserves the WHOLE remaining budget.
+
+        With no row on disk the batch has no evidence of what a job costs, so the
+        reservation is the remaining budget and the first job runs alone until it
+        finishes; only then do admissions follow the largest recorded cost. The
+        observation is made from another thread while the first job is held open —
+        a second worker that admitted would be visible in the claim count there.
+        """
+        batch_dir = tmp_path / "batch"
+        first_open = threading.Event()
+        release_first = threading.Event()
+        observed: list[int] = []
+
+        def on_call(n, job, manifest):
+            if n == 1:
+                first_open.set()
+                assert release_first.wait(timeout=10), "the test never released the first job"
+
+        preps, entries, split, calls = self._prepare(
+            monkeypatch, tmp_path, count=4, cost_usd=0.5, on_call=on_call
+        )
+
+        def observe():
+            assert first_open.wait(timeout=10)
+            # Wait out a scheduler slot: a wrongly admitted second job would claim
+            # at once, and `calls` would grow. The event is never set, so this is
+            # only a delay that needs no `time` import.
+            threading.Event().wait(0.3)
+            observed.append(len(calls))
+            release_first.set()
+
+        watcher = threading.Thread(target=observe)
+        watcher.start()
+        code, outcomes = self._run(
+            preps, entries, split, batch_dir, jobs=4, max_spend_usd=2.0
+        )
+        watcher.join()
+
+        assert observed == [1], (
+            "a cold batch has no cost to go on, so exactly one job may run at a time"
+        )
+        assert code == 0
+        assert len(calls) == 4, "a $2.00 cap fits all four $0.50 rows"
+        assert {outcome.reason for outcome in outcomes} == {""}
+        log = json.loads(
+            (batch_dir / runner_mod.SPEND_LOG_NAME).read_text(encoding="utf-8")
+        )
+        assert [a["reservation_usd"] for a in log["admissions"]] == [2.0, 0.5, 0.5, 0.5]
+
+    def test_the_report_records_each_admission_and_the_final_overshoot(
+        self, tmp_path, monkeypatch
+    ):
+        """G1 — the batch report carries the reservations and the overshoot.
+
+        The cap cannot refuse the row that crosses it (it is a budget, not a kill
+        switch), so a batch can end above its cap by exactly that one job. The
+        report says by how much, and lists what each admission reserved.
+        """
+        batch_dir = tmp_path / "batch"
+        preps, entries, split, _calls = self._prepare(
+            monkeypatch, tmp_path, count=2, cost_usd=0.75
+        )
+        self._run(preps, entries, split, batch_dir, jobs=1, max_spend_usd=0.5)
+
+        records = manifest_mod.Manifest(batch_dir).effective_records()
+        _labels_path, payload = runner_mod.write_batch_report(batch_dir, records)
+        spend = payload["spend"]
+        assert spend["cap_usd"] == 0.5
+        assert spend["spent_usd"] == 0.75
+        assert spend["overshoot_usd"] == 0.25, "the row that crossed the cap overshot it"
+        assert [a["reservation_usd"] for a in spend["admissions"]] == [0.5]
+        assert "spend: cap=$0.500000" in runner_mod.render_digest(payload)
+
+    def test_an_uncapped_batch_reports_no_spend_block(self, tmp_path, monkeypatch):
+        """The other half: `None`, not a block of zeros the batch never measured."""
+        batch_dir = tmp_path / "batch"
+        preps, entries, split, _calls = self._prepare(monkeypatch, tmp_path, count=1, cost_usd=0.5)
+        self._run(preps, entries, split, batch_dir, jobs=1)
+
+        records = manifest_mod.Manifest(batch_dir).effective_records()
+        _labels_path, payload = runner_mod.write_batch_report(batch_dir, records)
+        assert "spend" not in payload
+        assert "spend:" not in runner_mod.render_digest(payload)
+
     # -- the arms and seeds are a selection over the split, not a protocol --
     def test_an_arm_the_split_does_not_declare_is_refused(self, tmp_path, monkeypatch):
         preps, entries, split, calls = self._prepare(monkeypatch, tmp_path)

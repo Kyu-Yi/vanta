@@ -271,6 +271,7 @@ DERIVED_BUG_KEYS = frozenset(
         "native_green_on_vanta_tree",
         "native_skips_buggy",
         "native_skips_fixed",
+        "native_secs",
         "hidden_files_deleted",
         "partially_hidden_functions",
         "hidden_by_collect_flip",

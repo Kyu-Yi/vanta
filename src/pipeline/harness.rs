@@ -242,6 +242,19 @@ pub struct NativeSuiteReport {
     /// False when no report was produced (missing pytest/plugin, timeout,
     /// crash). A gate that could not run must never be read as "no regressions".
     pub ran: bool,
+    /// Did the suite hit its wall-clock cap and get killed?
+    ///
+    /// [VANTA-WHY] M3 item D1 — a TIMEOUT is not the same emptiness as a
+    /// collection error. Both leave `tests` empty and both make the native gate
+    /// vacuous, but the code to act on is the opposite: a collection error is the
+    /// repo's own import failing on the ORIGINAL tree (a fact about the tree),
+    /// while a timeout is the harness's cap being too small for a legitimate
+    /// suite (a fact about the harness). Measured on pandas/1: the native suite
+    /// takes ~487 s while the in-session cap was a fixed 120 s, so the gate could
+    /// never finish for that bug — and reporting it as "collected nothing" sends
+    /// the operator to the wrong file. Recorded here so `native_vacuous_reason`
+    /// can name it as its own reason (`native_timeout`).
+    pub timed_out: bool,
     /// The test command's exit status, when it ran at all.
     pub exit_code: Option<i32>,
     /// The last few non-empty stderr lines, for a run-failure report.
@@ -338,21 +351,47 @@ impl NativeSuiteReport {
             tests: Vec::new(),
             failure_outputs: HashMap::new(),
             ran: false,
+            timed_out: false,
             exit_code: None,
             stderr_tail: String::new(),
             collection: None,
         }
     }
 
-    /// The suite started but produced no usable report (timeout, crash, bad
-    /// JSON, or a collection error). Carries the exit code and stderr tail so a
-    /// caller can REPORT why the tree could not be measured instead of reading
-    /// the emptiness as "the tree has no tests".
+    /// The suite started but produced no usable report (crash, bad JSON, or a
+    /// collection error). Carries the exit code and stderr tail so a caller can
+    /// REPORT why the tree could not be measured instead of reading the emptiness
+    /// as "the tree has no tests".
+    ///
+    /// [VANTA-WHY] M3 item D1 — a TIMEOUT is split out into
+    /// :func:`timed_out_run` rather than folded in here: it is the one failed run
+    /// whose cause is the harness's own cap, so it gets its own reason.
     fn failed_run(exit_code: Option<i32>, stderr_tail: String) -> Self {
         Self {
             tests: Vec::new(),
             failure_outputs: HashMap::new(),
             ran: false,
+            timed_out: false,
+            exit_code,
+            stderr_tail,
+            collection: None,
+        }
+    }
+
+    /// The suite hit its wall-clock cap and was killed, so it measured nothing.
+    ///
+    /// [VANTA-WHY] M3 item D1. Kept apart from :func:`failed_run` because the
+    /// reason to report is different: a redundant "collected nothing" would send
+    /// the operator looking at the tree, when the fix is the cap. Measured on
+    /// pandas/1: both in-session runs (`shuru exec TIMEOUT after 120s`) died this
+    /// way while the same suite ran to completion in ~487 s under prepare's own
+    /// 1800 s cap.
+    fn timed_out_run(exit_code: Option<i32>, stderr_tail: String) -> Self {
+        Self {
+            tests: Vec::new(),
+            failure_outputs: HashMap::new(),
+            ran: false,
+            timed_out: true,
             exit_code,
             stderr_tail,
             collection: None,
@@ -402,7 +441,23 @@ pub fn stderr_tail(text: &str) -> String {
 ///
 /// The source tree includes the repo's `tests/`, so pytest discovers them from
 /// the sandbox root; no generated test file is written.
-pub async fn run_native_suite(source: &str, test_cmd: &TestCommand) -> NativeSuiteReport {
+///
+/// ``timeout_secs`` is the wall-clock cap for the pytest invocation. ``None``
+/// keeps the historical behaviour — :func:`test_timeout_secs` (120 s, or
+/// ``VANTA_TEST_TIMEOUT_SECS``) — which is every hand-run invocation and every
+/// call site that records no measurement.
+///
+/// [VANTA-WHY] M3 item D1. A repo's own suite is not all fast: measured through
+/// prepare, pandas/1's native suite takes ~487 s while ``test_timeout_secs()``
+/// capped the in-session gate at 120 s, so that gate could never finish and rows
+/// died as a false "collected nothing". The caller that HAS a per-bug measurement
+/// (prepare's own native wall time) therefore passes a derived cap here, and every
+/// suite that runs in-session for that row uses it.
+pub async fn run_native_suite(
+    source: &str,
+    test_cmd: &TestCommand,
+    timeout_secs: Option<u64>,
+) -> NativeSuiteReport {
     let sb = match Backend::spawn().await {
         Ok(b) => b,
         Err(_) => return NativeSuiteReport::not_run(),
@@ -423,7 +478,7 @@ pub async fn run_native_suite(source: &str, test_cmd: &TestCommand) -> NativeSui
         .execute(
             &cmd_refs,
             Path::new(""),
-            test_timeout_secs(),
+            timeout_secs.unwrap_or_else(test_timeout_secs),
             &test_cmd.env,
             &test_cmd.precompile,
         )
@@ -440,7 +495,11 @@ pub async fn run_native_suite(source: &str, test_cmd: &TestCommand) -> NativeSui
 fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuiteReport {
     let tail = stderr_tail(&exec.stderr);
     if exec.timed_out {
-        return NativeSuiteReport::failed_run(exec.exit_code, tail);
+        // [VANTA-WHY] M3 item D1 — a killed run is `timed_out_run`, not
+        // `failed_run`: its emptiness is the cap's fault, and `native_vacuous_reason`
+        // reports it as `native_timeout` with the cap named instead of a bare
+        // "collected nothing".
+        return NativeSuiteReport::timed_out_run(exec.exit_code, tail);
     }
     let Ok(text) = fs::read_to_string(report_path) else {
         return NativeSuiteReport::failed_run(exec.exit_code, tail);
@@ -512,6 +571,7 @@ fn parse_native_report(report_path: &Path, exec: &ExecutionResult) -> NativeSuit
         tests,
         failure_outputs,
         ran: true,
+        timed_out: false,
         exit_code: exec.exit_code,
         stderr_tail: tail,
         collection: CollectionFailure::of(&report),
@@ -712,15 +772,27 @@ pub fn native_gate_vacuous(
 /// original side never ran", "the patch side collected nothing" and "neither
 /// side produced a usable report" need different responses, and the exit code
 /// and the stderr tail of the empty side are what tell them apart.
+///
+/// [VANTA-WHY] M3 item D1 — a side killed by the wall-clock cap gets its OWN
+/// reason, ``native_timeout``, rather than the generic "collected nothing". The
+/// two emptinesses point at opposite fixes: a collection error is the tree's own
+/// import failing (pandas/1's xarray `TypeError`, fixed by the version pin),
+/// while a timeout is the harness's cap being too small for a legitimate suite
+/// (pandas/1's ~487 s native run under a 120 s in-session cap). `cap_secs` is the
+/// cap the run actually used, so the reason states the number the operator must
+/// raise. The guard is unchanged in force: either reason still ends the run as
+/// `InfraFailure`, and neither can ever count as zero regressions.
 pub fn native_vacuous_reason(
     expected_tests: usize,
+    cap_secs: u64,
     original: &NativeSuiteReport,
     patched: &NativeSuiteReport,
 ) -> String {
     let side = |label: &str, report: &NativeSuiteReport| -> String {
         format!(
-            "{label}={} (tests={} exit_code={} stderr={:?})",
+            "{label}={}{} (tests={} exit_code={} stderr={:?})",
             if report.ran { "ran" } else { "not_run" },
+            if report.timed_out { " timed_out" } else { "" },
             report.tests.len(),
             report
                 .exit_code
@@ -729,12 +801,30 @@ pub fn native_vacuous_reason(
             report.stderr_tail,
         )
     };
+    let sides = format!(
+        "{} {}",
+        side("original", original),
+        side("patched", patched),
+    );
+    if original.timed_out || patched.timed_out {
+        let which = match (original.timed_out, patched.timed_out) {
+            (true, true) => "both sides",
+            (true, false) => "the original side",
+            _ => "the patch side",
+        };
+        return format!(
+            "native_timeout=true expected_tests={expected_tests} native_timeout_secs={cap_secs} — \
+             {which} of the in-session native suite hit the run's {cap_secs}s wall-clock cap and was \
+             killed, so the native gate could not run and is NOT evidence of zero regressions. This is \
+             the cap being too small for this bug's suite, not the suite collecting nothing: raise the \
+             derived cap (prepare's measured native time × 3) rather than reading the emptiness as a \
+             tree with no tests. {sides}",
+        );
+    }
     format!(
         "native_vacuous=true expected_tests={expected_tests} — the row's own prepare recorded \
          {expected_tests} native test(s) for this bug, but the in-session suite collected nothing, \
-         so the native gate could not run and is NOT evidence of zero regressions: {} {}",
-        side("original", original),
-        side("patched", patched),
+         so the native gate could not run and is NOT evidence of zero regressions: {sides}",
     )
 }
 
@@ -2435,6 +2525,7 @@ mod tests {
                 .collect(),
             failure_outputs: HashMap::new(),
             ran: true,
+            timed_out: false,
             exit_code: Some(0),
             stderr_tail: String::new(),
             collection: None,
@@ -2888,6 +2979,7 @@ mod tests {
                 .collect(),
             failure_outputs: HashMap::new(),
             ran,
+            timed_out: false,
             exit_code,
             stderr_tail: String::new(),
             collection: None,
@@ -2957,7 +3049,7 @@ mod tests {
              first_collector_error=ImportError while importing test module)"
             .to_string();
 
-        let reason = native_vacuous_reason(88642, &full, &empty);
+        let reason = native_vacuous_reason(88642, 120, &full, &empty);
 
         assert!(reason.contains("native_vacuous=true"), "{reason}");
         assert!(reason.contains("expected_tests=88642"), "{reason}");
@@ -2974,6 +3066,77 @@ mod tests {
                 && reason.contains("first_failed_collector=pandas/tests/io/test_x.py")
                 && reason.contains("first_collector_error=ImportError while importing test module"),
             "the reason must name the module that broke collection: {reason}"
+        );
+    }
+
+    /// [VANTA-WHY] M3 item D1 — a run the backend KILLED is `timed_out`, not a
+    /// plain failed run. pandas/1's in-session suite died at the 120 s cap on BOTH
+    /// sides (`shuru exec TIMEOUT after 120s`, exit code unset), which the old
+    /// reader recorded as "collected nothing" — the same shape as a collection
+    /// error, and the wrong file for the operator to open.
+    #[test]
+    fn a_killed_native_run_is_recorded_as_timed_out_not_failed() {
+        let killed = ExecutionResult {
+            stdout: String::new(),
+            stderr: "shuru exec TIMEOUT after 120s\n".to_string(),
+            exit_code: None,
+            wall_time_ms: 120_000,
+            timed_out: true,
+        };
+        let report = parse_native_report(std::path::Path::new("/nonexistent/report.json"), &killed);
+        assert!(
+            report.timed_out,
+            "the kill must be recorded, not read as an empty suite"
+        );
+        assert!(!report.ran, "a killed run produced no report");
+        assert!(report.collected_nothing(), "a killed run is still vacuous");
+
+        // An unreadable report that was NOT killed must not acquire the flag.
+        let plain = ExecutionResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(2),
+            wall_time_ms: 1,
+            timed_out: false,
+        };
+        let report = parse_native_report(std::path::Path::new("/nonexistent/report.json"), &plain);
+        assert!(
+            !report.timed_out,
+            "an unreadable report is a failed run, not a timeout"
+        );
+    }
+
+    /// [VANTA-WHY] M3 item D1 — a vacuous gate caused by a KILLED side reports
+    /// `native_timeout` with the cap named, not `native_vacuous`. The two send the
+    /// operator to opposite places — the cap (a harness fact) vs the tree (an
+    /// import error) — and the guard's force is unchanged either way: a killed
+    /// side is still vacuous and still ends the run as `InfraFailure`.
+    #[test]
+    fn native_vacuous_reason_names_a_timeout_as_its_own_reason() {
+        let full = vacuity_report(&["a", "b"], true, Some(1));
+        let mut killed = vacuity_report(&[], false, None);
+        killed.timed_out = true;
+        killed.stderr_tail = "shuru exec TIMEOUT after 120s".to_string();
+
+        let reason = native_vacuous_reason(88642, 1461, &full, &killed);
+
+        assert!(reason.contains("native_timeout=true"), "{reason}");
+        assert!(
+            !reason.contains("native_vacuous=true"),
+            "a timeout is its own reason, not the generic one: {reason}"
+        );
+        assert!(
+            reason.contains("native_timeout_secs=1461"),
+            "the cap the run used must be named: {reason}"
+        );
+        assert!(reason.contains("the patch side"), "{reason}");
+        assert!(
+            reason.contains("patched=not_run timed_out (tests=0 exit_code=unset"),
+            "the killed side and its state must be reported: {reason}"
+        );
+        assert!(
+            native_gate_vacuous(88642, &full, &killed),
+            "the guard's force is unchanged: a killed side is still vacuous"
         );
     }
 

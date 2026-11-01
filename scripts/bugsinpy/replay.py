@@ -1480,6 +1480,13 @@ def replay_row(
     progress: bool = True,
 ) -> dict[str, Any]:
     """Build one row's replay record. Writes only under ``<batch>/replay/``."""
+    # M3 item D1 — a replay column runs the same *native* suite the live gate ran
+    # (and, in the oracle view, ``hidden_command``), so its cap is derived from
+    # prepare's own measurement by the one shared rule. The caller's value (1800) is
+    # the floor, so this can only raise the cap; ``native_secs`` is ``None`` on a row
+    # prepared before D1, which keeps the cap the caller passed. Derived here rather
+    # than in ``build_columns`` because this is the only place the suite is run.
+    timeout_secs = suite_mod.native_timeout_secs(prep.native_secs, floor=timeout_secs)
     key = str(record.get("key") or "")
     session_id = str(record.get("session_id") or "")
     debug_dir = sessions_dir / session_id / "debug"

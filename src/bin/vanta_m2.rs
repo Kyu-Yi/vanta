@@ -151,6 +151,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         sandbox_env: Vec::new(),
         precompile: Vec::new(),
         native_expected_tests: None,
+        // [VANTA-WHY] M3 item D1 — M2 records no prepare measurement, so it keeps
+        // the historical in-session native cap (`harness::test_timeout_secs()`)
+        // rather than deriving one. The derived cap is M3's, from a row's own
+        // prepare.
+        native_timeout_secs: None,
         original_tree: cli.original_tree,
     })
     .await?;

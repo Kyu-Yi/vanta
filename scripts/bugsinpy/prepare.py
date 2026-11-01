@@ -38,7 +38,7 @@ from .bugsinpy_meta import (
     load_bug_info,
     project_github_url,
 )
-from .records import field_of, map_of, memory_of, record_of, strings_of
+from .records import RecordError, field_of, map_of, memory_of, record_of, strings_of
 from .split import Split, sha256_file, sha256_text
 
 DISK_MB = 16384
@@ -167,6 +167,29 @@ class PrepareError(RuntimeError):
     """prepare could not proceed."""
 
 
+def native_secs_of(payload: object, *, owner: str, where: str = "") -> Optional[float]:
+    """``payload["native_secs"]`` as a positive wall time, or ``None``.
+
+    The reader for :attr:`BugPrep.native_secs`. It is deliberately tolerant of a
+    MISSING key: D1 added the field, and a ``prepare.json`` written before it —
+    every night3 row — has to keep loading, with the absence read as "this row
+    recorded no native wall time" rather than as a corrupt record. A present value
+    that is not a positive number is still refused, so a zero or a bool cannot slip
+    through as a duration that would derive a cap of zero.
+    """
+    if not isinstance(payload, Mapping) or "native_secs" not in payload:
+        return None
+    value = payload["native_secs"]
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise RecordError(
+            f"{owner}{(' ' + where) if where else ''}: field 'native_secs' is {value!r}, "
+            "not a positive number of seconds (or null for a row that recorded none)"
+        )
+    return float(value)
+
+
 @dataclass
 class BugPrep:
     """Everything prepare learned about one bug."""
@@ -282,6 +305,19 @@ class BugPrep:
     preexisting_failures: list[str] = field(default_factory=list)
     native_failure_baseline: list[str] = field(default_factory=list)
     native_green_on_vanta_tree: bool = False
+    native_secs: Optional[float] = None
+    """How long this bug's native suite takes, measured by the ``vanta_tree`` run.
+
+    [VANTA-WHY] M3 item D1. The in-session native gate runs the SAME suite as this
+    measurement, but under Rust ``harness::test_timeout_secs()`` (120 s by default)
+    while this run gets 1800 s — measured on pandas/1, the suite takes ~487 s, so the
+    gate could never finish, the native gate went vacuous and the row ended
+    ``infra_failure`` for a reason that was the CAP and not the tree. The runner turns
+    this number into the cap it hands the binary (``max(120, 3 × native_secs)``), so the
+    figure has to be THIS run's pytest wall time — measured in-VM around the command by
+    :attr:`suite.SuiteRun.secs` — and not a guess. ``None`` on a measure-only prepare, a
+    bug whose gate refused before the baseline, or any row prepared before D1.
+    """
     native_skips_buggy: int = 0
     native_skips_fixed: int = 0
     """Stable ``skipped`` outcomes in the non-graded suite, one count per commit.
@@ -516,6 +552,7 @@ class BugPrep:
             "preexisting_failures": sorted(self.preexisting_failures),
             "native_failure_baseline": sorted(self.native_failure_baseline),
             "native_green_on_vanta_tree": self.native_green_on_vanta_tree,
+            "native_secs": self.native_secs,
             "native_skips_buggy": self.native_skips_buggy,
             "native_skips_fixed": self.native_skips_fixed,
             "hidden_files_deleted": self.hidden_files_deleted,
@@ -589,6 +626,7 @@ class BugPrep:
             native_green_on_vanta_tree=bool(
                 field_of(payload, "native_green_on_vanta_tree", owner=owner, where=where)
             ),
+            native_secs=native_secs_of(payload, owner=owner, where=where),
             native_skips_buggy=int(
                 field_of(payload, "native_skips_buggy", owner=owner, where=where)
             ),
@@ -1394,6 +1432,15 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bo
         prep.native_failure_baseline
     )
     prep.native_green_on_vanta_tree = not prep.native_failure_baseline
+    # [VANTA-WHY] M3 item D1 — the native suite's own wall time, the number the
+    # in-session gate's cap is derived from. It comes from THIS run and not the
+    # oracle run for the same reason the baseline does: this is the tree the
+    # in-session suite will actually run (stripped, version-pinned), so it is the
+    # run whose duration the cap has to clear. `max_run_secs` is the slower of the
+    # pair of runs, because a cap sized on the warm run would under-cover the cold
+    # one. Measured in-VM by `SuiteRun.secs`; `None` when the markers were lost, in
+    # which case the runner falls back to the old 120 s.
+    prep.native_secs = after_strip.max_run_secs
 
     tree_mod.copy_tree(vanta, prep.root / "vanta_clean")
     return True
@@ -2567,6 +2614,7 @@ def derive_verdict(prep: BugPrep) -> dict[str, Any]:
         "native_green_on_vanta_tree": prep.native_green_on_vanta_tree,
         "native_skips_buggy": prep.native_skips_buggy,
         "native_skips_fixed": prep.native_skips_fixed,
+        "native_secs": prep.native_secs,
         "hidden_files_deleted": prep.hidden_files_deleted,
         "partially_hidden_functions": prep.partially_hidden_functions,
         "hidden_by_collect_flip": prep.hidden_by_collect_flip,

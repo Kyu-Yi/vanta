@@ -95,6 +95,16 @@ struct CliArgs {
     /// means "not recorded" (a hand-run binary) and leaves the run exactly as it
     /// was; `0` means the bug genuinely ships no native tests.
     native_expected_tests: Option<usize>,
+    /// M3 item D1 — `--native-timeout-secs N`: the wall-clock cap for the
+    /// in-session native suite, derived per bug from the row's own prepare
+    /// measurement (`max(120, 3 × measured)`). Absent keeps the historical
+    /// `harness::test_timeout_secs()` (120 s, or `VANTA_TEST_TIMEOUT_SECS`).
+    ///
+    /// The gate runs the repo's own suite twice in-session. pandas/1's suite
+    /// takes ~487 s through prepare, so the fixed 120 s cap killed BOTH runs and
+    /// the row died as a false "collected nothing" (night3). A per-bug cap is the
+    /// only value both large enough for the bug and still bounded.
+    native_timeout_secs: Option<u64>,
     /// Path to a clean original tree (git worktree of the base commit) for
     /// Mode B. If set, BATE runs against this tree instead of the in-memory
     /// original files. Spec §7: "both trees present simultaneously".
@@ -145,6 +155,7 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
     let mut sandbox_env: Vec<(String, String)> = Vec::new();
     let mut precompile: Vec<String> = Vec::new();
     let mut native_expected_tests: Option<usize> = None;
+    let mut native_timeout_secs: Option<u64> = None;
     let mut original_tree: Option<PathBuf> = None;
     let mut rerun_signals: Option<String> = None;
     let mut good_tree: Option<PathBuf> = None;
@@ -244,6 +255,24 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
                     .map_err(|e| format!("--native-expected-tests: {e}"))?;
                 native_expected_tests = Some(count);
             }
+            "--native-timeout-secs" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--native-timeout-secs requires a number of seconds".to_string());
+                }
+                let secs = args[i]
+                    .parse::<u64>()
+                    .map_err(|e| format!("--native-timeout-secs: {e}"))?;
+                // A zero-second cap would kill every suite immediately; the flag
+                // exists to RAISE the cap for a slow bug, never to make the gate
+                // unusable, so zero is refused with the flag named.
+                if secs == 0 {
+                    return Err(
+                        "--native-timeout-secs: must be a positive number of seconds".to_string()
+                    );
+                }
+                native_timeout_secs = Some(secs);
+            }
             "--original-tree" => {
                 i += 1;
                 if i >= args.len() {
@@ -342,6 +371,7 @@ fn parse_args_from(args: &[String]) -> Result<CliArgs, String> {
         sandbox_env,
         precompile,
         native_expected_tests,
+        native_timeout_secs,
         original_tree,
         rerun_signals,
         good_tree,
@@ -546,6 +576,7 @@ fn print_help() {
          --sandbox-env K=V     Inject K=V into every sandbox command of the run (repeatable). PYTHONPATH or MPLBACKEND only; refused for any other key\n    \
          --precompile PATH      Byte-compile PATH (tree-relative .py) in every suite VM before the test command runs (repeatable). A path outside the tree, a .py-less name or a non-.py file is refused\n    \
          --native-expected-tests N  How many native tests this row's prepare collected. With a positive N, an in-session native suite that collects NOTHING is an InfraFailure (exit 2) instead of a pass; absent means not recorded\n    \
+         --native-timeout-secs N  Wall-clock cap (seconds) for the in-session native suite, derived per bug from prepare's measured native run. Absent keeps the historical 120s; a suite killed by the cap is an InfraFailure\n    \
          --original-tree PATH   Clean original tree (git worktree of base commit) for Mode B two-tree mode\n    \
          --rerun-signals ID     Re-run session ID's review-mode rejection signals against --good-tree (writes vanta_sessions/ID_signal_reruns.json; no --repo needed)\n    \
          --good-tree PATH       Known-good source: a directory, or a patch file applied onto --base-tree\n    \
@@ -753,6 +784,52 @@ mod tests {
         );
     }
 
+    /// [VANTA-WHY] M3 item D1 — `--native-timeout-secs N`. Off unless the row's
+    /// own prepare measured its native suite; absent keeps the historical 120 s,
+    /// which is every hand-run invocation and every row whose prepare recorded no
+    /// time. The cap is a positive number; a missing one, a non-number or zero is
+    /// refused with the flag named.
+    #[test]
+    fn the_native_timeout_secs_flag_is_off_by_default_and_reads_seconds() {
+        let cli = parse_args_from(&args(&["--repo", "tree"])).unwrap();
+        assert_eq!(
+            cli.native_timeout_secs, None,
+            "absent must leave the in-session cap exactly as it was before item D1"
+        );
+
+        let cli =
+            parse_args_from(&args(&["--repo", "tree", "--native-timeout-secs", "1461"])).unwrap();
+        assert_eq!(cli.native_timeout_secs, Some(1461));
+
+        // A missing value, a non-number and zero are all refused with the flag named.
+        let error = match parse_args_from(&args(&["--repo", "tree", "--native-timeout-secs"])) {
+            Ok(_) => panic!("--native-timeout-secs with no value must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.starts_with("--native-timeout-secs") && error.contains("requires a number"),
+            "the refusal must name the flag; got: {error}"
+        );
+        let error =
+            match parse_args_from(&args(&["--repo", "tree", "--native-timeout-secs", "slow"])) {
+                Ok(_) => panic!("--native-timeout-secs slow must be refused"),
+                Err(error) => error,
+            };
+        assert!(
+            error.starts_with("--native-timeout-secs:"),
+            "the refusal must name the flag; got: {error}"
+        );
+        let error = match parse_args_from(&args(&["--repo", "tree", "--native-timeout-secs", "0"]))
+        {
+            Ok(_) => panic!("a zero-second cap must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.starts_with("--native-timeout-secs:"),
+            "the refusal must name the flag; got: {error}"
+        );
+    }
+
     /// [VANTA-WHY] M3 item 9 — `--fixed-rounds K`. Off unless asked for, read
     /// from either spelling, and refused where no number follows. The flag is
     /// parsed here and INTERPRETED by the driver (`resolve_fixed_rounds`), which
@@ -858,6 +935,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         sandbox_env: cli.sandbox_env,
         precompile: cli.precompile,
         native_expected_tests: cli.native_expected_tests,
+        native_timeout_secs: cli.native_timeout_secs,
         original_tree: cli.original_tree,
     })
     .await?;

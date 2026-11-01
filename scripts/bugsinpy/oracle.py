@@ -201,6 +201,12 @@ def grade(
     deleting it here would move a disk problem onto the correctness path.
     """
     started = time.monotonic()
+    # M3 item D1 — the grading runs cover the same *native* suite the in-session gate
+    # does (``patched_pair`` runs ``prep.test_cmd`` in full), so the cap is derived
+    # from prepare's own measurement by the one shared rule. The floor here is the
+    # caller's current value (1800), so a bug whose suite was measured fast keeps its
+    # cap and a slow one gets room; the rule can only ever raise it.
+    timeout_secs = suite_mod.native_timeout_secs(prep.native_secs, floor=timeout_secs)
     # §3.4: ``hidden_nodeids`` is the declared ``FAIL_TO_PASS`` **plus** the recorded
     # collect-flips — the files that do not collect on the buggy source at all, so
     # they appear in no BugsInPy list yet are exactly the fail→pass flips the oracle

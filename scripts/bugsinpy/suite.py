@@ -20,6 +20,7 @@ what the Creator is shown.
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -77,6 +78,23 @@ class SuiteRun:
     reason can quote what the reader said.
     """
 
+    secs: Optional[float] = None
+    """Wall-clock seconds the pytest invocation itself took, measured IN the VM.
+
+    [VANTA-WHY] M3 item D1. prepare has to record how long the native suite takes,
+    because the in-session native gate caps the same suite at Rust
+    ``harness::test_timeout_secs()`` (120 s from ``VANTA_TEST_TIMEOUT_SECS``) while
+    prepare's own runs use 1800 s — measured on pandas/1, whose native run takes
+    ~487 s, so the gate could never finish and the row ended ``native_vacuous``
+    for a reason that was the CAP and not the tree (matplotlib/1's ~103 s was
+    already at the edge). The cap handed to the binary is derived from THIS
+    number, so it has to be the pytest invocation alone: the two ``date +%s``
+    markers are emitted inside the VM around the command, excluding the VM boot
+    and the pre-compile step, which the in-session cap does not cover either.
+    ``None`` is a run that recorded no timing — every row before D1, and any run
+    whose markers were lost.
+    """
+
     @property
     def failures(self) -> set[str]:
         return {n for n, o in self.outcomes.items() if o in FAILURE_OUTCOMES}
@@ -114,6 +132,19 @@ class SuitePair:
     def stable_collected(self) -> set[str]:
         return set(self.stable_outcomes)
 
+    @property
+    def max_run_secs(self) -> Optional[float]:
+        """The slower of the two runs, in seconds, or ``None`` when neither timed.
+
+        [VANTA-WHY] M3 item D1. The cap the in-session gate needs must cover the
+        SLOWER run of the pair: the two runs are the same suite, but the first is
+        cold and the second warm, so the number a per-bug cap has to clear is the
+        larger one. Reading only the first run would under-size the cap by
+        however much the cold run cost.
+        """
+        timed = [s for s in (self.first.secs, self.second.secs) if s is not None]
+        return max(timed) if timed else None
+
 
 def compare_runs(first: SuiteRun, second: SuiteRun) -> SuitePair:
     """Diff two runs of the same suite: flaky, missing, and demonstrably stable.
@@ -133,6 +164,39 @@ def compare_runs(first: SuiteRun, second: SuiteRun) -> SuitePair:
         elif a != b:
             pair.flaky_nodeids.add(nodeid)
     return pair
+
+
+NATIVE_TIMEOUT_FLOOR_SECS = 120
+"""The in-session native gate's cap before D1 — the floor a derived cap never goes below.
+
+[VANTA-WHY] The Rust side's ``harness::test_timeout_secs()`` defaults to 120 s, and
+that default is what D1 exists to replace with a per-bug number. Keeping it as the
+FLOOR means the rule can only ever raise a cap: a bug whose suite is fast keeps the
+old 120 s, and one whose suite cannot finish in 120 s gets room to finish.
+"""
+
+
+def native_timeout_secs(native_secs: Optional[float], *, floor: int) -> int:
+    """The wall-clock cap for a full native suite, from prepare's own measurement.
+
+    [VANTA-WHY] M3 item D1. The rule is "3 × the measured run, never below the value
+    already in use". A cap that is too small does not merely fail slowly: it makes the
+    suite collect nothing, the native gate go vacuous and the row end ``infra_failure``
+    — a fact about the CAP reported as a fault of the machine or the tree.
+    Measured on pandas/1: the native run takes ~487 s against a 120 s in-session cap,
+    so the gate could never finish there; matplotlib/1's ~103 s was already inside the
+    margin.
+
+    One rule, one helper, applied everywhere a full native suite runs — the in-session
+    gate (floor :data:`NATIVE_TIMEOUT_FLOOR_SECS`), the replay columns and the oracle
+    grading (floor 1800) — so the three can never disagree about how long a bug's suite
+    may take. ``floor`` is the caller's CURRENT cap, so the rule can only raise a cap,
+    never lower one that was already large enough; ``native_secs is None`` (a row
+    prepared before D1, or a run whose timing was lost) returns ``floor`` unchanged.
+    """
+    if native_secs is None:
+        return floor
+    return max(floor, math.ceil(3 * native_secs))
 
 
 # ---------------------------------------------------------------------------
@@ -223,10 +287,22 @@ def run_suite_twice(
         [
             "set +e",
             *precompile_lines(precompile, test_cmd),
+            # [VANTA-WHY] M3 item D1 — the wall-clock markers. `T0` opens the clock
+            # immediately before the pytest invocation and `T1` closes it
+            # immediately after, with `__VANTA_EXIT_n__` left in between so the
+            # exit code is still `$?` of the pytest command and not of the
+            # marker (`echo …=$(date +%s)` would consume it). Measuring here, in
+            # the VM and around the command alone, is what makes the figure
+            # comparable with the in-session cap, which also covers pytest only —
+            # a number that included the boot would over-size every derived cap.
+            "echo __VANTA_T0_1__=$(date +%s)",
             cmd1,
             "echo __VANTA_EXIT_1__=$?",
+            "echo __VANTA_T1_1__=$(date +%s)",
+            "echo __VANTA_T0_2__=$(date +%s)",
             cmd2,
             "echo __VANTA_EXIT_2__=$?",
+            "echo __VANTA_T1_2__=$(date +%s)",
             "exit 0",
         ]
     )
@@ -768,6 +844,7 @@ def _load_run(report: Path, result: shuru.ExecResult, *, suffix: str) -> SuiteRu
         timed_out=result.timed_out,
         stdout_tail=result.stdout[-4000:],
         stderr_tail=result.stderr[-2000:],
+        secs=_marker_duration(result.stdout, suffix),
     )
     if report.is_file():
         try:
@@ -823,6 +900,39 @@ def _exit_code(stdout: str, suffix: str) -> Optional[int]:
             except ValueError:
                 return None
     return None
+
+
+def _marker_time(stdout: str, name: str, suffix: str) -> Optional[int]:
+    """The integer after ``__VANTA_<name>_<suffix>__=``, or ``None`` when absent.
+
+    The reader for the ``date +%s`` markers :func:`run_suite_twice` writes around
+    each pytest invocation. A run whose markers never arrived — an older script,
+    a truncated stdout, a command that took the shell with it — returns ``None``
+    rather than a wrong number, so a missing measurement can never be mistaken
+    for a very fast run (which would derive a cap that is far too small).
+    """
+    marker = f"__VANTA_{name}_{suffix}__="
+    for line in stdout.splitlines():
+        if line.startswith(marker):
+            try:
+                return int(line[len(marker) :].strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _marker_duration(stdout: str, suffix: str) -> Optional[float]:
+    """The measured pytest wall time for ``suffix``, or ``None`` when not measurable.
+
+    A negative or zero duration is refused as well as a missing one: ``date +%s``
+    is second-resolution, and an inverted pair can only mean the markers belong to
+    different runs (a mangled script), which is not a run time at all.
+    """
+    start = _marker_time(stdout, "T0", suffix)
+    end = _marker_time(stdout, "T1", suffix)
+    if start is None or end is None or end <= start:
+        return None
+    return float(end - start)
 
 
 def _clean_tree_noise(tree: Path) -> None:

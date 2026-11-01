@@ -1770,6 +1770,18 @@ def invoke_vanta(
     if prep.prepare_mode == prepare_mod.FULL:
         native_expected = prep.pass_to_pass_count + len(prep.native_failure_baseline)
         argv += ["--native-expected-tests", str(native_expected)]
+    # M3 item D1 — the in-session native suite's wall-clock cap, derived per bug from
+    # prepare's OWN measurement of the same suite. The old cap was the Rust default
+    # (120 s), which pandas/1's ~487 s native run can never fit: the gate then killed
+    # both runs, read as "collected nothing" and ended the row `native_vacuous` — an
+    # `infra_failure` blamed on the tree for what was a fact about the CAP. The rule is
+    # `max(120, 3 × measured)`; `native_secs` is `None` on a row prepared before D1 (or
+    # a measure-only row), which holds the old 120 s. The cap the run actually used is
+    # recorded on the row from `run.summary`.
+    native_cap = suite_mod.native_timeout_secs(
+        prep.native_secs, floor=suite_mod.NATIVE_TIMEOUT_FLOOR_SECS
+    )
+    argv += ["--native-timeout-secs", str(native_cap)]
     if candidate is not None:
         argv += ["--patch", str(candidate.patch_path)]
 
@@ -2134,6 +2146,20 @@ def build_record(
         # `None` is a row older than the option. The per-attempt detail it
         # indexes is `attempts` in the session's `run.evidence.json`.
         "fixed_rounds": summary.get("fixed_rounds"),
+        # [VANTA-WHY] M3 item D1 — how long the native suite takes, and the cap the
+        # run was given for it. `native_secs` is prepare's own measurement of the
+        # native suite (seconds, in-VM, pytest only); `native_timeout_secs` is the cap
+        # `runner` derived from it (`max(120, 3 × native_secs)`) and handed to
+        # `vanta_m3`, read back from `run.summary` so a row states the cap its gate
+        # really ran under rather than one re-derived afterwards. Both are recorded
+        # for `seed_policy`'s reason: a row whose gate was killed by the cap is not
+        # evidence about the tree, so a reader has to be able to tell it from one
+        # whose suite genuinely collected nothing. `native_secs` is `None` on a row
+        # prepared before D1 or on a measure-only row; `native_timeout_secs` is then
+        # the historical 120 s.
+        "native_secs": prep.native_secs,
+        "native_timeout_secs": _int(summary.get("native_timeout_secs")),
+        "native_timeout": _bool(summary.get("native_timeout")),
         "oracle": oracle.as_dict(),
         "label": label_for(outcome.decision, oracle),
         # Item Q — the reason a label needs one. `unresolved` for a run whose final

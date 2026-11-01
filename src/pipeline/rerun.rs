@@ -264,8 +264,12 @@ pub async fn rerun_signals(
         if native_regressions.is_empty() {
             None
         } else {
-            let bad = harness::run_native_suite(&bad_concat, &test_cmd).await;
-            let good = harness::run_native_suite(&good_concat, &test_cmd).await;
+            // [VANTA-WHY] M3 item D1 — the rerun reads a finished session and has
+            // no prepare measurement for the bug, so it keeps the historical cap
+            // (`None` → `harness::test_timeout_secs()`). The derived per-bug cap is
+            // the driver's, from a row's own prepare.
+            let bad = harness::run_native_suite(&bad_concat, &test_cmd, None).await;
+            let good = harness::run_native_suite(&good_concat, &test_cmd, None).await;
             Some((bad, good))
         };
     // [VANTA-WHY] Both sides must be analysed with the SAME repo config, so the
@@ -1582,6 +1586,7 @@ mod tests {
                 .collect(),
             failure_outputs: std::collections::HashMap::new(),
             ran,
+            timed_out: false,
             exit_code: Some(0),
             stderr_tail: String::new(),
             collection: None,
@@ -1616,6 +1621,7 @@ mod tests {
             tests: Vec::new(),
             failure_outputs: std::collections::HashMap::new(),
             ran: false,
+            timed_out: false,
             exit_code: Some(127),
             stderr_tail:
                 "env: /Users/nathan/heretic/.venv/bin/python: No such file or directory".to_string(),

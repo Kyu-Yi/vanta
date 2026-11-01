@@ -5865,6 +5865,76 @@ class TestShuruRunMemory:
 # ============================================================================
 # suite.py — command construction and report reading (no VM)
 # ============================================================================
+class TestNativeTimeoutDerivation:
+    """M3 item D1 — the native-suite cap, derived from prepare's own measurement.
+
+    [VANTA-WHY] The in-session native gate used to run the whole suite under one
+    fixed cap (Rust ``harness::test_timeout_secs()``, 120 s) while prepare's own
+    runs of the same suite used 1800 s. pandas/1's native run is ~487 s, so the
+    gate could never finish there: both runs were killed, read as "collected
+    nothing", and the row ended ``native_vacuous`` — an ``infra_failure`` blamed on
+    the tree for what was a fact about the CAP. The rule is ``max(floor, 3 × the
+    measured run)``; the floor is the caller's CURRENT value, so it can only ever
+    raise a cap. These tests are about the number itself; the Rust side proves the
+    same derivation reaches the run and that a killed run is named ``native_timeout``.
+    """
+
+    def test_the_rule_is_three_times_the_measured_run(self):
+        assert suite_mod.native_timeout_secs(487.0, floor=120) == 1461, (
+            "pandas/1's ~487 s run against the 120 s in-session floor"
+        )
+        assert suite_mod.native_timeout_secs(700.0, floor=1800) == 2100
+        assert suite_mod.native_timeout_secs(700.4, floor=1800) == 2102, "ceil, not round"
+
+    def test_the_rule_never_lowers_a_cap_below_its_floor(self):
+        assert suite_mod.native_timeout_secs(1.0, floor=120) == 120
+        assert suite_mod.native_timeout_secs(40.0, floor=120) == 120
+        assert suite_mod.native_timeout_secs(487.0, floor=1800) == 1800, (
+            "the replay/oracle floor is a large cap the rule must not shrink"
+        )
+
+    def test_no_measurement_keeps_the_floor(self):
+        assert suite_mod.native_timeout_secs(None, floor=120) == 120, (
+            "a row prepared before D1 keeps the historical cap"
+        )
+        assert suite_mod.native_timeout_secs(None, floor=1800) == 1800
+
+    def test_the_slower_run_of_a_pair_sizes_the_cap(self):
+        fast = suite_mod.SuiteRun(outcomes={}, exit_code=0, report_found=True, secs=90.0)
+        slow = suite_mod.SuiteRun(outcomes={}, exit_code=0, report_found=True, secs=487.0)
+        assert suite_mod.compare_runs(fast, slow).max_run_secs == 487.0, (
+            "the cap must clear the SLOWER run: the first is cold, the second warm"
+        )
+
+    def test_a_pair_with_no_timing_has_no_measurement(self):
+        run = suite_mod.SuiteRun(outcomes={}, exit_code=0, report_found=True)
+        assert suite_mod.compare_runs(run, run).max_run_secs is None
+
+    def test_the_marker_pair_measures_the_pytest_window(self):
+        stdout = (
+            "collecting...\n"
+            "__VANTA_T0_1__=100\n"
+            "__VANTA_EXIT_1__=1\n"
+            "__VANTA_T1_1__=587\n"
+            "done\n"
+        )
+        assert suite_mod._marker_duration(stdout, "1") == 487.0
+
+    def test_a_missing_marker_measures_nothing(self):
+        assert suite_mod._marker_duration("__VANTA_T0_1__=100\n", "1") is None
+        assert suite_mod._marker_duration("", "1") is None, (
+            "a lost measurement reads as None, never as a very fast run"
+        )
+
+    def test_an_inverted_marker_pair_is_refused(self):
+        stdout = "__VANTA_T0_1__=100\n__VANTA_T1_1__=100\n"
+        assert suite_mod._marker_duration(stdout, "1") is None
+
+    def test_a_non_numeric_marker_is_refused(self):
+        stdout = "__VANTA_T0_1__=oops\n__VANTA_T1_1__=200\n"
+        assert suite_mod._marker_duration(stdout, "1") is None
+
+
 class TestSuiteCommand:
     def test_substitutes_the_report_placeholder(self):
         cmd = suite_mod.build_command(
@@ -6174,6 +6244,13 @@ class TestPrepareInvariants:
         """A key drift here writes an unvalidatable split, or silently drops one."""
         assert set(prepare_mod.derive_verdict(prep())) == split_mod.DERIVED_BUG_KEYS
 
+    def test_derive_verdict_carries_the_measured_native_run(self):
+        """M3 item D1 — the measurement prepare made reaches ``prepare.json``/split."""
+        assert prepare_mod.derive_verdict(prep(native_secs=487.0))["native_secs"] == 487.0
+        assert prepare_mod.derive_verdict(prep())["native_secs"] is None, (
+            "a bug prepared before D1 records no measurement rather than a wrong one"
+        )
+
     def test_every_derived_field_survives_set_derived(self):
         split = split_mod.Split(split_data())
         split.set_derived("Demo", 1, **prepare_mod.derive_verdict(prep()))
@@ -6413,6 +6490,42 @@ class TestMemoryOf:
     def test_a_value_that_cannot_size_a_vm_is_refused(self, value):
         with pytest.raises(records_mod.RecordError, match="vm_memory_mb"):
             self._read({"vm_memory_mb": value})
+
+
+class TestNativeSecsReader:
+    """M3 item D1 — reading ``native_secs`` back from a stored ``prepare.json``.
+
+    [VANTA-WHY] The reader is deliberately tolerant of a MISSING key: D1 added the
+    field, and every ``prepare.json`` written before it has to keep loading, with the
+    absence read as "this row recorded no native wall time" rather than as a corrupt
+    record. A *present* value that cannot be a duration is still refused, so a zero,
+    a negative or a string can never derive a cap of zero.
+    """
+
+    @staticmethod
+    def _read(payload):
+        return prepare_mod.native_secs_of(payload, owner="BugPrep")
+
+    def test_a_pre_d1_row_reads_as_no_measurement(self):
+        assert self._read({}) is None, "night3's rows have no native_secs key"
+        assert self._read({"native_secs": None}) is None
+
+    def test_a_positive_number_reads_back_as_seconds(self):
+        assert self._read({"native_secs": 487}) == 487.0
+        assert self._read({"native_secs": 103.5}) == 103.5
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(0, id="zero"),
+            pytest.param(-1, id="negative"),
+            pytest.param(True, id="a-bool-is-not-a-duration"),
+            pytest.param("487", id="a-string"),
+        ],
+    )
+    def test_a_value_that_cannot_be_a_duration_is_refused(self, value):
+        with pytest.raises(records_mod.RecordError, match="native_secs"):
+            self._read({"native_secs": value})
 
 
 class TestRecordOf:
@@ -19590,6 +19703,21 @@ class TestOracleGrade:
         assert "tests/test_demo.py::test_fix" in hidden["test_cmd"]
         assert "tests" not in hidden["test_cmd"]
 
+    def test_the_grading_cap_is_derived_from_the_row_measurement(self, wired, tmp_path):
+        """M3 item D1 — the grading runs cover the native suite, so they get the derived cap.
+
+        The floor here is the caller's 1800; a measured run whose 3× exceeds it raises
+        both the hidden and the patched run, and a row with no measurement keeps 1800.
+        """
+        self._grade(wired, tmp_path, prep_over={"native_secs": 700.0})
+        assert [run["timeout_secs"] for run in wired["runs"]] == [2100, 2100], (
+            "max(1800, 3 × 700) = 2100, on both the hidden and the patched run"
+        )
+
+    def test_a_row_with_no_measurement_keeps_the_grading_floor(self, wired, tmp_path):
+        self._grade(wired, tmp_path)
+        assert [run["timeout_secs"] for run in wired["runs"]] == [1800, 1800]
+
     def test_a_collect_flip_oracle_is_graded_with_no_declared_fail_to_pass(
         self, wired, tmp_path
     ):
@@ -20261,6 +20389,62 @@ class TestInvokeVantaCarriesTheNativeExpectedTestCount:
         )
         assert "--native-expected-tests" not in text, (
             "a measure-only prepare never ran the native suite, so it has no size to assert"
+        )
+
+
+class TestInvokeVantaCarriesTheNativeTimeout:
+    """M3 item D1 — the cap derived from prepare's measurement reaches ``--native-timeout-secs``.
+
+    [VANTA-WHY] The in-session native suite was run under a fixed 120 s cap while
+    prepare's own runs of the same suite used 1800 s. pandas/1's native run is ~487 s,
+    so the in-session gate could never finish: both runs were killed, read as
+    "collected nothing" and the row ended ``native_vacuous`` — an ``infra_failure``
+    blamed on the tree for a fact about the CAP. The cap is derived from the row's
+    own measurement by the one shared rule (``max(120, 3 × measured)``); a row with
+    no measurement (pre-D1, or a measure-only row) keeps the historical 120 s.
+    """
+
+    @staticmethod
+    def _run(tmp_path, monkeypatch, **over):
+        import types
+
+        monkeypatch.setattr(
+            runner_mod.subprocess,
+            "run",
+            lambda *a, **kw: types.SimpleNamespace(returncode=0),
+        )
+        log_path = tmp_path / "vanta.log"
+        bug_prep = prep(
+            root=tmp_path / "root",
+            test_cmd=["python", "-m", "pytest", "tests", "--json-report-file={report}"],
+            **over,
+        )
+        runner_mod.invoke_vanta(
+            vanta_bin=tmp_path / "vanta_m3",
+            prep=bug_prep,
+            issue_path=tmp_path / "issue.md",
+            env={"PATH": "/usr/bin"},
+            log_path=log_path,
+            max_attempts=2,
+        )
+        return log_path.read_text(encoding="utf-8")
+
+    def test_a_measured_bug_gets_three_times_its_native_run(self, tmp_path, monkeypatch):
+        text = self._run(tmp_path, monkeypatch, native_secs=487.0)
+        assert "--native-timeout-secs 1461" in text, (
+            "pandas/1: max(120, 3 × 487) = 1461 s, room for the suite to finish"
+        )
+        assert text.index("--max-attempts 2") < text.index("--native-timeout-secs"), (
+            "the flag is appended after the fixed arguments"
+        )
+
+    def test_a_row_with_no_measurement_keeps_the_historical_cap(
+        self, tmp_path, monkeypatch
+    ):
+        text = self._run(tmp_path, monkeypatch)
+        assert "--native-timeout-secs 120" in text, (
+            "a pre-D1 or measure-only row keeps the old 120 s, never a cap derived "
+            "from a missing number"
         )
 
 
@@ -22948,6 +23132,49 @@ class TestRunJob:
             max_attempts=4, disk_mb=8192, python_version="3.8.20",
         )
         assert old["fixed_rounds"] is None
+
+    def test_a_row_records_the_measured_native_run_and_the_cap_it_ran_under(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item D1 — the measurement and the derived cap are on the row.
+
+        `native_secs` is prepare's own measurement; `native_timeout_secs` is the cap
+        `runner` derived from it and handed to `vanta_m3`, read back from
+        `run.summary` so the row states the cap its gate really ran under.
+        `native_timeout` is the reason flag a killed side sets. A row with neither the
+        measurement nor the summary key records `None`, never a wrong number.
+        """
+        base = _outcome(tmp_path)
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path,
+                summary=dict(
+                    base.summary, native_timeout_secs="1461", native_timeout="true"
+                ),
+            ),
+        )
+        measured = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root", native_secs=487.0)),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert measured["native_secs"] == 487.0
+        assert measured["native_timeout_secs"] == 1461
+        assert measured["native_timeout"] is True
+
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        old = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")),
+            paths=self._paths(tmp_path), manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3", max_attempts=4, disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert old["native_secs"] is None
+        assert old["native_timeout_secs"] is None
+        assert old["native_timeout"] is None
 
     def test_a_row_records_why_a_final_patch_that_did_not_apply_is_not_fixed(
         self, tmp_path, monkeypatch
@@ -27773,6 +28000,59 @@ class TestReplayRow:
         for path in batch.rglob("*"):
             if path.is_file() and path not in before:
                 assert replay_mod.REPLAY_DIRNAME in path.parts
+
+    def test_the_column_cap_is_derived_from_the_row_measurement(self, tmp_path, monkeypatch):
+        """M3 item D1 — a column runs the same native suite, so it gets the derived cap."""
+        calls: list[dict] = []
+        prep = _replay_prep(tmp_path, native_secs=700.0)
+        sessions, debug = _replay_session(tmp_path, attempts=1)
+        write(debug / "shared_tests.json", json.dumps([{"test_name": "g_c", "test_source": "assert 1"}]))
+        _fake_column(monkeypatch, {0: {"generated:g_c": "passed"}}, calls=calls)
+
+        replay_mod.replay_row(
+            record=_replay_record(),
+            prep=prep,
+            checkpoint="ck",
+            batch_dir=tmp_path / "batch",
+            sessions_dir=sessions,
+            views=(replay_mod.VIEW_GENERATED,),
+            seed=replay_mod.DEFAULT_SEED,
+            sample_rate=0.0,
+            disk_mb=prepare_mod.DISK_MB,
+            timeout_secs=replay_mod.DEFAULT_TIMEOUT_SECS,
+            progress=False,
+        )
+
+        assert calls, "the baseline column has to boot"
+        assert calls[0]["timeout_secs"] == 2100, (
+            "the replay floor is 1800, and a 700 s run derives max(1800, 3 × 700) = 2100, "
+            "so the per-bug cap reaches run_column"
+        )
+
+    def test_a_row_with_no_measurement_keeps_the_replay_floor(self, tmp_path, monkeypatch):
+        calls: list[dict] = []
+        prep = _replay_prep(tmp_path)
+        sessions, debug = _replay_session(tmp_path, attempts=1)
+        write(debug / "shared_tests.json", json.dumps([{"test_name": "g_c", "test_source": "assert 1"}]))
+        _fake_column(monkeypatch, {0: {"generated:g_c": "passed"}}, calls=calls)
+
+        replay_mod.replay_row(
+            record=_replay_record(),
+            prep=prep,
+            checkpoint="ck",
+            batch_dir=tmp_path / "batch",
+            sessions_dir=sessions,
+            views=(replay_mod.VIEW_GENERATED,),
+            seed=replay_mod.DEFAULT_SEED,
+            sample_rate=0.0,
+            disk_mb=prepare_mod.DISK_MB,
+            timeout_secs=replay_mod.DEFAULT_TIMEOUT_SECS,
+            progress=False,
+        )
+
+        assert calls[0]["timeout_secs"] == replay_mod.DEFAULT_TIMEOUT_SECS, (
+            "a pre-D1 row has no measurement, so the caller's floor is kept unchanged"
+        )
 
 
 class TestReplayViews:

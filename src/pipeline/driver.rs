@@ -107,6 +107,18 @@ pub struct RunConfig {
     /// infrastructure failure instead of a pass. Zero and `None` leave every
     /// pre-item-W run byte-for-byte as it was.
     pub native_expected_tests: Option<usize>,
+    /// [VANTA-WHY] M3 item D1 — `--native-timeout-secs N`: the wall-clock cap for
+    /// the in-session native suite, derived per bug from the run's own prepare
+    /// measurement (`max(120, 3 × measured)`). `None` keeps the historical
+    /// `harness::test_timeout_secs()` (120 s, or `VANTA_TEST_TIMEOUT_SECS`), which
+    /// is every hand-run invocation and every row whose prepare recorded no time.
+    ///
+    /// The native gate runs the repo's own suite twice in-session, and that suite
+    /// is not always fast: pandas/1's takes ~487 s through prepare while the fixed
+    /// 120 s cap killed BOTH in-session runs, so the row died as a false "collected
+    /// nothing" (measured session, night3). A per-bug cap derived from a measured
+    /// run is the only value that is both large enough for the bug and still bounded.
+    pub native_timeout_secs: Option<u64>,
     /// Path to a clean original tree (git worktree of the base commit) for
     /// two-tree mode. If set, BATE runs against this tree instead of the
     /// in-memory original files. Spec §7: "both trees present simultaneously".
@@ -1765,6 +1777,21 @@ pub async fn run(
     // `apply_failed_attempts`: it says the native check could not be done at all,
     // which is a property of the run and not of any one test.
     let mut native_vacuous_seen = false;
+    // [VANTA-WHY] M3 item D1 — was any attempt's native gate vacuous BECAUSE a
+    // side was killed by the wall-clock cap (rather than a tree that collected
+    // nothing)? Run-level like `native_vacuous_seen`, and kept separate because
+    // the two emptinesses have opposite remedies: raise the derived cap, or fix
+    // the tree's import. A `true` here never changes the label — the run is
+    // `InfraFailure` either way — it only records WHICH infra fault it was.
+    let mut native_timeout_seen = false;
+    // [VANTA-WHY] M3 item D1 — the wall-clock cap every in-session native suite
+    // of this run uses. Declared once, here, so the gate, the judge's run and the
+    // terminal `run.summary` all name the SAME number: `None` on the config keeps
+    // the historical `harness::test_timeout_secs()`, and a row whose prepare
+    // measured its native suite passes `max(120, 3 × measured)`.
+    let native_cap = config
+        .native_timeout_secs
+        .unwrap_or_else(harness::test_timeout_secs);
     // [VANTA-WHY] Every NEW static finding this run's patch introduced, per
     // attempt, so evidence.json can name the finding that rejected a review
     // round. Session 40e84874 was rejected for a mypy finding that appeared
@@ -2394,7 +2421,14 @@ pub async fn run(
                 let judge_patched_concat = build_source_concat(&native_tree.files);
                 println!("\n▌ JUDGE: running the repo's own suite on the candidate...");
                 let report = run_with_spinner("Running the native suite for the judge", async {
-                    harness::run_native_suite(&judge_patched_concat, &test_cmd).await
+                    // [VANTA-WHY] M3 item D1 — the judge's native run is the same
+                    // full repo suite as the gate's, so it takes the same per-bug cap.
+                    harness::run_native_suite(
+                        &judge_patched_concat,
+                        &test_cmd,
+                        config.native_timeout_secs,
+                    )
+                    .await
                 })
                 .await;
                 Some(render_judge_suite_result(&report))
@@ -3201,8 +3235,15 @@ pub async fn run(
                     .join(", ")
             );
         }
-        let native_original = harness::run_native_suite(&original_concat, &test_cmd).await;
-        let native_patched = harness::run_native_suite(&native_patched_concat, &test_cmd).await;
+        // [VANTA-WHY] M3 item D1 — the suite runs under `native_cap` (declared
+        // once for the run, above): a row with a prepare measurement passes
+        // `max(120, 3 × measured)`, and every other row keeps the historical
+        // `harness::test_timeout_secs()`.
+        let native_original =
+            harness::run_native_suite(&original_concat, &test_cmd, config.native_timeout_secs).await;
+        let native_patched =
+            harness::run_native_suite(&native_patched_concat, &test_cmd, config.native_timeout_secs)
+                .await;
         // [VANTA-WHY] M3 item W — a native gate that measured NOTHING is not a
         // clean gate. `native_regressions` over an empty original list is
         // vacuously empty and `native_suite_collapsed` needs a non-empty
@@ -3219,6 +3260,11 @@ pub async fn run(
         let native_vacuous =
             harness::native_gate_vacuous(native_expected, &native_original, &native_patched);
         native_vacuous_seen |= native_vacuous;
+        // [VANTA-WHY] M3 item D1 — record that the cause was a KILL, not a tree
+        // that collected nothing. Only meaningful when the gate is actually
+        // vacuous; a timed-out side on a non-vacuous gate would mean the suite
+        // still measured something, which the flag does not claim.
+        native_timeout_seen |= native_vacuous && (native_original.timed_out || native_patched.timed_out);
         let mut native_regressions =
             harness::native_regressions(&native_original.tests, &native_patched.tests);
         // [VANTA-WHY] A suite that ran N>0 tests on the original and collects
@@ -3261,9 +3307,17 @@ pub async fn run(
             // appended so a vacuous gate's session record names the module that
             // broke collection, for BOTH sides, instead of only reporting that
             // 0 tests were collected. See `harness::native_collection_summary`.
+            //
+            // [VANTA-WHY] M3 item D1 — `native_timeout_secs` is the cap this
+            // suite actually ran under, and `original_timed_out`/`patched_timed_out`
+            // say whether a side was killed by it. Without them a session record of
+            // a killed run is indistinguishable from one whose tree failed to
+            // import — the exact confusion that made pandas/1's night3 row read as
+            // "collected nothing" when its suite simply needed ~487 s.
             summary: format!(
                 "ran_original={} ran_patched={} original_tests={} patched_tests={} regressions={} \
-                 native_vacuous={} native_expected_tests={} {}",
+                 native_vacuous={} native_expected_tests={} native_timeout_secs={} \
+                 original_timed_out={} patched_timed_out={} {}",
                 native_original.ran,
                 native_patched.ran,
                 native_original.tests.len(),
@@ -3271,6 +3325,9 @@ pub async fn run(
                 native_regressions.len(),
                 native_vacuous,
                 native_expected,
+                native_cap,
+                native_original.timed_out,
+                native_patched.timed_out,
                 harness::native_collection_summary(&native_original, &native_patched)
             ),
             timestamp: now_iso(),
@@ -3285,8 +3342,12 @@ pub async fn run(
         // verdict `InfraFailure` → label `infra_failure`) is what makes the row
         // unapprovable on this evidence rather than a silent false accept.
         if native_vacuous {
-            let reason =
-                harness::native_vacuous_reason(native_expected, &native_original, &native_patched);
+            let reason = harness::native_vacuous_reason(
+                native_expected,
+                native_cap,
+                &native_original,
+                &native_patched,
+            );
             println!("  ✗ NATIVE VACUOUS: {reason}");
             infra_failure_error = Some(reason);
             break 'attempts GovernorDecision::InfraFailure;
@@ -4579,7 +4640,8 @@ pub async fn run(
              quarantine_count={} quarantined=[{}] \
              seed_method={} import_guard={} \
              n_ctx={} creator_effort={} creator_effort_mechanism={} \
-             creator_prompt_tokens={}{} fixed_rounds={} native_vacuous={}",
+             creator_prompt_tokens={}{} fixed_rounds={} native_vacuous={} \
+             native_timeout_secs={} native_timeout={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -4838,6 +4900,14 @@ pub async fn run(
             // `verdict=InfraFailure` and the label `infra_failure`, and a reader
             // must never pool it with a run whose native suite actually ran.
             native_vacuous_seen,
+            // [VANTA-WHY] M3 item D1 — the cap this run's native suite ran under,
+            // and whether its vacuity (if any) was caused by that cap KILLING a
+            // side rather than a tree that collected nothing. Appended after
+            // `native_vacuous` so an older row's reader sees the same fields in
+            // the same order; `native_timeout=true` always implies
+            // `native_vacuous=true` and never changes the label.
+            native_cap,
+            native_timeout_seen,
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),
@@ -5013,6 +5083,14 @@ pub async fn run(
             // 0 tests" are opposite claims that the old row could not tell apart.
             "native_vacuous": native_vacuous_seen,
             "native_expected_tests": config.native_expected_tests,
+            // [VANTA-WHY] M3 item D1 — the cap this run's in-session native suite
+            // actually ran under (`None` = the historical `test_timeout_secs()`), so
+            // the artifact states the number that produced the vacuity. A `true`
+            // `native_timeout` beside it means a side was KILLED by that cap rather
+            // than a tree that failed to import — opposite fixes, so the row must
+            // not have to guess which one it got.
+            "native_timeout_secs": config.native_timeout_secs,
+            "native_timeout": native_timeout_seen,
             "new_static_findings": static_findings_records,
             // [VANTA-WHY] The repo's own suite, per attempt. `native_test_source`
             // says the suite ran the ORIGINAL tests; this key names WHICH of them

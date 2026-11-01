@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
@@ -583,34 +584,46 @@ def preflight(
     work_rel = f"{oracle_mod.ORACLE_WORK_DIR}/{prep.slug}__pre-{mutant.sha256[:12]}"
     work = batch_dir / work_rel
     tree_mod.copy_tree(prep.root / "oracle_tree", work)
-    applied, detail, _ = suite_mod.git_apply_patch(
-        checkpoint=checkpoint,
-        batch_dir=batch_dir,
-        tree_rel=work_rel,
-        patch_path=patch_path,
-        disk_mb=disk_mb,
-        drop_test_hunks=True,
-        memory_mb=prep.vm_memory_mb,
-        timeout_secs=apply_timeout_secs,
-    )
-    if not applied:
-        return Preflight(applied=False, compiled=False, detail=detail)
+    # [VANTA-WHY] C3 — this tree is *scratch*: ``Preflight`` reports what happened to
+    # a patch, never where, and the graded tree belongs to ``grade``'s own label
+    # (``cand-…``), so nothing downstream reads this copy after the answer is
+    # computed. A mutant that is refused must therefore leave no tree: without the
+    # ``finally`` the ``applied=False`` early return kept one, so a mutant that
+    # failed to apply — the discarded majority — cost a whole project tree each, and
+    # ``oracle_work`` grew by that on every generation. The ``finally`` sheds it on
+    # every path, the successful one and the raising one included, so the preflight's
+    # footprint is bounded by one tree while it runs rather than by the bug's mutants.
+    try:
+        applied, detail, _ = suite_mod.git_apply_patch(
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            tree_rel=work_rel,
+            patch_path=patch_path,
+            disk_mb=disk_mb,
+            drop_test_hunks=True,
+            memory_mb=prep.vm_memory_mb,
+            timeout_secs=apply_timeout_secs,
+        )
+        if not applied:
+            return Preflight(applied=False, compiled=False, detail=detail)
 
-    files = _changed_py_files(mutant.text)
-    if not files:
-        return Preflight(applied=True, compiled=True, detail="no python file changed")
-    result = shuru_mod.run(
-        checkpoint=checkpoint,
-        host_root=batch_dir,
-        command=[_interpreter(prep.test_cmd), "-m", "py_compile", *files],
-        disk_mb=disk_mb,
-        memory_mb=prep.vm_memory_mb,
-        guest_cwd=f"/workspace/{work_rel}",
-        timeout_secs=compile_timeout_secs,
-    )
-    compiled = result.exit_code == 0
-    detail = "" if compiled else (result.stdout + result.stderr).strip()[-2000:]
-    return Preflight(applied=True, compiled=compiled, detail=detail)
+        files = _changed_py_files(mutant.text)
+        if not files:
+            return Preflight(applied=True, compiled=True, detail="no python file changed")
+        result = shuru_mod.run(
+            checkpoint=checkpoint,
+            host_root=batch_dir,
+            command=[_interpreter(prep.test_cmd), "-m", "py_compile", *files],
+            disk_mb=disk_mb,
+            memory_mb=prep.vm_memory_mb,
+            guest_cwd=f"/workspace/{work_rel}",
+            timeout_secs=compile_timeout_secs,
+        )
+        compiled = result.exit_code == 0
+        detail = "" if compiled else (result.stdout + result.stderr).strip()[-2000:]
+        return Preflight(applied=True, compiled=compiled, detail=detail)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

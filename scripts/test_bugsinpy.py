@@ -26297,6 +26297,32 @@ class TestMutantPreflight:
         assert "does not apply" in result.detail
         assert wired["runs"] == []
 
+    def test_a_mutant_that_does_not_apply_leaves_no_work_tree(self, wired, tmp_path, monkeypatch):
+        """C3 — the refused mutant is the *common* one, and it used to keep a tree.
+
+        ``copy_tree`` materialises a whole project per candidate, and a mutant that
+        does not apply is discarded and never graded, so nothing can read that tree
+        afterwards. The early ``return Preflight(applied=False, …)`` skipped the
+        cleanup entirely, leaking the largest set of trees (the majority) into
+        ``oracle_work``.
+        """
+        monkeypatch.setattr(
+            suite_mod,
+            "git_apply_patch",
+            lambda **kwargs: (False, "error: patch does not apply", suite_mod.APPLY_REJECTED),
+        )
+        self._preflight(wired, tmp_path)
+        (work,) = [dest for _src, dest in wired["copies"]]
+        assert not work.exists()
+
+    def test_a_mutant_that_compiled_also_leaves_no_work_tree(self, wired, tmp_path):
+        """The successful path sheds its tree too, so the preflight is bounded by one."""
+        result, _ = self._preflight(wired, tmp_path)
+        (work,) = [dest for _src, dest in wired["copies"]]
+        assert result.compiled is True
+        assert wired["runs"], "the compiled path is the one this asserts about"
+        assert not work.exists()
+
     def test_a_mutant_that_does_not_compile_is_reported_with_its_output(self, wired, tmp_path):
         wired["result"] = shuru_mod.ExecResult(
             stdout="", stderr="SyntaxError: invalid syntax", exit_code=1, timed_out=False

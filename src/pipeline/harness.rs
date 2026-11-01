@@ -2368,6 +2368,8 @@ mod tests {
     use crate::pipeline::candidate::TestCommand;
     use crate::sandbox::ExecutionResult;
     use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard};
 
     fn generated_test(name: &str, assertion: &str) -> GeneratedTest {
         GeneratedTest {
@@ -3705,8 +3707,52 @@ mod tests {
         );
     }
 
+    /// One lock plus a drop guard for the tests that touch the process-wide
+    /// `SEED_ROOT`/`SEED_METHOD` globals (C6).
+    ///
+    /// [VANTA-WHY] C6 — `SEED_ROOT` and `SEED_METHOD` are process-wide statics, and
+    /// the production-seed test below sets them and restores them by hand. Under
+    /// the default parallel runner another test that reads `seed_root()` — or calls
+    /// `seed_and_write`, which seeds through it — can observe a seed set mid-test,
+    /// which is why the suite had to run `--test-threads=1`. This lock makes the two
+    /// tests that touch the globals exclusive, and the guard clears the global on
+    /// `take` and restores it on `drop` (on every exit path, a panicking assert
+    /// included), so one test's seed can never leak into another's and the suite no
+    /// longer needs the flag.
+    static SEED_GLOBAL_LOCK: Mutex<()> = Mutex::new(());
+
+    struct SeedGlobalGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl SeedGlobalGuard {
+        /// Take the lock and start from the harness default (`None`), so a seed left
+        /// behind by an earlier panic cannot reach the test that now holds the lock.
+        fn take() -> Self {
+            let lock = SEED_GLOBAL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            set_seed_root(None);
+            Self { _lock: lock }
+        }
+
+        /// Point the harness at a seed tree for the rest of the guard's life.
+        fn set(&self, root: Option<PathBuf>) {
+            set_seed_root(root);
+        }
+    }
+
+    impl Drop for SeedGlobalGuard {
+        fn drop(&mut self) {
+            set_seed_root(None);
+        }
+    }
+
     #[test]
     fn seed_and_write_without_a_seed_writes_only_the_concat() {
+        // [VANTA-WHY] C6 — hold the seed lock so the production-seed test cannot set
+        // the global between this test's read and its `seed_and_write` call.
+        let _seed = SeedGlobalGuard::take();
         assert!(seed_root().is_none(), "no seed is the harness's default");
         let root = tempfile::tempdir().unwrap();
         let concat = "# FILE: pkg/__init__.py\nVALUE = 2\n";
@@ -3731,6 +3777,9 @@ mod tests {
     // `set_seed_root`, then `seed_and_write` — and restores the global after.
     #[test]
     fn the_production_seed_records_which_mechanism_it_used() {
+        // [VANTA-WHY] C6 — take the seed lock and let the guard restore the global,
+        // so the parallel runner cannot observe this test's seed.
+        let seed_guard = SeedGlobalGuard::take();
         let exec = tempfile::tempdir().unwrap();
         built_tree(exec.path());
         let seed = tempfile::tempdir().unwrap();
@@ -3738,7 +3787,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let concat = "# FILE: pkg/__init__.py\nVALUE = 2\n";
 
-        set_seed_root(Some(seed.path().to_path_buf()));
+        seed_guard.set(Some(seed.path().to_path_buf()));
         assert!(seed_method().is_none(), "a run has recorded nothing before it seeds");
         seed_and_write(root.path(), concat).unwrap();
         let first = seed_method();
@@ -3746,7 +3795,13 @@ mod tests {
         // later sandbox of the same run must not rewrite it.
         seed_and_write(root.path(), concat).unwrap();
         assert_eq!(seed_method(), first, "the record belongs to the run's first seed");
-        set_seed_root(None);
+        // Release the lock (and restore the global) here; the asserts below never
+        // read the globals, so they cannot observe a seed either way.
+        drop(seed_guard);
+        assert!(
+            seed_root().is_none(),
+            "the guard must restore the global on drop, so no later test can observe this seed"
+        );
 
         assert!(
             matches!(first.map(|m| m.as_str()), Some("clonefile") | Some("copy_tree")),

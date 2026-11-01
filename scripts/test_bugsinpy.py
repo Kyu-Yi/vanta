@@ -26190,6 +26190,27 @@ class TestMutantOperators:
         signature into ``->=`` and the mutant would not compile."""
         assert mutants_mod.condition_flip(_one_line_diff("pass", "def f(a) -> int:")) == []
 
+    def test_the_not_flip_refuses_a_continuation_line_and_a_fragment(self):
+        """[VANTA-WHY] E11 — a diff line can be a wrapped continuation
+        (``, b)):``), a method call on the previous line's result
+        (``.append(x)``), or a lone bracket (``)``). None of these can begin an
+        operand, so ``not <line>`` does not parse; they must be left alone."""
+        for line in (", b)):", ".append(x)", ")", "]", "}", ":", "*args, kw"):
+            assert mutants_mod._flip_not(line) is None, line
+
+    def test_the_not_flip_negates_every_legal_expression_start(self):
+        """[VANTA-WHY] E11 — the first-character guard must NOT reject a line
+        that genuinely begins an expression: unary ``-``/``+``/``~``, a quote, or
+        an opening bracket all still start an operand and must be negated."""
+        assert mutants_mod._flip_not("-x") == "not -x"
+        assert mutants_mod._flip_not("+x") == "not +x"
+        assert mutants_mod._flip_not("~x") == "not ~x"
+        assert mutants_mod._flip_not('"s"') == 'not "s"'
+        assert mutants_mod._flip_not("'s'") == "not 's'"
+        assert mutants_mod._flip_not("(a and b)") == "not (a and b)"
+        assert mutants_mod._flip_not("[1]") == "not [1]"
+        assert mutants_mod._flip_not("{1: 2}") == "not {1: 2}"
+
     def test_every_mutant_of_a_pile_of_conditions_is_syntactically_valid(self):
         """[VANTA-WHY] C10 — a mutant whose Python does not parse is *trivially*
         detectable: pytest collects nothing, the hidden nodeids read ``absent`` and

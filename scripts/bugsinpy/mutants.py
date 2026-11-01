@@ -326,6 +326,13 @@ _STATEMENT_START_RE = re.compile(
 # `<=`/`>=` out of the plain case would also swallow `<<=`/`>>=` (their `=` is
 # preceded by `<`/`>`), and `not x <<= 1` does not parse.
 _ASSIGN_RE = re.compile(r"[+\-*/%@&|^]=|<<=|>>=|(?<![=!<>:])=(?!=)")
+# [VANTA-WHY] E11 — the characters that can begin an operand. ``_flip_not``
+# prefixes ``not ``, so the line it rewrites must be able to start an expression:
+# a name or number (``isalnum``), an opening bracket, a quote, or a unary
+# ``-``/``+``/``~``. Anything else — a closing bracket, a comma, a colon, ``.``,
+# an operator — marks a continuation line or a fragment (``, b)):``,
+# ``.append(x)``, ``)``), and ``not <such a line>`` is a syntax error.
+_OPERAND_START_CHARS = frozenset("_([{'+~-\"")
 
 
 def _toggle_not(expr: str) -> str:
@@ -337,6 +344,9 @@ def _is_bare_expression(line: str) -> bool:
     """Is ``line`` a single expression, so that ``not <line>`` still parses?"""
     if _STATEMENT_START_RE.match(line) or line[0] in "@#":
         # a statement keyword, a decorator or a comment — not an expression
+        return False
+    if not (line[0].isalnum() or line[0] in _OPERAND_START_CHARS):
+        # a continuation line or a fragment — ``not <line>`` does not parse
         return False
     return _ASSIGN_RE.search(line) is None
 

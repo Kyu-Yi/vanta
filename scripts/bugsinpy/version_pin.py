@@ -80,6 +80,14 @@ interpreter the checkpoint's site-packages were not built for.
 PROBE_TIMEOUT_SECS = 300
 """A probe is one import and one ``git describe``; minutes, not the suite's timeout."""
 
+_PROBE_NOTE_LIMIT = 300
+"""How much of a failed probe's own complaint reaches :attr:`PinOutcome.reason`.
+
+The reason is prose a reader sees in ``prepare.json`` and in the prepare table, not a
+log: one bounded line says *which* failure it was, and the guest's full output is what
+a re-run of the probe is for.
+"""
+
 _PROBE_SANDBOX = "shuru"
 """The value the row records for *which sandbox measured the version*.
 
@@ -233,14 +241,41 @@ def _sentinel_payload(out: str) -> Any:
         return None
 
 
+def _probe_note(result: shuru.ExecResult) -> str:
+    """Why a probe that should have written the sentinel did not, as one line.
+
+    [VANTA-WHY] M3 item P1. Before this, the only record of a failed measurement was
+    "could not be measured": ``_guest_probe`` returned ``stdout`` and threw the rest of
+    the result away, so a crash on import, a mount that refused a write, a VM that
+    would not boot and a timeout all read the same and the cause could only be found by
+    booting the probe again by hand. The guest's ``stderr`` is quoted first because
+    that is where a traceback goes; the exit code is always named, because "exit 0 and
+    said nothing" and "exit 127" are different failures. Bounded, because this text
+    ends up inside :attr:`PinOutcome.reason` and from there inside ``prepare.json``.
+    """
+    if result.timed_out:
+        return f"the probe timed out after {PROBE_TIMEOUT_SECS}s"
+    ended = (
+        f"exit code {result.exit_code}"
+        if result.exit_code is not None
+        else "no exit code"
+    )
+    detail = " ".join((result.stderr.strip() or result.stdout.strip()).split())
+    if len(detail) > _PROBE_NOTE_LIMIT:
+        detail = detail[: _PROBE_NOTE_LIMIT - 1] + "…"
+    if not detail:
+        return f"the probe wrote nothing and ended with {ended}"
+    return f"the probe ended with {ended}: {detail}"
+
+
 def _guest_probe(
     tree: Path,
     program: str,
     argv: Sequence[str] = (),
     *,
     vm: ProbeVM,
-) -> str:
-    """Run ``program`` over ``tree`` in a read-only Shuru VM; return its stdout.
+) -> shuru.ExecResult:
+    """Run ``program`` over ``tree`` in a read-only Shuru VM; return its result.
 
     [VANTA-WHY] M3 item B7. Two properties are the whole reason this exists:
 
@@ -256,8 +291,14 @@ def _guest_probe(
 
     ``tree`` appears inside as :data:`GUEST_ROOT`, so callers pass guest paths (built
     from :data:`GUEST_ROOT`); the host path does not exist in the VM.
+
+    The whole :class:`shuru.ExecResult`, not its ``stdout``: [VANTA-WHY] M3 item P1 —
+    a probe that never reached its sentinel reported "could not be measured" and
+    nothing else, because ``stderr``, the exit code and the timeout flag were dropped
+    here. They are the only evidence of a failed measurement, and
+    :func:`_probe_note` is the one reader of them.
     """
-    result = shuru.run(
+    return shuru.run(
         checkpoint=vm.checkpoint,
         host_root=tree,
         command=[vm.python, "-c", program, *argv],
@@ -271,10 +312,9 @@ def _guest_probe(
         # reason.
         env={"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"},
     )
-    return result.stdout
 
 
-def _probe(path: Path, tree: Path, *, vm: ProbeVM) -> Optional[dict[str, Any]]:
+def _probe(path: Path, tree: Path, *, vm: ProbeVM) -> tuple[Optional[dict[str, Any]], str]:
     """Load a versioneer version file in the probe VM and read both of its maps.
 
     In the VM rather than in this process: the file is third-party checkout code whose
@@ -282,6 +322,13 @@ def _probe(path: Path, tree: Path, *, vm: ProbeVM) -> Optional[dict[str, Any]]:
     other piece of a project's code — inside Shuru, over a read-only mount
     (:func:`_guest_probe`). A ``runpy`` in *this* interpreter would also leave the
     project's module namespace in the harness process, the one place it must never be.
+
+    Returns ``(payload, note)``. The payload is the probe's own answer or ``None``;
+    the note is [VANTA-WHY] M3 item P1's one line about *why* there is no answer —
+    empty whenever the payload arrived. Keeping it beside the payload rather than
+    inside it means the caller reports a failed measurement without having to re-read
+    the guest's stderr, and :func:`_versioneer_version_file` can carry a different note
+    for each candidate file it could not measure.
     """
     program = (
         "import json, runpy, sys\n"
@@ -297,16 +344,16 @@ def _probe(path: Path, tree: Path, *, vm: ProbeVM) -> Optional[dict[str, Any]]:
         "}\n"
         "sys.stdout.write('" + _PROBE_SENTINEL + "' + json.dumps(payload))\n"
     )
-    out = _guest_probe(
+    result = _guest_probe(
         tree,
         program,
         [f"{GUEST_ROOT}/{path.relative_to(tree).as_posix()}"],
         vm=vm,
     )
-    payload = _sentinel_payload(out)
+    payload = _sentinel_payload(result.stdout)
     if not isinstance(payload, dict) or not isinstance(payload.get("versions"), dict):
-        return None
-    return payload
+        return None, _probe_note(result)
+    return payload, ""
 
 
 def _walk_version_files(tree: Path):
@@ -369,7 +416,7 @@ def _looks_like_versioneer(path: Path) -> bool:
 
 def _versioneer_version_file(
     tree: Path, *, vm: ProbeVM
-) -> tuple[Optional[tuple[Path, dict[str, Any]]], list[Path], bool]:
+) -> tuple[Optional[tuple[Path, dict[str, Any]]], list[tuple[Path, str]], bool]:
     """The tree's own versioneer version file and its measurement, and the rest.
 
     Returns ``(found, unmeasured, probed)``. ``found`` is ``(candidate, payload)``
@@ -377,12 +424,13 @@ def _versioneer_version_file(
     ``get_config().versionfile_source`` — the property that makes this a detector
     rather than a guess: a vendored copy of some other project's ``_version.py``,
     or a ``_version.py`` that is not versioneer's, names a different path and is
-    rejected. ``unmeasured`` is the versioneer-shaped files whose probe returned
-    nothing at all, which on a healthy host is empty — an importable Python file
-    with ``get_config``/``get_versions`` always probes. A non-empty list therefore
-    says the measurement itself failed (a VM that would not boot, a file that raises
-    on import), and the caller reports that rather than reading it as "this project
-    needs no pinning", which is the silent no-op this module exists to remove.
+    rejected. ``unmeasured`` is ``(path, note)`` for each versioneer-shaped file whose
+    probe returned nothing at all, which on a healthy host is empty — an importable
+    Python file with ``get_config``/``get_versions`` always probes. A non-empty list
+    therefore says the measurement itself failed (a VM that would not boot, a file
+    that raises on import), and the caller reports that — with the note the probe left
+    ([VANTA-WHY] M3 item P1) — rather than reading it as "this project needs no
+    pinning", which is the silent no-op this module exists to remove.
 
     ``probed`` is whether a probe VM was booted at all — the fact the row records.
     It is not ``bool(found or unmeasured)``: a tree whose only ``_version.py`` files
@@ -399,12 +447,12 @@ def _versioneer_version_file(
         path for path in _walk_version_files(tree)
         if path not in candidates and _looks_like_versioneer(path)
     ]
-    unmeasured: list[Path] = []
+    unmeasured: list[tuple[Path, str]] = []
     for candidate in candidates:
         rel = candidate.relative_to(tree).as_posix()
-        payload = _probe(candidate, tree, vm=vm)
+        payload, note = _probe(candidate, tree, vm=vm)
         if payload is None:
-            unmeasured.append(candidate)
+            unmeasured.append((candidate, note))
             continue
         if payload.get("vcs") != "git":
             continue
@@ -463,14 +511,20 @@ def _setuptools_scm_write_to(tree: Path, table: dict[str, str]) -> Optional[str]
     return None
 
 
-def _setuptools_scm_version(tree: Path, *, vm: ProbeVM) -> Optional[str]:
-    """``setuptools_scm.get_version(root=.)`` in the probe VM, or ``None``.
+def _setuptools_scm_version(tree: Path, *, vm: ProbeVM) -> tuple[Optional[str], str]:
+    """``setuptools_scm.get_version(root=.)`` in the probe VM, and why not, if not.
 
     In the VM for the same reason the versioneer probe is (:func:`_guest_probe`): the
     call imports the *checkout's* ``setuptools_scm`` and asks it to walk the checkout's
     ``.git``, so running it here would be host execution of third-party code over a
     repository this process must not open. ``root='.'`` resolves against
     ``guest_cwd``, which :func:`_guest_probe` sets to the mounted tree.
+
+    Returns ``(version, note)`` — the same pair :func:`_probe` returns, for the same
+    reason: [VANTA-WHY] M3 item P1, a probe that never reached its sentinel must say
+    which failure it was. The program here exits ``3`` when the sandbox cannot import
+    ``setuptools_scm`` and ``4`` when ``get_version`` raises, so the exit code in the
+    note is itself the answer.
     """
     program = (
         "import json, sys\n"
@@ -484,8 +538,11 @@ def _setuptools_scm_version(tree: Path, *, vm: ProbeVM) -> Optional[str]:
         "    sys.exit(4)\n"
         "sys.stdout.write('" + _PROBE_SENTINEL + "' + json.dumps(str(value)))\n"
     )
-    value = _sentinel_payload(_guest_probe(tree, program, vm=vm))
-    return value if isinstance(value, str) and value else None
+    result = _guest_probe(tree, program, vm=vm)
+    value = _sentinel_payload(result.stdout)
+    if isinstance(value, str) and value:
+        return value, ""
+    return None, _probe_note(result)
 
 
 def _version_tuple(version: str) -> tuple[Any, ...]:
@@ -593,16 +650,21 @@ def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
         # "no machinery here" answer — a silent no-op would leave the sandbox
         # reporting a placeholder version, which is the very bug being fixed.
         named = ", ".join(
-            path.relative_to(tree).as_posix() for path in unmeasured[:3]
+            path.relative_to(tree).as_posix() for path, _ in unmeasured[:3]
         )
         more = f" (+{len(unmeasured) - 3} more)" if len(unmeasured) > 3 else ""
+        reason = (
+            f"a versioneer-shaped version file was found but could not be "
+            f"measured: {named}{more}"
+        )
+        # [VANTA-WHY] M3 item P1 — the probe's own complaint, appended rather than
+        # left in the guest's discarded stderr: this reason is the only place a reader
+        # of the disabled row learns *which* failure it was.
+        why = "; ".join(note for _, note in unmeasured[:3] if note)
         return PinOutcome(
             kind="versioneer",
             pin=None,
-            reason=(
-                f"a versioneer-shaped version file was found but could not be "
-                f"measured: {named}{more}"
-            ),
+            reason=f"{reason} — {why}" if why else reason,
             probed=probed,
         )
 
@@ -622,14 +684,17 @@ def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
             ),
             probed=probed,
         )
-    version = _setuptools_scm_version(tree, vm=vm)
+    version, why = _setuptools_scm_version(tree, vm=vm)
     # A VM was booted to ask setuptools_scm, whatever it answered.
     probed = True
     if not version:
         return PinOutcome(
             kind="setuptools_scm",
             pin=None,
-            reason="setuptools_scm could not compute a version in the probe sandbox",
+            reason=(
+                "setuptools_scm could not compute a version in the probe sandbox"
+                + (f" — {why}" if why else "")
+            ),
             probed=probed,
         )
     contents = _setuptools_scm_contents(version)

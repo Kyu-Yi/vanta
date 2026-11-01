@@ -6648,7 +6648,15 @@ class TestVersionPin:
                 text=True,
                 timeout=60,
             )
-            return completed.stdout
+            # The whole result, as ``_guest_probe`` returns it: [VANTA-WHY] M3 item P1
+            # — a fake that answered with ``stdout`` alone could not stand in for a
+            # probe whose failure the reason must quote.
+            return shuru_mod.ExecResult(
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                exit_code=completed.returncode,
+                timed_out=False,
+            )
 
         monkeypatch.setattr(version_pin_mod, "_guest_probe", fake)
         return fake
@@ -6853,7 +6861,7 @@ class TestVersionPin:
         monkeypatch.setattr(
             version_pin_mod,
             "_setuptools_scm_version",
-            lambda _tree, *, vm: "1.2.3",
+            lambda _tree, *, vm: ("1.2.3", ""),
         )
         outcome = version_pin_mod.measure(tree, vm=self._vm())
         assert outcome.kind == "setuptools_scm"
@@ -6900,15 +6908,121 @@ class TestVersionPin:
         """
         tree = tmp_path / "tree"
         write(tree / "pkg" / "_version.py", self._stub())
-        monkeypatch.setattr(version_pin_mod, "_probe", lambda _path, _tree, *, vm: None)
+        monkeypatch.setattr(
+            version_pin_mod,
+            "_probe",
+            lambda _path, _tree, *, vm: (None, "the probe ended with exit code 1: boom"),
+        )
 
         outcome = version_pin_mod.measure(tree, vm=self._vm())
         assert outcome.kind == "versioneer"
         assert outcome.pin is None
         assert "could not be measured" in outcome.reason
         assert "pkg/_version.py" in outcome.reason
+        # [VANTA-WHY] M3 item P1 — the note travels with the reason, so the row says
+        # which failure it was and not merely that there was one.
+        assert "exit code 1: boom" in outcome.reason
         # And it is distinguishable from the honest no-op.
         assert outcome != version_pin_mod.PinOutcome(kind=None, pin=None, reason=None)
+
+    def test_an_unmeasured_pin_quotes_the_guest_stderr_and_exit_code(
+        self, tmp_path, monkeypatch
+    ):
+        """[VANTA-WHY] M3 item P1 — the failing probe's own complaint reaches the row.
+
+        ``_guest_probe`` used to return ``stdout`` alone, so a probe that never wrote
+        its sentinel — a crash on import, a mount that refused a write, a VM that would
+        not boot, a timeout — was recorded as "could not be measured" and nothing more,
+        and the cause had to be found by booting the probe again by hand. The
+        ``ExecResult`` is now carried to :func:`version_pin._probe_note`, which is what
+        this asserts on: the exit code is always named and ``stderr`` is quoted.
+        """
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "_version.py", self._stub())
+        monkeypatch.setattr(
+            version_pin_mod.shuru,
+            "run",
+            lambda **kwargs: shuru_mod.ExecResult(
+                stdout="shuru: booting VM (2cpus, 1024MB RAM, 16384MB disk)...\n",
+                stderr=(
+                    "Traceback (most recent call last):\n"
+                    "  File \"<string>\", line 4, in <module>\n"
+                    "OSError: [Errno 30] Read-only file system: '.git/index'\n"
+                ),
+                exit_code=1,
+                timed_out=False,
+            ),
+        )
+
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+
+        assert outcome.probed is True
+        assert outcome.pin is None
+        assert "exit code 1" in outcome.reason
+        assert "Read-only file system" in outcome.reason
+        assert "Traceback" in outcome.reason
+
+    def test_a_probe_that_times_out_says_which_cap_it_hit(self, tmp_path, monkeypatch):
+        """A timeout is a failed measurement too, and its note names the cap."""
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "_version.py", self._stub())
+        monkeypatch.setattr(
+            version_pin_mod.shuru,
+            "run",
+            lambda **kwargs: shuru_mod.ExecResult(
+                stdout="shuru: booting VM (2cpus, 1024MB RAM, 16384MB disk)...\n",
+                stderr=f"shuru run TIMEOUT after {version_pin_mod.PROBE_TIMEOUT_SECS}s",
+                exit_code=None,
+                timed_out=True,
+            ),
+        )
+
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+
+        assert outcome.pin is None
+        assert f"timed out after {version_pin_mod.PROBE_TIMEOUT_SECS}s" in outcome.reason
+
+    def test_the_note_is_bounded_so_a_reason_stays_one_line(
+        self, tmp_path, monkeypatch
+    ):
+        """The note is bounded: ``reason`` is prose in ``prepare.json``, not a log."""
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "_version.py", self._stub())
+        noise = "x" * 4000
+        monkeypatch.setattr(
+            version_pin_mod.shuru,
+            "run",
+            lambda **kwargs: shuru_mod.ExecResult(
+                stdout="", stderr=noise, exit_code=1, timed_out=False
+            ),
+        )
+
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+
+        assert outcome.pin is None
+        assert noise not in outcome.reason
+        assert outcome.reason.endswith("…")
+        assert len(outcome.reason) < 600
+
+    def test_a_probe_that_writes_nothing_and_exits_zero_still_says_so(
+        self, tmp_path, monkeypatch
+    ):
+        """A silent zero-exit probe is a different failure from a crash, and readable."""
+        tree = tmp_path / "tree"
+        write(tree / "pkg" / "_version.py", self._stub())
+        monkeypatch.setattr(
+            version_pin_mod.shuru,
+            "run",
+            lambda **kwargs: shuru_mod.ExecResult(
+                stdout="", stderr="", exit_code=0, timed_out=False
+            ),
+        )
+
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+
+        assert outcome.pin is None
+        assert "wrote nothing" in outcome.reason
+        assert "exit code 0" in outcome.reason
 
     def test_the_probe_mounts_the_tree_read_only_in_its_own_vm(
         self, tmp_path, monkeypatch

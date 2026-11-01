@@ -725,6 +725,17 @@ class Tally:
     """One record per unobservable grade — its hash, provenance and why it did not
     apply — so the count can be read back with the reason that produced it."""
 
+    inconclusive: int = 0
+    """Graded candidates whose patch applied but whose hidden run wrote no report
+    (``label_input`` = ``inconclusive``, item B4). The third state: neither ``bad``
+    nor ``good``, so it is counted here and excluded from selection entirely — the
+    same "never counted as good or bad anywhere" rule that governs ``unobservable``,
+    applied to the pool as item B4's follow-up.
+    """
+    inconclusive_reasons: list[dict[str, Any]] = field(default_factory=list)
+    """One record per inconclusive grade — its hash, provenance and what the grading
+    could not read — so the exclusion is citable, not a silent drop."""
+
 
 def dedupe(attempts: Sequence[HarvestedAttempt]) -> tuple[list[PatchCandidate], int]:
     """``(candidates, duplicates)`` — one candidate per normalised diff.
@@ -789,6 +800,12 @@ def select(
     pool every review row is measured against. The search keeps spending its budget
     (``graded`` counts it) until the cap or a full pair of sides stops it.
 
+    [VANTA-WHY] Item B4 follow-up — an ``inconclusive`` grade (the patch applied but
+    the hidden run wrote no report) is dropped and counted the same way. It is the
+    third state, and the general rule is that it is never counted as good or bad
+    anywhere: keeping it here would write a ``failed_model`` entry whose ``oracle``
+    reads ``inconclusive``, i.e. a bad patch to reject, on no evidence either way.
+
     [VANTA-WHY] "Keep at most two of each side" is a **cap on the kept lists**, not
     only a stop condition. The two sides fill at different speeds: a bug whose
     Creator usually works produces good patches long after its two bad ones, and
@@ -822,6 +839,26 @@ def select(
                     "reason": result.apply_detail
                     or result.error
                     or "the patch did not apply to the grading tree",
+                }
+            )
+            continue
+        if result.label_input == "inconclusive":
+            # [VANTA-WHY] Item B4 follow-up. The patch applied but the hidden run wrote
+            # no report, so there is no evidence that it fails *or* that it fixes
+            # anything. Item B4 already dropped such a grade from the *mutants* pool;
+            # the assembled pool was still keeping it as ``bad`` and
+            # ``entry_for_model`` would write ``kind=failed_model, oracle="inconclusive"``
+            # — a patch every review row is scored against, labelled a bad patch to
+            # reject on the strength of an unreadable run. It is dropped and counted
+            # here too, and the search keeps spending its budget.
+            tally.inconclusive += 1
+            tally.inconclusive_reasons.append(
+                {
+                    "patch_sha256": sha256_text(candidate.text),
+                    "patch_source": candidate.tag,
+                    "attempt": candidate.attempt,
+                    "reason": result.error
+                    or "the hidden run produced no pytest report at all",
                 }
             )
             continue
@@ -907,6 +944,7 @@ _REQUIRED_HEADER_KEYS = (
     "good",
     "equivalent",
     "unobservable",
+    "inconclusive",
     "cap-reached",
     "missing-snapshot",
     "not-reviewable",
@@ -979,6 +1017,7 @@ def render_pool(
             },
             "entries": [_entry_dict(entry) for entry in entries],
             "unobservable": list(tally.unobservable_reasons),
+            "inconclusive": list(tally.inconclusive_reasons),
         },
         indent=2,
         ensure_ascii=False,
@@ -1002,6 +1041,7 @@ def render_pool(
         f"- good: {tally.good}",
         f"- equivalent: {tally.equivalent}",
         f"- unobservable: {tally.unobservable}",
+        f"- inconclusive: {tally.inconclusive}",
         f"- cap-reached: {'true' if tally.cap_reached else 'false'}",
         f"- missing-snapshot: {tally.missing_snapshot}",
         f"- not-reviewable: {tally.not_reviewable}",
@@ -1159,6 +1199,12 @@ def parse_pool(text: str, *, path: Path) -> PoolFile:
         if isinstance(raw_unobservable, list)
         else []
     )
+    raw_inconclusive = payload.get("inconclusive")
+    inconclusive_reasons = (
+        [dict(item) for item in raw_inconclusive if isinstance(item, dict)]
+        if isinstance(raw_inconclusive, list)
+        else []
+    )
     mutants_entries = _verify_mutants(target, mutants)
     previous = header["previous-sha256"]
     return PoolFile(
@@ -1176,6 +1222,8 @@ def parse_pool(text: str, *, path: Path) -> PoolFile:
             equivalent=_int_of(header["equivalent"]),
             unobservable=_int_of(header["unobservable"]),
             unobservable_reasons=unobservable_reasons,
+            inconclusive=_int_of(header["inconclusive"]),
+            inconclusive_reasons=inconclusive_reasons,
             cap_reached=header["cap-reached"].strip().lower() in ("true", "1", "yes"),
             missing_snapshot=_int_of(header["missing-snapshot"]),
             not_reviewable=_int_of(header["not-reviewable"]),
@@ -1516,6 +1564,7 @@ def render_pool_line(prep: BugPrep, result: PoolResult) -> str:
         f"candidates {tally.candidates} · graded {tally.graded} · bad {tally.bad} · "
         f"good {tally.good} · equivalent {tally.equivalent} · "
         f"unobservable {tally.unobservable} · "
+        f"inconclusive {tally.inconclusive} · "
         f"cap-reached {'true' if tally.cap_reached else 'false'} · {result.path}"
     )
 

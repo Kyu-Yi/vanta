@@ -883,6 +883,15 @@ class RepairCounts:
     attempt_hist: Counter = field(default_factory=Counter)
     adversarial_catches: int = 0
     replayed: int = 0
+    inconclusive: int = 0
+    """Repair rows whose grading was unreadable — the patch applied but the hidden run
+    wrote no pytest report at all (``label_input`` = ``inconclusive``, item B4).
+
+    [VANTA-WHY] M3 item B4's general rule, applied to the analysis: such a row is
+    neither a fix nor a failure, so it is counted here and kept out of every rate —
+    ``total`` is the fix-rate denominator, so leaving it in would read the row as
+    "not fixed", i.e. blame the model on the strength of a run nobody could read.
+    """
 
     @property
     def fix_rate(self) -> Optional[float]:
@@ -908,6 +917,9 @@ def repair_counts(analysis: Analysis) -> RepairCounts:
     pass -> fail across a transition while the row's own oracle recorded NO native
     regression is a regression the generated suite caught and the native suite did
     not. A row with no replay record is outside that denominator, not a zero.
+
+    A row whose grading was unreadable (``inconclusive``) is in no denominator at all:
+    it is neither a fix nor a failure, so it is counted apart (item B4's general rule).
     """
     counts = RepairCounts()
     by_session: dict[str, dict[str, Any]] = {}
@@ -921,6 +933,14 @@ def repair_counts(analysis: Analysis) -> RepairCounts:
             continue
         oracle = row_oracle(record)
         if oracle is None:
+            continue
+        if oracle.inconclusive:
+            # [VANTA-WHY] Item B4's general rule — an inconclusive grade (the patch
+            # applied but the hidden run wrote no report) is neither a fix nor a
+            # failure. It is held in its own count and kept out of every rate; only
+            # `total` is the fix-rate denominator, so leaving it in would read the row
+            # as "not fixed", i.e. bad, on the strength of an unreadable run.
+            counts.inconclusive += 1
             continue
         counts.total += 1
         if oracle.apply_ok:
@@ -962,6 +982,7 @@ class RepairMetrics(Metric):
             ("repair rows", str(counts.total)),
             ("applied cleanly", str(counts.applied)),
             ("fixed (oracle patch_good)", str(counts.fixed)),
+            ("inconclusive gradings (in no rate)", str(counts.inconclusive)),
             ("fix rate", _fmt(counts.fix_rate)),
             ("fixed at attempt 1", str(counts.fixed_first_attempt)),
             ("attempts_run histogram", _tex(attempt_text)),
@@ -1019,6 +1040,11 @@ def _fix_regression_points(analysis: Analysis) -> list[tuple[str, float, float]]
             continue
         arm = arms_mod.row_arm(record)
         counts = by_arm.setdefault(arm, RepairCounts())
+        if oracle.inconclusive:
+            # Item B4's general rule — see `repair_counts`: an unreadable grading has
+            # no place in this per-arm scatter's denominators either.
+            counts.inconclusive += 1
+            continue
         counts.total += 1
         if oracle.apply_ok:
             counts.applied += 1

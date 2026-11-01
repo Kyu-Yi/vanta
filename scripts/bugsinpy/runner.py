@@ -951,6 +951,13 @@ def pool_failed_patches(
             continue
         if not oracle_payload.get("apply_ok"):
             continue
+        if oracle_payload.get("inconclusive"):
+            # [VANTA-WHY] Item B4's general rule — an inconclusive grading (the patch
+            # applied but the hidden run wrote no report) is never counted as good or bad.
+            # This pool is the *known-bad* set, so such a record has no place in it: the
+            # guard is `not patch_good`, which an inconclusive row satisfies while
+            # carrying no evidence that it is bad.
+            continue
         if oracle_payload.get("patch_good"):
             continue
         patch_path = ((record.get("artifacts") or {}).get("final_patch")) or None
@@ -3401,8 +3408,19 @@ def write_labels(records: Iterable[dict[str, Any]], path: Path) -> Path:
         session_id = record.get("session_id")
         if not candidate or not session_id:
             continue
+        candidate_oracle = candidate["oracle"]
+        # [VANTA-WHY] Item B4's general rule — an inconclusive candidate (the patch
+        # applied but the hidden run wrote no report) has no established ground truth, so
+        # the row claims none: `known_bad` is left `null` rather than `true`, since
+        # `not patch_good` would call it a bad patch to reject on no evidence either way.
+        # The row stays in the file, so it is still reported — just unlabelled.
+        known_bad = (
+            None
+            if candidate_oracle.get("inconclusive")
+            else not bool(candidate_oracle.get("patch_good"))
+        )
         labels[str(session_id)] = {
-            "known_bad": not bool(candidate["oracle"].get("patch_good")),
+            "known_bad": known_bad,
             "bug": record["bug"],
             "config": record["config"],
             # [VANTA-WHY] M3 item 8 follow-up — the arm, backfilled for a row written

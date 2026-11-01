@@ -969,6 +969,7 @@ def manifest_row(
     hidden_pass: bool = True,
     patch_good: bool = True,
     regressions: int = 0,
+    inconclusive: bool = False,
 ) -> dict:
     return {
         "session_id": session_id,
@@ -980,6 +981,7 @@ def manifest_row(
             "patch_good": patch_good,
             "suite_regressions_count": regressions,
             "suite_regressions": [],
+            "inconclusive": inconclusive,
         },
     }
 
@@ -1206,6 +1208,36 @@ def test_an_unobservable_oracle_is_not_a_failed_patch(tmp_path):
     assert pooled.unobservable == 1
     assert rates["resolve_rate"] == (1, 1)
     assert rates["unobservable_rate"] == (1, 2)
+
+
+def test_an_inconclusive_oracle_is_neither_a_resolve_nor_a_patch_good(tmp_path):
+    """Item B4's general rule, review side: applied but unreadable is a third state.
+
+    [WHY] `apply_ok=true` with a hidden run that wrote no report gives no evidence the
+    patch resolves anything, so counting it in `resolve_rate`/`patch_good_rate` would
+    blame the model for a run nobody could read. It is counted on its own instead.
+    """
+    summary = provenance_summary()
+    write_provenance_session(tmp_path, "run", summary)
+    write_provenance_session(tmp_path, "unreadable", summary)
+
+    groups, facts = groups_and_facts(
+        tmp_path,
+        rows=[
+            manifest_row("run"),
+            manifest_row("unreadable", hidden_pass=False, patch_good=False, inconclusive=True),
+        ],
+    )
+    pooled = metrics.pooled_metrics(groups[0], facts)
+    rates = pooled.rates()
+
+    assert pooled.oracle_runs == 2
+    assert pooled.observable == 1
+    assert pooled.inconclusive == 1
+    assert pooled.unobservable == 0
+    assert rates["resolve_rate"] == (1, 1)
+    assert rates["patch_good_rate"] == (1, 1)
+    assert rates["inconclusive_rate"] == (1, 2)
 
 
 def test_a_group_without_manifest_rows_reports_na_not_zero(tmp_path):

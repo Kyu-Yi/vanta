@@ -26145,6 +26145,15 @@ def _pool_unobservable(candidate) -> oracle_mod.OracleResult:
     )
 
 
+def _pool_inconclusive(candidate) -> oracle_mod.OracleResult:
+    """A patch that applied but whose hidden run wrote no report — the B4 third state."""
+    return oracle_mod.OracleResult(
+        apply_ok=True,
+        inconclusive=True,
+        error="the hidden run produced no pytest report at all (exit 1/1)",
+    )
+
+
 def _frozen_mutants(batch_dir: Path, prep: prepare_mod.BugPrep, entries=None) -> Path:
     """A real, frozen item-5 pool for a bug — the referent item 6 names by hash."""
     entries = entries or [
@@ -26780,6 +26789,55 @@ class TestPoolSelect:
         assert selected.tally.unobservable == 3
         assert selected.tally.graded == 3
 
+    def test_an_inconclusive_grade_is_never_selected_as_bad_or_good(self):
+        """Item B4 follow-up: an applied patch with no readable grading is the third state.
+
+        Before the follow-up it fell into ``elif len(bad) < max_bad`` and
+        ``entry_for_model`` would write ``kind=failed_model, oracle="inconclusive"`` — a
+        patch every review row is scored against, labelled a bad patch to reject on no
+        evidence either way. It is counted and dropped here, exactly as the mutants pool
+        drops it, and the search keeps spending its budget behind it.
+        """
+        candidates = [_cand(f"{index:064d}") for index in range(3)]
+
+        def grade(candidate):
+            if candidate.normalized_sha256 == "0" * 64:
+                return _pool_inconclusive(candidate)
+            return _pool_bad(candidate)
+
+        selected = pool_mod.select(
+            candidates=candidates, grade_fn=grade, reference_sha256="none", tally=pool_mod.Tally()
+        )
+        assert all(
+            result.label_input != "inconclusive" for _, result in selected.bad + selected.good
+        )
+        assert [c.normalized_sha256 for c, _ in selected.bad] == [
+            f"{1:064d}",
+            f"{2:064d}",
+        ]
+        assert selected.good == []
+        assert selected.tally.inconclusive == 1
+        assert selected.tally.graded == 3
+        assert selected.tally.bad == 2
+        (reason,) = selected.tally.inconclusive_reasons
+        assert reason["patch_sha256"] == pool_mod.sha256_text(candidates[0].text)
+        assert reason["patch_source"] == "repair"
+        assert reason["attempt"] == 1
+        assert "no pytest report" in reason["reason"]
+
+    def test_a_pool_of_only_inconclusive_grades_selects_nothing(self):
+        """No gradable evidence means an empty pool, never a side padded with unreadable grades."""
+        candidates = [_cand(f"{index:064d}") for index in range(3)]
+        selected = pool_mod.select(
+            candidates=candidates,
+            grade_fn=_pool_inconclusive,
+            reference_sha256="none",
+            tally=pool_mod.Tally(),
+        )
+        assert selected.bad == [] and selected.good == []
+        assert selected.tally.inconclusive == 3
+        assert selected.tally.graded == 3
+
 
 class TestPoolArtifact:
     """The locked file: item 5's mutants referenced by hash, and every entry's provenance."""
@@ -26949,6 +27007,53 @@ class TestPoolArtifact:
         pool = pool_mod.load_pool(path)
         assert pool.tally.unobservable == 1
         assert pool.tally.unobservable_reasons == [reason]
+
+    def test_the_inconclusive_count_and_reasons_round_trip(self, tmp_path):
+        """Item B4 follow-up: the third state is recorded per bug, with its reason."""
+        prep = _pool_prep(tmp_path)
+        mutants_file = _frozen_mutants(tmp_path / "batch", prep)
+        reason = {
+            "patch_sha256": "4" * 64,
+            "patch_source": "repair",
+            "attempt": 1,
+            "reason": "the hidden run produced no pytest report at all (exit 1/1)",
+        }
+        path = pool_mod.write_pool(
+            pool_mod.pool_path(tmp_path / "out", prep),
+            prep=prep,
+            mutants=_mutants_ref(mutants_file),
+            reference_sha256="r" * 64,
+            noop_sha256="n" * 64,
+            tally=pool_mod.Tally(
+                graded=3, bad=2, inconclusive=1, inconclusive_reasons=[reason]
+            ),
+            entries=self._entries(),
+            sources=["repair"],
+        )
+        assert "- inconclusive: 1" in path.read_text(encoding="utf-8")
+        pool = pool_mod.load_pool(path)
+        assert pool.tally.inconclusive == 1
+        assert pool.tally.inconclusive_reasons == [reason]
+
+    def test_a_pool_written_before_inconclusive_can_still_be_rebuilt(self, tmp_path):
+        """A ``--rebuild`` reads a file an older build wrote, which predates the key."""
+        prep = _pool_prep(tmp_path)
+        mutants_file = _frozen_mutants(tmp_path / "batch", prep)
+        path = pool_mod.write_pool(
+            pool_mod.pool_path(tmp_path / "out", prep),
+            prep=prep,
+            mutants=_mutants_ref(mutants_file),
+            reference_sha256="r" * 64,
+            noop_sha256="n" * 64,
+            tally=pool_mod.Tally(),
+            entries=[],
+            sources=["repair"],
+        )
+        legacy = path.read_text(encoding="utf-8").replace("- inconclusive: 0\n", "")
+        path.write_text(legacy, encoding="utf-8")
+        with pytest.raises(pool_mod.PoolError, match="inconclusive"):
+            pool_mod.load_pool(path)
+        assert re.fullmatch(r"[0-9a-f]{64}", pool_mod.previous_pool_sha256(path))
 
     def test_a_pool_written_before_unobservable_can_still_be_rebuilt(self, tmp_path):
         """#F: `--rebuild` must read the hash of a file an older build wrote, which predates
@@ -28574,6 +28679,7 @@ def _analyse_oracle(
     regressions=(),
     error: str = "",
     apply_outcome: str = "",
+    inconclusive: bool = False,
 ) -> dict:
     """One row's ``oracle`` payload, in the manifest's own recorded shape."""
     return {
@@ -28589,6 +28695,7 @@ def _analyse_oracle(
         "patch_good": patch_good,
         "oracle_secs": 0.0,
         "error": error,
+        "inconclusive": inconclusive,
     }
 
 
@@ -29074,6 +29181,32 @@ class TestAnalyseRepair:
         assert counts.replayed == 2
         assert counts.adversarial_catches == 1
         assert counts.adversarial_catch_rate == pytest.approx(0.5)
+
+    def test_an_inconclusive_repair_grade_is_in_no_rate(self, tmp_path):
+        """Item B4's general rule, in the analysis: an unreadable grading is neither a
+        fix nor a failure.
+
+        [WHY] The patch applied but the hidden run wrote no report, so the row carries
+        no evidence it failed. Leaving it in `total` — the fix-rate denominator — would
+        read it as "not fixed", i.e. blame the model on a run nobody could read.
+        """
+        rows = [
+            _analyse_row("k1", mode="repair", bug="A/1", session_id="s1"),
+            _analyse_row(
+                "k2", mode="repair", bug="B/1", session_id="s2",
+                oracle=_analyse_oracle(patch_good=False, inconclusive=True),
+            ),
+        ]
+        analysis = _analyse_load(_analyse_batch(tmp_path, rows=rows))
+        counts = analyse_mod.repair_counts(analysis)
+        assert counts.inconclusive == 1
+        assert counts.total == 1 and counts.applied == 1 and counts.fixed == 1
+        assert counts.fix_rate == pytest.approx(1.0)
+        assert counts.regression_rate == pytest.approx(0.0)
+
+        result = analyse_mod.RepairMetrics().run(analysis)
+        tex = {artifact.filename: artifact.text for artifact in result.artifacts}["repair.tex"]
+        assert "inconclusive gradings (in no rate) & 1" in tex
 
     def test_the_repair_tex_marks_cost_unavailable_and_never_zero(self, tmp_path):
         result = analyse_mod.RepairMetrics().run(_analyse_load(self._batch(tmp_path)))

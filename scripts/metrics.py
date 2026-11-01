@@ -1027,6 +1027,15 @@ class OracleFacts:
     hidden_pass: bool
     patch_good: bool
     suite_regressions: int
+    inconclusive: bool = False
+    """The patch applied but the hidden run wrote no report (item B4's third state).
+
+    [VANTA-WHY] Item B4's general rule — an inconclusive grading is never counted as
+    good or bad anywhere. ``apply_ok`` is true, so without this field the row would
+    land in ``observable`` and, because ``patch_good`` is false, count against
+    ``patch_good_rate``: a model failure invented from a grading nobody could read.
+    Read here so the pooled table can hold it apart, exactly as it holds the censor.
+    """
 
     @property
     def reason(self) -> str:
@@ -1060,6 +1069,7 @@ def oracle_by_session(records: list[dict[str, Any]]) -> dict[str, OracleFacts]:
             hidden_pass=bool(oracle.get("hidden_pass")),
             patch_good=bool(oracle.get("patch_good")),
             suite_regressions=int(regressions),
+            inconclusive=bool(oracle.get("inconclusive")),
         )
     return out
 
@@ -1083,6 +1093,7 @@ class PooledMetrics:
     hidden_pass: int
     patch_good: int
     unobservable: int
+    inconclusive: int
     ecr: int
     ecr_denominator: int
     eir: int
@@ -1116,6 +1127,7 @@ class PooledMetrics:
             ),
             "infra_failure_rate": (self.buckets.get(INFRA_FAILURE, 0), self.runs),
             "unobservable_rate": (self.unobservable, self.runs),
+            "inconclusive_rate": (self.inconclusive, self.runs),
             "ECR": (self.ecr, self.ecr_denominator),
             "EIR": (self.eir, self.eir_denominator),
         }
@@ -1164,7 +1176,7 @@ def pooled_metrics(
     """
     buckets = {name: 0 for name in BUCKET_ORDER}
     counters = dict(_EMPTY_COUNTERS)
-    oracle_runs = observable = hidden_pass = patch_good = unobservable = 0
+    oracle_runs = observable = hidden_pass = patch_good = unobservable = inconclusive = 0
     false_approvals: list[tuple[Any, Any, str]] = []
     false_rejects: list[tuple[Any, Any]] = []
     for verdict in group.verdicts:
@@ -1178,6 +1190,10 @@ def pooled_metrics(
             oracle_runs += 1
             if not facts.apply_ok:
                 unobservable += 1
+            elif facts.inconclusive:
+                # Item B4 — applied, but no readable grading: neither a resolve nor a
+                # patch_good, so it is held apart rather than counted against the model.
+                inconclusive += 1
             else:
                 observable += 1
                 hidden_pass += 1 if facts.hidden_pass else 0
@@ -1202,6 +1218,7 @@ def pooled_metrics(
         hidden_pass=hidden_pass,
         patch_good=patch_good,
         unobservable=unobservable,
+        inconclusive=inconclusive,
         ecr=counters["ecr"],
         ecr_denominator=counters["ecr_denominator"],
         eir=counters["eir"],
@@ -1277,6 +1294,7 @@ def render_pooled(
                     "spurious_reject_rate",
                     "infra_failure_rate",
                     "unobservable_rate",
+                    "inconclusive_rate",
                 )
             )
         )

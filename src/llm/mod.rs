@@ -1266,8 +1266,21 @@ pub fn requested_effort() -> Option<&'static str> {
 /// run's request bodies are unchanged. A `coding` run additionally pins `top_p` /
 /// `top_k` / `min_p` / `presence_penalty` on every site, the auditor included —
 /// only `max_tokens` is left to the call site, and only the batch audit scales it.
-pub fn with_sampling(mut extras: Value, site: &str) -> Value {
-    let pins = sampling_pins_json(sampling_preset(), site);
+pub fn with_sampling(extras: Value, site: &str) -> Value {
+    with_sampling_pins(extras, sampling_preset(), site)
+}
+
+/// [`with_sampling`] with the preset taken as an EXPLICIT input.
+///
+/// [VANTA-WHY] The preset is an argument rather than [`sampling_preset`] so a
+/// unit test can name the preset it is about. `sampling_preset` memoises
+/// `VANTA_SAMPLING` in a `OnceLock`, so a test that reached it only through
+/// `with_sampling` silently changed meaning with the ambient environment — the
+/// `coding` preset inserts `presence_penalty: 0.0` on every site, which broke a
+/// `pinned` body's "no `presence_penalty` key" assertion. The production entry
+/// point is unchanged: `with_sampling` still reads the run's preset here.
+fn with_sampling_pins(mut extras: Value, preset: SamplingPreset, site: &str) -> Value {
+    let pins = sampling_pins_json(preset, site);
     let object = extras
         .as_object_mut()
         .expect("call-site extras are always a JSON object");
@@ -3184,7 +3197,7 @@ mod _deadline_tests {
 mod _presence_penalty_tests {
     use super::{
         SAMPLING_SCHEDULE, SamplingPreset, sampling_pins_text, set_presence_penalty,
-        with_sampling,
+        with_sampling_pins,
     };
     use serde_json::json;
 
@@ -3208,7 +3221,7 @@ mod _presence_penalty_tests {
                 "an unset override must leave a pinned body byte-identical ({site})"
             );
             assert!(
-                with_sampling(json!({}), site)
+                with_sampling_pins(json!({}), SamplingPreset::Pinned, site)
                     .get("presence_penalty")
                     .is_none(),
                 "an unset override must insert no `presence_penalty` key ({site})"
@@ -3238,7 +3251,7 @@ mod _presence_penalty_tests {
                 "a non-zero override must reach every site ({site})"
             );
             assert_eq!(
-                with_sampling(json!({}), site)["presence_penalty"],
+                with_sampling_pins(json!({}), SamplingPreset::Pinned, site)["presence_penalty"],
                 json!(1.0),
                 "the override must reach the request body itself ({site})"
             );
@@ -3297,7 +3310,7 @@ mod _presence_penalty_tests {
 mod _max_tokens_override_tests {
     use super::{
         SAMPLING_SCHEDULE, SamplingPreset, max_tokens_env_var, max_tokens_overrides_text,
-        sampling_pins_text, set_max_tokens_overrides, with_sampling,
+        sampling_pins_text, set_max_tokens_overrides, with_sampling_pins,
     };
     use serde_json::json;
 
@@ -3329,7 +3342,7 @@ mod _max_tokens_override_tests {
                 "an unset override must leave the schedule's cap ({site})"
             );
             assert_eq!(
-                with_sampling(json!({}), site)["max_tokens"],
+                with_sampling_pins(json!({}), SamplingPreset::Pinned, site)["max_tokens"],
                 json!(*scheduled),
                 "the unset body must carry the schedule's cap ({site})"
             );
@@ -3354,7 +3367,7 @@ mod _max_tokens_override_tests {
                 );
                 assert_eq!(cap(preset, site), Some(12288), "({site})");
                 assert_eq!(
-                    with_sampling(json!({}), site)["max_tokens"],
+                    with_sampling_pins(json!({}), preset, site)["max_tokens"],
                     json!(12288),
                     "the override must reach the request body itself ({site})"
                 );
@@ -3380,7 +3393,7 @@ mod _max_tokens_override_tests {
         set_max_tokens_overrides(vec![("attacker_generate", 16384)]);
         assert_eq!(cap(SamplingPreset::Pinned, "attacker_generate"), Some(16384));
         assert_eq!(
-            with_sampling(json!({}), "attacker_generate")["max_tokens"],
+            with_sampling_pins(json!({}), SamplingPreset::Pinned, "attacker_generate")["max_tokens"],
             json!(16384)
         );
         assert_eq!(max_tokens_overrides_text(), "attacker_generate=16384");
@@ -3405,9 +3418,9 @@ mod _max_tokens_override_tests {
 mod _reasoning_control_tests {
     use super::{
         OPENAI_EFFORT_MECHANISM, PROVIDER_DEFAULT_EFFORT, REASONING_BUDGET_SITES, ReasoningEffort,
-        SAMPLING_SCHEDULE, UNSUPPORTED_MECHANISM, reasoning_budget_mechanism,
+        SAMPLING_SCHEDULE, SamplingPreset, UNSUPPORTED_MECHANISM, reasoning_budget_mechanism,
         reasoning_budget_text, reasoning_effort_mechanism, reasoning_effort_text,
-        set_reasoning_budget, set_reasoning_effort, with_sampling,
+        set_reasoning_budget, set_reasoning_effort, with_sampling_pins,
     };
     use serde_json::json;
 
@@ -3427,7 +3440,11 @@ mod _reasoning_control_tests {
         set_reasoning_budget(None);
         set_reasoning_effort(None);
         for (site, _, _) in SAMPLING_SCHEDULE {
-            let body = with_sampling(json!({"reasoning_effort": "low"}), site);
+            let body = with_sampling_pins(
+                json!({"reasoning_effort": "low"}),
+                SamplingPreset::Pinned,
+                site,
+            );
             assert_eq!(
                 body.get("reasoning_budget_tokens"),
                 None,
@@ -3459,7 +3476,7 @@ mod _reasoning_control_tests {
         //     both the value it asked for and the mechanism that carried it.
         set_reasoning_budget(Some(12000));
         for (site, _, _) in SAMPLING_SCHEDULE {
-            let body = with_sampling(json!({}), site);
+            let body = with_sampling_pins(json!({}), SamplingPreset::Pinned, site);
             if REASONING_BUDGET_SITES.contains(site) {
                 assert_eq!(
                     body["reasoning_budget_tokens"],
@@ -3490,9 +3507,13 @@ mod _reasoning_control_tests {
         //     this knob is about. The recorded mechanism says the transport ignores
         //     the level (`llamacpp:noop`), which is the truth for this template.
         set_reasoning_effort(Some(ReasoningEffort::High));
-        let pinned = with_sampling(json!({"reasoning_effort": "low"}), "attacker_revise");
+        let pinned = with_sampling_pins(
+            json!({"reasoning_effort": "low"}),
+            SamplingPreset::Pinned,
+            "attacker_revise",
+        );
         assert_eq!(pinned["reasoning_effort"], json!("high"));
-        let invented = with_sampling(json!({}), "attacker_revise");
+        let invented = with_sampling_pins(json!({}), SamplingPreset::Pinned, "attacker_revise");
         assert_eq!(
             invented.get("reasoning_effort"),
             None,
@@ -3509,7 +3530,11 @@ mod _reasoning_control_tests {
         // the backend to reason not at all, and the record must say so.
         set_reasoning_effort(Some(ReasoningEffort::None));
         assert_eq!(
-            with_sampling(json!({"reasoning_effort": "low"}), "attacker_revise")["reasoning_effort"],
+            with_sampling_pins(
+                json!({"reasoning_effort": "low"}),
+                SamplingPreset::Pinned,
+                "attacker_revise",
+            )["reasoning_effort"],
             json!("none")
         );
         assert_eq!(reasoning_effort_text(false), "none");

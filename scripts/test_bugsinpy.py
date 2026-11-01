@@ -26749,7 +26749,13 @@ class TestMutantPoolArtifact:
             ),
         ]
 
-    def _tally(self) -> mutants_mod.Tally:
+    # The pool as frozen on the item-5 tree (62a03f6), before E14 added the
+    # ``- inconclusive:`` header line. Kept as the compatibility fixture: a pool
+    # written then is still on disk, and must still load.
+    PRE_E14_BYTES = 1194
+    PRE_E14_SHA256 = "469f291a92671b590c2c940452ff1e772a14d5cc3ec0e362cba126c99edd040f"
+
+    def _tally(self, *, inconclusive: int = 0) -> mutants_mod.Tally:
         return mutants_mod.Tally(
             per_operator={
                 "hunk_drop": 3,
@@ -26761,15 +26767,16 @@ class TestMutantPoolArtifact:
             did_not_compile=2,
             graded=5,
             equivalent=1,
+            inconclusive=inconclusive,
             selected=2,
             cap_hit=False,
         )
 
-    def _render(self) -> str:
+    def _render(self, *, inconclusive: int = 0) -> str:
         return mutants_mod.render_pool(
             prep=oracle_prep(),
             source_sha256="c" * 64,
-            tally=self._tally(),
+            tally=self._tally(inconclusive=inconclusive),
             entries=self._entries(),
         )
 
@@ -26790,9 +26797,57 @@ class TestMutantPoolArtifact:
         assert "- did-not-compile: 2" in text
         assert "- graded: 5" in text
         assert "- equivalent: 1" in text
+        assert "- inconclusive: 0" in text
         assert "- selected: 2" in text
         assert "- cap-hit: false" in text
         assert mutants_mod.MUTANTS_MARKER in text
+
+    def test_the_inconclusive_count_round_trips(self, tmp_path):
+        """E14: the third state (B4/C10) survives a write and a read."""
+        path = mutants_mod.write_pool(
+            mutants_mod.pool_path(tmp_path / "batch", oracle_prep()),
+            prep=oracle_prep(),
+            source_sha256="c" * 64,
+            tally=self._tally(inconclusive=2),
+            entries=self._entries(),
+        )
+        assert "- inconclusive: 2" in path.read_text(encoding="utf-8")
+        assert mutants_mod.load_pool(path).tally.inconclusive == 2
+
+    def test_a_pool_frozen_before_the_inconclusive_field_still_loads(self):
+        """A pool written before E14 is already on disk, and must still load.
+
+        ``inconclusive`` is deliberately NOT a required header key: making it one
+        would leave every frozen pool unreadable. The pre-E14 form is the current
+        render with that one line dropped — the ``content-sha256`` lock covers the
+        JSON body, not the header, so the line is the *only* difference — and the
+        dropped form is asserted to be the exact artifact frozen at ``62a03f6``.
+        """
+        legacy = self._render().replace("- inconclusive: 0\n", "")
+        assert len(legacy.encode("utf-8")) == self.PRE_E14_BYTES
+        assert split_mod.sha256_text(legacy) == self.PRE_E14_SHA256
+        old = mutants_mod.parse_pool(legacy, path=Path("x"))
+        new = mutants_mod.parse_pool(self._render(), path=Path("x"))
+        assert old.tally.inconclusive == 0
+        # …and not one other field moved with it.
+        for field_name in (
+            "per_operator",
+            "did_not_apply",
+            "did_not_compile",
+            "graded",
+            "equivalent",
+            "selected",
+            "cap_hit",
+        ):
+            assert getattr(old.tally, field_name) == getattr(new.tally, field_name)
+        assert old.entries == new.entries
+        assert (old.bug, old.operators, old.max_mutants, old.grade_cap) == (
+            new.bug,
+            new.operators,
+            new.max_mutants,
+            new.grade_cap,
+        )
+        assert old.content_sha256 == new.content_sha256
 
     def test_every_entry_records_kind_operator_hash_and_label(self, tmp_path):
         path = mutants_mod.write_pool(
@@ -26852,13 +26907,22 @@ class TestTheLockIsOneImplementation:
     old file. So the two hashes were taken **before** the refactor, on the item-5 tree
     (``62a03f6``), and are pinned here — a change to the rendering fails a test rather
     than surfacing one stage later against a committed file no reader will accept.
+
+    The pool pin was re-anchored once, deliberately, when item E14 added
+    ``- inconclusive:`` to the header (see below); the pre-E14 bytes are kept as a
+    compatibility fixture, so the re-anchor did not discard the old assertion.
     """
 
     # Captured with ``render_frozen``/``render_pool`` on 62a03f6, before locked.py.
     FROZEN_SHA256 = "37341bd4975941b2b04417ee55e79d26f87678c84efc4100aa6aea5e609fccae"
     FROZEN_BYTES = 1369
-    POOL_SHA256 = "469f291a92671b590c2c940452ff1e772a14d5cc3ec0e362cba126c99edd040f"
-    POOL_BYTES = 1194
+    # Re-anchored by E14 (the pool header gained ``- inconclusive:``). The
+    # pre-E14 pool bytes — 1194 bytes, sha
+    # 469f291a92671b590c2c940452ff1e772a14d5cc3ec0e362cba126c99edd040f — are kept
+    # as the compatibility fixture in ``TestMutantPoolArtifact``, so what the
+    # re-anchor gave up is still asserted somewhere rather than only described here.
+    POOL_SHA256 = "55876f1287dc2eda6e762caeeae25d0c90fba475c76ac9121e6ade48ca3825f1"
+    POOL_BYTES = 1212
 
     def test_the_frozen_report_renders_to_its_pre_refactor_bytes(self, tmp_path):
         report = TestFrozenIssueReport()._report()

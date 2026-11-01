@@ -816,6 +816,7 @@ def render_pool(
         f"- did-not-compile: {tally.did_not_compile}",
         f"- graded: {tally.graded}",
         f"- equivalent: {tally.equivalent}",
+        f"- inconclusive: {tally.inconclusive}",
         f"- selected: {tally.selected}",
         f"- cap-hit: {'true' if tally.cap_hit else 'false'}",
         f"- content-sha256: {sha256_text(canonical)}",
@@ -898,6 +899,7 @@ def parse_pool(text: str, *, path: Path) -> MutantPool:
         did_not_compile=_parse_int(header, "did-not-compile", target),
         graded=_parse_int(header, "graded", target),
         equivalent=_parse_int(header, "equivalent", target),
+        inconclusive=_parse_int_default(header, "inconclusive", target, 0),
         selected=_parse_int(header, "selected", target),
         cap_hit=header["cap-hit"].strip().lower() in ("true", "1", "yes"),
     )
@@ -919,6 +921,25 @@ def _parse_int(header: dict[str, str], key: str, path: Path) -> int:
         return int(header[key])
     except ValueError as exc:
         raise MutantError(f"{path}: header field {key!r} is {header[key]!r}, not an integer") from exc
+
+
+def _parse_int_default(header: dict[str, str], key: str, path: Path, default: int) -> int:
+    """``_parse_int`` for a key that older files predate — absent reads as ``default``.
+
+    [VANTA-WHY] ``inconclusive`` was added after the first pools were frozen, and a
+    pool is written once and hash-locked. Making it a required header key would
+    make every already-frozen pool unreadable, so it stays out of
+    ``_REQUIRED_HEADER_KEYS`` and an absent (or blank) value reads as ``0`` — the
+    third state simply did not exist when that pool was made. A present but
+    non-integer value is still an error.
+    """
+    raw = header.get(key, "")
+    if not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise MutantError(f"{path}: header field {key!r} is {raw!r}, not an integer") from exc
 
 
 def _parse_generated(value: str) -> dict[str, int]:

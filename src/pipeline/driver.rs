@@ -7504,6 +7504,44 @@ mod tests {
         );
     }
 
+    /// [VANTA-WHY] Item E4 + Contract B (M3 item A1). A block with one good
+    /// search/replace and one malformed block must write NOTHING. Before E4 the
+    /// good block applied and the malformed one was skipped, so the write
+    /// succeeded — a program the Creator never proposed.
+    #[test]
+    fn a_block_with_a_good_and_a_malformed_search_replace_writes_nothing() {
+        let original = HashMap::from([(
+            "calc.py".to_string(),
+            "def scale(x):\n    return x\n".to_string(),
+        )]);
+        let blocks = HashMap::from([(
+            "calc.py".to_string(),
+            concat!(
+                "===SEARCH===\n    return x\n===REPLACE===\n    return x * 2\n===END===\n",
+                "===SEARCH===\n    return x\n",
+            )
+            .to_string(),
+        )]);
+
+        let (patched, failure) = match apply_patch_files_all_or_nothing(&original, &blocks) {
+            Ok(changed) => (changed, None),
+            Err(failure) => (original.clone(), Some(failure)),
+        };
+
+        let failure = failure.expect("the malformed block must fail the apply, not be skipped");
+        assert!(
+            failure.feedback().contains("calc.py"),
+            "the failing file must be named; got: {}",
+            failure.feedback()
+        );
+        assert!(
+            failure.feedback().contains("malformed"),
+            "the malformed block must be named; got: {}",
+            failure.feedback()
+        );
+        assert_eq!(patched, original, "Contract B: nothing may be written");
+    }
+
     /// The message and the gate read the SAME list, so the finding a rejection
     /// names is exactly the finding that rejected it.
     #[test]

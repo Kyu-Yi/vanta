@@ -681,9 +681,21 @@ pub enum SearchReplaceFailure {
     /// A block's SEARCH text does not appear in the original file. Carries the
     /// exact anchor text, so the Creator can see the line it wrote is not there.
     AnchorNotFound { search: String },
-    /// The patch declared blocks, but none of them changed anything (each block
-    /// needs both a `===SEARCH===` and a `===REPLACE===` marker).
+    /// The patch declared blocks, but none of them changed anything (the patch
+    /// named no well-formed block at all).
     NothingApplied,
+    /// A `===SEARCH===` block that cannot be applied as written: it has no
+    /// `===REPLACE===` marker, or its SEARCH text is empty.
+    ///
+    /// [VANTA-WHY] Item E4. Such a block used to be skipped in silence, so under
+    /// Contract B (M3 item A1) a patch with one good block and one malformed
+    /// block applied the good block and reported success — a program the Creator
+    /// never proposed. A malformed block now fails the whole apply. Carries the
+    /// block's own text so the Creator is told WHICH block is malformed.
+    ///
+    /// Only reachable for a file the tree already has: a block that introduces a
+    /// new file is taken verbatim by the caller and never reaches this function.
+    MalformedBlock { block: String },
 }
 
 impl std::fmt::Display for SearchReplaceFailure {
@@ -696,6 +708,11 @@ impl std::fmt::Display for SearchReplaceFailure {
             SearchReplaceFailure::NothingApplied => write!(
                 f,
                 "no ===SEARCH===/===REPLACE=== block changed anything"
+            ),
+            SearchReplaceFailure::MalformedBlock { block } => write!(
+                f,
+                "a ===SEARCH=== block is malformed — it needs a ===REPLACE=== marker and \
+                 non-empty SEARCH text:\n{block}"
             ),
         }
     }
@@ -710,17 +727,24 @@ pub fn apply_search_replace(
 
     let blocks: Vec<&str> = patch_text.split("===SEARCH===").collect();
     for block in blocks.iter().skip(1) {
-        let parts: Vec<&str> = block.splitn(2, "===REPLACE===").collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let search = parts[0].trim_matches('\n');
-        let rest = parts[1];
+        // [VANTA-WHY] Item E4 — a block with no `===REPLACE===` marker, and one
+        // whose SEARCH text is empty, are malformed: they fail the WHOLE apply
+        // rather than being skipped. Skipping either one let a later good block
+        // apply on its own, so a multi-block patch wrote a partial program under
+        // Contract B's all-or-nothing rule (M3 item A1).
+        let Some((search_part, rest)) = block.split_once("===REPLACE===") else {
+            return Err(SearchReplaceFailure::MalformedBlock {
+                block: block.trim_matches('\n').to_string(),
+            });
+        };
+        let search = search_part.trim_matches('\n');
         let replace_parts: Vec<&str> = rest.splitn(2, "===END===").collect();
         let replace = replace_parts[0].trim_matches('\n');
 
         if search.is_empty() {
-            continue;
+            return Err(SearchReplaceFailure::MalformedBlock {
+                block: block.trim_matches('\n').to_string(),
+            });
         }
 
         if result.contains(search) {
@@ -1026,6 +1050,42 @@ mod tests {
         let (patched, changed) = apply_patch(original, patch, "cart.py");
         assert!(changed);
         assert!(patched.contains("return a + b"));
+    }
+
+    /// [VANTA-WHY] Item E4. A block with no `===REPLACE===` marker must fail the
+    /// WHOLE apply, never be skipped: skipping it let a preceding good block
+    /// apply on its own, writing a partial program under Contract B (M3 item A1).
+    #[test]
+    fn a_block_without_a_replace_marker_fails_the_whole_apply() {
+        let original = "def add(a, b):\n    return a - b\n";
+        let patch = concat!(
+            "===SEARCH===\n    return a - b\n===REPLACE===\n    return a + b\n===END===\n",
+            "===SEARCH===\n    return a\n",
+        );
+        let err = apply_search_replace(original, patch)
+            .expect_err("the second block has no ===REPLACE=== marker");
+        assert!(
+            matches!(err, SearchReplaceFailure::MalformedBlock { .. }),
+            "the failure must name the malformed block: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("===REPLACE==="),
+            "the reason must say what is missing: {err}"
+        );
+    }
+
+    /// [VANTA-WHY] Item E4. An empty SEARCH is malformed too — the old code
+    /// skipped it, so a patch could declare a block that silently did nothing.
+    #[test]
+    fn an_empty_search_block_fails_the_whole_apply() {
+        let original = "x = 1\n";
+        let patch = "===SEARCH===\n===REPLACE===\ny = 2\n===END===\n";
+        let err =
+            apply_search_replace(original, patch).expect_err("an empty SEARCH text is malformed");
+        assert!(
+            matches!(err, SearchReplaceFailure::MalformedBlock { .. }),
+            "the failure must name the malformed block: {err:?}"
+        );
     }
 
     #[test]

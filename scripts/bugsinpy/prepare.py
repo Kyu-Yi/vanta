@@ -125,6 +125,20 @@ failure recorded; it is one more refusal of this step, recorded under this name 
 every other one."""
 
 
+VERSION_PIN_UNMEASURED_REASON = "version_pin_unmeasured"
+"""[VANTA-WHY] M3 item P3. The project's version machinery was reached and could not
+produce a version to freeze (``PinOutcome.measurement_failed``). Preparing on regardless
+was the pandas/1 failure: the bug was measured, run, and killed two stages later as
+``native_vacuous`` — because the tree the session seeded from reported the ``0+unknown``
+placeholder, which makes xarray's ``LooseVersion`` comparison raise and aborts collection
+on both sides — while the gate that would have named the cause had already been read as
+"pin recorded, nothing to see". The refusal belongs here, where the measurement failed and
+where the reason is in front of the reader, and not at the end of a suite run. It is
+recorded like the escape above it; the one outcome with a ``reason`` that is *not* a failed
+measurement — setuptools_scm configured without a ``write_to``, so the project keeps no
+version file at all — keeps preparing exactly as before."""
+
+
 NO_ISSUE_SOURCE_REASON = "issue_source=none"
 """[VANTA-WHY] A bug whose fix commit points at no issue has no report to send, and §2.4
 refuses to give it the commit message back: that message is written by the person who fixed
@@ -1442,6 +1456,17 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bo
             # leak above, so the bug is refused with a cause a reader can see.
             prep.gate_failures.append(f"{VERSION_PIN_ESCAPE_REASON}: {exc}")
             return False
+    elif pin.measurement_failed:
+        # [VANTA-WHY] M3 item P3 — the machinery was reached and produced no version to
+        # freeze, so the sandbox's tree would report the ``0+unknown`` placeholder. The
+        # pandas/1 shape: running on anyway reached the native suite, which aborted at
+        # collection on both sides and ended the row ``native_vacuous`` — an
+        # ``infra_failure`` naming the tree for what is a fact about the pin. Refused
+        # here, with the probe's own complaint in the record, so the cause is the row.
+        prep.gate_failures.append(
+            f"{VERSION_PIN_UNMEASURED_REASON}: {pin.reason}"
+        )
+        return False
     prep.version_pin = version_pin_mod.as_record(
         pin.pin, reason=pin.reason, probed=pin.probed
     )

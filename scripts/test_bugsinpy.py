@@ -6983,6 +6983,94 @@ class TestVersionPin:
         # And it is distinguishable from the honest no-op.
         assert outcome != version_pin_mod.PinOutcome(kind=None, pin=None, reason=None)
 
+    def test_a_failed_measurement_is_marked_for_the_gate(self, tmp_path, monkeypatch):
+        """[VANTA-WHY] M3 item P3 — the bit prepare refuses a bug on.
+
+        Three outcomes mean the machinery was reached and produced nothing usable, and
+        each is the pandas/1 shape if prepare runs on: the tree the sandbox seeds from
+        reports ``0+unknown``, the native suite aborts at collection on both sides, and
+        the row ends ``native_vacuous`` with the cause nowhere in the gate. This is the
+        first — the project's own version file could not be probed at all.
+        """
+        unmeasured = tmp_path / "unmeasured"
+        write(unmeasured / "pkg" / "_version.py", self._stub())
+        monkeypatch.setattr(
+            version_pin_mod,
+            "_probe",
+            lambda _path, _tree, *, vm: (None, "the probe ended with exit code 1: boom"),
+        )
+
+        outcome = version_pin_mod.measure(unmeasured, vm=self._vm())
+
+        assert outcome.pin is None and "could not be measured" in outcome.reason
+        assert outcome.measurement_failed is True
+
+    def test_a_measured_placeholder_is_marked_for_the_gate(self, tmp_path, monkeypatch):
+        """The second: the probe answered, and the answer is ``0+unknown`` itself."""
+        placeholder = tmp_path / "placeholder"
+        write(
+            placeholder / "pkg" / "_version.py",
+            self._stub(version="0+unknown", full=None, error="unable to compute version"),
+        )
+        self._fake_probe(monkeypatch)
+
+        outcome = version_pin_mod.measure(placeholder, vm=self._vm())
+
+        assert outcome.pin is None and "placeholder" in outcome.reason
+        assert outcome.measurement_failed is True
+
+    def test_setuptools_scm_that_answers_nothing_is_marked_for_the_gate(
+        self, tmp_path, monkeypatch
+    ):
+        """The third: a probe booted, ``write_to`` was declared, and nothing came back."""
+        scm = tmp_path / "scm"
+        write(
+            scm / "pyproject.toml",
+            "[tool.setuptools_scm]\nwrite_to = \"pkg/_version.py\"\n",
+        )
+        monkeypatch.setattr(
+            version_pin_mod,
+            "_setuptools_scm_version",
+            lambda _tree, *, vm: (None, "the probe ended with exit code 4: boom"),
+        )
+
+        outcome = version_pin_mod.measure(scm, vm=self._vm())
+
+        assert outcome.kind == "setuptools_scm" and outcome.pin is None
+        assert outcome.measurement_failed is True
+
+    def test_a_reason_that_is_not_a_failed_measurement_is_not_marked(self, tmp_path):
+        """[VANTA-WHY] M3 item P3 — the one carve-out, stated rather than inferred.
+
+        A ``reason`` alone cannot be what prepare refuses on. The honest no-op has no
+        reason at all, and the setuptools_scm-without-``write_to`` outcome has one while
+        nothing failed: the project keeps no version file for a sandbox to read, which
+        is a fact about its configuration, and prepare has always gone on to measure
+        that bug. Gating on ``probed`` instead would also gate it on the day a tree
+        carries both a vendored ``_version.py`` and a ``write_to``-less scm table.
+        """
+        nothing = tmp_path / "nothing"
+        write(
+            nothing / "setup.py",
+            "from setuptools import setup\nsetup(version='0.0.6')\n",
+        )
+        outcome = version_pin_mod.measure(nothing, vm=self._vm())
+        assert outcome.reason is None
+        assert outcome.measurement_failed is False
+
+        no_write = tmp_path / "no_write"
+        write(
+            no_write / "pyproject.toml",
+            "[tool.setuptools_scm]\n" 'version_scheme = "guess-next-dev"\n',
+        )
+        outcome = version_pin_mod.measure(no_write, vm=self._vm())
+        assert outcome.kind == "setuptools_scm"
+        assert "write_to" in outcome.reason
+        assert outcome.probed is False
+        assert outcome.measurement_failed is False, (
+            "P3 gates a failed measurement, not a project that keeps no version file"
+        )
+
     def test_an_unmeasured_pin_quotes_the_guest_stderr_and_exit_code(
         self, tmp_path, monkeypatch
     ):
@@ -7269,6 +7357,96 @@ class TestTheFreezeRefusalIsAGate:
         assert prepare_mod.VERSION_PIN_ESCAPE_REASON in bug_prep.gate_failures[0]
         assert not (root / "escape.py").exists()
         assert not (root.parent / "escape.py").exists()
+
+
+class TestTheUnmeasuredPinIsAGate:
+    """[VANTA-WHY] M3 item P3 — a pin that could not be measured refuses the bug.
+
+    ``strip_and_baseline`` recorded a ``reason`` outcome in ``version_pin`` and then
+    carried on, so a bug whose version machinery could not produce a version ran its
+    whole native suite against a tree reporting ``0+unknown``: on pandas/1 collection
+    aborted on both sides and the row ended ``native_vacuous`` — an ``infra_failure``
+    naming the tree for what was a fact about the pin. It is refused here, recorded
+    like the escape above it, with the probe's own complaint as the visible cause. The
+    ``write_to``-less setuptools_scm outcome keeps preparing exactly as it did.
+    """
+
+    def _prep_with(self, tmp_path, monkeypatch, pin):
+        root = tmp_path / "batch" / "worktrees" / "Demo_1"
+        write(root / "oracle_tree" / "demo.py", "x = 1\n")
+        monkeypatch.setattr(
+            prepare_mod, "_read_report", lambda batch_dir, stem: {"tests": []}
+        )
+        # No repository here, so the guard's candidate set is empty; nothing is scanned.
+        monkeypatch.setattr(tree_mod, "tracked_paths", lambda checkouts: set())
+        monkeypatch.setattr(version_pin_mod, "measure", lambda tree, *, vm: pin)
+        return prep(root=root)
+
+    def test_a_pin_that_cannot_be_measured_is_a_gate_failure(
+        self, tmp_path, monkeypatch
+    ):
+        unmeasured = version_pin_mod.PinOutcome(
+            kind="versioneer",
+            pin=None,
+            reason=(
+                "a versioneer-shaped version file was found but could not be "
+                "measured: demo/_version.py — the probe ended with exit code 1: boom"
+            ),
+            probed=True,
+            measurement_failed=True,
+        )
+        bug_prep = self._prep_with(tmp_path, monkeypatch, unmeasured)
+
+        recorded = prepare_mod.strip_and_baseline(
+            bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch"
+        )
+
+        assert recorded is False
+        assert len(bug_prep.gate_failures) == 1
+        assert prepare_mod.VERSION_PIN_UNMEASURED_REASON in bug_prep.gate_failures[0]
+        assert "could not be measured" in bug_prep.gate_failures[0]
+        # The cause P1 made visible travels all the way into the gate.
+        assert "exit code 1: boom" in bug_prep.gate_failures[0]
+
+    def test_the_setuptools_scm_without_write_to_case_still_prepares(
+        self, tmp_path, monkeypatch
+    ):
+        """The carve-out at the caller: a reason that is not a failure is not a gate.
+
+        The probe never booted and the project keeps no version file, so there is
+        nothing to freeze and nothing failed. Refusing here would drop every bug in
+        such a project from the batch.
+        """
+        carve_out = version_pin_mod.PinOutcome(
+            kind="setuptools_scm",
+            pin=None,
+            reason=(
+                "setuptools_scm is configured without a write_to/version_file, so "
+                "the project keeps no version file for a sandbox to read"
+            ),
+            probed=False,
+            measurement_failed=False,
+        )
+        bug_prep = self._prep_with(tmp_path, monkeypatch, carve_out)
+
+        class ReachedTheSuite(Exception):
+            """Raised where a VM would boot, so the step stops without one."""
+
+        def fake_suite(*_args, **_kwargs):
+            raise ReachedTheSuite
+
+        monkeypatch.setattr(prepare_mod, "_suite", fake_suite)
+
+        with pytest.raises(ReachedTheSuite):
+            prepare_mod.strip_and_baseline(
+                bug_prep, checkpoint="chk", batch_dir=tmp_path / "batch"
+            )
+
+        assert bug_prep.gate_failures == [], (
+            "the pin step must not have refused the bug"
+        )
+        assert bug_prep.version_pin["pinned"] is False
+        assert bug_prep.version_pin["reason"] == carve_out.reason
 
 
 class TestPrepareRunRecordContract:

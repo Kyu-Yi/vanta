@@ -612,6 +612,21 @@ class PinOutcome:
     so nothing silently reports a measurement that never happened.
     """
 
+    measurement_failed: bool = False
+    """Whether a version measurement was reached and did not yield a pin.
+
+    [VANTA-WHY] M3 item P3. :attr:`reason` alone cannot answer this, and prepare must
+    ask: the setuptools_scm-without-``write_to`` outcome also carries a ``reason`` — the
+    project simply keeps no version file, which is a fact about its configuration rather
+    than a failed reading — and prepare has always gone on to measure that bug. Every
+    other reason means the machinery was reached and could not produce a usable version,
+    and a bug left in that state runs its native suite against a tree whose project
+    reports the ``0+unknown`` placeholder: on pandas/1 that aborts collection and ends
+    the row ``native_vacuous``, which is why the caller refuses it at prepare time
+    instead. ``True`` at exactly the three sites that mean it, so the one carve-out is a
+    fact stated in the code rather than inferred from :attr:`probed`.
+    """
+
 
 def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
     """The version to freeze for ``tree``, and what to record about it.
@@ -631,7 +646,15 @@ def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
         unusable = _placeholder_free(versions)
         if unusable is not None:
             return PinOutcome(
-                kind="versioneer", pin=None, reason=unusable, probed=probed
+                kind="versioneer",
+                pin=None,
+                reason=unusable,
+                probed=probed,
+                # [VANTA-WHY] M3 item P3 — the probe answered and the answer is the
+                # placeholder: the machinery saw no repository, so there is nothing to
+                # freeze and the sandbox would report ``0+unknown``. A failed
+                # measurement like the others below.
+                measurement_failed=True,
             )
         contents = _short_version_contents(versions)
         pin = VersionPin(
@@ -666,6 +689,11 @@ def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
             pin=None,
             reason=f"{reason} — {why}" if why else reason,
             probed=probed,
+            # [VANTA-WHY] M3 item P3 — the file this project names as its own version
+            # source exists and the probe could not read it. This is the pandas/1
+            # shape: prepare went on, no pin was frozen, and the row died
+            # ``native_vacuous`` two stages later with the cause nowhere in the gate.
+            measurement_failed=True,
         )
 
     table = _pyproject_setuptools_scm(tree)
@@ -696,6 +724,10 @@ def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
                 + (f" — {why}" if why else "")
             ),
             probed=probed,
+            # [VANTA-WHY] M3 item P3 — a probe booted and answered nothing, so this is
+            # a failed measurement too. The ``write_to``-less branch above is the only
+            # reason that is not.
+            measurement_failed=True,
         )
     contents = _setuptools_scm_contents(version)
     pin = VersionPin(

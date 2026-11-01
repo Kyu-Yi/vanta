@@ -606,11 +606,16 @@ def harvest_batch(
     Only ``mode == "repair"`` rows: a review row's candidate is not a Creator
     attempt, and the review's own decisions are the thing being measured, not a
     source of patches.
+
+    [VANTA-WHY] F3 — the rows are read through ``manifest.effective_records``, so a
+    re-run's superseded session is not harvested alongside the row that replaced it.
+    Harvesting both would offer the same bug's stale attempts as review candidates
+    twice and inflate every count downstream of the pool.
     """
     entry = tag_for(tag)
     reader = manifest if manifest is not None else manifest_mod.Manifest(batch_dir)
     harvest = Harvest(tag=entry.name, priority=entry.priority, batch_dir=batch_dir)
-    for record in reader.records():
+    for record in manifest_mod.effective_records(reader.records()):
         if str(record.get("mode") or "") != arms_mod.REPAIR:
             continue
         session_id = record.get("session_id")

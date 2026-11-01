@@ -124,6 +124,41 @@ def oracle_inconclusive(record: Optional[dict[str, Any]]) -> bool:
     return bool(isinstance(oracle, dict) and oracle.get("inconclusive"))
 
 
+def effective_records(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The rows a reader may count: the last per key, minus any superseded session.
+
+    [VANTA-WHY] F3 — ``manifest.jsonl`` is append-only, so the same evidence appears
+    two ways that a *report* must not double-count: a resumed or re-run job appends a
+    second row under the same ``key``, and a re-run of an INCONCLUSIVE job names the
+    session it replaces in ``supersedes``. ``analyse.load_manifest`` and
+    ``metrics.oracle_by_session`` already dropped these, but every other reader (the
+    batch digest, ``write_labels``, the pool harvest, the replay selector) read the
+    raw rows and counted both, so a superseded session could appear in the digest and
+    in the labels file. This is the ONE definition of "the rows that are current";
+    every reader calls it rather than re-deriving the rule. It is idempotent, so a
+    reader may apply it to rows that were already filtered.
+
+    ``key`` is the identity of a job (:func:`job_key`), so the last row for a key is
+    the current one — the same rule :meth:`Manifest.find` uses for the cursor. A row
+    with no key has no identity to replace it, so it is kept under a synthetic key (as
+    the analyse reader has always done); ``supersedes`` names a *session*, not a key,
+    so a named session is dropped even when its own key is not the one the re-run was
+    appended under (§7.3, item E6).
+    """
+    latest: dict[str, dict[str, Any]] = {}
+    superseded: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        supersedes = record.get("supersedes")
+        if isinstance(supersedes, dict) and supersedes.get("session_id"):
+            superseded.add(str(supersedes["session_id"]))
+        key = str(record.get("key") or "")
+        latest[key if key else f"#{len(latest)}"] = record
+    rows = [latest[key] for key in sorted(latest)]
+    return [row for row in rows if str(row.get("session_id") or "") not in superseded]
+
+
 def job_key(
     *,
     batch_id: str,
@@ -194,6 +229,14 @@ class Manifest:
                 # says `running` for that job, so it is re-run rather than trusted.
                 continue
         return out
+
+    def effective_records(self) -> list[dict[str, Any]]:
+        """``records()`` filtered to the rows that are current (F3).
+
+        See :func:`effective_records`: the raw list is every row ever appended, so a
+        report built from it counts a superseded or re-run job twice.
+        """
+        return effective_records(self.records())
 
     def find(self, key: str) -> Optional[dict[str, Any]]:
         for record in reversed(self.records()):

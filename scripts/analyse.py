@@ -57,6 +57,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from bugsinpy import arms as arms_mod  # noqa: E402
+from bugsinpy import manifest as manifest_mod  # noqa: E402
 from bugsinpy import replay as replay_mod  # noqa: E402
 from bugsinpy import runner as runner_mod  # noqa: E402
 import metrics as metrics_mod  # noqa: E402
@@ -344,38 +345,31 @@ class Batch:
 
 
 def load_manifest(path: Path) -> list[dict[str, Any]]:
-    """Read a batch manifest, dropping a torn last line (§7.3, same rule as metrics).
+    """Read a batch manifest, keeping only the rows that are current (§7.3).
 
     The manifest is append-only, so a resumed job appears twice; the LAST
-    occurrence is the current one, which is what ``Manifest.find`` returns and
-    therefore what a report must read.
+    occurrence for a key is the current one, which is what ``Manifest.find``
+    returns and therefore what a report must read.
 
-    [VANTA-WHY] Item E6 + Q3 — a re-run of a job whose previous grade was
-    INCONCLUSIVE appends a new row that names the session it supersedes. That
-    superseded session is dropped from the reading as well, so a superseded
-    inconclusive row can never be counted even if its own key were the latest.
+    [VANTA-WHY] Item E6 + Q3 + F3 — a re-run of a job whose previous grade was
+    INCONCLUSIVE appends a new row that names the session it supersedes, and that
+    session is dropped too. The rule lives in ``manifest.effective_records`` so
+    every reader (this one, the batch digest, ``write_labels``, the pool harvest,
+    the replay selector) drops exactly the same rows rather than each re-deriving
+    "the last per key, minus a superseded session" for itself. A torn last line is
+    dropped here: the writer died mid-append and the cursor still says `running`.
     """
-    latest: dict[str, dict[str, Any]] = {}
-    superseded: set[str] = set()
+    rows: list[dict[str, Any]] = []
     with open(path, encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if not line:
                 continue
             try:
-                record = json.loads(line)
+                rows.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-            supersedes = record.get("supersedes")
-            if isinstance(supersedes, dict) and supersedes.get("session_id"):
-                superseded.add(str(supersedes["session_id"]))
-            key = str(record.get("key") or "")
-            if key:
-                latest[key] = record
-            else:
-                latest[f"#{len(latest)}"] = record
-    rows = [latest[key] for key in sorted(latest)]
-    return [row for row in rows if str(row.get("session_id") or "") not in superseded]
+    return manifest_mod.effective_records(rows)
 
 
 def load_replays(batch_dir: Path) -> list[dict[str, Any]]:

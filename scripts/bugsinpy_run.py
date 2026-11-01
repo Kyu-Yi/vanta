@@ -913,7 +913,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # The report is derived from the manifest on disk, not from this invocation's
     # return value: a resumed run must summarise the whole batch, not the tail of it.
-    records = manifest_mod.Manifest(batch_dir).records()
+    records = manifest_mod.Manifest(batch_dir).effective_records()
     if records:
         labels_path, payload = runner_mod.write_batch_report(batch_dir, records)
         print()
@@ -1050,7 +1050,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
     # Same tail as `run`: the report is the manifest on disk, so a resumed queue
     # summarises the whole batch and not the part this invocation happened to run.
-    records = manifest_mod.Manifest(batch_dir).records()
+    records = manifest_mod.Manifest(batch_dir).effective_records()
     if records:
         labels_path, payload = runner_mod.write_batch_report(batch_dir, records)
         print()
@@ -1383,7 +1383,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     approval" is how two numbers disagree.
     """
     batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
-    records = manifest_mod.Manifest(batch_dir).records()
+    records = manifest_mod.Manifest(batch_dir).effective_records()
     if not records:
         raise runner_mod.RunnerError(f"no manifest rows in {batch_dir}; run it first")
     labels_path, payload = runner_mod.write_batch_report(batch_dir, records)
@@ -1450,15 +1450,18 @@ def cmd_replay(args: argparse.Namespace) -> int:
     views = replay_mod.parse_views(args.views)
     sessions = runner_mod.sessions_dir()
 
-    latest: dict[str, dict[str, Any]] = {}
-    for record in manifest_mod.Manifest(batch_dir).records():
-        key = str(record.get("key") or "")
-        if key:
-            # The manifest is append-only, so a resumed or re-run job appears more
-            # than once; the last occurrence is the one `Manifest.find` and
-            # `state.json` treat as current, and therefore the one replayed.
-            latest[key] = record
-    rows = [record for record in latest.values() if replay_mod.is_repairable_row(record)]
+    # F3 — the rows that are current, through the one shared rule: a resumed or
+    # re-run job appears more than once and a re-run of an inconclusive job names the
+    # session it replaces, so the raw rows would replay a superseded session. The
+    # helper keeps the last row per key and drops a superseded session; a row with no
+    # key has no identity to replay under, so it is skipped as before.
+    rows = [
+        record
+        for record in manifest_mod.effective_records(
+            manifest_mod.Manifest(batch_dir).records()
+        )
+        if record.get("key") and replay_mod.is_repairable_row(record)
+    ]
     if not rows:
         raise replay_mod.ReplayError(
             f"no repair rows to replay in {batch_dir}: replay needs a repair row "

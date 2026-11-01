@@ -20532,6 +20532,33 @@ class TestManifest:
         assert manifest.find("k1")["label"] == "second"
         assert manifest.find("absent") is None
 
+    def test_effective_records_keeps_the_last_per_key_and_drops_a_superseded_session(
+        self, tmp_path
+    ):
+        """F3 — one shared rule: the last row per key, minus a named superseded session.
+
+        Every report reader calls this, so the digest, the labels file, the pool
+        harvest and the replay selector can never disagree about which rows exist. A
+        re-run appends a second row under the same key; a re-run of an inconclusive
+        job names, in `supersedes`, the session it replaces.
+        """
+        manifest = manifest_mod.Manifest(tmp_path)
+        manifest.append({"key": "k1", "session_id": "old", "tag": "first"})
+        manifest.append(
+            {
+                "key": "k1",
+                "session_id": "new",
+                "tag": "second",
+                "supersedes": {"session_id": "old", "key": "k1"},
+            }
+        )
+        manifest.append({"key": "k2", "session_id": "keep"})
+        effective = manifest.effective_records()
+        assert [row["key"] for row in effective] == ["k1", "k2"]
+        assert [row["session_id"] for row in effective] == ["new", "keep"]
+        # The rule is idempotent, so a reader may apply it to an already-filtered list.
+        assert manifest_mod.effective_records(effective) == effective
+
     def test_only_done_is_skipped_so_running_and_failed_are_re_run(self, tmp_path):
         """`running` means "no trustworthy row yet", and `failed` means "no evidence at all"."""
         manifest = manifest_mod.Manifest(tmp_path)
@@ -22227,6 +22254,27 @@ class TestDigestAndLabels:
         assert payload["runs"] == 3
         assert json.loads((tmp_path / "run_digest.json").read_text()) == payload
         assert (tmp_path / "run_digest.md").read_text().startswith("config")
+
+    def test_a_superseded_row_is_the_only_row_in_the_digest_and_the_labels(self, tmp_path):
+        """F3 — the batch report counts the CURRENT rows, not every row on disk.
+
+        A rerun appends a replacement and names, in `supersedes`, the session it
+        replaces. The digest used to count both and `write_labels` used to emit both,
+        so a rerun's report claimed two runs and a labels file labelled a session the
+        report no longer counted. The replacement is the only row left in either.
+        """
+        old = dict(self.ROWS[1], session_id="old", key="k1")
+        new = dict(
+            self.ROWS[1],
+            session_id="new",
+            key="k1",
+            supersedes={"session_id": "old", "key": "k1"},
+        )
+        labels_path, payload = runner_mod.write_batch_report(tmp_path, [old, new])
+        assert payload["runs"] == 1, "the superseded row was still counted in the digest"
+        assert json.loads((tmp_path / "run_digest.json").read_text())["runs"] == 1
+        labels = json.loads(labels_path.read_text())
+        assert set(labels) == {"new"}, "the superseded session was still labelled"
 
 
 class TestLocalizationHit:
@@ -27397,6 +27445,39 @@ class TestPoolHarvest:
         assert "second = 22" in attempt.patch_text
         assert harvest.missing == []
         assert harvest.not_reviewable == []
+
+    def test_a_superseded_row_is_not_harvested(self, tmp_path):
+        """F3 — the pool harvests the CURRENT rows, so a superseded session's attempts
+        are not offered as review candidates alongside the row that replaced it. Both
+        sessions carry a real snapshot, so the stale one WOULD be harvested if the raw
+        rows were read and this test would fail."""
+        prep = _pool_prep(tmp_path)
+        write(prep.root / "vanta_clean" / "pkg" / "mod.py", "one = 1\nsecond = 2\n")
+        for session, body in (("old", "second = 11\n"), ("new", "second = 22\n")):
+            write(
+                tmp_path
+                / "vanta_sessions"
+                / session
+                / "debug"
+                / "attempt_1_patched_tree"
+                / "pkg"
+                / "mod.py",
+                "one = 1\n" + body,
+            )
+        harvest = self._harvest(
+            tmp_path,
+            records=[
+                _attempt_row(session_id="old", key="k1"),
+                _attempt_row(
+                    session_id="new",
+                    key="k1",
+                    supersedes={"session_id": "old", "key": "k1"},
+                ),
+            ],
+            preps={prep.key: prep},
+        )
+        assert [attempt.source_run_id for attempt in harvest.attempts] == ["new"]
+        assert "second = 22" in harvest.attempts[0].patch_text
 
     def test_a_compacted_attempt_reconstructs_the_same_normalised_diff(self, tmp_path):
         prep = _pool_prep(tmp_path)

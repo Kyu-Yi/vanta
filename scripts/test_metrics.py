@@ -1416,3 +1416,19 @@ def test_load_manifest_drops_a_torn_last_line(tmp_path):
     records = metrics.load_manifest(str(path))
     assert [record["session_id"] for record in records] == ["s1"]
 
+
+def test_load_manifest_drops_a_superseded_session(tmp_path):
+    """F3 — `load_manifest` and `oracle_by_session` share one rule.
+
+    Both go through `manifest.effective_records`, so a session a later row names in
+    `supersedes` is dropped by the reader that loads the manifest as well as by the
+    reader that indexes the oracle, and the two can no longer disagree about which
+    rows exist.
+    """
+    rows = [
+        manifest_row("old", hidden_pass=False, patch_good=False, inconclusive=True),
+        {**manifest_row("new"), "supersedes": {"session_id": "old", "key": "k1"}},
+    ]
+    path = write_manifest(tmp_path, rows)
+    assert [record["session_id"] for record in metrics.load_manifest(path)] == ["new"]
+

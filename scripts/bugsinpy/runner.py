@@ -2753,9 +2753,11 @@ def run_job(
     )
     # [VANTA-WHY] Item E6 + Q3 — the only reason `is_done` let this key through is
     # that its previous row's oracle was INCONCLUSIVE. Rows stay append-only, so the
-    # old row is kept; this one names the session it supersedes, and both readers
-    # (`analyse.load_manifest`, `metrics.oracle_by_session`) drop that session. With
-    # no superseded session (the old row carried none), there is nothing to name.
+    # old row is kept; this one names the session it supersedes, and every reader —
+    # `analyse.load_manifest`, `metrics.oracle_by_session`, the batch digest,
+    # `write_labels`, the pool harvest and the replay selector — drops that session
+    # through the one shared rule, `manifest.effective_records` (F3). With no
+    # superseded session (the old row carried none), there is nothing to name.
     previous = manifest.find(job.key)
     if manifest_mod.oracle_inconclusive(previous) and previous.get("session_id"):
         record["supersedes"] = {
@@ -3648,9 +3650,14 @@ def write_labels(records: Iterable[dict[str, Any]], path: Path) -> Path:
     established, so an approval there is checkable. A repair row's patch has no
     declared truth — that is what its own oracle column is for — so labelling it
     here would claim a study design the batch does not have.
+
+    [VANTA-WHY] F3 — the rows are filtered to the current ones first
+    (``manifest.effective_records``), so a re-run's superseded session is not
+    labelled alongside its replacement. The rule is shared with every other reader
+    so the labels file and the digest can never disagree about which rows exist.
     """
     labels: dict[str, dict[str, Any]] = {}
-    for record in records:
+    for record in manifest_mod.effective_records(records):
         candidate = record.get("candidate")
         session_id = record.get("session_id")
         if not candidate or not session_id:
@@ -3697,9 +3704,15 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     (``b1`` and ``suite`` already share ``baseline``, and M3.5's ``b3-v2-*`` arms
     share ``vanta``). A row written before the field existed is backfilled from its
     own ``(mode, config)`` (:func:`arms.row_arm`), so old and new rows group alike.
+
+    [VANTA-WHY] F3 — ``runs`` is a count and must be a count of the CURRENT rows:
+    the rows are filtered through ``manifest.effective_records`` first, so a re-run
+    and the session it supersedes are not both counted. The same filter builds the
+    labels file, so the two artifacts always agree.
     """
     groups: dict[tuple, dict[str, Any]] = {}
-    for record in records:
+    effective = manifest_mod.effective_records(records)
+    for record in effective:
         key = (
             record.get("config"),
             arms_mod.row_arm(record),
@@ -3766,7 +3779,7 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
         group["localization"][
             "unknown" if hit is None else ("hit" if hit else "miss")
         ] += 1
-    return {"runs": len(records), "groups": list(groups.values())}
+    return {"runs": len(effective), "groups": list(groups.values())}
 
 
 def render_digest(payload: dict[str, Any]) -> str:

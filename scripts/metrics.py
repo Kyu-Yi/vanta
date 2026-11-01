@@ -115,6 +115,19 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+# [VANTA-WHY] F3 — `manifest.effective_records` is the ONE definition of "the rows
+# that are current" (the last row per key, minus any session a later row names in
+# `supersedes`). This module shares it rather than re-deriving the supersede rule,
+# so the oracle index and the batch digest can never disagree about which rows
+# exist. The scripts directory is on `sys.path` for every way this file is run
+# (`python3 scripts/metrics.py`, `analyse.py`'s import, the tests), but it is added
+# explicitly so the dependency is not an accident of the working directory.
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from bugsinpy import manifest as manifest_mod  # noqa: E402
+
 SUPPORTED_SCHEMA_VERSION = 1
 
 TRUE_CATCH = "true_catch"
@@ -1020,6 +1033,10 @@ def load_manifest(path: str) -> list[dict[str, Any]]:
     the job is re-run. This reader drops it for the same reason: a report taken
     from a crashed batch must report the rows that exist rather than refuse to
     run.
+
+    [WHY] F3 — the rows are then filtered to the current ones through
+    `manifest.effective_records`, so a resumed or re-run job is not read twice and a
+    re-run of an inconclusive job drops the session it supersedes.
     """
     records: list[dict[str, Any]] = []
     with open(path, encoding="utf-8") as handle:
@@ -1031,7 +1048,7 @@ def load_manifest(path: str) -> list[dict[str, Any]]:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    return records
+    return manifest_mod.effective_records(records)
 
 
 @dataclass
@@ -1070,25 +1087,20 @@ def oracle_by_session(records: list[dict[str, Any]]) -> dict[str, OracleFacts]:
     still failed" vs "the native suite regressed") instead of merely counted.
     Reading them from the manifest keeps one copy of the oracle in one place.
 
-    [WHY] Item E6 + Q3 — a re-run of a job whose previous grade was INCONCLUSIVE
-    appends a row naming the session it supersedes. That superseded session is
-    dropped here, so the inconclusive reading can never be counted. Read from the
-    rows, not from `load_manifest`, because this reader is handed every row in
-    order (including both the old and the new one).
+    [WHY] Item E6 + Q3 + F3 — a re-run of a job whose previous grade was
+    INCONCLUSIVE appends a row naming the session it supersedes. That superseded
+    session is dropped here, so the inconclusive reading can never be counted. The
+    filter is `manifest.effective_records`, the one shared rule: it keeps the last
+    row per key and drops a named superseded session, so this index is the same set
+    of rows the batch digest and `write_labels` count. Rows that already passed
+    through it are unaffected (the rule is idempotent), so a caller may hand this
+    reader either the raw manifest rows or an effective subset.
     """
-    superseded = {
-        str(supersedes["session_id"])
-        for record in records
-        for supersedes in [record.get("supersedes")]
-        if isinstance(supersedes, dict) and supersedes.get("session_id")
-    }
     out: dict[str, OracleFacts] = {}
-    for record in records:
+    for record in manifest_mod.effective_records(records):
         session_id = record.get("session_id")
         oracle = record.get("oracle")
         if not session_id or not isinstance(oracle, dict):
-            continue
-        if str(session_id) in superseded:
             continue
         regressions = oracle.get("suite_regressions_count")
         if regressions is None:

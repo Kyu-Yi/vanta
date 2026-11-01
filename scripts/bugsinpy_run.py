@@ -42,6 +42,7 @@ import subprocess
 import sys
 import traceback
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -754,6 +755,25 @@ def select_preps(
     return chosen
 
 
+def effective_env(
+    frozen_env: Mapping[str, str], *, base: Optional[Mapping[str, str]] = None
+) -> dict[str, str]:
+    """Item B1 — the environment a run's OWN checks and its children both see.
+
+    [VANTA-WHY] The frozen ``[env]`` settings are applied by the harness
+    (``runner.vanta_env``) to every child, on top of the caller's own
+    environment. Before this, the two reads the invocation makes about its OWN
+    configuration — §14.29's spend cap (``VANTA_MAX_SPEND_USD``) and item 14's
+    endpoint preflight (``VANTA_LLM_BASE_URL``) — read ``os.environ`` alone, so a
+    setting frozen in the file but not exported was honoured by the children and
+    ignored by the checks meant to guard them: a frozen ``VANTA_MAX_SPEND_USD``
+    left the batch *uncapped*. The effective environment is the one value used
+    for both, exactly as ``vanta_env`` layers them (frozen wins over the caller).
+    """
+
+    return {**(os.environ if base is None else base), **frozen_env}
+
+
 def max_spend_usd_from_env(env: Mapping[str, str]) -> Optional[float]:
     """§14.29 — ``VANTA_MAX_SPEND_USD``: the batch's budget, or ``None`` for no cap.
 
@@ -788,12 +808,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     wrong directory would mount nothing and fail per job instead of once.
     """
     runner_mod.require_repo_cwd()
-    # Item 14 — the same shape, and the same reason, as the repo-root check above:
-    # a run against a model endpoint that is not there fails one job at a time, and
-    # the only cheap moment to say so is before the first one. `--plan` is exempt
-    # because printing the schedule sends no request, so it must not need one.
-    if not args.plan:
-        runner_mod.require_model_endpoint()
     # Item 19 — the frozen configuration, resolved before anything else runs.
     # `load` reads `configs/v1-m3.toml`; `resolve` REFUSES the run when the caller's
     # own environment contradicts a setting the file freezes to a literal, unless
@@ -815,6 +829,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         ),
         flush=True,
     )
+    # Item B1 — the ONE effective environment: the caller's own, with the frozen
+    # `[env]` settings applied exactly as `runner.vanta_env` will apply them to
+    # each child. Every read this invocation makes about its OWN configuration
+    # must see it — item 14's endpoint preflight (reads `VANTA_LLM_BASE_URL`) and
+    # §14.29's spend cap (reads `VANTA_MAX_SPEND_USD`) — or a setting frozen in
+    # the file but not exported is honoured by the children and ignored by the
+    # checks that guard them. Built here, before the preflight, which used to run
+    # first against `os.environ` alone.
+    invocation_env = effective_env(frozen_env)
+    # Item 14 — the same shape, and the same reason, as the repo-root check above:
+    # a run against a model endpoint that is not there fails one job at a time, and
+    # the only cheap moment to say so is before the first one. `--plan` is exempt
+    # because printing the schedule sends no request, so it must not need one.
+    if not args.plan:
+        runner_mod.require_model_endpoint(
+            preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env)
+        )
     split = load_split(args.split.resolve())
     batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
     bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
@@ -840,8 +871,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # §14.29 — the batch's budget, if the caller set one. Announced before the
     # first job so the number a run is capped at is on the record at the top of
-    # the log rather than only in the environment that invoked it.
-    max_spend_usd = max_spend_usd_from_env(os.environ)
+    # the log rather than only in the environment that invoked it. Read from the
+    # effective environment (item B1), so a cap frozen in `[env]` is honoured even
+    # when the caller did not export it.
+    max_spend_usd = max_spend_usd_from_env(invocation_env)
     if max_spend_usd is not None:
         print(
             f"[spend] VANTA_MAX_SPEND_USD=${max_spend_usd:g}: the batch stops before "
@@ -865,7 +898,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_spend_usd=max_spend_usd,
         # Item 14's per-row half. `--plan` returns from `run_batch` before the loop,
         # so passing the probe unconditionally cannot make a plan need an endpoint.
-        preflight=runner_mod.model_endpoint_preflight,
+        # Bound to the effective environment (item B1) so the per-row probe asks the
+        # same endpoint the children will use.
+        preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env),
         # Item 19 — the frozen configuration resolved above: the block lands on every
         # row, the environment on every child.
         config_block=config_block,
@@ -929,8 +964,6 @@ def cmd_queue(args: argparse.Namespace) -> int:
     wave concurrently, delegating each bug to the same ``run_batch`` ``run`` uses.
     """
     runner_mod.require_repo_cwd()
-    if not args.plan:
-        runner_mod.require_model_endpoint()
     # Item 19 — the frozen configuration, resolved once for the whole queue. `jobs`
     # parallel bugs share one configuration; a queue split across two config files
     # would be two experiments sharing a batch directory.
@@ -948,6 +981,14 @@ def cmd_queue(args: argparse.Namespace) -> int:
         ),
         flush=True,
     )
+    # Item B1 — the same ONE effective environment as `run`: the caller's own with
+    # the frozen `[env]` applied, used by the preflight and the spend cap so a
+    # setting frozen in the file but not exported is not silently dropped.
+    invocation_env = effective_env(frozen_env)
+    if not args.plan:
+        runner_mod.require_model_endpoint(
+            preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env)
+        )
     split = load_split(args.split.resolve())
     batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
     bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
@@ -969,7 +1010,9 @@ def cmd_queue(args: argparse.Namespace) -> int:
     if stale_warning:
         print(f"WARNING: {stale_warning}", file=sys.stderr, flush=True)
 
-    max_spend_usd = max_spend_usd_from_env(os.environ)
+    # Read from the effective environment (item B1), so a cap frozen in `[env]` is
+    # honoured even when the caller did not export it.
+    max_spend_usd = max_spend_usd_from_env(invocation_env)
     if max_spend_usd is not None:
         print(
             f"[spend] VANTA_MAX_SPEND_USD=${max_spend_usd:g}: the queue stops claiming "
@@ -992,7 +1035,8 @@ def cmd_queue(args: argparse.Namespace) -> int:
         show_hints=args.show_hints,
         plan_only=args.plan,
         max_spend_usd=max_spend_usd,
-        preflight=runner_mod.model_endpoint_preflight,
+        # Bound to the effective environment (item B1), as in `run`.
+        preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env),
         config_block=config_block,
         frozen_env=frozen_env,
         arm_spellings=arm_spellings,

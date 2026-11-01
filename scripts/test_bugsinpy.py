@@ -29438,3 +29438,124 @@ class TestFrozenConfigWiring:
             is True
         )
 
+
+class TestTheInvocationEnvironment:
+    """Item B1 — the run's own checks must see the environment its children see.
+
+    ``runner.vanta_env`` layers the frozen ``[env]`` on top of the caller's own
+    environment for every child. Before item B1 the two reads the invocation made
+    about *its own* configuration — §14.29's spend cap (``VANTA_MAX_SPEND_USD``)
+    and item 14's endpoint preflight (``VANTA_LLM_BASE_URL``) — read
+    ``os.environ`` alone, so a value frozen in the file but not exported by the
+    shell was honoured by the children and ignored by the checks guarding them.
+    """
+
+    def test_a_frozen_setting_wins_over_the_callers_own(self):
+        env = run_mod.effective_env(
+            {"VANTA_ARM": "b3"}, base={"VANTA_ARM": "b0", "PATH": "/bin"}
+        )
+        assert env["VANTA_ARM"] == "b3"
+        # A variable the file does not freeze is left exactly as the caller had it.
+        assert env["PATH"] == "/bin"
+
+    def test_the_default_base_is_the_process_environment(self, monkeypatch):
+        monkeypatch.setenv("VANTA_B1_MARKER", "from-the-shell")
+        env = run_mod.effective_env({"VANTA_ARM": "b3"})
+        assert env["VANTA_B1_MARKER"] == "from-the-shell"
+        assert env["VANTA_ARM"] == "b3"
+
+    def test_the_cap_and_both_preflights_read_the_frozen_env(self, tmp_path, monkeypatch):
+        """One environment for the invocation's own checks: the run half."""
+        # The shell exports none of the frozen settings — that is the whole point.
+        # `resolve` refuses a caller who sets one to a *different* value, so this
+        # also keeps the test to the behaviour it is about.
+        for name in frozen_mod.load().frozen():
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(
+            run_mod,
+            "load_split",
+            lambda path: SimpleNamespace(bugsinpy_root="runs/bugsinpy", seeds=[0]),
+        )
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        batch = SimpleNamespace(preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path)
+        monkeypatch.setattr(runner_mod, "load_prepared", lambda **kwargs: batch)
+        monkeypatch.setattr(runner_mod, "context_window_warning", lambda b: None)
+        monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])
+        monkeypatch.setattr(runner_mod, "require_vanta_bin", lambda path: path)
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: None)
+
+        # Item 14's probe, replaced by a spy so no request leaves the test. `cmd_run`
+        # builds `partial(runner_mod.model_endpoint_preflight, env=…)`, so it binds
+        # whichever object this attribute holds at the moment it runs.
+        seen: list = []
+
+        def spy(*, env=None, probe=None):
+            seen.append(env)
+            return None
+
+        monkeypatch.setattr(runner_mod, "model_endpoint_preflight", spy)
+        captured: dict = {}
+
+        def fake_run_batch(**kwargs):
+            captured.update(kwargs)
+            return run_mod.EXIT_OK, []
+
+        monkeypatch.setattr(runner_mod, "run_batch", fake_run_batch)
+
+        code = run_mod.main(["run", "--batch", str(tmp_path)])
+
+        assert code == run_mod.EXIT_OK
+        # The value is frozen in the file and absent from the shell, yet the batch is
+        # capped at it: the read saw the effective environment, not `os.environ`.
+        assert "VANTA_MAX_SPEND_USD" not in os.environ
+        assert captured["max_spend_usd"] == 5.0
+        # The pre-batch preflight asked the frozen environment…
+        assert seen and seen[0]["VANTA_ARM"] == "b3"
+        # …and the per-row half is the same probe, bound to the same environment.
+        captured["preflight"]()
+        assert seen[1] == seen[0]
+        assert seen[1]["VANTA_MAX_SPEND_USD"] == "5"
+
+    def test_the_queue_uses_the_same_effective_environment(self, tmp_path, monkeypatch):
+        """The ``queue`` half: the same preamble, so the same fix and the same test."""
+        for name in frozen_mod.load().frozen():
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(
+            run_mod,
+            "load_split",
+            lambda path: SimpleNamespace(bugsinpy_root="runs/bugsinpy", seeds=[0]),
+        )
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        batch = SimpleNamespace(preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path)
+        monkeypatch.setattr(runner_mod, "load_prepared", lambda **kwargs: batch)
+        monkeypatch.setattr(runner_mod, "context_window_warning", lambda b: None)
+        monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])
+        monkeypatch.setattr(runner_mod, "require_vanta_bin", lambda path: path)
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: None)
+
+        seen: list = []
+
+        def spy(*, env=None, probe=None):
+            seen.append(env)
+            return None
+
+        monkeypatch.setattr(runner_mod, "model_endpoint_preflight", spy)
+        captured: dict = {}
+
+        def fake_run_queue(**kwargs):
+            captured.update(kwargs)
+            return run_mod.EXIT_OK, []
+
+        monkeypatch.setattr(runner_mod, "run_queue", fake_run_queue)
+
+        code = run_mod.main(["queue", "--batch", str(tmp_path)])
+
+        assert code == run_mod.EXIT_OK
+        assert "VANTA_MAX_SPEND_USD" not in os.environ
+        assert captured["max_spend_usd"] == 5.0
+        assert seen and seen[0]["VANTA_ARM"] == "b3"
+        captured["preflight"]()
+        assert seen[1] == seen[0]
+

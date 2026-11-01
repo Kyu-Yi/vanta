@@ -3389,9 +3389,14 @@ def wave_gate_failures(records: Sequence[dict[str, Any]]) -> list[str]:
         tag = f"{record['bug']} {record['config']} {record['mode']}"
         if record.get("verdict") == "InfraFailure":
             problems.append(f"{tag}: InfraFailure — the environment, not the model")
-        elif record.get("label") == "unobservable":
+        elif record.get("label") in ("unobservable", "inconclusive"):
+            # [VANTA-WHY] Item E7 — an INCONCLUSIVE grade (the patch applied but a run
+            # wrote no readable report) is the same class of fact as `unobservable`: a
+            # measurement the environment failed, not a decision about the model. Wave 1
+            # is the go/no-go gate for "the oracle or the plumbing misbehaves", and an
+            # unreadable grading is exactly that, so it stops the wave and names the row.
             problems.append(
-                f"{tag}: unobservable — verdict={record.get('verdict')} "
+                f"{tag}: {record['label']} — verdict={record.get('verdict')} "
                 f"({record['oracle'].get('apply_detail') or record['oracle'].get('error')})"
             )
     # §8.2 item 5: the developer fix must grade good and the no-op must not. This

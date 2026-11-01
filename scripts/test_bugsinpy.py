@@ -21963,6 +21963,33 @@ class TestWaveGate:
         problems = runner_mod.wave_gate_failures(rows)
         assert any("unobservable" in problem and "does not apply" in problem for problem in problems)
 
+    def test_an_inconclusive_grade_stops_the_wave_like_a_censor(self):
+        """Item E7 — a wave-1 row whose oracle read no report is a problem, not silence.
+
+        [WHY] The patch applied but the run wrote no readable report, so the grade
+        established no ground truth. Wave 1 gates "the oracle or the plumbing
+        misbehaves", and an unreadable grading is exactly that. The label is taken
+        from `label_for`, so this fails if the label table and the gate ever disagree
+        about what the state is called.
+        """
+        rows = _healthy_wave()
+        rows[0]["verdict"] = "AllTestsPassed"
+        rows[0]["oracle"]["apply_ok"] = True
+        rows[0]["oracle"]["error"] = "the hidden run produced no pytest report"
+        rows[0]["label"] = runner_mod.label_for(
+            "AllTestsPassed",
+            oracle_mod.OracleResult(
+                apply_ok=True,
+                inconclusive=True,
+                error="the hidden run produced no pytest report",
+            ),
+        )
+        assert rows[0]["label"] == "inconclusive"
+        problems = runner_mod.wave_gate_failures(rows)
+        assert any(
+            "inconclusive" in problem and "no pytest report" in problem for problem in problems
+        )
+
     def test_a_developer_fix_that_grades_bad_proves_the_oracle_is_wrong(self):
         rows = _healthy_wave()
         for row in rows:

@@ -7588,6 +7588,12 @@ class TestPrepareRunRecordContract:
             preps=list(preps),
             n_ctx=n_ctx,
             n_ctx_source=n_ctx_source,
+            config_block={
+                "config_hash": "0" * 64,
+                "config_path": "configs/v1-m3.toml",
+                "config_override": False,
+                "config_overrides": [],
+            },
         )
         (batch_dir / "prepare.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
@@ -23503,7 +23509,7 @@ class TestStaleBinary:
         monkeypatch.setattr(run_mod, "select", lambda *a, **k: [(entry, True)])
         monkeypatch.setattr(meta_mod, "ensure_clone", lambda root, *, commit: commit)
         monkeypatch.setattr(
-            ctx, "explicit_context_window", lambda n_ctx=None: (131_072, "test")
+            ctx, "explicit_context_window", lambda n_ctx=None, environ=None: (131_072, "test")
         )
         monkeypatch.setattr(
             runner_mod, "require_vanta_bin", lambda path: Path("/nonexistent/vanta_m3")
@@ -32856,6 +32862,121 @@ class TestFrozenConfigWiring:
             parser.parse_args(
                 ["--batches", "x", "--allow-mixed-configs"]
             ).allow_mixed_configs
+            is True
+        )
+
+
+class TestPrepareFrozenConfig:
+    """Q3 — ``prepare`` resolves the frozen configuration exactly as ``run`` does.
+
+    [VANTA-WHY] Two things were wrong before this. ``prepare`` never read
+    ``configs/v1-m3.toml`` at all, so a shell that contradicted the frozen
+    ``[env]`` prepared a batch whose rows would claim a configuration they did not
+    measure. And its context gate read ``os.environ`` alone, so a clean shell — the
+    normal case, exporting none of the frozen settings — failed with
+    ``ContextError`` even though the file freezes ``VANTA_LLM_CONTEXT_TOKENS``,
+    which is the window every child of the run is handed.
+    """
+
+    @staticmethod
+    def _clean_shell(monkeypatch) -> None:
+        """A real shell: nothing in the frozen ``[env]`` is exported."""
+        for name in list(os.environ):
+            if name.startswith("VANTA_"):
+                monkeypatch.delenv(name, raising=False)
+
+    def test_a_clean_shell_sizes_the_gate_from_the_frozen_window(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The gate must resolve the frozen window rather than refuse.
+
+        Everything expensive is stubbed, but ``explicit_context_window`` is left
+        REAL: the point is that the stage hands it the invocation's own
+        environment, so the frozen ``VANTA_LLM_CONTEXT_TOKENS`` is what it reads.
+        The one bug then fails in ``prepare_one`` (stubbed), which is what gets the
+        stage all the way to the writers and to ``prepare.json``.
+        """
+        self._clean_shell(monkeypatch)
+        # No server to ask, so the frozen file is the only remaining source.
+        monkeypatch.setattr(ctx, "probe_props_n_ctx", lambda *a, **k: None)
+        split = split_mod.Split(split_data())
+        split_path = tmp_path / "split.json"
+        split_path.write_text(split.to_json(), encoding="utf-8")
+        entry = split.bugs[0]
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split)
+        monkeypatch.setattr(run_mod, "select", lambda *a, **k: [(entry, True)])
+        monkeypatch.setattr(meta_mod, "ensure_clone", lambda root, *, commit: commit)
+        monkeypatch.setattr(
+            runner_mod, "require_vanta_bin", lambda path: tmp_path / "vanta_m3"
+        )
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: "")
+        monkeypatch.setattr(prepare_mod, "missing_checkpoints", lambda names: [])
+        monkeypatch.setattr(bake_mod, "missing_deps", lambda deps, names: [])
+        monkeypatch.setattr(
+            meta_mod,
+            "project_github_url",
+            lambda *a, **k: "https://example.invalid/x.git",
+        )
+        monkeypatch.setattr(run_mod, "tree_cache", lambda *a, **k: tmp_path / "repo")
+        monkeypatch.setattr(
+            prepare_mod,
+            "prepare_one",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stub-one")),
+        )
+        batch = tmp_path / "batch"
+        args = run_mod.build_parser().parse_args(
+            ["prepare", "--split", str(split_path), "--batch", str(batch)]
+        )
+        # It must reach the writers (a returned code, not a ContextError).
+        run_mod.cmd_prepare(args)
+        assert "n_ctx=262144" in capsys.readouterr().out
+        payload = json.loads((batch / "prepare.json").read_text(encoding="utf-8"))
+        assert payload["n_ctx"] == 262144
+        assert payload["n_ctx_source"] == "VANTA_LLM_CONTEXT_TOKENS"
+        # Q3 — the configuration block is recorded, the same four keys as a row.
+        assert payload["config_path"] == "configs/v1-m3.toml"
+        assert payload["config_hash"] == frozen_mod.load().sha256
+        assert payload["config_override"] is False
+        assert payload["config_overrides"] == []
+
+    def test_a_contradicting_shell_is_refused_unless_waived(self, monkeypatch):
+        """``VANTA_SAMPLING`` is frozen to ``coding``; pinning it is a contradiction."""
+        monkeypatch.setenv("VANTA_SAMPLING", "pinned")
+        args = run_mod.build_parser().parse_args(["prepare", "--split", "x.json"])
+        with pytest.raises(frozen_mod.FrozenConfigError, match="contradicts"):
+            run_mod.cmd_prepare(args)
+
+    def test_the_waiver_lets_prepare_through_and_records_the_override(
+        self, tmp_path, monkeypatch
+    ):
+        """``--allow-override`` clears the same contradiction.
+
+        The stage then runs on; ``load_split`` is stubbed to raise a sentinel, and
+        that sentinel — not a ``FrozenConfigError`` — is the proof it got past the
+        gate.
+        """
+        monkeypatch.setenv("VANTA_SAMPLING", "pinned")
+        seen: dict[str, Any] = {}
+
+        def _record_and_raise(path):
+            seen["entered"] = True
+            raise RuntimeError("past the gate")
+
+        monkeypatch.setattr(run_mod, "load_split", _record_and_raise)
+        args = run_mod.build_parser().parse_args(
+            ["prepare", "--split", "x.json", "--allow-override"]
+        )
+        with pytest.raises(RuntimeError, match="past the gate"):
+            run_mod.cmd_prepare(args)
+        assert seen["entered"] is True
+
+    def test_the_prepare_command_carries_allow_override_defaulting_off(self):
+        parser = run_mod.build_parser()
+        assert parser.parse_args(["prepare", "--split", "x"]).allow_override is False
+        assert (
+            parser.parse_args(
+                ["prepare", "--split", "x", "--allow-override"]
+            ).allow_override
             is True
         )
 

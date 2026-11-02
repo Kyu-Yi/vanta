@@ -1953,6 +1953,7 @@ def prepare_manifest(
     preps: list[BugPrep],
     n_ctx: int,
     n_ctx_source: str,
+    config_block: Mapping[str, Any],
 ) -> dict[str, Any]:
     """The whole ``prepare.json`` payload — the one writer ``run`` reads back.
 
@@ -1966,6 +1967,14 @@ def prepare_manifest(
     ``n_ctx``/``n_ctx_source`` are the window the gate was sized against (§1.6.1):
     recorded here, and compared against the run's own window by
     ``runner.context_window_warning``.
+
+    ``config_block`` is item 19's frozen-configuration block — ``config_hash``,
+    ``config_path``, ``config_override`` and ``config_overrides``, the same four
+    keys ``build_record`` puts on every row (item Q3). It is passed in rather than
+    loaded here so that the stage resolves the configuration *once*, at the start,
+    exactly as ``run`` does: the hash on the file is then the hash the batch
+    measured under, and a ``prepare.json`` naming a different configuration from
+    its rows is a contradiction this payload cannot express.
     """
     return {
         "schema_version": 1,
@@ -1982,6 +1991,7 @@ def prepare_manifest(
         # number came from. ``run`` reads these back and warns when its own differs.
         "n_ctx": n_ctx,
         "n_ctx_source": n_ctx_source,
+        **config_block,
         "selected": list(selected),
         "breaks": [{"bug": key, "detail": detail} for key, detail in broken],
         "bugs": [prep.to_dict() for prep in preps],

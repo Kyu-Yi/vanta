@@ -218,6 +218,36 @@ def render_plan(selected: list[tuple[dict[str, Any], bool]]) -> str:
 # prepare
 # ---------------------------------------------------------------------------
 def cmd_prepare(args: argparse.Namespace) -> int:
+    # Item 19 / Q3 — the frozen configuration, resolved exactly as `run` resolves
+    # it and before anything else. `resolve` REFUSES the invocation when the
+    # caller's own environment contradicts a setting the file freezes to a
+    # literal, unless `--allow-override` waives it, and it returns the row block
+    # (`config_hash` and friends, written into `prepare.json` below) and the
+    # `[env]` settings to apply. prepare used to read `os.environ` alone for the
+    # context window (§1.6.1), so a shell that exported none of the frozen
+    # settings — the normal case — failed the gate even though the file freezes
+    # `VANTA_LLM_CONTEXT_TOKENS`: the gate sized against nothing while every child
+    # of the batch would have been handed the frozen window. Resolving here is
+    # what lets it size against the window the run will actually use.
+    frozen = frozen_mod.load()
+    config_block, frozen_env = frozen_mod.resolve(
+        frozen, environ=os.environ, allow_override=args.allow_override
+    )
+    print(
+        f"[config] {frozen.name} {frozen.sha256[:12]} ({config_block['config_path']})"
+        + (
+            "; --allow-override waives "
+            + ", ".join(config_block["config_overrides"])
+            if config_block["config_overrides"]
+            else ""
+        ),
+        flush=True,
+    )
+    # Item B1 — the ONE effective environment, the caller's own with the frozen
+    # `[env]` settings applied exactly as `runner.vanta_env` will apply them to
+    # each child. The window the gate resolves below is read from it, so a clean
+    # shell sizes the gate against the frozen value rather than refusing.
+    invocation_env = effective_env(frozen_env)
     split_path: Path = args.split.resolve()
     split = load_split(split_path)
     if args.refreeze and args.measure_only:
@@ -257,8 +287,13 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     # source only (§1.6.1). This happens before the first checkout on purpose: with
     # the window unresolved the gate would size against the 65536 fallback and
     # reject bugs for a prompt no run would ever send, and it would do that after
-    # hours of suite runs rather than before them.
-    n_ctx, n_ctx_source = context_mod.explicit_context_window(n_ctx=args.n_ctx)
+    # hours of suite runs rather than before them. Read from the invocation's own
+    # environment (`invocation_env`, item Q3): the frozen `[env]` settings are what
+    # every child gets, so a shell that exported none of them still sizes the gate
+    # against the frozen window instead of refusing.
+    n_ctx, n_ctx_source = context_mod.explicit_context_window(
+        n_ctx=args.n_ctx, environ=invocation_env
+    )
     print(
         f"context window: n_ctx={n_ctx} (source: {n_ctx_source}) — the context gate "
         "is sized against this window",
@@ -389,6 +424,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         preps=preps,
         n_ctx=n_ctx,
         n_ctx_source=n_ctx_source,
+        config_block=config_block,
     )
     (batch_dir / "prepare.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
@@ -1680,6 +1716,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the selected plan from the committed split and exit",
     )
     prep.add_argument("--traceback", action="store_true", help="print tracebacks")
+    prep.add_argument(
+        "--allow-override",
+        action="store_true",
+        help=(
+            "prepare even though the environment contradicts configs/v1-m3.toml "
+            "(item 19/Q3). Without it, a `VANTA_` variable the file freezes to a "
+            "different value — or freezes to `unset` and the caller set — refuses "
+            "prepare before the first checkout, because the gate would be sized "
+            "against a window the run will not use. The waiver and the values it "
+            "waived are recorded in `prepare.json` (`config_override`, "
+            "`config_overrides`), so such a batch still cannot be pooled with one "
+            "that did not need it."
+        ),
+    )
     prep.set_defaults(func=cmd_prepare)
 
     bake = sub.add_parser(

@@ -2568,13 +2568,21 @@ def _list(value: Optional[str]) -> Optional[list[str]]:
     its space and inject a field; the driver encodes it space-free and this reads
     the path back exactly. An entry without a ``%`` is returned unchanged, so a
     row written before this change still reads as it did.
+
+    [VANTA-WHY] M3 item U7 — the literal ``none`` is the empty-list sentinel only
+    when it is NOT bracketed. The driver brackets every non-empty list, so a
+    ``none`` inside brackets is one path actually NAMED ``none``: reading it as
+    the sentinel would report a run that created a file named ``none`` as having
+    created nothing. A bare ``none`` (and a bracketed empty body) still reads as
+    ``[]``, so an old row keeps its meaning.
     """
     if value is None:
         return None
     body = value.strip()
-    if body.startswith("[") and body.endswith("]"):
+    bracketed = body.startswith("[") and body.endswith("]")
+    if bracketed:
         body = body[1:-1]
-    if body in ("", "none"):
+    elif body in ("", "none"):
         return []
     return [unquote(item) for item in body.split(";") if item]
 

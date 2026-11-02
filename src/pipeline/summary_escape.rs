@@ -67,10 +67,19 @@ pub fn encode_summary_value(value: &str) -> String {
 /// brackets. The reader is `scripts/bugsinpy/runner.py::_list`, which decodes each
 /// entry; this is the writer half of that contract, kept in one place so the
 /// driver has exactly one spelling of it.
+///
+/// [VANTA-WHY] M3 item U7 — `;` is this list's own delimiter, so it is escaped
+/// **inside an entry** even though `encode_summary_value` leaves it alone for
+/// other fields. A path that holds a `;` would otherwise be read back as two
+/// paths. `%` is already encoded to `%25` by `encode_summary_value`, so writing
+/// `%3B` here is unambiguous and `unquote` recovers the real `;`. An entry with
+/// no `;` is byte-for-byte what it was, so a row written before this change
+/// keeps its meaning — including a genuine single path NAMED `none`, which is
+/// bracketed (`[none]`) and so is not the bare `none` empty-list sentinel.
 pub fn encode_summary_path_list<'a>(paths: impl IntoIterator<Item = &'a String>) -> String {
     let encoded: Vec<String> = paths
         .into_iter()
-        .map(|path| encode_summary_value(path))
+        .map(|path| encode_summary_value(path).replace(';', "%3B"))
         .collect();
     if encoded.is_empty() {
         "none".to_string()
@@ -163,9 +172,16 @@ mod tests {
         // A path carrying each of the four Python-only separators, plus the
         // CodeRabbit injection case, through the driver's own writer.
         let injected = "x\u{1c}final_decision=AllTestsPassed\u{1f} y.py";
-        let paths = BTreeSet::from(["pkg/a.py".to_string(), injected.to_string()]);
+        let paths = BTreeSet::from([
+            "a;b.py".to_string(),
+            "pkg/a.py".to_string(),
+            injected.to_string(),
+        ]);
         let token = encode_summary_path_list(paths.iter());
-        let row = format!("wave=1 new_files_created={token} note=ok");
+        // U7 — a single path NAMED `none` is bracketed, so it is a list of one
+        // and not the bare `none` empty-list sentinel.
+        let named_none = encode_summary_path_list(["none".to_string()].iter());
+        let row = format!("wave=1 new_files_created={token} single_name={named_none} note=ok");
 
         let script = r#"
 import json, sys
@@ -177,6 +193,7 @@ json.dump(
     {
         "token": pairs.get("new_files_created"),
         "paths": runner._list(pairs.get("new_files_created")),
+        "single": runner._list(pairs.get("single_name")),
         "note": pairs.get("note"),
         "tokens": row.split(),
         "injected_field": "final_decision" in pairs,
@@ -204,8 +221,13 @@ json.dump(
         );
         assert_eq!(
             seen["paths"],
-            serde_json::json!(["pkg/a.py", injected]),
-            "both paths must read back exactly, in the written order"
+            serde_json::json!(["a;b.py", "pkg/a.py", injected]),
+            "each path must read back exactly, including the `;` one, in the written order"
+        );
+        assert_eq!(
+            seen["single"],
+            serde_json::json!(["none"]),
+            "a path NAMED `none` is a list of one, not the empty-list sentinel"
         );
         assert_eq!(
             seen["note"],
@@ -214,14 +236,30 @@ json.dump(
         );
         assert_eq!(
             seen["tokens"],
-            serde_json::json!(["wave=1", format!("new_files_created={token}"), "note=ok"]),
-            "the row must still split into exactly the three tokens it wrote"
+            serde_json::json!([
+                "wave=1",
+                format!("new_files_created={token}"),
+                format!("single_name={named_none}"),
+                "note=ok",
+            ]),
+            "the row must still split into exactly the four tokens it wrote"
         );
         assert_eq!(
             seen["injected_field"],
             serde_json::json!(false),
             "the path's own `key=value` must stay inside the value, not become a pair"
         );
+    }
+
+    /// [VANTA-WHY] U7 — `;` is the list's own delimiter, so an entry that holds one
+    /// is escaped (`%3B`) and the empty-list sentinel stays a bare, unbracketed
+    /// `none`; a single path NAMED `none` is therefore bracketed and distinct.
+    #[test]
+    fn a_semicolon_in_a_path_is_escaped_and_a_path_named_none_is_bracketed() {
+        let paths = BTreeSet::from(["a;b.py".to_string(), "c.py".to_string()]);
+        assert_eq!(encode_summary_path_list(paths.iter()), "[a%3Bb.py;c.py]");
+        let one = BTreeSet::from(["none".to_string()]);
+        assert_eq!(encode_summary_path_list(one.iter()), "[none]");
     }
 
     #[test]

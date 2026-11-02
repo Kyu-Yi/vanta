@@ -25310,6 +25310,26 @@ class TestNewFilesCreated:
         row = self._row(tmp_path, monkeypatch, summary)
         assert row["new_files_created"] is None
 
+    def test_a_semicolon_in_a_path_is_one_path_not_two(self, tmp_path, monkeypatch):
+        """M3 item U7 — `;` is the list's own delimiter, so the driver escapes it
+        inside an entry (`%3B`) and this reads the path back whole rather than as
+        two paths."""
+        summary = dict(_outcome(tmp_path).summary, new_files_created="[a%3Bb.py;c.py]")
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["new_files_created"] == ["a;b.py", "c.py"]
+
+    def test_a_single_path_named_none_is_not_the_empty_sentinel(self, tmp_path, monkeypatch):
+        """M3 item U7 — the driver brackets every non-empty list, so `[none]` is one
+        path actually named `none`; only a bare `none` is the empty-list sentinel."""
+        summary = dict(_outcome(tmp_path).summary, new_files_created="[none]")
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["new_files_created"] == ["none"]
+
+    def test_a_bare_none_is_still_the_empty_list(self):
+        """Old rows — and the writer's sentinel — keep their meaning (U7)."""
+        assert runner_mod._list("none") == []
+        assert runner_mod._list("[]") == []
+
 
 class TestRunJob:
     """The row, the censor and the resume ordering — all three fail silently if wrong."""

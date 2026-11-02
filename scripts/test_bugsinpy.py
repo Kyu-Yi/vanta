@@ -33521,7 +33521,7 @@ class TestPrepareFrozenConfig:
         gate.
         """
         monkeypatch.setenv("VANTA_SAMPLING", "pinned")
-        seen: dict[str, Any] = {}
+        seen: dict[str, object] = {}
 
         def _record_and_raise(path):
             seen["entered"] = True

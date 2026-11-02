@@ -74,6 +74,7 @@ from bugsinpy import version_pin as version_pin_mod  # noqa: E402
 from bugsinpy.split import SplitError, load_split  # noqa: E402
 import analyse as analyse_mod  # noqa: E402
 import bugsinpy_run as run_mod  # noqa: E402
+import probe_xdist as probe_xdist_mod  # noqa: E402
 
 SPLIT_PATH = REPO_ROOT / "plans" / "bugsinpy_split.json"
 DEV_SPLIT_PATH = REPO_ROOT / "plans" / "bugsinpy_dev_split.json"
@@ -6277,6 +6278,222 @@ class TestSuitePair:
         pair = self._pair({"a": "failed"}, {"a": "error"})
         assert pair.stable_failures == set()
         assert pair.stable_collected == set()
+
+
+class TestProbeXdist:
+    """M3 item S4 — the xdist equivalence probe's pure parts.
+
+    [VANTA-WHY] S4 enables xdist nowhere; its whole value is a *reading* of whether
+    ``-n auto`` moves any nodeid's outcome. That reading is made in one pure
+    function (``outcome_diff``) and written by one pure function
+    (``verdict_line``), and both are where a mistake would hide: comparing counts
+    instead of nodeids would report "identical" for a swap, and reducing outcomes
+    to pass/fail would report "identical" for a test that moved between ``skipped``
+    and ``failed``. These tests pin those two rules, plus the offline wheel checks
+    the probe refuses on. Nothing here boots a VM.
+    """
+
+    @staticmethod
+    def _report(**over):
+        base = {
+            "bug": "PySnooper/3",
+            "verdict": probe_xdist_mod.VERDICT_IDENTICAL,
+            "excluded_flaky": 0,
+            "serial": {"collected": 2},
+            "xdist": {"collected": 2},
+            "diff": {
+                "identical": True,
+                "only_in_serial": [],
+                "only_in_xdist": [],
+                "different_outcome": [],
+            },
+            "note": "",
+        }
+        base.update(over)
+        return base
+
+    # -- outcome_diff -------------------------------------------------------
+    def test_outcome_diff_identical(self):
+        outcomes = {"t::a": "passed", "t::b": "failed"}
+        assert probe_xdist_mod.outcome_diff(outcomes, dict(outcomes)) == {
+            "identical": True,
+            "only_in_serial": [],
+            "only_in_xdist": [],
+            "different_outcome": [],
+        }
+
+    def test_outcome_diff_only_in_serial(self):
+        diff = probe_xdist_mod.outcome_diff(
+            {"t::a": "passed", "t::b": "passed"}, {"t::a": "passed"}
+        )
+        assert diff["only_in_serial"] == ["t::b"]
+        assert diff["only_in_xdist"] == []
+        assert diff["different_outcome"] == []
+        assert diff["identical"] is False
+
+    def test_outcome_diff_only_in_xdist(self):
+        diff = probe_xdist_mod.outcome_diff(
+            {"t::a": "passed"}, {"t::a": "passed", "t::b": "passed"}
+        )
+        assert diff["only_in_xdist"] == ["t::b"]
+        assert diff["only_in_serial"] == []
+        assert diff["identical"] is False
+
+    def test_outcome_diff_different_outcome_lands_only_there(self):
+        diff = probe_xdist_mod.outcome_diff({"t::a": "passed"}, {"t::a": "failed"})
+        # a nodeid on both sides with different outcomes is *only* in the third list
+        assert diff["different_outcome"] == ["t::a"]
+        assert diff["only_in_serial"] == []
+        assert diff["only_in_xdist"] == []
+        assert diff["identical"] is False
+
+    def test_outcome_diff_drops_excluded_from_both_sides(self):
+        diff = probe_xdist_mod.outcome_diff(
+            {"t::a": "passed", "t::flaky": "failed"},
+            {"t::a": "passed", "t::flaky": "passed"},
+            excluded={"t::flaky"},
+        )
+        assert diff["identical"] is True
+        assert diff["different_outcome"] == []
+
+    def test_outcome_diff_compares_outcomes_raw(self):
+        # skipped -> passed, and xfailed -> passed, are both *movement*
+        diff = probe_xdist_mod.outcome_diff(
+            {"t::skip": "skipped", "t::xf": "xfailed", "t::err": "error"},
+            {"t::skip": "passed", "t::xf": "passed", "t::err": "error"},
+        )
+        assert diff["different_outcome"] == ["t::skip", "t::xf"]
+        assert diff["identical"] is False
+
+    def test_outcome_diff_lists_are_sorted(self):
+        diff = probe_xdist_mod.outcome_diff(
+            {"t::z": "passed", "t::a": "passed"}, {"t::z": "passed"}
+        )
+        assert diff["only_in_serial"] == ["t::a"]
+
+    # -- verdict_line -------------------------------------------------------
+    def test_verdict_line_identical_names_verdict_and_counts(self):
+        line = probe_xdist_mod.verdict_line(self._report())
+        assert line.startswith("probe-xdist PySnooper/3: identical")
+        assert "serial 2" in line and "xdist 2" in line
+        assert "[" not in line  # nothing differs, so no nodeid list
+
+    def test_verdict_line_different_lists_the_nodeids(self):
+        report = self._report(
+            verdict=probe_xdist_mod.VERDICT_DIFFERENT,
+            diff={
+                "identical": False,
+                "only_in_serial": ["t::gone"],
+                "only_in_xdist": ["t::new"],
+                "different_outcome": ["t::moved"],
+            },
+        )
+        line = probe_xdist_mod.verdict_line(report)
+        assert line.startswith("probe-xdist PySnooper/3: not_identical")
+        assert "t::gone" in line and "t::new" in line and "t::moved" in line
+        assert "only_in_serial=1" in line
+
+    def test_verdict_line_caps_and_counts_the_remainder(self):
+        report = self._report(
+            verdict=probe_xdist_mod.VERDICT_DIFFERENT,
+            diff={
+                "identical": False,
+                "only_in_serial": [f"t::{i}" for i in range(8)],
+                "only_in_xdist": [],
+                "different_outcome": [],
+            },
+        )
+        line = probe_xdist_mod.verdict_line(report, cap=3)
+        assert "t::0" in line and "t::2" in line
+        assert "t::3" not in line
+        assert "+5 more" in line
+
+    def test_verdict_line_unavailable_carries_the_note(self):
+        report = self._report(
+            verdict=probe_xdist_mod.VERDICT_UNAVAILABLE,
+            note="no importable xdist and no wheel dir",
+        )
+        line = probe_xdist_mod.verdict_line(report)
+        assert line.startswith("probe-xdist PySnooper/3: unavailable")
+        assert "no importable xdist" in line
+
+    # -- wheel metadata -----------------------------------------------------
+    def test_requires_dist_reads_the_lines(self):
+        metadata = (
+            "Metadata-Version: 2.1\n"
+            "Name: pytest-xdist\n"
+            "Requires-Dist: pytest>=7.0\n"
+            "Requires-Dist: execnet>=2.1\n"
+            "Classifier: x\n"
+        )
+        assert probe_xdist_mod.requires_dist(metadata) == ["pytest>=7.0", "execnet>=2.1"]
+
+    def test_requirement_for_matches_case_insensitively(self):
+        assert (
+            probe_xdist_mod.requirement_for(["execnet>=2.1", "Pytest>=7.0"], "pytest")
+            == "Pytest>=7.0"
+        )
+
+    def test_requirement_for_skips_unparsable_and_returns_none(self):
+        assert probe_xdist_mod.requirement_for(["<nonsense", "execnet"], "pytest") is None
+
+    def test_requirement_satisfied_pandas_case(self):
+        # pandas/1's checkpoint installs pytest==5.4.2; an xdist built for >=7 cannot load
+        assert probe_xdist_mod.requirement_satisfied("pytest>=7.0", "5.4.2") is False
+        assert probe_xdist_mod.requirement_satisfied("pytest>=5", "5.4.2") is True
+
+    def test_requirement_satisfied_unreadable_is_none(self):
+        assert probe_xdist_mod.requirement_satisfied(None, "5.4.2") is None
+        assert probe_xdist_mod.requirement_satisfied("pytest>=7.0", None) is None
+        assert probe_xdist_mod.requirement_satisfied("pytest>=7.0", "not-a-version") is None
+
+    def test_metadata_of_reads_a_wheel(self, tmp_path):
+        wheel = tmp_path / "xdist-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr(
+                "xdist-1.0.dist-info/METADATA",
+                "Name: pytest-xdist\nRequires-Dist: pytest>=7.0\n",
+            )
+        assert "pytest>=7.0" in probe_xdist_mod.metadata_of(wheel)
+
+    def test_metadata_of_refuses_a_wheel_without_metadata(self, tmp_path):
+        wheel = tmp_path / "bare-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("bare/__init__.py", "x = 1\n")
+        with pytest.raises(shuru_mod.ShuruError):
+            probe_xdist_mod.metadata_of(wheel)
+
+    def test_unpack_wheels_refuses_an_escaping_member(self, tmp_path):
+        wheel = tmp_path / "bad-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("../escape.py", "x = 1\n")
+        with pytest.raises(shuru_mod.ShuruError):
+            probe_xdist_mod.unpack_wheels([wheel], tmp_path / "stage")
+
+    def test_unpack_wheels_publishes_importable_files(self, tmp_path):
+        wheel = tmp_path / "xdist-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("xdist/__init__.py", "__version__ = '1.0'\n")
+            archive.writestr("xdist-1.0.dist-info/METADATA", "Name: pytest-xdist\n")
+        dest = tmp_path / "stage"
+        assert probe_xdist_mod.unpack_wheels([wheel], dest) == [wheel.name]
+        assert (dest / "xdist" / "__init__.py").is_file()
+
+    # -- preflight parsing --------------------------------------------------
+    def test_parse_preflight_takes_the_last_marker_line(self):
+        marker = probe_xdist_mod.PROBE_MARKER
+        stdout = (
+            "start-up banner\n"
+            + marker
+            + '{"pytest": "5.4.2"}\n'
+            + marker
+            + '{"pytest": "5.4.2", "xdist": null}\n'
+        )
+        assert probe_xdist_mod.parse_preflight(stdout) == {"pytest": "5.4.2", "xdist": None}
+
+    def test_parse_preflight_raises_without_a_marker(self):
+        with pytest.raises(shuru_mod.ShuruError):
+            probe_xdist_mod.parse_preflight("nothing here\n")
 
 
 class TestSuiteCache:

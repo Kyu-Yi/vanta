@@ -544,6 +544,10 @@ pub async fn run_native_suite(
 ///   * **A bad entry is never used.** `plan_native_suite` already refuses a
 ///     mismatched file; a payload that THIS build cannot decode is refused here
 ///     too, and the fresh run overwrites it.
+///   * **An unmeasured run is never cached.** A report with `ran: false` or
+///     `timed_out: true` measured nothing, so it is neither written here nor
+///     served by `plan_native_suite` (M3 item U1) — a cached emptiness would
+///     read as "no regressions" forever.
 ///   * **A dirty build is not cached at all.** See `suite_cache`'s module note:
 ///     `VANTA_BUILD_COMMIT` cannot separate two development builds of one commit,
 ///     so reuse is off and the reason lands on the row.
@@ -569,15 +573,32 @@ pub async fn run_native_suite_cached(
         }
     }
     let report = run_native_suite(source, test_cmd, Some(cap)).await;
-    // A plain miss writes the entry; a corrupt one is repaired. A `--no-cache`
-    // or dirty-build call writes nothing — the flag is non-mutating, so the entry
-    // it could not use is still there for the fresh result to be compared with.
-    if plan.write || note.state == "unreadable" {
+    // [VANTA-WHY] M3 item U1 — ONLY A MEASUREMENT IS CACHED. `not_run`,
+    // `failed_run` and `timed_out_run` all carry `ran: false`, and one of them
+    // inside the cache is served forever after as an empty suite, which
+    // `native_gate_vacuous` then reads as "the patch broke nothing". The write
+    // is therefore gated on the run having actually happened, not merely on the
+    // entry's absence. A plain miss writes the entry; a corrupt-for-us one is
+    // repaired. A `--no-cache` or dirty-build call writes nothing — the flag is
+    // non-mutating, so the entry it could not use is still there for the fresh
+    // result to be compared with.
+    let measured = report_is_measured(&report);
+    if measured && (plan.write || note.state == "unreadable") {
         if let Ok(payload) = serde_json::to_value(&report) {
             let _ = suite_cache::write_entry(&key.hex, &key.material, &payload, origin);
         }
     }
     (report, note)
+}
+
+/// Is this report a MEASUREMENT, i.e. may it be written to the suite cache?
+///
+/// [VANTA-WHY] M3 item U1. Pure over the report so the rule can be tested
+/// without a sandbox: the write gate is the only thing standing between a
+/// transient failure (no backend, a killed run) and an entry that would answer
+/// every future lookup with an empty suite.
+fn report_is_measured(report: &NativeSuiteReport) -> bool {
+    report.ran && !report.timed_out
 }
 
 /// Parse a pytest JSON report into per-test outcomes.
@@ -2525,7 +2546,8 @@ mod tests {
         native_outcome, native_regressions, native_results_index, native_suite_collapsed,
         native_tree_with_original_tests,
         native_vacuous_reason, new_diagnostics, parse_mypy_line, parse_native_report,
-        parse_pytest_report_detailed, parse_ruff_line, project_package, prune_keeps, report_tests,
+        parse_pytest_report_detailed, parse_ruff_line, project_package, prune_keeps,
+        report_is_measured, report_tests,
         ruff_is_error_class, run_single_test, run_tests_parallel, seed_and_write,
         seed_and_write_from, seed_method, seed_root, seed_sandbox_from, seed_source_and_conftest,
         set_seed_root,
@@ -2844,6 +2866,26 @@ mod tests {
         assert!(
             index.get("absent::t").is_none(),
             "a nodeid the report does not list must not be invented"
+        );
+    }
+
+    /// M3 item U1 — only a MEASUREMENT may be cached. `not_run`, `failed_run`
+    /// and `timed_out_run` all describe a suite that said nothing, so writing one
+    /// would leave an entry that every later lookup serves as "no regressions".
+    #[test]
+    fn only_a_measurement_is_written_to_the_cache() {
+        assert!(!report_is_measured(&NativeSuiteReport::not_run()));
+        assert!(!report_is_measured(&NativeSuiteReport::failed_run(
+            Some(1),
+            "boom".to_string()
+        )));
+        assert!(!report_is_measured(&NativeSuiteReport::timed_out_run(
+            None,
+            "killed".to_string()
+        )));
+        assert!(
+            report_is_measured(&native_report(&[("a::t", TestResult::Passed)])),
+            "a report that parsed is a measurement"
         );
     }
 

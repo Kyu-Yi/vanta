@@ -23,13 +23,18 @@
 //   * the harness build (commit + dirty), because the stored value describes a
 //     run performed by a particular binary.
 //
-// Three rules make the reuse safe rather than merely fast:
+// Four rules make the reuse safe rather than merely fast:
 //
 //   * **A key is the input, so a hit is the same experiment.** See above.
 //   * **A bad entry is never used.** An entry that is unreadable, carries
 //     another schema, another key, other material, a payload that does not match
 //     its own digest, or a payload this build cannot decode is treated as
 //     absent: the caller recomputes and overwrites it.
+//   * **An unmeasured run is never stored or served** (M3 item U1). A payload
+//     that says `ran: false` or `timed_out: true` measured nothing; caching it
+//     would serve an empty suite as if it were "no regressions". The write side
+//     refuses to store one and this reader refuses to serve one, so an entry
+//     written before the rule existed is repaired rather than believed.
 //   * **Reuse is auditable.** Every entry records who wrote it, and the caller
 //     is handed the key plus that identity, so `native_suite.summary` can say
 //     which earlier session row its native result actually came from.
@@ -402,6 +407,22 @@ pub struct CachePlan {
     pub write: bool,
 }
 
+/// Does this payload describe a run that produced no measurement?
+///
+/// [VANTA-WHY] M3 item U1. The cache exists to avoid re-measuring a constant,
+/// and a "run" that timed out or never produced a report is not a measurement:
+/// serving one would hand the caller an empty suite that `native_gate_vacuous`
+/// then reads as "no regressions", which is the exact failure D1 exists to
+/// prevent. The write side refuses to store one; this is the READ side, so an
+/// entry written before that rule existed — or by any other writer — cannot be
+/// served either. Both spellings are checked because both mean the same thing:
+/// `ran: false` is "the suite did not run", `timed_out: true` is "the suite was
+/// killed before it could say anything".
+fn payload_is_unmeasured(payload: &Value) -> bool {
+    payload.get("ran").and_then(Value::as_bool) == Some(false)
+        || payload.get("timed_out").and_then(Value::as_bool) == Some(true)
+}
+
 /// The plan for one native-suite call: read the entry, decide, and record why.
 pub fn plan_native_suite_from(
     root: &Path,
@@ -439,6 +460,19 @@ pub fn plan_native_suite_from(
             }
         }
         None => match entry.get("payload") {
+            Some(payload) if payload_is_unmeasured(payload) => {
+                // [VANTA-WHY] M3 item U1 — the entry is intact and belongs to
+                // this key, but its payload says the suite measured nothing. It
+                // is present and useless: recompute, overwrite, and name the rule
+                // that refused it instead of counting it a `hit` or a plain miss.
+                note.state = "unmeasured".to_string();
+                note.would_hit = true;
+                CachePlan {
+                    reuse: None,
+                    note,
+                    write: true,
+                }
+            }
             Some(payload) => {
                 note.state = "hit".to_string();
                 CachePlan {
@@ -574,6 +608,54 @@ mod tests {
         assert_eq!(plan.note.state, "miss");
         assert!(!plan.note.would_hit);
         assert!(plan.write);
+    }
+
+    /// M3 item U1 — an entry saying the suite measured nothing is present and
+    /// useless. It must not be served (`native_gate_vacuous` would read it as "no
+    /// regressions") and the fresh run must overwrite it.
+    #[test]
+    fn an_unmeasured_entry_is_never_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let key = key_for("writer", &test_cmd());
+        let payload = json!({"ran": false, "timed_out": false, "tests": []});
+        write_entry_to(root, &key.hex, &key.material, &payload, "old/session").unwrap();
+
+        let plan = plan_native_suite_from(root, &key, None);
+        assert!(plan.reuse.is_none(), "an unmeasured payload is never served");
+        assert_eq!(plan.note.state, "unmeasured");
+        assert!(plan.note.would_hit, "the entry was found and refused");
+        assert_eq!(plan.note.source, "old/session");
+        assert!(plan.write, "the fresh measurement overwrites it");
+    }
+
+    #[test]
+    fn a_timed_out_entry_is_unmeasured_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let key = key_for("writer", &test_cmd());
+        let payload = json!({"ran": false, "timed_out": true, "tests": []});
+        write_entry_to(root, &key.hex, &key.material, &payload, "old/session").unwrap();
+
+        let plan = plan_native_suite_from(root, &key, None);
+        assert!(plan.reuse.is_none(), "a killed run is not a measurement");
+        assert_eq!(plan.note.state, "unmeasured");
+        assert!(plan.write);
+    }
+
+    /// The read side must not over-reach: a payload that DID run is still served.
+    #[test]
+    fn a_measured_entry_is_still_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let key = key_for("writer", &test_cmd());
+        let payload = json!({"ran": true, "timed_out": false, "tests": [["a.py::t", "Passed"]]});
+        write_entry_to(root, &key.hex, &key.material, &payload, "sess1").unwrap();
+
+        let plan = plan_native_suite_from(root, &key, None);
+        assert_eq!(plan.note.state, "hit");
+        assert!(plan.reuse.is_some());
+        assert!(!plan.write);
     }
 
     #[test]

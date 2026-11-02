@@ -6494,6 +6494,158 @@ class TestSuiteCache:
         # ... and the repair left an entry that now answers.
         assert self._call(batch).cache["state"] == "hit"
 
+    def test_oracle_grading_labels_the_patch_it_grades(self, tmp_path, monkeypatch):
+        """M3 item S2 — a candidate patch's two runs name that patch's label.
+
+        A review row's candidate is the same bytes in every round and every arm,
+        so the origin is what a later hit is traced back to; the key is the bytes.
+        """
+        runs: list = []
+        monkeypatch.setattr(
+            tree_mod, "copy_tree", lambda src, dest: dest.mkdir(parents=True, exist_ok=True)
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "git_apply_patch",
+            lambda **kwargs: (True, "applied", suite_mod.APPLY_APPLIED),
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "run_suite_twice",
+            lambda **kwargs: runs.append(kwargs)
+            or suite_pair({"tests/test_demo.py::test_fix": "passed"}),
+        )
+        bug_prep = oracle_prep()
+
+        oracle_mod.grade(
+            prep=bug_prep,
+            batch_dir=tmp_path / "batch",
+            checkpoint="chk",
+            patch_path=write(tmp_path / "final.patch", "diff --git a/x b/x\n"),
+            label="sess1",
+            disk_mb=1024,
+        )
+
+        assert [run["origin"] for run in runs] == [
+            f"{bug_prep.slug}/sess1/hidden",
+            f"{bug_prep.slug}/sess1/patched",
+        ]
+
+    def test_a_grade_records_each_pair_s_cache_note(self, tmp_path, monkeypatch):
+        """M3 item S2 — the two grading pairs leave their provenance on the result.
+
+        Record-only: a note rides *beside* ``patch_good``, never inside it, so a
+        ``true_reject`` served from the cache is still traceable to the row that
+        measured those bytes first. Only ``grade``'s own two calls carry a note
+        here, so the pair order is the grading order.
+        """
+        pairs = []
+        for state, key, source in (("hit", "a" * 64, "Demo_1/sess1"), ("miss", "b" * 64, "")):
+            pair = suite_pair({"tests/test_demo.py::test_fix": "passed"})
+            pair.cache = {"key": key, "state": state, "source": source, "would_hit": False}
+            pairs.append(pair)
+        monkeypatch.setattr(
+            tree_mod, "copy_tree", lambda src, dest: dest.mkdir(parents=True, exist_ok=True)
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "git_apply_patch",
+            lambda **kwargs: (True, "applied", suite_mod.APPLY_APPLIED),
+        )
+        monkeypatch.setattr(suite_mod, "run_suite_twice", lambda **kwargs: pairs.pop(0))
+
+        result = oracle_mod.grade(
+            prep=oracle_prep(),
+            batch_dir=tmp_path / "batch",
+            checkpoint="chk",
+            patch_path=write(tmp_path / "final.patch", "diff --git a/x b/x\n"),
+            label="sess1",
+            disk_mb=1024,
+        )
+
+        assert result.cache == [
+            {
+                "side": "hidden",
+                "key": "a" * 64,
+                "state": "hit",
+                "source": "Demo_1/sess1",
+                "would_hit": False,
+            },
+            {
+                "side": "patched",
+                "key": "b" * 64,
+                "state": "miss",
+                "source": "",
+                "would_hit": False,
+            },
+        ]
+        # The dict form copies the entries, so a caller cannot mutate the field
+        # through it — and it keeps ``None`` as ``None`` (see the old-row test).
+        assert result.as_dict()["cache"] == result.cache
+        assert result.as_dict()["cache"] is not result.cache
+
+    def test_a_censored_grade_still_records_the_hidden_note(self, tmp_path, monkeypatch):
+        """The E3 guard returns on an unreadable hidden run — but that grading was
+        still a grading, and its note must not vanish exactly where the evidence is
+        weakest. No patched pair runs, so no patched note exists."""
+        pair = suite_mod.compare_runs(
+            suite_mod.SuiteRun(outcomes={}, exit_code=1, report_found=False),
+            suite_mod.SuiteRun(outcomes={}, exit_code=1, report_found=False),
+        )
+        pair.cache = {
+            "key": "c" * 64,
+            "state": "off:no_cache",
+            "source": "Demo_1/sess1",
+            "would_hit": True,
+        }
+        monkeypatch.setattr(
+            tree_mod, "copy_tree", lambda src, dest: dest.mkdir(parents=True, exist_ok=True)
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "git_apply_patch",
+            lambda **kwargs: (True, "applied", suite_mod.APPLY_APPLIED),
+        )
+        monkeypatch.setattr(suite_mod, "run_suite_twice", lambda **kwargs: pair)
+
+        result = oracle_mod.grade(
+            prep=oracle_prep(),
+            batch_dir=tmp_path / "batch",
+            checkpoint="chk",
+            patch_path=write(tmp_path / "final.patch", "diff --git a/x b/x\n"),
+            label="sess1",
+            disk_mb=1024,
+        )
+
+        assert result.inconclusive is True
+        assert result.cache == [
+            {
+                "side": "hidden",
+                "key": "c" * 64,
+                "state": "off:no_cache",
+                "source": "Demo_1/sess1",
+                "would_hit": True,
+            }
+        ]
+
+    def test_an_old_oracle_row_reads_the_cache_as_unknown(self):
+        """The standing rule for a record-only field: an ``oracle.json`` written
+        before this item reads as unknown, never as ``[]`` — an empty list would
+        claim the cache was consulted and held nothing, which for a row graded
+        before the cache existed is a lookup that never happened."""
+        old = {"apply_ok": True, "patch_good": False}
+        result = runner_mod.oracle_from_dict(old)
+        assert result.cache is None
+        assert result.as_dict()["cache"] is None
+
+        # A recorded list round-trips: only a present list is copied in.
+        recorded = oracle_mod.OracleResult(
+            apply_ok=True,
+            cache=[{"side": "hidden", "key": "d" * 64, "state": "hit"}],
+        )
+        back = runner_mod.oracle_from_dict(recorded.as_dict())
+        assert back.cache == [{"side": "hidden", "key": "d" * 64, "state": "hit"}]
+
 
 class TestCleanTreeNoise:
     """A run's leavings are not the tree: the caches are removed after each pair."""

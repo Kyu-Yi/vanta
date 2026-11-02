@@ -930,6 +930,15 @@ def oracle_from_dict(payload: dict[str, Any]) -> oracle_mod.OracleResult:
         oracle_secs=float(payload.get("oracle_secs") or 0.0),
         error=str(payload.get("error") or ""),
         inconclusive=bool(payload.get("inconclusive", False)),
+        # M3 item S2 — record-only, and ABSENT stays absent. An ``oracle.json``
+        # written before this item has no ``cache`` key, and rebuilding it as ``[]``
+        # would invent a cache lookup that never happened; only a present list is
+        # copied in, so the re-read of a cached candidate keeps its own provenance.
+        cache=(
+            [dict(item) for item in payload["cache"]]
+            if isinstance(payload.get("cache"), list)
+            else None
+        ),
     )
     return result
 

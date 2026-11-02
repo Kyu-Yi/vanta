@@ -24469,6 +24469,7 @@ def _job(
     harness=None,
     show_hints=False,
     config_block=None,
+    prep_config_block=None,
     frozen_env=None,
 ) -> runner_mod.Job:
     # [VANTA-WHY] M3 item 8 follow-up — `arm` is its own field now (the row records
@@ -24498,6 +24499,7 @@ def _job(
         harness=harness,
         show_hints=show_hints,
         config_block=config_block,
+        prep_config_block=prep_config_block,
         frozen_env=frozen_env,
     )
 
@@ -33423,6 +33425,259 @@ class TestPrepareFrozenConfig:
         )
 
 
+class TestPreparedConfigMatchesRun:
+    """M3 item T3 — ``run``/``queue`` refuse a batch prepared under another config.
+
+    ``prepare`` resolves the frozen configuration once and records it in
+    ``prepare.json``; ``run``/``queue`` resolve their own and record it on every row.
+    When the two describe different experiments the batch is a contradiction — the
+    context gate sized under one configuration and the repairs graded under another —
+    and the cheap moment to notice is before the first job. ``--allow-override`` is the
+    one waiver, exactly as it is for ``frozen_config.resolve``'s own check.
+    """
+
+    @staticmethod
+    def _clean_shell(monkeypatch) -> None:
+        for name in list(os.environ):
+            if name.startswith("VANTA_"):
+                monkeypatch.delenv(name, raising=False)
+
+    # -- the predicate, on its own ---------------------------------------
+    def test_a_different_hash_is_a_mismatch(self):
+        message = runner_mod.prepared_config_mismatch(
+            {"config_hash": "a" * 64, "config_override": False},
+            {"config_hash": "b" * 64, "config_override": False},
+        )
+        assert message is not None
+        assert "config_hash" in message
+
+    def test_a_different_override_status_is_a_mismatch(self):
+        message = runner_mod.prepared_config_mismatch(
+            {"config_hash": "a" * 64, "config_override": True},
+            {"config_hash": "a" * 64, "config_override": False},
+        )
+        assert message is not None
+        assert "waive" in message
+
+    def test_a_matching_preparation_is_no_mismatch(self):
+        block = {"config_hash": "a" * 64, "config_override": True}
+        assert runner_mod.prepared_config_mismatch(block, dict(block)) is None
+
+    def test_a_batch_with_no_recorded_config_is_no_mismatch(self):
+        """A pre-Q3 ``prepare.json`` recorded nothing to contradict."""
+        run = {"config_hash": "a" * 64, "config_override": False}
+        assert runner_mod.prepared_config_mismatch(None, run) is None
+        assert runner_mod.prepared_config_mismatch({}, run) is None
+
+    # -- the reader ------------------------------------------------------
+    def test_the_reader_reads_the_preparations_config_block(self, tmp_path):
+        write(
+            tmp_path / "prepare.json",
+            json.dumps(
+                {
+                    "bugs": [],
+                    "config_hash": "h" * 64,
+                    "config_path": "configs/v1-m3.toml",
+                    "config_override": True,
+                    "config_overrides": ["VANTA_SAMPLING=coding!=pinned"],
+                }
+            ),
+        )
+        batch = runner_mod.load_prepared(
+            batch_dir=tmp_path, split=SimpleNamespace(bugs=[]), bugsinpy_root=tmp_path
+        )
+        assert batch.config_block == {
+            "config_hash": "h" * 64,
+            "config_path": "configs/v1-m3.toml",
+            "config_override": True,
+            "config_overrides": ["VANTA_SAMPLING=coding!=pinned"],
+        }
+
+    def test_the_reader_returns_none_when_prepare_json_has_no_config_block(self, tmp_path):
+        write(tmp_path / "prepare.json", json.dumps({"bugs": []}))
+        batch = runner_mod.load_prepared(
+            batch_dir=tmp_path, split=SimpleNamespace(bugs=[]), bugsinpy_root=tmp_path
+        )
+        assert batch.config_block is None
+
+    # -- the row ---------------------------------------------------------
+    def test_the_row_records_the_preparations_config_alongside_the_runs(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        record = runner_mod.run_job(
+            job=_job(
+                prep(root=tmp_path / "root"),
+                config_block={
+                    "config_hash": "r" * 64,
+                    "config_path": "configs/v1-m3.toml",
+                    "config_override": False,
+                    "config_overrides": [],
+                },
+                prep_config_block={
+                    "config_hash": "p" * 64,
+                    "config_path": "configs/v1-m3.toml",
+                    "config_override": True,
+                    "config_overrides": ["VANTA_SAMPLING=coding!=pinned"],
+                },
+            ),
+            paths=runner_mod.BatchPaths.under(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4,
+            disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert record["config_hash"] == "r" * 64
+        assert record["prep_config_hash"] == "p" * 64
+        assert record["prep_config_override"] is True
+
+    def test_a_row_with_no_preparation_config_says_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")),
+            paths=runner_mod.BatchPaths.under(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4,
+            disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert record["prep_config_hash"] is None
+        assert record["prep_config_override"] is None
+
+    # -- the two stages, end to end --------------------------------------
+    def _prepare_with_override(self, tmp_path, monkeypatch) -> Path:
+        """Stage 1 — a real ``prepare`` with a contradiction and ``--allow-override``.
+
+        The shell pins ``VANTA_SAMPLING``, which the file freezes to ``coding``; the
+        waiver clears the contradiction and records ``config_override: true`` in
+        ``prepare.json``. Everything expensive is stubbed, but the writers are real.
+        """
+        monkeypatch.setenv("VANTA_SAMPLING", "pinned")
+        monkeypatch.setattr(ctx, "probe_props_n_ctx", lambda *a, **k: None)
+        split = split_mod.Split(split_data())
+        split_path = tmp_path / "split.json"
+        split_path.write_text(split.to_json(), encoding="utf-8")
+        entry = split.bugs[0]
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split)
+        monkeypatch.setattr(run_mod, "select", lambda *a, **k: [(entry, True)])
+        monkeypatch.setattr(meta_mod, "ensure_clone", lambda root, *, commit: commit)
+        monkeypatch.setattr(
+            runner_mod, "require_vanta_bin", lambda path: tmp_path / "vanta_m3"
+        )
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: "")
+        monkeypatch.setattr(prepare_mod, "missing_checkpoints", lambda names: [])
+        monkeypatch.setattr(bake_mod, "missing_deps", lambda deps, names: [])
+        monkeypatch.setattr(
+            meta_mod,
+            "project_github_url",
+            lambda *a, **k: "https://example.invalid/x.git",
+        )
+        monkeypatch.setattr(run_mod, "tree_cache", lambda *a, **k: tmp_path / "repo")
+        monkeypatch.setattr(
+            prepare_mod,
+            "prepare_one",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stub-one")),
+        )
+        batch = tmp_path / "batch"
+        run_mod.cmd_prepare(
+            run_mod.build_parser().parse_args(
+                [
+                    "prepare",
+                    "--split",
+                    str(split_path),
+                    "--batch",
+                    str(batch),
+                    "--allow-override",
+                ]
+            )
+        )
+        payload = json.loads((batch / "prepare.json").read_text(encoding="utf-8"))
+        assert payload["config_override"] is True
+        # The shell no longer contradicts the file, so a bare run resolves no waiver.
+        monkeypatch.delenv("VANTA_SAMPLING", raising=False)
+        return batch
+
+    def _stub_run_cli(self, monkeypatch, split, batch: Path) -> list:
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split)
+        # The window check would ask the model server; it is not what this test is about.
+        monkeypatch.setattr(runner_mod, "context_window_warning", lambda b: None)
+        monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])
+        monkeypatch.setattr(runner_mod, "require_vanta_bin", lambda path: path)
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: None)
+        called: list = []
+        monkeypatch.setattr(
+            runner_mod, "run_batch", lambda **kwargs: called.append(kwargs) or (0, [])
+        )
+        monkeypatch.setattr(
+            runner_mod, "run_queue", lambda **kwargs: called.append(kwargs) or (0, [])
+        )
+        return called
+
+    def test_prepare_with_override_then_a_bare_run_is_refused(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The mandated case: ``prepare --allow-override``, then ``run`` without it."""
+        self._clean_shell(monkeypatch)
+        batch = self._prepare_with_override(tmp_path, monkeypatch)
+        # Restore the real loader and split for the run half: the check must fire
+        # against the batch's own `prepare.json`, not a stub.
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split_mod.Split(split_data()))
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        called: list = []
+        monkeypatch.setattr(
+            runner_mod, "run_batch", lambda **kwargs: called.append(kwargs) or (0, [])
+        )
+
+        code = run_mod.main(["run", "--batch", str(batch), "--plan"])
+
+        err = capsys.readouterr().err
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert "error:" in err and "waive" in err
+        # Nothing was claimed: the refusal precedes the first job.
+        assert called == []
+
+    def test_the_queue_refuses_the_same_mismatch(self, tmp_path, monkeypatch, capsys):
+        self._clean_shell(monkeypatch)
+        batch = self._prepare_with_override(tmp_path, monkeypatch)
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split_mod.Split(split_data()))
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        called: list = []
+        monkeypatch.setattr(
+            runner_mod, "run_queue", lambda **kwargs: called.append(kwargs) or (0, [])
+        )
+
+        code = run_mod.main(["queue", "--batch", str(batch), "--plan"])
+
+        err = capsys.readouterr().err
+        assert code == run_mod.EXIT_HARNESS_FAILED
+        assert "error:" in err and "waive" in err
+        assert called == []
+
+    def test_a_bare_run_waived_with_allow_override_carries_the_preparation(
+        self, tmp_path, monkeypatch
+    ):
+        """``--allow-override`` on the run lets it through and the block rides along."""
+        self._clean_shell(monkeypatch)
+        batch = self._prepare_with_override(tmp_path, monkeypatch)
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split_mod.Split(split_data()))
+        called = self._stub_run_cli(monkeypatch, split_mod.Split(split_data()), batch)
+
+        code = run_mod.main(["run", "--batch", str(batch), "--plan", "--allow-override"])
+
+        assert code == run_mod.EXIT_OK
+        assert called and called[0]["prep_config_block"]["config_override"] is True
+
+
 class TestTheInvocationEnvironment:
     """Item B1 — the run's own checks must see the environment its children see.
 
@@ -33462,7 +33717,9 @@ class TestTheInvocationEnvironment:
             lambda path: SimpleNamespace(bugsinpy_root="runs/bugsinpy", seeds=[0]),
         )
         monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
-        batch = SimpleNamespace(preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path)
+        batch = SimpleNamespace(
+            preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path, config_block=None
+        )
         monkeypatch.setattr(runner_mod, "load_prepared", lambda **kwargs: batch)
         monkeypatch.setattr(runner_mod, "context_window_warning", lambda b: None)
         monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])
@@ -33512,7 +33769,9 @@ class TestTheInvocationEnvironment:
             lambda path: SimpleNamespace(bugsinpy_root="runs/bugsinpy", seeds=[0]),
         )
         monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
-        batch = SimpleNamespace(preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path)
+        batch = SimpleNamespace(
+            preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path, config_block=None
+        )
         monkeypatch.setattr(runner_mod, "load_prepared", lambda **kwargs: batch)
         monkeypatch.setattr(runner_mod, "context_window_warning", lambda b: None)
         monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])

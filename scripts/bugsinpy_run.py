@@ -920,6 +920,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     batch = runner_mod.load_prepared(
         batch_dir=batch_dir, split=split, bugsinpy_root=bugsinpy_root
     )
+    # Item T3 — the preparation resolved the frozen configuration too and recorded it
+    # in `prepare.json`; a run that contradicts it is a contradiction only
+    # `--allow-override` waives, checked here so the refusal lands before the first
+    # job rather than mid-wave. `--plan` runs the same check: the schedule a plan
+    # prints would be a schedule for a batch nobody is allowed to run.
+    config_mismatch = runner_mod.prepared_config_mismatch(batch.config_block, config_block)
+    if config_mismatch and not args.allow_override:
+        raise runner_mod.RunnerError(config_mismatch)
     # Before anything runs, and before --plan prints: a run whose window differs
     # from the one prepare sized against is measuring a different prompt than the
     # batch's verdicts describe (§1.6.1), and the cheap moment to notice is now.
@@ -972,8 +980,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         # same endpoint the children will use.
         preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env),
         # Item 19 — the frozen configuration resolved above: the block lands on every
-        # row, the environment on every child.
+        # row, the environment on every child. Item T3 — the preparation's own block
+        # rides along so each row states both configurations.
         config_block=config_block,
+        prep_config_block=batch.config_block,
         frozen_env=frozen_env,
     )
     if args.plan:
@@ -1068,6 +1078,11 @@ def cmd_queue(args: argparse.Namespace) -> int:
     batch = runner_mod.load_prepared(
         batch_dir=batch_dir, split=split, bugsinpy_root=bugsinpy_root
     )
+    # Item T3 — the same refusal as `run`, for the same reason: a queue shares one
+    # configuration with its preparation or it is two experiments in one directory.
+    config_mismatch = runner_mod.prepared_config_mismatch(batch.config_block, config_block)
+    if config_mismatch and not args.allow_override:
+        raise runner_mod.RunnerError(config_mismatch)
     window_warning = runner_mod.context_window_warning(batch)
     if window_warning:
         print(f"WARNING: {window_warning}", file=sys.stderr, flush=True)
@@ -1113,6 +1128,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
         # Bound to the effective environment (item B1), as in `run`.
         preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env),
         config_block=config_block,
+        prep_config_block=batch.config_block,
         frozen_env=frozen_env,
         arm_spellings=arm_spellings,
     )

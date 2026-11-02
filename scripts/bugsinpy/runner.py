@@ -2272,6 +2272,16 @@ def build_record(
         "config_path": (job.config_block or {}).get("config_path"),
         "config_override": (job.config_block or {}).get("config_override"),
         "config_overrides": list((job.config_block or {}).get("config_overrides") or []),
+        # Item T3 — the configuration the batch's PREPARATION recorded, carried
+        # onto every row beside the run's. `run`/`queue` refuse to run a batch whose
+        # preparation recorded a different `config_hash` or override status unless
+        # `--allow-override` waives it, so within a batch the two agree; recording
+        # both anyway is what lets `analyse` group on the preparation's claim (a
+        # batch prepared under one config and run under another is exactly the
+        # contradiction pooling must not average over). `None` when the batch's
+        # `prepare.json` recorded no config block.
+        "prep_config_hash": (job.prep_config_block or {}).get("config_hash"),
+        "prep_config_override": (job.prep_config_block or {}).get("config_override"),
         # §14.23 — how the pinned seed was turned into a per-round seed. Recorded
         # because the offset is DEFAULT-ON: a row's own `seed` cannot say whether its
         # later review rounds were independent draws or deterministic duplicates, so
@@ -2599,6 +2609,19 @@ class Job:
     and it lives on the job so ``run_job``'s signature (which tests stub) does not
     have to grow a parameter for it. ``None`` when no ``run`` invocation supplied
     one, which is every test-built job and every row written before this field.
+    """
+
+    prep_config_block: Optional[dict[str, Any]] = None
+    """Item T3 — the configuration the batch's **preparation** recorded.
+
+    The same four keys as ``config_block`` above (``config_hash``,
+    ``config_path``, ``config_override``, ``config_overrides``), read back from the
+    batch's ``prepare.json``. It rides on every row (``build_record``) for the same
+    reason ``config_hash`` does: a run's rows and the preparation that sized their
+    context gate are two claims, and a row that records only one of them cannot say
+    whether the tree it graded was prepared under the configuration it ran under.
+    ``None`` on a row whose batch recorded no config block (a batch prepared before
+    item Q3, or a test-built job).
     """
 
     frozen_env: Optional[Mapping[str, str]] = None
@@ -3340,6 +3363,7 @@ def run_batch(
     spend_gate: Optional[SpendGate] = None,
     preflight: Optional[Callable[[], Optional[str]]] = None,
     config_block: Optional[dict[str, Any]] = None,
+    prep_config_block: Optional[dict[str, Any]] = None,
     frozen_env: Optional[Mapping[str, str]] = None,
     stop_file: Optional[Path] = None,
     announce: bool = True,
@@ -3394,6 +3418,9 @@ def run_batch(
     ``config_block`` and ``frozen_env`` are item 19's frozen configuration, supplied by the
     ``run`` command (``frozen_config.resolve``) and carried on every job: the block goes onto
     each row (``build_record``), the environment onto each ``vanta_m3`` child (``vanta_env``).
+    ``prep_config_block`` is item T3's: the preparation's own block, read back from
+    ``prepare.json`` and carried onto every row beside the run's, so a row states both the
+    configuration it ran under and the one its batch was prepared under.
     Both are ``None`` by default for the same reason ``max_spend_usd`` and ``preflight`` are
     read in the CLI rather than here — the configuration belongs to the invocation, and a test
     that drives this loop must not depend on whatever file the developer happens to have
@@ -3528,6 +3555,7 @@ def run_batch(
                                 harness=harness,
                                 show_hints=show_hints,
                                 config_block=config_block,
+                                prep_config_block=prep_config_block,
                                 frozen_env=frozen_env,
                             )
                         ]
@@ -3549,6 +3577,7 @@ def run_batch(
                                 harness=harness,
                                 show_hints=show_hints,
                                 config_block=config_block,
+                                prep_config_block=prep_config_block,
                                 frozen_env=frozen_env,
                             )
                             for candidate in _review_candidates(
@@ -3954,6 +3983,19 @@ class PreparedBatch:
 
     n_ctx_source: Optional[str]
 
+    config_block: Optional[dict[str, Any]] = None
+    """Item T3 — the preparation's frozen-configuration block, as ``prepare.json``
+    recorded it.
+
+    ``prepare`` resolves the frozen config once and writes the same four keys a row
+    carries (``config_hash``, ``config_path``, ``config_override``,
+    ``config_overrides``). ``run``/``queue`` read them back here and refuse a run
+    whose own block contradicts the preparation's, unless ``--allow-override``
+    waives it (:func:`prepared_config_mismatch`). ``None`` when the batch recorded
+    no config block — a ``prepare.json`` written before item Q3 — in which case
+    there is nothing to compare and the run proceeds as it always did.
+    """
+
 
 def recorded_split_path(batch_dir: Path) -> Optional[Path]:
     """The split a batch was prepared with, as its ``prepare.json`` recorded it.
@@ -4020,12 +4062,25 @@ def load_prepared(
             f"{batch_dir / 'prepare.json'}: field 'n_ctx' is "
             f"{type(recorded_n_ctx).__name__}, not an integer"
         )
+    # Item T3 — the preparation's frozen-configuration block, read back with the
+    # SAME four keys `frozen_config.FrozenConfig.record` writes and `build_record`
+    # carries on a row. Absent for a `prepare.json` written before item Q3 (or by a
+    # caller that supplied no frozen config), in which case there is nothing to
+    # compare and the run proceeds. Read only when at least one key is present, so a
+    # pre-Q3 batch is `None` rather than a block of four `None`s that would look
+    # like a recorded configuration whose values all happen to be missing.
+    recorded_config = {
+        key: payload[key]
+        for key in ("config_hash", "config_path", "config_override", "config_overrides")
+        if key in payload
+    }
     return PreparedBatch(
         batch_dir=batch_dir,
         preps=preps,
         entries=entries,
         n_ctx=recorded_n_ctx,
         n_ctx_source=payload.get("n_ctx_source"),
+        config_block=recorded_config or None,
     )
 
 
@@ -4064,6 +4119,72 @@ def context_window_warning(batch: PreparedBatch) -> Optional[str]:
         "VANTA_LLM_CONTEXT_TOKENS (or point VANTA_LLM_BASE_URL at the server prepare "
         "measured) so the two agree, or re-run prepare."
     )
+
+
+def prepared_config_mismatch(
+    prepared: Optional[Mapping[str, Any]],
+    run: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    """Item T3 — refuse a run whose configuration contradicts its preparation's.
+
+    ``prepare`` resolves the frozen configuration once and records it in
+    ``prepare.json``; ``run``/``queue`` resolve their own and record it on every
+    row. When the two describe different experiments the batch is a contradiction:
+    the context gate was sized under one configuration and the repairs graded under
+    another, and nothing downstream could tell. The cheap moment to notice is before
+    the first job, so this returns the sentence the caller prints and refuses on —
+    or ``None`` when the two agree.
+
+    Two things are compared, and either alone is a mismatch:
+
+    * ``config_hash`` — the SHA-256 of the config file. A batch prepared against one
+      file and run against another measured two different prompt sets.
+    * ``config_override`` — whether the caller waived a frozen setting with
+      ``--allow-override``. A batch prepared with the waiver and run without it (or
+      the reverse) ran under a different environment even when the file is the same,
+      which is exactly the ``prepare --allow-override`` then bare ``run`` case.
+
+    A block that records neither field (a ``prepare.json`` written before item Q3,
+    or a caller that supplied no frozen config) has nothing to contradict, so it is
+    ``None`` — never a mismatch against a run that did record one. The caller waives
+    the refusal with ``--allow-override`` on the run, exactly as it waives
+    ``frozen_config.resolve``'s own contradiction check.
+    """
+    if not prepared:
+        return None
+    prep_hash = prepared.get("config_hash")
+    run_hash = (run or {}).get("config_hash")
+    if "config_hash" in prepared and prep_hash != run_hash:
+        return (
+            f"this batch was prepared under config_hash {str(prep_hash)[:12]} but "
+            f"this invocation resolves {str(run_hash)[:12]}. The context gate and the "
+            "repairs would run under different configurations, so their rows cannot be "
+            "read together. Re-run prepare under this configuration, or pass "
+            "--allow-override to run the batch anyway (the mismatch is then recorded on "
+            "every row)."
+        )
+    if "config_override" in prepared:
+        prep_override = bool(prepared.get("config_override"))
+        run_override = bool((run or {}).get("config_override"))
+        if prep_override != run_override:
+            prepared_with = (
+                "waived a frozen setting (--allow-override)"
+                if prep_override
+                else "did not waive any frozen setting"
+            )
+            run_with = (
+                "waives one (--allow-override)"
+                if run_override
+                else "waives none"
+            )
+            return (
+                f"this batch was prepared under a configuration that {prepared_with}, but "
+                f"this invocation {run_with}. The two ran under different environments, so "
+                "their rows cannot be read together. Re-run prepare under this invocation's "
+                "environment, or pass --allow-override so both sides waive it (the mismatch "
+                "is then recorded on every row)."
+            )
+    return None
 
 
 def _bug_key(entry: dict[str, Any]) -> str:
@@ -4491,6 +4612,7 @@ def run_queue(
     max_spend_usd: Optional[float] = None,
     preflight: Optional[Callable[[], Optional[str]]] = None,
     config_block: Optional[dict[str, Any]] = None,
+    prep_config_block: Optional[dict[str, Any]] = None,
     frozen_env: Optional[Mapping[str, str]] = None,
     arm_spellings: Optional[Sequence[str]] = None,
 ) -> tuple[int, list[QueueOutcome]]:
@@ -4540,6 +4662,7 @@ def run_queue(
             max_spend_usd=max_spend_usd,
             preflight=preflight,
             config_block=config_block,
+            prep_config_block=prep_config_block,
             frozen_env=frozen_env,
             arm_spellings=arm_spellings,
         )
@@ -4727,6 +4850,7 @@ def _run_task(
             spend_gate=kwargs["spend_gate"],
             preflight=kwargs["preflight"],
             config_block=kwargs["config_block"],
+            prep_config_block=kwargs["prep_config_block"],
             frozen_env=kwargs["frozen_env"],
             stop_file=stop_file,
             # The queue printed this batch's schedule once. `announce=False` keeps

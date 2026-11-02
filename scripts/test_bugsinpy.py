@@ -7234,9 +7234,9 @@ class TestVersionPin:
         record = version_pin_mod.as_record(
             outcome.pin, reason=outcome.reason, probed=outcome.probed
         )
-        # The exact shape recorded for PySnooper/3 in night3, plus the B7 field: a
-        # project with no version machinery pins nothing, reads no sandbox, and its
-        # tree is left exactly as it was.
+        # The exact shape recorded for PySnooper/3 in night3, plus the B7 and T4
+        # fields: a project with no version machinery pins nothing, reads no sandbox,
+        # passes over no candidate, and its tree is left exactly as it was.
         assert record == {
             "pinned": False,
             "kind": None,
@@ -7246,6 +7246,7 @@ class TestVersionPin:
             "sha256": None,
             "reason": None,
             "probe_sandbox": None,
+            "skipped": [],
         }
         # Nothing to freeze means nothing is written.
         assert sorted(str(p.relative_to(tree)) for p in tree.rglob("*")) == before
@@ -7394,6 +7395,100 @@ class TestVersionPin:
 
         assert outcome.pin is None and "could not be measured" in outcome.reason
         assert outcome.measurement_failed is True
+
+    @staticmethod
+    def _broken_version_file(source: str = "elsewhere/_version.py") -> str:
+        """A versioneer-shaped file that cannot be imported. (item T4)
+
+        It still carries the two names the text pre-filter keys on, so the walk
+        offers it for a probe — and then the probe's ``runpy`` hits the ``raise``
+        before either name is bound, which is exactly the shape T4 is about: the
+        file is probed, the probe answers nothing, and the harness never learns
+        whether it names itself.
+        """
+        return (
+            "raise RuntimeError('this vendored version file blows up on import')\n"
+            "\n"
+            "\n"
+            "def get_config():\n"
+            "    class C:\n"
+            "        pass\n"
+            "    c = C()\n"
+            "    c.VCS = 'git'\n"
+            f"    c.versionfile_source = {source!r}\n"
+            "    return c\n"
+            "\n"
+            "\n"
+            "def get_versions():\n"
+            "    return {'version': '0.0.0'}\n"
+        )
+
+    def test_a_vendored_version_file_that_fails_to_import_is_skipped(
+        self, tmp_path, monkeypatch
+    ):
+        """[VANTA-WHY] M3 item T4 — an undeclared candidate cannot decide the outcome.
+
+        A vendored copy of somebody else's ``_version.py`` that raises on import used
+        to be recorded as "the project's version file could not be measured" and refuse
+        the bug, even when the project's own configuration named a perfectly measurable
+        ``setuptools_scm`` version file. Ownership is established from that
+        configuration, so the undeclared candidate is recorded on the row
+        (:attr:`PinOutcome.skipped`) and the measurement falls through.
+        """
+        tree = tmp_path / "tree"
+        write(
+            tree / "pyproject.toml",
+            "[tool.setuptools_scm]\n" 'write_to = "pkg/_version.py"\n',
+        )
+        write(tree / "docs" / "_version.py", self._broken_version_file())
+        self._fake_probe(monkeypatch)
+        monkeypatch.setattr(
+            version_pin_mod,
+            "_setuptools_scm_version",
+            lambda _tree, *, vm: ("1.2.3", ""),
+        )
+
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+
+        assert outcome.kind == "setuptools_scm"
+        assert outcome.measurement_failed is False
+        assert outcome.pin is not None
+        assert outcome.pin.file == "pkg/_version.py"
+        assert outcome.pin.version == "1.2.3"
+        # Recorded, not silently dropped: the row says which file was passed over.
+        assert outcome.skipped == ("docs/_version.py",)
+
+        record = version_pin_mod.as_record(
+            outcome.pin, reason=outcome.reason, probed=outcome.probed,
+            skipped=outcome.skipped,
+        )
+        assert record["skipped"] == ["docs/_version.py"]
+
+    def test_a_declared_version_file_that_fails_to_import_still_gates(
+        self, tmp_path, monkeypatch
+    ):
+        """[VANTA-WHY] M3 item T4 — the declaration is what makes the gate.
+
+        The same unimportable file *is* the project's own when ``setup.cfg`` names it,
+        and then nothing may fall through: the tree the sandbox seeds from would report
+        ``0+unknown`` and the row would die ``native_vacuous`` two stages later.
+        """
+        tree = tmp_path / "tree"
+        write(
+            tree / "setup.cfg",
+            "[versioneer]\n" "versionfile_source = pkg/_version.py\n",
+        )
+        write(tree / "pkg" / "_version.py", self._broken_version_file("pkg/_version.py"))
+        self._fake_probe(monkeypatch)
+
+        outcome = version_pin_mod.measure(tree, vm=self._vm())
+
+        assert outcome.pin is None
+        assert outcome.measurement_failed is True
+        assert "could not be measured" in outcome.reason
+        assert "pkg/_version.py" in outcome.reason
+        # It decided the outcome, so it is not a skipped candidate.
+        assert outcome.skipped == ()
 
     def test_a_measured_placeholder_is_marked_for_the_gate(self, tmp_path, monkeypatch):
         """The second: the probe answered, and the answer is ``0+unknown`` itself."""

@@ -54,7 +54,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Sequence
 
 from . import shuru
@@ -511,6 +511,33 @@ def _setuptools_scm_write_to(tree: Path, table: dict[str, str]) -> Optional[str]
     return None
 
 
+def _declared_version_files(tree: Path) -> set[str]:
+    """The version file(s) the project's own configuration names. (item T4)
+
+    [VANTA-WHY] M3 item T4. A versioneer-shaped ``_version.py`` that raises on import
+    cannot be asked whether it names itself (``get_config().versionfile_source``), so
+    the property :func:`_versioneer_version_file` uses to tell the project's own file
+    from a vendored copy of somebody else's is unavailable for exactly the files that
+    used to decide the outcome. The one ownership the harness *can* establish without
+    running the file is the project's own configuration: versioneer's
+    ``versionfile_source`` in ``setup.cfg``'s ``[versioneer]`` section, and
+    setuptools_scm's ``write_to``/``version_file`` in ``pyproject.toml``'s
+    ``[tool.setuptools_scm]`` table. Those are the paths this returns; a probe-failed
+    candidate that is not one of them is a vendored copy and must be skipped rather
+    than allowed to refuse the bug.
+    """
+    declared: set[str] = set()
+    versioneer = _declared_version_file(tree)
+    if versioneer:
+        declared.add(PurePosixPath(versioneer).as_posix())
+    table = _pyproject_setuptools_scm(tree)
+    if table:
+        write_to = _setuptools_scm_write_to(tree, table)
+        if write_to:
+            declared.add(PurePosixPath(write_to).as_posix())
+    return declared
+
+
 def _setuptools_scm_version(tree: Path, *, vm: ProbeVM) -> tuple[Optional[str], str]:
     """``setuptools_scm.get_version(root=.)`` in the probe VM, and why not, if not.
 
@@ -627,6 +654,20 @@ class PinOutcome:
     fact stated in the code rather than inferred from :attr:`probed`.
     """
 
+    skipped: tuple[str, ...] = ()
+    """Tree-relative paths of versioneer-shaped files that were passed over. (item T4)
+
+    [VANTA-WHY] M3 item T4. A ``_version.py`` that matches the text pre-filter but
+    raises on import cannot be asked whether it names itself, so the harness cannot
+    call it the project's own version file — yet it used to decide the whole
+    measurement, refusing a bug whose project had a perfectly measurable
+    ``setuptools_scm`` version. A probe-failed candidate the project's own versioneer
+    or setuptools configuration does *not* name is therefore recorded here and
+    skipped: the measurement falls through to the other strategies, and a reader can
+    still see *which* file was passed over rather than finding it vanished from the
+    record.
+    """
+
 
 def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
     """The version to freeze for ``tree``, and what to record about it.
@@ -640,6 +681,22 @@ def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
     checkout code on the host and without opening the tree's ``.git`` here.
     """
     found, unmeasured, probed = _versioneer_version_file(tree, vm=vm)
+
+    # [VANTA-WHY] M3 item T4 — a probe-failed candidate decides the outcome only when
+    # it is the project's own version file. Ownership is established from the project's
+    # versioneer/setuptools configuration (:func:`_declared_version_files`); a candidate
+    # that configuration does not name is an unverified vendored copy of somebody
+    # else's, so it is recorded, skipped, and the measurement falls through to the
+    # strategies below. A tree that names no version file at all keeps the old reading:
+    # the walk found a version file and nothing contradicts it, so it is the project's.
+    declared = _declared_version_files(tree)
+    fatal: list[tuple[Path, str]] = []
+    skipped: list[tuple[Path, str]] = []
+    for path, note in unmeasured:
+        (fatal if not declared or path.relative_to(tree).as_posix() in declared
+         else skipped).append((path, note))
+    skipped_paths = tuple(path.relative_to(tree).as_posix() for path, _ in skipped)
+
     if found is not None:
         candidate, payload = found
         versions = payload["versions"]
@@ -655,6 +712,7 @@ def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
                 # freeze and the sandbox would report ``0+unknown``. A failed
                 # measurement like the others below.
                 measurement_failed=True,
+                skipped=skipped_paths,
             )
         contents = _short_version_contents(versions)
         pin = VersionPin(
@@ -665,17 +723,19 @@ def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
             full_revisionid=_str_or_none(versions.get("full-revisionid")),
             sha256=hashlib.sha256(contents.encode("utf-8")).hexdigest(),
         )
-        return PinOutcome(kind="versioneer", pin=pin, reason=None, probed=probed)
+        return PinOutcome(kind="versioneer", pin=pin, reason=None, probed=probed,
+                          skipped=skipped_paths)
 
-    if unmeasured:
-        # A versioneer-shaped file that could not be measured at all. On a healthy
-        # host this cannot happen, so it is reported rather than folded into the
-        # "no machinery here" answer — a silent no-op would leave the sandbox
-        # reporting a placeholder version, which is the very bug being fixed.
+    if fatal:
+        # A versioneer-shaped file that could not be measured at all, and that the
+        # project's own configuration names as its version source. On a healthy host
+        # this cannot happen, so it is reported rather than folded into the "no
+        # machinery here" answer — a silent no-op would leave the sandbox reporting a
+        # placeholder version, which is the very bug being fixed.
         named = ", ".join(
-            path.relative_to(tree).as_posix() for path, _ in unmeasured[:3]
+            path.relative_to(tree).as_posix() for path, _ in fatal[:3]
         )
-        more = f" (+{len(unmeasured) - 3} more)" if len(unmeasured) > 3 else ""
+        more = f" (+{len(fatal) - 3} more)" if len(fatal) > 3 else ""
         reason = (
             f"a versioneer-shaped version file was found but could not be "
             f"measured: {named}{more}"
@@ -683,7 +743,7 @@ def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
         # [VANTA-WHY] M3 item P1 — the probe's own complaint, appended rather than
         # left in the guest's discarded stderr: this reason is the only place a reader
         # of the disabled row learns *which* failure it was.
-        why = "; ".join(note for _, note in unmeasured[:3] if note)
+        why = "; ".join(note for _, note in fatal[:3] if note)
         return PinOutcome(
             kind="versioneer",
             pin=None,
@@ -694,11 +754,13 @@ def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
             # shape: prepare went on, no pin was frozen, and the row died
             # ``native_vacuous`` two stages later with the cause nowhere in the gate.
             measurement_failed=True,
+            skipped=skipped_paths,
         )
 
     table = _pyproject_setuptools_scm(tree)
     if table is None and not _setup_py_uses_scm(tree):
-        return PinOutcome(kind=None, pin=None, reason=None, probed=probed)
+        return PinOutcome(kind=None, pin=None, reason=None, probed=probed,
+                          skipped=skipped_paths)
     if table is None:
         table = {}
     write_to = _setuptools_scm_write_to(tree, table)
@@ -711,6 +773,7 @@ def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
                 "the project keeps no version file for a sandbox to read"
             ),
             probed=probed,
+            skipped=skipped_paths,
         )
     version, why = _setuptools_scm_version(tree, vm=vm)
     # A VM was booted to ask setuptools_scm, whatever it answered.
@@ -728,6 +791,7 @@ def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
             # a failed measurement too. The ``write_to``-less branch above is the only
             # reason that is not.
             measurement_failed=True,
+            skipped=skipped_paths,
         )
     contents = _setuptools_scm_contents(version)
     pin = VersionPin(
@@ -738,7 +802,8 @@ def measure(tree: Path, *, vm: ProbeVM) -> PinOutcome:
         full_revisionid=None,
         sha256=hashlib.sha256(contents.encode("utf-8")).hexdigest(),
     )
-    return PinOutcome(kind="setuptools_scm", pin=pin, reason=None, probed=probed)
+    return PinOutcome(kind="setuptools_scm", pin=pin, reason=None, probed=probed,
+                      skipped=skipped_paths)
 
 
 def _str_or_none(value: Any) -> Optional[str]:
@@ -805,7 +870,7 @@ def freeze(tree: Path, pin: VersionPin) -> None:
 
 
 def as_record(pin: Optional[VersionPin], *, reason: Optional[str] = None,
-              probed: bool = False) -> dict[str, Any]:
+              probed: bool = False, skipped: Sequence[str] = ()) -> dict[str, Any]:
     """The dict ``prepare.json`` and the manifest row carry.
 
     ``pinned`` is the load-bearing field: a reader must be able to tell "this
@@ -818,12 +883,16 @@ def as_record(pin: Optional[VersionPin], *, reason: Optional[str] = None,
     version machinery to read and nothing was measured at all. [VANTA-WHY] M3 item B7 —
     present on every row this writes, so a reader can tell a post-B7 row (measured
     without host execution of checkout code) from a pre-B7 one, which lacks the key.
+
+    ``skipped`` names the versioneer-shaped files that were passed over because the
+    project's own configuration did not name them (item T4), so a reader can see that
+    a vendored copy was found and set aside rather than silently ignored.
     """
     sandbox = _PROBE_SANDBOX if probed else None
     if pin is None:
         return {"pinned": False, "kind": None, "file": None, "version": None,
                 "full_revisionid": None, "sha256": None, "reason": reason,
-                "probe_sandbox": sandbox}
+                "probe_sandbox": sandbox, "skipped": list(skipped)}
     return {
         "pinned": True,
         "kind": pin.kind,
@@ -833,4 +902,5 @@ def as_record(pin: Optional[VersionPin], *, reason: Optional[str] = None,
         "sha256": pin.sha256,
         "reason": None,
         "probe_sandbox": sandbox,
+        "skipped": list(skipped),
     }

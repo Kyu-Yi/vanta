@@ -1474,7 +1474,7 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bo
         )
         return False
     prep.version_pin = version_pin_mod.as_record(
-        pin.pin, reason=pin.reason, probed=pin.probed
+        pin.pin, reason=pin.reason, probed=pin.probed, skipped=pin.skipped
     )
 
     after_strip = _suite(checkpoint, batch_dir, prep, "vanta_tree", "vanta")

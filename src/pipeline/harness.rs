@@ -18,11 +18,13 @@ use std::process::Stdio;
 use std::sync::RwLock;
 
 use futures::future::join_all;
+use serde::{Deserialize, Serialize};
 
 use crate::agents::attacker::GeneratedTest;
 use crate::agents::creator::SourceFile;
 use crate::core::TestResult;
 use crate::pipeline::candidate::TestCommand;
+use crate::pipeline::suite_cache;
 use crate::sandbox::{Backend, ExecutionResult};
 
 // ============================================================================
@@ -245,6 +247,14 @@ pub async fn run_single_test_with_timeout(
 // [VANTA-WHY] Per-test IDs, not one aggregate verdict: "pass on original, fail
 // on patch" is a regression; "already failing on original" is not (the patch
 // did not break it). A single pass/fail bit cannot express that difference.
+//
+// [VANTA-WHY] M3 item S1 — the serde derives are what let this whole report be
+// stored and served by `suite_cache`: a native run is a pure function of its
+// key, so the report that came out of it IS the cached value. Hand-rolling the
+// payload would be a second shape that could drift from the struct (a field
+// added here and forgotten there would be silently absent from every cached
+// report); deriving it means the compiler keeps the two the same.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeSuiteReport {
     /// nodeid → outcome. Empty when the suite could not be run at all.
     pub tests: Vec<(String, TestResult)>,
@@ -302,6 +312,11 @@ pub struct NativeSuiteReport {
 /// `ImportError while importing test module …` text. Naming it here is what
 /// turns "0 tests" from a dead end into a pointer at the module that broke the
 /// session, without a second sandbox boot.
+///
+/// [VANTA-WHY] M3 item S1 — derived for the same reason as `NativeSuiteReport`:
+/// an in-session run's collection census rides the cached report, so the two
+/// types have to be storable together.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollectionFailure {
     /// Collectors whose `outcome` is neither `passed` nor `skipped`: a module
     /// that failed to import, or any future outcome this reader does not
@@ -507,6 +522,61 @@ pub async fn run_native_suite(
     };
     sb.destroy();
     report
+}
+
+/// [`run_native_suite`] behind the content-keyed cache (M3 item S1).
+///
+/// [VANTA-WHY] The in-session native gate runs the SAME bytes twice per attempt —
+/// `native_original` against `native_patched` — and `native_original` is a
+/// function of the BUG alone, yet a Phase-3 arm-and-seed grid re-measured it once
+/// per arm, per seed, per attempt and per review round. `origin` names who asked
+/// (the session, attempt and side), so a served entry can be traced back to the
+/// row that produced it, which is what makes the reuse auditable rather than
+/// merely fast.
+///
+/// Three rules, in the order they matter:
+///
+///   * **A key is the input, so a hit is the same experiment.** The key carries
+///     the tree, the command, the env, the checkpoint and the WALL-CLOCK CAP
+///     (a run's timeout is a function of the cap, so a cap left out of the key
+///     would let one arm's kill be inherited as a fact about the tree).
+///   * **A bad entry is never used.** `plan_native_suite` already refuses a
+///     mismatched file; a payload that THIS build cannot decode is refused here
+///     too, and the fresh run overwrites it.
+///   * **A dirty build is not cached at all.** See `suite_cache`'s module note:
+///     `VANTA_BUILD_COMMIT` cannot separate two development builds of one commit,
+///     so reuse is off and the reason lands on the row.
+pub async fn run_native_suite_cached(
+    source: &str,
+    test_cmd: &TestCommand,
+    timeout_secs: Option<u64>,
+    origin: &str,
+) -> (NativeSuiteReport, suite_cache::CacheNote) {
+    let cap = timeout_secs.unwrap_or_else(test_timeout_secs);
+    let key = suite_cache::native_key(source, test_cmd, cap);
+    let plan = suite_cache::plan_native_suite(&key);
+    let mut note = plan.note.clone();
+    if let Some(payload) = &plan.reuse {
+        match serde_json::from_value::<NativeSuiteReport>(payload.clone()) {
+            Ok(report) => return (report, note),
+            // The entry is intact by `suite_cache`'s rules but this build cannot
+            // read it: a corrupt-for-us entry. Run fresh and overwrite it.
+            Err(_) => {
+                note.state = "unreadable".to_string();
+                note.would_hit = true;
+            }
+        }
+    }
+    let report = run_native_suite(source, test_cmd, Some(cap)).await;
+    // A plain miss writes the entry; a corrupt one is repaired. A `--no-cache`
+    // or dirty-build call writes nothing — the flag is non-mutating, so the entry
+    // it could not use is still there for the fresh result to be compared with.
+    if plan.write || note.state == "unreadable" {
+        if let Ok(payload) = serde_json::to_value(&report) {
+            let _ = suite_cache::write_entry(&key.hex, &key.material, &payload, origin);
+        }
+    }
+    (report, note)
 }
 
 /// Parse a pytest JSON report into per-test outcomes.

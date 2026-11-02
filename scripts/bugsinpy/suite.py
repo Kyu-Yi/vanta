@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
 from . import shuru
+from . import suite_cache
 
 FAILURE_OUTCOMES = frozenset({"failed", "error"})
 
@@ -121,6 +122,43 @@ class SuiteRun:
     def collected(self) -> set[str]:
         return set(self.outcomes)
 
+    def to_json(self) -> dict:
+        """This run as JSON, for a cached pair (M3 item S1)."""
+        return {
+            "outcomes": self.outcomes,
+            "exit_code": self.exit_code,
+            "timed_out": self.timed_out,
+            "stdout_tail": self.stdout_tail,
+            "stderr_tail": self.stderr_tail,
+            "report_found": self.report_found,
+            "report_error": self.report_error,
+            "secs": self.secs,
+        }
+
+    @classmethod
+    def from_json(cls, data: object) -> "SuiteRun":
+        """The inverse of :meth:`to_json`.
+
+        [VANTA-WHY] ``outcomes`` is REQUIRED: it is the run's whole measurement,
+        so a payload without it is not a run at all. The scalar fields default,
+        because the entry's digest and material have already proven the payload
+        was written by this version of this module for this exact key — a missing
+        scalar there is a shape this reader does not know, and refusing is the
+        caller's job (the wrapper treats a decode failure as a corrupt entry).
+        """
+        if not isinstance(data, dict) or not isinstance(data.get("outcomes"), dict):
+            raise ValueError("a cached run must carry an `outcomes` mapping")
+        return cls(
+            outcomes={str(k): str(v) for k, v in data["outcomes"].items()},
+            exit_code=data.get("exit_code"),
+            timed_out=bool(data.get("timed_out", False)),
+            stdout_tail=str(data.get("stdout_tail") or ""),
+            stderr_tail=str(data.get("stderr_tail") or ""),
+            report_found=bool(data.get("report_found", False)),
+            report_error=str(data.get("report_error") or ""),
+            secs=data.get("secs"),
+        )
+
 
 @dataclass
 class SuitePair:
@@ -130,6 +168,45 @@ class SuitePair:
     second: SuiteRun
     flaky_nodeids: set[str] = field(default_factory=set)
     missing_from_one_run: set[str] = field(default_factory=set)
+    cache: Optional[dict] = field(default=None, compare=False)
+    """How this pair was obtained (M3 item S1), or ``None`` for a pair that was
+    never looked up in the cache.
+
+    [VANTA-WHY] The key, the state (``hit``/``miss``/``unreadable``/``off:no_cache``),
+    the ``created_by`` of the entry that was served and whether an entry existed
+    that could not be used. Deliberately NOT part of :meth:`to_json`: it describes
+    the LOOKUP, not the experiment, so storing it would make a served pair claim
+    to have been served by whoever wrote it first. ``compare=False`` keeps it out
+    of equality, so an existing test comparing two pairs still compares the two
+    runs.
+    """
+
+    def to_json(self) -> dict:
+        """The pair as JSON — the whole cached value (M3 item S1).
+
+        [VANTA-WHY] BOTH runs are stored, not one: the flakiness comparison
+        (``flaky_nodeids``/``missing_from_one_run``) is a reading of the PAIR, so
+        a cache that stored a single run would make every later reader re-derive
+        flakiness from one observation and call it stability.
+        """
+        return {
+            "first": self.first.to_json(),
+            "second": self.second.to_json(),
+            "flaky_nodeids": sorted(self.flaky_nodeids),
+            "missing_from_one_run": sorted(self.missing_from_one_run),
+        }
+
+    @classmethod
+    def from_json(cls, data: object) -> "SuitePair":
+        """The inverse of :meth:`to_json`; ``cache`` is left for the caller."""
+        if not isinstance(data, dict):
+            raise ValueError("a cached pair must be an object")
+        return cls(
+            first=SuiteRun.from_json(data["first"]),
+            second=SuiteRun.from_json(data["second"]),
+            flaky_nodeids=set(data.get("flaky_nodeids") or []),
+            missing_from_one_run=set(data.get("missing_from_one_run") or []),
+        )
 
     @property
     def stable_failures(self) -> set[str]:
@@ -320,6 +397,102 @@ def precompile_lines(
     return [_shell_quote([python, "-m", "compileall", "-q", "-f", *precompile])]
 
 
+# ---------------------------------------------------------------------------
+# the suite cache (M3 items S1/S2/S3)
+# ---------------------------------------------------------------------------
+def cache_env(extra_env: Optional[Mapping[str, str]] = None) -> dict[str, str]:
+    """The environment a suite run is given, and the one its cache key hashes.
+
+    [VANTA-WHY] One function, because the key has to describe the environment the
+    run actually saw, and building the dict in two places is how a key silently
+    stops covering ``extra_env``. That is not a cosmetic difference: the recorded
+    per-project rule is fastapi/2's ``PYTHONPATH=./docs_src``, and the same tree
+    measured 775 passed with it and 0 tests collected without it — so a key that
+    missed it would serve one environment's result for another's.
+    """
+    env = {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"}
+    if extra_env:
+        env.update(extra_env)
+    return env
+
+
+def cache_material(
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    tree_rel: str,
+    test_cmd: Sequence[str],
+    disk_mb: int,
+    timeout_secs: int,
+    extra_env: Optional[Mapping[str, str]] = None,
+    memory_mb: Optional[int] = None,
+    precompile: Sequence[str] = (),
+) -> Optional[dict]:
+    """The key material for one pair of runs, or ``None`` when it cannot be built.
+
+    [VANTA-WHY] The key IS the input (M3 speed package): the exact tree bytes, the
+    command, the checkpoint, the harness build, the suite's effective environment and
+    the effective timeout cap. The cap is here because a run's TIMEOUT is a function
+    of the cap and nothing else — a key without it would inherit one arm's timing
+    out as a fact about the tree. ``None`` (an unreadable tree) turns the cache off
+    for this call rather than raising: the caller is inside a run that is about to
+    fail for its own reason, and a key that could raise would turn a permission
+    problem into a harness crash.
+
+    ``batch_dir`` is deliberately absent from the material (only the tree it holds
+    is hashed): the whole point is that two batches measuring the same tree share
+    one entry.
+    """
+    try:
+        tree = suite_cache.tree_fingerprint(batch_dir / tree_rel)
+    except (OSError, NotADirectoryError):
+        return None
+    return {
+        "schema": suite_cache.SCHEMA_VERSION,
+        "kind": suite_cache.KIND_SUITE_PAIR,
+        "harness": suite_cache.harness_build(),
+        "tree": tree,
+        "command": [str(part) for part in test_cmd],
+        "env": {str(k): str(v) for k, v in sorted(cache_env(extra_env).items())},
+        "precompile": [str(part) for part in precompile],
+        "checkpoint": str(checkpoint),
+        "disk_mb": int(disk_mb),
+        "memory_mb": None if memory_mb is None else int(memory_mb),
+        "timeout_secs": int(timeout_secs),
+    }
+
+
+def _write_reports(batch_dir: Path, report_rel_stem: str, pair: SuitePair) -> None:
+    """Put a cached pair's reports back where a run would have left them.
+
+    [VANTA-WHY] ``run_suite_twice`` is not the only reader of these files. The
+    stripper reads ``reports/{slug}-oracle.run1.json``
+    (:func:`prepare.strip_and_baseline`), and the replay baseline reads
+    ``reports/{slug}-vanta.run1/2.json`` (:func:`replay._prepare_baseline_outcomes`).
+    A hit that skipped the run without restoring the files would leave those readers
+    looking at "the report says nothing" and deriving a wrong answer out of a
+    correct cache hit. Only the runs that HAD a report get one, so a cached "no
+    report" is still no report.
+    """
+    for suffix, run in (("1", pair.first), ("2", pair.second)):
+        path = batch_dir / f"{report_rel_stem}.run{suffix}.json"
+        if not run.report_found:
+            path.unlink(missing_ok=True)
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "tests": [
+                        {"nodeid": nodeid, "outcome": outcome}
+                        for nodeid, outcome in sorted(run.outcomes.items())
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+
 def run_suite_twice(
     *,
     checkpoint: str,
@@ -332,8 +505,69 @@ def run_suite_twice(
     extra_env: Optional[dict[str, str]] = None,
     memory_mb: Optional[int] = None,
     precompile: Sequence[str] = (),
+    origin: Optional[str] = None,
 ) -> SuitePair:
-    """Run ``test_cmd`` twice inside the checkpoint and diff the two reports."""
+    """Run ``test_cmd`` twice inside the checkpoint and diff the two reports.
+
+    ``origin`` names the caller, and setting it turns on the content-keyed cache
+    (M3 items S2/S3): the same tree bytes + command + checkpoint + harness build +
+    environment + cap are measured once and the WHOLE pair is served afterwards,
+    across arms, seeds, attempts and batches. ``None`` — replay's call, and the
+    default — is today's behaviour exactly, with no lookup and no write.
+
+    The lookup still happens under ``--no-cache``: the flag forces a fresh run but
+    the row records what the cache WOULD have returned, which is the only way to
+    check the cache against a fresh measurement without a second experiment.
+    """
+    material = (
+        None
+        if origin is None
+        else cache_material(
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            tree_rel=tree_rel,
+            test_cmd=test_cmd,
+            disk_mb=disk_mb,
+            timeout_secs=timeout_secs,
+            extra_env=extra_env,
+            memory_mb=memory_mb,
+            precompile=precompile,
+        )
+    )
+    key = "" if material is None else suite_cache.key_of(material)
+    condition = "miss"
+    source = ""
+    would_hit = False
+    write = False
+    if material is not None:
+        entry = suite_cache.read_entry(material, key)
+        source = "" if entry is None else str(entry.get("created_by") or "")
+        disabled = suite_cache.cache_disabled()
+        if entry is not None and not disabled:
+            try:
+                served = SuitePair.from_json(entry.get("payload"))
+            except (KeyError, TypeError, ValueError):
+                # An entry that is intact by `suite_cache`'s rules but that this
+                # build cannot read: a corrupt-for-us entry. Never served; run
+                # fresh and repair it.
+                condition = "unreadable"
+                would_hit = True
+                write = True
+            else:
+                served.cache = {
+                    "key": key,
+                    "state": "hit",
+                    "source": source,
+                    "would_hit": False,
+                }
+                _write_reports(batch_dir, report_rel_stem, served)
+                return served
+        elif entry is not None:
+            condition = "off:no_cache"
+            would_hit = True
+        else:
+            write = not disabled
+
     reports_dir = batch_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     rel1 = f"{report_rel_stem}.run1.json"
@@ -368,9 +602,7 @@ def run_suite_twice(
         ]
     )
 
-    env = {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"}
-    if extra_env:
-        env.update(extra_env)
+    env = cache_env(extra_env)
 
     result = shuru.run(
         checkpoint=checkpoint,
@@ -388,6 +620,26 @@ def run_suite_twice(
     pair = compare_runs(first, second)
 
     _clean_tree_noise(batch_dir / tree_rel)
+
+    if material is not None:
+        # A plain miss writes the entry; a corrupt-for-us one is repaired. A
+        # ``--no-cache`` run writes nothing but still reports what it would have
+        # hit, so the entry stays available for the fresh measurement to be
+        # compared with.
+        if write:
+            entry = suite_cache.build_entry(material, pair.to_json(), origin=origin)
+            try:
+                suite_cache.write_entry(entry)
+            except OSError:
+                # A cache that cannot be written must never fail the run: the
+                # measurement is the product, the entry is an optimisation.
+                pass
+        pair.cache = {
+            "key": key,
+            "state": condition,
+            "source": source,
+            "would_hit": would_hit,
+        }
     return pair
 
 

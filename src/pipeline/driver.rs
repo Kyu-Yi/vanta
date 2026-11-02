@@ -1921,6 +1921,14 @@ pub async fn run(
     // the tree's import. A `true` here never changes the label — the run is
     // `InfraFailure` either way — it only records WHICH infra fault it was.
     let mut native_timeout_seen = false;
+    // [VANTA-WHY] M3 item S1 — every native gate call's cache note, per attempt
+    // and per side, so the reuse is auditable from the run's own artifacts: which
+    // results were served from an earlier row, under which key, and from whose
+    // row. `native_cache_hits` is the count that rides `run.summary` so a digest
+    // can cut by "how much of this run was measured vs. served" without a reader
+    // having to walk `evidence.json`.
+    let mut native_cache_records: Vec<serde_json::Value> = Vec::new();
+    let mut native_cache_hits: u32 = 0;
     // [VANTA-WHY] M3 item D1 — the wall-clock cap every in-session native suite
     // of this run uses. Declared once, here, so the gate, the judge's run and the
     // terminal `run.summary` all name the SAME number: `None` on the config keeps
@@ -3467,11 +3475,39 @@ pub async fn run(
         // once for the run, above): a row with a prepare measurement passes
         // `max(120, 3 × measured)`, and every other row keeps the historical
         // `harness::test_timeout_secs()`.
-        let native_original =
-            harness::run_native_suite(&original_concat, &test_cmd, config.native_timeout_secs).await;
-        let native_patched =
-            harness::run_native_suite(&native_patched_concat, &test_cmd, config.native_timeout_secs)
-                .await;
+        // [VANTA-WHY] M3 item S1 — the two sides go through the content-keyed
+        // cache. `native_original` is a function of the BUG (same original tree,
+        // same command, same cap), so across a Phase-3 arm-and-seed grid it is
+        // measured once per bug and served afterwards; `native_patched` is
+        // measured once per candidate patch. `origin` names this session, attempt
+        // and side so a served result is traceable to the row that produced it.
+        let (native_original, original_cache) = harness::run_native_suite_cached(
+            &original_concat,
+            &test_cmd,
+            config.native_timeout_secs,
+            &format!("{}/a{}/original", session_id.as_str(), attempt + 1),
+        )
+        .await;
+        let (native_patched, patched_cache) = harness::run_native_suite_cached(
+            &native_patched_concat,
+            &test_cmd,
+            config.native_timeout_secs,
+            &format!("{}/a{}/patched", session_id.as_str(), attempt + 1),
+        )
+        .await;
+        for (side, note) in [("original", &original_cache), ("patched", &patched_cache)] {
+            if note.state == "hit" {
+                native_cache_hits += 1;
+            }
+            native_cache_records.push(serde_json::json!({
+                "attempt": attempt + 1,
+                "side": side,
+                "state": note.state.as_str(),
+                "key": note.key.as_str(),
+                "source": note.source.as_str(),
+                "would_hit": note.would_hit,
+            }));
+        }
         // [VANTA-WHY] M3 item W — a native gate that measured NOTHING is not a
         // clean gate. `native_regressions` over an empty original list is
         // vacuously empty and `native_suite_collapsed` needs a non-empty
@@ -3549,7 +3585,8 @@ pub async fn run(
             summary: format!(
                 "ran_original={} ran_patched={} original_tests={} patched_tests={} regressions={} \
                  native_vacuous={} native_expected_tests={} native_timeout_secs={} \
-                 original_timed_out={} patched_timed_out={} {}",
+                 original_timed_out={} patched_timed_out={} \
+                 native_original_cache={} native_patched_cache={} {}",
                 native_original.ran,
                 native_patched.ran,
                 native_original.tests.len(),
@@ -3560,6 +3597,11 @@ pub async fn run(
                 native_cap,
                 native_original.timed_out,
                 native_patched.timed_out,
+                // [VANTA-WHY] M3 item S1 — each side's cache note
+                // (`state|key|source|would_hit`). Appended after the D1 fields so
+                // an older row's reader sees the same tokens in the same order.
+                original_cache.token(),
+                patched_cache.token(),
                 harness::native_collection_summary(&native_original, &native_patched)
             ),
             timestamp: now_iso(),
@@ -4880,7 +4922,7 @@ pub async fn run(
              seed_method={} import_guard={} \
              n_ctx={} creator_effort={} creator_effort_mechanism={} \
              creator_prompt_tokens={}{}{}{} fixed_rounds={} native_vacuous={} \
-             native_timeout_secs={} native_timeout={}",
+             native_timeout_secs={} native_timeout={} native_cache_hits={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -5184,6 +5226,11 @@ pub async fn run(
             // `native_vacuous=true` and never changes the label.
             native_cap,
             native_timeout_seen,
+            // [VANTA-WHY] M3 item S1 — how many of this run's native gate calls
+            // were served from the cache instead of measured. Purely descriptive
+            // (nothing reads it), appended after `native_timeout` so an older
+            // row's reader sees the same fields in the same order.
+            native_cache_hits,
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),
@@ -5367,6 +5414,14 @@ pub async fn run(
             // not have to guess which one it got.
             "native_timeout_secs": config.native_timeout_secs,
             "native_timeout": native_timeout_seen,
+            // [VANTA-WHY] M3 item S1 — one entry per native gate call (attempt ×
+            // side) recording whether the result was measured or served from the
+            // suite cache, under which key, and from whose row. The reuse is
+            // deliberately auditable from the artifact: a row whose
+            // `native_original` came from an earlier session is a legitimate
+            // measurement of the same bytes, and this list is what lets a reader
+            // confirm that rather than assume it.
+            "native_cache": native_cache_records,
             "new_static_findings": static_findings_records,
             // [VANTA-WHY] The repo's own suite, per attempt. `native_test_source`
             // says the suite ran the ORIGINAL tests; this key names WHICH of them

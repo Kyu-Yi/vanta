@@ -68,6 +68,7 @@ from bugsinpy import runner as runner_mod  # noqa: E402
 from bugsinpy import shuru as shuru_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
 from bugsinpy import suite as suite_mod  # noqa: E402
+from bugsinpy import suite_cache as suite_cache_mod  # noqa: E402
 from bugsinpy import trees as tree_mod  # noqa: E402
 from bugsinpy import version_pin as version_pin_mod  # noqa: E402
 from bugsinpy.split import SplitError, load_split  # noqa: E402
@@ -6276,6 +6277,222 @@ class TestSuitePair:
         pair = self._pair({"a": "failed"}, {"a": "error"})
         assert pair.stable_failures == set()
         assert pair.stable_collected == set()
+
+
+class TestSuiteCache:
+    """M3 items S1–S3 — the content-keyed cache for whole-suite runs.
+
+    [VANTA-WHY] The cache is only safe if a served pair IS the pair a fresh run
+    would have produced, and only useful if the key carries everything that can
+    move an outcome. These tests assert both, plus the three rules the mandate
+    names: a bad entry is never used, reuse is auditable (the key and the writer
+    ride the row), and ``--no-cache`` forces a fresh run while still reporting
+    what the cache would have returned. ``shuru.run`` is replaced, so no VM is
+    booted and every assertion is about the wrapper, not about a sandbox.
+    """
+
+    STEM = "reports/Demo_1-vanta"
+    OUTCOMES = {"tests/a.py::t": "failed", "tests/b.py::t": "passed"}
+
+    @staticmethod
+    def _host(tmp_path, monkeypatch):
+        """A batch directory holding one tree, and a private cache directory.
+
+        The cache directory is redirected so these tests never touch the real
+        ``runs/bugsinpy/suite_cache``, and ``VANTA_HARNESS_BUILD`` is pinned so a
+        key does not change with the sources under test (which the harness hash
+        otherwise covers on purpose — see ``suite_cache.harness_build``).
+        """
+        batch = tmp_path / "batch"
+        write(batch / "vanta_tree" / "demo.py", "x = 1\n")
+        monkeypatch.setenv(suite_cache_mod.CACHE_DIR_ENV, str(tmp_path / "cache"))
+        monkeypatch.setenv("VANTA_HARNESS_BUILD", "py:test")
+        monkeypatch.delenv(suite_cache_mod.DISABLE_ENV, raising=False)
+        return batch
+
+    @classmethod
+    def _vm_run(cls, calls, *, outcomes=None):
+        """A ``shuru.run`` that writes both reports instead of booting a VM."""
+
+        def run(**kwargs):
+            calls.append(kwargs)
+            for suffix in ("1", "2"):
+                write(
+                    kwargs["host_root"] / f"{cls.STEM}.run{suffix}.json",
+                    json.dumps(
+                        {
+                            "tests": [
+                                {"nodeid": nodeid, "outcome": outcome}
+                                for nodeid, outcome in sorted(
+                                    (outcomes or cls.OUTCOMES).items()
+                                )
+                            ]
+                        }
+                    ),
+                )
+            return shuru_mod.ExecResult(
+                stdout=(
+                    "__VANTA_T0_1__=100\n__VANTA_EXIT_1__=0\n__VANTA_T1_1__=101\n"
+                    "__VANTA_T0_2__=102\n__VANTA_EXIT_2__=0\n__VANTA_T1_2__=103\n"
+                ),
+                stderr="",
+                exit_code=0,
+                timed_out=False,
+            )
+
+        return run
+
+    @classmethod
+    def _call(cls, batch, **over):
+        kwargs = dict(
+            checkpoint="chk",
+            batch_dir=batch,
+            tree_rel="vanta_tree",
+            test_cmd=[
+                "python",
+                "-m",
+                "pytest",
+                "tests",
+                "--json-report",
+                "--json-report-file={report}",
+            ],
+            report_rel_stem=cls.STEM,
+            disk_mb=1024,
+            timeout_secs=60,
+            origin="Demo_1/vanta_tree",
+        )
+        kwargs.update(over)
+        return suite_mod.run_suite_twice(**kwargs)
+
+    def test_a_served_pair_is_identical_to_the_fresh_one(self, tmp_path, monkeypatch):
+        """The mandate's cache-equivalence test, in PySnooper/3's shape (one bug,
+        one tree): run fresh, then again, and the second call must be served from
+        the entry with byte-identical outcomes and no second VM boot.
+
+        The pair is compared with ``to_json`` rather than field by field because
+        that is exactly the value the cache stores; if the two disagree anywhere
+        the stored value is not the measurement, and every later reader of a hit
+        would be reading a different experiment.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+
+        fresh = self._call(batch)
+        assert fresh.cache is not None
+        assert fresh.cache["state"] == "miss"
+        assert len(calls) == 1, "the fresh call must boot exactly one VM"
+
+        served = self._call(batch)
+        assert served.cache is not None
+        assert served.cache["state"] == "hit"
+        assert served.cache["source"] == "Demo_1/vanta_tree"
+        assert served.cache["key"] == fresh.cache["key"]
+        assert served.cache["would_hit"] is False
+        assert len(calls) == 1, "a hit must not boot a VM"
+        assert served.to_json() == fresh.to_json()
+        assert served.stable_failures == fresh.stable_failures == {"tests/a.py::t"}
+        assert served.stable_collected == fresh.stable_collected
+        assert served.max_run_secs == fresh.max_run_secs
+
+    def test_a_hit_restores_the_report_files(self, tmp_path, monkeypatch):
+        """A served pair must put its reports back where the other readers look.
+
+        ``prepare.strip_and_baseline`` reads ``reports/{slug}-oracle.run1.json`` and
+        ``replay`` reads ``reports/{slug}-vanta.run1/2.json`` directly. A hit that
+        skipped the run without restoring the files would leave those readers
+        deriving their answer from an absent report — a wrong answer out of a
+        correct hit.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        self._call(batch)
+        for suffix in ("1", "2"):
+            (batch / f"{self.STEM}.run{suffix}.json").unlink()
+
+        self._call(batch)
+
+        assert len(calls) == 1
+        assert suite_mod.parse_report(batch / f"{self.STEM}.run1.json") == self.OUTCOMES
+        assert suite_mod.parse_report(batch / f"{self.STEM}.run2.json") == self.OUTCOMES
+
+    def test_without_an_origin_the_cache_is_never_touched(self, tmp_path, monkeypatch):
+        """Replay's call, and every call before this item: no lookup, no write.
+
+        The wrapper is opt-in per call site, which is what keeps ``replay`` out of
+        the cache without it having to know the cache exists.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+
+        pair = self._call(batch, origin=None)
+
+        assert pair.cache is None
+        assert len(calls) == 1
+        assert not (tmp_path / "cache").exists()
+
+    def test_no_cache_still_reports_what_it_would_have_hit(self, tmp_path, monkeypatch):
+        """``--no-cache`` forces a fresh run but does not hide the entry.
+
+        That is what lets the cache be verified on demand: the row still carries
+        the key and the writer of the entry it did not use.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        fresh = self._call(batch)
+
+        monkeypatch.setenv(suite_cache_mod.DISABLE_ENV, "1")
+        forced = self._call(batch)
+
+        assert forced.cache["state"] == "off:no_cache"
+        assert forced.cache["would_hit"] is True
+        assert forced.cache["key"] == fresh.cache["key"]
+        assert forced.cache["source"] == "Demo_1/vanta_tree"
+        assert len(calls) == 2, "the flag forces a fresh run"
+        assert forced.to_json() == fresh.to_json()
+
+    def test_the_key_covers_the_suite_environment(self, tmp_path, monkeypatch):
+        """fastapi/2's rule: the same bytes measured 775 passed with
+        ``PYTHONPATH=./docs_src`` and 0 collected without it, so the environment is
+        part of the experiment and a key that missed it would serve one
+        environment's result for another's."""
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+
+        plain = self._call(batch)
+        with_env = self._call(batch, extra_env={"PYTHONPATH": "./docs_src"})
+
+        assert plain.cache["key"] != with_env.cache["key"]
+        assert len(calls) == 2
+
+    def test_a_tampered_entry_is_never_served(self, tmp_path, monkeypatch):
+        """A bad entry is recomputed and repaired, never used.
+
+        The payload here still parses as a pair; its digest no longer matches the
+        file, which is the case a "does it look right" reader would miss. The
+        wrapper must treat it as absent, run fresh, and leave a good entry behind.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        first = self._call(batch)
+
+        path = suite_cache_mod.entry_path(first.cache["key"])
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["payload"]["first"]["outcomes"] = {"tests/a.py::t": "passed"}
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+        again = self._call(batch)
+
+        assert len(calls) == 2, "a tampered entry must not spare the run"
+        assert again.cache["state"] == "miss"
+        assert again.first.outcomes == self.OUTCOMES
+        # ... and the repair left an entry that now answers.
+        assert self._call(batch).cache["state"] == "hit"
 
 
 class TestCleanTreeNoise:

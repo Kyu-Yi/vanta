@@ -77,6 +77,7 @@ from . import prepare as prepare_mod
 from . import records as records_mod
 from . import redact as redact_mod
 from . import suite as suite_mod
+from . import suite_cache
 from . import trees as tree_mod
 from .manifest import DONE, FAILED, RUNNING, Manifest, job_key
 from .shuru import ShuruError
@@ -639,6 +640,14 @@ def vanta_env(
     # the row is the `no run.summary` shape the overnight batch produced. Ten
     # minutes is one long sanic call, which is the unit the margin has to cover.
     env["VANTA_DEADLINE_SECS"] = str(RUN_TIMEOUT_SECS - DEADLINE_MARGIN_SECS)
+    # [VANTA-WHY] M3 items S1–S3 — the ONE suite cache directory, made absolute and
+    # handed to every child. The harness process and the binary it spawns must look
+    # in the same place or a hit in one is a miss in the other, and the binary's own
+    # default is relative to its CWD. `VANTA_NO_CACHE`, when the caller set it, is
+    # deliberately NOT set here: it is inherited like everything else this function
+    # does not own, so `--no-cache` reaches the child and the harness process by the
+    # same route.
+    env[suite_cache.CACHE_DIR_ENV] = str(suite_cache.cache_dir().resolve())
     return env
 
 

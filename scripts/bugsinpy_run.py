@@ -67,6 +67,7 @@ from bugsinpy import replay as replay_mod  # noqa: E402
 from bugsinpy import runner as runner_mod  # noqa: E402
 from bugsinpy import split as split_mod  # noqa: E402
 from bugsinpy import suite as suite_mod  # noqa: E402
+from bugsinpy import suite_cache  # noqa: E402
 from bugsinpy import trees as tree_mod  # noqa: E402
 from bugsinpy.shuru import ShuruError  # noqa: E402
 from bugsinpy.split import Split, SplitError, load_split  # noqa: E402
@@ -243,6 +244,8 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         ),
         flush=True,
     )
+    # M3 items S1–S3 — `--no-cache` before the first suite of this stage.
+    honour_no_cache(args)
     # Item B1 — the ONE effective environment, the caller's own with the frozen
     # `[env]` settings applied exactly as `runner.vanta_env` will apply them to
     # each child. The window the gate resolves below is read from it, so a clean
@@ -836,6 +839,33 @@ def max_spend_usd_from_env(env: Mapping[str, str]) -> Optional[float]:
     return cap
 
 
+def honour_no_cache(args: argparse.Namespace) -> None:
+    """``--no-cache`` — force a fresh suite run, in BOTH processes of the stage.
+
+    [VANTA-WHY] M3 items S1–S3. A suite is run by two processes and each looks for
+    the cache by the same environment variable: the harness process itself (item
+    S3's ``prepare`` gate and item S2's ``oracle.grade``, both in-process, reading
+    ``suite_cache.cache_disabled()``) and the ``vanta_m3`` child it spawns (item
+    S1's in-session native gate, reading ``suite_cache.rs``'s ``DISABLE_ENV``).
+    Setting it once here covers both, because ``runner.vanta_env`` builds the
+    child's environment from ``os.environ`` and only ever ADDS keys — and the
+    frozen ``[env]`` does not name this one, so nothing overrides it.
+
+    Called AFTER ``frozen_config.resolve``: that function refuses an invocation
+    whose environment contradicts ``configs/v1-m3.toml``, and it reads
+    ``os.environ``. A flag-set variable the file does not freeze is not a
+    contradiction, but resolving first keeps this function from ever being the
+    reason a refusal fires.
+
+    The flag does not HIDE the cache: ``suite_cache.read_entry`` is still
+    consulted so the row can record that the entry would have hit
+    (``off:no_cache`` / ``cache_would_hit``), and the fresh payload then replaces
+    the entry. That is what makes the cache verifiable on demand.
+    """
+    if getattr(args, "no_cache", False):
+        os.environ[suite_cache.DISABLE_ENV] = "1"
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Run a prepared batch: repairs first, then both reviews, one job at a time.
 
@@ -865,6 +895,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         ),
         flush=True,
     )
+    # M3 items S1–S3 — `--no-cache` before the first job of this stage.
+    honour_no_cache(args)
     # Item B1 — the ONE effective environment: the caller's own, with the frozen
     # `[env]` settings applied exactly as `runner.vanta_env` will apply them to
     # each child. Every read this invocation makes about its OWN configuration
@@ -1019,6 +1051,9 @@ def cmd_queue(args: argparse.Namespace) -> int:
         ),
         flush=True,
     )
+    # M3 items S1–S3 — `--no-cache` before the first job of this queue, in the
+    # parent, so every concurrent job's child inherits it.
+    honour_no_cache(args)
     # Item B1 — the same ONE effective environment as `run`: the caller's own with
     # the frozen `[env]` applied, used by the preflight and the spend cap so a
     # setting frozen in the file but not exported is not silently dropped.
@@ -1730,6 +1765,17 @@ def build_parser() -> argparse.ArgumentParser:
             "that did not need it."
         ),
     )
+    prep.add_argument(
+        "--no-cache",
+        action="store_true",
+        help=(
+            "force a FRESH suite run instead of serving it from the M3 suite cache "
+            "(items S1–S3), so a cached result can be checked against a fresh one on "
+            "demand. The flag does not make the cache invisible: the entry is still "
+            "read, the row records that it WOULD have hit (`off:no_cache`), and the "
+            "entry is refreshed with the fresh payload."
+        ),
+    )
     prep.set_defaults(func=cmd_prepare)
 
     bake = sub.add_parser(
@@ -1893,6 +1939,17 @@ def build_parser() -> argparse.ArgumentParser:
             "compared by name to, the default run."
         ),
     )
+    run.add_argument(
+        "--no-cache",
+        action="store_true",
+        help=(
+            "force a FRESH suite run instead of serving it from the M3 suite cache "
+            "(items S1–S3), so a cached result can be checked against a fresh one on "
+            "demand. The flag does not make the cache invisible: the entry is still "
+            "read, the row records that it WOULD have hit (`off:no_cache` / "
+            "`cache_would_hit`), and the entry is refreshed with the fresh payload."
+        ),
+    )
     run.set_defaults(func=cmd_run)
 
     queue = sub.add_parser(
@@ -2004,6 +2061,17 @@ def build_parser() -> argparse.ArgumentParser:
             "default and off for every batch a verdict rests on; such rows take a "
             "`#hints` job key and cannot be resumed as, or compared by name to, a "
             "default run."
+        ),
+    )
+    queue.add_argument(
+        "--no-cache",
+        action="store_true",
+        help=(
+            "force a FRESH suite run instead of serving it from the M3 suite cache "
+            "(items S1–S3), so a cached result can be checked against a fresh one on "
+            "demand. The flag does not make the cache invisible: the entry is still "
+            "read, the row records that it WOULD have hit (`off:no_cache` / "
+            "`cache_would_hit`), and the entry is refreshed with the fresh payload."
         ),
     )
     queue.set_defaults(func=cmd_queue)

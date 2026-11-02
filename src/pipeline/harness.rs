@@ -540,7 +540,10 @@ pub async fn run_native_suite(
 ///   * **A key is the input, so a hit is the same experiment.** The key carries
 ///     the tree, the command, the env, the checkpoint and the WALL-CLOCK CAP
 ///     (a run's timeout is a function of the cap, so a cap left out of the key
-///     would let one arm's kill be inherited as a fact about the tree).
+///     would let one arm's kill be inherited as a fact about the tree), and the
+///     sandbox kind that ACTUALLY ran (M3 item U4): `auto` resolves through the
+///     shuru boot test, so the same request is two experiments on two machines,
+///     and a subprocess suite must never answer a shuru run.
 ///   * **A bad entry is never used.** `plan_native_suite` already refuses a
 ///     mismatched file; a payload that THIS build cannot decode is refused here
 ///     too, and the fresh run overwrites it.
@@ -558,10 +561,11 @@ pub async fn run_native_suite_cached(
     source: &str,
     test_cmd: &TestCommand,
     timeout_secs: Option<u64>,
+    backend: &str,
     origin: &str,
 ) -> (NativeSuiteReport, suite_cache::CacheNote) {
     let cap = timeout_secs.unwrap_or_else(test_timeout_secs);
-    let key = suite_cache::native_key(source, test_cmd, cap);
+    let key = suite_cache::native_key(source, test_cmd, cap, backend);
     let plan = suite_cache::plan_native_suite(&key);
     let mut note = plan.note.clone();
     if let Some(payload) = &plan.reuse {

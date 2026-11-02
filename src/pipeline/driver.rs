@@ -3487,6 +3487,7 @@ pub async fn run(
             &original_concat,
             &test_cmd,
             config.native_timeout_secs,
+            actual_backend,
             &format!("{}/a{}/original", session_id.as_str(), attempt + 1),
         )
         .await;
@@ -3494,6 +3495,7 @@ pub async fn run(
             &native_patched_concat,
             &test_cmd,
             config.native_timeout_secs,
+            actual_backend,
             &format!("{}/a{}/patched", session_id.as_str(), attempt + 1),
         )
         .await;

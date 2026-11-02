@@ -17,6 +17,12 @@
 //   * the test command, its env and its precompile rule;
 //   * the checkpoint, disk and memory the VM is created with (a too-small VM
 //     KILLS the run, which is an outcome, not a resource detail);
+//   * the sandbox kind that ACTUALLY ran (M3 item U4). `auto` resolves through
+//     the shuru availability and boot test, so the same request measures a
+//     different isolation on two machines; and a subprocess run inherits the
+//     host's interpreter and environment while a shuru run does not, so serving
+//     one's suite to the other would be serving another experiment's result —
+//     the PREFERENCE in `VANTA_SANDBOX_BACKEND` cannot say which one this was;
 //   * the LAYER's identity and not merely its name (M3 item U3): a re-bake
 //     reuses the name, so a name-keyed entry can outlive the layer it measured;
 //   * the wall-clock cap (a run's TIMEOUT is a function of the cap, and the cap
@@ -223,6 +229,7 @@ fn native_material(
     stamp: &str,
     checkpoint_raw: &str,
     checkpoint_id_raw: &str,
+    backend_raw: &str,
     disk_raw: &str,
     memory_raw: &str,
 ) -> Value {
@@ -245,6 +252,10 @@ fn native_material(
     material.insert("env".to_string(), json!(env));
     material.insert("precompile".to_string(), json!(test_cmd.precompile));
     material.insert("checkpoint".to_string(), json!(checkpoint_raw));
+    // [VANTA-WHY] M3 item U4 — the kind that RAN, not the preference that was
+    // asked for. `auto` resolves differently on two machines, and the two
+    // backends do not inherit the same environment.
+    material.insert("backend".to_string(), json!(backend_raw));
     // [VANTA-WHY] M3 item U3 — the NAME above says which cage was opened; this
     // says which animal is in it. A re-bake reuses the name, so an entry keyed on
     // the name alone can be served for a layer built from different pins.
@@ -266,7 +277,13 @@ pub struct Key {
 }
 
 /// The key for one in-session native-suite run.
-pub fn native_key(source: &str, test_cmd: &TestCommand, timeout_secs: u64) -> Key {
+///
+/// `backend` is the sandbox kind that ACTUALLY ran (`sandbox::backend_kind_label`
+/// over `\`sandbox::actual_backend_kind\``), passed in rather than read from the
+/// environment: the environment holds the PREFERENCE, and `auto` names two
+/// different experiments depending on whether shuru boots on this machine (M3
+/// item U4). Every other input is read from the process environment here.
+pub fn native_key(source: &str, test_cmd: &TestCommand, timeout_secs: u64, backend: &str) -> Key {
     native_key_with(
         source,
         test_cmd,
@@ -274,6 +291,7 @@ pub fn native_key(source: &str, test_cmd: &TestCommand, timeout_secs: u64) -> Ke
         &build_stamp(),
         &std::env::var("VANTA_SHURU_CHECKPOINT").unwrap_or_default(),
         &std::env::var(CHECKPOINT_ID_ENV).unwrap_or_default(),
+        backend,
         &std::env::var("VANTA_SHURU_DISK_MB").unwrap_or_default(),
         &std::env::var("VANTA_SHURU_MEMORY_MB").unwrap_or_default(),
     )
@@ -287,6 +305,7 @@ pub fn native_key_with(
     stamp: &str,
     checkpoint_raw: &str,
     checkpoint_id_raw: &str,
+    backend_raw: &str,
     disk_raw: &str,
     memory_raw: &str,
 ) -> Key {
@@ -297,6 +316,7 @@ pub fn native_key_with(
         stamp,
         checkpoint_raw,
         checkpoint_id_raw,
+        backend_raw,
         disk_raw,
         memory_raw,
     );
@@ -580,6 +600,7 @@ mod tests {
             "rs:abc123:false",
             "vanta-python",
             "layer-1",
+            "shuru",
             "",
             "",
         )
@@ -599,6 +620,7 @@ mod tests {
             "rs:abc123:false",
             "vanta-python",
             "layer-1",
+            "shuru",
             "",
             "",
         );
@@ -611,6 +633,7 @@ mod tests {
             "rs:abc123:false",
             "vanta-python",
             "layer-1",
+            "shuru",
             "",
             "",
         );
@@ -623,6 +646,7 @@ mod tests {
             "rs:def456:false",
             "vanta-python",
             "layer-1",
+            "shuru",
             "",
             "",
         );
@@ -644,6 +668,7 @@ mod tests {
             "rs:abc123:false",
             "vanta-python",
             "layer-2",
+            "shuru",
             "",
             "",
         );
@@ -659,10 +684,48 @@ mod tests {
             "rs:abc123:false",
             "vanta-other",
             "layer-1",
+            "shuru",
             "",
             "",
         );
         assert_ne!(first.hex, renamed.hex, "the name is still an input too");
+    }
+
+    /// M3 item U4 — the sandbox kind that RAN is an input, and the request is not
+    /// the answer. `auto` resolves through the shuru availability and boot test,
+    /// so the same command against the same tree is one experiment inside a VM
+    /// and another on the host, which inherits an interpreter and an environment
+    /// the VM never sees.
+    #[test]
+    fn the_backend_that_actually_ran_is_an_input() {
+        let cmd = test_cmd();
+        let in_vm = native_key_with(
+            "# FILE: a.py\nx = 1\n",
+            &cmd,
+            120,
+            "rs:abc123:false",
+            "vanta-python",
+            "layer-1",
+            "shuru",
+            "",
+            "",
+        );
+        let on_host = native_key_with(
+            "# FILE: a.py\nx = 1\n",
+            &cmd,
+            120,
+            "rs:abc123:false",
+            "vanta-python",
+            "layer-1",
+            "subprocess",
+            "",
+            "",
+        );
+        assert_ne!(
+            in_vm.hex, on_host.hex,
+            "another isolation is another experiment"
+        );
+        assert_eq!(in_vm.material["backend"], json!("shuru"));
     }
 
     #[test]
@@ -853,6 +916,7 @@ mod tests {
             "rs:abc123:false",
             "vanta-python",
             "",
+            "shuru",
             "",
             "",
         );
@@ -906,6 +970,7 @@ mod tests {
             "rs:abc123:false",
             "vanta-python",
             "layer-1",
+            "shuru",
             "",
             "",
         );
@@ -931,8 +996,28 @@ mod tests {
     #[test]
     fn a_tree_change_changes_the_key_even_at_the_same_size() {
         let cmd = test_cmd();
-        let a = native_key_with("aaaa", &cmd, 120, "rs:x:false", "", "layer-1", "", "");
-        let b = native_key_with("bbbb", &cmd, 120, "rs:x:false", "", "layer-1", "", "");
+        let a = native_key_with(
+            "aaaa",
+            &cmd,
+            120,
+            "rs:x:false",
+            "",
+            "layer-1",
+            "shuru",
+            "",
+            "",
+        );
+        let b = native_key_with(
+            "bbbb",
+            &cmd,
+            120,
+            "rs:x:false",
+            "",
+            "layer-1",
+            "shuru",
+            "",
+            "",
+        );
         assert_ne!(a.hex, b.hex);
     }
 

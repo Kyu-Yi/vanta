@@ -88,7 +88,10 @@ pub const CACHE_DIR_ENV: &str = "VANTA_SUITE_CACHE_DIR";
 /// [VANTA-WHY] The flag forces a FRESH run; it does not make the cache invisible.
 /// `read_entry` is still consulted, and the note records `would_hit`, so a cached
 /// result can be checked against a fresh one on demand — the only way to verify
-/// the cache without a second experiment design. The entry is then refreshed.
+/// the cache without a second experiment design. The entry is then refreshed
+/// (M3 item U2), so a bad entry cannot outlive the one invocation that was asked
+/// to check it; a fresh run that measured nothing refreshes nothing, and a DIRTY
+/// build writes nothing at all (see the module note).
 pub const DISABLE_ENV: &str = "VANTA_NO_CACHE";
 
 /// The default root, relative to the harness's cwd (the repo root).
@@ -364,7 +367,7 @@ pub fn write_entry(
 pub struct CacheNote {
     /// The 64-hex key of the run this note describes.
     pub key: String,
-    /// `hit`, `miss`, `unreadable`, or `off:<reason>`.
+    /// `hit`, `miss`, `unreadable`, `unmeasured`, or `off:<reason>`.
     pub state: String,
     /// The `created_by` of the entry that was found, or `""`.
     pub source: String,
@@ -453,10 +456,18 @@ pub fn plan_native_suite_from(
         Some(reason) => {
             note.state = format!("off:{reason}");
             note.would_hit = true;
+            // [VANTA-WHY] M3 item U2 — `--no-cache` REPLACES the entry it could
+            // not use, as this module's `DISABLE_ENV` note and the `--no-cache`
+            // help both say; leaving it alone meant a bad entry outlived the one
+            // invocation that was asked to check it. A DIRTY build is the other
+            // reason and must still write nothing: its key is not trusted to
+            // describe the binary that ran, so an entry written by it would be
+            // injected into a clean build's key space.
+            let refresh = reason == "no_cache";
             CachePlan {
                 reuse: None,
                 note,
-                write: false,
+                write: refresh,
             }
         }
         None => match entry.get("payload") {
@@ -671,7 +682,26 @@ mod tests {
         assert_eq!(plan.note.state, "off:no_cache");
         assert!(plan.note.would_hit, "what the cache would have returned is recorded");
         assert_eq!(plan.note.source, "sess1/attempt1/patched");
-        assert!(!plan.write, "a forced fresh run leaves the entry alone");
+        assert!(
+            plan.write,
+            "a forced fresh run replaces the entry it could not use (M3 item U2)"
+        );
+    }
+
+    /// M3 item U2 — the OTHER disabled reason must still write nothing: a dirty
+    /// build's key is not trusted, so its entry would land in the clean key space.
+    #[test]
+    fn a_dirty_build_never_writes_an_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let key = key_for("writer", &test_cmd());
+        write_entry_to(root, &key.hex, &key.material, &json!({"ran": true}), "sess1").unwrap();
+
+        let plan = plan_native_suite_from(root, &key, Some("dirty_build"));
+        assert!(plan.reuse.is_none(), "a dirty build never serves an entry");
+        assert_eq!(plan.note.state, "off:dirty_build");
+        assert!(plan.note.would_hit);
+        assert!(!plan.write, "a dirty build leaves the cache untouched");
     }
 
     #[test]

@@ -172,7 +172,8 @@ class SuitePair:
     """How this pair was obtained (M3 item S1), or ``None`` for a pair that was
     never looked up in the cache.
 
-    [VANTA-WHY] The key, the state (``hit``/``miss``/``unreadable``/``off:no_cache``),
+    [VANTA-WHY] The key, the state
+    (``hit``/``miss``/``unreadable``/``unmeasured``/``off:no_cache``),
     the ``created_by`` of the entry that was served and whether an entry existed
     that could not be used. Deliberately NOT part of :meth:`to_json`: it describes
     the LOOKUP, not the experiment, so storing it would make a served pair claim
@@ -517,7 +518,9 @@ def run_suite_twice(
 
     The lookup still happens under ``--no-cache``: the flag forces a fresh run but
     the row records what the cache WOULD have returned, which is the only way to
-    check the cache against a fresh measurement without a second experiment.
+    check the cache against a fresh measurement without a second experiment — a
+    fresh measurement that succeeded then replaces the entry it could not use
+    (M3 item U2).
     """
     material = (
         None
@@ -554,17 +557,35 @@ def run_suite_twice(
                 would_hit = True
                 write = True
             else:
-                served.cache = {
-                    "key": key,
-                    "state": "hit",
-                    "source": source,
-                    "would_hit": False,
-                }
-                _write_reports(batch_dir, report_rel_stem, served)
-                return served
+                # [VANTA-WHY] M3 item U2 — the U1 rule, mirrored on this side.
+                # The payload parsed, but a pair whose runs measured nothing is
+                # not a measurement: `run_state` is exactly the check the rest of
+                # the flow refuses a bug on, so an entry that fails it can only
+                # have been written before the write gate existed. Present and
+                # useless — recompute and overwrite it rather than serve an empty
+                # suite as a stable oracle.
+                states = (run_state(served.first), run_state(served.second))
+                if any(state is not None for state in states):
+                    condition = "unmeasured"
+                    would_hit = True
+                    write = True
+                else:
+                    served.cache = {
+                        "key": key,
+                        "state": "hit",
+                        "source": source,
+                        "would_hit": False,
+                    }
+                    _write_reports(batch_dir, report_rel_stem, served)
+                    return served
         elif entry is not None:
+            # [VANTA-WHY] M3 item U2 — a `--no-cache` run REPLACES the entry it
+            # could not use, as `suite_cache.DISABLE_ENV` and the `--no-cache`
+            # help both say. Leaving it alone meant a bad entry outlived the one
+            # invocation that was asked to check it.
             condition = "off:no_cache"
             would_hit = True
+            write = True
         else:
             write = not disabled
 
@@ -622,11 +643,17 @@ def run_suite_twice(
     _clean_tree_noise(batch_dir / tree_rel)
 
     if material is not None:
-        # A plain miss writes the entry; a corrupt-for-us one is repaired. A
-        # ``--no-cache`` run writes nothing but still reports what it would have
-        # hit, so the entry stays available for the fresh measurement to be
-        # compared with.
-        if write:
+        # [VANTA-WHY] M3 item U2 — ONLY A MEASUREMENT IS CACHED. `write` alone is
+        # not enough: a plain miss sets it for every fresh run, including one whose
+        # VM never booted, one the OOM killer ended, one that hit the cap under
+        # load, or one that left a report nothing can read. Stored, such a pair is
+        # served forever after as a stable oracle — `oracle.grade` reads it as
+        # inconclusive and `prepare` reuses it for the same tree — which is the
+        # defect, not the optimisation. `run_state` is the harness's own answer to
+        # "did this run measure anything", so the gate is that answer for BOTH
+        # runs. A `--no-cache` run that measured nothing therefore leaves the
+        # entry it could not use intact, and still reports what it would have hit.
+        if write and run_state(first) is None and run_state(second) is None:
             entry = suite_cache.build_entry(material, pair.to_json(), origin=origin)
             try:
                 suite_cache.write_entry(entry)

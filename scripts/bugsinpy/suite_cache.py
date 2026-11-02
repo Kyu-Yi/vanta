@@ -14,7 +14,7 @@ effective timeout cap. The stored value is the WHOLE pair (both runs, both
 reports, the flaky/missing sets, and the in-VM wall times), so a flakiness
 reading is always made on the recorded pair and never re-derived from one run.
 
-Three rules make the reuse safe rather than merely fast:
+Four rules make the reuse safe rather than merely fast:
 
 * **A key is the input, so a hit is the same experiment.** Anything that can
   move an outcome is in the key — including the timeout cap, because a run's
@@ -26,6 +26,12 @@ Three rules make the reuse safe rather than merely fast:
 * **Reuse is auditable.** Every entry records who wrote it, and every reader is
   handed the key plus the writer's identity, so a row can say which earlier row
   its native result came from.
+* **An unmeasured run is never stored or served** (M3 item U2). A pair whose
+  runs measured nothing — no report, a cap, a kill — is not a measurement, and
+  caching one would serve an empty suite as if it were "no regressions". The
+  write side refuses to store one and the read side refuses to serve one, so an
+  entry written before the rule existed is repaired rather than believed. The
+  Rust half of the same rule is item U1.
 
 Where it lives is a deliberate choice (Nathan, speed-package mandate): under
 `runs/` — gitignored — read host-side only as data, never inside a
@@ -75,10 +81,13 @@ DISABLE_ENV = "VANTA_NO_CACHE"
 """Set by `--no-cache` on `run`, `queue` and `prepare`.
 
 [VANTA-WHY] The flag forces a FRESH run; it does not make the cache invisible.
-`read_entry` is still consulted, and the row records `cache_would_hit` /
-`cache_matches`, so a cached result can be checked against a fresh one on
-demand — which is the only way to verify the cache without a second experiment
-design. The entry is then refreshed with the fresh payload.
+`read_entry` is still consulted, and the row records the lookup in its own
+`cache` list — one entry per side, each with `state` (`off:no_cache`) and
+`would_hit` — so a cached result can be checked against a fresh one on demand,
+which is the only way to verify the cache without a second experiment design.
+The fresh payload then REPLACES the entry (M3 item U2), so a bad entry cannot
+outlive the one invocation that was asked to check it; a fresh run that measured
+nothing replaces nothing, because `run_state` refuses it on both sides.
 """
 
 # Directories whose contents are a run's own leavings or another tool's state,

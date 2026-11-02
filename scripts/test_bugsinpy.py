@@ -6506,6 +6506,10 @@ class TestSuiteCache:
     ride the row), and ``--no-cache`` forces a fresh run while still reporting
     what the cache would have returned. ``shuru.run`` is replaced, so no VM is
     booted and every assertion is about the wrapper, not about a sandbox.
+
+    M3 item U2 adds the fourth rule, on both sides: a pair that measured nothing
+    is never stored, never served, and a ``--no-cache`` run replaces the entry it
+    could not use instead of leaving the bad one behind.
     """
 
     STEM = "reports/Demo_1-vanta"
@@ -6528,12 +6532,17 @@ class TestSuiteCache:
         return batch
 
     @classmethod
-    def _vm_run(cls, calls, *, outcomes=None):
-        """A ``shuru.run`` that writes both reports instead of booting a VM."""
+    def _vm_run(cls, calls, *, outcomes=None, report=True):
+        """A ``shuru.run`` that writes both reports instead of booting a VM.
+
+        ``report=False`` is the other ending: no report at all, which is what a
+        VM that never booted, an OOM kill or a capped run leaves behind — and
+        what ``run_state`` refuses as a measurement.
+        """
 
         def run(**kwargs):
             calls.append(kwargs)
-            for suffix in ("1", "2"):
+            for suffix in ("1", "2") if report else ():
                 write(
                     kwargs["host_root"] / f"{cls.STEM}.run{suffix}.json",
                     json.dumps(
@@ -6670,6 +6679,90 @@ class TestSuiteCache:
         assert forced.cache["source"] == "Demo_1/vanta_tree"
         assert len(calls) == 2, "the flag forces a fresh run"
         assert forced.to_json() == fresh.to_json()
+
+    @staticmethod
+    def _store_husk(path):
+        """Rewrite an entry so its payload is a pair that measured nothing.
+
+        Intact on purpose — schema, key, material and digest all agree — so
+        ``suite_cache.read_entry`` returns it and the U1/U2 rules are the only
+        thing standing between a husk and a reader. That is the entry an older
+        build could have written: the write gate that refuses one is new.
+        """
+        husk = suite_mod.compare_runs(
+            suite_mod.SuiteRun(outcomes={}, exit_code=0, report_found=False),
+            suite_mod.SuiteRun(outcomes={}, exit_code=0, report_found=False),
+        )
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["payload"] = husk.to_json()
+        document["payload_digest"] = suite_cache_mod.payload_digest(document["payload"])
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+    def test_an_unmeasured_fresh_pair_is_never_cached(self, tmp_path, monkeypatch):
+        """M3 item U2 — the write gate, the Python half of U1's.
+
+        A run whose VM never booted, that the OOM killer ended, or that hit the
+        cap leaves no report, and empty ``outcomes`` read as "no test fails". A
+        plain miss sets ``write`` for every fresh run, so the gate that saves the
+        cache from being the bug is ``run_state``, not ``write``.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls, report=False))
+
+        pair = self._call(batch)
+
+        assert pair.cache["state"] == "miss"
+        assert suite_mod.run_state(pair.first) is not None
+        assert suite_mod.run_state(pair.second) is not None
+        assert not suite_cache_mod.entry_path(pair.cache["key"]).exists()
+
+    def test_a_served_unmeasured_entry_is_refused_and_repaired(self, tmp_path, monkeypatch):
+        """M3 item U2 — the read-side mirror, so an entry written before the gate
+        is repaired rather than believed.
+
+        Refused with ``would_hit`` set, because the entry *was* there and a row
+        that said "miss" would claim a lookup that did not happen.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        stale = self._call(batch)
+        path = suite_cache_mod.entry_path(stale.cache["key"])
+        self._store_husk(path)
+
+        refused = self._call(batch)
+
+        assert refused.cache["state"] == "unmeasured"
+        assert refused.cache["would_hit"] is True
+        assert len(calls) == 2, "an unmeasured entry must not spare the run"
+        assert refused.first.outcomes == self.OUTCOMES
+        # The fresh measurement replaced the husk it could not use.
+        assert self._call(batch).cache["state"] == "hit"
+
+    def test_no_cache_replaces_the_entry_it_could_not_use(self, tmp_path, monkeypatch):
+        """M3 item U2 — the flag refreshes, as its help and ``DISABLE_ENV`` say.
+
+        Leaving the entry alone meant a bad one outlived the single invocation
+        that was asked to check it — the one call whose whole point is to produce
+        a fresh measurement to compare against.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        stale = self._call(batch)
+        self._store_husk(suite_cache_mod.entry_path(stale.cache["key"]))
+
+        monkeypatch.setenv(suite_cache_mod.DISABLE_ENV, "1")
+        forced = self._call(batch)
+
+        assert forced.cache["state"] == "off:no_cache"
+        assert forced.cache["would_hit"] is True
+        assert len(calls) == 2
+        # The fresh measurement replaced the husk, so the next lookup answers.
+        monkeypatch.delenv(suite_cache_mod.DISABLE_ENV)
+        assert self._call(batch).cache["state"] == "hit"
+        assert suite_mod.parse_report(batch / f"{self.STEM}.run1.json") == self.OUTCOMES
 
     def test_the_key_covers_the_suite_environment(self, tmp_path, monkeypatch):
         """fastapi/2's rule: the same bytes measured 775 passed with

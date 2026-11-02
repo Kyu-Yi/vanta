@@ -859,8 +859,10 @@ def honour_no_cache(args: argparse.Namespace) -> None:
 
     The flag does not HIDE the cache: ``suite_cache.read_entry`` is still
     consulted so the row can record that the entry would have hit
-    (``off:no_cache`` / ``cache_would_hit``), and the fresh payload then replaces
-    the entry. That is what makes the cache verifiable on demand.
+    (``off:no_cache``, with ``would_hit`` in the row's own ``cache`` list), and
+    the fresh payload then replaces the entry it could not use (M3 item U2) —
+    unless the fresh run measured nothing, which `run_state` refuses on both
+    sides. That is what makes the cache verifiable on demand.
     """
     if getattr(args, "no_cache", False):
         os.environ[suite_cache.DISABLE_ENV] = "1"
@@ -1798,7 +1800,7 @@ def build_parser() -> argparse.ArgumentParser:
             "(items S1–S3), so a cached result can be checked against a fresh one on "
             "demand. The flag does not make the cache invisible: the entry is still "
             "read, the row records that it WOULD have hit (`off:no_cache`), and the "
-            "entry is refreshed with the fresh payload."
+            "fresh payload then replaces the entry it could not use."
         ),
     )
     prep.set_defaults(func=cmd_prepare)
@@ -1971,8 +1973,9 @@ def build_parser() -> argparse.ArgumentParser:
             "force a FRESH suite run instead of serving it from the M3 suite cache "
             "(items S1–S3), so a cached result can be checked against a fresh one on "
             "demand. The flag does not make the cache invisible: the entry is still "
-            "read, the row records that it WOULD have hit (`off:no_cache` / "
-            "`cache_would_hit`), and the entry is refreshed with the fresh payload."
+            "read, the row records that it WOULD have hit (`off:no_cache`, with "
+            "`would_hit` in the row's own `cache` list), and the fresh payload then "
+            "replaces the entry it could not use."
         ),
     )
     run.set_defaults(func=cmd_run)
@@ -2095,8 +2098,9 @@ def build_parser() -> argparse.ArgumentParser:
             "force a FRESH suite run instead of serving it from the M3 suite cache "
             "(items S1–S3), so a cached result can be checked against a fresh one on "
             "demand. The flag does not make the cache invisible: the entry is still "
-            "read, the row records that it WOULD have hit (`off:no_cache` / "
-            "`cache_would_hit`), and the entry is refreshed with the fresh payload."
+            "read, the row records that it WOULD have hit (`off:no_cache`, with "
+            "`would_hit` in the row's own `cache` list), and the fresh payload then "
+            "replaces the entry it could not use."
         ),
     )
     queue.set_defaults(func=cmd_queue)

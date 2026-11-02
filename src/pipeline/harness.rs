@@ -578,10 +578,11 @@ pub async fn run_native_suite_cached(
     // inside the cache is served forever after as an empty suite, which
     // `native_gate_vacuous` then reads as "the patch broke nothing". The write
     // is therefore gated on the run having actually happened, not merely on the
-    // entry's absence. A plain miss writes the entry; a corrupt-for-us one is
-    // repaired. A `--no-cache` or dirty-build call writes nothing — the flag is
-    // non-mutating, so the entry it could not use is still there for the fresh
-    // result to be compared with.
+    // entry's absence. A plain miss writes the entry and a corrupt-for-us one is
+    // repaired; a `--no-cache` call replaces the entry it could not use, which is
+    // what `DISABLE_ENV` and the flag's own help promise (M3 item U2). A dirty
+    // build still writes nothing — `plan.write` stays false for it, because its
+    // key is not trusted to describe the binary that ran.
     let measured = report_is_measured(&report);
     if measured && (plan.write || note.state == "unreadable") {
         if let Ok(payload) = serde_json::to_value(&report) {

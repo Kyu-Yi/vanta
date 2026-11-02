@@ -13,6 +13,7 @@ pub mod governor;
 pub mod gatekeeper;
 pub mod rerun;
 pub mod safe_path;
+pub mod summary_escape;
 pub mod suite_cache;
 
 /// The per-attempt ceiling on the Attacker's remediation calls — revise (BATE)

@@ -57,6 +57,7 @@ use crate::pipeline::patch::{
     ApplyFailure, apply_patch_detailed, apply_patch_strict, patch_deleted_paths,
 };
 use crate::pipeline::safe_path::{confined_join, unsafe_relative_path_reason};
+use crate::pipeline::summary_escape::{encode_summary_path_list, encode_summary_value};
 use crate::pipeline::{BUDGET_EXHAUSTED, REVISE_BUDGET_PER_ATTEMPT, ReviseBudget};
 use crate::repo::Repo;
 use crate::session::{
@@ -5059,8 +5060,21 @@ pub async fn run(
             // pre-existing keys so an older row's reader is unaffected.
             cfg.service_tier_text(),
             deciding_rule.as_deref().unwrap_or("none"),
-            deciding_evidence.join(","),
-            needs_review_weak.join(","),
+            // [VANTA-WHY] M3 item T2 — the evidence and the weak-failure list are
+            // TEST NAMES, and a pytest node id can carry a space (a parametrize id
+            // is free text). Each element is percent-encoded so one such name can
+            // neither truncate the value nor inject a `key=value`; a name without
+            // whitespace is written unchanged.
+            deciding_evidence
+                .iter()
+                .map(|evidence| encode_summary_value(evidence))
+                .collect::<Vec<_>>()
+                .join(","),
+            needs_review_weak
+                .iter()
+                .map(|weak| encode_summary_value(weak))
+                .collect::<Vec<_>>()
+                .join(","),
             vanta_commit,
             vanta_dirty,
             // [VANTA-WHY] §14.10 — the prompt identity of the run, the same
@@ -5110,15 +5124,16 @@ pub async fn run(
             ledger_text(grounded_kept_by_issue_total),
             // [VANTA-WHY] M3 item 17 — the quarantine ledger: how many probes the
             // Diagnostician removed from the shared set this run, and which ones.
-            // Names are space-free (pytest node ids), so the list survives the
-            // space-terminated `key=value` reader. The reason each was removed is
-            // the per-test `quarantine[<name>]` session row and the
-            // `attempt_*_diagnostic_<name>.json` debug artifact, both of which can
-            // hold free text the row cannot.
+            // [VANTA-WHY] M3 item T2 — each name is percent-encoded rather than
+            // assumed space-free: a pytest node id is free text (a parametrize id
+            // can carry a space), and an unencoded one could truncate this value.
+            // The reason each was removed is the per-test `quarantine[<name>]`
+            // session row and the `attempt_*_diagnostic_<name>.json` debug
+            // artifact, both of which can hold free text the row cannot.
             quarantined.len(),
             quarantined
                 .iter()
-                .map(|q| q.test_name.clone())
+                .map(|q| encode_summary_value(&q.test_name))
                 .collect::<Vec<_>>()
                 .join(","),
             // [VANTA-WHY] Item P — which mechanism seeded this run's sandboxes
@@ -5180,19 +5195,19 @@ pub async fn run(
             // empty list — so an ABSENT key (an older row, or a review row) reads as
             // UNKNOWN, never as "created no files". RECORD ONLY: no metric, label or
             // verdict reads it.
+            //
+            // [VANTA-WHY] M3 item T2 — each path is percent-encoded
+            // (`summary_escape::encode_summary_value`) before the join, because a
+            // path is the Creator's own output: one shaped like
+            // `x final_decision=AllTestsPassed y.py` would otherwise TRUNCATE this
+            // value at its space and INJECT a `final_decision` the row never wrote.
+            // The runner's `_list` decodes each entry, so the row still names the
+            // path the patch really created.
             if config.patch_path.is_none() {
-                if new_files_created.is_empty() {
-                    " new_files_created=none".to_string()
-                } else {
-                    format!(
-                        " new_files_created=[{}]",
-                        new_files_created
-                            .iter()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(";")
-                    )
-                }
+                format!(
+                    " new_files_created={}",
+                    encode_summary_path_list(new_files_created.iter())
+                )
             } else {
                 String::new()
             },

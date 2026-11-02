@@ -23231,6 +23231,13 @@ class TestLocalizationHit:
         line = "mode=repair:selected=[pkg/a@1[path]full:1B/1tok]:pruned=[none]"
         assert runner_mod.selected_paths(line) == ["pkg/a"]
 
+    def test_a_percent_encoded_path_is_decoded_back_to_the_trees_own_text(self):
+        """M3 item T2 — the driver percent-encodes each path so a spaced one cannot
+        break the line; the reader must decode it back, or the metric compares an
+        encoded name against the patch's raw one and reports a miss forever."""
+        line = "mode=repair:selected=[pkg/odd%20name.py@1[path]full:1B/1tok]:pruned=[none]"
+        assert runner_mod.selected_paths(line) == ["pkg/odd name.py"]
+
     def test_no_selected_list_is_no_paths(self):
         assert runner_mod.selected_paths("none") == []
         assert runner_mod.selected_paths("") == []
@@ -23354,6 +23361,12 @@ class TestFixFileCoverage:
         must not be named two ways across two fields a reader diffs."""
         line = "mode=repair:selected=[pkg/a.py@1[path]path:1B/1tok]:pruned=[none]"
         assert runner_mod.selected_forms(line) == {"pkg/a.py": "path_only"}
+
+    def test_a_percent_encoded_path_is_decoded_like_the_other_reader(self):
+        """M3 item T2 — both selection readers decode the driver's encoding, so
+        ``fix_file_visibility`` keys the form map by a name the gold paths use."""
+        line = "mode=repair:selected=[pkg/odd%20name.py@1[path]full:1B/1tok]:pruned=[none]"
+        assert runner_mod.selected_forms(line) == {"pkg/odd name.py": "full"}
 
     def test_coverage_is_the_gold_files_shown_in_full_over_the_gold_files(self):
         """gold = {a, b, c}, full = {a, c} → 2/3. An outline is a pointer to the fix,
@@ -24562,6 +24575,45 @@ class TestNewFilesCreated:
         )
         row = self._row(tmp_path, monkeypatch, summary)
         assert row["new_files_created"] == ["pkg/a.py", "pkg/b.py"]
+
+    def test_a_spaced_path_round_trips_and_leaves_the_verdict_alone(self, tmp_path, monkeypatch):
+        """M3 item T2 — the driver percent-encodes each path before it joins the
+        list, so a path shaped like the CodeRabbit example cannot truncate the
+        value or inject a `final_decision`. The row reads the path back exactly and
+        its verdict is unchanged."""
+        summary = dict(
+            _outcome(tmp_path).summary,
+            new_files_created="[x%20final_decision=AllTestsPassed%20y.py]",
+        )
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["new_files_created"] == ["x final_decision=AllTestsPassed y.py"]
+        assert row["verdict"] == "Rejected"
+
+    def test_the_encoding_is_what_stops_a_path_injecting_a_summary_field(self):
+        """The CodeRabbit case at the reader the driver writes for.
+
+        The first half pins the hazard — without the encoding the raw path
+        truncates `new_files_created` at its space and the line reads as an
+        approval it never had — so this test fails if the encoding is dropped. The
+        second half pins that the encoded form reads back as the real verdict and
+        the real path.
+        """
+        raw = (
+            "final_decision=Rejected "
+            "new_files_created=[x final_decision=AllTestsPassed y.py] fixed_rounds=off"
+        )
+        assert runner_mod.parse_summary(raw)["final_decision"] == "AllTestsPassed"
+
+        encoded = (
+            "final_decision=Rejected "
+            "new_files_created=[x%20final_decision=AllTestsPassed%20y.py] "
+            "fixed_rounds=off"
+        )
+        pairs = runner_mod.parse_summary(encoded)
+        assert pairs["final_decision"] == "Rejected"
+        assert runner_mod._list(pairs["new_files_created"]) == [
+            "x final_decision=AllTestsPassed y.py"
+        ]
 
     def test_a_genuine_empty_list_reads_as_empty(self, tmp_path, monkeypatch):
         summary = dict(_outcome(tmp_path).summary, new_files_created="none")

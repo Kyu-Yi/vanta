@@ -65,6 +65,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
+from urllib.parse import unquote
 
 from . import bake as bake_mod
 from . import compact as compact_mod
@@ -1227,7 +1228,10 @@ def selected_paths(context_selection: str) -> list[str]:
         body = body[:-1]
     if body in ("", "none"):
         return []
-    return [entry.split("@", 1)[0] for entry in body.split(";") if entry]
+    # [VANTA-WHY] M3 item T2 — the driver percent-encodes each path so a spaced
+    # one cannot break the line; decode it back here so `localization_hit` and
+    # `fix_file_coverage` compare it against the fix patch's raw paths.
+    return [unquote(entry.split("@", 1)[0]) for entry in body.split(";") if entry]
 
 
 def fix_touched_paths(prep: prepare_mod.BugPrep) -> list[str]:
@@ -1390,7 +1394,10 @@ def selected_forms(context_selection: str) -> dict[str, str]:
     for entry in body.split(";"):
         if not entry:
             continue
-        path = entry.split("@", 1)[0]
+        # [VANTA-WHY] M3 item T2 — decode the same percent-encoding the driver
+        # applies, so `fix_file_coverage` keys the form map by the patch's own
+        # (raw) path.
+        path = unquote(entry.split("@", 1)[0])
         # The form is the token after the entry's LAST ``]`` (the one that closes
         # ``[reasons]``) up to the ``:`` that opens the ``bytesB/tok`` tail. An
         # entry with no ``]`` at all is not the grammar this producer writes; it is
@@ -2520,6 +2527,14 @@ def _list(value: Optional[str]) -> Optional[list[str]]:
     writes the literal ``none`` for a genuine empty list (``[]`` here), while a
     missing key returns ``None`` (UNKNOWN). An old row must never be read as
     having created no files, so ``None`` is not collapsed to ``[]``.
+
+    [VANTA-WHY] M3 item T2 — each entry is percent-decoded, the inverse of the
+    driver's ``summary_escape::encode_summary_value``. ``new_files_created``
+    carries the Creator's own paths, and one shaped like
+    ``x final_decision=AllTestsPassed y.py`` would otherwise truncate the value at
+    its space and inject a field; the driver encodes it space-free and this reads
+    the path back exactly. An entry without a ``%`` is returned unchanged, so a
+    row written before this change still reads as it did.
     """
     if value is None:
         return None
@@ -2528,7 +2543,7 @@ def _list(value: Optional[str]) -> Optional[list[str]]:
         body = body[1:-1]
     if body in ("", "none"):
         return []
-    return [item for item in body.split(";") if item]
+    return [unquote(item) for item in body.split(";") if item]
 
 
 # ---------------------------------------------------------------------------

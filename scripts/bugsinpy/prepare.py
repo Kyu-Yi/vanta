@@ -1345,6 +1345,11 @@ def _suite(
     tree_name: str,
     stem_suffix: str,
 ) -> suite_mod.SuitePair:
+    # M3 item S3 — a repeat prepare of the same bug measures the same tree bytes,
+    # so the pair is served from the cache instead of re-run (``origin`` turns the
+    # lookup on; see ``suite.run_suite_twice``). The tree name is part of the
+    # origin only, never of the key: the key is the tree's bytes, so a re-prepared
+    # tree is a hit exactly when it is the same tree.
     return suite_mod.run_suite_twice(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
@@ -1355,6 +1360,7 @@ def _suite(
         extra_env=prep.sandbox_env or None,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        origin=f"{prep.slug}/{tree_name}",
     )
 
 

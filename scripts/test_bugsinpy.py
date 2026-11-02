@@ -6646,6 +6646,27 @@ class TestSuiteCache:
         back = runner_mod.oracle_from_dict(recorded.as_dict())
         assert back.cache == [{"side": "hidden", "key": "d" * 64, "state": "hit"}]
 
+    def test_prepare_labels_the_tree_it_measures(self, tmp_path, monkeypatch):
+        """M3 item S3 — a repeat prepare names the tree, not the caller.
+
+        The tree NAME is in the origin only: the key is the tree's bytes, so a
+        re-prepared tree is a hit exactly when it is the same tree.
+        """
+        runs: list = []
+        monkeypatch.setattr(
+            suite_mod,
+            "run_suite_twice",
+            lambda **kwargs: runs.append(kwargs)
+            or suite_pair({"tests/a.py::t": "passed"}),
+        )
+        bug_prep = prep()
+
+        prepare_mod._suite("chk", tmp_path / "batch", bug_prep, "vanta_tree", "vanta")
+
+        assert runs[0]["origin"] == f"{bug_prep.slug}/vanta_tree"
+        assert runs[0]["report_rel_stem"] == f"reports/{bug_prep.slug}-vanta"
+        assert runs[0]["tree_rel"].endswith("/vanta_tree")
+
 
 class TestCleanTreeNoise:
     """A run's leavings are not the tree: the caches are removed after each pair."""

@@ -1948,6 +1948,14 @@ pub async fn run(
     // injects a file the Creator was not shown, and never touches the selection.
     let mut context_visibility_records: Vec<serde_json::Value> = Vec::new();
     let mut attempts_edited_unshown_file: u32 = 0;
+    // [VANTA-WHY] Q1 — how many `===FILE:` marker lines across this run's Creator
+    // attempts carried leading whitespace and had to be trimmed to be recognised.
+    // The Creator prompt shows the markers indented, so a run whose count is above
+    // zero is a Creator that copied the prompt's shape and a parser that would
+    // once have mis-read it. LOGGING ONLY: the number is counted and reported, and
+    // nothing — no metric, label or verdict — reads it. Present only where a
+    // Creator ran; a review run has no markers of its own.
+    let mut markers_trimmed: u32 = 0;
     // [VANTA-WHY] M3 item 9 — one record per attempt of a fixed-rounds run: the
     // patch it produced, the test set it ran, the feedback it handed to the next
     // attempt, the hash of the Creator prompt that produced it, and whether the
@@ -2266,10 +2274,18 @@ pub async fn run(
                 creator_response.confidence
             );
             patch_text = creator_response.patch_text.clone();
-            patch_files = split_multi_file_patch(
+            let (split_files, attempt_markers_trimmed) = split_multi_file_patch(
                 &creator_response.patch_text,
                 &creator_response.files_touched,
             );
+            patch_files = split_files;
+            // [VANTA-WHY] Q1 — how many `===FILE:` markers this attempt emitted
+            // with leading whitespace and so needed trimming. The prompt shows the
+            // markers indented, so a positive count is the Creator copying the
+            // prompt's shape; it rides the run's record because a count that stops
+            // being zero would name a prompt/parser mismatch before it becomes a
+            // "patch changed nothing".
+            markers_trimmed += attempt_markers_trimmed;
         }
 
         // [VANTA-WHY] F2 — open this attempt's record and advance the comparison
@@ -4847,7 +4863,7 @@ pub async fn run(
              quarantine_count={} quarantined=[{}] \
              seed_method={} import_guard={} \
              n_ctx={} creator_effort={} creator_effort_mechanism={} \
-             creator_prompt_tokens={}{} fixed_rounds={} native_vacuous={} \
+             creator_prompt_tokens={}{}{} fixed_rounds={} native_vacuous={} \
              native_timeout_secs={} native_timeout={}",
             attempts_run,
             fixed_at_attempt_1,
@@ -5081,6 +5097,18 @@ pub async fn run(
             // in this value, the way `judge_prompt_keys` carries its own.
             if config.patch_path.is_none() {
                 format!(" attempts_edited_unshown_file={attempts_edited_unshown_file}")
+            } else {
+                String::new()
+            },
+            // [VANTA-WHY] Q1 — appended after every pre-existing key so an older
+            // row's reader is unaffected, and present only where a Creator ran:
+            // the count of `===FILE:` markers that needed trimming is a statement
+            // about the Creator's own output, which a review run (whose patch was
+            // written outside the run) cannot make. LOGGING ONLY — no metric, label
+            // or verdict reads it. The leading space lives in the value, the way
+            // `attempts_edited_unshown_file` carries its own.
+            if config.patch_path.is_none() {
+                format!(" markers_trimmed={markers_trimmed}")
             } else {
                 String::new()
             },
@@ -7668,7 +7696,7 @@ mod tests {
             "===FILE: util.py===\n",
             "===SEARCH===\n    return 999\n===REPLACE===\n    return 1\n===END===\n",
         );
-        let blocks = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
+        let (blocks, _trimmed) = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
         assert_eq!(blocks.len(), 2, "the patch must name two files");
 
         // The driver's own decision, exactly: on `Err` it writes nothing.
@@ -7704,7 +7732,7 @@ mod tests {
             "===FILE: util.py===\n",
             "def helper():\n    return 2\n",
         );
-        let blocks = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
+        let (blocks, _trimmed) = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
 
         let patched =
             apply_patch_files_all_or_nothing(&original, &blocks).expect("both blocks anchor");

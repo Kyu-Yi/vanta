@@ -2398,6 +2398,16 @@ def build_record(
         "attempts_edited_unshown_file": _int(
             summary.get("attempts_edited_unshown_file")
         ),
+        # [VANTA-WHY] Q1 — how many `===FILE:` marker lines across this run's
+        # Creator attempts carried leading whitespace and had to be trimmed to be
+        # recognised. The Creator prompt shows the markers four-space indented, so
+        # the old column-0-only parser could turn such a patch into "patch changed
+        # nothing" or a silently wrong patch; a positive count names that shape.
+        # RECORD ONLY: no metric, label or verdict reads it. `None` (the key
+        # absent) is an older row OR a review run, and is kept distinct from a
+        # repair run that genuinely trimmed nothing (`0`) — an absent field means
+        # UNKNOWN, never "zero markers were trimmed".
+        "markers_trimmed": _int(summary.get("markers_trimmed")),
         # [VANTA-WHY] M3 item 9 — whether this run was asked to spend a FIXED
         # number of repair attempts (`--fixed-rounds K`), read back from
         # `run.summary` so a batch table can cut by it without opening a session

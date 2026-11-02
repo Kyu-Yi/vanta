@@ -24093,6 +24093,46 @@ def _job(
     )
 
 
+class TestMarkersTrimmed:
+    """Q1 — a RECORD-ONLY count of ``===FILE:`` markers that needed trimming.
+
+    The Creator prompt shows the multi-file markers four-space indented, so the
+    old column-0-only parser could read such a patch as "patch changed nothing"
+    or, worse, as a silently wrong patch. The driver counts the markers it had to
+    trim and writes the number into ``run.summary``; the row reads it back.
+    NOTHING — no metric, label or verdict — reads this field. A row written
+    before the field existed reads as UNKNOWN (``None``), never as ``0``: an
+    absent field means "not measured", not "no markers were trimmed".
+    """
+
+    def _row(self, tmp_path, monkeypatch, summary):
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(tmp_path, summary=summary),
+        )
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        return runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")),
+            paths=runner_mod.BatchPaths.under(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+
+    def test_the_row_records_the_count_the_driver_summarised(self, tmp_path, monkeypatch):
+        summary = dict(_outcome(tmp_path).summary, markers_trimmed="3")
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["markers_trimmed"] == 3
+
+    def test_a_row_without_the_field_reads_as_unknown_not_zero(self, tmp_path, monkeypatch):
+        summary = dict(_outcome(tmp_path).summary)
+        summary.pop("markers_trimmed", None)
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["markers_trimmed"] is None
+
+
 class TestRunJob:
     """The row, the censor and the resume ordering — all three fail silently if wrong."""
 

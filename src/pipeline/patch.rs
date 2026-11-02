@@ -114,14 +114,29 @@ pub fn apply_patch_strict(
         debug!("git apply refused the patch but --recount accepted it (miscounted header)");
     }
 
+    // [VANTA-WHY] U5 — a touched path that is ABSENT after the apply is only
+    // legitimate when the diff itself sends it to `/dev/null`; there is then no
+    // content to test and the path is skipped BY NAME, read from the diff.
+    // Everything else — a path the confinement gate refuses, or one that cannot
+    // be read for any other reason — is a failure this function must report.
+    // Swallowing it means a run tests fewer files than the patch named while
+    // reporting a verdict about the whole tree.
+    let deleted = patch_deleted_paths(patch_text);
     let mut changed: HashMap<String, String> = HashMap::new();
     for path in touched {
-        let Ok(patched) = confined_join(root, path).and_then(|p| {
-            fs::read_to_string(&p).map_err(|e| e.to_string())
-        }) else {
-            // Deleted by the patch, or never written. Either way there is no
-            // content to test.
-            continue;
+        let out = confined_join(root, path)?;
+        let patched = match fs::read_to_string(&out) {
+            Ok(patched) => patched,
+            Err(_) if deleted.contains(path) => {
+                debug!("{path}: deleted by the patch — nothing to test");
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "{UNSAFE_PATH}: the patch names `{path}` but it could not be read \
+                     ({error}) — only a path the patch deletes may be absent"
+                ));
+            }
         };
         match repo_files.get(path) {
             Some(original) if original == &patched => {}
@@ -1346,6 +1361,73 @@ diff --git a/src/pkg/mod.py b/src/pkg/mod.py
         let err = apply_patch_strict(&files, patch, &["src/pkg/mod.py".to_string()])
             .expect_err("a patch that changes nothing is not an application");
         assert!(err.contains("no-op"), "unhelpful reason: {err}");
+    }
+
+    /// [VANTA-WHY] U5 — a touched path is skipped ONLY when the diff itself
+    /// sends it to `/dev/null`. The skip is read off the patch, not inferred
+    /// from the file being gone.
+    #[test]
+    fn strict_apply_skips_only_a_path_the_patch_deletes() {
+        let mut files = repo();
+        files.insert("src/pkg/gone.py".to_string(), "x = 1\n".to_string());
+        let patch = "\
+diff --git a/src/pkg/gone.py b/src/pkg/gone.py
+--- a/src/pkg/gone.py
++++ /dev/null
+@@ -1 +0,0 @@
+-x = 1
+diff --git a/src/pkg/mod.py b/src/pkg/mod.py
+--- a/src/pkg/mod.py
++++ b/src/pkg/mod.py
+@@ -1,5 +1,5 @@
+ def f():
+-    return 1
++    return 7
+ 
+ 
+ def g():
+";
+        let changed = apply_patch_strict(
+            &files,
+            patch,
+            &["src/pkg/gone.py".to_string(), "src/pkg/mod.py".to_string()],
+        )
+        .expect("a clean deletion plus a clean edit must apply");
+        assert!(
+            !changed.contains_key("src/pkg/gone.py"),
+            "a deleted path has no content to test"
+        );
+        assert!(changed.get("src/pkg/mod.py").unwrap().contains("return 7"));
+    }
+
+    /// [VANTA-WHY] U5 — an absent touched path the patch does NOT delete is a
+    /// failure, not a skip: the run would otherwise report a verdict for a tree
+    /// with fewer files than the patch named, and say nothing about it.
+    #[test]
+    fn strict_apply_refuses_a_touched_path_it_cannot_read() {
+        let files = repo();
+        let patch = "\
+--- a/src/pkg/mod.py
++++ b/src/pkg/mod.py
+@@ -1,5 +1,5 @@
+ def f():
+-    return 1
++    return 7
+ 
+ 
+ def g():
+";
+        let err = apply_patch_strict(
+            &files,
+            patch,
+            &[
+                "src/pkg/mod.py".to_string(),
+                "src/pkg/never_written.py".to_string(),
+            ],
+        )
+        .expect_err("an absent path the patch does not delete is not skippable");
+        assert!(err.starts_with(UNSAFE_PATH), "got: {err}");
+        assert!(err.contains("never_written.py"), "got: {err}");
     }
 
     // ---- Fix 1 regression: the syntax guard ----

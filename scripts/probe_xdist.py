@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import zipfile
 from pathlib import Path
@@ -306,7 +307,16 @@ def unpack_wheels(wheels: Sequence[Path], dest: Path) -> list[str]:
     Members with a ``..`` component are refused rather than written: the wheels are
     the operator's, and a wheel that tries to escape the scratch directory is a
     staging mistake worth naming.
+
+    [VANTA-WHY] M3 item U9 — ``dest`` is cleared first. It goes on ``PYTHONPATH``, and
+    ``extractall`` only ever adds files: without this, a wheel staged by a **previous**
+    probe run keeps its packages in ``dest``, so a run whose wheel set changed (or whose
+    wheel was removed) imports a stale plugin from a directory the operator no longer
+    names. Clearing the directory makes its contents exactly the wheels passed in, which
+    is what the caller's ``staging`` claim means.
     """
+    if dest.exists():
+        shutil.rmtree(dest)
     dest.mkdir(parents=True, exist_ok=True)
     published: list[str] = []
     for wheel in wheels:

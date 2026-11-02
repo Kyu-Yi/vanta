@@ -6479,6 +6479,25 @@ class TestProbeXdist:
         assert probe_xdist_mod.unpack_wheels([wheel], dest) == [wheel.name]
         assert (dest / "xdist" / "__init__.py").is_file()
 
+    def test_unpack_wheels_clears_a_stale_staging_directory(self, tmp_path):
+        """[VANTA-WHY] M3 item U9 — the staging directory is CLEARED, not merged.
+
+        ``dest`` goes on ``PYTHONPATH`` and ``extractall`` only ever adds files, so a
+        wheel staged by a previous probe run keeps its packages there. A run whose wheel
+        set changed (or whose wheel was removed) would then import a stale plugin from a
+        directory the operator no longer names.
+        """
+        dest = tmp_path / "stage"
+        stale = dest / "stale_plugin"
+        stale.mkdir(parents=True)
+        (stale / "__init__.py").write_text("__version__ = '0.0'\n", encoding="utf-8")
+        wheel = tmp_path / "xdist-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("xdist/__init__.py", "__version__ = '1.0'\n")
+        assert probe_xdist_mod.unpack_wheels([wheel], dest) == [wheel.name]
+        assert not stale.exists(), "a stale package from a prior run must not survive"
+        assert (dest / "xdist" / "__init__.py").is_file()
+
     # -- preflight parsing --------------------------------------------------
     def test_parse_preflight_takes_the_last_marker_line(self):
         marker = probe_xdist_mod.PROBE_MARKER

@@ -24133,6 +24133,52 @@ class TestMarkersTrimmed:
         assert row["markers_trimmed"] is None
 
 
+class TestNewFilesCreated:
+    """Q2 — a RECORD-ONLY list of the paths a Creator patch introduced.
+
+    A mistyped marker path (`cartt.py` for a tree that has `cart.py`) is accepted
+    by the apply as a new module, so the run records which files it actually
+    wrote. NOTHING — no metric, label or verdict — reads this field. The run
+    writes the literal ``none`` for a genuine empty list (``[]`` on the row),
+    while an absent key — a review run, or a row older than the field — reads as
+    ``None`` (UNKNOWN), never as an empty list.
+    """
+
+    def _row(self, tmp_path, monkeypatch, summary):
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(tmp_path, summary=summary),
+        )
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        return runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")),
+            paths=runner_mod.BatchPaths.under(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+
+    def test_the_row_records_the_paths_the_creator_introduced(self, tmp_path, monkeypatch):
+        summary = dict(
+            _outcome(tmp_path).summary, new_files_created="[pkg/a.py;pkg/b.py]"
+        )
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["new_files_created"] == ["pkg/a.py", "pkg/b.py"]
+
+    def test_a_genuine_empty_list_reads_as_empty(self, tmp_path, monkeypatch):
+        summary = dict(_outcome(tmp_path).summary, new_files_created="none")
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["new_files_created"] == []
+
+    def test_a_row_without_the_field_reads_as_unknown_not_empty(self, tmp_path, monkeypatch):
+        summary = dict(_outcome(tmp_path).summary)
+        summary.pop("new_files_created", None)
+        row = self._row(tmp_path, monkeypatch, summary)
+        assert row["new_files_created"] is None
+
+
 class TestRunJob:
     """The row, the censor and the resume ordering — all three fail silently if wrong."""
 

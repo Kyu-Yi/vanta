@@ -2408,6 +2408,17 @@ def build_record(
         # repair run that genuinely trimmed nothing (`0`) — an absent field means
         # UNKNOWN, never "zero markers were trimmed".
         "markers_trimmed": _int(summary.get("markers_trimmed")),
+        # [VANTA-WHY] Q2 — the paths a Creator patch INTRODUCED: blocks whose path
+        # the original tree did not have and whose content was not empty, unioned
+        # across attempts and sorted. A mistyped marker path (`cartt.py` for a tree
+        # that has `cart.py`) lands here, so a patch that quietly created a file
+        # next to the one it meant to edit is visible on the row. RECORD ONLY: no
+        # metric, label or verdict reads it. The driver writes `none` for a genuine
+        # empty list (a repair run that created nothing), which reads as `[]`; an
+        # ABSENT key — a review run, or a row older than the field — reads as
+        # `None` (UNKNOWN), never as an empty list, so an old row is never claimed
+        # to have created no files.
+        "new_files_created": _list(summary.get("new_files_created")),
         # [VANTA-WHY] M3 item 9 — whether this run was asked to spend a FIXED
         # number of repair attempts (`--fixed-rounds K`), read back from
         # `run.summary` so a batch table can cut by it without opening a session
@@ -2482,6 +2493,24 @@ def _int(value: Optional[str]) -> Optional[int]:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _list(value: Optional[str]) -> Optional[list[str]]:
+    """A summary ``[a;b]`` list, or ``None`` when the key is absent.
+
+    [VANTA-WHY] Q2 — the reader keeps ABSENT distinct from EMPTY: the driver
+    writes the literal ``none`` for a genuine empty list (``[]`` here), while a
+    missing key returns ``None`` (UNKNOWN). An old row must never be read as
+    having created no files, so ``None`` is not collapsed to ``[]``.
+    """
+    if value is None:
+        return None
+    body = value.strip()
+    if body.startswith("[") and body.endswith("]"):
+        body = body[1:-1]
+    if body in ("", "none"):
+        return []
+    return [item for item in body.split(";") if item]
 
 
 # ---------------------------------------------------------------------------

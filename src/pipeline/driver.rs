@@ -1956,6 +1956,16 @@ pub async fn run(
     // nothing — no metric, label or verdict — reads it. Present only where a
     // Creator ran; a review run has no markers of its own.
     let mut markers_trimmed: u32 = 0;
+    // [VANTA-WHY] Q2 — the paths a Creator patch INTRODUCED: blocks whose path the
+    // original tree did not have and whose content was not empty. A mistyped marker
+    // path (`===FILE: cartt.py===` for a tree that has `cart.py`) is exactly one of
+    // these, and the apply already accepts it verbatim rather than refusing it — it
+    // is a new module the fix adds as far as the tree can tell. Nothing used to
+    // record it, so a patch that quietly created a file next to the one it meant to
+    // edit looked like an ordinary apply. LOGGING ONLY: no metric, label or verdict
+    // reads the list; it names what happened, it does not judge it. Union across
+    // attempts, sorted; present only where a Creator ran.
+    let mut new_files_created: BTreeSet<String> = BTreeSet::new();
     // [VANTA-WHY] M3 item 9 — one record per attempt of a fixed-rounds run: the
     // patch it produced, the test set it ran, the feedback it handed to the next
     // attempt, the hash of the Creator prompt that produced it, and whether the
@@ -2468,6 +2478,12 @@ pub async fn run(
                     patched_files = changed;
                     any_changed = true;
                     all_patch_failed = false;
+                    // [VANTA-WHY] Q2 — the blocks that introduced a file the
+                    // original tree did not have. Recorded only on a success: a
+                    // Contract-B failure writes nothing, so it creates nothing. The
+                    // helper is pure, so the rule is tested directly.
+                    new_files_created
+                        .extend(new_files_from_patch(&original_files, &patch_files));
                 }
                 Ok(_) => {
                     // Every block was a no-op (e.g. an all-empty new-file block):
@@ -4863,7 +4879,7 @@ pub async fn run(
              quarantine_count={} quarantined=[{}] \
              seed_method={} import_guard={} \
              n_ctx={} creator_effort={} creator_effort_mechanism={} \
-             creator_prompt_tokens={}{}{} fixed_rounds={} native_vacuous={} \
+             creator_prompt_tokens={}{}{}{} fixed_rounds={} native_vacuous={} \
              native_timeout_secs={} native_timeout={}",
             attempts_run,
             fixed_at_attempt_1,
@@ -5112,6 +5128,31 @@ pub async fn run(
             } else {
                 String::new()
             },
+            // [VANTA-WHY] Q2 — appended after every pre-existing key so an older
+            // row's reader is unaffected, and present only where a Creator ran: a
+            // review run's patch was written outside the run, so "which files did
+            // this patch introduce" is answered there by the patch the caller
+            // supplied, not by Vanta. Space-free, `;`-joined paths (the shape
+            // `selected=[…]` already uses) with the literal `none` for a genuine
+            // empty list — so an ABSENT key (an older row, or a review row) reads as
+            // UNKNOWN, never as "created no files". RECORD ONLY: no metric, label or
+            // verdict reads it.
+            if config.patch_path.is_none() {
+                if new_files_created.is_empty() {
+                    " new_files_created=none".to_string()
+                } else {
+                    format!(
+                        " new_files_created=[{}]",
+                        new_files_created
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(";")
+                    )
+                }
+            } else {
+                String::new()
+            },
             // [VANTA-WHY] M3 item 9 — appended after every pre-existing key so an
             // older row's reader is unaffected, and space-free so it survives the
             // `key=value` reader. `off` is the default and means the loop stopped
@@ -5353,6 +5394,13 @@ pub async fn run(
             // review run, which has no Creator.
             "context_visibility": context_visibility_records,
             "attempts_edited_unshown_file": attempts_edited_unshown_file,
+            // [VANTA-WHY] Q2 — the paths a Creator patch INTRODUCED (absent from the
+            // original tree, non-empty content), unioned across attempts and sorted.
+            // RECORD ONLY: a mistyped marker path lands here, so "the patch quietly
+            // created a file next to the one it meant to edit" is answerable from the
+            // run's own artifacts. Nothing reads this but a reader. The same list
+            // rides `run.summary` as `new_files_created=[…]`.
+            "new_files_created": new_files_created.iter().cloned().collect::<Vec<_>>(),
             // [VANTA-WHY] M3 item 9 — every attempt's patch, the test set it ran,
             // the feedback it was given, the hash of the Creator prompt that
             // produced it, and whether the Governor read it as passing. The
@@ -5514,6 +5562,30 @@ fn apply_patch_files_all_or_nothing(
         }
     }
     Ok(patched)
+}
+
+/// [VANTA-WHY] Q2 — the paths a repair patch INTRODUCES: blocks whose path the
+/// original tree does not have and whose content is not empty. An empty new-file
+/// block adds nothing (the apply's `None =>` arm), so it is not a created file.
+///
+/// [VANTA-WHY] PURE on purpose — `(original tree, patch blocks) -> sorted paths`,
+/// with no I/O and no logging — so the rule is tested directly. This decides
+/// NOTHING: `apply_patch_files_all_or_nothing` already accepts a new path, and
+/// this only names the ones it wrote so the run can RECORD them. Nothing reads
+/// the result but the record itself.
+fn new_files_from_patch(
+    original_files: &HashMap<String, String>,
+    patch_files: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut created: Vec<String> = patch_files
+        .iter()
+        .filter(|(path, content)| {
+            !original_files.contains_key(*path) && !content.trim().is_empty()
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    created.sort();
+    created
 }
 
 // ============================================================================
@@ -6965,7 +7037,8 @@ mod tests {
         harness_infrastructure_collapse,
         is_judge_site,
         ledger_text,
-        modified_test_config_records, open_fixed_round_record, patch_attempt_id_for_patch,
+        modified_test_config_records, new_files_from_patch, open_fixed_round_record,
+        patch_attempt_id_for_patch,
         prompt_over_budget_reason,
         record_new_static_findings,
         refuse_reasoning_budget_on_judge_arm,
@@ -7740,6 +7813,57 @@ mod tests {
         assert!(patched["calc.py"].contains("return x * 2"), "{patched:?}");
         assert!(patched["util.py"].contains("return 2"), "{patched:?}");
         assert_ne!(patched, original);
+    }
+
+    // ---- Q2: the paths a Creator patch introduces (record only) ----------------
+
+    /// [VANTA-WHY] Q2 — a mistyped marker path (`cartt.py` for a tree that has
+    /// `cart.py`) is accepted verbatim by the apply (it looks like a new module the
+    /// fix adds), and the pure helper names it so the run can RECORD it. Nothing
+    /// refuses it: the point of Q2 is that this is recorded, not policed.
+    #[test]
+    fn a_mistyped_marker_path_is_recorded_as_a_new_file() {
+        let original = HashMap::from([(
+            "cart.py".to_string(),
+            "def total():\n    return 0\n".to_string(),
+        )]);
+        // The Creator meant `cart.py` and typed one letter too many.
+        let patch_text = "===FILE: cartt.py===\ndef total():\n    return 1\n";
+        let (blocks, _trimmed) = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks.contains_key("cartt.py"));
+
+        // The apply accepts it (the new-file arm) and it does change the tree.
+        let patched =
+            apply_patch_files_all_or_nothing(&original, &blocks).expect("a new-file block applies");
+        assert_ne!(patched, original);
+
+        // The record names the file the patch actually wrote, not the one it meant.
+        assert_eq!(
+            new_files_from_patch(&original, &blocks),
+            vec!["cartt.py".to_string()]
+        );
+    }
+
+    /// An edit to a file the tree already has is not a created file, and an empty
+    /// new-file block adds nothing, so neither is recorded.
+    #[test]
+    fn an_edited_file_and_an_empty_new_block_are_not_new_files() {
+        let original = HashMap::from([(
+            "cart.py".to_string(),
+            "def total():\n    return 0\n".to_string(),
+        )]);
+        let blocks = HashMap::from([
+            (
+                "cart.py".to_string(),
+                "def total():\n    return 1\n".to_string(),
+            ),
+            ("empty.py".to_string(), "   \n".to_string()),
+        ]);
+        assert!(
+            new_files_from_patch(&original, &blocks).is_empty(),
+            "an existing file is an edit and a blank block writes nothing"
+        );
     }
 
     /// [VANTA-WHY] A syntax-broken block is refused, and the refusal names the

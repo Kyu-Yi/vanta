@@ -44,6 +44,7 @@ The disk requirement is a measured fact, not a tuning knob: the base image is
 from __future__ import annotations
 
 import ast
+import hashlib
 import io
 import json
 import re
@@ -54,6 +55,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Container, Iterable, Mapping, Optional, Sequence
@@ -67,6 +69,7 @@ from packaging.version import InvalidVersion, Version
 from .bugsinpy_meta import read_metadata_text
 from . import redact as redact_mod
 from . import suite as suite_mod
+from . import suite_cache as suite_cache_mod
 from . import trees as tree_mod
 from .shuru import (
     BUILD_JOB_ENV,
@@ -10706,11 +10709,115 @@ def deps_path(deps_dir: Path, checkpoint: str) -> Path:
     return deps_dir / f"{checkpoint}.json"
 
 
+CHECKPOINT_ID_KEY = suite_cache_mod.CHECKPOINT_ID_KEY
+BAKED_AT_KEY = suite_cache_mod.BAKED_AT_KEY
+"""The two stamp keys of a layer's identity (M3 item U3).
+
+[VANTA-WHY] Named once, in :mod:`suite_cache`, and bound here rather than spelled
+again: the writer (:func:`stamp_provenance`) and the readers (``suite_cache``, and
+through ``VANTA_SHURU_CHECKPOINT_ID`` the Rust half of the cache) must not be able
+to disagree about the key they mean.
+"""
+
+
+def provenance_digest(provenance: Mapping[str, Any]) -> str:
+    """A sha256 over the DECISIVE fields of one layer's provenance.
+
+    [VANTA-WHY] M3 item U3. This is what makes a checkpoint's identity a fact
+    about the layer rather than about its name: two bakes that resolved the same
+    pins produce the same digest, and a re-bake that resolved different ones
+    produces a different one — which is exactly the question the suite cache has
+    to answer before it serves a measurement.
+
+    Three keys are excluded, and each for its own reason:
+
+    * the two stamp keys themselves, or the digest would depend on itself;
+    * :data:`PIP_CHECK_KEY`, because it is the layer's verdict on itself written
+      back AFTER the bake (:func:`record_pip_check`) and not an input to it. A
+      digest that covered it would change the identity of a layer whenever its
+      own ``pip check`` output was recorded — turning every re-bake of an already
+      recorded layer into a "different" layer and emptying the suite cache.
+
+    Everything else is decisive, including the ``notes`` and ``skipped`` lists: a
+    field that moved is a resolution that changed, and the honest answer for the
+    cache is a miss.
+    """
+
+    material = {
+        key: value
+        for key, value in provenance.items()
+        if key not in (CHECKPOINT_ID_KEY, BAKED_AT_KEY, PIP_CHECK_KEY)
+    }
+    blob = json.dumps(
+        material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def stamp_provenance(
+    provenance: Mapping[str, Any], previous: Optional[Mapping[str, Any]] = None
+) -> dict[str, Any]:
+    """``provenance`` with its layer identity stamped in (M3 item U3).
+
+    ``previous`` is the provenance already on disk for this checkpoint, when there
+    is one. A re-bake that resolved the SAME layer keeps the ``baked_at`` it had,
+    so an unchanged layer keeps its identity: a fresh timestamp on every ``bake``
+    invocation would change ``checkpoint_id`` for a layer nothing about which
+    changed, and take the whole suite cache down with it every time the bake was
+    re-run. A layer the re-bake resolved differently gets a new stamp, which is
+    the point — the entry the old identity's key found describes a layer that no
+    longer exists.
+
+    ``checkpoint_id`` is the digest of the stamped material, so it moves when
+    either the layer or the moment it was first baked moves.
+    """
+
+    digest = provenance_digest(provenance)
+    baked_at = ""
+    if isinstance(previous, Mapping) and provenance_digest(previous) == digest:
+        remembered = previous.get(BAKED_AT_KEY)
+        if isinstance(remembered, str):
+            baked_at = remembered
+    if not baked_at:
+        baked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    identity = hashlib.sha256(f"{baked_at}\x00{digest}".encode("utf-8")).hexdigest()
+    stamped = dict(provenance)
+    stamped[BAKED_AT_KEY] = baked_at
+    stamped[CHECKPOINT_ID_KEY] = identity
+    return stamped
+
+
+def _read_provenance(path: Path) -> Optional[dict[str, Any]]:
+    """The provenance already at ``path``, or ``None`` — never raises.
+
+    [VANTA-WHY] :func:`stamp_provenance`'s ``previous`` is an optimisation and a
+    consistency check, not a dependency: a first bake, an unreadable file and a
+    file from a build that did not stamp at all all mean the same thing here —
+    there is nothing to preserve, so the layer gets a fresh stamp.
+    """
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def write_deps(deps_dir: Path, deps: BugDeps) -> Path:
+    """Write one layer's provenance, stamped with its identity (M3 item U3).
+
+    [VANTA-WHY] The stamp is computed HERE rather than in :func:`deps_provenance`
+    because only this function can see the file the layer may already have — and
+    preserving ``baked_at`` across a re-bake is what keeps an unchanged layer's
+    identity (and so the suite cache's entries for it) stable. See
+    :func:`stamp_provenance`.
+    """
+
     deps_dir.mkdir(parents=True, exist_ok=True)
     path = deps_path(deps_dir, deps.checkpoint)
+    provenance = stamp_provenance(deps.provenance, previous=_read_provenance(path))
     path.write_text(
-        json.dumps(deps.provenance, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        json.dumps(provenance, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     return path
 

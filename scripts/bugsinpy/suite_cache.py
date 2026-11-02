@@ -14,7 +14,7 @@ effective timeout cap. The stored value is the WHOLE pair (both runs, both
 reports, the flaky/missing sets, and the in-VM wall times), so a flakiness
 reading is always made on the recorded pair and never re-derived from one run.
 
-Four rules make the reuse safe rather than merely fast:
+Five rules make the reuse safe rather than merely fast:
 
 * **A key is the input, so a hit is the same experiment.** Anything that can
   move an outcome is in the key — including the timeout cap, because a run's
@@ -32,6 +32,12 @@ Four rules make the reuse safe rather than merely fast:
   write side refuses to store one and the read side refuses to serve one, so an
   entry written before the rule existed is repaired rather than believed. The
   Rust half of the same rule is item U1.
+* **A checkpoint's NAME is not its identity** (M3 item U3). The name is a
+  label a re-bake reuses, so a key carrying only the name can serve a
+  measurement of a layer that no longer exists. The key carries the identity
+  `bake` stamped into the layer's provenance — a digest of the pins that layer
+  was built from — and a layer with no stamp has an UNKNOWN identity: its runs
+  are neither served from nor written to the cache, and the row says so.
 
 Where it lives is a deliberate choice (Nathan, speed-package mandate): under
 `runs/` — gitignored — read host-side only as data, never inside a
@@ -52,7 +58,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 """The entry format's version, and part of every key.
 
 [VANTA-WHY] A key that did not carry the format version could be satisfied by an
@@ -62,6 +68,14 @@ added to the payload later would come back missing — read as "no flakiness"
 rather than as "this entry predates the field". Putting the version in the key
 material makes a format change unable to read old entries at all: the key
 changes, the entries are never found, and nothing has to be migrated or purged.
+
+[VANTA-WHY] M3 item U3 bumps it 1 → 2, on both sides (the Rust half is
+`src/pipeline/suite_cache.rs`). Adding `checkpoint_id` to the material is a
+format change in exactly that sense: an entry written before the field existed
+was keyed on the checkpoint's NAME alone, so it describes a layer this build can
+no longer identify — the honest answer is to not find it, and the bump is what
+makes "not find it" true for every such entry rather than for the ones whose
+bytes happened to differ.
 """
 
 KIND_SUITE_PAIR = "suite_pair"
@@ -76,6 +90,36 @@ lookup if the two ever hashed the same bytes.
 CACHE_DIR_ENV = "VANTA_SUITE_CACHE_DIR"
 """Overrides the cache root. Set by the harness so a batch can point every
 process of a run at one directory; unset uses the repo's own `runs/`."""
+
+CHECKPOINT_ID_KEY = "checkpoint_id"
+"""The provenance field naming WHICH layer a checkpoint holds (M3 item U3).
+
+[VANTA-WHY] Written by `bake.write_deps` and read here and (through
+`VANTA_SHURU_CHECKPOINT_ID`) by the Rust half of the cache, so the two sides
+cannot disagree about a layer's identity. It is a digest of the provenance that
+decided the layer — the pins, the commits, the build VM — and NOT the checkpoint
+name, which a re-bake reuses.
+"""
+
+BAKED_AT_KEY = "baked_at"
+"""The provenance field recording when an identity was first stamped.
+
+[VANTA-WHY] Recorded beside the digest so a reader can say when a layer was
+baked, and PRESERVED by a re-bake that resolves the same layer: a fresh
+timestamp on every `bake` invocation would change the identity of a layer that
+did not change, and take the whole suite cache down with it.
+"""
+
+CHECKPOINT_ID_ENV = "VANTA_SHURU_CHECKPOINT_ID"
+"""Carries a layer's identity into the binary, which keys its cache on it.
+
+[VANTA-WHY] M3 item U3. The in-session cache is keyed inside ``vanta_m3``, which
+cannot read a deps file — so ``runner.vanta_env`` reads
+:func:`checkpoint_identity`'s answer from the bug's provenance and passes it
+here. It is always set, empty when the layer has no stamp, so an inherited value
+can never name an identity the run is not measuring; the Rust reader treats the
+empty one as UNKNOWN and turns the cache off (`suite_cache.rs`).
+"""
 
 DISABLE_ENV = "VANTA_NO_CACHE"
 """Set by `--no-cache` on `run`, `queue` and `prepare`.
@@ -151,6 +195,41 @@ def cache_dir() -> Path:
 def cache_disabled() -> bool:
     """Whether `--no-cache` asked for a fresh run."""
     return os.environ.get(DISABLE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def deps_dir() -> Path:
+    """Where `bake` writes one provenance file per layer, `runs/bugsinpy/deps`.
+
+    [VANTA-WHY] Derived from :func:`repo_root` and not from the cwd, for the
+    same reason :func:`cache_dir` is: the harness process and the binary it
+    spawns do not share a working directory.
+    """
+    return repo_root() / "runs" / "bugsinpy" / "deps"
+
+
+def checkpoint_identity(checkpoint: str) -> Optional[str]:
+    """The baked identity of `checkpoint`, or `None` when it has no stamp.
+
+    [VANTA-WHY] M3 item U3. `bake.write_deps` stamps each layer's provenance
+    with a digest of the pins that layer was built from, and that stamp — not the
+    checkpoint's name — is what a run records in its key.
+
+    `None` means UNKNOWN, not "unbaked": a layer baked before the stamp existed
+    has a provenance file with no `checkpoint_id`, and its runs are neither
+    served from nor written to the cache. Answering "unknown" rather than
+    raising keeps one stale layer a per-bug cache miss instead of a harness
+    crash.
+    """
+    try:
+        data = json.loads(
+            (deps_dir() / f"{checkpoint}.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    identity = data.get(CHECKPOINT_ID_KEY)
+    return identity if isinstance(identity, str) and identity else None
 
 
 def tree_fingerprint(root: Path) -> str:

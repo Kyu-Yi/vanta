@@ -6516,19 +6516,34 @@ class TestSuiteCache:
     OUTCOMES = {"tests/a.py::t": "failed", "tests/b.py::t": "passed"}
 
     @staticmethod
-    def _host(tmp_path, monkeypatch):
+    def _host(tmp_path, monkeypatch, *, checkpoint_id="layer-1"):
         """A batch directory holding one tree, and a private cache directory.
 
         The cache directory is redirected so these tests never touch the real
         ``runs/bugsinpy/suite_cache``, and ``VANTA_HARNESS_BUILD`` is pinned so a
         key does not change with the sources under test (which the harness hash
         otherwise covers on purpose — see ``suite_cache.harness_build``).
+
+        [VANTA-WHY] M3 item U3 — the LAYER's identity now rides the key too, and
+        it is read from the deps provenance ``bake`` writes, so these tests must
+        own that file as well: left alone, every lookup would answer from whatever
+        this checkout happens to have baked under the name ``chk``. ``deps_dir``
+        is redirected for the same reason ``CACHE_DIR_ENV`` is.
+        ``checkpoint_id=None`` writes a provenance with NO stamp, which is the
+        layer U3 refuses to cache at all.
         """
         batch = tmp_path / "batch"
         write(batch / "vanta_tree" / "demo.py", "x = 1\n")
         monkeypatch.setenv(suite_cache_mod.CACHE_DIR_ENV, str(tmp_path / "cache"))
         monkeypatch.setenv("VANTA_HARNESS_BUILD", "py:test")
         monkeypatch.delenv(suite_cache_mod.DISABLE_ENV, raising=False)
+        deps = tmp_path / "deps"
+        deps.mkdir()
+        provenance = {"installs": [], "checkpoint": "chk"}
+        if checkpoint_id is not None:
+            provenance[suite_cache_mod.CHECKPOINT_ID_KEY] = checkpoint_id
+        write(deps / "chk.json", json.dumps(provenance))
+        monkeypatch.setattr(suite_cache_mod, "deps_dir", lambda: deps)
         return batch
 
     @classmethod
@@ -6763,6 +6778,89 @@ class TestSuiteCache:
         monkeypatch.delenv(suite_cache_mod.DISABLE_ENV)
         assert self._call(batch).cache["state"] == "hit"
         assert suite_mod.parse_report(batch / f"{self.STEM}.run1.json") == self.OUTCOMES
+
+    def test_an_unstamped_layer_is_never_served_and_never_written(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item U3 — a checkpoint with no recorded identity has no key.
+
+        The name is a label a re-bake reuses, so an entry keyed on it can outlive
+        the layer it measured. Without a stamp there is nothing this run could be
+        a repetition OF, so the cache is off for the call: the row says so, and
+        nothing is written under a key the next bake of this name would inherit.
+        """
+        batch = self._host(tmp_path, monkeypatch, checkpoint_id=None)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+
+        pair = self._call(batch)
+
+        assert pair.cache is not None
+        assert pair.cache["state"] == "off:unknown_checkpoint"
+        assert pair.cache["key"] == "", "no key could be built, so none is claimed"
+        assert pair.cache["would_hit"] is False
+        assert pair.first.outcomes == self.OUTCOMES, "the run itself still happened"
+        assert len(calls) == 1
+        assert not (tmp_path / "cache").exists(), "an unusable layer writes nothing"
+
+        # And the second call is a second run, not a hit: there is nothing to hit.
+        assert self._call(batch).cache["state"] == "off:unknown_checkpoint"
+        assert len(calls) == 2
+
+    def test_a_rebaked_layer_under_the_same_name_is_a_different_experiment(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item U3 — the name did not change, the layer did.
+
+        This is the defect the item is about: a re-bake reuses ``vanta-bi-<P>``,
+        so a name-keyed entry would serve the OLD layer's suite to a run measuring
+        a rebuilt one. The identity moved with the pins, so the lookup misses.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        first = self._call(batch)
+        assert first.cache["state"] == "miss"
+
+        rebaked = json.dumps(
+            {
+                "installs": ["decorator==4.4.0"],
+                "checkpoint": "chk",
+                suite_cache_mod.CHECKPOINT_ID_KEY: "layer-2",
+            }
+        )
+        (tmp_path / "deps" / "chk.json").write_text(rebaked, encoding="utf-8")
+
+        second = self._call(batch)
+
+        assert second.cache["state"] == "miss", "a rebuilt layer is not the old one"
+        assert second.cache["key"] != first.cache["key"]
+        assert len(calls) == 2, "the rebuilt layer is measured, not inherited"
+
+    def test_an_entry_from_before_the_schema_bump_is_not_found(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item U3 — the bump is what makes "not find it" true.
+
+        An entry written before the identity existed was keyed on the name alone,
+        so it describes a layer this build cannot identify. Rewriting its schema
+        is how an old file looks to this build, and the honest answer is not
+        ``None`` from ``read_entry``'s other checks but this one: the format
+        changed, so the file is not consulted.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(suite_mod.shuru, "run", self._vm_run(calls))
+        fresh = self._call(batch)
+
+        path = suite_cache_mod.entry_path(fresh.cache["key"])
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["schema"] = suite_cache_mod.SCHEMA_VERSION - 1
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert suite_cache_mod.read_entry(dict(document["material"]), document["key"]) is None
+        assert self._call(batch).cache["state"] == "miss"
+        assert len(calls) == 2
 
     def test_the_key_covers_the_suite_environment(self, tmp_path, monkeypatch):
         """fastapi/2's rule: the same bytes measured 775 passed with
@@ -19055,6 +19153,138 @@ class TestDependencyProvenance:
         assert bake_mod.load_deps(deps_dir, "vanta-bi-Demo-3")["import_name"] == "demo"
         assert bake_mod.missing_deps(deps_dir, ["vanta-bi-Demo-3"]) == []
 
+    # ---- the layer's identity (M3 item U3) --------------------------------
+    @staticmethod
+    def _layer(checkpoint, provenance):
+        return bake_mod.BugDeps(
+            entry={"project": "Demo", "bug_id": 3},
+            checkpoint=checkpoint,
+            installs=(),
+            provenance=provenance,
+        )
+
+    def test_the_written_provenance_carries_the_layers_identity(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item U3 — bake stamps a digest and the moment it was baked.
+
+        ``suite_cache`` reads exactly this field, so a layer that is written
+        without one is a layer no run may be served from.
+        """
+        deps_dir = tmp_path / "deps"
+        path = bake_mod.write_deps(
+            deps_dir, self._layer("chk", {"installs": [], "import_name": "demo"})
+        )
+        data = json.loads(path.read_text(encoding="utf-8"))
+        baked_at = data[bake_mod.BAKED_AT_KEY]
+        assert baked_at.endswith("+00:00"), "ISO-8601, UTC"
+        assert data[bake_mod.CHECKPOINT_ID_KEY] == hashlib.sha256(
+            f"{baked_at}\x00{bake_mod.provenance_digest(data)}".encode("utf-8")
+        ).hexdigest()
+
+        monkeypatch.setattr(suite_cache_mod, "deps_dir", lambda: deps_dir)
+        assert (
+            suite_cache_mod.checkpoint_identity("chk")
+            == data[bake_mod.CHECKPOINT_ID_KEY]
+        )
+
+    def test_an_unchanged_layer_keeps_its_identity_across_a_rebake(self, tmp_path):
+        """The stamp is preserved when a re-bake resolves the same layer.
+
+        A fresh timestamp on every ``bake`` invocation would change the identity
+        of a layer nothing changed — and take the suite cache down with it every
+        time the bake was re-run.
+        """
+        deps_dir = tmp_path / "deps"
+        first = bake_mod.write_deps(
+            deps_dir, self._layer("chk", {"installs": [], "import_name": "demo"})
+        )
+        before = json.loads(first.read_text(encoding="utf-8"))
+
+        second = bake_mod.write_deps(
+            deps_dir, self._layer("chk", {"installs": [], "import_name": "demo"})
+        )
+        after = json.loads(second.read_text(encoding="utf-8"))
+
+        assert after[bake_mod.CHECKPOINT_ID_KEY] == before[bake_mod.CHECKPOINT_ID_KEY]
+        assert after[bake_mod.BAKED_AT_KEY] == before[bake_mod.BAKED_AT_KEY]
+
+    def test_a_layer_rebaked_from_other_pins_is_a_new_identity(self, tmp_path):
+        """The name is reused; the identity must not be."""
+        deps_dir = tmp_path / "deps"
+        first = bake_mod.write_deps(
+            deps_dir, self._layer("chk", {"installs": [], "import_name": "demo"})
+        )
+        before = json.loads(first.read_text(encoding="utf-8"))
+
+        second = bake_mod.write_deps(
+            deps_dir,
+            self._layer("chk", {"installs": ["decorator==4.4.0"], "import_name": "demo"}),
+        )
+        after = json.loads(second.read_text(encoding="utf-8"))
+
+        assert after[bake_mod.CHECKPOINT_ID_KEY] != before[bake_mod.CHECKPOINT_ID_KEY]
+
+    def test_the_layers_own_pip_check_reading_is_not_part_of_its_identity(self, tmp_path):
+        """``record_pip_check`` runs AFTER the stamp and must not move it.
+
+        ``pip_check`` is the layer's verdict on itself, not an input to the bake.
+        A digest that covered it would make every re-bake of an already recorded
+        layer look like a different layer.
+        """
+        deps_dir = tmp_path / "deps"
+        provenance = {"installs": [], "import_name": "demo"}
+        path = bake_mod.write_deps(deps_dir, self._layer("chk", provenance))
+        before = json.loads(path.read_text(encoding="utf-8"))
+
+        bake_mod.record_pip_check(
+            deps_dir,
+            "chk",
+            (
+                bake_mod.PinConflict(
+                    case=bake_mod.CASE_BOTH_OWN_PINS,
+                    requires="httpcore==0.3.0 declares h11==0.8.*",
+                    held="h11==0.9.0",
+                    source="pip check",
+                    pins=("httpcore==0.3.0", "h11==0.9.0"),
+                ),
+            ),
+        )
+        after = json.loads(path.read_text(encoding="utf-8"))
+
+        assert after[bake_mod.PIP_CHECK_KEY], "the reading was written back"
+        assert after[bake_mod.CHECKPOINT_ID_KEY] == before[bake_mod.CHECKPOINT_ID_KEY]
+
+        rebaked = json.loads(
+            bake_mod.write_deps(deps_dir, self._layer("chk", provenance)).read_text(
+                encoding="utf-8"
+            )
+        )
+        assert rebaked[bake_mod.CHECKPOINT_ID_KEY] == before[bake_mod.CHECKPOINT_ID_KEY]
+
+    def test_a_layer_with_no_recorded_identity_is_read_as_unknown(self, tmp_path, monkeypatch):
+        """``None`` means UNKNOWN, and a missing file means the same thing.
+
+        Answering "unknown" rather than raising keeps one stale layer a per-bug
+        cache miss instead of a harness crash.
+        """
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        monkeypatch.setattr(suite_cache_mod, "deps_dir", lambda: deps_dir)
+
+        assert suite_cache_mod.checkpoint_identity("chk") is None
+        bake_mod.write_deps(deps_dir, self._layer("chk", {"installs": []}))
+        assert suite_cache_mod.checkpoint_identity("chk") == json.loads(
+            (deps_dir / "chk.json").read_text(encoding="utf-8")
+        )[bake_mod.CHECKPOINT_ID_KEY]
+
+        (deps_dir / "legacy.json").write_text(
+            json.dumps({"installs": [], "harness_pins": {}}), encoding="utf-8"
+        )
+        assert suite_cache_mod.checkpoint_identity("legacy") is None
+        (deps_dir / "broken.json").write_text("{oops\n", encoding="utf-8")
+        assert suite_cache_mod.checkpoint_identity("broken") is None
+
     def test_a_layer_with_no_recorded_provenance_must_be_rebaked(self, tmp_path):
         deps_dir = tmp_path / "deps"
         with pytest.raises(bake_mod.BakeError, match="re-run bake"):
@@ -24810,6 +25040,27 @@ class TestVantaEnv:
         """
         assert "VANTA_SHURU_MEMORY_MB" not in self._env()
         assert self._env(memory_mb=8192)["VANTA_SHURU_MEMORY_MB"] == "8192"
+
+    def test_the_layers_identity_reaches_the_binary(self):
+        """M3 item U3 — a cache key needs WHICH layer, not merely which name.
+
+        [VANTA-WHY] ``vanta_m3`` keys its suite cache on
+        ``VANTA_SHURU_CHECKPOINT_ID`` but cannot read a deps file, so the harness reads
+        the layer's stamp off the bug's provenance and passes it here. It is ALWAYS
+        set — empty when the layer has no stamp — so a value inherited from the
+        caller's shell can never name an identity the run is not measuring: the Rust
+        reader turns the empty one into ``off:unknown_checkpoint``.
+        """
+        deps = {suite_cache_mod.CHECKPOINT_ID_KEY: "layer-1"}
+        assert self._env(deps=deps)[suite_cache_mod.CHECKPOINT_ID_ENV] == "layer-1"
+        for env in (self._env(), self._env(deps={"installs": []})):
+            assert env[suite_cache_mod.CHECKPOINT_ID_ENV] == ""
+        assert (
+            self._env(base={"VANTA_SHURU_CHECKPOINT_ID": "stale"})[
+                suite_cache_mod.CHECKPOINT_ID_ENV
+            ]
+            == ""
+        )
 
     def test_the_deadline_is_set_short_of_the_timeout_that_kills_the_process(self):
         """§14.15 — the margin is the difference between a verdict and a corpse.

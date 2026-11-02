@@ -17,13 +17,15 @@
 //   * the test command, its env and its precompile rule;
 //   * the checkpoint, disk and memory the VM is created with (a too-small VM
 //     KILLS the run, which is an outcome, not a resource detail);
+//   * the LAYER's identity and not merely its name (M3 item U3): a re-bake
+//     reuses the name, so a name-keyed entry can outlive the layer it measured;
 //   * the wall-clock cap (a run's TIMEOUT is a function of the cap, and the cap
 //     is derived per bug from prepare's own measurement — without it in the key
 //     one arm's kill would be inherited as a fact about the tree);
 //   * the harness build (commit + dirty), because the stored value describes a
 //     run performed by a particular binary.
 //
-// Four rules make the reuse safe rather than merely fast:
+// Five rules make the reuse safe rather than merely fast:
 //
 //   * **A key is the input, so a hit is the same experiment.** See above.
 //   * **A bad entry is never used.** An entry that is unreadable, carries
@@ -35,6 +37,13 @@
 //     would serve an empty suite as if it were "no regressions". The write side
 //     refuses to store one and this reader refuses to serve one, so an entry
 //     written before the rule existed is repaired rather than believed.
+//   * **A checkpoint's NAME is not its identity** (M3 item U3). The name is a
+//     label a re-bake reuses. The key therefore carries the identity `bake`
+//     stamped into the layer's provenance — a digest of the pins it was built
+//     from, read from the deps file by the harness and handed over in
+//     `VANTA_SHURU_CHECKPOINT_ID` — and an ABSENT identity means the layer could
+//     not be identified, so its runs are neither served nor written and the row
+//     records `off:unknown_checkpoint`.
 //   * **Reuse is auditable.** Every entry records who wrote it, and the caller
 //     is handed the key plus that identity, so `native_suite.summary` can say
 //     which earlier session row its native result actually came from.
@@ -70,7 +79,15 @@ use crate::pipeline::candidate::TestCommand;
 /// rather than as "this entry predates the field". Putting the version in the key
 /// material makes a format change unable to read old entries at all: the key
 /// changes, the entries are never found, and nothing has to be migrated/purged.
-pub const SCHEMA_VERSION: u64 = 1;
+///
+/// [VANTA-WHY] M3 item U3 bumps it 1 → 2, on both sides (the Python half is
+/// `scripts/bugsinpy/suite_cache.py`). Adding `checkpoint_id` to the material is
+/// a format change in exactly that sense: an entry written before the field
+/// existed was keyed on the checkpoint's NAME alone, so it describes a layer this
+/// build can no longer identify — the honest answer is to not find it, and the
+/// bump is what makes "not find it" true for every such entry rather than for the
+/// ones whose bytes happened to differ.
+pub const SCHEMA_VERSION: u64 = 2;
 
 /// The discriminator for the in-session gate's single `NativeSuiteReport` entry.
 ///
@@ -82,6 +99,17 @@ pub const KIND_NATIVE_REPORT: &str = "native_report";
 
 /// Pins the cache root. Unset uses the repo-relative default below.
 pub const CACHE_DIR_ENV: &str = "VANTA_SUITE_CACHE_DIR";
+
+/// Carries a layer's identity into this binary, which keys its cache on it.
+///
+/// [VANTA-WHY] M3 item U3. This binary cannot read the harness's deps file, so
+/// `runner.vanta_env` reads the digest `bake` stamped into the bug's provenance
+/// and hands it over here. It is ALWAYS set by the harness — empty when the layer
+/// has no stamp — so a value inherited from a caller's shell can never name an
+/// identity this run is not measuring. Empty means UNKNOWN, not "no checkpoint":
+/// the layer cannot be identified, so the cache is off for the run (see
+/// [`disabled_reason_from`]) rather than keyed on a name a re-bake reuses.
+pub const CHECKPOINT_ID_ENV: &str = "VANTA_SHURU_CHECKPOINT_ID";
 
 /// Set by `--no-cache` on `run`, `queue` and `prepare`.
 ///
@@ -115,9 +143,23 @@ pub fn build_stamp() -> String {
 
 /// Why the cache cannot be USED on this invocation, or `None`.
 ///
-/// Pure over its two inputs so a test does not have to mutate the process
-/// environment to exercise either branch.
-pub fn disabled_reason_from(no_cache_raw: &str, dirty: &str) -> Option<&'static str> {
+/// Pure over its three inputs so a test does not have to mutate the process
+/// environment to exercise any branch.
+///
+/// [VANTA-WHY] `unknown_checkpoint` (M3 item U3) is checked FIRST, because it is
+/// the one reason that is not about this invocation at all: without an identity
+/// there is no question the cache could answer, and `--no-cache`'s refresh rule
+/// (`plan_native_suite_from`) must not run either — an entry written now would be
+/// inherited by whatever this name is next baked into. Naming `no_cache` over it
+/// would be true and beside the point.
+pub fn disabled_reason_from(
+    no_cache_raw: &str,
+    dirty: &str,
+    checkpoint_id_raw: &str,
+) -> Option<&'static str> {
+    if checkpoint_id_raw.trim().is_empty() {
+        return Some("unknown_checkpoint");
+    }
     if flag_is_set(no_cache_raw) {
         return Some("no_cache");
     }
@@ -132,6 +174,7 @@ pub fn disabled_reason() -> Option<&'static str> {
     disabled_reason_from(
         &std::env::var(DISABLE_ENV).unwrap_or_default(),
         env!("VANTA_BUILD_DIRTY"),
+        &std::env::var(CHECKPOINT_ID_ENV).unwrap_or_default(),
     )
 }
 
@@ -179,6 +222,7 @@ fn native_material(
     timeout_secs: u64,
     stamp: &str,
     checkpoint_raw: &str,
+    checkpoint_id_raw: &str,
     disk_raw: &str,
     memory_raw: &str,
 ) -> Value {
@@ -201,6 +245,10 @@ fn native_material(
     material.insert("env".to_string(), json!(env));
     material.insert("precompile".to_string(), json!(test_cmd.precompile));
     material.insert("checkpoint".to_string(), json!(checkpoint_raw));
+    // [VANTA-WHY] M3 item U3 — the NAME above says which cage was opened; this
+    // says which animal is in it. A re-bake reuses the name, so an entry keyed on
+    // the name alone can be served for a layer built from different pins.
+    material.insert("checkpoint_id".to_string(), json!(checkpoint_id_raw));
     material.insert("disk_mb".to_string(), json!(disk_raw));
     material.insert("memory_mb".to_string(), json!(memory_raw));
     material.insert("timeout_secs".to_string(), json!(timeout_secs));
@@ -225,6 +273,7 @@ pub fn native_key(source: &str, test_cmd: &TestCommand, timeout_secs: u64) -> Ke
         timeout_secs,
         &build_stamp(),
         &std::env::var("VANTA_SHURU_CHECKPOINT").unwrap_or_default(),
+        &std::env::var(CHECKPOINT_ID_ENV).unwrap_or_default(),
         &std::env::var("VANTA_SHURU_DISK_MB").unwrap_or_default(),
         &std::env::var("VANTA_SHURU_MEMORY_MB").unwrap_or_default(),
     )
@@ -237,6 +286,7 @@ pub fn native_key_with(
     timeout_secs: u64,
     stamp: &str,
     checkpoint_raw: &str,
+    checkpoint_id_raw: &str,
     disk_raw: &str,
     memory_raw: &str,
 ) -> Key {
@@ -246,6 +296,7 @@ pub fn native_key_with(
         timeout_secs,
         stamp,
         checkpoint_raw,
+        checkpoint_id_raw,
         disk_raw,
         memory_raw,
     );
@@ -528,6 +579,7 @@ mod tests {
             120,
             "rs:abc123:false",
             "vanta-python",
+            "layer-1",
             "",
             "",
         )
@@ -546,6 +598,7 @@ mod tests {
             120,
             "rs:abc123:false",
             "vanta-python",
+            "layer-1",
             "",
             "",
         );
@@ -557,6 +610,7 @@ mod tests {
             121,
             "rs:abc123:false",
             "vanta-python",
+            "layer-1",
             "",
             "",
         );
@@ -568,10 +622,47 @@ mod tests {
             120,
             "rs:def456:false",
             "vanta-python",
+            "layer-1",
             "",
             "",
         );
         assert_ne!(first.hex, rebuilt.hex, "the harness build is an input");
+    }
+
+    /// M3 item U3 — the checkpoint's NAME is not its identity. The same name
+    /// rebuilt from different pins is a different layer, and serving one's
+    /// measurement to the other is the defect this key field exists to prevent.
+    #[test]
+    fn the_layer_identity_is_an_input_and_the_name_alone_is_not() {
+        let cmd = test_cmd();
+        let first = key_for("a", &cmd);
+
+        let rebaked = native_key_with(
+            "# FILE: a.py\nx = 1\n",
+            &cmd,
+            120,
+            "rs:abc123:false",
+            "vanta-python",
+            "layer-2",
+            "",
+            "",
+        );
+        assert_ne!(
+            first.hex, rebaked.hex,
+            "the same checkpoint name must not be the same experiment"
+        );
+
+        let renamed = native_key_with(
+            "# FILE: a.py\nx = 1\n",
+            &cmd,
+            120,
+            "rs:abc123:false",
+            "vanta-other",
+            "layer-1",
+            "",
+            "",
+        );
+        assert_ne!(first.hex, renamed.hex, "the name is still an input too");
     }
 
     #[test]
@@ -706,11 +797,82 @@ mod tests {
 
     #[test]
     fn a_dirty_build_is_disabled_and_the_reason_is_recorded() {
-        assert_eq!(disabled_reason_from("", "true"), Some("dirty_build"));
-        assert_eq!(disabled_reason_from("1", "false"), Some("no_cache"));
-        assert_eq!(disabled_reason_from("", "false"), None);
-        assert_eq!(disabled_reason_from("TRUE", "false"), Some("no_cache"));
-        assert_eq!(disabled_reason_from("0", "false"), None);
+        assert_eq!(
+            disabled_reason_from("", "true", "layer-1"),
+            Some("dirty_build")
+        );
+        assert_eq!(
+            disabled_reason_from("1", "false", "layer-1"),
+            Some("no_cache")
+        );
+        assert_eq!(disabled_reason_from("", "false", "layer-1"), None);
+        assert_eq!(
+            disabled_reason_from("TRUE", "false", "layer-1"),
+            Some("no_cache")
+        );
+        assert_eq!(disabled_reason_from("0", "false", "layer-1"), None);
+    }
+
+    /// M3 item U3 — a layer with no recorded identity has nothing the cache could
+    /// answer, so the cache is off. It outranks `--no-cache` because the refresh
+    /// rule must not run either: an entry written now would be inherited by
+    /// whatever this name is next baked into.
+    #[test]
+    fn an_unknown_layer_identity_disables_the_cache_outright() {
+        assert_eq!(
+            disabled_reason_from("", "false", ""),
+            Some("unknown_checkpoint")
+        );
+        assert_eq!(
+            disabled_reason_from("", "false", "   "),
+            Some("unknown_checkpoint"),
+            "whitespace is not an identity"
+        );
+        assert_eq!(
+            disabled_reason_from("1", "false", ""),
+            Some("unknown_checkpoint"),
+            "--no-cache must not outvote an identity that does not exist"
+        );
+        assert_eq!(
+            disabled_reason_from("", "true", ""),
+            Some("unknown_checkpoint")
+        );
+    }
+
+    /// An unknown-identity run neither serves nor writes — the whole of U3's
+    /// "off" state, on the side that would otherwise key on the bare name.
+    #[test]
+    fn an_unknown_layer_identity_neither_serves_nor_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // An entry under the identity-less key: present, and not this layer's.
+        let nameless = native_key_with(
+            "# FILE: a.py\nx = 1\n",
+            &test_cmd(),
+            120,
+            "rs:abc123:false",
+            "vanta-python",
+            "",
+            "",
+            "",
+        );
+        write_entry_to(
+            root,
+            &nameless.hex,
+            &nameless.material,
+            &json!({"ran": true}),
+            "someone-else",
+        )
+        .unwrap();
+
+        let plan = plan_native_suite_from(root, &nameless, disabled_reason_from("", "false", ""));
+        assert!(
+            plan.reuse.is_none(),
+            "an unidentifiable layer is never served"
+        );
+        assert_eq!(plan.note.state, "off:unknown_checkpoint");
+        assert!(plan.note.would_hit);
+        assert!(!plan.write, "nothing may be written under an unusable key");
     }
 
     #[test]
@@ -743,6 +905,7 @@ mod tests {
             120,
             "rs:abc123:false",
             "vanta-python",
+            "layer-1",
             "",
             "",
         );
@@ -768,8 +931,8 @@ mod tests {
     #[test]
     fn a_tree_change_changes_the_key_even_at_the_same_size() {
         let cmd = test_cmd();
-        let a = native_key_with("aaaa", &cmd, 120, "rs:x:false", "", "", "");
-        let b = native_key_with("bbbb", &cmd, 120, "rs:x:false", "", "", "");
+        let a = native_key_with("aaaa", &cmd, 120, "rs:x:false", "", "layer-1", "", "");
+        let b = native_key_with("bbbb", &cmd, 120, "rs:x:false", "", "layer-1", "", "");
         assert_ne!(a.hex, b.hex);
     }
 

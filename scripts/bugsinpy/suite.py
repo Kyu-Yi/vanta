@@ -173,9 +173,12 @@ class SuitePair:
     never looked up in the cache.
 
     [VANTA-WHY] The key, the state
-    (``hit``/``miss``/``unreadable``/``unmeasured``/``off:no_cache``),
-    the ``created_by`` of the entry that was served and whether an entry existed
-    that could not be used. Deliberately NOT part of :meth:`to_json`: it describes
+    (``hit``/``miss``/``unreadable``/``unmeasured``/``off:no_cache``/
+    ``off:unknown_checkpoint``), the ``created_by`` of the entry that was served
+    and whether an entry existed that could not be used. ``off:unknown_checkpoint``
+    (M3 item U3) is the one state with an EMPTY key: the layer has no recorded
+    identity, so no key could be built for it and the cache was off entirely.
+    Deliberately NOT part of :meth:`to_json`: it describes
     the LOOKUP, not the experiment, so storing it would make a served pair claim
     to have been served by whoever wrote it first. ``compare=False`` keeps it out
     of equality, so an existing test comparing two pairs still compares the two
@@ -440,6 +443,15 @@ def cache_material(
     fail for its own reason, and a key that could raise would turn a permission
     problem into a harness crash.
 
+    ``checkpoint_id`` is the LAYER's identity, read from the provenance `bake`
+    wrote (:func:`suite_cache.checkpoint_identity`), and it is not the checkpoint
+    name (M3 item U3): the name is a label a re-bake reuses, so a name-keyed
+    entry can outlive the layer it measured. It may be ``None`` — a layer baked
+    before the stamp existed — and the material is still built, because the
+    CALLER has to be able to tell "unknown identity" from "unreadable tree": the
+    first is a per-bug cache miss that is recorded on the row, and the second is
+    this function's ``None``.
+
     ``batch_dir`` is deliberately absent from the material (only the tree it holds
     is hashed): the whole point is that two batches measuring the same tree share
     one entry.
@@ -457,6 +469,7 @@ def cache_material(
         "env": {str(k): str(v) for k, v in sorted(cache_env(extra_env).items())},
         "precompile": [str(part) for part in precompile],
         "checkpoint": str(checkpoint),
+        "checkpoint_id": suite_cache.checkpoint_identity(checkpoint),
         "disk_mb": int(disk_mb),
         "memory_mb": None if memory_mb is None else int(memory_mb),
         "timeout_secs": int(timeout_secs),
@@ -521,10 +534,16 @@ def run_suite_twice(
     check the cache against a fresh measurement without a second experiment — a
     fresh measurement that succeeded then replaces the entry it could not use
     (M3 item U2).
+
+    A layer with no recorded identity (M3 item U3) turns the cache off entirely
+    and records that on the row: the key would otherwise carry the checkpoint's
+    NAME, which a re-bake reuses, and an entry that outlives its layer is worse
+    than no entry. See :func:`cache_material`.
     """
+    record = origin is not None
     material = (
         None
-        if origin is None
+        if not record
         else cache_material(
             checkpoint=checkpoint,
             batch_dir=batch_dir,
@@ -542,6 +561,22 @@ def run_suite_twice(
     source = ""
     would_hit = False
     write = False
+    if material is not None and not material.get("checkpoint_id"):
+        # [VANTA-WHY] M3 item U3 — the layer's identity is unknown, so there is
+        # nothing this run could be a repetition OF. The cache is off for this
+        # call: no lookup (an entry found by name alone would be a measurement of
+        # a layer that may no longer exist) and no write (an entry written now
+        # would be inherited by whatever the name is next baked into). The row
+        # still records the state, so a wave whose layers predate the stamp says
+        # so per bug instead of looking like an ordinary miss.
+        condition = "off:unknown_checkpoint"
+        key = ""
+        # Dropping the material is what makes "no lookup … and no write" true:
+        # the two gates below are keyed on it, and leaving it set would look the
+        # entry up under the empty key and then write a fresh one at
+        # `cache_dir()/.json` — a junk entry inherited by the next layer baked
+        # into this name, which is the very failure this item exists to stop.
+        material = None
     if material is not None:
         entry = suite_cache.read_entry(material, key)
         source = "" if entry is None else str(entry.get("created_by") or "")
@@ -666,6 +701,16 @@ def run_suite_twice(
             "state": condition,
             "source": source,
             "would_hit": would_hit,
+        }
+    elif record:
+        # [VANTA-WHY] M3 item U3 — the one path where the cache was asked for
+        # and could not be used at all: the layer has no identity, so there is no
+        # key, no lookup and no write, and the row says exactly that.
+        pair.cache = {
+            "key": "",
+            "state": condition,
+            "source": "",
+            "would_hit": False,
         }
     return pair
 

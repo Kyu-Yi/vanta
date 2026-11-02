@@ -563,6 +563,7 @@ def vanta_env(
     memory_mb: Optional[int] = None,
     base: Optional[dict[str, str]] = None,
     frozen: Optional[Mapping[str, str]] = None,
+    deps: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, str]:
     """The controlled environment for one ``vanta_m3`` invocation (§7.4).
 
@@ -590,6 +591,15 @@ def vanta_env(
     ONE ``arms.py`` entry, so a run cannot be configured as one arm and recorded as
     another. That is the whole of "the harness refuses before launching": there is no
     combination here for it to get wrong.
+
+    ``deps`` is the bug's own dependency provenance (``prepare``'s ``load_deps``
+    result), and it is here for the same reason ``memory_mb`` is: the layer's
+    IDENTITY is in that file, and the in-session cache keys on it (M3 item U3).
+    ``VANTA_SHURU_CHECKPOINT_ID`` is set from it ALWAYS — to the empty string when
+    the layer has no stamp — because leaving it unset would let a caller's stale
+    value name an identity this run is not measuring. See
+    ``suite_cache.CHECKPOINT_ID_KEY``. The run log's ``# env:`` header carries the
+    value it set.
     """
     try:
         entry = arms_mod.arm(arm)
@@ -611,6 +621,19 @@ def vanta_env(
     # binary's argv is what it was before this key existed.
     if memory_mb is not None:
         env["VANTA_SHURU_MEMORY_MB"] = str(memory_mb)
+    # [VANTA-WHY] M3 item U3 — WHICH layer this is, not merely which name it is
+    # under. The name a re-bake reuses, so a key carrying only the name can serve a
+    # measurement of a layer that no longer exists; the identity is the digest
+    # `bake` stamped into the layer's provenance. Always set, empty when the layer
+    # has no stamp: an inherited value would name an identity this run is not
+    # measuring, and the binary reads an empty one as "unknown", which disables the
+    # cache for the run rather than guessing.
+    identity = ""
+    if deps is not None:
+        stamped = deps.get(suite_cache.CHECKPOINT_ID_KEY)
+        if isinstance(stamped, str):
+            identity = stamped
+    env[suite_cache.CHECKPOINT_ID_ENV] = identity
     # See the module docstring: the self-heal needs network the VM does not have.
     env["VANTA_SHURU_AUTO_DEPS"] = "0"
     env["VANTA_ATTACKER"] = "on" if entry.attacker else "off"
@@ -2767,6 +2790,8 @@ def run_job(
         memory_mb=prep.vm_memory_mb,
         # Item 19 — the frozen config's `[env]` settings, from the job (batch-level).
         frozen=job.frozen_env,
+        # M3 item U3 — the layer's identity, from the provenance `prepare` loaded.
+        deps=prep.deps,
     )
     outcome = invoke_vanta(
         vanta_bin=vanta_bin,

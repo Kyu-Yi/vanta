@@ -535,7 +535,7 @@ pub async fn run_native_suite(
 /// row that produced it, which is what makes the reuse auditable rather than
 /// merely fast.
 ///
-/// Three rules, in the order they matter:
+/// Four rules, in the order they matter:
 ///
 ///   * **A key is the input, so a hit is the same experiment.** The key carries
 ///     the tree, the command, the env, the checkpoint and the WALL-CLOCK CAP
@@ -550,7 +550,10 @@ pub async fn run_native_suite(
 ///     read as "no regressions" forever.
 ///   * **A dirty build is not cached at all.** See `suite_cache`'s module note:
 ///     `VANTA_BUILD_COMMIT` cannot separate two development builds of one commit,
-///     so reuse is off and the reason lands on the row.
+///     so reuse is off and the reason lands on the row. An UNIDENTIFIED layer
+///     (M3 item U3, no `VANTA_SHURU_CHECKPOINT_ID`) is off for the same shape of
+///     reason: a name a re-bake reuses is not an identity, so `plan.write` is
+///     false and the row says `off:unknown_checkpoint`.
 pub async fn run_native_suite_cached(
     source: &str,
     test_cmd: &TestCommand,

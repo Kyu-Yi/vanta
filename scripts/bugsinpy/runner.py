@@ -2302,9 +2302,17 @@ def build_record(
         # both anyway is what lets `analyse` group on the preparation's claim (a
         # batch prepared under one config and run under another is exactly the
         # contradiction pooling must not average over). `None` when the batch's
-        # `prepare.json` recorded no config block.
+        # `prepare.json` recorded no config block. Item U8 — the preparation's
+        # applied overrides ride along beside them, because the run-side `config_hash`
+        # / `config_override` pair is likewise not the whole configuration: two
+        # preparations can share a `config_hash` and waive different frozen settings
+        # with `--config-override`, and a row that recorded only the flag cannot tell
+        # those two trees apart. Written RAW (not coerced to a list) so `analyse` can
+        # keep "no field at all" (`None`) distinct from a recorded empty list — the
+        # first says nothing about the waived values, the second says there were none.
         "prep_config_hash": (job.prep_config_block or {}).get("config_hash"),
         "prep_config_override": (job.prep_config_block or {}).get("config_override"),
+        "prep_config_overrides": (job.prep_config_block or {}).get("config_overrides"),
         # §14.23 — how the pinned seed was turned into a per-round seed. Recorded
         # because the offset is DEFAULT-ON: a row's own `seed` cannot say whether its
         # later review rounds were independent draws or deterministic duplicates, so
@@ -2653,6 +2661,11 @@ class Job:
     whether the tree it graded was prepared under the configuration it ran under.
     ``None`` on a row whose batch recorded no config block (a batch prepared before
     item Q3, or a test-built job).
+
+    Item U8 — ``build_record`` carries all three of its pooling-relevant keys onto the
+    row (``prep_config_hash``, ``prep_config_override`` and ``prep_config_overrides``),
+    so two preparations that share a hash and a waiver flag but waived different frozen
+    settings cannot be pooled by ``analyse``.
     """
 
     frozen_env: Optional[Mapping[str, str]] = None

@@ -569,10 +569,24 @@ without it (or the reverse) ran under a different environment even when the conf
 is identical. Named here for the same reason the other two are — a typo would pool two
 preparations that differ only in their waiver."""
 
+PREP_CONFIG_OVERRIDES_FIELD = "prep_config_overrides"
+"""M3 item U8 — the overrides the **preparation** was run with.
 
-def _config_group(record: Mapping[str, Any]) -> tuple[Any, Any, Any, Any]:
-    """The ``(config_hash, config_overrides, prep_config_hash, prep_config_override)``
-    key two rows must share to be poolable.
+[VANTA-WHY] ``prep_config_hash`` and ``prep_config_override`` are not the whole of the
+preparation's configuration: ``--config-override`` waives a named frozen setting without
+touching the config file, so two preparations can share a hash and waive *something* with
+different values — the same reason item B8 added the run-side ``config_overrides`` to the
+key. Without this field those two are one group and their rows average the waived and the
+re-waived run under one name. The list is rendered strings (``frozen_config.Override.render``)
+and is sorted into the key. Named here for the same reason the others are — a typo would
+read every row as "no overrides recorded" and pool them all."""
+
+
+def _config_group(record: Mapping[str, Any]) -> tuple[Any, Any, Any, Any, Any]:
+    """The pooling key two rows must share to be comparable.
+
+    The key is ``(config_hash, config_overrides, prep_config_hash, prep_config_override,
+    prep_config_overrides)``.
 
     Overrides are recorded as an unordered list of rendered strings
     (``frozen_config.Override.render``), so they are sorted into the key — two rows that
@@ -587,6 +601,11 @@ def _config_group(record: Mapping[str, Any]) -> tuple[Any, Any, Any, Any]:
     second half of the key, under the same absence rule: a row whose batch recorded no
     preparation config (``None``) is its own group, never agreement with a row whose
     batch did.
+
+    M3 item U8 completes the preparation half with its **applied overrides**
+    (``prep_config_overrides``), sorted and under the same absence rule — a row that
+    never recorded them is its own group, never agreement with one that recorded an
+    empty list.
     """
     value = record.get(CONFIG_HASH_FIELD)
     hash_key = None if value is None else str(value)
@@ -599,7 +618,12 @@ def _config_group(record: Mapping[str, Any]) -> tuple[Any, Any, Any, Any]:
     prep_hash = None if prep_value is None else str(prep_value)
     prep_raw = record.get(PREP_CONFIG_OVERRIDE_FIELD)
     prep_override = None if prep_raw is None else bool(prep_raw)
-    return hash_key, overrides, prep_hash, prep_override
+    prep_over = record.get(PREP_CONFIG_OVERRIDES_FIELD)
+    if not isinstance(prep_over, list):
+        prep_overrides = None
+    else:
+        prep_overrides = tuple(sorted(str(item) for item in prep_over))
+    return hash_key, overrides, prep_hash, prep_override, prep_overrides
 
 
 def _refuse_mixed_configs(batches: Sequence[Batch]) -> None:
@@ -626,17 +650,23 @@ def _refuse_mixed_configs(batches: Sequence[Batch]) -> None:
     half is what makes two groups differ, the refusal names it; when every row's preparation
     is the same the label is left as it was, so the message stays about the difference that
     actually split the load.
+
+    [VANTA-WHY] M3 item U8 — the preparation half carries its **applied overrides**
+    (``prep_config_overrides``) as well, for the same reason the run half carries
+    ``config_overrides``: two trees prepared with the same file and waiver flag but
+    different waived values are different experiments, and the refusal names those values
+    when they are what split the load.
     """
-    groups: dict[tuple[Any, Any, Any, Any], list[str]] = {}
+    groups: dict[tuple[Any, Any, Any, Any, Any], list[str]] = {}
     for batch in batches:
         for record in batch.records:
             groups.setdefault(_config_group(record), []).append(str(batch.path))
     if len(groups) <= 1:
         return
     # Only describe the preparation half when it is part of what split the load.
-    prep_varies = len({(group[2], group[3]) for group in groups}) > 1
+    prep_varies = len({(group[2], group[3], group[4]) for group in groups}) > 1
     described: list[str] = []
-    for (hash_key, overrides, prep_hash, prep_override), where in sorted(
+    for (hash_key, overrides, prep_hash, prep_override, prep_overrides), where in sorted(
         groups.items(),
         key=lambda item: (
             item[0][0] is not None,
@@ -647,6 +677,8 @@ def _refuse_mixed_configs(batches: Sequence[Batch]) -> None:
             item[0][2] or "",
             item[0][3] is not None,
             bool(item[0][3]),
+            item[0][4] is not None,
+            item[0][4] or (),
         ),
     ):
         if hash_key is None:
@@ -662,7 +694,12 @@ def _refuse_mixed_configs(batches: Sequence[Batch]) -> None:
                 label += " (prepared under no recorded config)"
             else:
                 waived = "waived frozen settings" if prep_override else "waived none"
-                label += f" (prepared under {prep_hash[:12]}, {waived})"
+                label += f" (prepared under {prep_hash[:12]}, {waived}"
+                if prep_overrides:
+                    label += " with overrides " + ", ".join(prep_overrides)
+                elif prep_overrides is None:
+                    label += ", overrides not recorded"
+                label += ")"
         described.append(
             f"{label} ({len(where)} row(s) in {', '.join(sorted(set(where)))})"
         )

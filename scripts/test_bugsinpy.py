@@ -32715,6 +32715,70 @@ class TestAnalyseLoading:
             _analyse_load(batch)
         assert "overrides not recorded" in str(exc.value)
 
+    def test_the_same_prep_hash_with_different_waived_values_is_never_pooled(
+        self, tmp_path
+    ):
+        """[VANTA-WHY] M3 item U8 — the preparation's own overrides are part of its claim.
+
+        ``--config-override`` waives a named frozen setting without touching the config
+        file, so two preparations can share ``prep_config_hash`` and the waiver *flag*
+        (``prep_config_override``) while waiving different values. Before item U8 the key
+        read only the hash and the flag, so those two pooled — the rows averaged a tree
+        prepared one way with a tree prepared another under one name.
+        """
+        first = _analyse_row("k1")
+        first["config_hash"] = "h1"
+        first["config_overrides"] = []
+        first["prep_config_hash"] = "p1"
+        first["prep_config_override"] = True
+        first["prep_config_overrides"] = ["VANTA_SAMPLING=coding!=pinned"]
+        second = _analyse_row("k2")
+        second["config_hash"] = "h1"
+        second["config_overrides"] = []
+        second["prep_config_hash"] = "p1"
+        second["prep_config_override"] = True
+        second["prep_config_overrides"] = ["VANTA_N_CTX=32768!=65536"]
+        batch = _analyse_batch(tmp_path, rows=[first, second])
+        with pytest.raises(analyse_mod.AnalysisError) as exc:
+            _analyse_load(batch)
+        message = str(exc.value)
+        assert "VANTA_SAMPLING=coding!=pinned" in message
+        assert "VANTA_N_CTX=32768!=65536" in message
+
+    def test_the_same_prep_waived_values_are_one_group(self, tmp_path):
+        """The same preparation overrides in a different order are one configuration."""
+        rows = [_analyse_row("k1"), _analyse_row("k2")]
+        for index, row in enumerate(rows):
+            row["config_hash"] = "h1"
+            row["prep_config_hash"] = "p1"
+            row["prep_config_override"] = True
+            row["prep_config_overrides"] = ["a=1", "b=2"] if index == 0 else ["b=2", "a=1"]
+        analysis = _analyse_load(_analyse_batch(tmp_path, rows=rows))
+        assert len(analysis.rows) == 2
+
+    def test_an_unrecorded_prep_override_list_is_not_an_empty_one(self, tmp_path):
+        """Absence of the preparation's overrides is a different claim from "none".
+
+        A row that says nothing about the preparation's applied overrides is its own
+        group, exactly as a row with no ``prep_config_hash`` is — never agreement with a
+        row whose batch recorded "there were none" (item U8).
+        """
+        first = _analyse_row("k1")
+        first["config_hash"] = "h1"
+        first["config_overrides"] = []  # the run half is identical, so U8 is what splits
+        first["prep_config_hash"] = "p1"
+        first["prep_config_override"] = False
+        first["prep_config_overrides"] = []
+        second = _analyse_row("k2")
+        second["config_hash"] = "h1"
+        second["config_overrides"] = []
+        second["prep_config_hash"] = "p1"
+        second["prep_config_override"] = False  # no prep_config_overrides field at all
+        batch = _analyse_batch(tmp_path, rows=[first, second])
+        with pytest.raises(analyse_mod.AnalysisError) as exc:
+            _analyse_load(batch)
+        assert "overrides not recorded" in str(exc.value)
+
 
 class TestAnalyseReview:
     def _rows(self) -> list[dict]:
@@ -34234,6 +34298,8 @@ class TestPreparedConfigMatchesRun:
         assert record["config_hash"] == "r" * 64
         assert record["prep_config_hash"] == "p" * 64
         assert record["prep_config_override"] is True
+        # Item U8 — the preparation's waived values ride along, not just the flag.
+        assert record["prep_config_overrides"] == ["VANTA_SAMPLING=coding!=pinned"]
 
     def test_a_row_with_no_preparation_config_says_none(self, tmp_path, monkeypatch):
         monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
@@ -34251,6 +34317,7 @@ class TestPreparedConfigMatchesRun:
         )
         assert record["prep_config_hash"] is None
         assert record["prep_config_override"] is None
+        assert record["prep_config_overrides"] is None
 
     # -- the two stages, end to end --------------------------------------
     def _prepare_with_override(self, tmp_path, monkeypatch) -> Path:

@@ -8390,6 +8390,32 @@ class TestContextWindowWarning:
         assert warning is not None
         assert "records no n_ctx" in warning
 
+    def test_the_effective_environment_is_what_is_compared(self, tmp_path, monkeypatch):
+        """[VANTA-WHY] M3 item T5 — the window is read from the invocation's env.
+
+        A setting frozen in ``configs/v1-m3.toml`` but left out of the caller's shell
+        is applied to every child the run starts, so those children resolve the frozen
+        window — not the one ``os.environ`` would give here. The comparison must read
+        the same effective environment the children inherit, or a variable merely
+        exported in this shell reads as a divergence the run does not have.
+        """
+        batch = self._batch(tmp_path, n_ctx=131_072)
+        # The process environment says 65536; every child will actually see 131072.
+        monkeypatch.setenv("VANTA_LLM_CONTEXT_TOKENS", "65536")
+        assert (
+            runner_mod.context_window_warning(
+                batch, environ={"VANTA_LLM_CONTEXT_TOKENS": "131072"}
+            )
+            is None
+        )
+        # And the passed environment governs: a window that disagrees with the batch
+        # warns even when the process environment happens to agree.
+        monkeypatch.setenv("VANTA_LLM_CONTEXT_TOKENS", "131072")
+        warning = runner_mod.context_window_warning(
+            batch, environ={"VANTA_LLM_CONTEXT_TOKENS": "65536"}
+        )
+        assert warning is not None and "65536" in warning
+
 
 # ============================================================================
 # bake.py — the environment layers (§3, §11 step 3)
@@ -33703,7 +33729,9 @@ class TestPreparedConfigMatchesRun:
         monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
         monkeypatch.setattr(run_mod, "load_split", lambda path: split)
         # The window check would ask the model server; it is not what this test is about.
-        monkeypatch.setattr(runner_mod, "context_window_warning", lambda b: None)
+        monkeypatch.setattr(
+            runner_mod, "context_window_warning", lambda b, *, environ=None: None
+        )
         monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])
         monkeypatch.setattr(runner_mod, "require_vanta_bin", lambda path: path)
         monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: None)
@@ -33816,7 +33844,9 @@ class TestTheInvocationEnvironment:
             preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path, config_block=None
         )
         monkeypatch.setattr(runner_mod, "load_prepared", lambda **kwargs: batch)
-        monkeypatch.setattr(runner_mod, "context_window_warning", lambda b: None)
+        monkeypatch.setattr(
+            runner_mod, "context_window_warning", lambda b, *, environ=None: None
+        )
         monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])
         monkeypatch.setattr(runner_mod, "require_vanta_bin", lambda path: path)
         monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: None)
@@ -33868,7 +33898,9 @@ class TestTheInvocationEnvironment:
             preps=[], entries={}, n_ctx=262144, batch_dir=tmp_path, config_block=None
         )
         monkeypatch.setattr(runner_mod, "load_prepared", lambda **kwargs: batch)
-        monkeypatch.setattr(runner_mod, "context_window_warning", lambda b: None)
+        monkeypatch.setattr(
+            runner_mod, "context_window_warning", lambda b, *, environ=None: None
+        )
         monkeypatch.setattr(run_mod, "select_preps", lambda preps, **kwargs: [])
         monkeypatch.setattr(runner_mod, "require_vanta_bin", lambda path: path)
         monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: None)

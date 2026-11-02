@@ -4084,7 +4084,9 @@ def load_prepared(
     )
 
 
-def context_window_warning(batch: PreparedBatch) -> Optional[str]:
+def context_window_warning(
+    batch: PreparedBatch, *, environ: Optional[Mapping[str, str]] = None
+) -> Optional[str]:
     """Warn when this run's window is not the one ``prepare`` sized against (§1.6.1).
 
     ``prepare`` refuses to gate against the 65536 fallback, but the *run* still
@@ -4094,6 +4096,15 @@ def context_window_warning(batch: PreparedBatch) -> Optional[str]:
     shell that starts the run). When it does, every context verdict in the batch was
     measured against a prompt the run will not send, which is exactly how PySnooper/1
     and /2 came to be rejected for a window no run would have used.
+
+    [VANTA-WHY] M3 item T5. ``environ`` is the invocation's *effective* environment
+    (``bugsinpy_run.effective_env``), not ``os.environ``: a setting frozen in
+    ``configs/v1-m3.toml`` but left out of the caller's shell is applied to every
+    child the run starts, so the window those children resolve is the frozen one.
+    Reading ``os.environ`` here would compare prepare's window against a window no
+    job will use — the same divergence the check exists to catch, on the side that
+    does the catching. The default is ``os.environ`` for a caller that has no
+    resolution of its own to pass (:func:`context.server_context_window`).
 
     Returns the message, or ``None`` when they agree; printing is the caller's job so
     the comparison is testable without a batch or a server.
@@ -4105,7 +4116,7 @@ def context_window_warning(batch: PreparedBatch) -> Optional[str]:
             "That batch predates the recorded window; re-run prepare before trusting "
             "its context verdicts."
         )
-    run_n_ctx, run_source = ctx_mod.server_context_window()
+    run_n_ctx, run_source = ctx_mod.server_context_window(environ=environ)
     if run_n_ctx == batch.n_ctx:
         return None
     prepare_budget, _ = ctx_mod.budget_tokens(batch.n_ctx)

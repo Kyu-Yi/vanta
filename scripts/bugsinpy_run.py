@@ -930,8 +930,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise runner_mod.RunnerError(config_mismatch)
     # Before anything runs, and before --plan prints: a run whose window differs
     # from the one prepare sized against is measuring a different prompt than the
-    # batch's verdicts describe (§1.6.1), and the cheap moment to notice is now.
-    window_warning = runner_mod.context_window_warning(batch)
+    # batch's verdicts describe (§1.6.1), and the cheap moment to notice is now. The
+    # comparison reads the same effective environment every child inherits (item T5),
+    # so a setting frozen in the file but not exported is not read as a divergence.
+    window_warning = runner_mod.context_window_warning(
+        batch, environ=invocation_env
+    )
     if window_warning:
         print(f"WARNING: {window_warning}", file=sys.stderr, flush=True)
     waves = parse_waves(args.waves)
@@ -1083,7 +1087,12 @@ def cmd_queue(args: argparse.Namespace) -> int:
     config_mismatch = runner_mod.prepared_config_mismatch(batch.config_block, config_block)
     if config_mismatch and not args.allow_override:
         raise runner_mod.RunnerError(config_mismatch)
-    window_warning = runner_mod.context_window_warning(batch)
+    # Item T5 — the same effective environment `run` compares against, for the same
+    # reason: the queue's children resolve their window from the frozen `[env]`, so a
+    # variable merely exported in this shell must not read as a divergence.
+    window_warning = runner_mod.context_window_warning(
+        batch, environ=invocation_env
+    )
     if window_warning:
         print(f"WARNING: {window_warning}", file=sys.stderr, flush=True)
     waves = parse_waves(args.waves)

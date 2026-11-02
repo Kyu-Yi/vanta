@@ -51,6 +51,7 @@ REPO_ROOT = SCRIPTS_DIR.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from bugsinpy import bake as bake_mod  # noqa: E402
+from bugsinpy import budget as budget_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
 from bugsinpy import compact as compact_mod  # noqa: E402
 from bugsinpy import context as context_mod  # noqa: E402
@@ -348,6 +349,22 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     broken: list[tuple[str, str]] = []
     refreeze_keys = set(args.refreeze)
 
+    # [VANTA-WHY] M3 item S5 — the ONE scheduler of this invocation, created here and
+    # handed to every bug's suite runs. Default 1 keeps today's behaviour exactly
+    # (one suite run at a time); a higher `--prepare-jobs` lets a bug's independent
+    # derivations overlap, capped at host cores − 2 so the machine that owns the
+    # checkpoints and the batch directory keeps room. It is created per invocation
+    # rather than at import, so the recorded host load is this run's and no state
+    # survives from an earlier `prepare` in the same process.
+    budget = budget_mod.Budget(args.prepare_jobs)
+    print(
+        f"[scheduler] jobs={budget.jobs} concurrent={'yes' if budget.concurrent else 'no'} "
+        f"cores={budget.cores}/{budget.cap_cores} memory="
+        f"{'unbounded' if budget.cap_memory_mb is None else f'{budget.cap_memory_mb} MB'} "
+        f"host_load={budget.host_load}",
+        flush=True,
+    )
+
     for entry, full in selected:
         key = bug_key(entry)
         project = entry["project"]
@@ -387,6 +404,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
                 n_ctx_source=n_ctx_source,
                 vanta_bin=vanta_bin,
                 refreeze=key in refreeze_keys,
+                budget=budget,
             )
         except Exception as exc:  # one bug must not take the batch down
             detail = f"{type(exc).__name__}: {exc}"
@@ -428,6 +446,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         n_ctx=n_ctx,
         n_ctx_source=n_ctx_source,
         config_block=config_block,
+        scheduler=budget.record(),
     )
     (batch_dir / "prepare.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
@@ -1801,6 +1820,23 @@ def build_parser() -> argparse.ArgumentParser:
             "demand. The flag does not make the cache invisible: the entry is still "
             "read, the row records that it WOULD have hit (`off:no_cache`), and the "
             "fresh payload then replaces the entry it could not use."
+        ),
+    )
+    prep.add_argument(
+        "--prepare-jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "how many suite runs one prepare may execute at once (M3 item S5). Each "
+            "bug's three independent derivations (buggy / oracle / fixed) are "
+            "submitted together and overlap up to N at a time; the two runs of one "
+            "pair are always two separate VMs and overlap only when N allows it. N is "
+            "capped at host cores − 2, and each run holds its own recorded memory "
+            "(vm_memory_mb) plus one core. Default 1: one run at a time, today's "
+            "behaviour. A concurrent prepare records what it used on prepare.json and "
+            "on every bug row (`scheduler`), because a measurement made beside another "
+            "one is a different experiment from a serial one."
         ),
     )
     prep.set_defaults(func=cmd_prepare)

@@ -20,12 +20,14 @@ Every suite run happens inside Shuru — ``prepare`` is not exempt from C3.
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 from . import bake as bake_mod
+from . import budget as budget_mod
 from . import context as ctx
 from . import issue as issue_mod
 from . import issue_source
@@ -488,6 +490,22 @@ class BugPrep:
     ``prepare.json`` written before this key existed is refused by ``from_dict``
     like any other missing field, whose error says to re-run the stage.
     """
+    scheduler: dict[str, Any] = field(default_factory=dict)
+    """M3 items S5/S6 — the host-capacity budget this bug's own suite runs were made
+    under, and how long each of them took.
+
+    [VANTA-WHY] Items S5 and S6 let independent suite runs overlap, which means a run's
+    *result* is now a function of what else was running beside it — so "concurrent yes
+    or no", the jobs the operator asked for, the budget the host actually allowed
+    (cores and memory), the host load at the start and the peak the scheduler reached
+    all have to be on the record, or a flaky nodeid introduced by contention is
+    indistinguishable from one the project has. The value is :meth:`budget.Budget.record`
+    plus ``runs``: one entry per tree this bug ran, ``run1_secs``/``run2_secs`` — the
+    in-VM wall time of each of a pair's two runs (``suite.SuiteRun.secs``), the number
+    the D1 cap is derived from. Empty on a bug prepare refused before any suite ran, and
+    written on every row so a reader can tell a serial measurement from a concurrent one
+    without reading the batch's invocation-level record.
+    """
 
     @property
     def key(self) -> str:
@@ -596,6 +614,7 @@ class BugPrep:
             "deps": self.deps,
             "builds": self.builds,
             "version_pin": self.version_pin,
+            "scheduler": self.scheduler,
         }
 
     @classmethod
@@ -692,6 +711,7 @@ class BugPrep:
             deps=field_of(payload, "deps", owner=owner, where=where),
             builds=map_of(payload, "builds", owner=owner, where=where),
             version_pin=record_of(payload, "version_pin", owner=owner, where=where),
+            scheduler=record_of(payload, "scheduler", owner=owner, where=where),
         )
 
 
@@ -1183,6 +1203,7 @@ def derive_hidden(
     checkpoint: str,
     batch_dir: Path,
     collected: Optional[set[str]] = None,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> None:
     if collected is None:
         suite_mod.collect_only(
@@ -1196,9 +1217,49 @@ def derive_hidden(
             precompile=prep.precompile,
         )
 
-    buggy = _suite(checkpoint, batch_dir, prep, "src_buggy", "src_buggy")
-    before = _suite(checkpoint, batch_dir, prep, "oracle_tree", "oracle")
-    after = _suite(checkpoint, batch_dir, prep, "src_fixed", "src_fixed")
+    # [VANTA-WHY] M3 item S5 — the three derivations are independent: each reads its own
+    # tree and nothing they produce is read by another (the sets are only combined
+    # below), so running them back to back was a sequence with no dependency to justify
+    # it. They are submitted together and the shared budget decides how many actually
+    # overlap, which is ``--prepare-jobs`` — the concurrency is the operator's, not a
+    # number this function invents. Without a budget (or at one job) the three stay
+    # sequential, which is today's order and today's memory profile; when they do
+    # overlap, the row records it (:func:`_scheduler_record`), because two suites
+    # competing for the host is a fact a later flakiness reading must be able to see.
+    trees = (
+        ("src_buggy", "src_buggy"),
+        ("oracle_tree", "oracle"),
+        ("src_fixed", "src_fixed"),
+    )
+    if budget is not None and budget.concurrent:
+        with ThreadPoolExecutor(max_workers=len(trees)) as pool:
+            futures = [
+                pool.submit(
+                    _suite,
+                    checkpoint,
+                    batch_dir,
+                    prep,
+                    tree_name,
+                    stem,
+                    budget=budget,
+                )
+                for tree_name, stem in trees
+            ]
+            buggy, before, after = (future.result() for future in futures)
+    else:
+        buggy, before, after = (
+            _suite(checkpoint, batch_dir, prep, tree_name, stem, budget=budget)
+            for tree_name, stem in trees
+        )
+    _scheduler_record(
+        prep,
+        budget,
+        (
+            ("src_buggy", buggy),
+            ("oracle_tree", before),
+            ("src_fixed", after),
+        ),
+    )
 
     flaky = (
         buggy.flaky_nodeids
@@ -1344,12 +1405,19 @@ def _suite(
     prep: BugPrep,
     tree_name: str,
     stem_suffix: str,
+    *,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> suite_mod.SuitePair:
     # M3 item S3 — a repeat prepare of the same bug measures the same tree bytes,
     # so the pair is served from the cache instead of re-run (``origin`` turns the
     # lookup on; see ``suite.run_suite_twice``). The tree name is part of the
     # origin only, never of the key: the key is the tree's bytes, so a re-prepared
     # tree is a hit exactly when it is the same tree.
+    #
+    # M3 item S5 — ``budget`` is threaded straight through: the pair's two runs are
+    # the scheduler's unit, so one call here is up to two units and the caller's
+    # ``--prepare-jobs`` sizes them. Keyword-only so the five positional parameters
+    # stay the shape callers and tests already bind.
     return suite_mod.run_suite_twice(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
@@ -1361,10 +1429,47 @@ def _suite(
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
         origin=f"{prep.slug}/{tree_name}",
+        budget=budget,
     )
 
 
-def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bool:
+def _scheduler_record(
+    prep: BugPrep,
+    budget: Optional[budget_mod.Budget],
+    runs: Sequence[tuple[str, suite_mod.SuitePair]],
+) -> None:
+    """Record the budget this bug's suite runs were made under, and their wall times.
+
+    [VANTA-WHY] M3 items S5/S6. Overlapping means a run's flakiness can be the host's
+    rather than the project's, so the row has to say whether the runs overlapped, under
+    what cap, on a host already at what load — and how long each of the two runs of each
+    tree actually took, because that is the figure the in-session cap is derived from
+    (item D1, ``native_secs``). Recording it here, at the moment the pairs are in hand,
+    is the only place that has both numbers; a later reader has neither.
+
+    ``budget`` is the ONE scheduler of the invocation (S5/S6/``--jobs``); ``None`` means
+    a caller that does not participate, which is recorded as the empty mapping rather
+    than as "serial", because serial is a statement about a budget that exists.
+    """
+    previous = prep.scheduler.get("runs") if prep.scheduler else None
+    recorded = dict(previous) if isinstance(previous, Mapping) else {}
+    for tree_name, pair in runs:
+        recorded[tree_name] = {
+            "run1_secs": pair.first.secs,
+            "run2_secs": pair.second.secs,
+        }
+    block = {} if budget is None else budget.record()
+    block["runs"] = recorded
+    prep.scheduler = block
+
+
+def strip_and_baseline(
+    prep: BugPrep,
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    budget: Optional[budget_mod.Budget] = None,
+) -> bool:
     """Cut ``vanta_tree``/``vanta_clean`` from ``oracle_tree`` and re-run the suite.
 
     Returns whether the native baseline was recorded. ``False`` means this step
@@ -1477,7 +1582,10 @@ def strip_and_baseline(prep: BugPrep, *, checkpoint: str, batch_dir: Path) -> bo
         pin.pin, reason=pin.reason, probed=pin.probed, skipped=pin.skipped
     )
 
-    after_strip = _suite(checkpoint, batch_dir, prep, "vanta_tree", "vanta")
+    after_strip = _suite(
+        checkpoint, batch_dir, prep, "vanta_tree", "vanta", budget=budget
+    )
+    _scheduler_record(prep, budget, (("vanta_tree", after_strip),))
     # The same rule as ``derive_hidden``'s, on the fifth graded run. The baseline below
     # is measured from it, and an unmeasured run leaves it empty — which reads as "the
     # tree is natively green" and would clear every candidate of every regression. Left
@@ -1960,6 +2068,7 @@ def prepare_manifest(
     n_ctx: int,
     n_ctx_source: str,
     config_block: Mapping[str, Any],
+    scheduler: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """The whole ``prepare.json`` payload — the one writer ``run`` reads back.
 
@@ -2000,6 +2109,11 @@ def prepare_manifest(
         **config_block,
         "selected": list(selected),
         "breaks": [{"bug": key, "detail": detail} for key, detail in broken],
+        # M3 items S5/S6 — the invocation's ONE scheduler, as it ended: whether the
+        # runs overlapped, the jobs asked for, the budget the host allowed, the load
+        # at the start and the peak reached. The per-bug copy is on each row
+        # (``BugPrep.scheduler``); this one is what the batch as a whole ran under.
+        "scheduler": dict(scheduler) if scheduler is not None else {},
         "bugs": [prep.to_dict() for prep in preps],
     }
 
@@ -2439,6 +2553,7 @@ def prepare_one(
     n_ctx_source: str,
     vanta_bin: Path,
     refreeze: bool = False,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> BugPrep:
     """Everything ``prepare`` does for one bug, in the order §1.3 fixes.
 
@@ -2452,6 +2567,13 @@ def prepare_one(
 
     ``refreeze`` comes from ``prepare --refreeze PROJECT/BUG`` and means exactly one
     thing: this bug's committed report is to be re-fetched and rewritten (§2.4.3).
+
+    ``budget`` is the ONE host-capacity scheduler (M3 items S5/S6), created once per
+    ``prepare`` invocation by the caller and handed down so this bug's independent
+    suite runs (the three derivations) can overlap under ``--prepare-jobs``. It is
+    also what the row records (``BugPrep.scheduler``), so a reader can tell a
+    concurrent measurement from a serial one. ``None`` keeps the serial behaviour
+    for a caller that does not participate.
     """
     project = entry["project"]
     bug_id = int(entry["bug_id"])
@@ -2600,7 +2722,11 @@ def prepare_one(
 
     try:
         derive_hidden(
-            prep, checkpoint=checkpoint, batch_dir=batch_dir, collected=collected
+            prep,
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            collected=collected,
+            budget=budget,
         )
     except (suite_mod.SuiteError, tree_mod.TreeError) as exc:
         prep.gate_failures.append(f"hidden-oracle derivation failed: {exc}")
@@ -2622,7 +2748,7 @@ def prepare_one(
 
     try:
         baseline_recorded = strip_and_baseline(
-            prep, checkpoint=checkpoint, batch_dir=batch_dir
+            prep, checkpoint=checkpoint, batch_dir=batch_dir, budget=budget
         )
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(f"post-strip suite run failed: {exc}")

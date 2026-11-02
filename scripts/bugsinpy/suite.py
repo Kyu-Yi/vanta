@@ -23,10 +23,14 @@ import json
 import math
 import re
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
+from . import budget as budget_mod
 from . import shuru
 from . import suite_cache
 
@@ -401,6 +405,140 @@ def precompile_lines(
     return [_shell_quote([python, "-m", "compileall", "-q", "-f", *precompile])]
 
 
+def _run_script(
+    suffix: str, cmd: str, precompile: Sequence[str], test_cmd: Sequence[str]
+) -> str:
+    """The shell script ONE of a pair's two runs executes in its own VM.
+
+    [VANTA-WHY] M3 item S5. The markers keep the pair's ``1``/``2`` suffixes, so
+    :func:`_exit_code` and :func:`_marker_duration` read a run exactly as they did
+    when the two shared a VM — the change was which VM prints a marker, not what a
+    marker is. The ``T0``/``T1`` pair still opens and closes the clock immediately
+    around the pytest invocation (item D1): measuring in the VM and around the
+    command alone is what makes the figure comparable with the in-session cap, and
+    a number that included the boot would over-size every derived cap.
+
+    The pre-compile runs in BOTH VMs and not only the first, because the two may
+    overlap when the budget allows it (item S5). ``compileall -f`` writes each
+    ``.pyc`` through ``importlib``'s atomic rename, so two identical compiles
+    cannot corrupt one another; and a second run that skipped the step could race
+    the first and import the module under pytest's warning filters — exactly the
+    failure the step exists to prevent.
+    """
+    return "\n".join(
+        [
+            "set +e",
+            *precompile_lines(precompile, test_cmd),
+            f"echo __VANTA_T0_{suffix}__=$(date +%s)",
+            cmd,
+            # ``echo …=$(date +%s)`` consumes ``$?``, so the exit marker has to be
+            # emitted before the closing time marker or the code read back would be
+            # the marker's own.
+            f"echo __VANTA_EXIT_{suffix}__=$?",
+            f"echo __VANTA_T1_{suffix}__=$(date +%s)",
+            "exit 0",
+        ]
+    )
+
+
+def _run_one_vm(
+    *,
+    script: str,
+    checkpoint: str,
+    batch_dir: Path,
+    tree_rel: str,
+    disk_mb: int,
+    memory_mb: Optional[int],
+    timeout_secs: int,
+    env: Mapping[str, str],
+    budget: Optional[budget_mod.Budget],
+) -> shuru.ExecResult:
+    """Boot ONE VM for one run of a pair, holding a scheduler slot while it runs.
+
+    [VANTA-WHY] M3 items S5/S6. Splitting the pair's single VM into two is what makes
+    the runs independent, and this is the one place a run acquires its share of the
+    host: ``memory_mb`` is the row's own allocation and the run takes one effective
+    core (:func:`budget.Budget.slot`). The gate is held across ``shuru.run`` and
+    released in its ``finally``, so a VM that fails to boot, times out or is killed
+    frees the slot for the next run rather than wedging the queue.
+
+    ``timeout_secs`` is now the cap for THIS run alone (the pair's two runs each get
+    the full cap, where the shared script's cap covered both). That is the same
+    reading the in-session gate makes of the same number — the cap is what one suite
+    invocation may take — and it is why the derived cap (item D1) can be compared
+    with it directly.
+    """
+    gate = budget.slot(memory_mb=memory_mb) if budget is not None else nullcontext()
+    with gate:
+        return shuru.run(
+            checkpoint=checkpoint,
+            host_root=batch_dir,
+            command=["sh", "-c", script],
+            disk_mb=disk_mb,
+            memory_mb=memory_mb,
+            guest_cwd=guest_tree_root(tree_rel),
+            timeout_secs=timeout_secs,
+            env=env,
+        )
+
+
+def _run_pair(
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    tree_rel: str,
+    test_cmd: Sequence[str],
+    precompile: Sequence[str],
+    disk_mb: int,
+    memory_mb: Optional[int],
+    timeout_secs: int,
+    env: Mapping[str, str],
+    rel1: str,
+    rel2: str,
+    cmd1: str,
+    cmd2: str,
+    budget: Optional[budget_mod.Budget],
+) -> tuple[SuiteRun, SuiteRun]:
+    """Run the pair's two invocations in two separate VMs (M3 item S5).
+
+    Each run gets its OWN :class:`shuru.ExecResult`, so ``_load_run`` reads the
+    markers of the run it belongs to and nothing else — with the shared script the
+    two runs' ``stdout_tail`` were the same buffer, and a failure in run 2 could
+    only be told apart from one in run 1 by the suffix in the marker lines.
+
+    The two VMs may overlap only when the budget allows it (:attr:`Budget.concurrent`).
+    Without a budget — ``oracle``, ``replay`` and ``probe_xdist``'s calls, which do
+    not pass one — the runs are still two VMs but strictly serial, which is today's
+    ordering and today's ``.hypothesis`` visibility (run 2 sees run 1's database)
+    preserved with one extra boot.
+    """
+    script1 = _run_script("1", cmd1, precompile, test_cmd)
+    script2 = _run_script("2", cmd2, precompile, test_cmd)
+    common = {
+        "checkpoint": checkpoint,
+        "batch_dir": batch_dir,
+        "tree_rel": tree_rel,
+        "disk_mb": disk_mb,
+        "memory_mb": memory_mb,
+        "timeout_secs": timeout_secs,
+        "env": env,
+        "budget": budget,
+    }
+    if budget is not None and budget.concurrent:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(_run_one_vm, script=script1, **common)
+            second_future = pool.submit(_run_one_vm, script=script2, **common)
+            result2 = second_future.result()
+            result1 = first_future.result()
+    else:
+        result1 = _run_one_vm(script=script1, **common)
+        result2 = _run_one_vm(script=script2, **common)
+    return (
+        _load_run(batch_dir / rel1, result1, suffix="1"),
+        _load_run(batch_dir / rel2, result2, suffix="2"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # the suite cache (M3 items S1/S2/S3)
 # ---------------------------------------------------------------------------
@@ -507,6 +645,58 @@ def _write_reports(batch_dir: Path, report_rel_stem: str, pair: SuitePair) -> No
         )
 
 
+_FLIGHTS: dict[str, threading.Event] = {}
+"""The cache keys one thread in this process is measuring right now.
+
+[VANTA-WHY] M3 items S5/S6 — the in-process single flight. ``S5`` makes three of
+a bug's suite runs concurrent and ``S6`` makes rows concurrent, so two callers can
+want the SAME key at the same time: the same tree demanded by two rows, or the
+same candidate patch graded twice in one wave. Left alone, both would boot VMs for
+one measurement and race on the entry file. One caller computes and the others
+wait for its entry (or for its failure, in which case they measure it themselves).
+The map is guarded by ``_FLIGHTS_GUARD`` and a member is removed in the leader's
+``finally``, so a leader that raises still releases its waiters.
+"""
+
+_FLIGHTS_GUARD = threading.Lock()
+
+
+def _single_flight(key: str, produce: Callable[[], SuitePair]) -> SuitePair:
+    """Run ``produce`` once per ``key`` in this process; the rest wait for it.
+
+    [VANTA-WHY] M3 items S5/S6. ``produce`` is the whole cache-aware path —
+    lookup, then two VMs, then the write — so the flight covers exactly the work
+    that must not happen twice for one key. A waiter does NOT receive the leader's
+    value directly: it takes its own turn through ``produce`` once the leader has
+    released the key, which means it re-reads the entry. That is deliberate. The
+    leader may have measured nothing (item U1/U2's rule) or been asked not to write
+    (``--no-cache``), and a waiter handed the leader's object would then be handed
+    a pair the cache itself refuses to serve. Going back through ``produce`` makes
+    the waiter's outcome the same experiment the cache would have given it anyway:
+    a hit when the leader wrote a measurement, a fresh measurement when it did not.
+    An empty ``key`` is a layer with no identity or a caller that did not opt in —
+    no lookup and no write either way, so there is nothing to share and ``produce``
+    runs straight through.
+    """
+    if not key:
+        return produce()
+    while True:
+        with _FLIGHTS_GUARD:
+            flight = _FLIGHTS.get(key)
+            leader = flight is None
+            if leader:
+                flight = threading.Event()
+                _FLIGHTS[key] = flight
+        if leader:
+            try:
+                return produce()
+            finally:
+                with _FLIGHTS_GUARD:
+                    _FLIGHTS.pop(key, None)
+                flight.set()
+        flight.wait()
+
+
 def run_suite_twice(
     *,
     checkpoint: str,
@@ -520,6 +710,7 @@ def run_suite_twice(
     memory_mb: Optional[int] = None,
     precompile: Sequence[str] = (),
     origin: Optional[str] = None,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> SuitePair:
     """Run ``test_cmd`` twice inside the checkpoint and diff the two reports.
 
@@ -539,11 +730,19 @@ def run_suite_twice(
     and records that on the row: the key would otherwise carry the checkpoint's
     NAME, which a re-bake reuses, and an entry that outlives its layer is worse
     than no entry. See :func:`cache_material`.
+
+    ``budget`` (M3 items S5/S6) is the one host-capacity scheduler. Each of the two
+    runs takes a slot for the duration of its own VM; when the budget allows more
+    than one run at a time the two overlap, otherwise they are serial. ``None``
+    keeps the serial behaviour for callers that do not participate in a budget.
+
+    The key is taken before the work and the whole lookup-measure-write path runs
+    under :func:`_single_flight`, so two callers that want the same key at the same
+    time — which S5 and S6 make ordinary — measure it once (M3 items S5/S6).
     """
-    record = origin is not None
     material = (
         None
-        if not record
+        if origin is None
         else cache_material(
             checkpoint=checkpoint,
             batch_dir=batch_dir,
@@ -557,6 +756,55 @@ def run_suite_twice(
         )
     )
     key = "" if material is None else suite_cache.key_of(material)
+    # A layer with no identity is not an experiment anyone can share, so it takes
+    # no flight (the body below turns the cache off for it, item U3).
+    flight_key = key if material is not None and material.get("checkpoint_id") else ""
+    return _single_flight(
+        flight_key,
+        lambda: _measure_suite(
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            tree_rel=tree_rel,
+            test_cmd=test_cmd,
+            report_rel_stem=report_rel_stem,
+            disk_mb=disk_mb,
+            timeout_secs=timeout_secs,
+            extra_env=extra_env,
+            memory_mb=memory_mb,
+            precompile=precompile,
+            origin=origin,
+            budget=budget,
+            material=material,
+            key=key,
+        ),
+    )
+
+
+def _measure_suite(
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    tree_rel: str,
+    test_cmd: Sequence[str],
+    report_rel_stem: str,
+    disk_mb: int,
+    timeout_secs: int,
+    extra_env: Optional[dict[str, str]],
+    memory_mb: Optional[int],
+    precompile: Sequence[str],
+    origin: Optional[str],
+    budget: Optional[budget_mod.Budget],
+    material: Optional[dict],
+    key: str,
+) -> SuitePair:
+    """The cache-aware body of :func:`run_suite_twice`, run under its flight.
+
+    [VANTA-WHY] M3 items S5/S6. The body is split out so one in-process flight can
+    wrap "look up, then measure, then write" as a single unit: the key is computed
+    by the caller (before the flight is taken) and handed in, and the entry the
+    leader writes is what a waiter finds when it takes its own turn.
+    """
+    record = origin is not None
     condition = "miss"
     source = ""
     would_hit = False
@@ -634,45 +882,31 @@ def run_suite_twice(
     cmd1 = _shell_quote(build_command(test_cmd, f"/workspace/{rel1}"))
     cmd2 = _shell_quote(build_command(test_cmd, f"/workspace/{rel2}"))
 
-    script = "\n".join(
-        [
-            "set +e",
-            *precompile_lines(precompile, test_cmd),
-            # [VANTA-WHY] M3 item D1 — the wall-clock markers. `T0` opens the clock
-            # immediately before the pytest invocation and `T1` closes it
-            # immediately after, with `__VANTA_EXIT_n__` left in between so the
-            # exit code is still `$?` of the pytest command and not of the
-            # marker (`echo …=$(date +%s)` would consume it). Measuring here, in
-            # the VM and around the command alone, is what makes the figure
-            # comparable with the in-session cap, which also covers pytest only —
-            # a number that included the boot would over-size every derived cap.
-            "echo __VANTA_T0_1__=$(date +%s)",
-            cmd1,
-            "echo __VANTA_EXIT_1__=$?",
-            "echo __VANTA_T1_1__=$(date +%s)",
-            "echo __VANTA_T0_2__=$(date +%s)",
-            cmd2,
-            "echo __VANTA_EXIT_2__=$?",
-            "echo __VANTA_T1_2__=$(date +%s)",
-            "exit 0",
-        ]
-    )
-
     env = cache_env(extra_env)
 
-    result = shuru.run(
+    # [VANTA-WHY] M3 item S5 — TWO VMs, one per run, and the D1 markers ride on each
+    # run's own script (``_run_script``): `T0` opens the clock immediately before the
+    # pytest invocation and `T1` closes it immediately after, with `__VANTA_EXIT_n__`
+    # left in between so the exit code is still `$?` of the pytest command and not of
+    # the marker. Measuring in the VM and around the command alone is what makes the
+    # figure comparable with the in-session cap, which also covers pytest only — a
+    # number that included the boot would over-size every derived cap.
+    first, second = _run_pair(
         checkpoint=checkpoint,
-        host_root=batch_dir,
-        command=["sh", "-c", script],
+        batch_dir=batch_dir,
+        tree_rel=tree_rel,
+        test_cmd=test_cmd,
+        precompile=precompile,
         disk_mb=disk_mb,
         memory_mb=memory_mb,
-        guest_cwd=guest_tree_root(tree_rel),
         timeout_secs=timeout_secs,
         env=env,
+        rel1=rel1,
+        rel2=rel2,
+        cmd1=cmd1,
+        cmd2=cmd2,
+        budget=budget,
     )
-
-    first = _load_run(batch_dir / rel1, result, suffix="1")
-    second = _load_run(batch_dir / rel2, result, suffix="2")
     pair = compare_runs(first, second)
 
     _clean_tree_noise(batch_dir / tree_rel)

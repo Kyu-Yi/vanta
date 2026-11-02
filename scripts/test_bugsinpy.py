@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import time
 import zipfile
 from collections import Counter
 from dataclasses import replace
@@ -1932,7 +1933,9 @@ class TestDeclaredFailToPass:
         monkeypatch.setattr(
             prepare_mod,
             "_suite",
-            lambda checkpoint, batch_dir, prep, tree_name, stem_suffix: pairs[tree_name],
+            lambda checkpoint, batch_dir, prep, tree_name, stem_suffix, **kwargs: (
+                pairs[tree_name]
+            ),
         )
 
     def test_the_bug_s_own_file_is_declared_and_anything_else_is_not(self):
@@ -2303,7 +2306,9 @@ class TestUnmeasuredRunRefusal:
         monkeypatch.setattr(
             prepare_mod,
             "_suite",
-            lambda checkpoint, batch_dir, prep, tree_name, stem_suffix: pairs[tree_name],
+            lambda checkpoint, batch_dir, prep, tree_name, stem_suffix, **kwargs: (
+                pairs[tree_name]
+            ),
         )
         bug_prep = prep(
             bug=bug_info(test_file="tests/test_demo.py"),
@@ -6636,16 +6641,21 @@ class TestSuiteCache:
 
     @classmethod
     def _vm_run(cls, calls, *, outcomes=None, report=True):
-        """A ``shuru.run`` that writes both reports instead of booting a VM.
+        """A ``shuru.run`` that writes one run's report instead of booting a VM.
 
-        ``report=False`` is the other ending: no report at all, which is what a
-        VM that never booted, an OOM kill or a capped run leaves behind — and
-        what ``run_state`` refuses as a measurement.
+        [VANTA-WHY] M3 item S5 — a pair is TWO VMs now, one script each, so this
+        fake answers per call: the suffix is read off the script the caller handed
+        us (``__VANTA_T0_<suffix>__``), only that run's report is written, and only
+        that run's marker block is returned. ``report=False`` is the other ending:
+        no report at all, which is what a VM that never booted, an OOM kill or a
+        capped run leaves behind — and what ``run_state`` refuses as a measurement.
         """
 
         def run(**kwargs):
             calls.append(kwargs)
-            for suffix in ("1", "2") if report else ():
+            script = kwargs["command"][-1]
+            suffix = "1" if "__VANTA_T0_1__" in script else "2"
+            if report:
                 write(
                     kwargs["host_root"] / f"{cls.STEM}.run{suffix}.json",
                     json.dumps(
@@ -6659,10 +6669,12 @@ class TestSuiteCache:
                         }
                     ),
                 )
+            start = 100 if suffix == "1" else 102
             return shuru_mod.ExecResult(
                 stdout=(
-                    "__VANTA_T0_1__=100\n__VANTA_EXIT_1__=0\n__VANTA_T1_1__=101\n"
-                    "__VANTA_T0_2__=102\n__VANTA_EXIT_2__=0\n__VANTA_T1_2__=103\n"
+                    f"__VANTA_T0_{suffix}__={start}\n"
+                    f"__VANTA_EXIT_{suffix}__=0\n"
+                    f"__VANTA_T1_{suffix}__={start + 1}\n"
                 ),
                 stderr="",
                 exit_code=0,
@@ -6710,7 +6722,7 @@ class TestSuiteCache:
         fresh = self._call(batch)
         assert fresh.cache is not None
         assert fresh.cache["state"] == "miss"
-        assert len(calls) == 1, "the fresh call must boot exactly one VM"
+        assert len(calls) == 2, "the fresh call must boot one VM per run of the pair"
 
         served = self._call(batch)
         assert served.cache is not None
@@ -6718,11 +6730,66 @@ class TestSuiteCache:
         assert served.cache["source"] == "Demo_1/vanta_tree"
         assert served.cache["key"] == fresh.cache["key"]
         assert served.cache["would_hit"] is False
-        assert len(calls) == 1, "a hit must not boot a VM"
+        assert len(calls) == 2, "a hit must not boot a VM"
         assert served.to_json() == fresh.to_json()
         assert served.stable_failures == fresh.stable_failures == {"tests/a.py::t"}
         assert served.stable_collected == fresh.stable_collected
         assert served.max_run_secs == fresh.max_run_secs
+
+    def test_two_callers_of_one_key_measure_it_once(self, tmp_path, monkeypatch):
+        """M3 items S5/S6 — the in-process single flight.
+
+        S5 runs three of a bug's suite runs at once and S6 runs rows at once, so
+        two callers wanting the SAME key at the same time is ordinary (one
+        candidate patch graded by two rows, or one tree demanded twice). One
+        measures and the other waits for the entry, instead of booting a second
+        pair of VMs for the same bytes.
+        """
+        batch = self._host(tmp_path, monkeypatch)
+        calls: list = []
+        # A report-writing fake whose own bookkeeping is not the count under test:
+        # `calls` is appended by the gate below, once per VM the harness boots.
+        write_only = self._vm_run([])
+        entered = threading.Event()
+        release = threading.Event()
+
+        def run(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                entered.set()
+                release.wait(timeout=10)
+            return write_only(**kwargs)
+
+        monkeypatch.setattr(suite_mod.shuru, "run", run)
+
+        pairs: dict = {}
+
+        def call(name):
+            pairs[name] = self._call(batch)
+
+        leader = threading.Thread(target=call, args=("leader",))
+        leader.start()
+        assert entered.wait(timeout=10), "the leader never booted its first VM"
+
+        follower = threading.Thread(target=call, args=("follower",))
+        follower.start()
+        # While the leader holds the key the follower must not start a VM of its
+        # own: it is waiting for the leader's entry rather than measuring again.
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            assert len(calls) == 1, "the same key was measured twice at once"
+            time.sleep(0.01)
+
+        release.set()
+        leader.join(timeout=10)
+        follower.join(timeout=10)
+
+        assert len(calls) == 2, "one pair of VMs, for one key"
+        assert {pairs["leader"].cache["state"], pairs["follower"].cache["state"]} == {
+            "miss",
+            "hit",
+        }
+        assert pairs["leader"].to_json() == pairs["follower"].to_json()
 
     def test_a_hit_restores_the_report_files(self, tmp_path, monkeypatch):
         """A served pair must put its reports back where the other readers look.
@@ -6742,7 +6809,7 @@ class TestSuiteCache:
 
         self._call(batch)
 
-        assert len(calls) == 1
+        assert len(calls) == 2
         assert suite_mod.parse_report(batch / f"{self.STEM}.run1.json") == self.OUTCOMES
         assert suite_mod.parse_report(batch / f"{self.STEM}.run2.json") == self.OUTCOMES
 
@@ -6759,7 +6826,7 @@ class TestSuiteCache:
         pair = self._call(batch, origin=None)
 
         assert pair.cache is None
-        assert len(calls) == 1
+        assert len(calls) == 2
         assert not (tmp_path / "cache").exists()
 
     def test_no_cache_still_reports_what_it_would_have_hit(self, tmp_path, monkeypatch):
@@ -6780,7 +6847,7 @@ class TestSuiteCache:
         assert forced.cache["would_hit"] is True
         assert forced.cache["key"] == fresh.cache["key"]
         assert forced.cache["source"] == "Demo_1/vanta_tree"
-        assert len(calls) == 2, "the flag forces a fresh run"
+        assert len(calls) == 4, "the flag forces a fresh run"
         assert forced.to_json() == fresh.to_json()
 
     @staticmethod
@@ -6838,7 +6905,7 @@ class TestSuiteCache:
 
         assert refused.cache["state"] == "unmeasured"
         assert refused.cache["would_hit"] is True
-        assert len(calls) == 2, "an unmeasured entry must not spare the run"
+        assert len(calls) == 4, "an unmeasured entry must not spare the run"
         assert refused.first.outcomes == self.OUTCOMES
         # The fresh measurement replaced the husk it could not use.
         assert self._call(batch).cache["state"] == "hit"
@@ -6861,7 +6928,7 @@ class TestSuiteCache:
 
         assert forced.cache["state"] == "off:no_cache"
         assert forced.cache["would_hit"] is True
-        assert len(calls) == 2
+        assert len(calls) == 4
         # The fresh measurement replaced the husk, so the next lookup answers.
         monkeypatch.delenv(suite_cache_mod.DISABLE_ENV)
         assert self._call(batch).cache["state"] == "hit"
@@ -6888,12 +6955,12 @@ class TestSuiteCache:
         assert pair.cache["key"] == "", "no key could be built, so none is claimed"
         assert pair.cache["would_hit"] is False
         assert pair.first.outcomes == self.OUTCOMES, "the run itself still happened"
-        assert len(calls) == 1
+        assert len(calls) == 2
         assert not (tmp_path / "cache").exists(), "an unusable layer writes nothing"
 
         # And the second call is a second run, not a hit: there is nothing to hit.
         assert self._call(batch).cache["state"] == "off:unknown_checkpoint"
-        assert len(calls) == 2
+        assert len(calls) == 4
 
     def test_a_rebaked_layer_under_the_same_name_is_a_different_experiment(
         self, tmp_path, monkeypatch
@@ -6923,7 +6990,7 @@ class TestSuiteCache:
 
         assert second.cache["state"] == "miss", "a rebuilt layer is not the old one"
         assert second.cache["key"] != first.cache["key"]
-        assert len(calls) == 2, "the rebuilt layer is measured, not inherited"
+        assert len(calls) == 4, "the rebuilt layer is measured, not inherited"
 
     def test_an_entry_from_before_the_schema_bump_is_not_found(
         self, tmp_path, monkeypatch
@@ -6948,7 +7015,7 @@ class TestSuiteCache:
 
         assert suite_cache_mod.read_entry(dict(document["material"]), document["key"]) is None
         assert self._call(batch).cache["state"] == "miss"
-        assert len(calls) == 2
+        assert len(calls) == 4
 
     def test_the_key_covers_the_suite_environment(self, tmp_path, monkeypatch):
         """fastapi/2's rule: the same bytes measured 775 passed with
@@ -6963,7 +7030,7 @@ class TestSuiteCache:
         with_env = self._call(batch, extra_env={"PYTHONPATH": "./docs_src"})
 
         assert plain.cache["key"] != with_env.cache["key"]
-        assert len(calls) == 2
+        assert len(calls) == 4
 
     def test_a_tampered_entry_is_never_served(self, tmp_path, monkeypatch):
         """A bad entry is recomputed and repaired, never used.
@@ -6984,7 +7051,7 @@ class TestSuiteCache:
 
         again = self._call(batch)
 
-        assert len(calls) == 2, "a tampered entry must not spare the run"
+        assert len(calls) == 4, "a tampered entry must not spare the run"
         assert again.cache["state"] == "miss"
         assert again.first.outcomes == self.OUTCOMES
         # ... and the repair left an entry that now answers.

@@ -162,7 +162,7 @@ the suite itself may legitimately read. A cache key has to describe every byte
 the run can see, so it skips only what cannot be read as source.
 """
 
-_HARNESS_FILES = ("suite.py", "shuru.py", "suite_cache.py", "compact.py")
+_HARNESS_FILES = ("suite.py", "shuru.py", "suite_cache.py", "compact.py", "budget.py")
 """The harness files that decide how a suite is run.
 
 [VANTA-WHY] The stored value describes a run performed by THIS code, so a change
@@ -170,6 +170,13 @@ to the code that builds the shell script, resolves the checkpoint or reads the
 report must invalidate every entry rather than be served from one. Hashing the
 sources themselves is the honest version of a "harness build stamp" on a side
 that has no compiled binary; the Rust side uses `VANTA_BUILD_COMMIT` instead.
+
+``budget.py`` is here because of items S5/S6: the scheduler decides how many
+suite runs overlap, and two suites competing for the host can change a nodeid's
+outcome — so a change to that rule changes what a cached pair is a measurement
+of. It is deliberately conservative: a scheduler-only change invalidates entries
+whose bytes did not move, which costs one repeat measurement and cannot serve a
+result produced under a different concurrency.
 """
 
 

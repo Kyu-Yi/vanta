@@ -356,7 +356,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     # checkpoints and the batch directory keeps room. It is created per invocation
     # rather than at import, so the recorded host load is this run's and no state
     # survives from an earlier `prepare` in the same process.
-    budget = budget_mod.Budget(args.prepare_jobs)
+    budget = budget_mod.Budget(args.prepare_jobs, peak_vms=args.peak_vms)
     print(
         f"[scheduler] jobs={budget.jobs} concurrent={'yes' if budget.concurrent else 'no'} "
         f"cores={budget.cores}/{budget.cap_cores} memory="
@@ -858,6 +858,71 @@ def max_spend_usd_from_env(env: Mapping[str, str]) -> Optional[float]:
     return cap
 
 
+def row_budget(
+    args: argparse.Namespace, env: Mapping[str, str], *, flag: str
+) -> budget_mod.Budget:
+    """M3 item S6 — the ONE scheduler of a ``run``/``queue`` invocation.
+
+    [VANTA-WHY] §14.33's closing rule: "``Default stays 1``, and ``1`` must be
+    byte-identical to today". So a ``--jobs 1`` budget is created but never
+    advertises itself — no ``[scheduler]`` line and, because
+    :func:`runner.run_batch` guards its row block on ``budget.concurrent``, no
+    ``scheduler`` key on any row. A serial batch is therefore the batch it was
+    before this item, and the pool is a path ``--jobs 1`` does not enter rather
+    than one that degenerates to serial.
+
+    Above one, the backend gate is §14.33's second rule: parallel rows all call
+    the same provider, so only the hosted backend may run them — every other
+    backend is a local model that would be oversubscribed by its own concurrency.
+    The check is on the *requested* jobs, before the host's core cap, so a
+    smaller machine refuses ``--jobs 4`` for the same reason a large one does.
+    """
+    jobs = int(args.jobs)
+    if jobs < 1:
+        raise runner_mod.RunnerError(f"{flag} must be at least 1, not {jobs}.")
+    if jobs > 1:
+        backend = (env.get("VANTA_LLM_BACKEND") or "").strip()
+        if backend.lower() != "openai":
+            raise runner_mod.RunnerError(
+                f"{flag}={jobs} needs VANTA_LLM_BACKEND=openai: concurrent rows all "
+                "call the same provider (§14.33), and every other backend is a local "
+                "model that this concurrency would oversubscribe. "
+                f"VANTA_LLM_BACKEND={backend or '(unset)'}."
+            )
+    budget = budget_mod.Budget(jobs, peak_vms=args.peak_vms)
+    if budget.concurrent:
+        print(
+            f"[scheduler] jobs={budget.jobs} concurrent=yes "
+            f"cores={budget.cores}/{budget.cap_cores} memory="
+            f"{'unbounded' if budget.cap_memory_mb is None else f'{budget.cap_memory_mb} MB'} "
+            f"peak_vms={budget.peak_vms} host_load={budget.host_load}",
+            flush=True,
+        )
+    return budget
+
+
+def _start_host_sampler(
+    batch_dir: Path, budget: budget_mod.Budget
+) -> Optional[budget_mod.HostSampler]:
+    """M3 item S6 — sample the host only when rows will actually overlap.
+
+    A serial batch gains neither the file nor the thread: §14.33's ``--jobs 1``
+    must be byte-identical to today, and a sampler that ran would write a new
+    artifact into a batch directory that is supposed to be unchanged.
+    """
+    if not budget.concurrent:
+        return None
+    return budget_mod.HostSampler(batch_dir / budget_mod.HOST_SAMPLES_NAME).start()
+
+
+def _stop_host_sampler(sampler: Optional[budget_mod.HostSampler]) -> Optional[dict]:
+    """Stop the sampler and return its summary, or ``None`` when there was none."""
+    if sampler is None:
+        return None
+    sampler.stop()
+    return sampler.record()
+
+
 def honour_no_cache(args: argparse.Namespace) -> None:
     """``--no-cache`` — force a fresh suite run, in BOTH processes of the stage.
 
@@ -983,6 +1048,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             flush=True,
         )
 
+    # M3 item S6 — the ONE scheduler of this run. `--jobs 1` returns quietly and
+    # changes nothing; above one it is announced here, before the first VM. The
+    # host sampler rides along only for a run that will actually overlap rows.
+    budget = row_budget(args, invocation_env, flag="--jobs")
+    sampler = None if args.plan else _start_host_sampler(batch_dir, budget)
+
     code, results = runner_mod.run_batch(
         batch_dir=batch_dir,
         batch_id=batch_dir.name,
@@ -1010,15 +1081,22 @@ def cmd_run(args: argparse.Namespace) -> int:
         config_block=config_block,
         prep_config_block=batch.config_block,
         frozen_env=frozen_env,
+        budget=budget,
     )
     if args.plan:
         return EXIT_OK
+
+    # M3 item S6 — stop sampling before the report is derived, so the batch's own
+    # host samples are complete and consistent with the rows.
+    host_samples = _stop_host_sampler(sampler)
 
     # The report is derived from the manifest on disk, not from this invocation's
     # return value: a resumed run must summarise the whole batch, not the tail of it.
     records = manifest_mod.Manifest(batch_dir).effective_records()
     if records:
-        labels_path, payload = runner_mod.write_batch_report(batch_dir, records)
+        labels_path, payload = runner_mod.write_batch_report(
+            batch_dir, records, host_samples=host_samples
+        )
         print()
         print(runner_mod.render_digest(payload))
         print()
@@ -1138,6 +1216,11 @@ def cmd_queue(args: argparse.Namespace) -> int:
             flush=True,
         )
 
+    # M3 item S6 — the ONE scheduler of this queue, shared by every worker and
+    # threaded down into each per-bug `run_batch`; `--jobs 1` changes nothing.
+    budget = row_budget(args, invocation_env, flag="--jobs")
+    sampler = None if args.plan else _start_host_sampler(batch_dir, budget)
+
     code, outcomes = runner_mod.run_queue(
         batch_dir=batch_dir,
         batch_id=batch_dir.name,
@@ -1161,15 +1244,22 @@ def cmd_queue(args: argparse.Namespace) -> int:
         prep_config_block=batch.config_block,
         frozen_env=frozen_env,
         arm_spellings=arm_spellings,
+        budget=budget,
     )
     if args.plan:
         return EXIT_OK
+
+    # M3 item S6 — stop sampling before the report is derived, so the batch's own
+    # host samples are complete and consistent with the rows.
+    host_samples = _stop_host_sampler(sampler)
 
     # Same tail as `run`: the report is the manifest on disk, so a resumed queue
     # summarises the whole batch and not the part this invocation happened to run.
     records = manifest_mod.Manifest(batch_dir).effective_records()
     if records:
-        labels_path, payload = runner_mod.write_batch_report(batch_dir, records)
+        labels_path, payload = runner_mod.write_batch_report(
+            batch_dir, records, host_samples=host_samples
+        )
         print()
         print(runner_mod.render_digest(payload))
         print()
@@ -1828,15 +1918,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         metavar="N",
         help=(
-            "how many suite runs one prepare may execute at once (M3 item S5). Each "
-            "bug's three independent derivations (buggy / oracle / fixed) are "
-            "submitted together and overlap up to N at a time; the two runs of one "
-            "pair are always two separate VMs and overlap only when N allows it. N is "
-            "capped at host cores − 2, and each run holds its own recorded memory "
-            "(vm_memory_mb) plus one core. Default 1: one run at a time, today's "
-            "behaviour. A concurrent prepare records what it used on prepare.json and "
-            "on every bug row (`scheduler`), because a measurement made beside another "
-            "one is a different experiment from a serial one."
+            "the maximum number of prepared-suite runs in flight at once (M3 item S5, "
+            "default 1). Same meaning as `run --jobs` and `queue --jobs`: the memory "
+            "and core budget can admit fewer, never more. Each bug's three independent "
+            "derivations (buggy / oracle / fixed) are submitted together and overlap up "
+            "to N at a time; the two runs of one pair are always two separate VMs and "
+            "overlap only when N allows it. N is capped at host cores − 2, and each run "
+            "holds its own recorded memory (vm_memory_mb) plus one core. Default 1: one "
+            "run at a time, today's behaviour. A concurrent prepare records what it used "
+            "on prepare.json and on every bug row (`scheduler`), because a measurement "
+            "made beside another one is a different experiment from a serial one."
+        ),
+    )
+    prep.add_argument(
+        "--peak-vms",
+        type=int,
+        default=budget_mod.DEFAULT_PEAK_VMS,
+        metavar="N",
+        help=(
+            "the scheduler's conservative charge for a ROW, used by `run`/`queue`; "
+            "prepare charges each suite run its own memory instead, so this only sizes "
+            f"the shared budget knob (default {budget_mod.DEFAULT_PEAK_VMS})."
         ),
     )
     prep.set_defaults(func=cmd_prepare)
@@ -2014,6 +2116,30 @@ def build_parser() -> argparse.ArgumentParser:
             "replaces the entry it could not use."
         ),
     )
+    run.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help=(
+            "the maximum number of rows in flight at once across all bugs (default 1). "
+            "Same meaning as `queue --jobs` and `prepare --prepare-jobs`: the memory "
+            "and core budget can admit fewer, never more. `--jobs 1` is today's "
+            "behaviour exactly. Requires VANTA_LLM_BACKEND=openai to exceed 1 (§14.33)."
+        ),
+    )
+    run.add_argument(
+        "--peak-vms",
+        type=int,
+        default=budget_mod.DEFAULT_PEAK_VMS,
+        metavar="N",
+        help=(
+            "the scheduler's conservative charge for a row: assume up to N of its "
+            f"microVMs run at once (default {budget_mod.DEFAULT_PEAK_VMS}), so a row is "
+            "charged --peak-vms × its VM memory. Accounting only — no VM's memory or "
+            "vCPUs change; each row records the peak it actually reached so this can be "
+            "tuned from real runs."
+        ),
+    )
     run.set_defaults(func=cmd_run)
 
     queue = sub.add_parser(
@@ -2090,9 +2216,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help=(
-            "how many bugs of one wave to run at once (default 1). Each bug boots its "
-            "own VM, so this is bounded by memory: a pandas VM wants 8 GB. Waves stay "
-            "sequential — the gate is a statement about the earlier stages (§8.1)."
+            "the maximum number of rows in flight at once across all bugs (default 1). "
+            "Same meaning as `run --jobs` and `prepare --prepare-jobs`: the memory and "
+            "core budget can admit fewer, never more. Waves stay sequential — the gate "
+            "is a statement about the earlier stages (§8.1). Requires "
+            "VANTA_LLM_BACKEND=openai to exceed 1 (§14.33)."
+        ),
+    )
+    queue.add_argument(
+        "--peak-vms",
+        type=int,
+        default=budget_mod.DEFAULT_PEAK_VMS,
+        metavar="N",
+        help=(
+            "the scheduler's conservative charge for a row: assume up to N of its "
+            f"microVMs run at once (default {budget_mod.DEFAULT_PEAK_VMS}), so a row is "
+            "charged --peak-vms × its VM memory. Accounting only — no VM's memory or "
+            "vCPUs change; each row records the peak it actually reached so this can be "
+            "tuned from real runs."
         ),
     )
     queue.add_argument(

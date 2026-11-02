@@ -4926,7 +4926,8 @@ pub async fn run(
              seed_method={} import_guard={} \
              n_ctx={} creator_effort={} creator_effort_mechanism={} \
              creator_prompt_tokens={}{}{}{} fixed_rounds={} native_vacuous={} \
-             native_timeout_secs={} native_timeout={} native_cache_hits={}",
+             native_timeout_secs={} native_timeout={} native_cache_hits={} \
+             peak_sandboxes={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -5249,6 +5250,15 @@ pub async fn run(
             // (nothing reads it), appended after `native_timeout` so an older
             // row's reader sees the same fields in the same order.
             native_cache_hits,
+            // [VANTA-WHY] M3 item S6 — the exact peak of simultaneous live
+            // microVMs this run booted (`sandbox::peak_sandboxes`), space-free so
+            // it survives the `key=value` reader. The scheduler charges a row
+            // `peak_vms × vm_memory_mb`; a reader compares this observed peak with
+            // the conservative `--peak-vms` charge to calibrate it from real runs.
+            // Purely descriptive — nothing here feeds a verdict, a selection or a
+            // guard. Appended after every pre-existing key so an older row's
+            // reader is unaffected.
+            crate::sandbox::peak_sandboxes(),
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),

@@ -14,6 +14,7 @@ mod types;
 pub use types::{ExecutionResult, SandboxBackend, SandboxKind};
 
 use std::error::Error;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Once, OnceLock};
 use std::time::Duration;
 
@@ -308,7 +309,54 @@ fn announce_fallback(line: &str) {
     ANNOUNCE_BACKEND.call_once(|| eprintln!("{line}"));
 }
 
+// ============================================================================
+// Live-sandbox counter (M3 item S6)
+// ============================================================================
+//
+// [VANTA-WHY] The S6 scheduler charges each row `peak_vms × vm_memory_mb` of host
+// memory, so it needs the row's ACTUAL peak of simultaneous live microVMs to
+// calibrate that charge from real runs (S6's decided recording). `shuru` exposes
+// no `ps`/`list`, so the host cannot enumerate live VMs; this in-process counter,
+// kept at the one place every sandbox boots and dies, is the only thing that can
+// see the peak. "Sandbox" here is a shuru microVM — the subprocess backend is not
+// a sandbox (see types.rs) and is deliberately not counted, so the number is the
+// VMs exactly. A row is one `vanta_m3` process, so the high-water mark is the
+// row's observed peak.
+static LIVE_SANDBOXES: AtomicUsize = AtomicUsize::new(0);
+static PEAK_SANDBOXES: AtomicUsize = AtomicUsize::new(0);
+
+/// The high-water mark of simultaneous live microVMs in this process so far.
+///
+/// [VANTA-WHY] Read by the terminal `run.summary` row as the space-free
+/// `peak_sandboxes` key, so the Python side can record the row's real peak for
+/// calibration instead of assuming the conservative default charge.
+pub fn peak_sandboxes() -> usize {
+    PEAK_SANDBOXES.load(Ordering::SeqCst)
+}
+
+/// Count a microVM boot and advance the high-water mark.
+fn sandbox_booted() {
+    let live = LIVE_SANDBOXES.fetch_add(1, Ordering::SeqCst) + 1;
+    PEAK_SANDBOXES.fetch_max(live, Ordering::SeqCst);
+}
+
+/// Count a microVM teardown.
+fn sandbox_torn_down() {
+    LIVE_SANDBOXES.fetch_sub(1, Ordering::SeqCst);
+}
+
 impl Backend {
+    /// Construct the shuru variant, counting the boot (M3 item S6).
+    ///
+    /// [VANTA-WHY] Every successful shuru spawn goes through here and every
+    /// teardown through `destroy`, so the pair is the exact live count. Keeping
+    /// it in a named constructor (rather than at each `Ok(Backend::Shuru(..))`)
+    /// means a future third spawn site cannot forget to count.
+    fn shuru(b: shuru::ShuruBackend) -> Self {
+        sandbox_booted();
+        Backend::Shuru(b)
+    }
+
     pub async fn spawn() -> Result<Self, Box<dyn Error + Send + Sync>> {
         match backend_preference()? {
             BackendPreference::Subprocess => {
@@ -331,7 +379,7 @@ impl Backend {
                 let b = shuru::ShuruBackend::spawn().await?;
                 tracing::info!("using SHURU microVM backend (forced by VANTA_SANDBOX_BACKEND)");
                 announce_backend("▌ Backend: SHURU microVM active (forced)");
-                Ok(Backend::Shuru(b))
+                Ok(Backend::shuru(b))
             }
             BackendPreference::Auto => {
                 // [VANTA-WHY] `auto` degrades to subprocess, and a SILENT degrade
@@ -348,7 +396,7 @@ impl Backend {
                         Ok(b) => {
                             tracing::info!("using SHURU microVM backend (preferred)");
                             announce_backend("▌ Backend: SHURU microVM active (auto-selected)");
-                            return Ok(Backend::Shuru(b));
+                            return Ok(Backend::shuru(b));
                         }
                         Err(e) => format!("shuru spawn failed: {e}"),
                     }
@@ -397,7 +445,13 @@ impl Backend {
     pub fn destroy(self) {
         match self {
             Backend::Subprocess(b) => b.destroy(),
-            Backend::Shuru(b) => b.destroy(),
+            Backend::Shuru(b) => {
+                b.destroy();
+                // [VANTA-WHY] M3 item S6 — the matching teardown of the boot
+                // counted in `Backend::shuru`, so `peak_sandboxes` is the exact
+                // high-water mark of live microVMs.
+                sandbox_torn_down();
+            }
         }
     }
 }
@@ -486,5 +540,26 @@ mod tests {
             parse_sandbox_env("PYTHONPATH=./docs_src=./other").unwrap(),
             ("PYTHONPATH".to_string(), "./docs_src=./other".to_string())
         );
+    }
+
+    #[test]
+    fn peak_sandboxes_tracks_the_high_water_mark_of_live_vms() {
+        // [VANTA-WHY] M3 item S6 — the counter is process-global, so this asserts
+        // on the DELTA it moves rather than on an absolute value: `live` returns
+        // to where it started, and `peak` never falls below the new maximum. The
+        // lib tests run with `--test-threads=1`, and only the shuru constructor
+        // and `destroy` feed these atomics.
+        let live_before = LIVE_SANDBOXES.load(Ordering::SeqCst);
+        sandbox_booted();
+        sandbox_booted();
+        sandbox_booted();
+        assert_eq!(LIVE_SANDBOXES.load(Ordering::SeqCst), live_before + 3);
+        assert!(peak_sandboxes() >= live_before + 3);
+        sandbox_torn_down();
+        sandbox_torn_down();
+        sandbox_torn_down();
+        assert_eq!(LIVE_SANDBOXES.load(Ordering::SeqCst), live_before);
+        // A teardown never lowers the high-water mark.
+        assert!(peak_sandboxes() >= live_before + 3);
     }
 }

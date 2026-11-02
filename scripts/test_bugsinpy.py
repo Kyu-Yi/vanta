@@ -50,6 +50,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from bugsinpy import arms as arms_mod  # noqa: E402
 from bugsinpy import bake as bake_mod  # noqa: E402
+from bugsinpy import budget as budget_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
 from bugsinpy import compact as compact_mod  # noqa: E402
 from bugsinpy import context as ctx  # noqa: E402
@@ -26351,7 +26352,10 @@ class TestRunBatchLoop:
     def _stub(self, tmp_path, calls, *, leave_running=None):
         """A `run_job` that writes a gate-passing row and records the schedule."""
 
-        def stub(*, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version):
+        def stub(
+            *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
+            scheduler=None,
+        ):
             calls.append(job)
             record = self._row(tmp_path, job)
             manifest.append(record)
@@ -26451,7 +26455,10 @@ class TestRunBatchLoop:
         monkeypatch.setattr(runner_mod, "python_version_of", lambda *a, **k: "3.8.20")
         monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kwargs: kwargs["candidate"])
 
-        def stub(*, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version):
+        def stub(
+            *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
+            scheduler=None,
+        ):
             budgets.append((job.arm, max_attempts))
             record = self._row(tmp_path, job)
             manifest.append(record)
@@ -26491,7 +26498,10 @@ class TestRunBatchLoop:
     def _cost_stub(self, tmp_path, calls, *, cost_usd):
         """A `run_job` whose rows carry a price, so the cap has a number to count."""
 
-        def stub(*, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version):
+        def stub(
+            *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
+            scheduler=None,
+        ):
             calls.append(job)
             record = self._row(tmp_path, job)
             record["llm"] = {"cost_usd": cost_usd, "cost_basis": "test/tier/2026-10-26"}
@@ -26791,6 +26801,128 @@ class TestRunBatchLoop:
         assert not manifest_mod.Manifest(tmp_path / "batch-flaky").state().get(schedule[2])
 
 
+    # -- M3 item S6: the scheduler and the pooled phase ---------------------
+    def _capturing_stub(self, tmp_path, calls, blocks):
+        """A `run_job` that also records the `scheduler` block it was asked for."""
+
+        def stub(
+            *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
+            scheduler=None,
+        ):
+            calls.append(job)
+            blocks.append(scheduler)
+            record = self._row(tmp_path, job)
+            manifest.append(record)
+            manifest.mark(job.key, manifest_mod.DONE)
+            return record
+
+        return stub
+
+    def _drive(self, monkeypatch, tmp_path, preps, entries, split, *, name, budget):
+        calls: list = []
+        blocks: list = []
+        monkeypatch.setattr(
+            runner_mod, "run_job", self._capturing_stub(tmp_path, calls, blocks)
+        )
+        code, _results = runner_mod.run_batch(
+            batch_dir=tmp_path / name,
+            batch_id="b1",
+            split=split,
+            preps=preps,
+            entries=entries,
+            seeds=[0],
+            waves=[1],
+            vanta_bin=Path("/nonexistent/vanta_m3"),
+            max_attempts=4,
+            disk_mb=8192,
+            budget=budget,
+        )
+        return code, calls, blocks
+
+    def test_mode_phases_group_adjacent_modes_and_keep_the_spelling(self):
+        """D13 stays exact: repairs then reviews, and the group carries the SPELLING
+        (the config is resolved later, exactly as the serial loop resolves it)."""
+        phases = [
+            (arms_mod.REPAIR, "b0"),
+            (arms_mod.REPAIR, "vanta"),
+            (arms_mod.REVIEW, "b0"),
+            (arms_mod.REVIEW, "vanta"),
+        ]
+        assert runner_mod._mode_phases(phases) == [
+            (arms_mod.REPAIR, ["b0", "vanta"]),
+            (arms_mod.REVIEW, ["b0", "vanta"]),
+        ]
+
+    def test_a_budget_of_one_core_asks_for_no_scheduler_block(self, tmp_path, monkeypatch):
+        """§14.33 — `--jobs 1` is a path the pool does not enter, not one that
+        degenerates: every row is asked for with `scheduler=None`, so a serial batch
+        is byte-for-byte the batch it was before item S6."""
+        monkeypatch.setattr(runner_mod, "python_version_of", lambda *a, **k: "3.8.20")
+        monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kwargs: kwargs["candidate"])
+        preps, entries, split = self._fixture(tmp_path)
+
+        code, calls, blocks = self._drive(
+            monkeypatch, tmp_path, preps, entries, split,
+            name="serial", budget=budget_mod.Budget(1),
+        )
+
+        assert code == 0
+        assert calls, "the stub should have been called"
+        assert blocks == [None] * len(blocks)
+
+    def test_the_pooled_phase_claims_the_same_jobs_in_the_same_order(
+        self, tmp_path, monkeypatch
+    ):
+        """S6 — concurrency changes the wall clock, never the rows.
+
+        A stub turns the pool into a schedule question: the pooled path must claim
+        exactly the jobs the serial path claimed, in the same order, so the manifest
+        is the manifest a serial run would have produced. Every pooled row is priced
+        by the scheduler; no serial row is.
+        """
+        monkeypatch.setattr(runner_mod, "python_version_of", lambda *a, **k: "3.8.20")
+        monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kwargs: kwargs["candidate"])
+        preps, entries, split = self._fixture(tmp_path)
+
+        code_serial, serial, serial_blocks = self._drive(
+            monkeypatch, tmp_path, preps, entries, split,
+            name="serial", budget=budget_mod.Budget(1),
+        )
+        preps, entries, split = self._fixture(tmp_path)
+        code_parallel, pooled, pooled_blocks = self._drive(
+            monkeypatch, tmp_path, preps, entries, split,
+            name="parallel",
+            budget=budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20),
+        )
+
+        assert code_serial == 0 and code_parallel == 0
+        assert [job.key for job in pooled] == [job.key for job in serial]
+        assert serial_blocks == [None] * len(serial_blocks)
+        assert len(pooled_blocks) == len(pooled)
+        assert all(block and block["concurrent"] for block in pooled_blocks)
+        assert {block["jobs"] for block in pooled_blocks} == {4}
+        assert {block["peak_vms"] for block in pooled_blocks} == {1}
+
+    def test_the_row_block_prices_a_row_and_flags_one_the_budget_cannot_admit(self):
+        """The charge is `peak_vms × vm_memory_mb`; a row that cannot fit beside
+        another is flagged rather than silently admitted."""
+        roomy = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 20)
+        block = runner_mod._scheduler_row_block(
+            roomy, charge_mb=roomy.row_charge_mb(8192)
+        )
+        assert block["charge_mb"] == 12 * 8192
+        assert block["charge_exceeds_budget"] is False
+        assert block["peak_vms"] == 12
+        assert block["slot_wait_s"] == 0.0
+        assert block["budget"]["cap_cores"] == 14
+
+        tight = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 15)
+        tight_block = runner_mod._scheduler_row_block(
+            tight, charge_mb=tight.row_charge_mb(8192)
+        )
+        assert tight_block["charge_exceeds_budget"] is True
+
+
 class TestQueue:
     """M3 item 13 — the multi-bug queue: one owner, a shared cap, a stop, a resume.
 
@@ -26854,7 +26986,10 @@ class TestQueue:
     def _stub(self, calls, *, cost_usd=None, on_call=None):
         """A `run_job` that writes a gate-passing row and records the claim."""
 
-        def stub(*, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version):
+        def stub(
+            *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
+            scheduler=None,
+        ):
             calls.append(job)
             if on_call is not None:
                 on_call(len(calls), job, manifest)
@@ -27825,6 +27960,44 @@ class TestQueue:
     def test_an_empty_arms_or_seeds_flag_means_the_split_s_own(self):
         assert run_mod._parse_arms("") is None
         assert run_mod._parse_seeds("  ") is None
+
+    # -- M3 item S6: the invocation's ONE scheduler ------------------------
+    def test_the_run_command_defaults_to_one_job_and_twelve_peak_vms(self):
+        args = run_mod.build_parser().parse_args(["run", "--batch", "/tmp/x"])
+        assert args.jobs == 1
+        assert args.peak_vms == budget_mod.DEFAULT_PEAK_VMS
+
+    def test_jobs_above_one_is_refused_on_a_non_hosted_backend(self):
+        """§14.33 — parallel rows all call one provider, so only the hosted backend
+        may run them; the refusal names the flag and the backend it saw."""
+        args = SimpleNamespace(jobs=4, peak_vms=12)
+        with pytest.raises(runner_mod.RunnerError, match="VANTA_LLM_BACKEND=openai"):
+            run_mod.row_budget(args, {}, flag="--jobs")
+        with pytest.raises(runner_mod.RunnerError, match="VANTA_LLM_BACKEND=local"):
+            run_mod.row_budget(args, {"VANTA_LLM_BACKEND": "local"}, flag="--jobs")
+
+    def test_jobs_above_one_is_allowed_on_the_hosted_backend(self):
+        args = SimpleNamespace(jobs=4, peak_vms=12)
+        budget = run_mod.row_budget(
+            args, {"VANTA_LLM_BACKEND": "openai"}, flag="--jobs"
+        )
+        assert budget.jobs == 4
+        assert budget.peak_vms == 12
+
+    def test_row_budget_refuses_a_job_count_below_one(self):
+        """The scheduler, not the queue's own guard: ``run --jobs 0`` must be refused
+        by ``row_budget`` before it can build a pool (the queue path has its own test)."""
+        args = SimpleNamespace(jobs=0, peak_vms=12)
+        with pytest.raises(runner_mod.RunnerError, match="at least 1"):
+            run_mod.row_budget(args, {"VANTA_LLM_BACKEND": "openai"}, flag="--jobs")
+
+    def test_jobs_one_needs_no_backend_and_says_nothing(self, capsys):
+        """The serial path is not announced: `--jobs 1` must read like today."""
+        args = SimpleNamespace(jobs=1, peak_vms=12)
+        budget = run_mod.row_budget(args, {}, flag="--jobs")
+        assert budget.jobs == 1
+        assert budget.concurrent is False
+        assert capsys.readouterr().out == ""
 
 
 class TestModelEndpointPreflight:

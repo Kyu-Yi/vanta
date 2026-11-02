@@ -33,13 +33,33 @@ CI.
 the mandate states and the one that always applies. Memory is accounted (it is
 half of what a run costs) and the peak is recorded, but an undetectable host
 must not make the scheduler refuse to run anything.
+
+M3 item S6 adds a second price, for a ROW rather than a suite run. A row is one
+``vanta_m3`` process that boots many microVMs, up to its own peak of simultaneous
+ones, so it is charged ``peak_vms × vm_memory_mb`` of memory and one core
+(Nathan's "peak × mem, 1 core"). ``peak_vms`` is a conservative knob
+(``--peak-vms``, default 12) and the row also records the peak it ACTUALLY
+reached, so the charge can be calibrated from real runs instead of assumed. The
+charge is accounting only: no VM's configured memory or vCPUs are changed. A row
+whose charge alone exceeds the whole memory budget is run ALONE rather than
+deadlocked (``_fits`` already had that rule for a single run); the row records
+that it was.
+
+``HostSampler`` is the batch-level counterpart Nathan asked for: a row's peak is
+attributed per row, but host-wide used memory is not, because the VMs run inside
+processes that may not be the row's children. It samples the machine, not a row.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import subprocess
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Iterator, Optional
 
 HOST_CORE_RESERVE = 2
@@ -50,6 +70,16 @@ batch from starving the machine it runs on: the harness process, the shell that
 launched it, and whatever the operator has open all need a core, and a scheduler
 that took all of them would make a concurrent batch *slower* than a serial one
 by making every process wait for a core.
+"""
+
+DEFAULT_PEAK_VMS = 12
+"""M3 item S6 — the conservative per-row peak of simultaneous VMs, the charge knob.
+
+[VANTA-WHY] Nathan's decision: the row price is "(peak × mem, 1 core)" and the
+peak is a knob, ``--peak-vms N``, default ``12``. Twelve is the highest peak
+observed across 68 recorded ``attempt_*_tests.json`` artifacts (typical 8–12), so
+the default over-charges a small row and never under-charges a large one; every
+row records the peak it actually reached so the number can be tuned down later.
 """
 
 
@@ -108,6 +138,7 @@ class Budget:
         *,
         cores_cap: Optional[int] = None,
         memory_cap_mb: Optional[int] = None,
+        peak_vms: int = DEFAULT_PEAK_VMS,
     ) -> None:
         self.jobs = max(1, int(jobs))
         self.cap_cores = (
@@ -117,6 +148,9 @@ class Budget:
             host_memory_mb() if memory_cap_mb is None else memory_cap_mb
         )
         self.cores = max(1, min(self.jobs, self.cap_cores))
+        # M3 item S6 — the per-row charge knob. Stored on the budget so one
+        # invocation charges every row the same way, and so a row can state it.
+        self.peak_vms = max(1, int(peak_vms))
         self.host_load = host_load()
         self._cond = threading.Condition()
         self._used_cores = 0
@@ -128,6 +162,26 @@ class Budget:
     def concurrent(self) -> bool:
         """Whether this invocation may run more than one suite run at a time."""
         return self.cores > 1
+
+    def row_charge_mb(self, vm_memory_mb: Optional[int]) -> int:
+        """M3 item S6 — the host memory a ROW is charged: ``peak_vms × vm_memory_mb``.
+
+        A row boots many microVMs at once, so it is charged the whole of the
+        simultaneous set it may hold rather than one VM's worth (Nathan: "Charge
+        each row its peak simultaneous VMs, not one, or the pool will
+        oversubscribe memory"). The multiplication is the charge; no VM's own
+        memory is changed.
+        """
+        return self.peak_vms * max(0, int(vm_memory_mb or 0))
+
+    def charge_exceeds_budget(self, charge_mb: int) -> bool:
+        """Whether one row's charge cannot fit the whole memory budget.
+
+        Such a row is run ALONE (``_fits``), which is the closest thing to
+        "fits"; the row records the fact so a reader can tell a genuinely serial
+        run from one the scheduler could never admit beside another.
+        """
+        return self.cap_memory_mb is not None and charge_mb > self.cap_memory_mb
 
     @contextmanager
     def slot(self, *, memory_mb: Optional[int] = None, cores: int = 1) -> Iterator[None]:
@@ -182,3 +236,212 @@ class Budget:
             "peak_cores": self.peak_cores,
             "peak_memory_mb": self.peak_memory_mb,
         }
+
+
+# ============================================================================
+# HostSampler — the batch-level time series (M3 item S6)
+# ============================================================================
+#
+# [VANTA-WHY] Nathan: "For memory, do not attribute per row: on macOS the VMs run
+# inside Virtualization XPC service processes that may not be children of the
+# row. Instead a batch-level sampler records host-wide used memory and the total
+# live VM count over time; calibration uses those totals." So the per-row number
+# (`peak_sandboxes` on the row) and the host-wide numbers (here) are deliberately
+# different measurements of the same phenomenon, taken from the two places that
+# can each see one of them.
+SAMPLE_INTERVAL_SECS = 5.0
+
+HOST_SAMPLES_NAME = "host_samples.jsonl"
+
+# One live microVM is hosted by one `shuru run` process (the Virtualization
+# framework runs inside it), so counting those processes host-wide is counting
+# VMs — the only view the host has, since `shuru` has no `ps`/`list`.
+_SHURU_RUN = re.compile(r"(?:^|/|\s)shuru\s+run(?:\s|$)")
+
+# The three page classes macOS reports as resident application memory. Activity
+# Monitor's "Memory Used" is these plus wired and compressed, and it is the figure
+# a calibration reader can compare against the charge.
+_VM_STAT_FIELDS = ("Anonymous pages", "Pages wired down", "Pages occupied by compressor")
+_VM_STAT_PAGE_SIZE = re.compile(r"page size of (\d+) bytes")
+_VM_STAT_LINE = re.compile(r'^"?(?P<name>[^":]+)"?:\s+(?P<count>\d+)\.')
+
+
+def host_used_memory_mb() -> Optional[int]:
+    """Host-wide USED physical memory in MB, best effort, or ``None``.
+
+    Read straight from ``vm_stat`` so the sampler does not depend on a
+    third-party module being installed on the host. It never raises: any shape it
+    does not recognise returns ``None`` rather than a wrong number, because a
+    calibration sample that lies is worse than one that is missing.
+    """
+    try:
+        completed = subprocess.run(
+            ["vm_stat"], capture_output=True, text=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    page_size = 4096
+    used_pages = 0
+    seen = False
+    for line in completed.stdout.splitlines():
+        page_size_match = _VM_STAT_PAGE_SIZE.search(line)
+        if page_size_match:
+            page_size = int(page_size_match.group(1))
+            continue
+        match = _VM_STAT_LINE.match(line.strip())
+        if match and match.group("name") in _VM_STAT_FIELDS:
+            used_pages += int(match.group("count"))
+            seen = True
+    if not seen:
+        return None
+    return (used_pages * page_size) // (1024 * 1024)
+
+
+def host_live_vm_count() -> Optional[int]:
+    """How many shuru microVMs are live on this host right now, or ``None``."""
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return sum(1 for line in completed.stdout.splitlines() if _SHURU_RUN.search(line))
+
+
+class HostSampler:
+    """M3 item S6 — a batch-level time series of host memory and live VMs.
+
+    One daemon thread appends one JSON line per interval to ``path``. It is
+    deliberately fire-and-forget: a host probe that fails writes ``null`` for its
+    field, and the whole sampler is best-effort, because everything it produces is
+    calibration data and no verdict reads it — a sampler must never be able to
+    take a batch down.
+    """
+
+    def __init__(
+        self, path: Path, *, interval_secs: float = SAMPLE_INTERVAL_SECS
+    ) -> None:
+        self.path = Path(path)
+        self.interval_secs = float(interval_secs)
+        self.samples: list[dict] = []
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+
+    @property
+    def started(self) -> bool:
+        """Whether the sampling thread is running."""
+        return self._thread is not None
+
+    def start(self) -> "HostSampler":
+        """Start sampling. Idempotent, so every caller may ask for it."""
+        if self._thread is not None:
+            return self
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return self
+        self._thread = threading.Thread(
+            target=self._loop, name="vanta-host-sampler", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self.sample_once()
+            self._stop.wait(self.interval_secs)
+
+    def sample_once(self) -> dict:
+        """Take one sample, append it, and return it (also used by the tests)."""
+        sample = {
+            "t": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "used_memory_mb": host_used_memory_mb(),
+            "live_vms": host_live_vm_count(),
+            "host_load": host_load(),
+        }
+        self.samples.append(sample)
+        try:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                handle.flush()
+        except OSError:
+            pass
+        return sample
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=self.interval_secs + 1.0)
+        self._thread = None
+
+    def peak_used_memory_mb(self) -> Optional[int]:
+        values = [
+            sample["used_memory_mb"]
+            for sample in self.samples
+            if sample["used_memory_mb"] is not None
+        ]
+        return max(values) if values else None
+
+    def peak_live_vms(self) -> Optional[int]:
+        values = [
+            sample["live_vms"]
+            for sample in self.samples
+            if sample["live_vms"] is not None
+        ]
+        return max(values) if values else None
+
+    def record(self) -> dict:
+        """What the batch keeps about its own sampling, beside the sample file."""
+        return {
+            "path": str(self.path),
+            "interval_secs": self.interval_secs,
+            "samples": len(self.samples),
+            "peak_used_memory_mb": self.peak_used_memory_mb(),
+            "peak_live_vms": self.peak_live_vms(),
+        }
+
+
+def read_host_samples(
+    path: Path, *, interval_secs: float = SAMPLE_INTERVAL_SECS
+) -> Optional[dict]:
+    """The batch's sampler summary, re-derived from its own jsonl, or ``None``.
+
+    [VANTA-WHY] M3 item S6 — ``run_digest.json`` is a view of the batch directory
+    and nothing else, so a report regenerated later (``report``) has to describe
+    the same host samples the run recorded. Reading the jsonl back, rather than
+    requiring the sampler object, is what keeps the run's block and the report's
+    block the same block. Its shape mirrors :meth:`HostSampler.record` exactly.
+    """
+    path = Path(path)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    samples: list[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            samples.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # a torn last line, exactly as `Manifest.records` drops one
+    if not samples:
+        return None
+    used = [s["used_memory_mb"] for s in samples if s.get("used_memory_mb") is not None]
+    vms = [s["live_vms"] for s in samples if s.get("live_vms") is not None]
+    return {
+        "path": str(path),
+        "interval_secs": float(interval_secs),
+        "samples": len(samples),
+        "peak_used_memory_mb": max(used) if used else None,
+        "peak_live_vms": max(vms) if vms else None,
+    }
+

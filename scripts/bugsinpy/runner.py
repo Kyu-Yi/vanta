@@ -60,7 +60,12 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,6 +75,7 @@ from urllib.parse import unquote
 from . import bake as bake_mod
 from . import compact as compact_mod
 from . import arms as arms_mod
+from . import budget as budget_mod
 from . import context as ctx_mod
 from . import issue_source
 from . import manifest as manifest_mod
@@ -2238,10 +2244,51 @@ def build_record(
     python_version: str,
     oracle_json: Optional[Path],
     compaction: "compact_mod.Compaction",
+    scheduler: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """One ``manifest.jsonl`` line (§7.3)."""
+    """One ``manifest.jsonl`` line (§7.3).
+
+    ``scheduler`` is M3 item S6's account of what the one scheduler did for this
+    row, built by :func:`_scheduler_row_block` before the row ran and completed
+    here with the run-time facts only this function can see (the wall time, the
+    deadline left at the end, the peak of simultaneous microVMs the row actually
+    reached, and its provider retries). It is ``None`` for a caller that had no
+    budget — a unit test, a direct call — and a ``None`` scheduler adds **no key
+    at all**, so those rows stay byte-for-byte the rows they were before this
+    item while every row a real invocation writes states its own concurrency.
+    """
     summary = outcome.summary
     total = outcome.run_secs + oracle_secs
+    if scheduler is not None:
+        # [VANTA-WHY] M3 item S6 — the run-time half of the row's account. Nathan:
+        # "Concurrency must not change outcomes through time limits. ...
+        # VANTA_DEADLINE_SECS and the native timeout caps are wall-clock: under
+        # load a row runs slower and could hit a deadline it would not hit
+        # serially, which changes its label. Record per row its wall time,
+        # deadline remaining at the end, and provider retries and 429s". The
+        # scheduler block is where those live so a reader can tell a row that
+        # finished serially from one that was slowed by its neighbours.
+        scheduler = dict(scheduler)
+        scheduler["wall_s"] = round(outcome.run_secs, 3)
+        deadline_secs = _int(summary.get("deadline_secs"))
+        scheduler["deadline_secs"] = deadline_secs
+        scheduler["deadline_remaining_s"] = (
+            round(deadline_secs - outcome.run_secs, 3)
+            if deadline_secs is not None
+            else None
+        )
+        # The peak of simultaneous live sandboxes this row's own process reached,
+        # from the process-global counter `vanta_m3` now exposes (§`sandbox`).
+        scheduler["peak_sandboxes"] = _int(summary.get("peak_sandboxes"))
+        # Provider pressure, read from the same `run.summary` keys the `llm` block
+        # uses: copied, never re-measured, so the two can never disagree.
+        scheduler["provider_retries"] = _int(summary.get("provider_retries"))
+        scheduler["provider_retries_rate_limit"] = _int(
+            summary.get("provider_retries_rate_limit")
+        )
+        scheduler["provider_retries_unavailable"] = _int(
+            summary.get("provider_retries_unavailable")
+        )
     # [VANTA-WHY] M3 item A2 — fix-file coverage, computed AFTER the row has
     # finished, from the same two inputs `localization_hit` uses just below: the
     # gold fix paths and the Creator's own recorded selection. It is built here
@@ -2262,7 +2309,7 @@ def build_record(
             fix_coverage_files,
             fix_coverage_reason,
         ) = fix_file_coverage(prep, summary.get("context_selection"))
-    return {
+    record = {
         "schema_version": manifest_mod.SCHEMA_VERSION,
         "kind": "run",
         "key": job.key,
@@ -2546,6 +2593,12 @@ def build_record(
             "compact_reason": compaction.reason,
         },
     }
+    # M3 item S6 — the key is added only when there is a scheduler to describe.
+    # A `None` here is a unit test or a direct caller, and §14.33 requires those
+    # rows to keep the exact shape they had before this item.
+    if scheduler is not None:
+        record["scheduler"] = scheduler
+    return record
 
 
 def _bool(value: Optional[str]) -> Optional[bool]:
@@ -2786,6 +2839,7 @@ def run_job(
     max_attempts: int,
     disk_mb: int,
     python_version: str,
+    scheduler: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     """Execute one job end to end, or return ``None`` if it left no evidence.
 
@@ -2794,6 +2848,11 @@ def run_job(
     summary has no row to write — a half-written row would be a fabricated
     dataset entry — so its failure goes to ``failures.jsonl`` instead and the
     cursor stays ``failed``, which means it is re-run rather than skipped.
+
+    ``scheduler`` is M3 item S6's per-row account of the one scheduler, or
+    ``None`` for a caller that had no budget. It is passed straight through to
+    :func:`build_record`, which is the only place with the run's summary in hand;
+    ``None`` leaves the row exactly as it was before this item.
     """
     manifest.mark(job.key, RUNNING)
     prep = job.prep
@@ -2904,6 +2963,9 @@ def run_job(
         python_version=python_version,
         oracle_json=oracle_json,
         compaction=compaction,
+        # M3 item S6 — `None` for a caller without a budget, which leaves the row
+        # byte-for-byte what it was before this item.
+        scheduler=scheduler,
     )
     # [VANTA-WHY] Item E6 + Q3 — the only reason `is_done` let this key through is
     # that its previous row's oracle was INCONCLUSIVE. Rows stay append-only, so the
@@ -3414,8 +3476,20 @@ def run_batch(
     stop_file: Optional[Path] = None,
     announce: bool = True,
     arm_spellings: Optional[Sequence[str]] = None,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> tuple[int, list[WaveResult]]:
     """The whole batch: per wave, D13's four phases, then the wave-1 gate.
+
+    ``budget`` is M3 item S6's ONE scheduler (``budget.Budget``), or ``None`` for a
+    caller that has none (a unit test). It is the *only* cap on how many rows of a
+    phase run at once: ``budget.concurrent`` is the switch between the sequential
+    path this function has always had and the pooled path S6 adds, and
+    ``--jobs 1`` (a budget whose ``cores`` is 1) never enters the pooled path at
+    all — which is §14.33's rule that ``1`` must be a path N=1 does not enter
+    rather than a path that degenerates. With a budget in hand every row also
+    records what the scheduler did (``jobs``, ``concurrent``, the charge, the
+    slot wait, its own live-VM peak and the deadline left when it finished); with
+    ``None`` a row is byte-for-byte the row it was before this item.
 
     ``arm_spellings`` is the arms this invocation runs, or ``None`` for every arm
     the split declares (the whole protocol, which is what ``run`` does). The queue
@@ -3577,156 +3651,158 @@ def run_batch(
         if announce:
             print(f"\n=== wave {wave}: {len(wave_preps)} bug(s) ===", flush=True)
         result = WaveResult(wave=wave)
-        for mode, written in phases:
-            config = arms_mod.config_of(written)
-            arm = arms_mod.arm_for(written, mode)
-            for prep in wave_preps:
-                entry = entries[prep.key]
-                checkpoint = entry["checkpoint"]
-                for seed in seeds:
-                    if mode == REPAIR:
-                        jobs = [
-                            Job(
-                                batch_id=batch_id,
-                                wave=wave,
-                                bug=prep.key,
-                                prep=prep,
-                                entry=entry,
-                                config=config,
-                                arm=arm,
-                                mode=REPAIR,
-                                seed=seed,
-                                checkpoint=checkpoint,
-                                python_version_pinned=entry["python_version"],
-                                harness=harness,
-                                show_hints=show_hints,
-                                config_block=config_block,
-                                prep_config_block=prep_config_block,
-                                frozen_env=frozen_env,
+        # M3 item S6 — D13's phases grouped by MODE. The groups appear in
+        # `phases_for`'s own order (every repair pass before every review pass) and
+        # the spellings keep their order inside a group, so the sequential path
+        # below visits exactly the rows it visited before this item, in the same
+        # order. Only the pooled path — which a budget of one core, i.e. `--jobs 1`,
+        # does not enter — lets a phase's rows overlap.
+        for mode, written_list in _mode_phases(phases):
+            jobs = _phase_jobs(
+                mode=mode,
+                spellings=written_list,
+                wave=wave,
+                wave_preps=wave_preps,
+                seeds=seeds,
+                entries=entries,
+                batch_id=batch_id,
+                harness=harness,
+                show_hints=show_hints,
+                config_block=config_block,
+                prep_config_block=prep_config_block,
+                frozen_env=frozen_env,
+                batch_dir=batch_dir,
+                manifest=manifest,
+                repair_configs=repair_configs,
+                disk_mb=disk_mb,
+            )
+            if budget is not None and budget.concurrent:
+                status, phase_records, phase_failed = _run_jobs_concurrently(
+                    jobs=jobs,
+                    budget=budget,
+                    paths=paths,
+                    batch_dir=batch_dir,
+                    manifest=manifest,
+                    vanta_bin=vanta_bin,
+                    max_attempts=max_attempts,
+                    disk_mb=disk_mb,
+                    checkpoint_pythons=checkpoint_pythons,
+                    spend_gate=spend_gate,
+                    stop_file=stop_file,
+                    preflight=preflight,
+                )
+                result.records.extend(phase_records)
+                result.failed += phase_failed
+                if status == "stop_file":
+                    return stopped()
+                if status == "spend_cap":
+                    return 1, results
+                continue
+            for job in jobs:
+                if manifest.is_done(job.key):
+                    print(f"  {job.label()} done — skipping (resume)", flush=True)
+                    found = manifest.find(job.key)
+                    if found:
+                        result.records.append(found)
+                    continue
+                # Item 13 — the stop file. Checked between jobs, like the
+                # spend cap and for the same reason: the claim below is the
+                # last moment at which nothing has been written, so a stop
+                # never leaves a half-written row or a cursor parked at
+                # `running`. Deleting the file resumes from this key.
+                if stop_file is not None and Path(stop_file).exists():
+                    return stopped()
+                reservation: Optional[int] = None
+                # H7 — the `try` opens *before* `acquire`, not at the job.
+                # Between the return of a successful `acquire` and the old
+                # `try` there was a window in which a `KeyboardInterrupt` (or
+                # any other raise) left a token held by a frame that never
+                # reached the `finally`, and every waiter behind it slept out
+                # the batch. With the `finally` covering the acquire itself, a
+                # token is released on every path that can carry one;
+                # `release(None)` is a no-op, so a refusal or an H1 rollback
+                # still leaves nothing behind.
+                try:
+                    # §14.29 — the spend cap is checked BEFORE the job starts,
+                    # never during one: the check is between rows, so the row
+                    # that crossed the cap is already complete and the rows
+                    # that follow it are never half-written. `>=` rather than
+                    # `>`: a batch that has reached its budget has spent it.
+                    #
+                    # G1 — the admission is atomic across the queue's workers
+                    # (`SpendGate`): a re-read of the manifest was not. The
+                    # gate reserves this job's budget under a lock before the
+                    # job starts, so two workers cannot both pass on the same
+                    # `spent`, and `None` — the batch has reached its cap — is
+                    # the only value that stops it.
+                    if spend_gate is not None:
+                        reservation = spend_gate.acquire(job)
+                        if reservation is None:
+                            _record_spend_cap(
+                                batch_dir,
+                                spend_gate.cap_usd,
+                                _spent_so_far(manifest),
+                                job,
                             )
-                        ]
-                    else:
-                        jobs = [
-                            Job(
-                                batch_id=batch_id,
-                                wave=wave,
-                                bug=prep.key,
-                                prep=prep,
-                                entry=entry,
-                                config=config,
-                                arm=arm,
-                                mode=REVIEW,
-                                seed=seed,
-                                checkpoint=checkpoint,
-                                python_version_pinned=entry["python_version"],
-                                candidate=candidate,
-                                harness=harness,
-                                show_hints=show_hints,
-                                config_block=config_block,
-                                prep_config_block=prep_config_block,
-                                frozen_env=frozen_env,
-                            )
-                            for candidate in _review_candidates(
-                                batch_dir=batch_dir,
-                                batch_id=batch_id,
-                                manifest=manifest,
-                                prep=prep,
-                                configs=repair_configs,
-                                seed=seed,
-                                checkpoint=checkpoint,
-                                disk_mb=disk_mb,
-                                show_hints=show_hints,
-                            )
-                        ]
-                    for job in jobs:
-                        if manifest.is_done(job.key):
-                            print(f"  {job.label()} done — skipping (resume)", flush=True)
-                            found = manifest.find(job.key)
-                            if found:
-                                result.records.append(found)
-                            continue
-                        # Item 13 — the stop file. Checked between jobs, like the
-                        # spend cap and for the same reason: the claim below is the
-                        # last moment at which nothing has been written, so a stop
-                        # never leaves a half-written row or a cursor parked at
-                        # `running`. Deleting the file resumes from this key.
+                            return 1, results
+                        # H3 — the stop file can appear while this worker is
+                        # asleep in `acquire`. A job started after it exists
+                        # is exactly what the file was created to prevent, so
+                        # re-check it here; the `finally` releases the
+                        # reservation that `stopped()` returns past.
                         if stop_file is not None and Path(stop_file).exists():
                             return stopped()
-                        reservation: Optional[int] = None
-                        # H7 — the `try` opens *before* `acquire`, not at the job.
-                        # Between the return of a successful `acquire` and the old
-                        # `try` there was a window in which a `KeyboardInterrupt` (or
-                        # any other raise) left a token held by a frame that never
-                        # reached the `finally`, and every waiter behind it slept out
-                        # the batch. With the `finally` covering the acquire itself, a
-                        # token is released on every path that can carry one;
-                        # `release(None)` is a no-op, so a refusal or an H1 rollback
-                        # still leaves nothing behind.
-                        try:
-                            # §14.29 — the spend cap is checked BEFORE the job starts,
-                            # never during one: the check is between rows, so the row
-                            # that crossed the cap is already complete and the rows
-                            # that follow it are never half-written. `>=` rather than
-                            # `>`: a batch that has reached its budget has spent it.
-                            #
-                            # G1 — the admission is atomic across the queue's workers
-                            # (`SpendGate`): a re-read of the manifest was not. The
-                            # gate reserves this job's budget under a lock before the
-                            # job starts, so two workers cannot both pass on the same
-                            # `spent`, and `None` — the batch has reached its cap — is
-                            # the only value that stops it.
-                            if spend_gate is not None:
-                                reservation = spend_gate.acquire(job)
-                                if reservation is None:
-                                    _record_spend_cap(
-                                        batch_dir,
-                                        spend_gate.cap_usd,
-                                        _spent_so_far(manifest),
-                                        job,
-                                    )
-                                    return 1, results
-                                # H3 — the stop file can appear while this worker is
-                                # asleep in `acquire`. A job started after it exists
-                                # is exactly what the file was created to prevent, so
-                                # re-check it here; the `finally` releases the
-                                # reservation that `stopped()` returns past.
-                                if stop_file is not None and Path(stop_file).exists():
-                                    return stopped()
-                            # Item 14 — before the row, not after it. Asked here rather
-                            # than inside `run_job` because the refusal has to leave no
-                            # trace at all: `run_job`'s first act is to mark the key
-                            # `running` in `state.json`, and a key parked there is a row
-                            # the next resume re-runs. Raising before the call means the
-                            # cursor never moves and the batch continues from here once
-                            # the endpoint is back.
-                            if preflight is not None:
-                                require_model_endpoint(preflight=preflight, before=job.key)
-                            record = run_job(
-                                job=job,
-                                paths=paths,
-                                manifest=manifest,
-                                vanta_bin=vanta_bin,
-                                # The arm owns the budget, not the invocation: B0 is
-                                # "one Creator call, no feedback" (§M3 item 11), so a
-                                # pinned arm states its budget here and an explicit
-                                # `--max-attempts` that disagrees was already refused
-                                # by `_require_arm_budget`. Every other arm runs what
-                                # the invocation asked for, or the binary's default.
-                                max_attempts=_arm_attempt_budget(arm, max_attempts),
-                                disk_mb=disk_mb,
-                                python_version=checkpoint_pythons.get(checkpoint, ""),
+                    # Item 14 — before the row, not after it. Asked here rather
+                    # than inside `run_job` because the refusal has to leave no
+                    # trace at all: `run_job`'s first act is to mark the key
+                    # `running` in `state.json`, and a key parked there is a row
+                    # the next resume re-runs. Raising before the call means the
+                    # cursor never moves and the batch continues from here once
+                    # the endpoint is back.
+                    if preflight is not None:
+                        require_model_endpoint(preflight=preflight, before=job.key)
+                    record = run_job(
+                        job=job,
+                        paths=paths,
+                        manifest=manifest,
+                        vanta_bin=vanta_bin,
+                        # The arm owns the budget, not the invocation: B0 is
+                        # "one Creator call, no feedback" (§M3 item 11), so a
+                        # pinned arm states its budget here and an explicit
+                        # `--max-attempts` that disagrees was already refused
+                        # by `_require_arm_budget`. Every other arm runs what
+                        # the invocation asked for, or the binary's default.
+                        max_attempts=_arm_attempt_budget(job.arm, max_attempts),
+                        disk_mb=disk_mb,
+                        python_version=checkpoint_pythons.get(job.checkpoint, ""),
+                        # M3 item S6 — the scheduler's own account of this row,
+                        # written only when the invocation actually ran rows
+                        # concurrently. A budget of one core (`--jobs 1`) leaves
+                        # the row byte-for-byte the row it was before this item,
+                        # which is §14.33's closing rule; so does `None` (a test,
+                        # a direct caller).
+                        scheduler=(
+                            _scheduler_row_block(
+                                budget,
+                                charge_mb=budget.row_charge_mb(
+                                    job.prep.vm_memory_mb
+                                ),
                             )
-                        finally:
-                            # Reconcile against the job's recorded cost by releasing:
-                            # what it actually spent is on its row, which the next
-                            # `acquire` reads. Runs for a failed job and an
-                            # infra_failure too, so a reservation can never leak.
-                            if spend_gate is not None:
-                                spend_gate.release(reservation)
-                        if record:
-                            result.records.append(record)
-                        else:
-                            result.failed += 1
+                            if budget is not None and budget.concurrent
+                            else None
+                        ),
+                    )
+                finally:
+                    # Reconcile against the job's recorded cost by releasing:
+                    # what it actually spent is on its row, which the next
+                    # `acquire` reads. Runs for a failed job and an
+                    # infra_failure too, so a reservation can never leak.
+                    if spend_gate is not None:
+                        spend_gate.release(reservation)
+                if record:
+                    result.records.append(record)
+                else:
+                    result.failed += 1
         results.append(result)
         gate = wave_gate_failures(result.records)
         if gate:
@@ -3740,6 +3816,340 @@ def run_batch(
             )
             return 1, results
     return 0, results
+
+
+def _mode_phases(
+    phases: Sequence[tuple[str, str]],
+) -> list[tuple[str, list[str]]]:
+    """D13's ``(mode, written)`` phases grouped by mode, order preserved.
+
+    ``arms.phases_for`` already builds the list mode-major — every repair pass
+    before every review pass — so grouping the ADJACENT pairs cannot reorder
+    anything. The groups let the pooled path run one phase's rows together while
+    the phases themselves stay strictly sequential: a review row pools repair
+    rows, so it must not start before the repair phase has finished.
+
+    The second element keeps the SPELLING (``b1``, ``suite``), not the config, for
+    the same reason ``phases_for`` does: the config column of a phase's rows is
+    the spelling's config value, and a job key is byte-identical only if the
+    spelling is what reaches :func:`_phase_jobs`.
+    """
+    grouped: list[tuple[str, list[str]]] = []
+    for mode, written in phases:
+        if grouped and grouped[-1][0] == mode:
+            grouped[-1][1].append(written)
+        else:
+            grouped.append((mode, [written]))
+    return grouped
+
+
+def _phase_jobs(
+    *,
+    mode: str,
+    spellings: Sequence[str],
+    wave: int,
+    wave_preps: Sequence[prepare_mod.BugPrep],
+    seeds: Sequence[int],
+    entries: dict[str, dict[str, Any]],
+    batch_id: str,
+    harness: Any,
+    show_hints: bool,
+    config_block: Optional[dict[str, Any]],
+    prep_config_block: Optional[dict[str, Any]],
+    frozen_env: Optional[Mapping[str, str]],
+    batch_dir: Path,
+    manifest: Manifest,
+    repair_configs: Sequence[str],
+    disk_mb: int,
+) -> list["Job"]:
+    """One phase's jobs, in the exact order the serial loop visited them.
+
+    [VANTA-WHY] M3 item S6. The loop this replaces built and ran each
+    ``(spelling, prep, seed)`` unit's jobs in one pass; the pooled path needs the
+    whole phase's list first, so the construction is lifted out here — but the
+    ORDER is unchanged, spelling-major then prep then seed then candidate, because
+    the rows a phase writes and the order they are written in are what a
+    byte-identical ``--jobs 1`` run means (§14.33).
+
+    A review phase's candidate set comes from :func:`_review_candidates`, which
+    grades each candidate (booting an oracle VM). That grading happens HERE, on
+    the calling thread, exactly as it did before this item and *before* the pool is
+    entered: grading is not a row, so it must not overlap a row's VMs, and it must
+    see every repair row of the wave already on disk — which it does, because the
+    phases are sequential and the repair phase has joined its rows by now.
+    """
+    jobs: list["Job"] = []
+    for written in spellings:
+        config = arms_mod.config_of(written)
+        arm = arms_mod.arm_for(written, mode)
+        for prep in wave_preps:
+            entry = entries[prep.key]
+            checkpoint = entry["checkpoint"]
+            for seed in seeds:
+                if mode == REPAIR:
+                    jobs.append(
+                        Job(
+                            batch_id=batch_id,
+                            wave=wave,
+                            bug=prep.key,
+                            prep=prep,
+                            entry=entry,
+                            config=config,
+                            arm=arm,
+                            mode=REPAIR,
+                            seed=seed,
+                            checkpoint=checkpoint,
+                            python_version_pinned=entry["python_version"],
+                            harness=harness,
+                            show_hints=show_hints,
+                            config_block=config_block,
+                            prep_config_block=prep_config_block,
+                            frozen_env=frozen_env,
+                        )
+                    )
+                    continue
+                for candidate in _review_candidates(
+                    batch_dir=batch_dir,
+                    batch_id=batch_id,
+                    manifest=manifest,
+                    prep=prep,
+                    configs=repair_configs,
+                    seed=seed,
+                    checkpoint=checkpoint,
+                    disk_mb=disk_mb,
+                    show_hints=show_hints,
+                ):
+                    jobs.append(
+                        Job(
+                            batch_id=batch_id,
+                            wave=wave,
+                            bug=prep.key,
+                            prep=prep,
+                            entry=entry,
+                            config=config,
+                            arm=arm,
+                            mode=REVIEW,
+                            seed=seed,
+                            checkpoint=checkpoint,
+                            python_version_pinned=entry["python_version"],
+                            candidate=candidate,
+                            harness=harness,
+                            show_hints=show_hints,
+                            config_block=config_block,
+                            prep_config_block=prep_config_block,
+                            frozen_env=frozen_env,
+                        )
+                    )
+    return jobs
+
+
+def _scheduler_row_block(
+    budget: "budget_mod.Budget",
+    *,
+    charge_mb: int,
+    slot_wait_s: float = 0.0,
+) -> dict[str, Any]:
+    """M3 item S6 — the scheduler's account of ONE row, as far as it is known now.
+
+    The budget's own :meth:`budget.Budget.record` — the switch, ``jobs``, the
+    effective cores, the caps, the host's cores and load, the invocation's
+    high-water marks — plus this row's own price: the memory it was charged
+    (``peak_vms × vm_memory_mb``), whether that charge alone exceeds the whole
+    memory budget (a row the scheduler can never admit beside another, and so runs
+    alone), and how long the row waited for its slot. The run-time facts a row can
+    only state after it has finished — its wall time, the deadline left, the peak
+    of simultaneous VMs it actually reached, its provider retries — are added by
+    :func:`build_record`, which is the one place holding the session summary.
+    """
+    block = budget.record()
+    block["charge_mb"] = int(charge_mb)
+    block["charge_exceeds_budget"] = budget.charge_exceeds_budget(int(charge_mb))
+    block["peak_vms"] = budget.peak_vms
+    block["slot_wait_s"] = round(float(slot_wait_s), 3)
+    return block
+
+
+def _run_jobs_concurrently(
+    *,
+    jobs: Sequence["Job"],
+    budget: "budget_mod.Budget",
+    paths: BatchPaths,
+    batch_dir: Path,
+    manifest: Manifest,
+    vanta_bin: Path,
+    max_attempts: Optional[int],
+    disk_mb: int,
+    checkpoint_pythons: dict[str, str],
+    spend_gate: Optional["SpendGate"],
+    stop_file: Optional[Path],
+    preflight: Optional[Callable[[], Optional[str]]],
+) -> tuple[str, list[dict[str, Any]], int]:
+    """Run one phase's jobs on a pool, and report how the phase ended.
+
+    [VANTA-WHY] M3 item S6. This function is entered only when the budget's
+    effective concurrency is greater than one, so ``--jobs 1`` never reaches it —
+    §14.33's "a path N=1 does not enter rather than a path that degenerates". The
+    pool is sized by ``budget.cores`` and each row additionally holds
+    ``budget.slot(memory_mb=row_charge_mb(...))`` for the whole of its run, so the
+    number of rows in flight is bounded by the requested ``--jobs`` and the number
+    of VMs actually running is bounded by the memory budget; whichever binds
+    first wins, and neither is ever exceeded.
+
+    Everything the serial path guarantees per row is kept per row here:
+
+    * the resume skip, which reads the row's key from the cursor before claiming;
+    * item 13's stop file, checked before the claim and — H3 — again after the
+      spend gate's ``acquire`` returns, because the file can appear while a worker
+      sleeps;
+    * G1's :class:`SpendGate`, with H7's ``try`` opening before ``acquire`` so a
+      raise cannot leave a reservation nobody will release;
+    * item 14's endpoint preflight, asked once per row that is about to start;
+    * each row gets its OWN :class:`Manifest`, because ``FileLock`` excludes per
+      caller — one ``Manifest`` shared by two threads would let their appends
+      interleave.
+
+    Returns ``(status, records, failed)`` where ``status`` is ``""``, or
+    ``"stop_file"`` / ``"spend_cap"`` for the two conditions the caller turns into
+    a stop; ``records`` come back in JOB order and not completion order, so a
+    phase's rows read the way they would have read serially. A preflight refusal —
+    or any other raise inside a row — is re-raised from the lowest-index row that
+    raised, once the pool has drained.
+    """
+    count = len(jobs)
+    # `slots[i]` is what happened to job i: None until a worker reaches it, then
+    # ("record"|"failed"|"skip"|"stopped"|"spend"|"halted"|"error", value).
+    slots: list[Optional[tuple[str, Any]]] = [None] * count
+    guard = threading.Lock()
+    halt = threading.Event()
+    spend_cap_hit = threading.Event()
+
+    # The resume cursor, read in job order before anything is submitted — the same
+    # read the serial loop made, at the same point in the order. It goes through
+    # the batch's own shared `Manifest` because no row is running yet, and each
+    # row that does run then gets a `Manifest` of its own below.
+    pending: list[tuple[int, "Job"]] = []
+    for index, job in enumerate(jobs):
+        if manifest.is_done(job.key):
+            print(f"  {job.label()} done — skipping (resume)", flush=True)
+            slots[index] = ("skip", manifest.find(job.key))
+            continue
+        pending.append((index, job))
+
+    def stop_file_present() -> bool:
+        return stop_file is not None and Path(stop_file).exists()
+
+    def worker(index: int, job: "Job") -> None:
+        if halt.is_set():
+            slots[index] = ("halted", None)
+            return
+        # One Manifest per row: `FileLock` is per caller (see its docstring), so a
+        # shared one would let two rows' appends interleave into one line.
+        row_manifest = Manifest(batch_dir)
+        if stop_file_present():
+            halt.set()
+            slots[index] = ("stopped", None)
+            return
+        reservation: Optional[int] = None
+        try:
+            if spend_gate is not None:
+                reservation = spend_gate.acquire(job)
+                if reservation is None:
+                    with guard:
+                        first = not spend_cap_hit.is_set()
+                        spend_cap_hit.set()
+                        halt.set()
+                        slots[index] = ("spend", None)
+                    # One spend.json per phase, not one per refused row: the file
+                    # names the batch's cap, which does not depend on which row
+                    # crossed it.
+                    if first:
+                        _record_spend_cap(
+                            batch_dir,
+                            spend_gate.cap_usd,
+                            _spent_so_far(row_manifest),
+                            job,
+                        )
+                    return
+                if stop_file_present():
+                    halt.set()
+                    slots[index] = ("stopped", None)
+                    return
+            if preflight is not None:
+                require_model_endpoint(preflight=preflight, before=job.key)
+            charge_mb = budget.row_charge_mb(job.prep.vm_memory_mb)
+            waited_from = time.monotonic()
+            with budget.slot(memory_mb=charge_mb, cores=1):
+                slot_wait_s = time.monotonic() - waited_from
+                # The last moment before `run_job` claims the key: a stop that
+                # appeared while this row waited for memory still stops it.
+                if spend_cap_hit.is_set():
+                    slots[index] = ("spend", None)
+                    return
+                if stop_file_present():
+                    halt.set()
+                    slots[index] = ("stopped", None)
+                    return
+                record = run_job(
+                    job=job,
+                    paths=paths,
+                    manifest=row_manifest,
+                    vanta_bin=vanta_bin,
+                    max_attempts=_arm_attempt_budget(job.arm, max_attempts),
+                    disk_mb=disk_mb,
+                    python_version=checkpoint_pythons.get(job.checkpoint, ""),
+                    scheduler=_scheduler_row_block(
+                        budget, charge_mb=charge_mb, slot_wait_s=slot_wait_s
+                    ),
+                )
+            slots[index] = ("failed" if record is None else "record", record)
+        except BaseException as exc:  # noqa: BLE001 — stored and re-raised in order
+            # Stored, not raised: a raise here would abandon the rows already in
+            # flight. `halt` keeps any row that has not started from starting, and
+            # the first error is re-raised below, in job order, once the pool has
+            # drained — which is the serial path's "the raise stops the batch".
+            # `BaseException` and not `Exception`, because a `KeyboardInterrupt`
+            # in a worker is a way out of the batch like any other (H7).
+            halt.set()
+            slots[index] = ("error", exc)
+        finally:
+            if spend_gate is not None:
+                spend_gate.release(reservation)
+
+    with ThreadPoolExecutor(max_workers=max(1, budget.cores)) as pool:
+        futures = [pool.submit(worker, index, job) for index, job in pending]
+        for future in futures:
+            future.result()
+
+    # First pass — how the phase ended, from the lowest-index row that stopped it.
+    status = ""
+    for entry in slots:
+        if entry is None:
+            continue
+        kind, value = entry
+        if kind == "stopped":
+            status = "stop_file"
+            break
+        if kind == "spend":
+            status = "spend_cap"
+            break
+        if kind == "error":
+            raise value
+    # Second pass — the phase's rows, in job order.
+    records: list[dict[str, Any]] = []
+    failed = 0
+    for entry in slots:
+        if entry is None:
+            continue
+        kind, value = entry
+        if kind == "failed":
+            failed += 1
+        elif kind in ("record", "skip") and value is not None:
+            # `record` is a fresh row this phase wrote; `skip` is the row a resume
+            # found already on disk. Both are evidence the phase contributed, and
+            # `skip` is None only when the cursor was `done` but no row could be
+            # read back, which contributes nothing.
+            records.append(value)
+    return status, records, failed
 
 
 def _review_candidates(
@@ -4520,7 +4930,10 @@ def _spend_report(batch_dir: Path) -> Optional[dict[str, Any]]:
 
 
 def write_batch_report(
-    batch_dir: Path, records: Sequence[dict[str, Any]]
+    batch_dir: Path,
+    records: Sequence[dict[str, Any]],
+    *,
+    host_samples: Optional[dict[str, Any]] = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Write the batch's report artifacts, from the manifest and nothing else.
 
@@ -4528,6 +4941,12 @@ def write_batch_report(
     labels file are two views of them that can be regenerated at any time — so a
     crash between a run and a report costs nothing, and a report can never disagree
     with the rows it summarises.
+
+    M3 item S6 — ``host_samples`` is the batch-level sampler's summary, passed by
+    the concurrent run that produced it. When it is ``None`` the summary is read
+    back from the batch's own ``host_samples.jsonl`` (:func:`budget_mod.read_host_samples`),
+    so a ``report`` regeneration describes the same samples. A batch that never
+    sampled — every ``--jobs 1`` run — has neither, and gains no block.
     """
     labels_path = write_labels(records, batch_dir / "run_labels.json")
     payload = digest(records)
@@ -4537,6 +4956,11 @@ def write_batch_report(
     spend = _spend_report(batch_dir)
     if spend is not None:
         payload["spend"] = spend
+    # M3 item S6 — the batch's own host sampling, when it sampled at all.
+    if host_samples is None:
+        host_samples = budget_mod.read_host_samples(batch_dir / budget_mod.HOST_SAMPLES_NAME)
+    if host_samples is not None:
+        payload["host_samples"] = host_samples
     (batch_dir / "run_digest.json").write_text(
         json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8"
     )
@@ -4672,6 +5096,7 @@ def run_queue(
     prep_config_block: Optional[dict[str, Any]] = None,
     frozen_env: Optional[Mapping[str, str]] = None,
     arm_spellings: Optional[Sequence[str]] = None,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> tuple[int, list[QueueOutcome]]:
     """Item 13 — run a prepared batch's bugs up to ``jobs`` at a time.
 
@@ -4692,6 +5117,12 @@ def run_queue(
     wave gate, or a job that left no usable session. It is deliberately the same
     value ``run_batch`` uses for the first three, because the queue's callers read
     the outcome list, not the number, to tell them apart.
+
+    M3 item S6 — ``budget`` is the invocation's ONE scheduler, shared by every
+    worker here and threaded down into each per-bug :func:`run_batch`. ``jobs`` is
+    therefore only the row cap: the memory and core budget can admit fewer rows
+    than ``jobs`` at once, never more, and the same scheduler governs ``prepare``,
+    ``run`` and the queue.
     """
     if jobs < 1:
         raise RunnerError(f"--jobs must be at least 1, not {jobs}.")
@@ -4722,6 +5153,7 @@ def run_queue(
             prep_config_block=prep_config_block,
             frozen_env=frozen_env,
             arm_spellings=arm_spellings,
+            budget=budget,
         )
     finally:
         owner.release()
@@ -4773,8 +5205,17 @@ def _run_queue(**kwargs: Any) -> tuple[int, list[QueueOutcome]]:
             kwargs["waves"],
         )
     )
+    # M3 item S6 — the pool's own numbers, so an operator can see at a glance
+    # whether the memory budget, not `jobs`, is the binding constraint here.
+    budget: Optional[budget_mod.Budget] = kwargs.get("budget")
+    tail = ""
+    if budget is not None and budget.concurrent:
+        tail = (
+            f"; one scheduler, cores={budget.cores}/{budget.cap_cores} "
+            f"memory={'unbounded' if budget.cap_memory_mb is None else f'{budget.cap_memory_mb} MB'}"
+        )
     print(
-        f"[queue] {len(tasks)} task(s) = wave × bug, up to {jobs} at once; "
+        f"[queue] {len(tasks)} task(s) = wave × bug, up to {jobs} at once{tail}; "
         f"stop file {stop_file}",
         flush=True,
     )
@@ -4916,6 +5357,9 @@ def _run_task(
             # The arm selection, resolved once by `_run_queue` and carried on every
             # task so each bug runs exactly the arms the schedule named.
             arm_spellings=_select_arms(kwargs["split"], kwargs["arm_spellings"]),
+            # M3 item S6 — the ONE scheduler of the whole invocation, so every row
+            # of every bug of this wave shares the same budget.
+            budget=kwargs["budget"],
         )
     except Exception as exc:  # one bug must not take the queue down
         print(f"  [{prep.key}] FAILED — {type(exc).__name__}: {exc}", flush=True)

@@ -56,6 +56,7 @@ use crate::pipeline::harness::{self, TestExecutionDetails};
 use crate::pipeline::patch::{
     ApplyFailure, apply_patch_detailed, apply_patch_strict, patch_deleted_paths,
 };
+use crate::pipeline::safe_path::{confined_join, unsafe_relative_path_reason};
 use crate::pipeline::{BUDGET_EXHAUSTED, REVISE_BUDGET_PER_ATTEMPT, ReviseBudget};
 use crate::repo::Repo;
 use crate::session::{
@@ -5299,7 +5300,14 @@ pub async fn run(
                 let stage_dir = debug_dir.join("patched_repo");
                 let _ = fs::create_dir_all(&stage_dir);
                 for (path, content) in patched {
-                    let out_path = stage_dir.join(path);
+                    // [VANTA-WHY] T1 — the last patch-derived write site. The
+                    // apply already refused an unsafe path, so this is the second
+                    // lock on the same door: a path that could not be written
+                    // under Contract B cannot be written into the debug copy of
+                    // the tree either.
+                    let Ok(out_path) = confined_join(&stage_dir, path) else {
+                        continue;
+                    };
                     if let Some(parent) = out_path.parent() {
                         let _ = fs::create_dir_all(parent);
                     }
@@ -5533,8 +5541,16 @@ fn write_final_patch(
 }
 
 fn write_diff_tree(root: &Path, files: &HashMap<String, String>) -> io::Result<()> {
+    // [VANTA-WHY] T1 — this stages the original/patched trees for `git diff
+    // --no-index`, so `root.join(path)` is a WRITE named by the patch. Confine
+    // it: the caller only ever passes the apply's own (already-vetted) map, and
+    // this is the second lock on the same door. `create_dir_all(root)` first, so
+    // the containment check can resolve the root.
+    fs::create_dir_all(root)?;
     for (path, contents) in files {
-        let out_path = root.join(path);
+        let out_path = confined_join(root, path).map_err(|why| {
+            io::Error::new(io::ErrorKind::PermissionDenied, why)
+        })?;
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -5574,6 +5590,24 @@ fn apply_patch_files_all_or_nothing(
     // nondeterministic.
     let mut paths: Vec<&String> = patch_files.keys().collect();
     paths.sort();
+    // [VANTA-WHY] T1 — the path in a `===FILE:` marker is MODEL text, taken
+    // verbatim at any indentation (item Q1). Every block is checked before any
+    // is applied: a block naming an absolute path, a `..` component, a drive or
+    // UNC prefix, an empty or NUL-bearing path — or a padded one the
+    // concatenation would re-read as a DIFFERENT path — fails the WHOLE patch
+    // under Contract B with the reason `unsafe_path`, and nothing is written
+    // anywhere. PURE, like the rest of this function: the check is a string
+    // predicate, so the rule is tested directly instead of through a sandbox.
+    // Sorted first, so WHICH unsafe block is reported does not depend on
+    // HashMap iteration order.
+    for path in &paths {
+        if let Some(why) = unsafe_relative_path_reason(path) {
+            return Err(ApplyFailure::UnsafePath {
+                path: (*path).clone(),
+                why,
+            });
+        }
+    }
     let mut patched = original_files.clone();
     for path in paths {
         let patch_content = &patch_files[path];
@@ -7081,6 +7115,7 @@ fn now_iso() -> String {
 mod tests {
     use super::{
         apply_patch_files_all_or_nothing,
+        ApplyFailure,
         approval_invariant_status, attempt_verdict, bate_baseline_concat, benchmark_config_name,
         blocking_static_findings,
         build_fixed_round_pass_feedback,
@@ -7868,6 +7903,94 @@ mod tests {
         assert!(patched["calc.py"].contains("return x * 2"), "{patched:?}");
         assert!(patched["util.py"].contains("return 2"), "{patched:?}");
         assert_ne!(patched, original);
+    }
+
+    // ---- M3 item T1: a block naming an unsafe path fails the whole patch -----
+
+    /// [VANTA-WHY] M3 item T1. The path in a `===FILE:` marker is MODEL text,
+    /// taken verbatim at any indentation. An ABSOLUTE path must fail the whole
+    /// patch under Contract B with the reason `unsafe_path` — and the innocent
+    /// block beside it must not be written either, or the tree under test is a
+    /// tree nobody wrote.
+    #[test]
+    fn a_patch_naming_an_absolute_path_fails_with_unsafe_path_and_writes_nothing() {
+        let original = HashMap::from([(
+            "calc.py".to_string(),
+            "def scale(x):\n    return x\n".to_string(),
+        )]);
+        let patch_text = concat!(
+            "===FILE: calc.py===\n",
+            "def scale(x):\n    return x * 2\n",
+            "===FILE: /home/user/.ssh/authorized_keys===\n",
+            "ssh-rsa AAAA\n",
+        );
+        let (blocks, _trimmed) = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
+        assert_eq!(blocks.len(), 2, "both blocks must be recognised");
+
+        let (patched, failure) = match apply_patch_files_all_or_nothing(&original, &blocks) {
+            Ok(changed) => (changed, None),
+            Err(failure) => (original.clone(), Some(failure)),
+        };
+
+        let failure = failure.expect("an absolute path must fail the whole patch");
+        assert!(
+            matches!(failure, ApplyFailure::UnsafePath { .. }),
+            "expected UnsafePath; got {failure:?}"
+        );
+        assert!(
+            failure.feedback().starts_with("unsafe_path"),
+            "the reason must reach the `patch.apply_failed` row and the Creator's \
+             feedback verbatim; got: {}",
+            failure.feedback()
+        );
+        assert!(
+            failure.feedback().contains("/home/user/.ssh/authorized_keys"),
+            "the refused path must be named; got: {}",
+            failure.feedback()
+        );
+        assert_eq!(
+            patched, original,
+            "Contract B: no block may be written when any block names an unsafe path"
+        );
+    }
+
+    /// [VANTA-WHY] M3 item T1. The same rule for a `..` component: a patch that
+    /// climbs out of the tree is refused as `unsafe_path`, and the block that
+    /// would have written a legitimate file is refused with it.
+    #[test]
+    fn a_patch_naming_a_parent_escape_fails_with_unsafe_path_and_writes_nothing() {
+        let original = HashMap::from([(
+            "calc.py".to_string(),
+            "def scale(x):\n    return x\n".to_string(),
+        )]);
+        let patch_text = concat!(
+            "===FILE: calc.py===\n",
+            "def scale(x):\n    return x * 2\n",
+            "===FILE: ../escape.py===\n",
+            "evil = True\n",
+        );
+        let (blocks, _trimmed) = crate::agents::creator::split_multi_file_patch(&patch_text, &[]);
+        assert_eq!(blocks.len(), 2, "both blocks must be recognised");
+
+        let (patched, failure) = match apply_patch_files_all_or_nothing(&original, &blocks) {
+            Ok(changed) => (changed, None),
+            Err(failure) => (original.clone(), Some(failure)),
+        };
+
+        let failure = failure.expect("a parent escape must fail the whole patch");
+        assert!(
+            matches!(failure, ApplyFailure::UnsafePath { .. }),
+            "expected UnsafePath; got {failure:?}"
+        );
+        assert!(
+            failure.feedback().starts_with("unsafe_path"),
+            "got: {}",
+            failure.feedback()
+        );
+        assert_eq!(
+            patched, original,
+            "Contract B: the escape fails every block, not just the offending one"
+        );
     }
 
     // ---- Q2: the paths a Creator patch introduces (record only) ----------------

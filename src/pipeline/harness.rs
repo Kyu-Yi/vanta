@@ -24,6 +24,7 @@ use crate::agents::attacker::GeneratedTest;
 use crate::agents::creator::SourceFile;
 use crate::core::TestResult;
 use crate::pipeline::candidate::TestCommand;
+use crate::pipeline::safe_path::confined_join;
 use crate::pipeline::suite_cache;
 use crate::sandbox::{Backend, ExecutionResult};
 
@@ -1153,7 +1154,12 @@ pub fn write_source_files(
     source_concat: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for (path, content) in parse_source_files(source_concat)? {
-        let out = root.join(&path);
+        // [VANTA-WHY] T1 — the `# FILE:` header carries a path the patch chose
+        // (via the apply's own map), and `root.join(path)` is a WRITE. Confine
+        // it: an absolute or escaping path cannot reach here through the apply,
+        // but the concatenation is also read back from a snapshot on the rerun
+        // path, so this is the lock on the tree the tests actually run in.
+        let out = confined_join(root, &path)?;
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1178,7 +1184,11 @@ pub fn write_tree_snapshot(
 
     let file_count = files.len();
     for (path, content) in &files {
-        let out = snapshot_root.join(path);
+        // [VANTA-WHY] T1 — CodeRabbit's flagged writer: `snapshot_root.join(path)`
+        // took the path from the concatenation verbatim and wrote it on the host.
+        // Confined like every other write; the root is created just above, so the
+        // containment check can resolve it.
+        let out = confined_join(snapshot_root, path)?;
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -2519,7 +2529,7 @@ mod tests {
         ruff_is_error_class, run_single_test, run_tests_parallel, seed_and_write,
         seed_and_write_from, seed_method, seed_root, seed_sandbox_from, seed_source_and_conftest,
         set_seed_root,
-        static_tool_runner, write_source_files,
+        static_tool_runner, write_source_files, write_tree_snapshot,
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::core::{TestIntent, TestResult};
@@ -2570,6 +2580,93 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("pkg/core.py")).unwrap(),
             "def add(a, b):\n    return a + b\n\n"
+        );
+    }
+
+    // ---- M3 item T1: a write site may not leave the tree root ----------------
+
+    /// [VANTA-WHY] M3 item T1. The `# FILE:` header carries a path the patch
+    /// chose, and `write_source_files` writes it on the host. A `..` component
+    /// must be refused as `unsafe_path`, and NOTHING may appear next to the tree.
+    #[test]
+    fn write_source_files_refuses_a_parent_escape_and_writes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+
+        let err = write_source_files(&root, "# FILE: ../escape.py\nevil = True\n")
+            .expect_err("a parent escape must be refused");
+
+        assert!(err.to_string().starts_with("unsafe_path"), "got: {err}");
+        assert!(
+            !base.path().join("escape.py").exists(),
+            "nothing may be written outside the tree root"
+        );
+        assert!(
+            root.read_dir().unwrap().next().is_none(),
+            "nothing at all is written when the patch is refused"
+        );
+    }
+
+    /// [VANTA-WHY] M3 item T1 — the same rule for an absolute path.
+    #[test]
+    fn write_source_files_refuses_an_absolute_path_and_writes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let outside = base.path().join("outside.py");
+        let source = format!("# FILE: {}\nevil = True\n", outside.display());
+
+        let err = write_source_files(&root, &source).expect_err("an absolute path must be refused");
+
+        assert!(err.to_string().starts_with("unsafe_path"), "got: {err}");
+        assert!(
+            !outside.exists(),
+            "nothing may be written outside the tree root"
+        );
+    }
+
+    /// [VANTA-WHY] M3 item T1. A path that stays lexically inside the root but
+    /// RESOLVES — through a symlink that already exists on disk — to somewhere
+    /// outside must be refused, and the file it would have written must not
+    /// exist. Only a resolve-then-contains check can catch this: every lexical
+    /// check passes, because `link/evil.py` has no `..` and is not absolute.
+    #[test]
+    fn write_source_files_refuses_a_symlink_escape_and_writes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let err = write_source_files(&root, "# FILE: link/evil.py\nevil = True\n")
+            .expect_err("a symlink escape must be refused");
+
+        assert!(err.to_string().starts_with("unsafe_path"), "got: {err}");
+        assert!(
+            !outside.join("evil.py").exists(),
+            "nothing may be written through an escaping symlink"
+        );
+    }
+
+    /// [VANTA-WHY] M3 item T1 — the writer CodeRabbit flagged. The snapshot
+    /// writer must refuse an absolute path exactly as `write_source_files` does,
+    /// and write no manifest or file for it.
+    #[test]
+    fn write_tree_snapshot_refuses_an_absolute_path_and_writes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("snap");
+        let outside = base.path().join("outside.py");
+        let source = format!("# FILE: {}\nevil = True\n", outside.display());
+
+        let err =
+            write_tree_snapshot(&root, &source).expect_err("an absolute path must be refused");
+
+        assert!(err.to_string().starts_with("unsafe_path"), "got: {err}");
+        assert!(
+            !outside.exists(),
+            "nothing may be written outside the tree root"
         );
     }
 

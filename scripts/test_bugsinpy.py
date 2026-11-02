@@ -6498,6 +6498,75 @@ class TestProbeXdist:
         assert not stale.exists(), "a stale package from a prior run must not survive"
         assert (dest / "xdist" / "__init__.py").is_file()
 
+    # -- the dry run (M3 item U10) ------------------------------------------
+    def _dry_report(self, **over) -> dict:
+        return self._report(
+            verdict=probe_xdist_mod.VERDICT_UNAVAILABLE,
+            note="dry run: the preflight resolved xdist and nothing was booted",
+            checkpoint="ckpt",
+            tree="worktrees/Demo_1/src_buggy",
+            command=["python", "-m", "pytest"],
+            xdist_args=["-n", "auto"],
+            timeout_secs=1800,
+            disk_mb=16384,
+            memory_mb=8192,
+            xdist={
+                "source": probe_xdist_mod.SOURCE_CHECKPOINT,
+                "version": "3.6.1",
+                "pytest": "8.0.2",
+            },
+            **over,
+        )
+
+    def test_a_dry_run_prints_the_plan_and_writes_nothing(self, tmp_path, capsys):
+        """[VANTA-WHY] M3 item U10 — the dry run is a pure read of the batch.
+
+        It resolves xdist and prints the plan, but must not leave a report behind:
+        without ``--report`` the operator asked for a look, not an artifact, and a
+        written ``<batch>/probe_xdist/<slug>-xdist.json`` would be indistinguishable
+        from one a real probe produced.
+        """
+        out_path = tmp_path / "probe_xdist" / "x-xdist.json"
+        args = probe_xdist_mod._parse_args(
+            ["--batch", str(tmp_path), "--bug", "Demo/1", "--dry-run"]
+        )
+        assert probe_xdist_mod._stop(self._dry_report(), out_path, args) == 0
+        assert not out_path.exists(), "a dry run must not write a report without --report"
+        printed = capsys.readouterr().out
+        assert "dry run" in printed
+        assert "-n auto" in printed
+        assert "3.6.1" in printed
+
+    def test_a_dry_run_with_report_writes_it(self, tmp_path):
+        out_path = tmp_path / "x-xdist.json"
+        args = probe_xdist_mod._parse_args(
+            [
+                "--batch",
+                str(tmp_path),
+                "--bug",
+                "Demo/1",
+                "--dry-run",
+                "--report",
+                str(out_path),
+            ]
+        )
+        assert probe_xdist_mod._stop(self._dry_report(), out_path, args) == 0
+        assert out_path.is_file()
+        written = json.loads(out_path.read_text(encoding="utf-8"))
+        assert written["verdict"] == probe_xdist_mod.VERDICT_UNAVAILABLE
+        assert written["note"].startswith("dry run:")
+
+    def test_an_early_exit_that_is_not_a_dry_run_still_writes_the_report(self, tmp_path):
+        """U10 suppresses the report only for a dry run; ``unavailable`` is a result."""
+        out_path = tmp_path / "x-xdist.json"
+        args = probe_xdist_mod._parse_args(["--batch", str(tmp_path), "--bug", "Demo/1"])
+        report = self._report(
+            verdict=probe_xdist_mod.VERDICT_UNAVAILABLE,
+            note="the checkpoint has no importable pytest-xdist",
+        )
+        assert probe_xdist_mod._stop(report, out_path, args) == 0
+        assert out_path.is_file()
+
     # -- preflight parsing --------------------------------------------------
     def test_parse_preflight_takes_the_last_marker_line(self):
         marker = probe_xdist_mod.PROBE_MARKER

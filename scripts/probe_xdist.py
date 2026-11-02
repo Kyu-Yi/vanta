@@ -79,6 +79,10 @@ One verdict line (``identical`` / ``not_identical`` / ``unavailable`` /
 ``<batch>/probe_xdist/<slug>-xdist.json``. Exit codes: ``0`` the probe produced a
 verdict (including ``unavailable``), ``2`` the probe could not get as far as a
 suite — no batch, no tree, no checkpoint.
+
+A ``--dry-run`` boots nothing and **writes no report** unless ``--report`` names one:
+it prints the resolved xdist details and the plan, so the batch is read and never
+touched.
 """
 
 from __future__ import annotations
@@ -389,6 +393,57 @@ def _finish(report: dict[str, Any], out_path: Path) -> int:
     return 0
 
 
+def _print_dry_run_plan(report: Mapping[str, Any], *, will_write: bool) -> None:
+    """Print what a dry run resolved, and what it would have run (M3 item U10).
+
+    Everything ``_finish`` would have recorded, minus the measurements only a boot can
+    produce: the checkpoint and tree, the command and the ``-n auto`` suffix, and the
+    xdist the preflight resolved with its source, version and staging directory. It is
+    the whole point of ``--dry-run`` — the operator sees the plan without the batch
+    being touched.
+    """
+    xdist = report.get("xdist") or {}
+    rows = [
+        ("checkpoint", report.get("checkpoint")),
+        ("tree", report.get("tree")),
+        ("command", " ".join(str(p) for p in report.get("command") or [])),
+        ("xdist args", " ".join(str(p) for p in report.get("xdist_args") or [])),
+        ("xdist source", xdist.get("source")),
+        ("xdist version", xdist.get("version")),
+        ("pytest", xdist.get("pytest")),
+        ("staging", xdist.get("staging") or "-"),
+        ("wheels", ", ".join(xdist.get("wheels") or []) or "-"),
+        ("timeout", f"{report.get('timeout_secs')}s"),
+        ("disk / memory", f"{report.get('disk_mb')}MB / {report.get('memory_mb')}MB"),
+    ]
+    print(f"probe-xdist dry run: {report.get('bug')}")
+    for name, value in rows:
+        print(f"  {name}: {value}")
+    if xdist.get("source") is None:
+        print(f"  plan: nothing — {report.get('note')}")
+    else:
+        print(
+            "  plan: run the suite serially, then again with the xdist args above, and "
+            "diff the two nodeid->outcome maps"
+        )
+    if not will_write:
+        print("  report: not written (pass --report to write one)")
+
+
+def _stop(report: dict[str, Any], out_path: Path, args: argparse.Namespace) -> int:
+    """End the probe without booting a suite — the report, or a dry run's plan.
+
+    M3 item U10: a ``--dry-run`` writes a report only when ``--report`` names one, so
+    the dry run stays a pure read of the batch. Every other early exit writes its
+    report exactly as before.
+    """
+    if args.dry_run:
+        _print_dry_run_plan(report, will_write=args.report is not None)
+        if args.report is None:
+            return 0
+    return _finish(report, out_path)
+
+
 def _resolve_xdist(
     args: argparse.Namespace,
     *,
@@ -560,12 +615,12 @@ def _run_bug(args: argparse.Namespace) -> int:
     if resolved["source"] is None:
         report["verdict"] = VERDICT_UNAVAILABLE
         report["note"] = str(resolved["reason"])
-        return _finish(report, out_path)
+        return _stop(report, out_path, args)
 
     if args.dry_run:
         report["verdict"] = VERDICT_UNAVAILABLE
         report["note"] = "dry run: the preflight resolved xdist and nothing was booted"
-        return _finish(report, out_path)
+        return _stop(report, out_path, args)
 
     print(
         f"probe-xdist {args.bug}: xdist {resolved.get('version')} from "
@@ -688,7 +743,10 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="resolve xdist and print the plan, booting no suite",
+        help=(
+            "resolve xdist, print the plan and exit, booting no suite. Writes no report "
+            "unless --report names one (item U10)"
+        ),
     )
     return parser.parse_args(argv)
 

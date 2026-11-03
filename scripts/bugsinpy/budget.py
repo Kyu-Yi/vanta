@@ -276,7 +276,18 @@ def host_used_memory_mb() -> Optional[int]:
     """
     try:
         completed = subprocess.run(
-            ["vm_stat"], capture_output=True, text=True, timeout=5, check=False
+            ["vm_stat"],
+            capture_output=True,
+            text=True,
+            # [VANTA-WHY] M3 item V4 — `vm_stat`'s output is decoded, and a byte
+            # that is not valid UTF-8 raises `UnicodeDecodeError`, which is a
+            # `ValueError` and so slips past the `except` below and takes the
+            # sampler's thread down. `errors="replace"` turns such a byte into
+            # U+FFFD, which this parser already treats as an unrecognised line:
+            # the reads stay best-effort, which is the contract of both probes.
+            errors="replace",
+            timeout=5,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -304,6 +315,11 @@ def host_live_vm_count() -> Optional[int]:
             ["ps", "-axo", "command="],
             capture_output=True,
             text=True,
+            # [VANTA-WHY] M3 item V4 — same as `vm_stat` above: a process command
+            # line can hold any byte, and decoding it strictly raises a
+            # `UnicodeDecodeError` (a `ValueError`) that the `except` below does
+            # not catch. Replacing undecodable bytes keeps the count best-effort.
+            errors="replace",
             timeout=5,
             check=False,
         )

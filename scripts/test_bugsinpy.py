@@ -27723,6 +27723,52 @@ class TestRunBatchLoop:
             watcher.join()
 
 
+class TestHostProbes:
+    """M3 item V4 — a host probe is best-effort and must not be able to raise.
+
+    ``host_used_memory_mb`` and ``host_live_vm_count`` decode a subprocess' output.
+    A byte that is not valid UTF-8 makes ``text=True`` raise ``UnicodeDecodeError``
+    — a ``ValueError``, which their ``except (OSError, subprocess.SubprocessError)``
+    does not catch — so the sampler's thread would die on the first such byte
+    instead of recording a missing sample. ``errors="replace"`` is what keeps the
+    contract of both probes: they return a number or ``None``, never raise.
+    """
+
+    @staticmethod
+    def _fake_run(monkeypatch, stdout: bytes, *, returncode=0) -> None:
+        """A ``subprocess.run`` that decodes its bytes the way the CALLER asked.
+
+        Strict decoding raises ``UnicodeDecodeError`` here exactly as it would on a
+        real host, so a probe that forgets ``errors="replace"`` fails the test
+        rather than a batch.
+        """
+
+        def run(argv, **kwargs):
+            text = kwargs.get("text") or kwargs.get("universal_newlines")
+            out: Any = stdout
+            if text:
+                out = stdout.decode("utf-8", errors=kwargs.get("errors", "strict"))
+            return subprocess.CompletedProcess(argv, returncode, stdout=out, stderr="")
+
+        monkeypatch.setattr(budget_mod.subprocess, "run", run)
+
+    def test_vm_stat_survives_a_byte_that_is_not_utf8(self, monkeypatch):
+        self._fake_run(
+            monkeypatch,
+            b"\xff\xfe page size of 4096 bytes\n"
+            b'"Anonymous pages":               300000.\n',
+        )
+        assert budget_mod.host_used_memory_mb() == 300000 * 4096 // (1024 * 1024)
+
+    def test_ps_survives_a_byte_that_is_not_utf8(self, monkeypatch):
+        self._fake_run(
+            monkeypatch,
+            b"\xff\xfe /usr/local/bin/shuru run --from chk\n"
+            b"/usr/bin/other --process\n",
+        )
+        assert budget_mod.host_live_vm_count() == 1
+
+
 class TestQueue:
     """M3 item 13 — the multi-bug queue: one owner, a shared cap, a stop, a resume.
 

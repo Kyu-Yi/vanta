@@ -41,6 +41,7 @@ from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -76,6 +77,7 @@ from bugsinpy import version_pin as version_pin_mod  # noqa: E402
 from bugsinpy.split import SplitError, load_split  # noqa: E402
 import analyse as analyse_mod  # noqa: E402
 import bugsinpy_run as run_mod  # noqa: E402
+import compare_batches as compare_batches_mod  # noqa: E402
 import probe_xdist as probe_xdist_mod  # noqa: E402
 
 SPLIT_PATH = REPO_ROOT / "plans" / "bugsinpy_split.json"
@@ -6588,6 +6590,338 @@ class TestProbeXdist:
     def test_parse_preflight_raises_without_a_marker(self):
         with pytest.raises(shuru_mod.ShuruError):
             probe_xdist_mod.parse_preflight("nothing here\n")
+
+
+class TestCompareBatches:
+    """M3 item S6 — the pandas/1 equivalence check's pure parts.
+
+    [VANTA-WHY] The gate before S5/S6 may be used for real is a comparison of two
+    batches produced by the *same build*: one serial reference, one parallel. The
+    comparison has one hard problem — the two batches are two ``run`` invocations,
+    so the model answered twice and the patches differ by construction — and the
+    whole shape of this module follows from solving it: only the tree-and-schedule
+    facts are comparable, a row's identity includes its candidate's bytes, and the
+    only rows whose label/oracle may be compared are the ones whose candidate bytes
+    match. These tests pin that rule plus the four things a difference *does* fail
+    on (a prepare nodeid, a matched row, a missing group, a time limit). Nothing
+    here boots a VM; every row is a hand-built dict in a ``tmp_path`` batch.
+    """
+
+    @staticmethod
+    def _oracle(**over: Any) -> dict[str, Any]:
+        base = {
+            "apply_ok": True,
+            "apply_outcome": "applied",
+            "hidden_pass": True,
+            "patch_good": True,
+            "inconclusive": False,
+            "suite_regressions_count": 0,
+            "hidden_outcomes": {"t::a": "passed"},
+        }
+        base.update(over)
+        return base
+
+    def _row(self, **over: Any) -> dict[str, Any]:
+        rec: dict[str, Any] = {
+            "bug": "pandas/1",
+            "config": "attack",
+            "mode": "repair",
+            "seed": 2,
+            "label": "true_approval",
+            "label_rule": "rule",
+            "label_reason": "reason",
+            "verdict": "Fixed",
+            "timed_out": False,
+            "native_timeout": False,
+            "stop_reason": "none",
+            "native_timeout_secs": 1647,
+            "deadline_secs": 10200,
+            "timings": {"run_s": 100.0},
+            "scheduler": None,
+            "oracle": self._oracle(),
+        }
+        rec.update(over)
+        return rec
+
+    @staticmethod
+    def _write_batch(batch_dir: Path, *, rows: list[dict[str, Any]], prepare: Any = None) -> None:
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        payload = prepare if prepare is not None else {
+            "bugs": [
+                {
+                    "bug": "pandas/1",
+                    "fail_to_pass": ["t::a"],
+                    "f2p_undeclared": [],
+                    "flaky_nodeids": [],
+                    "preexisting_failures": [],
+                    "native_failure_baseline": [],
+                    "collect_flip_nodeids": [],
+                    "native_skips_buggy": 0,
+                    "native_skips_fixed": 0,
+                    "pass_to_pass_count": 5,
+                    "native_green_on_vanta_tree": True,
+                    "prepare_mode": "none",
+                    "vm_memory_mb": 8192,
+                    "native_secs": 549.0,
+                }
+            ],
+        }
+        (batch_dir / "prepare.json").write_text(json.dumps(payload), encoding="utf-8")
+        manifest = manifest_mod.Manifest(batch_dir)
+        for row in rows:
+            manifest.append(row)
+
+    # -- identity -----------------------------------------------------------
+    def test_row_identity_is_the_job_key_without_the_batch(self):
+        # `manifest.job_key` embeds the batch dir's id, so two batches' keys can
+        # never be equal; the identity is every other component, in the same order.
+        key = manifest_mod.job_key(
+            batch_id="m3-eq-a", bug="pandas/1", config="attack", mode="repair", seed=2
+        )
+        assert key.startswith("m3-eq-a#pandas/1#attack#repair#2")
+        assert compare_batches_mod.row_identity(self._row()) == (
+            "pandas/1",
+            "attack",
+            "repair",
+            2,
+            "",
+        )
+
+    def test_a_review_rows_identity_carries_its_candidate_bytes(self):
+        a = self._row(mode="review", candidate={"patch_sha256": "aa"})
+        b = self._row(mode="review", candidate={"patch_sha256": "bb"})
+        assert compare_batches_mod.row_identity(a) != compare_batches_mod.row_identity(b)
+
+    def test_group_identity_drops_the_candidate(self):
+        a = self._row(mode="review", candidate={"patch_sha256": "aa"})
+        b = self._row(mode="review", candidate={"patch_sha256": "bb"})
+        assert compare_batches_mod.group_identity(a) == compare_batches_mod.group_identity(b)
+
+    def test_a_repair_row_has_no_candidate_sha(self):
+        assert compare_batches_mod.candidate_sha(self._row()) == ""
+
+    # -- the `stop_reason` sentinel ----------------------------------------
+    def test_a_row_that_ran_to_its_verdict_did_not_hit_a_limit(self):
+        # driver.rs writes `stop_reason="none"` (unwrap_or("none")); reading that as
+        # a hit would make every ordinary row look like a timeout.
+        assert compare_batches_mod._hit_a_time_limit(self._row()) is False
+
+    def test_each_real_time_limit_counts(self):
+        assert compare_batches_mod._hit_a_time_limit(self._row(timed_out=True)) is True
+        assert compare_batches_mod._hit_a_time_limit(self._row(native_timeout=True)) is True
+        assert compare_batches_mod._hit_a_time_limit(self._row(stop_reason="budget_exhausted")) is True
+
+    def test_the_scheduler_numbers_are_recorded_beside_the_flags(self):
+        a = self._row()
+        b = self._row(
+            scheduler={
+                "wall_s": 999.0,
+                "deadline_remaining_s": 12.0,
+                "peak_sandboxes": 3,
+                "provider_retries": 1,
+            }
+        )
+        left, right = compare_batches_mod._time_limits(a), compare_batches_mod._time_limits(b)
+        # the three flags agree...
+        assert all(left[name] == right[name] for name in compare_batches_mod.TIME_LIMIT_FLAGS)
+        # ...and the calibration numbers are recorded separately, never folded in
+        assert right["peak_sandboxes"] == 3
+        assert left["peak_sandboxes"] is None  # `--jobs 1` writes no scheduler block
+
+    # -- prepare ------------------------------------------------------------
+    def test_prepare_identical_when_the_nodeid_sets_match(self):
+        report = compare_batches_mod.compare_prepare(
+            self._prepare(), self._prepare(), ["pandas/1"]
+        )
+        assert report["identical"] is True
+        assert report["bugs"]["pandas/1"]["nodeid_differences"] == {}
+
+    def test_prepare_reports_a_nodeid_that_moved(self):
+        serial = self._prepare(fail_to_pass=["t::a", "t::b"])
+        parallel = self._prepare(fail_to_pass=["t::a"])
+        report = compare_batches_mod.compare_prepare(serial, parallel, ["pandas/1"])
+        assert report["identical"] is False
+        moved = report["bugs"]["pandas/1"]["nodeid_differences"]["fail_to_pass"]
+        assert moved == {"only_in_serial": ["t::b"], "only_in_parallel": []}
+
+    def test_prepare_records_timing_but_never_fails_on_it(self):
+        report = compare_batches_mod.compare_prepare(
+            self._prepare(native_secs=549.0), self._prepare(native_secs=1310.0), ["pandas/1"]
+        )
+        assert report["identical"] is True  # a slower prepare is not a difference
+        assert report["bugs"]["pandas/1"]["timing"]["native_secs"] == [549.0, 1310.0]
+
+    def test_prepare_names_a_bug_that_was_only_prepared_once(self):
+        report = compare_batches_mod.compare_prepare({"bugs": [{"bug": "pandas/1"}]}, {"bugs": []}, ["pandas/1"])
+        assert report["identical"] is False
+        assert "only one batch" in report["bugs"]["pandas/1"]["reason"]
+
+    @staticmethod
+    def _prepare(**over: Any) -> dict[str, Any]:
+        block = {
+            "bug": "pandas/1",
+            "fail_to_pass": ["t::a"],
+            "f2p_undeclared": [],
+            "flaky_nodeids": [],
+            "preexisting_failures": [],
+            "native_failure_baseline": [],
+            "collect_flip_nodeids": [],
+            "native_skips_buggy": 0,
+            "native_skips_fixed": 0,
+            "pass_to_pass_count": 5,
+            "native_green_on_vanta_tree": True,
+            "prepare_mode": "none",
+            "vm_memory_mb": 8192,
+            "native_secs": 549.0,
+        }
+        block.update(over)
+        return {"bugs": [block]}
+
+    # -- rows ---------------------------------------------------------------
+    def test_matched_rows_are_identical_when_everything_agrees(self):
+        report = compare_batches_mod.compare_rows([self._row()], [self._row()], {})
+        assert report["identical"] is True
+        assert len(report["matched"]) == 1
+        assert report["matched"][0]["identical"] is True
+
+    def test_a_matched_row_whose_label_moved_is_not_identical(self):
+        report = compare_batches_mod.compare_rows(
+            [self._row()], [self._row(label="true_reject")], {}
+        )
+        assert report["identical"] is False
+        assert report["matched"][0]["label_differences"]["label"] == [
+            "true_approval",
+            "true_reject",
+        ]
+
+    def test_a_matched_row_whose_hidden_outcome_moved_is_not_identical(self):
+        moved = self._row(oracle=self._oracle(hidden_outcomes={"t::a": "failed"}))
+        report = compare_batches_mod.compare_rows([self._row()], [moved], {})
+        assert report["identical"] is False
+        nodeids = report["matched"][0]["oracle"]["hidden_outcomes"]
+        assert nodeids["different_outcome"] == ["t::a"]
+
+    def test_differing_candidate_bytes_do_not_fail_the_gate(self):
+        # The two batches' review rows reviewed different patches. That is a fact
+        # about the model, not the scheduler, so it is reported but never a failure
+        # — the one rule that is satisfiable without a deterministic model.
+        serial = [self._row(mode="review", candidate={"patch_sha256": "aa"})]
+        parallel = [self._row(mode="review", candidate={"patch_sha256": "bb"}, label="true_reject")]
+        report = compare_batches_mod.compare_rows(serial, parallel, {})
+        assert report["missing_groups"] == []
+        assert report["matched"] == []
+        assert report["unmatched_candidates"]["only_in_serial"][0]["identity"][4] == "aa"
+        assert report["unmatched_candidates"]["only_in_parallel"][0]["label"] == "true_reject"
+        assert report["identical"] is True
+
+    def test_a_group_present_in_only_one_batch_fails(self):
+        report = compare_batches_mod.compare_rows([self._row()], [], {})
+        assert report["identical"] is False
+        assert report["missing_groups"] == [
+            {"identity": ["pandas/1", "attack", "repair", 2], "present_in": "serial"}
+        ]
+
+    def test_a_group_that_hit_a_limit_only_in_the_parallel_batch_fails(self):
+        serial = [self._row(seed=1)]
+        parallel = [self._row(seed=1, timed_out=True)]
+        report = compare_batches_mod.compare_rows(serial, parallel, {})
+        assert report["identical"] is False
+        groups = report["time_limit_differences"]["groups"]
+        assert groups[0]["parallel_rows_hitting_a_limit"] == 1
+        assert groups[0]["serial_rows_hitting_a_limit"] == 0
+
+    def test_the_serial_flaky_set_is_dropped_from_both_oracle_maps(self):
+        serial = [self._row(oracle=self._oracle(hidden_outcomes={"t::flaky": "failed"}))]
+        parallel = [self._row(oracle=self._oracle(hidden_outcomes={"t::flaky": "passed"}))]
+        report = compare_batches_mod.compare_rows(serial, parallel, {"pandas/1": {"t::flaky"}})
+        assert report["identical"] is True
+
+    # -- the whole thing ----------------------------------------------------
+    def test_compare_batches_end_to_end_is_identical(self, tmp_path):
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row()])
+        report = compare_batches_mod.compare_batches(serial, parallel)
+        assert report["verdict"] == "identical"
+        assert report["bugs"] == ["pandas/1"]
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 0
+
+    def test_compare_batches_end_to_end_reports_a_difference(self, tmp_path):
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row(native_timeout=True)])
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "not_identical"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 1
+
+    def test_the_report_is_written_beside_the_parallel_batch(self, tmp_path):
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row()])
+        assert compare_batches_mod.main(["--serial", str(serial), "--parallel", str(parallel)]) == 0
+        written = json.loads((parallel / "compare_batches.json").read_text(encoding="utf-8"))
+        assert written["verdict"] == "identical"
+
+    def test_an_unreadable_batch_is_exit_two(self, tmp_path):
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        code = compare_batches_mod.main(
+            ["--serial", str(tmp_path / "a"), "--parallel", str(tmp_path / "b"), "--no-report"]
+        )
+        assert code == 2
+
+    def test_a_missing_directory_raises_compare_error(self, tmp_path):
+        with pytest.raises(compare_batches_mod.CompareError):
+            compare_batches_mod.compare_batches(tmp_path / "nope", tmp_path)
+
+    # -- the verdict line ---------------------------------------------------
+    def test_verdict_line_names_the_bug_the_verdict_and_the_counts(self):
+        serial, parallel = Path("A"), Path("B")
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "identical",
+            "prepare": {"bugs": {"pandas/1": {"identical": True}}},
+            "rows": {"matched": [{"identical": True}], "time_limit_differences": {"groups": []}},
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert line.startswith("compare-batches pandas/1: identical")
+        assert "prepare_diffs=0" in line and "matched=1" in line and "time_limit_diffs=0" in line
+        assert "[" not in line
+        assert serial != parallel
+
+    def test_verdict_line_names_a_moved_prepare_field(self):
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "not_identical",
+            "prepare": {
+                "bugs": {
+                    "pandas/1": {
+                        "identical": False,
+                        "nodeid_differences": {"fail_to_pass": {}},
+                        "scalar_differences": {},
+                    }
+                }
+            },
+            "rows": {"matched": [], "time_limit_differences": {"groups": [{"identity": []}]}},
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert "prepare pandas/1:fail_to_pass" in line
+        assert "time limits: 1 group(s)" in line
+
+    def test_verdict_line_prints_a_bug_prepared_once_instead_of_raising(self):
+        # The `reason`-only block is the shape that most needs naming and the one a
+        # naive lookup would crash on.
+        prepare = compare_batches_mod.compare_prepare(
+            {"bugs": [{"bug": "pandas/1"}]}, {"bugs": []}, ["pandas/1"]
+        )
+        line = compare_batches_mod.verdict_line(
+            {"bugs": ["pandas/1"], "verdict": "not_identical", "prepare": prepare, "rows": {}}
+        )
+        assert "prepare_diffs=1" in line
+        assert "pandas/1" in line
 
 
 class TestSuiteCache:

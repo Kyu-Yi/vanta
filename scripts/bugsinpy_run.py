@@ -219,6 +219,38 @@ def render_plan(selected: list[tuple[dict[str, Any], bool]]) -> str:
 # ---------------------------------------------------------------------------
 # prepare
 # ---------------------------------------------------------------------------
+def cache_state_line(
+    *, checkpoints: Sequence[str], unstamped: Sequence[str]
+) -> str:
+    """One line stating whether the selected layers can key the suite cache.
+
+    [VANTA-WHY] M3 item U3 — the failure this guards against is silent. A layer whose
+    provenance carries no ``checkpoint_id`` makes ``suite._measure_suite`` answer
+    ``off:unknown_checkpoint``, so its suites are measured on every run and never reused,
+    while every other line of the batch looks normal. The state is therefore *stated* in
+    the summary rather than left to be inferred from a hit count of zero.
+    """
+    if suite_cache.cache_disabled():
+        return (
+            "Suite cache: OFF — --no-cache was passed; every suite is measured this run "
+            "(U2 still replaces an entry it could not use)."
+        )
+    if not checkpoints:
+        return "Suite cache: on — no layer is selected, so there is nothing to key."
+    if unstamped:
+        return (
+            f"Suite cache: OFF — {len(unstamped)} of {len(checkpoints)} selected layer(s) "
+            "carry no checkpoint_id, so no suite of theirs can be keyed or reused: "
+            + ", ".join(unstamped)
+            + ". Fix them once, without re-baking: "
+            "`python3 scripts/bugsinpy_run.py stamp-existing`."
+        )
+    return (
+        f"Suite cache: on — all {len(checkpoints)} selected layer(s) carry a "
+        "checkpoint_id."
+    )
+
+
 def cmd_prepare(args: argparse.Namespace) -> int:
     # Item 19 / Q3 — the frozen configuration, resolved exactly as `run` resolves
     # it and before anything else. `resolve` REFUSES the invocation when the
@@ -334,6 +366,29 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     missing_provenance = set(
         bake_mod.missing_deps(deps_dir, [entry["checkpoint"] for entry in selected_full])
     )
+    # M3 item U3 — a layer baked before the identity existed has a provenance file and no
+    # ``checkpoint_id``, so the suite cache answers ``off:unknown_checkpoint`` for every
+    # suite of it and reuses nothing. `prepare` does NOT fix that for itself: silently
+    # stamping a layer is exactly how a layer that changed would keep an identity it no
+    # longer deserves (the stamp is refused by a boot-verify, and only `stamp-existing`
+    # performs one). It names the layers, the command, and — below, in the summary — the
+    # cache state, so the cache can never be off without the batch saying so.
+    selected_checkpoints = [entry["checkpoint"] for entry in selected_full]
+    unstamped = bake_mod.unstamped_deps(deps_dir, selected_checkpoints)
+    cache_state = cache_state_line(
+        checkpoints=selected_checkpoints, unstamped=unstamped
+    )
+    if unstamped and not suite_cache.cache_disabled():
+        print(
+            f"WARNING: the suite cache is OFF for {len(unstamped)} layer(s) with no "
+            f"checkpoint_id: {', '.join(unstamped)}.\n"
+            "  Every suite run of those layers is measured and never reused. Fix them "
+            "once, without re-baking any of them:\n"
+            "    python3 scripts/bugsinpy_run.py stamp-existing\n"
+            "  then re-run this prepare.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     batch_dir: Path = (args.batch or (RUNS_DIR / f"prepare-{utc_stamp()}")).resolve()
     batch_dir.mkdir(parents=True, exist_ok=True)
@@ -427,7 +482,9 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         batch_dir, preps, n_ctx=n_ctx, n_ctx_source=n_ctx_source
     )
 
-    summary = prepare_mod.render_summary(preps, n_ctx=n_ctx, n_ctx_source=n_ctx_source)
+    summary = prepare_mod.render_summary(
+        preps, n_ctx=n_ctx, n_ctx_source=n_ctx_source, cache_state=cache_state
+    )
     (batch_dir / "prepare_summary.md").write_text(summary, encoding="utf-8")
     # The split is an input, never an output: how many bugs this run measured, and
     # which of them it rejected, belongs in the batch's own artifacts. Rehashing the
@@ -748,6 +805,93 @@ def cmd_bake(args: argparse.Namespace) -> int:
     report_flagged()
     print("bake complete", flush=True)
     return EXIT_BUG_FAILED if flagged else EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# stamp-existing — an identity for the layers baked before U3 (M3 item U3)
+# ---------------------------------------------------------------------------
+def render_stamp_table(outcomes: Sequence[bake_mod.StampOutcome]) -> str:
+    """One line per deps file: what it is, its identity, and what the boot said.
+
+    [VANTA-WHY] M3 item U3 — the digest is printed beside the identity so the reader can
+    check the invariant by hand (``checkpoint_id == sha256("<baked_at>\\x00<digest>")``),
+    and the two are truncated because they are the same 64 hex characters in every row
+    and the full values are in the files. ``baked`` versus ``stamped`` is the column that
+    says whether a layer's identity came from a bake or from this command, which is the
+    only way to tell a layer this step touched from one it skipped.
+    """
+    lines = [
+        "| project | checkpoint | checkpoint id | digest | baked/stamped | verify |",
+        "|---|---|---|---|---|---|",
+    ]
+    for outcome in outcomes:
+        lines.append(
+            "| {project} | {checkpoint} | {cid} | {digest} | {origin} | {verify} |".format(
+                project=outcome.project or "—",
+                checkpoint=outcome.checkpoint,
+                cid=(outcome.checkpoint_id[:12] + "…")
+                if outcome.checkpoint_id
+                else "—",
+                digest=(outcome.digest[:12] + "…") if outcome.digest else "—",
+                origin=outcome.origin,
+                verify=outcome.verify or "—",
+            )
+        )
+    return "\n".join(lines)
+
+
+def cmd_stamp_existing(args: argparse.Namespace) -> int:
+    """Give every layer baked before M3 item U3 an identity, without re-baking it.
+
+    The layers this fixes were baked before the stamp existed, so their provenance has no
+    ``checkpoint_id`` and the suite cache reads ``off:unknown_checkpoint`` for each of
+    them: every suite is measured and nothing is reused. Each layer is booted once,
+    read-only, and its marker and ``pip freeze`` are compared against the pins its
+    provenance records — a layer that no longer matches is *left unstamped* and reported,
+    not re-baked and not stopped for, so ``prepare`` keeps warning about it and its cache
+    stays off. ``prepare`` never does this for itself, on purpose: a stamp is an identity,
+    and handing one to a layer that changed is the failure the boot-verify exists to
+    refuse.
+
+    Writes exactly where ``bake.write_deps`` writes, in the same shape, so a layer's
+    identity is fixed from here on. A later re-bake of the same layer still gets a fresh
+    identity, because a bake never records the ``stamped_existing`` marker this step does.
+    """
+    deps_dir: Path = RUNS_DIR / "deps"
+    if not deps_dir.is_dir():
+        raise bake_mod.BakeError(
+            f"no dependency provenance directory at {deps_dir}: nothing has been baked "
+            "here, so there is no layer to stamp."
+        )
+    print(f"stamp-existing: {deps_dir}", flush=True)
+    outcomes = bake_mod.stamp_existing(deps_dir)
+    if not outcomes:
+        print("no deps files found — nothing to stamp.", flush=True)
+        return EXIT_OK
+    print(render_stamp_table(outcomes), flush=True)
+    stamped = [o for o in outcomes if o.action == "stamped"]
+    already = [o for o in outcomes if o.action == "already"]
+    refused = [o for o in outcomes if o.action == "refused"]
+    skipped = [o for o in outcomes if o.action == "not a layer's provenance"]
+    print(
+        f"\nstamped {len(stamped)}, already {len(already)}, refused {len(refused)}, "
+        f"not a layer {len(skipped)}",
+        flush=True,
+    )
+    if refused:
+        print(
+            "\nrefused layers were left exactly as they were, so `prepare` keeps warning "
+            "about them and their cache stays off. Re-bake them (their environment no "
+            "longer matches its record) or investigate the difference above.",
+            file=sys.stderr,
+            flush=True,
+        )
+    if stamped:
+        print(
+            "the suite cache can now key every stamped layer; re-run `prepare`.",
+            flush=True,
+        )
+    return EXIT_BUG_FAILED if refused else EXIT_OK
 
 
 def tree_cache(repo_cache: Path, project: str, url: str) -> Path:
@@ -2012,6 +2156,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     bake.set_defaults(func=cmd_bake)
+
+    stamp = sub.add_parser(
+        "stamp-existing",
+        help=(
+            "give every checkpoint baked before M3 item U3 its identity, without "
+            "re-baking it, so the suite cache can key on it"
+        ),
+    )
+    stamp.set_defaults(func=cmd_stamp_existing)
 
     run = sub.add_parser(
         "run",

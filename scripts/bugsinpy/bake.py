@@ -84,6 +84,7 @@ from .shuru import (
     checkpoint_create,
     checkpoint_delete,
     checkpoint_exists,
+    run as shuru_run,
     startup_check_lines,
 )
 from .split import Split, SplitError
@@ -10868,6 +10869,302 @@ def record_pip_check(
         json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     return path
+
+
+# ---------------------------------------------------------------------------
+# giving the layers baked before U3 an identity (M3 item U3, `stamp-existing`)
+# ---------------------------------------------------------------------------
+STAMPED_EXISTING_KEY = "stamped_existing"
+"""The provenance key saying an identity came from ``stamp-existing``, not from a bake.
+
+[VANTA-WHY] M3 item U3 gave every layer baked *after* it an identity and left every layer
+baked before it with none, so ``suite._measure_suite`` answered ``off:unknown_checkpoint``
+for all of them and the whole suite cache was inert: every suite with a checkpoint was
+measured again, in every batch, forever. Re-baking was the only way to give those layers a
+stamp, and a re-bake re-derives an environment that is already correct, minutes at a time.
+
+The key is deliberately **inside** the digested material — :func:`provenance_digest`
+excludes only the two stamp keys themselves and :data:`PIP_CHECK_KEY` — and that is what
+keeps the two ways of getting an identity from colliding: :func:`write_deps` never writes
+this key, so a bake of a stamped layer digests different material, cannot preserve
+``baked_at``, and gives the layer a fresh identity. A stamped identity therefore describes
+only the layer that was stamped, which is the whole of "any future rebake still gets a new
+one".
+"""
+
+PREFLIGHT_SUFFIX = ".preflight.json"
+"""The bake's pin-classification files, which sit in ``deps/`` and are not layers.
+
+Skipped by name when the directory is walked, and never the target of a stamp: a
+``.preflight.json`` is what the *bake* predicted before a layer existed, it holds no
+``installs``, and it has no identity to fix.
+"""
+
+LAYER_VERIFY_TIMEOUT_SECS = 300
+"""One boot-verify's budget. The marker probe uses the same 300 s (§3.2)."""
+
+VERIFY_MARKER_OK = "VANTA-VERIFY-MARKER-OK"
+"""Printed by :func:`boot_layer_probe` when the layer carries its ``touch`` marker."""
+
+VERIFY_MARKER_MISSING = "VANTA-VERIFY-MARKER-MISSING"
+"""Printed when it does not — the layer would have been deleted by its own bake."""
+
+VERIFY_FREEZE_MISSING = "VANTA-VERIFY-FREEZE-MISSING"
+"""Printed when the layer holds no ``pip freeze`` to compare against."""
+
+
+def was_stamped_existing(provenance: Mapping[str, Any]) -> bool:
+    """Whether a layer's identity came from ``stamp-existing`` rather than from a bake."""
+    return bool(provenance.get(STAMPED_EXISTING_KEY))
+
+
+def layer_deps_files(deps_dir: Path) -> list[Path]:
+    """The deps files that describe a baked layer, in name order.
+
+    ``*.preflight.json`` is skipped (:data:`PREFLIGHT_SUFFIX`): it is the bake's own
+    record of what it predicted, written before a layer existed and holding no
+    ``installs``, so it is not a layer and has no identity. What is left is one
+    provenance file per layer.
+    """
+    return sorted(
+        path
+        for path in deps_dir.glob("*.json")
+        if not path.name.endswith(PREFLIGHT_SUFFIX)
+    )
+
+
+def boot_layer_probe(checkpoint: str, *, disk_mb: int = BAKE_DISK_MB) -> ExecResult:
+    """Boot ``checkpoint`` once, read-only, and report its marker and its freeze.
+
+    [VANTA-WHY] The layer's own truth — ``/opt/vanta-deps-ok`` and
+    ``/opt/vanta-deps-freeze.txt`` (:data:`DEPS_FREEZE_OUTPUT`) — lives *inside* the
+    checkpoint and cannot be read without booting it, so a stamp that refuses to describe
+    a layer that changed has to boot it. One boot, two readings: the marker is echoed as a
+    sentinel and the freeze is ``cat``-ed after it, so a single VM start answers both
+    questions and a layer that has neither still reports which one it lost.
+
+    ``--disk-size`` is the disk the layer was *built* at (:data:`BAKE_DISK_MB`), so the
+    boot cannot be the thing that truncates it, and the mount is read-only with no host
+    writes: verifying a layer must not be able to change it. No ``--memory`` — reading a
+    file needs no more than shuru's own default. The boot's start-up guard prints on
+    stderr (``DEV_SHM_GUARD``), so ``stdout`` carries only these readings.
+    """
+    command = [
+        "sh",
+        "-c",
+        f"test -f {MARKER} && echo {VERIFY_MARKER_OK} || echo {VERIFY_MARKER_MISSING}",
+        "sh",
+        "-c",
+        f"cat {DEPS_FREEZE_OUTPUT} 2>/dev/null || echo {VERIFY_FREEZE_MISSING}",
+    ]
+    return shuru_run(
+        checkpoint=checkpoint,
+        host_root=Path.cwd(),
+        command=command,
+        disk_mb=disk_mb,
+        timeout_secs=LAYER_VERIFY_TIMEOUT_SECS,
+        allow_host_writes=False,
+    )
+
+
+def freeze_versions(lines: Iterable[str]) -> dict[str, str]:
+    """``{canonical name: version}`` for the distributions a ``pip freeze`` names.
+
+    Compared by canonical name because ``pip freeze`` spells a project per PEP 503
+    while a pin keeps the spelling its own file used (:func:`unpinned_freeze`).
+    """
+    out: dict[str, str] = {}
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith(("-", "#")):
+            continue
+        name = line.partition("==")[0].partition(" @ ")[0].strip()
+        if not name:
+            continue
+        out[canonicalize_name(name)] = line.partition("==")[2].strip()
+    return out
+
+
+def compare_layer(result: ExecResult, *, installs: Sequence[str]) -> tuple[bool, str]:
+    """Whether a boot-verify's readings match the layer's recorded installs.
+
+    ``(ok, detail)``, and ``detail`` is written for the refusal to be readable: it names
+    the marker, or each recorded pin the layer no longer carries and at what version it
+    carries it instead. "verification failed" would send a reader back to boot the layer
+    by hand to learn what this function already knew.
+    """
+    if not result.ok:
+        return False, (
+            f"the boot failed: exit={result.exit_code}"
+            + (" (timeout)" if result.timed_out else "")
+            + f"; stderr: {result.stderr.strip()[-400:] or '(empty)'}"
+        )
+    lines = [line.strip() for line in result.stdout.splitlines()]
+    if VERIFY_MARKER_MISSING in lines:
+        return False, f"the layer has no marker {MARKER}"
+    if VERIFY_MARKER_OK not in lines:
+        return False, (
+            "the boot reported neither the marker nor its absence; stdout: "
+            f"{result.stdout.strip()[-400:] or '(empty)'}"
+        )
+    if VERIFY_FREEZE_MISSING in lines:
+        return False, f"the layer has no {DEPS_FREEZE_OUTPUT}"
+    frozen = freeze_versions(
+        line for line in lines if line != VERIFY_MARKER_OK
+    )
+    differed: list[str] = []
+    for pin in installs:
+        name, _, version = pin.partition("==")
+        held = frozen.get(canonicalize_name(name.strip()))
+        if held is None:
+            differed.append(f"{pin} is not installed")
+        elif version and held != version:
+            differed.append(f"{pin} is installed at {name.strip()}=={held}")
+    if differed:
+        return False, (
+            "the layer no longer matches its recorded provenance: "
+            + "; ".join(differed)
+        )
+    return True, (
+        f"marker present; {len(installs)} recorded pin(s) at their recorded version"
+    )
+
+
+@dataclass(frozen=True)
+class StampOutcome:
+    """What ``stamp-existing`` did to one deps file, and why.
+
+    One record per file in the directory, in walk order, so the command's table is the
+    whole story and a reader can see a layer that was skipped or refused rather than
+    finding it simply absent.
+    """
+
+    checkpoint: str
+    project: str
+    action: str
+    """``stamped``, ``already``, ``not a layer's provenance`` or ``refused``."""
+
+    origin: str
+    """``baked`` or ``stamped`` for a layer that has an identity, else ``—``."""
+
+    checkpoint_id: str
+    digest: str
+    verify: str
+
+
+def unstamped_deps(deps_dir: Path, checkpoints: Sequence[str]) -> list[str]:
+    """The named layers whose provenance carries no identity, sorted.
+
+    [VANTA-WHY] ``prepare`` reports this rather than fixing it. A layer with a
+    provenance file and no ``checkpoint_id`` is a layer the suite cache cannot key on, so
+    every run of it measures instead of reusing — and the fix (a boot-verify and a stamp)
+    is deliberately *not* something ``prepare`` may do for itself, because a stamp applied
+    to a layer that changed would hand it an identity it no longer deserves. Naming the
+    layers and the command that fixes them is what keeps this from being silent.
+
+    A layer with no provenance at all is not listed: it has no record to stamp, and
+    ``prepare`` refuses it separately through :func:`missing_deps`.
+    """
+    out: list[str] = []
+    for name in checkpoints:
+        try:
+            data = json.loads(
+                deps_path(deps_dir, name).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict) or "installs" not in data:
+            continue
+        identity = data.get(CHECKPOINT_ID_KEY)
+        if not (isinstance(identity, str) and identity):
+            out.append(name)
+    return sorted(out)
+
+
+def stamp_existing(
+    deps_dir: Path, *, disk_mb: int = BAKE_DISK_MB
+) -> list[StampOutcome]:
+    """Give every unstamped layer an identity, without re-baking it (M3 item U3).
+
+    [VANTA-WHY] The layers this fixes were baked before the identity existed, so their
+    provenance has no ``checkpoint_id`` and the suite cache reads ``off:unknown_checkpoint``
+    for each of them. A re-bake would fix that and also re-derive the layer, which is
+    minutes per layer and changes nothing about the environment. This writes the identity
+    where :func:`write_deps` writes it, in the same shape, so from here on a layer's
+    identity is fixed — and a *later* re-bake of it still gets a fresh one, because this
+    run records :data:`STAMPED_EXISTING_KEY` and a bake never does.
+
+    The stamp is computed over the layer's provenance with that marker in it, through the
+    same :func:`stamp_provenance`, so ``checkpoint_id`` is
+    ``sha256("<baked_at>\\x00<digest>")`` exactly as a bake's is — and ``digest`` is the
+    digest of what the file now holds.
+
+    Refuses a layer whose boot-verify (:func:`compare_layer`) disagrees with its recorded
+    installs, and keeps going: one layer that changed is that layer's problem, and the
+    others still deserve an identity. A refused layer is left byte-for-byte as it was, so
+    ``prepare`` keeps warning about it and its cache stays off.
+    """
+    outcomes: list[StampOutcome] = []
+    for path in layer_deps_files(deps_dir):
+        checkpoint = path.stem
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, "", "not a layer's provenance", "—", "", "",
+                    f"unreadable: {exc}",
+                )
+            )
+            continue
+        if not isinstance(data, dict) or "installs" not in data:
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, "", "not a layer's provenance", "—", "", "",
+                    "no installs key: this is not dependency provenance",
+                )
+            )
+            continue
+        project = str(data.get("project") or "")
+        existing = data.get(CHECKPOINT_ID_KEY)
+        if isinstance(existing, str) and existing:
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, project, "already",
+                    "stamped" if was_stamped_existing(data) else "baked",
+                    existing, provenance_digest(data),
+                    "identity already recorded; left untouched",
+                )
+            )
+            continue
+        if not layer_exists(checkpoint):
+            outcomes.append(
+                StampOutcome(
+                    checkpoint, project, "refused", "—", "", "",
+                    f"no checkpoint named {checkpoint}",
+                )
+            )
+            continue
+        result = boot_layer_probe(checkpoint, disk_mb=disk_mb)
+        ok, detail = compare_layer(result, installs=tuple(data.get("installs") or ()))
+        if not ok:
+            outcomes.append(
+                StampOutcome(checkpoint, project, "refused", "—", "", "", detail)
+            )
+            continue
+        stamped = dict(data)
+        stamped[STAMPED_EXISTING_KEY] = True
+        stamped = stamp_provenance(stamped, previous=None)
+        path.write_text(
+            json.dumps(stamped, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        outcomes.append(
+            StampOutcome(
+                checkpoint, project, "stamped", "stamped",
+                stamped[CHECKPOINT_ID_KEY], provenance_digest(stamped), detail,
+            )
+        )
+    return outcomes
 
 
 def layer_pin(deps: Mapping[str, Any], name: str) -> Optional[str]:

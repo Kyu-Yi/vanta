@@ -2881,12 +2881,19 @@ def render_summary(
     *,
     n_ctx: Optional[int] = None,
     n_ctx_source: Optional[str] = None,
+    cache_state: Optional[str] = None,
 ) -> str:
     """The ``prepare`` console + ``prepare_summary.md`` table.
 
     The window is printed above the table (§1.6.1) because every ``context tok``
     below it is meaningless without it: the first full prepare sized against the
     65536 fallback and rejected two PySnooper bugs, and nothing in the table said so.
+
+    ``cache_state`` is one line the caller composes (``bugsinpy_run.cache_state_line``,
+    M3 item U3) saying whether every selected layer can key the suite cache. It rides
+    the summary for the same reason the window does: a layer with no ``checkpoint_id``
+    turns the cache off *silently* — every suite is measured and nothing is reused —
+    and a batch whose summary does not say so reads exactly like one whose cache is on.
     """
     lines: list[str] = []
     if n_ctx is not None:
@@ -2895,6 +2902,8 @@ def render_summary(
             "every verdict below was sized against this window.",
             "",
         ]
+    if cache_state is not None:
+        lines += [cache_state, ""]
     lines += [
         "| bug | role | wave | mode | verdict | F2P | collected | native fails | context tok | issue |",
         "|---|---|---|---|---|---|---|---|---|---|",

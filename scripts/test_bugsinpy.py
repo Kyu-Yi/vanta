@@ -20228,6 +20228,130 @@ class TestDependencyProvenance:
         with pytest.raises(bake_mod.BakeError, match="not dependency provenance"):
             bake_mod.load_deps(deps_dir, "vanta-bi-Demo-3")
 
+    # ---- giving the layers baked before U3 an identity (`stamp-existing`) ---
+    @staticmethod
+    def _verified(stdout: str):
+        """A boot-verify result, so these tests never boot a VM."""
+        return bake_mod.ExecResult(
+            stdout=stdout, stderr="", exit_code=0, timed_out=False
+        )
+
+    def test_stamp_existing_gives_a_legacy_layer_an_identity_without_rebaking(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item U3 — a layer baked before the stamp gains one where it stands.
+
+        The checkpoints that exist were baked before U3, so the whole suite cache read
+        ``off:unknown_checkpoint`` and nothing was ever reused. The stamp is the identity
+        a bake would have written, in the file a bake writes it to, so the layer keeps its
+        place; the boot-verify is faked because this is about the identity, not a sandbox.
+        """
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        legacy = {
+            "project": "Demo",
+            "installs": ["decorator==4.4.0"],
+            "import_name": "demo",
+        }
+        write(deps_dir / "chk.json", json.dumps(legacy))
+        write(deps_dir / "chk.preflight.json", json.dumps({"checkpoint": "chk"}))
+        write(deps_dir / "nothing.json", json.dumps({"import_name": "demo"}))
+
+        monkeypatch.setattr(bake_mod, "layer_exists", lambda name: True)
+        monkeypatch.setattr(
+            bake_mod,
+            "boot_layer_probe",
+            lambda checkpoint, *, disk_mb: self._verified(
+                f"{bake_mod.VERIFY_MARKER_OK}\ndecorator==4.4.0\npytest==6.2.5\n"
+            ),
+        )
+
+        outcomes = {o.checkpoint: o for o in bake_mod.stamp_existing(deps_dir)}
+
+        assert outcomes["chk"].action == "stamped"
+        assert outcomes["chk"].origin == "stamped"
+        assert "chk.preflight" not in outcomes, "a preflight record is not a layer"
+        assert outcomes["nothing"].action == "not a layer's provenance"
+
+        data = json.loads((deps_dir / "chk.json").read_text(encoding="utf-8"))
+        assert data[bake_mod.STAMPED_EXISTING_KEY] is True
+        assert data[bake_mod.CHECKPOINT_ID_KEY] == hashlib.sha256(
+            f"{data[bake_mod.BAKED_AT_KEY]}\x00{bake_mod.provenance_digest(data)}".encode(
+                "utf-8"
+            )
+        ).hexdigest(), "the identity is the stamped material's digest, as a bake's is"
+        assert outcomes["chk"].digest == bake_mod.provenance_digest(data)
+
+        monkeypatch.setattr(suite_cache_mod, "deps_dir", lambda: deps_dir)
+        assert suite_cache_mod.checkpoint_identity("chk") == data[bake_mod.CHECKPOINT_ID_KEY]
+        assert not bake_mod.unstamped_deps(deps_dir, ["chk"]), "the layer is stamped now"
+
+        # Idempotent: a second run is a no-op and does not move the identity.
+        again = {o.checkpoint: o for o in bake_mod.stamp_existing(deps_dir)}
+        assert again["chk"].action == "already"
+        assert again["chk"].origin == "stamped"
+        assert json.loads((deps_dir / "chk.json").read_text(encoding="utf-8")) == data
+
+        # A later bake of the SAME pins is a new identity: the marker is digested, so the
+        # bake's material differs, ``baked_at`` cannot be preserved, and the stamp is not
+        # the identity of the layer the bake just built.
+        rebaked = json.loads(
+            bake_mod.write_deps(deps_dir, self._layer("chk", legacy)).read_text(
+                encoding="utf-8"
+            )
+        )
+        assert bake_mod.STAMPED_EXISTING_KEY not in rebaked
+        assert rebaked[bake_mod.CHECKPOINT_ID_KEY] != data[bake_mod.CHECKPOINT_ID_KEY]
+
+    def test_stamp_existing_refuses_a_layer_that_no_longer_matches(
+        self, tmp_path, monkeypatch
+    ):
+        """The refusal is per layer, and a refused layer is left byte-for-byte alone.
+
+        A stamp is an identity, so handing one to a layer whose boot-verify disagrees
+        with its recorded pins is the one thing this step must not do — and one such
+        layer must not stop the others from being stamped.
+        """
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        prov = {"project": "Demo", "installs": ["decorator==4.4.0"]}
+        write(deps_dir / "changed.json", json.dumps(prov))
+        write(deps_dir / "fine.json", json.dumps(prov))
+        before = (deps_dir / "changed.json").read_text(encoding="utf-8")
+
+        monkeypatch.setattr(bake_mod, "layer_exists", lambda name: True)
+        monkeypatch.setattr(
+            bake_mod,
+            "boot_layer_probe",
+            lambda checkpoint, *, disk_mb: self._verified(
+                f"{bake_mod.VERIFY_MARKER_OK}\n"
+                + ("" if checkpoint == "changed" else "decorator==4.4.0\n")
+            ),
+        )
+
+        outcomes = {o.checkpoint: o for o in bake_mod.stamp_existing(deps_dir)}
+
+        assert outcomes["changed"].action == "refused"
+        assert "decorator==4.4.0 is not installed" in outcomes["changed"].verify
+        assert (deps_dir / "changed.json").read_text(encoding="utf-8") == before
+        assert bake_mod.unstamped_deps(deps_dir, ["changed"]) == ["changed"]
+        assert outcomes["fine"].action == "stamped"
+
+    def test_stamp_existing_refuses_a_layer_whose_marker_is_gone(self, tmp_path, monkeypatch):
+        """A missing marker is a refusal with its own sentence, not a generic failure."""
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        write(deps_dir / "chk.json", json.dumps({"installs": []}))
+        monkeypatch.setattr(bake_mod, "layer_exists", lambda name: True)
+        monkeypatch.setattr(
+            bake_mod,
+            "boot_layer_probe",
+            lambda checkpoint, *, disk_mb: self._verified(bake_mod.VERIFY_MARKER_MISSING),
+        )
+        [outcome] = bake_mod.stamp_existing(deps_dir)
+        assert outcome.action == "refused"
+        assert outcome.verify == f"the layer has no marker {bake_mod.MARKER}"
+
 
 needs_bare_repos = pytest.mark.skipif(
     not (REPO_ROOT / "runs" / "bugsinpy" / "repos" / "PySnooper.git").is_dir(),

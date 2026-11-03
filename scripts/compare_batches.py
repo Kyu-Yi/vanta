@@ -70,6 +70,10 @@ VERDICT
 oracle difference, no group present in only one batch, no time-limit difference
 (neither a matched row whose flags moved nor a group that hit a limit in the
 parallel batch where the serial batch did not), and no cache-isolation problem.
+It additionally requires that the comparison was not vacuous: at least one bug was
+wanted and at least one row existed across the two batches. Two batches that
+compared nothing (no ``prepare.json`` bugs, no rows) are ``not_identical``, never
+``identical`` — ``all([])`` is ``True``, and a gate must not pass on absence.
 
 USAGE (run from the repository root)
 ------------------------------------
@@ -731,6 +735,13 @@ def compare_batches(
         wanted = sorted(set(prepare_bugs(serial_prepare)) | set(prepare_bugs(parallel_prepare)))
     else:
         wanted = list(bugs)
+        # [VANTA-WHY] M3 item V2 — `--bug` must scope the ROWS half too. It scoped
+        # only `compare_prepare`, so `--bug pandas/1` still compared every other
+        # bug's rows and could answer `not_identical` for a difference in a bug the
+        # operator did not ask about.
+        in_scope = set(wanted)
+        serial_rows = [row for row in serial_rows if str(row.get("bug") or "") in in_scope]
+        parallel_rows = [row for row in parallel_rows if str(row.get("bug") or "") in in_scope]
 
     # The flaky set is the SERIAL batch's, per the spec ("apart from the tests the
     # serial pair marked flaky"), unioned with the parallel batch's so a nodeid
@@ -752,7 +763,23 @@ def compare_batches(
     rows = compare_rows(serial_rows, parallel_rows, excluded_by_bug)
     cache = compare_cache(serial_prepare, parallel_prepare, serial_rows, parallel_rows)
 
-    identical = bool(prepare["identical"] and rows["identical"] and cache["identical"])
+    # [VANTA-WHY] M3 item V2 — "identical" must mean "compared and equal", never
+    # "compared nothing". Every half folds with `all(...)`, and `all([])` is True,
+    # so two batches with no prepared bugs and no rows (a mistyped directory, a
+    # batch that never ran, a prepare that died before its first bug) used to read
+    # as `identical` — the one answer a gate must never give vacuously. Both halves
+    # must have had material to compare: at least one bug wanted, and at least one
+    # row across the two batches to match. A run whose review candidates all differ
+    # is unaffected: it has rows, and their disagreement is `unmatched_candidates`.
+    compared = {
+        "bugs": len(wanted),
+        "rows": len(serial_rows) + len(parallel_rows),
+        "matched_rows": len(rows["matched"]),
+        "ran": bool(wanted) and bool(serial_rows or parallel_rows),
+    }
+    identical = bool(
+        compared["ran"] and prepare["identical"] and rows["identical"] and cache["identical"]
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "serial": {
@@ -769,6 +796,7 @@ def compare_batches(
             "concurrency": row_concurrency(parallel_rows),
         },
         "bugs": wanted,
+        "compared": compared,
         "prepare": prepare,
         "cache": cache,
         "rows": rows,
@@ -838,6 +866,14 @@ def verdict_line(report: Mapping[str, Any], *, cap: int = 8) -> str:
     parallel_peak = ((report.get("parallel") or {}).get("concurrency") or {}).get("peak_cores")
     if serial_peak is not None or parallel_peak is not None:
         line += f" [rows peak: serial={serial_peak} parallel={parallel_peak}]"
+    # M3 item V2 — a `not_identical` that is really "nothing was compared" must say
+    # so, or the operator reads the gate's most alarming answer as a real finding.
+    compared = report.get("compared") or {}
+    if compared and not compared.get("ran", True):
+        line += (
+            f" [nothing compared: wanted={compared.get('bugs')} bug(s), "
+            f"{compared.get('rows')} row(s)]"
+        )
     return line
 
 
@@ -883,6 +919,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report = compare_batches(args.serial, args.parallel, bugs=args.bug)
     except CompareError as exc:
         print(f"compare-batches: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as exc:
+        # [VANTA-WHY] M3 item V2 — exit 1 means "the two batches differ" and nothing
+        # else, so a batch that could not be *read* must not share that code. A
+        # per-row permission error (`OSError`), a row whose `seed` is not an int and
+        # a manifest with a stray byte (`UnicodeDecodeError`, a `ValueError`) all
+        # used to escape `main` as an uncaught traceback and a non-zero status a
+        # caller could not tell from a real difference.
+        print(f"compare-batches: cannot read the batches: {exc!r}", file=sys.stderr)
         return 2
     print(verdict_line(report))
     if not args.no_report:

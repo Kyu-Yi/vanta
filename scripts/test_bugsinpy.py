@@ -7104,6 +7104,71 @@ class TestCompareBatches:
         with pytest.raises(compare_batches_mod.CompareError):
             compare_batches_mod.compare_batches(tmp_path / "nope", tmp_path)
 
+    # -- M3 item V2: a vacuous comparison is never "identical" --------------
+    def test_two_batches_with_nothing_to_compare_are_not_identical(self, tmp_path):
+        # `all([])` is True, so an empty `wanted` and an empty row set used to fold
+        # to `identical` — the one answer a gate must never give vacuously.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[], prepare={"bugs": []})
+        self._write_batch(parallel, rows=[], prepare={"bugs": []})
+
+        report = compare_batches_mod.compare_batches(serial, parallel)
+
+        assert report["compared"]["ran"] is False
+        assert report["verdict"] == "not_identical"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 1
+        assert "nothing compared" in compare_batches_mod.verdict_line(report)
+
+    def test_two_batches_that_recorded_no_rows_are_not_identical(self, tmp_path):
+        # Preparing a bug but running no row is a batch that failed early, not two
+        # batches that agreed; it must not read as `identical` either.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[])
+        self._write_batch(parallel, rows=[])
+
+        report = compare_batches_mod.compare_batches(serial, parallel)
+
+        assert report["compared"] == {"bugs": 1, "rows": 0, "matched_rows": 0, "ran": False}
+        assert report["verdict"] == "not_identical"
+
+    def test_the_bug_flag_scopes_the_rows_half(self, tmp_path):
+        # `--bug` scoped only `compare_prepare`, so the rows half still compared
+        # every other bug and could answer `not_identical` for a bug the operator
+        # never named.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row(), self._row(bug="other/2")])
+        self._write_batch(
+            parallel, rows=[self._row(), self._row(bug="other/2", native_timeout=True)]
+        )
+
+        scoped = compare_batches_mod.compare_batches(serial, parallel, bugs=["pandas/1"])
+        assert scoped["bugs"] == ["pandas/1"]
+        assert scoped["verdict"] == "identical"
+        # The unscoped run still sees the other bug's moved limit.
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "not_identical"
+
+    def test_a_row_whose_seed_is_not_an_int_is_exit_two(self, tmp_path):
+        # Exit 1 means "the batches differ"; an unreadable row must not share it.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row(seed="not-a-number")])
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 2
+
+    def test_a_manifest_with_a_stray_byte_is_exit_two(self, tmp_path):
+        # A `UnicodeDecodeError` is a `ValueError`; both are "cannot read", never 1.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row()])
+        with (parallel / "manifest.jsonl").open("ab") as handle:
+            handle.write(b"\xff\xfe not utf-8\n")
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 2
+
     # -- the verdict line ---------------------------------------------------
     def test_verdict_line_names_the_bug_the_verdict_and_the_counts(self):
         serial, parallel = Path("A"), Path("B")

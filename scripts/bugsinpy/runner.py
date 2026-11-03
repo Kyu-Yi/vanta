@@ -627,6 +627,17 @@ def vanta_env(
     # binary's argv is what it was before this key existed.
     if memory_mb is not None:
         env["VANTA_SHURU_MEMORY_MB"] = str(memory_mb)
+    else:
+        # [VANTA-WHY] M3 item X2 — a row that records no ``vm_memory_mb`` is charged
+        # the default VM (``budget.DEFAULT_VM_MEMORY_MB``), and the VM it boots must
+        # be that same size. Leaving an inherited ``VANTA_SHURU_MEMORY_MB`` in place
+        # would let ``src/sandbox/shuru.rs`` boot a bigger VM than the row was
+        # charged, so the child environment must not carry one. Removing it is safe
+        # because ``configs/v1-m3.toml`` does NOT freeze it — the key is [recorded],
+        # "set by runner.vanta_env ... absent = shuru's default" — so there is no
+        # frozen value here to preserve; if the file ever froze it, the charge would
+        # have to follow the frozen size instead (see the note above the key).
+        env.pop("VANTA_SHURU_MEMORY_MB", None)
     # [VANTA-WHY] M3 item U3 — WHICH layer this is, not merely which name it is
     # under. The name a re-bake reuses, so a key carrying only the name can serve a
     # measurement of a layer that no longer exists; the identity is the digest

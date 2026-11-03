@@ -26263,9 +26263,18 @@ class TestVantaEnv:
         [VANTA-WHY] The value is the row's (``prepare.vm_memory_mb``), threaded through
         the harness's own environment rather than a CLI knob, because the split entry --
         not the command line -- is what declares a per-project fact.
+
+        M3 item X2 — "records none" means the key is not merely left unset but taken
+        away: a row with no ``vm_memory_mb`` is charged the default VM, so an inherited
+        ``VANTA_SHURU_MEMORY_MB`` (a bigger size from the caller's shell) would boot a
+        VM larger than the row was charged. ``configs/v1-m3.toml`` does not freeze the
+        key, so removing it cannot drop a frozen value.
         """
         assert "VANTA_SHURU_MEMORY_MB" not in self._env()
         assert self._env(memory_mb=8192)["VANTA_SHURU_MEMORY_MB"] == "8192"
+        assert "VANTA_SHURU_MEMORY_MB" not in self._env(
+            base={"VANTA_SHURU_MEMORY_MB": "65536"}
+        ), "an inherited size must not reach a row that records none"
 
     def test_the_layers_identity_reaches_the_binary(self):
         """M3 item U3 — a cache key needs WHICH layer, not merely which name.
@@ -28157,6 +28166,27 @@ class TestRunBatchLoop:
             assert budget.row_charge_mb(absent) == 12 * 2048
         # A recorded size still prices as itself.
         assert budget.row_charge_mb(8192) == 12 * 8192
+
+    # -- M3 item X2: a suite-run booking prices an absent size too ---------
+    def test_a_suite_run_that_records_no_vm_memory_is_charged_the_default_vm(self):
+        """X2 — the V7 rule, on the SUITE-RUN reservation rather than the row.
+
+        ``_run_one_vm`` books one VM through ``Budget.slot(memory_mb=...)``; a run
+        with no recorded size passed ``None``, which reserved ``0`` while shuru booted
+        a 2048 MB VM. A concurrent ``prepare`` could therefore run more VMs than the
+        memory cap allowed and report a zero peak. An explicitly supplied value —
+        including the negative one ``_fits`` reads as "do not account memory" — is
+        unchanged.
+        """
+        budget = budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+        with budget.slot(memory_mb=None):
+            assert budget.peak_memory_mb == budget_mod.DEFAULT_VM_MEMORY_MB
+        with budget.slot(memory_mb=8192):
+            assert budget.peak_memory_mb == 8192
+        assert budget_mod.DEFAULT_VM_MEMORY_MB == shuru_mod.DEFAULT_RUN_MEMORY_MB
+        # An explicit non-positive value still means "do not account memory".
+        with budget.slot(memory_mb=-1):
+            assert budget.peak_memory_mb == 8192
 
     # -- M3 item V3: a raise outranks a stop -------------------------------
     def test_a_stored_worker_raise_outranks_a_stop_in_the_same_phase(

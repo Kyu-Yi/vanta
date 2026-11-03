@@ -215,9 +215,20 @@ class Budget:
         woken by the release that makes room. The ``finally`` release runs on an
         exception too — a VM that failed still gives its cores back — and every
         waiter is woken, so an exception cannot wedge the invocation.
+
+        [VANTA-WHY] M3 item X2 — the V7 rule, carried from the ROW charge to the
+        SUITE-RUN reservation. A run that records no ``memory_mb`` still boots a VM,
+        at ``shuru.DEFAULT_RUN_MEMORY_MB`` (``DEFAULT_VM_MEMORY_MB``), so it must
+        reserve that size rather than zero; charging ``None`` as ``0`` let a
+        concurrent ``prepare`` run more VMs than the memory cap allowed and report a
+        zero peak. An explicitly supplied value is unchanged, including the clamp of
+        a negative one to ``0`` — which :meth:`_fits` reads as "do not account memory
+        for this run", exactly as before.
         """
         want_cores = max(1, int(cores))
-        want_memory = 0 if memory_mb is None else max(0, int(memory_mb))
+        want_memory = (
+            DEFAULT_VM_MEMORY_MB if memory_mb is None else max(0, int(memory_mb))
+        )
         with self._cond:
             while not self._fits(want_cores, want_memory):
                 self._cond.wait()

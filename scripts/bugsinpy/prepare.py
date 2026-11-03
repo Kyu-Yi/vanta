@@ -814,6 +814,7 @@ def check_deps(
     checkpoint: str,
     batch_dir: Path,
     deps: dict[str, Any],
+    budget: Optional[budget_mod.Budget] = None,
 ) -> set[str]:
     """Prove the bug's layer can run its suite *before* the derivation spends it.
 
@@ -855,10 +856,11 @@ def check_deps(
             extra_env=env,
             memory_mb=prep.vm_memory_mb,
             precompile=prep.precompile,
+            budget=budget,
         )
     except suite_mod.SuiteError as exc:
         nodeids = _collect_flip_or_raise(
-            prep, exc, checkpoint=checkpoint, batch_dir=batch_dir, env=env
+            prep, exc, checkpoint=checkpoint, batch_dir=batch_dir, env=env, budget=budget
         )
 
     try:
@@ -872,6 +874,7 @@ def check_deps(
             extra_env=env,
             memory_mb=prep.vm_memory_mb,
             precompile=prep.precompile,
+            budget=budget,
         )
     except suite_mod.SuiteError as exc:
         raise suite_mod.SuiteError(
@@ -894,6 +897,7 @@ def _collect_flip_or_raise(
     checkpoint: str,
     batch_dir: Path,
     env: Optional[dict[str, str]],
+    budget: Optional[budget_mod.Budget] = None,
 ) -> set[str]:
     """The collect gate's second reading: the error is a collect-flip, so re-run.
 
@@ -910,7 +914,7 @@ def _collect_flip_or_raise(
     what passes is a clean collection rather than a filtered error list.
     """
     flips, nodeids, errors = detect_collect_flip(
-        prep, checkpoint=checkpoint, batch_dir=batch_dir, env=env
+        prep, checkpoint=checkpoint, batch_dir=batch_dir, env=env, budget=budget
     )
     unexplained = {file: err for file, err in errors.items() if file not in flips}
     if not flips or unexplained:
@@ -928,6 +932,7 @@ def _collect_flip_or_raise(
         ignore=sorted(flips),
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        budget=budget,
     )
 
 
@@ -937,6 +942,7 @@ def detect_collect_flip(
     checkpoint: str,
     batch_dir: Path,
     env: Optional[dict[str, str]] = None,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> tuple[dict[str, str], list[str], dict[str, str]]:
     """Fixed-commit test files that error on the buggy source and collect on the fixed one.
 
@@ -979,6 +985,7 @@ def detect_collect_flip(
         extra_env=env,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        budget=budget,
     )
     if not buggy.errors:
         return {}, [], {}
@@ -992,6 +999,7 @@ def detect_collect_flip(
         extra_env=env,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        budget=budget,
     )
     fixed_by_file = suite_mod.collect_by_file(sorted(fixed.nodeids))
     flips = {
@@ -1037,7 +1045,12 @@ def setup_args_for(pythonpath: Optional[str]) -> tuple[str, ...]:
 
 
 def build_trees_in_place(
-    prep: BugPrep, *, checkpoint: str, batch_dir: Path, repo: Path
+    prep: BugPrep,
+    *,
+    checkpoint: str,
+    batch_dir: Path,
+    repo: Path,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> None:
     """Build each of the bug's trees in the layer, and record what happened.
 
@@ -1099,6 +1112,9 @@ def build_trees_in_place(
     # so the name is carried in beside it. The relative path inside the clone is the
     # same, so ``build_env``'s own ``/workspace/<name>`` still resolves.
     carry = tuple(sorted(prep.build_files))
+    # M3 item Y1 — each build's VM holds one slot of the invocation's budget while it
+    # boots (suite.build_tree_in_place), so a concurrent prepare prices them like the
+    # suite runs they sit beside; without a budget they boot as they always did.
     for tree_name in BUILD_TREES:
         fingerprint = suite_mod.build_tree_in_place(
             checkpoint=checkpoint,
@@ -1110,6 +1126,7 @@ def build_trees_in_place(
             env=env,
             memory_mb=prep.vm_memory_mb,
             carry=carry,
+            budget=budget,
         )
         prep.builds[tree_name] = f"built: {command}"
         # The VM built the tree and the host adopted it (item V8/Q1); the adopted
@@ -2752,7 +2769,11 @@ def prepare_one(
     # prevent — a missing *extension* reported as a missing *dependency*.
     try:
         build_trees_in_place(
-            prep, checkpoint=checkpoint, batch_dir=batch_dir, repo=repo_cache
+            prep,
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            repo=repo_cache,
+            budget=budget,
         )
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(str(exc))
@@ -2761,7 +2782,11 @@ def prepare_one(
 
     try:
         collected = check_deps(
-            prep, checkpoint=checkpoint, batch_dir=batch_dir, deps=deps
+            prep,
+            checkpoint=checkpoint,
+            batch_dir=batch_dir,
+            deps=deps,
+            budget=budget,
         )
     except suite_mod.SuiteError as exc:
         prep.gate_failures.append(str(exc))

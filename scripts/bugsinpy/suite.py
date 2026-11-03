@@ -1522,6 +1522,7 @@ def collect_report(
     extra_env: Optional[dict[str, str]] = None,
     memory_mb: Optional[int] = None,
     precompile: Sequence[str] = (),
+    budget: Optional[budget_mod.Budget] = None,
 ) -> CollectionReport:
     """Collect the whole suite, reporting every error instead of stopping at one.
 
@@ -1545,7 +1546,9 @@ def collect_report(
     env = {"PYTHONDONTWRITEBYTECODE": "1"}
     if extra_env:
         env.update(extra_env)
-    with VmRoot(batch_dir=batch_dir, tree_rel=tree_rel) as root:
+    # M3 item Y1 — the collection VM holds one budget slot, like every other run's.
+    gate = budget.slot(memory_mb=memory_mb) if budget is not None else nullcontext()
+    with gate, VmRoot(batch_dir=batch_dir, tree_rel=tree_rel) as root:
         result = shuru.run(
             checkpoint=checkpoint,
             host_root=root.host,
@@ -1606,6 +1609,7 @@ def build_tree_in_place(
     timeout_secs: int = DEFAULT_BUILD_TIMEOUT_SECS,
     memory_mb: Optional[int] = None,
     carry: Sequence[str] = (),
+    budget: Optional[budget_mod.Budget] = None,
 ) -> str:
     """``python setup.py <setup_args>`` in the tree, inside the layer's VM.
 
@@ -1651,7 +1655,12 @@ def build_tree_in_place(
     if env:
         env_full.update(env)
     where = guest_tree_root(tree_rel)
-    with VmRoot(batch_dir=batch_dir, tree_rel=tree_rel, carry=carry) as root:
+    # [VANTA-WHY] M3 item Y1 — the build's VM is one VM, so it holds one slot of the
+    # invocation's budget exactly as a suite run does; a build that ran outside the
+    # budget would let a concurrent prepare boot more VMs than the cap admits. Without
+    # a budget (a test, `pool`, a serial prepare) it boots as it always did.
+    gate = budget.slot(memory_mb=memory_mb) if budget is not None else nullcontext()
+    with gate, VmRoot(batch_dir=batch_dir, tree_rel=tree_rel, carry=carry) as root:
         result = shuru.run(
             checkpoint=checkpoint,
             host_root=root.host,
@@ -1687,6 +1696,7 @@ def collect_only(
     ignore: Sequence[str] = (),
     memory_mb: Optional[int] = None,
     precompile: Sequence[str] = (),
+    budget: Optional[budget_mod.Budget] = None,
 ) -> set[str]:
     """``pytest --collect-only -q`` — the collectability gate (§3.4).
 
@@ -1718,7 +1728,9 @@ def collect_only(
     env = {"PYTHONDONTWRITEBYTECODE": "1"}
     if extra_env:
         env.update(extra_env)
-    with VmRoot(batch_dir=batch_dir, tree_rel=tree_rel) as root:
+    # M3 item Y1 — the gate's VM holds one budget slot, like every other run's.
+    gate = budget.slot(memory_mb=memory_mb) if budget is not None else nullcontext()
+    with gate, VmRoot(batch_dir=batch_dir, tree_rel=tree_rel) as root:
         result = shuru.run(
             checkpoint=checkpoint,
             host_root=root.host,
@@ -1759,6 +1771,7 @@ def import_probe(
     extra_env: Optional[dict[str, str]] = None,
     memory_mb: Optional[int] = None,
     precompile: Sequence[str] = (),
+    budget: Optional[budget_mod.Budget] = None,
 ) -> str:
     """``import <module>; print(<module>.__file__)``, run exactly as the suites run.
 
@@ -1792,7 +1805,9 @@ def import_probe(
     env = {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"}
     if extra_env:
         env.update(extra_env)
-    with VmRoot(batch_dir=batch_dir, tree_rel=tree_rel) as root:
+    # M3 item Y1 — the probe's VM holds one budget slot, like every other run's.
+    gate = budget.slot(memory_mb=memory_mb) if budget is not None else nullcontext()
+    with gate, VmRoot(batch_dir=batch_dir, tree_rel=tree_rel) as root:
         result = shuru.run(
             checkpoint=checkpoint,
             host_root=root.host,

@@ -21269,6 +21269,38 @@ class TestDepGate:
                 deps=self._deps(),
             )
 
+    def test_the_budget_reaches_the_gate_vms(self, tmp_path, monkeypatch):
+        """M3 item Y1 — the collect gate and the import probe are priced too.
+
+        Both boot a VM, so both are handed the invocation's budget; a gate that ran
+        outside it would make ``--prepare-jobs`` a claim about fewer VMs than the
+        machine was actually running.
+        """
+        seen: dict = {}
+        monkeypatch.setattr(
+            suite_mod,
+            "collect_only",
+            lambda **kwargs: seen.update(collect=kwargs) or {"tests/test_x.py::test_a"},
+        )
+        monkeypatch.setattr(
+            suite_mod,
+            "import_probe",
+            lambda **kwargs: seen.update(probe=kwargs)
+            or "/workspace/worktrees/Demo_1/oracle_tree/pysnooper/__init__.py",
+        )
+        budget = budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+
+        prepare_mod.check_deps(
+            self._prep(tmp_path),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            deps=self._deps(),
+            budget=budget,
+        )
+
+        assert seen["collect"]["budget"] is budget
+        assert seen["probe"]["budget"] is budget
+
     def test_the_derivation_reuses_the_gate_s_collection(self, tmp_path, monkeypatch):
         """Two collections of one tree are two chances to disagree."""
         calls: list = []
@@ -21457,6 +21489,33 @@ class TestBuildTreesInPlace:
             "src_buggy": "built: python setup.py build_ext --inplace",
             "src_fixed": "built: python setup.py build_ext --inplace",
         }
+
+    def test_the_budget_reaches_every_build_vm(self, tmp_path, monkeypatch):
+        """M3 item Y1 — each tree's build VM holds a slot of the one scheduler.
+
+        A build boots a VM exactly as a suite run does; without the budget a
+        concurrent ``prepare`` would boot its builds beside the runs the cap was
+        counting, so every ``build_tree_in_place`` call is handed the budget.
+        """
+        calls: list = []
+        monkeypatch.setattr(
+            suite_mod,
+            "build_tree_in_place",
+            lambda **kwargs: calls.append(kwargs),
+        )
+        self._rule(monkeypatch, needed=True)
+        budget = budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+
+        prepare_mod.build_trees_in_place(
+            self._prep(tmp_path),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            repo=tmp_path / "clone",
+            budget=budget,
+        )
+
+        assert len(calls) == 3, "the three independent trees are each built"
+        assert all(call["budget"] is budget for call in calls)
 
     def test_the_layers_own_compiler_environment_reaches_the_build(self, tmp_path, monkeypatch):
         seen: dict = {}
@@ -21961,6 +22020,32 @@ class TestCollectFlip:
         assert flips == {}
         assert errors == {"tests/test_gone.py": "ImportError: a"}
 
+    def test_the_budget_reaches_both_collection_vms(self, tmp_path, monkeypatch):
+        """M3 item Y1 — both readings of the flip are priced by the one scheduler.
+
+        Two collection VMs that booted outside the budget would let a concurrent
+        ``prepare`` run more VMs than ``--prepare-jobs`` admits, so the budget is
+        handed to both ``collect_report`` calls.
+        """
+        seen: list = []
+        self._collect_report(
+            monkeypatch,
+            seen,
+            buggy_errors={"tests/test_flip.py": "TypeError: a"},
+            fixed=self._report([], {}),
+        )
+        budget = budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+
+        prepare_mod.detect_collect_flip(
+            self._prep(tmp_path),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            budget=budget,
+        )
+
+        assert len(seen) == 2, "the buggy tree errored, so the fixed tree is read too"
+        assert [call["budget"] for call in seen] == [budget, budget]
+
 
 class TestCollectFlipGate:
     """``check_deps``'s second reading: the recorded flip makes the gate pass cleanly."""
@@ -22248,6 +22333,116 @@ class TestSandboxEnvReachesEveryRun:
         assert "--continue-on-collection-errors" in seen["command"][2]
         assert report.nodeids == {"tests/x.py::t"}
         assert report.exit_code == 2
+
+
+class TestGateVmsHoldTheBudgetSlot:
+    """M3 item Y1 — the VMs that are not suite runs are priced by the same scheduler.
+
+    ``Budget`` counts suite runs (``suite._run_one_vm``); everything else a
+    ``prepare`` boots — a tree's build, the collect gate, the import probe, the
+    collect-flip's two reports — was outside it, so ``--prepare-jobs`` capped
+    fewer VMs than were actually live. Each of those four functions now holds one
+    slot of the invocation's budget for the life of its VM, exactly as a suite run
+    does. The tests below watch the budget *from inside the boot*, which is the
+    only moment the claim is about: the slot is held while ``shuru.run`` is up and
+    released when it returns.
+    """
+
+    @staticmethod
+    def _result(**over) -> shuru_mod.ExecResult:
+        base = dict(stdout="tests/x.py::t\n", stderr="", exit_code=0, timed_out=False)
+        base.update(over)
+        return shuru_mod.ExecResult(**base)
+
+    @staticmethod
+    def _batch(tmp_path: Path) -> Path:
+        """A real batch dir with a real tree (:class:`suite_mod.VmRoot` clones it)."""
+        batch_dir = tmp_path / "batch"
+        tree = batch_dir / "w" / "Demo_1" / "oracle_tree"
+        tree.mkdir(parents=True)
+        (tree / "setup.py").write_text("", encoding="utf-8")
+        return batch_dir
+
+    def _hooked_slot(self, monkeypatch, taken, live):
+        """Record every slot a VM asks for, and whether it is held during the boot."""
+        real_slot = budget_mod.Budget.slot
+
+        @contextmanager
+        def hooked_slot(self, *, memory_mb=None, cores=1):
+            with real_slot(self, memory_mb=memory_mb, cores=cores):
+                taken.append((cores, memory_mb))
+                live.append(1)
+                yield
+                live.pop()
+
+        monkeypatch.setattr(budget_mod.Budget, "slot", hooked_slot)
+
+    def test_each_gate_vm_holds_its_own_slot_while_it_boots(self, monkeypatch, tmp_path):
+        budget = budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+        taken: list = []
+        live: list = []
+        self._hooked_slot(monkeypatch, taken, live)
+        here = self._batch(tmp_path)
+
+        def run(**kwargs):
+            # The boot is *inside* the slot: the VM is up while the charge is held.
+            assert live == [1], "shuru.run was booted outside the budget slot"
+            return self._result()
+
+        monkeypatch.setattr(suite_mod.shuru, "run", run)
+
+        suite_mod.build_tree_in_place(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            python="python", setup_args=("build_ext", "--inplace"), disk_mb=1024,
+            memory_mb=4096, budget=budget,
+        )
+        suite_mod.collect_only(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
+            memory_mb=2048, budget=budget,
+        )
+        suite_mod.import_probe(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            test_cmd=["python", "-m", "pytest", "tests"], module="demo",
+            disk_mb=1024, memory_mb=1024, budget=budget,
+        )
+        suite_mod.collect_report(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
+            memory_mb=8192, budget=budget,
+        )
+
+        # Each VM asked for exactly its own charge, one core and its own memory.
+        assert taken == [(1, 4096), (1, 2048), (1, 1024), (1, 8192)]
+        # And each released it, so the budget was empty again for the next boot.
+        assert live == []
+        assert budget.peak_cores == 1
+        assert budget.peak_memory_mb == 8192
+
+    def test_a_gate_vm_with_no_budget_boots_as_it_always_did(self, monkeypatch, tmp_path):
+        """The serial path — a test, ``pool``, a one-core prepare — is unchanged."""
+        taken: list = []
+        live: list = []
+        self._hooked_slot(monkeypatch, taken, live)
+        seen: list = []
+        monkeypatch.setattr(
+            suite_mod.shuru, "run", lambda **kwargs: seen.append(kwargs) or self._result()
+        )
+        here = self._batch(tmp_path)
+
+        suite_mod.build_tree_in_place(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            python="python", setup_args=("build_ext", "--inplace"), disk_mb=1024,
+            memory_mb=4096,
+        )
+        suite_mod.collect_only(
+            checkpoint="chk", batch_dir=here, tree_rel="w/Demo_1/oracle_tree",
+            test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
+            memory_mb=2048,
+        )
+
+        assert len(seen) == 2, "both VMs booted without a scheduler"
+        assert taken == [] and live == [], "no budget, so no slot was ever taken"
 
 
 class TestVmRootIsolation:

@@ -22208,8 +22208,46 @@ class TestVmRootIsolation:
         assert suite_cache_mod.tree_fingerprint(batch / self.TREE) == pristine, (
             "the run's writes reached the host's tree"
         )
-        assert not (batch / suite_mod.VM_ROOT_DIR).exists(), (
-            "the .vm_roots holder disappears with the last root"
+        holder = batch / suite_mod.VM_ROOT_DIR
+        assert holder.is_dir() and not list(holder.iterdir()), (
+            "each run's clone is deleted; the empty .vm_roots holder itself now "
+            "stays (item X1: removing it raced a sibling's mkdir/mkdtemp)"
+        )
+
+    def test_two_roots_entering_and_discarding_concurrently_never_collide(self, tmp_path):
+        """Item X1 — a sibling's cleanup must not remove the shared holder.
+
+        ``__enter__`` creates the ``.vm_roots`` holder and then ``mkdtemp``s inside it
+        as two steps with no lock, so a ``discard`` that ``rmdir``ed the holder
+        whenever it happened to be empty could delete it between the two and make
+        ``mkdtemp`` raise ``FileNotFoundError`` — an ``OSError``, not a ``SuiteError``,
+        so ``prepare`` (which catches only ``SuiteError``) never recorded it as a gate
+        failure while the pool re-raised it and stopped the whole batch. The fix is to
+        stop removing the holder, so this drives two roots in a tight loop and requires
+        that no attempt ever raises.
+        """
+        batch = self._batch(tmp_path)
+        errors: list = []
+        barrier = threading.Barrier(2)
+
+        def worker() -> None:
+            try:
+                barrier.wait(timeout=10)
+                for _ in range(200):
+                    with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE):
+                        pass
+            except Exception as exc:  # noqa: BLE001 — recorded, asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert not errors, f"a concurrent VmRoot raised: {errors!r}"
+        holder = batch / suite_mod.VM_ROOT_DIR
+        assert holder.is_dir() and not list(holder.iterdir()), (
+            "every clone is gone and one empty holder remains"
         )
 
     def test_a_carried_path_is_a_copy_so_a_write_to_it_never_reaches_the_batch(self, tmp_path):

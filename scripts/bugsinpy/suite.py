@@ -666,19 +666,24 @@ class VmRoot:
         return self.path
 
     def discard(self) -> None:
-        """Delete the whole root. Called by ``__exit__``; safe to call again."""
+        """Delete this run's root. Called by ``__exit__``; safe to call again.
+
+        [VANTA-WHY] M3 item X1. The ``.vm_roots`` holder itself is NOT removed.
+        ``__enter__`` creates the holder and then ``mkdtemp``s inside it as two
+        steps with no lock, so a sibling's ``discard`` that ``rmdir``ed the holder
+        whenever it happened to be the only root left could delete it between the
+        two — and ``mkdtemp`` then raised ``FileNotFoundError``. That is an
+        ``OSError``, not a ``SuiteError``, so the callers that catch only
+        ``SuiteError`` (:func:`prepare`) never recorded it as a gate failure and it
+        escaped the bug, while the pool stored and re-raised it and stopped the whole
+        batch. An empty holder left in the batch is harmless, so the removal is the
+        thing to drop, not the creation to synchronise. Each run's own clone is still
+        deleted here.
+        """
         if self.path is None:
             return
         shutil.rmtree(self.path, ignore_errors=True)
         self.path = None
-        try:
-            # The holder disappears when it is empty, so a finished run leaves the
-            # batch exactly as it found it. Under concurrency a sibling root is
-            # usually still there and this fails harmlessly; the last one out removes
-            # it.
-            (self.batch_dir / VM_ROOT_DIR).rmdir()
-        except OSError:
-            pass
 
     def lift_outputs(self) -> None:
         """Copy this VM's declared outputs back to the host, after checking them.

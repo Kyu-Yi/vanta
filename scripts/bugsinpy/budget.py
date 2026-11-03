@@ -82,6 +82,20 @@ the default over-charges a small row and never under-charges a large one; every
 row records the peak it actually reached so the number can be tuned down later.
 """
 
+DEFAULT_VM_MEMORY_MB = 2048
+"""M3 item V7 — the memory one VM costs a row that records no ``vm_memory_mb``.
+
+[VANTA-WHY] This is ``shuru.DEFAULT_RUN_MEMORY_MB``: the size a run VM boots at
+when a bug's split records no ``vm_memory_mb``. A row that records nothing is not
+a row that costs nothing — it boots VMs at this size — so charging ``peak_vms × 0``
+would make the least-documented rows the cheapest to run beside each other, which
+is the opposite of what a conservative scheduler is for. ``split.validate`` refuses
+a recorded size at or below this, so "recorded nothing" and "recorded the default"
+are the same VM in practice. The constant is mirrored here the way
+``split.VM_MEMORY_MB_MIN`` mirrors it, and a test pins both to
+``shuru.DEFAULT_RUN_MEMORY_MB`` so they cannot drift.
+"""
+
 
 def host_cores() -> int:
     """The number of CPUs this host reports, never less than 1."""
@@ -171,8 +185,18 @@ class Budget:
         each row its peak simultaneous VMs, not one, or the pool will
         oversubscribe memory"). The multiplication is the charge; no VM's own
         memory is changed.
+
+        [VANTA-WHY] M3 item V7. A row that records no ``vm_memory_mb`` still boots
+        VMs, at ``shuru.DEFAULT_RUN_MEMORY_MB``, so it is charged
+        ``peak_vms × DEFAULT_VM_MEMORY_MB`` rather than ``peak_vms × 0``. A
+        non-positive number is treated as absent for the same reason: the
+        accounting must never price a VM at zero, or the rows that say least about
+        themselves would be the cheapest to admit beside each other.
         """
-        return self.peak_vms * max(0, int(vm_memory_mb or 0))
+        size = int(vm_memory_mb or 0)
+        if size <= 0:
+            size = DEFAULT_VM_MEMORY_MB
+        return self.peak_vms * size
 
     def charge_exceeds_budget(self, charge_mb: int) -> bool:
         """Whether one row's charge cannot fit the whole memory budget.

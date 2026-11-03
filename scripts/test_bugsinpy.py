@@ -27791,6 +27791,23 @@ class TestRunBatchLoop:
         )
         assert tight_block["charge_exceeds_budget"] is True
 
+    # -- M3 item V7: a row that records no VM memory is not free -----------
+    def test_a_row_that_records_no_vm_memory_is_charged_the_default_vm(self):
+        """V7 — absent ``vm_memory_mb`` prices at the default VM, never at zero.
+
+        ``split.validate`` refuses a recorded size at or below the default, so a
+        row that records nothing boots VMs at ``shuru.DEFAULT_RUN_MEMORY_MB`` all
+        the same. Charging ``peak_vms × 0`` made the least-documented rows the
+        cheapest to admit beside each other, which is the opposite of a
+        conservative scheduler.
+        """
+        assert budget_mod.DEFAULT_VM_MEMORY_MB == shuru_mod.DEFAULT_RUN_MEMORY_MB == 2048
+        budget = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 20)
+        for absent in (None, 0, -1):
+            assert budget.row_charge_mb(absent) == 12 * 2048
+        # A recorded size still prices as itself.
+        assert budget.row_charge_mb(8192) == 12 * 8192
+
     # -- M3 item V3: a raise outranks a stop -------------------------------
     def test_a_stored_worker_raise_outranks_a_stop_in_the_same_phase(
         self, tmp_path, monkeypatch

@@ -316,9 +316,20 @@ def payload_digest(payload: object) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def entry_path_in(root: Path, key: str) -> Path:
+    """One entry's path under an arbitrary cache root.
+
+    [VANTA-WHY] M3 item S7 — split out of :func:`entry_path` so a reader that knows
+    a root other than this process's own can resolve a key without a second copy of
+    the layout. ``compare_batches`` is that reader: it must decide whether a hit was
+    served from a batch's own directory, and a re-spelled layout would let the check
+    pass against a directory this module no longer writes.
+    """
+    return Path(root) / key[:2] / f"{key}.json"
+
+
 def entry_path(key: str) -> Path:
-    path = cache_dir() / key[:2] / f"{key}.json"
-    return path
+    return entry_path_in(cache_dir(), key)
 
 
 def read_entry(material: Mapping[str, object], key: str) -> Optional[dict]:

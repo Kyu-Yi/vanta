@@ -858,6 +858,7 @@ def _measure_suite(
                         "state": "hit",
                         "source": source,
                         "would_hit": False,
+                        "dir": str(suite_cache.cache_dir()),
                     }
                     _write_reports(batch_dir, report_rel_stem, served)
                     return served
@@ -930,11 +931,20 @@ def _measure_suite(
                 # A cache that cannot be written must never fail the run: the
                 # measurement is the product, the entry is an optimisation.
                 pass
+        # [VANTA-WHY] M3 item S7 — the DIRECTORY is recorded beside the key.
+        # One suite cache root is shared by every batch unless a batch overrides
+        # ``VANTA_SUITE_CACHE_DIR``, and the equivalence check runs two batches on
+        # the same build and the same trees: left shared, the second batch is
+        # served the first's entries and the comparison is vacuous. The key alone
+        # cannot say which directory served it, so the row states the root this
+        # measurement came from and the comparator can require the two batches to
+        # name DIFFERENT roots.
         pair.cache = {
             "key": key,
             "state": condition,
             "source": source,
             "would_hit": would_hit,
+            "dir": str(suite_cache.cache_dir()),
         }
     elif record:
         # [VANTA-WHY] M3 item U3 — the one path where the cache was asked for
@@ -945,6 +955,7 @@ def _measure_suite(
             "state": condition,
             "source": "",
             "would_hit": False,
+            "dir": str(suite_cache.cache_dir()),
         }
     return pair
 

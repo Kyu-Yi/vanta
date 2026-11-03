@@ -36,15 +36,40 @@ are therefore comparable, and the parts the model produced are not:
     not about the scheduler.
 
 The one place the two meet is a row whose candidate **bytes match**: then the
-grading is a measurement of the same patch and its label and oracle block must be
-identical. Those rows are in ``rows.matched`` and a difference fails the gate.
+grading is a measurement of the same patch, so its **oracle** block must be
+identical and a difference there fails the gate. Its **labels** are a different
+matter (see below).
+
+WHY A MATCHED ROW'S LABEL IS REPORTED AND NOT GRADED
+----------------------------------------------------
+Nathan's rule (b), overruled in part: *"for matched candidates the oracle result
+must match (deterministic), but a label difference is reported side by side and
+does not fail, because the Attacker writes new tests each run."* The oracle block
+is the harness's own measurement of a fixed patch against a fixed hidden suite —
+deterministic, so a difference is a finding. A label is produced from the model's
+own report of what it changed, and the attack arm writes fresh tests every run, so
+two runs of the same patch bytes can legitimately carry different labels. Those
+differences are reported in ``rows.matched[*].label_differences`` and never fail
+the gate. Rules (a), (c), (d) and (e) are unchanged.
+
+CACHE ISOLATION
+---------------
+The two batches run on the same build and the same trees, so on ONE suite-cache
+root the parallel batch would be served the serial batch's prepare suites and
+in-session native gates — and the comparison would pass vacuously. Each batch is
+therefore given its own root (``VANTA_SUITE_CACHE_DIR``, which drives both the
+Python and the Rust caches) and this script proves it: it reads the cache root
+each batch recorded (``prepare.json``'s per-tree ``scheduler.runs[*].cache.dir``)
+and **fails** when the two batches name the same root, or when any recorded hit's
+key is not an entry under its own batch's root. It reports each batch's
+prepare-suite and native-gate hit/miss counts and the writer of every hit.
 
 VERDICT
 -------
-``identical`` requires all four: no prepare-side nodeid difference, no matched-row
-difference, no group present in only one batch, and no time-limit difference
+``identical`` requires all five: no prepare-side nodeid difference, no matched-row
+oracle difference, no group present in only one batch, no time-limit difference
 (neither a matched row whose flags moved nor a group that hit a limit in the
-parallel batch where the serial batch did not). Anything else is ``not_identical``.
+parallel batch where the serial batch did not), and no cache-isolation problem.
 
 USAGE (run from the repository root)
 ------------------------------------
@@ -76,6 +101,7 @@ REPO_ROOT = SCRIPTS_DIR.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from bugsinpy import manifest as manifest_mod  # noqa: E402
+from bugsinpy import suite_cache as suite_cache_mod  # noqa: E402
 
 # The nodeid map diff is S4's own primitive (`probe_xdist.outcome_diff`): the rule
 # "two nodeid->outcome maps, minus a known-flaky set" already exists and is already
@@ -128,6 +154,28 @@ ORACLE_EXACT_FIELDS = (
 )
 """The oracle's verdict-shaped fields. Compared only for a matched candidate."""
 
+CACHE_HIT_STATE = "hit"
+CACHE_MISS_STATE = "miss"
+"""``suite.SuitePair.cache["state"]``, and the native gate's state, that mean hit/miss.
+
+``hit`` is the one state a run was served by an entry; ``miss`` measured fresh. The
+rest (``off:no_cache``, ``off:unknown_checkpoint``, ``unreadable``, ``unmeasured``)
+are counted separately rather than folded into ``miss``: each is a different reason
+the cache was not consulted, and the isolation check is about which state the two
+batches reached, not about how many entries they kept.
+"""
+
+SESSIONS_DIRNAME = "vanta_sessions"
+"""Where ``driver.rs`` writes ``<session>_evidence.json``, relative to the repo root.
+
+[VANTA-WHY] The in-session native gate's cache records are NOT on the row: the row
+carries only their count (``native_cache_hits``, on the ``run.summary`` log line),
+and the records themselves ride ``<sid>_evidence.json``. Reading that file is the
+only way to audit the Rust half of the cache from a batch — and the Rust half is
+what a *review* row's native gate uses, so it is the half most likely to be served
+from the other batch's directory if the two were left sharing one.
+"""
+
 
 class CompareError(RuntimeError):
     """A batch could not be read as a batch."""
@@ -168,6 +216,125 @@ def prepare_bugs(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         if isinstance(block, dict) and block.get("bug"):
             out[str(block["bug"])] = block
     return out
+
+
+# ---------------------------------------------------------------------------
+# reading a batch's cache traffic
+# ---------------------------------------------------------------------------
+def _counts(values: Iterable[str]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for value in values:
+        out[value] = out.get(value, 0) + 1
+    return dict(sorted(out.items()))
+
+
+def prepare_suite_cache(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Every prepare suite's recorded cache state — one record per bug × tree.
+
+    Written by ``prepare._scheduler_record`` from ``suite.SuitePair.cache`` into
+    ``prepare.json``'s per-bug ``scheduler.runs[<tree>].cache``. ``dir`` is the
+    cache ROOT the measurement came from, which is the whole point: two batches on
+    one root would be served each other's results.
+    """
+    out: list[dict[str, Any]] = []
+    for bug, block in sorted(prepare_bugs(payload).items()):
+        scheduler = block.get("scheduler")
+        runs = scheduler.get("runs") if isinstance(scheduler, Mapping) else None
+        if not isinstance(runs, Mapping):
+            continue
+        for tree, record in sorted(runs.items()):
+            cache = record.get("cache") if isinstance(record, Mapping) else None
+            if not isinstance(cache, Mapping):
+                continue
+            out.append(
+                {
+                    "bug": bug,
+                    "where": str(tree),
+                    "key": str(cache.get("key") or ""),
+                    "state": str(cache.get("state") or ""),
+                    "source": str(cache.get("source") or ""),
+                    "dir": str(cache.get("dir") or ""),
+                    "would_hit": bool(cache.get("would_hit")),
+                }
+            )
+    return out
+
+
+def evidence_path(session_dir: str) -> Path:
+    """``vanta_sessions/<sid>`` → the sibling ``<sid>_evidence.json``.
+
+    ``session_dir`` is repo-relative on a real row and absolute in a test; an
+    absolute one is used as given so a batch built under ``tmp_path`` is readable.
+    """
+    directory = Path(session_dir)
+    root = directory if directory.is_absolute() else REPO_ROOT / directory
+    return root.parent / f"{directory.name}_evidence.json"
+
+
+def native_cache_records(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Every in-session native-gate cache record this batch's rows left behind.
+
+    One record per attempt × side (``original``/``patched``), read from the
+    session's evidence file. A row with no evidence file (never booted a native
+    gate, or a cleaned ``vanta_sessions``) contributes nothing rather than raising:
+    the absence shows up as a smaller count, and the isolation check runs on what
+    *is* recorded. Direction is one-way on purpose — a missing file must not read
+    as "isolated", because it is not evidence of isolation either way.
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        artifacts = row.get("artifacts") if isinstance(row.get("artifacts"), Mapping) else None
+        session_dir = str((artifacts or {}).get("session_dir") or "")
+        if not session_dir:
+            continue
+        try:
+            payload = json.loads(evidence_path(session_dir).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        records = payload.get("native_cache") if isinstance(payload, Mapping) else None
+        if not isinstance(records, list):
+            continue
+        session = Path(session_dir).name
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            out.append(
+                {
+                    "bug": str(row.get("bug") or ""),
+                    "where": f"{session}/a{record.get('attempt')}/{record.get('side')}",
+                    "key": str(record.get("key") or ""),
+                    "state": str(record.get("state") or ""),
+                    "source": str(record.get("source") or ""),
+                    "dir": "",
+                    "would_hit": bool(record.get("would_hit")),
+                }
+            )
+    return out
+
+
+def cache_dirs(records: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The cache roots these records name, resolved, deduplicated and sorted."""
+    found = {str(Path(str(r["dir"])).resolve()) for r in records if r.get("dir")}
+    return sorted(found)
+
+
+def cache_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """One batch's cache traffic: the counts, the states, and who wrote each hit."""
+    hits = [r for r in records if r["state"] == CACHE_HIT_STATE]
+    misses = [r for r in records if r["state"] == CACHE_MISS_STATE]
+    sources: dict[str, int] = {}
+    for record in hits:
+        name = str(record["source"] or "(unrecorded)")
+        sources[name] = sources.get(name, 0) + 1
+    return {
+        "total": len(records),
+        "hits": len(hits),
+        "misses": len(misses),
+        "other": len(records) - len(hits) - len(misses),
+        "states": _counts(str(r["state"]) for r in records),
+        "hit_sources": dict(sorted(sources.items())),
+        "hit_keys": sorted({str(r["key"]) for r in hits if r["key"]}),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +503,12 @@ def compare_rows(
     for key in sorted(set(left) & set(right)):
         a, b = left[key], right[key]
         bug = key[0]
+        # [VANTA-WHY] Nathan's rule (b), overruled in part: the ORACLE must match
+        # (it is the harness's deterministic measurement of these exact bytes),
+        # but the LABEL is the model's own account of what it changed, and the
+        # attack arm writes new tests each run — so two runs of one patch can
+        # legitimately be labelled differently. Recorded side by side, never
+        # graded. Rules (a), (c), (d) and (e) are untouched.
         labels = {
             name: [value_a, value_b]
             for name, value_a, value_b in (
@@ -358,7 +531,7 @@ def compare_rows(
                 "label_differences": labels,
                 "oracle": oracle,
                 "time_limit_differences": limits,
-                "identical": not labels and oracle["identical"] and not limits,
+                "identical": oracle["identical"] and not limits,
             }
         )
 
@@ -428,6 +601,116 @@ def compare_rows(
     }
 
 
+# ---------------------------------------------------------------------------
+# cache isolation — the two batches must not have shared a root
+# ---------------------------------------------------------------------------
+def _unresolved_hits(
+    label: str, dirs: Sequence[str], groups: Sequence[tuple[str, Sequence[Mapping[str, Any]]]]
+) -> list[str]:
+    """Every recorded hit whose key is not an entry under *this* batch's own roots.
+
+    A hit is served from a directory by definition, so a key that resolves under no
+    directory this batch named was served from one it did not name — the other
+    batch's, which is the vacuous pass this whole check exists to stop.
+    """
+    problems: list[str] = []
+    for kind, records in groups:
+        for record in records:
+            key = str(record["key"])
+            if record["state"] != CACHE_HIT_STATE or not key:
+                continue
+            if any(suite_cache_mod.entry_path_in(root, key).is_file() for root in dirs):
+                continue
+            problems.append(
+                f"{label} {kind} cache hit {key[:12]}… is not an entry under {label}'s own "
+                f"cache directory ({', '.join(dirs)})"
+            )
+    return problems
+
+
+def compare_cache(
+    serial_prepare: Mapping[str, Any],
+    parallel_prepare: Mapping[str, Any],
+    serial_rows: Sequence[Mapping[str, Any]],
+    parallel_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Prove the two batches did not share a suite-cache root.
+
+    Each batch's root is the one its prepare suites recorded; the in-session native
+    gate uses the SAME root (one ``VANTA_SUITE_CACHE_DIR`` drives both caches), so a
+    native hit is checked against it too. The check needs a recorded root to run at
+    all, so ``checked`` says whether it did — it never fails for being un-runnable,
+    because "no root recorded" is not evidence of a shared one, and a failure that
+    fired on absence would fire on every batch that predates this item.
+    """
+    serial_suite = prepare_suite_cache(serial_prepare)
+    parallel_suite = prepare_suite_cache(parallel_prepare)
+    serial_native = native_cache_records(serial_rows)
+    parallel_native = native_cache_records(parallel_rows)
+    serial_dirs = cache_dirs(serial_suite)
+    parallel_dirs = cache_dirs(parallel_suite)
+
+    problems: list[str] = []
+    checked = bool(serial_dirs and parallel_dirs)
+    if checked:
+        shared = sorted(set(serial_dirs) & set(parallel_dirs))
+        if shared:
+            problems.append(
+                "both batches used the same suite cache directory, so neither computed "
+                f"its own results: {', '.join(shared)}"
+            )
+        problems.extend(
+            _unresolved_hits(
+                "serial", serial_dirs, (("prepare", serial_suite), ("native", serial_native))
+            )
+        )
+        problems.extend(
+            _unresolved_hits(
+                "parallel",
+                parallel_dirs,
+                (("prepare", parallel_suite), ("native", parallel_native)),
+            )
+        )
+
+    return {
+        "checked": checked,
+        "problems": problems,
+        "serial": {
+            "dirs": serial_dirs,
+            "prepare": cache_summary(serial_suite),
+            "native": cache_summary(serial_native),
+        },
+        "parallel": {
+            "dirs": parallel_dirs,
+            "prepare": cache_summary(parallel_suite),
+            "native": cache_summary(parallel_native),
+        },
+        "identical": not problems,
+    }
+
+
+def row_concurrency(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The effective row concurrency a batch reached — what ``--jobs`` actually got.
+
+    ``Budget.peak_cores`` is the high-water mark of rows holding the scheduler's
+    slot and a row is charged exactly one core, so it IS the number of rows that ran
+    at once. ``None`` means no row carried a ``scheduler`` block, which is what a
+    ``--jobs 1`` batch looks like: concurrency is a fact about a budget, and a serial
+    invocation writes no block to record one.
+    """
+    peaks = [
+        int(row["scheduler"]["peak_cores"])
+        for row in rows
+        if isinstance(row.get("scheduler"), Mapping)
+        and isinstance(row["scheduler"].get("peak_cores"), (int, float))
+    ]
+    return {
+        "rows": len(rows),
+        "rows_with_a_scheduler_block": len(peaks),
+        "peak_cores": max(peaks) if peaks else None,
+    }
+
+
 def compare_batches(
     serial_dir: Path, parallel_dir: Path, *, bugs: Optional[Sequence[str]] = None
 ) -> dict[str, Any]:
@@ -467,23 +750,27 @@ def compare_batches(
 
     prepare = compare_prepare(serial_prepare, parallel_prepare, wanted)
     rows = compare_rows(serial_rows, parallel_rows, excluded_by_bug)
+    cache = compare_cache(serial_prepare, parallel_prepare, serial_rows, parallel_rows)
 
-    identical = bool(prepare["identical"] and rows["identical"])
+    identical = bool(prepare["identical"] and rows["identical"] and cache["identical"])
     return {
         "schema_version": SCHEMA_VERSION,
         "serial": {
             "batch_dir": str(serial_dir),
             "rows": len(serial_rows),
             "scheduler": serial_prepare.get("scheduler") or {},
+            "concurrency": row_concurrency(serial_rows),
         },
         "parallel": {
             "batch_dir": str(parallel_dir),
             "rows": len(parallel_rows),
             "scheduler": parallel_prepare.get("scheduler") or {},
             "host_samples": _host_samples(parallel_dir),
+            "concurrency": row_concurrency(parallel_rows),
         },
         "bugs": wanted,
         "prepare": prepare,
+        "cache": cache,
         "rows": rows,
         "verdict": "identical" if identical else "not_identical",
     }
@@ -508,19 +795,23 @@ def verdict_line(report: Mapping[str, Any], *, cap: int = 8) -> str:
     rows = report.get("rows") or {}
     matched = rows.get("matched") or []
     row_diffs = [row for row in matched if not row["identical"]]
+    label_diffs = [row for row in matched if row.get("label_differences")]
     limits = (rows.get("time_limit_differences") or {}).get("groups") or []
     missing = rows.get("missing_groups") or []
     unmatched = rows.get("unmatched_candidates") or {}
     n_unmatched = len(unmatched.get("only_in_serial") or []) + len(
         unmatched.get("only_in_parallel") or []
     )
+    cache_problems = (report.get("cache") or {}).get("problems") or []
     parts = [
         f"prepare_diffs={len(prepare_diffs)}",
         f"matched={len(matched)}",
         f"row_diffs={len(row_diffs)}",
+        f"label_diffs={len(label_diffs)}",
         f"time_limit_diffs={len(limits)}",
         f"missing_groups={len(missing)}",
         f"unmatched_candidates={n_unmatched}",
+        f"cache_problems={len(cache_problems)}",
     ]
     line = f"{head} ({', '.join(parts)})"
     named: list[str] = []
@@ -541,6 +832,12 @@ def verdict_line(report: Mapping[str, Any], *, cap: int = 8) -> str:
         line += f" [prepare {shown}{more}]"
     if limits:
         line += f" [time limits: {len(limits)} group(s)]"
+    if cache_problems:
+        line += f" [cache: {cache_problems[0]}]"
+    serial_peak = ((report.get("serial") or {}).get("concurrency") or {}).get("peak_cores")
+    parallel_peak = ((report.get("parallel") or {}).get("concurrency") or {}).get("peak_cores")
+    if serial_peak is not None or parallel_peak is not None:
+        line += f" [rows peak: serial={serial_peak} parallel={parallel_peak}]"
     return line
 
 

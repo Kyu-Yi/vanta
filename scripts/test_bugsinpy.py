@@ -6602,8 +6602,10 @@ class TestCompareBatches:
     whole shape of this module follows from solving it: only the tree-and-schedule
     facts are comparable, a row's identity includes its candidate's bytes, and the
     only rows whose label/oracle may be compared are the ones whose candidate bytes
-    match. These tests pin that rule plus the four things a difference *does* fail
-    on (a prepare nodeid, a matched row, a missing group, a time limit). Nothing
+    match. These tests pin that rule plus the five things a difference *does* fail
+    on (a prepare nodeid, a matched row's **oracle**, a missing group, a time limit,
+    and a shared cache root). A matched row's **label** is reported and not graded
+    (rule (b), overruled in part: the Attacker writes new tests each run). Nothing
     here boots a VM; every row is a hand-built dict in a ``tmp_path`` batch.
     """
 
@@ -6784,15 +6786,28 @@ class TestCompareBatches:
         assert len(report["matched"]) == 1
         assert report["matched"][0]["identical"] is True
 
-    def test_a_matched_row_whose_label_moved_is_not_identical(self):
+    def test_a_matched_row_whose_label_moved_is_identical_but_reported(self):
+        # Rule (b), overruled in part: the ORACLE is the harness's deterministic
+        # measurement of these exact bytes and must match; the LABEL is the model's
+        # own account of what it changed, and the attack arm writes new tests each
+        # run, so two runs of one patch may legitimately be labelled differently.
+        # Reported side by side; never graded.
         report = compare_batches_mod.compare_rows(
             [self._row()], [self._row(label="true_reject")], {}
         )
-        assert report["identical"] is False
+        assert report["identical"] is True
+        assert report["matched"][0]["identical"] is True
         assert report["matched"][0]["label_differences"]["label"] == [
             "true_approval",
             "true_reject",
         ]
+
+    def test_a_matched_row_whose_label_rule_moved_is_also_only_reported(self):
+        report = compare_batches_mod.compare_rows(
+            [self._row()], [self._row(label_rule="other_rule", verdict="NotFixed")], {}
+        )
+        assert report["identical"] is True
+        assert sorted(report["matched"][0]["label_differences"]) == ["label_rule", "verdict"]
 
     def test_a_matched_row_whose_hidden_outcome_moved_is_not_identical(self):
         moved = self._row(oracle=self._oracle(hidden_outcomes={"t::a": "failed"}))
@@ -6836,6 +6851,198 @@ class TestCompareBatches:
         report = compare_batches_mod.compare_rows(serial, parallel, {"pandas/1": {"t::flaky"}})
         assert report["identical"] is True
 
+    # -- cache isolation ----------------------------------------------------
+    def _runs(self, **trees: Any) -> dict[str, Any]:
+        """A bug block whose ``scheduler.runs`` carries one cache record per tree."""
+        return self._prepare(scheduler={"runs": {name: {"cache": cache} for name, cache in trees.items()}})
+
+    @staticmethod
+    def _cache(*, key="", state="miss", source="", directory="") -> dict[str, Any]:
+        return {
+            "key": key,
+            "state": state,
+            "source": source,
+            "would_hit": False,
+            "dir": directory,
+        }
+
+    def test_prepare_suite_cache_reads_each_trees_state(self):
+        payload = self._runs(
+            src_buggy=self._cache(key="a" * 64, state="hit", source="pandas_1/src_buggy", directory="/tmp/cache-a"),
+            vanta_tree=self._cache(key="b" * 64, directory="/tmp/cache-a"),
+        )
+        records = compare_batches_mod.prepare_suite_cache(payload)
+        assert [r["where"] for r in records] == ["src_buggy", "vanta_tree"]
+        assert records[0]["state"] == "hit"
+        assert records[0]["source"] == "pandas_1/src_buggy"
+        assert compare_batches_mod.cache_dirs(records) == [str(Path("/tmp/cache-a").resolve())]
+        summary = compare_batches_mod.cache_summary(records)
+        assert (summary["hits"], summary["misses"], summary["other"]) == (1, 1, 0)
+        assert summary["hit_sources"] == {"pandas_1/src_buggy": 1}
+
+    def test_the_states_beside_a_miss_are_not_counted_as_misses(self):
+        # `off:no_cache` and friends are a different reason for not consulting the
+        # cache; folding them into `miss` would hide which one happened.
+        records = compare_batches_mod.prepare_suite_cache(
+            self._runs(vanta_tree=self._cache(state="off:unknown_checkpoint"))
+        )
+        summary = compare_batches_mod.cache_summary(records)
+        assert (summary["hits"], summary["misses"], summary["other"]) == (0, 0, 1)
+        assert summary["states"] == {"off:unknown_checkpoint": 1}
+
+    def test_cache_isolation_is_not_claimed_when_no_root_was_recorded(self):
+        report = compare_batches_mod.compare_cache(self._prepare(), self._prepare(), [], [])
+        assert report["checked"] is False
+        assert report["identical"] is True, "absence of a root is not a shared root"
+
+    def test_two_batches_on_one_cache_root_fail(self):
+        payload = self._runs(vanta_tree=self._cache(directory="/tmp/one-cache"))
+        report = compare_batches_mod.compare_cache(payload, payload, [], [])
+        assert report["checked"] is True
+        assert report["identical"] is False
+        assert "same suite cache directory" in report["problems"][0]
+
+    def test_two_batches_on_their_own_roots_pass(self):
+        serial = self._runs(vanta_tree=self._cache(key="a" * 64, directory="/tmp/cache-serial"))
+        parallel = self._runs(vanta_tree=self._cache(key="b" * 64, directory="/tmp/cache-parallel"))
+        report = compare_batches_mod.compare_cache(serial, parallel, [], [])
+        assert report["identical"] is True
+        assert report["serial"]["prepare"]["misses"] == 1
+        assert report["parallel"]["prepare"]["misses"] == 1
+        assert report["serial"]["dirs"] != report["parallel"]["dirs"]
+
+    def test_a_hit_under_the_batchs_own_root_is_isolated(self, tmp_path):
+        # The check must not be a blanket refusal: a re-prepared tree inside one
+        # batch legitimately hits its own entry.
+        root = tmp_path / "parallel-cache"
+        key = "c" * 64
+        entry = suite_cache_mod.entry_path_in(root, key)
+        entry.parent.mkdir(parents=True)
+        entry.write_text("{}", encoding="utf-8")
+        serial = self._runs(vanta_tree=self._cache(directory=str(tmp_path / "serial-cache")))
+        parallel = self._runs(
+            vanta_tree=self._cache(key=key, state="hit", source="pandas_1/vanta_tree", directory=str(root))
+        )
+        report = compare_batches_mod.compare_cache(serial, parallel, [], [])
+        assert report["identical"] is True
+        assert report["parallel"]["prepare"]["hit_sources"] == {"pandas_1/vanta_tree": 1}
+
+    def test_a_parallel_hit_served_from_the_other_batchs_root_fails(self, tmp_path):
+        serial_root, parallel_root = tmp_path / "serial-cache", tmp_path / "parallel-cache"
+        key = "d" * 64
+        # The entry exists under the SERIAL root only — i.e. the parallel batch was
+        # served the serial batch's measurement, the vacuous pass this check exists
+        # to stop.
+        entry = suite_cache_mod.entry_path_in(serial_root, key)
+        entry.parent.mkdir(parents=True)
+        entry.write_text("{}", encoding="utf-8")
+        serial = self._runs(vanta_tree=self._cache(directory=str(serial_root)))
+        parallel = self._runs(
+            vanta_tree=self._cache(key=key, state="hit", source="pandas_1/vanta_tree", directory=str(parallel_root))
+        )
+        report = compare_batches_mod.compare_cache(serial, parallel, [], [])
+        assert report["identical"] is False
+        assert "not an entry under parallel's own cache directory" in report["problems"][0]
+
+    def test_native_gate_hits_are_read_from_the_evidence_file(self, tmp_path):
+        session = tmp_path / "vanta_sessions" / "sid-1"
+        session.parent.mkdir(parents=True)
+        (session.parent / "sid-1_evidence.json").write_text(
+            json.dumps(
+                {
+                    "native_cache": [
+                        {
+                            "attempt": 1,
+                            "side": "original",
+                            "state": "hit",
+                            "key": "e" * 64,
+                            "source": "sid-1/a1/original",
+                            "would_hit": False,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        records = compare_batches_mod.native_cache_records(
+            [self._row(artifacts={"session_dir": str(session)})]
+        )
+        assert records == [
+            {
+                "bug": "pandas/1",
+                "where": "sid-1/a1/original",
+                "key": "e" * 64,
+                "state": "hit",
+                "source": "sid-1/a1/original",
+                "dir": "",
+                "would_hit": False,
+            }
+        ]
+
+    def test_a_native_hit_outside_the_batchs_root_fails(self, tmp_path):
+        serial = self._runs(vanta_tree=self._cache(directory=str(tmp_path / "serial-cache")))
+        parallel = self._runs(vanta_tree=self._cache(directory=str(tmp_path / "parallel-cache")))
+        session = tmp_path / "vanta_sessions" / "sid-2"
+        session.parent.mkdir(parents=True)
+        (session.parent / "sid-2_evidence.json").write_text(
+            json.dumps(
+                {
+                    "native_cache": [
+                        {
+                            "attempt": 1,
+                            "side": "patched",
+                            "state": "hit",
+                            "key": "f" * 64,
+                            "source": "sid-2/a1/patched",
+                            "would_hit": False,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        report = compare_batches_mod.compare_cache(
+            serial,
+            parallel,
+            [self._row()],
+            [self._row(artifacts={"session_dir": str(session)})],
+        )
+        assert report["identical"] is False
+        assert "parallel native cache hit" in report["problems"][0]
+
+    # -- effective row concurrency -----------------------------------------
+    def test_row_concurrency_reads_the_peak_the_scheduler_recorded(self):
+        rows = [self._row(), self._row(seed=3, scheduler={"peak_cores": 4})]
+        assert compare_batches_mod.row_concurrency(rows) == {
+            "rows": 2,
+            "rows_with_a_scheduler_block": 1,
+            "peak_cores": 4,
+        }
+
+    def test_a_serial_batch_recorded_no_concurrency_at_all(self):
+        # A `--jobs 1` row writes no scheduler block, so the peak is `None` — "not
+        # recorded", never zero, exactly as `_time_limits` reads it.
+        assert compare_batches_mod.row_concurrency([self._row()]) == {
+            "rows": 1,
+            "rows_with_a_scheduler_block": 0,
+            "peak_cores": None,
+        }
+
+    def test_verdict_line_names_a_cache_problem_and_the_row_peak(self):
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "not_identical",
+            "prepare": {"bugs": {}},
+            "rows": {"matched": [], "time_limit_differences": {"groups": []}},
+            "cache": {"problems": ["both batches used the same suite cache directory, so neither computed its own results: /tmp/c"]},
+            "serial": {"concurrency": {"peak_cores": None}},
+            "parallel": {"concurrency": {"peak_cores": 4}},
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert "cache_problems=1" in line
+        assert "same suite cache directory" in line
+        assert "rows peak: serial=None parallel=4" in line
+
     # -- the whole thing ----------------------------------------------------
     def test_compare_batches_end_to_end_is_identical(self, tmp_path):
         serial, parallel = tmp_path / "serial", tmp_path / "parallel"
@@ -6844,9 +7051,29 @@ class TestCompareBatches:
         report = compare_batches_mod.compare_batches(serial, parallel)
         assert report["verdict"] == "identical"
         assert report["bugs"] == ["pandas/1"]
+        # The hand-built batches record no cache root, so isolation is un-checked
+        # rather than claimed — and the concurrency is "not recorded", not zero.
+        assert report["cache"]["checked"] is False
+        assert report["serial"]["concurrency"]["peak_cores"] is None
         assert compare_batches_mod.main(
             ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
         ) == 0
+
+    def test_a_shared_cache_root_makes_the_whole_verdict_not_identical(self, tmp_path):
+        # The end-to-end shape of fix #1: everything else agrees, and the batch is
+        # still not identical, because both batches were served one directory.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        shared = self._prepare(
+            scheduler={
+                "runs": {"vanta_tree": {"cache": self._cache(directory="/tmp/one-root")}}
+            }
+        )
+        self._write_batch(serial, rows=[self._row()], prepare=shared)
+        self._write_batch(parallel, rows=[self._row()], prepare=shared)
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "not_identical"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 1
 
     def test_compare_batches_end_to_end_reports_a_difference(self, tmp_path):
         serial, parallel = tmp_path / "serial", tmp_path / "parallel"

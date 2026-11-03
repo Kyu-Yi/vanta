@@ -1450,6 +1450,15 @@ def _scheduler_record(
     ``budget`` is the ONE scheduler of the invocation (S5/S6/``--jobs``); ``None`` means
     a caller that does not participate, which is recorded as the empty mapping rather
     than as "serial", because serial is a statement about a budget that exists.
+
+    [VANTA-WHY] M3 item S7 — each tree also carries its pair's ``cache`` block
+    (``suite.SuitePair.cache``: the key, whether it was a hit, the writer and the
+    cache ROOT it came from). ``prepare`` is the only stage that measures a tree
+    through the cache, so this is the only place the Python half of the cache can
+    be audited from the batch — and the equivalence check needs it to prove the
+    two batches did not share one root. It rides the ``scheduler`` mapping, which
+    ``BugPrep.to_dict`` already writes whole and ``from_dict`` already reads with
+    ``record_of``, so no field is added to the record's own schema.
     """
     previous = prep.scheduler.get("runs") if prep.scheduler else None
     recorded = dict(previous) if isinstance(previous, Mapping) else {}
@@ -1457,6 +1466,7 @@ def _scheduler_record(
         recorded[tree_name] = {
             "run1_secs": pair.first.secs,
             "run2_secs": pair.second.secs,
+            "cache": pair.cache,
         }
     block = {} if budget is None else budget.record()
     block["runs"] = recorded

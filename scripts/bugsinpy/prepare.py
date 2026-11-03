@@ -1652,7 +1652,13 @@ def strip_and_baseline(
     return True
 
 
-def selfcheck_dev_fix(prep: BugPrep, *, batch_dir: Path, checkpoint: str) -> bool:
+def selfcheck_dev_fix(
+    prep: BugPrep,
+    *,
+    batch_dir: Path,
+    checkpoint: str,
+    budget: Optional[budget_mod.Budget] = None,
+) -> bool:
     """Grade the developer fix with the real oracle; refuse the bug unless it is good.
 
     Returns whether the bug may continue. Called last, after the strip, because the
@@ -1674,7 +1680,11 @@ def selfcheck_dev_fix(prep: BugPrep, *, batch_dir: Path, checkpoint: str) -> boo
         return True
 
     result = oracle_mod.grade_dev_fix(
-        prep=prep, batch_dir=batch_dir, checkpoint=checkpoint, disk_mb=DISK_MB
+        prep=prep,
+        batch_dir=batch_dir,
+        checkpoint=checkpoint,
+        disk_mb=DISK_MB,
+        budget=budget,
     )
     if result.patch_good:
         return True
@@ -2809,7 +2819,9 @@ def prepare_one(
     # measured as a candidate; those two numbers would only describe a bug no run will
     # ever use.
     try:
-        if not selfcheck_dev_fix(prep, batch_dir=batch_dir, checkpoint=checkpoint):
+        if not selfcheck_dev_fix(
+            prep, batch_dir=batch_dir, checkpoint=checkpoint, budget=budget
+        ):
             note_drops()
             return prep
     except suite_mod.SuiteError as exc:

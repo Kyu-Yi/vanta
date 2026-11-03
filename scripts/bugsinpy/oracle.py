@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from . import budget as budget_mod
 from . import suite as suite_mod
 from . import trees as tree_mod
 from .prepare import BugPrep
@@ -264,6 +265,7 @@ def grade(
     disk_mb: int,
     baseline_failures: Optional[Sequence[str]] = None,
     timeout_secs: int = 1800,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> OracleResult:
     """Grade ``patch_path`` against ``prep``'s oracle. Never raises for a bad patch.
 
@@ -274,6 +276,14 @@ def grade(
     The work tree is left in place on purpose: §6.3's rerun-safety rule needs the
     graded tree to still exist for a session whose signal has to be re-run, so
     deleting it here would move a disk problem onto the correctness path.
+
+    ``budget`` (M3 item Y1) is the invocation's ONE scheduler, threaded straight
+    into both grading pairs so each pair's two runs may overlap exactly as a
+    preparation suite's do (:func:`suite.run_suite_twice`). The two PAIRS stay
+    sequential, and must: the patched suite only runs once the hidden pair has
+    produced a readable report (item B4's guard returns before the second pair
+    whenever it has not). ``None`` — a test, ``pool``, ``mutants`` — keeps the
+    grading exactly the serial pair it was.
     """
     started = time.monotonic()
     # M3 item D1 — the grading runs cover the same *native* suite the in-session gate
@@ -361,6 +371,7 @@ def grade(
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
         origin=f"{prep.slug}/{label}/hidden",
+        budget=budget,
     )
     # M3 item S2 — record how the hidden pair was obtained BEFORE the guard below
     # can return: a censored grading is still a grading that may have been served
@@ -411,6 +422,7 @@ def grade(
         # M3 item S2 — the same keying as the hidden pair, on the native command
         # (the patched side of the regression reading).
         origin=f"{prep.slug}/{label}/patched",
+        budget=budget,
     )
     # M3 item S2 — the patched pair's note, again before its guard can return.
     if patched_pair.cache is not None:
@@ -463,6 +475,7 @@ def grade_dev_fix(
     checkpoint: str,
     disk_mb: int,
     timeout_secs: int = 1800,
+    budget: Optional[budget_mod.Budget] = None,
 ) -> OracleResult:
     """Grade the developer fix against the oracle ``prep`` just derived (§11 step 2).
 
@@ -501,6 +514,7 @@ def grade_dev_fix(
         label=DEV_FIX_STEM,
         disk_mb=disk_mb,
         timeout_secs=timeout_secs,
+        budget=budget,
     )
     save(batch_dir / f"{stem}.oracle.json", result)
     return result

@@ -22845,6 +22845,36 @@ class TestOracleGrade:
         self._grade(wired, tmp_path)
         assert [run["timeout_secs"] for run in wired["runs"]] == [1800, 1800]
 
+    # -- M3 item Y1: the grading's pairs share the invocation's one scheduler ---
+    def test_both_grading_pairs_are_handed_the_one_budget(self, wired, tmp_path):
+        """[VANTA-WHY] Y1 — ``grade``'s two pairs run through the SAME concurrent
+        two-VM path a preparation suite does.
+
+        ``budget`` is the invocation's one scheduler, so the claim is identity:
+        both ``run_suite_twice`` calls see that one object, and neither pair
+        invents its own. The two PAIRS stay sequential — the patched suite only
+        runs once the hidden pair's report exists (item B4's guard) — so this
+        item widens each pair, never the gap between them.
+        """
+        budget = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 20)
+        oracle_mod.grade(
+            prep=oracle_prep(),
+            batch_dir=tmp_path / "batch",
+            checkpoint="vanta-bi-Demo-1",
+            patch_path=write(tmp_path / "final.patch", "diff --git a/x b/x\n"),
+            label="sess1",
+            disk_mb=16384,
+            budget=budget,
+        )
+        assert [run["budget"] for run in wired["runs"]] == [budget, budget]
+
+    def test_a_grading_with_no_budget_stays_the_serial_pairs_it_was(self, wired, tmp_path):
+        """The default leaf keeps every other caller — a test, ``pool``,
+        ``mutants`` — the serial two-pair grading it had before item Y1, so those
+        paths are unchanged and only the batch's own scheduler overlaps anything."""
+        self._grade(wired, tmp_path)
+        assert [run["budget"] for run in wired["runs"]] == [None, None]
+
     def test_a_collect_flip_oracle_is_graded_with_no_declared_fail_to_pass(
         self, wired, tmp_path
     ):
@@ -23100,6 +23130,34 @@ class TestGradeCandidateCache:
         )
         assert graded.oracle.patch_good is True
 
+    def test_the_budget_reaches_the_oracle_grade(self, tmp_path, monkeypatch):
+        """M3 item Y1 — the candidate's grading is admitted by the SAME scheduler
+        the invocation built, not by a private one.
+
+        ``grade_candidate`` is the seam between the review phase and the grading;
+        the budget has to cross it or a candidate's two pairs would overlap only
+        when nothing told them they might.
+        """
+        bug_prep, candidate, _ = self._candidate(tmp_path)
+        seen: list = []
+        monkeypatch.setattr(
+            oracle_mod,
+            "grade",
+            lambda **kwargs: seen.append(kwargs)
+            or oracle_mod.OracleResult(apply_ok=True, patch_good=True),
+        )
+        budget = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 20)
+
+        runner_mod.grade_candidate(
+            batch_dir=tmp_path,
+            prep=bug_prep,
+            candidate=candidate,
+            checkpoint="vanta-bi-Demo-1",
+            disk_mb=8192,
+            budget=budget,
+        )
+        assert [call["budget"] for call in seen] == [budget]
+
 
 class TestDevFixSelfCheck:
     """prepare grades the developer fix with the real oracle and refuses the bug if it fails.
@@ -23152,14 +23210,17 @@ class TestDevFixSelfCheck:
         )
         return calls
 
-    def _run(self, tmp_path, *, text=None, fail_to_pass=None):
+    def _run(self, tmp_path, *, text=None, fail_to_pass=None, budget=None):
         prep = oracle_prep(
             bug=bug_info(bug_patch_txt=self.SOURCE_DIFF if text is None else text)
         )
         if fail_to_pass is not None:
             prep.fail_to_pass = list(fail_to_pass)
         ok = prepare_mod.selfcheck_dev_fix(
-            prep, batch_dir=tmp_path / "batch", checkpoint="vanta-bi-Demo-1"
+            prep,
+            batch_dir=tmp_path / "batch",
+            checkpoint="vanta-bi-Demo-1",
+            budget=budget,
         )
         return ok, prep
 
@@ -23167,6 +23228,18 @@ class TestDevFixSelfCheck:
         ok, prep = self._run(tmp_path)
         assert ok is True
         assert prep.gate_failures == []
+
+    def test_the_budget_reaches_the_developer_fix_grading(self, graded, tmp_path):
+        """M3 item Y1 — the self-check's grading is the same concurrent two-VM
+        grading a preparation suite gets.
+
+        ``selfcheck_dev_fix`` is the last grading in ``prepare_one``; leaving it
+        out of the budget would make the developer-fix pair the one grading in the
+        prep that never overlapped, for no reason but a missing argument.
+        """
+        budget = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 20)
+        self._run(tmp_path, budget=budget)
+        assert [call["budget"] for call in graded["gradings"]] == [budget]
 
     def test_the_graded_patch_is_the_one_candidate_set_will_grade(self, graded, tmp_path):
         """Same source through the same filter as ``runner.candidate_set``: two gradings of
@@ -24036,6 +24109,84 @@ class TestCandidateSet:
             records=[],
         )
         assert candidates[1].source == "noop:pkg/mod.py"
+
+    # -- M3 item Y1: a set's candidates overlap, the set's order does not ------
+    def test_a_concurrent_budget_grades_the_set_together_in_input_order(
+        self, tmp_path, monkeypatch
+    ):
+        """M3 item Y1 — a set's candidates are independent, so their gradings run
+        together under the one budget, and the caller still gets them in the order
+        the set was built.
+
+        [VANTA-WHY] The probe holds each grader for a span set by its arrival
+        index — the first arrival sleeps longest — so a set assembled in
+        COMPLETION order would come back reversed. The indexed slots are what keep
+        the list in the order b1/b2/… saw, which is the order the rows pair in.
+        """
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+        arrivals: list = []
+        budgets: list = []
+
+        def probe(**kw):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                arrivals.append(kw["candidate"])
+                budgets.append(kw["budget"])
+                index = len(arrivals) - 1
+            time.sleep(0.05 * (3 - index))
+            with lock:
+                active -= 1
+            return kw["candidate"]
+
+        monkeypatch.setattr(runner_mod, "grade_candidate", probe)
+        budget = budget_mod.Budget(4, peak_vms=12, cores_cap=14, memory_cap_mb=1 << 20)
+        rows = [_pool_row(tmp_path / "a.patch", _diff("pkg/other.py", "a1"))]
+        candidates = runner_mod.candidate_set(
+            batch_dir=tmp_path, prep=self._prep(tmp_path), checkpoint="chk",
+            disk_mb=8192, records=rows, budget=budget,
+        )
+
+        assert peak > 1, "a concurrent budget must let two graders overlap"
+        assert [c.kind for c in candidates] == [
+            runner_mod.DEV_FIX, runner_mod.NOOP, runner_mod.FAILED_PATCH
+        ]
+        # Every grader ran under the one budget it was handed, not a private one.
+        assert budgets == [budget, budget, budget]
+
+    def test_a_serial_budget_grades_the_set_one_at_a_time(self, tmp_path, monkeypatch):
+        """``--jobs 1`` keeps the set exactly the serial construction-order
+        grading it had before item Y1, so a serial batch stays byte-for-byte the
+        batch it was (§14.33)."""
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+        order: list = []
+
+        def probe(**kw):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                order.append(kw["candidate"].kind)
+            time.sleep(0.01)
+            with lock:
+                active -= 1
+            return kw["candidate"]
+
+        monkeypatch.setattr(runner_mod, "grade_candidate", probe)
+        rows = [_pool_row(tmp_path / "a.patch", _diff("pkg/other.py", "a1"))]
+        candidates = runner_mod.candidate_set(
+            batch_dir=tmp_path, prep=self._prep(tmp_path), checkpoint="chk",
+            disk_mb=8192, records=rows, budget=budget_mod.Budget(1),
+        )
+
+        assert peak == 1
+        assert order == [runner_mod.DEV_FIX, runner_mod.NOOP, runner_mod.FAILED_PATCH]
+        assert [c.kind for c in candidates] == order
 
 
 class TestLabelFor:

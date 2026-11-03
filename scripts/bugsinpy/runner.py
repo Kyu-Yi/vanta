@@ -921,12 +921,17 @@ def grade_candidate(
     candidate: Candidate,
     checkpoint: str,
     disk_mb: int,
+    budget: Optional["budget_mod.Budget"] = None,
 ) -> Candidate:
     """Grade ``candidate`` once, caching the result keyed by its own identity.
 
     The cache is what makes a resume cheap: re-deriving a candidate set after a
     crash must not re-grade a patch the batch already graded, or a 3-hour batch
     would spend its first hour repeating known-good evidence.
+
+    ``budget`` (M3 item Y1) is handed to :func:`oracle.grade` so the grading's two
+    pairs may overlap under the invocation's one scheduler; ``None`` — ``pool``,
+    ``mutants``, a test — keeps the serial grading they had.
     """
     cached = batch_dir / "oracle" / "candidates" / prep.slug / f"{candidate.name}.json"
     if cached.is_file():
@@ -947,6 +952,7 @@ def grade_candidate(
         label=f"cand-{prep.slug}-{candidate.name}",
         disk_mb=disk_mb,
         timeout_secs=ORACLE_TIMEOUT_SECS,
+        budget=budget,
     )
     cached.parent.mkdir(parents=True, exist_ok=True)
     oracle_mod.save(cached, result)
@@ -1069,12 +1075,23 @@ def candidate_set(
     checkpoint: str,
     disk_mb: int,
     records: Sequence[dict[str, Any]],
+    budget: Optional["budget_mod.Budget"] = None,
 ) -> list[Candidate]:
     """The per-bug review set, identical for both configs (§5.4, §7.1).
 
     Always the developer fix (known-good by construction) and the no-op floor;
     plus up to two pooled failed patches. Built **once per bug** and reused by
     both configs' review passes, which is what makes those rows paired.
+
+    [VANTA-WHY] M3 item Y1. The candidates of one set are independent — each is
+    graded against its own patch bytes in its own oracle work tree, and none reads
+    another's result — so they are graded together on a pool sized by the shared
+    budget and the ORDER of the returned list is the input order, not completion
+    order. Two graders running at once is ordinary under S5/S6 as well, so
+    :func:`suite.run_suite_twice`'s in-process flight already covers the case where
+    they want the same key; here they want different ones. Without a concurrent
+    budget (``--jobs 1``, a test, ``pool``, ``mutants``) the set is graded serially
+    in construction order, exactly as before this item.
     """
     dev = write_candidate_patch(
         batch_dir,
@@ -1090,6 +1107,29 @@ def candidate_set(
     )
     candidates = [dev, noop]
     candidates += pool_failed_patches(batch_dir=batch_dir, prep=prep, records=records)
+    # M3 item Y1 — one grader per candidate, admitted as the shared budget allows.
+    # `slots` is indexed rather than appended, so the list a caller gets back is the
+    # candidate order b1/b2/… saw, never the order the graders happened to finish in.
+    if budget is not None and budget.concurrent and len(candidates) > 1:
+        graded: list[Optional[Candidate]] = [None] * len(candidates)
+        with ThreadPoolExecutor(
+            max_workers=min(len(candidates), max(1, budget.cores))
+        ) as pool:
+            futures = {
+                pool.submit(
+                    grade_candidate,
+                    batch_dir=batch_dir,
+                    prep=prep,
+                    candidate=candidate,
+                    checkpoint=checkpoint,
+                    disk_mb=disk_mb,
+                    budget=budget,
+                ): index
+                for index, candidate in enumerate(candidates)
+            }
+            for future, index in futures.items():
+                graded[index] = future.result()
+        return [candidate for candidate in graded if candidate is not None]
     return [
         grade_candidate(
             batch_dir=batch_dir,
@@ -1097,6 +1137,7 @@ def candidate_set(
             candidate=candidate,
             checkpoint=checkpoint,
             disk_mb=disk_mb,
+            budget=budget,
         )
         for candidate in candidates
     ]
@@ -3709,6 +3750,7 @@ def run_batch(
                 manifest=manifest,
                 repair_configs=repair_configs,
                 disk_mb=disk_mb,
+                budget=budget,
             )
             if budget is not None and budget.concurrent:
                 status, phase_records, phase_failed = _run_jobs_concurrently(
@@ -3895,6 +3937,7 @@ def _phase_jobs(
     manifest: Manifest,
     repair_configs: Sequence[str],
     disk_mb: int,
+    budget: Optional["budget_mod.Budget"] = None,
 ) -> list["Job"]:
     """One phase's jobs, in the exact order the serial loop visited them.
 
@@ -3906,11 +3949,16 @@ def _phase_jobs(
     byte-identical ``--jobs 1`` run means (§14.33).
 
     A review phase's candidate set comes from :func:`_review_candidates`, which
-    grades each candidate (booting an oracle VM). That grading happens HERE, on
-    the calling thread, exactly as it did before this item and *before* the pool is
-    entered: grading is not a row, so it must not overlap a row's VMs, and it must
-    see every repair row of the wave already on disk — which it does, because the
-    phases are sequential and the repair phase has joined its rows by now.
+    grades each candidate (booting oracle VMs). That grading happens HERE, on the
+    calling thread and *before* the pool is entered, so it never overlaps a ROW's
+    VMs — which it does not, because the phase's rows do not exist until this
+    function returns. It must also see every repair row of the wave already on
+    disk, which it does, because the phases are sequential and the repair phase has
+    joined its rows by now.
+
+    [VANTA-WHY] M3 item Y1. ``budget`` reaches that grading so a set's independent
+    candidates are admitted as the invocation's scheduler allows — the wait is for
+    the host's budget, not for the phase's rows, which have not started.
     """
     jobs: list["Job"] = []
     for written in spellings:
@@ -3952,6 +4000,7 @@ def _phase_jobs(
                     checkpoint=checkpoint,
                     disk_mb=disk_mb,
                     show_hints=show_hints,
+                    budget=budget,
                 ):
                     jobs.append(
                         Job(
@@ -4211,6 +4260,7 @@ def _review_candidates(
     checkpoint: str,
     disk_mb: int,
     show_hints: bool = False,
+    budget: Optional["budget_mod.Budget"] = None,
 ) -> list[Candidate]:
     """The candidate set for one (bug, seed), from the repair rows already written.
 
@@ -4223,6 +4273,9 @@ def _review_candidates(
     list: it is part of the key (§2.4.4), so a with-hints batch's repair rows are
     keyed ``…#hints`` and a lookup that left the flag out would find none of them
     and silently shrink every review set.
+
+    ``budget`` (M3 item Y1) reaches :func:`candidate_set`, which is where the set's
+    graders are admitted; this function only finds the records they are pooled from.
     """
     records: list[dict[str, Any]] = []
     for config in configs:
@@ -4243,6 +4296,7 @@ def _review_candidates(
         checkpoint=checkpoint,
         disk_mb=disk_mb,
         records=records,
+        budget=budget,
     )
 
 

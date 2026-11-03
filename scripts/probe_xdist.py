@@ -395,16 +395,23 @@ def _preflight(
     memory_mb: Optional[int],
     extra_env: Optional[Mapping[str, str]],
 ) -> dict[str, Any]:
-    result = shuru_mod.run(
-        checkpoint=checkpoint,
-        host_root=batch_dir,
-        command=[interpreter, "-c", PREFLIGHT_CODE],
-        disk_mb=disk_mb,
-        memory_mb=memory_mb,
-        guest_cwd="/workspace",
-        timeout_secs=PREFLIGHT_TIMEOUT_SECS,
-        env=suite_mod.cache_env(extra_env),
-    )
+    """Ask the checkpoint's interpreter what it can import, in a root of its own.
+
+    [VANTA-WHY] M3 item V8 — the preflight reads no checkout code, so its VM mounts
+    an empty root (:class:`suite.VmRoot` with no tree) rather than the whole batch
+    directory. Nothing the batch holds is reachable from it.
+    """
+    with suite_mod.VmRoot(batch_dir=batch_dir, tree_rel=None) as root:
+        result = shuru_mod.run(
+            checkpoint=checkpoint,
+            host_root=root.host,
+            command=[interpreter, "-c", PREFLIGHT_CODE],
+            disk_mb=disk_mb,
+            memory_mb=memory_mb,
+            guest_cwd="/workspace",
+            timeout_secs=PREFLIGHT_TIMEOUT_SECS,
+            env=suite_mod.cache_env(extra_env),
+        )
     if not result.ok:
         raise shuru_mod.ShuruError(
             f"the preflight boot of {checkpoint} failed (exit {result.exit_code}, "
@@ -605,6 +612,10 @@ def _resolve_xdist(
     env["PYTHONPATH"] = f"{guest_staging}:{existing}" if existing else guest_staging
     block["source"] = SOURCE_STAGED_WHEEL
     block["extra_env"] = env
+    # [VANTA-WHY] M3 item V8 — the suites' VMs mount a clone of the tree only, so the
+    # staging directory the ``PYTHONPATH`` above names has to be carried into each of
+    # them. The relative path is unchanged, so ``guest_staging`` still resolves.
+    block["carry"] = [staging.relative_to(batch_dir).as_posix()]
     return block
 
 
@@ -685,7 +696,9 @@ def _run_bug(args: argparse.Namespace) -> int:
         sandbox_env=prep.sandbox_env or {},
     )
     report["xdist"] = {
-        key: value for key, value in resolved.items() if key != "extra_env"
+        key: value
+        for key, value in resolved.items()
+        if key not in ("extra_env", "carry")
     }
     if resolved["source"] is None:
         report["verdict"] = VERDICT_UNAVAILABLE
@@ -741,6 +754,7 @@ def _run_bug(args: argparse.Namespace) -> int:
         extra_env=resolved["extra_env"] or None,
         memory_mb=prep.vm_memory_mb,
         precompile=prep.precompile,
+        carry=resolved.get("carry") or (),
     )
     parallel_state = suite_mod.run_state(parallel_pair.first) or suite_mod.run_state(
         parallel_pair.second

@@ -19,10 +19,15 @@ what the Creator is shown.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
 import re
 import shutil
+import stat
+import subprocess
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -441,6 +446,304 @@ def _run_script(
     )
 
 
+# ---------------------------------------------------------------------------
+# the per-VM root: a disposable clone of the tree, and nothing else (M3 V8)
+# ---------------------------------------------------------------------------
+VM_ROOT_DIR = ".vm_roots"
+"""Where a run's private root is built — inside the batch directory.
+
+[VANTA-WHY] M3 item V8. ``shuru run``'s ``--mount`` is a single, non-repeatable
+flag (``shuru.py``): one boot sees exactly one host directory, so the ruling's
+"mount the tree read-only beside a writable output directory" cannot be spelled in
+one argv. The fix is to make that one directory *disposable* instead — a fresh
+clone of the tree the VM is to work on, carrying nothing else the batch holds — so
+the guest still reaches its tree at ``/workspace/<tree_rel>``, every report path
+stays ``/workspace``-relative and byte-identical, and everything the batch holds
+beside the tree (``oracle/``, other bugs' worktrees, the manifest, the suite cache)
+is outside the VM's filesystem rather than merely denied.
+
+The clone has to sit on the *same filesystem* as the tree it will replace, because
+a mutating run adopts its tree back with an atomic rename (:meth:`VmRoot.adopt`),
+which ``EXDEV``s across filesystems. ``batch_dir`` and its ``.vm_roots`` children
+share one, so this is the only correct home for it. The guest cannot see it: the
+mount root *is* the clone, so ``.vm_roots`` and every path beside it are above the
+VM's filesystem root.
+"""
+
+ADOPTED_TREE_MAX_BYTES = 8 << 30
+"""The largest tree a VM may hand back to be adopted (8 GiB).
+
+Far above the largest measured build — matplotlib compiles its vendored Agg and
+freetype trees — so it can only catch a runaway, never a legitimate build. A larger
+one is a gate failure with the reason recorded, never a silently adopted tree.
+"""
+
+OUTPUT_MAX_BYTES = 256 << 20
+"""The largest single file a run may hand back as an output (256 MiB).
+
+A pytest JSON report for a whole project suite is a few megabytes; the cap exists
+so that a "report" cannot be a way to make the host read a file that was never one.
+"""
+
+
+def _vm_copy(src: Path, dest: Path) -> None:
+    """Copy ``src`` onto ``dest`` as an APFS clonefile, or a real copy where that fails.
+
+    [VANTA-WHY] M3 item V8. The in-session sandbox seeds every VM this way
+    (``harness::seed_sandbox_from``: ``cp -cR``, falling back to a recursive copy),
+    and the reason is cost: ``clonefile(2)`` is copy-on-write, so a per-VM tree is a
+    directory entry rather than a second copy of a project. A filesystem without it
+    (a container overlay, a non-APFS volume) falls back to :func:`shutil.copytree`
+    rather than failing the run — the isolation does not depend on which ran, only
+    the cost does. ``cp -R`` keeps a symlink a symlink (macOS follows links only
+    under ``-L``), which is what ``copytree(symlinks=True)`` does too.
+    """
+    if dest.is_symlink() or dest.is_file():
+        dest.unlink()
+    elif dest.is_dir():
+        shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        ["cp", "-cR", str(src), str(dest)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode == 0 and dest.exists():
+        return
+    if dest.is_symlink() or dest.is_file():
+        dest.unlink()
+    elif dest.is_dir():
+        shutil.rmtree(dest, ignore_errors=True)
+    if src.is_dir():
+        shutil.copytree(src, dest, symlinks=True)
+    else:
+        shutil.copy2(src, dest)
+
+
+def _validate_tree(tree: Path, *, max_bytes: int, where: str) -> None:
+    """A tree a VM hands back must be a tree, and only a tree.
+
+    [VANTA-WHY] M3 item V8 — the host adopts this tree, so the guest gets a say in
+    what the host will afterwards read, hash and run on. Four things are refused,
+    each because it turns "a directory of files" into something else:
+
+    * a **symlink** whose target is outside the tree: the guest could point one at
+      ``batch_dir/oracle`` — or anywhere else on the host — and the *host* would
+      follow it while hashing or copying the adopted tree;
+    * a **device, fifo or socket**: reading it is a leak or a block, and neither is
+      a file in a source tree;
+    * a **setuid/setgid bit**: a privilege the guest granted itself and the host
+      would then carry;
+    * more bytes than ``max_bytes`` (:data:`ADOPTED_TREE_MAX_BYTES`).
+
+    A refusal raises :class:`SuiteError`. ``prepare`` records that as a gate failure
+    with the reason, which is the whole point: a tree that fails validation is never
+    silently replaced by the tree the VM did not touch.
+    """
+    if not tree.is_dir():
+        raise SuiteError(f"{where} is not a directory, so it cannot replace the tree")
+    root = tree.resolve()
+    total = 0
+    stack = [tree]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError as exc:
+            raise SuiteError(f"cannot read {where} at {current}: {exc}") from exc
+        for entry in entries:
+            st = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(st.st_mode):
+                target = Path(os.path.realpath(entry.path))
+                if target != root and root not in target.parents:
+                    raise SuiteError(
+                        f"{where} contains {entry.path}, a symlink to {target} outside "
+                        "the tree; a tree may not point out of itself"
+                    )
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                stack.append(Path(entry.path))
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                raise SuiteError(
+                    f"{where} contains {entry.path}, which is not a regular file"
+                )
+            if st.st_mode & (stat.S_ISUID | stat.S_ISGID):
+                raise SuiteError(
+                    f"{where} contains {entry.path}, which carries a setuid/setgid bit"
+                )
+            total += st.st_size
+            if total > max_bytes:
+                raise SuiteError(
+                    f"{where} is larger than the {max_bytes}-byte limit a tree may be"
+                )
+
+
+def _validate_output_file(path: Path, *, max_bytes: int, where: str) -> None:
+    """A run's output must be a regular, bounded, symlink-free file before we read it.
+
+    [VANTA-WHY] M3 item V8 — the host reads these files, so the VM that wrote them
+    does not get to choose what they are. A symlink would make the "copy" read a
+    path outside the clone, a device or fifo would make reading block or leak, and a
+    file past the cap is not a report but a way to spend the host's memory. Refused
+    loudly rather than skipped: an output that fails this is not a measurement, and
+    reading it as "the suite said nothing" is the silent fallback the ruling forbids.
+    """
+    st = path.lstat()
+    if stat.S_ISLNK(st.st_mode):
+        raise SuiteError(f"{where} is a symbolic link; a run's output must be a real file")
+    if not stat.S_ISREG(st.st_mode):
+        raise SuiteError(f"{where} is not a regular file")
+    if st.st_size > max_bytes:
+        raise SuiteError(
+            f"{where} is {st.st_size} bytes, past the {max_bytes}-byte cap an output "
+            "may be"
+        )
+
+
+class VmRoot:
+    """One VM's private root: a fresh clone of the tree, plus the scratch it carries.
+
+    [VANTA-WHY] M3 item V8, and the answer to the one mount Shuru can express. See
+    :data:`VM_ROOT_DIR` for why the VM's single mount is this directory. Three rules
+    follow from it and are the whole contract:
+
+    * **A clone per VM, never one per pair** — serial and parallel alike (M3 item
+      V8/Q2). Each boot starts from the pristine tree's own bytes, so run 2 no longer
+      inherits run 1's ``.hypothesis`` database and results do not depend on whether
+      the budget let the two runs overlap. Recorded as a deliberate change: earlier
+      rows were measured with the shared database.
+    * **``carry`` is explicit** (:meth:`__init__`) — a build's configuration file, a
+      staged patch, wheel staging. Anything the guest legitimately needs is named by
+      the caller that needs it, so "what the VM can see" is a list a reader can check
+      rather than "the batch directory".
+    * **The host reads nothing until it has validated it** — :meth:`lift_outputs`
+      for a run's files, :meth:`adopt` for a tree a mutating step changed.
+
+    ``tree_rel`` is ``None`` for the few boots that need no tree at all (the
+    interpreter probe), which still get a private, empty root rather than the batch
+    directory.
+    """
+
+    def __init__(
+        self,
+        *,
+        batch_dir: Path,
+        tree_rel: Optional[str],
+        carry: Sequence[str] = (),
+        outputs: Sequence[str] = (),
+    ) -> None:
+        self.batch_dir = Path(batch_dir)
+        self.tree_rel = tree_rel
+        self.carry = tuple(str(rel) for rel in carry)
+        self.outputs = tuple(str(rel) for rel in outputs)
+        self.path: Optional[Path] = None
+
+    def __enter__(self) -> "VmRoot":
+        base = self.batch_dir / VM_ROOT_DIR
+        base.mkdir(parents=True, exist_ok=True)
+        self.path = Path(tempfile.mkdtemp(prefix="run-", dir=str(base)))
+        if self.tree_rel is not None:
+            _vm_copy(self.batch_dir / self.tree_rel, self.path / self.tree_rel)
+        for rel in self.carry:
+            _vm_copy(self.batch_dir / rel, self.path / rel)
+        for rel in self.outputs:
+            # pytest-json-report opens the report it is told to write; it does not
+            # create the directory, so the run's own parent has to exist in the clone
+            # the same way it exists in the batch (:func:`_measure_suite`).
+            (self.path / rel).parent.mkdir(parents=True, exist_ok=True)
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        self.discard()
+        return False
+
+    @property
+    def host(self) -> Path:
+        """The directory to hand ``shuru.run`` as ``host_root``."""
+        if self.path is None:
+            raise SuiteError("this VM root was used outside its `with` block")
+        return self.path
+
+    def discard(self) -> None:
+        """Delete the whole root. Called by ``__exit__``; safe to call again."""
+        if self.path is None:
+            return
+        shutil.rmtree(self.path, ignore_errors=True)
+        self.path = None
+        try:
+            # The holder disappears when it is empty, so a finished run leaves the
+            # batch exactly as it found it. Under concurrency a sibling root is
+            # usually still there and this fails harmlessly; the last one out removes
+            # it.
+            (self.batch_dir / VM_ROOT_DIR).rmdir()
+        except OSError:
+            pass
+
+    def lift_outputs(self) -> None:
+        """Copy this VM's declared outputs back to the host, after checking them.
+
+        An output the run never wrote is skipped rather than refused: a VM that never
+        booted, one the OOM killer ended and one that hit the cap all leave no report,
+        and that absence is the run's own result — :func:`run_state` reads it. An
+        output that *is* there must pass :func:`_validate_output_file` first.
+        """
+        for rel in self.outputs:
+            src = self.host / rel
+            if not src.exists() and not src.is_symlink():
+                continue
+            _validate_output_file(
+                src, max_bytes=OUTPUT_MAX_BYTES, where=f"{rel} written by {self.host}"
+            )
+            dest = self.batch_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+
+    def adopt(self, *, max_bytes: int = ADOPTED_TREE_MAX_BYTES) -> str:
+        """Swap this VM's tree in for the host's, and return the adopted tree's hash.
+
+        [VANTA-WHY] M3 item V8/Q1. A step that *mutates* a tree — the in-place build,
+        the patch apply — produces something every later step reads, so the guest's
+        tree has to become the host's. It does so only after :func:`_validate_tree`,
+        and the swap is two renames rather than a copy: POSIX ``rename`` cannot
+        replace a non-empty directory, so the old tree steps aside first and is
+        deleted once the new one is in place. If the second rename fails the old tree
+        goes straight back and the error propagates — never a silent fallback to it.
+
+        The returned hash is :func:`suite_cache.tree_fingerprint` of the adopted
+        tree. Every later cache key is computed from the tree on disk at key time,
+        so it is automatically the adopted one; the value is returned so ``prepare``
+        can record *which* bytes that was on ``prepare.json``.
+        """
+        if self.tree_rel is None:
+            raise SuiteError("this VM root has no tree to adopt")
+        src = self.host / self.tree_rel
+        _validate_tree(
+            src,
+            max_bytes=max_bytes,
+            where=f"the tree {self.tree_rel} that {self.host} built",
+        )
+        dest = self.batch_dir / self.tree_rel
+        replaced = dest.with_name(dest.name + ".replaced")
+        if replaced.is_symlink() or replaced.is_file():
+            replaced.unlink()
+        elif replaced.is_dir():
+            shutil.rmtree(replaced)
+        if dest.is_symlink() or dest.is_file():
+            dest.unlink()
+        elif dest.is_dir():
+            os.replace(dest, replaced)
+        try:
+            os.replace(src, dest)
+        except OSError:
+            if replaced.exists():
+                os.replace(replaced, dest)
+            raise
+        if replaced.is_dir():
+            shutil.rmtree(replaced, ignore_errors=True)
+        return suite_cache.tree_fingerprint(dest)
+
+
 def _run_one_vm(
     *,
     script: str,
@@ -452,6 +755,8 @@ def _run_one_vm(
     timeout_secs: int,
     env: Mapping[str, str],
     budget: Optional[budget_mod.Budget],
+    carry: Sequence[str] = (),
+    output_rel: Optional[str] = None,
 ) -> shuru.ExecResult:
     """Boot ONE VM for one run of a pair, holding a scheduler slot while it runs.
 
@@ -467,19 +772,36 @@ def _run_one_vm(
     reading the in-session gate makes of the same number — the cap is what one suite
     invocation may take — and it is why the derived cap (item D1) can be compared
     with it directly.
+
+    [VANTA-WHY] M3 item V8. The VM mounts a fresh clone of the tree rather than the
+    batch directory (:class:`VmRoot`), so the guest reaches its tree at
+    ``/workspace/<tree_rel>`` exactly as before and everything the batch holds beside
+    the tree — oracle, other bugs' worktrees, the manifest, the suite cache — is
+    above the VM's filesystem root instead of merely writable-and-ignored. The clone
+    is deleted when this run ends, so a run's writes into its tree are invisible to
+    the next run and to the pristine tree. ``carry`` names batch-relative paths the
+    run's script also needs (a build file, a staged patch); ``output_rel`` is the one
+    file the run hands back, copied out and checked (:meth:`VmRoot.lift_outputs`)
+    before anything reads it.
     """
     gate = budget.slot(memory_mb=memory_mb) if budget is not None else nullcontext()
     with gate:
-        return shuru.run(
-            checkpoint=checkpoint,
-            host_root=batch_dir,
-            command=["sh", "-c", script],
-            disk_mb=disk_mb,
-            memory_mb=memory_mb,
-            guest_cwd=guest_tree_root(tree_rel),
-            timeout_secs=timeout_secs,
-            env=env,
-        )
+        outputs = () if output_rel is None else (output_rel,)
+        with VmRoot(
+            batch_dir=batch_dir, tree_rel=tree_rel, carry=carry, outputs=outputs
+        ) as root:
+            result = shuru.run(
+                checkpoint=checkpoint,
+                host_root=root.host,
+                command=["sh", "-c", script],
+                disk_mb=disk_mb,
+                memory_mb=memory_mb,
+                guest_cwd=guest_tree_root(tree_rel),
+                timeout_secs=timeout_secs,
+                env=env,
+            )
+            root.lift_outputs()
+            return result
 
 
 def _run_pair(
@@ -498,6 +820,7 @@ def _run_pair(
     cmd1: str,
     cmd2: str,
     budget: Optional[budget_mod.Budget],
+    carry: Sequence[str] = (),
 ) -> tuple[SuiteRun, SuiteRun]:
     """Run the pair's two invocations in two separate VMs (M3 item S5).
 
@@ -508,9 +831,16 @@ def _run_pair(
 
     The two VMs may overlap only when the budget allows it (:attr:`Budget.concurrent`).
     Without a budget — ``oracle``, ``replay`` and ``probe_xdist``'s calls, which do
-    not pass one — the runs are still two VMs but strictly serial, which is today's
-    ordering and today's ``.hypothesis`` visibility (run 2 sees run 1's database)
-    preserved with one extra boot.
+    not pass one — the runs are still two VMs but strictly serial.
+
+    [VANTA-WHY] M3 item V8/Q2. Each run gets its OWN clone of the pristine tree
+    (:func:`_run_one_vm`), in serial and parallel mode alike, so run 2 never sees
+    run 1's ``.hypothesis`` database and neither sees the host tree. That is a
+    deliberate change from the shared-VM era, where run 2 started from the database
+    run 1 had just written: the pair is what measures one tree twice, and a run whose
+    starting state depends on its sibling's example cache is not two measurements of
+    the same input. The two runs are therefore independent, which is what the
+    pre-registration states.
     """
     script1 = _run_script("1", cmd1, precompile, test_cmd)
     script2 = _run_script("2", cmd2, precompile, test_cmd)
@@ -523,16 +853,21 @@ def _run_pair(
         "timeout_secs": timeout_secs,
         "env": env,
         "budget": budget,
+        "carry": carry,
     }
     if budget is not None and budget.concurrent:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            first_future = pool.submit(_run_one_vm, script=script1, **common)
-            second_future = pool.submit(_run_one_vm, script=script2, **common)
+            first_future = pool.submit(
+                _run_one_vm, script=script1, output_rel=rel1, **common
+            )
+            second_future = pool.submit(
+                _run_one_vm, script=script2, output_rel=rel2, **common
+            )
             result2 = second_future.result()
             result1 = first_future.result()
     else:
-        result1 = _run_one_vm(script=script1, **common)
-        result2 = _run_one_vm(script=script2, **common)
+        result1 = _run_one_vm(script=script1, output_rel=rel1, **common)
+        result2 = _run_one_vm(script=script2, output_rel=rel2, **common)
     return (
         _load_run(batch_dir / rel1, result1, suffix="1"),
         _load_run(batch_dir / rel2, result2, suffix="2"),
@@ -558,6 +893,31 @@ def cache_env(extra_env: Optional[Mapping[str, str]] = None) -> dict[str, str]:
     return env
 
 
+def carry_material(batch_dir: Path, carry: Sequence[str]) -> Optional[list[dict]]:
+    """The carried paths, digested, as they enter a key (:func:`cache_material`).
+
+    [VANTA-WHY] M3 item V8. ``carry`` is an *input* to the run — ``probe_xdist``'s
+    staged wheels are on the interpreter's ``PYTHONPATH`` — so two calls that differ
+    only in what they carry must not share a key. A directory is hashed with
+    :func:`suite_cache.tree_fingerprint` (the same digest a tree gets); a file is
+    hashed by content. ``None`` when one of them cannot be read, which turns the cache
+    off for the call exactly as an unreadable tree does, rather than keying on a path
+    whose content was never read.
+    """
+    out: list[dict] = []
+    for rel in carry:
+        path = batch_dir / rel
+        try:
+            if path.is_dir():
+                digest = suite_cache.tree_fingerprint(path)
+            else:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except (OSError, NotADirectoryError):
+            return None
+        out.append({"rel": str(rel), "digest": digest})
+    return out
+
+
 def cache_material(
     *,
     checkpoint: str,
@@ -569,6 +929,7 @@ def cache_material(
     extra_env: Optional[Mapping[str, str]] = None,
     memory_mb: Optional[int] = None,
     precompile: Sequence[str] = (),
+    carry: Sequence[str] = (),
 ) -> Optional[dict]:
     """The key material for one pair of runs, or ``None`` when it cannot be built.
 
@@ -580,6 +941,11 @@ def cache_material(
     for this call rather than raising: the caller is inside a run that is about to
     fail for its own reason, and a key that could raise would turn a permission
     problem into a harness crash.
+
+    ``carry`` (M3 item V8) is the batch-relative paths a VM needs *beside* its tree,
+    and it is hashed only when it is non-empty: an empty carry is the shape every
+    caller but ``probe_xdist`` has, and folding an empty list into the rendering would
+    invalidate every entry that describes the same experiment.
 
     ``checkpoint_id`` is the LAYER's identity, read from the provenance `bake`
     wrote (:func:`suite_cache.checkpoint_identity`), and it is not the checkpoint
@@ -598,7 +964,7 @@ def cache_material(
         tree = suite_cache.tree_fingerprint(batch_dir / tree_rel)
     except (OSError, NotADirectoryError):
         return None
-    return {
+    material = {
         "schema": suite_cache.SCHEMA_VERSION,
         "kind": suite_cache.KIND_SUITE_PAIR,
         "harness": suite_cache.harness_build(),
@@ -612,6 +978,12 @@ def cache_material(
         "memory_mb": None if memory_mb is None else int(memory_mb),
         "timeout_secs": int(timeout_secs),
     }
+    if carry:
+        carried = carry_material(batch_dir, carry)
+        if carried is None:
+            return None
+        material["carry"] = carried
+    return material
 
 
 def _write_reports(batch_dir: Path, report_rel_stem: str, pair: SuitePair) -> None:
@@ -711,6 +1083,7 @@ def run_suite_twice(
     precompile: Sequence[str] = (),
     origin: Optional[str] = None,
     budget: Optional[budget_mod.Budget] = None,
+    carry: Sequence[str] = (),
 ) -> SuitePair:
     """Run ``test_cmd`` twice inside the checkpoint and diff the two reports.
 
@@ -739,6 +1112,13 @@ def run_suite_twice(
     The key is taken before the work and the whole lookup-measure-write path runs
     under :func:`_single_flight`, so two callers that want the same key at the same
     time — which S5 and S6 make ordinary — measure it once (M3 items S5/S6).
+
+    ``carry`` (M3 item V8) names batch-relative paths the run needs beside its tree —
+    ``probe_xdist``'s staged wheels, which the run imports off ``PYTHONPATH``. Each
+    run's VM mounts its own clone of the tree (:class:`VmRoot`), so without this a
+    path beside the tree would simply not exist inside the VM. Non-empty ``carry`` is
+    part of the cache key (:func:`cache_material`); empty ``carry`` contributes
+    nothing, so today's callers keep today's keys byte for byte.
     """
     material = (
         None
@@ -753,6 +1133,7 @@ def run_suite_twice(
             extra_env=extra_env,
             memory_mb=memory_mb,
             precompile=precompile,
+            carry=carry,
         )
     )
     key = "" if material is None else suite_cache.key_of(material)
@@ -776,6 +1157,7 @@ def run_suite_twice(
             budget=budget,
             material=material,
             key=key,
+            carry=carry,
         ),
     )
 
@@ -796,6 +1178,7 @@ def _measure_suite(
     budget: Optional[budget_mod.Budget],
     material: Optional[dict],
     key: str,
+    carry: Sequence[str] = (),
 ) -> SuitePair:
     """The cache-aware body of :func:`run_suite_twice`, run under its flight.
 
@@ -907,6 +1290,7 @@ def _measure_suite(
         cmd1=cmd1,
         cmd2=cmd2,
         budget=budget,
+        carry=carry,
     )
     pair = compare_runs(first, second)
 
@@ -1147,31 +1531,37 @@ def collect_report(
 
     Runs under the same interpreter, cwd and recorded ``sandbox_env`` as the graded
     suites, for the same reason :func:`collect_only` does (§3.4).
+
+    [VANTA-WHY] M3 item V8 — the VM mounts a clone of the tree, never the batch
+    directory, so the collection run cannot read the oracle, the hidden tests or the
+    manifest even by absolute path, and the caches collection leaves behind are
+    deleted with the clone instead of landing in the tree the next step reads.
     """
     env = {"PYTHONDONTWRITEBYTECODE": "1"}
     if extra_env:
         env.update(extra_env)
-    result = shuru.run(
-        checkpoint=checkpoint,
-        host_root=batch_dir,
-        command=[
-            "sh",
-            "-c",
-            "\n".join(
-                [
-                    *precompile_lines(precompile, test_cmd),
-                    _shell_quote(
-                        collect_command(test_cmd) + ["--continue-on-collection-errors"]
-                    ),
-                ]
-            ),
-        ],
-        disk_mb=disk_mb,
-        memory_mb=memory_mb,
-        guest_cwd=guest_tree_root(tree_rel),
-        timeout_secs=timeout_secs,
-        env=env,
-    )
+    with VmRoot(batch_dir=batch_dir, tree_rel=tree_rel) as root:
+        result = shuru.run(
+            checkpoint=checkpoint,
+            host_root=root.host,
+            command=[
+                "sh",
+                "-c",
+                "\n".join(
+                    [
+                        *precompile_lines(precompile, test_cmd),
+                        _shell_quote(
+                            collect_command(test_cmd) + ["--continue-on-collection-errors"]
+                        ),
+                    ]
+                ),
+            ],
+            disk_mb=disk_mb,
+            memory_mb=memory_mb,
+            guest_cwd=guest_tree_root(tree_rel),
+            timeout_secs=timeout_secs,
+            env=env,
+        )
     output = f"{result.stdout}\n{result.stderr}"
     report = CollectionReport(
         nodeids=parse_collected(result.stdout),
@@ -1210,7 +1600,8 @@ def build_tree_in_place(
     env: Optional[Mapping[str, str]] = None,
     timeout_secs: int = DEFAULT_BUILD_TIMEOUT_SECS,
     memory_mb: Optional[int] = None,
-) -> None:
+    carry: Sequence[str] = (),
+) -> str:
     """``python setup.py <setup_args>`` in the tree, inside the layer's VM.
 
     [VANTA-WHY] The failure this exists for: matplotlib/1's oracle tree was never
@@ -1230,38 +1621,53 @@ def build_tree_in_place(
     (``bake.build_env_lines``), so without it the build runs the compiler the
     interpreter *recorded*, which is the machine it was built on.
 
-    The build writes into the host tree (the batch directory is mounted ``rw``), so the
-    compiled objects are there for every suite that runs afterwards.
+    The build's compiled objects have to be there for every suite that runs
+    afterwards, which is why the VM's tree is adopted back onto the host (item V8/Q1,
+    below) rather than discarded with the VM.
 
     Raises :class:`SuiteError`, whose message names the tree and carries the error lines
     (:func:`failure_excerpt`), so a build failure is reported as itself and never as the
     collection it would otherwise have caused.
+
+    [VANTA-WHY] M3 item V8/Q1. The build now runs in a **clone** of the tree, and the
+    host adopts the clone's result when — and only when — the build succeeded: the VM
+    was the only writer, so the tree that replaces the host's is the tree the build
+    actually produced, validated (:meth:`VmRoot.adopt`) and swapped in atomically. A
+    build that fails or times out raises before the swap, so a half-built tree is
+    never left where the next step would read it. The adopted tree's fingerprint is
+    returned for ``prepare`` to record on ``prepare.json``; every later cache key is
+    computed from the tree on disk at key time, so it is automatically the adopted
+    one. ``carry`` names the batch-relative build files (:func:`prepare`) the build
+    reads — written beside the trees, which the VM no longer sees as ``/workspace``
+    unless they are carried in.
     """
     command = [python, "setup.py", *setup_args]
     env_full = {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"}
     if env:
         env_full.update(env)
-    result = shuru.run(
-        checkpoint=checkpoint,
-        host_root=batch_dir,
-        command=["sh", "-c", _shell_quote(command)],
-        disk_mb=disk_mb,
-        memory_mb=memory_mb,
-        guest_cwd=guest_tree_root(tree_rel),
-        timeout_secs=timeout_secs,
-        env=env_full,
-    )
     where = guest_tree_root(tree_rel)
-    if result.timed_out:
-        raise SuiteError(
-            f"build timed out after {timeout_secs}s in {where} "
-            f"(`{_shell_quote(command)}`); {failure_excerpt(result.stdout + result.stderr)}"
+    with VmRoot(batch_dir=batch_dir, tree_rel=tree_rel, carry=carry) as root:
+        result = shuru.run(
+            checkpoint=checkpoint,
+            host_root=root.host,
+            command=["sh", "-c", _shell_quote(command)],
+            disk_mb=disk_mb,
+            memory_mb=memory_mb,
+            guest_cwd=where,
+            timeout_secs=timeout_secs,
+            env=env_full,
         )
-    if not result.ok:
-        raise SuiteError(
-            f"build failed in {where}: `{_shell_quote(command)}` exited "
-            f"{result.exit_code}; {failure_excerpt(result.stdout + result.stderr)}"
-        )
+        if result.timed_out:
+            raise SuiteError(
+                f"build timed out after {timeout_secs}s in {where} "
+                f"(`{_shell_quote(command)}`); {failure_excerpt(result.stdout + result.stderr)}"
+            )
+        if not result.ok:
+            raise SuiteError(
+                f"build failed in {where}: `{_shell_quote(command)}` exited "
+                f"{result.exit_code}; {failure_excerpt(result.stdout + result.stderr)}"
+            )
+        return root.adopt()
 
 
 def collect_only(
@@ -1299,29 +1705,34 @@ def collect_only(
     its full meaning. The caller has already proved, on both trees, that each
     ignored file errors on the buggy source and collects cleanly on the fixed one
     (:func:`prepare.detect_collect_flip`) — that error *is* the oracle there.
+
+    [VANTA-WHY] M3 item V8 — the VM mounts a clone of the tree, never the batch
+    directory, so the gate cannot read the oracle or the hidden tests even by
+    absolute path.
     """
     env = {"PYTHONDONTWRITEBYTECODE": "1"}
     if extra_env:
         env.update(extra_env)
-    result = shuru.run(
-        checkpoint=checkpoint,
-        host_root=batch_dir,
-        command=[
-            "sh",
-            "-c",
-            "\n".join(
-                [
-                    *precompile_lines(precompile, test_cmd),
-                    _shell_quote(collect_command(test_cmd, ignore)),
-                ]
-            ),
-        ],
-        disk_mb=disk_mb,
-        memory_mb=memory_mb,
-        guest_cwd=guest_tree_root(tree_rel),
-        timeout_secs=timeout_secs,
-        env=env,
-    )
+    with VmRoot(batch_dir=batch_dir, tree_rel=tree_rel) as root:
+        result = shuru.run(
+            checkpoint=checkpoint,
+            host_root=root.host,
+            command=[
+                "sh",
+                "-c",
+                "\n".join(
+                    [
+                        *precompile_lines(precompile, test_cmd),
+                        _shell_quote(collect_command(test_cmd, ignore)),
+                    ]
+                ),
+            ],
+            disk_mb=disk_mb,
+            memory_mb=memory_mb,
+            guest_cwd=guest_tree_root(tree_rel),
+            timeout_secs=timeout_secs,
+            env=env,
+        )
     nodeids = collected_or_raise(
         parse_collected(result.stdout),
         exit_code=result.exit_code,
@@ -1360,6 +1771,11 @@ def import_probe(
     imported instead of the graded tree, and every patch would then grade the same.
 
     Returns the path the interpreter actually loaded.
+
+    [VANTA-WHY] M3 item V8 — the VM mounts a clone of the tree, never the batch
+    directory. The path the probe prints is therefore still ``/workspace/<tree_rel>``
+    and comparable with :func:`guest_tree_root`, while the oracle beside the tree is
+    outside the VM's filesystem root.
     """
     if not module.isidentifier():
         raise SuiteError(
@@ -1371,25 +1787,26 @@ def import_probe(
     env = {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"}
     if extra_env:
         env.update(extra_env)
-    result = shuru.run(
-        checkpoint=checkpoint,
-        host_root=batch_dir,
-        command=[
-            "sh",
-            "-c",
-            "\n".join(
-                [
-                    *precompile_lines(precompile, test_cmd),
-                    _shell_quote([python, "-c", code]),
-                ]
-            ),
-        ],
-        disk_mb=disk_mb,
-        memory_mb=memory_mb,
-        guest_cwd=guest_tree_root(tree_rel),
-        timeout_secs=timeout_secs,
-        env=env,
-    )
+    with VmRoot(batch_dir=batch_dir, tree_rel=tree_rel) as root:
+        result = shuru.run(
+            checkpoint=checkpoint,
+            host_root=root.host,
+            command=[
+                "sh",
+                "-c",
+                "\n".join(
+                    [
+                        *precompile_lines(precompile, test_cmd),
+                        _shell_quote([python, "-c", code]),
+                    ]
+                ),
+            ],
+            disk_mb=disk_mb,
+            memory_mb=memory_mb,
+            guest_cwd=guest_tree_root(tree_rel),
+            timeout_secs=timeout_secs,
+            env=env,
+        )
     where = next(
         (line.strip() for line in reversed(result.stdout.splitlines()) if line.strip()),
         "",
@@ -1573,8 +1990,12 @@ def _clean_tree_noise(tree: Path) -> None:
     into whichever tree it ran in — so a tree left uncleaned carries them into every
     copy taken from it (and into the tree the Creator reads). Removing it here is the
     same rule as ``__pycache__``/``.pytest_cache``: a run's leavings are not the tree.
-    Called *after* both runs of a pair (:func:`run_suite_twice`), so the second run
-    still sees the first run's database.
+
+    [VANTA-WHY] M3 item V8/Q2 — a suite run no longer writes into the host tree at
+    all: it runs in a clone (:class:`VmRoot`) that is deleted with its VM, so this is
+    now the belt to the clone's braces. It still runs, because the tree it guards is
+    the one later steps copy, and because a run that predates item V8 — or a step
+    that adopts a built tree — can have left the same artefacts behind.
     """
     for name in (
         "__pycache__",
@@ -1632,25 +2053,34 @@ def git_apply_patch(
                 "patch contained only test hunks; nothing to apply",
                 APPLY_APPLIED,
             )
-    staged = batch_dir / "reports" / f"_apply_{patch_path.name}"
+    staged_rel = f"reports/_apply_{patch_path.name}"
+    staged = batch_dir / staged_rel
     staged.parent.mkdir(parents=True, exist_ok=True)
     staged.write_text(body, encoding="utf-8")
-    result = shuru.run(
-        checkpoint=checkpoint,
-        host_root=batch_dir,
-        command=["git", "apply", "--verbose", f"/workspace/{staged.relative_to(batch_dir)}"],
-        disk_mb=disk_mb,
-        memory_mb=memory_mb,
-        guest_cwd=f"/workspace/{tree_rel}",
-        timeout_secs=timeout_secs,
-    )
-    detail = (result.stdout + result.stderr).strip()[-2000:]
-    if result.timed_out or result.exit_code is None:
-        # The command did not finish, so nothing about the patch was learned:
-        # neither an acceptance nor a refusal.
-        return False, detail, APPLY_EXEC_FAILURE
-    if result.exit_code != 0:
-        return False, detail, APPLY_REJECTED
+    with VmRoot(
+        batch_dir=batch_dir, tree_rel=tree_rel, carry=(staged_rel,)
+    ) as root:
+        result = shuru.run(
+            checkpoint=checkpoint,
+            host_root=root.host,
+            command=["git", "apply", "--verbose", f"/workspace/{staged_rel}"],
+            disk_mb=disk_mb,
+            memory_mb=memory_mb,
+            guest_cwd=f"/workspace/{tree_rel}",
+            timeout_secs=timeout_secs,
+        )
+        detail = (result.stdout + result.stderr).strip()[-2000:]
+        if result.timed_out or result.exit_code is None:
+            # The command did not finish, so nothing about the patch was learned:
+            # neither an acceptance nor a refusal.
+            return False, detail, APPLY_EXEC_FAILURE
+        if result.exit_code != 0:
+            return False, detail, APPLY_REJECTED
+        # [VANTA-WHY] M3 item V8/Q1 — the applied tree is what every later step
+        # reads, so the host adopts the VM's tree. Only on a clean apply: a rejected
+        # diff changed nothing the host should keep, and the clone is discarded with
+        # its VM rather than replacing the tree with a partially patched one.
+        root.adopt()
     return True, detail, APPLY_APPLIED
 
 

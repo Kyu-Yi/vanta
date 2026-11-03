@@ -21182,7 +21182,21 @@ class TestBuildTreeInPlace:
         base.update(over)
         return shuru_mod.ExecResult(**base)
 
-    def test_it_runs_setup_py_in_the_tree_with_the_layers_env(self, monkeypatch):
+    @staticmethod
+    def _batch(tmp_path: Path, tree_rel: str = "worktrees/matplotlib_1/oracle_tree") -> Path:
+        """A real batch dir holding a real tree.
+
+        [VANTA-WHY] M3 item V8. The build now runs in a fresh clone of the tree
+        (:class:`suite_mod.VmRoot`), so both the batch and the tree have to exist on
+        disk before the call — this used to be ``Path("/nonexistent")`` because the
+        batch was mounted directly.
+        """
+        batch_dir = tmp_path / "batch"
+        (batch_dir / tree_rel).mkdir(parents=True)
+        (batch_dir / tree_rel / "setup.py").write_text("", encoding="utf-8")
+        return batch_dir
+
+    def test_it_runs_setup_py_in_the_tree_with_the_layers_env(self, monkeypatch, tmp_path):
         seen: dict = {}
         monkeypatch.setattr(
             suite_mod.shuru, "run", lambda **kwargs: seen.update(kwargs) or self._result()
@@ -21190,7 +21204,7 @@ class TestBuildTreeInPlace:
 
         suite_mod.build_tree_in_place(
             checkpoint="vanta-bi-matplotlib-1",
-            batch_dir=Path("/nonexistent"),
+            batch_dir=self._batch(tmp_path),
             tree_rel="worktrees/matplotlib_1/oracle_tree",
             python="python",
             setup_args=("build_ext", "--inplace"),
@@ -21209,7 +21223,9 @@ class TestBuildTreeInPlace:
         )
         assert seen["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
 
-    def test_a_failed_build_names_the_tree_and_carries_the_error_lines(self, monkeypatch):
+    def test_a_failed_build_names_the_tree_and_carries_the_error_lines(
+        self, monkeypatch, tmp_path
+    ):
         monkeypatch.setattr(
             suite_mod.shuru,
             "run",
@@ -21226,7 +21242,7 @@ class TestBuildTreeInPlace:
         with pytest.raises(suite_mod.SuiteError) as excinfo:
             suite_mod.build_tree_in_place(
                 checkpoint="chk",
-                batch_dir=Path("/nonexistent"),
+                batch_dir=self._batch(tmp_path),
                 tree_rel="worktrees/matplotlib_1/oracle_tree",
                 python="python",
                 setup_args=("build_ext", "--inplace"),
@@ -21243,7 +21259,9 @@ class TestBuildTreeInPlace:
             "progress output"
         )
 
-    def test_a_build_that_hangs_is_a_build_failure_not_a_suite_timeout(self, monkeypatch):
+    def test_a_build_that_hangs_is_a_build_failure_not_a_suite_timeout(
+        self, monkeypatch, tmp_path
+    ):
         monkeypatch.setattr(
             suite_mod.shuru,
             "run",
@@ -21253,7 +21271,7 @@ class TestBuildTreeInPlace:
         with pytest.raises(suite_mod.SuiteError, match="^build timed out after 7s in "):
             suite_mod.build_tree_in_place(
                 checkpoint="chk",
-                batch_dir=Path("/nonexistent"),
+                batch_dir=self._batch(tmp_path, "worktrees/Demo_1/oracle_tree"),
                 tree_rel="worktrees/Demo_1/oracle_tree",
                 python="python",
                 setup_args=("build_ext", "--inplace"),
@@ -21478,7 +21496,20 @@ class TestImportProbe:
             stdout=stdout, stderr="", exit_code=exit_code, timed_out=False
         )
 
-    def test_the_probe_runs_the_suite_interpreter_in_the_suite_cwd(self, monkeypatch):
+    @staticmethod
+    def _batch(tmp_path: Path) -> Path:
+        """A real batch dir with a real tree.
+
+        [VANTA-WHY] M3 item V8. ``import_probe`` now mounts a fresh clone of the
+        tree rather than the batch directory, so the tree has to exist on disk.
+        """
+        batch_dir = tmp_path / "batch"
+        (batch_dir / "w" / "Demo_1" / "oracle_tree").mkdir(parents=True)
+        return batch_dir
+
+    def test_the_probe_runs_the_suite_interpreter_in_the_suite_cwd(
+        self, monkeypatch, tmp_path
+    ):
         seen: dict = {}
         monkeypatch.setattr(
             suite_mod.shuru,
@@ -21489,7 +21520,7 @@ class TestImportProbe:
 
         where = suite_mod.import_probe(
             checkpoint="chk",
-            batch_dir=Path("/tmp/batch"),
+            batch_dir=self._batch(tmp_path),
             tree_rel="w/Demo_1/oracle_tree",
             test_cmd=["python", "-m", "pytest", "tests"],
             module="pysnooper",
@@ -21508,7 +21539,7 @@ class TestImportProbe:
         assert "PYTHONPATH" not in probe
 
     def test_a_module_that_does_not_import_raises_rather_than_returning_a_path(
-        self, monkeypatch
+        self, monkeypatch, tmp_path
     ):
         monkeypatch.setattr(
             suite_mod.shuru,
@@ -21520,7 +21551,7 @@ class TestImportProbe:
         )
         with pytest.raises(suite_mod.SuiteError, match="ModuleNotFoundError"):
             suite_mod.import_probe(
-                checkpoint="chk", batch_dir=Path("/tmp/batch"),
+                checkpoint="chk", batch_dir=self._batch(tmp_path),
                 tree_rel="w/Demo_1/oracle_tree",
                 test_cmd=["python", "-m", "pytest", "tests"], module="pysnooper",
                 disk_mb=8192,
@@ -22026,7 +22057,18 @@ class TestSandboxEnvReachesEveryRun:
         assert len(runs) == 2
         assert all(run["extra_env"] is None for run in runs)
 
-    def test_collect_only_merges_the_extra_env_over_its_own(self, monkeypatch):
+    @staticmethod
+    def _batch(tmp_path: Path) -> Path:
+        """A real batch dir with a real tree.
+
+        [VANTA-WHY] M3 item V8. ``collect_only``/``collect_report`` now mount a fresh
+        clone of the tree rather than the batch directory, so the tree has to exist.
+        """
+        batch_dir = tmp_path / "batch"
+        (batch_dir / "w" / "Demo_1" / "oracle_tree").mkdir(parents=True)
+        return batch_dir
+
+    def test_collect_only_merges_the_extra_env_over_its_own(self, monkeypatch, tmp_path):
         seen: dict = {}
         monkeypatch.setattr(
             suite_mod.shuru,
@@ -22037,14 +22079,15 @@ class TestSandboxEnvReachesEveryRun:
             ),
         )
         suite_mod.collect_only(
-            checkpoint="chk", batch_dir=Path("/tmp/b"), tree_rel="w/Demo_1/oracle_tree",
+            checkpoint="chk", batch_dir=self._batch(tmp_path),
+            tree_rel="w/Demo_1/oracle_tree",
             test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
             extra_env={"PYTHONPATH": "./docs_src"},
         )
         assert seen["env"]["PYTHONPATH"] == "./docs_src"
         assert seen["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
 
-    def test_collect_only_ignores_the_recorded_flip_files(self, monkeypatch):
+    def test_collect_only_ignores_the_recorded_flip_files(self, monkeypatch, tmp_path):
         seen: dict = {}
         monkeypatch.setattr(
             suite_mod.shuru,
@@ -22055,13 +22098,14 @@ class TestSandboxEnvReachesEveryRun:
             ),
         )
         suite_mod.collect_only(
-            checkpoint="chk", batch_dir=Path("/tmp/b"), tree_rel="w/Demo_1/oracle_tree",
+            checkpoint="chk", batch_dir=self._batch(tmp_path),
+            tree_rel="w/Demo_1/oracle_tree",
             test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
             ignore=["tests/test_flip.py"],
         )
         assert "--ignore=tests/test_flip.py" in seen["command"][2]
 
-    def test_collect_report_keeps_going_past_the_first_error(self, monkeypatch):
+    def test_collect_report_keeps_going_past_the_first_error(self, monkeypatch, tmp_path):
         """The exhaustive reading the rule needs — a gate run would stop at one."""
         seen: dict = {}
         monkeypatch.setattr(
@@ -22073,12 +22117,231 @@ class TestSandboxEnvReachesEveryRun:
             ),
         )
         report = suite_mod.collect_report(
-            checkpoint="chk", batch_dir=Path("/tmp/b"), tree_rel="w/Demo_1/oracle_tree",
+            checkpoint="chk", batch_dir=self._batch(tmp_path),
+            tree_rel="w/Demo_1/oracle_tree",
             test_cmd=["python", "-m", "pytest", "tests"], disk_mb=1024,
         )
         assert "--continue-on-collection-errors" in seen["command"][2]
         assert report.nodeids == {"tests/x.py::t"}
         assert report.exit_code == 2
+
+
+class TestVmRootIsolation:
+    """Item V8 — the guest's whole view of the host is its own clone.
+
+    The ruling asks for three properties and all three are properties of the mount
+    root :class:`suite_mod.VmRoot` builds, so they are pinned there rather than
+    inferred from a boot: a batch path the run was not given is not in the root, so a
+    guest write to it can only ever create a file in the clone; a run's writes into
+    its tree are invisible to the next run and to the pristine tree (one clone per VM,
+    item V8/Q2 — the change that made run 1 and run 2 independent); and a carried path
+    is a *copy*, so writing to it never reaches the batch either.
+    """
+
+    TREE = "worktrees/Demo_1/stripped_tree"
+    ORACLE_TREE = "worktrees/Demo_1/oracle_tree"
+
+    @classmethod
+    def _batch(cls, tmp_path: Path) -> Path:
+        """A batch holding the tree a run uses and everything it must not see.
+
+        The protected entries are the audit's own list: the shell of the batch that
+        today's ``batch_dir :rw`` mount put in front of every guest — the oracle
+        tree with its hidden tests intact, the oracle logs, the issues, the env
+        cache, the run logs, the failure ledger and the manifest.
+        """
+        batch = tmp_path / "batch"
+        write(batch / cls.TREE / "demo.py", "x = 1\n")
+        write(batch / cls.TREE / "tests" / "test_demo.py", "def test_x():\n    assert 1\n")
+        write(batch / cls.ORACLE_TREE / "tests" / "test_hidden.py",
+              "def test_hidden():\n    assert 1\n")
+        write(batch / "oracle" / "hidden.log", "the hidden nodeids\n")
+        write(batch / "issues" / "Demo_1.md", "issue\n")
+        write(batch / "env" / "cache.tar", "")
+        write(batch / "run_logs" / "run.jsonl", "")
+        write(batch / "failures.jsonl", "{}\n")
+        write(batch / "manifest.json", "{}\n")
+        return batch
+
+    def test_the_root_holds_the_named_tree_and_nothing_beside_it(self, tmp_path):
+        """A guest read of an oracle or hidden-test path has nothing to read."""
+        batch = self._batch(tmp_path)
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as root:
+            assert [entry.name for entry in root.host.iterdir()] == ["worktrees"]
+            assert [p.name for p in (root.host / "worktrees").iterdir()] == ["Demo_1"]
+            assert [p.name for p in (root.host / "worktrees" / "Demo_1").iterdir()] == [
+                "stripped_tree"
+            ], "the sibling oracle tree (hidden tests intact) is in the mount root"
+            for rel in (
+                "oracle",
+                "issues",
+                "env",
+                "run_logs",
+                "failures.jsonl",
+                "manifest.json",
+                self.ORACLE_TREE,
+            ):
+                assert not (root.host / rel).exists(), (
+                    f"{rel} is inside the mount root, so the guest reaches it at "
+                    f"/workspace/{rel}"
+                )
+
+    def test_a_run_writes_into_its_tree_and_neither_the_next_run_nor_the_pristine_tree_sees_it(
+        self, tmp_path
+    ):
+        batch = self._batch(tmp_path)
+        pristine = suite_cache_mod.tree_fingerprint(batch / self.TREE)
+
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as first:
+            write(first.host / self.TREE / ".hypothesis" / "example", "run 1\n")
+            write(first.host / self.TREE / "demo.py", "x = 2\n")
+            first_root = first.host
+
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as second:
+            assert not (second.host / self.TREE / ".hypothesis").exists(), (
+                "run 2 inherited run 1's .hypothesis database; every run starts from "
+                "the pristine tree's own state (item V8/Q2)"
+            )
+            assert (second.host / self.TREE / "demo.py").read_text(encoding="utf-8") == "x = 1\n"
+
+        assert not first_root.exists(), "a finished run's clone is deleted"
+        assert suite_cache_mod.tree_fingerprint(batch / self.TREE) == pristine, (
+            "the run's writes reached the host's tree"
+        )
+        assert not (batch / suite_mod.VM_ROOT_DIR).exists(), (
+            "the .vm_roots holder disappears with the last root"
+        )
+
+    def test_a_carried_path_is_a_copy_so_a_write_to_it_never_reaches_the_batch(self, tmp_path):
+        batch = self._batch(tmp_path)
+        write(batch / "vanta-build.cfg", "original\n")
+        with suite_mod.VmRoot(
+            batch_dir=batch, tree_rel=self.TREE, carry=("vanta-build.cfg",)
+        ) as root:
+            assert (root.host / "vanta-build.cfg").read_text(encoding="utf-8") == "original\n"
+            write(root.host / "vanta-build.cfg", "rewritten in the VM\n")
+        assert (batch / "vanta-build.cfg").read_text(encoding="utf-8") == "original\n"
+
+    def test_each_run_of_a_pair_gets_its_own_clone(self, tmp_path, monkeypatch):
+        """Item V8/Q2 — the pair's two runs no longer share a tree or its database."""
+        batch = self._batch(tmp_path)
+        roots: list = []
+        saw_a_previous_run: list = []
+
+        def run(**kwargs):
+            tree = kwargs["host_root"] / self.TREE
+            roots.append(kwargs["host_root"])
+            saw_a_previous_run.append((tree / "seen.txt").exists())
+            write(tree / "seen.txt", f"run {len(roots)}\n")
+            return shuru_mod.ExecResult(stdout="", stderr="", exit_code=0, timed_out=False)
+
+        monkeypatch.setattr(suite_mod.shuru, "run", run)
+        for _ in range(2):
+            suite_mod._run_one_vm(
+                script="true", checkpoint="chk", batch_dir=batch, tree_rel=self.TREE,
+                disk_mb=1024, memory_mb=None, timeout_secs=60, env={}, budget=None,
+            )
+        assert roots[0] != roots[1], "the pair shared one root, so the runs are not independent"
+        assert saw_a_previous_run == [False, False], (
+            "the second run's tree carried the first run's writes"
+        )
+        assert not (batch / self.TREE / "seen.txt").exists()
+
+    def test_the_clone_is_attempted_as_a_clonefile_before_a_real_copy(self, tmp_path, monkeypatch):
+        """The cost decision, pinned: ``cp -cR`` is what makes a tree per VM cheap."""
+        batch = self._batch(tmp_path)
+        argv: list = []
+        monkeypatch.setattr(
+            suite_mod.subprocess,
+            "run",
+            lambda args, **kwargs: argv.append(args)
+            or subprocess.CompletedProcess(args, 1),
+        )
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as root:
+            assert argv[0] == [
+                "cp",
+                "-cR",
+                str(batch / self.TREE),
+                str(root.host / self.TREE),
+            ]
+            assert (root.host / self.TREE / "demo.py").read_text(encoding="utf-8") == "x = 1\n"
+
+
+class TestAdoptTree:
+    """Item V8/Q1 — a mutating run's tree becomes the host's, but only if it is a tree.
+
+    The host adopts what the guest built, so the guest would otherwise choose the
+    bytes the host afterwards hashes and runs on. Every refusal here is a *gate
+    failure with the reason*, never a silent fallback to the tree the VM did not
+    touch: the old tree is still exactly as it was after each one.
+    """
+
+    TREE = TestVmRootIsolation.TREE
+
+    @staticmethod
+    def _batch(tmp_path: Path) -> Path:
+        return TestVmRootIsolation._batch(tmp_path)
+
+    def test_a_validated_tree_replaces_the_hosts_and_its_hash_comes_back(self, tmp_path):
+        batch = self._batch(tmp_path)
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as root:
+            write(root.host / self.TREE / "built.so", "compiled\n")
+            fingerprint = root.adopt()
+
+        assert (batch / self.TREE / "built.so").read_text(encoding="utf-8") == "compiled\n"
+        assert (batch / self.TREE / "demo.py").read_text(encoding="utf-8") == "x = 1\n"
+        assert fingerprint == suite_cache_mod.tree_fingerprint(batch / self.TREE)
+
+    def test_a_symlink_out_of_the_tree_is_refused_and_the_old_tree_stays(self, tmp_path):
+        batch = self._batch(tmp_path)
+        before = suite_cache_mod.tree_fingerprint(batch / self.TREE)
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as root:
+            write(root.host / self.TREE / "built.so", "compiled\n")
+            os.symlink(batch / "oracle" / "hidden.log", root.host / self.TREE / "leak")
+            with pytest.raises(suite_mod.SuiteError, match="symlink"):
+                root.adopt()
+
+        assert suite_cache_mod.tree_fingerprint(batch / self.TREE) == before
+        assert not (batch / self.TREE / "built.so").exists(), (
+            "a refused tree was adopted anyway"
+        )
+
+    def test_a_file_that_is_not_a_regular_file_is_refused(self, tmp_path):
+        batch = self._batch(tmp_path)
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as root:
+            os.mkfifo(root.host / self.TREE / "pipe")
+            with pytest.raises(suite_mod.SuiteError, match="not a regular file"):
+                root.adopt()
+
+    def test_a_tree_past_the_size_limit_is_refused(self, tmp_path):
+        batch = self._batch(tmp_path)
+        with suite_mod.VmRoot(batch_dir=batch, tree_rel=self.TREE) as root:
+            with pytest.raises(suite_mod.SuiteError, match="larger than the 1-byte limit"):
+                root.adopt(max_bytes=1)
+
+    def test_an_output_that_is_a_symlink_is_refused_rather_than_copied(self, tmp_path):
+        """A "report" that is a link is a way to make the host read another file."""
+        batch = self._batch(tmp_path)
+        write(batch / "secret.txt", "not a report\n")
+        rel = "reports/Demo_1-vanta.run1.json"
+        with suite_mod.VmRoot(
+            batch_dir=batch, tree_rel=self.TREE, outputs=(rel,)
+        ) as root:
+            os.symlink(batch / "secret.txt", root.host / rel)
+            with pytest.raises(suite_mod.SuiteError, match="symbolic link"):
+                root.lift_outputs()
+        assert not (batch / rel).exists()
+
+    def test_an_output_the_run_never_wrote_is_skipped_not_refused(self, tmp_path):
+        """A VM that never booted, an OOM kill and a cap all leave no report — that
+        absence is the run's own result, which ``run_state`` reads."""
+        batch = self._batch(tmp_path)
+        rel = "reports/Demo_1-vanta.run1.json"
+        with suite_mod.VmRoot(
+            batch_dir=batch, tree_rel=self.TREE, outputs=(rel,)
+        ) as root:
+            root.lift_outputs()
+        assert not (batch / rel).exists()
 
 
 # ============================================================================

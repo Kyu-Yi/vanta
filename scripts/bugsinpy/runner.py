@@ -2776,19 +2776,24 @@ def python_version_of(paths: BatchPaths, checkpoint: str, disk_mb: int) -> str:
 
     §7.3 records both this and the pinned version. Probing costs one boot per
     checkpoint and is cached, so a 100-run batch pays it once per environment.
+
+    [VANTA-WHY] M3 item V8 — the probe needs no tree at all, only an interpreter, so
+    its VM mounts an empty root of its own (:class:`suite.VmRoot` with no tree)
+    rather than the whole batch directory.
     """
     cached = paths.env_cache / f"{checkpoint}.json"
     if cached.is_file():
         return str(_read_json(cached).get("python_version") or "")
     from . import shuru as shuru_mod
 
-    probe = shuru_mod.run(
-        checkpoint=checkpoint,
-        host_root=paths.batch_dir,
-        command=["sh", "-c", "python --version; python3 --version"],
-        disk_mb=disk_mb,
-        timeout_secs=PROBE_TIMEOUT_SECS,
-    )
+    with suite_mod.VmRoot(batch_dir=paths.batch_dir, tree_rel=None) as root:
+        probe = shuru_mod.run(
+            checkpoint=checkpoint,
+            host_root=root.host,
+            command=["sh", "-c", "python --version; python3 --version"],
+            disk_mb=disk_mb,
+            timeout_secs=PROBE_TIMEOUT_SECS,
+        )
     text = (probe.stdout + probe.stderr).strip()
     version = ""
     match = re.search(r"Python (\d+\.\d+\.\d+)", text)

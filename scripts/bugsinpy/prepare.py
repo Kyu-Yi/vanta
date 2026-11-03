@@ -454,6 +454,20 @@ class BugPrep:
     (``not built: setup.py declares no ext_modules…``), so a tree with no entry would
     mean the stage was skipped rather than that the tree needed nothing.
     """
+    tree_hashes: dict[str, str] = field(default_factory=dict)
+    """M3 item V8 — the fingerprint of each tree the host ADOPTED from a VM.
+
+    [VANTA-WHY] The in-place build and the patch apply run in a VM of their own and
+    the host adopts the tree that VM produced (``suite.VmRoot.adopt``), so the bytes
+    every later step reads are the bytes that VM wrote — validated (no symlink out of
+    the tree, no device, no setuid bit, within a size limit) and swapped in
+    atomically. The adopted tree's ``suite_cache.tree_fingerprint`` is recorded here,
+    per tree, so a reader can line a later cache key up with the exact bytes that
+    produced it. Empty for a bug whose trees were never mutated by a VM.
+
+    A tree that fails validation is a prepare gate failure with the reason on
+    ``gate_failures`` — never a silent fallback to the tree the VM did not touch.
+    """
     version_pin: dict[str, Any] = field(default_factory=dict)
     """§1.2 — the project version frozen into the sandbox tree, and how.
 
@@ -613,6 +627,7 @@ class BugPrep:
             "issue_text_names_symbols": sorted(self.issue_text_names_symbols),
             "deps": self.deps,
             "builds": self.builds,
+            "tree_hashes": self.tree_hashes,
             "version_pin": self.version_pin,
             "scheduler": self.scheduler,
         }
@@ -710,6 +725,7 @@ class BugPrep:
             ),
             deps=field_of(payload, "deps", owner=owner, where=where),
             builds=map_of(payload, "builds", owner=owner, where=where),
+            tree_hashes=map_of(payload, "tree_hashes", owner=owner, where=where),
             version_pin=record_of(payload, "version_pin", owner=owner, where=where),
             scheduler=record_of(payload, "scheduler", owner=owner, where=where),
         )
@@ -1040,7 +1056,9 @@ def build_trees_in_place(
     against. The command follows the rule's own trigger (:func:`setup_args_for`) and the
     environment is the layer's (``bake.build_env_for``) with the project's own
     ``build_env`` added to it and its ``build_files`` written beside the trees, for the
-    reason ``suite.build_tree_in_place`` records.
+    reason ``suite.build_tree_in_place`` records. Each build's VM mounts a clone of its
+    own tree (M3 item V8), so the build files travel *into* that clone and each built
+    tree comes back adopted, with its fingerprint recorded on the row.
 
     Only ``full`` prepares reach this — it is called after ``load_deps`` and before the
     dependency gate — so a measure-only run never pays a compiler.
@@ -1066,18 +1084,23 @@ def build_trees_in_place(
             env[name] = f"{layer_value} {value}".strip() if layer_value else value
     if prep.build_files:
         # §3.4 — the build's own configuration file, written into the batch directory
-        # rather than into a tree: ``batch_dir`` is what Shuru mounts at ``/workspace``,
-        # so the file lands *beside* the trees and the trees stay exactly what the
-        # benchmark ships. Written before the first VM boots, so every one of the three
-        # builds already sees it, and rewritten each time so a re-prepare is the same
-        # run. The name is a bare file name (§3.4, the split's own validation), so it
-        # cannot be a path to somewhere else.
+        # rather than into a tree, so the trees stay exactly what the benchmark ships.
+        # Written before the first VM boots, and rewritten each time so a re-prepare is
+        # the same run. Each build's VM mounts a clone of its tree only (item V8), so
+        # the name is carried into that clone beside the tree rather than being visible
+        # because the whole batch is mounted. The name is a bare file name (§3.4, the
+        # split's own validation), so it cannot be a path to somewhere else.
         for name, content in sorted(prep.build_files.items()):
             (batch_dir / name).write_text(content, encoding="utf-8")
     setup_args = setup_args_for(prep.bug.pythonpath)
     command = f"python setup.py {' '.join(setup_args)}"
+    # [VANTA-WHY] M3 item V8 — the build file lives in the batch directory, which the
+    # guest no longer sees as ``/workspace``: the VM mounts a clone of the tree only,
+    # so the name is carried in beside it. The relative path inside the clone is the
+    # same, so ``build_env``'s own ``/workspace/<name>`` still resolves.
+    carry = tuple(sorted(prep.build_files))
     for tree_name in BUILD_TREES:
-        suite_mod.build_tree_in_place(
+        fingerprint = suite_mod.build_tree_in_place(
             checkpoint=checkpoint,
             batch_dir=batch_dir,
             tree_rel=_rel(prep, tree_name),
@@ -1086,8 +1109,13 @@ def build_trees_in_place(
             disk_mb=DISK_MB,
             env=env,
             memory_mb=prep.vm_memory_mb,
+            carry=carry,
         )
         prep.builds[tree_name] = f"built: {command}"
+        # The VM built the tree and the host adopted it (item V8/Q1); the adopted
+        # bytes' fingerprint goes on the row so a later cache key can be lined up
+        # with the tree that produced it.
+        prep.tree_hashes[tree_name] = fingerprint
 
 
 # ---------------------------------------------------------------------------

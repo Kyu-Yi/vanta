@@ -4021,7 +4021,9 @@ def _run_jobs_concurrently(
     a stop; ``records`` come back in JOB order and not completion order, so a
     phase's rows read the way they would have read serially. A preflight refusal —
     or any other raise inside a row — is re-raised from the lowest-index row that
-    raised, once the pool has drained.
+    raised, once the pool has drained, and it OUTRANKS a ``"stop_file"`` /
+    ``"spend_cap"`` status found on a different row (M3 item V3): an exception is
+    never converted into an orderly stop.
     """
     count = len(jobs)
     # `slots[i]` is what happened to job i: None until a worker reaches it, then
@@ -4128,7 +4130,21 @@ def _run_jobs_concurrently(
         for future in futures:
             future.result()
 
-    # First pass — how the phase ended, from the lowest-index row that stopped it.
+    # First pass — a stored worker exception OUTRANKS any stop or spend status.
+    # [VANTA-WHY] M3 item V3. The status scan below reads the slots in job order
+    # and stops at the first row that ended the phase, but a raise and a stop can
+    # land on DIFFERENT rows: if row 0 saw the stop file and row 1 raised, the
+    # single interleaved loop would hit row 0's `stopped`, break, and hand the
+    # caller a clean `"stop_file"` — the exception would be swallowed and a row
+    # that actually failed would be reported as an orderly stop. A raise is a
+    # statement that the batch could not continue; a stop is a statement that the
+    # operator asked it not to. The raise has to win regardless of index, so it is
+    # looked for first, across every slot, and re-raised from the lowest-index row
+    # that raised — the same rule the docstring states.
+    for entry in slots:
+        if entry is not None and entry[0] == "error":
+            raise entry[1]
+    # Second pass — how the phase ended, from the lowest-index row that stopped it.
     status = ""
     for entry in slots:
         if entry is None:
@@ -4140,9 +4156,7 @@ def _run_jobs_concurrently(
         if kind == "spend":
             status = "spend_cap"
             break
-        if kind == "error":
-            raise value
-    # Second pass — the phase's rows, in job order.
+    # Third pass — the phase's rows, in job order.
     records: list[dict[str, Any]] = []
     failed = 0
     for entry in slots:

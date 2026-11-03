@@ -38,6 +38,7 @@ import threading
 import time
 import zipfile
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -27633,6 +27634,93 @@ class TestRunBatchLoop:
             tight, charge_mb=tight.row_charge_mb(8192)
         )
         assert tight_block["charge_exceeds_budget"] is True
+
+    # -- M3 item V3: a raise outranks a stop -------------------------------
+    def test_a_stored_worker_raise_outranks_a_stop_in_the_same_phase(
+        self, tmp_path, monkeypatch
+    ):
+        """V3 — a stored worker exception is never converted into an orderly stop.
+
+        A phase's slots are read in job order and the scan for "how the phase
+        ended" stops at the first row that ended it. But a raise and a stop land on
+        *different* rows when two rows are in flight: here row 0 waits for its
+        memory slot and finds the stop file the moment it is admitted — its stop
+        check happens after the wait — while row 1, already past the stop check,
+        raises. Read as one interleaved scan, row 0's ``stopped`` ends the loop
+        before row 1's ``error`` is ever seen, and a row that failed is handed to
+        the caller as a clean ``"stop_file"``. The raise has to win regardless of
+        index.
+
+        Driven through ``_run_jobs_concurrently`` directly: the interleaving is a
+        fact about *where each row is* when the file appears, and no fixture makes
+        that deterministic through ``run_batch``. The two rows get different
+        ``vm_memory_mb`` so the slot hook can tell them apart by charge.
+        """
+        batch_dir = tmp_path / "batch"
+        batch_dir.mkdir(parents=True)
+        jobs = [
+            _job(prep(bug=bug_info(bug_id=1), root=self._tree(tmp_path, "one"), vm_memory_mb=1000)),
+            _job(
+                prep(bug=bug_info(bug_id=2), root=self._tree(tmp_path, "two"), vm_memory_mb=2000),
+                config="b0",
+            ),
+        ]
+        budget = budget_mod.Budget(2, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+        in_the_slot_for_row_zero = threading.Event()
+        stop_created = threading.Event()
+        row_one_raised = threading.Event()
+        real_slot = budget_mod.Budget.slot
+
+        @contextmanager
+        def hooked_slot(self, *, memory_mb=None, cores=1):
+            if memory_mb == budget.row_charge_mb(1000):
+                # Row 0: hold it BEFORE it takes the slot, so it is already inside
+                # the `try` — past every stop check — when the file appears.
+                in_the_slot_for_row_zero.set()
+                assert stop_created.wait(timeout=10)
+            with real_slot(self, memory_mb=memory_mb, cores=cores):
+                yield
+
+        monkeypatch.setattr(budget_mod.Budget, "slot", hooked_slot)
+
+        def stub(
+            *, job, paths, manifest, vanta_bin, max_attempts, disk_mb, python_version,
+            scheduler=None,
+        ):
+            # Row 1: only once row 0 is committed to the wait, raise.
+            assert in_the_slot_for_row_zero.wait(timeout=10)
+            row_one_raised.set()
+            raise RuntimeError("worker exploded")
+
+        monkeypatch.setattr(runner_mod, "run_job", stub)
+        stop_file = runner_mod.queue_stop_path(batch_dir)
+
+        def create_the_stop_once_the_row_has_raised() -> None:
+            assert row_one_raised.wait(timeout=10)
+            stop_file.write_text("", encoding="utf-8")
+            stop_created.set()
+
+        watcher = threading.Thread(target=create_the_stop_once_the_row_has_raised)
+        watcher.start()
+        try:
+            with pytest.raises(RuntimeError, match="worker exploded"):
+                runner_mod._run_jobs_concurrently(
+                    jobs=jobs,
+                    budget=budget,
+                    paths=runner_mod.BatchPaths.under(batch_dir),
+                    batch_dir=batch_dir,
+                    manifest=manifest_mod.Manifest(batch_dir),
+                    vanta_bin=Path("/nonexistent/vanta_m3"),
+                    max_attempts=1,
+                    disk_mb=8192,
+                    checkpoint_pythons={"chk": "3.8.20"},
+                    spend_gate=None,
+                    stop_file=stop_file,
+                    preflight=None,
+                )
+        finally:
+            stop_created.set()
+            watcher.join()
 
 
 class TestQueue:

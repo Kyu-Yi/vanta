@@ -27679,7 +27679,7 @@ class TestRunBatchLoop:
         monkeypatch.setattr(
             runner_mod, "run_job", self._capturing_stub(tmp_path, calls, blocks)
         )
-        code, _results = runner_mod.run_batch(
+        code, results = runner_mod.run_batch(
             batch_dir=tmp_path / name,
             batch_id="b1",
             split=split,
@@ -27692,7 +27692,7 @@ class TestRunBatchLoop:
             disk_mb=8192,
             budget=budget,
         )
-        return code, calls, blocks
+        return code, calls, blocks, results
 
     def test_mode_phases_group_adjacent_modes_and_keep_the_spelling(self):
         """D13 stays exact: repairs then reviews, and the group carries the SPELLING
@@ -27716,7 +27716,7 @@ class TestRunBatchLoop:
         monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kwargs: kwargs["candidate"])
         preps, entries, split = self._fixture(tmp_path)
 
-        code, calls, blocks = self._drive(
+        code, calls, blocks, _ = self._drive(
             monkeypatch, tmp_path, preps, entries, split,
             name="serial", budget=budget_mod.Budget(1),
         )
@@ -27734,24 +27734,38 @@ class TestRunBatchLoop:
         exactly the jobs the serial path claimed, in the same order, so the manifest
         is the manifest a serial run would have produced. Every pooled row is priced
         by the scheduler; no serial row is.
+
+        [VANTA-WHY] M3 item V6. The stub appends to its call log from the worker
+        threads, so under the pool that log is in COMPLETION order — asserting on it
+        directly is a race the test can lose. The schedule claim is therefore checked
+        in two parts: the pooled jobs as a SET (same jobs), and the records
+        `run_batch` returns as an ORDERED list (same order), because those records
+        are assembled from the pool's slots in job order on both paths.
         """
         monkeypatch.setattr(runner_mod, "python_version_of", lambda *a, **k: "3.8.20")
         monkeypatch.setattr(runner_mod, "grade_candidate", lambda **kwargs: kwargs["candidate"])
         preps, entries, split = self._fixture(tmp_path)
 
-        code_serial, serial, serial_blocks = self._drive(
+        code_serial, serial, serial_blocks, serial_results = self._drive(
             monkeypatch, tmp_path, preps, entries, split,
             name="serial", budget=budget_mod.Budget(1),
         )
         preps, entries, split = self._fixture(tmp_path)
-        code_parallel, pooled, pooled_blocks = self._drive(
+        code_parallel, pooled, pooled_blocks, pooled_results = self._drive(
             monkeypatch, tmp_path, preps, entries, split,
             name="parallel",
             budget=budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20),
         )
 
         assert code_serial == 0 and code_parallel == 0
-        assert [job.key for job in pooled] == [job.key for job in serial]
+        serial_rows = [row["key"] for wave in serial_results for row in wave.records]
+        pooled_rows = [row["key"] for wave in pooled_results for row in wave.records]
+        # Same jobs, whatever order the pool happened to finish them in.
+        assert {job.key for job in pooled} == {job.key for job in serial}
+        # Same order, checked on the job-ordered records rather than the call log.
+        assert pooled_rows == serial_rows
+        # And the job order those records are in is the schedule, not an accident.
+        assert serial_rows == [job.key for job in serial]
         assert serial_blocks == [None] * len(serial_blocks)
         assert len(pooled_blocks) == len(pooled)
         assert all(block and block["concurrent"] for block in pooled_blocks)

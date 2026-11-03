@@ -312,18 +312,54 @@ fn announce_fallback(line: &str) {
 // ============================================================================
 // Live-sandbox counter (M3 item S6)
 // ============================================================================
-//
-// [VANTA-WHY] The S6 scheduler charges each row `peak_vms × vm_memory_mb` of host
-// memory, so it needs the row's ACTUAL peak of simultaneous live microVMs to
-// calibrate that charge from real runs (S6's decided recording). `shuru` exposes
-// no `ps`/`list`, so the host cannot enumerate live VMs; this in-process counter,
-// kept at the one place every sandbox boots and dies, is the only thing that can
-// see the peak. "Sandbox" here is a shuru microVM — the subprocess backend is not
-// a sandbox (see types.rs) and is deliberately not counted, so the number is the
-// VMs exactly. A row is one `vanta_m3` process, so the high-water mark is the
-// row's observed peak.
-static LIVE_SANDBOXES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_SANDBOXES: AtomicUsize = AtomicUsize::new(0);
+
+/// The process-wide live/peak microVM counter, as a value rather than a pair of
+/// statics.
+///
+/// [VANTA-WHY] The S6 scheduler charges each row `peak_vms × vm_memory_mb` of host
+/// memory, so it needs the row's ACTUAL peak of simultaneous live microVMs to
+/// calibrate that charge from real runs (S6's decided recording). `shuru` exposes
+/// no `ps`/`list`, so the host cannot enumerate live VMs; this in-process counter,
+/// kept at the one place every sandbox boots and dies, is the only thing that can
+/// see the peak. "Sandbox" here is a shuru microVM — the subprocess backend is not
+/// a sandbox (see types.rs) and is deliberately not counted, so the number is the
+/// VMs exactly. A row is one `vanta_m3` process, so the high-water mark is the
+/// row's observed peak.
+///
+/// [VANTA-WHY] M3 item V6. The S6 recording needs one process-wide counter, but a
+/// test that reads a process-wide counter can only assert on a *delta*: another
+/// thread's boot would move the number under the test, and the two statics gave
+/// the test no way to own the state it measured. Making the counter a value lets
+/// the real path keep one shared instance (`SANDBOXES`) while a test instantiates
+/// its own and asserts exact numbers.
+struct SandboxCounter {
+    live: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl SandboxCounter {
+    const fn new() -> Self {
+        Self { live: AtomicUsize::new(0), peak: AtomicUsize::new(0) }
+    }
+
+    /// Count a microVM boot and advance the high-water mark.
+    fn booted(&self) {
+        let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(live, Ordering::SeqCst);
+    }
+
+    /// Count a microVM teardown.
+    fn torn_down(&self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+/// The process-wide counter every real sandbox boot and teardown feeds.
+static SANDBOXES: SandboxCounter = SandboxCounter::new();
 
 /// The high-water mark of simultaneous live microVMs in this process so far.
 ///
@@ -331,18 +367,17 @@ static PEAK_SANDBOXES: AtomicUsize = AtomicUsize::new(0);
 /// `peak_sandboxes` key, so the Python side can record the row's real peak for
 /// calibration instead of assuming the conservative default charge.
 pub fn peak_sandboxes() -> usize {
-    PEAK_SANDBOXES.load(Ordering::SeqCst)
+    SANDBOXES.peak()
 }
 
 /// Count a microVM boot and advance the high-water mark.
 fn sandbox_booted() {
-    let live = LIVE_SANDBOXES.fetch_add(1, Ordering::SeqCst) + 1;
-    PEAK_SANDBOXES.fetch_max(live, Ordering::SeqCst);
+    SANDBOXES.booted();
 }
 
 /// Count a microVM teardown.
 fn sandbox_torn_down() {
-    LIVE_SANDBOXES.fetch_sub(1, Ordering::SeqCst);
+    SANDBOXES.torn_down();
 }
 
 impl Backend {
@@ -544,22 +579,23 @@ mod tests {
 
     #[test]
     fn peak_sandboxes_tracks_the_high_water_mark_of_live_vms() {
-        // [VANTA-WHY] M3 item S6 — the counter is process-global, so this asserts
-        // on the DELTA it moves rather than on an absolute value: `live` returns
-        // to where it started, and `peak` never falls below the new maximum. The
-        // lib tests run with `--test-threads=1`, and only the shuru constructor
-        // and `destroy` feed these atomics.
-        let live_before = LIVE_SANDBOXES.load(Ordering::SeqCst);
-        sandbox_booted();
-        sandbox_booted();
-        sandbox_booted();
-        assert_eq!(LIVE_SANDBOXES.load(Ordering::SeqCst), live_before + 3);
-        assert!(peak_sandboxes() >= live_before + 3);
-        sandbox_torn_down();
-        sandbox_torn_down();
-        sandbox_torn_down();
-        assert_eq!(LIVE_SANDBOXES.load(Ordering::SeqCst), live_before);
+        // [VANTA-WHY] M3 item V6 — the counter is a value, so this test owns its
+        // own instance and asserts exact numbers. Reading the process-wide
+        // `SANDBOXES` would let another thread's boot move the number under the
+        // assertions (the old test could only assert a delta for that reason).
+        let counter = SandboxCounter::new();
+        assert_eq!(counter.peak(), 0);
+        assert_eq!(counter.live.load(Ordering::SeqCst), 0);
+        counter.booted();
+        counter.booted();
+        counter.booted();
+        assert_eq!(counter.live.load(Ordering::SeqCst), 3);
+        assert_eq!(counter.peak(), 3);
+        counter.torn_down();
+        counter.torn_down();
+        counter.torn_down();
+        assert_eq!(counter.live.load(Ordering::SeqCst), 0);
         // A teardown never lowers the high-water mark.
-        assert!(peak_sandboxes() >= live_before + 3);
+        assert_eq!(counter.peak(), 3);
     }
 }

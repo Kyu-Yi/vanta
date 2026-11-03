@@ -6477,7 +6477,7 @@ class TestProbeXdist:
         with zipfile.ZipFile(wheel, "w") as archive:
             archive.writestr("../escape.py", "x = 1\n")
         with pytest.raises(shuru_mod.ShuruError):
-            probe_xdist_mod.unpack_wheels([wheel], tmp_path / "stage")
+            probe_xdist_mod.unpack_wheels([wheel], tmp_path / "stage", root=tmp_path)
 
     def test_unpack_wheels_publishes_importable_files(self, tmp_path):
         wheel = tmp_path / "xdist-1.0-py3-none-any.whl"
@@ -6485,7 +6485,7 @@ class TestProbeXdist:
             archive.writestr("xdist/__init__.py", "__version__ = '1.0'\n")
             archive.writestr("xdist-1.0.dist-info/METADATA", "Name: pytest-xdist\n")
         dest = tmp_path / "stage"
-        assert probe_xdist_mod.unpack_wheels([wheel], dest) == [wheel.name]
+        assert probe_xdist_mod.unpack_wheels([wheel], dest, root=tmp_path) == [wheel.name]
         assert (dest / "xdist" / "__init__.py").is_file()
 
     def test_unpack_wheels_clears_a_stale_staging_directory(self, tmp_path):
@@ -6503,9 +6503,151 @@ class TestProbeXdist:
         wheel = tmp_path / "xdist-1.0-py3-none-any.whl"
         with zipfile.ZipFile(wheel, "w") as archive:
             archive.writestr("xdist/__init__.py", "__version__ = '1.0'\n")
-        assert probe_xdist_mod.unpack_wheels([wheel], dest) == [wheel.name]
+        assert probe_xdist_mod.unpack_wheels([wheel], dest, root=tmp_path) == [wheel.name]
         assert not stale.exists(), "a stale package from a prior run must not survive"
         assert (dest / "xdist" / "__init__.py").is_file()
+
+    # -- V5: the clear-and-extract is confined to the batch directory -------
+    def test_unpack_wheels_refuses_a_destination_outside_the_root(self, tmp_path):
+        """[VANTA-WHY] M3 item V5 — the clear only ever runs inside ``root``."""
+        wheel = tmp_path / "xdist-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("xdist/__init__.py", "__version__ = '1.0'\n")
+        outside = tmp_path / "outside" / "stage"
+        with pytest.raises(shuru_mod.ShuruError):
+            probe_xdist_mod.unpack_wheels([wheel], outside, root=tmp_path / "batch")
+        assert not (tmp_path / "outside").exists(), "nothing may be created outside root"
+
+    def test_unpack_wheels_refuses_a_symlinked_component_under_the_root(self, tmp_path):
+        """[VANTA-WHY] M3 item V5 — a planted symlink cannot move the cleanup out.
+
+        ``rmtree`` follows symlinks, so ``probe_xdist`` being a link would send the clear
+        into whatever it points at. The component is refused and the target survives.
+        """
+        root = tmp_path / "batch"
+        root.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        (elsewhere / "keep").mkdir(parents=True)
+        sentinel = elsewhere / "keep" / "file.txt"
+        sentinel.write_text("must survive\n", encoding="utf-8")
+        (root / "probe_xdist").symlink_to(elsewhere, target_is_directory=True)
+        wheel = tmp_path / "xdist-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("xdist/__init__.py", "__version__ = '1.0'\n")
+        dest = root / "probe_xdist" / "Demo_1" / "_wheels"
+        with pytest.raises(shuru_mod.ShuruError):
+            probe_xdist_mod.unpack_wheels([wheel], dest, root=root)
+        assert sentinel.is_file(), "the symlink target must not have been cleared"
+        assert not (elsewhere / "Demo_1").exists(), "nothing may be extracted there"
+
+    # -- V5: the wheel directory the operator names -------------------------
+    @staticmethod
+    def _staged_wheel(dir_path, *, requires: str = "pytest>=7.0"):
+        wheel = dir_path / "xdist-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("xdist/__init__.py", "__version__ = '1.0'\n")
+            archive.writestr(
+                "xdist-1.0.dist-info/METADATA",
+                f"Name: pytest-xdist\nRequires-Dist: {requires}\n",
+            )
+        return wheel
+
+    def _resolve_staged(self, batch_dir, monkeypatch, *, wheel_dir, dry_run, pytest_version):
+        monkeypatch.setattr(
+            probe_xdist_mod,
+            "_preflight",
+            lambda **kwargs: {"pytest": pytest_version, "xdist": None, "python": "3.10"},
+        )
+        args = SimpleNamespace(xdist_wheel_dir=wheel_dir, dry_run=dry_run)
+        return probe_xdist_mod._resolve_xdist(
+            args,
+            checkpoint="ckpt",
+            interpreter="python3",
+            batch_dir=batch_dir,
+            tree_rel="worktrees/Demo_1/src_buggy",
+            disk_mb=16384,
+            memory_mb=8192,
+            sandbox_env={},
+        )
+
+    def test_a_dry_run_reads_wheel_metadata_without_unpacking(self, tmp_path, monkeypatch):
+        """[VANTA-WHY] M3 item V5 — resolving the plan is a pure read.
+
+        ``_run_bug`` resolves xdist *before* its ``--dry-run`` branch, so when the wheels
+        were unpacked inside ``_resolve_xdist`` a dry run cleared and rewrote
+        ``<batch>/probe_xdist/<tree>/_wheels`` — the opposite of what ``--dry-run``
+        documents. Nothing about the plan needs the unpack: the pytest requirement comes
+        straight out of each wheel's ``METADATA``.
+        """
+        wheels_dir = tmp_path / "wheels"
+        wheels_dir.mkdir()
+        wheel = self._staged_wheel(wheels_dir)
+        block = self._resolve_staged(
+            tmp_path, monkeypatch, wheel_dir=wheels_dir, dry_run=True, pytest_version="8.0.2"
+        )
+        assert block["source"] == probe_xdist_mod.SOURCE_STAGED_WHEEL
+        assert block["wheels"] == [wheel.name]
+        assert block["stance"][wheel.name]["satisfied"] is True
+        assert not (tmp_path / "probe_xdist").exists(), (
+            "a dry run must not create the staging directory"
+        )
+
+    def test_the_staging_directory_is_unpacked_only_when_the_run_will_boot(
+        self, tmp_path, monkeypatch
+    ):
+        """The complement of the dry run: a real run still stages the wheels."""
+        wheels_dir = tmp_path / "wheels"
+        wheels_dir.mkdir()
+        self._staged_wheel(wheels_dir)
+        block = self._resolve_staged(
+            tmp_path, monkeypatch, wheel_dir=wheels_dir, dry_run=False, pytest_version="8.0.2"
+        )
+        staging = tmp_path / "probe_xdist" / "Demo_1" / "_wheels"
+        assert block["source"] == probe_xdist_mod.SOURCE_STAGED_WHEEL
+        assert block["staging"] == str(staging)
+        assert (staging / "xdist" / "__init__.py").is_file()
+        assert block["extra_env"]["PYTHONPATH"] == "/workspace/probe_xdist/Demo_1/_wheels"
+
+    def test_an_unusable_wheel_set_leaves_the_batch_untouched(self, tmp_path, monkeypatch):
+        """The stance loop reads METADATA only, so an unsatisfiable wheel set is refused
+        before anything is written — not after it has been staged."""
+        wheels_dir = tmp_path / "wheels"
+        wheels_dir.mkdir()
+        self._staged_wheel(wheels_dir, requires="pytest>=99.0")
+        block = self._resolve_staged(
+            tmp_path, monkeypatch, wheel_dir=wheels_dir, dry_run=False, pytest_version="8.0.2"
+        )
+        assert block["source"] is None
+        assert "pytest>=99.0" in block["reason"]
+        assert not (tmp_path / "probe_xdist").exists(), (
+            "an unusable wheel set must not have been staged"
+        )
+
+    def test_resolve_xdist_refuses_a_wheel_dir_inside_the_staging_area(
+        self, tmp_path, monkeypatch
+    ):
+        """[VANTA-WHY] M3 item V5 — the staging area is where ``unpack_wheels`` clears."""
+        inside = tmp_path / "probe_xdist" / "Demo_1" / "_wheels"
+        inside.mkdir(parents=True)
+        with pytest.raises(shuru_mod.ShuruError) as caught:
+            self._resolve_staged(
+                tmp_path, monkeypatch, wheel_dir=inside, dry_run=True, pytest_version="8.0.2"
+            )
+        assert "staging area" in str(caught.value)
+
+    def test_resolve_xdist_refuses_a_symlinked_wheel_dir(self, tmp_path, monkeypatch):
+        """[VANTA-WHY] M3 item V5 — the containment test uses resolved paths, so a link
+        into the staging area would read as a directory outside it; the link is refused
+        instead of followed."""
+        real = tmp_path / "wheels"
+        real.mkdir()
+        link = tmp_path / "link-wheels"
+        link.symlink_to(real, target_is_directory=True)
+        with pytest.raises(shuru_mod.ShuruError) as caught:
+            self._resolve_staged(
+                tmp_path, monkeypatch, wheel_dir=link, dry_run=True, pytest_version="8.0.2"
+            )
+        assert "symlink" in str(caught.value)
 
     # -- the dry run (M3 item U10) ------------------------------------------
     def _dry_report(self, **over) -> dict:

@@ -51,9 +51,10 @@ The VMs booted from a checkpoint have **no network device at all** (``shuru.run`
 
   1. the checkpoint itself, when it already has ``xdist`` importable; or
   2. a wheel (or wheels) the operator staged offline, passed as
-     ``--xdist-wheel-dir``. The probe unpacks them under the batch directory, puts
-     that directory on ``PYTHONPATH``, and checks each wheel's ``Requires-Dist``
-     against the checkpoint's pytest before booting anything.
+     ``--xdist-wheel-dir``. The probe checks each wheel's ``Requires-Dist`` against
+     the checkpoint's pytest, and only then unpacks them under the batch directory and
+     puts that directory on ``PYTHONPATH`` — so a wheel set the checkpoint cannot use,
+     and a ``--dry-run``, write nothing at all (M3 item V5).
 
 If neither is available — or the staged wheel's pytest requirement is not satisfied
 by the checkpoint's pytest — the probe reports ``unavailable`` with the reason and
@@ -298,7 +299,37 @@ def metadata_of(wheel: Path) -> str:
     raise shuru_mod.ShuruError(f"{wheel} carries no *.dist-info/METADATA")
 
 
-def unpack_wheels(wheels: Sequence[Path], dest: Path) -> list[str]:
+def _refuse_within(dest: Path, *, root: Path, what: str) -> None:
+    """Refuse unless ``dest`` lies plainly inside ``root``, with no symlink on the way.
+
+    [VANTA-WHY] M3 item V5. ``unpack_wheels`` CLEARS its destination with
+    ``shutil.rmtree`` before extracting, and that destination is built by joining names
+    onto the batch directory. ``rmtree`` follows a symlink, so a symlink planted at any
+    name in that join — ``probe_xdist`` itself, or a deeper one — would make the
+    clear-and-extract delete and write something outside the batch directory. Two rules
+    remove that: the destination must be lexically under ``root``, and no component from
+    ``root`` down to it may be a symlink. That second rule is the "symlinked ancestors"
+    refusal: the cleanup stays inside the batch directory even when the batch directory
+    has been tampered with. ``root`` itself is not checked — the caller has already
+    resolved it.
+    """
+    try:
+        dest.relative_to(root)
+    except ValueError:
+        raise shuru_mod.ShuruError(
+            f"refusing {what}: {dest} is not inside {root}"
+        ) from None
+    component = dest
+    while component != root:
+        if component.is_symlink():
+            raise shuru_mod.ShuruError(
+                f"refusing {what}: {component} is a symlink, so clearing {dest} could "
+                f"reach outside {root}"
+            )
+        component = component.parent
+
+
+def unpack_wheels(wheels: Sequence[Path], dest: Path, *, root: Path) -> list[str]:
     """Unpack staged wheels into ``dest`` so an offline boot can import them.
 
     A wheel is a zip whose packages sit at the archive root, and a checkout of it
@@ -318,7 +349,13 @@ def unpack_wheels(wheels: Sequence[Path], dest: Path) -> list[str]:
     wheel was removed) imports a stale plugin from a directory the operator no longer
     names. Clearing the directory makes its contents exactly the wheels passed in, which
     is what the caller's ``staging`` claim means.
+
+    [VANTA-WHY] M3 item V5 — ``root`` is the directory that clear is confined to, and
+    :func:`_refuse_within` is asked before anything is removed or created. It is a
+    required keyword rather than a defaulted one so no caller can forget it: the whole
+    point is that ``rmtree`` never runs on a path the batch directory does not own.
     """
+    _refuse_within(dest, root=root, what=f"staging directory {dest}")
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True, exist_ok=True)
@@ -444,6 +481,36 @@ def _stop(report: dict[str, Any], out_path: Path, args: argparse.Namespace) -> i
     return _finish(report, out_path)
 
 
+def _resolve_wheel_dir(raw: Path, *, batch_dir: Path) -> Path:
+    """The operator's ``--xdist-wheel-dir``, refused when it cannot be read safely.
+
+    [VANTA-WHY] M3 item V5. The probe writes exactly one thing for a staged wheel: it
+    CLEARS and then extracts into ``batch_dir/probe_xdist/<tree>/_wheels``. A wheel
+    directory inside that scratch is refused, because ``unpack_wheels`` would delete the
+    operator's own wheels — or, on a second run, feed the probe back the packages it
+    extracted the first time, from a directory the operator no longer names. The
+    containment test is made on the *resolved* path, so a symlink could otherwise let
+    the same directory pass as one outside the scratch and slip past the refusal; the
+    symlink itself is refused so the test stays a statement about what was named. The
+    path is returned resolved, so every later use of it is the directory the refusal was
+    made against.
+    """
+    given = Path(raw)
+    if given.is_symlink():
+        raise shuru_mod.ShuruError(
+            f"refusing --xdist-wheel-dir {given}: it is a symlink, so the directory read "
+            "here is not the directory named"
+        )
+    wheel_dir = given.resolve()
+    scratch = (batch_dir / "probe_xdist").resolve()
+    if wheel_dir == scratch or scratch in wheel_dir.parents:
+        raise shuru_mod.ShuruError(
+            f"refusing --xdist-wheel-dir {wheel_dir}: it is inside the probe's staging "
+            f"area {scratch}, which unpack_wheels clears before it extracts"
+        )
+    return wheel_dir
+
+
 def _resolve_xdist(
     args: argparse.Namespace,
     *,
@@ -488,15 +555,20 @@ def _resolve_xdist(
         )
         return block
 
-    wheel_dir = Path(args.xdist_wheel_dir).resolve()
+    wheel_dir = _resolve_wheel_dir(args.xdist_wheel_dir, batch_dir=batch_dir)
     wheels = sorted(p for p in wheel_dir.glob("*.whl") if p.is_file())
     if not wheels:
         block["reason"] = f"{wheel_dir} contains no *.whl, so the parallel side was not run"
         return block
 
     staging = batch_dir / "probe_xdist" / Path(tree_rel).parent.name / "_wheels"
-    published = unpack_wheels(wheels, staging)
-    block["wheels"] = published
+    # [VANTA-WHY] M3 item V5 — everything above is a read of the operator's wheel
+    # directory, and the stance loop below is a read of each wheel's METADATA. Nothing is
+    # written to the batch directory before the wheels are known to be usable, so a dry
+    # run — and a run whose wheels the checkpoint cannot use — leaves the batch exactly
+    # as it found it. ``unpack_wheels`` is the one write, and it happens immediately
+    # before the boot that needs the packages on ``PYTHONPATH``.
+    block["wheels"] = [wheel.name for wheel in wheels]
     block["staging"] = str(staging)
 
     pytest_version = probe.get("pytest")
@@ -523,6 +595,9 @@ def _resolve_xdist(
             f"the requirement is {xdist_spec!r} — the parallel side was not run"
         )
         return block
+
+    if not args.dry_run:
+        unpack_wheels(wheels, staging, root=batch_dir)
 
     env = dict(sandbox_env)
     guest_staging = _guest_path(batch_dir, staging)

@@ -4927,7 +4927,7 @@ pub async fn run(
              n_ctx={} creator_effort={} creator_effort_mechanism={} \
              creator_prompt_tokens={}{}{}{} fixed_rounds={} native_vacuous={} \
              native_timeout_secs={} native_timeout={} native_cache_hits={} \
-             peak_sandboxes={}",
+             peak_sandboxes={} sandbox_backend={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -5259,6 +5259,17 @@ pub async fn run(
             // guard. Appended after every pre-existing key so an older row's
             // reader is unaffected.
             crate::sandbox::peak_sandboxes(),
+            // [VANTA-WHY] W1 — which security boundary ACTUALLY ran this row.
+            // `sandbox_backend=shuru` is a microVM; `sandbox_backend=subprocess`
+            // is untrusted code on the host with no boundary, reachable only by
+            // an explicit `VANTA_SANDBOX_BACKEND=subprocess` (an `auto` run that
+            // cannot boot shuru now refuses before any row is written). Recording
+            // it per row is what makes that downgrade auditable: the value is the
+            // same one `session.start` already carries as `actual_backend`, read
+            // through to the row (`runner.build_record`). Space-free, so it
+            // survives the `key=value` reader; appended after every pre-existing
+            // key so an older row's reader is unaffected.
+            actual_backend,
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),

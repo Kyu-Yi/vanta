@@ -26874,6 +26874,55 @@ class TestRunJob:
         )
         assert plain["seed_method"] is None
 
+    def test_a_row_says_which_sandbox_backend_ran_it(self, tmp_path, monkeypatch):
+        """W1 — the security boundary is a recorded field, not an inference.
+
+        `auto` now FAILS CLOSED, so a row's backend is either a `shuru` microVM
+        or an explicitly requested `subprocess` — untrusted code on the host with
+        no boundary. The harness always forces `shuru` (`vanta_env`), so a
+        `subprocess` row can only come from a run made outside it; recording the
+        value on the row makes that downgrade auditable without opening the
+        session log. `None` for a summary that predates the field.
+        """
+        base = _outcome(tmp_path)
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, summary=dict(base.summary, sandbox_backend="shuru")
+            ),
+        )
+        microvm = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert microvm["sandbox_backend"] == "shuru"
+
+        # An explicit `VANTA_SANDBOX_BACKEND=subprocess` run is recorded as such,
+        # so the row itself says no boundary was in force.
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path, summary=dict(base.summary, sandbox_backend="subprocess")
+            ),
+        )
+        host = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert host["sandbox_backend"] == "subprocess"
+
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        plain = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")), paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path), vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4, disk_mb=8192, python_version="3.8.20",
+        )
+        assert plain["sandbox_backend"] is None
+
     def test_a_row_says_whether_it_ran_a_fixed_number_of_rounds(
         self, tmp_path, monkeypatch
     ):

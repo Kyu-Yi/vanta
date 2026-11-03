@@ -2700,8 +2700,49 @@ mod tests {
         );
     }
 
+    /// W1 — the three `#[tokio::test]`s below run real pytest through the
+    /// harness's own sandbox, so they need a working backend. They exercise the
+    /// harness's test-running SEMANTICS (report parsing, the generated-test
+    /// command, the repo-`addopts` neutralisation), not the sandbox boundary, and
+    /// in the base environment (no `VANTA_SANDBOX_BACKEND`) `auto` used to degrade
+    /// to the host silently — which is exactly the fallback W1 removes: an `auto`
+    /// run with no bootable shuru now REFUSES. So these tests ask for the host
+    /// backend BY NAME for the duration of the test and restore the caller's value
+    /// on `drop` (a panicking assert included), so no later test can inherit a
+    /// backend the test did not ask for and none passes by silently changing
+    /// backend.
+    struct ExplicitHostBackend {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ExplicitHostBackend {
+        fn enter() -> Self {
+            let previous = std::env::var_os("VANTA_SANDBOX_BACKEND");
+            // SAFETY: the suite runs single-threaded (`cargo test --lib --
+            // --test-threads=1`), so no other thread reads the environment
+            // concurrently, and the value is restored on drop.
+            unsafe {
+                std::env::set_var("VANTA_SANDBOX_BACKEND", "subprocess");
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for ExplicitHostBackend {
+        fn drop(&mut self) {
+            // SAFETY: as `enter`.
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var("VANTA_SANDBOX_BACKEND", value),
+                    None => std::env::remove_var("VANTA_SANDBOX_BACKEND"),
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn baseline_and_patched_paths_match_on_identical_source() {
+        let _host = ExplicitHostBackend::enter();
         let source = "# FILE: calc.py\ndef add(a, b):\n    return a + b\n";
         let test_cmd = TestCommand::default();
         let tests = vec![
@@ -2737,6 +2778,7 @@ mod tests {
 
     #[tokio::test]
     async fn semantic_patch_reports_assertion_failures_not_static_errors() {
+        let _host = ExplicitHostBackend::enter();
         let patched_source = "# FILE: calc.py\ndef add(a, b):\n    return a - b\n";
         let test_cmd = TestCommand::default();
         let test = generated_test("test_behavior_preservation", "assert add(2, 3) == 5");
@@ -2763,6 +2805,7 @@ mod tests {
     // and pins that the generated-test command neutralizes it so the test is graded.
     #[tokio::test]
     async fn a_repo_conftest_only_addopts_does_not_stop_the_generated_test() {
+        let _host = ExplicitHostBackend::enter();
         let source = concat!(
             "# FILE: setup.cfg\n",
             "[tool:pytest]\n",

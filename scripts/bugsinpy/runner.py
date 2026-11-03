@@ -2377,6 +2377,16 @@ def build_record(
         # never be pooled with one after it. Read back from `run.summary` so a
         # batch table can cut by it without opening a session log.
         "seed_method": summary.get("seed_method"),
+        # [VANTA-WHY] W1 — which security boundary actually ran this row, read back
+        # from `run.summary` (the run's own `actual_backend`). `shuru` is a microVM;
+        # `subprocess` is untrusted code on the host with no boundary, reachable
+        # only by an explicit `VANTA_SANDBOX_BACKEND=subprocess` — the harness
+        # itself always forces `shuru` (`vanta_env`), so this is `subprocess` only
+        # for a run made outside it. Recording it per row makes the downgrade
+        # auditable rather than something a reader has to infer from a session log;
+        # `None` on a row written before the field existed. Appended after the
+        # pre-existing keys so older readers are unaffected.
+        "sandbox_backend": summary.get("sandbox_backend"),
         # §1.2 — the project version frozen into the sandbox tree at prepare time,
         # as `version_pin.as_record` recorded it on the bug's row and carried here
         # onto its run rows. Recorded for `seed_method`'s reason: the version a

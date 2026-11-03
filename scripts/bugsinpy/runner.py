@@ -2856,7 +2856,15 @@ def run_job(
     """
     manifest.mark(job.key, RUNNING)
     prep = job.prep
-    issue_path = paths.issues / f"{prep.slug}.txt"
+    # [VANTA-WHY] M3 item V1 — the issue file is keyed by the JOB, not the bug.
+    # `prep.slug` is the bug, and once rows run concurrently (S6) two rows of one
+    # bug would both write `issues/<slug>.txt` and then both read it back to hash
+    # the issue they *think* they were shown: whichever write won is the issue
+    # every row hashes, so a row's recorded `issue_sha256` can describe another
+    # row's prompt. `job.key` already carries bug × config × mode × seed ×
+    # candidate × hints, which is why `log_path` and `oracle_json` are keyed the
+    # same way; the issue path is the one that was still keyed by the bug.
+    issue_path = paths.issues / f"{_stem(job.key)}.txt"
     issue_path.parent.mkdir(parents=True, exist_ok=True)
     issue_path.write_text(issue_text_for(prep, show_hints=job.show_hints), encoding="utf-8")
     issue_sha256 = sha256_text(issue_path.read_text(encoding="utf-8"))

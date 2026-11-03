@@ -26854,6 +26854,92 @@ class TestRunJob:
         assert record["verdict"] == "AllTestsPassed"
         assert record["label"] == "true_approval"
 
+    def test_two_concurrent_rows_of_one_bug_each_write_and_hash_its_own_issue_file(
+        self, tmp_path, monkeypatch
+    ):
+        """V1 — the issue file is keyed by the job, not the bug.
+
+        Two rows of *one* bug — same slug, different configs, so two distinct
+        ``job.key``s — run concurrently, exactly as the S6 pool runs them. While
+        the path was ``issues/<slug>.txt`` both rows wrote that one file and both
+        read it back, so whichever write landed last was the issue *every* row
+        hashed: a row's recorded ``issue_sha256`` could describe another row's
+        prompt. Each row must now own a file named after its own key, hold its own
+        bytes there, and hash exactly those bytes — never the shared slug file.
+        """
+        paths = self._paths(tmp_path)
+        bug = bug_info(bug_id=1)
+
+        def make(config: str, text: str) -> runner_mod.Job:
+            issue = issue_mod.IssueText(
+                text=text,
+                pre_gate=text,
+                leak=issue_mod.LeakResult(text=text),
+                failure_kinds=[],
+                ok=True,
+                needs_decision=None,
+            )
+            return _job(
+                prep(root=tmp_path / "root", bug=bug, issue=issue), config=config
+            )
+
+        jobs = [make("vanta", "the vanta row's issue\n"), make("b0", "the b0 row's issue\n")]
+        assert jobs[0].key != jobs[1].key, "the fixture needs two distinct rows"
+        assert jobs[0].prep.slug == jobs[1].prep.slug, "…of the SAME bug"
+
+        started = threading.Barrier(len(jobs))
+
+        def fake_invoke(**kwargs):
+            # Both rows are inside their own `run_job` at once, which is the
+            # window the shared path raced in. The barrier cannot turn one write
+            # into two (the issue file is written before this call), so a
+            # per-bug path fails this test on its own file assertion below.
+            started.wait(timeout=30)
+            return _outcome(tmp_path)
+
+        monkeypatch.setattr(runner_mod, "invoke_vanta", fake_invoke)
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+
+        rows: dict[str, dict] = {}
+
+        def drive(job: runner_mod.Job) -> None:
+            # One Manifest per row, mirroring `_run_jobs_concurrently`: `FileLock`
+            # is per object, not per path (see its docstring).
+            rows[job.key] = runner_mod.run_job(
+                job=job,
+                paths=paths,
+                manifest=manifest_mod.Manifest(tmp_path),
+                vanta_bin=tmp_path / "vanta_m3",
+                max_attempts=4,
+                disk_mb=8192,
+                python_version="3.8.20",
+            )
+
+        threads = [threading.Thread(target=drive, args=(job,)) for job in jobs]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(rows) == 2, "both rows must land"
+        for job in jobs:
+            own = paths.issues / f"{runner_mod._stem(job.key)}.txt"
+            assert own.is_file(), (
+                "every row names its issue file after its own job key, not the bug"
+            )
+            text = own.read_text(encoding="utf-8")
+            assert rows[job.key]["artifacts"]["issue_sha256"] == split_mod.sha256_text(text)
+
+        assert (
+            rows[jobs[0].key]["artifacts"]["issue_sha256"]
+            != rows[jobs[1].key]["artifacts"]["issue_sha256"]
+        ), "each row hashed the file its own key named"
+        assert not (paths.issues / f"{jobs[0].prep.slug}.txt").exists(), (
+            "no row may write a file named after the shared bug slug"
+        )
+
 
 class _FakeSplit:
     """A `Split` with only the fields `run_batch` and the queue read, so no split

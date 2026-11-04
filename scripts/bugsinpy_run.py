@@ -41,7 +41,7 @@ import os
 import subprocess
 import sys
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -51,6 +51,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+from bugsinpy import arms as arms_mod  # noqa: E402
 from bugsinpy import bake as bake_mod  # noqa: E402
 from bugsinpy import budget as budget_mod  # noqa: E402
 from bugsinpy import bugsinpy_meta as meta_mod  # noqa: E402
@@ -252,6 +253,86 @@ def cache_state_line(
     )
 
 
+def prepare_one_bug(
+    *,
+    entry: Mapping[str, Any],
+    full: bool,
+    split: Split,
+    bugsinpy_root: Path,
+    repo_cache: Path,
+    batch_dir: Path,
+    deps_dir: Path,
+    issue_sources: Any,
+    n_ctx: int,
+    n_ctx_source: str,
+    vanta_bin: Path,
+    refreeze_keys: set[str],
+    missing_layers: set[str],
+    missing_provenance: set[str],
+    budget: budget_mod.Budget,
+    traceback_on: bool,
+) -> tuple[str, Any]:
+    """One bug's prepare, under the invocation's one budget (M3 item Y1).
+
+    [VANTA-WHY] M3 item AA4. This body lived inside ``cmd_prepare`` as the closure
+    ``prepare_bug``; the pipelined queue needs the very same work — a bug prepared
+    to a frozen record before its rows start — without a second copy of it, so it
+    is a function here and ``cmd_prepare`` and ``_queue_pipeline`` both call it.
+    It prints the same two progress lines the serial prepare always printed
+    (``[key] full ...`` and then ``ok``/``not runnable``/``FAILED``), so a pipeline
+    prints the same story a serial ``prepare`` does.
+
+    Returns ``("prep", BugPrep)`` or ``("broken", (key, detail))``; nothing is
+    raised, because one bug's failure must not take the batch down (§3.2).
+    """
+    key = bug_key(entry)
+    project = entry["project"]
+    print(f"[{key}] {'full' if full else 'context-only'} ...", flush=True)
+    checkpoint = entry["checkpoint"]
+    if full and checkpoint in missing_layers:
+        detail = (
+            f"PrepareError: checkpoint {checkpoint} does not exist. Bake it first "
+            "(design §11 step 3 for py3.8, §3.2 for the older interpreters)."
+        )
+        print(f"[{key}] FAILED — {detail}", flush=True)
+        return "broken", (key, detail)
+    if full and checkpoint in missing_provenance:
+        detail = (
+            f"BakeError: no dependency provenance for {checkpoint} under {deps_dir}. "
+            "Its dependencies could not be read at bake time; re-run bake for it."
+        )
+        print(f"[{key}] FAILED — {detail}", flush=True)
+        return "broken", (key, detail)
+    try:
+        url = meta_mod.project_github_url(bugsinpy_root, project)
+        if not url:
+            raise SplitError(f"no github_url for {project} in project.info")
+        repo = tree_cache(repo_cache, project, url)
+        prep = prepare_mod.prepare_one(
+            entry,
+            split=split,
+            bugsinpy_root=bugsinpy_root,
+            repo_cache=repo,
+            batch_dir=batch_dir,
+            deps_dir=deps_dir,
+            issue_sources=issue_sources,
+            full=full,
+            n_ctx=n_ctx,
+            n_ctx_source=n_ctx_source,
+            vanta_bin=vanta_bin,
+            refreeze=key in refreeze_keys,
+            budget=budget,
+        )
+    except Exception as exc:  # one bug must not take the batch down
+        detail = f"{type(exc).__name__}: {exc}"
+        print(f"[{key}] FAILED — {detail}", flush=True)
+        if traceback_on:
+            traceback.print_exc()
+        return "broken", (key, detail)
+    print(f"[{key}] {'ok' if prep.runnable else 'not runnable'}", flush=True)
+    return "prep", prep
+
+
 def cmd_prepare(args: argparse.Namespace) -> int:
     # Item 19 / Q3 — the frozen configuration, resolved exactly as `run` resolves
     # it and before anything else. `resolve` REFUSES the invocation when the
@@ -437,55 +518,24 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     def prepare_bug(index: int, entry: Mapping[str, Any], full: bool) -> None:
         """One bug's prepare, under the invocation's one budget (M3 item Y1)."""
-        key = bug_key(entry)
-        project = entry["project"]
-        print(f"[{key}] {'full' if full else 'context-only'} ...", flush=True)
-        checkpoint = entry["checkpoint"]
-        if full and checkpoint in missing_layers:
-            detail = (
-                f"PrepareError: checkpoint {checkpoint} does not exist. Bake it first "
-                "(design §11 step 3 for py3.8, §3.2 for the older interpreters)."
-            )
-            slots[index] = ("broken", (key, detail))
-            print(f"[{key}] FAILED — {detail}", flush=True)
-            return
-        if full and checkpoint in missing_provenance:
-            detail = (
-                f"BakeError: no dependency provenance for {checkpoint} under {deps_dir}. "
-                "Its dependencies could not be read at bake time; re-run bake for it."
-            )
-            slots[index] = ("broken", (key, detail))
-            print(f"[{key}] FAILED — {detail}", flush=True)
-            return
-        try:
-            url = meta_mod.project_github_url(bugsinpy_root, project)
-            if not url:
-                raise SplitError(f"no github_url for {project} in project.info")
-            repo = tree_cache(repo_cache, project, url)
-            prep = prepare_mod.prepare_one(
-                entry,
-                split=split,
-                bugsinpy_root=bugsinpy_root,
-                repo_cache=repo,
-                batch_dir=batch_dir,
-                deps_dir=deps_dir,
-                issue_sources=issue_sources,
-                full=full,
-                n_ctx=n_ctx,
-                n_ctx_source=n_ctx_source,
-                vanta_bin=vanta_bin,
-                refreeze=key in refreeze_keys,
-                budget=budget,
-            )
-        except Exception as exc:  # one bug must not take the batch down
-            detail = f"{type(exc).__name__}: {exc}"
-            slots[index] = ("broken", (key, detail))
-            print(f"[{key}] FAILED — {detail}", flush=True)
-            if args.traceback:
-                traceback.print_exc()
-            return
-        slots[index] = ("prep", prep)
-        print(f"[{key}] {'ok' if prep.runnable else 'not runnable'}", flush=True)
+        slots[index] = prepare_one_bug(
+            entry=entry,
+            full=full,
+            split=split,
+            bugsinpy_root=bugsinpy_root,
+            repo_cache=repo_cache,
+            batch_dir=batch_dir,
+            deps_dir=deps_dir,
+            issue_sources=issue_sources,
+            n_ctx=n_ctx,
+            n_ctx_source=n_ctx_source,
+            vanta_bin=vanta_bin,
+            refreeze_keys=refreeze_keys,
+            missing_layers=missing_layers,
+            missing_provenance=missing_provenance,
+            budget=budget,
+            traceback_on=args.traceback,
+        )
 
     with ThreadPoolExecutor(max_workers=max(1, budget.cores)) as pool:
         futures = [
@@ -1358,6 +1408,481 @@ def _parse_seeds(raw: str) -> Optional[list[int]]:
         raise SplitError(f"--seeds must be comma-separated integers, got {raw!r}") from exc
 
 
+def _render_pipeline_schedule(
+    batch_id: str,
+    selected: Sequence[tuple[dict[str, Any], bool]],
+    spellings: Sequence[str],
+    seeds: Sequence[int],
+    waves: Sequence[int],
+) -> str:
+    """The pipeline's plan: ``_render_schedule``'s table, read from the split.
+
+    [VANTA-WHY] M3 item AA4 — ``runner._render_schedule`` prints this table from
+    ``BugPrep`` objects, and in a pipeline none exist when the table is printed:
+    the bugs it introduces are prepared by the very run that follows. The split
+    names them already, and the row arithmetic is the same floor the queue's own
+    renderer uses, so the table is the same table.
+    """
+    phases = arms_mod.phases_for(spellings)
+    repairs = sum(1 for mode, _ in phases if mode == arms_mod.REPAIR)
+    reviews = sum(1 for mode, _ in phases if mode == arms_mod.REVIEW)
+    lines = [
+        f"batch {batch_id} (pipelined: prepare then run, per bug)",
+        f"order: {' → '.join(f'{mode} {written}' for mode, written in phases)}",
+        "",
+        "| wave | bug | checkpoint | py (pinned) | repair rows | review rows (floor) |",
+        "|---|---|---|---|---|---|",
+    ]
+    total = 0
+    for wave in waves:
+        for entry, _full in selected:
+            if int(entry["wave"]) != wave:
+                continue
+            repair = repairs * len(seeds)
+            review = reviews * 2 * len(seeds)
+            total += repair + review
+            lines.append(
+                f"| {wave} | {bug_key(entry)} | {entry['checkpoint']} | "
+                f"{entry['python_version']} | {repair} | {review} |"
+            )
+    lines += [
+        "",
+        f"{total} rows if no bug yields a pooled failed patch; "
+        f"up to {total * 2} if every bug yields two (§7.1).",
+    ]
+    return "\n".join(lines)
+
+
+def _queue_pipeline(
+    args: argparse.Namespace,
+    *,
+    split: Split,
+    config_block: dict[str, Any],
+    frozen_env: Mapping[str, str],
+    invocation_env: Mapping[str, str],
+    fixed_rounds_declaration: Optional[Mapping[str, int]],
+) -> int:
+    """M3 item AA4 — ``queue --pipeline``: prepare each bug, then start its rows.
+
+    [VANTA-WHY] The serial shape is ``prepare`` for the whole split, then ``queue``.
+    A bug's rows therefore wait for every other bug's prepare, however long the
+    last one takes, even though a bug's rows depend on nothing but that bug's own
+    prepare and its predecessors inside its own wave (D13, §7.1). This command runs
+    the two stages as one: within a wave, every selected bug's prepare is submitted
+    at once, and the moment one bug's prepare is final and frozen its rows are
+    submitted — while the other bugs are still preparing. Waves stay sequential,
+    because §8.1's gate is a statement about the earlier stages of the same batch.
+
+    What does NOT change, deliberately:
+      * ONE ``Budget`` governs every suite run AND every row (S5 + S6 + Y1). The
+        budget's size is ``max(--prepare-jobs, --jobs)``; the prepare pool is
+        ``--prepare-jobs`` wide and the row pool ``--jobs`` wide, so each flag keeps
+        its own meaning while the memory/core gate is a single object.
+      * ONE ``SpendGate`` for the whole batch (G1), created here exactly as
+        ``_run_queue`` creates it.
+      * Each bug's rows are run by ``runner._run_task`` — literally the queue's own
+        per-bug unit — so a row is the row the queue would have written, D13 order
+        included, and admission is unchanged.
+      * The batch-level prepare record is the one ``cmd_prepare`` writes: the same
+        ``prepare.json``/``prepare_summary.md``/``context_report.json``/
+        ``signals.md``/``issue_texts_all.md``, from the same preps and broken list,
+        written once every wave is done (a pipeline's prepare.json can only be
+        complete at the end: later waves have not been prepared yet). Its
+        ``scheduler`` block describes the whole pipeline invocation, which is what
+        it is the record of.
+      * ``--only``/``--waves``/``--reserves``/``--measure-only``/``--refreeze``
+        select bugs exactly as they do in ``prepare``.
+    """
+    # The same two refusals `prepare` makes, in `prepare`'s own order and for the
+    # same reasons: the flags are prepare flags and `--pipeline` runs the prepare.
+    if args.refreeze and args.measure_only:
+        raise SplitError(
+            "--refreeze rewrites a frozen issue report, and --measure-only freezes nothing: "
+            "a measure-only pass reads the file a full prepare wrote. The re-fetch and the "
+            "rewrite have to run with suites (§2.4.3), so drop --measure-only."
+        )
+    selected = select(
+        split,
+        only=args.only,
+        waves=parse_waves(args.waves),
+        reserves=args.reserves,
+        measure_only=args.measure_only,
+        refreeze=args.refreeze,
+    )
+    if not selected:
+        raise SplitError("the selection is empty")
+    # `--plan` decides the selection and stops, exactly where `prepare --plan` stops:
+    # before the clone, the context window and the binary. A plan that needed the
+    # network or a build to print would be a plan of a different command.
+    if args.plan:
+        sys.stdout.write(render_plan(selected))
+        return EXIT_OK
+
+    bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
+    commit = meta_mod.ensure_clone(bugsinpy_root, commit=split.bugsinpy_commit)
+    if commit != split.bugsinpy_commit:
+        raise SplitError(
+            f"BugsInPy is at {commit}, the split pins {split.bugsinpy_commit}. "
+            "Refusing to derive ground truth from metadata that moved."
+        )
+    n_ctx, n_ctx_source = context_mod.explicit_context_window(
+        n_ctx=args.n_ctx, environ=invocation_env
+    )
+    print(
+        f"context window: n_ctx={n_ctx} (source: {n_ctx_source}) — the context gate "
+        "is sized against this window",
+        flush=True,
+    )
+    # `prepare` refuses a stale binary (the gate shells out to it), and a pipeline
+    # IS a prepare, so it refuses for the same reason here.
+    vanta_bin = runner_mod.require_vanta_bin(args.vanta_bin.resolve())
+    stale_warning = runner_mod.stale_binary_warning(vanta_bin)
+    if stale_warning:
+        raise runner_mod.RunnerError(
+            f"{stale_warning} `prepare` cannot size the context gate against it: the "
+            "gate shells out to this binary, so every verdict it writes would describe "
+            "a Vanta the batch will not run."
+        )
+
+    selected_full = [entry for entry, full in selected if full]
+    missing_layers = set(
+        prepare_mod.missing_checkpoints([entry["checkpoint"] for entry in selected_full])
+    )
+    deps_dir = RUNS_DIR / "deps"
+    missing_provenance = set(
+        bake_mod.missing_deps(deps_dir, [entry["checkpoint"] for entry in selected_full])
+    )
+    selected_checkpoints = [entry["checkpoint"] for entry in selected_full]
+    unstamped = bake_mod.unstamped_deps(deps_dir, selected_checkpoints)
+    cache_state = cache_state_line(
+        checkpoints=selected_checkpoints, unstamped=unstamped
+    )
+    if unstamped and not suite_cache.cache_disabled():
+        print(
+            f"WARNING: the suite cache is OFF for {len(unstamped)} layer(s) with no "
+            f"checkpoint_id: {', '.join(unstamped)}.\n"
+            "  Every suite run of those layers is measured and never reused. Fix them "
+            "once, without re-baking any of them:\n"
+            "    python3 scripts/bugsinpy_run.py stamp-existing\n"
+            "  then re-run this prepare.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    repo_cache = RUNS_DIR / "repos"
+    issue_sources = prepare_mod.IssueSources(
+        issues_dir=REPO_ROOT / issue_source.ISSUES_DIR,
+        github_cache_dir=RUNS_DIR / "github-cache",
+    )
+
+    # §14.33's backend gate for `--jobs`, same sentence `row_budget` uses: the
+    # pipeline creates its own one Budget (S5 + S6), so it makes the check itself.
+    if args.jobs > 1:
+        backend = (invocation_env.get("VANTA_LLM_BACKEND") or "").strip()
+        if backend.lower() != "openai":
+            raise runner_mod.RunnerError(
+                f"--jobs={args.jobs} needs VANTA_LLM_BACKEND=openai: concurrent rows all "
+                "call the same provider (§14.33), and every other backend is a local "
+                "model that this concurrency would oversubscribe. "
+                f"VANTA_LLM_BACKEND={backend or '(unset)'}."
+            )
+    # The ONE scheduler of the whole invocation: a bug's suite runs and every row
+    # charge come out of this one object. Its size is the wider of the two flags,
+    # because each pool is capped by its own flag below while the resources are
+    # gated here.
+    budget = budget_mod.Budget(
+        max(args.prepare_jobs, args.jobs), peak_vms=args.peak_vms
+    )
+    print(
+        f"[scheduler] jobs={budget.jobs} concurrent={'yes' if budget.concurrent else 'no'} "
+        f"cores={budget.cores}/{budget.cap_cores} memory="
+        f"{'unbounded' if budget.cap_memory_mb is None else f'{budget.cap_memory_mb} MB'} "
+        f"host_load={budget.host_load}",
+        flush=True,
+    )
+
+    seeds = _parse_seeds(args.seeds) or split.seeds
+    arm_spellings = _parse_arms(args.arms)
+    max_spend_usd = max_spend_usd_from_env(invocation_env)
+    if max_spend_usd is not None:
+        print(
+            f"[spend] VANTA_MAX_SPEND_USD=${max_spend_usd:g}: the queue stops claiming "
+            "once its rows' cost has reached this.",
+            flush=True,
+        )
+    # The queue's own refusals, made once here instead of once per bug — the same
+    # four `_run_queue` makes before it prints the schedule.
+    spellings = runner_mod._select_arms(split, arm_spellings)
+    runner_mod._require_arm_list(spellings)
+    runner_mod._require_arm_budget(spellings, args.max_attempts)
+    runner_mod._require_fixed_rounds(
+        spellings, args.fixed_rounds, fixed_rounds_declaration
+    )
+    runner_mod._require_seeds(split, seeds)
+
+    entries = {bug_key(entry): entry for entry in split.bugs}
+    waves = parse_waves(args.waves) or sorted(
+        {int(entry["wave"]) for entry, _full in selected}
+    )
+    stop_file = runner_mod.queue_stop_path(batch_dir)
+    manifest = manifest_mod.Manifest(batch_dir)
+    spend_gate = (
+        runner_mod.SpendGate(batch_dir, max_spend_usd, manifest)
+        if max_spend_usd is not None
+        else None
+    )
+    # `runner._run_task`'s own keyword set, built once: every bug of every wave is
+    # run through the queue's per-bug unit, so a row is exactly the row a `queue`
+    # would have written.
+    run_kwargs: dict[str, Any] = dict(
+        batch_dir=batch_dir,
+        batch_id=batch_dir.name,
+        split=split,
+        entries=entries,
+        seeds=seeds,
+        vanta_bin=vanta_bin,
+        max_attempts=args.max_attempts,
+        fixed_rounds=args.fixed_rounds,
+        fixed_rounds_declaration=fixed_rounds_declaration,
+        disk_mb=args.disk_mb,
+        show_hints=args.show_hints,
+        max_spend_usd=max_spend_usd,
+        spend_gate=spend_gate,
+        preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env),
+        config_block=config_block,
+        # The preparation's block is this invocation's block: in a pipeline the
+        # prepare and the run are one command, so what `prepare.json` will record
+        # and what the rows carry cannot disagree.
+        prep_config_block=config_block,
+        frozen_env=frozen_env,
+        arm_spellings=arm_spellings,
+        budget=budget,
+    )
+
+    print(_render_pipeline_schedule(batch_dir.name, selected, spellings, seeds, waves))
+    tail = ""
+    if budget.concurrent:
+        tail = (
+            f"; one scheduler, cores={budget.cores}/{budget.cap_cores} "
+            f"memory={'unbounded' if budget.cap_memory_mb is None else f'{budget.cap_memory_mb} MB'}"
+        )
+    print(
+        f"[queue] {len(selected)} task(s) = wave × bug, up to {args.jobs} rows at once, "
+        f"prepare up to {args.prepare_jobs}{tail}; stop file {stop_file}",
+        flush=True,
+    )
+    if stop_file.exists():
+        print(
+            f"[queue] {stop_file} already exists: no job will be claimed. Delete it "
+            "and run again.",
+            flush=True,
+        )
+
+    owner = runner_mod.queue_lock(batch_dir)
+    if not owner.acquire(blocking=False):
+        raise manifest_mod.BatchLocked(str(owner.held_message))
+    preps: list[prepare_mod.BugPrep] = []
+    broken: list[tuple[str, str]] = []
+    outcomes: list[Any] = []
+    refreeze_keys = set(args.refreeze)
+    sampler = _start_host_sampler(batch_dir, budget)
+    try:
+        for wave in waves:
+            wave_selected = [
+                (entry, full)
+                for entry, full in selected
+                if int(entry["wave"]) == wave
+            ]
+            if not wave_selected:
+                continue
+            print(
+                f"\n=== wave {wave}: {len(wave_selected)} bug(s), up to "
+                f"{min(args.jobs, len(wave_selected))} rows at once, prepare up to "
+                f"{min(args.prepare_jobs, len(wave_selected))} ===",
+                flush=True,
+            )
+            wave_outcomes: list[Any] = []
+            with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as row_pool, \
+                    ThreadPoolExecutor(max_workers=max(1, args.prepare_jobs)) as prep_pool:
+                # Every bug of the wave is prepared at once (up to `--prepare-jobs`
+                # in flight), and a bug's rows are submitted the moment THAT bug's
+                # prepare returns — `as_completed`, not submission order — so one
+                # bug's slow prepare cannot hold back another's rows. That is the
+                # whole point of the item. The record stays deterministic anyway:
+                # `preps` and `broken` are rebuilt in the split's own file order.
+                prep_futures = {
+                    prep_pool.submit(
+                        prepare_one_bug,
+                        entry=_entry,
+                        full=_full,
+                        split=split,
+                        bugsinpy_root=bugsinpy_root,
+                        repo_cache=repo_cache,
+                        batch_dir=batch_dir,
+                        deps_dir=deps_dir,
+                        issue_sources=issue_sources,
+                        n_ctx=n_ctx,
+                        n_ctx_source=n_ctx_source,
+                        vanta_bin=vanta_bin,
+                        refreeze_keys=refreeze_keys,
+                        missing_layers=missing_layers,
+                        missing_provenance=missing_provenance,
+                        budget=budget,
+                        traceback_on=args.traceback,
+                    ): index
+                    for index, (_entry, _full) in enumerate(wave_selected)
+                }
+                prepared: dict[int, prepare_mod.BugPrep] = {}
+                wave_broken: dict[int, tuple[str, str]] = {}
+                row_futures: list[Any] = []
+                for future in as_completed(prep_futures):
+                    index = prep_futures[future]
+                    kind, value = future.result()
+                    if kind == "broken":
+                        wave_broken[index] = value
+                        continue
+                    prep = value
+                    prepared[index] = prep
+                    if not prep.runnable:
+                        continue
+                    if stop_file.exists():
+                        print(
+                            f"  [queue] {stop_file} appeared: not claiming "
+                            f"{prep.key}.",
+                            flush=True,
+                        )
+                        continue
+                    row_futures.append(
+                        row_pool.submit(
+                            runner_mod._run_task,
+                            wave=wave,
+                            prep=prep,
+                            stop_file=stop_file,
+                            **run_kwargs,
+                        )
+                    )
+                for index in sorted(prepared):
+                    preps.append(prepared[index])
+                for index in sorted(wave_broken):
+                    broken.append(wave_broken[index])
+                for future in row_futures:
+                    wave_outcomes.append(future.result())
+            outcomes.extend(wave_outcomes)
+            # §8.1 — the same gate `_run_queue` applies: a wave whose gate failed,
+            # or that was stopped deliberately, stops the next wave.
+            stoppers = [
+                outcome
+                for outcome in wave_outcomes
+                if outcome.reason in ("stop_file", "spend_cap", "gate")
+            ]
+            if stoppers:
+                print(
+                    f"\n=== queue stopped in wave {wave}: "
+                    + ", ".join(f"{o.bug} ({o.reason})" for o in stoppers)
+                    + " ===",
+                    flush=True,
+                )
+                break
+    finally:
+        owner.release()
+    host_samples = _stop_host_sampler(sampler)
+
+    # The batch-level prepare record, exactly as `cmd_prepare` writes it. Written
+    # once, here, because a pipelined batch's prepare is only complete when its last
+    # wave has been prepared.
+    for prep in preps:
+        if prep.issue is not None:
+            prepare_mod.write_leak_gate(batch_dir, prep)
+    prepare_mod.write_issue_texts(batch_dir, preps)
+    prepare_mod.write_context_sizes(batch_dir, preps)
+    prepare_mod.write_signals(batch_dir, preps)
+    prepare_mod.write_context_report(
+        batch_dir, preps, n_ctx=n_ctx, n_ctx_source=n_ctx_source
+    )
+    summary = prepare_mod.render_summary(
+        preps, n_ctx=n_ctx, n_ctx_source=n_ctx_source, cache_state=cache_state
+    )
+    (batch_dir / "prepare_summary.md").write_text(summary, encoding="utf-8")
+    split_path = args.split.resolve()
+    split_sha_before = split_mod.sha256_file(split_path)
+    prepare_record = prepare_mod.prepare_manifest(
+        split=split,
+        split_path=split_path,
+        split_sha_before=split_sha_before,
+        batch_dir=batch_dir,
+        commit=commit,
+        bugsinpy_root=bugsinpy_root,
+        selected=[bug_key(entry) for entry, _ in selected],
+        broken=broken,
+        preps=preps,
+        n_ctx=n_ctx,
+        n_ctx_source=n_ctx_source,
+        config_block=config_block,
+        scheduler=budget.record(),
+    )
+    (batch_dir / "prepare.json").write_text(
+        json.dumps(prepare_record, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    split_sha_after = split_mod.sha256_file(split_path)
+    if split_sha_after != split_sha_before:
+        raise SplitError(
+            f"{split_path} changed during prepare ({split_sha_before} → "
+            f"{split_sha_after}). The split is an input; something wrote to it."
+        )
+
+    print()
+    print(summary)
+    print()
+    print(prepare_mod.render_context_table(preps))
+    if broken:
+        print()
+        print(render_flagged(broken))
+    print()
+    print(f"batch dir : {batch_dir}")
+    print(f"split     : {split_path} (read-only; {split_sha_after[:12]} unchanged)")
+
+    # The queue's own tail, unchanged.
+    records = manifest_mod.Manifest(batch_dir).effective_records()
+    if records:
+        labels_path, payload = runner_mod.write_batch_report(
+            batch_dir, records, host_samples=host_samples
+        )
+        print()
+        print(runner_mod.render_digest(payload))
+        print()
+        print(f"{payload['runs']} rows -> {batch_dir / 'run_digest.md'}")
+        print(f"labels for metrics.py -> {labels_path}")
+
+    failed = sum(outcome.failed for outcome in outcomes)
+    raised = [outcome.bug for outcome in outcomes if outcome.reason == "task_failed"]
+    if failed:
+        print(
+            f"\n{failed} job(s) left no usable session and were written to "
+            f"{batch_dir / 'failures.jsonl'}; their keys stay `failed` in "
+            "state.json, so the next `queue` re-runs them.",
+            file=sys.stderr,
+        )
+    if raised:
+        print(
+            f"\n{len(raised)} bug(s) raised and were skipped: {raised}. Re-run them "
+            "once the cause is fixed; their claimed jobs keep their keys.",
+            file=sys.stderr,
+        )
+    unprepared = [prep for prep in preps if not prep.runnable]
+    if unprepared:
+        print(
+            f"\n{len(unprepared)} bug(s) did not prepare and their rows were not run: "
+            f"{[prep.key for prep in unprepared]}.",
+            file=sys.stderr,
+        )
+    if failed or raised or unprepared or broken:
+        return EXIT_BUG_FAILED
+    return 1 if any(outcome.code != 0 for outcome in outcomes) else EXIT_OK
+
+
 def cmd_queue(args: argparse.Namespace) -> int:
     """Item 13 — run a prepared batch's bugs several at a time.
 
@@ -1398,6 +1923,20 @@ def cmd_queue(args: argparse.Namespace) -> int:
             preflight=partial(runner_mod.model_endpoint_preflight, env=invocation_env)
         )
     split = load_split(args.split.resolve())
+    # M3 item AA4 — `--pipeline` is the same command with the prepare stage folded
+    # in: it prepares each bug and starts that bug's rows the moment its prepare is
+    # final, instead of reading a batch `prepare` already finished. It needs no
+    # `prepare.json`, so it branches before `load_prepared` (which raises "no
+    # prepare.json in …" for a fresh directory) and writes one when it is done.
+    if args.pipeline:
+        return _queue_pipeline(
+            args,
+            split=split,
+            config_block=config_block,
+            frozen_env=frozen_env,
+            invocation_env=invocation_env,
+            fixed_rounds_declaration=frozen.fixed_rounds(),
+        )
     batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
     bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
     batch = runner_mod.load_prepared(
@@ -2388,6 +2927,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="the batch directory `prepare` created — the resume cursor lives there",
     )
     queue.add_argument(
+        "--pipeline",
+        action="store_true",
+        help=(
+            "M3 item AA4 — prepare and run in ONE invocation: each selected bug is "
+            "prepared, and the moment its prepare is final and frozen its rows start, "
+            "while the other bugs of its wave are still preparing. Waves stay "
+            "sequential. One scheduler and one spend cap govern the whole pipeline, "
+            "and the batch's prepare.json is written when the last wave is prepared. "
+            "Off by default: without it a queue reads a batch `prepare` already "
+            "finished, exactly as before."
+        ),
+    )
+    queue.add_argument(
         "--only",
         action="append",
         default=[],
@@ -2510,6 +3062,67 @@ def build_parser() -> argparse.ArgumentParser:
             "`would_hit` in the row's own `cache` list), and the fresh payload then "
             "replaces the entry it could not use."
         ),
+    )
+    # M3 item AA4 — the prepare-side flags, for `--pipeline`. They are exactly the
+    # ones `prepare` takes and mean the same thing; without `--pipeline` they are
+    # read by nothing, and a queue that reads a prepared batch needs none of them.
+    queue.add_argument(
+        "--prepare-jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "with --pipeline: the maximum number of prepared-suite runs in flight at "
+            "once (M3 item S5, default 1), the same meaning as `prepare "
+            "--prepare-jobs`. The prepare pool is N wide and the row pool is "
+            "`--jobs` wide; both draw on the ONE scheduler, whose size is the wider "
+            "of the two. Ignored without --pipeline, which prepares nothing."
+        ),
+    )
+    queue.add_argument(
+        "--refreeze",
+        action="append",
+        default=[],
+        metavar="PROJECT/BUG",
+        help=(
+            "with --pipeline: re-fetch and rewrite this bug's frozen issue report "
+            "(prepare's own flag, §2.4.3). Repeatable, and it selects only the bugs it "
+            "names, in full. Ignored without --pipeline."
+        ),
+    )
+    queue.add_argument(
+        "--n-ctx",
+        type=int,
+        default=None,
+        metavar="TOKENS",
+        help=(
+            "with --pipeline: the context window the context gate is sized against "
+            "(§1.6.1, prepare's own flag). Checked against VANTA_LLM_CONTEXT_TOKENS "
+            "and the server's /props n_ctx rather than overriding them. Ignored "
+            "without --pipeline."
+        ),
+    )
+    queue.add_argument(
+        "--reserves",
+        choices=("measure", "skip"),
+        default="measure",
+        help=(
+            "with --pipeline: what to do with role=reserve bugs — measure their "
+            "context only (default) or skip them (prepare's own flag). Ignored "
+            "without --pipeline."
+        ),
+    )
+    queue.add_argument(
+        "--measure-only",
+        action="store_true",
+        help=(
+            "with --pipeline: context-measure every selected bug without running a "
+            "suite or booting a VM (prepare's own flag, §1.6). Ignored without "
+            "--pipeline."
+        ),
+    )
+    queue.add_argument(
+        "--traceback", action="store_true", help="print tracebacks (with --pipeline)"
     )
     queue.set_defaults(func=cmd_queue)
 

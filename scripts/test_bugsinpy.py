@@ -30861,6 +30861,425 @@ class TestQueue:
         assert capsys.readouterr().out == ""
 
 
+class _PipelineSplit:
+    """A `Split` with only the fields `_queue_pipeline` reads, so no split file is
+    needed. ``bugs`` are the entry dicts ``select`` walks; ``configs``/``seeds`` are
+    the protocol the queue refuses to widen."""
+
+    def __init__(self, bugs, *, configs=("b0",), seeds=(0,), commit="c0ffee"):
+        self.bugs = list(bugs)
+        self.configs = list(configs)
+        self.seeds = list(seeds)
+        self.bugsinpy_root = "runs/bugsinpy"
+        self.bugsinpy_commit = commit
+
+
+def _pipeline_entry(project: str, bug_id: int, *, wave: int = 1, role: str = "pilot") -> dict:
+    return {
+        "project": project,
+        "bug_id": bug_id,
+        "wave": wave,
+        "role": role,
+        "checkpoint": f"chk-{project}-{bug_id}".lower(),
+        "python_version": "3.8.20",
+        "test_file": "tests/test_mod.py",
+    }
+
+
+def _fake_prep(entry: dict, *, runnable: bool = True, issue=None) -> SimpleNamespace:
+    key = f"{entry['project']}/{entry['bug_id']}"
+    return SimpleNamespace(
+        key=key,
+        slug=key.replace("/", "-"),
+        runnable=runnable,
+        issue=issue,
+        wave=entry["wave"],
+        checkpoint=entry["checkpoint"],
+        python_version=entry["python_version"],
+    )
+
+
+class TestPipelineQueue:
+    """M3 item AA4 — ``queue --pipeline`` prepares each bug, then starts its rows.
+
+    The serial shape is ``prepare`` for the whole split, then ``queue``: a bug's
+    rows wait for every other bug's prepare. The pipeline folds the two stages into
+    one command and starts a bug's rows the moment that bug's prepare is frozen.
+
+    ``prepare_one_bug`` and ``runner._run_task`` are replaced, so no VM boots and
+    **nothing is prepared**: what is under test is the schedule — one budget, one
+    gate, waves sequential, a bug's rows gated on that bug's own prepare — and that
+    the command reads no ``prepare.json`` because it is the thing that writes one.
+    """
+
+    # -- fixture -----------------------------------------------------------
+    @staticmethod
+    def _args(batch: Path, *extra: str):
+        return run_mod.build_parser().parse_args(["queue", "--batch", str(batch), *extra])
+
+    @staticmethod
+    def _default_prepare(events, *, broken=(), not_runnable=()):
+        def stub(**kwargs):
+            entry = kwargs["entry"]
+            key = f"{entry['project']}/{entry['bug_id']}"
+            if key in broken:
+                events.append(("prepare-broken", key))
+                return "broken", (key, "a prepare error")
+            events.append(("prepare", key))
+            return "prep", _fake_prep(entry, runnable=key not in not_runnable)
+
+        return stub
+
+    @staticmethod
+    def _default_run(events, capture):
+        def stub(*, wave, prep, stop_file, **kwargs):
+            capture.append(kwargs)
+            events.append(("run", prep.key))
+            return runner_mod.QueueOutcome(wave=wave, bug=prep.key, code=0)
+
+        return stub
+
+    def _drive(
+        self,
+        monkeypatch,
+        tmp_path,
+        split,
+        *,
+        extra=(),
+        prepare=None,
+        run=None,
+        events=None,
+        capture=None,
+        manifest=None,
+    ):
+        """Run ``_queue_pipeline`` with every external effect replaced."""
+        batch_dir = tmp_path / "batch"
+        events = [] if events is None else events
+        capture = [] if capture is None else capture
+        monkeypatch.setattr(
+            run_mod.meta_mod, "ensure_clone", lambda root, commit=None: commit
+        )
+        monkeypatch.setattr(
+            run_mod.context_mod,
+            "explicit_context_window",
+            lambda **kwargs: (262144, "test"),
+        )
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        monkeypatch.setattr(runner_mod, "require_vanta_bin", lambda path: path)
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: None)
+        monkeypatch.setattr(run_mod.prepare_mod, "missing_checkpoints", lambda cps: [])
+        monkeypatch.setattr(run_mod.bake_mod, "missing_deps", lambda d, cps: [])
+        monkeypatch.setattr(run_mod.bake_mod, "unstamped_deps", lambda d, cps: [])
+        monkeypatch.setattr(
+            run_mod.prepare_mod, "IssueSources", lambda **kwargs: object()
+        )
+        for name in (
+            "write_leak_gate",
+            "write_issue_texts",
+            "write_context_sizes",
+            "write_signals",
+            "write_context_report",
+        ):
+            monkeypatch.setattr(run_mod.prepare_mod, name, lambda *a, **k: None)
+        monkeypatch.setattr(
+            run_mod.prepare_mod, "render_summary", lambda *a, **k: "summary"
+        )
+        monkeypatch.setattr(
+            run_mod.prepare_mod, "render_context_table", lambda preps: ""
+        )
+        monkeypatch.setattr(
+            run_mod.prepare_mod,
+            "prepare_manifest",
+            manifest or (lambda **kwargs: {"stub": True}),
+        )
+        monkeypatch.setattr(run_mod.split_mod, "sha256_file", lambda path: "a" * 64)
+        monkeypatch.setattr(runner_mod, "write_batch_report", lambda *a, **k: (None, {}))
+        monkeypatch.setattr(runner_mod, "render_digest", lambda payload: "")
+        # No host sampler thread: --prepare-jobs > 1 would otherwise really sample.
+        monkeypatch.setattr(run_mod, "_start_host_sampler", lambda *a, **k: None)
+
+        monkeypatch.setattr(
+            run_mod, "prepare_one_bug", prepare or self._default_prepare(events)
+        )
+        monkeypatch.setattr(
+            runner_mod, "_run_task", run or self._default_run(events, capture)
+        )
+
+        code = run_mod._queue_pipeline(
+            self._args(batch_dir, *extra),
+            split=split,
+            config_block={},
+            frozen_env={},
+            # `--jobs > 1` needs the hosted backend (§14.33); the tests that use two
+            # rows would otherwise be refused before anything is scheduled.
+            invocation_env={"VANTA_LLM_BACKEND": "openai"},
+            fixed_rounds_declaration=None,
+        )
+        return code, batch_dir, events, capture
+
+    # -- the point of the item: rows start per bug -------------------------
+    def test_a_bugs_rows_start_before_a_slower_bugs_prepare_finishes(
+        self, tmp_path, monkeypatch
+    ):
+        """B's rows run while A is still preparing; A finishes only because they do.
+
+        A's prepare blocks on an event that B's *run* sets. If the queue waited for
+        A's prepare before it claimed B's rows (submission order), A would block
+        until the wait timed out and the batch would fail — so the successful order
+        is itself the proof that rows are claimed as each prepare completes.
+        """
+        gate = threading.Event()
+        events: list = []
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+
+        def prepare(**kwargs):
+            key = f"{kwargs['entry']['project']}/{kwargs['entry']['bug_id']}"
+            events.append(("prepare-start", key))
+            if key == "A/1":
+                assert gate.wait(timeout=10), (
+                    "B's rows never ran, so A's slow prepare could never finish: the "
+                    "queue is still claiming rows in prepare-submission order"
+                )
+            events.append(("prepare-end", key))
+            return "prep", _fake_prep(kwargs["entry"])
+
+        def run(*, wave, prep, stop_file, **kwargs):
+            events.append(("run", prep.key))
+            if prep.key == "B/2":
+                gate.set()
+            return runner_mod.QueueOutcome(wave=wave, bug=prep.key, code=0)
+
+        code, _batch, events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--prepare-jobs", "2", "--jobs", "2"),
+            prepare=prepare,
+            run=run,
+            events=events,
+        )
+        assert code == run_mod.EXIT_OK
+        assert events.index(("run", "B/2")) < events.index(("prepare-end", "A/1"))
+
+    # -- one scheduler, one gate (S5 + S6 + G1) ----------------------------
+    def test_every_bug_of_the_wave_shares_one_budget_and_one_spend_gate(
+        self, tmp_path, monkeypatch
+    ):
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+        code, _batch, _events, capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--prepare-jobs", "2"),
+        )
+        assert code == run_mod.EXIT_OK
+        assert len(capture) == 2, "one row-task per bug"
+        assert len({id(kwargs["budget"]) for kwargs in capture}) == 1, (
+            "one budget for the whole invocation"
+        )
+        assert len({id(kwargs["spend_gate"]) for kwargs in capture}) == 1, (
+            "one spend gate for the whole batch (G1)"
+        )
+
+    def test_the_scheduler_is_as_wide_as_the_wider_of_the_two_flags(
+        self, tmp_path, monkeypatch
+    ):
+        """``--prepare-jobs 5`` with ``--jobs 1`` still gates five suite runs."""
+        split = _PipelineSplit([_pipeline_entry("A", 1)])
+        _code, _batch, _events, capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--prepare-jobs", "5"),
+        )
+        assert capture[0]["budget"].jobs == 5
+
+    # -- waves stay sequential (§8.1) --------------------------------------
+    def test_wave_two_does_not_start_until_wave_one_has_finished(
+        self, tmp_path, monkeypatch
+    ):
+        split = _PipelineSplit(
+            [
+                _pipeline_entry("A", 1, wave=1),
+                _pipeline_entry("B", 2, wave=1),
+                _pipeline_entry("C", 3, wave=2),
+            ]
+        )
+        events: list = []
+        code, _batch, events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--prepare-jobs", "2", "--jobs", "2"),
+            events=events,
+        )
+        assert code == run_mod.EXIT_OK
+        wave_one = [
+            index
+            for index, event in enumerate(events)
+            if event[0] == "run" and event[1] in ("A/1", "B/2")
+        ]
+        assert max(wave_one) < events.index(("run", "C/3"))
+
+    # -- the record the command leaves -------------------------------------
+    def test_the_batch_writes_prepare_json_once_for_the_whole_pipeline(
+        self, tmp_path, monkeypatch
+    ):
+        captured: dict = {}
+
+        def manifest(**kwargs):
+            captured.update(kwargs)
+            return {"stub": True}
+
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+        code, batch_dir, _events, _capture = self._drive(
+            monkeypatch,
+            tmp_path,
+            split,
+            extra=("--pipeline", "--prepare-jobs", "2"),
+            manifest=manifest,
+        )
+        assert code == run_mod.EXIT_OK
+        assert (batch_dir / "prepare.json").exists(), (
+            "the pipeline prepares, so it must write the batch's prepare.json"
+        )
+        assert captured["selected"] == ["A/1", "B/2"], "selection in file order"
+        assert captured["broken"] == []
+
+    # -- exit codes --------------------------------------------------------
+    def test_a_bug_that_cannot_prepare_fails_the_batch_and_runs_no_rows(
+        self, tmp_path, monkeypatch
+    ):
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+        events: list = []
+        prepare = self._default_prepare(events, broken={"B/2"})
+        code, _batch, events, _capture = self._drive(
+            monkeypatch, tmp_path, split, extra=("--pipeline",),
+            prepare=prepare, events=events,
+        )
+        assert code == run_mod.EXIT_BUG_FAILED
+        assert [event for event in events if event[0] == "run"] == [("run", "A/1")]
+
+    def test_a_bug_that_does_not_prepare_fails_the_batch(self, tmp_path, monkeypatch):
+        split = _PipelineSplit([_pipeline_entry("A", 1), _pipeline_entry("B", 2)])
+        events: list = []
+        prepare = self._default_prepare(events, not_runnable={"B/2"})
+        code, _batch, events, _capture = self._drive(
+            monkeypatch, tmp_path, split, extra=("--pipeline",),
+            prepare=prepare, events=events,
+        )
+        assert code == run_mod.EXIT_BUG_FAILED
+        assert [event for event in events if event[0] == "run"] == [("run", "A/1")]
+
+    # -- --plan and the two refusals ---------------------------------------
+    def test_plan_prints_the_selection_without_a_clone_or_a_binary(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        def explode(*args, **kwargs):
+            raise AssertionError("--plan must not reach this")
+
+        monkeypatch.setattr(run_mod.meta_mod, "ensure_clone", explode)
+        monkeypatch.setattr(runner_mod, "require_vanta_bin", explode)
+        split = _PipelineSplit([_pipeline_entry("A", 1)])
+        code = run_mod._queue_pipeline(
+            self._args(tmp_path / "batch", "--pipeline", "--plan"),
+            split=split,
+            config_block={},
+            frozen_env={},
+            invocation_env={},
+            fixed_rounds_declaration=None,
+        )
+        assert code == run_mod.EXIT_OK
+        out = capsys.readouterr().out
+        assert "| bug |" in out and "A/1" in out
+
+    def test_refreeze_with_measure_only_is_refused(self, tmp_path):
+        split = _PipelineSplit([_pipeline_entry("A", 1)])
+        with pytest.raises(run_mod.SplitError, match="--measure-only"):
+            run_mod._queue_pipeline(
+                self._args(
+                    tmp_path / "batch", "--pipeline", "--refreeze", "A/1", "--measure-only"
+                ),
+                split=split,
+                config_block={},
+                frozen_env={},
+                invocation_env={},
+                fixed_rounds_declaration=None,
+            )
+
+    # -- CLI routing -------------------------------------------------------
+    def test_the_pipeline_flag_routes_the_command_into_the_pipeline(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(runner_mod, "require_model_endpoint", lambda **kwargs: None)
+        monkeypatch.setattr(
+            run_mod, "load_split", lambda path: _PipelineSplit([_pipeline_entry("A", 1)])
+        )
+        seen: list = []
+        monkeypatch.setattr(
+            run_mod,
+            "_queue_pipeline",
+            lambda args, **kwargs: seen.append(kwargs) or run_mod.EXIT_OK,
+        )
+        code = run_mod.main(["queue", "--batch", str(tmp_path / "b"), "--pipeline"])
+        assert code == run_mod.EXIT_OK
+        assert len(seen) == 1, "the flag must reach the pipeline and nothing else"
+
+    def test_without_the_flag_the_queue_reads_a_prepared_batch(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(runner_mod, "require_repo_cwd", lambda: REPO_ROOT)
+        monkeypatch.setattr(runner_mod, "require_model_endpoint", lambda **kwargs: None)
+        monkeypatch.setattr(
+            run_mod, "load_split", lambda path: _PipelineSplit([_pipeline_entry("A", 1)])
+        )
+        monkeypatch.setattr(runner_mod, "require_batch_dir", lambda path: path)
+        monkeypatch.setattr(
+            run_mod,
+            "_queue_pipeline",
+            lambda args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("the default queue must not pipeline")
+            ),
+        )
+        read: list = []
+
+        def stop(**kwargs):
+            read.append(kwargs)
+            raise runner_mod.RunnerError("stop here")
+
+        monkeypatch.setattr(runner_mod, "load_prepared", stop)
+        code = run_mod.main(["queue", "--batch", str(tmp_path / "b")])
+        assert read, "the default queue must read the batch prepare.json"
+        assert code == run_mod.EXIT_HARNESS_FAILED
+
+    # -- the parser --------------------------------------------------------
+    def test_the_queue_parser_defaults_to_no_pipeline(self):
+        args = run_mod.build_parser().parse_args(["queue", "--batch", "/tmp/x"])
+        assert args.pipeline is False
+        assert args.prepare_jobs == 1
+
+    def test_the_queue_parser_reads_the_pipeline_flags(self):
+        args = run_mod.build_parser().parse_args(
+            [
+                "queue",
+                "--batch",
+                "/tmp/x",
+                "--pipeline",
+                "--prepare-jobs",
+                "12",
+                "--peak-vms",
+                "8",
+                "--refreeze",
+                "Demo/1",
+            ]
+        )
+        assert args.pipeline is True
+        assert args.prepare_jobs == 12
+        assert args.peak_vms == 8
+        assert args.refreeze == ["Demo/1"]
+
+
 class TestModelEndpointPreflight:
     """Item 14's resolution and classification, away from the batch loop.
 

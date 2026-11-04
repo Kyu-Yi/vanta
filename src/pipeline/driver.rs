@@ -929,6 +929,38 @@ fn cost_and_detail_totals(
     )
 }
 
+/// The run's served model version, collapsed from the per-call `served_model`
+/// facts (M3 item B).
+///
+/// * every call that reported one agrees → that snapshot;
+/// * the calls disagree → the sorted distinct snapshots as the `[a;b]` list
+///   `run.summary` writes for a set;
+/// * no call named one (including a run that made no call) → `unknown`.
+///
+/// [VANTA-WHY] M3 item B — `unknown` rather than the requested id: the field's
+/// job is to record what the SERVER said, and a run that never got an answer, or
+/// a local server that names nothing, did not state one. A run whose calls
+/// disagree is NOT collapsed to the first: that is exactly the
+/// alias-rolled-mid-run case the per-call rows exist to surface, and picking one
+/// would hide it. Values are encoded space-free so the `key=value` reader cannot
+/// be truncated by a model id that carries a space.
+fn served_model_version_value(calls: &[crate::llm::CallUsage]) -> String {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for model in calls.iter().filter_map(|c| c.served_model.as_deref()) {
+        if !model.is_empty() {
+            seen.insert(model);
+        }
+    }
+    match seen.len() {
+        0 => "unknown".to_string(),
+        1 => encode_summary_value(seen.iter().next().expect("len() == 1")),
+        _ => {
+            let owned: Vec<String> = seen.iter().map(|s| (*s).to_string()).collect();
+            encode_summary_path_list(owned.iter())
+        }
+    }
+}
+
 /// Count the calls the server cut off at `max_tokens`, per role (§14.5).
 ///
 /// [VANTA-WHY] A truncated call is one whose generation hit the output cap —
@@ -4675,7 +4707,7 @@ pub async fn run(
                 "seq={} site={} round={} attempt={} prompt_tokens={} completion_tokens={} \
                  total_tokens={} source={} seed={} seed_mechanism={} finish_reason={} wall_ms={} \
                  truncated={} {} cached_tokens={} reasoning_tokens={} cost_usd={} cost_basis={} \
-                 provider_retries={} service_tier={}",
+                 provider_retries={} service_tier={} served_model={}",
                 usage.seq,
                 usage.site,
                 // [VANTA-WHY] §14.12 — the round and the retry index travel with
@@ -4734,6 +4766,14 @@ pub async fn run(
                 // Appended last so every key an older row carried keeps its
                 // position.
                 usage.service_tier,
+                // [VANTA-WHY] M3 item B — the model the SERVER said it served
+                // this call with, beside the tier and the cost it produced. The
+                // per-call fact; `run.summary` collapses these to one
+                // `model_version`. `unset` when the server named none — never the
+                // requested id, which would hide a provider serving a different
+                // snapshot than the one asked for. Appended last so every key an
+                // older row carried keeps its position.
+                usage.served_model.as_deref().unwrap_or("unset"),
             ),
             timestamp: now_iso(),
             benchmark_instance: None,
@@ -4940,7 +4980,7 @@ pub async fn run(
              n_ctx={} creator_effort={} creator_effort_mechanism={} \
              creator_prompt_tokens={}{}{}{} fixed_rounds={} native_vacuous={} \
              native_timeout_secs={} native_timeout={} native_cache_hits={} \
-             peak_sandboxes={} sandbox_backend={}",
+             peak_sandboxes={} sandbox_backend={} model_version={}",
             attempts_run,
             fixed_at_attempt_1,
             decision,
@@ -5283,6 +5323,17 @@ pub async fn run(
             // survives the `key=value` reader; appended after every pre-existing
             // key so an older row's reader is unaffected.
             actual_backend,
+            // [VANTA-WHY] M3 item B — the run's served model version, collapsed
+            // from the per-call `served_model` rows (see
+            // `served_model_version_value`): the snapshot when every call that
+            // named one agrees, the sorted `[a;b]` list when they differ, and
+            // `unknown` when no call named one. This is ADDITIVE to
+            // `session.start`'s `model_version`, not a replacement: that row is
+            // written before the first call and so cannot know what the server
+            // served; it keeps its own `VANTA_MODEL_VERSION` env read. The
+            // measured, post-hoc fact lives here. Appended after every
+            // pre-existing key so an older row's reader is unaffected.
+            served_model_version_value(&call_usages),
         ),
         timestamp: now_iso(),
         benchmark_instance: Some(config_name.to_string()),
@@ -7185,6 +7236,7 @@ mod tests {
         refuse_reasoning_budget_on_judge_arm,
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
         resolve_arm, resolve_fixed_rounds, resolve_native_timeout_secs, sampling_not_sent_rule,
+        served_model_version_value,
         stamp_transition_row,
         stable_patch_fingerprint, ARMS,
         INVARIANT_SATISFIED,
@@ -7192,6 +7244,7 @@ mod tests {
     };
     use crate::agents::attacker::GeneratedTest;
     use crate::config::{LlmBackend, LlmConfig};
+    use crate::llm::{CallUsage, ShapedBody};
     use crate::core::{
         AttemptTransition, EvidenceSource, FailureClass, GovernorDecision, TestEvidence,
         TestIntent, TestResult, VerificationOutcome,
@@ -7217,6 +7270,82 @@ mod tests {
         assert_eq!(cache_hit_rate_value(Some(0), 0), "unset");
         // A whole prompt served from cache is a rate of one, not a special case.
         assert_eq!(cache_hit_rate_value(Some(500), 500), "1.0000");
+    }
+
+    /// M3 item B — the run-level `model_version` is DERIVED, not guessed: one
+    /// snapshot when every call that named one agrees, the sorted `[a;b]` list
+    /// when they disagree (an alias rolled mid-run), and `unknown` only when no
+    /// call named one. A value that collapsed a disagreement to the first would
+    /// hide exactly the drift the per-call rows exist to show.
+    #[test]
+    fn the_run_model_version_is_collapsed_from_the_per_call_facts_never_invented() {
+        // A call with no served model leaves nothing behind — it must not read as
+        // agreement with a named one.
+        assert_eq!(served_model_version_value(&[]), "unknown");
+
+        assert_eq!(
+            served_model_version_value(&[call_with_served(Some("gpt-5-2025-10-06"))]),
+            "gpt-5-2025-10-06"
+        );
+        // Two calls naming the SAME snapshot collapse to it, once.
+        assert_eq!(
+            served_model_version_value(&[
+                call_with_served(Some("gpt-5-2025-10-06")),
+                call_with_served(Some("gpt-5-2025-10-06")),
+            ]),
+            "gpt-5-2025-10-06"
+        );
+        // Two DIFFERENT snapshots are the `[a;b]` list, sorted, not the first.
+        assert_eq!(
+            served_model_version_value(&[
+                call_with_served(Some("gpt-5-2025-11-01")),
+                call_with_served(Some("gpt-5-2025-10-06")),
+            ]),
+            "[gpt-5-2025-10-06;gpt-5-2025-11-01]"
+        );
+        // A silent call beside a named one does not erase the named one, and does
+        // not turn it into a list.
+        assert_eq!(
+            served_model_version_value(&[
+                call_with_served(None),
+                call_with_served(Some("gpt-5-2025-10-06")),
+            ]),
+            "gpt-5-2025-10-06"
+        );
+        // A model id with a space is encoded space-free so the `key=value` reader
+        // cannot truncate it.
+        assert_eq!(
+            served_model_version_value(&[call_with_served(Some("local model v2"))]),
+            "local%20model%20v2"
+        );
+    }
+
+    /// A `CallUsage` carrying only what `served_model_version_value` reads — the
+    /// rest are the type's own defaults for this purpose.
+    fn call_with_served(model: Option<&str>) -> CallUsage {
+        CallUsage {
+            seq: 0,
+            site: "test".to_string(),
+            round: 1,
+            attempt: 1,
+            provider_retries: 0,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            cached_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
+            cost_basis: "no_usage".to_string(),
+            source: "estimate".to_string(),
+            seed: None,
+            seed_mechanism: "unset".to_string(),
+            finish_reason: None,
+            wall_ms: 0,
+            truncated: false,
+            request_shape: ShapedBody { requested: Vec::new(), sent: Vec::new(), dropped: Vec::new(), renamed: Vec::new() },
+            service_tier: "unset".to_string(),
+            served_model: model.map(str::to_string),
+        }
     }
 
     // ---- M3 item F5: the prompt-over-budget reason ----------------------------

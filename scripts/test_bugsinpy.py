@@ -30876,7 +30876,36 @@ class TestQueue:
 
     def test_an_empty_arms_or_seeds_flag_means_the_split_s_own(self):
         assert run_mod._parse_arms("") is None
+        assert run_mod._parse_arms([]) is None
         assert run_mod._parse_seeds("  ") is None
+
+    def test_a_repeated_arms_flag_accumulates_every_value(self):
+        """M3 item G — a second `--arms` must add to the first, not replace it.
+
+        The flag silently kept only its last value before, so a scheduled arm was
+        dropped from a smoke run without a word.
+        """
+        args = run_mod.build_parser().parse_args(
+            [
+                "queue",
+                "--batch",
+                "/tmp/x",
+                "--arms",
+                "b1-k4",
+                "--arms",
+                "b3-k4",
+            ]
+        )
+        assert args.arms == ["b1-k4", "b3-k4"]
+        assert run_mod._parse_arms(args.arms) == ["b1-k4", "b3-k4"]
+        # Each repeated value may itself be a comma/space list, and the older
+        # single `--arms a,b` spelling is unchanged.
+        assert run_mod._parse_arms(["b1-k4, b3-k4"]) == ["b1-k4", "b3-k4"]
+        assert run_mod._parse_arms(["b1-k4 b3-k4", "vanta"]) == [
+            "b1-k4",
+            "b3-k4",
+            "vanta",
+        ]
 
     # -- M3 item S6: the invocation's ONE scheduler ------------------------
     def test_the_run_command_defaults_to_one_job_and_twelve_peak_vms(self):

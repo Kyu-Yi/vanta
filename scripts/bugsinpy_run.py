@@ -45,7 +45,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence, Union
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent
@@ -1387,15 +1387,24 @@ def cmd_run(args: argparse.Namespace) -> int:
     return code
 
 
-def _parse_arms(raw: str) -> Optional[list[str]]:
+def _parse_arms(raw: Union[str, Sequence[str]]) -> Optional[list[str]]:
     """``--arms`` as a spelling list, or ``None`` for the split's own arms.
 
     Empty means "not given", which is the whole protocol — the same default the
     ``run`` command has, so a queue with no ``--arms`` runs every arm.
+
+    [VANTA-WHY] M3 item G — the flag is ``action="append"``, so a repeated
+    ``--arms b1-k4 --arms b3-k4`` accumulates rather than silently keeping only
+    the last value (which is how the scheduled ``b1-k4`` arm was dropped from a
+    smoke run). Every element may itself be comma- or space-separated, so the
+    older ``--arms a,b`` spelling keeps working.
     """
-    if not raw.strip():
-        return None
-    return [part for part in raw.replace(",", " ").split() if part]
+    if isinstance(raw, str):
+        raw = [raw]
+    spellings: list[str] = []
+    for chunk in raw:
+        spellings.extend(part for part in chunk.replace(",", " ").split() if part)
+    return spellings or None
 
 
 def _parse_seeds(raw: str) -> Optional[list[int]]:
@@ -2949,12 +2958,14 @@ def build_parser() -> argparse.ArgumentParser:
     queue.add_argument("--waves", default="", help="comma-separated wave numbers")
     queue.add_argument(
         "--arms",
-        default="",
+        action="append",
+        default=[],
         metavar="SPELLING,...",
         help=(
-            "the arm spellings to run, comma- or space-separated. Default: every arm "
-            "the split declares. A spelling the split does not declare is refused — "
-            "the split is the protocol and this flag is only a selection (§12.2.5)"
+            "the arm spellings to run, comma- or space-separated (repeatable; each "
+            "value accumulates). Default: every arm the split declares. A spelling "
+            "the split does not declare is refused — the split is the protocol and "
+            "this flag is only a selection (§12.2.5)"
         ),
     )
     queue.add_argument(

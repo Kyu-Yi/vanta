@@ -1688,6 +1688,114 @@ class TestProjectCloneIsOnceUnderConcurrency:
         assert results == [cache_root / "Demo.git", cache_root / "Demo.git"]
 
 
+class TestCloneMirror:
+    """M3 item AA2 — the local mirror is the batch's only network writer, a
+    checkout reads it and never writes it, and every export is verified to have
+    landed on the commit it claims.
+
+    ``runs/bugsinpy/repos/<project>.git`` is cloned once from upstream; the three
+    trees of a bug, and every later bug of the project, are cloned from that path.
+    A commit the mirror does not hold (a PR merge, a tag-only commit) is fetched
+    into it by :func:`ensure_commit_available` — and only then.
+    """
+
+    def _repo_with_commit(self, tmp_path, name: str = "repo"):
+        """A real one-commit repository and its commit id."""
+        repo = tmp_path / name
+        repo.mkdir()
+        tree_mod._git(["init", "--quiet"], cwd=repo)
+        tree_mod._git(["config", "user.email", "t@example.com"], cwd=repo)
+        tree_mod._git(["config", "user.name", "T"], cwd=repo)
+        write(repo / "pkg" / "mod.py", "VALUE = 1\n")
+        tree_mod._git(["add", "-A"], cwd=repo)
+        tree_mod._git(["commit", "--quiet", "-m", "one"], cwd=repo)
+        return repo, tree_mod._git(["rev-parse", "HEAD"], cwd=repo).strip()
+
+    def test_a_commit_the_mirror_holds_is_never_fetched(self, tmp_path, monkeypatch):
+        """The mirror already has the commit: putting it there is a local read.
+
+        A ``git fetch`` here would be the network being touched for a bug whose
+        commit the batch already cloned — the cost AA2 exists to remove.
+        """
+        repo, commit = self._repo_with_commit(tmp_path)
+        calls: list[list[str]] = []
+        real_run = subprocess.run
+
+        def spy(cmd, *args, **kwargs):
+            calls.append(list(cmd))
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(tree_mod.subprocess, "run", spy)
+        tree_mod.ensure_commit_available(repo, commit)
+
+        assert calls, "the check itself should have asked git"
+        assert [call for call in calls if "fetch" in call] == [], calls
+
+    def test_a_commit_missing_from_the_mirror_is_fetched_from_origin(self, tmp_path):
+        """A commit the mirror does not hold is fetched, by sha, into the mirror.
+
+        This is the PR-merge / tag-only case the old ``export_tree`` fallback
+        handled by fetching into the *checkout*; AA2 moves it into the mirror, so
+        the next bug of the project pays nothing. The local origin is given the
+        same sha-fetch permission GitHub grants, or the fetch would be refused for
+        a reason that has nothing to do with the harness.
+        """
+        origin, _ = self._repo_with_commit(tmp_path, "origin")
+        tree_mod._git(["config", "uploadpack.allowAnySHA1InWant", "true"], cwd=origin)
+        mirror = tmp_path / "mirror.git"
+        tree_mod._git(["clone", "--quiet", "--", str(origin), str(mirror)], cwd=None)
+
+        # a commit origin gains *after* the mirror was cloned
+        write(origin / "pkg" / "mod.py", "VALUE = 2\n")
+        tree_mod._git(["add", "-A"], cwd=origin)
+        tree_mod._git(["commit", "--quiet", "-m", "two"], cwd=origin)
+        second = tree_mod._git(["rev-parse", "HEAD"], cwd=origin).strip()
+
+        assert not tree_mod._has_commit(mirror, second)
+        tree_mod.ensure_commit_available(mirror, second)
+        assert tree_mod._has_commit(mirror, second)
+
+    def test_a_commit_that_cannot_be_fetched_is_refused(self, tmp_path):
+        """A commit neither held nor obtainable is a refusal, not a silent pass."""
+        origin, _ = self._repo_with_commit(tmp_path, "origin")
+        mirror = tmp_path / "mirror.git"
+        tree_mod._git(["clone", "--quiet", "--", str(origin), str(mirror)], cwd=None)
+
+        with pytest.raises(tree_mod.TreeError, match="not in the local clone mirror"):
+            tree_mod.ensure_commit_available(mirror, "0" * 40)
+
+    def test_export_tree_lands_exactly_on_the_requested_commit(self, tmp_path):
+        """The happy path still checks out, and the checkout is verified."""
+        repo, commit = self._repo_with_commit(tmp_path)
+        dest = tmp_path / "out"
+        tree_mod.export_tree(repo, commit, dest)
+        assert tree_mod._git(["rev-parse", "HEAD"], cwd=dest).strip() == commit
+
+    def test_export_tree_refuses_a_tree_that_is_not_the_commit(
+        self, tmp_path, monkeypatch
+    ):
+        """A checkout that lands elsewhere is a refusal, never a recorded tree."""
+        dest = tmp_path / "out"
+
+        def fake_git(args, *, cwd):
+            if args[0] == "clone":
+                Path(args[-1]).mkdir(parents=True, exist_ok=True)
+                return ""
+            if args[0] == "rev-parse" and args[1] == "HEAD":
+                return "1111111111111111111111111111111111111111\n"
+            if args[0] == "rev-parse":
+                return "2222222222222222222222222222222222222222\n"
+            return ""
+
+        monkeypatch.setattr(tree_mod, "ensure_commit_available", lambda mirror, commit: None)
+        monkeypatch.setattr(tree_mod, "_git", fake_git)
+
+        with pytest.raises(tree_mod.TreeError, match="checked out"):
+            tree_mod.export_tree(
+                tmp_path / "mirror", "2222222222222222222222222222222222222222", dest
+            )
+
+
 class TestBuildTreesRefusesALeakedOracle:
     """The permanent guard, at the one place both trees are composed."""
 

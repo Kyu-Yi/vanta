@@ -30655,6 +30655,30 @@ class TestQueue:
             "a recorded zero IS a bound — the local backend prices nothing"
         )
 
+    def test_a_zero_call_row_costs_zero_and_a_called_row_with_no_price_is_a_hole(self):
+        """M3 item F — `calls == 0` makes the absent `cost_usd` a measurement.
+
+        The pipeline writes `cost_usd=unset` (→ `None`) for "nothing was priced".
+        A review row that only reused a candidate priced nothing because it asked
+        nothing, and six such rows sat in the m3 smoke as "unknown spend". A row
+        that DID call and priced nothing is still a hole: the cost exists and was
+        not recorded.
+        """
+        # Zero calls ⇒ $0.00, measured — however the absent field is spelled.
+        assert runner_mod._row_cost({"llm": {"calls": 0}}) == 0.0
+        assert runner_mod._row_cost({"llm": {"calls": 0, "cost_usd": None}}) == 0.0
+        assert runner_mod._row_cost({"llm": {"calls": 0, "cost_usd": "unset"}}) == 0.0
+        # Calls were made ⇒ the absent price is a hole, not zero.
+        assert runner_mod._row_cost({"llm": {"calls": 3}}) is None
+        assert runner_mod._row_cost({"llm": {"calls": 4, "cost_usd": None}}) is None
+        assert runner_mod._row_cost({"llm": {"calls": 1, "cost_usd": "unset"}}) is None
+        # No call count at all is still a hole — the old, conservative reading.
+        assert runner_mod._row_cost({"llm": {"cost_basis": "test/tier/2026-10-26"}}) is None
+        # A recorded price always wins over the call count.
+        assert runner_mod._row_cost({"llm": {"calls": 0, "cost_usd": 0.25}}) == 0.25
+        # A bool is never a number (True == 1 would otherwise read as one call).
+        assert runner_mod._row_cost({"llm": {"calls": True}}) is None
+
     def test_a_resumed_batch_over_costless_rows_still_runs_one_job_at_a_time(
         self, tmp_path, monkeypatch
     ):

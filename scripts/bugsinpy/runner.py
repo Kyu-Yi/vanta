@@ -3221,13 +3221,27 @@ def _row_cost(record: dict[str, Any]) -> Optional[float]:
     ``cost_usd: 0.0`` and that is a measurement; an absent or non-numeric field is
     a hole, and the gate answers a hole with the cold-start rule rather than with
     a number it invented.
+
+    [VANTA-WHY] M3 item F — the one hole that is not a hole. A row whose
+    ``llm.calls`` is a recorded ``0`` made no call, so it cannot have spent
+    anything: its absent ``cost_usd`` is $0.00 **as a measurement**, not an
+    unknown. The pipeline writes ``cost_usd=unset`` (→ ``None``) for "nothing was
+    priced", and a review row that only reused a candidate prices nothing because
+    it asked nothing — six such rows sat in the m3 smoke as "unknown spend" and
+    forced the batch's spend report to carry a hole it did not have. A hole is
+    still a hole when the row *did* call (``calls`` >= 1, or no ``calls`` field at
+    all): the cost exists and was not recorded, and the cold-start rule stays the
+    answer.
     """
     llm = record.get("llm")
     if not isinstance(llm, dict):
         return None
     cost = llm.get("cost_usd")
     if isinstance(cost, bool) or not isinstance(cost, (int, float)):
-        return None
+        calls = llm.get("calls")
+        if isinstance(calls, bool) or not isinstance(calls, (int, float)):
+            return None
+        return 0.0 if calls == 0 else None
     return float(cost)
 
 

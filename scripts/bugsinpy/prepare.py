@@ -846,6 +846,7 @@ def check_deps(
     tree_rel = _rel(prep, "oracle_tree")
     env = prep.sandbox_env or None
 
+    progress(prep.key, "deps gate: collect oracle_tree")
     try:
         nodeids = suite_mod.collect_only(
             checkpoint=checkpoint,
@@ -863,6 +864,7 @@ def check_deps(
             prep, exc, checkpoint=checkpoint, batch_dir=batch_dir, env=env, budget=budget
         )
 
+    progress(prep.key, f"deps gate: import probe {module}")
     try:
         where = suite_mod.import_probe(
             checkpoint=checkpoint,
@@ -922,6 +924,7 @@ def _collect_flip_or_raise(
 
     prep.hidden_by_collect_flip = flips
     prep.collect_flip_nodeids = nodeids
+    progress(prep.key, "deps gate: collect oracle_tree ignoring the flipped files")
     return suite_mod.collect_only(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
@@ -1115,8 +1118,9 @@ def build_trees_in_place(
     # M3 item Y1 — each build's VM holds one slot of the invocation's budget while it
     # boots (suite.build_tree_in_place), so a concurrent prepare prices them like the
     # suite runs they sit beside; without a budget they boot as they always did.
-    for tree_name in BUILD_TREES:
-        fingerprint = suite_mod.build_tree_in_place(
+    def build_one(tree_name: str) -> str:
+        progress(prep.key, f"build {tree_name}")
+        return suite_mod.build_tree_in_place(
             checkpoint=checkpoint,
             batch_dir=batch_dir,
             tree_rel=_rel(prep, tree_name),
@@ -1128,6 +1132,31 @@ def build_trees_in_place(
             carry=carry,
             budget=budget,
         )
+
+    # [VANTA-WHY] M3 item AA1 — the three trees are independent exports from git, so
+    # their builds are independent work and run at the same time under the one budget,
+    # which prices them like the suite runs they sit beside. At `--prepare-jobs 1` (or
+    # for a caller with no budget) `budget.concurrent` is false and this is the serial
+    # loop it always was, in the same order, recording the same rows. When they do
+    # overlap, the rows are still written in `BUILD_TREES` order and the first failure
+    # in that order is the one raised, so `prep.builds`/`prep.tree_hashes` and the
+    # recorded gate failure are byte-for-byte what a serial run would have produced.
+    if budget is not None and budget.concurrent:
+        outcomes: dict[str, tuple[Optional[str], Optional[BaseException]]] = {}
+        with ThreadPoolExecutor(max_workers=len(BUILD_TREES)) as pool:
+            futures = {tree: pool.submit(build_one, tree) for tree in BUILD_TREES}
+            for tree, future in futures.items():
+                try:
+                    outcomes[tree] = (future.result(), None)
+                except BaseException as exc:  # recorded in order, raised below
+                    outcomes[tree] = (None, exc)
+        ordered = ((tree, *outcomes[tree]) for tree in BUILD_TREES)
+    else:
+        ordered = ((tree, build_one(tree), None) for tree in BUILD_TREES)
+
+    for tree_name, fingerprint, failure in ordered:
+        if failure is not None:
+            raise failure
         prep.builds[tree_name] = f"built: {command}"
         # The VM built the tree and the host adopted it (item V8/Q1); the adopted
         # bytes' fingerprint goes on the row so a later cache key can be lined up
@@ -1463,6 +1492,10 @@ def _suite(
     # the scheduler's unit, so one call here is up to two units and the caller's
     # ``--prepare-jobs`` sizes them. Keyword-only so the five positional parameters
     # stay the shape callers and tests already bind.
+    # M3 item AA1 — one progress line per suite pair, so the derivations, the
+    # stripped baseline and every other prepare suite are visible while they run
+    # rather than only when the bug finishes.
+    progress(prep.key, f"suite {tree_name} ({stem_suffix})")
     return suite_mod.run_suite_twice(
         checkpoint=checkpoint,
         batch_dir=batch_dir,
@@ -1551,6 +1584,7 @@ def strip_and_baseline(
     oracle = prep.root / "oracle_tree"
     vanta = prep.root / "vanta_tree"
 
+    progress(prep.key, "strip oracle_tree and run the stripped baseline")
     report = _read_report(batch_dir, f"{prep.slug}-oracle")
     # Through the shared reader: the oracle report of a bug whose own pytest pin caps
     # pytest-json-report at 0.2 is a flat list (§3.2), and reading only `["tests"]`
@@ -1696,6 +1730,7 @@ def selfcheck_dev_fix(
     if not prep.hidden_nodeids:
         return True
 
+    progress(prep.key, "developer-fix self-check (the real oracle grades the dev fix)")
     result = oracle_mod.grade_dev_fix(
         prep=prep,
         batch_dir=batch_dir,
@@ -2473,6 +2508,27 @@ def _batch_root(prep: BugPrep) -> Path:
     return prep.root.parent.parent
 
 
+PROGRESS_CLOCK = "%H:%M:%S"
+"""The wall-clock shape of a progress line (M3 item AA1)."""
+
+
+def progress(key: str, step: str) -> None:
+    """One timestamped line for a prepare step or a suite run (M3 item AA1).
+
+    [VANTA-WHY] ``prepare`` is minutes of silent work: the batch printed
+    ``[<key>] full ...`` and then nothing at all until ``[<key>] ok``, so a
+    28-minute pandas prepare, a hung one and a batch running at a crawl all read
+    the same on the terminal — the operator cannot tell progress from a stall.
+    One line per setup step and per suite run makes the stage legible while
+    changing nothing it computes: the line goes to stdout and is read by no
+    verdict, label, admission or result. It is emitted here rather than inside
+    ``suite.run_suite_twice`` because that would print for every stage of the
+    harness (``run``, ``queue``, ``replay``); ``prepare`` is the stage that was
+    silent, so ``prepare`` is where the line belongs.
+    """
+    print(f"[{datetime.now().strftime(PROGRESS_CLOCK)}] [{key}] {step}", flush=True)
+
+
 def _read_report(batch_dir: Path, stem: str) -> dict:
     path = batch_dir / f"reports/{stem}.run1.json"
     try:
@@ -2682,6 +2738,7 @@ def prepare_one(
         precompile=_precompile_entry(entry),
     )
 
+    progress(prep.key, "check the row against the split")
     mismatches = check_declared(entry, bug)
     # `needs_build` is checked against the buggy commit's own tree and not against the
     # metadata: it is a property of the files (§3.2), and the split is the protocol, so
@@ -2692,6 +2749,7 @@ def prepare_one(
         prep.gate_failures.extend(mismatches)
         return prep
 
+    progress(prep.key, "materialise the trees (git exports)")
     prep.test_paths = build_trees(bug, repo_cache, prep.root)
 
     # The issue text comes from the committed frozen report, and it is read *here*
@@ -2702,6 +2760,7 @@ def prepare_one(
     if not github_url:
         prep.gate_failures.append(f"{FROZEN_ISSUE_REASON}: no github_url for {project}")
         return prep
+    progress(prep.key, "read the frozen issue text")
     frozen = build_issue(
         prep,
         repo_cache=repo_cache,
@@ -2722,6 +2781,7 @@ def prepare_one(
     # (the strip only removes test functions), so measuring it costs nothing and
     # saves the three double suite runs on a bug that cannot fit anyway — which is
     # the whole point of the precheck for a candidate like youtube-dl.
+    progress(prep.key, "precheck (pre-strip tree, window-sized)")
     early = ctx.precheck(
         prep.root / "oracle_tree",
         prep.issue.text,
@@ -2741,6 +2801,7 @@ def prepare_one(
     # The dependency gate comes first, and comes before the derivation, because a
     # missing dependency must never be reported as an oracle failure (§3.3). It
     # needs no oracle work at all: the layer is baked, the trees are on disk.
+    progress(prep.key, "load the layer's dependency provenance")
     try:
         deps = bake_mod.load_deps(deps_dir, checkpoint)
         prep.deps = deps
@@ -2767,6 +2828,7 @@ def prepare_one(
     # has C extensions is not importable until its own `setup.py` has run (§3.4), so
     # without this the gate's failure would be the ImportError the build exists to
     # prevent — a missing *extension* reported as a missing *dependency*.
+    progress(prep.key, "build the trees in place")
     try:
         build_trees_in_place(
             prep,
@@ -2780,6 +2842,7 @@ def prepare_one(
         note_drops()
         return prep
 
+    progress(prep.key, "dependency gate")
     try:
         collected = check_deps(
             prep,
@@ -2793,6 +2856,7 @@ def prepare_one(
         note_drops()
         return prep
 
+    progress(prep.key, "derive the hidden oracle (three suite pairs)")
     try:
         derive_hidden(
             prep,
@@ -2813,6 +2877,7 @@ def prepare_one(
     # text was gated against a narrower oracle than the run grades with. Flagged, never
     # re-gated — the committed text is what the run sends.
     if frozen is not None:
+        progress(prep.key, "check the frozen text against the derived oracle")
         drift = check_gate_drift(prep, frozen, issues_dir=issue_sources.issues_dir)
         if drift:
             prep.gate_failures.append(drift)
@@ -2858,6 +2923,7 @@ def prepare_one(
     # issue text it will actually be given. Smaller than `early`, never larger — the
     # text is the same frozen file, and the tree is the same source with the hidden
     # tests stripped.
+    progress(prep.key, "authoritative context measurement (vanta_tree)")
     prep.context = ctx.precheck(
         prep.root / "vanta_tree",
         prep.issue.text if prep.issue else "",

@@ -22029,6 +22029,185 @@ class TestBuildTreesInPlace:
         assert built == ["worktrees/Demo_1/oracle_tree"]
 
 
+class TestParallelBuilds:
+    """M3 item AA1 — the three independent builds run at once under the one budget.
+
+    ``oracle_tree``/``src_buggy``/``src_fixed`` are independent git exports, so
+    building them back to back was a sequence with no dependency to justify it and
+    the length of a pandas prepare (three ``build_ext`` runs) sat on the critical
+    path. They overlap under the same scheduler that prices the suite runs. What
+    must not change: at one job (or with no budget) the loop is the serial one it
+    always was — same order, same rows, same first failure — and even when they
+    overlap the rows are written in ``BUILD_TREES`` order, so a later reader cannot
+    tell a parallel build from a serial one by what the row records.
+    """
+
+    @staticmethod
+    def _needs_build(monkeypatch) -> None:
+        monkeypatch.setattr(
+            bake_mod,
+            "needs_build_at",
+            lambda repo, commit, pythonpath=None: (True, "declares ext_modules"),
+        )
+
+    @staticmethod
+    def _prep(tmp_path: Path) -> prepare_mod.BugPrep:
+        return prep(
+            root=tmp_path / "batch" / "worktrees" / "Demo_1",
+            test_cmd=["python", "-m", "pytest", "tests"],
+        )
+
+    @staticmethod
+    def _budget() -> budget_mod.Budget:
+        return budget_mod.Budget(4, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20)
+
+    def test_the_three_builds_overlap_under_the_budget(self, tmp_path, monkeypatch):
+        """All three builds are in flight together — a serial loop would time out.
+
+        A barrier of three: every build waits for the other two. If the builds were
+        serial the first would break the barrier on timeout and ``peak`` would stay
+        at one, which is the assertion.
+        """
+        self._needs_build(monkeypatch)
+        watch = _PrepareInFlight()
+        barrier = threading.Barrier(len(prepare_mod.BUILD_TREES), timeout=5.0)
+
+        def slow(**kwargs):
+            watch.enter(kwargs["tree_rel"])
+            try:
+                try:
+                    barrier.wait()
+                except threading.BrokenBarrierError:
+                    pass
+            finally:
+                watch.leave()
+            return "fp"
+
+        monkeypatch.setattr(suite_mod, "build_tree_in_place", slow)
+        bug_prep = self._prep(tmp_path)
+
+        prepare_mod.build_trees_in_place(
+            bug_prep,
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            repo=tmp_path / "clone",
+            budget=self._budget(),
+        )
+
+        assert watch.peak == 3, (
+            "the builds did not overlap under a four-job budget: they ran "
+            f"one at a time ({watch.keys})"
+        )
+        assert bug_prep.builds == {
+            "vanta_tree": prepare_mod.VANTA_TREE_INHERITANCE,
+            "oracle_tree": "built: python setup.py build_ext --inplace",
+            "src_buggy": "built: python setup.py build_ext --inplace",
+            "src_fixed": "built: python setup.py build_ext --inplace",
+        }
+
+    def test_at_one_job_the_builds_stay_serial_in_order(self, tmp_path, monkeypatch):
+        """``--prepare-jobs 1`` is the serial loop, in ``BUILD_TREES`` order."""
+        self._needs_build(monkeypatch)
+        order: list[str] = []
+        monkeypatch.setattr(
+            suite_mod,
+            "build_tree_in_place",
+            lambda **kwargs: order.append(kwargs["tree_rel"]) or "fp",
+        )
+
+        prepare_mod.build_trees_in_place(
+            self._prep(tmp_path),
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            repo=tmp_path / "clone",
+            budget=budget_mod.Budget(1, peak_vms=1, cores_cap=14, memory_cap_mb=1 << 20),
+        )
+
+        assert order == [
+            "worktrees/Demo_1/oracle_tree",
+            "worktrees/Demo_1/src_buggy",
+            "worktrees/Demo_1/src_fixed",
+        ], "the one-job build is the loop it always was, in the order it always ran"
+
+    def test_a_parallel_failure_records_the_first_tree_in_order(self, tmp_path, monkeypatch):
+        """A later tree's failure never hides an earlier one's.
+
+        Under the serial loop the first tree to fail in ``BUILD_TREES`` order ends
+        the step; the parallel path runs all three, so it has to *report* the same
+        one — the first in order — and record the same rows the serial loop would
+        have recorded before it stopped.
+        """
+        self._needs_build(monkeypatch)
+
+        def boom(**kwargs):
+            if "src_buggy" in kwargs["tree_rel"]:
+                raise suite_mod.SuiteError("build failed in /workspace/…: src_buggy said no")
+            return "fp"
+
+        monkeypatch.setattr(suite_mod, "build_tree_in_place", boom)
+        bug_prep = self._prep(tmp_path)
+
+        with pytest.raises(suite_mod.SuiteError, match="src_buggy said no"):
+            prepare_mod.build_trees_in_place(
+                bug_prep,
+                checkpoint="chk",
+                batch_dir=tmp_path / "batch",
+                repo=tmp_path / "clone",
+                budget=self._budget(),
+            )
+
+        assert set(bug_prep.builds) == {"vanta_tree", "oracle_tree"}, (
+            "a tree after the first failure must not be recorded, exactly as the "
+            "serial loop would never have reached it"
+        )
+
+
+class TestPrepareProgress:
+    """M3 item AA1 — a prepare step and a suite run are visible while they happen.
+
+    ``prepare`` printed ``[<key>] full ...`` and then nothing until ``[<key>] ok``,
+    so a long prepare and a hung one read the same. Each line carries a wall clock
+    and the bug's key, and nothing here is read by a verdict — the assertion is
+    only that the line is emitted, in the shape an operator can read.
+    """
+
+    def test_the_line_carries_a_clock_and_the_key(self, capsys):
+        prepare_mod.progress("pandas/1", "build oracle_tree")
+        out = capsys.readouterr().out
+        assert re.fullmatch(
+            r"\[\d{2}:\d{2}:\d{2}\] \[pandas/1\] build oracle_tree\n", out
+        ), out
+
+    def test_every_build_and_suite_pair_prints_one_line(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            bake_mod,
+            "needs_build_at",
+            lambda repo, commit, pythonpath=None: (True, "declares ext_modules"),
+        )
+        monkeypatch.setattr(suite_mod, "build_tree_in_place", lambda **kwargs: "fp")
+        monkeypatch.setattr(suite_mod, "run_suite_twice", lambda **kwargs: object())
+        bug_prep = prep(
+            root=tmp_path / "batch" / "worktrees" / "Demo_1",
+            test_cmd=["python", "-m", "pytest", "tests"],
+        )
+
+        prepare_mod.build_trees_in_place(
+            bug_prep,
+            checkpoint="chk",
+            batch_dir=tmp_path / "batch",
+            repo=tmp_path / "clone",
+        )
+        prepare_mod._suite("chk", tmp_path / "batch", bug_prep, "oracle_tree", "oracle")
+
+        lines = capsys.readouterr().out.splitlines()
+        assert any("] [Demo/1] build oracle_tree" in line for line in lines), lines
+        assert any(
+            "] [Demo/1] suite oracle_tree (oracle)" in line for line in lines
+        ), lines
+
+
 class TestImportProbe:
     """``import_probe`` reuses the suite invocation, not a convenient one."""
 

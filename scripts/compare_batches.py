@@ -8,9 +8,26 @@ gate before either may be used for real is an equivalence check on one bug:
 *"a serial prepare and run on the same build as the reference, then the parallel
 version, compared per nodeid apart from the tests the serial pair marked flaky"*
 (``plans/private/M3-progress.md``, "The gate before real use"). This script is
-that comparison. It reads two batch directories produced by the *same build* — one
-prepared and run with ``--prepare-jobs 1 --jobs 1``, one with the parallel
-settings — and reports every difference that concurrency could have caused.
+that comparison. It reads two batch directories — one prepared and run with
+``--prepare-jobs 1 --jobs 1``, one with the parallel settings — and reports every
+difference that concurrency could have caused.
+
+ACROSS BUILDS (M3 item Z2)
+--------------------------
+The serial reference is not always re-run on the new build. To check Y1 — "every
+new overlap charges the shared budget and results stay identical" — the parallel
+batch of the NEW build is compared against the serial batch that already exists
+from an OLDER build (``m3-equiv-*``). That is sound because the serial batch is
+only a *reference tree*: what it must supply is the per-nodeid native facts and
+the row's time-limit behaviour, none of which depend on the harness build. The
+harness build DOES enter the suite-cache key, so two builds cannot be served each
+other's measurements even on one root.
+
+So the from-build facts are compared and **reported as information**: a difference
+in ``harness_commit`` / ``vanta_build_commit`` (or their dirty flags) or in a
+bug's ``checkpoint`` is recorded in the ``build`` block and never fails the gate.
+A build difference is a fact about the two runs, not a disagreement about the
+tree or the schedule.
 
 WHAT IS COMPARABLE, AND WHAT IS NOT
 -----------------------------------
@@ -54,15 +71,29 @@ the gate. Rules (a), (c), (d) and (e) are unchanged.
 
 CACHE ISOLATION
 ---------------
-The two batches run on the same build and the same trees, so on ONE suite-cache
-root the parallel batch would be served the serial batch's prepare suites and
-in-session native gates — and the comparison would pass vacuously. Each batch is
-therefore given its own root (``VANTA_SUITE_CACHE_DIR``, which drives both the
-Python and the Rust caches) and this script proves it: it reads the cache root
-each batch recorded (``prepare.json``'s per-tree ``scheduler.runs[*].cache.dir``)
-and **fails** when the two batches name the same root, or when any recorded hit's
-key is not an entry under its own batch's root. It reports each batch's
-prepare-suite and native-gate hit/miss counts and the writer of every hit.
+On one suite-cache root two batches of the SAME build and the SAME trees would be
+served each other's prepare suites and in-session native gates — and the
+comparison would pass vacuously. Each batch is therefore given its own root
+(``VANTA_SUITE_CACHE_DIR``, which drives both the Python and the Rust caches) and
+this script checks it: it reads the cache root each batch recorded
+(``prepare.json``'s per-tree ``scheduler.runs[*].cache.dir``) and **fails** when
+the two batches name the same root, or when a recorded hit resolves under the
+*other* batch's root instead of its own. It reports each batch's prepare-suite and
+native-gate hit/miss counts and the writer of every hit.
+
+The check is *never skipped silently*, and it is honest about what it cannot see:
+
+  * A side that recorded **no hit** has nothing to resolve, and passes trivially
+    (last night's serial batch ran with the cache off, so this is the normal case
+    for a cross-build comparison).
+  * A recorded **hit** is verified against that side's own root — and, as a
+    sharper finding, if it resolves under the OTHER side's root instead, the hit
+    was demonstrably served from the other batch.
+  * If a side recorded hits but its root no longer exists on disk, the hits cannot
+    be checked at all. That side is ``isolation unverifiable`` and the verdict is
+    ``identical_unverified`` — never a plain ``identical`` (which would claim a
+    proof that was not made) and never a false ``not_identical`` (which would
+    blame the batches for a directory the operator deleted).
 
 VERDICT
 -------
@@ -75,11 +106,20 @@ wanted and at least one row existed across the two batches. Two batches that
 compared nothing (no ``prepare.json`` bugs, no rows) are ``not_identical``, never
 ``identical`` — ``all([])`` is ``True``, and a gate must not pass on absence.
 
+When everything agrees but a side's cache isolation could not be verified, the
+verdict is ``identical_unverified``: the comparison passed, but the cache half of
+the proof was not available. Build-stamp differences never change the verdict.
+
 USAGE (run from the repository root)
 ------------------------------------
     python3 scripts/compare_batches.py \
         --serial runs/bugsinpy/m3-eq-pandas_1-serial \
         --parallel runs/bugsinpy/m3-eq-pandas_1-parallel
+
+    # the new parallel batch against last night's (older-build) serial reference:
+    python3 scripts/compare_batches.py \
+        --serial runs/bugsinpy/m3-equiv-pandas_1-serial \
+        --parallel runs/bugsinpy/m3-timing-pandas_1-parallel
 
     # only one bug, and an explicit report path:
     python3 scripts/compare_batches.py --serial A --parallel B --bug pandas/1 \
@@ -89,7 +129,9 @@ OUTPUT
 ------
 One verdict line, and a JSON report at ``<parallel>/compare_batches.json`` unless
 ``--report`` names one (``--no-report`` writes none). Exit codes: ``0`` identical,
-``1`` not identical, ``2`` the two batches could not be read.
+``1`` not identical, ``2`` the two batches could not be read, ``3``
+``identical_unverified`` (the batches agree, but one side's cache isolation could
+not be verified).
 """
 
 from __future__ import annotations
@@ -139,6 +181,22 @@ PREPARE_SCALAR_FIELDS = (
 
 PREPARE_TIMING_FIELDS = ("native_secs",)
 """Measured, and expected to differ under load — recorded, never a failure."""
+
+BUILD_STAMP_FIELDS = (
+    "harness_commit",
+    "harness_dirty",
+    "vanta_build_commit",
+    "vanta_build_dirty",
+)
+"""The from-build facts a row records (``runner._row_record``).
+
+Two trees, two commits (§7.3): ``vanta_build_commit`` is what ``build.rs`` baked
+into the binary and ``run.summary`` reports, ``harness_commit`` is this repo's HEAD
+when the batch started. Across builds these differ **by design** — the whole point
+of item Z2 is comparing a new-build parallel batch against an old-build serial
+reference — so a difference here is *reported* and never fails the gate. The
+per-bug ``checkpoint`` is compared beside them for the same reason.
+"""
 
 TIME_LIMIT_FLAGS = ("timed_out", "stop_reason", "native_timeout")
 """A row's time-limit behaviour. A difference in any of these fails the gate.
@@ -606,30 +664,119 @@ def compare_rows(
 
 
 # ---------------------------------------------------------------------------
+# build stamps — reported as information, never graded
+# ---------------------------------------------------------------------------
+def build_stamps(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The distinct from-build facts one batch's rows recorded, per field and per bug.
+
+    A set per field, not one value: a batch that ran rows from two invocations (or a
+    ``--resume`` after a rebuild) can legitimately record more than one commit, and
+    collapsing that to "the last one" would hide exactly the drift this item wants
+    visible. The per-bug ``checkpoint`` is collected the same way, because a layer
+    can be re-stamped between the two batches.
+    """
+    fields: dict[str, set[Any]] = {name: set() for name in BUILD_STAMP_FIELDS}
+    checkpoints: dict[str, set[Any]] = {}
+    for row in rows:
+        for name in BUILD_STAMP_FIELDS:
+            fields[name].add(row.get(name))
+        checkpoints.setdefault(str(row.get("bug") or ""), set()).add(row.get("checkpoint"))
+    return {
+        # ``key=str`` because a field can hold ``None`` beside a string or a bool, and
+        # ``None`` is not orderable against either — the mix is expected, not a bug.
+        "fields": {name: sorted(values, key=str) for name, values in fields.items()},
+        "checkpoints": {
+            bug: sorted(values, key=str) for bug, values in sorted(checkpoints.items())
+        },
+    }
+
+
+def compare_build(
+    serial_rows: Sequence[Mapping[str, Any]],
+    parallel_rows: Sequence[Mapping[str, Any]],
+    bugs: Sequence[str],
+) -> dict[str, Any]:
+    """Both batches' build stamps, and every way they differ — **information only**.
+
+    [VANTA-WHY] M3 item Z2 — this half never touches the verdict. The serial
+    reference is an older build by construction (``m3-equiv-*``), so its
+    ``harness_commit`` and ``vanta_build_commit`` are *expected* to differ from the
+    new batch's, and a gate that failed on that would reject the very comparison it
+    was asked to make. What the two batches must agree on is the tree and the
+    schedule (``prepare`` and ``rows``); the build is reported so the operator can
+    see it, and the suite cache — which keys on the build — is what actually stops
+    two builds being served each other's measurements.
+    """
+    serial = build_stamps(serial_rows)
+    parallel = build_stamps(parallel_rows)
+    differences: list[str] = []
+    for name in BUILD_STAMP_FIELDS:
+        left, right = serial["fields"][name], parallel["fields"][name]
+        if left != right:
+            differences.append(f"{name}: serial={left} parallel={right}")
+    for bug in bugs:
+        left = serial["checkpoints"].get(bug, [])
+        right = parallel["checkpoints"].get(bug, [])
+        if left != right:
+            differences.append(f"{bug} checkpoint: serial={left} parallel={right}")
+    return {
+        "serial": serial,
+        "parallel": parallel,
+        "differences": differences,
+        "matches": not differences,
+    }
+
+
+# ---------------------------------------------------------------------------
 # cache isolation — the two batches must not have shared a root
 # ---------------------------------------------------------------------------
-def _unresolved_hits(
-    label: str, dirs: Sequence[str], groups: Sequence[tuple[str, Sequence[Mapping[str, Any]]]]
-) -> list[str]:
-    """Every recorded hit whose key is not an entry under *this* batch's own roots.
+def _hit_isolation(
+    label: str,
+    own_dirs: Sequence[str],
+    other_dirs: Sequence[str],
+    groups: Sequence[tuple[str, Sequence[Mapping[str, Any]]]],
+) -> tuple[list[str], list[str]]:
+    """One batch's recorded hits, sorted into *definite leaks* and *unverifiable*.
 
-    A hit is served from a directory by definition, so a key that resolves under no
-    directory this batch named was served from one it did not name — the other
-    batch's, which is the vacuous pass this whole check exists to stop.
+    A hit was served from a directory by definition, so asking where its key lives
+    answers where it came from — three ways, and the three must not be collapsed:
+
+    * **Under this batch's own root** — isolated. The normal re-prepared-tree case.
+    * **Under the other batch's root** — a definite leak: this batch was served the
+      other batch's measurement, the vacuous pass the check exists to stop.
+    * **Under neither** — the honest gap. The entry may have been served from the
+      other batch's root and *that* was deleted too, or this batch's own root is
+      gone. Either way nothing here can be resolved, so it is an *unverifiable* side
+      rather than a fabricated difference: reporting it as a problem would blame the
+      batches for a directory the operator deleted.
     """
     problems: list[str] = []
+    unverified: list[str] = []
+
+    def _resolves(dirs: Sequence[str], key: str) -> bool:
+        return any(suite_cache_mod.entry_path_in(root, key).is_file() for root in dirs)
+
     for kind, records in groups:
         for record in records:
             key = str(record["key"])
             if record["state"] != CACHE_HIT_STATE or not key:
                 continue
-            if any(suite_cache_mod.entry_path_in(root, key).is_file() for root in dirs):
+            if _resolves(own_dirs, key):
                 continue
-            problems.append(
-                f"{label} {kind} cache hit {key[:12]}… is not an entry under {label}'s own "
-                f"cache directory ({', '.join(dirs)})"
+            where = ", ".join(own_dirs) or "(no directory recorded)"
+            if _resolves(other_dirs, key):
+                problems.append(
+                    f"{label} {kind} cache hit {key[:12]}… is not an entry under {label}'s own "
+                    f"cache directory ({where}); it resolves under the other batch's root, so it "
+                    f"was served from the other batch"
+                )
+                continue
+            unverified.append(
+                f"{label} {kind} cache hit {key[:12]}… is not an entry under {label}'s own cache "
+                f"directory ({where}) and resolves under no directory the other batch named; "
+                f"{label}'s cache isolation cannot be verified"
             )
-    return problems
+    return problems, unverified
 
 
 def compare_cache(
@@ -638,14 +785,21 @@ def compare_cache(
     serial_rows: Sequence[Mapping[str, Any]],
     parallel_rows: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Prove the two batches did not share a suite-cache root.
+    """Prove the two batches did not share a suite-cache root — or say that it cannot.
 
     Each batch's root is the one its prepare suites recorded; the in-session native
     gate uses the SAME root (one ``VANTA_SUITE_CACHE_DIR`` drives both caches), so a
-    native hit is checked against it too. The check needs a recorded root to run at
-    all, so ``checked`` says whether it did — it never fails for being un-runnable,
-    because "no root recorded" is not evidence of a shared one, and a failure that
-    fired on absence would fire on every batch that predates this item.
+    native hit is checked against it too.
+
+    [VANTA-WHY] M3 item Z2 — the check is **never skipped silently**. A side that
+    recorded no hit has nothing to resolve and passes trivially; a side that recorded
+    hits is resolved against its own root. ``checked`` still says whether both batches
+    recorded a root (a shared-root test needs one on each side to mean anything), but
+    it no longer gates the hit check: a hit whose key resolves nowhere is an
+    *unverifiable* side, carried in ``unverified`` and turned into the
+    ``identical_unverified`` verdict, never a plain ``identical`` (which would claim a
+    proof that was not made) and never a false ``not_identical`` (which would blame
+    the batches for a directory that is gone).
     """
     serial_suite = prepare_suite_cache(serial_prepare)
     parallel_suite = prepare_suite_cache(parallel_prepare)
@@ -655,6 +809,7 @@ def compare_cache(
     parallel_dirs = cache_dirs(parallel_suite)
 
     problems: list[str] = []
+    unverified: list[str] = []
     checked = bool(serial_dirs and parallel_dirs)
     if checked:
         shared = sorted(set(serial_dirs) & set(parallel_dirs))
@@ -663,22 +818,23 @@ def compare_cache(
                 "both batches used the same suite cache directory, so neither computed "
                 f"its own results: {', '.join(shared)}"
             )
-        problems.extend(
-            _unresolved_hits(
-                "serial", serial_dirs, (("prepare", serial_suite), ("native", serial_native))
-            )
-        )
-        problems.extend(
-            _unresolved_hits(
-                "parallel",
-                parallel_dirs,
-                (("prepare", parallel_suite), ("native", parallel_native)),
-            )
-        )
+    for label, own, other, groups in (
+        ("serial", serial_dirs, parallel_dirs, (("prepare", serial_suite), ("native", serial_native))),
+        (
+            "parallel",
+            parallel_dirs,
+            serial_dirs,
+            (("prepare", parallel_suite), ("native", parallel_native)),
+        ),
+    ):
+        found, unresolved = _hit_isolation(label, own, other, groups)
+        problems.extend(found)
+        unverified.extend(unresolved)
 
     return {
         "checked": checked,
         "problems": problems,
+        "unverified": unverified,
         "serial": {
             "dirs": serial_dirs,
             "prepare": cache_summary(serial_suite),
@@ -690,6 +846,7 @@ def compare_cache(
             "native": cache_summary(parallel_native),
         },
         "identical": not problems,
+        "verifiable": not unverified,
     }
 
 
@@ -762,6 +919,9 @@ def compare_batches(
     prepare = compare_prepare(serial_prepare, parallel_prepare, wanted)
     rows = compare_rows(serial_rows, parallel_rows, excluded_by_bug)
     cache = compare_cache(serial_prepare, parallel_prepare, serial_rows, parallel_rows)
+    # [VANTA-WHY] M3 item Z2 — the build stamps of two batches that are *meant* to
+    # come from different builds. Read and reported; never folded into the verdict.
+    build = compare_build(serial_rows, parallel_rows, wanted)
 
     # [VANTA-WHY] M3 item V2 — "identical" must mean "compared and equal", never
     # "compared nothing". Every half folds with `all(...)`, and `all([])` is True,
@@ -777,9 +937,20 @@ def compare_batches(
         "matched_rows": len(rows["matched"]),
         "ran": bool(wanted) and bool(serial_rows or parallel_rows),
     }
-    identical = bool(
+    passed = bool(
         compared["ran"] and prepare["identical"] and rows["identical"] and cache["identical"]
     )
+    # [VANTA-WHY] M3 item Z2 — three outcomes, not two. Everything agreeing with the
+    # cache half fully verified is `identical`; everything agreeing but a side's hits
+    # unresolvable is `identical_unverified` — the comparison passed, but the cache
+    # half of the proof was not available, so a plain `identical` would overclaim. A
+    # real difference is `not_identical` and wins over an unverifiable side.
+    if not passed:
+        verdict = "not_identical"
+    elif cache["unverified"]:
+        verdict = "identical_unverified"
+    else:
+        verdict = "identical"
     return {
         "schema_version": SCHEMA_VERSION,
         "serial": {
@@ -797,10 +968,11 @@ def compare_batches(
         },
         "bugs": wanted,
         "compared": compared,
+        "build": build,
         "prepare": prepare,
         "cache": cache,
         "rows": rows,
-        "verdict": "identical" if identical else "not_identical",
+        "verdict": verdict,
     }
 
 
@@ -831,6 +1003,8 @@ def verdict_line(report: Mapping[str, Any], *, cap: int = 8) -> str:
         unmatched.get("only_in_parallel") or []
     )
     cache_problems = (report.get("cache") or {}).get("problems") or []
+    cache_unverified = (report.get("cache") or {}).get("unverified") or []
+    build_diffs = (report.get("build") or {}).get("differences") or []
     parts = [
         f"prepare_diffs={len(prepare_diffs)}",
         f"matched={len(matched)}",
@@ -840,6 +1014,8 @@ def verdict_line(report: Mapping[str, Any], *, cap: int = 8) -> str:
         f"missing_groups={len(missing)}",
         f"unmatched_candidates={n_unmatched}",
         f"cache_problems={len(cache_problems)}",
+        f"cache_unverified={len(cache_unverified)}",
+        f"build_diffs={len(build_diffs)}",
     ]
     line = f"{head} ({', '.join(parts)})"
     named: list[str] = []
@@ -862,6 +1038,18 @@ def verdict_line(report: Mapping[str, Any], *, cap: int = 8) -> str:
         line += f" [time limits: {len(limits)} group(s)]"
     if cache_problems:
         line += f" [cache: {cache_problems[0]}]"
+    # M3 item Z2 — an unverifiable cache side is what makes the verdict
+    # `identical_unverified`; name it, or the operator cannot tell why the gate did
+    # not say plain `identical`.
+    if cache_unverified:
+        line += f" [cache unverified: {cache_unverified[0]}]"
+    # M3 item Z2 — build differences never change the verdict, so they are named as
+    # information: the operator comparing a new build against an old reference must
+    # see WHICH of the two trees moved, not just that something did.
+    if build_diffs:
+        shown = "; ".join(build_diffs[:cap])
+        more = "" if len(build_diffs) <= cap else f"; +{len(build_diffs) - cap} more"
+        line += f" [build (information, not a failure): {shown}{more}]"
     serial_peak = ((report.get("serial") or {}).get("concurrency") or {}).get("peak_cores")
     parallel_peak = ((report.get("parallel") or {}).get("concurrency") or {}).get("peak_cores")
     if serial_peak is not None or parallel_peak is not None:
@@ -933,7 +1121,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.no_report:
         path = args.report or (Path(args.parallel) / "compare_batches.json")
         print(f"report: {write_report(report, path)}")
-    return 0 if report["verdict"] == "identical" else 1
+    # [VANTA-WHY] M3 item Z2 — three outcomes need three codes: 0 identical, 3
+    # `identical_unverified` (the batches agree, but a side's cache isolation could
+    # not be resolved), and 1 `not_identical` (a real difference — and, because the
+    # fold runs first, a real difference always wins over an unverifiable side).
+    return {"identical": 0, "identical_unverified": 3}.get(report["verdict"], 1)
 
 
 if __name__ == "__main__":

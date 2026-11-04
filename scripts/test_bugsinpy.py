@@ -7173,9 +7173,17 @@ class TestCompareBatches:
             }
         ]
 
-    def test_a_native_hit_outside_the_batchs_root_fails(self, tmp_path):
-        serial = self._runs(vanta_tree=self._cache(directory=str(tmp_path / "serial-cache")))
-        parallel = self._runs(vanta_tree=self._cache(directory=str(tmp_path / "parallel-cache")))
+    def test_a_native_hit_served_from_the_other_batchs_root_fails(self, tmp_path):
+        serial_root, parallel_root = tmp_path / "serial-cache", tmp_path / "parallel-cache"
+        key = "f" * 64
+        # The entry exists under the SERIAL root only — the parallel batch's native
+        # gate was served the serial batch's measurement. A definite leak, because the
+        # key resolves under the other batch's root.
+        entry = suite_cache_mod.entry_path_in(serial_root, key)
+        entry.parent.mkdir(parents=True)
+        entry.write_text("{}", encoding="utf-8")
+        serial = self._runs(vanta_tree=self._cache(directory=str(serial_root)))
+        parallel = self._runs(vanta_tree=self._cache(directory=str(parallel_root)))
         session = tmp_path / "vanta_sessions" / "sid-2"
         session.parent.mkdir(parents=True)
         (session.parent / "sid-2_evidence.json").write_text(
@@ -7186,7 +7194,7 @@ class TestCompareBatches:
                             "attempt": 1,
                             "side": "patched",
                             "state": "hit",
-                            "key": "f" * 64,
+                            "key": key,
                             "source": "sid-2/a1/patched",
                             "would_hit": False,
                         }
@@ -7203,6 +7211,88 @@ class TestCompareBatches:
         )
         assert report["identical"] is False
         assert "parallel native cache hit" in report["problems"][0]
+
+    def test_a_hit_that_resolves_nowhere_is_unverifiable_not_a_failure(self, tmp_path):
+        # M3 item Z2 / Nathan's rule: a recorded hit whose entry cannot be found
+        # anywhere — its root was cleaned — is `isolation unverifiable`, never a
+        # false `not_identical` that would blame the batches for a deleted directory.
+        key = "9" * 64
+        serial = self._runs(
+            vanta_tree=self._cache(
+                key=key,
+                state="hit",
+                source="pandas_1/vanta_tree",
+                directory=str(tmp_path / "gone-serial"),
+            )
+        )
+        parallel = self._runs(vanta_tree=self._cache(directory=str(tmp_path / "parallel-cache")))
+        report = compare_batches_mod.compare_cache(serial, parallel, [], [])
+        assert report["identical"] is True
+        assert report["verifiable"] is False
+        assert "cannot be verified" in report["unverified"][0]
+
+    def test_a_side_that_recorded_no_hit_passes_trivially(self, tmp_path):
+        # The other half of the rule, and the normal cross-build case: last night's
+        # serial ran with the cache off, so it recorded no hit and has nothing to
+        # resolve — its root, even a missing one, is not a problem and not a gap.
+        serial = self._runs(
+            vanta_tree=self._cache(
+                state="off:unknown_checkpoint", directory=str(tmp_path / "gone-serial")
+            )
+        )
+        parallel = self._runs(vanta_tree=self._cache(directory=str(tmp_path / "parallel-cache")))
+        report = compare_batches_mod.compare_cache(serial, parallel, [], [])
+        assert report["identical"] is True
+        assert report["unverified"] == []
+
+    # -- build stamps (M3 item Z2) ------------------------------------------
+    def test_build_stamps_are_read_per_field_and_per_bug(self):
+        rows = [
+            self._row(harness_commit="aaa", vanta_build_commit="bbb", checkpoint="ck-1"),
+            self._row(
+                mode="review",
+                candidate={"patch_sha256": "x"},
+                harness_commit="aaa",
+                vanta_build_commit="bbb",
+                checkpoint="ck-1",
+            ),
+        ]
+        stamps = compare_batches_mod.build_stamps(rows)
+        assert stamps["fields"]["harness_commit"] == ["aaa"]
+        assert stamps["fields"]["vanta_build_commit"] == ["bbb"]
+        assert stamps["checkpoints"] == {"pandas/1": ["ck-1"]}
+
+    def test_a_build_difference_is_reported_and_never_a_finding(self):
+        serial = [self._row(harness_commit="old", vanta_build_commit="old")]
+        parallel = [self._row(harness_commit="new", vanta_build_commit="new")]
+        build = compare_batches_mod.compare_build(serial, parallel, ["pandas/1"])
+        assert build["matches"] is False
+        assert any("harness_commit" in d for d in build["differences"])
+        assert any("vanta_build_commit" in d for d in build["differences"])
+
+    def test_a_checkpoint_difference_is_reported_too(self):
+        build = compare_batches_mod.compare_build(
+            [self._row(checkpoint="ck-old")], [self._row(checkpoint="ck-new")], ["pandas/1"]
+        )
+        assert build["matches"] is False
+        assert any("checkpoint" in d for d in build["differences"])
+
+    def test_an_end_to_end_build_difference_still_reads_identical(self, tmp_path):
+        # Z2's core: the serial reference is an OLDER build by construction, so the
+        # whole comparison must pass across builds — the build is reported, not graded.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(
+            serial, rows=[self._row(harness_commit="old", vanta_build_commit="old")]
+        )
+        self._write_batch(
+            parallel, rows=[self._row(harness_commit="new", vanta_build_commit="new")]
+        )
+        report = compare_batches_mod.compare_batches(serial, parallel)
+        assert report["verdict"] == "identical"
+        assert report["build"]["matches"] is False
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 0
 
     # -- effective row concurrency -----------------------------------------
     def test_row_concurrency_reads_the_peak_the_scheduler_recorded(self):
@@ -7237,6 +7327,42 @@ class TestCompareBatches:
         assert "same suite cache directory" in line
         assert "rows peak: serial=None parallel=4" in line
 
+    def test_verdict_line_names_build_differences_as_information(self):
+        # M3 item Z2 — a cross-build comparison whose only difference is the build
+        # must still read `identical`, and the line must say WHICH stamp moved and
+        # that it is information rather than a failure.
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "identical",
+            "prepare": {"bugs": {"pandas/1": {"identical": True}}},
+            "rows": {"matched": [{"identical": True}], "time_limit_differences": {"groups": []}},
+            "build": {
+                "differences": ["harness_commit: serial=['old'] parallel=['new']"],
+                "matches": False,
+            },
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert line.startswith("compare-batches pandas/1: identical")
+        assert "build_diffs=1" in line
+        assert "build (information, not a failure)" in line
+        assert "harness_commit" in line
+
+    def test_verdict_line_names_the_unverified_cache_side(self):
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "identical_unverified",
+            "prepare": {"bugs": {"pandas/1": {"identical": True}}},
+            "rows": {"matched": [{"identical": True}], "time_limit_differences": {"groups": []}},
+            "cache": {
+                "problems": [],
+                "unverified": ["serial prepare cache hit abcd… cannot be verified"],
+            },
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert line.startswith("compare-batches pandas/1: identical_unverified")
+        assert "cache_unverified=1" in line
+        assert "cache unverified:" in line
+
     # -- the whole thing ----------------------------------------------------
     def test_compare_batches_end_to_end_is_identical(self, tmp_path):
         serial, parallel = tmp_path / "serial", tmp_path / "parallel"
@@ -7264,6 +7390,71 @@ class TestCompareBatches:
         )
         self._write_batch(serial, rows=[self._row()], prepare=shared)
         self._write_batch(parallel, rows=[self._row()], prepare=shared)
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "not_identical"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 1
+
+    def test_an_unverifiable_cache_side_is_identical_unverified_and_exit_three(self, tmp_path):
+        # M3 item Z2 — everything agrees, but one side recorded a hit whose entry is
+        # nowhere to be found (its root was cleaned). Plain `identical` would overclaim
+        # a proof that was not made; `not_identical` would blame the batches for a
+        # deleted directory. The verdict is the honest third thing, and exit 3.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        gone = self._prepare(
+            scheduler={
+                "runs": {
+                    "vanta_tree": {
+                        "cache": self._cache(
+                            key="7" * 64,
+                            state="hit",
+                            source="pandas/1/vanta_tree",
+                            directory=str(tmp_path / "gone-serial"),
+                        )
+                    }
+                }
+            }
+        )
+        live = self._prepare(
+            scheduler={
+                "runs": {"vanta_tree": {"cache": self._cache(directory=str(tmp_path / "live"))}}
+            }
+        )
+        self._write_batch(serial, rows=[self._row()], prepare=gone)
+        self._write_batch(parallel, rows=[self._row()], prepare=live)
+        report = compare_batches_mod.compare_batches(serial, parallel)
+        assert report["verdict"] == "identical_unverified"
+        assert report["cache"]["identical"] is True  # no definite problem
+        assert report["cache"]["unverified"]  # but the proof was not available
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 3
+
+    def test_a_real_difference_wins_over_an_unverifiable_side(self, tmp_path):
+        # The fold runs before the unverified check: a genuine difference is
+        # `not_identical`, never softened to `identical_unverified`.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        gone = self._prepare(
+            scheduler={
+                "runs": {
+                    "vanta_tree": {
+                        "cache": self._cache(
+                            key="8" * 64,
+                            state="hit",
+                            source="pandas/1/vanta_tree",
+                            directory=str(tmp_path / "gone-serial"),
+                        )
+                    }
+                }
+            }
+        )
+        live = self._prepare(
+            scheduler={
+                "runs": {"vanta_tree": {"cache": self._cache(directory=str(tmp_path / "live"))}}
+            }
+        )
+        self._write_batch(serial, rows=[self._row()], prepare=gone)
+        self._write_batch(parallel, rows=[self._row(native_timeout=True)], prepare=live)
         assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "not_identical"
         assert compare_batches_mod.main(
             ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]

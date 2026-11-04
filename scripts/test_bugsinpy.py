@@ -29002,6 +29002,146 @@ class TestRunJob:
         )
 
 
+class TestOracleBestAttempt:
+    """M3 item H — the best attempt's grade, recorded BESIDE the last attempt's.
+
+    A K arm spends exactly K attempts, so its verdict is about the LAST one: a
+    Creator that fixed the bug at attempt 1 and broke it again by attempt 4 is
+    graded ``unresolved`` with the correct fix sitting unread three attempts
+    earlier (PySnooper/3 ``b3-k4``, measured 2026-11-05). The ``oracle_best``
+    block answers the other question — *was a correct fix ever reached?* — with
+    oracle knowledge, and is recorded BESIDE the primary grade without changing
+    the primary label, verdict or admission.
+    """
+
+    def _paths(self, tmp_path):
+        return runner_mod.BatchPaths.under(tmp_path)
+
+    @staticmethod
+    def _result(*, good: bool) -> oracle_mod.OracleResult:
+        return oracle_mod.OracleResult(
+            apply_ok=True,
+            apply_detail="applied",
+            apply_outcome=suite_mod.APPLY_APPLIED,
+            hidden_pass=good,
+            patch_good=good,
+        )
+
+    def test_the_best_attempt_is_the_earliest_one_that_fixes_it(self):
+        """Among good attempts the EARLIEST wins — a fix reached sooner is at least
+        as good — and the flag says it is NOT the primary (the last) attempt."""
+        primary = self._result(good=False)
+        graded = [(1, self._result(good=True)), (2, self._result(good=True))]
+        attempt, result, same_as_primary = runner_mod.best_attempt_of(
+            graded, attempts_run=4, primary=primary
+        )
+        assert (attempt, same_as_primary) == (1, False)
+        assert result.patch_good is True
+
+    def test_when_no_earlier_attempt_fixed_it_the_best_is_the_last(self):
+        """No good attempt: the best IS the primary, and the flag says so, so a
+        reader never has to compare two blocks by hand."""
+        primary = self._result(good=False)
+        graded = [(1, self._result(good=False)), (3, self._result(good=False))]
+        attempt, result, same_as_primary = runner_mod.best_attempt_of(
+            graded, attempts_run=4, primary=primary
+        )
+        assert (attempt, same_as_primary) == (4, True)
+        assert result is primary
+
+    def test_a_k_arm_records_the_best_attempt_and_leaves_the_primary_label_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """The measured PySnooper/3 case: attempts 1-2 are one correct fix, the last
+        attempt breaks it. The row's own label stays about the last attempt; the
+        additive block reports that a correct fix WAS reached at attempt 1."""
+        broken = write(tmp_path / "final.patch", "PATCH-BROKEN\n")
+        monkeypatch.setattr(
+            runner_mod,
+            "invoke_vanta",
+            lambda **kwargs: _outcome(
+                tmp_path,
+                decision="MaxAttemptsReached",
+                final_patch=broken,
+                summary=dict(
+                    _outcome(tmp_path).summary,
+                    attempts_run="3",
+                    final_decision="MaxAttemptsReached",
+                ),
+            ),
+        )
+        # The reader the review pool uses hands back the applied diff per attempt:
+        # 1 and 2 are the SAME bytes (a correct fix re-sent), 3 differs.
+        texts = {1: "PATCH-GOOD\n", 2: "PATCH-GOOD\n", 3: "PATCH-BROKEN\n"}
+        monkeypatch.setattr(
+            pool_mod,
+            "attempt_patch",
+            lambda *, debug_dir, base_tree, attempt: (texts.get(attempt), None, "snapshot"),
+        )
+
+        graded: list[str] = []
+
+        def fake_grade(*, patch_path, label, **kwargs):
+            text = (
+                Path(patch_path).read_text(encoding="utf-8")
+                if Path(patch_path).is_file()
+                else ""
+            )
+            graded.append(label)
+            good = "GOOD" in text
+            return oracle_mod.OracleResult(
+                apply_ok=True,
+                apply_detail="applied",
+                apply_outcome=suite_mod.APPLY_APPLIED,
+                hidden_pass=good,
+                patch_good=good,
+            )
+
+        monkeypatch.setattr(oracle_mod, "grade", fake_grade)
+
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root"), arm="b3-k4"),
+            paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4,
+            disk_mb=8192,
+            python_version="3.8.20",
+        )
+
+        # The primary grade is untouched: the LAST attempt broke the fix.
+        assert record["label"] == "unresolved"
+        # The additive block: attempt 1 was the correct fix, graded once (attempt 2
+        # was the same bytes), and the label the row WOULD have carried is named.
+        best = record["oracle_best"]
+        assert best["attempt"] == 1
+        assert best["same_as_primary"] is False
+        assert best["patch_good"] is True
+        assert best["graded_attempts"] == [1]
+        assert best["skipped"] == []
+        assert best["label"] == "unresolved_but_fixed"
+        assert best["note"] == runner_mod.ORACLE_BEST_NOTE
+        assert graded == ["sess-1", "sess-1__attempt1"]
+
+    def test_a_non_k_arm_carries_no_oracle_best_key(self, tmp_path, monkeypatch):
+        """Additive-only shape: an ordinary arm's row is byte-for-byte what it was
+        before the item, so no reader sees a key it never saw."""
+        monkeypatch.setattr(runner_mod, "invoke_vanta", lambda **kwargs: _outcome(tmp_path))
+        monkeypatch.setattr(
+            oracle_mod, "grade", lambda **kwargs: oracle_mod.OracleResult(apply_ok=True)
+        )
+        record = runner_mod.run_job(
+            job=_job(prep(root=tmp_path / "root")),
+            paths=self._paths(tmp_path),
+            manifest=manifest_mod.Manifest(tmp_path),
+            vanta_bin=tmp_path / "vanta_m3",
+            max_attempts=4,
+            disk_mb=8192,
+            python_version="3.8.20",
+        )
+        assert "oracle_best" not in record
+
+
 class _FakeSplit:
     """A `Split` with only the fields `run_batch` and the queue read, so no split
     file is needed. ``seeds`` defaults to ``[0]`` — the value every fixture seeds

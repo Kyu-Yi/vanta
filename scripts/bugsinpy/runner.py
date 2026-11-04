@@ -2316,6 +2316,147 @@ def label_reason_for(verdict: str, oracle: oracle_mod.OracleResult) -> Optional[
     return None
 
 
+# ---------------------------------------------------------------------------
+# M3 item H — the best attempt's grade, beside the last attempt's
+# ---------------------------------------------------------------------------
+ORACLE_BEST_NOTE = (
+    "the best attempt's grade, chosen with oracle knowledge; recorded BESIDE the "
+    "primary (last-attempt) grade and never a deployable selector"
+)
+"""One sentence, on every row that carries ``oracle_best`` (M3 item H).
+
+A K arm spends exactly K attempts, so the run's own verdict is about the LAST one —
+and a Creator that fixed the bug at attempt 1 and then broke it again at attempt 4
+is graded ``unresolved``, with the correct fix sitting unread three attempts earlier
+(PySnooper/3 `b3-k4`, measured 2026-11-05). ``oracle_best`` answers the other
+question — *was a correct fix ever reached?* — and it can only be answered by
+grading each attempt against the hidden oracle, which is knowledge no deployable
+selector has. The primary label is unchanged; nothing reads this key but a reader.
+"""
+
+
+def best_attempt_of(
+    graded: Sequence[tuple[int, "oracle_mod.OracleResult"]],
+    *,
+    attempts_run: int,
+    primary: "oracle_mod.OracleResult",
+) -> tuple[int, "oracle_mod.OracleResult", bool]:
+    """``(attempt, result, same_as_primary)`` — which attempt is the best one.
+
+    A ``patch_good`` attempt beats one that is not; among good attempts the EARLIEST
+    wins, because a fix the Creator reached sooner is at least as good. When no
+    earlier attempt is ``patch_good`` the best attempt IS the last one (the run's
+    primary), and ``same_as_primary`` is ``True``: that flag is what lets a reader
+    read the key without comparing two blocks by hand.
+
+    Pure, so the ordering is testable without a VM.
+    """
+    best: Optional[tuple[int, "oracle_mod.OracleResult"]] = None
+    for attempt, result in graded:
+        if not result.patch_good:
+            continue
+        if best is None or attempt < best[0]:
+            best = (attempt, result)
+    if best is None:
+        return attempts_run, primary, True
+    return best[0], best[1], False
+
+
+def grade_best_attempt(
+    *,
+    prep: prepare_mod.BugPrep,
+    paths: BatchPaths,
+    session_dir: Path,
+    decision: str,
+    attempts_run: int,
+    primary: "oracle_mod.OracleResult",
+    checkpoint: str,
+    disk_mb: int,
+    stem: str,
+) -> Optional[dict[str, Any]]:
+    """M3 item H — grade every DISTINCT earlier attempt and record the best.
+
+    ``attempts_run <= 1`` returns ``None`` (nowhere for a "best" to differ), so a
+    one-attempt row keeps exactly the shape it had before this item.
+
+    [VANTA-WHY] Each attempt is read as a *diff against the sanitized base*
+    (``pool.attempt_patch``, the same reader the review pool uses), never as the
+    Creator's raw patch text: the Creator emits source markers or search/replace
+    blocks, and only the applied tree's diff is what ``git apply`` can be handed.
+    Attempts are de-duplicated by that diff's ``sha256``, so the common
+    "returned the same patch again" history costs ONE grading rather than K-1
+    (PySnooper/3 `b3-k4`: attempts 1-3 are one diff). An attempt whose snapshot is
+    gone is recorded in ``skipped`` with the reader's own reason and never guessed.
+
+    The gradings are **additive** work on a K arm only, and the primary grading is
+    untouched: this function cannot change the row's ``oracle``, ``label``,
+    ``verdict`` or admission.
+    """
+    if attempts_run < 2:
+        return None
+    # Deferred: `pool` imports this module at module level.
+    from . import pool as pool_mod
+
+    debug_dir = session_dir / "debug"
+    base_tree = prep.root / "vanta_clean"
+    out_dir = paths.batch_dir / "oracle_best"
+    graded: list[tuple[int, "oracle_mod.OracleResult"]] = []
+    skipped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for attempt in range(1, attempts_run + 1):
+        text, reason, _origin = pool_mod.attempt_patch(
+            debug_dir=debug_dir, base_tree=base_tree, attempt=attempt
+        )
+        if text is None:
+            skipped.append({"attempt": attempt, "reason": reason})
+            continue
+        digest = sha256_text(text)
+        if attempt == attempts_run or digest in seen:
+            # The last attempt IS the primary grading, and a repeated diff was
+            # already graded under the attempt it first appeared as.
+            seen.add(digest)
+            continue
+        seen.add(digest)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        patch_path = out_dir / f"{stem}__attempt{attempt}.patch"
+        patch_path.write_text(text, encoding="utf-8")
+        result = oracle_mod.grade(
+            prep=prep,
+            batch_dir=paths.batch_dir,
+            checkpoint=checkpoint,
+            patch_path=patch_path,
+            label=f"{session_dir.name}__attempt{attempt}",
+            disk_mb=disk_mb,
+            timeout_secs=ORACLE_TIMEOUT_SECS,
+        )
+        oracle_mod.save(out_dir / f"{stem}__attempt{attempt}.json", result)
+        graded.append((attempt, result))
+
+    best_attempt, best_result, same_as_primary = best_attempt_of(
+        graded, attempts_run=attempts_run, primary=primary
+    )
+    return {
+        "attempt": best_attempt,
+        "same_as_primary": same_as_primary,
+        "patch_good": best_result.patch_good,
+        "hidden_pass": best_result.hidden_pass,
+        "apply_ok": best_result.apply_ok,
+        "apply_outcome": best_result.apply_outcome,
+        "suite_regressions_count": len(best_result.suite_regressions),
+        # The label the row WOULD have carried had the run graded the best attempt
+        # instead of the last one. `label_for` is the same pure function the primary
+        # label came from, so the two are comparable by construction.
+        "label": label_for(decision, best_result),
+        "label_rule": label_rule_for(best_result),
+        # What was actually graded, and what could not be read — the audit trail for
+        # "we looked at every attempt" rather than "we looked at the last one".
+        "graded_attempts": [attempt for attempt, _result in graded],
+        "skipped": skipped,
+        "oracle_secs": round(sum(result.oracle_secs for _a, result in graded), 3),
+        "note": ORACLE_BEST_NOTE,
+    }
+
+
 def build_record(
     *,
     job: "Job",
@@ -2330,6 +2471,7 @@ def build_record(
     oracle_json: Optional[Path],
     compaction: "compact_mod.Compaction",
     scheduler: Optional[dict[str, Any]] = None,
+    oracle_best: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """One ``manifest.jsonl`` line (§7.3).
 
@@ -2341,6 +2483,11 @@ def build_record(
     budget — a unit test, a direct call — and a ``None`` scheduler adds **no key
     at all**, so those rows stay byte-for-byte the rows they were before this
     item while every row a real invocation writes states its own concurrency.
+
+    ``oracle_best`` (M3 item H) is the best-attempt grade :func:`grade_best_attempt`
+    built, or ``None`` for a row that is not a K arm and for every row older than
+    the item. ``None`` adds **no key at all**, for the same reason ``scheduler``
+    does not, so a non-K row keeps its exact shape.
     """
     summary = outcome.summary
     total = outcome.run_secs + oracle_secs
@@ -2693,6 +2840,10 @@ def build_record(
     # rows to keep the exact shape they had before this item.
     if scheduler is not None:
         record["scheduler"] = scheduler
+    # M3 item H — same rule, for the same reason: only a K arm's row carries the
+    # best-attempt grade, and every other row is byte-for-byte the row it was.
+    if oracle_best is not None:
+        record["oracle_best"] = oracle_best
     return record
 
 
@@ -3044,6 +3195,27 @@ def run_job(
     # (it computes and writes every artifact before the first `rmtree`), and the
     # row records `failed` with the reason instead of vanishing.
     session_dir = sessions_dir() / outcome.session_id
+
+    # [VANTA-WHY] M3 item H — a K arm spends exactly K attempts, so its verdict is
+    # about the LAST one and an earlier correct fix would otherwise go unread. This
+    # grades the distinct earlier attempts (additive work, K arms only) and returns
+    # the secondary `oracle_best` block; `None` on every other row. It runs from the
+    # session's own trees, so it comes BEFORE compaction removes them — and it reads
+    # the compacted form if a session was already compacted.
+    oracle_best: Optional[dict[str, Any]] = None
+    if arms_mod.arm_fixed_rounds(job.arm) is not None:
+        oracle_best = grade_best_attempt(
+            prep=prep,
+            paths=paths,
+            session_dir=session_dir,
+            decision=outcome.decision,
+            attempts_run=_int(outcome.summary.get("attempts_run")) or 0,
+            primary=oracle,
+            checkpoint=job.checkpoint,
+            disk_mb=disk_mb,
+            stem=_stem(job.key),
+        )
+
     try:
         compaction = compact_mod.compact_session(
             session_dir=session_dir,
@@ -3074,6 +3246,9 @@ def run_job(
         # M3 item S6 — `None` for a caller without a budget, which leaves the row
         # byte-for-byte what it was before this item.
         scheduler=scheduler,
+        # M3 item H — `None` for every row that is not a K arm (and for a K row
+        # with one attempt), which likewise leaves that row's shape untouched.
+        oracle_best=oracle_best,
     )
     # [VANTA-WHY] Item E6 + Q3 — the only reason `is_done` let this key through is
     # that its previous row's oracle was INCONCLUSIVE. Rows stay append-only, so the

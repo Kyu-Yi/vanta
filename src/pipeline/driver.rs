@@ -1865,6 +1865,17 @@ pub async fn run(
     let mut prior_feedback: Option<String> = None;
     let mut final_evidence: Vec<TestEvidence> = Vec::new();
     let mut final_patched_files: Option<HashMap<String, String>> = None;
+    // [VANTA-WHY] M3 item E — the last tree the run actually PRODUCED, i.e. the
+    // `patched_files` of the most recent attempt whose patch applied. The loop
+    // re-applies each attempt from `original_files` and writes nothing when an
+    // apply fails, so a run that ends on a malformed patch would otherwise leave
+    // `final_patched_files` at `None` and write no `final.patch` — censoring a
+    // `MaxAttemptsReached` row to `unobservable` even though the run produced a
+    // perfectly gradeable tree one attempt earlier. Holding the last applied tree
+    // lets the terminal arms below write THAT tree, and only a run where nothing
+    // ever applied falls back to the original (an empty patch, a measured
+    // failure). `None` until the first successful apply.
+    let mut last_applied_patched_files: Option<HashMap<String, String>> = None;
     // Accepted Attacker tests (concatenated source) for the PR, set on the
     // final approved attempt.
     let mut final_accepted_tests: Option<String> = None;
@@ -2621,6 +2632,14 @@ pub async fn run(
             if decision == GovernorDecision::Continue {
                 continue;
             }
+            // [VANTA-WHY] M3 item E — a run whose LAST attempt is the one that
+            // failed to apply terminates here (review mode stops on it, repair
+            // mode stops when that attempt exhausts the budget). It is a terminal
+            // verdict, so it must still leave a `final.patch`: the run's last
+            // PRODUCED tree, or the original tree when nothing ever applied. Only
+            // `HarnessFailure`/`InfraFailure` below stay patchless.
+            final_patched_files =
+                Some(final_patch_tree(last_applied_patched_files.as_ref(), &original_files));
             break decision;
         }
         let _ = any_changed; // used implicitly via all_patch_failed
@@ -2630,6 +2649,11 @@ pub async fn run(
         if let Some(record) = fixed_round_records.get_mut(fixed_round_record_index) {
             record["applied"] = serde_json::json!(true);
         }
+        // [VANTA-WHY] M3 item E — remember this applied tree as the run's last
+        // produced one, so a LATER attempt that fails to apply cannot erase it
+        // from `final.patch`. Cheap (a clone of the map the run already holds);
+        // the terminal arms read it only on the failed-apply path.
+        last_applied_patched_files = Some(patched_files.clone());
 
         // ---- Build source strings ----
         // [VANTA-WHY] §14.18 — the concat the tests run in is now the whole
@@ -4416,6 +4440,15 @@ pub async fn run(
                 break decision;
             }
             GovernorDecision::PatchApplicationFailed => {
+                // [VANTA-WHY] M3 item E — a terminal verdict, so it leaves a
+                // `final.patch` like every other: the run's last PRODUCED tree, or
+                // the original tree when nothing ever applied (an empty patch, a
+                // measured failure). This arm is the review-mode path — the
+                // candidate was written outside the run and would not apply — and
+                // an empty patch graded against the tests says "this candidate did
+                // not fix the bug", which is the honest label, not `unobservable`.
+                final_patched_files =
+                    Some(final_patch_tree(last_applied_patched_files.as_ref(), &original_files));
                 break decision;
             }
             GovernorDecision::HarnessFailure => {
@@ -5378,8 +5411,13 @@ pub async fn run(
                 false
             }
         },
-        // PatchApplicationFailed / HarnessFailure / InfraFailure produce no patch
-        // of their own; there is nothing to diff.
+        // [VANTA-WHY] M3 item E — only `HarnessFailure` / `InfraFailure` still
+        // leave this `None`: the setup never ran or an LLM call failed, so no
+        // tree exists to diff and the row is genuinely unmeasurable
+        // (`unobservable`). Every other terminal verdict — including a
+        // `PatchApplicationFailed`, and a repair run that ended on a malformed
+        // patch — now attaches a tree (the last one produced, or the original when
+        // nothing ever applied), so the oracle grades it instead of censoring it.
         None => false,
     };
 
@@ -5593,6 +5631,27 @@ pub async fn run(
     println!("▌ Session  → {session_path}");
 
     Ok(decision)
+}
+
+/// The tree `final.patch` is written from when a terminal verdict carried no
+/// tree of its own (M3 item E): the run's last PRODUCED tree — the most recent
+/// attempt whose patch applied — or the original tree when nothing ever applied.
+///
+/// [VANTA-WHY] M3 item E — the loop re-applies each attempt from the original and
+/// writes nothing on a failed apply, so a run whose LAST attempt was malformed
+/// (a review candidate that would not apply, or a repair run that spent its
+/// budget on one) has no `patched_files` of its own. Falling back to the original
+/// rather than leaving the terminal arms patchless keeps the label a measurement:
+/// the empty patch does not fix the bug, so the oracle grades the row a failure
+/// and it counts against the arm — which is the honest reading — instead of
+/// censoring it to `unobservable`.
+fn final_patch_tree(
+    last_applied: Option<&HashMap<String, String>>,
+    original: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    last_applied
+        .cloned()
+        .unwrap_or_else(|| original.clone())
 }
 
 // ============================================================================
@@ -7237,6 +7296,7 @@ mod tests {
         rejection_signal_message, render_committed_test_file, require_clean_target_repo_for_open_pr,
         resolve_arm, resolve_fixed_rounds, resolve_native_timeout_secs, sampling_not_sent_rule,
         served_model_version_value,
+        final_patch_tree,
         stamp_transition_row,
         stable_patch_fingerprint, ARMS,
         INVARIANT_SATISFIED,
@@ -7346,6 +7406,34 @@ mod tests {
             service_tier: "unset".to_string(),
             served_model: model.map(str::to_string),
         }
+    }
+
+    /// M3 item E — the tree a terminal verdict with no tree of its own writes
+    /// `final.patch` from: the last tree the run PRODUCED when there was one, and
+    /// the original tree when nothing ever applied. The second half is the point:
+    /// a run whose only attempt was malformed must still be graded (an empty patch
+    /// that does not fix the bug is a measured failure) rather than censored to
+    /// `unobservable`.
+    #[test]
+    fn the_final_patch_falls_back_to_the_last_produced_tree_then_the_original() {
+        let original: HashMap<String, String> = HashMap::from([
+            ("pkg/mod.py".to_string(), "value = 1\n".to_string()),
+            ("pkg/tests/test_mod.py".to_string(), "def test_x():\n    pass\n".to_string()),
+        ]);
+        // Nothing ever applied: the fallback is the original tree, i.e. the empty
+        // diff — never a panic and never a missing patch.
+        let none = final_patch_tree(None, &original);
+        assert_eq!(none, original, "with no produced tree the original is the tree");
+
+        // One attempt applied, then the run ended on a later failed apply: the
+        // LAST produced tree is kept, not the original and not the first.
+        let applied_last: HashMap<String, String> = HashMap::from([
+            ("pkg/mod.py".to_string(), "value = 2\n".to_string()),
+            ("pkg/tests/test_mod.py".to_string(), "def test_x():\n    pass\n".to_string()),
+        ]);
+        let kept = final_patch_tree(Some(&applied_last), &original);
+        assert_eq!(kept, applied_last, "the last produced tree is what is written");
+        assert_ne!(kept, original, "it is not silently reset to the original");
     }
 
     // ---- M3 item F5: the prompt-over-budget reason ----------------------------

@@ -37139,27 +37139,31 @@ class TestPrepareOverlapsBugs:
         return split_path, selected
 
     def test_at_two_jobs_two_bugs_are_in_flight_together(self, tmp_path, monkeypatch):
-        """The second bug starts while the first is still preparing.
+        """Both bugs are inside ``prepare_one`` at the same instant.
 
-        The first bug holds until the second has entered ``prepare_one``; if that
-        never happens the wait times out and ``peak`` stays at one. Both bugs then
+        The two stubs meet at a barrier, so neither can finish before the other has
+        entered and ``peak`` is two exactly when the pool overlapped them. If they
+        never overlap the barrier times out and ``peak`` stays at one. Both bugs then
         fail (the stub raises), which is what the stage records — the assertion is
         about the overlap, not about the bugs.
+
+        [VANTA-WHY] The barrier replaced a one-way event (the second bug set it and
+        was free to leave) because that reads a pool's thread-start order as if it
+        were the submit order: the second bug could enter and leave before the first
+        bug's worker had started, which looks like "no overlap" for a pool that did
+        overlap. Observed once in ten isolated runs and once in a full-suite run, on
+        a loaded host (``host_load`` 5.1) — the product overlapped the bugs; only the
+        test's synchronisation was wrong.
         """
         watch = _PrepareInFlight()
-        second_entered = threading.Event()
-        first_key = run_mod.bug_key(
-            bug_entry()
-        )  # "Demo/1" — the split's first bug
+        together = threading.Barrier(2, timeout=5.0)
 
         def fake(entry, **kwargs):
-            key = run_mod.bug_key(entry)
-            watch.enter(key)
+            watch.enter(run_mod.bug_key(entry))
             try:
-                if key == first_key:
-                    second_entered.wait(timeout=5.0)
-                else:
-                    second_entered.set()
+                together.wait()
+            except threading.BrokenBarrierError:
+                pass  # the other bug never showed up in time — ``peak`` will say so
             finally:
                 watch.leave()
             raise RuntimeError("stub")

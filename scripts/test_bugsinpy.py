@@ -27392,6 +27392,29 @@ class TestVantaEnv:
             base={"VANTA_SHURU_MEMORY_MB": "65536"}
         ), "an inherited size must not reach a row that records none"
 
+    def test_a_frozen_vm_memory_is_honoured_exactly_or_refused(self):
+        """M3 item X5 — a frozen ``VANTA_SHURU_MEMORY_MB`` is never silently ignored.
+
+        The frozen block is applied before the harness's own keys, so without this the
+        row's size would overwrite the frozen one, or the pop would drop it and boot
+        shuru's default — both leave the record naming a memory the VM did not have. A
+        row whose own size equals the frozen value is the one case where the two agree
+        and the run proceeds; every other frozen value fails closed.
+        """
+        key = runner_mod.SHURU_MEMORY_ENV
+        # Equal: the row's own size is the frozen value, so nothing is ignored.
+        env = self._env(memory_mb=4096, frozen={key: "4096"})
+        assert env[key] == "4096"
+        # Disagreeing size: the assignment would have quietly won.
+        with pytest.raises(runner_mod.RunnerError, match="records 4096"):
+            self._env(memory_mb=4096, frozen={key: "8192"})
+        # No row size: the pop would have quietly booted shuru's default.
+        with pytest.raises(runner_mod.RunnerError, match="records no vm_memory_mb"):
+            self._env(frozen={key: "8192"})
+        # A frozen block that does not name the key is untouched by the rule.
+        assert self._env(memory_mb=4096, frozen={"VANTA_SAMPLING": "pinned"})[key] == "4096"
+        assert key not in self._env(frozen={"VANTA_SAMPLING": "pinned"})
+
     def test_the_layers_identity_reaches_the_binary(self):
         """M3 item U3 — a cache key needs WHICH layer, not merely which name.
 

@@ -118,6 +118,13 @@ DEADLINE_MARGIN_SECS = 10 * 60
 PROBE_TIMEOUT_SECS = 120
 ORACLE_TIMEOUT_SECS = 1800
 
+# §3.4 — the row's per-project VM memory. ``src/sandbox/shuru.rs`` boots the VM to
+# this size and ``src/pipeline/suite_cache.rs`` folds it into the cache key, so the
+# same key decides both what runs and how it is cached. Named once because §3.4, X2
+# and X5 all reason about this one variable and a literal repeated three ways is a
+# place for the three to drift.
+SHURU_MEMORY_ENV = "VANTA_SHURU_MEMORY_MB"
+
 # The harness's two modes. Defined in the arm registry, which is keyed by them, and
 # re-exported here because this module and the split's vocabulary share them.
 REPAIR = arms_mod.REPAIR
@@ -593,6 +600,11 @@ def vanta_env(
     timeout arithmetic the file names, and the value differs only for a caller the
     freeze should have refused.
 
+    [VANTA-WHY] M3 item X5 — the VM-memory key is the exception to "the harness's value
+    wins": it is not a caller-side guard but the row's own recorded fact, and a frozen
+    value the row cannot match exactly (a different size, or no size at all) is REFUSED
+    rather than overwritten, so the record can never name a memory the VM did not have.
+
     [VANTA-WHY] Every switch, the attempt budget's owner and the arm name come from
     ONE ``arms.py`` entry, so a run cannot be configured as one arm and recorded as
     another. That is the whole of "the harness refuses before launching": there is no
@@ -625,8 +637,29 @@ def vanta_env(
     # gates ran in. ``VANTA_SHURU_MEMORY_MB`` unset (the normal case, and every bug that
     # records no size) leaves ``src/sandbox/shuru.rs`` at shuru's own default, so the
     # binary's argv is what it was before this key existed.
+    #
+    # [VANTA-WHY] M3 item X5 — a FROZEN ``VANTA_SHURU_MEMORY_MB`` is honoured exactly or
+    # refused, never silently ignored. ``frozen`` was applied above, so both branches
+    # below would otherwise defeat it: the assignment would boot a VM of a different
+    # size than the file froze, and the pop would boot shuru's default while the file
+    # still claimed a size. In either case the record would name a memory the VM never
+    # had — the same class of drift X2 refuses for the inherited case. The one case
+    # that is not drift is a row whose own size EQUALS the frozen value: the assignment
+    # then writes the frozen value back, so nothing is ignored and the run proceeds. A
+    # frozen value the row cannot honour exactly (a row with no size, or a disagreeing
+    # size) is a refusal, because there is no correct size for the harness to pick on
+    # its own.
+    frozen_memory = frozen.get(SHURU_MEMORY_ENV) if frozen else None
+    if frozen_memory is not None and (
+        memory_mb is None or str(memory_mb) != frozen_memory
+    ):
+        raise RunnerError(
+            f"configs freeze {SHURU_MEMORY_ENV}={frozen_memory} but this row "
+            f"{'records no vm_memory_mb' if memory_mb is None else f'records {memory_mb}'}"
+            " — refusing to boot a VM at a size the frozen config did not name"
+        )
     if memory_mb is not None:
-        env["VANTA_SHURU_MEMORY_MB"] = str(memory_mb)
+        env[SHURU_MEMORY_ENV] = str(memory_mb)
     else:
         # [VANTA-WHY] M3 item X2 — a row that records no ``vm_memory_mb`` is charged
         # the default VM (``budget.DEFAULT_VM_MEMORY_MB``), and the VM it boots must
@@ -634,10 +667,10 @@ def vanta_env(
         # would let ``src/sandbox/shuru.rs`` boot a bigger VM than the row was
         # charged, so the child environment must not carry one. Removing it is safe
         # because ``configs/v1-m3.toml`` does NOT freeze it — the key is [recorded],
-        # "set by runner.vanta_env ... absent = shuru's default" — so there is no
-        # frozen value here to preserve; if the file ever froze it, the charge would
-        # have to follow the frozen size instead (see the note above the key).
-        env.pop("VANTA_SHURU_MEMORY_MB", None)
+        # "set by runner.vanta_env ... absent = shuru's default" — and item X5 above
+        # has already refused the case where it ever did: a frozen value with no row
+        # size to honour it never reaches this pop.
+        env.pop(SHURU_MEMORY_ENV, None)
     # [VANTA-WHY] M3 item U3 — WHICH layer this is, not merely which name it is
     # under. The name a re-bake reuses, so a key carrying only the name can serve a
     # measurement of a layer that no longer exists; the identity is the digest

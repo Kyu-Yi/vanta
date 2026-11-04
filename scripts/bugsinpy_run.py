@@ -851,14 +851,20 @@ def render_stamp_table(outcomes: Sequence[bake_mod.StampOutcome]) -> str:
     and the full values are in the files. ``baked`` versus ``stamped`` is the column that
     says whether a layer's identity came from a bake or from this command, which is the
     only way to tell a layer this step touched from one it skipped.
+
+    ``interpreter`` and ``python`` are what the verify actually queried, read back from
+    the boot rather than assumed: the pre-registration records *what was checked*, and a
+    row that showed only "ok" would not say through which environment.
     """
     lines = [
-        "| project | checkpoint | checkpoint id | digest | baked/stamped | verify |",
-        "|---|---|---|---|---|---|",
+        "| project | checkpoint | checkpoint id | digest | baked/stamped | "
+        "interpreter | python | verify |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for outcome in outcomes:
         lines.append(
-            "| {project} | {checkpoint} | {cid} | {digest} | {origin} | {verify} |".format(
+            "| {project} | {checkpoint} | {cid} | {digest} | {origin} | {interp} | "
+            "{pyver} | {verify} |".format(
                 project=outcome.project or "—",
                 checkpoint=outcome.checkpoint,
                 cid=(outcome.checkpoint_id[:12] + "…")
@@ -866,10 +872,36 @@ def render_stamp_table(outcomes: Sequence[bake_mod.StampOutcome]) -> str:
                 else "—",
                 digest=(outcome.digest[:12] + "…") if outcome.digest else "—",
                 origin=outcome.origin,
+                interp=outcome.interpreter or "—",
+                pyver=outcome.python_version or "—",
                 verify=outcome.verify or "—",
             )
         )
     return "\n".join(lines)
+
+
+def layer_interpreters() -> dict[str, str]:
+    """``{project: test_cmd[0]}`` over both splits — the interpreter each suite runs.
+
+    [VANTA-WHY] ``stamp-existing`` verifies a layer by asking the interpreter *inside it*
+    what it can see installed, and the only answer that means anything is the one from the
+    interpreter ``test_cmd[0]`` names — the one ``suite.run_suite_twice`` runs. Every
+    project names bare ``python`` today, so this map only ever confirms the default; it
+    exists so that a split which later names another interpreter makes this command
+    *refuse* that layer rather than verify a different environment and stamp the layer on
+    that basis. A project in neither split maps to nothing, and a layer of it is refused
+    for the same reason: the interpreter is not knowable, so it is not guessed.
+    """
+    interpreters: dict[str, str] = {}
+    for path in (DEV_SPLIT, DEFAULT_SPLIT):
+        if not path.is_file():
+            continue
+        split = load_split(path)
+        for entry in split.bugs:
+            test_cmd = entry.get("test_cmd") or []
+            if test_cmd:
+                interpreters[str(entry["project"])] = str(test_cmd[0])
+    return interpreters
 
 
 def cmd_stamp_existing(args: argparse.Namespace) -> int:
@@ -878,12 +910,19 @@ def cmd_stamp_existing(args: argparse.Namespace) -> int:
     The layers this fixes were baked before the stamp existed, so their provenance has no
     ``checkpoint_id`` and the suite cache reads ``off:unknown_checkpoint`` for each of
     them: every suite is measured and nothing is reused. Each layer is booted once,
-    read-only, and its marker and ``pip freeze`` are compared against the pins its
-    provenance records — a layer that no longer matches is *left unstamped* and reported,
-    not re-baked and not stopped for, so ``prepare`` keeps warning about it and its cache
-    stays off. ``prepare`` never does this for itself, on purpose: a stamp is an identity,
-    and handing one to a layer that changed is the failure the boot-verify exists to
-    refuse.
+    read-only, and asked — through the same interpreter its suite runs
+    (:func:`layer_interpreters`) — what it can see installed; that listing is compared
+    against the pins its provenance records. A layer that no longer matches is *left
+    unstamped* and reported, not re-baked and not stopped for, so ``prepare`` keeps
+    warning about it and its cache stays off. A layer whose checkpoint is simply gone is
+    reported ``missing`` and is not a failure: there is nothing to act on. ``prepare``
+    never does this for itself, on purpose: a stamp is an identity, and handing one to a
+    layer that changed is the failure the boot-verify exists to refuse.
+
+    A boot-verify that could not *read* the environment — no interpreter, a listing that
+    failed or came back empty — refuses the layer with :data:`bake_mod.ENV_UNREADABLE`
+    rather than reporting a mismatch, because an unread layer is a probe problem and a
+    mismatch is a layer problem, and they want different responses.
 
     Writes exactly where ``bake.write_deps`` writes, in the same shape, so a layer's
     identity is fixed from here on. A later re-bake of the same layer still gets a fresh
@@ -896,7 +935,7 @@ def cmd_stamp_existing(args: argparse.Namespace) -> int:
             "here, so there is no layer to stamp."
         )
     print(f"stamp-existing: {deps_dir}", flush=True)
-    outcomes = bake_mod.stamp_existing(deps_dir)
+    outcomes = bake_mod.stamp_existing(deps_dir, interpreters=layer_interpreters())
     if not outcomes:
         print("no deps files found — nothing to stamp.", flush=True)
         return EXIT_OK
@@ -904,10 +943,11 @@ def cmd_stamp_existing(args: argparse.Namespace) -> int:
     stamped = [o for o in outcomes if o.action == "stamped"]
     already = [o for o in outcomes if o.action == "already"]
     refused = [o for o in outcomes if o.action == "refused"]
+    missing = [o for o in outcomes if o.action == "missing"]
     skipped = [o for o in outcomes if o.action == "not a layer's provenance"]
     print(
-        f"\nstamped {len(stamped)}, already {len(already)}, refused {len(refused)}, "
-        f"not a layer {len(skipped)}",
+        f"\nstamped {len(stamped)}, already {len(already)}, missing {len(missing)}, "
+        f"refused {len(refused)}, not a layer {len(skipped)}",
         flush=True,
     )
     if refused:
@@ -916,6 +956,12 @@ def cmd_stamp_existing(args: argparse.Namespace) -> int:
             "about them and their cache stays off. Re-bake them (their environment no "
             "longer matches its record) or investigate the difference above.",
             file=sys.stderr,
+            flush=True,
+        )
+    if missing:
+        print(
+            "missing layers have a provenance record but no checkpoint: there is nothing "
+            "to stamp, and no cache entry to key.",
             flush=True,
         )
     if stamped:

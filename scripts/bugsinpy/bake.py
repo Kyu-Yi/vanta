@@ -10909,8 +10909,69 @@ VERIFY_MARKER_OK = "VANTA-VERIFY-MARKER-OK"
 VERIFY_MARKER_MISSING = "VANTA-VERIFY-MARKER-MISSING"
 """Printed when it does not — the layer would have been deleted by its own bake."""
 
-VERIFY_FREEZE_MISSING = "VANTA-VERIFY-FREEZE-MISSING"
-"""Printed when the layer holds no ``pip freeze`` to compare against."""
+VERIFY_NO_PYTHON = "VANTA-VERIFY-NO-PYTHON"
+"""Printed when the layer has no ``python`` on ``PATH``, so there is nothing to query."""
+
+VERIFY_INTERPRETER = "VANTA-VERIFY-INTERPRETER"
+VERIFY_VERSION = "VANTA-VERIFY-VERSION"
+"""The boot's own reading of the interpreter it queried: its path, then its version.
+
+Recorded rather than assumed because the table has to show which interpreter a layer was
+verified through, and "``python`` is the 3.8 venv wrapper in every layer" is exactly the
+assumption this step exists not to make (the base image's ``python3`` is a different
+Python entirely).
+"""
+
+VERIFY_LISTING_BEGIN = "VANTA-VERIFY-LISTING-BEGIN"
+VERIFY_LISTING_END = "VANTA-VERIFY-LISTING-END"
+VERIFY_LISTING_FAILED = "VANTA-VERIFY-LISTING-FAILED"
+"""The envelope around the distributions the layer's interpreter can see.
+
+[VANTA-WHY] M3 item U3 — an envelope rather than a bare listing, because the ways of
+failing to *read* an environment (no interpreter, a listing that exits non-zero, a listing
+that prints nothing) have to stay distinguishable from an environment that really is
+missing a pin. Without the sentinels each of them reads as "every recorded package is not
+installed", which is the one verdict this step must not reach: it refuses a layer that is
+fine, and it reports drift about an environment nothing managed to look at.
+"""
+
+LAYER_INTERPRETER = "python"
+"""The interpreter the verify queries — the one every split's ``test_cmd[0]`` names.
+
+[VANTA-WHY] A suite runs ``python -m pytest`` with the tree as the guest's working
+directory (``suite.run_suite_twice`` over ``split.test_cmd``), so the environment a
+measurement happens in is the one bare ``python`` resolves to. Querying any other
+interpreter would verify an environment the suite is never run in — and ``python3`` in
+particular is the *base image's*, not the layer's venv wrapper.
+"""
+
+ENV_UNREADABLE = "verify could not read the environment"
+"""The one reason a boot that could not be read refuses with.
+
+Deliberately not a mismatch sentence: a reader has to be able to tell "the layer drifted"
+from "the verify did not manage to look", because the two want different responses — a
+re-bake, versus a look at the probe.
+"""
+
+LIST_ENV_CODE = (
+    "import importlib.metadata as m; "
+    "[print(f\"{d.metadata.get('Name')}=={d.version}\") "
+    "for d in m.distributions() if d.metadata.get('Name')]"
+)
+"""The listing the layer's own interpreter is asked for: what it can see installed.
+
+[VANTA-WHY] ``importlib.metadata`` and not ``pip freeze``, measured on the layers
+themselves. pip's listing commands skip any distribution whose name is a standard-library
+module — ``pip._internal.commands.list`` does ``skip = set(stdlib_pkgs)`` — so
+``argparse==1.3.0``, which ``luigi/1`` and ``luigi/2`` really carry (``pip show argparse``
+reports 1.3.0 and ``importlib.metadata`` reports ``('argparse', '1.3.0')``), is absent
+from ``pip freeze``, from ``pip freeze --all`` *and* from ``pip list --format=freeze``.
+Plain ``pip freeze`` additionally hides ``pip``/``setuptools``/``distribute``/``wheel``
+unless ``--all`` is given, which is how ``pandas/1``'s recorded ``setuptools==46.4.0``
+came back as "not installed". Both are pip's own filters and not facts about the layer,
+and comparing recorded pins against a listing that cannot show them refuses healthy
+layers. ``importlib.metadata`` is the interpreter's own answer, with no pip in the way.
+"""
 
 
 def was_stamped_existing(provenance: Mapping[str, Any]) -> bool:
@@ -10934,33 +10995,49 @@ def layer_deps_files(deps_dir: Path) -> list[Path]:
 
 
 def boot_layer_probe(checkpoint: str, *, disk_mb: int = BAKE_DISK_MB) -> ExecResult:
-    """Boot ``checkpoint`` once, read-only, and report its marker and its freeze.
+    """Boot ``checkpoint`` once, read-only, and report its marker and its environment.
 
-    [VANTA-WHY] The layer's own truth — ``/opt/vanta-deps-ok`` and
-    ``/opt/vanta-deps-freeze.txt`` (:data:`DEPS_FREEZE_OUTPUT`) — lives *inside* the
-    checkpoint and cannot be read without booting it, so a stamp that refuses to describe
-    a layer that changed has to boot it. One boot, two readings: the marker is echoed as a
-    sentinel and the freeze is ``cat``-ed after it, so a single VM start answers both
-    questions and a layer that has neither still reports which one it lost.
+    [VANTA-WHY] The layer's own truth — ``/opt/vanta-deps-ok`` and what its ``python``
+    can see installed — lives *inside* the checkpoint and cannot be read without booting
+    it, so a stamp that refuses to describe a layer that changed has to boot it. One
+    boot, three readings: the marker, the interpreter it queried, and that interpreter's
+    own listing, each echoed between sentinels so a single VM start answers all of them
+    and a layer that lost any one still says which.
+
+    [VANTA-WHY] **One** ``sh -c`` string, not an argv of several commands. The probe used
+    to pass ``["sh", "-c", A, "sh", "-c", B]``, which :func:`shuru.run` quotes with
+    ``shlex.join`` into ``sh -c A sh -c B`` — and POSIX ``sh -c`` takes ``$0,$1,$2`` from
+    the words after the script, so ``B`` was never executed at all. The marker printed and
+    the listing did not, which read downstream as an environment missing every recorded
+    pin (a *mismatch*) rather than as a probe that never looked. A single script removes
+    the failure mode instead of documenting it.
 
     ``--disk-size`` is the disk the layer was *built* at (:data:`BAKE_DISK_MB`), so the
     boot cannot be the thing that truncates it, and the mount is read-only with no host
-    writes: verifying a layer must not be able to change it. No ``--memory`` — reading a
-    file needs no more than shuru's own default. The boot's start-up guard prints on
-    stderr (``DEV_SHM_GUARD``), so ``stdout`` carries only these readings.
+    writes: verifying a layer must not be able to change it. No ``--memory`` — reading an
+    environment needs no more than shuru's own default. The boot's start-up guard prints
+    on stderr (``DEV_SHM_GUARD``), so ``stdout`` carries only these readings.
     """
-    command = [
-        "sh",
-        "-c",
-        f"test -f {MARKER} && echo {VERIFY_MARKER_OK} || echo {VERIFY_MARKER_MISSING}",
-        "sh",
-        "-c",
-        f"cat {DEPS_FREEZE_OUTPUT} 2>/dev/null || echo {VERIFY_FREEZE_MISSING}",
-    ]
+    interpreter = shlex.quote(LAYER_INTERPRETER)
+    script = "\n".join(
+        [
+            f"if test -f {MARKER}; then echo {VERIFY_MARKER_OK}; "
+            f"else echo {VERIFY_MARKER_MISSING}; fi",
+            f"if command -v {interpreter} >/dev/null 2>&1; then",
+            f"  echo {VERIFY_INTERPRETER} \"$(command -v {interpreter})\"",
+            f"  echo {VERIFY_VERSION} \"$({interpreter} -V 2>&1)\"",
+            f"  echo {VERIFY_LISTING_BEGIN}",
+            f"  if {interpreter} -c {shlex.quote(LIST_ENV_CODE)}; then "
+            f"echo {VERIFY_LISTING_END}; else echo {VERIFY_LISTING_FAILED}; fi",
+            "else",
+            f"  echo {VERIFY_NO_PYTHON}",
+            "fi",
+        ]
+    )
     return shuru_run(
         checkpoint=checkpoint,
         host_root=Path.cwd(),
-        command=command,
+        command=["sh", "-c", script],
         disk_mb=disk_mb,
         timeout_secs=LAYER_VERIFY_TIMEOUT_SECS,
         allow_host_writes=False,
@@ -10968,10 +11045,12 @@ def boot_layer_probe(checkpoint: str, *, disk_mb: int = BAKE_DISK_MB) -> ExecRes
 
 
 def freeze_versions(lines: Iterable[str]) -> dict[str, str]:
-    """``{canonical name: version}`` for the distributions a ``pip freeze`` names.
+    """``{canonical name: version}`` for the distributions a listing names.
 
-    Compared by canonical name because ``pip freeze`` spells a project per PEP 503
-    while a pin keeps the spelling its own file used (:func:`unpinned_freeze`).
+    Compared by canonical name because a listing spells a project per PEP 503 while a
+    pin keeps the spelling its own file used (:func:`unpinned_freeze`), so
+    ``PySnooper`` and ``pysnooper`` are the same distribution and
+    :func:`canonicalize_name` is what makes them so.
     """
     out: dict[str, str] = {}
     for raw in lines:
@@ -10985,48 +11064,125 @@ def freeze_versions(lines: Iterable[str]) -> dict[str, str]:
     return out
 
 
-def compare_layer(result: ExecResult, *, installs: Sequence[str]) -> tuple[bool, str]:
+@dataclass(frozen=True)
+class LayerVerify:
+    """What one boot-verify read from a layer, and whether it matches its record.
+
+    ``ok`` is whether the layer's environment matches the pins its provenance records;
+    ``detail`` is the sentence a refusal prints. ``interpreter`` and ``version`` are what
+    the boot reported querying — recorded even on a refusal, so the table shows what was
+    looked at rather than leaving the reader to guess which ``python`` answered.
+    """
+
+    ok: bool
+    detail: str
+    interpreter: str = ""
+    version: str = ""
+
+
+def _sentinel_value(lines: Sequence[str], prefix: str) -> str:
+    """The value after ``prefix`` on the first line that carries it, else ``""``."""
+    for line in lines:
+        if line.startswith(prefix + " "):
+            return line[len(prefix) + 1:].strip()
+    return ""
+
+
+def compare_layer(result: ExecResult, *, installs: Sequence[str]) -> LayerVerify:
     """Whether a boot-verify's readings match the layer's recorded installs.
 
-    ``(ok, detail)``, and ``detail`` is written for the refusal to be readable: it names
-    the marker, or each recorded pin the layer no longer carries and at what version it
-    carries it instead. "verification failed" would send a reader back to boot the layer
-    by hand to learn what this function already knew.
+    [VANTA-WHY] M3 item U3 — a failure to *read* the environment and a layer that is
+    genuinely missing a pin are different verdicts, and this function is where they are
+    kept apart. Every reading comes from a sentinel the probe printed (:data:`VERIFY_NO_PYTHON`,
+    :data:`VERIFY_LISTING_FAILED`, an empty listing) precisely so that "could not look"
+    returns :data:`ENV_UNREADABLE` rather than the "the layer no longer matches its
+    recorded provenance" sentence, which is a claim about the layer. A reader has to be
+    able to tell a re-bake from a look at the probe, and only the reason distinguishes
+    them. Names are compared per :func:`canonicalize_name`, so a PEP 503 spelling in the
+    listing matches the pin's own spelling (:func:`freeze_versions`).
     """
     if not result.ok:
-        return False, (
-            f"the boot failed: exit={result.exit_code}"
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the boot failed: exit={result.exit_code}"
             + (" (timeout)" if result.timed_out else "")
-            + f"; stderr: {result.stderr.strip()[-400:] or '(empty)'}"
+            + f"; stderr: {result.stderr.strip()[-400:] or '(empty)'}",
         )
     lines = [line.strip() for line in result.stdout.splitlines()]
     if VERIFY_MARKER_MISSING in lines:
-        return False, f"the layer has no marker {MARKER}"
+        return LayerVerify(False, f"the layer has no marker {MARKER}")
     if VERIFY_MARKER_OK not in lines:
-        return False, (
-            "the boot reported neither the marker nor its absence; stdout: "
-            f"{result.stdout.strip()[-400:] or '(empty)'}"
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the boot reported neither the marker nor its absence; "
+            f"stdout: {result.stdout.strip()[-400:] or '(empty)'}",
         )
-    if VERIFY_FREEZE_MISSING in lines:
-        return False, f"the layer has no {DEPS_FREEZE_OUTPUT}"
-    frozen = freeze_versions(
-        line for line in lines if line != VERIFY_MARKER_OK
-    )
+    interpreter = _sentinel_value(lines, VERIFY_INTERPRETER)
+    version = _sentinel_value(lines, VERIFY_VERSION)
+    if VERIFY_NO_PYTHON in lines or not interpreter:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the layer has no {LAYER_INTERPRETER} on PATH",
+            interpreter,
+            version,
+        )
+    if VERIFY_LISTING_FAILED in lines:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the listing exited non-zero",
+            interpreter,
+            version,
+        )
+    try:
+        begin = lines.index(VERIFY_LISTING_BEGIN)
+        end = lines.index(VERIFY_LISTING_END)
+    except ValueError:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the listing did not complete",
+            interpreter,
+            version,
+        )
+    listing = [line for line in lines[begin + 1:end] if line]
+    if not listing:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the listing was empty",
+            interpreter,
+            version,
+        )
+    malformed = [line for line in listing if "==" not in line]
+    if malformed:
+        return LayerVerify(
+            False,
+            f"{ENV_UNREADABLE}: the listing could not be parsed: "
+            f"{malformed[0][:80]}",
+            interpreter,
+            version,
+        )
+    frozen = freeze_versions(listing)
     differed: list[str] = []
     for pin in installs:
-        name, _, version = pin.partition("==")
+        name, _, pin_version = pin.partition("==")
         held = frozen.get(canonicalize_name(name.strip()))
         if held is None:
             differed.append(f"{pin} is not installed")
-        elif version and held != version:
+        elif pin_version and held != pin_version:
             differed.append(f"{pin} is installed at {name.strip()}=={held}")
     if differed:
-        return False, (
+        return LayerVerify(
+            False,
             "the layer no longer matches its recorded provenance: "
-            + "; ".join(differed)
+            + "; ".join(differed),
+            interpreter,
+            version,
         )
-    return True, (
-        f"marker present; {len(installs)} recorded pin(s) at their recorded version"
+    return LayerVerify(
+        True,
+        f"{interpreter} ({version}); marker present; "
+        f"{len(installs)} recorded pin(s) at their recorded version",
+        interpreter,
+        version,
     )
 
 
@@ -11042,7 +11198,12 @@ class StampOutcome:
     checkpoint: str
     project: str
     action: str
-    """``stamped``, ``already``, ``not a layer's provenance`` or ``refused``."""
+    """``stamped``, ``already``, ``missing``, ``not a layer's provenance`` or ``refused``.
+
+    ``missing`` is separate from ``refused`` deliberately: a deps file whose checkpoint no
+    longer exists is not a *failure* of this step — there is no layer to mismatch — and
+    treating it as one would make the command exit non-zero over nothing it can act on.
+    """
 
     origin: str
     """``baked`` or ``stamped`` for a layer that has an identity, else ``—``."""
@@ -11050,6 +11211,13 @@ class StampOutcome:
     checkpoint_id: str
     digest: str
     verify: str
+    interpreter: str = ""
+    python_version: str = ""
+    """The interpreter the verify queried and the version it reported, when it booted one.
+
+    Empty for a layer this run did not boot (``already``, ``missing``), because the table
+    must show what was actually read and not imply a check that never ran.
+    """
 
 
 def unstamped_deps(deps_dir: Path, checkpoints: Sequence[str]) -> list[str]:
@@ -11082,7 +11250,10 @@ def unstamped_deps(deps_dir: Path, checkpoints: Sequence[str]) -> list[str]:
 
 
 def stamp_existing(
-    deps_dir: Path, *, disk_mb: int = BAKE_DISK_MB
+    deps_dir: Path,
+    *,
+    disk_mb: int = BAKE_DISK_MB,
+    interpreters: Optional[Mapping[str, str]] = None,
 ) -> list[StampOutcome]:
     """Give every unstamped layer an identity, without re-baking it (M3 item U3).
 
@@ -11103,6 +11274,12 @@ def stamp_existing(
     installs, and keeps going: one layer that changed is that layer's problem, and the
     others still deserve an identity. A refused layer is left byte-for-byte as it was, so
     ``prepare`` keeps warning about it and its cache stays off.
+
+    ``interpreters`` maps a project to the interpreter its suite runs
+    (``test_cmd[0]``). When given, a layer whose project's interpreter is not
+    :data:`LAYER_INTERPRETER` — or whose project is absent from the map — is refused
+    rather than verified through an interpreter the suite may never use. ``None`` skips
+    the guard, which is how the tests exercise the boot-verify in isolation.
     """
     outcomes: list[StampOutcome] = []
     for path in layer_deps_files(deps_dir):
@@ -11140,16 +11317,32 @@ def stamp_existing(
         if not layer_exists(checkpoint):
             outcomes.append(
                 StampOutcome(
-                    checkpoint, project, "refused", "—", "", "",
+                    checkpoint, project, "missing", "—", "", "",
                     f"no checkpoint named {checkpoint}",
                 )
             )
             continue
+        if interpreters is not None:
+            expected = interpreters.get(project)
+            if expected != LAYER_INTERPRETER:
+                recorded = f"``{expected}``" if expected else "nothing"
+                outcomes.append(
+                    StampOutcome(
+                        checkpoint, project, "refused", "—", "", "",
+                        "cannot verify through the interpreter the suite runs: the split "
+                        f"records {recorded} for {project or '(no project)'}, and this "
+                        f"step queries only ``{LAYER_INTERPRETER}`` rather than guessing",
+                    )
+                )
+                continue
         result = boot_layer_probe(checkpoint, disk_mb=disk_mb)
-        ok, detail = compare_layer(result, installs=tuple(data.get("installs") or ()))
-        if not ok:
+        verify = compare_layer(result, installs=tuple(data.get("installs") or ()))
+        if not verify.ok:
             outcomes.append(
-                StampOutcome(checkpoint, project, "refused", "—", "", "", detail)
+                StampOutcome(
+                    checkpoint, project, "refused", "—", "", "", verify.detail,
+                    verify.interpreter, verify.version,
+                )
             )
             continue
         stamped = dict(data)
@@ -11161,7 +11354,8 @@ def stamp_existing(
         outcomes.append(
             StampOutcome(
                 checkpoint, project, "stamped", "stamped",
-                stamped[CHECKPOINT_ID_KEY], provenance_digest(stamped), detail,
+                stamped[CHECKPOINT_ID_KEY], provenance_digest(stamped), verify.detail,
+                verify.interpreter, verify.version,
             )
         )
     return outcomes

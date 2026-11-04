@@ -20287,6 +20287,34 @@ class TestDependencyProvenance:
             stdout=stdout, stderr="", exit_code=0, timed_out=False
         )
 
+    @staticmethod
+    def _probe(
+        listing,
+        *,
+        interpreter="/usr/local/bin/python",
+        version="Python 3.8.20",
+        listing_failed=False,
+    ):
+        """The stdout :func:`bake_mod.boot_layer_probe` prints for one boot.
+
+        Built from the probe's own sentinels — the marker, the interpreter it queried and
+        the version that interpreter reported, then its listing between the envelope — so
+        these tests exercise the real parse rather than a stand-in, and a change to the
+        probe's shape fails them. ``listing_failed`` emits ``VERIFY_LISTING_FAILED`` in
+        place of the listing, which is what a listing that exits non-zero looks like.
+        """
+        lines = [
+            bake_mod.VERIFY_MARKER_OK,
+            f"{bake_mod.VERIFY_INTERPRETER} {interpreter}",
+            f"{bake_mod.VERIFY_VERSION} {version}",
+            bake_mod.VERIFY_LISTING_BEGIN,
+        ]
+        if listing_failed:
+            lines.append(bake_mod.VERIFY_LISTING_FAILED)
+        else:
+            lines += [*listing, bake_mod.VERIFY_LISTING_END]
+        return "\n".join(lines) + "\n"
+
     def test_stamp_existing_gives_a_legacy_layer_an_identity_without_rebaking(
         self, tmp_path, monkeypatch
     ):
@@ -20313,7 +20341,7 @@ class TestDependencyProvenance:
             bake_mod,
             "boot_layer_probe",
             lambda checkpoint, *, disk_mb: self._verified(
-                f"{bake_mod.VERIFY_MARKER_OK}\ndecorator==4.4.0\npytest==6.2.5\n"
+                self._probe(["decorator==4.4.0", "pytest==6.2.5"])
             ),
         )
 
@@ -20375,8 +20403,9 @@ class TestDependencyProvenance:
             bake_mod,
             "boot_layer_probe",
             lambda checkpoint, *, disk_mb: self._verified(
-                f"{bake_mod.VERIFY_MARKER_OK}\n"
-                + ("" if checkpoint == "changed" else "decorator==4.4.0\n")
+                self._probe(
+                    ["pytest==6.2.5"] if checkpoint == "changed" else ["decorator==4.4.0"]
+                )
             ),
         )
 
@@ -20402,6 +20431,94 @@ class TestDependencyProvenance:
         [outcome] = bake_mod.stamp_existing(deps_dir)
         assert outcome.action == "refused"
         assert outcome.verify == f"the layer has no marker {bake_mod.MARKER}"
+
+    def test_stamp_existing_stamps_a_layer_whose_own_interpreter_lists_its_pins(
+        self, tmp_path, monkeypatch
+    ):
+        """A layer stamps when its own interpreter's listing carries every recorded pin.
+
+        The fake VM returns exactly what :func:`bake_mod.boot_layer_probe` prints, so this
+        exercises the real parse — and the listing is the one a working layer produces,
+        which is why it names ``argparse==1.3.0`` (hidden from ``pip freeze`` because it is
+        a standard-library module's name, so a pip-based listing would call a healthy layer
+        drifted) and ``pysnooper`` in PEP 503 form against a ``PySnooper`` pin (so the
+        comparison has to canonicalise names). A second deps file whose checkpoint is gone
+        is reported ``missing`` — not refused — and the first still stamps.
+        """
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        write(
+            deps_dir / "live.json",
+            json.dumps(
+                {
+                    "project": "PySnooper",
+                    "installs": [
+                        "decorator==4.4.0",
+                        "argparse==1.3.0",
+                        "PySnooper==0.2.8",
+                    ],
+                    "import_name": "pysnooper",
+                }
+            ),
+        )
+        write(deps_dir / "gone.json", json.dumps({"project": "Demo", "installs": []}))
+
+        monkeypatch.setattr(bake_mod, "layer_exists", lambda name: name == "live")
+        monkeypatch.setattr(
+            bake_mod,
+            "boot_layer_probe",
+            lambda checkpoint, *, disk_mb: self._verified(
+                self._probe(
+                    [
+                        "decorator==4.4.0",
+                        "argparse==1.3.0",
+                        "pysnooper==0.2.8",
+                        "pytest==6.2.5",
+                    ],
+                    interpreter="/usr/local/bin/python",
+                    version="Python 3.8.20",
+                )
+            ),
+        )
+
+        outcomes = {o.checkpoint: o for o in bake_mod.stamp_existing(deps_dir)}
+
+        assert outcomes["live"].action == "stamped"
+        assert outcomes["live"].interpreter == "/usr/local/bin/python"
+        assert outcomes["live"].python_version == "Python 3.8.20"
+        assert outcomes["gone"].action == "missing"
+        assert "no checkpoint named gone" in outcomes["gone"].verify
+
+    def test_stamp_existing_refuses_when_the_listing_cannot_be_read(
+        self, tmp_path, monkeypatch
+    ):
+        """A listing that failed is a verify error, never a mismatch.
+
+        A listing that exits non-zero is the probe not managing to look, so the layer is
+        refused with :data:`bake_mod.ENV_UNREADABLE` and the reason — not with the "no
+        longer matches its recorded provenance" sentence, which would claim the layer
+        drifted and send a reader to re-bake a layer that is fine.
+        """
+        deps_dir = tmp_path / "deps"
+        deps_dir.mkdir()
+        write(
+            deps_dir / "chk.json",
+            json.dumps({"project": "Demo", "installs": ["decorator==4.4.0"]}),
+        )
+        monkeypatch.setattr(bake_mod, "layer_exists", lambda name: True)
+        monkeypatch.setattr(
+            bake_mod,
+            "boot_layer_probe",
+            lambda checkpoint, *, disk_mb: self._verified(
+                self._probe([], listing_failed=True)
+            ),
+        )
+
+        [outcome] = bake_mod.stamp_existing(deps_dir)
+
+        assert outcome.action == "refused"
+        assert bake_mod.ENV_UNREADABLE in outcome.verify
+        assert "no longer matches its recorded provenance" not in outcome.verify
 
 
 needs_bare_repos = pytest.mark.skipif(

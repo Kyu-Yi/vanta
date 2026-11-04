@@ -8617,6 +8617,10 @@ mod tests {
             }
         }
 
+        // M3 item X4 — the crate-wide environment lock: two of the three switch
+        // tests below write `VANTA_BATE`, so they are exclusive with each other and
+        // with every other test that reads the environment.
+        let _env = crate::test_env::lock();
         // An absent switch is the documented default ON, not an error.
         let previous = std::env::var("VANTA_BATE").ok();
         unsafe { std::env::remove_var("VANTA_BATE") };
@@ -8681,6 +8685,8 @@ mod tests {
     // `vanta` row for a run the operator asked to be `b2`.
     #[test]
     fn the_bate_switch_is_strict_and_defaults_on() {
+        // M3 item X4 — the crate-wide environment lock (see the note above).
+        let _env = crate::test_env::lock();
         let previous = std::env::var("VANTA_BATE").ok();
 
         unsafe { std::env::remove_var("VANTA_BATE") };
@@ -8714,6 +8720,8 @@ mod tests {
     // before.
     #[test]
     fn an_absent_arm_var_resolves_to_the_switch_derived_name() {
+        // M3 item X4 — the crate-wide environment lock (see the note above).
+        let _env = crate::test_env::lock();
         let previous = std::env::var("VANTA_ARM").ok();
 
         unsafe { std::env::remove_var("VANTA_ARM") };

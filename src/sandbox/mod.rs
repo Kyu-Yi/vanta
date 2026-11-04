@@ -530,13 +530,13 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn backend_preference_defaults_to_auto() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // M3 item X4 — the crate-wide environment lock, not a module-local one.
+        // These tests write `VANTA_SANDBOX_BACKEND` and `PATH`, and the harness
+        // tests that spawn pytest read the environment they inherit.
+        let _guard = crate::test_env::lock();
         unsafe {
             std::env::remove_var("VANTA_SANDBOX_BACKEND");
         }
@@ -545,7 +545,7 @@ mod tests {
 
     #[test]
     fn backend_preference_accepts_forced_values() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::test_env::lock();
         unsafe {
             std::env::set_var("VANTA_SANDBOX_BACKEND", "shuru");
         }
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn backend_preference_rejects_unknown_value() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::test_env::lock();
         unsafe {
             std::env::set_var("VANTA_SANDBOX_BACKEND", "mystery");
         }
@@ -580,11 +580,13 @@ mod tests {
     /// on any host, so this pins the refusal rather than the machine.
     #[tokio::test]
     async fn auto_refuses_instead_of_degrading_when_shuru_is_unavailable() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::test_env::lock();
         let previous_path = std::env::var_os("PATH");
         let previous_backend = std::env::var_os("VANTA_SANDBOX_BACKEND");
-        // SAFETY: single-threaded test process (`--test-threads=1`); the lock
-        // above guards this module's own env mutation.
+        // SAFETY: M3 item X4 — the crate-wide `test_env` lock (taken above) makes
+        // this the only test writing or reading the environment for as long as it
+        // holds it, so no other thread observes `PATH` or the backend mid-test.
+        // The value is restored below, before the assertions.
         unsafe {
             std::env::set_var("PATH", "/nonexistent-vanta-w1-empty-path");
             std::env::remove_var("VANTA_SANDBOX_BACKEND");

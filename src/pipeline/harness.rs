@@ -2711,26 +2711,43 @@ mod tests {
     /// on `drop` (a panicking assert included), so no later test can inherit a
     /// backend the test did not ask for and none passes by silently changing
     /// backend.
+    ///
+    /// M3 item X4 — that guard also holds the crate-wide `test_env` lock, because
+    /// these tests spawn real pytest subprocesses that inherit the whole
+    /// environment: for as long as the guard is alive no sibling test can write
+    /// the environment the subprocess is about to read.
     struct ExplicitHostBackend {
         previous: Option<std::ffi::OsString>,
+        // M3 item X4 — the crate-wide environment lock, held for the guard's whole
+        // life so the forced backend, the environment every spawned pytest
+        // inherits and the restore on drop all happen while no other test can
+        // write the environment. Never read: it is the proof the test owns it.
+        _lock: MutexGuard<'static, ()>,
     }
 
     impl ExplicitHostBackend {
         fn enter() -> Self {
+            let lock = crate::test_env::lock();
             let previous = std::env::var_os("VANTA_SANDBOX_BACKEND");
-            // SAFETY: the suite runs single-threaded (`cargo test --lib --
-            // --test-threads=1`), so no other thread reads the environment
-            // concurrently, and the value is restored on drop.
+            // SAFETY: M3 item X4 — the `test_env` lock taken above is the crate's
+            // one token for writing the environment, so no other test can read or
+            // write it while this guard is alive, and the previous value is
+            // restored on drop (a panicking assert included).
             unsafe {
                 std::env::set_var("VANTA_SANDBOX_BACKEND", "subprocess");
             }
-            Self { previous }
+            Self {
+                previous,
+                _lock: lock,
+            }
         }
     }
 
     impl Drop for ExplicitHostBackend {
         fn drop(&mut self) {
-            // SAFETY: as `enter`.
+            // SAFETY: as `enter` — the `test_env` guard this struct holds is still
+            // alive here (fields drop after `Drop::drop` returns), so the restore
+            // is inside the same protected region.
             unsafe {
                 match self.previous.take() {
                     Some(value) => std::env::set_var("VANTA_SANDBOX_BACKEND", value),

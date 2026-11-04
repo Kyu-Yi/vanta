@@ -476,11 +476,13 @@ mod tests {
     };
     use crate::session::{SCHEMA_VERSION, SessionId, SessionRecord};
 
-    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
-
     #[tokio::test]
     async fn open_pr_uses_tested_commit_from_session_start_and_never_serializes_token() {
-        let _env_guard = TEST_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // M3 item X4 — the crate-wide environment lock, not a module-local one:
+        // this test writes `VANTA_GITHUB_TOKEN`/`VANTA_GITHUB_API_BASE` and takes
+        // `VANTA_PR_REPO` away, so it must not run beside any other test that
+        // reads the environment (including the ones that spawn subprocesses).
+        let _env_guard = crate::test_env::lock();
         let repo = TestRepo::new();
         let session_id = SessionId::new("sess-pr");
         let session_log = repo.write_session_log(&session_id);

@@ -1637,6 +1637,57 @@ class TestTrackedPaths:
         }
 
 
+class TestProjectCloneIsOnceUnderConcurrency:
+    """M3 item Y1 — "clone once" must hold when callers overlap, not only in sequence.
+
+    ``prepare`` now overlaps different bugs, and the dev split holds two bugs of one
+    project (``fastapi``, ``luigi``, ``matplotlib``), so two callers can reach an
+    absent clone destination at the same moment. Without a lock both would run
+    ``git clone`` into it and git refuses the second — failing a bug for a race
+    rather than for anything about the bug.
+    """
+
+    def test_two_concurrent_callers_clone_the_project_once(self, tmp_path, monkeypatch):
+        cache_root = tmp_path / "repos"
+        at_the_gate = threading.Barrier(2)
+        clones: list[str] = []
+        clone_lock = threading.Lock()
+
+        def fake_git(args, *, cwd):
+            """Stand in for ``git clone``: record it, hold it open, make the dest."""
+            with clone_lock:
+                clones.append(args[-1])
+            time.sleep(0.05)  # a real clone is slow; keep the window open
+            Path(args[-1]).mkdir(parents=True, exist_ok=True)
+            return ""
+
+        monkeypatch.setattr(tree_mod, "_git", fake_git)
+
+        results: list[Path] = []
+        errors: list[BaseException] = []
+
+        def worker():
+            try:
+                at_the_gate.wait(timeout=5.0)
+                results.append(
+                    tree_mod.ensure_project_clone(cache_root, "Demo", "https://x/y.git")
+                )
+            except BaseException as exc:  # noqa: BLE001 — reported, not raised here
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.0)
+
+        assert not errors, errors
+        assert clones == [str(cache_root / "Demo.git")], (
+            f"the project was cloned {len(clones)} time(s) for two callers: {clones}"
+        )
+        assert results == [cache_root / "Demo.git", cache_root / "Demo.git"]
+
+
 class TestBuildTreesRefusesALeakedOracle:
     """The permanent guard, at the one place both trees are composed."""
 
@@ -36385,6 +36436,158 @@ class TestPrepareFrozenConfig:
                 ["prepare", "--split", "x", "--allow-override"]
             ).allow_override
             is True
+        )
+
+
+class _PrepareInFlight:
+    """How many ``prepare_one`` calls were running at the same time.
+
+    ``peak`` is the high-water mark and ``keys`` the order the bugs entered, which
+    is what a test needs to tell "the second bug ran beside the first" from "the
+    second bug ran after it".
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.live = 0
+        self.peak = 0
+        self.keys: list[str] = []
+
+    def enter(self, key: str) -> None:
+        with self._lock:
+            self.live += 1
+            self.peak = max(self.peak, self.live)
+            self.keys.append(key)
+
+    def leave(self) -> None:
+        with self._lock:
+            self.live -= 1
+
+
+class TestPrepareOverlapsBugs:
+    """M3 item Y1 — different bugs are independent, so ``prepare`` runs them together.
+
+    ``prepare`` walked the split one bug at a time on the calling thread, so the
+    only VMs in flight were one bug's, and the machine's other cores sat idle for
+    the length of the batch. A bug's own derivations already overlap (S5); this is
+    that rule one level up — every bug is submitted at once and the invocation's
+    ONE budget decides how many actually overlap. Two things must not change: a
+    bug's place in ``preps`` (and in ``broken``) is its place in the split, never
+    whichever worker finished first, and at the default ``--prepare-jobs 1`` the
+    budget is a single core, so nothing overlaps and the loop is the serial one it
+    always was.
+    """
+
+    @staticmethod
+    def _stage(monkeypatch, tmp_path, *, prepare_one):
+        """A two-bug prepare with every expensive step stubbed away.
+
+        ``prepare_one`` is the seam the test supplies. The host core budget is
+        pinned so the pool's size — ``min(--prepare-jobs, host cores − 2)`` — is a
+        fact about the flag under test and not about the machine running the tests.
+        """
+        for name in list(os.environ):
+            if name.startswith("VANTA_"):
+                monkeypatch.delenv(name, raising=False)
+        split = split_mod.Split(
+            split_data(
+                bugs=[
+                    bug_entry(),
+                    bug_entry(project="Other", bug_id=2, checkpoint="vanta-bi-Other-2"),
+                ]
+            )
+        )
+        split_path = tmp_path / "split.json"
+        split_path.write_text(split.to_json(), encoding="utf-8")
+        selected = [(split.bugs[0], True), (split.bugs[1], True)]
+        monkeypatch.setattr(ctx, "probe_props_n_ctx", lambda *a, **k: None)
+        monkeypatch.setattr(run_mod, "load_split", lambda path: split)
+        monkeypatch.setattr(run_mod, "select", lambda *a, **k: selected)
+        monkeypatch.setattr(meta_mod, "ensure_clone", lambda root, *, commit: commit)
+        monkeypatch.setattr(
+            runner_mod, "require_vanta_bin", lambda path: tmp_path / "vanta_m3"
+        )
+        monkeypatch.setattr(runner_mod, "stale_binary_warning", lambda path: "")
+        monkeypatch.setattr(prepare_mod, "missing_checkpoints", lambda names: [])
+        monkeypatch.setattr(bake_mod, "missing_deps", lambda deps, names: [])
+        monkeypatch.setattr(
+            meta_mod,
+            "project_github_url",
+            lambda *a, **k: "https://example.invalid/x.git",
+        )
+        monkeypatch.setattr(run_mod, "tree_cache", lambda *a, **k: tmp_path / "repo")
+        monkeypatch.setattr(prepare_mod, "prepare_one", prepare_one)
+        monkeypatch.setattr(budget_mod, "host_cores_budget", lambda: 8)
+        return split_path, selected
+
+    def test_at_two_jobs_two_bugs_are_in_flight_together(self, tmp_path, monkeypatch):
+        """The second bug starts while the first is still preparing.
+
+        The first bug holds until the second has entered ``prepare_one``; if that
+        never happens the wait times out and ``peak`` stays at one. Both bugs then
+        fail (the stub raises), which is what the stage records — the assertion is
+        about the overlap, not about the bugs.
+        """
+        watch = _PrepareInFlight()
+        second_entered = threading.Event()
+        first_key = run_mod.bug_key(
+            bug_entry()
+        )  # "Demo/1" — the split's first bug
+
+        def fake(entry, **kwargs):
+            key = run_mod.bug_key(entry)
+            watch.enter(key)
+            try:
+                if key == first_key:
+                    second_entered.wait(timeout=5.0)
+                else:
+                    second_entered.set()
+            finally:
+                watch.leave()
+            raise RuntimeError("stub")
+
+        split_path, _ = self._stage(monkeypatch, tmp_path, prepare_one=fake)
+        args = run_mod.build_parser().parse_args(
+            [
+                "prepare",
+                "--split",
+                str(split_path),
+                "--batch",
+                str(tmp_path / "batch"),
+                "--prepare-jobs",
+                "2",
+            ]
+        )
+        run_mod.cmd_prepare(args)
+        assert watch.peak == 2, (
+            "the second bug never ran beside the first — prepare did not overlap "
+            f"them (entered: {watch.keys})"
+        )
+
+    def test_at_one_job_the_bugs_stay_serial(self, tmp_path, monkeypatch):
+        """``--prepare-jobs 1`` is the serial loop, whatever the host has to spare."""
+        watch = _PrepareInFlight()
+
+        def fake(entry, **kwargs):
+            watch.enter(run_mod.bug_key(entry))
+            try:
+                time.sleep(0.05)
+            finally:
+                watch.leave()
+            raise RuntimeError("stub")
+
+        split_path, _ = self._stage(monkeypatch, tmp_path, prepare_one=fake)
+        args = run_mod.build_parser().parse_args(
+            ["prepare", "--split", str(split_path), "--batch", str(tmp_path / "batch")]
+        )
+        run_mod.cmd_prepare(args)
+        assert watch.peak == 1, (
+            "two bugs prepared at once at the default --prepare-jobs 1: the budget "
+            "did not hold the pool to one worker"
+        )
+        assert watch.keys == ["Demo/1", "Other/2"], (
+            "the bugs were prepared out of the split's order even though one worker "
+            f"ran them: {watch.keys}"
         )
 
 

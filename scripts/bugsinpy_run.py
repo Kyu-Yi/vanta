@@ -41,6 +41,7 @@ import os
 import subprocess
 import sys
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -420,7 +421,22 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         flush=True,
     )
 
-    for entry, full in selected:
+    # [VANTA-WHY] M3 item Y1 — different bugs are independent, so every bug is
+    # submitted at once and the ONE budget decides how many overlap, exactly as it
+    # does for a bug's own derivations. Submitting them adds no concurrency the
+    # operator did not ask for: at `--prepare-jobs 1` the budget is a single core,
+    # so the gate admits one suite run at a time and a bug's second VM waits for the
+    # first's slot to free; the pool below is `max(1, budget.cores)` workers, which
+    # is one at that setting and therefore the same serial loop, in the same order,
+    # producing the same `preps` and `broken` — the worker's index decides a bug's
+    # place in both lists, never its completion order. This is what lets bug A's
+    # vanta run (which starts when A's oracle pair lands, its real dependency)
+    # overlap bug B's still-running derivations instead of waiting for the whole
+    # batch to reach A's turn.
+    slots: list[Optional[tuple[str, Any]]] = [None] * len(selected)
+
+    def prepare_bug(index: int, entry: Mapping[str, Any], full: bool) -> None:
+        """One bug's prepare, under the invocation's one budget (M3 item Y1)."""
         key = bug_key(entry)
         project = entry["project"]
         print(f"[{key}] {'full' if full else 'context-only'} ...", flush=True)
@@ -430,17 +446,17 @@ def cmd_prepare(args: argparse.Namespace) -> int:
                 f"PrepareError: checkpoint {checkpoint} does not exist. Bake it first "
                 "(design §11 step 3 for py3.8, §3.2 for the older interpreters)."
             )
-            broken.append((key, detail))
+            slots[index] = ("broken", (key, detail))
             print(f"[{key}] FAILED — {detail}", flush=True)
-            continue
+            return
         if full and checkpoint in missing_provenance:
             detail = (
                 f"BakeError: no dependency provenance for {checkpoint} under {deps_dir}. "
                 "Its dependencies could not be read at bake time; re-run bake for it."
             )
-            broken.append((key, detail))
+            slots[index] = ("broken", (key, detail))
             print(f"[{key}] FAILED — {detail}", flush=True)
-            continue
+            return
         try:
             url = meta_mod.project_github_url(bugsinpy_root, project)
             if not url:
@@ -463,14 +479,30 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             )
         except Exception as exc:  # one bug must not take the batch down
             detail = f"{type(exc).__name__}: {exc}"
-            broken.append((key, detail))
+            slots[index] = ("broken", (key, detail))
             print(f"[{key}] FAILED — {detail}", flush=True)
             if args.traceback:
                 traceback.print_exc()
-            continue
-
-        preps.append(prep)
+            return
+        slots[index] = ("prep", prep)
         print(f"[{key}] {'ok' if prep.runnable else 'not runnable'}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=max(1, budget.cores)) as pool:
+        futures = [
+            pool.submit(prepare_bug, index, entry, full)
+            for index, (entry, full) in enumerate(selected)
+        ]
+        for future in futures:
+            future.result()
+
+    for slot in slots:
+        if slot is None:
+            continue
+        kind, value = slot
+        if kind == "prep":
+            preps.append(value)
+        else:
+            broken.append(value)
 
     for prep in preps:
         if prep.issue is not None:

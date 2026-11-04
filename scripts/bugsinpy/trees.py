@@ -31,6 +31,7 @@ import hashlib
 import re
 import shutil
 import subprocess
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,12 +56,40 @@ def _git(args: list[str], *, cwd: Optional[Path]) -> str:
     return proc.stdout
 
 
+def _clone_lock(dest: Path) -> threading.Lock:
+    """The lock that guards one cache destination's clone."""
+    with _CLONE_LOCKS_GUARD:
+        lock = _CLONE_LOCKS.get(str(dest))
+        if lock is None:
+            lock = threading.Lock()
+            _CLONE_LOCKS[str(dest)] = lock
+        return lock
+
+
+_CLONE_LOCKS: dict[str, threading.Lock] = {}
+_CLONE_LOCKS_GUARD = threading.Lock()
+
+
 def ensure_project_clone(cache_root: Path, project: str, url: str) -> Path:
-    """Clone (once) the upstream project repo and return the cache path."""
+    """Clone (once) the upstream project repo and return the cache path.
+
+    [VANTA-WHY] M3 item Y1 — the "once" is now enforced under concurrency rather
+    than assumed. ``prepare`` overlaps different bugs (and different bugs of one
+    project, e.g. the dev split's two ``fastapi`` bugs), so two callers can reach
+    an absent destination at the same time; both would run ``git clone`` into it
+    and git refuses the second ("destination path already exists"), failing a bug
+    for a race rather than for anything about the bug. The lock is per
+    destination, so two *different* projects still clone in parallel, and the
+    second check inside it is what makes the common "somebody else just made it"
+    case a plain return.
+    """
     dest = cache_root / f"{project}.git"
-    if not dest.is_dir():
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        _git(["clone", "--quiet", "--", url, str(dest)], cwd=None)
+    if dest.is_dir():
+        return dest
+    with _clone_lock(dest):
+        if not dest.is_dir():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            _git(["clone", "--quiet", "--", url, str(dest)], cwd=None)
     return dest
 
 

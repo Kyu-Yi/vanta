@@ -44,7 +44,8 @@ are therefore comparable, and the parts the model produced are not:
     ``native_timeout``, plus the ``scheduler`` block's wall time, deadline left and
     provider retries. This last group is the S6 half of the gate, stated by Nathan
     as *"Concurrency must not change outcomes through time limits ... If any does,
-    the recommended --jobs is too high for this Mac."*
+    the recommended --jobs is too high for this Mac."* ``flaky_nodeids`` is the one
+    exception inside this group — M3 item AA5, below.
   * **Not comparable** (expected to differ): the patches the model wrote, and
     therefore the labels and oracle gradings derived from them. A row's identity
     includes its candidate patch's SHA-256 for exactly this reason. Two rows whose
@@ -56,6 +57,17 @@ The one place the two meet is a row whose candidate **bytes match**: then the
 grading is a measurement of the same patch, so its **oracle** block must be
 identical and a difference there fails the gate. Its **labels** are a different
 matter (see below).
+
+THE FLAKY SET (M3 item AA5)
+---------------------------
+Which tests a batch happens to *catch* being flaky is a fact about the clock, not
+about the tree: the same suite can flip a different test on each run, so two
+batches of one tree will not agree on ``flaky_nodeids`` for free. A difference
+that is *only* that is therefore given its own verdict, ``identical_except_flaky``
+(exit 4), with the nodeids each side saw and the other did not listed per side —
+and only when the difference is proven inert: nothing else in ``prepare`` or
+``rows`` differs, and no matched row's label moved (a moved grading already fails
+``rows``). Anything else is ``not_identical``, exactly as before this item.
 
 WHY A MATCHED ROW'S LABEL IS REPORTED AND NOT GRADED
 ----------------------------------------------------
@@ -162,12 +174,19 @@ PREPARE_NAME = "prepare.json"
 PREPARE_NODEID_FIELDS = (
     "fail_to_pass",
     "f2p_undeclared",
-    "flaky_nodeids",
     "preexisting_failures",
     "native_failure_baseline",
     "collect_flip_nodeids",
 )
-"""The per-nodeid sets ``prepare.json`` records per bug — the S5 half of the gate."""
+"""The per-nodeid sets ``prepare.json`` records per bug — the S5 half of the gate.
+
+[VANTA-WHY] M3 item AA5 — ``flaky_nodeids`` is deliberately NOT in this tuple.
+Which tests a batch happens to *catch* in the act of being flaky is a fact about
+the clock, not about the tree: the same suite can flip a different test on each
+run. It is compared, but as its own category
+(:func:`compare_prepare`'s ``flaky_differences``) and under the ``identical_except_flaky``
+verdict, never as a plain nodeid difference.
+"""
 
 PREPARE_SCALAR_FIELDS = (
     "native_skips_buggy",
@@ -288,6 +307,24 @@ def _counts(values: Iterable[str]) -> dict[str, int]:
     for value in values:
         out[value] = out.get(value, 0) + 1
     return dict(sorted(out.items()))
+
+
+def _in_scope(
+    records: Sequence[Mapping[str, Any]], bugs: Optional[Sequence[str]]
+) -> list[Mapping[str, Any]]:
+    """The records for the bugs in scope; ``None`` keeps every record.
+
+    [VANTA-WHY] M3 item X3 — ``--bug`` must scope the cache half the same way it
+    already scopes ``prepare`` and ``rows``. Before this, ``--bug pandas/1`` still
+    checked every other bug's hits, so an unrelated bug's unresolvable entry could
+    turn a scoped comparison into ``identical_unverified`` — the operator asking
+    about one bug was told about another. ``None`` (no ``--bug``) is the identity,
+    so the unscoped behaviour is bit-for-bit what it was.
+    """
+    if bugs is None:
+        return list(records)
+    wanted = {str(bug) for bug in bugs}
+    return [record for record in records if str(record.get("bug") or "") in wanted]
 
 
 def prepare_suite_cache(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -513,7 +550,17 @@ def compare_oracle(
 def compare_prepare(
     serial: Mapping[str, Any], parallel: Mapping[str, Any], bugs: Sequence[str]
 ) -> dict[str, Any]:
-    """The S5 half: are the two preparations' nodeid-level facts the same?"""
+    """The S5 half: are the two preparations' nodeid-level facts the same?
+
+    [VANTA-WHY] M3 item AA5 — the returned block distinguishes two kinds of
+    agreement. ``identical`` still means *nothing at all differs*, so every
+    existing reader keeps its meaning. ``identical_except_flaky`` is the wider
+    one: everything agrees apart from ``flaky_nodeids``, which is a difference the
+    clock can manufacture on its own. The two are separate keys rather than a
+    widened ``identical`` because the module's rule is that ``identical`` must
+    never overclaim (see :func:`compare_batches`, which decides whether the flaky
+    difference is inert before it may use the wider key).
+    """
     left = prepare_bugs(serial)
     right = prepare_bugs(parallel)
     per_bug: dict[str, Any] = {}
@@ -523,6 +570,7 @@ def compare_prepare(
         if a is None or b is None:
             per_bug[bug] = {
                 "identical": False,
+                "identical_except_flaky": False,
                 "reason": f"prepared in only one batch: "
                 f"serial={a is not None} parallel={b is not None}",
             }
@@ -533,6 +581,14 @@ def compare_prepare(
             only_parallel = sorted(set(b.get(field) or []) - set(a.get(field) or []))
             if only_serial or only_parallel:
                 nodeids[field] = {"only_in_serial": only_serial, "only_in_parallel": only_parallel}
+        # M3 item AA5 — the flaky set, compared in its own category.
+        flaky_only_serial = sorted(set(a.get("flaky_nodeids") or []) - set(b.get("flaky_nodeids") or []))
+        flaky_only_parallel = sorted(set(b.get("flaky_nodeids") or []) - set(a.get("flaky_nodeids") or []))
+        flaky = (
+            {"only_in_serial": flaky_only_serial, "only_in_parallel": flaky_only_parallel}
+            if flaky_only_serial or flaky_only_parallel
+            else {}
+        )
         scalars = {
             field: [a.get(field), b.get(field)]
             for field in PREPARE_SCALAR_FIELDS
@@ -545,11 +601,17 @@ def compare_prepare(
         }
         per_bug[bug] = {
             "nodeid_differences": nodeids,
+            "flaky_differences": flaky,
             "scalar_differences": scalars,
             "timing": timing,
-            "identical": not nodeids and not scalars,
+            "identical": not nodeids and not scalars and not flaky,
+            "identical_except_flaky": not nodeids and not scalars,
         }
-    return {"bugs": per_bug, "identical": all(b["identical"] for b in per_bug.values())}
+    return {
+        "bugs": per_bug,
+        "identical": all(b["identical"] for b in per_bug.values()),
+        "identical_except_flaky": all(b["identical_except_flaky"] for b in per_bug.values()),
+    }
 
 
 def compare_rows(
@@ -784,6 +846,7 @@ def compare_cache(
     parallel_prepare: Mapping[str, Any],
     serial_rows: Sequence[Mapping[str, Any]],
     parallel_rows: Sequence[Mapping[str, Any]],
+    bugs: Optional[Sequence[str]] = None,
 ) -> dict[str, Any]:
     """Prove the two batches did not share a suite-cache root — or say that it cannot.
 
@@ -800,13 +863,24 @@ def compare_cache(
     ``identical_unverified`` verdict, never a plain ``identical`` (which would claim a
     proof that was not made) and never a false ``not_identical`` (which would blame
     the batches for a directory that is gone).
+
+    [VANTA-WHY] M3 item X3 — ``bugs`` scopes the **hit checks and the summaries**
+    to the bugs the operator asked about, and nothing else. The **root** stays
+    read from *every* record on both sides (``cache_dirs`` and the shared-root
+    test below): sharing a root is a fact about the whole batch, and a scoped
+    ``--bug`` must not be able to hide it by leaving the shared root's records
+    out of scope. ``None`` is the identity, so an unscoped comparison is
+    unchanged.
     """
-    serial_suite = prepare_suite_cache(serial_prepare)
-    parallel_suite = prepare_suite_cache(parallel_prepare)
-    serial_native = native_cache_records(serial_rows)
-    parallel_native = native_cache_records(parallel_rows)
-    serial_dirs = cache_dirs(serial_suite)
-    parallel_dirs = cache_dirs(parallel_suite)
+    all_serial_suite = prepare_suite_cache(serial_prepare)
+    all_parallel_suite = prepare_suite_cache(parallel_prepare)
+    serial_suite = _in_scope(all_serial_suite, bugs)
+    parallel_suite = _in_scope(all_parallel_suite, bugs)
+    serial_native = _in_scope(native_cache_records(serial_rows), bugs)
+    parallel_native = _in_scope(native_cache_records(parallel_rows), bugs)
+    # Root detection reads every record, deliberately unscoped (see the docstring).
+    serial_dirs = cache_dirs(all_serial_suite)
+    parallel_dirs = cache_dirs(all_parallel_suite)
 
     problems: list[str] = []
     unverified: list[str] = []
@@ -833,6 +907,7 @@ def compare_cache(
 
     return {
         "checked": checked,
+        "bugs": list(bugs) if bugs is not None else None,
         "problems": problems,
         "unverified": unverified,
         "serial": {
@@ -918,7 +993,13 @@ def compare_batches(
 
     prepare = compare_prepare(serial_prepare, parallel_prepare, wanted)
     rows = compare_rows(serial_rows, parallel_rows, excluded_by_bug)
-    cache = compare_cache(serial_prepare, parallel_prepare, serial_rows, parallel_rows)
+    # [VANTA-WHY] M3 item X3 — `bugs` (the raw `--bug`, `None` when unset) scopes the
+    # cache half's hit checks and summaries. `wanted` is deliberately NOT passed: it
+    # is the all-bugs union when `--bug` is absent, and the root/shared-root test must
+    # keep reading every record either way.
+    cache = compare_cache(
+        serial_prepare, parallel_prepare, serial_rows, parallel_rows, bugs=bugs
+    )
     # [VANTA-WHY] M3 item Z2 — the build stamps of two batches that are *meant* to
     # come from different builds. Read and reported; never folded into the verdict.
     build = compare_build(serial_rows, parallel_rows, wanted)
@@ -937,20 +1018,60 @@ def compare_batches(
         "matched_rows": len(rows["matched"]),
         "ran": bool(wanted) and bool(serial_rows or parallel_rows),
     }
-    passed = bool(
-        compared["ran"] and prepare["identical"] and rows["identical"] and cache["identical"]
+    # [VANTA-WHY] M3 item AA5 — which tests a batch catches being flaky is a fact
+    # about the clock, so a difference there is not a disagreement about the tree:
+    # the timing batch's pandas/1 was `not_identical` from a flaky Hypothesis test
+    # and nothing else. But the carve-out is allowed ONLY when the difference is
+    # inert, and the two ways it could not be are exactly the two a comparison can
+    # see: it must not have moved any row's grading (a moved grading fails
+    # ``rows["identical"]``, which still gates ``passed`` below), and it must not
+    # have moved any row's label. A label is reported and not graded (rule (b)), so
+    # a label difference alone never fails the gate — but it is also the one place
+    # we cannot prove the flaky flip was innocent, and the rule is "otherwise it is
+    # ``not_identical`` as now". So any label difference at all withholds the carve-out.
+    flaky_diff_bugs = sorted(
+        bug
+        for bug, block in (prepare["bugs"] or {}).items()
+        if block.get("flaky_differences")
     )
-    # [VANTA-WHY] M3 item Z2 — three outcomes, not two. Everything agreeing with the
-    # cache half fully verified is `identical`; everything agreeing but a side's hits
-    # unresolvable is `identical_unverified` — the comparison passed, but the cache
-    # half of the proof was not available, so a plain `identical` would overclaim. A
-    # real difference is `not_identical` and wins over an unverifiable side.
+    label_changed = any(row.get("label_differences") for row in rows["matched"])
+    flaky_only = bool(flaky_diff_bugs) and not label_changed
+    # A flaky difference that is NOT proven inert is a real difference, so it fails
+    # the fold rather than falling through to a softer verdict. This is the "as now"
+    # half of the rule: before this item a flaky difference was a prepare difference,
+    # and the same input must still read `not_identical`.
+    flaky_unexcused = bool(flaky_diff_bugs) and label_changed
+    passed = bool(
+        compared["ran"]
+        and prepare["identical_except_flaky"]
+        and rows["identical"]
+        and cache["identical"]
+        and not flaky_unexcused
+    )
+    # [VANTA-WHY] M3 item Z2/AA5 — four outcomes, in this order. A real difference
+    # (which now includes "prepare moved in a way the flaky carve-out does not cover")
+    # is `not_identical` and wins over every softer verdict. An unverifiable cache
+    # side is next: the comparison passed, but the cache half of the proof was not
+    # available, so a plainer verdict would overclaim — and the carve-out's own rule
+    # is "nothing else differs", which an unresolvable side contradicts. Only then
+    # the flaky carve-out, and only for a difference proven inert. Everything else
+    # is plain `identical`.
     if not passed:
         verdict = "not_identical"
     elif cache["unverified"]:
         verdict = "identical_unverified"
+    elif flaky_only:
+        verdict = "identical_except_flaky"
     else:
         verdict = "identical"
+    flaky = {
+        "bugs": flaky_diff_bugs,
+        "differences": {
+            bug: (prepare["bugs"][bug].get("flaky_differences") or {}) for bug in flaky_diff_bugs
+        },
+        "label_changed": label_changed,
+        "discounted": flaky_only,
+    }
     return {
         "schema_version": SCHEMA_VERSION,
         "serial": {
@@ -972,6 +1093,7 @@ def compare_batches(
         "prepare": prepare,
         "cache": cache,
         "rows": rows,
+        "flaky": flaky,
         "verdict": verdict,
     }
 
@@ -991,7 +1113,15 @@ def verdict_line(report: Mapping[str, Any], *, cap: int = 8) -> str:
     bugs = ", ".join(report.get("bugs") or []) or "-"
     head = f"compare-batches {bugs}: {report['verdict']}"
     prepare_bugs_report = (report.get("prepare") or {}).get("bugs") or {}
-    prepare_diffs = sorted(b for b, block in prepare_bugs_report.items() if not block["identical"])
+    # M3 item AA5 — `identical` is False for a bug whose ONLY difference is the flaky
+    # set, which the verdict discounts; a bug belongs in the failure list only when
+    # the difference survives the carve-out. `.get(..., block["identical"])` keeps a
+    # hand-built report (one that predates the wider key) reading as it always did.
+    prepare_diffs = sorted(
+        b
+        for b, block in prepare_bugs_report.items()
+        if not block.get("identical_except_flaky", block["identical"])
+    )
     rows = report.get("rows") or {}
     matched = rows.get("matched") or []
     row_diffs = [row for row in matched if not row["identical"]]
@@ -1005,6 +1135,7 @@ def verdict_line(report: Mapping[str, Any], *, cap: int = 8) -> str:
     cache_problems = (report.get("cache") or {}).get("problems") or []
     cache_unverified = (report.get("cache") or {}).get("unverified") or []
     build_diffs = (report.get("build") or {}).get("differences") or []
+    flaky_bugs = (report.get("flaky") or {}).get("bugs") or []
     parts = [
         f"prepare_diffs={len(prepare_diffs)}",
         f"matched={len(matched)}",
@@ -1015,6 +1146,7 @@ def verdict_line(report: Mapping[str, Any], *, cap: int = 8) -> str:
         f"unmatched_candidates={n_unmatched}",
         f"cache_problems={len(cache_problems)}",
         f"cache_unverified={len(cache_unverified)}",
+        f"flaky_diffs={len(flaky_bugs)}",
         f"build_diffs={len(build_diffs)}",
     ]
     line = f"{head} ({', '.join(parts)})"
@@ -1034,6 +1166,24 @@ def verdict_line(report: Mapping[str, Any], *, cap: int = 8) -> str:
         shown = ", ".join(named[:cap])
         more = "" if len(named) <= cap else f", +{len(named) - cap} more"
         line += f" [prepare {shown}{more}]"
+    # M3 item AA5 — a flaky-only difference is discounted, not a failure, so it is
+    # named as its own thing (with the nodeids each side saw and the other did not),
+    # or the operator cannot tell which difference the verdict excused.
+    if flaky_bugs:
+        named_flaky: list[str] = []
+        for bug in flaky_bugs:
+            diff = (prepare_bugs_report.get(bug) or {}).get("flaky_differences") or {}
+            serial_only = ", ".join(diff.get("only_in_serial") or []) or "-"
+            parallel_only = ", ".join(diff.get("only_in_parallel") or []) or "-"
+            named_flaky.append(
+                f"{bug} serial-only=[{serial_only}] parallel-only=[{parallel_only}]"
+            )
+        shown = "; ".join(named_flaky[:cap])
+        more = "" if len(named_flaky) <= cap else f"; +{len(named_flaky) - cap} more"
+        excuse = "" if (report.get("flaky") or {}).get("discounted", True) else (
+            " (withheld: a label moved)"
+        )
+        line += f" [flaky{excuse}: {shown}{more}]"
     if limits:
         line += f" [time limits: {len(limits)} group(s)]"
     if cache_problems:
@@ -1072,6 +1222,52 @@ def write_report(report: Mapping[str, Any], path: Path) -> Path:
     return path
 
 
+PER_BUG_DIRNAME = "compare_batches"
+"""M3 item AA5 — where the per-bug reports go, under the parallel batch directory.
+
+``<parallel>/compare_batches.json`` is the whole comparison; a file per bug beside
+it (``<parallel>/compare_batches/<bug>.json``) is the same comparison as
+``--bug <bug>`` would have produced, so a single bug's equivalence can be read —
+and cited — on its own.
+"""
+
+
+def bug_slug(bug: str) -> str:
+    """A bug key as a file name. ``pandas/1`` → ``pandas__1``.
+
+    A bug key contains ``/`` by construction, so it cannot be a file name as it
+    stands: ``pandas/1.json`` would write into a ``pandas`` directory rather than
+    beside the other bugs, and ``write_report`` would be handed a path whose parent
+    does not exist. The separator is doubled rather than dropped so the slug always
+    shows where the split was.
+
+    The mapping is injective over the keys a manifest actually writes — always
+    ``<project>/<index>``, exactly one ``/``, and the index is digits-only — so two
+    distinct bugs never share a file. It is *not* injective over arbitrary strings
+    (a synthetic ``a__b`` and ``a/b`` both slug to ``a__b``); that is fine, because
+    the only keys it is ever called with come from the manifest.
+    """
+    return str(bug).replace("/", "__")
+
+
+def write_per_bug_reports(
+    serial_dir: Path, parallel_dir: Path, bugs: Sequence[str]
+) -> dict[str, Path]:
+    """Write one `--bug`-scoped report per bug, and return bug → path.
+
+    Each file is a real re-run of :func:`compare_batches` scoped to that one bug,
+    not a slice of the whole report: scoping also narrows the cache half (M3 item
+    X3) and the row set, so a slice would quietly disagree with what ``--bug``
+    prints. The comparison is pure file reading, so re-running it per bug is cheap.
+    """
+    directory = Path(parallel_dir) / PER_BUG_DIRNAME
+    out: dict[str, Path] = {}
+    for bug in bugs:
+        scoped = compare_batches(serial_dir, parallel_dir, bugs=[bug])
+        out[bug] = write_report(scoped, directory / f"{bug_slug(bug)}.json")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1105,6 +1301,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
     try:
         report = compare_batches(args.serial, args.parallel, bugs=args.bug)
+        # M3 item AA5 — the per-bug reports are computed inside the `try` with the
+        # main comparison: they re-read the same two batches, so a read failure must
+        # be exit 2 ("cannot read"), never a half-written run that already printed a
+        # verdict. `--no-report` writes nothing at all, as it always has.
+        per_bug = (
+            {}
+            if args.no_report
+            else write_per_bug_reports(args.serial, args.parallel, report["bugs"])
+        )
     except CompareError as exc:
         print(f"compare-batches: {exc}", file=sys.stderr)
         return 2
@@ -1121,11 +1326,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.no_report:
         path = args.report or (Path(args.parallel) / "compare_batches.json")
         print(f"report: {write_report(report, path)}")
-    # [VANTA-WHY] M3 item Z2 — three outcomes need three codes: 0 identical, 3
+        for bug in report["bugs"]:
+            print(f"report [{bug}]: {per_bug[bug]}")
+    # [VANTA-WHY] M3 item Z2/AA5 — four outcomes need four codes: 0 identical, 3
     # `identical_unverified` (the batches agree, but a side's cache isolation could
-    # not be resolved), and 1 `not_identical` (a real difference — and, because the
-    # fold runs first, a real difference always wins over an unverifiable side).
-    return {"identical": 0, "identical_unverified": 3}.get(report["verdict"], 1)
+    # not be resolved), 4 `identical_except_flaky` (the batches agree apart from a
+    # flaky-set difference proven inert — M3 item AA5, its own code so a gate can
+    # tell it from a plain pass), and 1 `not_identical` (a real difference — and,
+    # because the fold runs first, a real difference always wins over the softer
+    # verdicts).
+    return {"identical": 0, "identical_unverified": 3, "identical_except_flaky": 4}.get(
+        report["verdict"], 1
+    )
 
 
 if __name__ == "__main__":

@@ -7060,6 +7060,29 @@ class TestCompareBatches:
         assert report["identical"] is False
         assert "only one batch" in report["bugs"]["pandas/1"]["reason"]
 
+    # -- M3 item AA5: the flaky set is its own category ----------------------
+    def test_a_flaky_only_difference_is_not_a_plain_nodeid_difference(self):
+        # Which tests a batch catches being flaky is a fact about the clock, so a
+        # difference there must not read as `fail_to_pass` moving.
+        report = compare_batches_mod.compare_prepare(
+            self._prepare(flaky_nodeids=["t::flaky"]), self._prepare(), ["pandas/1"]
+        )
+        bug = report["bugs"]["pandas/1"]
+        assert bug["nodeid_differences"] == {}
+        assert bug["flaky_differences"] == {"only_in_serial": ["t::flaky"], "only_in_parallel": []}
+        assert report["identical"] is False
+        assert report["identical_except_flaky"] is True
+
+    def test_a_flaky_difference_beside_a_real_one_is_not_excused(self):
+        serial = self._prepare(flaky_nodeids=["t::flaky"], fail_to_pass=["t::a", "t::b"])
+        parallel = self._prepare(fail_to_pass=["t::a"])
+        report = compare_batches_mod.compare_prepare(serial, parallel, ["pandas/1"])
+        assert report["identical_except_flaky"] is False
+
+    def test_a_bug_prepared_once_never_reads_identical_except_flaky(self):
+        report = compare_batches_mod.compare_prepare({"bugs": [{"bug": "pandas/1"}]}, {"bugs": []}, ["pandas/1"])
+        assert report["identical_except_flaky"] is False
+
     @staticmethod
     def _prepare(**over: Any) -> dict[str, Any]:
         block = {
@@ -7352,6 +7375,306 @@ class TestCompareBatches:
         report = compare_batches_mod.compare_cache(serial, parallel, [], [])
         assert report["identical"] is True
         assert report["unverified"] == []
+
+    # -- M3 item X3: --bug scopes the cache half too -------------------------
+    @staticmethod
+    def _bug_run(bug: str, *, key: str = "", state: str = "miss", directory: str = "") -> dict[str, Any]:
+        """One bug block carrying a single prepare-suite cache record."""
+        return {
+            "bug": bug,
+            "flaky_nodeids": [],
+            "scheduler": {
+                "runs": {
+                    "vanta_tree": {
+                        "cache": {
+                            "key": key,
+                            "state": state,
+                            "source": "",
+                            "would_hit": False,
+                            "dir": directory,
+                        }
+                    }
+                }
+            },
+        }
+
+    def test_the_bug_flag_scopes_the_cache_hit_checks(self, tmp_path):
+        # M3 item X3 — `other/2` recorded a hit whose entry is nowhere, but the
+        # operator asked about `pandas/1`, so that gap must not be reported as this
+        # comparison's.
+        def payload(prefix: str, *, other_hit: bool) -> dict[str, Any]:
+            return {
+                "bugs": [
+                    self._bug_run("pandas/1", directory=str(tmp_path / f"{prefix}-pandas")),
+                    self._bug_run(
+                        "other/2",
+                        key=("9" * 64) if other_hit else "",
+                        state="hit" if other_hit else "miss",
+                        directory=str(tmp_path / f"{prefix}-other"),
+                    ),
+                ]
+            }
+
+        serial = payload("serial", other_hit=True)
+        parallel = payload("parallel", other_hit=False)
+
+        scoped = compare_batches_mod.compare_cache(serial, parallel, [], [], bugs=["pandas/1"])
+        assert scoped["bugs"] == ["pandas/1"]
+        assert scoped["unverified"] == []
+        assert scoped["identical"] is True
+
+        # Unscoped, the same batches DO carry the unresolvable hit — the difference
+        # the scoping makes, stated as a fact rather than assumed.
+        unscoped = compare_batches_mod.compare_cache(serial, parallel, [], [])
+        assert unscoped["bugs"] is None
+        assert unscoped["unverified"] != []
+
+    def test_a_shared_root_is_still_found_when_the_named_bug_is_not_the_sharer(self, tmp_path):
+        # The root test is deliberately unscoped: sharing a cache directory is a fact
+        # about the whole batch, and `--bug` must not be able to hide it by leaving
+        # the sharing bug's records out of scope.
+        shared = str(tmp_path / "one-cache")
+
+        def payload(prefix: str) -> dict[str, Any]:
+            return {
+                "bugs": [
+                    self._bug_run("pandas/1", directory=str(tmp_path / f"{prefix}-pandas")),
+                    self._bug_run("other/2", directory=shared),
+                ]
+            }
+
+        report = compare_batches_mod.compare_cache(
+            payload("serial"), payload("parallel"), [], [], bugs=["pandas/1"]
+        )
+        assert report["problems"]
+        assert "same suite cache directory" in report["problems"][0]
+        assert report["identical"] is False
+
+    def test_without_the_bug_flag_the_cache_summaries_stay_unscoped(self, tmp_path):
+        payload = {
+            "bugs": [
+                self._bug_run("pandas/1", directory=str(tmp_path / "a")),
+                self._bug_run("other/2", directory=str(tmp_path / "b")),
+            ]
+        }
+        report = compare_batches_mod.compare_cache(payload, payload, [], [])
+        assert report["bugs"] is None
+        assert report["serial"]["prepare"]["total"] == 2
+
+    def test_the_bug_flag_keeps_an_unrelated_cache_gap_out_of_the_verdict(self, tmp_path):
+        # The end-to-end shape of X3: everything agrees for `pandas/1`, and the other
+        # bug's unresolvable hit — which the operator never asked about — must not
+        # turn the scoped verdict into `identical_unverified`.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+
+        def prepare(prefix: str, *, other_hit: bool) -> dict[str, Any]:
+            return {
+                "bugs": [
+                    self._bug_run("pandas/1", directory=str(tmp_path / f"{prefix}-pandas")),
+                    self._bug_run(
+                        "other/2",
+                        key=("9" * 64) if other_hit else "",
+                        state="hit" if other_hit else "miss",
+                        directory=str(tmp_path / f"{prefix}-other"),
+                    ),
+                ]
+            }
+
+        self._write_batch(serial, rows=[self._row()], prepare=prepare("serial", other_hit=True))
+        self._write_batch(parallel, rows=[self._row()], prepare=prepare("parallel", other_hit=False))
+
+        scoped = compare_batches_mod.compare_batches(serial, parallel, bugs=["pandas/1"])
+        assert scoped["verdict"] == "identical"
+        assert scoped["cache"]["unverified"] == []
+        assert compare_batches_mod.main(
+            [
+                "--serial",
+                str(serial),
+                "--parallel",
+                str(parallel),
+                "--bug",
+                "pandas/1",
+                "--no-report",
+            ]
+        ) == 0
+        # Unscoped, the same batches reach the honest third verdict.
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == (
+            "identical_unverified"
+        )
+
+    # -- M3 item AA5: the flaky-only verdict --------------------------------
+    def test_a_flaky_only_difference_reads_identical_except_flaky_and_exit_four(self, tmp_path):
+        # The timing batch's pandas/1 was `not_identical` from a flaky Hypothesis test
+        # and nothing else. That difference is the clock's, so it gets its own verdict
+        # and its own exit code rather than failing a gate it did not break.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(
+            serial, rows=[self._row()], prepare=self._prepare(flaky_nodeids=["t::flaky"])
+        )
+        self._write_batch(parallel, rows=[self._row()])
+
+        report = compare_batches_mod.compare_batches(serial, parallel)
+
+        assert report["verdict"] == "identical_except_flaky"
+        assert report["flaky"]["bugs"] == ["pandas/1"]
+        assert report["flaky"]["differences"]["pandas/1"] == {
+            "only_in_serial": ["t::flaky"],
+            "only_in_parallel": [],
+        }
+        assert report["flaky"]["discounted"] is True
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 4
+
+    def test_the_flaky_carve_out_is_withheld_when_a_label_moved(self, tmp_path):
+        # A label difference alone never fails the gate — but beside a flaky difference
+        # it is the one case where the flaky flip cannot be proven innocent, and the
+        # rule is "otherwise it is `not_identical` as now".
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(
+            serial, rows=[self._row()], prepare=self._prepare(flaky_nodeids=["t::flaky"])
+        )
+        self._write_batch(parallel, rows=[self._row(label="true_reject")])
+
+        report = compare_batches_mod.compare_batches(serial, parallel)
+
+        assert report["rows"]["identical"] is True  # the label itself is not graded
+        assert report["flaky"]["label_changed"] is True
+        assert report["flaky"]["discounted"] is False
+        assert report["verdict"] == "not_identical"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 1
+
+    def test_an_unverifiable_cache_side_outranks_the_flaky_carve_out(self, tmp_path):
+        # The carve-out's own rule is "nothing else differs", and an unresolvable cache
+        # side is something else: a proof the comparison could not make.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        gone = self._prepare(
+            flaky_nodeids=["t::flaky"],
+            scheduler={
+                "runs": {
+                    "vanta_tree": {
+                        "cache": self._cache(
+                            key="7" * 64,
+                            state="hit",
+                            source="pandas/1/vanta_tree",
+                            directory=str(tmp_path / "gone-serial"),
+                        )
+                    }
+                }
+            },
+        )
+        live = self._prepare(
+            scheduler={
+                "runs": {"vanta_tree": {"cache": self._cache(directory=str(tmp_path / "live"))}}
+            }
+        )
+        self._write_batch(serial, rows=[self._row()], prepare=gone)
+        self._write_batch(parallel, rows=[self._row()], prepare=live)
+
+        report = compare_batches_mod.compare_batches(serial, parallel)
+
+        assert report["cache"]["identical"] is True
+        assert report["cache"]["unverified"]
+        assert report["verdict"] == "identical_unverified"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 3
+
+    def test_a_real_row_difference_beats_the_flaky_carve_out(self, tmp_path):
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(
+            serial, rows=[self._row()], prepare=self._prepare(flaky_nodeids=["t::flaky"])
+        )
+        self._write_batch(parallel, rows=[self._row(native_timeout=True)])
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "not_identical"
+
+    def test_a_bug_key_becomes_a_file_name_without_making_a_directory(self):
+        # `pandas/1` must become one file beside the others, not a `pandas`
+        # directory holding `1.json`.
+        assert compare_batches_mod.bug_slug("pandas/1") == "pandas__1"
+        assert "/" not in compare_batches_mod.bug_slug("pandas/1")
+        # Distinct bugs stay distinct files: the index is digits-only and a project
+        # name never contains `/`, so the joined slug is injective over real keys.
+        keys = ["pandas/1", "pandas/11", "pandas/2", "a/1", "a_/1", "a__b/1"]
+        slugs = [compare_batches_mod.bug_slug(key) for key in keys]
+        assert len(set(slugs)) == len(keys)
+
+    def test_a_per_bug_report_is_written_beside_the_main_one(self, tmp_path):
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row()])
+        assert compare_batches_mod.main(["--serial", str(serial), "--parallel", str(parallel)]) == 0
+        per_bug = parallel / "compare_batches" / "pandas__1.json"
+        assert per_bug.is_file()
+        written = json.loads(per_bug.read_text(encoding="utf-8"))
+        assert written["bugs"] == ["pandas/1"]
+        assert written["verdict"] == "identical"
+        # The per-bug file is the `--bug`-scoped comparison, so its cache half is
+        # scoped too (M3 item X3) and it never claims more than the main report.
+        assert written["cache"]["bugs"] == ["pandas/1"]
+
+    def test_no_report_writes_no_per_bug_files_either(self, tmp_path):
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row()])
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 0
+        assert not (parallel / "compare_batches").exists()
+
+    def test_verdict_line_names_the_flaky_nodeids_per_side(self):
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "identical_except_flaky",
+            "prepare": {
+                "bugs": {
+                    "pandas/1": {
+                        "identical": False,
+                        "identical_except_flaky": True,
+                        "nodeid_differences": {},
+                        "scalar_differences": {},
+                        "flaky_differences": {
+                            "only_in_serial": ["t::flaky"],
+                            "only_in_parallel": ["t::other"],
+                        },
+                    }
+                }
+            },
+            "rows": {"matched": [{"identical": True}], "time_limit_differences": {"groups": []}},
+            "flaky": {"bugs": ["pandas/1"], "discounted": True},
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert line.startswith("compare-batches pandas/1: identical_except_flaky")
+        assert "flaky_diffs=1" in line
+        # The excused difference must not be counted as a prepare failure...
+        assert "prepare_diffs=0" in line
+        # ...and both sides' nodeids must be named.
+        assert "serial-only=[t::flaky]" in line
+        assert "parallel-only=[t::other]" in line
+
+    def test_verdict_line_says_when_the_carve_out_was_withheld(self):
+        report = {
+            "bugs": ["pandas/1"],
+            "verdict": "not_identical",
+            "prepare": {
+                "bugs": {
+                    "pandas/1": {
+                        "identical": False,
+                        "identical_except_flaky": True,
+                        "nodeid_differences": {},
+                        "scalar_differences": {},
+                        "flaky_differences": {"only_in_serial": ["t::flaky"], "only_in_parallel": []},
+                    }
+                }
+            },
+            "rows": {"matched": [{"identical": True}], "time_limit_differences": {"groups": []}},
+            "flaky": {"bugs": ["pandas/1"], "discounted": False},
+        }
+        line = compare_batches_mod.verdict_line(report)
+        assert "withheld: a label moved" in line
+        assert "serial-only=[t::flaky]" in line
 
     # -- build stamps (M3 item Z2) ------------------------------------------
     def test_build_stamps_are_read_per_field_and_per_bug(self):

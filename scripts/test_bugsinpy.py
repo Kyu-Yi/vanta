@@ -6904,11 +6904,14 @@ class TestCompareBatches:
     whole shape of this module follows from solving it: only the tree-and-schedule
     facts are comparable, a row's identity includes its candidate's bytes, and the
     only rows whose label/oracle may be compared are the ones whose candidate bytes
-    match. These tests pin that rule plus the five things a difference *does* fail
-    on (a prepare nodeid, a matched row's **oracle**, a missing group, a time limit,
-    and a shared cache root). A matched row's **label** is reported and not graded
-    (rule (b), overruled in part: the Attacker writes new tests each run). Nothing
-    here boots a VM; every row is a hand-built dict in a ``tmp_path`` batch.
+    match. These tests pin that rule plus the six things a difference *does* fail
+    on (a prepare nodeid, a matched row's **oracle**, a matched row's **label**, a
+    missing group, a time limit, and a shared cache root), and the `incomparable`
+    verdict for a group whose candidate bytes exist on one side only. M3 item AB1:
+    a matched row's **label** is graded (rule (b), overruled: the Attacker writes
+    new tests each run, but they must not change how the same patch bytes are
+    graded). Nothing here boots a VM; every row is a hand-built dict in a
+    ``tmp_path`` batch.
     """
 
     @staticmethod
@@ -7111,27 +7114,34 @@ class TestCompareBatches:
         assert len(report["matched"]) == 1
         assert report["matched"][0]["identical"] is True
 
-    def test_a_matched_row_whose_label_moved_is_identical_but_reported(self):
-        # Rule (b), overruled in part: the ORACLE is the harness's deterministic
-        # measurement of these exact bytes and must match; the LABEL is the model's
-        # own account of what it changed, and the attack arm writes new tests each
-        # run, so two runs of one patch may legitimately be labelled differently.
-        # Reported side by side; never graded.
+    def test_a_matched_row_whose_label_moved_is_not_identical(self, tmp_path):
+        # M3 item AB1, rule (b) overruled: a matched row is the SAME candidate bytes
+        # on both sides, so its label — what the run concluded about those bytes — is
+        # graded, exactly as its oracle is. The values are still reported side by
+        # side, but a moved label fails the row and the gate.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(serial, rows=[self._row()])
+        self._write_batch(parallel, rows=[self._row(label="true_reject")])
+
         report = compare_batches_mod.compare_rows(
             [self._row()], [self._row(label="true_reject")], {}
         )
-        assert report["identical"] is True
-        assert report["matched"][0]["identical"] is True
+        assert report["identical"] is False
+        assert report["matched"][0]["identical"] is False
         assert report["matched"][0]["label_differences"]["label"] == [
             "true_approval",
             "true_reject",
         ]
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "not_identical"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 1
 
-    def test_a_matched_row_whose_label_rule_moved_is_also_only_reported(self):
+    def test_a_matched_row_whose_label_rule_moved_is_also_not_identical(self):
         report = compare_batches_mod.compare_rows(
             [self._row()], [self._row(label_rule="other_rule", verdict="NotFixed")], {}
         )
-        assert report["identical"] is True
+        assert report["identical"] is False
         assert sorted(report["matched"][0]["label_differences"]) == ["label_rule", "verdict"]
 
     def test_a_matched_row_whose_hidden_outcome_moved_is_not_identical(self):
@@ -7141,18 +7151,39 @@ class TestCompareBatches:
         nodeids = report["matched"][0]["oracle"]["hidden_outcomes"]
         assert nodeids["different_outcome"] == ["t::a"]
 
-    def test_differing_candidate_bytes_do_not_fail_the_gate(self):
-        # The two batches' review rows reviewed different patches. That is a fact
-        # about the model, not the scheduler, so it is reported but never a failure
-        # — the one rule that is satisfiable without a deterministic model.
-        serial = [self._row(mode="review", candidate={"patch_sha256": "aa"})]
-        parallel = [self._row(mode="review", candidate={"patch_sha256": "bb"}, label="true_reject")]
-        report = compare_batches_mod.compare_rows(serial, parallel, {})
+    def test_differing_candidate_bytes_read_incomparable(self, tmp_path):
+        # M3 item AB1. The two batches' review rows reviewed different patches: the
+        # group matched, but the candidate bytes did not, so those rows were never
+        # compared. That is neither a difference nor agreement, so it has its own
+        # verdict (`incomparable`) and its own exit code (5) — it must not read as a
+        # plain pass, which would claim a comparison that never happened.
+        serial, parallel = tmp_path / "serial", tmp_path / "parallel"
+        self._write_batch(
+            serial, rows=[self._row(mode="review", candidate={"patch_sha256": "aa"})]
+        )
+        self._write_batch(
+            parallel,
+            rows=[
+                self._row(
+                    mode="review", candidate={"patch_sha256": "bb"}, label="true_reject"
+                )
+            ],
+        )
+
+        report = compare_batches_mod.compare_rows(
+            [self._row(mode="review", candidate={"patch_sha256": "aa"})],
+            [self._row(mode="review", candidate={"patch_sha256": "bb"}, label="true_reject")],
+            {},
+        )
         assert report["missing_groups"] == []
         assert report["matched"] == []
         assert report["unmatched_candidates"]["only_in_serial"][0]["identity"][4] == "aa"
         assert report["unmatched_candidates"]["only_in_parallel"][0]["label"] == "true_reject"
-        assert report["identical"] is True
+
+        assert compare_batches_mod.compare_batches(serial, parallel)["verdict"] == "incomparable"
+        assert compare_batches_mod.main(
+            ["--serial", str(serial), "--parallel", str(parallel), "--no-report"]
+        ) == 5
 
     def test_a_group_present_in_only_one_batch_fails(self):
         report = compare_batches_mod.compare_rows([self._row()], [], {})
@@ -7527,9 +7558,10 @@ class TestCompareBatches:
         ) == 4
 
     def test_the_flaky_carve_out_is_withheld_when_a_label_moved(self, tmp_path):
-        # A label difference alone never fails the gate — but beside a flaky difference
-        # it is the one case where the flaky flip cannot be proven innocent, and the
-        # rule is "otherwise it is `not_identical` as now".
+        # M3 item AB1 — a matched row's label is now graded, so a moved label fails
+        # ``rows`` on its own; beside a flaky difference the flaky set is no longer
+        # the only difference, so the carve-out cannot excuse it. The result is the
+        # same `not_identical` as before, now for two reasons rather than one.
         serial, parallel = tmp_path / "serial", tmp_path / "parallel"
         self._write_batch(
             serial, rows=[self._row()], prepare=self._prepare(flaky_nodeids=["t::flaky"])
@@ -7538,7 +7570,7 @@ class TestCompareBatches:
 
         report = compare_batches_mod.compare_batches(serial, parallel)
 
-        assert report["rows"]["identical"] is True  # the label itself is not graded
+        assert report["rows"]["identical"] is False  # the label is graded (AB1)
         assert report["flaky"]["label_changed"] is True
         assert report["flaky"]["discounted"] is False
         assert report["verdict"] == "not_identical"

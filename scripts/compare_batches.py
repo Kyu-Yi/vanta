@@ -69,17 +69,29 @@ and only when the difference is proven inert: nothing else in ``prepare`` or
 ``rows`` differs, and no matched row's label moved (a moved grading already fails
 ``rows``). Anything else is ``not_identical``, exactly as before this item.
 
-WHY A MATCHED ROW'S LABEL IS REPORTED AND NOT GRADED
-----------------------------------------------------
-Nathan's rule (b), overruled in part: *"for matched candidates the oracle result
-must match (deterministic), but a label difference is reported side by side and
-does not fail, because the Attacker writes new tests each run."* The oracle block
-is the harness's own measurement of a fixed patch against a fixed hidden suite —
-deterministic, so a difference is a finding. A label is produced from the model's
-own report of what it changed, and the attack arm writes fresh tests every run, so
-two runs of the same patch bytes can legitimately carry different labels. Those
-differences are reported in ``rows.matched[*].label_differences`` and never fail
-the gate. Rules (a), (c), (d) and (e) are unchanged.
+WHY A MATCHED ROW'S LABEL IS GRADED (M3 item AB1)
+-------------------------------------------------
+Nathan's rule (b), overruled: a matched row is the SAME candidate bytes judged by
+the harness on both sides, so every field of its record is a statement about those
+bytes and all of them must agree. The oracle block is a measurement of a fixed
+patch against a fixed hidden suite; the label (and its rule, reason and verdict) is
+what the run concluded about that same patch. Two runs of one patch that end
+differently are a real difference in the recorded result, not noise — the attack
+arm's fresh tests change which tests ran, but they must not change how the same
+bytes are graded, and when they do that IS the finding. A moved label therefore
+fails ``rows`` exactly as a moved oracle does; it is still reported in
+``rows.matched[*].label_differences`` for side-by-side reading. Rules (a), (c),
+(d) and (e) are unchanged.
+
+UNMATCHED CANDIDATES (M3 item AB1)
+----------------------------------
+A review row whose candidate bytes are unique to one batch was never compared:
+there is no matched counterpart. That is neither a difference nor agreement, so it
+gets its own verdict, ``incomparable`` (exit 5), naming the groups that have
+candidates on one side only. It ranks below ``not_identical`` — a proven difference
+is the stronger, more actionable statement — and above the soft passes
+(``identical_unverified`` / ``identical_except_flaky`` / ``identical``), because a
+comparison that could not be made must never read as one that passed.
 
 CACHE ISOLATION
 ---------------
@@ -109,18 +121,23 @@ The check is *never skipped silently*, and it is honest about what it cannot see
 
 VERDICT
 -------
-``identical`` requires all five: no prepare-side nodeid difference, no matched-row
-oracle difference, no group present in only one batch, no time-limit difference
-(neither a matched row whose flags moved nor a group that hit a limit in the
-parallel batch where the serial batch did not), and no cache-isolation problem.
-It additionally requires that the comparison was not vacuous: at least one bug was
-wanted and at least one row existed across the two batches. Two batches that
-compared nothing (no ``prepare.json`` bugs, no rows) are ``not_identical``, never
-``identical`` — ``all([])`` is ``True``, and a gate must not pass on absence.
+``identical`` requires all six: no prepare-side nodeid difference, no matched-row
+difference (the oracle AND the label must match, both being statements about the
+same candidate bytes), no group present in only one batch, no unmatched candidate
+group, no time-limit difference (neither a matched row whose flags moved nor a
+group that hit a limit in the parallel batch where the serial batch did not), and
+no cache-isolation problem. It additionally requires that the comparison was not
+vacuous: at least one bug was wanted and at least one row existed across the two
+batches. Two batches that compared nothing (no ``prepare.json`` bugs, no rows) are
+``not_identical``, never ``identical`` — ``all([])`` is ``True``, and a gate must
+not pass on absence.
 
-When everything agrees but a side's cache isolation could not be verified, the
-verdict is ``identical_unverified``: the comparison passed, but the cache half of
-the proof was not available. Build-stamp differences never change the verdict.
+The verdicts, worst first: ``not_identical`` (exit 1, a proven difference),
+``incomparable`` (exit 5, a group whose candidates exist on one side only, so its
+rows were never compared), ``identical_unverified`` (exit 3, agreed but the cache
+half of the proof was unavailable), ``identical_except_flaky`` (exit 4, agreed
+apart from a flaky-set difference proven inert) and ``identical`` (exit 0). Build
+stamp differences are reported and never change the verdict.
 
 USAGE (run from the repository root)
 ------------------------------------
@@ -627,12 +644,16 @@ def compare_rows(
     for key in sorted(set(left) & set(right)):
         a, b = left[key], right[key]
         bug = key[0]
-        # [VANTA-WHY] Nathan's rule (b), overruled in part: the ORACLE must match
-        # (it is the harness's deterministic measurement of these exact bytes),
-        # but the LABEL is the model's own account of what it changed, and the
-        # attack arm writes new tests each run — so two runs of one patch can
-        # legitimately be labelled differently. Recorded side by side, never
-        # graded. Rules (a), (c), (d) and (e) are untouched.
+        # [VANTA-WHY] M3 item AB1 — Nathan's rule (b), overruled. A matched row is
+        # the same candidate bytes on both sides, so the ORACLE and the LABEL are
+        # both statements about those bytes and both must agree. The oracle is the
+        # harness's own deterministic measurement; the label is what the run
+        # concluded about the same patch, and two runs of one patch that end
+        # differently are a real difference in the recorded result. A moved label
+        # therefore fails the row, exactly as a moved oracle does — the attack arm
+        # writes new tests each run, but those tests must not change how the same
+        # bytes are graded, and when they do that IS the finding. The label values
+        # are still recorded in ``label_differences`` for side-by-side reading.
         labels = {
             name: [value_a, value_b]
             for name, value_a, value_b in (
@@ -655,7 +676,7 @@ def compare_rows(
                 "label_differences": labels,
                 "oracle": oracle,
                 "time_limit_differences": limits,
-                "identical": oracle["identical"] and not limits,
+                "identical": oracle["identical"] and not limits and not labels,
             }
         )
 
@@ -1021,43 +1042,44 @@ def compare_batches(
     # [VANTA-WHY] M3 item AA5 — which tests a batch catches being flaky is a fact
     # about the clock, so a difference there is not a disagreement about the tree:
     # the timing batch's pandas/1 was `not_identical` from a flaky Hypothesis test
-    # and nothing else. But the carve-out is allowed ONLY when the difference is
-    # inert, and the two ways it could not be are exactly the two a comparison can
-    # see: it must not have moved any row's grading (a moved grading fails
-    # ``rows["identical"]``, which still gates ``passed`` below), and it must not
-    # have moved any row's label. A label is reported and not graded (rule (b)), so
-    # a label difference alone never fails the gate — but it is also the one place
-    # we cannot prove the flaky flip was innocent, and the rule is "otherwise it is
-    # ``not_identical`` as now". So any label difference at all withholds the carve-out.
+    # alone. M3 item AA5/AB1 — the flaky carve-out is allowed ONLY when the
+    # flaky set is the only difference. A moved row grading OR a moved row label now
+    # fails ``rows["identical"]`` (M3 item AB1: both are statements about the same
+    # candidate bytes), so the carve-out cannot apply once either has moved; the
+    # ``label_changed`` flag is kept for the report.
     flaky_diff_bugs = sorted(
         bug
         for bug, block in (prepare["bugs"] or {}).items()
         if block.get("flaky_differences")
     )
     label_changed = any(row.get("label_differences") for row in rows["matched"])
+    unmatched = rows["unmatched_candidates"]
+    incomparable_groups = sorted(
+        {
+            tuple(entry["identity"][:4])
+            for entry in (unmatched.get("only_in_serial") or [])
+            + (unmatched.get("only_in_parallel") or [])
+        }
+    )
     flaky_only = bool(flaky_diff_bugs) and not label_changed
-    # A flaky difference that is NOT proven inert is a real difference, so it fails
-    # the fold rather than falling through to a softer verdict. This is the "as now"
-    # half of the rule: before this item a flaky difference was a prepare difference,
-    # and the same input must still read `not_identical`.
-    flaky_unexcused = bool(flaky_diff_bugs) and label_changed
     passed = bool(
         compared["ran"]
         and prepare["identical_except_flaky"]
         and rows["identical"]
         and cache["identical"]
-        and not flaky_unexcused
     )
-    # [VANTA-WHY] M3 item Z2/AA5 — four outcomes, in this order. A real difference
-    # (which now includes "prepare moved in a way the flaky carve-out does not cover")
-    # is `not_identical` and wins over every softer verdict. An unverifiable cache
-    # side is next: the comparison passed, but the cache half of the proof was not
-    # available, so a plainer verdict would overclaim — and the carve-out's own rule
-    # is "nothing else differs", which an unresolvable side contradicts. Only then
-    # the flaky carve-out, and only for a difference proven inert. Everything else
-    # is plain `identical`.
+    # [VANTA-WHY] M3 item Z2/AA5/AB1 — five outcomes, worst first. A proven difference
+    # (a moved oracle, label, time limit, prepare field or cache isolation) is
+    # `not_identical` and wins over every softer verdict. `incomparable` is next: a
+    # group whose candidate bytes exist on one side only was never compared — its rows
+    # have no counterpart, so the comparison must not claim to have passed, and it is
+    # not a difference either, hence its own verdict and its own exit code (5). Then
+    # the soft passes: an unverifiable cache side, then a flaky-only difference proven
+    # inert, then plain `identical`.
     if not passed:
         verdict = "not_identical"
+    elif incomparable_groups:
+        verdict = "incomparable"
     elif cache["unverified"]:
         verdict = "identical_unverified"
     elif flaky_only:
@@ -1184,6 +1206,20 @@ def verdict_line(report: Mapping[str, Any], *, cap: int = 8) -> str:
             " (withheld: a label moved)"
         )
         line += f" [flaky{excuse}: {shown}{more}]"
+    # M3 item AB1 — an `incomparable` verdict means a group's candidate bytes exist on
+    # one side only, so its rows were never compared; name those groups, or the
+    # operator cannot tell which bug's review candidates went missing.
+    incomparable_named: list[str] = []
+    for entry in unmatched.get("only_in_serial") or []:
+        incomparable_named.append(f"{entry['identity'][0]} serial-only")
+    for entry in unmatched.get("only_in_parallel") or []:
+        incomparable_named.append(f"{entry['identity'][0]} parallel-only")
+    if incomparable_named:
+        shown = ", ".join(incomparable_named[:cap])
+        more = (
+            "" if len(incomparable_named) <= cap else f", +{len(incomparable_named) - cap} more"
+        )
+        line += f" [incomparable: {shown}{more}]"
     if limits:
         line += f" [time limits: {len(limits)} group(s)]"
     if cache_problems:
@@ -1328,16 +1364,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"report: {write_report(report, path)}")
         for bug in report["bugs"]:
             print(f"report [{bug}]: {per_bug[bug]}")
-    # [VANTA-WHY] M3 item Z2/AA5 — four outcomes need four codes: 0 identical, 3
-    # `identical_unverified` (the batches agree, but a side's cache isolation could
+    # [VANTA-WHY] M3 item Z2/AA5/AB1 — five outcomes need five codes: 0 identical,
+    # 3 `identical_unverified` (the batches agree, but a side's cache isolation could
     # not be resolved), 4 `identical_except_flaky` (the batches agree apart from a
     # flaky-set difference proven inert — M3 item AA5, its own code so a gate can
-    # tell it from a plain pass), and 1 `not_identical` (a real difference — and,
-    # because the fold runs first, a real difference always wins over the softer
-    # verdicts).
-    return {"identical": 0, "identical_unverified": 3, "identical_except_flaky": 4}.get(
-        report["verdict"], 1
-    )
+    # tell it from a plain pass), 5 `incomparable` (a group's candidate bytes exist on
+    # one side only, so its rows were never compared — M3 item AB1, its own code so a
+    # gate cannot mistake "could not compare" for "compared and passed"), and 1
+    # `not_identical` (a proven difference — and, because the fold runs first, a
+    # proven difference always wins over every softer verdict, including
+    # `incomparable`).
+    return {
+        "identical": 0,
+        "identical_unverified": 3,
+        "identical_except_flaky": 4,
+        "incomparable": 5,
+    }.get(report["verdict"], 1)
 
 
 if __name__ == "__main__":

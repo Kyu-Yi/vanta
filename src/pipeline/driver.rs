@@ -3483,22 +3483,35 @@ pub async fn run(
         // measured once per bug and served afterwards; `native_patched` is
         // measured once per candidate patch. `origin` names this session, attempt
         // and side so a served result is traceable to the row that produced it.
-        let (native_original, original_cache) = harness::run_native_suite_cached(
-            &original_concat,
-            &test_cmd,
-            config.native_timeout_secs,
-            actual_backend,
-            &format!("{}/a{}/original", session_id.as_str(), attempt + 1),
-        )
-        .await;
-        let (native_patched, patched_cache) = harness::run_native_suite_cached(
-            &native_patched_concat,
-            &test_cmd,
-            config.native_timeout_secs,
-            actual_backend,
-            &format!("{}/a{}/patched", session_id.as_str(), attempt + 1),
-        )
-        .await;
+        // [VANTA-WHY] M3 item AA3 — the two sides run at the same time. They are
+        // independent measurements (different trees, different cache keys) whose
+        // only shared resource is the sandbox counter, so overlapping them halves
+        // the wall time of a cold gate without changing what is measured. A side
+        // that is a cache hit returns at its own `plan_native_suite` lookup and
+        // spawns nothing, so a warm gate still boots no VM; the cold double-miss
+        // is the case that boots two at once and `peak_sandboxes` records 2 (a
+        // descriptive count, never a verdict). Everything the two sides produce —
+        // the reports, the cache keys and the entries written — is byte-identical
+        // to running them in sequence: each is the same call with the same
+        // arguments, joined rather than awaited one after the other.
+        let original_origin = format!("{}/a{}/original", session_id.as_str(), attempt + 1);
+        let patched_origin = format!("{}/a{}/patched", session_id.as_str(), attempt + 1);
+        let ((native_original, original_cache), (native_patched, patched_cache)) = tokio::join!(
+            harness::run_native_suite_cached(
+                &original_concat,
+                &test_cmd,
+                config.native_timeout_secs,
+                actual_backend,
+                &original_origin,
+            ),
+            harness::run_native_suite_cached(
+                &native_patched_concat,
+                &test_cmd,
+                config.native_timeout_secs,
+                actual_backend,
+                &patched_origin,
+            ),
+        );
         for (side, note) in [("original", &original_cache), ("patched", &patched_cache)] {
             if note.state == "hit" {
                 native_cache_hits += 1;

@@ -3765,6 +3765,7 @@ def run_batch(
     max_attempts: Optional[int] = None,
     fixed_rounds: Optional[int] = None,
     fixed_rounds_declaration: Optional[Mapping[str, int]] = None,
+    attempts_declaration: Optional[Mapping[str, int]] = None,
     disk_mb: int,
     show_hints: bool = False,
     plan_only: bool = False,
@@ -3826,6 +3827,11 @@ def run_batch(
     flag the harness states the pin and records it, and an explicit flag that contradicts
     it is refused by :func:`_require_arm_budget` before the schedule is printed. Every
     other arm runs what the invocation asked for, or the binary's own default.
+    ``attempts_declaration`` is the frozen configuration's ``[attempts]`` table
+    (``FrozenConfig.attempts``), supplied by the ``run``/``queue`` command: it is the
+    declaration of record for the budget, so a scheduled non-pinning arm whose budget
+    would differ from it — or a caller's flag that disagrees — is refused by
+    :func:`_require_attempts` before the first VM boots.
 
     ``fixed_rounds`` is the invocation's ``--fixed-rounds``, or ``None`` when the flag was
     NOT given (M3 item 9/A5). A fixed-round arm owns its K: the harness STATES it on the
@@ -3880,6 +3886,9 @@ def run_batch(
     # `[fixed_rounds]` declaration of record and a caller's flag must all agree before
     # the first VM boots.
     _require_fixed_rounds(spellings, fixed_rounds, fixed_rounds_declaration)
+    # M3 item 11 — the same refusal for `--max-attempts`: the frozen `[attempts]`
+    # declaration of record and a caller's flag must agree before the first VM boots.
+    _require_attempts(spellings, max_attempts, attempts_declaration)
     # D13's order, mode-major, derived from the spellings themselves, so every repair
     # pass precedes every review pass by construction. The `config` column of a
     # phase's rows is the spelling's config value (`baseline` for both `b1` and
@@ -4622,6 +4631,55 @@ def _require_fixed_rounds(
                     f"--fixed-rounds {requested} disagrees with arm {name!r}, which IS "
                     f"{k} attempts; drop the flag or schedule an arm that runs {requested}"
                 )
+
+
+def _require_attempts(
+    spellings: Sequence[str],
+    requested: Optional[int],
+    declaration: Optional[Mapping[str, int]],
+) -> None:
+    """Refuse a ``--max-attempts`` (or a frozen declaration) the arm list contradicts.
+
+    [VANTA-WHY] M3 item 11 — the attempt budget was declared in ``[prereg]``, which
+    the harness never applies, so a caller could run every arm under the ``v1-m3``
+    banner with any ``--max-attempts`` they liked. It is now read from the enforced
+    ``[attempts]`` table, and this is the refusal, made the way the fixed-round
+    guard is: the frozen ``default``, the arm's own budget, and a caller's flag must
+    agree before the schedule prints. The PINNING arms are not checked against
+    ``default`` — ``b0``, ``judge`` and ``judge+suite`` pin their budget to 1 because
+    one call IS the arm, and :func:`_require_arm_budget` already refuses a flag that
+    contradicts one. The declaration is checked only when a frozen configuration was
+    supplied; a test-driven job carries ``None`` and is answered from the registry
+    alone.
+    """
+    if declaration is None:
+        return
+    declared = declaration.get("default")
+    if declared is None:
+        raise RunnerError(
+            "the frozen configuration's [attempts] table declares no `default` "
+            "budget; a table that names no budget cannot be enforced, so give it a "
+            "`default` or remove it"
+        )
+    # The caller's own statement.
+    if requested is not None and requested != declared:
+        raise RunnerError(
+            f"--max-attempts {requested} disagrees with the frozen [attempts] "
+            f"default = {declared}; the budget belongs to the configuration, so drop "
+            f"the flag or run under a configuration that declares {requested}"
+        )
+    # And the budget each scheduled arm would actually run, pinned arms excepted.
+    for mode, written in arms_mod.phases_for(spellings):
+        name = arms_mod.arm_for(written, mode)
+        if arms_mod.ARMS[name].max_attempts is not None:
+            continue  # a pinning arm IS its budget; `_require_arm_budget` guards it
+        effective = _arm_attempt_budget(name, requested)
+        if effective != declared:
+            raise RunnerError(
+                f"the scheduled arm {name!r} would run {effective} attempts, but the "
+                f"frozen [attempts] default is {declared}; the arm list and the hashed "
+                "configuration disagree"
+            )
 
 
 def _require_arm_budget(spellings: Sequence[str], requested: Optional[int]) -> None:
@@ -5460,6 +5518,7 @@ def run_queue(
     max_attempts: Optional[int] = None,
     fixed_rounds: Optional[int] = None,
     fixed_rounds_declaration: Optional[Mapping[str, int]] = None,
+    attempts_declaration: Optional[Mapping[str, int]] = None,
     disk_mb: int,
     show_hints: bool = False,
     plan_only: bool = False,
@@ -5517,6 +5576,7 @@ def run_queue(
             max_attempts=max_attempts,
             fixed_rounds=fixed_rounds,
             fixed_rounds_declaration=fixed_rounds_declaration,
+            attempts_declaration=attempts_declaration,
             disk_mb=disk_mb,
             show_hints=show_hints,
             plan_only=plan_only,
@@ -5555,6 +5615,9 @@ def _run_queue(**kwargs: Any) -> tuple[int, list[QueueOutcome]]:
     _require_arm_budget(spellings, kwargs["max_attempts"])
     _require_fixed_rounds(
         spellings, kwargs["fixed_rounds"], kwargs["fixed_rounds_declaration"]
+    )
+    _require_attempts(
+        spellings, kwargs["max_attempts"], kwargs["attempts_declaration"]
     )
     _require_seeds(kwargs["split"], kwargs["seeds"])
     # G1 — ONE gate for the whole queue, shared by every per-bug call, so the cap
@@ -5712,6 +5775,7 @@ def _run_task(
             max_attempts=kwargs["max_attempts"],
             fixed_rounds=kwargs["fixed_rounds"],
             fixed_rounds_declaration=kwargs["fixed_rounds_declaration"],
+            attempts_declaration=kwargs["attempts_declaration"],
             disk_mb=kwargs["disk_mb"],
             show_hints=kwargs["show_hints"],
             plan_only=False,

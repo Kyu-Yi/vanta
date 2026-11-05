@@ -1338,6 +1338,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_attempts=args.max_attempts,
         fixed_rounds=args.fixed_rounds,
         fixed_rounds_declaration=frozen.fixed_rounds(),
+        attempts_declaration=frozen.attempts(),
         disk_mb=args.disk_mb,
         show_hints=args.show_hints,
         plan_only=args.plan,
@@ -1470,6 +1471,7 @@ def _queue_pipeline(
     frozen_env: Mapping[str, str],
     invocation_env: Mapping[str, str],
     fixed_rounds_declaration: Optional[Mapping[str, int]],
+    attempts_declaration: Optional[Mapping[str, int]],
 ) -> int:
     """M3 item AA4 — ``queue --pipeline``: prepare each bug, then start its rows.
 
@@ -1622,13 +1624,14 @@ def _queue_pipeline(
             flush=True,
         )
     # The queue's own refusals, made once here instead of once per bug — the same
-    # four `_run_queue` makes before it prints the schedule.
+    # five `_run_queue` makes before it prints the schedule.
     spellings = runner_mod._select_arms(split, arm_spellings)
     runner_mod._require_arm_list(spellings)
     runner_mod._require_arm_budget(spellings, args.max_attempts)
     runner_mod._require_fixed_rounds(
         spellings, args.fixed_rounds, fixed_rounds_declaration
     )
+    runner_mod._require_attempts(spellings, args.max_attempts, attempts_declaration)
     runner_mod._require_seeds(split, seeds)
 
     entries = {bug_key(entry): entry for entry in split.bugs}
@@ -1655,6 +1658,7 @@ def _queue_pipeline(
         max_attempts=args.max_attempts,
         fixed_rounds=args.fixed_rounds,
         fixed_rounds_declaration=fixed_rounds_declaration,
+        attempts_declaration=attempts_declaration,
         disk_mb=args.disk_mb,
         show_hints=args.show_hints,
         max_spend_usd=max_spend_usd,
@@ -1945,6 +1949,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
             frozen_env=frozen_env,
             invocation_env=invocation_env,
             fixed_rounds_declaration=frozen.fixed_rounds(),
+            attempts_declaration=frozen.attempts(),
         )
     batch_dir = runner_mod.require_batch_dir(args.batch.resolve())
     bugsinpy_root = (REPO_ROOT / split.bugsinpy_root).resolve()
@@ -2004,6 +2009,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
         max_attempts=args.max_attempts,
         fixed_rounds=args.fixed_rounds,
         fixed_rounds_declaration=frozen.fixed_rounds(),
+        attempts_declaration=frozen.attempts(),
         disk_mb=args.disk_mb,
         show_hints=args.show_hints,
         plan_only=args.plan,

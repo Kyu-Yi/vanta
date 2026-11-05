@@ -216,6 +216,37 @@ b1-k4 = 4
 b3-k4 = 4
 
 # ---------------------------------------------------------------------------
+# [attempts] — the repair budget's declaration (M3 item 11). ENFORCED.
+# ---------------------------------------------------------------------------
+# The attempt budget every non-pinning arm runs with: the loop's ceiling in the
+# binary, and the number `--max-attempts` states on the child's argv. It is here,
+# rather than in `[prereg]`, for the same two reasons `[fixed_rounds]` is:
+#
+#   * It is INSIDE the file's bytes, so changing it moves `config_hash`. A batch
+#     run at a different budget therefore cannot be pooled with a `v1-m3` batch,
+#     which is what `seed_policy`'s rule requires of any setting that changes the
+#     meaning of a verdict.
+#   * It is READ, not merely stated: `bugsinpy_run.py` passes this table to
+#     `runner.run_batch`, which refuses a run whose effective budget disagrees with
+#     it. `[prereg]` (which the harness never applies) could not refuse anything —
+#     which is why `[prereg]`'s `max_attempts` line above is a MEASURED note and
+#     this table is the freeze.
+#
+# `default = 4` is the M3 plan's Phase-3 value, cited rather than chosen: §6.4 says
+# "Fixed rounds K: 4, matching the default attempt budget", and the night smokes
+# ran every invocation with `--max-attempts 4` on its argv. The PINNING arms are
+# not covered here and are not meant to be — B0, `judge` and `judge+suite` pin
+# their own budget to 1 in `arms.py` because one call IS the arm, and
+# `arm_attempts` refuses a contradicting `--max-attempts` for them already.
+#
+# [VANTA-WHY] `scripts/bugsinpy/arms.py` mirrors this value as `DEFAULT_ATTEMPTS`,
+# and a test binds the two (`TestArms::test_the_default_attempt_budget_matches_the_frozen_config`):
+# a hand-edit on either side fails the suite, so the registry cannot run a budget
+# the configuration does not declare, nor the reverse.
+[attempts]
+default = 4
+
+# ---------------------------------------------------------------------------
 # [prompts] — the SHA-256 of every prompt TEMPLATE. Each value is the 12-hex
 # `prompt_content_hash` of that role's system and user templates, joined by U+001F
 # in a fixed order: the role's system templates first, then its user templates.

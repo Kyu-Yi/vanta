@@ -27792,6 +27792,44 @@ class TestArms:
         # An ordinary arm list with no flag and no declaration is untouched.
         runner_mod._require_fixed_rounds(["baseline", "vanta"], None, None)
 
+    # -- M3 item 11 — the attempt budget --------------------------------------
+    def test_the_default_attempt_budget_matches_the_frozen_config(self):
+        """[VANTA-WHY] M3 item 11 — `arms.py` does not CHOOSE the attempt budget: it
+        mirrors the frozen configuration's `[attempts]` table, the declaration of
+        record that is hashed into every row and that the harness refuses to disagree
+        with. This test is the binding, so neither side moves alone."""
+        declared = frozen_mod.load().attempts()
+        assert declared == {"default": 4}
+        assert arms_mod.DEFAULT_ATTEMPTS == declared["default"]
+
+    def test_the_attempts_guard_refuses_a_disagreeing_flag_or_arm_list(self):
+        """Three things must agree before the schedule prints: the frozen `[attempts]`
+        `default`, the budget each scheduled non-pinning arm would actually run, and a
+        caller's own `--max-attempts` when one was given."""
+        # The caller's flag must state the frozen budget; no flag is answered from the
+        # registry, which agrees with the frozen default.
+        runner_mod._require_attempts(["baseline", "vanta"], 4, {"default": 4})
+        runner_mod._require_attempts(["baseline", "vanta"], None, {"default": 4})
+        with pytest.raises(runner_mod.RunnerError, match="disagrees with the frozen"):
+            runner_mod._require_attempts(["baseline", "vanta"], 3, {"default": 4})
+        # A declaration that names no budget cannot be enforced.
+        with pytest.raises(runner_mod.RunnerError, match="declares no `default`"):
+            runner_mod._require_attempts(["b3"], None, {"something": 4})
+        # A declaration the scheduled arm would contradict (with no flag given, the arm
+        # would fall back to the registry's own default of 4).
+        with pytest.raises(runner_mod.RunnerError, match="would run 4 attempts"):
+            runner_mod._require_attempts(["b3"], None, {"default": 2})
+        # A pinned arm is not the budget's owner: it IS its own one-call budget, and
+        # `_require_arm_budget` guards it, so this guard passes it through untouched.
+        runner_mod._require_attempts(["b0"], None, {"default": 4})
+        runner_mod._require_attempts(["judge"], None, {"default": 4})
+        # A test-driven job carries no declaration and is answered from the registry.
+        runner_mod._require_attempts(["baseline", "vanta"], 3, None)
+        # The fixed-round arms are ordinary arms for the budget's purpose: they run the
+        # invocation's budget, so they agree with the frozen default.
+        runner_mod._require_attempts(["b1-k4", "b3-k4"], 4, {"default": 4})
+        runner_mod._require_attempts(["b1-k4", "b3-k4"], None, {"default": 4})
+
     def test_two_spellings_under_one_config_are_refused(self):
         with pytest.raises(arms_mod.ArmError, match="share a job key"):
             arms_mod.resolve_configs(["baseline", "suite"])
@@ -31434,6 +31472,7 @@ class TestPipelineQueue:
             # rows would otherwise be refused before anything is scheduled.
             invocation_env={"VANTA_LLM_BACKEND": "openai"},
             fixed_rounds_declaration=None,
+            attempts_declaration=None,
         )
         return code, batch_dir, events, capture
 
@@ -31608,6 +31647,7 @@ class TestPipelineQueue:
             frozen_env={},
             invocation_env={},
             fixed_rounds_declaration=None,
+            attempts_declaration=None,
         )
         assert code == run_mod.EXIT_OK
         out = capsys.readouterr().out
@@ -31625,6 +31665,7 @@ class TestPipelineQueue:
                 frozen_env={},
                 invocation_env={},
                 fixed_rounds_declaration=None,
+                attempts_declaration=None,
             )
 
     # -- CLI routing -------------------------------------------------------
@@ -37801,6 +37842,9 @@ class TestFrozenConfig:
         # The K arm's declaration is its own ENFORCED table (M3 item 9/A5), not a
         # `[prereg]` literal: the harness reads it and refuses a mismatch.
         assert config.fixed_rounds() == {"b1-k4": 4, "b3-k4": 4}
+        # The attempt budget is the same kind of statement (M3 item 11): an ENFORCED
+        # table, read by the harness, refused on mismatch.
+        assert config.attempts() == {"default": 4}
         # C4 — the judge is here too: its prompt is sent only on a judge arm, so it
         # is not a role `prompt_hashes()` records on every row, but its text is a
         # prompt the binary sends and a reworded judge block must move `config_hash`.
@@ -37986,6 +38030,40 @@ class TestFrozenConfig:
             write(tmp_path / "other.toml", raw.replace("b3-k4 = 4", "b3-k4 = 6"))
         )
         assert base.fixed_rounds() != other.fixed_rounds()
+        assert base.sha256 != other.sha256
+
+    # -- M3 item 11 — the attempt-budget declaration --------------------------
+    def test_the_attempts_table_is_optional_and_read_as_a_mapping(self, tmp_path):
+        """A configuration written before M3 item 11 declares no budget, and that is
+        not an error: `attempts()` reads an absent table as "no claim", the same way
+        the rest of the module reads an absent setting."""
+        assert frozen_mod.load(_frozen_file(tmp_path, "v1")).attempts() == {}
+
+    def test_a_bad_attempts_value_is_refused(self, tmp_path):
+        """The table is ENFORCED, so a file that could not mean what the reader assumes
+        is refused at load rather than turning into a silently wrong budget at run
+        time."""
+        for bad in ("default = 0", "default = true", 'default = "4"', "default = -1"):
+            path = write(
+                tmp_path / f"bad_{bad.replace(' ', '_').replace('\"', '')}.toml",
+                'schema = 1\nname = "bad"\n[env]\n[recorded]\n[prereg]\n'
+                "[attempts]\n" + bad + "\n[prompts]\n",
+            )
+            with pytest.raises(frozen_mod.FrozenConfigError, match=r"\[attempts\]"):
+                frozen_mod.load(path)
+
+    def test_editing_the_attempts_table_moves_the_config_hash(self, tmp_path):
+        """The budget is inside the file's bytes, so a change to it moves
+        `config_hash` — the property that keeps two budgets from pooling."""
+        raw = (
+            'schema = 1\nname = "t"\n[env]\n[recorded]\n[prereg]\n'
+            "[attempts]\ndefault = 4\n[prompts]\ncreator = \"abc\"\n"
+        )
+        base = frozen_mod.load(write(tmp_path / "base.toml", raw))
+        other = frozen_mod.load(
+            write(tmp_path / "other.toml", raw.replace("default = 4", "default = 6"))
+        )
+        assert base.attempts() != other.attempts()
         assert base.sha256 != other.sha256
 
 

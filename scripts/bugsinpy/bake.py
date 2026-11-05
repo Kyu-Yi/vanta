@@ -3648,6 +3648,7 @@ def requirements_recipe(
     no_deps_pins: Sequence[str] = (),
     orphans: Sequence[str] = (),
     minor: Optional[str] = None,
+    early_pins_first: bool = False,
 ) -> str:
     """Install one bug's *resolved* dependencies on top of the interpreter layer.
 
@@ -3757,8 +3758,18 @@ def requirements_recipe(
     ``cryptography 47.0.0`` for it; ``pandas/1``'s ``statsmodels==0.11.1`` declares
     ``pandas`` and the layer held ``pandas 2.0.3``. It runs **after** the main pass, so
     everything the pin declared is already installed (the closure walk pinned it) and
-    ``--no-deps`` costs nothing but the absent name, and **before** the orphan removal,
-    which is the last thing before the reading.
+    ``--no-deps`` costs nothing but the absent name, and **before** the orphan removal, which is the last thing before the reading.
+
+    ``early_pins_first`` is the one thing a **second** attempt may move, and §8.6 R1's
+    whole content: with it, the ``early_pins`` install above is emitted **before** the
+    build requirements' instead of after, so a build requirement's own ``setup.py``
+    finds the pins the layer already holds rather than reaching ``easy_install`` for a
+    release of the day. ``luigi/30`` measured the difference — its ``pytest-runner==
+    2.5.1``'s ``egg_info`` loaded today's ``setuptools_scm`` and died on
+    ``setuptools.sic`` while the layer's own ``setuptools-scm==3.4.1`` sat uninstalled
+    one step below. It is ``False`` by default and reaches the recipe **only** from
+    :func:`retry_plan`, after a first attempt has already failed, so every first-pass
+    recipe — and so every already-baked layer — is byte-identical.
     """
     no_deps = [spec.strip() for spec in no_deps_pins if spec.strip()]
     no_deps_set = set(no_deps)
@@ -3811,6 +3822,32 @@ def requirements_recipe(
             # against the day's PyPI is the measured `fastapi/1` failure.
             f"python -m pip install --no-cache-dir {held}-r /tmp/build-tools.txt",
         ]
+    early = [spec.strip() for spec in early_pins if spec.strip()]
+    early_block = (
+        [
+            "cat > /tmp/early-req.txt <<'VANTA_EARLY_REQUIRES'",
+            "\n".join(early),
+            "VANTA_EARLY_REQUIRES",
+            # The dependency pins that another pin in this layer builds against,
+            # installed before the main list so the build finds them: with
+            # `--no-build-isolation` an unsatisfied setup_requires is fetched by
+            # easy_install at today's version rather than the pinned one (§3.2). It
+            # carries the flag for the same reason the main install does — it is a
+            # dependency install and a dependency can itself be a source build.
+            "python -m pip install --no-cache-dir "
+            f"{held}--no-build-isolation {LEGACY_RESOLVER_FLAG} -r /tmp/early-req.txt",
+            _no_isolated_build_env("the early build-requirement install"),
+        ]
+        if early
+        else []
+    )
+    if early_pins_first:
+        # §8.6 R1's one retry, and only ever on a *second* attempt: a build
+        # requirement's own `setup.py` runs before the early pins when the first pass
+        # died in a build requirement's `egg_info` (luigi/30), so the second attempt
+        # installs them first. The first pass never passes this flag, so its recipe is
+        # byte-identical to what it was before the rule existed.
+        lines += early_block
     if build_requires:
         lines += [
             "cat > /tmp/build-req.txt <<'VANTA_BUILD_REQUIRES'",
@@ -3832,22 +3869,8 @@ def requirements_recipe(
         check = _build_pin_check(build_pins)
         if check:
             lines.append(check)
-    early = [spec.strip() for spec in early_pins if spec.strip()]
-    if early:
-        lines += [
-            "cat > /tmp/early-req.txt <<'VANTA_EARLY_REQUIRES'",
-            "\n".join(early),
-            "VANTA_EARLY_REQUIRES",
-            # The dependency pins that another pin in this layer builds against,
-            # installed before the main list so the build finds them: with
-            # `--no-build-isolation` an unsatisfied setup_requires is fetched by
-            # easy_install at today's version rather than the pinned one (§3.2). It
-            # carries the flag for the same reason the main install does — it is a
-            # dependency install and a dependency can itself be a source build.
-            "python -m pip install --no-cache-dir "
-            f"{held}--no-build-isolation {LEGACY_RESOLVER_FLAG} -r /tmp/early-req.txt",
-            _no_isolated_build_env("the early build-requirement install"),
-        ]
+    if not early_pins_first:
+        lines += early_block
     if body:
         lines += [
             "cat > /tmp/req.txt <<'VANTA_REQUIREMENTS'",
@@ -6665,6 +6688,19 @@ the *evidence* a drop records because it names exactly one distribution: the sum
 is what says "the retry applies at all", this is what says which log line says why.
 """
 
+EGG_INFO_FAILURE = "python setup.py egg_info"
+"""How pip names the command whose failure R1 answers, on the line that states it.
+
+Measured on ``luigi/30``: the build requirement's legacy ``setup.py`` died in
+``egg_info`` — pip reached PyPI's ``easy_install`` for a ``setup_requires`` the recipe
+had not installed yet — and pip's own summary line is ``ERROR: Command errored out with
+exit status 1: python setup.py egg_info Check the logs for full command output.`` The
+whole log holds **no** ``Failed to build …`` line, because nothing reached the wheel
+stage: that is exactly why :func:`failed_builds` answers ``()`` for it and
+:func:`retry_drops` leaves it alone. This is the reading that turns it into R1's retry
+(:func:`failed_build_requirement_metadata`).
+"""
+
 RETRY_KEY = "retry"
 """The provenance key saying a layer's first build failed and its one retry what did.
 
@@ -6673,6 +6709,12 @@ reason: what the retry learned exists only once a build has been attempted, and 
 provenance that could not say "this layer needed its second attempt" would describe the
 first-pass resolution as though it had built.
 """
+
+RETRY_RULE_DROP = "R2(ii)"
+"""§8.6 R2(ii)'s name, so the ``retry`` record says the second attempt was a *drop*."""
+
+RETRY_RULE_EARLY = "R1"
+"""§8.6 R1's name, so the ``retry`` record says the second attempt only *reordered*."""
 
 PREFLIGHT_CLASS_LETTERS: Mapping[str, str] = {
     INSTALLABLE_WHEEL: "a",
@@ -9220,6 +9262,26 @@ def failed_builds(output: str) -> tuple[str, ...]:
     return ()
 
 
+def failed_build_requirement_metadata(output: str) -> bool:
+    """Whether the failing build's own last word is a package's ``setup.py egg_info``.
+
+    §8.6 R1's trigger, and the positive :func:`failed_builds` documents as its negative:
+    pip wrote no ``Failed to build …`` line, because nothing reached the wheel stage — the
+    failure happened while pip *read the metadata* of a build requirement, whose
+    ``setup.py`` reached PyPI's ``easy_install`` for a ``setup_requires`` the recipe had
+    not installed yet (``luigi/30``: ``pytest-runner==2.5.1``'s ``egg_info`` pulled
+    ``setuptools_scm``'s **today** release, which needs a ``setuptools`` newer than the
+    pinned one). The marker is pip's summary line, which opens with ``ERROR`` and names
+    the ``egg_info`` command (:data:`EGG_INFO_FAILURE`); searched from the end, like
+    :func:`failed_builds`, so a log holding more than one attempt answers with the last.
+    """
+    for raw in reversed(output.replace("\r", "\n").splitlines()):
+        line = raw.strip()
+        if line.startswith(ERROR_LINE_PREFIXES) and EGG_INFO_FAILURE in line:
+            return True
+    return False
+
+
 def failed_build_line(output: str, name: str) -> str:
     """Where the failing layer's log names ``name`` as an unbuildable wheel, or ``""``.
 
@@ -9333,26 +9395,33 @@ class RetryMaterial:
 
 @dataclass(frozen=True)
 class RetryPlan:
-    """One per-bug layer's single second attempt (§8.6 R2(ii)).
+    """One per-bug layer's single second attempt (§8.6 R1 and R2(ii)).
 
-    ``script`` is the first-pass recipe with the pins the retry dropped removed — from
-    the main pass, from the early pass or from the ``--no-deps`` pass, whichever held
-    them — and nothing else changed: the first pass is byte-identical to what it was
-    before this rule existed, and only a build that has already failed reaches here.
-    ``drops`` is what it removed and why, and it is what reaches both the layer's
-    provenance and the run's own summary.
+    ``script`` is the recipe the second attempt runs, and only a build that has already
+    failed reaches here: the first pass is byte-identical to what it was before either
+    rule existed. Under **R2(ii)** it is the first-pass recipe with the pins the retry
+    dropped removed — from the main pass, from the early pass or from the ``--no-deps``
+    pass, whichever held them — and ``drops`` is what it removed and why. Under **R1**
+    nothing is dropped (``drops`` is empty) and the only change is the ordering: the
+    early pins installed before the build requirements, which is what ``why`` says. In
+    both cases ``drops`` and ``why`` reach the layer's provenance and the run's summary.
     """
 
     script: str
     drops: tuple[DroppedPin, ...]
+    rule: str = RETRY_RULE_DROP
+    why: str = ""
 
     def describe(self) -> list[str]:
         """One line per drop, in the shape the bake's log and summary both print."""
-        return [
+        lines = [
             f"dropping {drop.pin} — {drop.reason}; "
             + (drop.import_note or "nothing in either tree imports it")
             for drop in self.drops
         ]
+        if self.why:
+            lines.append(self.why)
+        return lines
 
 
 def _declared_sources(deps: "BugDeps") -> dict[str, tuple[str, ...]]:
@@ -9369,48 +9438,77 @@ def _declared_sources(deps: "BugDeps") -> dict[str, tuple[str, ...]]:
 
 
 def retry_plan(deps: "BugDeps", output: str) -> Optional[RetryPlan]:
-    """The one retry a per-bug layer whose build *failed* is allowed (§8.6 R2(ii)).
+    """The one retry a per-bug layer whose build *failed* is allowed (§8.6 R1, R2(ii)).
 
-    ``None`` for every layer the rule does not reach: one with no material (an
-    interpreter layer, or a caller that did not attach it), one whose log names nothing
-    pip failed to build, one whose failed names the safeguard protects or the graded
-    tests reach. Otherwise the recipe is re-rendered from the layer's own pin lists with
-    the dropped pins removed, so the second attempt is the first one minus exactly what
-    the rule dropped — the same ``BugDeps`` fields :func:`layer_recipes` renders from,
-    and not a re-resolution.
+    ``None`` for every layer neither rule reaches: one with no material (an interpreter
+    layer, or a caller that did not attach it), and every log that is not one of the two
+    rules' cases. The two are told apart by :func:`failed_builds` and never overlap:
+
+    * **a distribution named** (:func:`failed_builds` is non-empty) — §8.6 R2(ii). The
+      recipe is re-rendered from the layer's own pin lists with the dropped pins removed
+      (the same ``BugDeps`` fields :func:`layer_recipes` renders from, and not a
+      re-resolution). ``None`` when the answer is not a drop: a name that is not a pin of
+      this layer, one the safeguard protects, or one the graded tests reach — each a
+      flag, not a drop (:func:`retry_drops`).
+    * **nothing named** — §8.6 R1's case, and only when the log's last word is a build
+      requirement's own ``setup.py egg_info`` (:func:`failed_build_requirement_metadata`)
+      *and* this layer has early pins to move. Nothing is dropped; the recipe is the first
+      pass with ``early_pins_first`` set, so the pins the build requirement reached past
+      are installed before it.
     """
     material = deps.retry
     if material is None:
         return None
-    drops = retry_drops(
-        output,
-        installs=deps.installs,
-        declared=_declared_sources(deps),
-        audit=material.audit,
-        safeguard=material.safeguard,
-    )
-    if not drops:
+    if failed_builds(output):
+        drops = retry_drops(
+            output,
+            installs=deps.installs,
+            declared=_declared_sources(deps),
+            audit=material.audit,
+            safeguard=material.safeguard,
+        )
+        if not drops:
+            return None
+        gone = {drop.name for drop in drops}
+
+        def kept(specs: Sequence[str]) -> tuple[str, ...]:
+            out = []
+            for spec in specs:
+                parts = _pinned_parts(spec)
+                if parts is None or canonicalize_name(parts[0]) not in gone:
+                    out.append(spec)
+            return tuple(out)
+
+        return RetryPlan(
+            script=requirements_recipe(
+                kept(deps.installs),
+                build_pins=kept(deps.build_pins),
+                early_pins=kept(deps.early_pins),
+                no_deps_pins=kept(deps.no_deps_pins),
+                orphans=deps.orphans,
+                minor=material.minor,
+            ),
+            drops=drops,
+        )
+    if not deps.early_pins or not failed_build_requirement_metadata(output):
         return None
-    gone = {drop.name for drop in drops}
-
-    def kept(specs: Sequence[str]) -> tuple[str, ...]:
-        out = []
-        for spec in specs:
-            parts = _pinned_parts(spec)
-            if parts is None or canonicalize_name(parts[0]) not in gone:
-                out.append(spec)
-        return tuple(out)
-
     return RetryPlan(
         script=requirements_recipe(
-            kept(deps.installs),
-            build_pins=kept(deps.build_pins),
-            early_pins=kept(deps.early_pins),
-            no_deps_pins=kept(deps.no_deps_pins),
+            deps.installs,
+            build_pins=deps.build_pins,
+            early_pins=deps.early_pins,
+            no_deps_pins=deps.no_deps_pins,
             orphans=deps.orphans,
             minor=material.minor,
+            early_pins_first=True,
         ),
-        drops=drops,
+        drops=(),
+        rule=RETRY_RULE_EARLY,
+        why=(
+            "the first pass died in a build requirement's setup.py egg_info with the "
+            "early pins absent (§8.6 R1); the layer was rebuilt once with the early pins "
+            "installed before the build requirements"
+        ),
     )
 
 
@@ -11800,21 +11898,25 @@ def record_retry(deps_dir: Path, checkpoint: str, plan: RetryPlan) -> Path:
 
     [VANTA-WHY] Back into the file, like :func:`record_pip_check`, and for a related
     reason: what the retry learned exists only once a build has been attempted, and
-    ``prepare`` reads one provenance per bug. The drops go into ``dropped`` — the key the
-    rest of the harness already reads — so their second reader is automatic: ``prepare``
-    names every dropped pin in a gate failure's reason
+    ``prepare`` reads one provenance per bug. Under **R2(ii)** the drops go into
+    ``dropped`` — the key the rest of the harness already reads — so their second reader
+    is automatic: ``prepare`` names every dropped pin in a gate failure's reason
     (``prepare.dropped_pin_note``), and the gate is the measurement that refutes a drop
     that was wrong. ``retry`` is written beside them as the record of the *path*: that
-    this layer's first build failed, on what, and what the second attempt left out. Both
-    keys together are "every drop, with its source, its failure reason and its closure
-    evidence, in the layer metadata".
+    this layer's first build failed, which rule answered it (``rule``), on what (``why``)
+    and what the second attempt left out. Under **R1** nothing is dropped, so ``dropped``
+    is untouched and ``retry`` alone carries the fact that the second attempt only
+    reordered the installs. Both keys together are "every drop, with its source, its
+    failure reason and its closure evidence, in the layer metadata".
 
     The identity is **re-stamped**, unlike :func:`record_pip_check`, and the difference is
     the point: ``pip_check`` is a verdict *about* a layer and :func:`provenance_digest`
     excludes it, whereas these drops change which pins the layer holds — ``dropped`` is
     decisive material. Leaving the first pass's ``checkpoint_id`` in place would be a file
     whose identity does not describe it, and two layers that resolved the same first-pass
-    pins would share a key while holding different environments.
+    pins would share a key while holding different environments. R1 re-stamps for the same
+    reason: ``retry`` is decisive too, and the second attempt's ordering is not the
+    first's.
     """
 
     data = load_deps(deps_dir, checkpoint)
@@ -11824,7 +11926,9 @@ def record_retry(deps_dir: Path, checkpoint: str, plan: RetryPlan) -> Path:
     data["dropped"] = dropped
     data[RETRY_KEY] = {
         "used": True,
-        "reason": (
+        "rule": plan.rule,
+        "reason": plan.why
+        or (
             "the first-pass build failed on "
             + ", ".join(drop.pin for drop in plan.drops)
             + " (§8.6 R2(ii)); the layer was rebuilt once without them"

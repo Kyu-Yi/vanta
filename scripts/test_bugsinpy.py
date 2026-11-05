@@ -17743,15 +17743,17 @@ class TestTheSafeguardsEntryPointQuestion:
 
 
 class TestTheRetryOnAnUnbuildablePin:
-    """§8.6's R2(ii): a per-bug layer rebuilt once without the pins that failed here.
+    """§8.6's retries: a per-bug layer rebuilt once after its build already failed.
 
     The trigger is an **observed** build failure, never a static prediction, which is
     what leaves every already-baked layer untouched by construction: a retry runs only
     after a build has already failed, and the first-pass recipe is byte-identical. The
-    rule answers ``None`` for every failure it does not cover (rows 11–12, luigi's
-    ``egg_info`` crash), drops only pins **outside the failing tests' closure** that the
-    safeguard does not protect, records each drop in the layer metadata, and fails
-    **closed** if the retry also fails.
+    **R2(ii)** half (measured on ``pandas/7``) answers ``None`` for every failure it does
+    not cover, drops only pins **outside the failing tests' closure** that the safeguard
+    does not protect, records each drop in the layer metadata, and fails **closed** if
+    the retry also fails. The **R1** half (rows 11–12, luigi's ``egg_info`` crash, the
+    very case R2(ii) answers ``None`` for) drops nothing and only moves the early-pin
+    install before the build requirements.
     """
 
     INSTALLS = (
@@ -17958,6 +17960,72 @@ class TestTheRetryOnAnUnbuildablePin:
         assert "h5py==2.10.0" in after["retry"]["reason"]
         assert len(after["retry"]["dropped"]) == 2
         # The identity moves with the drops: this file now describes a different layer.
+        assert after["checkpoint_id"] != before["checkpoint_id"]
+
+    # ---- R1: the early pins move before the build requirements -----------
+    def test_the_egg_info_detector_reads_luigi_30_and_not_pandas_7(self):
+        """R1's trigger, and the positive ``failed_builds`` documents as its negative."""
+        assert bake_mod.failed_build_requirement_metadata(_LUIGI_30_BUILD_LOG) is True
+        assert bake_mod.failed_build_requirement_metadata(_PANDAS_7_BUILD_LOG) is False
+        assert bake_mod.failed_build_requirement_metadata("") is False
+
+    # ``pytest-runner`` is luigi/30's real build requirement and is *not* a build tool,
+    # so ``_split_build_pins`` keeps it in ``/tmp/build-req.txt`` — which is what the
+    # reorder is about. A build tool (``cython``) would land in the always-first
+    # ``/tmp/build-tools.txt`` group and leave no build-req block to move.
+    _R1_BUILD = ("pytest-runner==2.5.1",)
+    _R1_EARLY = ("setuptools-scm==3.4.1",)
+
+    def _recipe(self, *, early_pins_first: bool) -> str:
+        return bake_mod.requirements_recipe(
+            self.INSTALLS,
+            build_pins=self._R1_BUILD,
+            early_pins=self._R1_EARLY,
+            minor="3.8",
+            early_pins_first=early_pins_first,
+        )
+
+    def test_the_default_recipe_installs_the_early_pins_after_the_build_requirements(self):
+        script = self._recipe(early_pins_first=False)
+        assert script.index("/tmp/build-req.txt") < script.index("/tmp/early-req.txt")
+
+    def test_the_retry_recipe_only_reorders_the_two_installs(self):
+        """``early_pins_first`` moves the block and changes nothing else, line for line."""
+        first = self._recipe(early_pins_first=False)
+        retry = self._recipe(early_pins_first=True)
+        assert retry.index("/tmp/early-req.txt") < retry.index("/tmp/build-req.txt")
+        assert sorted(retry.splitlines()) == sorted(first.splitlines())
+
+    def test_a_build_requirement_egg_info_failure_retries_with_the_early_pins_first(self):
+        deps = self._deps(build_pins=self._R1_BUILD, early_pins=self._R1_EARLY)
+        plan = bake_mod.retry_plan(deps, _LUIGI_30_BUILD_LOG)
+        assert plan is not None
+        assert plan.drops == ()
+        assert plan.rule == bake_mod.RETRY_RULE_EARLY
+        assert plan.describe()
+        assert plan.script == self._recipe(early_pins_first=True)
+
+    def test_a_layer_with_no_early_pins_never_gets_the_r1_retry(self):
+        deps = self._deps(build_pins=self._R1_BUILD)
+        assert bake_mod.retry_plan(deps, _LUIGI_30_BUILD_LOG) is None
+
+    def test_a_log_that_is_not_an_egg_info_crash_never_gets_the_r1_retry(self):
+        deps = self._deps(early_pins=self._R1_EARLY)
+        assert bake_mod.retry_plan(deps, "some other failure\n") is None
+
+    def test_record_retry_records_the_reordering_without_a_drop(self, tmp_path):
+        deps = self._deps(early_pins=self._R1_EARLY)
+        bake_mod.write_deps(tmp_path, deps)
+        before = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        plan = bake_mod.retry_plan(deps, _LUIGI_30_BUILD_LOG)
+        bake_mod.record_retry(tmp_path, deps.checkpoint, plan)
+        after = bake_mod.load_deps(tmp_path, deps.checkpoint)
+        assert after["retry"]["used"] is True
+        assert after["retry"]["rule"] == bake_mod.RETRY_RULE_EARLY
+        assert after["retry"]["dropped"] == []
+        # R1 drops nothing, so ``dropped`` is exactly what the first pass left there.
+        assert after["dropped"] == before.get("dropped", [])
+        # The retry record is decisive material too, so the identity moves.
         assert after["checkpoint_id"] != before["checkpoint_id"]
 
     # ---- run_bake_actions: the retry, and failing closed -----------------

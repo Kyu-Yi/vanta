@@ -8991,6 +8991,13 @@ def import_auditor(
     importer (a fix that removed an import), and a test file only the fix carries can
     be too, so either side alone would drop a pin the tree needs. The site keeps the
     commit it was read at, so the claim is checkable rather than a summary.
+
+    [VANTA-WHY] The closure's roots are the failing test files, and only a commit that
+    carries one has roots to give. A commit without it is skipped for the closure, not
+    stood in for by its whole tree: ``pandas/66``'s buggy commit lacks the file the fix
+    carries, and reading its whole tree as reachable made a pin its own tests never
+    reach look required (§8.6 row 14). The whole-tree fallback is kept for the one case
+    *neither* commit carries the failing test file, where there are no roots at all.
     """
     walk = list_files or (lambda commit: tree_mod.list_files_at(repo, commit))
     read = read_file or (lambda commit, path: tree_mod.read_file_at(repo, commit, path))
@@ -9000,6 +9007,7 @@ def import_auditor(
         sites: dict[str, tuple[ImportSite, ...]] = {}
         seen: dict[str, list[ImportSite]] = {}
         closure: set[str] = set()
+        trees: list[tuple[Mapping[str, Sequence[str]], list[str]]] = []
         for commit in dict.fromkeys(commits):
             if not commit:
                 continue
@@ -9011,16 +9019,20 @@ def import_auditor(
                     replace(record, commit=commit) for record in records
                 )
             graph = module_import_graph(files, read_file=partial(read, commit))
-            roots = [path for path in test_files if path in graph]
-            if roots:
-                closure.update(import_closure(roots, graph))
-            else:
-                # Neither tree carries the failing test file, so the closure question
-                # has no roots to answer from. An empty closure would drop every pin
-                # nothing can install, so the whole tree counts as reachable instead:
-                # the conservative direction, and the one that cannot bake a bug
-                # without a module its own tests reach.
+            trees.append((graph, [path for path in test_files if path in graph]))
+        # A commit without the failing test file contributes no roots, and must not
+        # stand in for the commit that has them: ``pandas/66``'s buggy commit lacks the
+        # file the fix carries, and counting its whole tree as reachable made a pin its
+        # own tests never reach look required (§8.6 row 14). The whole-tree fallback is
+        # for the one case the closure question has no roots at all — *neither* commit
+        # carries the failing test file — where an empty closure would drop every pin
+        # nothing can install, and the conservative direction is the safe one.
+        whole = not any(roots for _, roots in trees)
+        for graph, roots in trees:
+            if whole:
                 closure.update(graph)
+            elif roots:
+                closure.update(import_closure(roots, graph))
         sites = {module: tuple(records) for module, records in seen.items()}
         return sites, frozenset(closure)
 

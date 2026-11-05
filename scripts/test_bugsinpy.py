@@ -16663,6 +16663,60 @@ class TestUnresolvablePins:
         assert found.sites[1].optional == "type-checking only"
         assert "no unconditional import of it is in" in found.reason
 
+    def test_a_commit_without_the_failing_test_file_does_not_stand_in_with_its_tree(self):
+        """``pandas/66``: the buggy commit lacks the test file the fix carries.
+
+        The only unconditional ``import pyarrow`` is in the buggy commit's
+        ``demo/extra.py``, which the fix's test never reaches. Standing the buggy tree
+        in for the roots it cannot give read that site as reachable, so the pin looked
+        required and the bug was refused. Only the commit that carries the failing test
+        file has roots to answer the closure question with.
+        """
+        walk = {
+            "b" * 40: ["demo/extra.py", "demo/api.py"],
+            "f" * 40: ["demo/api.py", "tests/test_demo.py"],
+        }
+        text = {
+            ("b" * 40, "demo/extra.py"): "import pyarrow\n",
+            ("b" * 40, "demo/api.py"): "",
+            ("f" * 40, "demo/api.py"): "",
+            ("f" * 40, "tests/test_demo.py"): "import api\n",
+        }
+        audit = bake_mod.import_auditor(
+            Path("/nonexistent"),
+            ("b" * 40, "f" * 40),
+            distributions={},
+            test_files=["tests/test_demo.py"],
+            read_file=lambda commit, path: text.get((commit, path)),
+            list_files=lambda commit: walk[commit],
+        )
+        found = audit("pyarrow")
+        assert found.required_by is None, "the fix's test never reaches demo/extra.py"
+        assert [site.path for site in found.sites] == ["demo/extra.py"]
+        assert "no unconditional import of it is in" in found.reason
+
+    def test_neither_commit_carrying_the_failing_test_file_keeps_the_whole_tree(self):
+        """No roots at all, so the whole tree counts as reachable: the conservative half.
+
+        A bug whose recorded ``test_file`` exists in *neither* commit still has to bake
+        or flag on what it can read. With no roots to answer from, an empty closure
+        would drop every pin nothing can install, so every file counts as reachable and
+        an unconditional site is required rather than dropped.
+        """
+        audit = bake_mod.import_auditor(
+            Path("/nonexistent"),
+            ("b" * 40, "f" * 40),
+            distributions={},
+            test_files=["tests/test_demo.py"],
+            read_file=lambda commit, path: (
+                "import pyarrow\n" if path == "demo/core.py" else None
+            ),
+            list_files=lambda commit: ["demo/core.py"],
+        )
+        found = audit("pyarrow")
+        assert found.required_by == f"demo/core.py:1 at {'b' * 12}"
+        assert "inside the failing tests' import closure" in found.reason
+
     def test_the_audit_reads_each_commit_once_however_many_pins_ask(self):
         walks: list[str] = []
 

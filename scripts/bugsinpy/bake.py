@@ -249,6 +249,22 @@ from one a *dependency's* sdist asked for — ``setuptools_scm`` appearing in a 
 pin list is otherwise unexplainable.
 """
 
+BUILD_REQUIREMENT_FALLBACK_PIN_RULE = (
+    "build requirement, the declaring pin's own date"
+)
+"""The ``pin_rule`` of a build requirement placed by §3.2's widened window (§8.6 rule R3).
+
+[VANTA-WHY] :data:`BUILD_REQUIREMENT_PIN_RULE`'s date rule, read a second time and only when
+it found **nothing**: the window widens to the declaring pin's own release date
+(:func:`_declarer_pin_cutoff`), because a pin installed *as written* is not held to the bug's
+date (:func:`pin_cutoff`). It is a distinct phrase rather than the base one because the reader
+has to be able to tell a pin the bug's own date could reach from one it could not — the two
+carry the same ``declared_by``, and only ``pin_rule`` (and the ``widened_by`` key beside it)
+says the second rule was what placed it. Measured on ``fastapi/11``: ``ujson==3.0.0`` declares
+``setuptools_scm>=3.4``, nothing at the bug's date satisfies it, and the declarer's own date
+(2020-06-03) admits ``setuptools-scm==4.1.2``.
+"""
+
 BUGSINPY_PIN_RULE = "BugsInPy's own exact pin, installed as written"
 """The ``pin_rule`` of a pin that came from BugsInPy's own files (:func:`reference_pin`).
 
@@ -8073,6 +8089,13 @@ def build_requirement_pins(
     and ``/3`` pick ``setuptools-scm==3.5.0`` and ``fastapi/5`` and ``/6`` pick ``==3.4.1``
     from the bug's own date, which is what keeps them byte-identical.
 
+    A pin the widened window places records the fallback rather than leaving it to
+    ``declared_by``: its ``pin_rule`` names the widened window
+    (:data:`BUILD_REQUIREMENT_FALLBACK_PIN_RULE`) and ``widened_by`` names the declaring
+    release(s) whose own date became the cutoff — so the JSON says *why* the release is
+    newer than the bug's own date, which ``declared_by`` alone cannot (the same key is on
+    a pin the bug's date already reached).
+
     ``releases`` is the caller's — it has to include these names, which the caller learns
     from :func:`uncovered_build_requirements` — so the whole decision is exercised by a
     test that never touches the network.
@@ -8112,25 +8135,19 @@ def build_requirement_pins(
             and _specifier_accepts(specifier, version)
         ]
         cutoff = commit_date
+        widened_by: tuple[tuple[str, str], ...] = ()
         if not matching:
             # §3.2's fallback, reached **only** here: the bug's date found nothing, so
             # the window widens to the declaring pin's own date and no further
             # (:func:`_declarer_pin_cutoff`, :func:`pin_cutoff`). A layer that already
             # resolves never gets here, which is what makes the rule byte-identical for
             # every baked layer.
-            cutoff = max(
-                [
-                    commit_date,
-                    *(
-                        date
-                        for claim in claims
-                        if (
-                            date := _declarer_pin_cutoff(claim.declarer, releases)
-                        )
-                        is not None
-                    ),
-                ]
-            )
+            declarer_dates = {
+                claim.declarer: date
+                for claim in claims
+                if (date := _declarer_pin_cutoff(claim.declarer, releases)) is not None
+            }
+            cutoff = max([commit_date, *declarer_dates.values()])
             matching = [
                 (version, date)
                 for version, date in available.items()
@@ -8139,6 +8156,15 @@ def build_requirement_pins(
                 and _date_rule_candidate(version, specifier)
                 and _specifier_accepts(specifier, version)
             ]
+            if matching:
+                # The pin is placed only because the window widened, so the declaring
+                # release(s) whose own date became the cutoff are what anchored it — the
+                # fallback is recorded, not left to ``declared_by`` alone (:data:`widened_by`).
+                widened_by = tuple(
+                    (declarer, date)
+                    for declarer, date in sorted(declarer_dates.items())
+                    if date == cutoff
+                )
         if not matching:
             newest = _newest_release(available)
             raise BakeError(
@@ -8154,6 +8180,7 @@ def build_requirement_pins(
                 source=claims[0].source,
                 released_at=released_at[:10],
                 build_requirement_of=claims[0].declarer,
+                widened_by=widened_by,
             )
         )
     return pins
@@ -10450,6 +10477,18 @@ class BuildPin:
     ``setuptools_scm`` into this layer" is a question a reader asks of the JSON, and
     ``source`` is where it is answered rather than a key they can query.
     """
+    widened_by: tuple[tuple[str, str], ...] = ()
+    """The declaring pins whose own release date widened the window (§3.2, §8.6 rule R3).
+
+    [VANTA-WHY] ``build_requirement_of`` alone cannot say *which* rule placed the pin: a
+    build requirement the bug's own date reaches and one only the declaring pin's own date
+    reaches carry the same ``declared_by``, and the second is a different fact — the pin
+    installed is newer than the bug. So each ``(declarer, released_at)`` pair here is a
+    declaring pin whose own release landed at the widened cutoff, recorded so the JSON says
+    the fallback was used *and* what anchored it. Empty for every pin the bug's own date
+    already reached, which is what keeps an already-baked layer's record byte-identical.
+    Measured on ``fastapi/11``: one pair, ``("ujson==3.0.0", "2020-06-03")``.
+    """
 
     @property
     def pin_rule(self) -> str:
@@ -10462,6 +10501,8 @@ class BuildPin:
             return "the oldest release that satisfies " + "; ".join(
                 f"{pin} declares {specifier}" for pin, specifier in self.narrowed_by
             )
+        if self.widened_by:
+            return BUILD_REQUIREMENT_FALLBACK_PIN_RULE
         if self.build_requirement_of is not None:
             return BUILD_REQUIREMENT_PIN_RULE
         return BUILD_PIN_RULE
@@ -10482,6 +10523,11 @@ class BuildPin:
             data["narrowed_by"] = [
                 {"pin": pin, "requires": specifier}
                 for pin, specifier in self.narrowed_by
+            ]
+        if self.widened_by:
+            data["widened_by"] = [
+                {"pin": pin, "released_at": released_at}
+                for pin, released_at in self.widened_by
             ]
         return data
 

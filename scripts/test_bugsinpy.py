@@ -13512,13 +13512,71 @@ class TestBuildRequirementPins:
         assert pins[0].released_at == "2020-01-01"
         assert pins[0].build_requirement_of == "ujson==3.0.0"
 
+    def test_a_window_widened_to_the_declaring_releases_own_date_is_recorded(self):
+        """``fastapi/11`` in the JSON: the fallback was used, and what anchored it.
+
+        [VANTA-WHY] ``declared_by`` alone cannot say *which* rule placed the pin — a pin
+        the bug's own date reaches and one only the declaring pin's own date reaches carry
+        the same key. So the widened window records itself: a distinct ``pin_rule`` and a
+        ``widened_by`` naming the declaring release whose own date became the cutoff, down
+        to the day it landed. Here ``ujson==3.0.0`` (2020-06-03) declares
+        ``setuptools_scm>=3.4``, nothing at the bug's 2019-08-06 date satisfies it, and the
+        widened window admits ``setuptools-scm==4.1.2`` (2020-05-31).
+        """
+        releases = {
+            "setuptools-scm": {
+                "3.3.3": "2019-03-01",
+                "3.4.1": "2019-09-05",
+                "3.5.0": "2020-01-01",
+                "4.1.2": "2020-05-31",
+            },
+            "ujson": {"3.0.0": "2020-06-03"},
+        }
+        pins = self._pins(
+            [self._requirement("ujson==3.0.0", "setuptools_scm>=3.4")],
+            commit_date="2019-08-06",
+            releases=releases,
+        )
+        assert [pin.pin for pin in pins] == ["setuptools-scm==4.1.2"]
+        assert pins[0].pin_rule == bake_mod.BUILD_REQUIREMENT_FALLBACK_PIN_RULE
+        assert pins[0].widened_by == (("ujson==3.0.0", "2020-06-03"),)
+        assert pins[0].as_dict() == {
+            "name": "setuptools-scm",
+            "pin": "setuptools-scm==4.1.2",
+            "source": "ujson==3.0.0 setup_requires (setup.py) line 24",
+            "pin_rule": bake_mod.BUILD_REQUIREMENT_FALLBACK_PIN_RULE,
+            "released_at": "2020-05-31",
+            "declared_by": "ujson==3.0.0",
+            "widened_by": [{"pin": "ujson==3.0.0", "released_at": "2020-06-03"}],
+        }
+
+    def test_a_widened_window_that_still_finds_nothing_still_flags_the_bug(self):
+        """The fallback fails closed: a widened window with no candidate raises as before.
+
+        [VANTA-WHY] The widened cutoff is what the refusal now names, so the record still
+        says which window was searched — no candidate is invented and the bug is flagged.
+        """
+        releases = {
+            "setuptools-scm": {"3.3.3": "2019-03-01"},
+            "ujson": {"3.0.0": "2020-06-03"},
+        }
+        with pytest.raises(
+            bake_mod.BakeError,
+            match=r"'setuptools-scm' has no release on or before 2020-06-03",
+        ):
+            self._pins(
+                [self._requirement("ujson==3.0.0", "setuptools_scm>=3.4")],
+                releases=releases,
+            )
+
     def test_a_window_the_bug_date_already_resolves_is_left_alone(self):
         """The fallback is reached **only** when the bug's date finds nothing.
 
         [VANTA-WHY] This is what keeps the rule byte-identical for every already-baked
         layer: an empty window raised :class:`BakeError`, so a layer that baked by
         construction never had one, and the declarer's later date cannot move a pin the
-        bug's own date already placed.
+        bug's own date already placed. The record proves it: a pin the bug's date reached
+        carries no ``widened_by`` and the base ``pin_rule``.
         """
         releases = {
             "setuptools-scm": {"3.3.3": "2019-03-01", "3.5.0": "2020-01-01"},
@@ -13529,6 +13587,9 @@ class TestBuildRequirementPins:
             releases=releases,
         )
         assert [pin.pin for pin in pins] == ["setuptools-scm==3.3.3"]
+        assert pins[0].widened_by == ()
+        assert pins[0].pin_rule == bake_mod.BUILD_REQUIREMENT_PIN_RULE
+        assert "widened_by" not in pins[0].as_dict()
 
 
 class TestABuildRequirementNoPinCoversReachesTheLayer:

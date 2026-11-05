@@ -1037,6 +1037,13 @@ def load_manifest(path: str) -> list[dict[str, Any]]:
     [WHY] F3 — the rows are then filtered to the current ones through
     `manifest.effective_records`, so a resumed or re-run job is not read twice and a
     re-run of an inconclusive job drops the session it supersedes.
+
+    [WHY] M3-E follow-up — the rows carry any measured relabel the batch recorded
+    (`manifest.with_measured_relabels`), so this module sees the same row every
+    other reader resolves. What this module scores is NOT that label: its buckets
+    come from the session's `final_decision` paired with the CANDIDATE's ground
+    truth (`known_bad`, from the candidate's own oracle), which no relabel moves.
+    The attach is what keeps a future reader of the outcome label here honest.
     """
     records: list[dict[str, Any]] = []
     with open(path, encoding="utf-8") as handle:
@@ -1048,7 +1055,9 @@ def load_manifest(path: str) -> list[dict[str, Any]]:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    return manifest_mod.effective_records(records)
+    return manifest_mod.with_measured_relabels(
+        manifest_mod.effective_records(records), os.path.dirname(path)
+    )
 
 
 @dataclass

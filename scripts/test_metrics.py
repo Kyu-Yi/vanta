@@ -1432,3 +1432,24 @@ def test_load_manifest_drops_a_superseded_session(tmp_path):
     path = write_manifest(tmp_path, rows)
     assert [record["session_id"] for record in metrics.load_manifest(path)] == ["new"]
 
+
+def test_load_manifest_attaches_a_measured_relabel(tmp_path):
+    """M3-E follow-up — a MEASURED relabel lives in a sidecar beside the manifest.
+
+    The reader attaches it under the one key every other reader resolves
+    (``manifest.label_of``), so `metrics` sees the same row the digest and
+    `analyse` do rather than a copy nobody has corrected.
+    """
+    key = "b#Demo/1#vanta#repair#0#"
+    path = write_manifest(tmp_path, [{**manifest_row("s1"), "key": key, "label": "unobservable"}])
+    sidecar = metrics.manifest_mod.relabel_path(tmp_path, key)
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(
+        json.dumps({"label_relabelled_measured": {"label": "true_approval"}}), encoding="utf-8"
+    )
+    record = metrics.load_manifest(path)[0]
+    assert metrics.manifest_mod.label_of(record) == (
+        "true_approval",
+        metrics.manifest_mod.LABEL_SOURCE_MEASURED,
+    )
+

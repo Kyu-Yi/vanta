@@ -3329,7 +3329,11 @@ def _null_lock() -> Iterator[None]:
 
 
 def _stem(key: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in key)
+    # M3-E follow-up — the stem is defined once, in `manifest.stem`, because the run
+    # log, the oracle JSON, the issue text and the measured-relabel sidecar are all
+    # named by it; a second copy here could drift from the one a reader uses to find
+    # a row's sidecar.
+    return manifest_mod.stem(key)
 
 
 @dataclass
@@ -4659,16 +4663,21 @@ def wave_gate_failures(records: Sequence[dict[str, Any]]) -> list[str]:
         return ["the wave produced no records at all"]
     for record in records:
         tag = f"{record['bug']} {record['config']} {record['mode']}"
+        # M3-E follow-up — the EFFECTIVE label (`manifest.label_of`), so a censor a
+        # relabel has already corrected is not reported as one. A row the batch has
+        # not relabelled resolves to its own `label`, so this is the same test it
+        # has always been for every batch on disk.
+        label, _ = manifest_mod.label_of(record)
         if record.get("verdict") == "InfraFailure":
             problems.append(f"{tag}: InfraFailure — the environment, not the model")
-        elif record.get("label") in ("unobservable", "inconclusive"):
+        elif label in ("unobservable", "inconclusive"):
             # [VANTA-WHY] Item E7 — an INCONCLUSIVE grade (the patch applied but a run
             # wrote no readable report) is the same class of fact as `unobservable`: a
             # measurement the environment failed, not a decision about the model. Wave 1
             # is the go/no-go gate for "the oracle or the plumbing misbehaves", and an
             # unreadable grading is exactly that, so it stops the wave and names the row.
             problems.append(
-                f"{tag}: {record['label']} — verdict={record.get('verdict')} "
+                f"{tag}: {label} — verdict={record.get('verdict')} "
                 f"({record['oracle'].get('apply_detail') or record['oracle'].get('error')})"
             )
     # §8.2 item 5: the developer fix must grade good and the no-op must not. This
@@ -5109,6 +5118,11 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
                 "vanta_build_dirty": record.get("vanta_build_dirty"),
                 "runs": 0,
                 "labels": {},
+                # M3-E follow-up — which label SOURCE each row's label came from
+                # (measured relabel / derived relabel / original). Counted beside the
+                # histogram so a group that pooled a relabelled row and an original
+                # one is visible as such rather than reading as one kind of number.
+                "label_sources": {},
                 # §1.6.2 item 5 — the localization metric, pooled per group so the
                 # digest answers "was the bug's own file in the prompt" without a
                 # reader re-deriving it from `context_selection` strings. `unknown`
@@ -5131,8 +5145,21 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
             },
         )
         group["runs"] += 1
-        label = str(record.get("label"))
+        # [VANTA-WHY] M3-E follow-up — the histogram is of the EFFECTIVE label
+        # (`manifest.label_of`: measured relabel, then derived relabel, then the
+        # original), and the source each row used is counted beside it. A digest
+        # that read `record["label"]` directly would report the value a relabel
+        # exists to correct, and would disagree with every tool that resolves the
+        # precedence — the failure this rule exists to make impossible.
+        label, label_source = manifest_mod.label_of(record)
+        # A row with no label at all has always been counted under `str(None)`
+        # ("None"); the histogram is a count of what the rows say, so keep that
+        # spelling rather than inventing a new empty-string bucket for old batches.
+        label = label or str(record.get(manifest_mod.LABEL_KEY))
         group["labels"][label] = group["labels"].get(label, 0) + 1
+        group["label_sources"][label_source] = (
+            group["label_sources"].get(label_source, 0) + 1
+        )
         # Item T — derive the null when reading: a review row written before this
         # item can carry a `localization_hit`, and it cannot mean anything, so it
         # is ignored rather than counted. Rows on disk are never rewritten. Item V's
@@ -5156,9 +5183,23 @@ def digest(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 
 def render_digest(payload: dict[str, Any]) -> str:
+    # M3-E follow-up — the label SOURCES are printed only when at least one row's
+    # label came from a relabel. A batch nobody has re-measured resolves every label
+    # from the row itself, so its line is byte-identical to what it printed before
+    # this item — the rule `judge_failed` follows, and for the same reason: a report
+    # must not change under a reader merely because a feature exists. A payload
+    # written before this item carries no `label_sources` and reads as all-original.
+    show_sources = any(
+        any(
+            source != manifest_mod.LABEL_SOURCE_ORIGINAL
+            for source in group.get("label_sources", {})
+        )
+        for group in payload.get("groups", [])
+    )
     lines = [
         f"{'config':<10} {'arm':<7} {'mode':<8} {'seed':>4} {'model':<18} {'harness':<10} "
-        f"{'build':<10} {'runs':>5}  labels  localization  unshown_edits",
+        f"{'build':<10} {'runs':>5}  labels  localization  unshown_edits"
+        + ("  sources" if show_sources else ""),
         "-" * 150,
     ]
     for group in payload.get("groups", []):
@@ -5166,6 +5207,14 @@ def render_digest(payload: dict[str, Any]) -> str:
         build = str(group.get("vanta_build_commit") or "")[:9]
         model = str(group.get("model") or "")[:18]
         labels = " ".join(f"{k}={v}" for k, v in sorted(group["labels"].items()))
+        sources = (
+            "  "
+            + " ".join(
+                f"{k}={v}" for k, v in sorted(group.get("label_sources", {}).items())
+            )
+            if show_sources
+            else ""
+        )
         loc = group.get("localization") or {}
         # Item T — a review group's localization rate is not reported: the question
         # has no meaning over a seeded candidate. `localization_applies` defaults
@@ -5189,7 +5238,7 @@ def render_digest(payload: dict[str, Any]) -> str:
             f"{str(group['config']):<10} {str(group.get('arm') or ''):<7} "
             f"{str(group['mode']):<8} {str(group['seed']):>4} "
             f"{model:<18} {harness:<10} {build:<10} {group['runs']:>5}  {labels}  "
-            f"{localization}  {unshown}"
+            f"{localization}  {unshown}{sources}"
         )
     # G1 — the spend cap, when the batch ran under one. A line rather than a
     # column: it describes the batch, not a group, and a report from an uncapped

@@ -135,14 +135,45 @@ def unavailable(why: str) -> str:
     return f"unavailable({why})"
 
 
-def label_for(record: Mapping[str, Any]) -> str:
-    """One manifest row's §5.3 label, or ``""`` when the row carries no oracle."""
+def label_and_source(record: Mapping[str, Any]) -> tuple[str, str]:
+    """``(label, source)`` for one row — the EFFECTIVE label and where it was read.
+
+    [VANTA-WHY] M3-E follow-up — the row's stored ``label`` is the ORIGINAL, and two
+    corrections outrank it under the ONE fixed precedence (``manifest.label_of``): a
+    MEASURED relabel (the oracle re-run on the reconstructed final patch) and a
+    DERIVED one. Reading the stored value rather than re-deriving it here is what
+    keeps this module, the batch digest and ``compare_batches`` from disagreeing —
+    re-deriving would report the exact value a relabel exists to correct, which is
+    the failure the precedence rule exists to make impossible.
+
+    A row that records NO label under any of the three keys is read the way it always
+    was: from its own verdict and oracle. That is still the ORIGINAL reading (the
+    row's own evidence), and it keeps every legacy row — and the rows the runner
+    wrote before it recorded a ``label`` — readable.
+    """
+    label, source = manifest_mod.label_of(record)
+    if label:
+        return label, source
     payload = record.get("oracle")
     if not isinstance(payload, dict):
-        return ""
-    return runner_mod.label_for(
+        return "", ""
+    derived = runner_mod.label_for(
         str(record.get("verdict") or ""), runner_mod.oracle_from_dict(payload)
     )
+    if not derived:
+        return "", ""
+    return derived, manifest_mod.LABEL_SOURCE_ORIGINAL
+
+
+def label_for(record: Mapping[str, Any]) -> str:
+    """One manifest row's EFFECTIVE §5.3 label, or ``""`` when it carries none."""
+    return label_and_source(record)[0]
+
+
+def label_source_for(record: Mapping[str, Any]) -> str:
+    """Which source :func:`label_for` read: a relabel (measured or derived), or the
+    original label. ``""`` for a row that carries no label at all."""
+    return label_and_source(record)[1]
 
 
 def label_rule_for(record: Mapping[str, Any]) -> str:
@@ -178,6 +209,24 @@ def label_rule_counts(analysis: "Analysis") -> dict[str, int]:
             rule = label_rule_for(record)
             if rule:
                 counts[rule] = counts.get(rule, 0) + 1
+    return counts
+
+
+def label_source_counts(analysis: "Analysis") -> dict[str, int]:
+    """How many rows resolved their label from each source (M3-E follow-up).
+
+    The companion of :func:`label_rule_counts`: the rule says WHICH LABELLING RULE
+    a row's label came from, this says WHICH OF THE THREE COPIES it was read from —
+    a measured relabel, a derived relabel, or the original. A load that pooled a
+    relabelled row and an original one under one bucket is visible here rather than
+    implied by the number.
+    """
+    counts: dict[str, int] = {}
+    for batch in analysis.batches:
+        for record in batch.records:
+            source = label_source_for(record)
+            if source:
+                counts[source] = counts.get(source, 0) + 1
     return counts
 
 
@@ -362,6 +411,11 @@ def load_manifest(path: Path) -> list[dict[str, Any]]:
     the replay selector) drops exactly the same rows rather than each re-deriving
     "the last per key, minus a superseded session" for itself. A torn last line is
     dropped here: the writer died mid-append and the cursor still says `running`.
+
+    [VANTA-WHY] M3-E follow-up — a row the batch has MEASURED-relabelled carries
+    that correction too (``manifest.with_measured_relabels``), so the label this
+    module reports is the same one every other reader resolves. The sidecar lives
+    beside the manifest, which is why it is read here from ``path.parent``.
     """
     rows: list[dict[str, Any]] = []
     with open(path, encoding="utf-8") as handle:
@@ -373,7 +427,9 @@ def load_manifest(path: Path) -> list[dict[str, Any]]:
                 rows.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    return manifest_mod.effective_records(rows)
+    return manifest_mod.with_measured_relabels(
+        manifest_mod.effective_records(rows), path.parent
+    )
 
 
 def load_replays(batch_dir: Path) -> tuple[list[dict[str, Any]], int]:
@@ -2082,6 +2138,15 @@ def render_summary(analysis: Analysis, results: Sequence[MetricResult]) -> str:
         lines.append("label rules:")
         for rule in sorted(rules):
             lines.append(f"  {rule:<20} {rules[rule]}")
+    # M3-E follow-up — which of the three copies of the label each row was read
+    # from. Printed only when at least one row was read from a RELABEL, so a
+    # summary of an un-relabelled load is unchanged by this item.
+    sources = label_source_counts(analysis)
+    if any(source != manifest_mod.LABEL_SOURCE_ORIGINAL for source in sources):
+        lines.append("")
+        lines.append("label sources:")
+        for source in sorted(sources):
+            lines.append(f"  {source:<20} {sources[source]}")
     for result in results:
         lines.extend(result.summary)
     lines.append("")

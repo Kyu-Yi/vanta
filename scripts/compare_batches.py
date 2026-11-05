@@ -491,8 +491,20 @@ def group_identity(record: Mapping[str, Any]) -> tuple[str, str, str, int]:
 
 
 def _label_of(record: Mapping[str, Any]) -> dict[str, Any]:
+    """A row's reported label, its rule, and the SOURCE the label was read from.
+
+    [VANTA-WHY] M3-E follow-up — the label is the EFFECTIVE one
+    (``manifest.label_of``): a MEASURED relabel (the oracle re-run on the row's
+    reconstructed final patch) outranks a DERIVED one, which outranks the original
+    the run wrote. ``label_source`` names which of the three this row resolved to,
+    so a difference is readable rather than implied; it is REPORTED and not graded,
+    because the same value read from two sources is the same conclusion about the
+    candidate's bytes.
+    """
+    label, source = manifest_mod.label_of(record)
     return {
-        "label": record.get("label"),
+        "label": label or record.get("label"),
+        "label_source": source,
         "label_rule": record.get("label_rule"),
         "label_reason": record.get("label_reason"),
         "verdict": record.get("verdict"),
@@ -657,12 +669,19 @@ def compare_rows(
         labels = {
             name: [value_a, value_b]
             for name, value_a, value_b in (
-                ("label", a.get("label"), b.get("label")),
+                ("label", _label_of(a)["label"], _label_of(b)["label"]),
                 ("label_rule", a.get("label_rule"), b.get("label_rule")),
                 ("label_reason", a.get("label_reason"), b.get("label_reason")),
                 ("verdict", a.get("verdict"), b.get("verdict")),
             )
             if value_a != value_b
+        }
+        # M3-E follow-up — which copy each side's label was read from. Reported
+        # beside the grading rather than graded: the same value read from two
+        # sources is the same conclusion about the same candidate bytes.
+        label_sources = {
+            "serial": _label_of(a)["label_source"],
+            "parallel": _label_of(b)["label_source"],
         }
         oracle = compare_oracle(a, b, excluded_by_bug.get(bug, ()))
         limits = {
@@ -674,6 +693,7 @@ def compare_rows(
             {
                 "identity": list(key),
                 "label_differences": labels,
+                "label_sources": label_sources,
                 "oracle": oracle,
                 "time_limit_differences": limits,
                 "identical": oracle["identical"] and not limits and not labels,

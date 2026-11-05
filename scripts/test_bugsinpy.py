@@ -7144,6 +7144,34 @@ class TestCompareBatches:
         assert report["identical"] is False
         assert sorted(report["matched"][0]["label_differences"]) == ["label_rule", "verdict"]
 
+    def test_the_reported_label_is_resolved_under_the_one_precedence(self):
+        """M3-E follow-up — the label is the EFFECTIVE one, and the source is named."""
+        measured = compare_batches_mod._label_of(
+            self._row(
+                label="unobservable",
+                label_relabelled_measured={"label": "true_approval", "oracle_rerun": True},
+            )
+        )
+        assert measured["label"] == "true_approval"
+        assert measured["label_source"] == manifest_mod.LABEL_SOURCE_MEASURED
+        plain = compare_batches_mod._label_of(self._row())
+        assert plain["label_source"] == manifest_mod.LABEL_SOURCE_ORIGINAL
+
+    def test_a_matched_row_reports_both_sources_without_grading_the_source(self):
+        """The same value read from two copies is the same conclusion about the same
+        bytes, so the source is reported beside the grade, never graded."""
+        report = compare_batches_mod.compare_rows(
+            [self._row()],
+            [self._row(label_relabelled={"label": "true_approval"})],
+            {},
+        )
+        assert report["identical"] is True
+        assert report["matched"][0]["label_differences"] == {}
+        assert report["matched"][0]["label_sources"] == {
+            "serial": manifest_mod.LABEL_SOURCE_ORIGINAL,
+            "parallel": manifest_mod.LABEL_SOURCE_DERIVED,
+        }
+
     def test_a_matched_row_whose_hidden_outcome_moved_is_not_identical(self):
         moved = self._row(oracle=self._oracle(hidden_outcomes={"t::a": "failed"}))
         report = compare_batches_mod.compare_rows([self._row()], [moved], {})
@@ -24770,6 +24798,129 @@ class TestManifest:
         assert manifest_mod.Manifest(tmp_path).state() == {}
 
 
+class TestLabelPrecedence:
+    """M3-E follow-up — every reader resolves a row's outcome label in ONE order.
+
+    [VANTA-WHY] A row's ``label`` is the original; a corrections may outrank it and
+    neither rewrites the row (``manifest.jsonl`` is append-only evidence). The
+    measured relabel lives in a sidecar, the derived one on the row, and both are
+    resolved by :func:`manifest.label_of` in the fixed order measured → derived →
+    original — so two tools can never disagree about what a row says, and each can
+    report which of the three copies it used. Nothing here boots a VM.
+    """
+
+    KEY = "m3-smoke#matplotlib/1#vanta#repair#0#"
+
+    def test_measured_beats_derived_beats_original(self):
+        record = {
+            "label": "unobservable",
+            "label_relabelled": {"label": "derived"},
+            "label_relabelled_measured": {"label": "measured"},
+        }
+        assert manifest_mod.label_of(record) == (
+            "measured",
+            manifest_mod.LABEL_SOURCE_MEASURED,
+        )
+
+    def test_the_derived_relabel_beats_the_original(self):
+        record = {"label": "unobservable", "label_relabelled": {"label": "derived"}}
+        assert manifest_mod.label_of(record) == (
+            "derived",
+            manifest_mod.LABEL_SOURCE_DERIVED,
+        )
+
+    def test_the_original_is_the_last_resort_and_reports_itself(self):
+        assert manifest_mod.label_of({"label": "true_approval"}) == (
+            "true_approval",
+            manifest_mod.LABEL_SOURCE_ORIGINAL,
+        )
+
+    def test_a_row_with_no_label_at_all_is_an_absence_not_a_value(self):
+        assert manifest_mod.label_of({}) == ("", "")
+
+    def test_an_empty_relabel_does_not_mask_a_real_label(self):
+        """A marker that carried no label must not outrank one that did."""
+        record = {"label": "unobservable", "label_relabelled": {"oracle_rerun": False}}
+        assert manifest_mod.label_of(record) == (
+            "unobservable",
+            manifest_mod.LABEL_SOURCE_ORIGINAL,
+        )
+
+    def test_the_sidecar_stem_is_the_runs_own_stem(self):
+        """One stem names every file a row owns, so a reader holding the key finds
+        its sidecar — the run log, the oracle record and the relabel all agree."""
+        assert manifest_mod.stem(self.KEY) == "m3-smoke_matplotlib_1_vanta_repair_0_"
+        assert manifest_mod.stem(self.KEY) == runner_mod._stem(self.KEY)
+
+    def test_the_sidecar_path_is_the_agreed_filename(self, tmp_path):
+        assert manifest_mod.relabel_path(tmp_path, self.KEY) == (
+            tmp_path / "relabel" / "m3-smoke_matplotlib_1_vanta_repair_0_.json"
+        )
+
+    def test_a_batch_with_no_relabel_directory_returns_the_same_objects(self, tmp_path):
+        """The normal case is a batch nobody has re-measured; it costs one ``stat``."""
+        records = [{"key": "k1", "label": "true_approval"}]
+        out = manifest_mod.with_measured_relabels(records, tmp_path)
+        assert out[0] is records[0]
+
+    def test_a_measured_sidecar_is_attached_without_rewriting_the_row(self, tmp_path):
+        sidecar = manifest_mod.relabel_path(tmp_path, self.KEY)
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text(
+            json.dumps(
+                {"label_relabelled_measured": {"label": "true_approval", "oracle_rerun": True}}
+            ),
+            encoding="utf-8",
+        )
+        records = [{"key": self.KEY, "label": "unobservable"}]
+        out = manifest_mod.with_measured_relabels(records, tmp_path)
+        assert out[0] is not records[0], "the row must be copied, never mutated in place"
+        assert records[0]["label"] == "unobservable" and "label_relabelled_measured" not in records[0]
+        assert manifest_mod.label_of(out[0]) == (
+            "true_approval",
+            manifest_mod.LABEL_SOURCE_MEASURED,
+        )
+
+    def test_effective_records_attaches_the_sidecar_for_the_manifest(self, tmp_path):
+        """A reader that goes through the manifest sees the measured label."""
+        manifest = manifest_mod.Manifest(tmp_path)
+        manifest.append({"key": self.KEY, "label": "unobservable"})
+        sidecar = manifest_mod.relabel_path(tmp_path, self.KEY)
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text(
+            json.dumps({"label_relabelled_measured": {"label": "true_approval"}}),
+            encoding="utf-8",
+        )
+        row = manifest.effective_records()[0]
+        assert manifest_mod.label_of(row) == (
+            "true_approval",
+            manifest_mod.LABEL_SOURCE_MEASURED,
+        )
+
+    def test_a_malformed_sidecar_is_skipped_not_raised(self, tmp_path):
+        """One bad file must not take a whole report down; every other file is read."""
+        directory = manifest_mod.relabel_dir(tmp_path)
+        directory.mkdir(parents=True)
+        (directory / "bad.json").write_text("{not json", encoding="utf-8")
+        (directory / "no_block.json").write_text(json.dumps({"other": 1}), encoding="utf-8")
+        assert manifest_mod.measured_relabels(tmp_path) == {}
+
+    def test_a_sidecar_with_no_measured_block_contributes_nothing(self, tmp_path):
+        directory = manifest_mod.relabel_dir(tmp_path)
+        directory.mkdir(parents=True)
+        (directory / "x.json").write_text(json.dumps({"label_relabelled": {}}), encoding="utf-8")
+        assert manifest_mod.measured_relabels(tmp_path) == {}
+
+    def test_the_three_sources_are_the_only_ones_and_are_ordered(self):
+        """The precedence is stated once; a fourth copy must be added here, not
+        guessed at a reader."""
+        assert [source for _key, source in manifest_mod.LABEL_PRECEDENCE] == [
+            manifest_mod.LABEL_SOURCE_MEASURED,
+            manifest_mod.LABEL_SOURCE_DERIVED,
+            manifest_mod.LABEL_SOURCE_ORIGINAL,
+        ]
+
+
 class TestVantaTestCmd:
     """Vanta splits `--test-cmd` on whitespace with no quoting (`harness::build_test_cmd`)."""
 
@@ -26543,6 +26694,50 @@ class TestDigestAndLabels:
         assert json.loads((tmp_path / "run_digest.json").read_text())["runs"] == 1
         labels = json.loads(labels_path.read_text())
         assert set(labels) == {"new"}, "the superseded session was still labelled"
+
+    def test_the_digest_counts_the_label_source_beside_the_label(self):
+        """M3-E follow-up — a group pools the SOURCE each label was read from.
+
+        Every row of an un-relabelled batch resolves from the row itself, so the
+        histogram reads exactly as it did before this item and the rendered line
+        gains no column.
+        """
+        payload = runner_mod.digest(self.ROWS)
+        for group in payload["groups"]:
+            assert set(group["label_sources"]) == {manifest_mod.LABEL_SOURCE_ORIGINAL}
+        assert "sources" not in runner_mod.render_digest(payload).splitlines()[0]
+
+    def test_a_relabelled_row_is_counted_under_its_relabel_and_shown(self):
+        """A row whose label came from a relabel is visible as such, and the digest
+        prints the source column rather than reading as all-original."""
+        relabelled = dict(
+            self.ROWS[0],
+            label_relabelled={"label": "false_reject", "oracle_rerun": False},
+        )
+        payload = runner_mod.digest([relabelled])
+        group = payload["groups"][0]
+        assert group["labels"] == {"false_reject": 1}
+        assert group["label_sources"] == {manifest_mod.LABEL_SOURCE_DERIVED: 1}
+        assert "sources" in runner_mod.render_digest(payload).splitlines()[0]
+
+    def test_a_measured_relabel_outranks_the_derived_one_in_the_digest(self):
+        row = dict(
+            self.ROWS[0],
+            label="unobservable",
+            label_relabelled={"label": "derived"},
+            label_relabelled_measured={"label": "true_approval", "oracle_rerun": True},
+        )
+        group = runner_mod.digest([row])["groups"][0]
+        assert group["labels"] == {"true_approval": 1}
+        assert group["label_sources"] == {manifest_mod.LABEL_SOURCE_MEASURED: 1}
+
+    def test_a_row_with_no_label_keeps_the_historic_none_bucket(self):
+        """The histogram is a count of what rows say; an unlabelled row has always
+        read as ``None``, and this item must not change that spelling."""
+        row = dict(self.ROWS[0])
+        row.pop("label")
+        group = runner_mod.digest([row])["groups"][0]
+        assert group["labels"] == {"None": 1}
 
 
 class TestLocalizationHit:
@@ -36211,6 +36406,50 @@ class TestAnalyseNumbers:
         assert analyse_mod.label_rule_counts(_analyse_load(batch)) == {
             runner_mod.LABEL_RULE_LEGACY_ITEM_Q: 1,
             runner_mod.LABEL_RULE_STRICT_B6: 1,
+        }
+
+    def test_label_source_for_names_the_copy_the_label_came_from(self):
+        """M3-E follow-up — the reader reports WHICH of the three copies it used."""
+        original = _analyse_row("k", label="true_approval")
+        assert analyse_mod.label_for(original) == "true_approval"
+        assert analyse_mod.label_source_for(original) == manifest_mod.LABEL_SOURCE_ORIGINAL
+        derived = _analyse_row(
+            "k", label="unobservable", label_relabelled={"label": "true_approval"}
+        )
+        assert analyse_mod.label_for(derived) == "true_approval"
+        assert analyse_mod.label_source_for(derived) == manifest_mod.LABEL_SOURCE_DERIVED
+        measured = _analyse_row(
+            "k",
+            label="unobservable",
+            label_relabelled={"label": "derived"},
+            label_relabelled_measured={"label": "true_approval", "oracle_rerun": True},
+        )
+        assert analyse_mod.label_for(measured) == "true_approval"
+        assert analyse_mod.label_source_for(measured) == manifest_mod.LABEL_SOURCE_MEASURED
+
+    def test_a_row_without_a_stored_label_reads_from_its_own_evidence(self):
+        """A legacy row records no label; its own oracle still reads it, as the
+        ORIGINAL — so the metric never sees an empty cell it used to compute."""
+        row = _analyse_row("k", verdict="AllTestsPassed")
+        assert analyse_mod.label_for(row) == "true_approval"
+        assert analyse_mod.label_source_for(row) == manifest_mod.LABEL_SOURCE_ORIGINAL
+
+    def test_label_source_counts_reports_the_copies_apart(self, tmp_path):
+        """A mixed load — a relabelled row pooled with an original one — is visible."""
+        batch = _analyse_batch(
+            tmp_path,
+            rows=[
+                _analyse_row("plain"),
+                _analyse_row("relabelled", label_relabelled={"label": "true_approval"}),
+                _analyse_row(
+                    "measured", label_relabelled_measured={"label": "true_approval"}
+                ),
+            ],
+        )
+        assert analyse_mod.label_source_counts(_analyse_load(batch)) == {
+            manifest_mod.LABEL_SOURCE_ORIGINAL: 1,
+            manifest_mod.LABEL_SOURCE_DERIVED: 1,
+            manifest_mod.LABEL_SOURCE_MEASURED: 1,
         }
 
     def test_candidate_kind_names_the_papers_word_and_cuts_mutants_by_operator(self):
